@@ -1,0 +1,58 @@
+<div class="space-y-4">
+  <div class="flex items-center justify-between">
+    <h3 class="text-lg font-semibold">Email Details</h3>
+    <button onclick="document.getElementById('preview-modal').classList.add('hidden')"
+            class="text-gray-400 hover:text-white text-xl">&times;</button>
+  </div>
+
+  <div class="grid grid-cols-2 gap-2 text-sm">
+    <div>
+      <span class="text-gray-500">From:</span>
+      <span class="ml-2"><%= action.fromEmail %></span>
+    </div>
+    <div>
+      <span class="text-gray-500">Date:</span>
+      <span class="ml-2"><%= new Date(action.createdAt).toLocaleString() %></span>
+    </div>
+    <div class="col-span-2">
+      <span class="text-gray-500">Subject:</span>
+      <span class="ml-2 font-medium"><%= action.subject %></span>
+    </div>
+    <div class="col-span-2">
+      <span class="text-gray-500">Status:</span>
+      <span class="ml-2 font-medium
+        <%= action.status === 'sent' || action.status === 'approved' ? 'text-green-400' :
+            action.status === 'rejected' ? 'text-red-400' :
+            action.status === 'error' ? 'text-yellow-400' : 'text-blue-400' %>">
+        <%= action.status %>
+      </span>
+    </div>
+  </div>
+
+  <% if (action.originalBody) { %>
+    <div>
+      <h4 class="text-sm font-medium text-gray-400 mb-2">Original Email</h4>
+      <div class="bg-gray-800 rounded-lg p-4 text-sm whitespace-pre-wrap max-h-48 overflow-y-auto border border-gray-700">
+        <%= action.originalBody %>
+      </div>
+    </div>
+  <% } %>
+
+  <% if (action.draftBody) { %>
+    <div>
+      <h4 class="text-sm font-medium text-gray-400 mb-2">AI Draft Reply</h4>
+      <div class="bg-gray-800 rounded-lg p-4 text-sm whitespace-pre-wrap max-h-48 overflow-y-auto border border-green-900/50">
+        <%= action.draftBody %>
+      </div>
+    </div>
+  <% } %>
+
+  <% if (action.errorMessage) { %>
+    <div>
+      <h4 class="text-sm font-medium text-red-400 mb-2">Error</h4>
+      <div class="bg-red-950/30 rounded-lg p-4 text-sm text-red-300 border border-red-900/50">
+        <%= action.errorMessage %>
+      </div>
+    </div>
+  <% } %>
+</div>

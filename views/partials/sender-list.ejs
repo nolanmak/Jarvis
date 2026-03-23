@@ -1,0 +1,35 @@
+<% if (senders.length === 0) { %>
+  <p class="text-sm text-gray-500 py-4">No senders configured. Add email addresses above.</p>
+<% } else { %>
+  <% senders.forEach(function(sender) { %>
+    <div id="sender-<%= sender.id %>"
+         class="flex items-center justify-between py-2 px-3 rounded-lg hover:bg-gray-800/50 group">
+      <div class="flex items-center gap-3">
+        <button
+          hx-patch="/api/senders/<%= sender.id %>/toggle"
+          hx-target="#sender-list"
+          hx-swap="innerHTML"
+          class="w-4 h-4 rounded border flex items-center justify-center text-xs
+                 <%= sender.active ? 'bg-green-600 border-green-500 text-white' : 'border-gray-600 text-transparent' %>">
+          <% if (sender.active) { %>&#10003;<% } %>
+        </button>
+        <div>
+          <span class="text-sm <%= sender.active ? 'text-white' : 'text-gray-500 line-through' %>">
+            <%= sender.email %>
+          </span>
+          <% if (sender.label) { %>
+            <span class="text-xs text-gray-500 ml-2">(<%= sender.label %>)</span>
+          <% } %>
+        </div>
+      </div>
+      <button
+        hx-delete="/api/senders/<%= sender.id %>"
+        hx-target="#sender-<%= sender.id %>"
+        hx-swap="outerHTML"
+        hx-confirm="Remove <%= sender.email %>?"
+        class="text-gray-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity text-sm">
+        Remove
+      </button>
+    </div>
+  <% }); %>
+<% } %>

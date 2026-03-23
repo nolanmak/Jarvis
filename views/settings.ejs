@@ -1,0 +1,96 @@
+<% var body = `
+<div class="space-y-8">
+  <h1 class="text-xl font-semibold">Settings</h1>
+
+  <!-- Integration Status -->
+  <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
+    <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-4">Integrations</h2>
+    <div id="config-status">
+      <%- include('partials/config-status', { configStatus: configStatus }) %>
+    </div>
+  </div>
+
+  <!-- API Keys -->
+  <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
+    <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-4">API Configuration</h2>
+    <div class="space-y-4">
+      <!-- Groq -->
+      <form hx-post="/api/config" hx-target="#config-status" hx-swap="innerHTML" class="flex gap-3 items-end">
+        <input type="hidden" name="key" value="groq_api_key" />
+        <div class="flex-1">
+          <label class="block text-sm text-gray-400 mb-1">Groq API Key</label>
+          <input type="password" name="value" placeholder="gsk_..."
+                 class="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500" />
+        </div>
+        <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-md text-sm font-medium transition-colors">
+          Save
+        </button>
+      </form>
+
+      <!-- Composio -->
+      <form hx-post="/api/config" hx-target="#config-status" hx-swap="innerHTML" class="flex gap-3 items-end">
+        <input type="hidden" name="key" value="composio_api_key" />
+        <div class="flex-1">
+          <label class="block text-sm text-gray-400 mb-1">Composio API Key</label>
+          <input type="password" name="value" placeholder="ak_..."
+                 class="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500" />
+        </div>
+        <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-md text-sm font-medium transition-colors">
+          Save
+        </button>
+      </form>
+
+      <!-- Discord Webhook -->
+      <form hx-post="/api/config" hx-target="#config-status" hx-swap="innerHTML" class="flex gap-3 items-end">
+        <input type="hidden" name="key" value="discord_webhook_url" />
+        <div class="flex-1">
+          <label class="block text-sm text-gray-400 mb-1">Discord Webhook URL</label>
+          <input type="password" name="value" placeholder="https://discord.com/api/webhooks/..."
+                 class="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500" />
+        </div>
+        <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-md text-sm font-medium transition-colors">
+          Save
+        </button>
+      </form>
+
+      <!-- Discord Bot Token (Optional) -->
+      <form hx-post="/api/config" hx-target="#config-status" hx-swap="innerHTML" class="flex gap-3 items-end">
+        <input type="hidden" name="key" value="discord_bot_token" />
+        <div class="flex-1">
+          <label class="block text-sm text-gray-400 mb-1">Discord Bot Token <span class="text-gray-600">(optional - for interactive approval)</span></label>
+          <input type="password" name="value" placeholder="Bot token..."
+                 class="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500" />
+        </div>
+        <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-md text-sm font-medium transition-colors">
+          Save
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Senders -->
+  <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
+    <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-4">Tracked Senders</h2>
+    <p class="text-xs text-gray-500 mb-4">The agent will only process emails from these addresses.</p>
+
+    <!-- Add Sender Form -->
+    <form hx-post="/api/senders" hx-target="#sender-list" hx-swap="innerHTML"
+          class="flex gap-3 mb-4"
+          hx-on::after-request="this.reset()">
+      <input type="email" name="email" placeholder="sender@example.com" required
+             class="flex-1 bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500" />
+      <input type="text" name="label" placeholder="Label (optional)"
+             class="w-40 bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500" />
+      <button type="submit" class="px-4 py-2 bg-green-600 hover:bg-green-500 rounded-md text-sm font-medium transition-colors">
+        Add
+      </button>
+    </form>
+
+    <!-- Sender List -->
+    <div id="sender-list">
+      <%- include('partials/sender-list', { senders: senders }) %>
+    </div>
+  </div>
+</div>
+` %>
+<%- include('layout', { body: body, page: page }) %>

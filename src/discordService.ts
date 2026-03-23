@@ -7,7 +7,7 @@ import {
   TextChannel,
   ComponentType,
 } from "discord.js";
-import type { Email } from "./gmailService";
+import type { Email } from "./types";
 import dotenv from "dotenv";
 
 dotenv.config();

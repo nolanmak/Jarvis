@@ -1,0 +1,42 @@
+<% var body = `
+<div class="space-y-6">
+  <div class="flex items-center justify-between">
+    <h1 class="text-xl font-semibold">Dashboard</h1>
+    <span class="text-xs text-gray-500">Auto-refreshes every 10s</span>
+  </div>
+
+  <!-- Stats -->
+  <div id="stats-container" hx-get="/api/stats" hx-trigger="every 10s" hx-swap="innerHTML">
+    <%- include('partials/stats', { stats: stats }) %>
+  </div>
+
+  <!-- Recent Actions -->
+  <div>
+    <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-3">Recent Activity</h2>
+    <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+      <table class="w-full">
+        <thead>
+          <tr class="border-b border-gray-800 text-left">
+            <th class="px-4 py-2 text-xs text-gray-500 font-medium">Time</th>
+            <th class="px-4 py-2 text-xs text-gray-500 font-medium">From</th>
+            <th class="px-4 py-2 text-xs text-gray-500 font-medium">Subject</th>
+            <th class="px-4 py-2 text-xs text-gray-500 font-medium">Status</th>
+            <th class="px-4 py-2 text-xs text-gray-500 font-medium"></th>
+          </tr>
+        </thead>
+        <tbody>
+          <%- include('partials/action-rows', { actions: actions, currentPage: 1, totalPages: 1, currentStatus: 'all' }) %>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Preview Modal -->
+  <div id="preview-modal" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+       onclick="if(event.target===this) this.classList.add('hidden')">
+    <div id="preview-modal-content" class="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-2xl w-full max-h-[80vh] overflow-y-auto">
+    </div>
+  </div>
+</div>
+` %>
+<%- include('layout', { body: body, page: page }) %>
