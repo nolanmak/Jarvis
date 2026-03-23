@@ -1,0 +1,30 @@
+<div class="space-y-3">
+  <div class="flex items-center justify-between py-2">
+    <div class="flex items-center gap-2">
+      <span class="w-2 h-2 rounded-full <%= configStatus.groqKey ? 'bg-green-400' : 'bg-gray-600' %>"></span>
+      <span class="text-sm">Groq (LLM)</span>
+    </div>
+    <span class="text-xs text-gray-500"><%= configStatus.groqKey ? 'Connected' : 'Not configured' %></span>
+  </div>
+  <div class="flex items-center justify-between py-2">
+    <div class="flex items-center gap-2">
+      <span class="w-2 h-2 rounded-full <%= configStatus.composioKey ? 'bg-green-400' : 'bg-gray-600' %>"></span>
+      <span class="text-sm">Composio (Gmail)</span>
+    </div>
+    <span class="text-xs text-gray-500"><%= configStatus.composioKey ? 'Connected' : 'Not configured' %></span>
+  </div>
+  <div class="flex items-center justify-between py-2">
+    <div class="flex items-center gap-2">
+      <span class="w-2 h-2 rounded-full <%= configStatus.discordWebhook ? 'bg-green-400' : 'bg-gray-600' %>"></span>
+      <span class="text-sm">Discord Webhook</span>
+    </div>
+    <span class="text-xs text-gray-500"><%= configStatus.discordWebhook ? 'Connected' : 'Not configured' %></span>
+  </div>
+  <div class="flex items-center justify-between py-2">
+    <div class="flex items-center gap-2">
+      <span class="w-2 h-2 rounded-full <%= configStatus.discordBotToken ? 'bg-green-400' : 'bg-gray-600' %>"></span>
+      <span class="text-sm">Discord Bot (optional)</span>
+    </div>
+    <span class="text-xs text-gray-500"><%= configStatus.discordBotToken ? 'Connected' : 'Not configured' %></span>
+  </div>
+</div>

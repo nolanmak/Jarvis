@@ -1,0 +1,86 @@
+<% var body = `
+<div class="space-y-6">
+  <div class="flex items-center justify-between">
+    <h1 class="text-xl font-semibold">Action History</h1>
+    <span class="text-sm text-gray-500">${total} total</span>
+  </div>
+
+  <!-- Filters -->
+  <div class="flex gap-2">
+    <button
+      hx-get="/api/actions?status=all"
+      hx-target="#action-table-body"
+      hx-swap="innerHTML"
+      class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
+             ${currentStatus === 'all' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'}">
+      All
+    </button>
+    <button
+      hx-get="/api/actions?status=sent"
+      hx-target="#action-table-body"
+      hx-swap="innerHTML"
+      class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
+             ${currentStatus === 'sent' ? 'bg-green-900/50 text-green-400 border border-green-800' : 'text-gray-400 hover:text-white hover:bg-gray-800'}">
+      Sent
+    </button>
+    <button
+      hx-get="/api/actions?status=approved"
+      hx-target="#action-table-body"
+      hx-swap="innerHTML"
+      class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
+             ${currentStatus === 'approved' ? 'bg-green-900/50 text-green-400 border border-green-800' : 'text-gray-400 hover:text-white hover:bg-gray-800'}">
+      Approved
+    </button>
+    <button
+      hx-get="/api/actions?status=rejected"
+      hx-target="#action-table-body"
+      hx-swap="innerHTML"
+      class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
+             ${currentStatus === 'rejected' ? 'bg-red-900/50 text-red-400 border border-red-800' : 'text-gray-400 hover:text-white hover:bg-gray-800'}">
+      Rejected
+    </button>
+    <button
+      hx-get="/api/actions?status=pending"
+      hx-target="#action-table-body"
+      hx-swap="innerHTML"
+      class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
+             ${currentStatus === 'pending' ? 'bg-blue-900/50 text-blue-400 border border-blue-800' : 'text-gray-400 hover:text-white hover:bg-gray-800'}">
+      Pending
+    </button>
+    <button
+      hx-get="/api/actions?status=error"
+      hx-target="#action-table-body"
+      hx-swap="innerHTML"
+      class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
+             ${currentStatus === 'error' ? 'bg-yellow-900/50 text-yellow-400 border border-yellow-800' : 'text-gray-400 hover:text-white hover:bg-gray-800'}">
+      Errors
+    </button>
+  </div>
+
+  <!-- Actions Table -->
+  <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+    <table class="w-full">
+      <thead>
+        <tr class="border-b border-gray-800 text-left">
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Time</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">From</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Subject</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Status</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium"></th>
+        </tr>
+      </thead>
+      <tbody id="action-table-body">
+        <%- include('partials/action-rows', { actions: actions, currentPage: currentPage, totalPages: totalPages, currentStatus: currentStatus }) %>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Preview Modal -->
+  <div id="preview-modal" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+       onclick="if(event.target===this) this.classList.add('hidden')">
+    <div id="preview-modal-content" class="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-2xl w-full max-h-[80vh] overflow-y-auto">
+    </div>
+  </div>
+</div>
+` %>
+<%- include('layout', { body: body, page: page }) %>

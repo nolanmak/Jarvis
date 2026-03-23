@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AugmentAgent</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            surface: { DEFAULT: '#1a1a2e', light: '#16213e', card: '#0f3460' },
+            accent: { DEFAULT: '#e94560', soft: '#533483' },
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; }
+    .htmx-indicator { display: none; }
+    .htmx-request .htmx-indicator { display: inline-block; }
+    .htmx-request.htmx-indicator { display: inline-block; }
+    .fade-in { animation: fadeIn 0.2s ease-in; }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+  <!-- Nav -->
+  <nav class="border-b border-gray-800 bg-gray-900/80 backdrop-blur sticky top-0 z-50">
+    <div class="max-w-6xl mx-auto px-4 flex items-center h-14 gap-8">
+      <a href="/dashboard" class="text-lg font-semibold tracking-tight text-white">
+        AugmentAgent
+      </a>
+      <div class="flex gap-1">
+        <a href="/dashboard"
+           class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
+                  <%= page === 'dashboard' ? 'bg-gray-800 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800/50' %>">
+          Dashboard
+        </a>
+        <a href="/history"
+           class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
+                  <%= page === 'history' ? 'bg-gray-800 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800/50' %>">
+          History
+        </a>
+        <a href="/settings"
+           class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
+                  <%= page === 'settings' ? 'bg-gray-800 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800/50' %>">
+          Settings
+        </a>
+      </div>
+      <div class="ml-auto">
+        <span class="text-xs text-gray-500">v1.0.0</span>
+      </div>
+    </div>
+  </nav>
+
+  <!-- Content -->
+  <main class="max-w-6xl mx-auto px-4 py-6">
+    <%- body %>
+  </main>
+</body>
+</html>

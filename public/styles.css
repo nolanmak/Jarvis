@@ -1,0 +1,27 @@
+/* Minimal custom styles — Tailwind CDN handles everything else */
+
+/* Smooth HTMX transitions */
+.htmx-swapping {
+  opacity: 0;
+  transition: opacity 0.15s ease-out;
+}
+
+.htmx-settling {
+  opacity: 1;
+  transition: opacity 0.15s ease-in;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #374151;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #4b5563;
+}
