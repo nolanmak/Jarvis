@@ -1,16 +1,10 @@
 import { Composio } from "@composio/client";
 import dotenv from "dotenv";
+import type { Email } from "./types";
 
 dotenv.config();
 
-export interface Email {
-  messageId: string;
-  threadId: string;
-  from: string;
-  subject: string;
-  body: string;
-  date: string;
-}
+export type { Email };
 
 const composio = new Composio({ apiKey: process.env.COMPOSIO_API_KEY });
 
@@ -19,7 +13,7 @@ export async function fetchUnreadEmails(
 ): Promise<Email[]> {
   // TODO: Implement with Composio Gmail integration
   // Will use composio.actions.execute to call GMAIL_FETCH_EMAILS
-  throw new Error("Not implemented — Phase 1 scaffold");
+  throw new Error("Not implemented — wire up Composio Gmail actions");
 }
 
 export async function createDraft(
@@ -30,11 +24,11 @@ export async function createDraft(
 ): Promise<string> {
   // TODO: Implement with Composio Gmail integration
   // Will use composio.actions.execute to call GMAIL_CREATE_DRAFT
-  throw new Error("Not implemented — Phase 1 scaffold");
+  throw new Error("Not implemented — wire up Composio Gmail actions");
 }
 
 export async function sendDraft(draftId: string): Promise<void> {
   // TODO: Implement with Composio Gmail integration
   // Will use composio.actions.execute to call GMAIL_SEND_DRAFT
-  throw new Error("Not implemented — Phase 1 scaffold");
+  throw new Error("Not implemented — wire up Composio Gmail actions");
 }
