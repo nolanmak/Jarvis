@@ -5,7 +5,6 @@ import {
 } from "@openai/agents";
 import type { FunctionTool, Tool, RunContext } from "@openai/agents";
 import OpenAI from "openai";
-import { z } from "zod";
 import dotenv from "dotenv";
 
 import { fetchUnreadEmails, createDraft, sendDraft } from "./gmailService";
@@ -15,7 +14,8 @@ import type { Email } from "./types";
 
 dotenv.config();
 
-const MODEL = "gpt-oss-120b";
+const CEREBRAS_MODEL = "gpt-oss-120b";
+const GROQ_MODEL = "openai/gpt-oss-120b";
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
 
@@ -41,23 +41,8 @@ if (!cerebrasClient && !groqClient) {
   );
 }
 
-// --- Zod schemas for compound tools ---
-
-const gmailSchema = z.object(
-  {
-    action: z.enum(["fetch_unread", "create_draft", "send_draft"]),
-    params: z.record(z.string(), z.unknown()),
-  },
-);
-
-const notifySchema = z.object(
-  {
-    action: z.enum(["send_for_approval", "log_action", "update_action"]),
-    params: z.record(z.string(), z.unknown()),
-  },
-);
-
-// --- Compound Tools (2 tools, stable schemas — cacheable) ---
+// --- Compound Tools (2 tools, stable JSON schemas — cacheable) ---
+// Using explicit JSON Schema with additionalProperties: false (required by Groq/Cerebras)
 
 interface GmailInput {
   action: "fetch_unread" | "create_draft" | "send_draft";
@@ -76,12 +61,25 @@ const gmailTool: FunctionTool<any, any, any> = {
 - fetch_unread: Get unread emails. params: { senders: string[] }
 - create_draft: Create a reply draft. params: { to: string, subject: string, body: string, threadId?: string }
 - send_draft: Send a draft. params: { draftId: string }`,
-  parameters: gmailSchema as any,
-  strict: true,
+  parameters: {
+    type: "object",
+    properties: {
+      action: {
+        type: "string",
+        enum: ["fetch_unread", "create_draft", "send_draft"],
+      },
+      params: {
+        type: "object",
+      },
+    },
+    required: ["action", "params"],
+    additionalProperties: false,
+  } as any,
+  strict: false,
   needsApproval: false as any,
   isEnabled: true as any,
   invoke: async (_ctx: RunContext<any>, input: string) => {
-    const { action, params } = gmailSchema.parse(JSON.parse(input)) as GmailInput;
+    const { action, params } = JSON.parse(input) as GmailInput;
     switch (action) {
       case "fetch_unread": {
         const senders = params.senders as string[];
@@ -114,12 +112,25 @@ const notifyTool: FunctionTool<any, any, any> = {
 - send_for_approval: Send email + draft to Discord for human approval. params: { email: { messageId, threadId, from, subject, body, date }, draft: string }. Returns { approved: boolean }
 - log_action: Record an action to the database. params: { messageId: string, threadId?: string, fromEmail: string, subject: string, originalBody?: string, draftBody?: string, status: "pending"|"approved"|"rejected"|"sent"|"error" }. Returns { actionId: string }
 - update_action: Update an existing action's status. params: { actionId: string, status: string, draftBody?: string, errorMessage?: string }`,
-  parameters: notifySchema as any,
-  strict: true,
+  parameters: {
+    type: "object",
+    properties: {
+      action: {
+        type: "string",
+        enum: ["send_for_approval", "log_action", "update_action"],
+      },
+      params: {
+        type: "object",
+      },
+    },
+    required: ["action", "params"],
+    additionalProperties: false,
+  } as any,
+  strict: false,
   needsApproval: false as any,
   isEnabled: true as any,
   invoke: async (_ctx: RunContext<any>, input: string) => {
-    const { action, params } = notifySchema.parse(JSON.parse(input)) as NotifyInput;
+    const { action, params } = JSON.parse(input) as NotifyInput;
     switch (action) {
       case "send_for_approval": {
         const email = params.email as Email;
@@ -185,12 +196,12 @@ Draft guidelines:
 
 const agentTools: Tool[] = [gmailTool, notifyTool];
 
-function createAgent(client: OpenAI): Agent {
+function createAgent(client: OpenAI, model: string): Agent {
   return new Agent({
     name: "AugmentAgent",
     instructions: AGENT_INSTRUCTIONS,
     tools: agentTools,
-    model: new OpenAIChatCompletionsModel(client, MODEL),
+    model: new OpenAIChatCompletionsModel(client, model),
   });
 }
 
@@ -232,18 +243,19 @@ async function runWithRetry(
 }
 
 export async function runAgent(dynamicContext: string): Promise<string> {
-  const providers: { name: string; client: OpenAI }[] = [];
+  const providers: { name: string; client: OpenAI; model: string }[] = [];
 
   if (cerebrasClient)
-    providers.push({ name: "Cerebras", client: cerebrasClient });
-  if (groqClient) providers.push({ name: "Groq", client: groqClient });
+    providers.push({ name: "Cerebras", client: cerebrasClient, model: CEREBRAS_MODEL });
+  if (groqClient)
+    providers.push({ name: "Groq", client: groqClient, model: GROQ_MODEL });
 
   const errors: string[] = [];
 
   for (const provider of providers) {
     try {
-      console.log(`Trying ${provider.name} (${MODEL})...`);
-      const agent = createAgent(provider.client);
+      console.log(`Trying ${provider.name} (${provider.model})...`);
+      const agent = createAgent(provider.client, provider.model);
       const result = await runWithRetry(
         agent,
         dynamicContext,

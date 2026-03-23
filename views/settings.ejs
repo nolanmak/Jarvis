@@ -1,4 +1,5 @@
-<% var body = `
+<%- include('partials/header', { page: 'settings' }) %>
+
 <div class="space-y-8">
   <h1 class="text-xl font-semibold">Settings</h1>
 
@@ -92,5 +93,5 @@
     </div>
   </div>
 </div>
-` %>
-<%- include('layout', { body: body, page: page }) %>
+
+<%- include('partials/footer') %>
