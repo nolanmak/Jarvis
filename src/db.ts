@@ -179,6 +179,13 @@ export function getStats(): DashboardStats {
   };
 }
 
+export function getRecentProcessedIds(limit = 50): string[] {
+  const rows = getDb()
+    .prepare("SELECT messageId FROM actions ORDER BY createdAt DESC LIMIT ?")
+    .all(limit) as { messageId: string }[];
+  return rows.map((r) => r.messageId);
+}
+
 // --- Senders ---
 
 export function getSenders(): Sender[] {

@@ -3,18 +3,15 @@ dotenv.config();
 
 import express from "express";
 import path from "path";
-import { fetchUnreadEmails, sendDraft, createDraft } from "./gmailService";
-import { generateReply } from "./llmService";
-import { initBot, sendForApproval } from "./discordService";
+import { initBot } from "./discordService";
 import {
   initDb,
-  logAction,
-  updateActionStatus,
-  isMessageProcessed,
   getActiveSenders,
+  getRecentProcessedIds,
   addSender,
   getSenders,
 } from "./db";
+import { runAgent } from "./agent";
 import dashboardRouter from "./dashboard";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
@@ -46,60 +43,22 @@ async function pollAndProcess(): Promise<void> {
     return;
   }
 
+  // Dynamic context — keeps agent instructions (prefix) stable for caching
+  const recentIds = getRecentProcessedIds();
+  const dynamicContext = `<context>
+Active senders: ${senders.join(", ")}
+Current time: ${new Date().toISOString()}
+Recently processed message IDs (skip these): ${recentIds.join(", ") || "none"}
+</context>
+
+Check for new emails from the tracked senders and process any you find.`;
+
   console.log(
-    `[${new Date().toISOString()}] Polling for emails from ${senders.length} sender(s)...`
+    `[${new Date().toISOString()}] Running agent for ${senders.length} sender(s)...`
   );
 
-  const emails = await fetchUnreadEmails(senders);
-  const newEmails = emails.filter((e) => !isMessageProcessed(e.messageId));
-
-  if (newEmails.length === 0) {
-    console.log("No new emails found.");
-    return;
-  }
-
-  console.log(`Found ${newEmails.length} new email(s).`);
-
-  for (const email of newEmails) {
-    const actionId = logAction({
-      messageId: email.messageId,
-      threadId: email.threadId,
-      fromEmail: email.from,
-      subject: email.subject,
-      originalBody: email.body,
-      status: "pending",
-    });
-
-    try {
-      console.log(`Processing: "${email.subject}" from ${email.from}`);
-
-      const draft = await generateReply(email.body);
-      updateActionStatus(actionId, "pending", { draftBody: draft });
-      console.log("Draft generated. Sending to Discord for approval...");
-
-      const approved = await sendForApproval(email, draft);
-
-      if (approved) {
-        updateActionStatus(actionId, "approved");
-        const draftId = await createDraft(
-          email.from,
-          `Re: ${email.subject}`,
-          draft,
-          email.threadId
-        );
-        await sendDraft(draftId);
-        updateActionStatus(actionId, "sent");
-        console.log(`Reply sent to ${email.from}`);
-      } else {
-        updateActionStatus(actionId, "rejected");
-        console.log(`Draft rejected for "${email.subject}"`);
-      }
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      updateActionStatus(actionId, "error", { errorMessage: errorMsg });
-      console.error(`Error processing email "${email.subject}":`, err);
-    }
-  }
+  const result = await runAgent(dynamicContext);
+  console.log(`Agent completed: ${result}`);
 }
 
 function startDashboard(): void {
