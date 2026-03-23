@@ -1,4 +1,5 @@
-<% var body = `
+<%- include('partials/header', { page: 'dashboard' }) %>
+
 <div class="space-y-6">
   <div class="flex items-center justify-between">
     <h1 class="text-xl font-semibold">Dashboard</h1>
@@ -38,5 +39,5 @@
     </div>
   </div>
 </div>
-` %>
-<%- include('layout', { body: body, page: page }) %>
+
+<%- include('partials/footer') %>

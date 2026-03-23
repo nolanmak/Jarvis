@@ -1,8 +1,9 @@
-<% var body = `
+<%- include('partials/header', { page: 'history' }) %>
+
 <div class="space-y-6">
   <div class="flex items-center justify-between">
     <h1 class="text-xl font-semibold">Action History</h1>
-    <span class="text-sm text-gray-500">${total} total</span>
+    <span class="text-sm text-gray-500"><%= total %> total</span>
   </div>
 
   <!-- Filters -->
@@ -12,7 +13,7 @@
       hx-target="#action-table-body"
       hx-swap="innerHTML"
       class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
-             ${currentStatus === 'all' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800'}">
+             <%= currentStatus === 'all' ? 'bg-gray-700 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800' %>">
       All
     </button>
     <button
@@ -20,7 +21,7 @@
       hx-target="#action-table-body"
       hx-swap="innerHTML"
       class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
-             ${currentStatus === 'sent' ? 'bg-green-900/50 text-green-400 border border-green-800' : 'text-gray-400 hover:text-white hover:bg-gray-800'}">
+             <%= currentStatus === 'sent' ? 'bg-green-900/50 text-green-400 border border-green-800' : 'text-gray-400 hover:text-white hover:bg-gray-800' %>">
       Sent
     </button>
     <button
@@ -28,7 +29,7 @@
       hx-target="#action-table-body"
       hx-swap="innerHTML"
       class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
-             ${currentStatus === 'approved' ? 'bg-green-900/50 text-green-400 border border-green-800' : 'text-gray-400 hover:text-white hover:bg-gray-800'}">
+             <%= currentStatus === 'approved' ? 'bg-green-900/50 text-green-400 border border-green-800' : 'text-gray-400 hover:text-white hover:bg-gray-800' %>">
       Approved
     </button>
     <button
@@ -36,7 +37,7 @@
       hx-target="#action-table-body"
       hx-swap="innerHTML"
       class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
-             ${currentStatus === 'rejected' ? 'bg-red-900/50 text-red-400 border border-red-800' : 'text-gray-400 hover:text-white hover:bg-gray-800'}">
+             <%= currentStatus === 'rejected' ? 'bg-red-900/50 text-red-400 border border-red-800' : 'text-gray-400 hover:text-white hover:bg-gray-800' %>">
       Rejected
     </button>
     <button
@@ -44,7 +45,7 @@
       hx-target="#action-table-body"
       hx-swap="innerHTML"
       class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
-             ${currentStatus === 'pending' ? 'bg-blue-900/50 text-blue-400 border border-blue-800' : 'text-gray-400 hover:text-white hover:bg-gray-800'}">
+             <%= currentStatus === 'pending' ? 'bg-blue-900/50 text-blue-400 border border-blue-800' : 'text-gray-400 hover:text-white hover:bg-gray-800' %>">
       Pending
     </button>
     <button
@@ -52,7 +53,7 @@
       hx-target="#action-table-body"
       hx-swap="innerHTML"
       class="px-3 py-1.5 rounded-md text-sm font-medium transition-colors
-             ${currentStatus === 'error' ? 'bg-yellow-900/50 text-yellow-400 border border-yellow-800' : 'text-gray-400 hover:text-white hover:bg-gray-800'}">
+             <%= currentStatus === 'error' ? 'bg-yellow-900/50 text-yellow-400 border border-yellow-800' : 'text-gray-400 hover:text-white hover:bg-gray-800' %>">
       Errors
     </button>
   </div>
@@ -82,5 +83,5 @@
     </div>
   </div>
 </div>
-` %>
-<%- include('layout', { body: body, page: page }) %>
+
+<%- include('partials/footer') %>
