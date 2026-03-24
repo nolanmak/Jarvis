@@ -11,15 +11,58 @@
     </div>
   </div>
 
+  <!-- Email Storage -->
+  <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
+    <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-4">Email Storage</h2>
+    <p class="text-xs text-gray-500 mb-4">
+      Emails are stored locally for deduplication, analytics, and AI training data.
+      <span class="text-gray-300 font-medium"><%= emailCount %></span> email(s) in archive.
+    </p>
+
+    <form hx-post="/api/config" hx-target="#config-status" hx-swap="innerHTML" class="flex gap-3 items-end">
+      <input type="hidden" name="key" value="email_retention_days" />
+      <div class="flex-1">
+        <label class="block text-sm text-gray-400 mb-1">Retention Policy</label>
+        <select name="value"
+                class="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
+          <option value="0" <%= emailRetention === '0' ? 'selected' : '' %>>Keep forever (recommended)</option>
+          <option value="30" <%= emailRetention === '30' ? 'selected' : '' %>>30 days</option>
+          <option value="90" <%= emailRetention === '90' ? 'selected' : '' %>>90 days</option>
+          <option value="180" <%= emailRetention === '180' ? 'selected' : '' %>>180 days</option>
+          <option value="365" <%= emailRetention === '365' ? 'selected' : '' %>>1 year</option>
+        </select>
+      </div>
+      <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-md text-sm font-medium transition-colors">
+        Save
+      </button>
+    </form>
+    <p class="text-xs text-gray-600 mt-2">
+      "Keep forever" stores all emails indefinitely. Other options auto-purge processed emails older than the selected period. Unprocessed emails are never deleted.
+    </p>
+  </div>
+
   <!-- API Keys -->
   <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
     <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-4">API Configuration</h2>
     <div class="space-y-4">
-      <!-- Groq -->
+      <!-- Cerebras (Primary) -->
+      <form hx-post="/api/config" hx-target="#config-status" hx-swap="innerHTML" class="flex gap-3 items-end">
+        <input type="hidden" name="key" value="cerebras_api_key" />
+        <div class="flex-1">
+          <label class="block text-sm text-gray-400 mb-1">Cerebras API Key <span class="text-gray-600">(primary)</span></label>
+          <input type="password" name="value" placeholder="csk-..."
+                 class="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500" />
+        </div>
+        <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-md text-sm font-medium transition-colors">
+          Save
+        </button>
+      </form>
+
+      <!-- Groq (Fallback) -->
       <form hx-post="/api/config" hx-target="#config-status" hx-swap="innerHTML" class="flex gap-3 items-end">
         <input type="hidden" name="key" value="groq_api_key" />
         <div class="flex-1">
-          <label class="block text-sm text-gray-400 mb-1">Groq API Key</label>
+          <label class="block text-sm text-gray-400 mb-1">Groq API Key <span class="text-gray-600">(fallback)</span></label>
           <input type="password" name="value" placeholder="gsk_..."
                  class="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500" />
         </div>
