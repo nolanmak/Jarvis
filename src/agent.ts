@@ -163,7 +163,7 @@ const gmailTool = (tool as any)({
 const notifyTool = (tool as any)({
   name: "notify",
   description: `Send notifications, log actions, and learn patterns. Available actions:
-- send_for_approval: Send email + draft to Discord for human approval. params: { email: { messageId, threadId, from, subject, body, date }, draft: string }. Returns { approved: boolean }
+- send_for_approval: Send email + draft to Discord for human approval (opens a thread). User can approve, revise (with feedback), or skip. params: { email: { messageId, threadId, from, subject, body, date }, draft: string }. Returns { approved: boolean, finalDraft: string }. IMPORTANT: use finalDraft (not your original draft) for creating the Gmail draft, as the user may have revised it.
 - log_action: Record an action to the database. params: { messageId: string, fromEmail: string, subject: string, originalBody?: string, draftBody?: string, status: "pending"|"approved"|"rejected"|"sent"|"error"|"skipped"|"flagged" }. Returns { actionId: string }
 - update_action: Update an existing action's status. params: { actionId: string, status: string, draftBody?: string, errorMessage?: string }
 - learn_pattern: Save a pattern for future triage. params: { type: "sender"|"domain"|"subject"|"style", pattern: string, action: "skip"|"flag"|"reply", reason: string }
@@ -177,8 +177,8 @@ const notifyTool = (tool as any)({
       case "send_for_approval": {
         const email = input.params.email as Email;
         const draft = input.params.draft as string;
-        const approved = await sendForApproval(email, draft);
-        return JSON.stringify({ approved });
+        const result = await sendForApproval(email, draft);
+        return JSON.stringify(result);
       }
       case "log_action": {
         const actionId = logAction({
@@ -253,8 +253,9 @@ For each email provided:
    - Draft a reply following the Writing Style rules strictly
    - call notify({ action: "update_action", params: { actionId, status: "pending", draftBody: <draft> } })
    - call notify({ action: "send_for_approval", params: { email, draft } })
-   - If approved: create_draft then send_draft, update status to "sent"
-   - If rejected: update status to "rejected"
+   - The result includes { approved, finalDraft }. The user may have revised the draft in Discord.
+   - If approved: use finalDraft (not your original draft) for create_draft, then send_draft, update status to "sent"
+   - If not approved: update status to "rejected"
    - call notify({ action: "mark_processed", params: { messageId, triageResult: "reply" } })
 5. After processing all emails, call learn_pattern for any new skip/flag patterns you discovered
 6. Report a brief summary: X emails checked, Y skipped, Z drafted, W sent`;
@@ -349,4 +350,50 @@ export async function runAgent(dynamicContext: string): Promise<string> {
   throw new Error(
     `All LLM providers failed:\n${errors.map((e) => `  - ${e}`).join("\n")}`
   );
+}
+
+/**
+ * Re-draft an email reply based on user feedback.
+ * Used by Discord revise flow. Runs a focused agent call with no tools needed.
+ */
+export async function redraftWithFeedback(
+  original: Email,
+  previousDraft: string,
+  feedback: string
+): Promise<string> {
+  const skill = loadSkillFile();
+  const redraftInstructions = `You are a professional email draft editor. Follow these writing rules strictly:
+
+${skill ? skill.split("## Writing Style")[1]?.split("##")[0] || "" : ""}
+
+Revise the draft below based on the user's feedback. Return ONLY the revised email text, nothing else.`;
+
+  const redraftAgent = new Agent({
+    name: "RedraftAgent",
+    instructions: redraftInstructions,
+    tools: [],
+    model: (() => {
+      if (process.env.CEREBRAS_API_KEY) return createCerebrasModel(CEREBRAS_MODEL);
+      return createGroqModel(GROQ_MODEL);
+    })(),
+  });
+
+  const input = `Original email from ${original.from}:
+Subject: ${original.subject}
+
+${original.body}
+
+---
+
+Previous draft:
+${previousDraft}
+
+---
+
+User feedback: "${feedback}"
+
+Write the revised draft now. Only output the email text.`;
+
+  const result = await run(redraftAgent, input);
+  return result.finalOutput ?? previousDraft;
 }

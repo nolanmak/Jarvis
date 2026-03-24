@@ -4,7 +4,7 @@ dotenv.config();
 import { execSync } from "child_process";
 import express from "express";
 import path from "path";
-import { initBot } from "./discordService";
+import { initBot, setRedraftFunction } from "./discordService";
 import {
   initDb,
   getActiveGmailAccounts,
@@ -12,7 +12,7 @@ import {
   purgeOldEmails,
 } from "./db";
 import { fetchUnreadEmails } from "./gmailService";
-import { runAgent } from "./agent";
+import { runAgent, redraftWithFeedback } from "./agent";
 import dashboardRouter from "./dashboard";
 import type { Email } from "./types";
 
@@ -120,8 +120,9 @@ async function main(): Promise<void> {
   // Start web dashboard
   startDashboard();
 
-  // Initialize Discord bot
+  // Initialize Discord bot + wire redraft function
   try {
+    setRedraftFunction(redraftWithFeedback);
     await initBot();
     console.log("Discord bot ready.");
   } catch (err) {
