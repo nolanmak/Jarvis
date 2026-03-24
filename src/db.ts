@@ -41,9 +41,35 @@ export function initDb(dbPath?: string): Database.Database {
       updatedAt INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS gmail_accounts (
+      id TEXT PRIMARY KEY,
+      connectionId TEXT NOT NULL,
+      email TEXT,
+      label TEXT,
+      entityId TEXT NOT NULL,
+      active INTEGER DEFAULT 1,
+      createdAt INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS emails (
+      messageId TEXT PRIMARY KEY,
+      threadId TEXT,
+      fromEmail TEXT NOT NULL,
+      subject TEXT NOT NULL,
+      body TEXT,
+      receivedAt TEXT,
+      accountEntityId TEXT,
+      firstSeenAt INTEGER NOT NULL,
+      triageResult TEXT,
+      agentProcessedAt INTEGER
+    );
+
     CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);
     CREATE INDEX IF NOT EXISTS idx_actions_created ON actions(createdAt);
     CREATE INDEX IF NOT EXISTS idx_actions_messageId ON actions(messageId);
+    CREATE INDEX IF NOT EXISTS idx_gmail_accounts_active ON gmail_accounts(active);
+    CREATE INDEX IF NOT EXISTS idx_emails_triage ON emails(triageResult);
+    CREATE INDEX IF NOT EXISTS idx_emails_seen ON emails(firstSeenAt);
   `);
 
   return db;
@@ -221,6 +247,61 @@ export function toggleSender(id: string): void {
     .run(id);
 }
 
+// --- Gmail Accounts ---
+
+export interface GmailAccount {
+  id: string;
+  connectionId: string;
+  email: string | null;
+  label: string | null;
+  entityId: string;
+  active: boolean;
+  createdAt: number;
+}
+
+export function getGmailAccounts(): GmailAccount[] {
+  return getDb()
+    .prepare("SELECT * FROM gmail_accounts ORDER BY createdAt DESC")
+    .all()
+    .map((row: any) => ({ ...row, active: !!row.active })) as GmailAccount[];
+}
+
+export function getActiveGmailAccounts(): GmailAccount[] {
+  return getDb()
+    .prepare("SELECT * FROM gmail_accounts WHERE active = 1 ORDER BY createdAt DESC")
+    .all()
+    .map((row: any) => ({ ...row, active: !!row.active })) as GmailAccount[];
+}
+
+export function addGmailAccount(connectionId: string, entityId: string, email?: string, label?: string): string {
+  const id = crypto.randomUUID();
+  getDb()
+    .prepare(
+      "INSERT OR REPLACE INTO gmail_accounts (id, connectionId, email, label, entityId, active, createdAt) VALUES (?, ?, ?, ?, ?, 1, ?)"
+    )
+    .run(id, connectionId, email || null, label || null, entityId, Date.now());
+  return id;
+}
+
+export function removeGmailAccount(id: string): void {
+  getDb().prepare("DELETE FROM gmail_accounts WHERE id = ?").run(id);
+}
+
+export function getGmailAccountByConnectionId(connectionId: string): GmailAccount | undefined {
+  const row = getDb()
+    .prepare("SELECT * FROM gmail_accounts WHERE connectionId = ?")
+    .get(connectionId) as any;
+  if (!row) return undefined;
+  return { ...row, active: !!row.active };
+}
+
+export function hasAnyGmailAccount(): boolean {
+  const row = getDb()
+    .prepare("SELECT 1 FROM gmail_accounts WHERE active = 1 LIMIT 1")
+    .get();
+  return !!row;
+}
+
 // --- Config ---
 
 export function getConfig(key: string): string | null {
@@ -240,4 +321,111 @@ export function setConfig(key: string, value: string): void {
 
 export function deleteConfig(key: string): void {
   getDb().prepare("DELETE FROM config WHERE key = ?").run(key);
+}
+
+// --- Emails (ETL) ---
+
+import type { Email } from "./types";
+
+/**
+ * Insert an email if it doesn't already exist.
+ * Returns true if the email was new (inserted), false if it already existed.
+ */
+export function upsertEmail(email: Email, accountEntityId: string): boolean {
+  const existing = getDb()
+    .prepare("SELECT 1 FROM emails WHERE messageId = ?")
+    .get(email.messageId);
+
+  if (existing) return false;
+
+  getDb()
+    .prepare(
+      `INSERT INTO emails (messageId, threadId, fromEmail, subject, body, receivedAt, accountEntityId, firstSeenAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      email.messageId,
+      email.threadId || null,
+      email.from,
+      email.subject,
+      email.body || null,
+      email.date || null,
+      accountEntityId,
+      Date.now()
+    );
+
+  return true;
+}
+
+export function getUnprocessedEmails(): (Email & { accountEntityId: string })[] {
+  const rows = getDb()
+    .prepare(
+      "SELECT * FROM emails WHERE agentProcessedAt IS NULL ORDER BY firstSeenAt ASC"
+    )
+    .all() as any[];
+
+  return rows.map((r) => ({
+    messageId: r.messageId,
+    threadId: r.threadId || "",
+    from: r.fromEmail,
+    subject: r.subject,
+    body: r.body || "",
+    date: r.receivedAt || "",
+    accountEntityId: r.accountEntityId || "",
+  }));
+}
+
+export function markEmailProcessed(messageId: string, triageResult: string): void {
+  getDb()
+    .prepare(
+      "UPDATE emails SET triageResult = ?, agentProcessedAt = ? WHERE messageId = ?"
+    )
+    .run(triageResult, Date.now(), messageId);
+}
+
+export function getEmailHistory(opts: {
+  limit?: number;
+  offset?: number;
+  triageResult?: string;
+}): any[] {
+  const { limit = 20, offset = 0, triageResult } = opts;
+
+  if (triageResult) {
+    return getDb()
+      .prepare(
+        "SELECT * FROM emails WHERE triageResult = ? ORDER BY firstSeenAt DESC LIMIT ? OFFSET ?"
+      )
+      .all(triageResult, limit, offset);
+  }
+
+  return getDb()
+    .prepare("SELECT * FROM emails ORDER BY firstSeenAt DESC LIMIT ? OFFSET ?")
+    .all(limit, offset);
+}
+
+/**
+ * Purge emails older than the configured retention period.
+ * Returns the number of rows deleted.
+ * If retention is 0 or not set, keeps everything (indefinite).
+ */
+export function purgeOldEmails(): number {
+  const retentionDays = getConfig("email_retention_days");
+  if (!retentionDays || retentionDays === "0") return 0;
+
+  const days = parseInt(retentionDays, 10);
+  if (isNaN(days) || days <= 0) return 0;
+
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const result = getDb()
+    .prepare("DELETE FROM emails WHERE firstSeenAt < ? AND agentProcessedAt IS NOT NULL")
+    .run(cutoff);
+
+  return result.changes;
+}
+
+export function getEmailCount(): number {
+  const row = getDb()
+    .prepare("SELECT COUNT(*) as count FROM emails")
+    .get() as { count: number };
+  return row.count;
 }

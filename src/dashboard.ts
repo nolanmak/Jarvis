@@ -1,4 +1,7 @@
 import { Router } from "express";
+import { exec } from "child_process";
+import crypto from "crypto";
+import Composio from "@composio/client";
 import {
   getActions,
   getActionById,
@@ -11,10 +14,39 @@ import {
   setConfig,
   deleteConfig,
   getActionCount,
+  getGmailAccounts,
+  getActiveGmailAccounts,
+  addGmailAccount,
+  removeGmailAccount,
+  hasAnyGmailAccount,
+  getEmailCount,
+  purgeOldEmails,
 } from "./db";
 import type { ActionStatus } from "./types";
 
 const router = Router();
+
+function getComposioClient(): Composio | null {
+  const apiKey = getConfig("composio_api_key") || process.env.COMPOSIO_API_KEY;
+  if (!apiKey) return null;
+  return new Composio({ apiKey });
+}
+
+// Check both DB config and env vars for integration status
+function getConfigStatus() {
+  const gmailAccounts = getGmailAccounts();
+  return {
+    groqKey: !!(getConfig("groq_api_key") || process.env.GROQ_API_KEY),
+    cerebrasKey: !!(getConfig("cerebras_api_key") || process.env.CEREBRAS_API_KEY),
+    composioKey: !!(getConfig("composio_api_key") || process.env.COMPOSIO_API_KEY),
+    gmailAccounts,
+    gmailConnected: gmailAccounts.some((a) => a.active),
+    discordWebhook: !!(getConfig("discord_webhook_url") || process.env.DISCORD_WEBHOOK_URL),
+    discordBotToken: !!(getConfig("discord_bot_token") || process.env.DISCORD_BOT_TOKEN),
+    emailRetentionDays: getConfig("email_retention_days") || "0",
+    emailCount: getEmailCount(),
+  };
+}
 
 // --- Page Routes ---
 
@@ -50,13 +82,10 @@ router.get("/history", (req, res) => {
 
 router.get("/settings", (_req, res) => {
   const senders = getSenders();
-  const configStatus = {
-    groqKey: !!getConfig("groq_api_key"),
-    composioKey: !!getConfig("composio_api_key"),
-    discordWebhook: !!getConfig("discord_webhook_url"),
-    discordBotToken: !!getConfig("discord_bot_token"),
-  };
-  res.render("settings", { senders, configStatus, page: "settings" });
+  const configStatus = getConfigStatus();
+  const emailRetention = getConfig("email_retention_days") || "0";
+  const emailCount = getEmailCount();
+  res.render("settings", { senders, configStatus, emailRetention, emailCount, page: "settings" });
 });
 
 // --- HTMX API Routes ---
@@ -127,9 +156,12 @@ router.post("/api/config", (req, res) => {
   const { key, value } = req.body;
   const allowedKeys = [
     "groq_api_key",
+    "cerebras_api_key",
     "composio_api_key",
     "discord_webhook_url",
     "discord_bot_token",
+    "email_retention_days",
+    "github_webhook_secret",
   ];
 
   if (!allowedKeys.includes(key)) {
@@ -143,24 +175,263 @@ router.post("/api/config", (req, res) => {
     deleteConfig(key);
   }
 
-  const configStatus = {
-    groqKey: !!getConfig("groq_api_key"),
-    composioKey: !!getConfig("composio_api_key"),
-    discordWebhook: !!getConfig("discord_webhook_url"),
-    discordBotToken: !!getConfig("discord_bot_token"),
-  };
+  const configStatus = getConfigStatus();
 
   res.render("partials/config-status", { configStatus });
 });
 
 router.get("/api/config/status", (_req, res) => {
-  const configStatus = {
-    groqKey: !!getConfig("groq_api_key"),
-    composioKey: !!getConfig("composio_api_key"),
-    discordWebhook: !!getConfig("discord_webhook_url"),
-    discordBotToken: !!getConfig("discord_bot_token"),
-  };
+  const configStatus = getConfigStatus();
   res.render("partials/config-status", { configStatus });
+});
+
+// --- Composio OAuth (same pattern as Orchid) ---
+
+/**
+ * Generate a unique entity ID for each Gmail account connection.
+ * Composio scopes connections per entity_id — unique IDs allow multiple accounts.
+ */
+function generateEntityId(): string {
+  return `augmentagent-${Date.now()}`;
+}
+
+/**
+ * Find or create a Composio auth config for a toolkit.
+ * Composio requires a real auth_config_id UUID, not a toolkit slug.
+ */
+async function getOrCreateAuthConfig(
+  client: Composio,
+  toolkit: string
+): Promise<string> {
+  // Check DB cache first
+  const cached = getConfig(`auth_config_${toolkit}`);
+  if (cached) return cached;
+
+  // Search for existing Composio-managed config
+  const configs = await client.authConfigs.list({
+    toolkit_slug: toolkit,
+    is_composio_managed: true,
+  });
+
+  const existing = configs.items[0];
+  if (existing) {
+    setConfig(`auth_config_${toolkit}`, existing.id);
+    return existing.id;
+  }
+
+  // Try without the is_composio_managed filter
+  const allConfigs = await client.authConfigs.list({ toolkit_slug: toolkit });
+  const anyConfig = allConfigs.items[0];
+  if (anyConfig) {
+    setConfig(`auth_config_${toolkit}`, anyConfig.id);
+    return anyConfig.id;
+  }
+
+  // Create a new Composio-managed auth config
+  console.log(`Creating Composio auth config for ${toolkit}...`);
+  const created = await client.authConfigs.create({
+    toolkit: { slug: toolkit },
+    auth_config: {
+      type: "use_composio_managed_auth",
+      name: `augmentagent-${toolkit}`,
+      credentials: {},
+    },
+  });
+
+  const authConfigId = (created as any).auth_config?.id || (created as any).id;
+  if (!authConfigId) {
+    throw new Error("Composio returned no auth config ID");
+  }
+
+  setConfig(`auth_config_${toolkit}`, authConfigId);
+  console.log(`Created auth config for ${toolkit}: ${authConfigId}`);
+  return authConfigId;
+}
+
+router.get("/oauth/gmail/start", async (_req, res) => {
+  try {
+    const client = getComposioClient();
+    if (!client) {
+      res.status(400).send("Composio API key not configured. Add it in Settings first.");
+      return;
+    }
+
+    // Get a real auth config UUID (find existing or create)
+    const authConfigId = await getOrCreateAuthConfig(client, "gmail");
+
+    // Each account gets a unique entity ID so Composio tracks them separately
+    const entityId = generateEntityId();
+
+    // Initiate the connection
+    const linkResponse = await client.link.create({
+      user_id: entityId,
+      auth_config_id: authConfigId,
+    });
+
+    if (!linkResponse.redirect_url) {
+      throw new Error("No redirect URL returned from Composio");
+    }
+
+    // Store pending connection info so callback can finalize
+    if (linkResponse.connected_account_id) {
+      setConfig("gmail_pending_connection_id", linkResponse.connected_account_id);
+      setConfig("gmail_pending_entity_id", entityId);
+    }
+
+    console.log(`Gmail OAuth initiated for entity ${entityId}, redirecting...`);
+    res.redirect(linkResponse.redirect_url);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("Gmail OAuth start failed:", msg);
+    res.status(500).send(`
+      <div class="p-4 bg-gray-950 text-gray-100 min-h-screen">
+        <h2 class="text-lg font-semibold text-red-400 mb-2">OAuth Error</h2>
+        <p class="text-sm text-gray-300 mb-4">${msg}</p>
+        <a href="/settings" class="text-blue-400 hover:underline">Back to Settings</a>
+      </div>
+    `);
+  }
+});
+
+router.get("/oauth/gmail/callback", async (_req, res) => {
+  try {
+    const connectionId = getConfig("gmail_pending_connection_id");
+    const entityId = getConfig("gmail_pending_entity_id");
+    const client = getComposioClient();
+
+    if (connectionId && entityId && client) {
+      // Check connection status
+      try {
+        const account = await client.connectedAccounts.retrieve(connectionId);
+        const status = (account as any).status || "unknown";
+        const email = (account as any).member_email || (account as any).email || null;
+
+        if (status === "ACTIVE") {
+          addGmailAccount(connectionId, entityId, email, email);
+          console.log(`Gmail account connected: ${email || connectionId}`);
+        } else {
+          // Not active yet — store anyway, polling will update
+          addGmailAccount(connectionId, entityId, email, `Pending (${status})`);
+          console.log(`Gmail callback: status=${status}, stored pending`);
+        }
+      } catch (err) {
+        // Connection might not be ready yet — store with pending label
+        addGmailAccount(connectionId, entityId, undefined, "Pending verification");
+        console.log("Gmail callback: could not verify yet, stored pending");
+      }
+
+      // Clean up pending state
+      deleteConfig("gmail_pending_connection_id");
+      deleteConfig("gmail_pending_entity_id");
+    }
+
+    res.redirect("/settings?gmail=connected");
+  } catch (err) {
+    console.error("Gmail OAuth callback error:", err);
+    res.redirect("/settings?gmail=error");
+  }
+});
+
+// Poll endpoint for frontend to check connection status
+router.get("/api/oauth/gmail/status", (_req, res) => {
+  const accounts = getActiveGmailAccounts();
+  res.json({
+    isConnected: accounts.length > 0,
+    accountCount: accounts.length,
+    accounts: accounts.map((a) => ({
+      id: a.id,
+      email: a.email,
+      entityId: a.entityId,
+    })),
+  });
+});
+
+router.delete("/api/oauth/gmail/:id", async (req, res) => {
+  try {
+    const client = getComposioClient();
+    const accounts = getGmailAccounts();
+    const account = accounts.find((a) => a.id === req.params.id);
+
+    if (account && client) {
+      try {
+        await client.connectedAccounts.delete(account.connectionId);
+      } catch {
+        // Ignore — may already be deleted on Composio side
+      }
+    }
+
+    removeGmailAccount(req.params.id);
+  } catch {
+    removeGmailAccount(req.params.id);
+  }
+
+  const configStatus = getConfigStatus();
+  res.render("partials/config-status", { configStatus });
+});
+
+// --- GitHub Webhook (auto-update on push) ---
+
+function verifyGitHubSignature(payload: string, signature: string | undefined, secret: string): boolean {
+  if (!signature) return false;
+  const expected = "sha256=" + crypto.createHmac("sha256", secret).update(payload).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+}
+
+let updateInProgress = false;
+
+router.post("/api/webhook/github", (req, res) => {
+  const secret = getConfig("github_webhook_secret") || process.env.GITHUB_WEBHOOK_SECRET;
+  if (!secret) {
+    res.status(500).json({ error: "GITHUB_WEBHOOK_SECRET not configured" });
+    return;
+  }
+
+  // Verify signature
+  const body = JSON.stringify(req.body);
+  const signature = req.headers["x-hub-signature-256"] as string | undefined;
+  if (!verifyGitHubSignature(body, signature, secret)) {
+    console.warn("[webhook] Invalid GitHub signature — rejected");
+    res.status(403).json({ error: "Invalid signature" });
+    return;
+  }
+
+  // Only act on pushes to main
+  const ref = req.body?.ref as string | undefined;
+  if (ref !== "refs/heads/main") {
+    console.log(`[webhook] Push to ${ref} — ignoring (not main)`);
+    res.json({ status: "ignored", reason: "not main branch" });
+    return;
+  }
+
+  if (updateInProgress) {
+    console.log("[webhook] Update already in progress — skipping");
+    res.json({ status: "skipped", reason: "update already in progress" });
+    return;
+  }
+
+  // Respond immediately, run update in background
+  res.json({ status: "updating" });
+  updateInProgress = true;
+
+  const pusher = req.body?.pusher?.name || "unknown";
+  console.log(`[webhook] Push to main by ${pusher} — starting update...`);
+
+  const updateCmd = [
+    "git pull origin main",
+    "npm install --production",
+    "npm run build",
+    "pm2 restart augmentagent",
+  ].join(" && ");
+
+  exec(updateCmd, { cwd: process.cwd() }, (err, stdout, stderr) => {
+    updateInProgress = false;
+    if (err) {
+      console.error("[webhook] Update failed:", err.message);
+      if (stderr) console.error("[webhook] stderr:", stderr);
+    } else {
+      console.log("[webhook] Update complete. Output:", stdout);
+    }
+  });
 });
 
 export default router;

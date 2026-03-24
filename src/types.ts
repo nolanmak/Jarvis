@@ -5,6 +5,7 @@ export interface Email {
   subject: string;
   body: string;
   date: string;
+  accountEntityId?: string;
 }
 
 export type ActionStatus =
@@ -13,7 +14,9 @@ export type ActionStatus =
   | "rejected"
   | "sent"
   | "error"
-  | "timed_out";
+  | "timed_out"
+  | "skipped"
+  | "flagged";
 
 export interface ActionRecord {
   id: string;

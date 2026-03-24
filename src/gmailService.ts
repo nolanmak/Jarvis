@@ -11,17 +11,14 @@ const composio = new Composio({
 });
 
 export async function fetchUnreadEmails(
-  senders: string[]
+  entityId?: string
 ): Promise<Email[]> {
-  const query = senders
-    .map((s) => `from:${s}`)
-    .join(" OR ");
-
   const response = await composio.tools.execute("GMAIL_FETCH_EMAILS", {
     arguments: {
-      query: `is:unread (${query})`,
+      query: "is:unread",
       max_results: 20,
     },
+    ...(entityId && { user_id: entityId }),
   });
 
   if (response.error) {
@@ -47,7 +44,8 @@ export async function createDraft(
   to: string,
   subject: string,
   body: string,
-  threadId?: string
+  threadId?: string,
+  entityId?: string
 ): Promise<string> {
   const args: Record<string, unknown> = {
     to,
@@ -61,6 +59,7 @@ export async function createDraft(
 
   const response = await composio.tools.execute("GMAIL_CREATE_DRAFT", {
     arguments: args,
+    ...(entityId && { user_id: entityId }),
   });
 
   if (response.error) {
@@ -75,11 +74,15 @@ export async function createDraft(
   return String(draftId);
 }
 
-export async function sendDraft(draftId: string): Promise<void> {
+export async function sendDraft(
+  draftId: string,
+  entityId?: string
+): Promise<void> {
   const response = await composio.tools.execute("GMAIL_SEND_DRAFT", {
     arguments: {
       draft_id: draftId,
     },
+    ...(entityId && { user_id: entityId }),
   });
 
   if (response.error) {
