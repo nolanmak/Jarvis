@@ -1,5 +1,7 @@
 node_modules/
 dist/
+target/
+
 .env
 *.db
 *.db-shm
