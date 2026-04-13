@@ -1,0 +1,19 @@
+[package]
+name = "augmentagent-approval-discord"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+augmentagent-store = { path = "../augmentagent-store" }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+serenity = { workspace = true }
+serde = { workspace = true }

@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/augmentagent-store",
+    "crates/augmentagent-channel-email",
+    "crates/augmentagent-approval-discord",
+    "crates/augmentagent-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94.1"
+license = "ISC"
+repository = "https://github.com/nolanmak/AugmentAgent"
+
+[workspace.dependencies]
+# Dangercat (jupitersoftco/dangercat) is a private repo and cannot be consumed
+# as a public cargo git dep. `ClaudeCliReasoner` re-implements the
+# ~60 lines of claudekernel we actually need (stream-json child process spawn);
+# the `Reasoner` trait boundary in augmentagent-channel-email leaves the door
+# open for a dangercat-backed impl if/when the user grants cargo git access.
+
+# Runtime
+tokio = { version = "1.41", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Errors / logging / config
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+
+# Data
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Concurrency
+dashmap = "6"
+
+# Discord (Phase 2)
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model", "http", "cache"] }
+
+# Misc
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }

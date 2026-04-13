@@ -1,0 +1,24 @@
+[package]
+name = "augmentagent-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "augmentagent"
+path = "src/main.rs"
+
+[dependencies]
+augmentagent-store = { path = "../augmentagent-store" }
+augmentagent-channel-email = { path = "../augmentagent-channel-email" }
+augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenvy = { workspace = true }
