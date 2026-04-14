@@ -30,7 +30,7 @@ impl Default for GmailChannelConfig {
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_secs(120),
-            per_account_limit: 20,
+            per_account_limit: 100,
             skill_dir: PathBuf::from("skills/email-triage"),
             dry_run: true,
             model: None,
