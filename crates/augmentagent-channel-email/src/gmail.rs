@@ -64,9 +64,9 @@ impl ComposioClient {
         entity_id: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, GmailError> {
-        let url = format!("{}/api/v3/actions/{}/execute", self.base_url, action);
+        let url = format!("{}/api/v3/tools/execute/{}", self.base_url, action);
         let body = serde_json::json!({
-            "entityId": entity_id,
+            "user_id": entity_id,
             "arguments": arguments,
         });
 
@@ -135,6 +135,15 @@ struct FetchResp {
 struct FetchData {
     #[serde(default)]
     messages: Vec<FetchMessage>,
+    /// Gmail's pagination cursor. Composio may serialize it under any of these keys.
+    #[serde(
+        default,
+        alias = "next_page_token",
+        alias = "nextPageToken",
+        alias = "page_token",
+        alias = "nextPage"
+    )]
+    next_page_token: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -169,20 +178,54 @@ impl FetchMessage {
 
 #[async_trait]
 impl GmailApi for ComposioClient {
-    async fn fetch_unread(&self, entity_id: &str, limit: u32) -> Result<Vec<Email>, GmailError> {
-        let args = serde_json::json!({
-            "query": "is:unread",
-            "max_results": limit,
-        });
-        let v = self.execute("GMAIL_FETCH_EMAILS", entity_id, args).await?;
-        let parsed: FetchResp = serde_json::from_value(v)
-            .map_err(|e| GmailError::Decode(e.to_string()))?;
-        Ok(parsed
-            .data
-            .messages
-            .into_iter()
-            .filter_map(|m| m.into_email(entity_id))
-            .collect())
+    async fn fetch_unread(&self, entity_id: &str, max_total: u32) -> Result<Vec<Email>, GmailError> {
+        // Composio caps response payload size (seen 413 above ~40 KB of bodies),
+        // so paginate in 20-email pages up to `max_total`.
+        const PAGE_SIZE: u32 = 20;
+        const MAX_PAGES: u32 = 10; // safety guard against runaway loops
+
+        let mut collected: Vec<Email> = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        for _page in 0..MAX_PAGES {
+            let want = (max_total as usize).saturating_sub(collected.len());
+            if want == 0 {
+                break;
+            }
+            let this_page = (want as u32).min(PAGE_SIZE);
+
+            let mut args = serde_json::json!({
+                "query": "is:unread",
+                "max_results": this_page,
+            });
+            if let Some(tok) = &page_token {
+                // Gmail native param is `pageToken`; Composio passes it through.
+                args["page_token"] = serde_json::Value::String(tok.clone());
+            }
+
+            let v = self.execute("GMAIL_FETCH_EMAILS", entity_id, args).await?;
+            let parsed: FetchResp = serde_json::from_value(v)
+                .map_err(|e| GmailError::Decode(e.to_string()))?;
+
+            let page_emails: Vec<Email> = parsed
+                .data
+                .messages
+                .into_iter()
+                .filter_map(|m| m.into_email(entity_id))
+                .collect();
+
+            if page_emails.is_empty() && parsed.data.next_page_token.is_none() {
+                break;
+            }
+
+            collected.extend(page_emails);
+            page_token = parsed.data.next_page_token;
+            if page_token.is_none() {
+                break;
+            }
+        }
+
+        Ok(collected)
     }
 
     async fn create_draft(
@@ -194,7 +237,7 @@ impl GmailApi for ComposioClient {
         thread_id: Option<&str>,
     ) -> Result<String, GmailError> {
         let mut args = serde_json::json!({
-            "recipient_email": to,
+            "to": to,
             "subject": subject,
             "body": body,
         });
@@ -203,7 +246,7 @@ impl GmailApi for ComposioClient {
         }
         let v = self.execute("GMAIL_CREATE_DRAFT", entity_id, args).await?;
         v.get("data")
-            .and_then(|d| d.get("draft_id").or_else(|| d.get("id")))
+            .and_then(|d| d.get("id").or_else(|| d.get("draftId")).or_else(|| d.get("draft_id")))
             .and_then(|s| s.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| GmailError::Decode("missing draft id".into()))

@@ -57,10 +57,17 @@ impl Reasoner for ClaudeCliReasoner {
             "--allowedTools".into(),
             String::new(), // explicit empty allow-list: no tools
         ];
-        if !system_prompt.trim().is_empty() {
-            args.push("--append-system-prompt".into());
-            args.push(system_prompt.to_string());
-        }
+        // `--system-prompt` REPLACES Claude Code's default system (tools list,
+        // MCP metadata, agent catalog — ~25k tokens). For pure-reasoner use we
+        // don't want any of that. If the skill file is empty we still pass
+        // a minimal replacement so the default doesn't leak back in.
+        let effective_system = if system_prompt.trim().is_empty() {
+            "You are a concise email triage assistant."
+        } else {
+            system_prompt
+        };
+        args.push("--system-prompt".into());
+        args.push(effective_system.to_string());
         if let Some(m) = &self.model {
             args.push("--model".into());
             args.push(m.clone());
