@@ -38,7 +38,7 @@ enum Cmd {
     /// Run one poll cycle and exit.
     PollOnce {
         /// Dry-run (default): writes `dry_run` actions, no drafts, no sends.
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
     },
     /// Run the poll loop as a daemon.
@@ -46,7 +46,7 @@ enum Cmd {
         #[arg(long, default_value_t = 120)]
         interval_secs: u64,
         /// Dry-run (default true). Flip with `--dry-run false` after Phase 2 cutover.
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
     },
     /// List active gmail accounts from the shared db.
