@@ -5,8 +5,8 @@
 
 use augmentagent_store::Email;
 use serenity::all::{
-    ActionRowComponent, ButtonStyle, CreateActionRow, CreateButton, CreateEmbed,
-    CreateEmbedFooter, CreateInputText, CreateMessage, CreateModal, InputTextStyle,
+    ActionRowComponent, ButtonStyle, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedFooter,
+    CreateInputText, CreateMessage, CreateModal, InputTextStyle,
 };
 
 use crate::custom_id::{CustomId, Verb};

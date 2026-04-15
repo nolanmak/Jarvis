@@ -79,11 +79,7 @@ impl BrokerState {
         self.drafts.insert(action_id.to_string(), draft.to_string());
     }
 
-    pub(crate) fn deliver(
-        &self,
-        action_id: &str,
-        outcome: ApprovalOutcome,
-    ) -> DeliveryOutcome {
+    pub(crate) fn deliver(&self, action_id: &str, outcome: ApprovalOutcome) -> DeliveryOutcome {
         let Some((_, tx)) = self.pending.remove(action_id) else {
             return DeliveryOutcome::Unknown;
         };
@@ -113,7 +109,9 @@ impl DiscordApprovalBroker {
     pub async fn start(config: DiscordConfig) -> Result<Self, ApprovalError> {
         let state = Arc::new(BrokerState::new());
         let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES;
-        let handler = Handler { state: Arc::clone(&state) };
+        let handler = Handler {
+            state: Arc::clone(&state),
+        };
 
         let mut client = serenity::Client::builder(&config.bot_token, intents)
             .event_handler(handler)

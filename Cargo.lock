@@ -134,6 +134,7 @@ dependencies = [
  "async-trait",
  "augmentagent-approval-discord",
  "augmentagent-store",
+ "augmentagent-wiki",
  "reqwest",
  "rusqlite",
  "serde",
@@ -173,6 +174,19 @@ dependencies = [
  "time",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "augmentagent-wiki"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "augmentagent-store",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
