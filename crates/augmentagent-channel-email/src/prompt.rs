@@ -5,6 +5,20 @@ use std::path::{Path, PathBuf};
 
 use augmentagent_store::Email;
 
+/// System prompt for the triage-only call. Haiku-sized — no writing style
+/// rules, no learned patterns, just decide-and-justify.
+pub const TRIAGE_SYSTEM: &str = r#"You are an email triage classifier. For each email, decide:
+
+- "reply"  — deserves a personal reply from the user
+- "skip"   — automated, newsletter, no-reply, not actionable
+- "flag"   — important but should be handled by a human without auto-reply (legal, financial, sensitive)
+
+Return ONLY a single JSON object with this exact shape:
+  {"decision": "reply" | "skip" | "flag", "reason": "<one short sentence>"}
+
+No prose, no markdown fences, no extra fields.
+"#;
+
 pub struct SkillPrompt {
     pub system: String,
     pub skill_dir: PathBuf,
@@ -20,7 +34,6 @@ impl SkillPrompt {
     }
 
     /// Gather all `learned/*.json` patterns into a single annotated block.
-    /// Matches Node's `loadLearnedPatterns`.
     pub fn load_learned(&self) -> String {
         let dir = self.skill_dir.join("learned");
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -32,9 +45,15 @@ impl SkillPrompt {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(raw) = fs::read_to_string(&path) else { continue };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
-            let Some(arr) = value.as_array() else { continue };
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let Some(arr) = value.as_array() else {
+                continue;
+            };
             if arr.is_empty() {
                 continue;
             }
@@ -50,22 +69,37 @@ impl SkillPrompt {
         if sections.is_empty() {
             String::new()
         } else {
-            format!("\n## Learned Patterns (from previous cycles)\n{}", sections.join("\n\n"))
+            format!(
+                "\n## Learned Patterns (from previous cycles)\n{}",
+                sections.join("\n\n")
+            )
         }
     }
 }
 
-/// Build the per-email user message that Claude reasons over.
-pub fn user_message(email: &Email, learned: &str) -> String {
+/// Build the triage user message. Minimal — just the email + any learned
+/// skip/flag patterns. Draft work is deferred to the second call.
+pub fn triage_user_message(email: &Email, learned: &str) -> String {
     format!(
-        r#"Decide triage for the email below and return ONLY a single JSON object matching this schema:
-{{
-  "decision": "reply" | "skip" | "flag",
-  "draft":    "<string, required if decision is reply>",
-  "reason":   "<short string>"
-}}
+        "Classify this email.{learned}\n\n<email>\nFrom: {from}\nSubject: {subject}\nDate: {date}\nMessageId: {message_id}\n\n{body}\n</email>\n",
+        from = email.from,
+        subject = email.subject,
+        date = email.date,
+        message_id = email.message_id,
+        body = email.body,
+    )
+}
 
-Do not include any prose outside the JSON object.{learned}
+/// Build the draft user message. `wiki_hint` is an optional pre-built string
+/// naming wiki pages Claude may open; empty string disables the hint.
+pub fn draft_user_message(email: &Email, wiki_hint: &str) -> String {
+    let hint_block = if wiki_hint.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{wiki_hint}\n")
+    };
+    format!(
+        r#"Draft a reply to this email. Follow the writing-style rules in your system prompt strictly.{hint_block}
 
 <email>
 From: {from}
@@ -76,6 +110,8 @@ MessageId: {message_id}
 
 {body}
 </email>
+
+Return ONLY the reply text — no JSON, no quotes, no commentary, no subject line.
 "#,
         from = email.from,
         subject = email.subject,
@@ -87,12 +123,7 @@ MessageId: {message_id}
 }
 
 /// Build the redraft prompt when the user clicks "Revise" in Discord.
-/// Mirrors src/agent.ts:redraftWithFeedback.
-pub fn redraft_message(
-    email: &Email,
-    previous_draft: &str,
-    feedback: &str,
-) -> String {
+pub fn redraft_message(email: &Email, previous_draft: &str, feedback: &str) -> String {
     format!(
         r#"You are a professional email draft editor. Revise the draft based on the user's feedback and return ONLY the revised email text — no JSON, no quotes, no commentary.
 

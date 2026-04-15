@@ -1,0 +1,19 @@
+[package]
+name = "augmentagent-wiki"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+augmentagent-store = { path = "../augmentagent-store" }
+
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

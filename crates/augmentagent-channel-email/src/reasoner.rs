@@ -1,12 +1,10 @@
 //! Direct `claude` CLI reasoner.
 //!
-//! Phase 1 implementation: spawns the `claude` binary with `-p` and reads
-//! the final assistant text from stream-json stdout. Authenticated via the
-//! user's Claude Max subscription session (`claude login`), no API key.
-//!
-//! Phase 2 replaces this with `claudekernel::ClaudeSession` from dangercat;
-//! the `Reasoner` trait boundary makes that swap mechanical.
+//! Spawns the `claude` binary with `-p --output-format stream-json` and reads
+//! the final assistant text. Authenticated via the user's Claude Max
+//! subscription session (`claude login`); no API key.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use async_trait::async_trait;
@@ -15,20 +13,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, warn};
 
-use crate::channel::Reasoner;
+use crate::channel::{Reasoner, ReasonerOpts};
 
 pub struct ClaudeCliReasoner {
     bin: String,
-    model: Option<String>,
-    extra_args: Vec<String>,
 }
 
 impl Default for ClaudeCliReasoner {
     fn default() -> Self {
         Self {
             bin: std::env::var("CLAUDE_CLI").unwrap_or_else(|_| "claude".into()),
-            model: None,
-            extra_args: Vec::new(),
         }
     }
 }
@@ -38,41 +32,49 @@ impl ClaudeCliReasoner {
         Self::default()
     }
 
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
-        self.model = Some(model.into());
+    /// Legacy convenience: pin a model for callers that don't build a full
+    /// `ReasonerOpts` themselves. Kept only as a construction helper; model
+    /// is applied via `ReasonerOpts::model` now.
+    pub fn with_model(self, _model: impl Into<String>) -> Self {
         self
     }
 }
 
 #[async_trait]
 impl Reasoner for ClaudeCliReasoner {
-    async fn decide(&self, system_prompt: &str, user_message: &str) -> anyhow::Result<String> {
+    async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
         let mut args: Vec<String> = vec![
             "-p".into(),
             "--output-format".into(),
             "stream-json".into(),
             "--verbose".into(),
             "--permission-mode".into(),
-            "default".into(),
-            "--allowedTools".into(),
-            String::new(), // explicit empty allow-list: no tools
+            opts.permission_mode.clone(),
         ];
+
+        // `--allowedTools`: empty list = no tools. Space-separated names per claude CLI docs.
+        args.push("--allowedTools".into());
+        args.push(opts.allowed_tools.join(" "));
+
         // `--system-prompt` REPLACES Claude Code's default system (tools list,
-        // MCP metadata, agent catalog — ~25k tokens). For pure-reasoner use we
-        // don't want any of that. If the skill file is empty we still pass
-        // a minimal replacement so the default doesn't leak back in.
-        let effective_system = if system_prompt.trim().is_empty() {
-            "You are a concise email triage assistant."
+        // MCP metadata, agent catalog — ~25k tokens). Empty → minimal stub.
+        let effective_system = if opts.system_prompt.trim().is_empty() {
+            "You are a concise assistant."
         } else {
-            system_prompt
+            &opts.system_prompt
         };
         args.push("--system-prompt".into());
         args.push(effective_system.to_string());
-        if let Some(m) = &self.model {
+
+        if let Some(m) = &opts.model {
             args.push("--model".into());
             args.push(m.clone());
         }
-        args.extend(self.extra_args.clone());
+
+        for dir in &opts.add_dirs {
+            args.push("--add-dir".into());
+            args.push(dir.to_string_lossy().into_owned());
+        }
 
         let mut child = Command::new(&self.bin)
             .args(&args)
@@ -126,7 +128,9 @@ impl Reasoner for ClaudeCliReasoner {
             }
             warn!("claude exited {status:?}: {stderr_buf}");
             if final_text.is_empty() {
-                return Err(anyhow::anyhow!("claude exited non-zero: {status:?}: {stderr_buf}"));
+                return Err(anyhow::anyhow!(
+                    "claude exited non-zero: {status:?}: {stderr_buf}"
+                ));
             }
         }
         if final_text.is_empty() {
@@ -136,10 +140,65 @@ impl Reasoner for ClaudeCliReasoner {
     }
 }
 
+/// Preset builders for the three call types.
+pub fn triage_opts() -> ReasonerOpts {
+    ReasonerOpts {
+        system_prompt: crate::prompt::TRIAGE_SYSTEM.to_string(),
+        model: Some("claude-haiku-4-5-20251001".into()),
+        allowed_tools: Vec::new(),
+        add_dirs: Vec::new(),
+        permission_mode: "default".into(),
+    }
+}
+
+pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> ReasonerOpts {
+    let mut add_dirs = Vec::new();
+    let mut allowed_tools = Vec::new();
+    if let Some(root) = wiki_root {
+        add_dirs.push(root);
+        allowed_tools = vec!["Read".into(), "Grep".into(), "Glob".into()];
+    }
+    ReasonerOpts {
+        system_prompt,
+        model: None, // Opus default — quality matters for user-facing drafts
+        allowed_tools,
+        add_dirs,
+        permission_mode: "default".into(),
+    }
+}
+
+pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
+    ReasonerOpts {
+        system_prompt,
+        model: None, // Opus — lint is reasoning-heavy, low volume
+        allowed_tools: vec!["Read".into(), "Grep".into(), "Glob".into()],
+        add_dirs: vec![wiki_root],
+        permission_mode: "default".into(),
+    }
+}
+
+pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
+    ReasonerOpts {
+        system_prompt,
+        model: Some("claude-haiku-4-5-20251001".into()),
+        allowed_tools: vec![
+            "Read".into(),
+            "Grep".into(),
+            "Glob".into(),
+            "Write".into(),
+            "Edit".into(),
+        ],
+        add_dirs: vec![wiki_root],
+        permission_mode: "acceptEdits".into(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum StreamEvent {
-    Assistant { message: AssistantMessage },
+    Assistant {
+        message: AssistantMessage,
+    },
     Result {
         #[serde(default)]
         result: Option<String>,
@@ -157,7 +216,9 @@ struct AssistantMessage {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     #[serde(other)]
     Other,
 }

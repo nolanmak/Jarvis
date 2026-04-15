@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
+augmentagent-wiki = { path = "../augmentagent-wiki" }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }

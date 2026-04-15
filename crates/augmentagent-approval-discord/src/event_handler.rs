@@ -33,11 +33,12 @@ impl EventHandler for Handler {
                 };
                 match cid.verb {
                     Verb::Approve => {
-                        let delivered = self
-                            .state
-                            .deliver(&cid.action_id, ApprovalOutcome::Approved {
+                        let delivered = self.state.deliver(
+                            &cid.action_id,
+                            ApprovalOutcome::Approved {
                                 final_draft: self.state.draft_for(&cid.action_id),
-                            });
+                            },
+                        );
                         let msg = match delivered {
                             DeliveryOutcome::Delivered => "Approved — sending.",
                             DeliveryOutcome::Unknown => "This request has expired.",
@@ -45,7 +46,8 @@ impl EventHandler for Handler {
                         ack(&ctx, &comp, msg).await;
                     }
                     Verb::Skip => {
-                        let delivered = self.state.deliver(&cid.action_id, ApprovalOutcome::Skipped);
+                        let delivered =
+                            self.state.deliver(&cid.action_id, ApprovalOutcome::Skipped);
                         let msg = match delivered {
                             DeliveryOutcome::Delivered => "Skipped.",
                             DeliveryOutcome::Unknown => "This request has expired.",
@@ -68,7 +70,9 @@ impl EventHandler for Handler {
                 }
             }
             Interaction::Modal(modal) => {
-                let Some(cid) = CustomId::parse(&modal.data.custom_id) else { return };
+                let Some(cid) = CustomId::parse(&modal.data.custom_id) else {
+                    return;
+                };
                 if cid.verb != Verb::ReviseModal {
                     return;
                 }
@@ -84,7 +88,9 @@ impl EventHandler for Handler {
                     .create_response(
                         &ctx.http,
                         CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new().content(msg).ephemeral(true),
+                            CreateInteractionResponseMessage::new()
+                                .content(msg)
+                                .ephemeral(true),
                         ),
                     )
                     .await
@@ -97,11 +103,7 @@ impl EventHandler for Handler {
     }
 }
 
-async fn ack(
-    ctx: &Context,
-    comp: &serenity::all::ComponentInteraction,
-    message: &str,
-) {
+async fn ack(ctx: &Context, comp: &serenity::all::ComponentInteraction, message: &str) {
     if let Err(e) = comp
         .create_response(
             &ctx.http,

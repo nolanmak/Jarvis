@@ -43,7 +43,10 @@ pub struct CustomId {
 
 impl CustomId {
     pub fn new(action_id: impl Into<String>, verb: Verb) -> Self {
-        Self { action_id: action_id.into(), verb }
+        Self {
+            action_id: action_id.into(),
+            verb,
+        }
     }
 
     pub fn parse(raw: &str) -> Option<Self> {
