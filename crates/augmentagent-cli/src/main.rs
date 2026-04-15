@@ -9,9 +9,11 @@ use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use augmentagent_approval_discord::{ApprovalBroker, DiscordApprovalBroker, DiscordConfig, NoopBroker};
+use augmentagent_approval_discord::{
+    ApprovalBroker, DiscordApprovalBroker, DiscordConfig, NoopBroker,
+};
 use augmentagent_channel_email::gmail::ComposioClient;
-use augmentagent_channel_email::{ClaudeCliReasoner, GmailChannel, GmailChannelConfig};
+use augmentagent_channel_email::{ClaudeCliReasoner, GmailChannel, GmailChannelConfig, Reasoner};
 use augmentagent_store::Store;
 
 #[derive(Parser)]
@@ -25,7 +27,17 @@ struct Cli {
     #[arg(long, default_value = "skills/email-triage")]
     skill_dir: PathBuf,
 
-    /// Claude model (passed to `claude --model`).
+    /// Wiki root directory. When set, enables the three-call pipeline
+    /// (triage → draft with wiki read → async ingest with wiki write).
+    #[arg(long)]
+    wiki_dir: Option<PathBuf>,
+
+    /// Path to the wiki maintenance schema (committed to git).
+    /// Defaults to `./schema/wiki-skill.md` when `--wiki-dir` is set.
+    #[arg(long)]
+    wiki_schema: Option<PathBuf>,
+
+    /// Claude model override for drafting (`claude --model …`).
     #[arg(long)]
     model: Option<String>,
 
@@ -51,6 +63,21 @@ enum Cmd {
     },
     /// List active gmail accounts from the shared db.
     AccountsList,
+    /// Wiki maintenance.
+    Wiki {
+        #[command(subcommand)]
+        op: WikiOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum WikiOp {
+    /// Health-check the wiki: contradictions, orphans, stale claims, missing cross-refs.
+    Lint {
+        /// Write the report to this path. Default: stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -89,21 +116,17 @@ async fn main() -> Result<()> {
         }
         Cmd::PollOnce { dry_run } => {
             let broker = build_broker(dry_run).await?;
-            let ch = build_channel(&cli.skill_dir, cli.model.clone(), store, broker, dry_run, 120)?;
+            let ch = build_channel(&cli, store, broker, dry_run, 120)?;
             let out = ch.poll_once().await?;
             println!("{out:#?}");
             Ok(())
         }
-        Cmd::Serve { interval_secs, dry_run } => {
+        Cmd::Serve {
+            interval_secs,
+            dry_run,
+        } => {
             let broker = build_broker(dry_run).await?;
-            let ch = build_channel(
-                &cli.skill_dir,
-                cli.model.clone(),
-                store,
-                broker,
-                dry_run,
-                interval_secs,
-            )?;
+            let ch = build_channel(&cli, store, broker, dry_run, interval_secs)?;
             let shutdown = CancellationToken::new();
             let s2 = shutdown.clone();
             tokio::spawn(async move {
@@ -114,7 +137,45 @@ async fn main() -> Result<()> {
             });
             ch.run(shutdown).await
         }
+        Cmd::Wiki { ref op } => match op {
+            WikiOp::Lint { out } => run_wiki_lint(&cli, out.clone()).await,
+        },
     }
+}
+
+async fn run_wiki_lint(cli: &Cli, out: Option<PathBuf>) -> Result<()> {
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for wiki lint")?;
+    let schema_path = cli
+        .wiki_schema
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("schema/wiki-skill.md"));
+    let schema = std::fs::read_to_string(&schema_path)
+        .with_context(|| format!("read schema at {}", schema_path.display()))?;
+
+    let reasoner = ClaudeCliReasoner::new();
+    let opts = augmentagent_channel_email::reasoner::lint_opts(schema, wiki_root.clone());
+    let user_msg = format!(
+        "Run the lint workflow from your system prompt against the wiki at `{}`. Produce a markdown report listing findings by category (contradictions, orphans, stale, missing pages, broken links). Use relative paths. End with a short summary line.\n",
+        wiki_root.display()
+    );
+
+    info!(wiki = %wiki_root.display(), "running wiki lint");
+    let report = reasoner.call(&opts, &user_msg).await?;
+
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &report)
+                .with_context(|| format!("write lint report to {}", path.display()))?;
+            println!("wiki lint report written to {}", path.display());
+        }
+        None => {
+            println!("{report}");
+        }
+    }
+    Ok(())
 }
 
 async fn build_broker(dry_run: bool) -> Result<Arc<dyn ApprovalBroker>> {
@@ -147,26 +208,38 @@ async fn build_broker(dry_run: bool) -> Result<Arc<dyn ApprovalBroker>> {
 }
 
 fn build_channel(
-    skill_dir: &PathBuf,
-    model: Option<String>,
+    cli: &Cli,
     store: Arc<Store>,
     broker: Arc<dyn ApprovalBroker>,
     dry_run: bool,
     interval_secs: u64,
 ) -> Result<GmailChannel<ComposioClient, ClaudeCliReasoner>> {
-    let api_key = std::env::var("COMPOSIO_API_KEY")
-        .context("COMPOSIO_API_KEY env var required")?;
+    let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = Arc::new(ComposioClient::new(api_key));
-    let mut reasoner = ClaudeCliReasoner::new();
-    if let Some(m) = model.clone() {
-        reasoner = reasoner.with_model(m);
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+
+    // Resolve wiki enable/disable and schema path.
+    let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
+        Some(root) => {
+            let schema = cli
+                .wiki_schema
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("schema/wiki-skill.md"));
+            (Some(root.clone()), Some(schema))
+        }
+        None => (None, None),
+    };
+    if let Some(path) = &wiki_root {
+        info!(wiki = %path.display(), "wiki integration enabled");
     }
-    let reasoner = Arc::new(reasoner);
+
     let config = GmailChannelConfig {
-        skill_dir: skill_dir.clone(),
+        skill_dir: cli.skill_dir.clone(),
         dry_run,
-        model,
+        model: cli.model.clone(),
         poll_interval: Duration::from_secs(interval_secs),
+        wiki_root,
+        wiki_schema_path,
         ..Default::default()
     };
     Ok(GmailChannel::new(store, gmail, reasoner, broker, config))

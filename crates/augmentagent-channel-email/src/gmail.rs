@@ -178,7 +178,11 @@ impl FetchMessage {
 
 #[async_trait]
 impl GmailApi for ComposioClient {
-    async fn fetch_unread(&self, entity_id: &str, max_total: u32) -> Result<Vec<Email>, GmailError> {
+    async fn fetch_unread(
+        &self,
+        entity_id: &str,
+        max_total: u32,
+    ) -> Result<Vec<Email>, GmailError> {
         // Composio caps response payload size (seen 413 above ~40 KB of bodies),
         // so paginate in 20-email pages up to `max_total`.
         const PAGE_SIZE: u32 = 20;
@@ -204,8 +208,8 @@ impl GmailApi for ComposioClient {
             }
 
             let v = self.execute("GMAIL_FETCH_EMAILS", entity_id, args).await?;
-            let parsed: FetchResp = serde_json::from_value(v)
-                .map_err(|e| GmailError::Decode(e.to_string()))?;
+            let parsed: FetchResp =
+                serde_json::from_value(v).map_err(|e| GmailError::Decode(e.to_string()))?;
 
             let page_emails: Vec<Email> = parsed
                 .data
@@ -246,7 +250,11 @@ impl GmailApi for ComposioClient {
         }
         let v = self.execute("GMAIL_CREATE_DRAFT", entity_id, args).await?;
         v.get("data")
-            .and_then(|d| d.get("id").or_else(|| d.get("draftId")).or_else(|| d.get("draft_id")))
+            .and_then(|d| {
+                d.get("id")
+                    .or_else(|| d.get("draftId"))
+                    .or_else(|| d.get("draft_id"))
+            })
             .and_then(|s| s.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| GmailError::Decode("missing draft id".into()))

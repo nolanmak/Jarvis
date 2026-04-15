@@ -28,7 +28,9 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Insert email if new. Returns `true` when the row did not previously exist.
@@ -135,11 +137,7 @@ impl Store {
         Ok(())
     }
 
-    pub fn mark_email_processed(
-        &self,
-        message_id: &str,
-        triage: TriageResult,
-    ) -> StoreResult<()> {
+    pub fn mark_email_processed(&self, message_id: &str, triage: TriageResult) -> StoreResult<()> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
         guard.execute(
@@ -260,9 +258,18 @@ mod tests {
     fn log_and_update_action_status() {
         let (s, _f) = fresh_store();
         let id = s
-            .log_action("m1", None, "a@b.com", "subj", None, None, ActionStatus::Pending)
+            .log_action(
+                "m1",
+                None,
+                "a@b.com",
+                "subj",
+                None,
+                None,
+                ActionStatus::Pending,
+            )
             .unwrap();
-        s.update_action_status(&id, ActionStatus::Sent, Some("draft"), None).unwrap();
+        s.update_action_status(&id, ActionStatus::Sent, Some("draft"), None)
+            .unwrap();
     }
 
     #[test]
@@ -276,7 +283,8 @@ mod tests {
     fn is_message_processed_reflects_action_existence() {
         let (s, _f) = fresh_store();
         assert!(!s.is_message_processed("nope").unwrap());
-        s.log_action("m1", None, "a@b.com", "s", None, None, ActionStatus::DryRun).unwrap();
+        s.log_action("m1", None, "a@b.com", "s", None, None, ActionStatus::DryRun)
+            .unwrap();
         assert!(s.is_message_processed("m1").unwrap());
     }
 }

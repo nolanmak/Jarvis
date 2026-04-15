@@ -6,11 +6,12 @@
 
 pub mod decision;
 pub mod gmail;
+pub mod ingest;
 pub mod prompt;
 pub mod reasoner;
 
 mod channel;
 
-pub use channel::{GmailChannel, GmailChannelConfig, PollOutcome, Reasoner};
+pub use channel::{GmailChannel, GmailChannelConfig, PollOutcome, Reasoner, ReasonerOpts};
 pub use decision::{Decision, DecisionKind};
 pub use reasoner::ClaudeCliReasoner;

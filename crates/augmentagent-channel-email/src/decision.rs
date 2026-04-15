@@ -24,8 +24,6 @@ pub enum ParseError {
     NoJson,
     #[error("JSON parse: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("reply decision missing draft")]
-    MissingDraft,
 }
 
 /// Parse the final assistant text into a `Decision`.
@@ -34,9 +32,6 @@ pub enum ParseError {
 pub fn parse(raw: &str) -> Result<Decision, ParseError> {
     let candidate = extract_json_blob(raw).ok_or(ParseError::NoJson)?;
     let decision: Decision = serde_json::from_str(&candidate)?;
-    if decision.decision == DecisionKind::Reply && decision.draft.as_deref().unwrap_or("").trim().is_empty() {
-        return Err(ParseError::MissingDraft);
-    }
     Ok(decision)
 }
 
@@ -111,7 +106,8 @@ mod tests {
 
     #[test]
     fn parses_fenced_json() {
-        let d = parse("sure here\n```json\n{\"decision\":\"reply\",\"draft\":\"ok\"}\n```\n").unwrap();
+        let d =
+            parse("sure here\n```json\n{\"decision\":\"reply\",\"draft\":\"ok\"}\n```\n").unwrap();
         assert_eq!(d.decision, DecisionKind::Reply);
         assert_eq!(d.draft.as_deref(), Some("ok"));
     }
@@ -123,9 +119,12 @@ mod tests {
     }
 
     #[test]
-    fn reply_without_draft_errors() {
-        let err = parse(r#"{"decision":"reply"}"#).unwrap_err();
-        assert!(matches!(err, ParseError::MissingDraft));
+    fn reply_without_draft_is_allowed_now() {
+        // Triage-only returns {decision, reason} without a draft; the draft
+        // comes from a second Claude call.
+        let d = parse(r#"{"decision":"reply","reason":"actionable"}"#).unwrap();
+        assert_eq!(d.decision, DecisionKind::Reply);
+        assert!(d.draft.is_none());
     }
 
     #[test]
