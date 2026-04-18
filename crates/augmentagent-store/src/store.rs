@@ -6,7 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::models::{Account, ActionStatus, Email, LearnedPattern, TriageResult};
+use crate::models::{Account, ActionRecord, ActionStatus, Email, LearnedPattern, TriageResult};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -28,9 +28,23 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Additive, idempotent schema migrations. Safe to run against databases
+    /// that were created by the original Node daemon (they just lack some of
+    /// the newer columns).
+    fn migrate(conn: &Connection) -> StoreResult<()> {
+        if !column_exists(conn, "actions", "retryCount")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN retryCount INTEGER DEFAULT 0", [])?;
+        }
+        if !column_exists(conn, "actions", "draftId")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN draftId TEXT", [])?;
+        }
+        Ok(())
     }
 
     /// Insert email if new. Returns `true` when the row did not previously exist.
@@ -75,6 +89,22 @@ impl Store {
             )?;
             Ok(true)
         }
+    }
+
+    /// True iff the email has been carried to a terminal outcome — skip, flag,
+    /// dry-run reply, successful send, or an explicit rejection/timeout from
+    /// the approver. Transient errors leave `agentProcessedAt = NULL`, which
+    /// makes them retryable.
+    pub fn is_email_complete(&self, message_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row: Option<Option<i64>> = guard
+            .query_row(
+                "SELECT agentProcessedAt FROM emails WHERE messageId = ?1",
+                params![message_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        Ok(matches!(row, Some(Some(_))))
     }
 
     pub fn is_message_processed(&self, message_id: &str) -> StoreResult<bool> {
@@ -173,6 +203,202 @@ impl Store {
         // Phase 3 decides final home. For Phase 1 this is a no-op; channel adapter logs instead.
         Ok(())
     }
+
+    /// Load a single action row plus its email body. Used by the Discord
+    /// event handler on approve/revise/skip clicks to reconstruct context.
+    pub fn get_action_with_email(&self, action_id: &str) -> StoreResult<Option<ActionWithEmail>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row: Option<ActionWithEmail> = guard
+            .query_row(
+                "SELECT \
+                   a.id, a.messageId, a.threadId, a.fromEmail, a.subject, \
+                   a.originalBody, a.draftBody, a.status, a.errorMessage, \
+                   a.createdAt, a.updatedAt, COALESCE(a.retryCount, 0), a.draftId, \
+                   e.body, e.receivedAt, e.accountEntityId \
+                 FROM actions a \
+                 LEFT JOIN emails e ON a.messageId = e.messageId \
+                 WHERE a.id = ?1",
+                params![action_id],
+                |r| {
+                    Ok(ActionWithEmail {
+                        action: ActionRecord {
+                            id: r.get(0)?,
+                            message_id: r.get(1)?,
+                            thread_id: r.get(2)?,
+                            from_email: r.get(3)?,
+                            subject: r.get(4)?,
+                            original_body: r.get(5)?,
+                            draft_body: r.get(6)?,
+                            status: r.get(7)?,
+                            error_message: r.get(8)?,
+                            created_at: ms_to_rfc3339(r.get::<_, i64>(9)?),
+                            updated_at: ms_to_rfc3339(r.get::<_, i64>(10)?),
+                        },
+                        retry_count: r.get::<_, i64>(11)?,
+                        draft_id: r.get::<_, Option<String>>(12)?,
+                        email: Email {
+                            message_id: r.get(1)?,
+                            thread_id: r.get(2)?,
+                            from: r.get(3)?,
+                            subject: r.get(4)?,
+                            body: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                            date: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
+                            account_entity_id: r.get::<_, Option<String>>(15)?,
+                        },
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Store the Gmail-side draft id alongside an action. Called right after
+    /// create_draft succeeds.
+    pub fn set_action_draft_id(&self, action_id: &str, draft_id: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE actions SET draftId = ?2, updatedAt = ?3 WHERE id = ?1",
+            params![action_id, draft_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Find reply-intent actions that errored out and deserve another try.
+    ///
+    /// Criteria:
+    /// - `actions.status = 'error'` (not `permanent_error`, not terminal)
+    /// - `actions.createdAt` within `max_age_ms` (don't retry ancient errors forever)
+    /// - `actions.updatedAt` older than `min_gap_ms` ago (space attempts out)
+    /// - `actions.retryCount < max_attempts`
+    /// - Joined with `emails` so the caller has the email body to retry with
+    pub fn list_retryable_replies(
+        &self,
+        now_ms: i64,
+        max_age_ms: i64,
+        min_gap_ms: i64,
+        max_attempts: i64,
+        limit: i64,
+    ) -> StoreResult<Vec<RetryableReply>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT \
+               a.id, a.messageId, a.threadId, a.fromEmail, a.subject, \
+               a.originalBody, a.draftBody, a.status, a.errorMessage, \
+               a.createdAt, a.updatedAt, COALESCE(a.retryCount, 0), \
+               e.body, e.receivedAt, e.accountEntityId \
+             FROM actions a \
+             JOIN emails e ON a.messageId = e.messageId \
+             WHERE a.status = 'error' \
+               AND a.createdAt >= ?1 \
+               AND a.updatedAt <= ?2 \
+               AND COALESCE(a.retryCount, 0) < ?3 \
+             ORDER BY a.createdAt ASC \
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                now_ms - max_age_ms,
+                now_ms - min_gap_ms,
+                max_attempts,
+                limit,
+            ],
+            |r| {
+                Ok(RetryableReply {
+                    action: ActionRecord {
+                        id: r.get(0)?,
+                        message_id: r.get(1)?,
+                        thread_id: r.get(2)?,
+                        from_email: r.get(3)?,
+                        subject: r.get(4)?,
+                        original_body: r.get(5)?,
+                        draft_body: r.get(6)?,
+                        status: r.get(7)?,
+                        error_message: r.get(8)?,
+                        created_at: ms_to_rfc3339(r.get::<_, i64>(9)?),
+                        updated_at: ms_to_rfc3339(r.get::<_, i64>(10)?),
+                    },
+                    retry_count: r.get::<_, i64>(11)?,
+                    email: Email {
+                        message_id: r.get(1)?,
+                        thread_id: r.get(2)?,
+                        from: r.get(3)?,
+                        subject: r.get(4)?,
+                        body: r.get::<_, Option<String>>(12)?.unwrap_or_default(),
+                        date: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+                        account_entity_id: r.get::<_, Option<String>>(14)?,
+                    },
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Increment an action's retry counter. When it crosses `max_attempts`,
+    /// flip the status to `permanent_error` so the retry loop stops touching it.
+    pub fn increment_retry_count(
+        &self,
+        action_id: &str,
+        max_attempts: i64,
+    ) -> StoreResult<i64> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE actions SET retryCount = COALESCE(retryCount, 0) + 1, updatedAt = ?2 WHERE id = ?1",
+            params![action_id, now],
+        )?;
+        let new_count: i64 = guard.query_row(
+            "SELECT COALESCE(retryCount, 0) FROM actions WHERE id = ?1",
+            params![action_id],
+            |r| r.get(0),
+        )?;
+        if new_count >= max_attempts {
+            guard.execute(
+                "UPDATE actions SET status = 'permanent_error', updatedAt = ?2 WHERE id = ?1",
+                params![action_id, now],
+            )?;
+        }
+        Ok(new_count)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RetryableReply {
+    pub action: ActionRecord,
+    pub retry_count: i64,
+    pub email: Email,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionWithEmail {
+    pub action: ActionRecord,
+    pub retry_count: i64,
+    pub draft_id: Option<String>,
+    pub email: Email,
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> StoreResult<bool> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for name in rows {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ms_to_rfc3339(ms: i64) -> String {
+    use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+    OffsetDateTime::from_unix_timestamp(ms / 1000)
+        .ok()
+        .and_then(|dt| dt.format(&Rfc3339).ok())
+        .unwrap_or_default()
 }
 
 fn now_millis() -> i64 {

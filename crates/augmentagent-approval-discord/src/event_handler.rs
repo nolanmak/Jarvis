@@ -1,5 +1,11 @@
-//! Serenity event handler: routes button/modal interactions into the approval
-//! broker, and routes qualifying messages into the wiki query handler.
+//! Serenity event handler.
+//!
+//! Routes button clicks + modal submits to the injected `ApprovalActionHandler`
+//! (which owns sqlite + Gmail + reasoner access). Approvals are resolved via
+//! the database, so old cards remain valid indefinitely.
+//!
+//! Also routes qualifying messages in the query channel (or DMs) to the
+//! `QueryHandler` for wiki-ask answers.
 
 use std::sync::Arc;
 
@@ -9,12 +15,12 @@ use serenity::all::{
 };
 use tracing::{debug, info, warn};
 
-use crate::broker::{BrokerState, DeliveryOutcome};
+use crate::broker::BrokerState;
 use crate::custom_id::{CustomId, Verb};
-use crate::layout::{extract_feedback, revise_modal};
-use crate::ApprovalOutcome;
+use crate::layout::{approval_message, extract_feedback, revise_modal};
+use crate::ApprovalActionOutcome;
 
-const DISCORD_MSG_LIMIT: usize = 1900; // conservative under the hard 2000
+const DISCORD_MSG_LIMIT: usize = 1900;
 
 pub struct Handler {
     pub state: Arc<BrokerState>,
@@ -32,10 +38,9 @@ impl EventHandler for Handler {
             return;
         }
         let Some(handler) = &self.state.query_handler else {
-            return; // query feature disabled
+            return;
         };
 
-        // Accept from: the designated query channel, OR any DM.
         let is_dm = msg.guild_id.is_none();
         let in_query_channel = self
             .state
@@ -45,7 +50,6 @@ impl EventHandler for Handler {
             return;
         }
 
-        // User allowlist (single-user bot by default).
         if let Some(allowed) = self.state.allowed_user_id {
             if msg.author.id != allowed {
                 debug!(
@@ -99,28 +103,52 @@ impl EventHandler for Handler {
                     debug!("unrecognized custom_id: {}", comp.data.custom_id);
                     return;
                 };
+                // Enforce user allowlist on clicks.
+                if let Some(allowed) = self.state.allowed_user_id {
+                    if comp.user.id != allowed {
+                        ack_ephemeral(
+                            &ctx,
+                            &comp,
+                            "You are not authorized to approve replies on this bot.",
+                        )
+                        .await;
+                        return;
+                    }
+                }
                 match cid.verb {
                     Verb::Approve => {
-                        let delivered = self.state.deliver(
-                            &cid.action_id,
-                            ApprovalOutcome::Approved {
-                                final_draft: self.state.draft_for(&cid.action_id),
-                            },
-                        );
-                        let msg = match delivered {
-                            DeliveryOutcome::Delivered => "Approved — sending.",
-                            DeliveryOutcome::Unknown => "This request has expired.",
-                        };
-                        ack(&ctx, &comp, msg).await;
+                        let handler = self.state.action_handler.clone();
+                        let action_id = cid.action_id.clone();
+                        let ctx_clone = ctx.clone();
+                        let comp_clone = comp.clone();
+                        tokio::spawn(async move {
+                            let outcome = match handler {
+                                Some(h) => h.approve(&action_id).await,
+                                None => {
+                                    ApprovalActionOutcome::Failed {
+                                        message: "no action handler configured".into(),
+                                    }
+                                }
+                            };
+                            ack_outcome(&ctx_clone, &comp_clone, outcome, None).await;
+                        });
                     }
                     Verb::Skip => {
-                        let delivered =
-                            self.state.deliver(&cid.action_id, ApprovalOutcome::Skipped);
-                        let msg = match delivered {
-                            DeliveryOutcome::Delivered => "Skipped.",
-                            DeliveryOutcome::Unknown => "This request has expired.",
-                        };
-                        ack(&ctx, &comp, msg).await;
+                        let handler = self.state.action_handler.clone();
+                        let action_id = cid.action_id.clone();
+                        let ctx_clone = ctx.clone();
+                        let comp_clone = comp.clone();
+                        tokio::spawn(async move {
+                            let outcome = match handler {
+                                Some(h) => h.skip(&action_id).await,
+                                None => {
+                                    ApprovalActionOutcome::Failed {
+                                        message: "no action handler configured".into(),
+                                    }
+                                }
+                            };
+                            ack_outcome(&ctx_clone, &comp_clone, outcome, None).await;
+                        });
                     }
                     Verb::Revise => {
                         let modal = revise_modal(&cid.action_id, None);
@@ -143,34 +171,100 @@ impl EventHandler for Handler {
                 if cid.verb != Verb::ReviseModal {
                     return;
                 }
-                let feedback = extract_feedback(&modal.data.components).unwrap_or_default();
-                let delivered = self
-                    .state
-                    .deliver(&cid.action_id, ApprovalOutcome::Revise { feedback });
-                let msg = match delivered {
-                    DeliveryOutcome::Delivered => "Revising…",
-                    DeliveryOutcome::Unknown => "This request has expired.",
-                };
-                if let Err(e) = modal
-                    .create_response(
-                        &ctx.http,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .content(msg)
-                                .ephemeral(true),
-                        ),
-                    )
-                    .await
-                {
-                    warn!("failed to ack modal: {e}");
+                if let Some(allowed) = self.state.allowed_user_id {
+                    if modal.user.id != allowed {
+                        let _ = modal
+                            .create_response(
+                                &ctx.http,
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content("Not authorized.")
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await;
+                        return;
+                    }
                 }
+                let feedback = extract_feedback(&modal.data.components).unwrap_or_default();
+                let handler = self.state.action_handler.clone();
+                let action_id = cid.action_id.clone();
+                let approval_channel = self.state.approval_channel_id;
+                let ctx_clone = ctx.clone();
+                let modal_clone = modal.clone();
+
+                tokio::spawn(async move {
+                    let outcome = match handler {
+                        Some(h) => h.revise(&action_id, &feedback).await,
+                        None => ApprovalActionOutcome::Failed {
+                            message: "no action handler configured".into(),
+                        },
+                    };
+
+                    // Capture revise-specific fields before the move into ack.
+                    let repost = if let ApprovalActionOutcome::Revised { email, draft } =
+                        &outcome
+                    {
+                        Some((email.clone(), draft.clone()))
+                    } else {
+                        None
+                    };
+
+                    ack_outcome_modal(&ctx_clone, &modal_clone, outcome).await;
+
+                    // After ack, post the new approval card with the revised draft.
+                    if let Some((email, draft)) = repost {
+                        let msg = approval_message(&action_id, &email, &draft);
+                        if let Err(e) = approval_channel.send_message(&ctx_clone.http, msg).await {
+                            warn!(
+                                action_id = %action_id,
+                                "revise: failed to re-post approval card: {e}"
+                            );
+                        }
+                    }
+                });
             }
             _ => {}
         }
     }
 }
 
-async fn ack(ctx: &Context, comp: &serenity::all::ComponentInteraction, message: &str) {
+async fn ack_outcome(
+    ctx: &Context,
+    comp: &serenity::all::ComponentInteraction,
+    outcome: ApprovalActionOutcome,
+    override_msg: Option<&str>,
+) {
+    let message = override_msg.map(String::from).unwrap_or_else(|| describe(&outcome));
+    ack_ephemeral(ctx, comp, &message).await;
+}
+
+async fn ack_outcome_modal(
+    ctx: &Context,
+    modal: &serenity::all::ModalInteraction,
+    outcome: ApprovalActionOutcome,
+) {
+    let message = describe(&outcome);
+    if let Err(e) = modal
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(message)
+                    .ephemeral(true),
+            ),
+        )
+        .await
+    {
+        warn!("failed to ack modal: {e}");
+    }
+}
+
+async fn ack_ephemeral(
+    ctx: &Context,
+    comp: &serenity::all::ComponentInteraction,
+    message: &str,
+) {
     if let Err(e) = comp
         .create_response(
             &ctx.http,
@@ -186,13 +280,26 @@ async fn ack(ctx: &Context, comp: &serenity::all::ComponentInteraction, message:
     }
 }
 
-/// Split a wiki answer into Discord-friendly chunks (< 2000 chars each),
-/// preferring paragraph then line boundaries.
-pub(crate) fn chunk_for_discord(full: &str) -> Vec<String> {
+fn describe(outcome: &ApprovalActionOutcome) -> String {
+    match outcome {
+        ApprovalActionOutcome::NotFound => {
+            "No record of that approval — it may have been cleared.".into()
+        }
+        ApprovalActionOutcome::AlreadyResolved { status } => {
+            format!("Already resolved ({status}).")
+        }
+        ApprovalActionOutcome::Approved => "Approved — sending.".into(),
+        ApprovalActionOutcome::Skipped => "Skipped — draft discarded.".into(),
+        ApprovalActionOutcome::Revised { .. } => "Revising — new draft posted below.".into(),
+        ApprovalActionOutcome::Failed { message } => format!("Failed: {message}"),
+    }
+}
+
+/// Split a wiki answer into Discord-friendly chunks.
+pub fn chunk_for_discord(full: &str) -> Vec<String> {
     if full.len() <= DISCORD_MSG_LIMIT {
         return vec![full.to_string()];
     }
-
     let mut chunks = Vec::new();
     let mut current = String::new();
     for paragraph in full.split("\n\n") {
@@ -209,7 +316,6 @@ pub(crate) fn chunk_for_discord(full: &str) -> Vec<String> {
             if paragraph.len() <= DISCORD_MSG_LIMIT {
                 current.push_str(paragraph);
             } else {
-                // Paragraph itself too long — hard-split on chars.
                 for piece in hard_split(paragraph, DISCORD_MSG_LIMIT) {
                     chunks.push(piece);
                 }
@@ -252,7 +358,6 @@ mod tests {
         let para = "a".repeat(1000);
         let full = format!("{para}\n\n{para}\n\n{para}");
         let chunks = chunk_for_discord(&full);
-        // 3000 chars, limit ~1900 → expect 2 or 3 chunks, each under the cap
         assert!(chunks.len() >= 2);
         for c in &chunks {
             assert!(c.len() <= DISCORD_MSG_LIMIT, "chunk too long: {}", c.len());

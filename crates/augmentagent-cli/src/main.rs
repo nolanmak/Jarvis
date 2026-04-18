@@ -10,12 +10,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use augmentagent_approval_discord::{
-    ApprovalBroker, DiscordApprovalBroker, DiscordConfig, NoopBroker, QueryHandler,
+    ApprovalActionHandler, ApprovalActionOutcome, ApprovalBroker, DiscordApprovalBroker,
+    DiscordConfig, NoopBroker, QueryHandler,
 };
-use augmentagent_channel_email::gmail::ComposioClient;
-use augmentagent_channel_email::reasoner::ask_opts;
+use augmentagent_channel_email::gmail::{ComposioClient, GmailApi};
+use augmentagent_channel_email::reasoner::{ask_opts, draft_opts};
 use augmentagent_channel_email::{ClaudeCliReasoner, GmailChannel, GmailChannelConfig, Reasoner};
-use augmentagent_store::Store;
+use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 #[derive(Parser)]
@@ -122,7 +123,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::PollOnce { dry_run } => {
-            let broker = build_broker(&cli, dry_run).await?;
+            let broker = build_broker(&cli, Arc::clone(&store), dry_run).await?;
             let ch = build_channel(&cli, store, broker, dry_run, 120)?;
             let out = ch.poll_once().await?;
             println!("{out:#?}");
@@ -132,7 +133,7 @@ async fn main() -> Result<()> {
             interval_secs,
             dry_run,
         } => {
-            let broker = build_broker(&cli, dry_run).await?;
+            let broker = build_broker(&cli, Arc::clone(&store), dry_run).await?;
             let ch = build_channel(&cli, store, broker, dry_run, interval_secs)?;
             let shutdown = CancellationToken::new();
             let s2 = shutdown.clone();
@@ -216,7 +217,192 @@ impl QueryHandler for WikiQuerier {
     }
 }
 
-async fn build_broker(cli: &Cli, dry_run: bool) -> Result<Arc<dyn ApprovalBroker>> {
+/// Executes Approve / Revise / Skip clicks against sqlite + Composio +
+/// reasoner. Backed entirely by the persistent action row — no in-memory
+/// state — so cards remain valid across daemon restarts and indefinitely.
+struct ReplyApprover {
+    store: Arc<Store>,
+    gmail: Arc<ComposioClient>,
+    reasoner: Arc<ClaudeCliReasoner>,
+    draft_skill: String,
+    wiki_root: Option<PathBuf>,
+}
+
+impl ReplyApprover {
+    fn handle_load(
+        &self,
+        action_id: &str,
+    ) -> Option<augmentagent_store::ActionWithEmail> {
+        match self.store.get_action_with_email(action_id) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(action_id, "approver: store lookup failed: {e}");
+                None
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ApprovalActionHandler for ReplyApprover {
+    async fn approve(&self, action_id: &str) -> ApprovalActionOutcome {
+        let Some(action) = self.handle_load(action_id) else {
+            return ApprovalActionOutcome::NotFound;
+        };
+        if action.action.status != "pending" {
+            return ApprovalActionOutcome::AlreadyResolved {
+                status: action.action.status,
+            };
+        }
+        let Some(draft_id) = action.draft_id.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no draftId on action; cannot send".into(),
+            };
+        };
+        let Some(entity_id) = action.email.account_entity_id.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no accountEntityId on email; cannot send".into(),
+            };
+        };
+
+        if let Err(e) = self.gmail.send_draft(entity_id, draft_id).await {
+            let msg = format!("send_draft: {e}");
+            let _ = self.store.update_action_status(
+                action_id,
+                ActionStatus::Error,
+                None,
+                Some(&msg),
+            );
+            return ApprovalActionOutcome::Failed { message: msg };
+        }
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Sent,
+            action.action.draft_body.as_deref(),
+            None,
+        );
+        let _ = self
+            .store
+            .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+        tracing::info!(action_id, "reply sent via approval handler");
+        ApprovalActionOutcome::Approved
+    }
+
+    async fn skip(&self, action_id: &str) -> ApprovalActionOutcome {
+        let Some(action) = self.handle_load(action_id) else {
+            return ApprovalActionOutcome::NotFound;
+        };
+        if action.action.status != "pending" {
+            return ApprovalActionOutcome::AlreadyResolved {
+                status: action.action.status,
+            };
+        }
+        // Best-effort cleanup of the unsent Gmail draft.
+        if let (Some(draft_id), Some(entity_id)) = (
+            action.draft_id.as_deref(),
+            action.email.account_entity_id.as_deref(),
+        ) {
+            if let Err(e) = self.gmail.delete_draft(entity_id, draft_id).await {
+                tracing::warn!(action_id, draft_id, "skip: delete_draft failed: {e}");
+            }
+        }
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Rejected,
+            None,
+            Some("skipped by approver"),
+        );
+        let _ = self
+            .store
+            .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+        ApprovalActionOutcome::Skipped
+    }
+
+    async fn revise(&self, action_id: &str, feedback: &str) -> ApprovalActionOutcome {
+        let Some(action) = self.handle_load(action_id) else {
+            return ApprovalActionOutcome::NotFound;
+        };
+        if action.action.status != "pending" {
+            return ApprovalActionOutcome::AlreadyResolved {
+                status: action.action.status,
+            };
+        }
+        let Some(entity_id) = action.email.account_entity_id.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no accountEntityId on email; cannot revise".into(),
+            };
+        };
+        let previous_draft = action.action.draft_body.clone().unwrap_or_default();
+
+        // 1. Generate revised draft via reasoner.
+        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
+        let prompt =
+            augmentagent_channel_email::prompt::redraft_message(&action.email, &previous_draft, feedback);
+        let redraft = match self.reasoner.call(&opts, &prompt).await {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("redraft call failed: {e}"),
+                };
+            }
+        };
+
+        // 2. Create a fresh Gmail draft with the revised body.
+        let subject = if action.email.subject.to_ascii_lowercase().starts_with("re:") {
+            action.email.subject.clone()
+        } else {
+            format!("Re: {}", action.email.subject)
+        };
+        let new_draft_id = match self
+            .gmail
+            .create_draft(
+                entity_id,
+                &action.email.from,
+                &subject,
+                &redraft,
+                action.email.thread_id.as_deref(),
+            )
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("create_draft: {e}"),
+                };
+            }
+        };
+
+        // 3. Delete the now-stale old draft best-effort.
+        if let Some(old) = action.draft_id.as_deref() {
+            if let Err(e) = self.gmail.delete_draft(entity_id, old).await {
+                tracing::warn!(action_id, old_draft = old, "revise: delete old draft failed: {e}");
+            }
+        }
+
+        // 4. Update sqlite: new draft body + new draft id, still Pending.
+        let _ = self
+            .store
+            .set_action_draft_id(action_id, &new_draft_id);
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Pending,
+            Some(&redraft),
+            None,
+        );
+
+        tracing::info!(action_id, new_draft_id, "revise: new draft posted");
+        ApprovalActionOutcome::Revised {
+            email: action.email,
+            draft: redraft,
+        }
+    }
+}
+
+async fn build_broker(
+    cli: &Cli,
+    store: Arc<Store>,
+    dry_run: bool,
+) -> Result<Arc<dyn ApprovalBroker>> {
     if dry_run {
         return Ok(Arc::new(NoopBroker));
     }
@@ -231,14 +417,7 @@ async fn build_broker(cli: &Cli, dry_run: bool) -> Result<Arc<dyn ApprovalBroker
         .context("DISCORD_CHANNEL_ID env var required")?
         .parse()
         .context("DISCORD_CHANNEL_ID must be a numeric channel id")?;
-    let timeout_secs: u64 = std::env::var("DISCORD_APPROVAL_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3600);
 
-    // Wiki query channel defaults to the approval channel when unset — one
-    // channel for both approval cards and user questions. Override with
-    // DISCORD_QUERY_CHANNEL_ID if you want them split.
     let query_channel_id: Option<u64> = Some(
         std::env::var("DISCORD_QUERY_CHANNEL_ID")
             .ok()
@@ -249,23 +428,38 @@ async fn build_broker(cli: &Cli, dry_run: bool) -> Result<Arc<dyn ApprovalBroker
         .ok()
         .and_then(|s| s.parse().ok());
 
-    // Only plug in a query handler when wiki is configured. Otherwise there's
-    // no corpus to answer from.
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+
     let query_handler: Option<Arc<dyn QueryHandler>> = cli.wiki_dir.as_ref().map(|root| {
         let q = WikiQuerier {
-            reasoner: Arc::new(ClaudeCliReasoner::new()),
+            reasoner: Arc::clone(&reasoner),
             wiki_root: root.clone(),
         };
         Arc::new(q) as Arc<dyn QueryHandler>
     });
 
+    // Approval action handler: needs Composio for send/delete/create_draft,
+    // reasoner for revise, and the skill body for the redraft prompt.
+    let api_key =
+        std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
+    let gmail = Arc::new(ComposioClient::new(api_key));
+    let skill_dir = cli.skill_dir.clone();
+    let draft_skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap_or_default();
+    let approver = Arc::new(ReplyApprover {
+        store,
+        gmail,
+        reasoner: Arc::clone(&reasoner),
+        draft_skill,
+        wiki_root: cli.wiki_dir.clone(),
+    });
+
     let broker = DiscordApprovalBroker::start(DiscordConfig {
         bot_token: token,
         channel_id,
-        timeout: Duration::from_secs(timeout_secs),
         query_channel_id,
         allowed_user_id,
         query_handler,
+        action_handler: Some(approver),
     })
     .await
     .context("start discord broker")?;

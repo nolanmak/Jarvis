@@ -8,4 +8,4 @@ pub mod models;
 mod store;
 
 pub use models::{Account, ActionRecord, ActionStatus, Email, LearnedPattern, TriageResult};
-pub use store::{Store, StoreError, StoreResult};
+pub use store::{ActionWithEmail, RetryableReply, Store, StoreError, StoreResult};
