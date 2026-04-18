@@ -16,15 +16,13 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use augmentagent_approval_discord::{ApprovalBroker, ApprovalError, ApprovalOutcome, NoopBroker};
-use augmentagent_store::{ActionStatus, Store, TriageResult};
+use augmentagent_approval_discord::{ApprovalBroker, NoopBroker};
+use augmentagent_store::{ActionStatus, RetryableReply, Store, TriageResult};
 
 use crate::decision::{parse as parse_decision, DecisionKind};
 use crate::gmail::GmailApi;
 use crate::ingest::{spawn_ingest, IngestTrigger};
-use crate::prompt::{
-    draft_user_message, redraft_message, triage_user_message, SkillPrompt, TRIAGE_SYSTEM,
-};
+use crate::prompt::{draft_user_message, triage_user_message, SkillPrompt, TRIAGE_SYSTEM};
 
 #[derive(Clone, Debug)]
 pub struct GmailChannelConfig {
@@ -39,6 +37,18 @@ pub struct GmailChannelConfig {
     pub wiki_root: Option<PathBuf>,
     /// Path to schema/wiki-skill.md. Required when wiki_root is set; loaded once per poll cycle.
     pub wiki_schema_path: Option<PathBuf>,
+
+    // --- retry queue ---
+    /// How often to scan `actions` for errored replies to retry. 0 = disabled.
+    pub retry_interval: Duration,
+    /// Max retries per action before flipping to `permanent_error`.
+    pub retry_max_attempts: i64,
+    /// Age cap: errors older than this are abandoned. Default: 24h.
+    pub retry_max_age: Duration,
+    /// Minimum gap between attempts on the same action. Default: 5m.
+    pub retry_min_gap: Duration,
+    /// Max actions processed per retry tick (bounds a burst after an outage).
+    pub retry_batch: i64,
 }
 
 impl Default for GmailChannelConfig {
@@ -52,6 +62,11 @@ impl Default for GmailChannelConfig {
             max_revise_rounds: 3,
             wiki_root: None,
             wiki_schema_path: None,
+            retry_interval: Duration::from_secs(300), // 5 min
+            retry_max_attempts: 5,
+            retry_max_age: Duration::from_secs(24 * 60 * 60),
+            retry_min_gap: Duration::from_secs(300),
+            retry_batch: 10,
         }
     }
 }
@@ -64,8 +79,7 @@ pub struct PollOutcome {
     pub skipped: usize,
     pub flagged: usize,
     pub replied_dry_run: usize,
-    pub sent: usize,
-    pub rejected: usize,
+    pub awaiting_approval: usize,
     pub errors: usize,
 }
 
@@ -177,21 +191,104 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
     }
 
     pub async fn run(&self, shutdown: CancellationToken) -> anyhow::Result<()> {
-        let mut ticker = tokio::time::interval(self.config.poll_interval);
+        let mut poll_ticker = tokio::time::interval(self.config.poll_interval);
+        let retry_enabled = !self.config.retry_interval.is_zero();
+        let mut retry_ticker = tokio::time::interval(if retry_enabled {
+            self.config.retry_interval
+        } else {
+            // Stub interval; we'll never actually select on this branch.
+            Duration::from_secs(3600)
+        });
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     info!("gmail channel: shutdown signal received");
                     return Ok(());
                 }
-                _ = ticker.tick() => {
+                _ = poll_ticker.tick() => {
                     match self.poll_once().await {
                         Ok(outcome) => info!(?outcome, "gmail poll complete"),
                         Err(e) => error!("gmail poll failed: {e:#}"),
                     }
                 }
+                _ = retry_ticker.tick(), if retry_enabled => {
+                    match self.retry_once().await {
+                        Ok(n) if n > 0 => info!(retried = n, "retry tick complete"),
+                        Ok(_) => {}
+                        Err(e) => error!("retry tick failed: {e:#}"),
+                    }
+                }
             }
         }
+    }
+
+    /// One pass of the retry queue. Returns the number of actions re-attempted.
+    /// Not public since normal callers should rely on `run`, but tests call it
+    /// directly to exercise the logic deterministically.
+    pub async fn retry_once(&self) -> anyhow::Result<usize> {
+        let now_ms = now_millis();
+        let candidates: Vec<RetryableReply> = self.store.list_retryable_replies(
+            now_ms,
+            self.config.retry_max_age.as_millis() as i64,
+            self.config.retry_min_gap.as_millis() as i64,
+            self.config.retry_max_attempts,
+            self.config.retry_batch,
+        )?;
+
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        info!(count = candidates.len(), "retrying errored reply actions");
+
+        let skill = SkillPrompt::load(&self.config.skill_dir);
+        let _ = skill.load_learned(); // not needed for retry, but ensures file system is reachable
+
+        let mut attempted = 0usize;
+        for item in candidates {
+            let entity_id = match &item.email.account_entity_id {
+                Some(e) => e.clone(),
+                None => {
+                    warn!(action_id = %item.action.id, "skipping retry: missing account_entity_id");
+                    continue;
+                }
+            };
+
+            // Bump the retry counter FIRST. If we crash mid-retry, the counter
+            // is still incremented — we don't want to risk an infinite loop.
+            let new_count = self.store.increment_retry_count(
+                &item.action.id,
+                self.config.retry_max_attempts,
+            )?;
+            info!(
+                action_id = %item.action.id,
+                attempt = new_count,
+                max = self.config.retry_max_attempts,
+                subject = %item.action.subject,
+                "retrying reply"
+            );
+
+            let draft = item
+                .action
+                .draft_body
+                .clone()
+                .unwrap_or_default();
+            // Reuse the existing action_id so the Discord card already showing
+            // for this action stays valid (the event handler looks up this id
+            // in sqlite on click).
+            let result = self
+                .dispatch_reply(
+                    &entity_id,
+                    item.email.clone(),
+                    draft,
+                    Some(item.action.id.clone()),
+                )
+                .await;
+            if let Err(e) = result {
+                warn!(action_id = %item.action.id, "retry attempt failed: {e:#}");
+            }
+            attempted += 1;
+        }
+        Ok(attempted)
     }
 
     pub async fn poll_once(&self) -> anyhow::Result<PollOutcome> {
@@ -223,8 +320,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                                 Some(DispatchOutcome::Skipped) => outcome.skipped += 1,
                                 Some(DispatchOutcome::Flagged) => outcome.flagged += 1,
                                 Some(DispatchOutcome::DryRun) => outcome.replied_dry_run += 1,
-                                Some(DispatchOutcome::Sent) => outcome.sent += 1,
-                                Some(DispatchOutcome::Rejected) => outcome.rejected += 1,
+                                Some(DispatchOutcome::AwaitingApproval) => {
+                                    outcome.awaiting_approval += 1
+                                }
                                 None => {}
                             },
                             Err(e) => {
@@ -244,8 +342,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         outcome.new_emails = outcome.skipped
             + outcome.flagged
             + outcome.replied_dry_run
-            + outcome.sent
-            + outcome.rejected;
+            + outcome.awaiting_approval;
         Ok(outcome)
     }
 
@@ -256,8 +353,11 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         entity_id: &str,
         email: augmentagent_store::Email,
     ) -> anyhow::Result<Option<DispatchOutcome>> {
-        let is_new = self.store.upsert_email(&email)?;
-        if !is_new || self.store.is_message_processed(&email.message_id)? {
+        // Always upsert so the body stays fresh. Gate only on *completion* — if
+        // the email hasn't been carried to a terminal outcome we process it,
+        // even if we've seen the messageId before (retryable error state).
+        self.store.upsert_email(&email)?;
+        if self.store.is_email_complete(&email.message_id)? {
             return Ok(None);
         }
 
@@ -278,8 +378,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     None,
                     ActionStatus::Error,
                 )?;
-                self.store
-                    .mark_email_processed(&email.message_id, TriageResult::Flag)?;
+                // NOT mark_email_processed: a triage parse failure is transient
+                // (Claude flakiness). Leave agentProcessedAt NULL so the retry
+                // tick can pick it up.
                 return Err(e.into());
             }
         };
@@ -368,8 +469,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                             None,
                             ActionStatus::Error,
                         )?;
-                        self.store
-                            .mark_email_processed(&email.message_id, TriageResult::Reply)?;
+                        // NOT mark_email_processed — retry tick will pick up.
                         return Err(e);
                     }
                 };
@@ -399,30 +499,46 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     );
                     return Ok(Some(DispatchOutcome::DryRun));
                 }
-                self.dispatch_reply(draft_skill, entity_id, email, draft)
-                    .await
+                self.dispatch_reply(entity_id, email, draft, None).await
             }
         }
     }
 
+    /// Non-blocking reply dispatch: create Gmail draft, log/update the action,
+    /// post the approval card, return. The subsequent Approve / Revise / Skip
+    /// is handled by the Discord event handler against the sqlite row.
+    ///
+    /// `existing_action_id` is `None` for first-time dispatch (log a fresh
+    /// row), or `Some(id)` from the retry path (reuse the row so old Discord
+    /// cards with that action_id remain valid).
     async fn dispatch_reply(
         &self,
-        draft_skill: &str,
         entity_id: &str,
         email: augmentagent_store::Email,
         initial_draft: String,
+        existing_action_id: Option<String>,
     ) -> anyhow::Result<Option<DispatchOutcome>> {
-        let action_id = self.store.log_action(
-            &email.message_id,
-            email.thread_id.as_deref(),
-            &email.from,
-            &email.subject,
-            Some(&email.body),
-            Some(&initial_draft),
-            ActionStatus::Pending,
-        )?;
+        let action_id = match existing_action_id {
+            Some(id) => {
+                self.store.update_action_status(
+                    &id,
+                    ActionStatus::Pending,
+                    Some(&initial_draft),
+                    None,
+                )?;
+                id
+            }
+            None => self.store.log_action(
+                &email.message_id,
+                email.thread_id.as_deref(),
+                &email.from,
+                &email.subject,
+                Some(&email.body),
+                Some(&initial_draft),
+                ActionStatus::Pending,
+            )?,
+        };
 
-        // Create Gmail draft up-front so Approve just needs to send.
         let draft_id = match self
             .gmail
             .create_draft(
@@ -442,146 +558,36 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     None,
                     Some(&format!("create_draft: {e}")),
                 )?;
-                self.store
-                    .mark_email_processed(&email.message_id, TriageResult::Reply)?;
                 return Err(e.into());
             }
         };
+        self.store.set_action_draft_id(&action_id, &draft_id)?;
 
-        let mut current_draft = initial_draft;
-        let mut rounds: u8 = 0;
-        loop {
-            let outcome = self
-                .approvals
-                .request(&action_id, &email, &current_draft)
-                .await;
-
-            match outcome {
-                Ok(ApprovalOutcome::Approved { final_draft }) => {
-                    let _ = final_draft;
-                    match self.gmail.send_draft(entity_id, &draft_id).await {
-                        Ok(()) => {
-                            self.store.update_action_status(
-                                &action_id,
-                                ActionStatus::Sent,
-                                Some(&current_draft),
-                                None,
-                            )?;
-                            self.store
-                                .mark_email_processed(&email.message_id, TriageResult::Reply)?;
-                            info!(action_id, "reply sent");
-                            self.maybe_ingest(
-                                &email,
-                                DecisionKind::Reply,
-                                None,
-                                Some(&current_draft),
-                                IngestTrigger::Sent,
-                            );
-                            return Ok(Some(DispatchOutcome::Sent));
-                        }
-                        Err(e) => {
-                            self.store.update_action_status(
-                                &action_id,
-                                ActionStatus::Error,
-                                None,
-                                Some(&format!("send_draft: {e}")),
-                            )?;
-                            self.store
-                                .mark_email_processed(&email.message_id, TriageResult::Reply)?;
-                            return Err(e.into());
-                        }
-                    }
-                }
-                Ok(ApprovalOutcome::Revise { feedback }) => {
-                    rounds += 1;
-                    if rounds > self.config.max_revise_rounds {
-                        self.store.update_action_status(
-                            &action_id,
-                            ActionStatus::Rejected,
-                            None,
-                            Some("exceeded max revise rounds"),
-                        )?;
-                        self.store
-                            .mark_email_processed(&email.message_id, TriageResult::Reply)?;
-                        warn!(action_id, "revise exceeded max rounds");
-                        return Ok(Some(DispatchOutcome::Rejected));
-                    }
-
-                    let revise_opts = crate::reasoner::draft_opts(
-                        draft_skill.to_string(),
-                        self.config.wiki_root.clone(),
-                    );
-                    let redraft = self
-                        .reasoner
-                        .call(
-                            &revise_opts,
-                            &redraft_message(&email, &current_draft, &feedback),
-                        )
-                        .await?;
-                    current_draft = redraft.trim().to_string();
-                    self.store.update_action_status(
-                        &action_id,
-                        ActionStatus::Pending,
-                        Some(&current_draft),
-                        None,
-                    )?;
-                    warn!(
-                        "revise: keeping original Gmail draft {} (UPDATE_DRAFT not yet wired)",
-                        draft_id
-                    );
-                    continue;
-                }
-                Ok(ApprovalOutcome::Skipped) => {
-                    self.store.update_action_status(
-                        &action_id,
-                        ActionStatus::Rejected,
-                        None,
-                        Some("skipped by approver"),
-                    )?;
-                    self.store
-                        .mark_email_processed(&email.message_id, TriageResult::Reply)?;
-                    self.maybe_ingest(
-                        &email,
-                        DecisionKind::Reply,
-                        None,
-                        Some(&current_draft),
-                        IngestTrigger::Rejected,
-                    );
-                    return Ok(Some(DispatchOutcome::Rejected));
-                }
-                Err(ApprovalError::TimedOut) => {
-                    self.store.update_action_status(
-                        &action_id,
-                        ActionStatus::TimedOut,
-                        None,
-                        Some("approval timeout"),
-                    )?;
-                    self.store
-                        .mark_email_processed(&email.message_id, TriageResult::Reply)?;
-                    warn!(action_id, "approval timed out");
-                    self.maybe_ingest(
-                        &email,
-                        DecisionKind::Reply,
-                        None,
-                        Some(&current_draft),
-                        IngestTrigger::Rejected,
-                    );
-                    return Ok(Some(DispatchOutcome::Rejected));
-                }
-                Err(e) => {
-                    self.store.update_action_status(
-                        &action_id,
-                        ActionStatus::Error,
-                        None,
-                        Some(&format!("approval: {e}")),
-                    )?;
-                    self.store
-                        .mark_email_processed(&email.message_id, TriageResult::Reply)?;
-                    return Err(anyhow::anyhow!("approval error: {e}"));
-                }
-            }
+        if let Err(e) = self
+            .approvals
+            .post_approval(&action_id, &email, &initial_draft)
+            .await
+        {
+            self.store.update_action_status(
+                &action_id,
+                ActionStatus::Error,
+                None,
+                Some(&format!("post_approval: {e}")),
+            )?;
+            return Err(anyhow::anyhow!("post_approval: {e}"));
         }
+
+        info!(action_id, draft_id = %draft_id, "approval card posted");
+        Ok(Some(DispatchOutcome::AwaitingApproval))
     }
+}
+
+fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn reply_subject(original: &str) -> String {
@@ -597,8 +603,9 @@ enum DispatchOutcome {
     Skipped,
     Flagged,
     DryRun,
-    Sent,
-    Rejected,
+    /// Draft created, approval card posted. Terminal outcome happens
+    /// asynchronously when the user clicks a button in Discord.
+    AwaitingApproval,
 }
 
 // Silence dead_code warning for TRIAGE_SYSTEM constant which is exported for
@@ -634,7 +641,20 @@ mod tests {
         ) -> Result<String, crate::gmail::GmailError> {
             Ok("draft".into())
         }
+        async fn update_draft(
+            &self,
+            _e: &str,
+            _d: &str,
+            _t: &str,
+            _s: &str,
+            _b: &str,
+        ) -> Result<(), crate::gmail::GmailError> {
+            Ok(())
+        }
         async fn send_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
+            Ok(())
+        }
+        async fn delete_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
             Ok(())
         }
     }
@@ -757,23 +777,27 @@ mod tests {
         assert_eq!(out.replied_dry_run, 1);
     }
 
-    struct ApproveBroker;
+    /// Broker that records every post without blocking. Used by tests to
+    /// assert the channel's non-blocking dispatch semantics.
+    #[derive(Default)]
+    struct RecordingBroker {
+        posts: std::sync::Mutex<Vec<String>>,
+    }
     #[async_trait]
-    impl ApprovalBroker for ApproveBroker {
-        async fn request(
+    impl ApprovalBroker for RecordingBroker {
+        async fn post_approval(
             &self,
-            _action_id: &str,
+            action_id: &str,
             _email: &Email,
-            initial_draft: &str,
-        ) -> Result<ApprovalOutcome, ApprovalError> {
-            Ok(ApprovalOutcome::Approved {
-                final_draft: initial_draft.to_string(),
-            })
+            _draft: &str,
+        ) -> Result<(), augmentagent_approval_discord::ApprovalError> {
+            self.posts.lock().unwrap().push(action_id.to_string());
+            Ok(())
         }
     }
 
     #[tokio::test]
-    async fn live_reply_flow_sends() {
+    async fn live_reply_flow_posts_approval_card() {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
@@ -790,11 +814,12 @@ mod tests {
             r#"{"decision":"reply","reason":"ping"}"#,
             "Yes — shipping today.",
         ]));
+        let broker = Arc::new(RecordingBroker::default());
         let ch = GmailChannel::new(
-            store,
+            store.clone(),
             gmail,
             reasoner,
-            Arc::new(ApproveBroker),
+            broker.clone(),
             GmailChannelConfig {
                 skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
                 dry_run: false,
@@ -802,53 +827,109 @@ mod tests {
             },
         );
         let out = ch.poll_once().await.unwrap();
-        assert_eq!(out.sent, 1);
+        assert_eq!(out.awaiting_approval, 1);
+        assert_eq!(broker.posts.lock().unwrap().len(), 1);
+        // Email is NOT complete — awaiting the user's Discord click.
+        assert!(!store.is_email_complete("m3").unwrap());
     }
 
-    struct SkipBroker;
+    /// A Gmail stub that fails create_draft the first N times, then succeeds.
+    struct FlakyGmail {
+        emails: Vec<Email>,
+        create_failures_remaining: std::sync::Mutex<u32>,
+    }
     #[async_trait]
-    impl ApprovalBroker for SkipBroker {
-        async fn request(
+    impl GmailApi for FlakyGmail {
+        async fn fetch_unread(
             &self,
-            _: &str,
-            _: &Email,
-            _: &str,
-        ) -> Result<ApprovalOutcome, ApprovalError> {
-            Ok(ApprovalOutcome::Skipped)
+            _e: &str,
+            _l: u32,
+        ) -> Result<Vec<Email>, crate::gmail::GmailError> {
+            Ok(self.emails.clone())
+        }
+        async fn update_draft(
+            &self,
+            _e: &str,
+            _d: &str,
+            _t: &str,
+            _s: &str,
+            _b: &str,
+        ) -> Result<(), crate::gmail::GmailError> {
+            Ok(())
+        }
+        async fn create_draft(
+            &self,
+            _e: &str,
+            _t: &str,
+            _s: &str,
+            _b: &str,
+            _th: Option<&str>,
+        ) -> Result<String, crate::gmail::GmailError> {
+            let mut lock = self.create_failures_remaining.lock().unwrap();
+            if *lock > 0 {
+                *lock -= 1;
+                return Err(crate::gmail::GmailError::Composio {
+                    message: "synthetic transient".into(),
+                });
+            }
+            Ok("draft-abc".into())
+        }
+        async fn send_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
+            Ok(())
+        }
+        async fn delete_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
+            Ok(())
         }
     }
 
     #[tokio::test]
-    async fn live_reply_flow_rejected_on_skip() {
+    async fn errored_reply_recovers_on_retry_tick() {
         let (store, _f) = tmp_store();
-        let gmail = Arc::new(StubGmail {
+        let gmail = Arc::new(FlakyGmail {
             emails: vec![Email {
-                message_id: "m4".into(),
-                thread_id: None,
+                message_id: "m-retry".into(),
+                thread_id: Some("t-retry".into()),
                 from: "user@client.com".into(),
-                subject: "Ping".into(),
-                body: "any update?".into(),
-                date: "2026-04-13".into(),
+                subject: "quick q".into(),
+                body: "free Thursday?".into(),
+                date: "2026-04-18".into(),
                 account_entity_id: Some("acc1".into()),
             }],
+            create_failures_remaining: std::sync::Mutex::new(1),
         });
         let reasoner = Arc::new(ScriptedReasoner::new([
-            r#"{"decision":"reply","reason":"ping"}"#,
-            "hi",
+            // first-pass triage + draft
+            r#"{"decision":"reply","reason":"actionable"}"#,
+            "Thursday 3pm works.",
         ]));
+        let broker = Arc::new(RecordingBroker::default());
         let ch = GmailChannel::new(
-            store,
+            store.clone(),
             gmail,
             reasoner,
-            Arc::new(SkipBroker),
+            broker.clone(),
             GmailChannelConfig {
                 skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
                 dry_run: false,
+                retry_min_gap: Duration::from_millis(0),
+                retry_interval: Duration::from_millis(50),
                 ..Default::default()
             },
         );
-        let out = ch.poll_once().await.unwrap();
-        assert_eq!(out.rejected, 1);
-        assert_eq!(out.sent, 0);
+
+        // First pass: triage OK, draft OK, create_draft FAILS, action recorded
+        // as Error; not marked complete.
+        let out1 = ch.poll_once().await.unwrap();
+        assert_eq!(out1.awaiting_approval, 0);
+        assert_eq!(out1.errors, 1);
+        assert!(!store.is_email_complete("m-retry").unwrap());
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+
+        // Retry tick: create_draft now succeeds, approval card posted.
+        let retried = ch.retry_once().await.unwrap();
+        assert_eq!(retried, 1);
+        assert_eq!(broker.posts.lock().unwrap().len(), 1);
+        // Email still NOT complete (user hasn't clicked Approve yet).
+        assert!(!store.is_email_complete("m-retry").unwrap());
     }
 }
