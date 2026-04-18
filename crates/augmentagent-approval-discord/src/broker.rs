@@ -1,68 +1,63 @@
-//! `DiscordApprovalBroker` — the long-lived serenity client plus per-action
-//! oneshot wait list, plus (optionally) the wiki query message handler.
+//! `DiscordApprovalBroker` — long-lived serenity client + post-only approval
+//! card surface. All approval state persists in sqlite (handled by
+//! `ApprovalActionHandler`); this broker holds no per-action memory.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
-use dashmap::DashMap;
 use serenity::all::{ChannelId, GatewayIntents, UserId};
-use tokio::sync::{oneshot, Notify};
-use tracing::{error, info, warn};
+use tokio::sync::Notify;
+use tracing::{error, info};
 
 use augmentagent_store::Email;
 
 use crate::event_handler::Handler;
 use crate::layout::approval_message;
-use crate::{ApprovalBroker, ApprovalError, ApprovalOutcome, QueryHandler};
+use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, QueryHandler};
 
 #[derive(Clone)]
 pub struct DiscordConfig {
     pub bot_token: String,
     /// Channel where approval cards get posted.
     pub channel_id: u64,
-    /// Timeout waiting for a button/modal response.
-    pub timeout: Duration,
     /// Channel where wiki queries are accepted. `None` disables query replies
     /// in server channels (DMs still work if `allowed_user_id` is set).
     pub query_channel_id: Option<u64>,
-    /// User ID allowed to send wiki queries. `None` = accept from anyone who
-    /// can reach the query channel or DM. For personal bots, set this to
-    /// your own Discord user ID to lock the feature down.
+    /// User ID allowed to send wiki queries OR click approval buttons. `None`
+    /// = no allowlist (any user in the channel can drive).
     pub allowed_user_id: Option<u64>,
     /// Plugs wiki querying into Discord message handling. `None` disables it.
     pub query_handler: Option<Arc<dyn QueryHandler>>,
-}
-
-pub(crate) enum DeliveryOutcome {
-    Delivered,
-    Unknown,
+    /// Handles Approve / Revise / Skip clicks. `None` silently ignores.
+    pub action_handler: Option<Arc<dyn ApprovalActionHandler>>,
 }
 
 pub(crate) struct BrokerState {
-    pending: DashMap<String, oneshot::Sender<ApprovalOutcome>>,
-    drafts: DashMap<String, String>,
     ready: Arc<Notify>,
     ready_flag: std::sync::atomic::AtomicBool,
     pub(crate) query_channel_id: Option<ChannelId>,
     pub(crate) allowed_user_id: Option<UserId>,
     pub(crate) query_handler: Option<Arc<dyn QueryHandler>>,
+    pub(crate) action_handler: Option<Arc<dyn ApprovalActionHandler>>,
+    pub(crate) approval_channel_id: ChannelId,
 }
 
 impl BrokerState {
     fn new(
+        approval_channel_id: ChannelId,
         query_channel_id: Option<ChannelId>,
         allowed_user_id: Option<UserId>,
         query_handler: Option<Arc<dyn QueryHandler>>,
+        action_handler: Option<Arc<dyn ApprovalActionHandler>>,
     ) -> Self {
         Self {
-            pending: DashMap::new(),
-            drafts: DashMap::new(),
             ready: Arc::new(Notify::new()),
             ready_flag: std::sync::atomic::AtomicBool::new(false),
             query_channel_id,
             allowed_user_id,
             query_handler,
+            action_handler,
+            approval_channel_id,
         }
     }
 
@@ -78,64 +73,27 @@ impl BrokerState {
         }
         self.ready.notified().await;
     }
-
-    pub(crate) fn register(
-        &self,
-        action_id: &str,
-        tx: oneshot::Sender<ApprovalOutcome>,
-        draft: &str,
-    ) {
-        self.pending.insert(action_id.to_string(), tx);
-        self.drafts.insert(action_id.to_string(), draft.to_string());
-    }
-
-    pub(crate) fn draft_for(&self, action_id: &str) -> String {
-        self.drafts
-            .get(action_id)
-            .map(|v| v.clone())
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn update_draft(&self, action_id: &str, draft: &str) {
-        self.drafts.insert(action_id.to_string(), draft.to_string());
-    }
-
-    pub(crate) fn deliver(&self, action_id: &str, outcome: ApprovalOutcome) -> DeliveryOutcome {
-        let Some((_, tx)) = self.pending.remove(action_id) else {
-            return DeliveryOutcome::Unknown;
-        };
-        if tx.send(outcome).is_err() {
-            return DeliveryOutcome::Unknown;
-        }
-        DeliveryOutcome::Delivered
-    }
-
-    fn forget(&self, action_id: &str) {
-        self.pending.remove(action_id);
-        self.drafts.remove(action_id);
-    }
 }
 
 pub struct DiscordApprovalBroker {
     http: Arc<serenity::http::Http>,
     channel_id: ChannelId,
-    state: Arc<BrokerState>,
-    timeout: Duration,
 }
 
 impl DiscordApprovalBroker {
     /// Start the serenity client in a background task. Blocks the current task
-    /// until the gateway is `Ready`, after which `request` calls may be issued.
+    /// until the gateway is `Ready`, after which `post_approval` calls may be
+    /// issued.
     pub async fn start(config: DiscordConfig) -> Result<Self, ApprovalError> {
+        let approval_channel = ChannelId::new(config.channel_id);
         let state = Arc::new(BrokerState::new(
+            approval_channel,
             config.query_channel_id.map(ChannelId::new),
             config.allowed_user_id.map(UserId::new),
             config.query_handler.clone(),
+            config.action_handler.clone(),
         ));
 
-        // MESSAGE_CONTENT is required to read message bodies for wiki queries.
-        // This is a privileged intent — the bot operator must enable it in the
-        // Discord developer portal (Bot → Privileged Gateway Intents).
         let mut intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES;
         if config.query_handler.is_some() {
             intents |= GatewayIntents::MESSAGE_CONTENT | GatewayIntents::DIRECT_MESSAGES;
@@ -160,55 +118,34 @@ impl DiscordApprovalBroker {
         state.await_ready().await;
         info!(
             query_enabled = config.query_handler.is_some(),
+            action_enabled = config.action_handler.is_some(),
             "discord approval broker online"
         );
 
+        // `state` is moved into the Handler and dropped from the broker
+        // after client.start. That's intentional: the broker is post-only.
+        drop(state);
+
         Ok(Self {
             http,
-            channel_id: ChannelId::new(config.channel_id),
-            state,
-            timeout: config.timeout,
+            channel_id: approval_channel,
         })
-    }
-
-    /// Allow callers (the redraft loop) to update the stored draft associated
-    /// with an action so that an "Approve" after revise uses the newest copy.
-    pub fn update_draft(&self, action_id: &str, new_draft: &str) {
-        self.state.update_draft(action_id, new_draft);
     }
 }
 
 #[async_trait]
 impl ApprovalBroker for DiscordApprovalBroker {
-    async fn request(
+    async fn post_approval(
         &self,
         action_id: &str,
         email: &Email,
-        initial_draft: &str,
-    ) -> Result<ApprovalOutcome, ApprovalError> {
-        let (tx, rx) = oneshot::channel();
-        self.state.register(action_id, tx, initial_draft);
-
-        let message = approval_message(action_id, email, initial_draft);
-        if let Err(e) = self.channel_id.send_message(&*self.http, message).await {
-            self.state.forget(action_id);
-            return Err(ApprovalError::Discord(e.to_string()));
-        }
-
-        match tokio::time::timeout(self.timeout, rx).await {
-            Ok(Ok(outcome)) => {
-                self.state.forget(action_id);
-                Ok(outcome)
-            }
-            Ok(Err(_)) => {
-                self.state.forget(action_id);
-                warn!("approval sender dropped for {action_id}");
-                Err(ApprovalError::Discord("sender dropped".into()))
-            }
-            Err(_) => {
-                self.state.forget(action_id);
-                Err(ApprovalError::TimedOut)
-            }
-        }
+        draft: &str,
+    ) -> Result<(), ApprovalError> {
+        let message = approval_message(action_id, email, draft);
+        self.channel_id
+            .send_message(&*self.http, message)
+            .await
+            .map_err(|e| ApprovalError::Discord(e.to_string()))?;
+        Ok(())
     }
 }

@@ -34,8 +34,22 @@ pub trait GmailApi: Send + Sync {
         thread_id: Option<&str>,
     ) -> Result<String, GmailError>;
 
+    /// Replace the body of an existing draft (used by the revise flow).
+    async fn update_draft(
+        &self,
+        entity_id: &str,
+        draft_id: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<(), GmailError>;
+
     /// Send an existing draft.
     async fn send_draft(&self, entity_id: &str, draft_id: &str) -> Result<(), GmailError>;
+
+    /// Delete an unsent draft from Gmail/Drafts. Used to clean up orphans
+    /// after revise and to discard drafts the approver chose to skip.
+    async fn delete_draft(&self, entity_id: &str, draft_id: &str) -> Result<(), GmailError>;
 }
 
 pub struct ComposioClient {
@@ -116,6 +130,74 @@ impl ComposioClient {
 
 fn is_transient_reqwest(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request()
+}
+
+/// Extract the bare email address from an RFC 5322 header-style string.
+/// `Name <x@y.com>` → `x@y.com`. Already-bare addresses pass through.
+fn extract_bare_email(raw: &str) -> String {
+    if let (Some(open), Some(close)) = (raw.find('<'), raw.rfind('>')) {
+        if open < close {
+            return raw[open + 1..close].trim().to_string();
+        }
+    }
+    raw.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_bare_strips_display_name() {
+        assert_eq!(extract_bare_email("Name <x@y.com>"), "x@y.com");
+        assert_eq!(extract_bare_email("\"Quoted Name\" <x@y.com>"), "x@y.com");
+    }
+
+    #[test]
+    fn extract_bare_passes_through_simple() {
+        assert_eq!(extract_bare_email("x@y.com"), "x@y.com");
+        assert_eq!(extract_bare_email("  x@y.com  "), "x@y.com");
+    }
+
+    #[test]
+    fn extract_bare_handles_plus_addressing() {
+        assert_eq!(
+            extract_bare_email("User <user+tag@example.com>"),
+            "user+tag@example.com"
+        );
+    }
+}
+
+/// Recursively search a JSON value for the first string-valued field whose
+/// key matches any of `keys`. Used to tolerate Composio's variable response
+/// shapes (sometimes nested under `data`, `data.response_data`, etc.).
+fn find_string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in keys {
+                if let Some(serde_json::Value::String(s)) = map.get(*key) {
+                    if !s.is_empty() {
+                        return Some(s.clone());
+                    }
+                }
+            }
+            for (_k, v) in map {
+                if let Some(found) = find_string_field(v, keys) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                if let Some(found) = find_string_field(v, keys) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 async fn backoff(attempt: u32) {
@@ -240,8 +322,12 @@ impl GmailApi for ComposioClient {
         body: &str,
         thread_id: Option<&str>,
     ) -> Result<String, GmailError> {
+        // Composio's GMAIL_CREATE_EMAIL_DRAFT expects a bare email address in
+        // `recipient_email` — not the full RFC 5322 form with a display name.
+        // Strip `Name <x@y.com>` → `x@y.com`. Leave already-bare addresses alone.
+        let bare_to = extract_bare_email(to);
         let mut args = serde_json::json!({
-            "to": to,
+            "recipient_email": bare_to,
             "subject": subject,
             "body": body,
         });
@@ -249,20 +335,45 @@ impl GmailApi for ComposioClient {
             args["thread_id"] = serde_json::Value::String(t.to_string());
         }
         let v = self.execute("GMAIL_CREATE_EMAIL_DRAFT", entity_id, args).await?;
-        v.get("data")
-            .and_then(|d| {
-                d.get("id")
-                    .or_else(|| d.get("draftId"))
-                    .or_else(|| d.get("draft_id"))
-            })
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| GmailError::Decode("missing draft id".into()))
+        // Composio response shapes vary across actions; recursively search for
+        // any of the common draft-id key names.
+        const DRAFT_ID_KEYS: &[&str] = &["draft_id", "draftId", "id"];
+        if let Some(id) = find_string_field(&v, DRAFT_ID_KEYS) {
+            return Ok(id);
+        }
+        Err(GmailError::Decode(format!(
+            "missing draft id in response: {}",
+            serde_json::to_string(&v).unwrap_or_default()
+        )))
+    }
+
+    async fn update_draft(
+        &self,
+        entity_id: &str,
+        draft_id: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<(), GmailError> {
+        let args = serde_json::json!({
+            "draft_id": draft_id,
+            "recipient_email": extract_bare_email(to),
+            "subject": subject,
+            "body": body,
+        });
+        self.execute("GMAIL_UPDATE_DRAFT", entity_id, args).await?;
+        Ok(())
     }
 
     async fn send_draft(&self, entity_id: &str, draft_id: &str) -> Result<(), GmailError> {
         let args = serde_json::json!({ "draft_id": draft_id });
         self.execute("GMAIL_SEND_DRAFT", entity_id, args).await?;
+        Ok(())
+    }
+
+    async fn delete_draft(&self, entity_id: &str, draft_id: &str) -> Result<(), GmailError> {
+        let args = serde_json::json!({ "draft_id": draft_id });
+        self.execute("GMAIL_DELETE_DRAFT", entity_id, args).await?;
         Ok(())
     }
 }
