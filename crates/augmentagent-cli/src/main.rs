@@ -10,11 +10,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use augmentagent_approval_discord::{
-    ApprovalBroker, DiscordApprovalBroker, DiscordConfig, NoopBroker,
+    ApprovalBroker, DiscordApprovalBroker, DiscordConfig, NoopBroker, QueryHandler,
 };
 use augmentagent_channel_email::gmail::ComposioClient;
+use augmentagent_channel_email::reasoner::ask_opts;
 use augmentagent_channel_email::{ClaudeCliReasoner, GmailChannel, GmailChannelConfig, Reasoner};
 use augmentagent_store::Store;
+use async_trait::async_trait;
 
 #[derive(Parser)]
 #[command(name = "augmentagent", version, about = "AugmentAgent Rust daemon")]
@@ -78,6 +80,11 @@ enum WikiOp {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Ask the wiki a question. Spawns Opus with read-only access and prints the answer.
+    Ask {
+        /// The question. Wrap in quotes if multi-word.
+        question: String,
+    },
 }
 
 #[tokio::main]
@@ -115,7 +122,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::PollOnce { dry_run } => {
-            let broker = build_broker(dry_run).await?;
+            let broker = build_broker(&cli, dry_run).await?;
             let ch = build_channel(&cli, store, broker, dry_run, 120)?;
             let out = ch.poll_once().await?;
             println!("{out:#?}");
@@ -125,7 +132,7 @@ async fn main() -> Result<()> {
             interval_secs,
             dry_run,
         } => {
-            let broker = build_broker(dry_run).await?;
+            let broker = build_broker(&cli, dry_run).await?;
             let ch = build_channel(&cli, store, broker, dry_run, interval_secs)?;
             let shutdown = CancellationToken::new();
             let s2 = shutdown.clone();
@@ -139,8 +146,23 @@ async fn main() -> Result<()> {
         }
         Cmd::Wiki { ref op } => match op {
             WikiOp::Lint { out } => run_wiki_lint(&cli, out.clone()).await,
+            WikiOp::Ask { question } => run_wiki_ask(&cli, question.clone()).await,
         },
     }
+}
+
+async fn run_wiki_ask(cli: &Cli, question: String) -> Result<()> {
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for wiki ask")?;
+
+    let reasoner = ClaudeCliReasoner::new();
+    let opts = augmentagent_channel_email::reasoner::ask_opts(wiki_root.clone());
+    info!(wiki = %wiki_root.display(), "wiki ask");
+    let answer = reasoner.call(&opts, &question).await?;
+    println!("{answer}");
+    Ok(())
 }
 
 async fn run_wiki_lint(cli: &Cli, out: Option<PathBuf>) -> Result<()> {
@@ -178,7 +200,23 @@ async fn run_wiki_lint(cli: &Cli, out: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn build_broker(dry_run: bool) -> Result<Arc<dyn ApprovalBroker>> {
+/// Adapter: bridges the Discord broker's `QueryHandler` trait to our
+/// `ClaudeCliReasoner` + `ask_opts`. Lives in the CLI to avoid a circular
+/// dep between the discord crate and the channel-email crate.
+struct WikiQuerier {
+    reasoner: Arc<ClaudeCliReasoner>,
+    wiki_root: PathBuf,
+}
+
+#[async_trait]
+impl QueryHandler for WikiQuerier {
+    async fn answer(&self, question: &str) -> anyhow::Result<String> {
+        let opts = ask_opts(self.wiki_root.clone());
+        self.reasoner.call(&opts, question).await
+    }
+}
+
+async fn build_broker(cli: &Cli, dry_run: bool) -> Result<Arc<dyn ApprovalBroker>> {
     if dry_run {
         return Ok(Arc::new(NoopBroker));
     }
@@ -197,10 +235,37 @@ async fn build_broker(dry_run: bool) -> Result<Arc<dyn ApprovalBroker>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3600);
+
+    // Wiki query channel defaults to the approval channel when unset — one
+    // channel for both approval cards and user questions. Override with
+    // DISCORD_QUERY_CHANNEL_ID if you want them split.
+    let query_channel_id: Option<u64> = Some(
+        std::env::var("DISCORD_QUERY_CHANNEL_ID")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(channel_id),
+    );
+    let allowed_user_id: Option<u64> = std::env::var("DISCORD_ALLOWED_USER_ID")
+        .ok()
+        .and_then(|s| s.parse().ok());
+
+    // Only plug in a query handler when wiki is configured. Otherwise there's
+    // no corpus to answer from.
+    let query_handler: Option<Arc<dyn QueryHandler>> = cli.wiki_dir.as_ref().map(|root| {
+        let q = WikiQuerier {
+            reasoner: Arc::new(ClaudeCliReasoner::new()),
+            wiki_root: root.clone(),
+        };
+        Arc::new(q) as Arc<dyn QueryHandler>
+    });
+
     let broker = DiscordApprovalBroker::start(DiscordConfig {
         bot_token: token,
         channel_id,
         timeout: Duration::from_secs(timeout_secs),
+        query_channel_id,
+        allowed_user_id,
+        query_handler,
     })
     .await
     .context("start discord broker")?;

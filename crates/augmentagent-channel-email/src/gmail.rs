@@ -248,7 +248,7 @@ impl GmailApi for ComposioClient {
         if let Some(t) = thread_id {
             args["thread_id"] = serde_json::Value::String(t.to_string());
         }
-        let v = self.execute("GMAIL_CREATE_DRAFT", entity_id, args).await?;
+        let v = self.execute("GMAIL_CREATE_EMAIL_DRAFT", entity_id, args).await?;
         v.get("data")
             .and_then(|d| {
                 d.get("id")

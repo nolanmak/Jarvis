@@ -151,6 +151,7 @@ name = "augmentagent-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "augmentagent-approval-discord",
  "augmentagent-channel-email",
  "augmentagent-store",
