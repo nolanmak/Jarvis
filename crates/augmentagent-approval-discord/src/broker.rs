@@ -1,12 +1,12 @@
 //! `DiscordApprovalBroker` — the long-lived serenity client plus per-action
-//! oneshot wait list.
+//! oneshot wait list, plus (optionally) the wiki query message handler.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use serenity::all::{ChannelId, GatewayIntents};
+use serenity::all::{ChannelId, GatewayIntents, UserId};
 use tokio::sync::{oneshot, Notify};
 use tracing::{error, info, warn};
 
@@ -14,13 +14,24 @@ use augmentagent_store::Email;
 
 use crate::event_handler::Handler;
 use crate::layout::approval_message;
-use crate::{ApprovalBroker, ApprovalError, ApprovalOutcome};
+use crate::{ApprovalBroker, ApprovalError, ApprovalOutcome, QueryHandler};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DiscordConfig {
     pub bot_token: String,
+    /// Channel where approval cards get posted.
     pub channel_id: u64,
+    /// Timeout waiting for a button/modal response.
     pub timeout: Duration,
+    /// Channel where wiki queries are accepted. `None` disables query replies
+    /// in server channels (DMs still work if `allowed_user_id` is set).
+    pub query_channel_id: Option<u64>,
+    /// User ID allowed to send wiki queries. `None` = accept from anyone who
+    /// can reach the query channel or DM. For personal bots, set this to
+    /// your own Discord user ID to lock the feature down.
+    pub allowed_user_id: Option<u64>,
+    /// Plugs wiki querying into Discord message handling. `None` disables it.
+    pub query_handler: Option<Arc<dyn QueryHandler>>,
 }
 
 pub(crate) enum DeliveryOutcome {
@@ -33,15 +44,25 @@ pub(crate) struct BrokerState {
     drafts: DashMap<String, String>,
     ready: Arc<Notify>,
     ready_flag: std::sync::atomic::AtomicBool,
+    pub(crate) query_channel_id: Option<ChannelId>,
+    pub(crate) allowed_user_id: Option<UserId>,
+    pub(crate) query_handler: Option<Arc<dyn QueryHandler>>,
 }
 
 impl BrokerState {
-    fn new() -> Self {
+    fn new(
+        query_channel_id: Option<ChannelId>,
+        allowed_user_id: Option<UserId>,
+        query_handler: Option<Arc<dyn QueryHandler>>,
+    ) -> Self {
         Self {
             pending: DashMap::new(),
             drafts: DashMap::new(),
             ready: Arc::new(Notify::new()),
             ready_flag: std::sync::atomic::AtomicBool::new(false),
+            query_channel_id,
+            allowed_user_id,
+            query_handler,
         }
     }
 
@@ -83,7 +104,6 @@ impl BrokerState {
         let Some((_, tx)) = self.pending.remove(action_id) else {
             return DeliveryOutcome::Unknown;
         };
-        // If the receiver is already gone (timeout), treat as unknown.
         if tx.send(outcome).is_err() {
             return DeliveryOutcome::Unknown;
         }
@@ -107,8 +127,20 @@ impl DiscordApprovalBroker {
     /// Start the serenity client in a background task. Blocks the current task
     /// until the gateway is `Ready`, after which `request` calls may be issued.
     pub async fn start(config: DiscordConfig) -> Result<Self, ApprovalError> {
-        let state = Arc::new(BrokerState::new());
-        let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES;
+        let state = Arc::new(BrokerState::new(
+            config.query_channel_id.map(ChannelId::new),
+            config.allowed_user_id.map(UserId::new),
+            config.query_handler.clone(),
+        ));
+
+        // MESSAGE_CONTENT is required to read message bodies for wiki queries.
+        // This is a privileged intent — the bot operator must enable it in the
+        // Discord developer portal (Bot → Privileged Gateway Intents).
+        let mut intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES;
+        if config.query_handler.is_some() {
+            intents |= GatewayIntents::MESSAGE_CONTENT | GatewayIntents::DIRECT_MESSAGES;
+        }
+
         let handler = Handler {
             state: Arc::clone(&state),
         };
@@ -126,7 +158,10 @@ impl DiscordApprovalBroker {
         });
 
         state.await_ready().await;
-        info!("discord approval broker online");
+        info!(
+            query_enabled = config.query_handler.is_some(),
+            "discord approval broker online"
+        );
 
         Ok(Self {
             http,
