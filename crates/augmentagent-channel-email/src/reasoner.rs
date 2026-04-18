@@ -177,6 +177,19 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
     }
 }
 
+/// Preset for ad-hoc wiki queries (CLI `wiki ask` + Discord DMs).
+/// System prompt is the embedded `schema/wiki-ask.md` so callers don't need
+/// to find and read the file themselves.
+pub fn ask_opts(wiki_root: PathBuf) -> ReasonerOpts {
+    ReasonerOpts {
+        system_prompt: include_str!("../../../schema/wiki-ask.md").to_string(),
+        model: None, // Opus — quality matters for answer coherence
+        allowed_tools: vec!["Read".into(), "Grep".into(), "Glob".into()],
+        add_dirs: vec![wiki_root],
+        permission_mode: "default".into(),
+    }
+}
+
 pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
     ReasonerOpts {
         system_prompt,

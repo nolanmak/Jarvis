@@ -15,6 +15,7 @@ augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-channel-email = { path = "../augmentagent-channel-email" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 
+async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 clap = { workspace = true }

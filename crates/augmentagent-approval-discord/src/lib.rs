@@ -1,4 +1,4 @@
-//! Discord approval broker for AugmentAgent reply-draft gating.
+//! Discord broker for AugmentAgent: reply-approval buttons/modals + wiki query messages.
 //!
 //! Match-Node recovery mode: pending approvals live in-process only. A restart
 //! abandons any in-flight Discord threads (rows stay `pending` in sqlite;
@@ -55,4 +55,13 @@ impl ApprovalBroker for NoopBroker {
     async fn request(&self, _: &str, _: &Email, _: &str) -> Result<ApprovalOutcome, ApprovalError> {
         Err(ApprovalError::NotReady)
     }
+}
+
+/// Plugged into the broker to answer wiki queries that arrive as Discord messages.
+/// The CLI wires this to `ClaudeCliReasoner` + `ask_opts(wiki_root)`.
+/// Kept here (rather than in `augmentagent-channel-email`) to avoid a circular
+/// dep: channel-email already depends on this crate for the `ApprovalBroker`.
+#[async_trait]
+pub trait QueryHandler: Send + Sync {
+    async fn answer(&self, question: &str) -> anyhow::Result<String>;
 }
