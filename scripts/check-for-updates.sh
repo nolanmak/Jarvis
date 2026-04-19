@@ -110,3 +110,40 @@ case "$(uname -s)" in
 esac
 
 log "update complete: now at $REMOTE"
+
+# --- Auto-register optional scheduled jobs once ----------------------------
+# When a new install-*.sh ships with the pull, check whether its
+# corresponding unit is registered. If not, run the install script to wire
+# it up. Idempotent: after the first run the unit is registered and the
+# subsequent auto-update passes skip.
+#
+# This is how the remote machine automatically adopts new schedules the
+# operator pushed, without needing an SSH session to opt in.
+auto_register() {
+  local script_name="$1"  # e.g. install-digest.sh
+  local unit_id="$2"      # Linux: systemd unit (augmentagent-digest.timer)
+                          # macOS: launchd label (com.nolanmak.augmentagent.digest)
+  local script_path="$REPO_ROOT/scripts/$script_name"
+
+  [ -x "$script_path" ] || return 0
+
+  case "$(uname -s)" in
+    Darwin)
+      if ! launchctl print "gui/$(id -u)/$unit_id" >/dev/null 2>&1; then
+        log "auto-registering $unit_id via $script_name"
+        "$script_path" >> "$LOG" 2>&1 || log "auto-register $unit_id failed (continuing)"
+      fi
+      ;;
+    Linux)
+      if ! systemctl --user list-unit-files "$unit_id" 2>/dev/null | grep -q "$unit_id"; then
+        log "auto-registering $unit_id via $script_name"
+        "$script_path" >> "$LOG" 2>&1 || log "auto-register $unit_id failed (continuing)"
+      fi
+      ;;
+  esac
+}
+
+# Enumerate here. Adding a new optional schedule = one-line entry below +
+# the install-*.sh script in the repo.
+auto_register "install-digest.sh" "augmentagent-digest.timer"  # Linux
+auto_register "install-digest.sh" "com.nolanmak.augmentagent.digest"  # macOS label (uname gate inside)
