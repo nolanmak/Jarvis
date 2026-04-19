@@ -76,12 +76,16 @@ impl Reasoner for ClaudeCliReasoner {
             args.push(dir.to_string_lossy().into_owned());
         }
 
-        let mut child = Command::new(&self.bin)
-            .args(&args)
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        // Scope Write/Edit by setting the spawned CLI's cwd when requested.
+        if let Some(cwd) = &opts.cwd {
+            cmd.current_dir(cwd);
+        }
+        let mut child = cmd.spawn()?;
 
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(user_message.as_bytes()).await?;
@@ -148,6 +152,7 @@ pub fn triage_opts() -> ReasonerOpts {
         allowed_tools: Vec::new(),
         add_dirs: Vec::new(),
         permission_mode: "default".into(),
+        cwd: None,
     }
 }
 
@@ -160,10 +165,11 @@ pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> Reasoner
     }
     ReasonerOpts {
         system_prompt,
-        model: None, // Opus default — quality matters for user-facing drafts
+        model: None,
         allowed_tools,
         add_dirs,
         permission_mode: "default".into(),
+        cwd: None,
     }
 }
 
@@ -174,19 +180,39 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         allowed_tools: vec!["Read".into(), "Grep".into(), "Glob".into()],
         add_dirs: vec![wiki_root],
         permission_mode: "default".into(),
+        cwd: None,
     }
 }
 
 /// Preset for ad-hoc wiki queries (CLI `wiki ask` + Discord DMs).
-/// System prompt is the embedded `schema/wiki-ask.md` so callers don't need
-/// to find and read the file themselves.
-pub fn ask_opts(wiki_root: PathBuf) -> ReasonerOpts {
+///
+/// Claude gets a broad toolbelt for this one — if the wiki doesn't answer, it
+/// can search the inbox via the `augmentagent gmail search` subcommand (scoped
+/// Bash allowlist), reach the web, and persist durable new facts back to the
+/// wiki via Write/Edit. The spawned CLI's cwd is pinned to `wiki_root` so
+/// Write/Edit cannot escape into the source tree.
+pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
+    let bin = repo_root.join("target/release/augmentagent");
+    // Scoped Bash pattern: Claude can ONLY invoke our gmail subcommand via
+    // the release binary's absolute path. Anything else is denied by claude CLI.
+    let bash_allow = format!("Bash({} gmail *)", bin.display());
     ReasonerOpts {
         system_prompt: include_str!("../../../schema/wiki-ask.md").to_string(),
         model: None, // Opus — quality matters for answer coherence
-        allowed_tools: vec!["Read".into(), "Grep".into(), "Glob".into()],
-        add_dirs: vec![wiki_root],
-        permission_mode: "default".into(),
+        allowed_tools: vec![
+            "Read".into(),
+            "Grep".into(),
+            "Glob".into(),
+            "Write".into(),
+            "Edit".into(),
+            "WebSearch".into(),
+            "WebFetch".into(),
+            bash_allow,
+        ],
+        add_dirs: vec![wiki_root.clone()],
+        permission_mode: "acceptEdits".into(),
+        // Pin cwd to the wiki so Write/Edit cannot touch the source tree.
+        cwd: Some(wiki_root),
     }
 }
 
@@ -207,6 +233,7 @@ pub fn digest_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         allowed_tools,
         add_dirs,
         permission_mode: "default".into(),
+        cwd: None,
     }
 }
 
@@ -223,6 +250,7 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         ],
         add_dirs: vec![wiki_root],
         permission_mode: "acceptEdits".into(),
+        cwd: None,
     }
 }
 
