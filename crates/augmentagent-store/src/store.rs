@@ -204,6 +204,67 @@ impl Store {
         Ok(())
     }
 
+    /// Count actions grouped by status for rows created in the last `since_ms`
+    /// milliseconds. Pairs the `actions.status` text with its count.
+    pub fn action_counts_since(
+        &self,
+        since_ms: i64,
+    ) -> StoreResult<Vec<(String, i64)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT status, COUNT(*) FROM actions WHERE createdAt >= ?1 GROUP BY status",
+        )?;
+        let rows = stmt.query_map(params![since_ms], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Most recently processed emails. Each row: (from, subject, triageResult).
+    /// `triageResult` is `None` for rows still awaiting processing.
+    pub fn recent_emails_since(
+        &self,
+        since_ms: i64,
+        limit: i64,
+    ) -> StoreResult<Vec<(String, String, Option<String>)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT fromEmail, subject, triageResult \
+             FROM emails \
+             WHERE firstSeenAt >= ?1 \
+             ORDER BY firstSeenAt DESC \
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since_ms, limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// How many reply actions are currently sitting in `pending` status
+    /// (awaiting the user's Discord click). Useful as a digest metric.
+    pub fn pending_reply_count(&self) -> StoreResult<i64> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM actions WHERE status = 'pending'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     /// Load a single action row plus its email body. Used by the Discord
     /// event handler on approve/revise/skip clicks to reconstruct context.
     pub fn get_action_with_email(&self, action_id: &str) -> StoreResult<Option<ActionWithEmail>> {
