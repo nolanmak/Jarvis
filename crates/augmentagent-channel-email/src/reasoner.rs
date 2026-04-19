@@ -190,6 +190,26 @@ pub fn ask_opts(wiki_root: PathBuf) -> ReasonerOpts {
     }
 }
 
+/// Preset for the morning digest synthesis call.
+/// System prompt embedded from `schema/digest-prompt.md`. Opus quality, wiki
+/// read-only access so Claude can enrich bare stats with context from
+/// people/project pages when the signal warrants it.
+pub fn digest_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
+    let mut add_dirs = Vec::new();
+    let mut allowed_tools = Vec::new();
+    if let Some(root) = wiki_root {
+        add_dirs.push(root);
+        allowed_tools = vec!["Read".into(), "Grep".into(), "Glob".into()];
+    }
+    ReasonerOpts {
+        system_prompt: include_str!("../../../schema/digest-prompt.md").to_string(),
+        model: None, // Opus — digest tone + coverage benefit from quality
+        allowed_tools,
+        add_dirs,
+        permission_mode: "default".into(),
+    }
+}
+
 pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
     ReasonerOpts {
         system_prompt,

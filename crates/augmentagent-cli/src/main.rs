@@ -14,7 +14,7 @@ use augmentagent_approval_discord::{
     DiscordConfig, NoopBroker, QueryHandler,
 };
 use augmentagent_channel_email::gmail::{ComposioClient, GmailApi};
-use augmentagent_channel_email::reasoner::{ask_opts, draft_opts};
+use augmentagent_channel_email::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_email::{ClaudeCliReasoner, GmailChannel, GmailChannelConfig, Reasoner};
 use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
@@ -70,6 +70,15 @@ enum Cmd {
     Wiki {
         #[command(subcommand)]
         op: WikiOp,
+    },
+    /// Compose a morning digest of recent inbox activity.
+    Digest {
+        /// Window size in hours. Defaults to 24.
+        #[arg(long, default_value_t = 24)]
+        since: u32,
+        /// Also post to DISCORD_CHANNEL_ID (uses DISCORD_BOT_TOKEN). Otherwise stdout only.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        post_discord: bool,
     },
 }
 
@@ -149,7 +158,109 @@ async fn main() -> Result<()> {
             WikiOp::Lint { out } => run_wiki_lint(&cli, out.clone()).await,
             WikiOp::Ask { question } => run_wiki_ask(&cli, question.clone()).await,
         },
+        Cmd::Digest {
+            since,
+            post_discord,
+        } => run_digest(&cli, store, since, post_discord).await,
     }
+}
+
+async fn run_digest(
+    cli: &Cli,
+    store: Arc<Store>,
+    since_hours: u32,
+    post_discord: bool,
+) -> Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let window_ms = (since_hours as i64) * 60 * 60 * 1000;
+    let since_ms = now_ms - window_ms;
+
+    // Gather the raw stats we hand Claude as user-message context.
+    let counts = store.action_counts_since(since_ms)?;
+    let recent = store.recent_emails_since(since_ms, 40)?;
+    let pending = store.pending_reply_count()?;
+
+    let mut ctx = String::new();
+    ctx.push_str(&format!(
+        "Time window: last {since_hours} hour(s)\n\n## Action counts by status\n"
+    ));
+    if counts.is_empty() {
+        ctx.push_str("(no actions in window)\n");
+    } else {
+        for (status, n) in &counts {
+            ctx.push_str(&format!("- {status}: {n}\n"));
+        }
+    }
+    ctx.push_str(&format!("\n## Pending replies (awaiting approval)\n- {pending}\n"));
+    ctx.push_str("\n## Recent emails (from / subject / triage)\n");
+    if recent.is_empty() {
+        ctx.push_str("(no emails in window)\n");
+    } else {
+        for (from, subject, triage) in &recent {
+            let t = triage.as_deref().unwrap_or("(unprocessed)");
+            ctx.push_str(&format!(
+                "- [{t}] {from} — {}\n",
+                truncate(subject, 120)
+            ));
+        }
+    }
+
+    // Compose the digest via Claude.
+    let reasoner = ClaudeCliReasoner::new();
+    let opts = digest_opts(cli.wiki_dir.clone());
+    info!(window_hours = since_hours, post_discord, "composing digest");
+    let digest = reasoner.call(&opts, &ctx).await?;
+
+    println!("{digest}");
+
+    if post_discord {
+        post_digest_to_discord(&digest)
+            .await
+            .context("post_digest_to_discord")?;
+        info!("digest posted to Discord");
+    }
+    Ok(())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        let mut end = max.saturating_sub(3);
+        while !s.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        format!("{}...", &s[..end])
+    }
+}
+
+/// Post the digest text to DISCORD_CHANNEL_ID using a bare serenity::Http
+/// client (no gateway, no state). Works as a one-shot from a cron-like job.
+/// Splits on paragraph boundaries for Discord's 2000-char limit.
+async fn post_digest_to_discord(digest: &str) -> Result<()> {
+    use serenity::all::{ChannelId, CreateMessage};
+    use serenity::http::Http;
+
+    let token = std::env::var("DISCORD_BOT_TOKEN").context("DISCORD_BOT_TOKEN env var required")?;
+    let channel_id: u64 = std::env::var("DISCORD_CHANNEL_ID")
+        .context("DISCORD_CHANNEL_ID env var required")?
+        .parse()
+        .context("DISCORD_CHANNEL_ID must be numeric")?;
+
+    let http = Http::new(&token);
+    let channel = ChannelId::new(channel_id);
+
+    for chunk in augmentagent_approval_discord::chunk_for_discord(digest) {
+        channel
+            .send_message(&http, CreateMessage::new().content(chunk))
+            .await
+            .context("discord send_message")?;
+    }
+    Ok(())
 }
 
 async fn run_wiki_ask(cli: &Cli, question: String) -> Result<()> {
