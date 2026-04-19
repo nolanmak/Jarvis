@@ -1,11 +1,11 @@
 #!/bin/bash
-# Register AugmentAgent Rust daemon as a macOS LaunchAgent so it:
+# Register the AugmentAgent Rust daemon as a user-level service so it:
 #   - auto-starts on user login
 #   - auto-restarts if it crashes
-#   - survives Terminal close
+#   - survives terminal close
 #
-# Writes ~/Library/LaunchAgents/com.nolanmak.augmentagent.plist and bootstraps it.
-# Idempotent: running twice just reloads the agent with the current plist.
+# Cross-platform: writes a launchd plist on macOS, or a systemd user unit
+# on Linux. Idempotent — re-running reloads with the current config.
 #
 # Usage: ./scripts/install-autostart.sh
 
@@ -13,26 +13,26 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LABEL="com.nolanmak.augmentagent"
-PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOG_DIR="$HOME/Library/Logs/augmentagent"
 
 log() { printf '\033[1;36m[install-autostart]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[install-autostart ERR]\033[0m %s\n' "$*" >&2; exit 1; }
 
-[ "$(uname)" = "Darwin" ] || die "macOS only (uses launchd)"
 [ -x "$REPO_ROOT/scripts/run-rs.sh" ] || die "run-rs.sh not executable — run chmod +x scripts/*.sh"
 [ -x "$REPO_ROOT/target/release/augmentagent" ] \
   || die "release binary missing — run: cargo build --release -p augmentagent-cli"
 
-mkdir -p "$LOG_DIR"
-mkdir -p "$(dirname "$PLIST")"
+install_macos() {
+  local PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+  local LOG_DIR="$HOME/Library/Logs/augmentagent"
+  mkdir -p "$LOG_DIR"
+  mkdir -p "$(dirname "$PLIST")"
 
-# Build PATH that works for a graphical login (launchd inherits /usr/bin:/bin by default).
-# Include the usual suspects so `claude`, `cargo`, `node`, Homebrew, etc. are found.
-LAUNCH_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+  # Build PATH that works for a graphical login (launchd inherits /usr/bin:/bin by default).
+  # Include the usual suspects so `claude`, `cargo`, `node`, Homebrew, etc. are found.
+  local LAUNCH_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
-log "Writing plist: $PLIST"
-cat > "$PLIST" <<PLIST_EOF
+  log "Writing plist: $PLIST"
+  cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -86,24 +86,86 @@ cat > "$PLIST" <<PLIST_EOF
 </plist>
 PLIST_EOF
 
-# Reload the agent so the new plist takes effect.
-UID_NUM="$(id -u)"
-DOMAIN="gui/$UID_NUM"
+  local UID_NUM
+  UID_NUM="$(id -u)"
+  local DOMAIN="gui/$UID_NUM"
 
-if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
-  log "Previous agent found — bootout first"
-  launchctl bootout "$DOMAIN/$LABEL" || true
-  sleep 1
-fi
+  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    log "Previous agent found — bootout first"
+    launchctl bootout "$DOMAIN/$LABEL" || true
+    sleep 1
+  fi
 
-log "Bootstrapping agent"
-launchctl bootstrap "$DOMAIN" "$PLIST"
-launchctl enable "$DOMAIN/$LABEL"
-launchctl kickstart -k "$DOMAIN/$LABEL"
+  log "Bootstrapping agent"
+  launchctl bootstrap "$DOMAIN" "$PLIST"
+  launchctl enable "$DOMAIN/$LABEL"
+  launchctl kickstart -k "$DOMAIN/$LABEL"
 
-log "Installed."
-log "  Label:     $LABEL"
-log "  Plist:     $PLIST"
-log "  Logs:      $LOG_DIR/"
-log "  Status:    launchctl print $DOMAIN/$LABEL | head -30"
-log "  Uninstall: ./scripts/uninstall-autostart.sh"
+  log "Installed."
+  log "  Label:     $LABEL"
+  log "  Plist:     $PLIST"
+  log "  Logs:      $LOG_DIR/"
+  log "  Status:    launchctl print $DOMAIN/$LABEL | head -30"
+  log "  Uninstall: ./scripts/uninstall-autostart.sh"
+}
+
+install_linux() {
+  local UNIT_NAME="augmentagent.service"
+  local UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  local UNIT="$UNIT_DIR/$UNIT_NAME"
+  local LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent"
+  mkdir -p "$UNIT_DIR" "$LOG_DIR"
+
+  command -v systemctl >/dev/null 2>&1 \
+    || die "systemctl not found — this installer needs systemd"
+
+  # PATH a systemd --user service inherits is minimal; pre-seed the usual
+  # spots so cargo/node/etc are findable from the script.
+  local SERVICE_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+
+  log "Writing unit: $UNIT"
+  cat > "$UNIT" <<UNIT_EOF
+[Unit]
+Description=AugmentAgent Rust daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$REPO_ROOT
+ExecStart=$REPO_ROOT/scripts/run-rs.sh --wiki-dir ./wiki serve --dry-run false
+Environment=PATH=$SERVICE_PATH
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:$LOG_DIR/stdout.log
+StandardError=append:$LOG_DIR/stderr.log
+
+[Install]
+WantedBy=default.target
+UNIT_EOF
+
+  log "Reloading systemd --user"
+  systemctl --user daemon-reload
+
+  log "Enabling + (re)starting $UNIT_NAME"
+  systemctl --user enable "$UNIT_NAME" >/dev/null
+  systemctl --user restart "$UNIT_NAME"
+
+  if ! loginctl show-user "$USER" 2>/dev/null | grep -q "Linger=yes"; then
+    log "NOTE: linger is OFF — daemon will only run while you're logged in."
+    log "      To run it 24/7 even after logout: sudo loginctl enable-linger $USER"
+  fi
+
+  log "Installed."
+  log "  Unit:      $UNIT"
+  log "  Logs:      $LOG_DIR/  (also: journalctl --user -u $UNIT_NAME -f)"
+  log "  Status:    systemctl --user status $UNIT_NAME"
+  log "  Uninstall: ./scripts/uninstall-autostart.sh"
+}
+
+case "$(uname -s)" in
+  Darwin) install_macos ;;
+  Linux)  install_linux ;;
+  *)      die "unsupported platform: $(uname -s)" ;;
+esac

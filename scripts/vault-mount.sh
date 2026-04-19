@@ -16,7 +16,12 @@ VAULT_SERVICE="${AUGMENTAGENT_VAULT_SERVICE:-augmentagent-vault}"
 log() { printf '\033[1;36m[vault-mount]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[vault-mount ERR]\033[0m %s\n' "$*" >&2; exit 1; }
 
-[ "$(uname)" = "Darwin" ] || die "macOS only"
+# Vault is a macOS-only sparsebundle. On other platforms the daemon runs
+# against plaintext ./wiki and ./data.db — same as the unconfigured-vault
+# path on macOS — so this is a clean no-op.
+if [ "$(uname)" != "Darwin" ]; then
+  exit 0
+fi
 
 # Vault not configured = no-op. This is the "I haven't run vault-init yet"
 # state; let the daemon boot against plaintext ./wiki and ./data.db.
