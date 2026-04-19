@@ -40,6 +40,9 @@ pub(crate) struct BrokerState {
     pub(crate) query_handler: Option<Arc<dyn QueryHandler>>,
     pub(crate) action_handler: Option<Arc<dyn ApprovalActionHandler>>,
     pub(crate) approval_channel_id: ChannelId,
+    /// Populated once, from the first `Ready` event. Used to distinguish the
+    /// bot's own messages from the user's when building conversation context.
+    pub(crate) bot_user_id: std::sync::OnceLock<UserId>,
 }
 
 impl BrokerState {
@@ -58,6 +61,7 @@ impl BrokerState {
             query_handler,
             action_handler,
             approval_channel_id,
+            bot_user_id: std::sync::OnceLock::new(),
         }
     }
 

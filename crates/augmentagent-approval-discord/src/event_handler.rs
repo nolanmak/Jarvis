@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serenity::all::{
-    Attachment, Context, CreateInteractionResponse, CreateInteractionResponseFollowup,
-    CreateInteractionResponseMessage, CreateMessage, EventHandler, Interaction, Message,
-    MessageReference, Ready,
+    Attachment, ChannelId, Context, CreateInteractionResponse, CreateInteractionResponseFollowup,
+    CreateInteractionResponseMessage, CreateMessage, EventHandler, GetMessages, Interaction,
+    Message, MessageId, MessageReference, Ready, UserId,
 };
 use tracing::{debug, info, warn};
 
@@ -32,6 +32,10 @@ pub struct Handler {
 impl EventHandler for Handler {
     async fn ready(&self, _ctx: Context, ready: Ready) {
         info!("discord broker ready as {}", ready.user.name);
+        // Stash the bot's own user id so `message()` can tell the bot's prior
+        // replies apart from the user's questions when building conversation
+        // context for follow-ups.
+        let _ = self.state.bot_user_id.set(ready.user.id);
         self.state.mark_ready();
     }
 
@@ -69,17 +73,31 @@ impl EventHandler for Handler {
         }
 
         let handler = Arc::clone(handler);
+        let ctx_for_history = ctx.clone();
         let http = ctx.http.clone();
         let channel_id = msg.channel_id;
         let msg_id = msg.id;
+        let bot_user_id = self.state.bot_user_id.get().copied();
+        let allowed_user_id = self.state.allowed_user_id;
 
         tokio::spawn(async move {
+            // Fetch recent messages in this channel/DM so follow-up questions
+            // see the prior exchange. Bounded by age + char cap inside the fn.
+            let history = fetch_conversation_context(
+                &ctx_for_history,
+                channel_id,
+                msg_id,
+                bot_user_id,
+                allowed_user_id,
+            )
+            .await;
+
             // Download images to /tmp so the reasoner's Read tool can open them.
             // A partial download (some succeed, some fail) is fine — we proceed
             // with whatever landed and warn about the rest.
             let downloaded = download_images(&images, msg_id.get()).await;
 
-            let prompt = build_prompt(&user_text, &downloaded);
+            let prompt = build_prompt_with_context(&history, &user_text, &downloaded);
 
             let result = handler.answer(&prompt).await;
 
@@ -437,6 +455,109 @@ fn build_prompt(user_text: &str, images: &[PathBuf]) -> String {
     s
 }
 
+/// Layer a pre-formatted `<conversation_history>` block in front of the
+/// current-turn prompt. If `history` is empty, falls through to the bare
+/// `build_prompt` so first-turn messages match prior behavior exactly.
+fn build_prompt_with_context(history: &str, user_text: &str, images: &[PathBuf]) -> String {
+    let current = build_prompt(user_text, images);
+    if history.is_empty() {
+        return current;
+    }
+    format!("{history}\n\nuser's current message:\n{current}")
+}
+
+/// Conversation-history constants. Tuned by hand for the single-user DM case.
+const HISTORY_LIMIT: u8 = 30;
+const MAX_AGE_SECS: i64 = 2 * 60 * 60; // 2 hours
+const HISTORY_CHAR_CAP: usize = 10_000;
+
+/// Pull recent messages from the channel/DM and format them as a role-tagged
+/// transcript. Empty string when there's nothing to include (first turn, or
+/// everything exceeded the age cap, or fetch failed).
+async fn fetch_conversation_context(
+    ctx: &Context,
+    channel_id: ChannelId,
+    before: MessageId,
+    bot_user_id: Option<UserId>,
+    allowed_user_id: Option<UserId>,
+) -> String {
+    let builder = GetMessages::new().before(before).limit(HISTORY_LIMIT);
+    let messages = match channel_id.messages(&ctx.http, builder).await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("fetch conversation history failed: {e}");
+            return String::new();
+        }
+    };
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff = now_secs - MAX_AGE_SECS;
+
+    // Discord returns newest-first. Process newest → oldest but emit in
+    // chronological order at the end.
+    let mut turns: Vec<(&'static str, String)> = Vec::with_capacity(messages.len());
+    for m in messages.into_iter() {
+        if m.timestamp.unix_timestamp() < cutoff {
+            continue;
+        }
+        let role = if bot_user_id == Some(m.author.id) {
+            "assistant"
+        } else {
+            match allowed_user_id {
+                Some(allowed) if m.author.id != allowed => continue,
+                _ => "user",
+            }
+        };
+        let mut body = m.content.trim().to_string();
+        if !m.attachments.is_empty() {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str("[image attachment]");
+        }
+        if body.is_empty() {
+            continue;
+        }
+        turns.push((role, body));
+    }
+    // `messages` was newest-first; the Vec we built is therefore newest-first too.
+    turns.reverse();
+    format_transcript(&turns, HISTORY_CHAR_CAP)
+}
+
+/// Pure renderer so unit tests don't need a live Discord connection.
+/// Truncates from the FRONT (oldest) when over `char_cap` — recent context
+/// is more valuable than ancient context.
+fn format_transcript(turns: &[(&str, String)], char_cap: usize) -> String {
+    if turns.is_empty() {
+        return String::new();
+    }
+    let mut kept: Vec<String> = Vec::with_capacity(turns.len());
+    let mut total = 0usize;
+    for (role, body) in turns.iter().rev() {
+        let entry = format!("{role}: {body}\n");
+        if total + entry.len() > char_cap {
+            break;
+        }
+        total += entry.len();
+        kept.push(entry);
+    }
+    if kept.is_empty() {
+        return String::new();
+    }
+    kept.reverse();
+    let mut out = String::with_capacity(total + 64);
+    out.push_str("<conversation_history>\n");
+    for entry in kept {
+        out.push_str(&entry);
+    }
+    out.push_str("</conversation_history>");
+    out
+}
+
 /// Split a wiki answer into Discord-friendly chunks.
 pub fn chunk_for_discord(full: &str) -> Vec<String> {
     if full.len() <= DISCORD_MSG_LIMIT {
@@ -514,6 +635,62 @@ mod tests {
         for c in &chunks {
             assert!(c.len() <= DISCORD_MSG_LIMIT);
         }
+    }
+
+    #[test]
+    fn transcript_empty_for_empty_input() {
+        assert_eq!(format_transcript(&[], 10_000), "");
+    }
+
+    #[test]
+    fn transcript_preserves_chronological_order() {
+        let turns = vec![
+            ("user", "first question".to_string()),
+            ("assistant", "first answer".to_string()),
+            ("user", "follow-up".to_string()),
+        ];
+        let out = format_transcript(&turns, 10_000);
+        assert!(out.starts_with("<conversation_history>\n"));
+        assert!(out.ends_with("</conversation_history>"));
+        // Earliest turn should appear before later ones.
+        let i1 = out.find("first question").unwrap();
+        let i2 = out.find("first answer").unwrap();
+        let i3 = out.find("follow-up").unwrap();
+        assert!(i1 < i2 && i2 < i3);
+    }
+
+    #[test]
+    fn transcript_drops_oldest_when_over_cap() {
+        let turns = vec![
+            ("user", "A".repeat(200)),
+            ("assistant", "B".repeat(200)),
+            ("user", "C".repeat(200)),
+        ];
+        // Cap small enough that only the last two fit.
+        let out = format_transcript(&turns, 500);
+        assert!(!out.contains(&"A".repeat(200)));
+        assert!(out.contains(&"B".repeat(200)));
+        assert!(out.contains(&"C".repeat(200)));
+    }
+
+    #[test]
+    fn transcript_returns_empty_when_nothing_fits() {
+        let turns = vec![("user", "x".repeat(10_000))];
+        assert_eq!(format_transcript(&turns, 100), "");
+    }
+
+    #[test]
+    fn build_prompt_without_history_matches_bare_prompt() {
+        let got = build_prompt_with_context("", "hello", &[]);
+        assert_eq!(got, "hello");
+    }
+
+    #[test]
+    fn build_prompt_layers_history_before_current_message() {
+        let history = "<conversation_history>\nuser: hi\nassistant: hello\n</conversation_history>";
+        let got = build_prompt_with_context(history, "what's next?", &[]);
+        assert!(got.starts_with("<conversation_history>"));
+        assert!(got.contains("user's current message:\nwhat's next?"));
     }
 
     fn att(filename: &str, content_type: Option<&str>) -> Attachment {
