@@ -10,8 +10,9 @@
 use std::sync::Arc;
 
 use serenity::all::{
-    Context, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage,
-    EventHandler, Interaction, Message, MessageReference, Ready,
+    Context, CreateInteractionResponse, CreateInteractionResponseFollowup,
+    CreateInteractionResponseMessage, CreateMessage, EventHandler, Interaction, Message,
+    MessageReference, Ready,
 };
 use tracing::{debug, info, warn};
 
@@ -117,6 +118,14 @@ impl EventHandler for Handler {
                 }
                 match cid.verb {
                     Verb::Approve => {
+                        // Discord gives us 3 seconds to acknowledge an
+                        // interaction. Defer immediately so the user doesn't
+                        // see "something went wrong", then do the slow work
+                        // (send_draft) and follow up with the result.
+                        if let Err(e) = defer_ephemeral(&ctx, &comp).await {
+                            warn!("failed to defer Approve: {e}");
+                            return;
+                        }
                         let handler = self.state.action_handler.clone();
                         let action_id = cid.action_id.clone();
                         let ctx_clone = ctx.clone();
@@ -124,16 +133,18 @@ impl EventHandler for Handler {
                         tokio::spawn(async move {
                             let outcome = match handler {
                                 Some(h) => h.approve(&action_id).await,
-                                None => {
-                                    ApprovalActionOutcome::Failed {
-                                        message: "no action handler configured".into(),
-                                    }
-                                }
+                                None => ApprovalActionOutcome::Failed {
+                                    message: "no action handler configured".into(),
+                                },
                             };
-                            ack_outcome(&ctx_clone, &comp_clone, outcome, None).await;
+                            followup(&ctx_clone, &comp_clone, &describe(&outcome)).await;
                         });
                     }
                     Verb::Skip => {
+                        if let Err(e) = defer_ephemeral(&ctx, &comp).await {
+                            warn!("failed to defer Skip: {e}");
+                            return;
+                        }
                         let handler = self.state.action_handler.clone();
                         let action_id = cid.action_id.clone();
                         let ctx_clone = ctx.clone();
@@ -141,16 +152,15 @@ impl EventHandler for Handler {
                         tokio::spawn(async move {
                             let outcome = match handler {
                                 Some(h) => h.skip(&action_id).await,
-                                None => {
-                                    ApprovalActionOutcome::Failed {
-                                        message: "no action handler configured".into(),
-                                    }
-                                }
+                                None => ApprovalActionOutcome::Failed {
+                                    message: "no action handler configured".into(),
+                                },
                             };
-                            ack_outcome(&ctx_clone, &comp_clone, outcome, None).await;
+                            followup(&ctx_clone, &comp_clone, &describe(&outcome)).await;
                         });
                     }
                     Verb::Revise => {
+                        // Opening a modal IS the response — fast enough.
                         let modal = revise_modal(&cid.action_id, None);
                         if let Err(e) = comp
                             .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
@@ -186,6 +196,22 @@ impl EventHandler for Handler {
                         return;
                     }
                 }
+                // Defer the modal submission immediately — the revise work
+                // (reasoner call, create_draft, delete_draft) takes well over
+                // 3s, which is Discord's interaction ack deadline.
+                if let Err(e) = modal
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Defer(
+                            CreateInteractionResponseMessage::new().ephemeral(true),
+                        ),
+                    )
+                    .await
+                {
+                    warn!("failed to defer modal submit: {e}");
+                    return;
+                }
+
                 let feedback = extract_feedback(&modal.data.components).unwrap_or_default();
                 let handler = self.state.action_handler.clone();
                 let action_id = cid.action_id.clone();
@@ -201,7 +227,6 @@ impl EventHandler for Handler {
                         },
                     };
 
-                    // Capture revise-specific fields before the move into ack.
                     let repost = if let ApprovalActionOutcome::Revised { email, draft } =
                         &outcome
                     {
@@ -210,9 +235,20 @@ impl EventHandler for Handler {
                         None
                     };
 
-                    ack_outcome_modal(&ctx_clone, &modal_clone, outcome).await;
+                    // Follow up on the deferred modal interaction.
+                    let message = describe(&outcome);
+                    if let Err(e) = modal_clone
+                        .create_followup(
+                            &ctx_clone.http,
+                            CreateInteractionResponseFollowup::new()
+                                .content(message)
+                                .ephemeral(true),
+                        )
+                        .await
+                    {
+                        warn!(action_id = %action_id, "revise: followup failed: {e}");
+                    }
 
-                    // After ack, post the new approval card with the revised draft.
                     if let Some((email, draft)) = repost {
                         let msg = approval_message(&action_id, &email, &draft);
                         if let Err(e) = approval_channel.send_message(&ctx_clone.http, msg).await {
@@ -229,37 +265,42 @@ impl EventHandler for Handler {
     }
 }
 
-async fn ack_outcome(
+/// Immediate, within-budget ack for a component interaction (Approve / Skip)
+/// before we start slow work. Follow up with `followup` once the work is done.
+async fn defer_ephemeral(
     ctx: &Context,
     comp: &serenity::all::ComponentInteraction,
-    outcome: ApprovalActionOutcome,
-    override_msg: Option<&str>,
-) {
-    let message = override_msg.map(String::from).unwrap_or_else(|| describe(&outcome));
-    ack_ephemeral(ctx, comp, &message).await;
+) -> Result<(), serenity::Error> {
+    comp.create_response(
+        &ctx.http,
+        CreateInteractionResponse::Defer(
+            CreateInteractionResponseMessage::new().ephemeral(true),
+        ),
+    )
+    .await
 }
 
-async fn ack_outcome_modal(
+/// Post the result of the deferred component interaction.
+async fn followup(
     ctx: &Context,
-    modal: &serenity::all::ModalInteraction,
-    outcome: ApprovalActionOutcome,
+    comp: &serenity::all::ComponentInteraction,
+    message: &str,
 ) {
-    let message = describe(&outcome);
-    if let Err(e) = modal
-        .create_response(
+    if let Err(e) = comp
+        .create_followup(
             &ctx.http,
-            CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content(message)
-                    .ephemeral(true),
-            ),
+            CreateInteractionResponseFollowup::new()
+                .content(message)
+                .ephemeral(true),
         )
         .await
     {
-        warn!("failed to ack modal: {e}");
+        warn!("failed to send followup: {e}");
     }
 }
 
+/// Non-deferred immediate ephemeral ack — used only for the authorization
+/// rejection path, where we have no slow work to do.
 async fn ack_ephemeral(
     ctx: &Context,
     comp: &serenity::all::ComponentInteraction,
