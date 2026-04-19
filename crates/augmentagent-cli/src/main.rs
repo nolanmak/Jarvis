@@ -80,6 +80,31 @@ enum Cmd {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         post_discord: bool,
     },
+    /// Gmail inbox tooling for Claude to invoke via Bash when the wiki
+    /// can't answer a question.
+    Gmail {
+        #[command(subcommand)]
+        op: GmailOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum GmailOp {
+    /// Search all connected Gmail accounts with a Gmail query string
+    /// (e.g. `from:jeremy@acme.com`, `subject:deadline after:2026/04/01`).
+    /// Prints a short listing (from / subject / date / messageId) by default.
+    Search {
+        /// Gmail search query. Supports all operators `from:`, `to:`,
+        /// `subject:`, `has:`, `after:`, `before:`, etc.
+        #[arg(long)]
+        query: String,
+        /// Max results per account.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        /// Also include the email body in the output.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        full: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -162,7 +187,77 @@ async fn main() -> Result<()> {
             since,
             post_discord,
         } => run_digest(&cli, store, since, post_discord).await,
+        Cmd::Gmail { ref op } => match op {
+            GmailOp::Search { query, limit, full } => {
+                run_gmail_search(store, query.clone(), *limit, *full).await
+            }
+        },
     }
+}
+
+async fn run_gmail_search(
+    store: Arc<Store>,
+    query: String,
+    limit: u32,
+    full: bool,
+) -> Result<()> {
+    let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
+    let gmail = ComposioClient::new(api_key);
+    let accounts = store.get_active_gmail_accounts()?;
+    if accounts.is_empty() {
+        println!("(no active gmail accounts)");
+        return Ok(());
+    }
+
+    let mut any = false;
+    for account in &accounts {
+        let emails = match gmail
+            .fetch_with_query(&account.entity_id, &query, limit)
+            .await
+        {
+            Ok(es) => es,
+            Err(e) => {
+                eprintln!("account {} search failed: {e}", account.entity_id);
+                continue;
+            }
+        };
+        if emails.is_empty() {
+            continue;
+        }
+        any = true;
+        println!(
+            "## account {} ({}) — {} results",
+            account.entity_id,
+            account.email,
+            emails.len()
+        );
+        for (i, email) in emails.iter().enumerate() {
+            println!(
+                "[{:>2}] from: {}\n     subject: {}\n     date: {}\n     messageId: {}",
+                i + 1,
+                email.from,
+                email.subject,
+                email.date,
+                email.message_id
+            );
+            if full {
+                println!("     body:\n{}\n", indent_body(&email.body, 7));
+            }
+        }
+        println!();
+    }
+    if !any {
+        println!("(no results)");
+    }
+    Ok(())
+}
+
+fn indent_body(body: &str, cols: usize) -> String {
+    let pad = " ".repeat(cols);
+    body.lines()
+        .map(|l| format!("{pad}{l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn run_digest(
@@ -270,7 +365,8 @@ async fn run_wiki_ask(cli: &Cli, question: String) -> Result<()> {
         .context("--wiki-dir is required for wiki ask")?;
 
     let reasoner = ClaudeCliReasoner::new();
-    let opts = augmentagent_channel_email::reasoner::ask_opts(wiki_root.clone());
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let opts = augmentagent_channel_email::reasoner::ask_opts(wiki_root.clone(), repo_root);
     info!(wiki = %wiki_root.display(), "wiki ask");
     let answer = reasoner.call(&opts, &question).await?;
     println!("{answer}");
@@ -318,12 +414,13 @@ async fn run_wiki_lint(cli: &Cli, out: Option<PathBuf>) -> Result<()> {
 struct WikiQuerier {
     reasoner: Arc<ClaudeCliReasoner>,
     wiki_root: PathBuf,
+    repo_root: PathBuf,
 }
 
 #[async_trait]
 impl QueryHandler for WikiQuerier {
     async fn answer(&self, question: &str) -> anyhow::Result<String> {
-        let opts = ask_opts(self.wiki_root.clone());
+        let opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
         self.reasoner.call(&opts, question).await
     }
 }
@@ -541,10 +638,12 @@ async fn build_broker(
 
     let reasoner = Arc::new(ClaudeCliReasoner::new());
 
+    let repo_root = std::env::current_dir().context("current_dir")?;
     let query_handler: Option<Arc<dyn QueryHandler>> = cli.wiki_dir.as_ref().map(|root| {
         let q = WikiQuerier {
             reasoner: Arc::clone(&reasoner),
             wiki_root: root.clone(),
+            repo_root: repo_root.clone(),
         };
         Arc::new(q) as Arc<dyn QueryHandler>
     });
