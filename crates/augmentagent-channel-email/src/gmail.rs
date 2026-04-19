@@ -24,6 +24,15 @@ pub trait GmailApi: Send + Sync {
     /// Fetch unread emails for an entity. Returns up to `limit` messages.
     async fn fetch_unread(&self, entity_id: &str, limit: u32) -> Result<Vec<Email>, GmailError>;
 
+    /// Fetch emails matching a Gmail search query (e.g. `from:jeremy@acme.com`,
+    /// `subject:deadline after:2026/04/01`). Returns up to `limit` messages.
+    async fn fetch_with_query(
+        &self,
+        entity_id: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<Email>, GmailError>;
+
     /// Create a reply draft. Returns the draft ID.
     async fn create_draft(
         &self,
@@ -265,6 +274,16 @@ impl GmailApi for ComposioClient {
         entity_id: &str,
         max_total: u32,
     ) -> Result<Vec<Email>, GmailError> {
+        self.fetch_with_query(entity_id, "is:unread", max_total)
+            .await
+    }
+
+    async fn fetch_with_query(
+        &self,
+        entity_id: &str,
+        query: &str,
+        max_total: u32,
+    ) -> Result<Vec<Email>, GmailError> {
         // Composio caps response payload size (seen 413 above ~40 KB of bodies),
         // so paginate in 20-email pages up to `max_total`.
         const PAGE_SIZE: u32 = 20;
@@ -281,11 +300,10 @@ impl GmailApi for ComposioClient {
             let this_page = (want as u32).min(PAGE_SIZE);
 
             let mut args = serde_json::json!({
-                "query": "is:unread",
+                "query": query,
                 "max_results": this_page,
             });
             if let Some(tok) = &page_token {
-                // Gmail native param is `pageToken`; Composio passes it through.
                 args["page_token"] = serde_json::Value::String(tok.clone());
             }
 

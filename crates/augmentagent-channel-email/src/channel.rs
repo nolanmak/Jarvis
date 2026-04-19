@@ -93,6 +93,10 @@ pub struct ReasonerOpts {
     pub allowed_tools: Vec<String>,
     pub add_dirs: Vec<PathBuf>,
     pub permission_mode: String,
+    /// Override the spawned Claude CLI's working directory. Useful to scope
+    /// Write/Edit to a specific subtree (e.g. wiki root) so accidental writes
+    /// can't escape into the source tree.
+    pub cwd: Option<PathBuf>,
 }
 
 /// Trait the channel uses to reach Claude. Test doubles stub this.
@@ -631,6 +635,14 @@ mod tests {
         ) -> Result<Vec<Email>, crate::gmail::GmailError> {
             Ok(self.emails.clone())
         }
+        async fn fetch_with_query(
+            &self,
+            _e: &str,
+            _q: &str,
+            _l: u32,
+        ) -> Result<Vec<Email>, crate::gmail::GmailError> {
+            Ok(self.emails.clone())
+        }
         async fn create_draft(
             &self,
             _e: &str,
@@ -843,6 +855,14 @@ mod tests {
         async fn fetch_unread(
             &self,
             _e: &str,
+            _l: u32,
+        ) -> Result<Vec<Email>, crate::gmail::GmailError> {
+            Ok(self.emails.clone())
+        }
+        async fn fetch_with_query(
+            &self,
+            _e: &str,
+            _q: &str,
             _l: u32,
         ) -> Result<Vec<Email>, crate::gmail::GmailError> {
             Ok(self.emails.clone())
