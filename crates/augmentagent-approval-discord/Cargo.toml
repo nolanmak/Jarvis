@@ -17,3 +17,7 @@ tracing = { workspace = true }
 dashmap = { workspace = true }
 serenity = { workspace = true }
 serde = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
