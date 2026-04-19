@@ -7,10 +7,11 @@
 //! Also routes qualifying messages in the query channel (or DMs) to the
 //! `QueryHandler` for wiki-ask answers.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serenity::all::{
-    Context, CreateInteractionResponse, CreateInteractionResponseFollowup,
+    Attachment, Context, CreateInteractionResponse, CreateInteractionResponseFollowup,
     CreateInteractionResponseMessage, CreateMessage, EventHandler, Interaction, Message,
     MessageReference, Ready,
 };
@@ -61,8 +62,9 @@ impl EventHandler for Handler {
             }
         }
 
-        let question = msg.content.trim().to_string();
-        if question.is_empty() {
+        let user_text = msg.content.trim().to_string();
+        let images = filter_image_attachments(&msg.attachments);
+        if user_text.is_empty() && images.is_empty() {
             return;
         }
 
@@ -72,7 +74,24 @@ impl EventHandler for Handler {
         let msg_id = msg.id;
 
         tokio::spawn(async move {
-            match handler.answer(&question).await {
+            // Download images to /tmp so the reasoner's Read tool can open them.
+            // A partial download (some succeed, some fail) is fine — we proceed
+            // with whatever landed and warn about the rest.
+            let downloaded = download_images(&images, msg_id.get()).await;
+
+            let prompt = build_prompt(&user_text, &downloaded);
+
+            let result = handler.answer(&prompt).await;
+
+            // Best-effort cleanup. Image tmpfiles aren't load-bearing for the
+            // reply we're about to post, so we tolerate failures.
+            for path in &downloaded {
+                if let Err(e) = tokio::fs::remove_file(path).await {
+                    warn!("failed to remove tempfile {}: {e}", path.display());
+                }
+            }
+
+            match result {
                 Ok(answer) => {
                     for chunk in chunk_for_discord(&answer) {
                         let builder = CreateMessage::new()
@@ -336,6 +355,88 @@ fn describe(outcome: &ApprovalActionOutcome) -> String {
     }
 }
 
+/// Keep only attachments whose Discord-reported `content_type` looks like an
+/// image. Discord populates this from the upload, so it's reliable enough to
+/// gate which attachments we hand to the vision model.
+fn filter_image_attachments(attachments: &[Attachment]) -> Vec<Attachment> {
+    attachments
+        .iter()
+        .filter(|a| {
+            a.content_type
+                .as_deref()
+                .is_some_and(|ct| ct.starts_with("image/"))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Pick a sensible file extension for the tempfile. Prefer the URL filename's
+/// extension, otherwise derive from the MIME subtype, otherwise fall back to
+/// `bin`.
+fn extension_for(att: &Attachment) -> String {
+    if let Some(ext) = std::path::Path::new(&att.filename)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        if !ext.is_empty() {
+            return ext.to_lowercase();
+        }
+    }
+    if let Some(ct) = att.content_type.as_deref() {
+        if let Some(rest) = ct.strip_prefix("image/") {
+            // image/jpeg → jpg; everything else passes through.
+            let ext = match rest {
+                "jpeg" => "jpg",
+                other => other,
+            };
+            return ext.to_string();
+        }
+    }
+    "bin".into()
+}
+
+/// Download each attachment to `/tmp/aa-img-<msg_id>-<idx>.<ext>`. Returns the
+/// paths that succeeded; failures are logged and skipped.
+async fn download_images(attachments: &[Attachment], msg_id: u64) -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(attachments.len());
+    for (idx, att) in attachments.iter().enumerate() {
+        let ext = extension_for(att);
+        let path = PathBuf::from(format!("/tmp/aa-img-{msg_id}-{idx}.{ext}"));
+        match reqwest::get(&att.url).await {
+            Ok(resp) => match resp.bytes().await {
+                Ok(bytes) => match tokio::fs::write(&path, &bytes).await {
+                    Ok(()) => out.push(path),
+                    Err(e) => warn!("write image tempfile {} failed: {e}", path.display()),
+                },
+                Err(e) => warn!("read image bytes from {} failed: {e}", att.url),
+            },
+            Err(e) => warn!("download image {} failed: {e}", att.url),
+        }
+    }
+    out
+}
+
+/// Combine the user's text (possibly empty) with a list of locally-downloaded
+/// image paths, instructing Claude to use the Read tool to inspect them.
+fn build_prompt(user_text: &str, images: &[PathBuf]) -> String {
+    if images.is_empty() {
+        return user_text.to_string();
+    }
+    let mut s = String::new();
+    if !user_text.is_empty() {
+        s.push_str(user_text);
+        s.push_str("\n\n");
+    }
+    s.push_str("[attached images to analyze]\n");
+    for path in images {
+        s.push_str("- ");
+        s.push_str(&path.display().to_string());
+        s.push('\n');
+    }
+    s.push_str("\nUse the Read tool to view each image and answer based on them.");
+    s
+}
+
 /// Split a wiki answer into Discord-friendly chunks.
 pub fn chunk_for_discord(full: &str) -> Vec<String> {
     if full.len() <= DISCORD_MSG_LIMIT {
@@ -413,5 +514,68 @@ mod tests {
         for c in &chunks {
             assert!(c.len() <= DISCORD_MSG_LIMIT);
         }
+    }
+
+    fn att(filename: &str, content_type: Option<&str>) -> Attachment {
+        // Round-trip a minimal Attachment through serde_json so we don't have
+        // to hand-construct every field of the upstream type.
+        let json = serde_json::json!({
+            "id": "1",
+            "filename": filename,
+            "content_type": content_type,
+            "size": 1u64,
+            "url": "https://cdn.discordapp.com/example.png",
+            "proxy_url": "https://cdn.discordapp.com/example.png",
+            "ephemeral": false,
+        });
+        serde_json::from_value(json).expect("attachment fixture should deserialize")
+    }
+
+    #[test]
+    fn filter_keeps_only_image_content_types() {
+        let atts = vec![
+            att("a.png", Some("image/png")),
+            att("b.pdf", Some("application/pdf")),
+            att("c.jpg", Some("image/jpeg")),
+            att("d.txt", None),
+        ];
+        let images = filter_image_attachments(&atts);
+        let names: Vec<&str> = images.iter().map(|a| a.filename.as_str()).collect();
+        assert_eq!(names, vec!["a.png", "c.jpg"]);
+    }
+
+    #[test]
+    fn extension_prefers_filename_then_mime() {
+        assert_eq!(extension_for(&att("photo.JPG", Some("image/jpeg"))), "jpg");
+        assert_eq!(extension_for(&att("noext", Some("image/png"))), "png");
+        assert_eq!(extension_for(&att("noext", Some("image/jpeg"))), "jpg");
+        assert_eq!(extension_for(&att("noext", None)), "bin");
+    }
+
+    #[test]
+    fn build_prompt_with_only_images_does_not_panic_on_empty_text() {
+        let images = vec![PathBuf::from("/tmp/aa-img-42-0.png")];
+        let prompt = build_prompt("", &images);
+        assert!(prompt.contains("[attached images to analyze]"));
+        assert!(prompt.contains("/tmp/aa-img-42-0.png"));
+        assert!(prompt.contains("Use the Read tool"));
+    }
+
+    #[test]
+    fn build_prompt_combines_text_and_images() {
+        let images = vec![
+            PathBuf::from("/tmp/aa-img-7-0.png"),
+            PathBuf::from("/tmp/aa-img-7-1.jpg"),
+        ];
+        let prompt = build_prompt("what's in this?", &images);
+        assert!(prompt.starts_with("what's in this?"));
+        assert!(prompt.contains("/tmp/aa-img-7-0.png"));
+        assert!(prompt.contains("/tmp/aa-img-7-1.jpg"));
+    }
+
+    #[test]
+    fn build_prompt_without_images_returns_plain_text() {
+        let prompt = build_prompt("hello", &[]);
+        assert_eq!(prompt, "hello");
     }
 }
