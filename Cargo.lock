@@ -159,6 +159,7 @@ dependencies = [
  "augmentagent-store",
  "clap",
  "dotenvy",
+ "serenity",
  "tokio",
  "tokio-util",
  "tracing",
