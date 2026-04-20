@@ -4,11 +4,28 @@ The daemon polls LinkedIn every 4 hours, runs each inbound DM through the same t
 
 ## One-time setup
 
-You need to harvest a session cookie from a logged-in Chrome, ship it to the Linux daemon host, and run `augmentagent linkedin login` there to persist it. The helper script below drives the whole flow.
-
 > **The auth file contains your LinkedIn session cookie. Treat it like a password.** Anyone with `linkedin-auth.json` can read and send DMs as you until you log out on linkedin.com (which rotates `li_at`). The `.gitignore` in this repo already excludes `linkedin-auth.json` and `linkedin-cookies.json` so a stray `git add` can't leak it.
 
-### Step 1 — grab four values from Chrome devtools
+### Option A — auto-extract from Claude Intercept (easiest)
+
+If you've already run `/intercept` and browsed `linkedin.com/messaging/` through the proxy, your cookies are already sitting in the intercept capture DB. One command pulls them out:
+
+```sh
+LINKEDIN_SSH_TARGET=nolan-makatche@100.91.92.24 \
+  ./scripts/linkedin-harvest-from-intercept.sh
+```
+
+No prompts, no devtools. The script reads `captures.db`, extracts `li_at` / `JSESSIONID` / `bcookie` from the most recent voyager request's cookie header, pulls your `member_urn` from the URL, writes `linkedin-auth.json`, ships it to the Linux host, and runs `augmentagent linkedin login` there. Total: one command.
+
+Without `LINKEDIN_SSH_TARGET` it just writes the JSON locally and prints the scp+ssh commands to run by hand.
+
+Skip to [Step 3](#step-3--smoke-test) once done.
+
+### Option B — manual cookie paste
+
+If you don't have intercept captures (fresh install, different machine, etc.), use this path instead.
+
+#### Step 1 — grab four values from Chrome devtools
 
 Open https://www.linkedin.com/messaging/ in Chrome (logged in). Open devtools → **Application** tab → **Storage** → **Cookies** → `https://www.linkedin.com`.
 
@@ -24,7 +41,7 @@ You also need your own member URN. Easiest way:
 2. Click any request to `voyager/api/*`
 3. In the request URL or body, find a string like `urn:li:fsd_profile:ACoAA...` — copy the whole URN, that's yours
 
-### Step 2 — run the harvest script
+#### Step 2 — run the harvest script
 
 On your Mac (or wherever Chrome is logged in):
 
