@@ -12,7 +12,7 @@ use tracing::{error, info};
 use augmentagent_store::Email;
 
 use crate::event_handler::Handler;
-use crate::layout::approval_message;
+use crate::layout::{approval_message, flag_notice_message};
 use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, QueryHandler};
 
 #[derive(Clone)]
@@ -146,6 +146,19 @@ impl ApprovalBroker for DiscordApprovalBroker {
         draft: &str,
     ) -> Result<(), ApprovalError> {
         let message = approval_message(action_id, email, draft);
+        self.channel_id
+            .send_message(&*self.http, message)
+            .await
+            .map_err(|e| ApprovalError::Discord(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn post_flag_notice(
+        &self,
+        email: &Email,
+        reason: &str,
+    ) -> Result<(), ApprovalError> {
+        let message = flag_notice_message(email, reason);
         self.channel_id
             .send_message(&*self.http, message)
             .await

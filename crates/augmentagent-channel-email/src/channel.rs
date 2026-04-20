@@ -435,6 +435,22 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     email.from,
                     decision.reason.as_deref().unwrap_or("")
                 );
+                // Post the heads-up to Discord. Best-effort — failure to reach
+                // the broker shouldn't abort the flag flow (wiki ingest still
+                // runs below and the email stays marked complete).
+                let reason = decision.reason.as_deref().unwrap_or("flagged");
+                if let Err(e) = self.approvals.post_flag_notice(&email, reason).await {
+                    warn!(
+                        message_id = %email.message_id,
+                        "post_flag_notice failed: {e}"
+                    );
+                } else {
+                    info!(
+                        message_id = %email.message_id,
+                        from = %email.from,
+                        "flag notice posted"
+                    );
+                }
                 self.maybe_ingest(
                     &email,
                     DecisionKind::Flag,
@@ -794,6 +810,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingBroker {
         posts: std::sync::Mutex<Vec<String>>,
+        flag_posts: std::sync::Mutex<Vec<(String, String)>>,
     }
     #[async_trait]
     impl ApprovalBroker for RecordingBroker {
@@ -806,6 +823,96 @@ mod tests {
             self.posts.lock().unwrap().push(action_id.to_string());
             Ok(())
         }
+
+        async fn post_flag_notice(
+            &self,
+            email: &Email,
+            reason: &str,
+        ) -> Result<(), augmentagent_approval_discord::ApprovalError> {
+            self.flag_posts
+                .lock()
+                .unwrap()
+                .push((email.message_id.clone(), reason.to_string()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn flag_decision_posts_notice_no_approval_card() {
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                message_id: "m-flag".into(),
+                thread_id: None,
+                from: "friend@edu.com".into(),
+                subject: "Catching up".into(),
+                body: "saw your post, wanted to reach out...".into(),
+                date: "2026-04-19".into(),
+                account_entity_id: Some("acc1".into()),
+            }],
+        });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"flag","reason":"personal outreach from known contact"}"#,
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.flagged, 1);
+        assert_eq!(out.awaiting_approval, 0);
+        // No approval card — flags don't get the draft flow.
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+        // But the heads-up notice was posted.
+        let flags = broker.flag_posts.lock().unwrap();
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0].0, "m-flag");
+        assert!(flags[0].1.contains("personal outreach"));
+        // Email IS complete — flag is a terminal triage outcome.
+        assert!(store.is_email_complete("m-flag").unwrap());
+    }
+
+    #[tokio::test]
+    async fn skip_decision_posts_nothing() {
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                message_id: "m-skip".into(),
+                thread_id: None,
+                from: "noreply@marketing.com".into(),
+                subject: "50% off!".into(),
+                body: "deal deal".into(),
+                date: "2026-04-19".into(),
+                account_entity_id: Some("acc1".into()),
+            }],
+        });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"skip","reason":"marketing"}"#,
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.skipped, 1);
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+        assert_eq!(broker.flag_posts.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]
