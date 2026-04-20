@@ -1,0 +1,121 @@
+<%- include('partials/header', { page: 'resume' }) %>
+
+<div class="max-w-2xl mx-auto space-y-6">
+  <div>
+    <h1 class="text-xl font-semibold mb-2">Seed the wiki from your resume</h1>
+    <p class="text-sm text-gray-400">
+      Upload a <code class="px-1.5 py-0.5 rounded bg-gray-800 text-gray-200 text-xs">.pdf</code>,
+      <code class="px-1.5 py-0.5 rounded bg-gray-800 text-gray-200 text-xs">.txt</code>, or
+      <code class="px-1.5 py-0.5 rounded bg-gray-800 text-gray-200 text-xs">.md</code> resume.
+      AugmentAgent will extract durable background facts and seed:
+    </p>
+    <ul class="mt-3 space-y-1 text-sm text-gray-400 list-disc pl-5">
+      <li><code class="px-1.5 py-0.5 rounded bg-gray-800 text-gray-200 text-xs">wiki/about/me.md</code> — your profile (current roles, background, active priorities)</li>
+      <li><code class="px-1.5 py-0.5 rounded bg-gray-800 text-gray-200 text-xs">wiki/people/&lt;slug&gt;.md</code> — stub pages for each person named in the resume</li>
+    </ul>
+  </div>
+
+  <div class="rounded-md border border-gray-800 bg-gray-900/60 p-4 text-xs text-gray-400 leading-relaxed">
+    <span class="text-gray-300 font-medium">Heads up.</span>
+    Run once. Subsequent emails fill in the rest automatically. Claude is granted scoped write access to
+    <code class="px-1 py-0.5 rounded bg-gray-800 text-gray-200">wiki/</code> only — nothing outside that
+    directory can be touched.
+  </div>
+
+  <div class="rounded-lg border border-gray-800 bg-gray-900 p-6">
+    <form id="resume-form" class="space-y-4">
+      <label class="block">
+        <span class="block text-sm font-medium text-gray-300 mb-2">Resume file</span>
+        <input type="file" name="resume" accept=".pdf,.txt,.md" required
+               class="block w-full text-sm text-gray-300
+                      file:mr-4 file:py-2 file:px-4
+                      file:rounded-md file:border-0
+                      file:text-sm file:font-medium
+                      file:bg-gray-800 file:text-gray-200
+                      hover:file:bg-gray-700
+                      cursor-pointer
+                      border border-dashed border-gray-700 rounded-md p-3
+                      focus:outline-none focus:border-accent" />
+      </label>
+      <button type="submit" id="submit-btn"
+              class="inline-flex items-center gap-2 px-4 py-2 rounded-md
+                     bg-accent hover:bg-accent/90 text-white text-sm font-medium
+                     disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
+        <span id="submit-label">Ingest</span>
+      </button>
+    </form>
+
+    <div id="status" class="hidden mt-5 rounded-md border p-4 text-sm fade-in"></div>
+  </div>
+
+  <p class="text-sm">
+    <a href="/dashboard" class="text-accent hover:underline">&larr; Back to dashboard</a>
+  </p>
+</div>
+
+<script>
+  (function () {
+    const form = document.getElementById('resume-form');
+    const btn = document.getElementById('submit-btn');
+    const label = document.getElementById('submit-label');
+    const status = document.getElementById('status');
+    const origLabel = label.textContent;
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, function (c) {
+        return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c];
+      });
+    }
+
+    function setStatus(kind, html) {
+      status.className = 'mt-5 rounded-md border p-4 text-sm fade-in ' +
+        (kind === 'ok'
+          ? 'border-green-700 bg-green-900/20 text-green-200'
+          : kind === 'err'
+            ? 'border-red-700 bg-red-900/20 text-red-200'
+            : 'border-gray-700 bg-gray-800/40 text-gray-300');
+      status.innerHTML = html;
+    }
+
+    form.addEventListener('submit', async function (e) {
+      e.preventDefault();
+      const fd = new FormData(form);
+      btn.disabled = true;
+      label.innerHTML = '<svg class="animate-spin h-4 w-4 inline" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"></path></svg> Ingesting…';
+      setStatus(
+        'info',
+        '<div class="flex items-start gap-3"><svg class="animate-spin h-4 w-4 mt-0.5 flex-shrink-0" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="opacity-75"></path></svg><div><div class="font-medium text-gray-200">Extracting facts with Claude</div><div class="text-gray-400 text-xs mt-1">This typically takes 60–90 seconds. Don\'t close this tab.</div></div></div>'
+      );
+      try {
+        const res = await fetch('/api/resume', {
+          method: 'POST',
+          body: fd,
+          headers: { Accept: 'application/json' },
+        });
+        const data = await res.json().catch(function () { return {}; });
+        if (!res.ok || data.ok === false) {
+          setStatus(
+            'err',
+            '<div class="font-medium">Ingest failed' + (data.code != null ? ' (exit ' + data.code + ')' : '') + '</div>' +
+              (data.stderr ? '<details class="mt-2"><summary class="cursor-pointer text-xs text-red-300/80">stderr</summary><pre class="mt-2 p-2 rounded bg-gray-950 text-xs text-gray-300 overflow-x-auto whitespace-pre-wrap break-all">' + escapeHtml(data.stderr) + '</pre></details>' : '') +
+              (data.stdout ? '<details class="mt-2"><summary class="cursor-pointer text-xs text-red-300/80">stdout</summary><pre class="mt-2 p-2 rounded bg-gray-950 text-xs text-gray-300 overflow-x-auto whitespace-pre-wrap break-all">' + escapeHtml(data.stdout) + '</pre></details>' : '')
+          );
+        } else {
+          setStatus(
+            'ok',
+            '<div class="font-medium text-green-200">Resume ingested.</div>' +
+              (data.wrote ? '<div class="text-xs text-gray-400 mt-1">' + escapeHtml(data.wrote) + '</div>' : '') +
+              (data.stdout ? '<details class="mt-2"><summary class="cursor-pointer text-xs text-gray-400">Full CLI output</summary><pre class="mt-2 p-2 rounded bg-gray-950 text-xs text-gray-300 overflow-x-auto whitespace-pre-wrap break-all">' + escapeHtml(data.stdout) + '</pre></details>' : '')
+          );
+        }
+      } catch (err) {
+        setStatus('err', '<div class="font-medium">Network error</div><div class="text-xs mt-1">' + escapeHtml(err.message) + '</div>');
+      } finally {
+        btn.disabled = false;
+        label.textContent = origLabel;
+      }
+    });
+  })();
+</script>
+
+<%- include('partials/footer') %>
