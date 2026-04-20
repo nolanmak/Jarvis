@@ -53,6 +53,37 @@ impl<'a> WikiReader<'a> {
             lines.join("\n")
         )
     }
+
+    /// Produce a short nudge for the triage call. Single-line-per-page, no
+    /// prose — triage is cost-sensitive so we keep the token footprint under
+    /// 100 chars. Empty string when no relevant wiki page exists.
+    pub fn triage_hint(&self, email: &Email) -> String {
+        let mut lines: Vec<String> = Vec::new();
+
+        let person_page = self.layout.person_page(&email.from);
+        if exists(&person_page) {
+            lines.push(format!(
+                "- Sender has a wiki page ({}) — open with Read; weight importance by Relationship/Tone.",
+                relative_to_root(&self.layout.root, &person_page)
+            ));
+        }
+
+        if let Some(tid) = &email.thread_id {
+            let thread_page = self.layout.thread_page(tid);
+            if exists(&thread_page) {
+                lines.push(format!(
+                    "- Prior thread context at {} — open with Read if the email is a follow-up.",
+                    relative_to_root(&self.layout.root, &thread_page)
+                ));
+            }
+        }
+
+        if lines.is_empty() {
+            String::new()
+        } else {
+            lines.join("\n")
+        }
+    }
 }
 
 fn exists(p: &Path) -> bool {
@@ -111,5 +142,51 @@ mod tests {
         let r = WikiReader::new(&layout);
         let hint = r.draft_hint(&email("a@b.com", Some("t1")));
         assert!(hint.contains("threads/t1.md"));
+    }
+
+    #[test]
+    fn triage_hint_empty_when_no_pages_exist() {
+        let d = TempDir::new().unwrap();
+        let layout = WikiLayout::new(d.path().to_path_buf());
+        layout.bootstrap().unwrap();
+        let r = WikiReader::new(&layout);
+        assert_eq!(r.triage_hint(&email("a@b.com", Some("t1"))), "");
+    }
+
+    #[test]
+    fn triage_hint_references_person_page() {
+        let d = TempDir::new().unwrap();
+        let layout = WikiLayout::new(d.path().to_path_buf());
+        layout.bootstrap().unwrap();
+        std::fs::write(layout.person_page("a@b.com"), "# A\n").unwrap();
+        let r = WikiReader::new(&layout);
+        let hint = r.triage_hint(&email("a@b.com", None));
+        assert!(hint.contains("people/a_at_b_com.md"));
+        assert!(hint.contains("Relationship"));
+    }
+
+    #[test]
+    fn triage_hint_includes_thread_when_present() {
+        let d = TempDir::new().unwrap();
+        let layout = WikiLayout::new(d.path().to_path_buf());
+        layout.bootstrap().unwrap();
+        std::fs::write(layout.thread_page("t1"), "# t1\n").unwrap();
+        let r = WikiReader::new(&layout);
+        let hint = r.triage_hint(&email("a@b.com", Some("t1")));
+        assert!(hint.contains("threads/t1.md"));
+    }
+
+    #[test]
+    fn triage_hint_stays_short() {
+        // Token cost sanity — hint should fit inside ~200 chars per page so
+        // triage prompts don't balloon. Two pages max = 400 chars.
+        let d = TempDir::new().unwrap();
+        let layout = WikiLayout::new(d.path().to_path_buf());
+        layout.bootstrap().unwrap();
+        std::fs::write(layout.person_page("a@b.com"), "# A\n").unwrap();
+        std::fs::write(layout.thread_page("t1"), "# t1\n").unwrap();
+        let r = WikiReader::new(&layout);
+        let hint = r.triage_hint(&email("a@b.com", Some("t1")));
+        assert!(hint.len() < 400, "triage hint too long: {} chars", hint.len());
     }
 }

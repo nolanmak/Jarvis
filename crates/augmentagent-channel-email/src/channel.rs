@@ -365,9 +365,18 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             return Ok(None);
         }
 
-        // --- 1. TRIAGE call (Haiku, no tools, returns {decision, reason})
-        let triage_opts = crate::reasoner::triage_opts();
-        let triage_prompt = triage_user_message(&email, learned);
+        // --- 1. TRIAGE call (Opus, wiki read-only, returns {decision, reason})
+        let triage_opts = crate::reasoner::triage_opts(self.config.wiki_root.clone());
+        let wiki_hint = self
+            .config
+            .wiki_root
+            .as_ref()
+            .map(|root| {
+                let layout = augmentagent_wiki::WikiLayout::new(root.clone());
+                augmentagent_wiki::WikiReader::new(&layout).triage_hint(&email)
+            })
+            .unwrap_or_default();
+        let triage_prompt = triage_user_message(&email, learned, &wiki_hint);
         let raw = self.reasoner.call(&triage_opts, &triage_prompt).await?;
         let decision = match parse_decision(&raw) {
             Ok(d) => d,

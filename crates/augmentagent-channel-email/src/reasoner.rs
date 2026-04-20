@@ -145,16 +145,24 @@ impl Reasoner for ClaudeCliReasoner {
 }
 
 /// Preset builders for the three call types.
-pub fn triage_opts() -> ReasonerOpts {
+pub fn triage_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
+    // Opus for triage. Haiku was too narrow on "flag" — missed personal
+    // messages from known contacts asking for engagement. Volume is ~70
+    // emails/day so the cost bump is rounding error; this is the most
+    // quality-critical step in the pipeline.
+    let mut add_dirs = Vec::new();
+    let mut allowed_tools = Vec::new();
+    if let Some(root) = wiki_root {
+        add_dirs.push(root);
+        // Read-only access lets triage open a sender's people page and weight
+        // importance by prior context without risking wiki mutation.
+        allowed_tools = vec!["Read".into(), "Grep".into(), "Glob".into()];
+    }
     ReasonerOpts {
         system_prompt: crate::prompt::TRIAGE_SYSTEM.to_string(),
-        // Opus for triage. Haiku was too narrow on "flag" — missed personal
-        // messages from known contacts asking for engagement. Volume is ~70
-        // emails/day so the cost bump is rounding error; this is the most
-        // quality-critical step in the pipeline.
         model: None,
-        allowed_tools: Vec::new(),
-        add_dirs: Vec::new(),
+        allowed_tools,
+        add_dirs,
         permission_mode: "default".into(),
         cwd: None,
     }
@@ -255,6 +263,25 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         add_dirs: vec![wiki_root],
         permission_mode: "acceptEdits".into(),
         cwd: None,
+    }
+}
+
+/// Preset for the one-shot `resume ingest` CLI. Opus quality for a single-run
+/// seeding pass. Full wiki R/W/E with cwd pinned so writes cannot escape.
+pub fn resume_opts(wiki_root: PathBuf) -> ReasonerOpts {
+    ReasonerOpts {
+        system_prompt: include_str!("../../../schema/resume-ingest.md").to_string(),
+        model: None, // Opus — seeding the wiki is high-leverage and one-shot
+        allowed_tools: vec![
+            "Read".into(),
+            "Grep".into(),
+            "Glob".into(),
+            "Write".into(),
+            "Edit".into(),
+        ],
+        add_dirs: vec![wiki_root.clone()],
+        permission_mode: "acceptEdits".into(),
+        cwd: Some(wiki_root),
     }
 }
 
