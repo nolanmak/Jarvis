@@ -61,6 +61,16 @@ pub trait ApprovalBroker: Send + Sync {
         email: &Email,
         draft: &str,
     ) -> Result<(), ApprovalError>;
+
+    /// Post a simple "heads up" notice for a triage-flagged email. No buttons,
+    /// no draft — the user is expected to open Gmail themselves if they want
+    /// to reply. This is the reach-out channel for emails that matter but
+    /// don't warrant auto-drafting.
+    async fn post_flag_notice(
+        &self,
+        email: &Email,
+        reason: &str,
+    ) -> Result<(), ApprovalError>;
 }
 
 /// No-op broker for dry-run mode; returns immediately.
@@ -71,6 +81,14 @@ impl ApprovalBroker for NoopBroker {
     async fn post_approval(
         &self,
         _: &str,
+        _: &Email,
+        _: &str,
+    ) -> Result<(), ApprovalError> {
+        Ok(())
+    }
+
+    async fn post_flag_notice(
+        &self,
         _: &Email,
         _: &str,
     ) -> Result<(), ApprovalError> {

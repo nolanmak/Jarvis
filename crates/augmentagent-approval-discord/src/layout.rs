@@ -14,6 +14,17 @@ use crate::custom_id::{CustomId, Verb};
 const MAX_EMBED_DESCRIPTION: usize = 3800;
 const SEPARATOR: &str = "\n\n— DRAFT —\n\n";
 
+/// Plain-text "heads up" card for triage-flagged emails. No buttons, no draft.
+pub fn flag_notice_message(email: &Email, reason: &str) -> CreateMessage {
+    let subject = truncate(&email.subject, 256);
+    let from = truncate(&email.from, 200);
+    let reason = truncate(reason, 500);
+    let content = format!(
+        "🚩 **Important** — from `{from}`\n**{subject}**\n_reason: {reason}_"
+    );
+    CreateMessage::new().content(content)
+}
+
 pub fn approval_message(action_id: &str, email: &Email, draft: &str) -> CreateMessage {
     let embed = CreateEmbed::new()
         .title(truncate(&email.subject, 256))
