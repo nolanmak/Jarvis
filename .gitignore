@@ -10,3 +10,7 @@ wiki/
 skills/*/learned/*
 !skills/*/learned/.gitkeep
 skills/*/config.json
+
+# LinkedIn session cookies — treat as secret.
+linkedin-auth.json
+linkedin-cookies.json
