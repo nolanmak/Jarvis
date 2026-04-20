@@ -85,6 +85,13 @@ impl Reasoner for ClaudeCliReasoner {
         if let Some(cwd) = &opts.cwd {
             cmd.current_dir(cwd);
         }
+        // Forward any extra env vars. These are inherited by any subprocesses
+        // Claude spawns (notably `augmentagent gmail search` via the scoped
+        // Bash allowlist in `ask_opts`), which is how we carry `AUGMENTAGENT_DB`
+        // through to a sub-CLI whose cwd is unrelated to the repo root.
+        if !opts.env.is_empty() {
+            cmd.envs(opts.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        }
         let mut child = cmd.spawn()?;
 
         if let Some(mut stdin) = child.stdin.take() {
@@ -144,6 +151,27 @@ impl Reasoner for ClaudeCliReasoner {
     }
 }
 
+/// Resolve the absolute on-disk path of the app database so it can be passed
+/// as `AUGMENTAGENT_DB` to sub-CLIs whose cwd may differ from the repo root.
+///
+/// Mirrors the resolution order in `main.rs`: explicit `AUGMENTAGENT_DB` env
+/// wins, else `<repo_root>/data.db`. We always return an absolute path —
+/// `canonicalize` when the file exists, otherwise fall back to a manual
+/// absolute join so callers never inherit a relative path.
+fn resolve_db_path(repo_root: &std::path::Path) -> PathBuf {
+    let raw = std::env::var("AUGMENTAGENT_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root.join("data.db"));
+    if let Ok(abs) = raw.canonicalize() {
+        return abs;
+    }
+    if raw.is_absolute() {
+        raw
+    } else {
+        repo_root.join(&raw)
+    }
+}
+
 /// Preset builders for the three call types.
 pub fn triage_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
     // Opus for triage. Haiku was too narrow on "flag" — missed personal
@@ -165,6 +193,7 @@ pub fn triage_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         add_dirs,
         permission_mode: "default".into(),
         cwd: None,
+        env: Vec::new(),
     }
 }
 
@@ -182,6 +211,7 @@ pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> Reasoner
         add_dirs,
         permission_mode: "default".into(),
         cwd: None,
+        env: Vec::new(),
     }
 }
 
@@ -193,6 +223,7 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         add_dirs: vec![wiki_root],
         permission_mode: "default".into(),
         cwd: None,
+        env: Vec::new(),
     }
 }
 
@@ -208,6 +239,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // Scoped Bash pattern: Claude can ONLY invoke our gmail subcommand via
     // the release binary's absolute path. Anything else is denied by claude CLI.
     let bash_allow = format!("Bash({} gmail *)", bin.display());
+    // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
+    // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
+    // resolves the db regardless of cwd.
+    let db_path = resolve_db_path(&repo_root);
     ReasonerOpts {
         system_prompt: include_str!("../../../schema/wiki-ask.md").to_string(),
         model: None, // Opus — quality matters for answer coherence
@@ -225,6 +260,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         permission_mode: "acceptEdits".into(),
         // Pin cwd to the wiki so Write/Edit cannot touch the source tree.
         cwd: Some(wiki_root),
+        env: vec![(
+            "AUGMENTAGENT_DB".into(),
+            db_path.to_string_lossy().into_owned(),
+        )],
     }
 }
 
@@ -246,6 +285,7 @@ pub fn digest_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         add_dirs,
         permission_mode: "default".into(),
         cwd: None,
+        env: Vec::new(),
     }
 }
 
@@ -263,6 +303,102 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         add_dirs: vec![wiki_root],
         permission_mode: "acceptEdits".into(),
         cwd: None,
+        env: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ask_opts_ships_absolute_db_env() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        // Touch the db file so canonicalize succeeds, mirroring a real repo.
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+
+        // Clear a potentially-inherited env that would override our resolution.
+        let _guard = EnvGuard::unset("AUGMENTAGENT_DB");
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+
+        let (key, value) = opts
+            .env
+            .iter()
+            .find(|(k, _)| k == "AUGMENTAGENT_DB")
+            .expect("AUGMENTAGENT_DB env var present");
+        assert_eq!(key, "AUGMENTAGENT_DB");
+        let path = std::path::Path::new(value);
+        assert!(path.is_absolute(), "db path must be absolute: {value}");
+        assert_eq!(path.file_name().unwrap(), "data.db");
+    }
+
+    #[test]
+    fn ask_opts_honors_augmentagent_db_override() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        let override_dir = tempfile::tempdir().expect("override tmpdir");
+        let override_db = override_dir.path().join("custom.db");
+        std::fs::write(&override_db, b"").unwrap();
+
+        let _guard = EnvGuard::set("AUGMENTAGENT_DB", override_db.to_str().unwrap());
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+        let value = opts
+            .env
+            .iter()
+            .find(|(k, _)| k == "AUGMENTAGENT_DB")
+            .map(|(_, v)| v.clone())
+            .expect("AUGMENTAGENT_DB env present");
+        assert!(std::path::Path::new(&value).is_absolute());
+        assert_eq!(
+            std::path::Path::new(&value).file_name().unwrap(),
+            "custom.db"
+        );
+    }
+
+    /// Serialize env-var mutations across the two tests so they don't race.
+    /// (`cargo test` runs tests in parallel by default; both touch the same
+    /// process-wide `AUGMENTAGENT_DB` var.)
+    struct EnvGuard {
+        key: &'static str,
+        prior: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn lock() -> std::sync::MutexGuard<'static, ()> {
+            static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            M.lock().unwrap_or_else(|e| e.into_inner())
+        }
+        fn unset(key: &'static str) -> Self {
+            let lock = Self::lock();
+            let prior = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self {
+                key,
+                prior,
+                _lock: lock,
+            }
+        }
+        fn set(key: &'static str, value: &str) -> Self {
+            let lock = Self::lock();
+            let prior = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self {
+                key,
+                prior,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 }
 
@@ -282,6 +418,7 @@ pub fn resume_opts(wiki_root: PathBuf) -> ReasonerOpts {
         add_dirs: vec![wiki_root.clone()],
         permission_mode: "acceptEdits".into(),
         cwd: Some(wiki_root),
+        env: Vec::new(),
     }
 }
 
