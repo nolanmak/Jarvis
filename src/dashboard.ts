@@ -510,34 +510,7 @@ const resumeUpload = multer({
 });
 
 router.get("/resume", (_req, res) => {
-  res.send(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Seed wiki from resume — AugmentAgent</title>
-  <style>
-    body { font: 14px/1.5 -apple-system, system-ui, sans-serif; max-width: 640px; margin: 3em auto; padding: 0 1em; color: #222; }
-    h1 { font-size: 1.4em; }
-    .note { background: #f6f6f6; border-left: 3px solid #888; padding: 0.75em 1em; margin: 1.5em 0; font-size: 13px; color: #444; }
-    form { margin-top: 1.5em; }
-    input[type=file] { display: block; margin-bottom: 1em; }
-    button { padding: 0.6em 1.2em; font-size: 14px; cursor: pointer; }
-  </style>
-</head>
-<body>
-  <h1>Seed the wiki from your resume</h1>
-  <p>Upload a <code>.pdf</code>, <code>.txt</code>, or <code>.md</code> resume. AugmentAgent will extract durable background facts and seed:</p>
-  <ul>
-    <li><code>wiki/about/me.md</code> — your profile (current roles, background, active priorities)</li>
-    <li><code>wiki/people/&lt;slug&gt;.md</code> — stub pages for each person named in the resume</li>
-  </ul>
-  <div class="note">Run once. Subsequent emails fill in the rest automatically. Claude opts include scoped write access to the wiki root only — nothing outside <code>wiki/</code> can be touched.</div>
-  <form action="/api/resume" method="post" enctype="multipart/form-data">
-    <input type="file" name="resume" accept=".pdf,.txt,.md" required>
-    <button type="submit">Ingest</button>
-  </form>
-</body>
-</html>`);
+  res.render("resume", { page: "resume" });
 });
 
 router.post("/api/resume", resumeUpload.single("resume"), (req, res) => {
@@ -584,12 +557,7 @@ router.post("/api/resume", resumeUpload.single("resume"), (req, res) => {
     }
 
     if (code !== 0) {
-      res
-        .status(500)
-        .type("text/html")
-        .send(
-          `<h1>Ingest failed (exit ${code})</h1><h2>stderr</h2><pre>${escapeHtml(stderr)}</pre><h2>stdout</h2><pre>${escapeHtml(stdout)}</pre>`,
-        );
+      res.status(500).json({ ok: false, code, stderr, stdout });
       return;
     }
 
@@ -601,28 +569,13 @@ router.post("/api/resume", resumeUpload.single("resume"), (req, res) => {
         .reverse()
         .find((l) => l.toLowerCase().startsWith("wrote:")) || "(no wrote: line found)";
 
-    res.type("text/html").send(
-      `<!doctype html><html><body style="font: 14px/1.5 -apple-system, system-ui, sans-serif; max-width: 640px; margin: 3em auto;">
-  <h1>Resume ingested</h1>
-  <p><strong>${escapeHtml(wroteLine)}</strong></p>
-  <details><summary>Full CLI output</summary><pre>${escapeHtml(stdout)}</pre></details>
-  <p><a href="/resume">Ingest another</a> · <a href="/dashboard">Back to dashboard</a></p>
-</body></html>`,
-    );
+    res.json({ ok: true, wrote: wroteLine, stdout });
   });
 
   child.on("error", (e) => {
     clearTimeout(timeout);
-    res.status(500).send(`failed to spawn resume CLI: ${e.message}`);
+    res.status(500).json({ ok: false, error: e.message });
   });
 });
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
 
 export default router;
