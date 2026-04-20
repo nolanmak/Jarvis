@@ -16,6 +16,10 @@ use augmentagent_approval_discord::{
 use augmentagent_channel_email::gmail::{ComposioClient, GmailApi};
 use augmentagent_channel_email::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_email::{ClaudeCliReasoner, GmailChannel, GmailChannelConfig, Reasoner};
+use augmentagent_channel_linkedin::{
+    default_auth_path, is_linkedin_email, LinkedInApi, LinkedInAuth, LinkedInChannel,
+    LinkedInChannelConfig, VoyagerClient, ACCOUNT_PREFIX, DEFAULT_POLL_SECS,
+};
 use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
@@ -91,6 +95,11 @@ enum Cmd {
         #[command(subcommand)]
         op: ResumeOp,
     },
+    /// LinkedIn DM channel: harvest cookies, poll the inbox, search threads.
+    Linkedin {
+        #[command(subcommand)]
+        op: LinkedinOp,
+    },
 }
 
 #[derive(Subcommand)]
@@ -110,6 +119,28 @@ enum GmailOp {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         full: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum LinkedinOp {
+    /// Validate + persist harvested cookies from a JSON file.
+    ///
+    /// The JSON must contain `member_urn` and a `cookies` object with at
+    /// least `li_at` and `JSESSIONID`. See docs/LINKEDIN.md for how to
+    /// extract these from Chrome devtools.
+    Login {
+        /// Path to the cookies JSON file.
+        #[arg(long)]
+        cookies_json: PathBuf,
+    },
+    /// Run one LinkedIn poll cycle and exit. Respects `--dry-run`.
+    PollOnce {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+    /// Quick read-only check: list recent threads + print peer + snippet.
+    /// Good smoke test after `login` to confirm cookies work.
+    Recent,
 }
 
 #[derive(Subcommand)]
@@ -184,7 +215,25 @@ async fn main() -> Result<()> {
             dry_run,
         } => {
             let broker = build_broker(&cli, Arc::clone(&store), dry_run).await?;
-            let ch = build_channel(&cli, store, broker, dry_run, interval_secs)?;
+            let gmail_ch = build_channel(
+                &cli,
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                dry_run,
+                interval_secs,
+            )?;
+            // LinkedIn is optional — builds only if cookies exist; an absent
+            // or invalid auth file downgrades the daemon to Gmail-only with
+            // a warning, no crash.
+            let linkedin_ch =
+                match build_linkedin_channel(&cli, Arc::clone(&store), Arc::clone(&broker), dry_run)
+                {
+                    Ok(ch) => Some(ch),
+                    Err(e) => {
+                        warn!("linkedin channel disabled: {e:#}");
+                        None
+                    }
+                };
             let shutdown = CancellationToken::new();
             let s2 = shutdown.clone();
             tokio::spawn(async move {
@@ -193,7 +242,19 @@ async fn main() -> Result<()> {
                     s2.cancel();
                 }
             });
-            ch.run(shutdown).await
+            match linkedin_ch {
+                Some(li_ch) => {
+                    let sd_gmail = shutdown.clone();
+                    let sd_li = shutdown.clone();
+                    let g = tokio::spawn(async move { gmail_ch.run(sd_gmail).await });
+                    let l = tokio::spawn(async move { li_ch.run(sd_li).await });
+                    let (g_res, l_res) = tokio::join!(g, l);
+                    g_res??;
+                    l_res??;
+                    Ok(())
+                }
+                None => gmail_ch.run(shutdown).await,
+            }
         }
         Cmd::Wiki { ref op } => match op {
             WikiOp::Lint { out } => run_wiki_lint(&cli, out.clone()).await,
@@ -210,6 +271,17 @@ async fn main() -> Result<()> {
         },
         Cmd::Resume { ref op } => match op {
             ResumeOp::Ingest { file } => run_resume_ingest(&cli, file.clone()).await,
+        },
+        Cmd::Linkedin { ref op } => match op {
+            LinkedinOp::Login { cookies_json } => run_linkedin_login(cookies_json.clone()).await,
+            LinkedinOp::PollOnce { dry_run } => {
+                let broker = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
+                let ch = build_linkedin_channel(&cli, store, broker, *dry_run)?;
+                let out = ch.poll_once().await?;
+                println!("{out:#?}");
+                Ok(())
+            }
+            LinkedinOp::Recent => run_linkedin_recent().await,
         },
     }
 }
@@ -512,9 +584,16 @@ impl QueryHandler for WikiQuerier {
 /// Executes Approve / Revise / Skip clicks against sqlite + Composio +
 /// reasoner. Backed entirely by the persistent action row — no in-memory
 /// state — so cards remain valid across daemon restarts and indefinitely.
+///
+/// Routes each click to Gmail or LinkedIn based on the email's
+/// `account_entity_id` prefix (`linkedin:` = LinkedIn, else Gmail).
 struct ReplyApprover {
     store: Arc<Store>,
     gmail: Arc<ComposioClient>,
+    /// Optional voyager client. `None` = LinkedIn disabled for this run
+    /// (cookies not configured). Any LinkedIn-tagged action hitting this
+    /// approver with a None client surfaces as `Failed`.
+    linkedin: Option<Arc<VoyagerClient>>,
     reasoner: Arc<ClaudeCliReasoner>,
     draft_skill: String,
     wiki_root: Option<PathBuf>,
@@ -533,6 +612,107 @@ impl ReplyApprover {
             }
         }
     }
+
+    async fn approve_linkedin(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        let Some(linkedin) = self.linkedin.as_ref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "LinkedIn is not configured (no cookies); run `linkedin login`".into(),
+            };
+        };
+        let Some(conv_urn) = action.email.thread_id.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no conversationUrn on email; cannot send".into(),
+            };
+        };
+        let Some(body) = action.action.draft_body.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no draft body on action; cannot send".into(),
+            };
+        };
+        match linkedin.send_message(conv_urn, body).await {
+            Ok(_) => {
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Sent,
+                    Some(body),
+                    None,
+                );
+                let _ = self
+                    .store
+                    .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                tracing::info!(action_id, "linkedin reply sent via approval handler");
+                ApprovalActionOutcome::Approved
+            }
+            Err(e) => {
+                let msg = format!("linkedin send_message: {e}");
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                ApprovalActionOutcome::Failed { message: msg }
+            }
+        }
+    }
+
+    async fn revise_linkedin(
+        &self,
+        action_id: &str,
+        feedback: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        // LinkedIn has no server-side draft to swap — we just regenerate
+        // text, update the action row, and re-post the card.
+        let previous_draft = action.action.draft_body.clone().unwrap_or_default();
+        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
+        let prompt = augmentagent_channel_email::prompt::redraft_message(
+            &action.email,
+            &previous_draft,
+            feedback,
+        );
+        let redraft = match self.reasoner.call(&opts, &prompt).await {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("redraft call failed: {e}"),
+                };
+            }
+        };
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Pending,
+            Some(&redraft),
+            None,
+        );
+        tracing::info!(action_id, "linkedin revise: new draft persisted");
+        ApprovalActionOutcome::Revised {
+            email: action.email,
+            draft: redraft,
+        }
+    }
+
+    fn skip_linkedin(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        // Nothing to delete server-side — LinkedIn has no draft concept.
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Rejected,
+            None,
+            Some("skipped by approver"),
+        );
+        let _ = self
+            .store
+            .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+        ApprovalActionOutcome::Skipped
+    }
 }
 
 #[async_trait]
@@ -545,6 +725,9 @@ impl ApprovalActionHandler for ReplyApprover {
             return ApprovalActionOutcome::AlreadyResolved {
                 status: action.action.status,
             };
+        }
+        if is_linkedin_email(&action.email) {
+            return self.approve_linkedin(action_id, action).await;
         }
         let Some(draft_id) = action.draft_id.as_deref() else {
             return ApprovalActionOutcome::Failed {
@@ -589,6 +772,9 @@ impl ApprovalActionHandler for ReplyApprover {
                 status: action.action.status,
             };
         }
+        if is_linkedin_email(&action.email) {
+            return self.skip_linkedin(action_id, action);
+        }
         // Best-effort cleanup of the unsent Gmail draft.
         if let (Some(draft_id), Some(entity_id)) = (
             action.draft_id.as_deref(),
@@ -618,6 +804,9 @@ impl ApprovalActionHandler for ReplyApprover {
             return ApprovalActionOutcome::AlreadyResolved {
                 status: action.action.status,
             };
+        }
+        if is_linkedin_email(&action.email) {
+            return self.revise_linkedin(action_id, feedback, action).await;
         }
         let Some(entity_id) = action.email.account_entity_id.as_deref() else {
             return ApprovalActionOutcome::Failed {
@@ -739,9 +928,15 @@ async fn build_broker(
     let gmail = Arc::new(ComposioClient::new(api_key));
     let skill_dir = cli.skill_dir.clone();
     let draft_skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap_or_default();
+    // LinkedIn voyager client is optional. Present iff we can load auth; if
+    // the file is missing or malformed the daemon stays up and just can't
+    // send LinkedIn replies (Gmail-only mode).
+    let linkedin = load_linkedin_client(&repo_root);
+
     let approver = Arc::new(ReplyApprover {
         store,
         gmail,
+        linkedin,
         reasoner: Arc::clone(&reasoner),
         draft_skill,
         wiki_root: cli.wiki_dir.clone(),
@@ -797,3 +992,135 @@ fn build_channel(
     };
     Ok(GmailChannel::new(store, gmail, reasoner, broker, config))
 }
+
+fn build_linkedin_channel(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<LinkedInChannel<VoyagerClient, ClaudeCliReasoner>> {
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let path = default_auth_path(&repo_root);
+    let auth = LinkedInAuth::load(&path).with_context(|| {
+        format!(
+            "load linkedin auth at {} — run `augmentagent linkedin login --cookies-json <file>`",
+            path.display()
+        )
+    })?;
+    let member_urn = auth.member_urn.clone();
+    let voyager = Arc::new(VoyagerClient::new(auth));
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+
+    let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
+        Some(root) => {
+            let schema = cli
+                .wiki_schema
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("schema/wiki-skill.md"));
+            (Some(root.clone()), Some(schema))
+        }
+        None => (None, None),
+    };
+
+    let poll_interval = match std::env::var("AUGMENTAGENT_LINKEDIN_POLL_SECS") {
+        Ok(s) => s
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .unwrap_or_else(|_| Duration::from_secs(DEFAULT_POLL_SECS)),
+        Err(_) => Duration::from_secs(DEFAULT_POLL_SECS),
+    };
+
+    let config = LinkedInChannelConfig {
+        poll_interval,
+        dry_run,
+        wiki_root,
+        wiki_schema_path,
+        skill_dir: cli.skill_dir.clone(),
+    };
+    info!(member = %member_urn, interval_secs = poll_interval.as_secs(), "linkedin channel ready");
+    Ok(LinkedInChannel::new(
+        store, voyager, reasoner, broker, member_urn, config,
+    ))
+}
+
+/// Best-effort load of the voyager client from the default auth path. None
+/// when the auth file is missing or invalid — callers treat this as
+/// "LinkedIn disabled for this run".
+fn load_linkedin_client(repo_root: &std::path::Path) -> Option<Arc<VoyagerClient>> {
+    let path = default_auth_path(repo_root);
+    match LinkedInAuth::load(&path) {
+        Ok(auth) => Some(Arc::new(VoyagerClient::new(auth))),
+        Err(e) => {
+            info!(
+                "linkedin auth not loaded from {}: {e} (linkedin send disabled this run)",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+async fn run_linkedin_login(cookies_json: PathBuf) -> Result<()> {
+    let raw = std::fs::read_to_string(&cookies_json)
+        .with_context(|| format!("read cookies file at {}", cookies_json.display()))?;
+    let mut auth: LinkedInAuth = serde_json::from_str(&raw)
+        .with_context(|| "parse cookies JSON")?;
+    auth.validate()
+        .with_context(|| "cookie file missing required fields")?;
+    // Stamp harvested_at_ms unless the file already had a value.
+    if auth.harvested_at_ms == 0 {
+        auth.harvested_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+    }
+
+    // Probe voyager once to validate cookies before persisting. Avoids
+    // writing a broken auth file that would only surface at poll time.
+    let voyager = VoyagerClient::new(auth.clone());
+    match voyager.fetch_recent_dms().await {
+        Ok(dms) => info!(thread_count = dms.len(), "linkedin cookie probe OK"),
+        Err(e) => anyhow::bail!("cookie probe failed: {e}; aborting save"),
+    }
+
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let out = default_auth_path(&repo_root);
+    auth.save(&out)
+        .with_context(|| format!("save auth to {}", out.display()))?;
+    println!("linkedin auth saved to {}", out.display());
+    println!("member: {}", auth.member_urn);
+    Ok(())
+}
+
+async fn run_linkedin_recent() -> Result<()> {
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let path = default_auth_path(&repo_root);
+    let auth = LinkedInAuth::load(&path)
+        .with_context(|| format!("load linkedin auth at {}", path.display()))?;
+    let voyager = VoyagerClient::new(auth.clone());
+    let dms = voyager.fetch_recent_dms().await.context("fetch DMs")?;
+
+    let me = &auth.member_urn;
+    println!("{} threads\n", dms.len());
+    for (i, dm) in dms.iter().take(15).enumerate() {
+        let arrow = if dm.is_outbound(me) { "you →" } else { "peer →" };
+        let snippet: String = dm.text.chars().take(100).collect();
+        println!(
+            "[{:>2}] {}  {}\n     {} {}",
+            i + 1,
+            chrono::DateTime::<chrono::Local>::from(
+                std::time::UNIX_EPOCH + Duration::from_millis(dm.delivered_at_ms as u64)
+            )
+            .format("%Y-%m-%d %H:%M"),
+            dm.peer_name,
+            arrow,
+            snippet,
+        );
+    }
+    Ok(())
+}
+
+/// Compile-fences to prove prefix constant is referenced (silence dead-code
+/// warning in the unlikely event it's not pulled in elsewhere).
+#[allow(dead_code)]
+const _LINKEDIN_PREFIX: &str = ACCOUNT_PREFIX;
