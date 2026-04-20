@@ -86,6 +86,11 @@ enum Cmd {
         #[command(subcommand)]
         op: GmailOp,
     },
+    /// Resume ingestion — one-shot seed of the wiki from the user's CV.
+    Resume {
+        #[command(subcommand)]
+        op: ResumeOp,
+    },
 }
 
 #[derive(Subcommand)]
@@ -104,6 +109,17 @@ enum GmailOp {
         /// Also include the email body in the output.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         full: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ResumeOp {
+    /// Parse a resume file and seed the wiki with an `about/me.md` and
+    /// stub `people/<slug>.md` pages for every named contact.
+    Ingest {
+        /// Path to the resume. Supported: .txt, .md, .pdf (requires `pdftotext`).
+        #[arg(long)]
+        file: PathBuf,
     },
 }
 
@@ -191,6 +207,9 @@ async fn main() -> Result<()> {
             GmailOp::Search { query, limit, full } => {
                 run_gmail_search(store, query.clone(), *limit, *full).await
             }
+        },
+        Cmd::Resume { ref op } => match op {
+            ResumeOp::Ingest { file } => run_resume_ingest(&cli, file.clone()).await,
         },
     }
 }
@@ -356,6 +375,71 @@ async fn post_digest_to_discord(digest: &str) -> Result<()> {
             .context("discord send_message")?;
     }
     Ok(())
+}
+
+async fn run_resume_ingest(cli: &Cli, file: PathBuf) -> Result<()> {
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for resume ingest")?;
+    if !wiki_root.is_dir() {
+        anyhow::bail!(
+            "wiki dir {} does not exist — run `augmentagent wiki lint` once or create it first",
+            wiki_root.display()
+        );
+    }
+
+    let text = extract_resume_text(&file)?;
+    if text.trim().is_empty() {
+        anyhow::bail!("resume at {} produced empty text", file.display());
+    }
+
+    let opts = augmentagent_channel_email::reasoner::resume_opts(wiki_root.clone());
+    let user_msg = format!(
+        "Seed the wiki from this resume. Today's date: {today}. Follow the procedure in your system prompt exactly.\n\n<resume>\n{text}\n</resume>\n",
+        today = chrono::Local::now().format("%Y-%m-%d"),
+        text = text,
+    );
+
+    info!(wiki = %wiki_root.display(), file = %file.display(), "running resume ingest");
+    let reasoner = ClaudeCliReasoner::new();
+    let report = reasoner.call(&opts, &user_msg).await?;
+    println!("{report}");
+    Ok(())
+}
+
+fn extract_resume_text(path: &std::path::Path) -> Result<String> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "txt" | "md" => std::fs::read_to_string(path)
+            .with_context(|| format!("read resume at {}", path.display())),
+        "pdf" => {
+            // Shell out to `pdftotext` (poppler-utils). Avoids a PDF crate
+            // dependency; pdftotext is already installed on most Linuxes and
+            // on macOS via brew.
+            use std::process::Command;
+            let output = Command::new("pdftotext")
+                .arg(path)
+                .arg("-") // stdout
+                .output()
+                .with_context(|| {
+                    "pdftotext missing — install via `apt install poppler-utils` (Ubuntu) or `brew install poppler` (macOS)"
+                })?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("pdftotext failed: {stderr}");
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        _ => anyhow::bail!(
+            "unsupported resume extension '{}' — use .txt, .md, or .pdf",
+            ext
+        ),
+    }
 }
 
 async fn run_wiki_ask(cli: &Cli, question: String) -> Result<()> {
