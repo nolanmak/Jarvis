@@ -97,6 +97,11 @@ pub struct ReasonerOpts {
     /// Write/Edit to a specific subtree (e.g. wiki root) so accidental writes
     /// can't escape into the source tree.
     pub cwd: Option<PathBuf>,
+    /// Extra env vars to set on the spawned Claude CLI process. Inherited by
+    /// any sub-processes Claude itself spawns (e.g. `augmentagent gmail
+    /// search`). Used to pass `AUGMENTAGENT_DB` so sub-CLIs find the db even
+    /// when `cwd` is pinned to a sibling directory like the wiki root.
+    pub env: Vec<(String, String)>,
 }
 
 /// Trait the channel uses to reach Claude. Test doubles stub this.
