@@ -22,11 +22,15 @@ use uuid::Uuid;
 use crate::auth::LinkedInAuth;
 use crate::types::{Dm, MemberUrn};
 
-/// queryId as observed in captures on 2026-04-19. If LinkedIn rotates it,
-/// override via `AUGMENTAGENT_LINKEDIN_CONVERSATIONS_QUERY_ID` without a
-/// recompile.
+/// Cold-start queryId (no `syncToken` variable needed). Observed in captures
+/// on 2026-04-19. LinkedIn has a *separate* queryId for incremental-sync
+/// follow-ups (`74c17e85...`) that requires a syncToken; we use the cold
+/// variant since each poll is independent — a 4h cadence means there's
+/// nothing meaningful to incrementally sync against. If LinkedIn rotates
+/// either id, override via `AUGMENTAGENT_LINKEDIN_CONVERSATIONS_QUERY_ID`
+/// without a recompile.
 pub const DEFAULT_CONVERSATIONS_QUERY_ID: &str =
-    "messengerConversations.74c17e85611b60b7ba2700481151a316";
+    "messengerConversations.0d5e6781bbee71c3e51c8843c6519f48";
 
 #[derive(Debug, Error)]
 pub enum LinkedInError {
