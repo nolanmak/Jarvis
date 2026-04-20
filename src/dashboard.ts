@@ -1,6 +1,10 @@
-import { Router } from "express";
-import { exec } from "child_process";
+import { Router, Request } from "express";
+import { exec, spawn } from "child_process";
 import crypto from "crypto";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import multer from "multer";
 import Composio from "@composio/client";
 import {
   getActions,
@@ -485,5 +489,140 @@ router.post("/api/webhook/github", (req, res) => {
     }
   });
 });
+
+// --- Resume ingestion ---
+// One-shot seeding of the wiki from the user's CV. Hands the uploaded file to
+// the Rust CLI's `resume ingest` subcommand which drives a Claude call that
+// writes `about/me.md` + stub `people/<slug>.md` pages.
+
+const RESUME_TMP_DIR = path.join(os.tmpdir(), "augmentagent-resume");
+const resumeUpload = multer({
+  dest: RESUME_TMP_DIR,
+  limits: { fileSize: 20 * 1024 * 1024 }, // 20 MB cap
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if ([".pdf", ".txt", ".md"].includes(ext)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`unsupported extension ${ext}; use .pdf, .txt, or .md`));
+    }
+  },
+});
+
+router.get("/resume", (_req, res) => {
+  res.send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Seed wiki from resume — AugmentAgent</title>
+  <style>
+    body { font: 14px/1.5 -apple-system, system-ui, sans-serif; max-width: 640px; margin: 3em auto; padding: 0 1em; color: #222; }
+    h1 { font-size: 1.4em; }
+    .note { background: #f6f6f6; border-left: 3px solid #888; padding: 0.75em 1em; margin: 1.5em 0; font-size: 13px; color: #444; }
+    form { margin-top: 1.5em; }
+    input[type=file] { display: block; margin-bottom: 1em; }
+    button { padding: 0.6em 1.2em; font-size: 14px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>Seed the wiki from your resume</h1>
+  <p>Upload a <code>.pdf</code>, <code>.txt</code>, or <code>.md</code> resume. AugmentAgent will extract durable background facts and seed:</p>
+  <ul>
+    <li><code>wiki/about/me.md</code> — your profile (current roles, background, active priorities)</li>
+    <li><code>wiki/people/&lt;slug&gt;.md</code> — stub pages for each person named in the resume</li>
+  </ul>
+  <div class="note">Run once. Subsequent emails fill in the rest automatically. Claude opts include scoped write access to the wiki root only — nothing outside <code>wiki/</code> can be touched.</div>
+  <form action="/api/resume" method="post" enctype="multipart/form-data">
+    <input type="file" name="resume" accept=".pdf,.txt,.md" required>
+    <button type="submit">Ingest</button>
+  </form>
+</body>
+</html>`);
+});
+
+router.post("/api/resume", resumeUpload.single("resume"), (req, res) => {
+  const file = (req as Request & { file?: Express.Multer.File }).file;
+  if (!file) {
+    res.status(400).send("no file uploaded");
+    return;
+  }
+
+  // multer gives us a tmp path without the original extension. Rename to
+  // preserve extension so the Rust CLI picks the right parser.
+  const originalExt = path.extname(file.originalname).toLowerCase();
+  const finalPath = path.join(RESUME_TMP_DIR, `resume-${Date.now()}${originalExt}`);
+  try {
+    fs.renameSync(file.path, finalPath);
+  } catch (e) {
+    res.status(500).send(`failed to stage resume file: ${(e as Error).message}`);
+    return;
+  }
+
+  const repoRoot = process.cwd();
+  const wikiDir = process.env.AUGMENTAGENT_WIKI_DIR || path.join(repoRoot, "wiki");
+  const binPath = path.join(repoRoot, "target/release/augmentagent");
+
+  const args = ["--wiki-dir", wikiDir, "resume", "ingest", "--file", finalPath];
+  const child = spawn(binPath, args, { cwd: repoRoot });
+
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (d) => (stdout += d.toString()));
+  child.stderr.on("data", (d) => (stderr += d.toString()));
+
+  // Generous ceiling — Opus ingest of a full CV can take ~60-90s.
+  const timeout = setTimeout(() => {
+    child.kill("SIGKILL");
+  }, 180_000);
+
+  child.on("close", (code) => {
+    clearTimeout(timeout);
+    try {
+      fs.unlinkSync(finalPath);
+    } catch {
+      /* best-effort cleanup */
+    }
+
+    if (code !== 0) {
+      res
+        .status(500)
+        .type("text/html")
+        .send(
+          `<h1>Ingest failed (exit ${code})</h1><h2>stderr</h2><pre>${escapeHtml(stderr)}</pre><h2>stdout</h2><pre>${escapeHtml(stdout)}</pre>`,
+        );
+      return;
+    }
+
+    // Claude ends its response with `wrote: path1, path2, ...`. Pull that line out.
+    const wroteLine =
+      stdout
+        .split("\n")
+        .map((l) => l.trim())
+        .reverse()
+        .find((l) => l.toLowerCase().startsWith("wrote:")) || "(no wrote: line found)";
+
+    res.type("text/html").send(
+      `<!doctype html><html><body style="font: 14px/1.5 -apple-system, system-ui, sans-serif; max-width: 640px; margin: 3em auto;">
+  <h1>Resume ingested</h1>
+  <p><strong>${escapeHtml(wroteLine)}</strong></p>
+  <details><summary>Full CLI output</summary><pre>${escapeHtml(stdout)}</pre></details>
+  <p><a href="/resume">Ingest another</a> · <a href="/dashboard">Back to dashboard</a></p>
+</body></html>`,
+    );
+  });
+
+  child.on("error", (e) => {
+    clearTimeout(timeout);
+    res.status(500).send(`failed to spawn resume CLI: ${e.message}`);
+  });
+});
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
 
 export default router;
