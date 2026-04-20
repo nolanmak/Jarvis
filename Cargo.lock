@@ -158,7 +158,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "augmentagent-cli"
+name = "augmentagent-channel-linkedin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -166,9 +166,34 @@ dependencies = [
  "augmentagent-approval-discord",
  "augmentagent-channel-email",
  "augmentagent-store",
+ "augmentagent-wiki",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "augmentagent-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-channel-email",
+ "augmentagent-channel-linkedin",
+ "augmentagent-store",
  "chrono",
  "clap",
  "dotenvy",
+ "serde_json",
  "serenity",
  "tokio",
  "tokio-util",
