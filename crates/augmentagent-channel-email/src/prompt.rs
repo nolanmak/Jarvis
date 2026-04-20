@@ -19,6 +19,13 @@ Tie-break rules:
 - A known person writing personally (professor, friend, colleague, founder, investor) defaults to at least "flag" even if their ask is "just FYI".
 - Automated emails from "no-reply", "notifications", "alerts", "deals", "updates", "newsletter", marketing platforms default to "skip" unless the content is clearly a direct action item.
 
+Using wiki context (when provided):
+- You may be given a short hint pointing at a wiki people/ or threads/ page.
+- If the sender has a wiki page, OPEN IT with the Read tool before deciding. Its Relationship/Tone/Commitments sections are ground truth on how important this person is to the user — weight the decision accordingly.
+- A message from someone with a documented active-collaborator or close-contact relationship should escalate: skip → flag, or flag → reply.
+- You may Grep/Glob the wiki for project names, organization names, or keywords you see in the subject/body. Useful for catching cases where the sender isn't in the wiki yet but the topic is (e.g. a new contact emailing about a project the user is known to be active on).
+- Prefer wiki-documented context over surface-level pattern matching. "Volunteer sign-up form" from a documented colleague is not the same as the same subject from a stranger.
+
 Return ONLY a single JSON object with this exact shape:
   {"decision": "reply" | "skip" | "flag", "reason": "<one short sentence>"}
 
@@ -84,10 +91,16 @@ impl SkillPrompt {
 }
 
 /// Build the triage user message. Minimal — just the email + any learned
-/// skip/flag patterns. Draft work is deferred to the second call.
-pub fn triage_user_message(email: &Email, learned: &str) -> String {
+/// skip/flag patterns + optional wiki hint. Draft work is deferred to the
+/// second call.
+pub fn triage_user_message(email: &Email, learned: &str, wiki_hint: &str) -> String {
+    let hint_block = if wiki_hint.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\n<wiki_hint>\n{wiki_hint}\n</wiki_hint>")
+    };
     format!(
-        "Classify this email.{learned}\n\n<email>\nFrom: {from}\nSubject: {subject}\nDate: {date}\nMessageId: {message_id}\n\n{body}\n</email>\n",
+        "Classify this email.{learned}{hint_block}\n\n<email>\nFrom: {from}\nSubject: {subject}\nDate: {date}\nMessageId: {message_id}\n\n{body}\n</email>\n",
         from = email.from,
         subject = email.subject,
         date = email.date,
