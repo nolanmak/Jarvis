@@ -148,7 +148,11 @@ impl Reasoner for ClaudeCliReasoner {
 pub fn triage_opts() -> ReasonerOpts {
     ReasonerOpts {
         system_prompt: crate::prompt::TRIAGE_SYSTEM.to_string(),
-        model: Some("claude-haiku-4-5-20251001".into()),
+        // Opus for triage. Haiku was too narrow on "flag" — missed personal
+        // messages from known contacts asking for engagement. Volume is ~70
+        // emails/day so the cost bump is rounding error; this is the most
+        // quality-critical step in the pipeline.
+        model: None,
         allowed_tools: Vec::new(),
         add_dirs: Vec::new(),
         permission_mode: "default".into(),
