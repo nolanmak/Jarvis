@@ -13,7 +13,7 @@ use augmentagent_store::Email;
 
 use crate::event_handler::Handler;
 use crate::layout::{approval_message, flag_notice_message};
-use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, QueryHandler};
+use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, DmMessageHandler, QueryHandler};
 
 #[derive(Clone)]
 pub struct DiscordConfig {
@@ -30,6 +30,10 @@ pub struct DiscordConfig {
     pub query_handler: Option<Arc<dyn QueryHandler>>,
     /// Handles Approve / Revise / Skip clicks. `None` silently ignores.
     pub action_handler: Option<Arc<dyn ApprovalActionHandler>>,
+    /// Handles DMs from users other than the bot owner (`allowed_user_id`).
+    /// `None` = incoming DMs from non-owners are silently dropped (matches
+    /// pre-#9 behavior).
+    pub dm_message_handler: Option<Arc<dyn DmMessageHandler>>,
 }
 
 pub(crate) struct BrokerState {
@@ -39,6 +43,7 @@ pub(crate) struct BrokerState {
     pub(crate) allowed_user_id: Option<UserId>,
     pub(crate) query_handler: Option<Arc<dyn QueryHandler>>,
     pub(crate) action_handler: Option<Arc<dyn ApprovalActionHandler>>,
+    pub(crate) dm_message_handler: Option<Arc<dyn DmMessageHandler>>,
     pub(crate) approval_channel_id: ChannelId,
     /// Populated once, from the first `Ready` event. Used to distinguish the
     /// bot's own messages from the user's when building conversation context.
@@ -46,12 +51,14 @@ pub(crate) struct BrokerState {
 }
 
 impl BrokerState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         approval_channel_id: ChannelId,
         query_channel_id: Option<ChannelId>,
         allowed_user_id: Option<UserId>,
         query_handler: Option<Arc<dyn QueryHandler>>,
         action_handler: Option<Arc<dyn ApprovalActionHandler>>,
+        dm_message_handler: Option<Arc<dyn DmMessageHandler>>,
     ) -> Self {
         Self {
             ready: Arc::new(Notify::new()),
@@ -60,6 +67,7 @@ impl BrokerState {
             allowed_user_id,
             query_handler,
             action_handler,
+            dm_message_handler,
             approval_channel_id,
             bot_user_id: std::sync::OnceLock::new(),
         }
@@ -96,10 +104,14 @@ impl DiscordApprovalBroker {
             config.allowed_user_id.map(UserId::new),
             config.query_handler.clone(),
             config.action_handler.clone(),
+            config.dm_message_handler.clone(),
         ));
 
         let mut intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES;
-        if config.query_handler.is_some() {
+        // Both features need the privileged intents: MESSAGE_CONTENT to read
+        // the body, DIRECT_MESSAGES to receive DMs at all. Enable if either is
+        // wired.
+        if config.query_handler.is_some() || config.dm_message_handler.is_some() {
             intents |= GatewayIntents::MESSAGE_CONTENT | GatewayIntents::DIRECT_MESSAGES;
         }
 
@@ -123,6 +135,7 @@ impl DiscordApprovalBroker {
         info!(
             query_enabled = config.query_handler.is_some(),
             action_enabled = config.action_handler.is_some(),
+            dm_handler_enabled = config.dm_message_handler.is_some(),
             "discord approval broker online"
         );
 
