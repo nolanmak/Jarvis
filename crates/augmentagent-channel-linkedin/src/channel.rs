@@ -182,6 +182,13 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
         if self.store.is_email_complete(&email.message_id)? {
             return Ok(None);
         }
+        // A prior poll may have logged an action for this DM (pending, sent,
+        // rejected, etc.). Gate re-triage on action presence so we don't
+        // stack duplicate approval cards across polls — LinkedIn's 4h
+        // cadence makes this a real problem vs Gmail's 2min.
+        if self.store.is_message_processed(&email.message_id)? {
+            return Ok(None);
+        }
 
         // --- TRIAGE (Opus with optional wiki read) ---
         let triage_opts = triage_opts(self.config.wiki_root.clone());
@@ -553,6 +560,58 @@ mod tests {
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
         // The email is NOT complete until the user clicks approve.
         assert!(!store.is_email_complete("m-reply").unwrap());
+    }
+
+    #[tokio::test]
+    async fn dm_with_prior_action_is_skipped() {
+        // Regression for the Dana HtetAung duplicate-cards bug: the LinkedIn
+        // channel was re-triaging and re-posting cards on every poll while
+        // the previous action was still pending. Simulate a second poll
+        // against a DM that already has a pending action: the reasoner
+        // should not be called and no new card should be posted.
+        let (store, _f) = tmp_store();
+        // Seed a pending action for the DM we're about to poll on.
+        let dm = sample_dm("m-dupe");
+        let email = dm.clone().into_email("urn:li:fsd_profile:ME");
+        store.upsert_email(&email).unwrap();
+        store
+            .log_action(
+                &email.message_id,
+                email.thread_id.as_deref(),
+                &email.from,
+                &email.subject,
+                Some(&email.body),
+                Some("previously-drafted text"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+
+        let api = Arc::new(StubApi { dms: vec![dm] });
+        // Empty reasoner queue — if handle_dm wrongly proceeds past the gate
+        // it'll try to pop a response and we assert the queue stayed empty.
+        let reasoner = Arc::new(ScriptedReasoner::new([]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = LinkedInChannel::new(
+            store.clone(),
+            api,
+            reasoner.clone(),
+            broker.clone(),
+            "urn:li:fsd_profile:ME".into(),
+            LinkedInChannelConfig {
+                dry_run: false,
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.dms_checked, 1);
+        assert_eq!(out.awaiting_approval, 0);
+        assert_eq!(out.flagged, 0);
+        assert_eq!(out.skipped, 0);
+        // No new approval card posted on top of the existing pending action.
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+        // Reasoner was never called (queue started empty, stayed empty).
+        assert!(reasoner.responses.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
