@@ -26,10 +26,23 @@ key: <slug matching filename>
 created: <ISO date>
 updated: <ISO date>
 sources: [<messageId>, ...]   # cite every message that contributed
+identities:                    # person pages only; optional, omit block if empty
+  email: [<addr>, ...]         # array — people often use multiple addresses
+  linkedin: <urn>              # scalar — one account per platform is the norm
+  discord: "<snowflake>"       # quote numeric IDs so YAML parses them as strings
+  twitter: <handle>
+  slack: <workspace-user-id>
+  whatsapp: "<phone>"
+  instagram: <handle>
 ---
 ```
 
-**people/`<slug>`.md** — One page per email address.
+**people/`<slug>`.md** — One page per person. The filename slug is derived from a primary email, but the `identities:` block is authoritative for cross-platform routing.
+
+**Populating `identities:`**
+- Always include the sender's email address in `identities.email` when creating the page.
+- When a later message arrives from the same person on a different platform (e.g. a Discord DM whose user's known email is already on a page), append that platform's ID to the existing page's `identities:` block. Update `updated:` accordingly. Do not create a new page.
+- When in doubt whether two identities belong to the same person, keep them on separate pages — wrongly merging is harder to undo than leaving duplicates.
 
 Sections (create only the ones you have content for):
 
