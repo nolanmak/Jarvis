@@ -41,7 +41,13 @@ pub enum AuthError {
     MissingCookie(&'static str),
     #[error("invalid: {0}")]
     Invalid(String),
+    #[error("keychain: {0}")]
+    Keychain(#[from] augmentagent_auth::AuthError),
 }
+
+/// Keychain platform namespace. Combined with [`augmentagent_auth::DEFAULT_ACCOUNT`]
+/// to form the single LinkedIn credential slot (`augmentagent/linkedin/default`).
+pub const KEYCHAIN_PLATFORM: &str = "linkedin";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkedInAuth {
@@ -115,6 +121,61 @@ impl LinkedInAuth {
             .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join("; ")
+    }
+
+    /// Read LinkedIn credentials from macOS Keychain at
+    /// `augmentagent/linkedin/default`.
+    pub fn load_from_keychain() -> Result<Self, AuthError> {
+        let bytes = augmentagent_auth::Auth::get(
+            KEYCHAIN_PLATFORM,
+            augmentagent_auth::DEFAULT_ACCOUNT,
+        )?;
+        let parsed: LinkedInAuth = serde_json::from_slice(&bytes)?;
+        parsed.validate()?;
+        Ok(parsed)
+    }
+
+    /// Write LinkedIn credentials to macOS Keychain at
+    /// `augmentagent/linkedin/default`.
+    pub fn save_to_keychain(&self) -> Result<(), AuthError> {
+        let bytes = serde_json::to_vec(self)?;
+        augmentagent_auth::Auth::put(
+            KEYCHAIN_PLATFORM,
+            augmentagent_auth::DEFAULT_ACCOUNT,
+            &bytes,
+        )?;
+        Ok(())
+    }
+
+    /// Load from Keychain first; fall back to the legacy auth file under
+    /// [`default_auth_path`]. On a successful file-fallback hit, promote the
+    /// credentials into Keychain so subsequent loads skip the file entirely.
+    ///
+    /// Callers should prefer this over [`load`] so existing single-user
+    /// deployments migrate to Keychain on their first poll after this ships.
+    pub fn load_with_migration(repo_root: &Path) -> Result<Self, AuthError> {
+        match Self::load_from_keychain() {
+            Ok(auth) => {
+                tracing::debug!("linkedin auth loaded from keychain");
+                Ok(auth)
+            }
+            Err(AuthError::Keychain(augmentagent_auth::AuthError::NotFound { .. })) => {
+                let path = default_auth_path(repo_root);
+                let auth = Self::load(&path)?;
+                match auth.save_to_keychain() {
+                    Ok(()) => tracing::info!(
+                        from = %path.display(),
+                        "linkedin auth migrated to keychain from legacy file",
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "linkedin auth loaded from file but keychain write failed; will retry next boot",
+                    ),
+                }
+                Ok(auth)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
