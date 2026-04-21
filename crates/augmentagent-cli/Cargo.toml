@@ -15,9 +15,7 @@ augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-channel-core = { path = "../augmentagent-channel-core" }
 augmentagent-channel-email = { path = "../augmentagent-channel-email" }
 augmentagent-channel-linkedin = { path = "../augmentagent-channel-linkedin" }
-augmentagent-channel-discord-dm = { path = "../augmentagent-channel-discord-dm" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
-augmentagent-wiki = { path = "../augmentagent-wiki" }
 
 async-trait = { workspace = true }
 serenity = { workspace = true }
