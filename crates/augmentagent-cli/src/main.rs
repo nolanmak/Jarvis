@@ -1001,12 +1001,8 @@ fn build_linkedin_channel(
     dry_run: bool,
 ) -> Result<LinkedInChannel<VoyagerClient, ClaudeCliReasoner>> {
     let repo_root = std::env::current_dir().context("current_dir")?;
-    let path = default_auth_path(&repo_root);
-    let auth = LinkedInAuth::load(&path).with_context(|| {
-        format!(
-            "load linkedin auth at {} — run `augmentagent linkedin login --cookies-json <file>`",
-            path.display()
-        )
+    let auth = LinkedInAuth::load_with_migration(&repo_root).with_context(|| {
+        "load linkedin auth from keychain or legacy file — run `augmentagent linkedin login --cookies-json <file>`"
     })?;
     let member_urn = auth.member_urn.clone();
     let voyager = Arc::new(VoyagerClient::new(auth));
@@ -1044,17 +1040,15 @@ fn build_linkedin_channel(
     ))
 }
 
-/// Best-effort load of the voyager client from the default auth path. None
-/// when the auth file is missing or invalid — callers treat this as
-/// "LinkedIn disabled for this run".
+/// Best-effort load of the voyager client. None when neither Keychain nor the
+/// legacy file has credentials — callers treat this as "LinkedIn disabled for
+/// this run".
 fn load_linkedin_client(repo_root: &std::path::Path) -> Option<Arc<VoyagerClient>> {
-    let path = default_auth_path(repo_root);
-    match LinkedInAuth::load(&path) {
+    match LinkedInAuth::load_with_migration(repo_root) {
         Ok(auth) => Some(Arc::new(VoyagerClient::new(auth))),
         Err(e) => {
             info!(
-                "linkedin auth not loaded from {}: {e} (linkedin send disabled this run)",
-                path.display()
+                "linkedin auth not loaded (keychain + legacy file): {e} (linkedin send disabled this run)"
             );
             None
         }
@@ -1088,16 +1082,22 @@ async fn run_linkedin_login(cookies_json: PathBuf) -> Result<()> {
     let out = default_auth_path(&repo_root);
     auth.save(&out)
         .with_context(|| format!("save auth to {}", out.display()))?;
-    println!("linkedin auth saved to {}", out.display());
+    // Belt-and-suspenders during the Keychain transition: write to both. The
+    // file path is the legacy fallback that `load_with_migration` consults;
+    // the Keychain entry is what production loads go through from now on.
+    // First-time Keychain writes trigger a macOS permission prompt — click
+    // "Always Allow" so subsequent boots don't re-prompt.
+    auth.save_to_keychain()
+        .context("save auth to keychain (augmentagent/linkedin/default)")?;
+    println!("linkedin auth saved to {} + keychain (augmentagent/linkedin/default)", out.display());
     println!("member: {}", auth.member_urn);
     Ok(())
 }
 
 async fn run_linkedin_recent() -> Result<()> {
     let repo_root = std::env::current_dir().context("current_dir")?;
-    let path = default_auth_path(&repo_root);
-    let auth = LinkedInAuth::load(&path)
-        .with_context(|| format!("load linkedin auth at {}", path.display()))?;
+    let auth = LinkedInAuth::load_with_migration(&repo_root)
+        .context("load linkedin auth from keychain or legacy file")?;
     let voyager = VoyagerClient::new(auth.clone());
     let dms = voyager.fetch_recent_dms().await.context("fetch DMs")?;
 
