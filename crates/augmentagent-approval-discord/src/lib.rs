@@ -22,6 +22,12 @@ use thiserror::Error;
 
 /// Outcome of an approval-action handler call. Drives the Discord ack shown
 /// to the user.
+///
+/// `Revised` carries a full Email for card re-posting; other variants are
+/// small. Boxing would ripple through every construction + pattern match,
+/// and this enum is constructed once per user click — variant-size
+/// imbalance isn't worth the churn.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ApprovalActionOutcome {
     /// No such action in the db.
