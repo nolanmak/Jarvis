@@ -58,6 +58,8 @@ impl Dm {
             body: self.text,
             date,
             account_entity_id: Some(account_entity_id),
+            platform: "linkedin".into(),
+            kind: "dm".into(),
         }
     }
 }
@@ -138,6 +140,8 @@ mod tests {
             body: "b".into(),
             date: "d".into(),
             account_entity_id: Some("composio-acc1".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
         };
         assert!(!is_linkedin_email(&email));
     }
