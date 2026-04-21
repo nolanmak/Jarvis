@@ -14,11 +14,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use augmentagent_approval_discord::ApprovalBroker;
-use augmentagent_channel_email::decision::{parse as parse_decision, DecisionKind};
-use augmentagent_channel_email::ingest::{spawn_ingest, IngestTrigger};
-use augmentagent_channel_email::prompt::{draft_user_message, triage_user_message};
-use augmentagent_channel_email::reasoner::{draft_opts, triage_opts};
-use augmentagent_channel_email::Reasoner;
+use augmentagent_channel_core::decision::{parse as parse_decision, DecisionKind};
+use augmentagent_channel_core::ingest::{spawn_ingest, IngestTrigger};
+use augmentagent_channel_core::prompt::{draft_user_message, triage_user_message};
+use augmentagent_channel_core::reasoner::{draft_opts, triage_opts};
+use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{ActionStatus, Store, TriageResult};
 
 use crate::api::{LinkedInApi, LinkedInError};
@@ -380,7 +380,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use augmentagent_approval_discord::{ApprovalBroker, ApprovalError};
-    use augmentagent_channel_email::{Reasoner, ReasonerOpts};
+    use augmentagent_channel_core::{Reasoner, ReasonerOpts};
     use augmentagent_store::Email;
 
     use crate::api::LinkedInError;

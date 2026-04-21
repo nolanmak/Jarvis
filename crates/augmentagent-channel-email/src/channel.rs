@@ -12,17 +12,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use augmentagent_approval_discord::{ApprovalBroker, NoopBroker};
+use augmentagent_channel_core::decision::{parse as parse_decision, DecisionKind};
+use augmentagent_channel_core::ingest::{spawn_ingest, IngestTrigger};
+use augmentagent_channel_core::prompt::{draft_user_message, triage_user_message, SkillPrompt, TRIAGE_SYSTEM};
+use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{ActionStatus, RetryableReply, Store, TriageResult};
 
-use crate::decision::{parse as parse_decision, DecisionKind};
 use crate::gmail::GmailApi;
-use crate::ingest::{spawn_ingest, IngestTrigger};
-use crate::prompt::{draft_user_message, triage_user_message, SkillPrompt, TRIAGE_SYSTEM};
 
 #[derive(Clone, Debug)]
 pub struct GmailChannelConfig {
@@ -81,33 +81,6 @@ pub struct PollOutcome {
     pub replied_dry_run: usize,
     pub awaiting_approval: usize,
     pub errors: usize,
-}
-
-/// Per-call options for a `Reasoner`. Each call type (triage, draft, ingest)
-/// gets a different preset — see `crate::reasoner::ReasonerOpts::triage`,
-/// `::draft`, `::ingest`.
-#[derive(Debug, Clone)]
-pub struct ReasonerOpts {
-    pub system_prompt: String,
-    pub model: Option<String>,
-    pub allowed_tools: Vec<String>,
-    pub add_dirs: Vec<PathBuf>,
-    pub permission_mode: String,
-    /// Override the spawned Claude CLI's working directory. Useful to scope
-    /// Write/Edit to a specific subtree (e.g. wiki root) so accidental writes
-    /// can't escape into the source tree.
-    pub cwd: Option<PathBuf>,
-    /// Extra env vars to set on the spawned Claude CLI process. Inherited by
-    /// any sub-processes Claude itself spawns (e.g. `augmentagent gmail
-    /// search`). Used to pass `AUGMENTAGENT_DB` so sub-CLIs find the db even
-    /// when `cwd` is pinned to a sibling directory like the wiki root.
-    pub env: Vec<(String, String)>,
-}
-
-/// Trait the channel uses to reach Claude. Test doubles stub this.
-#[async_trait]
-pub trait Reasoner: Send + Sync {
-    async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String>;
 }
 
 pub struct GmailChannel<G: GmailApi, R: Reasoner> {
@@ -651,6 +624,7 @@ const _TRIAGE_SYSTEM_REF: &str = TRIAGE_SYSTEM;
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use augmentagent_channel_core::ReasonerOpts;
     use augmentagent_store::Email;
 
     struct StubGmail {

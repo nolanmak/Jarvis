@@ -10,9 +10,8 @@ use std::sync::Arc;
 use augmentagent_store::Email;
 use tracing::{debug, warn};
 
-use crate::channel::Reasoner;
 use crate::decision::DecisionKind;
-use crate::reasoner::ingest_opts;
+use crate::reasoner::{ingest_opts, Reasoner};
 
 /// What the ingest call should know about the outcome of the surrounding flow.
 /// Drives the log.md entry and any commitment tracking.

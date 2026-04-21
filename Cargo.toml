@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/augmentagent-store",
+    "crates/augmentagent-channel-core",
     "crates/augmentagent-channel-email",
     "crates/augmentagent-channel-linkedin",
     "crates/augmentagent-approval-discord",
