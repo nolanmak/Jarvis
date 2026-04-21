@@ -5,10 +5,12 @@
 //! `augmentagent-channel-email` drive the Claude spawns; this crate only
 //! knows *where* files go and how to name them.
 
+pub mod identity;
 pub mod layout;
 pub mod reader;
 pub mod slug;
 
+pub use identity::{Identities, IdentityIndex, PersonPage};
 pub use layout::WikiLayout;
 pub use reader::WikiReader;
 pub use slug::slug_from_email;
