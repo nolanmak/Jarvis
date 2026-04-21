@@ -13,9 +13,10 @@ use augmentagent_approval_discord::{
     ApprovalActionHandler, ApprovalActionOutcome, ApprovalBroker, DiscordApprovalBroker,
     DiscordConfig, NoopBroker, QueryHandler,
 };
+use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
+use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
 use augmentagent_channel_email::gmail::{ComposioClient, GmailApi};
-use augmentagent_channel_email::reasoner::{ask_opts, digest_opts, draft_opts};
-use augmentagent_channel_email::{ClaudeCliReasoner, GmailChannel, GmailChannelConfig, Reasoner};
+use augmentagent_channel_email::{GmailChannel, GmailChannelConfig};
 use augmentagent_channel_linkedin::{
     default_auth_path, is_linkedin_email, LinkedInApi, LinkedInAuth, LinkedInChannel,
     LinkedInChannelConfig, VoyagerClient, ACCOUNT_PREFIX, DEFAULT_POLL_SECS,
@@ -466,7 +467,7 @@ async fn run_resume_ingest(cli: &Cli, file: PathBuf) -> Result<()> {
         anyhow::bail!("resume at {} produced empty text", file.display());
     }
 
-    let opts = augmentagent_channel_email::reasoner::resume_opts(wiki_root.clone());
+    let opts = augmentagent_channel_core::reasoner::resume_opts(wiki_root.clone());
     let user_msg = format!(
         "Seed the wiki from this resume. Today's date: {today}. Follow the procedure in your system prompt exactly.\n\n<resume>\n{text}\n</resume>\n",
         today = chrono::Local::now().format("%Y-%m-%d"),
@@ -522,7 +523,7 @@ async fn run_wiki_ask(cli: &Cli, question: String) -> Result<()> {
 
     let reasoner = ClaudeCliReasoner::new();
     let repo_root = std::env::current_dir().context("current_dir")?;
-    let opts = augmentagent_channel_email::reasoner::ask_opts(wiki_root.clone(), repo_root);
+    let opts = augmentagent_channel_core::reasoner::ask_opts(wiki_root.clone(), repo_root);
     info!(wiki = %wiki_root.display(), "wiki ask");
     let answer = reasoner.call(&opts, &question).await?;
     println!("{answer}");
@@ -542,7 +543,7 @@ async fn run_wiki_lint(cli: &Cli, out: Option<PathBuf>) -> Result<()> {
         .with_context(|| format!("read schema at {}", schema_path.display()))?;
 
     let reasoner = ClaudeCliReasoner::new();
-    let opts = augmentagent_channel_email::reasoner::lint_opts(schema, wiki_root.clone());
+    let opts = augmentagent_channel_core::reasoner::lint_opts(schema, wiki_root.clone());
     let user_msg = format!(
         "Run the lint workflow from your system prompt against the wiki at `{}`. Produce a markdown report listing findings by category (contradictions, orphans, stale, missing pages, broken links). Use relative paths. End with a short summary line.\n",
         wiki_root.display()
@@ -670,7 +671,7 @@ impl ReplyApprover {
         // text, update the action row, and re-post the card.
         let previous_draft = action.action.draft_body.clone().unwrap_or_default();
         let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
-        let prompt = augmentagent_channel_email::prompt::redraft_message(
+        let prompt = augmentagent_channel_core::prompt::redraft_message(
             &action.email,
             &previous_draft,
             feedback,
@@ -818,7 +819,7 @@ impl ApprovalActionHandler for ReplyApprover {
         // 1. Generate revised draft via reasoner.
         let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
         let prompt =
-            augmentagent_channel_email::prompt::redraft_message(&action.email, &previous_draft, feedback);
+            augmentagent_channel_core::prompt::redraft_message(&action.email, &previous_draft, feedback);
         let redraft = match self.reasoner.call(&opts, &prompt).await {
             Ok(s) => s.trim().to_string(),
             Err(e) => {

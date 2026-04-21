@@ -138,12 +138,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-channel-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-store",
+ "augmentagent-wiki",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "augmentagent-channel-email"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "augmentagent-approval-discord",
+ "augmentagent-channel-core",
  "augmentagent-store",
  "augmentagent-wiki",
  "reqwest",
@@ -164,7 +182,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "augmentagent-approval-discord",
- "augmentagent-channel-email",
+ "augmentagent-channel-core",
  "augmentagent-store",
  "augmentagent-wiki",
  "reqwest",
@@ -187,6 +205,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "augmentagent-approval-discord",
+ "augmentagent-channel-core",
  "augmentagent-channel-email",
  "augmentagent-channel-linkedin",
  "augmentagent-store",
