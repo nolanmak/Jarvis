@@ -1,5 +1,5 @@
 [package]
-name = "augmentagent-channel-email"
+name = "augmentagent-channel-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,6 @@ repository.workspace = true
 
 [dependencies]
 augmentagent-store = { path = "../augmentagent-store" }
-augmentagent-channel-core = { path = "../augmentagent-channel-core" }
-augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
 
 tokio = { workspace = true }
@@ -20,10 +18,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { workspace = true }
-
-# Dangercat git dep deferred: repo is private; see root Cargo.toml note.
 
 [dev-dependencies]
 tempfile = "3"
-rusqlite = { workspace = true }

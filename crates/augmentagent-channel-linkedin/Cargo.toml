@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
-augmentagent-channel-email = { path = "../augmentagent-channel-email" }
+augmentagent-channel-core = { path = "../augmentagent-channel-core" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
 
 tokio = { workspace = true }
