@@ -44,6 +44,26 @@ impl Store {
         if !column_exists(conn, "actions", "draftId")? {
             conn.execute("ALTER TABLE actions ADD COLUMN draftId TEXT", [])?;
         }
+        if !column_exists(conn, "emails", "platform")? {
+            conn.execute(
+                "ALTER TABLE emails ADD COLUMN platform TEXT NOT NULL DEFAULT 'gmail'",
+                [],
+            )?;
+            // One-shot backfill for pre-platform-column rows: any row whose
+            // accountEntityId looks like a LinkedIn URN is tagged 'linkedin'.
+            // Safe to run once at column-add time — fresh rows from the channels
+            // write their platform directly.
+            conn.execute(
+                "UPDATE emails SET platform = 'linkedin' WHERE accountEntityId LIKE 'urn:li:%'",
+                [],
+            )?;
+        }
+        if !column_exists(conn, "emails", "kind")? {
+            conn.execute(
+                "ALTER TABLE emails ADD COLUMN kind TEXT NOT NULL DEFAULT 'dm'",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -74,8 +94,8 @@ impl Store {
         } else {
             let now = now_millis();
             guard.execute(
-                "INSERT INTO emails (messageId, threadId, fromEmail, subject, body, receivedAt, accountEntityId, firstSeenAt) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO emails (messageId, threadId, fromEmail, subject, body, receivedAt, accountEntityId, firstSeenAt, platform, kind) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     email.message_id,
                     email.thread_id,
@@ -85,6 +105,8 @@ impl Store {
                     email.date,
                     email.account_entity_id,
                     now,
+                    email.platform,
+                    email.kind,
                 ],
             )?;
             Ok(true)
@@ -275,7 +297,7 @@ impl Store {
                    a.id, a.messageId, a.threadId, a.fromEmail, a.subject, \
                    a.originalBody, a.draftBody, a.status, a.errorMessage, \
                    a.createdAt, a.updatedAt, COALESCE(a.retryCount, 0), a.draftId, \
-                   e.body, e.receivedAt, e.accountEntityId \
+                   e.body, e.receivedAt, e.accountEntityId, e.platform, e.kind \
                  FROM actions a \
                  LEFT JOIN emails e ON a.messageId = e.messageId \
                  WHERE a.id = ?1",
@@ -305,6 +327,8 @@ impl Store {
                             body: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
                             date: r.get::<_, Option<String>>(14)?.unwrap_or_default(),
                             account_entity_id: r.get::<_, Option<String>>(15)?,
+                            platform: r.get::<_, Option<String>>(16)?.unwrap_or_else(|| "gmail".into()),
+                            kind: r.get::<_, Option<String>>(17)?.unwrap_or_else(|| "dm".into()),
                         },
                     })
                 },
@@ -347,7 +371,7 @@ impl Store {
                a.id, a.messageId, a.threadId, a.fromEmail, a.subject, \
                a.originalBody, a.draftBody, a.status, a.errorMessage, \
                a.createdAt, a.updatedAt, COALESCE(a.retryCount, 0), \
-               e.body, e.receivedAt, e.accountEntityId \
+               e.body, e.receivedAt, e.accountEntityId, e.platform, e.kind \
              FROM actions a \
              JOIN emails e ON a.messageId = e.messageId \
              WHERE a.status = 'error' \
@@ -388,6 +412,8 @@ impl Store {
                         body: r.get::<_, Option<String>>(12)?.unwrap_or_default(),
                         date: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
                         account_entity_id: r.get::<_, Option<String>>(14)?,
+                        platform: r.get::<_, Option<String>>(15)?.unwrap_or_else(|| "gmail".into()),
+                        kind: r.get::<_, Option<String>>(16)?.unwrap_or_else(|| "dm".into()),
                     },
                 })
             },
@@ -503,7 +529,9 @@ mod tests {
                     accountEntityId TEXT,
                     firstSeenAt INTEGER NOT NULL,
                     triageResult TEXT,
-                    agentProcessedAt INTEGER
+                    agentProcessedAt INTEGER,
+                    platform TEXT NOT NULL DEFAULT 'gmail',
+                    kind TEXT NOT NULL DEFAULT 'dm'
                 );
                 CREATE TABLE gmail_accounts (
                     id TEXT PRIMARY KEY,
@@ -530,6 +558,8 @@ mod tests {
             body: "hello".into(),
             date: "2026-04-13T12:00:00Z".into(),
             account_entity_id: Some("acc".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
         }
     }
 

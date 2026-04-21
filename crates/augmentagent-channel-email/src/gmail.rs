@@ -263,6 +263,8 @@ impl FetchMessage {
             body: self.body.unwrap_or_default(),
             date: self.date.or(self.received_time).unwrap_or_default(),
             account_entity_id: Some(account.to_string()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
         })
     }
 }

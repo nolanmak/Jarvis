@@ -9,6 +9,22 @@ pub struct Email {
     pub body: String,
     pub date: String,
     pub account_entity_id: Option<String>,
+    /// Source platform: `gmail`, `linkedin`, `slack`, `discord`, `whatsapp`, `twitter`, `instagram`.
+    /// Free-form string — no DB CHECK constraint — so new platforms don't require a schema migration.
+    #[serde(default = "default_platform")]
+    pub platform: String,
+    /// Interaction kind: `dm`, `post_reply`, `post_engagement`, `digest_item`.
+    /// Separates reactive 1:1 DMs from proactive feed engagement and read-only digest items.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+}
+
+fn default_platform() -> String {
+    "gmail".into()
+}
+
+fn default_kind() -> String {
+    "dm".into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +63,10 @@ pub enum TriageResult {
     Reply,
     Skip,
     Flag,
+    /// Feed engagement: agent drafts a supportive comment/reaction on a friend's post.
+    Engage,
+    /// Firehose item: ingested for digest roll-up, never prompts the user directly.
+    DigestOnly,
 }
 
 impl TriageResult {
@@ -55,6 +75,8 @@ impl TriageResult {
             Self::Reply => "reply",
             Self::Skip => "skip",
             Self::Flag => "flag",
+            Self::Engage => "engage",
+            Self::DigestOnly => "digest_only",
         }
     }
 }
