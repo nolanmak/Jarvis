@@ -1,0 +1,292 @@
+//! Identity index over `people/*.md` pages.
+//!
+//! Each page may declare an `identities:` block in its YAML front-matter linking
+//! the same person across platforms (email, linkedin urn, discord snowflake, …).
+//! The index walks `people/` once, parses front-matter, and answers
+//! `(platform, id) → PersonPage` queries.
+//!
+//! Scale: hundreds of people pages. Linear scan on lookup is fine; no caching.
+
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+use tracing::warn;
+
+use crate::layout::WikiLayout;
+
+/// Multi-platform identity block lifted from a `people/<slug>.md` front-matter.
+///
+/// `email` is a `Vec<String>` because one person often has multiple addresses.
+/// The other fields are `Option<String>` — one account per platform is the
+/// normal case; upgrade to `Vec` only if that changes.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct Identities {
+    #[serde(default)]
+    pub email: Vec<String>,
+    #[serde(default)]
+    pub linkedin: Option<String>,
+    #[serde(default)]
+    pub discord: Option<String>,
+    #[serde(default)]
+    pub twitter: Option<String>,
+    #[serde(default)]
+    pub slack: Option<String>,
+    #[serde(default)]
+    pub whatsapp: Option<String>,
+    #[serde(default)]
+    pub instagram: Option<String>,
+}
+
+impl Identities {
+    /// `true` if this identity block has an entry for `platform` matching `id`.
+    /// Case-sensitive for IDs (emails are lowercased before comparison since
+    /// address case is non-significant per RFC 5321, but we don't normalize
+    /// LinkedIn URNs / Discord snowflakes / etc.).
+    pub fn matches(&self, platform: &str, id: &str) -> bool {
+        match platform {
+            "email" => {
+                let target = id.to_ascii_lowercase();
+                self.email.iter().any(|e| e.to_ascii_lowercase() == target)
+            }
+            "linkedin" => self.linkedin.as_deref() == Some(id),
+            "discord" => self.discord.as_deref() == Some(id),
+            "twitter" => self.twitter.as_deref() == Some(id),
+            "slack" => self.slack.as_deref() == Some(id),
+            "whatsapp" => self.whatsapp.as_deref() == Some(id),
+            "instagram" => self.instagram.as_deref() == Some(id),
+            _ => false,
+        }
+    }
+}
+
+/// Minimal front-matter subset we care about. `#[serde(default)]` makes every
+/// field optional so legacy pages (no `identities:` block) deserialize cleanly.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct FrontMatter {
+    #[serde(default)]
+    identities: Identities,
+}
+
+/// One `people/<slug>.md` page + its parsed identities.
+#[derive(Debug, Clone)]
+pub struct PersonPage {
+    pub slug: String,
+    pub path: PathBuf,
+    pub identities: Identities,
+}
+
+/// In-memory index of every `people/*.md` page's identity block. Rebuild on
+/// demand — the walk is cheap and there's no invalidation logic to get wrong.
+#[derive(Debug, Clone, Default)]
+pub struct IdentityIndex {
+    people: Vec<PersonPage>,
+}
+
+impl IdentityIndex {
+    /// Walk `layout.people_dir()`, parse each `.md` file's front-matter, and
+    /// collect every page with its parsed (possibly empty) identity block.
+    ///
+    /// Files that fail to parse (malformed YAML, missing delimiters, etc.)
+    /// are logged and skipped — one bad page must not break the whole index.
+    pub fn build(layout: &WikiLayout) -> io::Result<Self> {
+        let dir = layout.people_dir();
+        if !dir.exists() {
+            return Ok(Self::default());
+        }
+
+        let mut people = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let slug = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+
+            match parse_front_matter(&path) {
+                Ok(identities) => people.push(PersonPage { slug, path, identities }),
+                Err(e) => warn!(path = %path.display(), error = %e, "skipping page with bad front-matter"),
+            }
+        }
+        Ok(Self { people })
+    }
+
+    /// O(n) scan — hundreds of pages, irrelevant at our scale.
+    pub fn lookup(&self, platform: &str, id: &str) -> Option<&PersonPage> {
+        self.people.iter().find(|p| p.identities.matches(platform, id))
+    }
+
+    pub fn len(&self) -> usize {
+        self.people.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.people.is_empty()
+    }
+
+    pub fn pages(&self) -> &[PersonPage] {
+        &self.people
+    }
+}
+
+/// Extract the YAML front-matter from a markdown file and deserialize it.
+/// Accepts files without front-matter (returns `Identities::default()`).
+fn parse_front_matter(path: &Path) -> anyhow::Result<Identities> {
+    let raw = fs::read_to_string(path)?;
+    let yaml = match extract_yaml_block(&raw) {
+        Some(y) => y,
+        None => return Ok(Identities::default()),
+    };
+    let fm: FrontMatter = serde_yaml_ng::from_str(yaml)?;
+    Ok(fm.identities)
+}
+
+/// Pull the YAML between the opening `---\n` and the next `\n---` line.
+/// Returns `None` if there is no front-matter block.
+fn extract_yaml_block(src: &str) -> Option<&str> {
+    let after_open = src.strip_prefix("---\n").or_else(|| src.strip_prefix("---\r\n"))?;
+    // Scan line-by-line for a closing `---` on its own line.
+    let mut offset = 0usize;
+    for line in after_open.lines() {
+        if line.trim_end() == "---" {
+            return Some(&after_open[..offset]);
+        }
+        // +1 for the newline that `lines()` strips. On the last line without a
+        // trailing newline this would overshoot, but we'd only get here if the
+        // closing `---` never appeared — in which case we return None below.
+        offset += line.len() + 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_page(dir: &Path, slug: &str, front_matter: &str) {
+        let path = dir.join(format!("{slug}.md"));
+        let body = format!("---\n{front_matter}\n---\n\n# {slug}\n");
+        fs::write(path, body).unwrap();
+    }
+
+    fn layout_with_pages(pages: &[(&str, &str)]) -> (TempDir, WikiLayout) {
+        let dir = TempDir::new().unwrap();
+        let layout = WikiLayout::new(dir.path().to_path_buf());
+        fs::create_dir_all(layout.people_dir()).unwrap();
+        for (slug, fm) in pages {
+            write_page(&layout.people_dir(), slug, fm);
+        }
+        (dir, layout)
+    }
+
+    #[test]
+    fn parses_identities_block() {
+        let (_d, layout) = layout_with_pages(&[(
+            "jane",
+            "kind: person\nkey: jane\nidentities:\n  email: [jane@corp.com, jane@personal.com]\n  linkedin: urn:li:fsd_profile:XYZ\n  discord: \"999\"",
+        )]);
+        let index = IdentityIndex::build(&layout).unwrap();
+        let page = index.lookup("linkedin", "urn:li:fsd_profile:XYZ").unwrap();
+        assert_eq!(page.slug, "jane");
+        assert_eq!(page.identities.linkedin.as_deref(), Some("urn:li:fsd_profile:XYZ"));
+        assert_eq!(page.identities.email.len(), 2);
+    }
+
+    #[test]
+    fn legacy_page_without_identities_block_deserializes_to_default() {
+        let (_d, layout) = layout_with_pages(&[(
+            "aadit",
+            "kind: person\nkey: aadit\ncreated: 2026-04-18",
+        )]);
+        let index = IdentityIndex::build(&layout).unwrap();
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.pages()[0].identities, Identities::default());
+    }
+
+    #[test]
+    fn lookup_by_email_is_case_insensitive() {
+        let (_d, layout) = layout_with_pages(&[(
+            "jane",
+            "kind: person\nkey: jane\nidentities:\n  email: [Jane@Corp.COM]",
+        )]);
+        let index = IdentityIndex::build(&layout).unwrap();
+        assert!(index.lookup("email", "jane@corp.com").is_some());
+        assert!(index.lookup("email", "JANE@CORP.COM").is_some());
+    }
+
+    #[test]
+    fn lookup_by_discord_matches_exact() {
+        let (_d, layout) = layout_with_pages(&[(
+            "bob",
+            "kind: person\nkey: bob\nidentities:\n  discord: \"123456789012345678\"",
+        )]);
+        let index = IdentityIndex::build(&layout).unwrap();
+        assert!(index.lookup("discord", "123456789012345678").is_some());
+        assert!(index.lookup("discord", "000").is_none());
+    }
+
+    #[test]
+    fn lookup_miss_returns_none() {
+        let (_d, layout) = layout_with_pages(&[(
+            "jane",
+            "kind: person\nkey: jane\nidentities:\n  discord: \"999\"",
+        )]);
+        let index = IdentityIndex::build(&layout).unwrap();
+        assert!(index.lookup("twitter", "999").is_none());
+    }
+
+    #[test]
+    fn unknown_platform_returns_none() {
+        let (_d, layout) = layout_with_pages(&[(
+            "jane",
+            "kind: person\nkey: jane\nidentities:\n  discord: \"999\"",
+        )]);
+        let index = IdentityIndex::build(&layout).unwrap();
+        assert!(index.lookup("signal", "999").is_none());
+    }
+
+    #[test]
+    fn malformed_yaml_is_skipped_not_fatal() {
+        let dir = TempDir::new().unwrap();
+        let layout = WikiLayout::new(dir.path().to_path_buf());
+        fs::create_dir_all(layout.people_dir()).unwrap();
+        // Valid page first.
+        write_page(
+            &layout.people_dir(),
+            "ok",
+            "kind: person\nkey: ok\nidentities:\n  discord: \"111\"",
+        );
+        // Intentionally broken YAML (unclosed array).
+        let broken = layout.people_dir().join("broken.md");
+        fs::write(broken, "---\nidentities:\n  email: [one,\n---\n\n# broken\n").unwrap();
+
+        let index = IdentityIndex::build(&layout).unwrap();
+        // Broken skipped, good one present.
+        assert_eq!(index.len(), 1);
+        assert!(index.lookup("discord", "111").is_some());
+    }
+
+    #[test]
+    fn empty_people_dir_yields_empty_index() {
+        let dir = TempDir::new().unwrap();
+        let layout = WikiLayout::new(dir.path().to_path_buf());
+        let index = IdentityIndex::build(&layout).unwrap();
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn missing_people_dir_yields_empty_index_not_error() {
+        let dir = TempDir::new().unwrap();
+        let layout = WikiLayout::new(dir.path().to_path_buf());
+        // Note: never created layout.people_dir()
+        let index = IdentityIndex::build(&layout).unwrap();
+        assert!(index.is_empty());
+    }
+}
