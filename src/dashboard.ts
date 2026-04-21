@@ -66,17 +66,19 @@ router.get("/dashboard", (_req, res) => {
 
 router.get("/history", (req, res) => {
   const status = req.query.status as ActionStatus | undefined;
+  const platform = req.query.platform as string | undefined;
   const page = parseInt(req.query.page as string) || 1;
   const limit = 20;
   const offset = (page - 1) * limit;
 
-  const actions = getActions({ limit, offset, status });
-  const total = getActionCount(status);
+  const actions = getActions({ limit, offset, status, platform });
+  const total = getActionCount(status, platform);
   const totalPages = Math.ceil(total / limit);
 
   res.render("history", {
     actions,
     currentStatus: status || "all",
+    currentPlatform: platform || "all",
     currentPage: page,
     totalPages,
     total,
@@ -101,16 +103,21 @@ router.get("/api/stats", (_req, res) => {
 
 router.get("/api/actions", (req, res) => {
   const status = req.query.status as ActionStatus | undefined;
+  const platform = req.query.platform as string | undefined;
   const page = parseInt(req.query.page as string) || 1;
   const limit = 20;
   const offset = (page - 1) * limit;
 
+  const resolvedStatus = status === ("all" as any) ? undefined : status;
+  const resolvedPlatform = platform === "all" ? undefined : platform;
+
   const actions = getActions({
     limit,
     offset,
-    status: status === ("all" as any) ? undefined : status,
+    status: resolvedStatus,
+    platform: resolvedPlatform,
   });
-  const total = getActionCount(status === ("all" as any) ? undefined : status);
+  const total = getActionCount(resolvedStatus, resolvedPlatform);
   const totalPages = Math.ceil(total / limit);
 
   res.render("partials/action-rows", {
@@ -118,6 +125,7 @@ router.get("/api/actions", (req, res) => {
     currentPage: page,
     totalPages,
     currentStatus: status || "all",
+    currentPlatform: platform || "all",
   });
 });
 

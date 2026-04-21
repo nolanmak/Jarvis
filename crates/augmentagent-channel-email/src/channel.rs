@@ -740,6 +740,8 @@ mod tests {
                 body: "buy things".into(),
                 date: "2026-04-13".into(),
                 account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
             }],
         });
         let reasoner = Arc::new(ScriptedReasoner::new([
@@ -772,6 +774,8 @@ mod tests {
                 body: "how do I...".into(),
                 date: "2026-04-13".into(),
                 account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
             }],
         });
         let reasoner = Arc::new(ScriptedReasoner::new([
@@ -837,6 +841,8 @@ mod tests {
                 body: "saw your post, wanted to reach out...".into(),
                 date: "2026-04-19".into(),
                 account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
             }],
         });
         let reasoner = Arc::new(ScriptedReasoner::new([
@@ -880,6 +886,8 @@ mod tests {
                 body: "deal deal".into(),
                 date: "2026-04-19".into(),
                 account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
             }],
         });
         let reasoner = Arc::new(ScriptedReasoner::new([
@@ -915,6 +923,8 @@ mod tests {
                 body: "any update?".into(),
                 date: "2026-04-13".into(),
                 account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
             }],
         });
         let reasoner = Arc::new(ScriptedReasoner::new([
@@ -1009,6 +1019,8 @@ mod tests {
                 body: "free Thursday?".into(),
                 date: "2026-04-18".into(),
                 account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
             }],
             create_failures_remaining: std::sync::Mutex::new(1),
         });

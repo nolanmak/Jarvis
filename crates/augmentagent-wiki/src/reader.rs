@@ -110,6 +110,8 @@ mod tests {
             body: "b".into(),
             date: "2026-04-14".into(),
             account_entity_id: None,
+            platform: "gmail".into(),
+            kind: "dm".into(),
         }
     }
 

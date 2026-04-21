@@ -6,6 +6,8 @@ export interface Email {
   body: string;
   date: string;
   accountEntityId?: string;
+  platform?: string;
+  kind?: string;
 }
 
 export type ActionStatus =
@@ -30,6 +32,9 @@ export interface ActionRecord {
   errorMessage?: string;
   createdAt: number;
   updatedAt: number;
+  /// Populated via LEFT JOIN on emails.messageId. Absent for orphan actions (should be rare).
+  platform?: string;
+  kind?: string;
 }
 
 export interface Sender {
