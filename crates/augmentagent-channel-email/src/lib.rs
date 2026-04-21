@@ -1,17 +1,18 @@
-//! Gmail channel adapter for AugmentAgent on dangercat.
+//! Gmail channel adapter for AugmentAgent.
 //!
-//! Phase 1 (dry-run): polls Gmail via Composio, spawns Claude per new email,
-//! parses the JSON decision, writes to sqlite, prints to stdout. No drafts,
-//! no sends, no Discord.
+//! Polls Gmail via Composio, spawns Claude per new email (triage → draft → ingest),
+//! writes to sqlite, hands drafts to the Discord approval broker. Shared pipeline
+//! primitives (`Reasoner`, prompt builders, decision parsing, ingest) live in
+//! `augmentagent-channel-core`; this crate owns only Gmail-specific transport.
 
-pub mod decision;
 pub mod gmail;
-pub mod ingest;
-pub mod prompt;
-pub mod reasoner;
-
 mod channel;
 
-pub use channel::{GmailChannel, GmailChannelConfig, PollOutcome, Reasoner, ReasonerOpts};
-pub use decision::{Decision, DecisionKind};
-pub use reasoner::ClaudeCliReasoner;
+pub use channel::{GmailChannel, GmailChannelConfig, PollOutcome};
+
+// Back-compat re-exports: old callers can keep using `augmentagent_channel_email::X`
+// for items that moved to `augmentagent-channel-core`. Remove once all callers migrate.
+pub use augmentagent_channel_core::{
+    decision, decision::Decision, decision::DecisionKind, ingest, prompt, reasoner,
+    ClaudeCliReasoner, Reasoner, ReasonerOpts,
+};
