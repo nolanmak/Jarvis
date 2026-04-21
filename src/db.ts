@@ -61,7 +61,9 @@ export function initDb(dbPath?: string): Database.Database {
       accountEntityId TEXT,
       firstSeenAt INTEGER NOT NULL,
       triageResult TEXT,
-      agentProcessedAt INTEGER
+      agentProcessedAt INTEGER,
+      platform TEXT NOT NULL DEFAULT 'gmail',
+      kind TEXT NOT NULL DEFAULT 'dm'
     );
 
     CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);
@@ -70,7 +72,22 @@ export function initDb(dbPath?: string): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_gmail_accounts_active ON gmail_accounts(active);
     CREATE INDEX IF NOT EXISTS idx_emails_triage ON emails(triageResult);
     CREATE INDEX IF NOT EXISTS idx_emails_seen ON emails(firstSeenAt);
+    CREATE INDEX IF NOT EXISTS idx_emails_platform ON emails(platform);
   `);
+
+  // Additive migrations for existing DBs created before the platform/kind columns landed.
+  // Safe to run on every boot: column_exists guards make each ALTER idempotent, and the
+  // one-shot LinkedIn fixup only touches rows still tagged 'gmail' with a LinkedIn URN.
+  const emailCols = db.prepare("PRAGMA table_info(emails)").all() as { name: string }[];
+  const hasPlatform = emailCols.some((c) => c.name === "platform");
+  const hasKind = emailCols.some((c) => c.name === "kind");
+  if (!hasPlatform) {
+    db.exec("ALTER TABLE emails ADD COLUMN platform TEXT NOT NULL DEFAULT 'gmail'");
+    db.exec("UPDATE emails SET platform = 'linkedin' WHERE accountEntityId LIKE 'urn:li:%'");
+  }
+  if (!hasKind) {
+    db.exec("ALTER TABLE emails ADD COLUMN kind TEXT NOT NULL DEFAULT 'dm'");
+  }
 
   return db;
 }
@@ -136,20 +153,31 @@ export function getActions(opts: {
   limit?: number;
   offset?: number;
   status?: ActionStatus;
+  platform?: string;
 }): ActionRecord[] {
-  const { limit = 20, offset = 0, status } = opts;
+  const { limit = 20, offset = 0, status, platform } = opts;
 
+  // LEFT JOIN on emails brings platform/kind into each row. Actions always reference
+  // a messageId that lives in emails, so the JOIN is effectively 1:1 but kept LEFT
+  // to be defensive against any orphan rows.
+  const baseSelect =
+    "SELECT a.*, e.platform AS platform, e.kind AS kind FROM actions a LEFT JOIN emails e ON a.messageId = e.messageId";
+
+  const where: string[] = [];
+  const params: unknown[] = [];
   if (status) {
-    return getDb()
-      .prepare(
-        "SELECT * FROM actions WHERE status = ? ORDER BY createdAt DESC LIMIT ? OFFSET ?"
-      )
-      .all(status, limit, offset) as ActionRecord[];
+    where.push("a.status = ?");
+    params.push(status);
   }
+  if (platform) {
+    where.push("e.platform = ?");
+    params.push(platform);
+  }
+  const whereClause = where.length ? ` WHERE ${where.join(" AND ")}` : "";
 
   return getDb()
-    .prepare("SELECT * FROM actions ORDER BY createdAt DESC LIMIT ? OFFSET ?")
-    .all(limit, offset) as ActionRecord[];
+    .prepare(`${baseSelect}${whereClause} ORDER BY a.createdAt DESC LIMIT ? OFFSET ?`)
+    .all(...params, limit, offset) as ActionRecord[];
 }
 
 export function getActionById(id: string): ActionRecord | undefined {
@@ -158,16 +186,22 @@ export function getActionById(id: string): ActionRecord | undefined {
     .get(id) as ActionRecord | undefined;
 }
 
-export function getActionCount(status?: ActionStatus): number {
+export function getActionCount(status?: ActionStatus, platform?: string): number {
+  const base = "SELECT COUNT(*) as count FROM actions a LEFT JOIN emails e ON a.messageId = e.messageId";
+  const where: string[] = [];
+  const params: unknown[] = [];
   if (status) {
-    const row = getDb()
-      .prepare("SELECT COUNT(*) as count FROM actions WHERE status = ?")
-      .get(status) as { count: number };
-    return row.count;
+    where.push("a.status = ?");
+    params.push(status);
   }
+  if (platform) {
+    where.push("e.platform = ?");
+    params.push(platform);
+  }
+  const whereClause = where.length ? ` WHERE ${where.join(" AND ")}` : "";
   const row = getDb()
-    .prepare("SELECT COUNT(*) as count FROM actions")
-    .get() as { count: number };
+    .prepare(`${base}${whereClause}`)
+    .get(...params) as { count: number };
   return row.count;
 }
 
@@ -340,8 +374,8 @@ export function upsertEmail(email: Email, accountEntityId: string): boolean {
 
   getDb()
     .prepare(
-      `INSERT INTO emails (messageId, threadId, fromEmail, subject, body, receivedAt, accountEntityId, firstSeenAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO emails (messageId, threadId, fromEmail, subject, body, receivedAt, accountEntityId, firstSeenAt, platform, kind)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       email.messageId,
@@ -351,7 +385,9 @@ export function upsertEmail(email: Email, accountEntityId: string): boolean {
       email.body || null,
       email.date || null,
       accountEntityId,
-      Date.now()
+      Date.now(),
+      email.platform || "gmail",
+      email.kind || "dm"
     );
 
   return true;

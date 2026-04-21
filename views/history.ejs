@@ -56,6 +56,23 @@
              <%= currentStatus === 'error' ? 'bg-yellow-900/50 text-yellow-400 border border-yellow-800' : 'text-gray-400 hover:text-white hover:bg-gray-800' %>">
       Errors
     </button>
+
+    <div class="ml-auto flex items-center gap-2">
+      <label for="platform-filter" class="text-xs text-gray-500 uppercase">Platform</label>
+      <select
+        id="platform-filter"
+        name="platform"
+        hx-get="/api/actions"
+        hx-target="#action-table-body"
+        hx-swap="innerHTML"
+        hx-trigger="change"
+        hx-include="[name='platform']"
+        class="bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-sm">
+        <option value="all" <%= currentPlatform === 'all' ? 'selected' : '' %>>All</option>
+        <option value="gmail" <%= currentPlatform === 'gmail' ? 'selected' : '' %>>Gmail</option>
+        <option value="linkedin" <%= currentPlatform === 'linkedin' ? 'selected' : '' %>>LinkedIn</option>
+      </select>
+    </div>
   </div>
 
   <!-- Actions Table -->
@@ -64,6 +81,7 @@
       <thead>
         <tr class="border-b border-gray-800 text-left">
           <th class="px-4 py-2 text-xs text-gray-500 font-medium">Time</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Platform</th>
           <th class="px-4 py-2 text-xs text-gray-500 font-medium">From</th>
           <th class="px-4 py-2 text-xs text-gray-500 font-medium">Subject</th>
           <th class="px-4 py-2 text-xs text-gray-500 font-medium">Status</th>
@@ -71,7 +89,7 @@
         </tr>
       </thead>
       <tbody id="action-table-body">
-        <%- include('partials/action-rows', { actions: actions, currentPage: currentPage, totalPages: totalPages, currentStatus: currentStatus }) %>
+        <%- include('partials/action-rows', { actions: actions, currentPage: currentPage, totalPages: totalPages, currentStatus: currentStatus, currentPlatform: currentPlatform }) %>
       </tbody>
     </table>
   </div>
