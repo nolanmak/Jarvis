@@ -115,19 +115,3 @@ pub trait ApprovalActionHandler: Send + Sync {
 pub trait QueryHandler: Send + Sync {
     async fn answer(&self, question: &str) -> anyhow::Result<String>;
 }
-
-/// Plugged into the broker to handle DMs that arrive from users **other than
-/// the bot owner** (`allowed_user_id`). The owner's DMs continue to route to
-/// `QueryHandler` for wiki queries; strangers get routed here, where the
-/// channel impl runs them through the triage → draft → approval pipeline.
-///
-/// `http` is the live serenity HTTP client — used by the handler to send the
-/// eventual approved reply back to the DM channel.
-#[async_trait]
-pub trait DmMessageHandler: Send + Sync {
-    async fn handle(
-        &self,
-        msg: &serenity::model::channel::Message,
-        http: &std::sync::Arc<serenity::http::Http>,
-    ) -> anyhow::Result<()>;
-}

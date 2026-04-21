@@ -43,48 +43,15 @@ impl EventHandler for Handler {
         if msg.author.bot {
             return;
         }
+        let Some(handler) = &self.state.query_handler else {
+            return;
+        };
 
         let is_dm = msg.guild_id.is_none();
         let in_query_channel = self
             .state
             .query_channel_id
             .is_some_and(|cid| cid == msg.channel_id);
-
-        // Route DMs from non-owner users to the DmMessageHandler (triage
-        // pipeline). Owner DMs and query-channel messages fall through to the
-        // existing QueryHandler path below.
-        let is_from_owner = self
-            .state
-            .allowed_user_id
-            .is_some_and(|allowed| msg.author.id == allowed);
-        if is_dm && !is_from_owner {
-            if let Some(dm_handler) = &self.state.dm_message_handler {
-                let dm_handler = Arc::clone(dm_handler);
-                let http = ctx.http.clone();
-                let msg_for_handler = msg.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = dm_handler.handle(&msg_for_handler, &http).await {
-                        warn!(
-                            sender = %msg_for_handler.author.id.get(),
-                            "dm handler failed: {e:#}"
-                        );
-                    }
-                });
-                return;
-            }
-            // No DM handler configured — preserve pre-#9 behavior (drop).
-            debug!(
-                "ignoring DM from non-owner user {} (no dm_message_handler)",
-                msg.author.id.get()
-            );
-            return;
-        }
-
-        // Below: owner DM or query-channel message → QueryHandler path.
-        let Some(handler) = &self.state.query_handler else {
-            return;
-        };
-
         if !is_dm && !in_query_channel {
             return;
         }

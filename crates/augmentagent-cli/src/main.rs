@@ -15,14 +15,13 @@ use augmentagent_approval_discord::{
 };
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
-use augmentagent_channel_discord_dm::DiscordDmChannelConfig;
 use augmentagent_channel_email::gmail::{ComposioClient, GmailApi};
 use augmentagent_channel_email::{GmailChannel, GmailChannelConfig};
 use augmentagent_channel_linkedin::{
     default_auth_path, is_linkedin_email, LinkedInApi, LinkedInAuth, LinkedInChannel,
     LinkedInChannelConfig, VoyagerClient, ACCOUNT_PREFIX, DEFAULT_POLL_SECS,
 };
-use augmentagent_store::{ActionStatus, Email, Store, TriageResult};
+use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 #[derive(Parser)]
@@ -596,10 +595,6 @@ struct ReplyApprover {
     /// (cookies not configured). Any LinkedIn-tagged action hitting this
     /// approver with a None client surfaces as `Failed`.
     linkedin: Option<Arc<VoyagerClient>>,
-    /// Optional serenity HTTP client for Discord outbound DM sends. `None` =
-    /// discord_dm disabled for this run. Any `platform='discord'` action
-    /// hitting this approver with `None` surfaces as `Failed`.
-    discord_http: Option<Arc<serenity::http::Http>>,
     reasoner: Arc<ClaudeCliReasoner>,
     draft_skill: String,
     wiki_root: Option<PathBuf>,
@@ -719,124 +714,6 @@ impl ReplyApprover {
             .mark_email_processed(&action.email.message_id, TriageResult::Reply);
         ApprovalActionOutcome::Skipped
     }
-
-    async fn approve_discord(
-        &self,
-        action_id: &str,
-        action: augmentagent_store::ActionWithEmail,
-    ) -> ApprovalActionOutcome {
-        let Some(http) = self.discord_http.as_ref() else {
-            return ApprovalActionOutcome::Failed {
-                message: "Discord DM channel is not configured (no http client)".into(),
-            };
-        };
-        let Some(channel_id) = action
-            .email
-            .thread_id
-            .as_deref()
-            .and_then(|s| s.parse::<u64>().ok())
-        else {
-            return ApprovalActionOutcome::Failed {
-                message: "no Discord channel id on email thread_id; cannot send".into(),
-            };
-        };
-        let Some(body) = action.action.draft_body.as_deref() else {
-            return ApprovalActionOutcome::Failed {
-                message: "no draft body on action; cannot send".into(),
-            };
-        };
-        match augmentagent_channel_discord_dm::send_discord_dm(http, channel_id, body).await {
-            Ok(()) => {
-                let _ = self.store.update_action_status(
-                    action_id,
-                    ActionStatus::Sent,
-                    Some(body),
-                    None,
-                );
-                let _ = self
-                    .store
-                    .mark_email_processed(&action.email.message_id, TriageResult::Reply);
-                tracing::info!(action_id, "discord reply sent via approval handler");
-                ApprovalActionOutcome::Approved
-            }
-            Err(e) => {
-                let msg = format!("discord send: {e}");
-                let _ = self.store.update_action_status(
-                    action_id,
-                    ActionStatus::Error,
-                    None,
-                    Some(&msg),
-                );
-                ApprovalActionOutcome::Failed { message: msg }
-            }
-        }
-    }
-
-    async fn revise_discord(
-        &self,
-        action_id: &str,
-        feedback: &str,
-        action: augmentagent_store::ActionWithEmail,
-    ) -> ApprovalActionOutcome {
-        // Same shape as LinkedIn — no server-side draft to swap; just regen
-        // text and re-post the card.
-        let previous_draft = action.action.draft_body.clone().unwrap_or_default();
-        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
-        let prompt = augmentagent_channel_core::prompt::redraft_message(
-            &action.email,
-            &previous_draft,
-            feedback,
-        );
-        let redraft = match self.reasoner.call(&opts, &prompt).await {
-            Ok(s) => s.trim().to_string(),
-            Err(e) => {
-                return ApprovalActionOutcome::Failed {
-                    message: format!("redraft call failed: {e}"),
-                };
-            }
-        };
-        let _ = self.store.update_action_status(
-            action_id,
-            ActionStatus::Pending,
-            Some(&redraft),
-            None,
-        );
-        tracing::info!(action_id, "discord revise: new draft persisted");
-        ApprovalActionOutcome::Revised {
-            email: action.email,
-            draft: redraft,
-        }
-    }
-
-    fn skip_discord(
-        &self,
-        action_id: &str,
-        action: augmentagent_store::ActionWithEmail,
-    ) -> ApprovalActionOutcome {
-        let _ = self.store.update_action_status(
-            action_id,
-            ActionStatus::Rejected,
-            None,
-            Some("skipped by approver"),
-        );
-        let _ = self
-            .store
-            .mark_email_processed(&action.email.message_id, TriageResult::Reply);
-        ApprovalActionOutcome::Skipped
-    }
-}
-
-/// Dispatch key: which platform-specific send path should an action take?
-/// Keyed on `email.platform` (authoritative as of issue #3), falling back to
-/// the legacy `account_entity_id` prefix for pre-migration rows.
-fn platform_of(email: &Email) -> &str {
-    if !email.platform.is_empty() {
-        return email.platform.as_str();
-    }
-    if is_linkedin_email(email) {
-        return "linkedin";
-    }
-    "gmail"
 }
 
 #[async_trait]
@@ -850,10 +727,8 @@ impl ApprovalActionHandler for ReplyApprover {
                 status: action.action.status,
             };
         }
-        match platform_of(&action.email) {
-            "linkedin" => return self.approve_linkedin(action_id, action).await,
-            "discord" => return self.approve_discord(action_id, action).await,
-            _ => {}
+        if is_linkedin_email(&action.email) {
+            return self.approve_linkedin(action_id, action).await;
         }
         let Some(draft_id) = action.draft_id.as_deref() else {
             return ApprovalActionOutcome::Failed {
@@ -898,10 +773,8 @@ impl ApprovalActionHandler for ReplyApprover {
                 status: action.action.status,
             };
         }
-        match platform_of(&action.email) {
-            "linkedin" => return self.skip_linkedin(action_id, action),
-            "discord" => return self.skip_discord(action_id, action),
-            _ => {}
+        if is_linkedin_email(&action.email) {
+            return self.skip_linkedin(action_id, action);
         }
         // Best-effort cleanup of the unsent Gmail draft.
         if let (Some(draft_id), Some(entity_id)) = (
@@ -933,10 +806,8 @@ impl ApprovalActionHandler for ReplyApprover {
                 status: action.action.status,
             };
         }
-        match platform_of(&action.email) {
-            "linkedin" => return self.revise_linkedin(action_id, feedback, action).await,
-            "discord" => return self.revise_discord(action_id, feedback, action).await,
-            _ => {}
+        if is_linkedin_email(&action.email) {
+            return self.revise_linkedin(action_id, feedback, action).await;
         }
         let Some(entity_id) = action.email.account_entity_id.as_deref() else {
             return ApprovalActionOutcome::Failed {
@@ -1063,51 +934,15 @@ async fn build_broker(
     // send LinkedIn replies (Gmail-only mode).
     let linkedin = load_linkedin_client(&repo_root);
 
-    // Build the Discord DM channel. It needs the approvals broker, but the
-    // broker needs the DM channel (via DiscordConfig::dm_message_handler) —
-    // break the cycle with `DiscordDmChannel::set_approvals` after start.
-    let dm_channel_config = DiscordDmChannelConfig {
-        dry_run: false,
-        wiki_root: cli.wiki_dir.clone(),
-        wiki_schema_path: cli.wiki_schema.clone().or_else(|| {
-            cli.wiki_dir
-                .as_ref()
-                .map(|_| PathBuf::from("schema/wiki-skill.md"))
-        }),
-        skill_dir: PathBuf::from("skills/discord-triage"),
-    };
-    let identity_index = cli
-        .wiki_dir
-        .as_ref()
-        .and_then(|root| {
-            let layout = augmentagent_wiki::WikiLayout::new(root.clone());
-            augmentagent_wiki::IdentityIndex::build(&layout).ok().map(Arc::new)
-        });
-    let dm_channel = Arc::new(augmentagent_channel_discord_dm::DiscordDmChannel::new(
-        Arc::clone(&store),
-        Arc::clone(&reasoner),
-        dm_channel_config,
-        identity_index,
-    ));
-
-    // Discord HTTP client for outbound DM sends on approval. Shares the same
-    // token as the broker; constructed here so the approver can carry it
-    // without waiting on `broker.start()` (the broker later gives us its own
-    // arc, but this one is fine — same token, same rate-limit bucket).
-    let discord_http = Arc::new(serenity::http::Http::new(&token));
-
     let approver = Arc::new(ReplyApprover {
         store,
         gmail,
         linkedin,
-        discord_http: Some(Arc::clone(&discord_http)),
         reasoner: Arc::clone(&reasoner),
         draft_skill,
         wiki_root: cli.wiki_dir.clone(),
     });
 
-    let dm_handler: Arc<dyn augmentagent_approval_discord::DmMessageHandler> =
-        Arc::clone(&dm_channel) as _;
     let broker = DiscordApprovalBroker::start(DiscordConfig {
         bot_token: token,
         channel_id,
@@ -1115,13 +950,10 @@ async fn build_broker(
         allowed_user_id,
         query_handler,
         action_handler: Some(approver),
-        dm_message_handler: Some(dm_handler),
     })
     .await
     .context("start discord broker")?;
-    let broker_arc: Arc<dyn ApprovalBroker> = Arc::new(broker);
-    dm_channel.set_approvals(Arc::clone(&broker_arc));
-    Ok(broker_arc)
+    Ok(Arc::new(broker))
 }
 
 fn build_channel(

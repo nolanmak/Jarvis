@@ -281,23 +281,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "augmentagent-channel-discord-dm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "augmentagent-approval-discord",
- "augmentagent-channel-core",
- "augmentagent-store",
- "augmentagent-wiki",
- "serde_json",
- "serenity",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "augmentagent-channel-email"
 version = "0.1.0"
 dependencies = [
@@ -350,11 +333,9 @@ dependencies = [
  "async-trait",
  "augmentagent-approval-discord",
  "augmentagent-channel-core",
- "augmentagent-channel-discord-dm",
  "augmentagent-channel-email",
  "augmentagent-channel-linkedin",
  "augmentagent-store",
- "augmentagent-wiki",
  "chrono",
  "clap",
  "dotenvy",
