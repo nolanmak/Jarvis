@@ -77,6 +77,32 @@ pub trait ApprovalBroker: Send + Sync {
         email: &Email,
         reason: &str,
     ) -> Result<(), ApprovalError>;
+
+    /// Post a daily digest summary to the approvals channel. `title` describes
+    /// the source (e.g. "#general in Code & Coffee"), `body` is the
+    /// Claude-generated summary. Default implementation forwards to
+    /// `post_flag_notice` so brokers not yet updated still surface something;
+    /// concrete brokers should override with a dedicated digest embed.
+    async fn post_digest(
+        &self,
+        title: &str,
+        body: &str,
+    ) -> Result<(), ApprovalError> {
+        // Fallback: synthesize a minimal Email + reason. Channels relying on
+        // this must render it readably.
+        let email = Email {
+            message_id: format!("digest:{title}"),
+            thread_id: None,
+            from: title.to_string(),
+            subject: format!("[digest] {title}"),
+            body: body.to_string(),
+            date: String::new(),
+            account_entity_id: None,
+            platform: "discord".into(),
+            kind: "digest_item".into(),
+        };
+        self.post_flag_notice(&email, body).await
+    }
 }
 
 /// No-op broker for dry-run mode; returns immediately.

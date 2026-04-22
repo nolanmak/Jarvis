@@ -25,8 +25,14 @@ import {
   hasAnyGmailAccount,
   getEmailCount,
   purgeOldEmails,
+  listSubscriptions,
+  getSubscription,
+  upsertSubscription,
+  updateSubscriptionMode,
+  deleteSubscription,
 } from "./db";
-import type { ActionStatus } from "./types";
+import type { ActionStatus, SubscriptionMode } from "./types";
+import { listDms, listGuilds, listGuildChannels } from "./discordApi";
 
 const router = Router();
 
@@ -92,6 +98,91 @@ router.get("/settings", (_req, res) => {
   const emailRetention = getConfig("email_retention_days") || "0";
   const emailCount = getEmailCount();
   res.render("settings", { senders, configStatus, emailRetention, emailCount, page: "settings" });
+});
+
+router.get("/subscriptions", (_req, res) => {
+  const subs = listSubscriptions();
+  res.render("subscriptions", { subs, page: "subscriptions" });
+});
+
+// --- Subscription CRUD ---
+
+const ALLOWED_MODES: SubscriptionMode[] = ["priority", "digest", "store_only"];
+const ALLOWED_PLATFORMS = new Set(["discord"]);
+
+router.get("/api/subscriptions", (_req, res) => {
+  const subs = listSubscriptions();
+  res.render("partials/subscription-rows", { subs });
+});
+
+router.post("/api/subscriptions", (req, res) => {
+  const { platform, channel_id, display_name, mode } = req.body as {
+    platform?: string;
+    channel_id?: string;
+    display_name?: string;
+    mode?: string;
+  };
+  if (!platform || !ALLOWED_PLATFORMS.has(platform)) {
+    return res.status(400).send("invalid platform");
+  }
+  if (!channel_id || !display_name) {
+    return res.status(400).send("channel_id and display_name required");
+  }
+  if (!mode || !ALLOWED_MODES.includes(mode as SubscriptionMode)) {
+    return res.status(400).send("invalid mode");
+  }
+  upsertSubscription(platform, channel_id, display_name, mode as SubscriptionMode);
+  const subs = listSubscriptions();
+  return res.render("partials/subscription-rows", { subs });
+});
+
+router.put("/api/subscriptions/:id", (req, res) => {
+  const id = req.params.id;
+  const mode = req.body?.mode as string | undefined;
+  if (!mode || !ALLOWED_MODES.includes(mode as SubscriptionMode)) {
+    return res.status(400).send("invalid mode");
+  }
+  if (!getSubscription(id)) return res.status(404).send("not found");
+  updateSubscriptionMode(id, mode as SubscriptionMode);
+  const subs = listSubscriptions();
+  return res.render("partials/subscription-rows", { subs });
+});
+
+router.delete("/api/subscriptions/:id", (req, res) => {
+  const id = req.params.id;
+  if (!getSubscription(id)) return res.status(404).send("not found");
+  deleteSubscription(id);
+  const subs = listSubscriptions();
+  return res.render("partials/subscription-rows", { subs });
+});
+
+// --- Discord source-picker proxies (shell out to Rust CLI) ---
+
+router.get("/api/discord/dms", async (_req, res) => {
+  try {
+    const dms = await listDms();
+    res.json(dms);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+router.get("/api/discord/guilds", async (_req, res) => {
+  try {
+    const guilds = await listGuilds();
+    res.json(guilds);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+router.get("/api/discord/guilds/:id/channels", async (req, res) => {
+  try {
+    const channels = await listGuildChannels(req.params.id);
+    res.json(channels);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
 });
 
 // --- HTMX API Routes ---

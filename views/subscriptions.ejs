@@ -1,0 +1,217 @@
+<%- include('partials/header', { page: 'subscriptions' }) %>
+
+<div class="space-y-6">
+  <div class="flex items-center justify-between">
+    <h1 class="text-xl font-semibold">Channel Subscriptions</h1>
+    <button
+      onclick="document.getElementById('add-modal').classList.remove('hidden')"
+      class="px-3 py-1.5 rounded-md text-sm font-medium bg-accent text-white hover:bg-accent/90 transition-colors">
+      Add subscription
+    </button>
+  </div>
+
+  <p class="text-sm text-gray-400">
+    Each subscription watches one Discord channel (DM or guild channel) and routes messages by mode.
+    <span class="font-medium text-white">priority</span> runs the full triage → draft → approval pipeline.
+    <span class="font-medium text-white">digest</span> stores messages for the daily digest.
+    <span class="font-medium text-white">store_only</span> persists without Claude.
+  </p>
+
+  <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+    <table class="w-full">
+      <thead>
+        <tr class="border-b border-gray-800 text-left">
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Platform</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Channel</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Mode</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Last seen</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Last digest</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium"></th>
+        </tr>
+      </thead>
+      <tbody id="sub-table-body">
+        <%- include('partials/subscription-rows', { subs: subs }) %>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Add-subscription modal -->
+<div id="add-modal" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+     onclick="if(event.target===this) this.classList.add('hidden')">
+  <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-lg w-full">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-lg font-semibold">Add subscription</h2>
+      <button onclick="document.getElementById('add-modal').classList.add('hidden')"
+              class="text-gray-400 hover:text-white">✕</button>
+    </div>
+
+    <form id="add-form" class="space-y-4">
+      <div>
+        <label class="block text-xs uppercase text-gray-500 mb-1">Platform</label>
+        <select id="platform-select" name="platform"
+                class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-sm"
+                onchange="loadSources()">
+          <option value="discord" selected>Discord</option>
+        </select>
+      </div>
+
+      <div>
+        <label class="block text-xs uppercase text-gray-500 mb-1">Source</label>
+        <select id="source-type" class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-sm"
+                onchange="loadSources()">
+          <option value="dm">DM</option>
+          <option value="guild">Guild channel</option>
+        </select>
+      </div>
+
+      <div id="guild-picker" class="hidden">
+        <label class="block text-xs uppercase text-gray-500 mb-1">Guild</label>
+        <select id="guild-select" class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-sm"
+                onchange="loadGuildChannels()">
+          <option value="">Loading…</option>
+        </select>
+      </div>
+
+      <div>
+        <label class="block text-xs uppercase text-gray-500 mb-1">Channel</label>
+        <select id="channel-select" name="channel_id"
+                class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-sm"
+                onchange="onChannelPick()">
+          <option value="">Loading…</option>
+        </select>
+        <input type="hidden" id="display-name-hidden" name="display_name" />
+      </div>
+
+      <div>
+        <label class="block text-xs uppercase text-gray-500 mb-1">Mode</label>
+        <select name="mode" class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-sm">
+          <option value="priority">priority — full triage + approval</option>
+          <option value="digest" selected>digest — daily summary</option>
+          <option value="store_only">store_only — raw persistence</option>
+        </select>
+      </div>
+
+      <div id="add-error" class="hidden text-sm text-red-400"></div>
+
+      <div class="flex gap-2 justify-end">
+        <button type="button"
+                onclick="document.getElementById('add-modal').classList.add('hidden')"
+                class="px-3 py-1.5 rounded-md text-sm font-medium text-gray-400 hover:text-white hover:bg-gray-800">
+          Cancel
+        </button>
+        <button type="submit"
+                class="px-3 py-1.5 rounded-md text-sm font-medium bg-accent text-white hover:bg-accent/90">
+          Add
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+  const channelState = new Map(); // id -> display label for hidden display_name
+
+  async function loadSources() {
+    const type = document.getElementById('source-type').value;
+    const guildPicker = document.getElementById('guild-picker');
+    const channelSel = document.getElementById('channel-select');
+    channelSel.innerHTML = '<option value="">Loading…</option>';
+    if (type === 'dm') {
+      guildPicker.classList.add('hidden');
+      try {
+        const res = await fetch('/api/discord/dms');
+        const dms = await res.json();
+        channelState.clear();
+        channelSel.innerHTML = dms
+          .map((d) => {
+            const label = 'DM: ' + d.display_name;
+            channelState.set(d.id, label);
+            return '<option value="' + d.id + '">' + label + '</option>';
+          })
+          .join('');
+        onChannelPick();
+      } catch (e) {
+        channelSel.innerHTML = '<option>(error loading)</option>';
+      }
+    } else {
+      guildPicker.classList.remove('hidden');
+      try {
+        const res = await fetch('/api/discord/guilds');
+        const guilds = await res.json();
+        const gSel = document.getElementById('guild-select');
+        gSel.innerHTML = guilds
+          .map((g) => '<option value="' + g.id + '" data-name="' + g.name + '">' + g.name + '</option>')
+          .join('');
+        await loadGuildChannels();
+      } catch (e) {
+        document.getElementById('guild-select').innerHTML = '<option>(error)</option>';
+      }
+    }
+  }
+
+  async function loadGuildChannels() {
+    const gSel = document.getElementById('guild-select');
+    const guildId = gSel.value;
+    const guildName = gSel.selectedOptions[0]?.dataset?.name || 'guild';
+    const channelSel = document.getElementById('channel-select');
+    if (!guildId) {
+      channelSel.innerHTML = '<option value="">(pick a guild)</option>';
+      return;
+    }
+    channelSel.innerHTML = '<option value="">Loading…</option>';
+    try {
+      const res = await fetch('/api/discord/guilds/' + guildId + '/channels');
+      const channels = await res.json();
+      channelState.clear();
+      channelSel.innerHTML = channels
+        .map((c) => {
+          const label = '#' + c.name + ' in ' + guildName;
+          channelState.set(c.id, label);
+          return '<option value="' + c.id + '">' + label + '</option>';
+        })
+        .join('');
+      onChannelPick();
+    } catch (e) {
+      channelSel.innerHTML = '<option>(error)</option>';
+    }
+  }
+
+  function onChannelPick() {
+    const sel = document.getElementById('channel-select');
+    const label = channelState.get(sel.value) || sel.value;
+    document.getElementById('display-name-hidden').value = label;
+  }
+
+  document.getElementById('add-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const err = document.getElementById('add-error');
+    err.classList.add('hidden');
+    const body = {
+      platform: form.platform.value,
+      channel_id: form.channel_id.value,
+      display_name: form.display_name.value,
+      mode: form.mode.value,
+    };
+    const res = await fetch('/api/subscriptions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      err.textContent = await res.text();
+      err.classList.remove('hidden');
+      return;
+    }
+    const html = await res.text();
+    document.getElementById('sub-table-body').innerHTML = html;
+    document.getElementById('add-modal').classList.add('hidden');
+    form.reset();
+  });
+
+  // Prime dropdowns on load so the modal shows data when opened.
+  loadSources();
+</script>
+
+<%- include('partials/footer') %>

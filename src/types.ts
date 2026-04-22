@@ -54,3 +54,20 @@ export interface DashboardStats {
   todayCount: number;
   approvalRate: number;
 }
+
+/// Routing mode for a channel subscription. Matches Rust
+/// `augmentagent_store::SubscriptionMode` serde representation.
+export type SubscriptionMode = "priority" | "digest" | "store_only";
+
+export interface ChannelSubscription {
+  id: string;
+  platform: string;
+  channel_id: string;
+  display_name: string;
+  mode: SubscriptionMode;
+  active: boolean;
+  last_seen_message_id?: string | null;
+  last_digest_at_ms?: number | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
