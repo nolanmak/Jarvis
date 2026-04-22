@@ -112,3 +112,58 @@ pub struct LearnedPattern {
     pub action: String,
     pub reason: String,
 }
+
+/// Routing mode for a channel subscription. Drives how the Discord (and
+/// future Slack/WhatsApp/Twitter) channel poller dispatches each incoming
+/// message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionMode {
+    /// Full triage → draft → approval card → send (DM pipeline).
+    Priority,
+    /// Store messages as they arrive; once-daily Claude summary.
+    Digest,
+    /// Raw persistence; no Claude, no approval cards.
+    StoreOnly,
+}
+
+impl SubscriptionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Priority => "priority",
+            Self::Digest => "digest",
+            Self::StoreOnly => "store_only",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "priority" => Some(Self::Priority),
+            "digest" => Some(Self::Digest),
+            "store_only" => Some(Self::StoreOnly),
+            _ => None,
+        }
+    }
+}
+
+/// A watched channel (Discord DM, Discord guild channel, future Slack channel)
+/// and the mode it's polled under.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelSubscription {
+    pub id: String,
+    pub platform: String,
+    pub channel_id: String,
+    pub display_name: String,
+    pub mode: SubscriptionMode,
+    pub active: bool,
+    /// Snowflake of the newest message we've already seen — used for
+    /// `GET /channels/{id}/messages?after=<this>` polling. `None` on a fresh
+    /// subscription (next poll grabs the most recent `limit` messages).
+    pub last_seen_message_id: Option<String>,
+    /// Timestamp (ms since epoch) of the last digest post for this subscription.
+    /// Only meaningful for `Digest` mode. Used to skip subscriptions that
+    /// already got a digest in the current window.
+    pub last_digest_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}

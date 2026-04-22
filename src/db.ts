@@ -1,7 +1,14 @@
 import Database from "better-sqlite3";
 import crypto from "crypto";
 import path from "path";
-import type { ActionRecord, ActionStatus, DashboardStats, Sender } from "./types";
+import type {
+  ActionRecord,
+  ActionStatus,
+  ChannelSubscription,
+  DashboardStats,
+  Sender,
+  SubscriptionMode,
+} from "./types";
 
 let db: Database.Database;
 
@@ -66,6 +73,20 @@ export function initDb(dbPath?: string): Database.Database {
       kind TEXT NOT NULL DEFAULT 'dm'
     );
 
+    CREATE TABLE IF NOT EXISTS channel_subscriptions (
+      id                   TEXT PRIMARY KEY,
+      platform             TEXT NOT NULL,
+      channel_id           TEXT NOT NULL,
+      display_name         TEXT NOT NULL,
+      mode                 TEXT NOT NULL,
+      active               INTEGER NOT NULL DEFAULT 1,
+      last_seen_message_id TEXT,
+      last_digest_at_ms    INTEGER,
+      created_at_ms        INTEGER NOT NULL,
+      updated_at_ms        INTEGER NOT NULL,
+      UNIQUE(platform, channel_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);
     CREATE INDEX IF NOT EXISTS idx_actions_created ON actions(createdAt);
     CREATE INDEX IF NOT EXISTS idx_actions_messageId ON actions(messageId);
@@ -73,6 +94,7 @@ export function initDb(dbPath?: string): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_emails_triage ON emails(triageResult);
     CREATE INDEX IF NOT EXISTS idx_emails_seen ON emails(firstSeenAt);
     CREATE INDEX IF NOT EXISTS idx_emails_platform ON emails(platform);
+    CREATE INDEX IF NOT EXISTS idx_channel_subs_active_mode ON channel_subscriptions(active, mode);
   `);
 
   // Additive migrations for existing DBs created before the platform/kind columns landed.
@@ -464,4 +486,78 @@ export function getEmailCount(): number {
     .prepare("SELECT COUNT(*) as count FROM emails")
     .get() as { count: number };
   return row.count;
+}
+
+// --- channel_subscriptions (issue #27) ---
+
+export function listSubscriptions(
+  platform?: string,
+  activeOnly: boolean = true
+): ChannelSubscription[] {
+  let sql =
+    "SELECT id, platform, channel_id, display_name, mode, active, last_seen_message_id, last_digest_at_ms, created_at_ms, updated_at_ms FROM channel_subscriptions";
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (activeOnly) {
+    where.push("active = 1");
+  }
+  if (platform) {
+    where.push("platform = ?");
+    params.push(platform);
+  }
+  if (where.length) sql += " WHERE " + where.join(" AND ");
+  sql += " ORDER BY created_at_ms ASC";
+  const rows = getDb().prepare(sql).all(...params) as Array<Omit<ChannelSubscription, "active"> & { active: number }>;
+  return rows.map((r) => ({ ...r, active: !!r.active }));
+}
+
+export function getSubscription(id: string): ChannelSubscription | null {
+  const row = getDb()
+    .prepare(
+      "SELECT id, platform, channel_id, display_name, mode, active, last_seen_message_id, last_digest_at_ms, created_at_ms, updated_at_ms FROM channel_subscriptions WHERE id = ?"
+    )
+    .get(id) as (Omit<ChannelSubscription, "active"> & { active: number }) | undefined;
+  return row ? { ...row, active: !!row.active } : null;
+}
+
+export function upsertSubscription(
+  platform: string,
+  channelId: string,
+  displayName: string,
+  mode: SubscriptionMode
+): ChannelSubscription {
+  const now = Date.now();
+  const existing = getDb()
+    .prepare("SELECT id FROM channel_subscriptions WHERE platform = ? AND channel_id = ?")
+    .get(platform, channelId) as { id: string } | undefined;
+  if (existing) {
+    getDb()
+      .prepare(
+        "UPDATE channel_subscriptions SET display_name = ?, mode = ?, active = 1, updated_at_ms = ? WHERE id = ?"
+      )
+      .run(displayName, mode, now, existing.id);
+    return getSubscription(existing.id)!;
+  }
+  const id = crypto.randomUUID();
+  getDb()
+    .prepare(
+      `INSERT INTO channel_subscriptions
+         (id, platform, channel_id, display_name, mode, active, created_at_ms, updated_at_ms)
+       VALUES (?, ?, ?, ?, ?, 1, ?, ?)`
+    )
+    .run(id, platform, channelId, displayName, mode, now, now);
+  return getSubscription(id)!;
+}
+
+export function updateSubscriptionMode(id: string, mode: SubscriptionMode): void {
+  getDb()
+    .prepare("UPDATE channel_subscriptions SET mode = ?, updated_at_ms = ? WHERE id = ?")
+    .run(mode, Date.now(), id);
+}
+
+export function deleteSubscription(id: string): void {
+  // Soft delete — flip `active = 0` so (platform, channel_id) stays unique.
+  getDb()
+    .prepare("UPDATE channel_subscriptions SET active = 0, updated_at_ms = ? WHERE id = ?")
+    .run(Date.now(), id);
 }

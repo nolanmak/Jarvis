@@ -6,7 +6,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::models::{Account, ActionRecord, ActionStatus, Email, LearnedPattern, TriageResult};
+use crate::models::{
+    Account, ActionRecord, ActionStatus, ChannelSubscription, Email, LearnedPattern,
+    SubscriptionMode, TriageResult,
+};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -64,6 +67,30 @@ impl Store {
                 [],
             )?;
         }
+        // Issue #27: per-channel subscription registry (platform-agnostic).
+        // Rows control which Discord/Slack/etc channels the poller watches and
+        // which mode (priority / digest / store_only) they route through.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS channel_subscriptions (\
+                 id                   TEXT PRIMARY KEY,\
+                 platform             TEXT NOT NULL,\
+                 channel_id           TEXT NOT NULL,\
+                 display_name         TEXT NOT NULL,\
+                 mode                 TEXT NOT NULL,\
+                 active               INTEGER NOT NULL DEFAULT 1,\
+                 last_seen_message_id TEXT,\
+                 last_digest_at_ms    INTEGER,\
+                 created_at_ms        INTEGER NOT NULL,\
+                 updated_at_ms        INTEGER NOT NULL,\
+                 UNIQUE(platform, channel_id)\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_channel_subs_active_mode \
+                ON channel_subscriptions(active, mode)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -451,6 +478,213 @@ impl Store {
         }
         Ok(new_count)
     }
+
+    // --- channel_subscriptions (issue #27) ---
+
+    /// Create or update a subscription. Keyed on `(platform, channel_id)` so
+    /// re-running a CLI `subscribe` command updates mode/display_name instead
+    /// of erroring.
+    pub fn upsert_subscription(
+        &self,
+        platform: &str,
+        channel_id: &str,
+        display_name: &str,
+        mode: SubscriptionMode,
+    ) -> StoreResult<ChannelSubscription> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let existing: Option<String> = guard
+            .query_row(
+                "SELECT id FROM channel_subscriptions \
+                 WHERE platform = ?1 AND channel_id = ?2",
+                params![platform, channel_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let id = match existing {
+            Some(id) => {
+                guard.execute(
+                    "UPDATE channel_subscriptions \
+                        SET display_name = ?2, mode = ?3, active = 1, updated_at_ms = ?4 \
+                      WHERE id = ?1",
+                    params![id, display_name, mode.as_str(), now],
+                )?;
+                id
+            }
+            None => {
+                let id = Uuid::new_v4().to_string();
+                guard.execute(
+                    "INSERT INTO channel_subscriptions \
+                        (id, platform, channel_id, display_name, mode, active, \
+                         created_at_ms, updated_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)",
+                    params![
+                        id,
+                        platform,
+                        channel_id,
+                        display_name,
+                        mode.as_str(),
+                        now,
+                    ],
+                )?;
+                id
+            }
+        };
+        drop(guard);
+        self.get_subscription(&id)?
+            .ok_or_else(|| StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn get_subscription(&self, id: &str) -> StoreResult<Option<ChannelSubscription>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row: Option<ChannelSubscription> = guard
+            .query_row(
+                "SELECT id, platform, channel_id, display_name, mode, active, \
+                        last_seen_message_id, last_digest_at_ms, created_at_ms, updated_at_ms \
+                   FROM channel_subscriptions \
+                  WHERE id = ?1",
+                params![id],
+                row_to_subscription,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// List active subscriptions for a platform. Callers iterate these per
+    /// poll tick. Returns deterministic order by `created_at_ms ASC` so tests
+    /// are stable.
+    pub fn list_active_subscriptions(
+        &self,
+        platform: &str,
+    ) -> StoreResult<Vec<ChannelSubscription>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, platform, channel_id, display_name, mode, active, \
+                    last_seen_message_id, last_digest_at_ms, created_at_ms, updated_at_ms \
+               FROM channel_subscriptions \
+              WHERE active = 1 AND platform = ?1 \
+              ORDER BY created_at_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![platform], row_to_subscription)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn update_subscription_mode(
+        &self,
+        id: &str,
+        mode: SubscriptionMode,
+    ) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE channel_subscriptions \
+                SET mode = ?2, updated_at_ms = ?3 \
+              WHERE id = ?1",
+            params![id, mode.as_str(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Soft delete — flips `active = 0`. Kept around for audit + to prevent
+    /// the unique-pair constraint blocking a later re-subscribe.
+    pub fn delete_subscription(&self, id: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE channel_subscriptions \
+                SET active = 0, updated_at_ms = ?2 \
+              WHERE id = ?1",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Update `last_seen_message_id` after a successful poll. Snowflakes are
+    /// time-sortable, so the caller passes the newest message id seen this
+    /// tick.
+    pub fn update_last_seen_message(
+        &self,
+        id: &str,
+        message_id: &str,
+    ) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE channel_subscriptions \
+                SET last_seen_message_id = ?2, updated_at_ms = ?3 \
+              WHERE id = ?1",
+            params![id, message_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch (from, subject, body) rows for messages in a thread since
+    /// `since_ms`. Used by the digest scheduler to aggregate one channel's
+    /// recent activity. Oldest first so the prompt reads top-down.
+    pub fn recent_emails_for_thread(
+        &self,
+        thread_id: &str,
+        since_ms: i64,
+    ) -> StoreResult<Vec<(String, String, String)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT fromEmail, subject, COALESCE(body, '') \
+               FROM emails \
+              WHERE threadId = ?1 AND firstSeenAt >= ?2 \
+              ORDER BY firstSeenAt ASC",
+        )?;
+        let rows = stmt.query_map(params![thread_id, since_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn mark_digest_posted(&self, id: &str, at_ms: i64) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE channel_subscriptions \
+                SET last_digest_at_ms = ?2, updated_at_ms = ?3 \
+              WHERE id = ?1",
+            params![id, at_ms, now],
+        )?;
+        Ok(())
+    }
+}
+
+fn row_to_subscription(r: &rusqlite::Row) -> rusqlite::Result<ChannelSubscription> {
+    let mode_str: String = r.get(4)?;
+    let mode = SubscriptionMode::parse(&mode_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            4,
+            rusqlite::types::Type::Text,
+            format!("unknown subscription mode: {mode_str}").into(),
+        )
+    })?;
+    Ok(ChannelSubscription {
+        id: r.get(0)?,
+        platform: r.get(1)?,
+        channel_id: r.get(2)?,
+        display_name: r.get(3)?,
+        mode,
+        active: r.get::<_, i64>(5)? != 0,
+        last_seen_message_id: r.get::<_, Option<String>>(6)?,
+        last_digest_at_ms: r.get::<_, Option<i64>>(7)?,
+        created_at_ms: r.get(8)?,
+        updated_at_ms: r.get(9)?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -603,5 +837,122 @@ mod tests {
         s.log_action("m1", None, "a@b.com", "s", None, None, ActionStatus::DryRun)
             .unwrap();
         assert!(s.is_message_processed("m1").unwrap());
+    }
+
+    // --- channel_subscriptions ---
+
+    #[test]
+    fn upsert_subscription_creates_then_updates() {
+        let (s, _f) = fresh_store();
+        let sub = s
+            .upsert_subscription(
+                "discord",
+                "ch1",
+                "DM with alice",
+                SubscriptionMode::Priority,
+            )
+            .unwrap();
+        assert_eq!(sub.platform, "discord");
+        assert_eq!(sub.channel_id, "ch1");
+        assert_eq!(sub.mode, SubscriptionMode::Priority);
+        assert!(sub.active);
+        assert!(sub.last_seen_message_id.is_none());
+
+        let updated = s
+            .upsert_subscription(
+                "discord",
+                "ch1",
+                "DM with alice (renamed)",
+                SubscriptionMode::Digest,
+            )
+            .unwrap();
+        assert_eq!(updated.id, sub.id, "same (platform, channel_id) re-upserts in place");
+        assert_eq!(updated.display_name, "DM with alice (renamed)");
+        assert_eq!(updated.mode, SubscriptionMode::Digest);
+    }
+
+    #[test]
+    fn list_active_subscriptions_filters_by_platform_and_active() {
+        let (s, _f) = fresh_store();
+        let d1 = s
+            .upsert_subscription("discord", "d1", "d1", SubscriptionMode::Priority)
+            .unwrap();
+        s.upsert_subscription("discord", "d2", "d2", SubscriptionMode::Digest)
+            .unwrap();
+        s.upsert_subscription("slack", "s1", "s1", SubscriptionMode::StoreOnly)
+            .unwrap();
+
+        let discord_subs = s.list_active_subscriptions("discord").unwrap();
+        assert_eq!(discord_subs.len(), 2);
+        assert!(discord_subs.iter().all(|x| x.platform == "discord"));
+
+        s.delete_subscription(&d1.id).unwrap();
+        let after_delete = s.list_active_subscriptions("discord").unwrap();
+        assert_eq!(after_delete.len(), 1, "soft-deleted subs excluded");
+        assert_eq!(after_delete[0].channel_id, "d2");
+    }
+
+    #[test]
+    fn update_subscription_mode_persists() {
+        let (s, _f) = fresh_store();
+        let sub = s
+            .upsert_subscription("discord", "ch1", "dm", SubscriptionMode::Priority)
+            .unwrap();
+        s.update_subscription_mode(&sub.id, SubscriptionMode::StoreOnly)
+            .unwrap();
+        let reloaded = s.get_subscription(&sub.id).unwrap().unwrap();
+        assert_eq!(reloaded.mode, SubscriptionMode::StoreOnly);
+    }
+
+    #[test]
+    fn update_last_seen_message_persists() {
+        let (s, _f) = fresh_store();
+        let sub = s
+            .upsert_subscription("discord", "ch1", "dm", SubscriptionMode::Priority)
+            .unwrap();
+        s.update_last_seen_message(&sub.id, "1234567890").unwrap();
+        let reloaded = s.get_subscription(&sub.id).unwrap().unwrap();
+        assert_eq!(reloaded.last_seen_message_id.as_deref(), Some("1234567890"));
+    }
+
+    #[test]
+    fn mark_digest_posted_persists() {
+        let (s, _f) = fresh_store();
+        let sub = s
+            .upsert_subscription("discord", "ch1", "dm", SubscriptionMode::Digest)
+            .unwrap();
+        s.mark_digest_posted(&sub.id, 1776806000000).unwrap();
+        let reloaded = s.get_subscription(&sub.id).unwrap().unwrap();
+        assert_eq!(reloaded.last_digest_at_ms, Some(1776806000000));
+    }
+
+    #[test]
+    fn delete_then_reupsert_restores_same_row() {
+        // Soft-delete preserves the (platform, channel_id) unique pair; a
+        // subsequent upsert should flip active back to 1 and overwrite fields.
+        let (s, _f) = fresh_store();
+        let sub = s
+            .upsert_subscription("discord", "ch1", "first", SubscriptionMode::Priority)
+            .unwrap();
+        s.delete_subscription(&sub.id).unwrap();
+        let restored = s
+            .upsert_subscription("discord", "ch1", "second", SubscriptionMode::Digest)
+            .unwrap();
+        assert_eq!(restored.id, sub.id);
+        assert_eq!(restored.display_name, "second");
+        assert_eq!(restored.mode, SubscriptionMode::Digest);
+        assert!(restored.active);
+    }
+
+    #[test]
+    fn subscription_mode_parse_round_trip() {
+        for m in [
+            SubscriptionMode::Priority,
+            SubscriptionMode::Digest,
+            SubscriptionMode::StoreOnly,
+        ] {
+            assert_eq!(SubscriptionMode::parse(m.as_str()), Some(m));
+        }
+        assert_eq!(SubscriptionMode::parse("garbage"), None);
     }
 }
