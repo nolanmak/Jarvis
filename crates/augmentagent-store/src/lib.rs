@@ -7,5 +7,8 @@
 pub mod models;
 mod store;
 
-pub use models::{Account, ActionRecord, ActionStatus, Email, LearnedPattern, TriageResult};
+pub use models::{
+    Account, ActionRecord, ActionStatus, ChannelSubscription, Email, LearnedPattern,
+    SubscriptionMode, TriageResult,
+};
 pub use store::{ActionWithEmail, RetryableReply, Store, StoreError, StoreResult};

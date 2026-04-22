@@ -101,6 +101,60 @@ enum Cmd {
         #[command(subcommand)]
         op: LinkedinOp,
     },
+    /// Discord channel: user-token REST client. Reads personal DMs + watched
+    /// guild channels, routes through subscriptions (priority/digest/store_only).
+    Discord {
+        #[command(subcommand)]
+        op: DiscordOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum DiscordOp {
+    /// Validate + persist harvested Discord creds JSON to Keychain.
+    ///
+    /// Creds JSON must contain `user_id`, `token`, `super_properties_b64`, and
+    /// `user_agent`. Use `scripts/discord-harvest.sh` to produce it.
+    Login {
+        #[arg(long)]
+        creds_json: PathBuf,
+    },
+    /// List DM channels (id + display name).
+    ListDms {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// List guilds (id + name).
+    ListGuilds {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// List text channels in a guild.
+    ListGuildChannels {
+        guild_id: String,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Add or update a subscription in the shared channel_subscriptions table.
+    Subscribe {
+        channel_id: String,
+        #[arg(long, value_parser = ["priority", "digest", "store_only"])]
+        mode: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List active subscriptions (platform='discord').
+    Subscriptions {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Soft-remove a subscription by id.
+    Unsubscribe { id: String },
+    /// Run one poll cycle and exit.
+    PollOnce {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -235,6 +289,19 @@ async fn main() -> Result<()> {
                         None
                     }
                 };
+            // Discord is optional too — builds only if creds are in Keychain.
+            let discord_ch = match build_discord_channel(
+                &cli,
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                dry_run,
+            ) {
+                Ok(ch) => Some(ch),
+                Err(e) => {
+                    warn!("discord channel disabled: {e:#}");
+                    None
+                }
+            };
             let shutdown = CancellationToken::new();
             let s2 = shutdown.clone();
             tokio::spawn(async move {
@@ -243,19 +310,32 @@ async fn main() -> Result<()> {
                     s2.cancel();
                 }
             });
-            match linkedin_ch {
-                Some(li_ch) => {
-                    let sd_gmail = shutdown.clone();
-                    let sd_li = shutdown.clone();
-                    let g = tokio::spawn(async move { gmail_ch.run(sd_gmail).await });
-                    let l = tokio::spawn(async move { li_ch.run(sd_li).await });
-                    let (g_res, l_res) = tokio::join!(g, l);
-                    g_res??;
-                    l_res??;
-                    Ok(())
-                }
-                None => gmail_ch.run(shutdown).await,
+            // Collect the enabled channels' runners + optional digest scheduler.
+            let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+            let sd = shutdown.clone();
+            tasks.push(tokio::spawn(async move { gmail_ch.run(sd).await }));
+            if let Some(li) = linkedin_ch {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { li.run(sd).await }));
             }
+            if let Some(dc) = discord_ch {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { dc.run(sd).await }));
+                // Digest scheduler rides alongside the Discord channel when
+                // Discord is enabled. Skips cleanly when no Digest-mode subs.
+                let digest = augmentagent_channel_discord_dm::digest::DigestScheduler::new(
+                    Arc::clone(&store),
+                    Arc::new(ClaudeCliReasoner::new()),
+                    Arc::clone(&broker),
+                    cli.wiki_dir.clone(),
+                );
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { digest.run(sd).await }));
+            }
+            for handle in tasks {
+                handle.await??;
+            }
+            Ok(())
         }
         Cmd::Wiki { ref op } => match op {
             WikiOp::Lint { out } => run_wiki_lint(&cli, out.clone()).await,
@@ -283,6 +363,26 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             LinkedinOp::Recent => run_linkedin_recent().await,
+        },
+        Cmd::Discord { ref op } => match op {
+            DiscordOp::Login { creds_json } => run_discord_login(creds_json.clone()).await,
+            DiscordOp::ListDms { json } => run_discord_list_dms(*json).await,
+            DiscordOp::ListGuilds { json } => run_discord_list_guilds(*json).await,
+            DiscordOp::ListGuildChannels { guild_id, json } => {
+                run_discord_list_guild_channels(guild_id.clone(), *json).await
+            }
+            DiscordOp::Subscribe { channel_id, mode, name } => {
+                run_discord_subscribe(store, channel_id.clone(), mode.clone(), name.clone())
+            }
+            DiscordOp::Subscriptions { json } => run_discord_subscriptions(store, *json),
+            DiscordOp::Unsubscribe { id } => run_discord_unsubscribe(store, id.clone()),
+            DiscordOp::PollOnce { dry_run } => {
+                let broker = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
+                let ch = build_discord_channel(&cli, store, broker, *dry_run)?;
+                let out = ch.poll_once().await?;
+                println!("{out:#?}");
+                Ok(())
+            }
         },
     }
 }
@@ -595,6 +695,9 @@ struct ReplyApprover {
     /// (cookies not configured). Any LinkedIn-tagged action hitting this
     /// approver with a None client surfaces as `Failed`.
     linkedin: Option<Arc<VoyagerClient>>,
+    /// Optional Discord client. `None` = Discord disabled for this run
+    /// (auth not loaded). Any discord-tagged action hits `Failed`.
+    discord: Option<Arc<augmentagent_channel_discord_dm::DiscordClient>>,
     reasoner: Arc<ClaudeCliReasoner>,
     draft_skill: String,
     wiki_root: Option<PathBuf>,
@@ -714,6 +817,104 @@ impl ReplyApprover {
             .mark_email_processed(&action.email.message_id, TriageResult::Reply);
         ApprovalActionOutcome::Skipped
     }
+
+    async fn approve_discord(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        let Some(discord) = self.discord.as_ref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "Discord is not configured; run `augmentagent discord login`".into(),
+            };
+        };
+        let Some(channel_id) = action.email.thread_id.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no channel id on email; cannot send".into(),
+            };
+        };
+        let Some(body) = action.action.draft_body.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no draft body on action; cannot send".into(),
+            };
+        };
+        match discord.send_message(channel_id, body).await {
+            Ok(_) => {
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Sent,
+                    Some(body),
+                    None,
+                );
+                let _ = self
+                    .store
+                    .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                tracing::info!(action_id, "discord reply sent via approval handler");
+                ApprovalActionOutcome::Approved
+            }
+            Err(e) => {
+                let msg = format!("discord send_message: {e}");
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                ApprovalActionOutcome::Failed { message: msg }
+            }
+        }
+    }
+
+    async fn revise_discord(
+        &self,
+        action_id: &str,
+        feedback: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        let previous_draft = action.action.draft_body.clone().unwrap_or_default();
+        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
+        let prompt = augmentagent_channel_core::prompt::redraft_message(
+            &action.email,
+            &previous_draft,
+            feedback,
+        );
+        let redraft = match self.reasoner.call(&opts, &prompt).await {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("redraft call failed: {e}"),
+                };
+            }
+        };
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Pending,
+            Some(&redraft),
+            None,
+        );
+        tracing::info!(action_id, "discord revise: new draft persisted");
+        ApprovalActionOutcome::Revised {
+            email: action.email,
+            draft: redraft,
+        }
+    }
+
+    fn skip_discord(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Rejected,
+            None,
+            Some("skipped by approver"),
+        );
+        let _ = self
+            .store
+            .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+        ApprovalActionOutcome::Skipped
+    }
 }
 
 #[async_trait]
@@ -726,6 +927,9 @@ impl ApprovalActionHandler for ReplyApprover {
             return ApprovalActionOutcome::AlreadyResolved {
                 status: action.action.status,
             };
+        }
+        if action.email.platform == "discord" {
+            return self.approve_discord(action_id, action).await;
         }
         if is_linkedin_email(&action.email) {
             return self.approve_linkedin(action_id, action).await;
@@ -773,6 +977,9 @@ impl ApprovalActionHandler for ReplyApprover {
                 status: action.action.status,
             };
         }
+        if action.email.platform == "discord" {
+            return self.skip_discord(action_id, action);
+        }
         if is_linkedin_email(&action.email) {
             return self.skip_linkedin(action_id, action);
         }
@@ -805,6 +1012,9 @@ impl ApprovalActionHandler for ReplyApprover {
             return ApprovalActionOutcome::AlreadyResolved {
                 status: action.action.status,
             };
+        }
+        if action.email.platform == "discord" {
+            return self.revise_discord(action_id, feedback, action).await;
         }
         if is_linkedin_email(&action.email) {
             return self.revise_linkedin(action_id, feedback, action).await;
@@ -934,10 +1144,12 @@ async fn build_broker(
     // send LinkedIn replies (Gmail-only mode).
     let linkedin = load_linkedin_client(&repo_root);
 
+    let discord = load_discord_client();
     let approver = Arc::new(ReplyApprover {
         store,
         gmail,
         linkedin,
+        discord,
         reasoner: Arc::clone(&reasoner),
         draft_skill,
         wiki_root: cli.wiki_dir.clone(),
@@ -1119,6 +1331,224 @@ async fn run_linkedin_recent() -> Result<()> {
         );
     }
     Ok(())
+}
+
+// ================================================================
+// Discord (issue #27)
+// ================================================================
+
+async fn run_discord_login(creds_json: PathBuf) -> Result<()> {
+    use augmentagent_channel_discord_dm::{DiscordAuth, DiscordClient};
+    let raw = std::fs::read_to_string(&creds_json)
+        .with_context(|| format!("read creds file at {}", creds_json.display()))?;
+    let auth: DiscordAuth = serde_json::from_str(&raw).context("parse discord creds JSON")?;
+    auth.validate().context("creds missing required fields")?;
+
+    // Probe GET /users/@me to confirm the token is accepted before we
+    // persist. Avoids saving a broken auth blob that'd fail at poll time.
+    let client = DiscordClient::new(auth.clone()).context("build discord client")?;
+    let dms = client
+        .list_dm_channels()
+        .await
+        .context("token probe via /users/@me/channels failed")?;
+    info!(dm_count = dms.len(), "discord token probe ok");
+
+    auth.save_to_keychain()
+        .context("save discord auth to keychain")?;
+    println!(
+        "discord auth saved to keychain (augmentagent/discord/default)\nuser_id: {}",
+        auth.user_id
+    );
+    Ok(())
+}
+
+fn load_discord_client() -> Option<Arc<augmentagent_channel_discord_dm::DiscordClient>> {
+    match augmentagent_channel_discord_dm::DiscordAuth::load_with_migration(None) {
+        Ok(auth) => match augmentagent_channel_discord_dm::DiscordClient::new(auth) {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                warn!("discord client build failed: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            info!("discord auth not loaded: {e} (discord send disabled this run)");
+            None
+        }
+    }
+}
+
+async fn run_discord_list_dms(json: bool) -> Result<()> {
+    let client =
+        load_discord_client().ok_or_else(|| anyhow::anyhow!("discord auth not configured"))?;
+    let dms = client.list_dm_channels().await.context("list DMs")?;
+    if json {
+        println!("{}", serde_json::to_string(&dms_to_json(&dms))?);
+    } else {
+        println!("{} DM channels\n", dms.len());
+        for d in &dms {
+            let kind = if d.is_one_to_one() { "dm" } else { "group" };
+            println!("  {}  [{}]  {}", d.id, kind, d.display_name());
+        }
+    }
+    Ok(())
+}
+
+async fn run_discord_list_guilds(json: bool) -> Result<()> {
+    let client =
+        load_discord_client().ok_or_else(|| anyhow::anyhow!("discord auth not configured"))?;
+    let guilds = client.list_guilds().await.context("list guilds")?;
+    if json {
+        let rows: Vec<_> = guilds
+            .iter()
+            .map(|g| serde_json::json!({ "id": g.id, "name": g.name }))
+            .collect();
+        println!("{}", serde_json::to_string(&rows)?);
+    } else {
+        println!("{} guilds\n", guilds.len());
+        for g in &guilds {
+            println!("  {}  {}", g.id, g.name);
+        }
+    }
+    Ok(())
+}
+
+async fn run_discord_list_guild_channels(guild_id: String, json: bool) -> Result<()> {
+    let client =
+        load_discord_client().ok_or_else(|| anyhow::anyhow!("discord auth not configured"))?;
+    let channels = client
+        .list_guild_channels(&guild_id)
+        .await
+        .context("list guild channels")?;
+    let text: Vec<_> = channels.iter().filter(|c| c.is_text()).collect();
+    if json {
+        let rows: Vec<_> = text
+            .iter()
+            .map(|c| serde_json::json!({ "id": c.id, "name": c.name }))
+            .collect();
+        println!("{}", serde_json::to_string(&rows)?);
+    } else {
+        println!("{} text channels in guild {}\n", text.len(), guild_id);
+        for c in &text {
+            println!("  {}  #{}", c.id, c.name);
+        }
+    }
+    Ok(())
+}
+
+fn run_discord_subscribe(
+    store: Arc<Store>,
+    channel_id: String,
+    mode: String,
+    name: Option<String>,
+) -> Result<()> {
+    use augmentagent_store::SubscriptionMode;
+    let parsed = SubscriptionMode::parse(&mode)
+        .ok_or_else(|| anyhow::anyhow!("invalid mode: {mode}"))?;
+    let display = name.unwrap_or_else(|| channel_id.clone());
+    let sub = store
+        .upsert_subscription(augmentagent_channel_discord_dm::PLATFORM, &channel_id, &display, parsed)
+        .context("upsert subscription")?;
+    println!(
+        "subscription id={} platform={} channel_id={} mode={} name={}",
+        sub.id, sub.platform, sub.channel_id, sub.mode.as_str(), sub.display_name
+    );
+    Ok(())
+}
+
+fn run_discord_subscriptions(store: Arc<Store>, json: bool) -> Result<()> {
+    let subs = store
+        .list_active_subscriptions(augmentagent_channel_discord_dm::PLATFORM)
+        .context("list subscriptions")?;
+    if json {
+        println!("{}", serde_json::to_string(&subs)?);
+    } else {
+        println!("{} active discord subscriptions\n", subs.len());
+        for s in &subs {
+            println!(
+                "  {}  mode={}  channel={}  last_seen={:?}  name={}",
+                s.id,
+                s.mode.as_str(),
+                s.channel_id,
+                s.last_seen_message_id,
+                s.display_name,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_discord_unsubscribe(store: Arc<Store>, id: String) -> Result<()> {
+    store
+        .delete_subscription(&id)
+        .context("delete subscription")?;
+    println!("subscription {id} deactivated");
+    Ok(())
+}
+
+fn dms_to_json(dms: &[augmentagent_channel_discord_dm::types::DmChannel]) -> Vec<serde_json::Value> {
+    dms.iter()
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "type": d.channel_type,
+                "display_name": d.display_name(),
+                "is_one_to_one": d.is_one_to_one(),
+            })
+        })
+        .collect()
+}
+
+fn build_discord_channel(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<augmentagent_channel_discord_dm::DiscordChannel<ClaudeCliReasoner>> {
+    use augmentagent_channel_discord_dm::{DiscordAuth, DiscordChannel, DiscordChannelConfig};
+    let auth = DiscordAuth::load_with_migration(None).context(
+        "load discord auth — run `augmentagent discord login --creds-json <file>`",
+    )?;
+    let my_user_id = auth.user_id.clone();
+    let client = Arc::new(
+        augmentagent_channel_discord_dm::DiscordClient::new(auth)
+            .context("build discord client")?,
+    );
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+
+    let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
+        Some(root) => {
+            let schema = cli
+                .wiki_schema
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("schema/wiki-skill.md"));
+            (Some(root.clone()), Some(schema))
+        }
+        None => (None, None),
+    };
+    let identity_index = wiki_root
+        .as_ref()
+        .and_then(|root| {
+            let layout = augmentagent_wiki::WikiLayout::new(root.clone());
+            augmentagent_wiki::IdentityIndex::build(&layout).ok().map(Arc::new)
+        });
+
+    let config = DiscordChannelConfig {
+        poll_interval: Duration::from_secs(augmentagent_channel_discord_dm::channel::DEFAULT_POLL_SECS),
+        dry_run,
+        wiki_root,
+        wiki_schema_path,
+        skill_dir: PathBuf::from("skills/discord-triage"),
+    };
+    Ok(DiscordChannel::new(
+        store,
+        client,
+        reasoner,
+        broker,
+        my_user_id,
+        config,
+        identity_index,
+    ))
 }
 
 /// Compile-fences to prove prefix constant is referenced (silence dead-code

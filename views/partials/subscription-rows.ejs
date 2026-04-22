@@ -1,0 +1,58 @@
+<% if (subs.length === 0) { %>
+  <tr>
+    <td colspan="6" class="px-4 py-8 text-center text-gray-500">
+      No subscriptions yet. Click “Add subscription” to start watching a Discord channel.
+    </td>
+  </tr>
+<% } else { %>
+  <% subs.forEach(function(sub) { %>
+    <tr class="border-b border-gray-800 hover:bg-gray-800/50">
+      <td class="px-4 py-3 text-xs text-gray-400 uppercase"><%= sub.platform %></td>
+      <td class="px-4 py-3 text-sm">
+        <div class="font-medium"><%= sub.display_name %></div>
+        <div class="text-xs text-gray-500 font-mono"><%= sub.channel_id %></div>
+      </td>
+      <td class="px-4 py-3">
+        <select
+          class="bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-xs"
+          onchange="updateMode('<%= sub.id %>', this.value)">
+          <option value="priority" <%= sub.mode === 'priority' ? 'selected' : '' %>>priority</option>
+          <option value="digest" <%= sub.mode === 'digest' ? 'selected' : '' %>>digest</option>
+          <option value="store_only" <%= sub.mode === 'store_only' ? 'selected' : '' %>>store_only</option>
+        </select>
+      </td>
+      <td class="px-4 py-3 text-xs text-gray-500 font-mono">
+        <%= sub.last_seen_message_id || '—' %>
+      </td>
+      <td class="px-4 py-3 text-xs text-gray-500">
+        <%= sub.last_digest_at_ms ? new Date(sub.last_digest_at_ms).toLocaleString() : '—' %>
+      </td>
+      <td class="px-4 py-3 text-right">
+        <button
+          onclick="removeSubscription('<%= sub.id %>')"
+          class="text-xs text-red-400 hover:text-red-300">
+          remove
+        </button>
+      </td>
+    </tr>
+  <% }); %>
+<% } %>
+
+<script>
+  async function updateMode(id, mode) {
+    const res = await fetch('/api/subscriptions/' + id, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+    if (!res.ok) { alert('update failed: ' + await res.text()); return; }
+    document.getElementById('sub-table-body').innerHTML = await res.text();
+  }
+
+  async function removeSubscription(id) {
+    if (!confirm('Remove this subscription?')) return;
+    const res = await fetch('/api/subscriptions/' + id, { method: 'DELETE' });
+    if (!res.ok) { alert('delete failed: ' + await res.text()); return; }
+    document.getElementById('sub-table-body').innerHTML = await res.text();
+  }
+</script>
