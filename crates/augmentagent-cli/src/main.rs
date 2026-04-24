@@ -310,7 +310,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::PollOnce { dry_run } => {
-            let broker = build_broker(&cli, Arc::clone(&store), dry_run).await?;
+            let (broker, _) = build_broker(&cli, Arc::clone(&store), dry_run).await?;
             let ch = build_channel(&cli, store, broker, dry_run, 120)?;
             let out = ch.poll_once().await?;
             println!("{out:#?}");
@@ -320,7 +320,7 @@ async fn main() -> Result<()> {
             interval_secs,
             dry_run,
         } => {
-            let broker = build_broker(&cli, Arc::clone(&store), dry_run).await?;
+            let (broker, approver) = build_broker(&cli, Arc::clone(&store), dry_run).await?;
             let gmail_ch = build_channel(
                 &cli,
                 Arc::clone(&store),
@@ -399,6 +399,28 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { sc.run(sd).await }));
             }
+            // Nudge scheduler — surfaces pending approval cards one at a time
+            // (serial queue). Cross-channel: any pending action (gmail /
+            // linkedin / discord / slack) is eligible. The approver holds a
+            // Weak ref back to the scheduler so resolve handlers can advance
+            // the queue instantly on approve/skip without waiting for the
+            // next tick. Skipped under dry-run (NoopBroker) — bumping
+            // counters with no visible card is pointless.
+            if !dry_run {
+                let nudge = Arc::new(augmentagent_approval_discord::NudgeScheduler::new(
+                    Arc::clone(&store),
+                    Arc::clone(&broker),
+                ));
+                if let Some(ref approver) = approver {
+                    approver
+                        .nudge
+                        .set(Arc::downgrade(&nudge))
+                        .ok();
+                }
+                let sd = shutdown.clone();
+                let nudge_for_task = Arc::clone(&nudge);
+                tasks.push(tokio::spawn(async move { nudge_for_task.run(sd).await }));
+            }
             for handle in tasks {
                 handle.await??;
             }
@@ -423,7 +445,7 @@ async fn main() -> Result<()> {
         Cmd::Linkedin { ref op } => match op {
             LinkedinOp::Login { cookies_json } => run_linkedin_login(cookies_json.clone()).await,
             LinkedinOp::PollOnce { dry_run } => {
-                let broker = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
+                let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
                 let ch = build_linkedin_channel(&cli, store, broker, *dry_run)?;
                 let out = ch.poll_once().await?;
                 println!("{out:#?}");
@@ -442,7 +464,7 @@ async fn main() -> Result<()> {
             SlackOp::Subscriptions { json } => run_slack_subscriptions(store, *json),
             SlackOp::Unsubscribe { id } => run_slack_unsubscribe(store, id.clone()),
             SlackOp::PollOnce { dry_run } => {
-                let broker = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
+                let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
                 let ch = build_slack_channel(&cli, store, broker, *dry_run)?;
                 let out = ch.poll_once().await?;
                 println!("{out:#?}");
@@ -462,7 +484,7 @@ async fn main() -> Result<()> {
             DiscordOp::Subscriptions { json } => run_discord_subscriptions(store, *json),
             DiscordOp::Unsubscribe { id } => run_discord_unsubscribe(store, id.clone()),
             DiscordOp::PollOnce { dry_run } => {
-                let broker = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
+                let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
                 let ch = build_discord_channel(&cli, store, broker, *dry_run)?;
                 let out = ch.poll_once().await?;
                 println!("{out:#?}");
@@ -789,6 +811,11 @@ struct ReplyApprover {
     reasoner: Arc<ClaudeCliReasoner>,
     draft_skill: String,
     wiki_root: Option<PathBuf>,
+    /// Set after construction (in serve) to allow approve/skip handlers to
+    /// trigger the next queue card immediately on terminal outcome. Held as
+    /// `Weak` to break the Approver ↔ Scheduler ↔ Broker reference cycle.
+    /// Empty in dry-run / one-shot poll commands.
+    nudge: std::sync::OnceLock<std::sync::Weak<augmentagent_approval_discord::NudgeScheduler>>,
 }
 
 impl ReplyApprover {
@@ -802,6 +829,18 @@ impl ReplyApprover {
                 tracing::warn!(action_id, "approver: store lookup failed: {e}");
                 None
             }
+        }
+    }
+
+    /// Surface the next queue item if the user just resolved one. Best-effort:
+    /// if the scheduler is gone (Weak upgrade fails) or the post fails, the
+    /// next 60s scheduler tick will catch up. Called only after Approved or
+    /// Skipped outcomes — not on Revised (revise keeps the card active).
+    async fn trigger_next_nudge(&self) {
+        let Some(weak) = self.nudge.get() else { return };
+        let Some(scheduler) = weak.upgrade() else { return };
+        if let Err(e) = scheduler.post_next_if_idle().await {
+            tracing::warn!("trigger_next_nudge failed: {e:#}");
         }
     }
 
@@ -881,6 +920,7 @@ impl ReplyApprover {
             Some(&redraft),
             None,
         );
+        let _ = self.store.reset_nudge_schedule(action_id);
         tracing::info!(action_id, "linkedin revise: new draft persisted");
         ApprovalActionOutcome::Revised {
             email: action.email,
@@ -980,6 +1020,7 @@ impl ReplyApprover {
             Some(&redraft),
             None,
         );
+        let _ = self.store.reset_nudge_schedule(action_id);
         tracing::info!(action_id, "discord revise: new draft persisted");
         ApprovalActionOutcome::Revised {
             email: action.email,
@@ -1106,6 +1147,31 @@ impl ReplyApprover {
 #[async_trait]
 impl ApprovalActionHandler for ReplyApprover {
     async fn approve(&self, action_id: &str) -> ApprovalActionOutcome {
+        let outcome = self.run_approve(action_id).await;
+        if matches!(outcome, ApprovalActionOutcome::Approved) {
+            self.trigger_next_nudge().await;
+        }
+        outcome
+    }
+
+    async fn skip(&self, action_id: &str) -> ApprovalActionOutcome {
+        let outcome = self.run_skip(action_id).await;
+        if matches!(outcome, ApprovalActionOutcome::Skipped) {
+            self.trigger_next_nudge().await;
+        }
+        outcome
+    }
+
+    async fn revise(&self, action_id: &str, feedback: &str) -> ApprovalActionOutcome {
+        // Revise does NOT advance the queue — the card stays active until the
+        // user finally approves or skips. The instant-new-draft response is
+        // handled by the broker's event handler from the Revised outcome.
+        self.run_revise(action_id, feedback).await
+    }
+}
+
+impl ReplyApprover {
+    async fn run_approve(&self, action_id: &str) -> ApprovalActionOutcome {
         let Some(action) = self.handle_load(action_id) else {
             return ApprovalActionOutcome::NotFound;
         };
@@ -1157,7 +1223,7 @@ impl ApprovalActionHandler for ReplyApprover {
         ApprovalActionOutcome::Approved
     }
 
-    async fn skip(&self, action_id: &str) -> ApprovalActionOutcome {
+    async fn run_skip(&self, action_id: &str) -> ApprovalActionOutcome {
         let Some(action) = self.handle_load(action_id) else {
             return ApprovalActionOutcome::NotFound;
         };
@@ -1196,7 +1262,7 @@ impl ApprovalActionHandler for ReplyApprover {
         ApprovalActionOutcome::Skipped
     }
 
-    async fn revise(&self, action_id: &str, feedback: &str) -> ApprovalActionOutcome {
+    async fn run_revise(&self, action_id: &str, feedback: &str) -> ApprovalActionOutcome {
         let Some(action) = self.handle_load(action_id) else {
             return ApprovalActionOutcome::NotFound;
         };
@@ -1276,6 +1342,7 @@ impl ApprovalActionHandler for ReplyApprover {
             Some(&redraft),
             None,
         );
+        let _ = self.store.reset_nudge_schedule(action_id);
 
         tracing::info!(action_id, new_draft_id, "revise: new draft posted");
         ApprovalActionOutcome::Revised {
@@ -1289,15 +1356,15 @@ async fn build_broker(
     cli: &Cli,
     store: Arc<Store>,
     dry_run: bool,
-) -> Result<Arc<dyn ApprovalBroker>> {
+) -> Result<(Arc<dyn ApprovalBroker>, Option<Arc<ReplyApprover>>)> {
     if dry_run {
-        return Ok(Arc::new(NoopBroker));
+        return Ok((Arc::new(NoopBroker), None));
     }
     let token = match std::env::var("DISCORD_BOT_TOKEN") {
         Ok(t) => t,
         Err(_) => {
             warn!("DISCORD_BOT_TOKEN unset; approval broker disabled (replies will error)");
-            return Ok(Arc::new(NoopBroker));
+            return Ok((Arc::new(NoopBroker), None));
         }
     };
     let channel_id: u64 = std::env::var("DISCORD_CHANNEL_ID")
@@ -1350,19 +1417,21 @@ async fn build_broker(
         reasoner: Arc::clone(&reasoner),
         draft_skill,
         wiki_root: cli.wiki_dir.clone(),
+        nudge: std::sync::OnceLock::new(),
     });
 
+    let approver_for_broker = Arc::clone(&approver);
     let broker = DiscordApprovalBroker::start(DiscordConfig {
         bot_token: token,
         channel_id,
         query_channel_id,
         allowed_user_id,
         query_handler,
-        action_handler: Some(approver),
+        action_handler: Some(approver_for_broker),
     })
     .await
     .context("start discord broker")?;
-    Ok(Arc::new(broker))
+    Ok((Arc::new(broker), Some(approver)))
 }
 
 fn build_channel(
