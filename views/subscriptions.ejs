@@ -51,8 +51,9 @@
         <label class="block text-xs uppercase text-gray-500 mb-1">Platform</label>
         <select id="platform-select" name="platform"
                 class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-sm"
-                onchange="loadSources()">
+                onchange="onPlatformChange()">
           <option value="discord" selected>Discord</option>
+          <option value="slack">Slack</option>
         </select>
       </div>
 
@@ -60,6 +61,7 @@
         <label class="block text-xs uppercase text-gray-500 mb-1">Source</label>
         <select id="source-type" class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-sm"
                 onchange="loadSources()">
+          <!-- Discord defaults; rewritten when platform changes -->
           <option value="dm">DM</option>
           <option value="guild">Guild channel</option>
         </select>
@@ -112,14 +114,33 @@
 <script>
   const channelState = new Map(); // id -> display label for hidden display_name
 
+  function onPlatformChange() {
+    const platform = document.getElementById('platform-select').value;
+    const srcSel = document.getElementById('source-type');
+    if (platform === 'slack') {
+      srcSel.innerHTML = [
+        '<option value="slack_dm">Slack: DM</option>',
+        '<option value="slack_channel">Slack: channel</option>',
+      ].join('');
+    } else {
+      srcSel.innerHTML = [
+        '<option value="dm">DM</option>',
+        '<option value="guild">Guild channel</option>',
+      ].join('');
+    }
+    loadSources();
+  }
+
   async function loadSources() {
+    const platform = document.getElementById('platform-select').value;
     const type = document.getElementById('source-type').value;
     const guildPicker = document.getElementById('guild-picker');
     const channelSel = document.getElementById('channel-select');
     channelSel.innerHTML = '<option value="">Loading…</option>';
-    if (type === 'dm') {
-      guildPicker.classList.add('hidden');
-      try {
+    guildPicker.classList.add('hidden');
+
+    try {
+      if (platform === 'discord' && type === 'dm') {
         const res = await fetch('/api/discord/dms');
         const dms = await res.json();
         channelState.clear();
@@ -131,12 +152,8 @@
           })
           .join('');
         onChannelPick();
-      } catch (e) {
-        channelSel.innerHTML = '<option>(error loading)</option>';
-      }
-    } else {
-      guildPicker.classList.remove('hidden');
-      try {
+      } else if (platform === 'discord' && type === 'guild') {
+        guildPicker.classList.remove('hidden');
         const res = await fetch('/api/discord/guilds');
         const guilds = await res.json();
         const gSel = document.getElementById('guild-select');
@@ -144,9 +161,22 @@
           .map((g) => '<option value="' + g.id + '" data-name="' + g.name + '">' + g.name + '</option>')
           .join('');
         await loadGuildChannels();
-      } catch (e) {
-        document.getElementById('guild-select').innerHTML = '<option>(error)</option>';
+      } else if (platform === 'slack') {
+        const slackTypes = type === 'slack_dm' ? 'im,mpim' : 'public_channel,private_channel';
+        const res = await fetch('/api/slack/conversations?types=' + encodeURIComponent(slackTypes));
+        const convs = await res.json();
+        channelState.clear();
+        channelSel.innerHTML = convs
+          .map((c) => {
+            const label = c.display_name;
+            channelState.set(c.id, label);
+            return '<option value="' + c.id + '">' + label + '</option>';
+          })
+          .join('');
+        onChannelPick();
       }
+    } catch (e) {
+      channelSel.innerHTML = '<option>(error loading)</option>';
     }
   }
 

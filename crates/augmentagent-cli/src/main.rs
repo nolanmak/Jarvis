@@ -107,6 +107,57 @@ enum Cmd {
         #[command(subcommand)]
         op: DiscordOp,
     },
+    /// Slack channel: Composio-managed OAuth client. Reads watched DMs +
+    /// channels via subscriptions (priority/digest/store_only).
+    Slack {
+        #[command(subcommand)]
+        op: SlackOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum SlackOp {
+    /// Validate + persist Slack auth JSON to Keychain.
+    ///
+    /// JSON must contain entity_id, connection_id, team_id, team_name,
+    /// user_id, and composio_api_key. Get entity_id + connection_id by
+    /// connecting a Slack workspace through the dashboard Settings page
+    /// (OAuth flow); team_id + user_id come from the Composio connection
+    /// metadata after OAuth succeeds.
+    Login {
+        #[arg(long)]
+        auth_json: PathBuf,
+    },
+    /// List conversations the user can see.
+    ListConversations {
+        /// Slack-style CSV of types to include.
+        #[arg(long, default_value = "public_channel,private_channel,im,mpim")]
+        types: String,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Add or update a subscription in the shared channel_subscriptions table.
+    Subscribe {
+        channel_id: String,
+        #[arg(long, value_parser = ["priority", "digest", "store_only"])]
+        mode: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List active subscriptions (platform='slack').
+    Subscriptions {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Soft-remove a subscription by id.
+    Unsubscribe { id: String },
+    /// Run one poll cycle and exit.
+    PollOnce {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -302,6 +353,18 @@ async fn main() -> Result<()> {
                     None
                 }
             };
+            let slack_ch = match build_slack_channel(
+                &cli,
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                dry_run,
+            ) {
+                Ok(ch) => Some(ch),
+                Err(e) => {
+                    warn!("slack channel disabled: {e:#}");
+                    None
+                }
+            };
             let shutdown = CancellationToken::new();
             let s2 = shutdown.clone();
             tokio::spawn(async move {
@@ -331,6 +394,10 @@ async fn main() -> Result<()> {
                 );
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { digest.run(sd).await }));
+            }
+            if let Some(sc) = slack_ch {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { sc.run(sd).await }));
             }
             for handle in tasks {
                 handle.await??;
@@ -363,6 +430,24 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             LinkedinOp::Recent => run_linkedin_recent().await,
+        },
+        Cmd::Slack { ref op } => match op {
+            SlackOp::Login { auth_json } => run_slack_login(auth_json.clone()).await,
+            SlackOp::ListConversations { types, limit, json } => {
+                run_slack_list_conversations(types.clone(), *limit, *json).await
+            }
+            SlackOp::Subscribe { channel_id, mode, name } => {
+                run_slack_subscribe(store, channel_id.clone(), mode.clone(), name.clone())
+            }
+            SlackOp::Subscriptions { json } => run_slack_subscriptions(store, *json),
+            SlackOp::Unsubscribe { id } => run_slack_unsubscribe(store, id.clone()),
+            SlackOp::PollOnce { dry_run } => {
+                let broker = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
+                let ch = build_slack_channel(&cli, store, broker, *dry_run)?;
+                let out = ch.poll_once().await?;
+                println!("{out:#?}");
+                Ok(())
+            }
         },
         Cmd::Discord { ref op } => match op {
             DiscordOp::Login { creds_json } => run_discord_login(creds_json.clone()).await,
@@ -698,6 +783,9 @@ struct ReplyApprover {
     /// Optional Discord client. `None` = Discord disabled for this run
     /// (auth not loaded). Any discord-tagged action hits `Failed`.
     discord: Option<Arc<augmentagent_channel_discord_dm::DiscordClient>>,
+    /// Optional Slack client. `None` = Slack disabled for this run.
+    /// Slack-tagged actions surface `Failed` with a "run slack login" hint.
+    slack: Option<Arc<augmentagent_channel_slack::SlackClient>>,
     reasoner: Arc<ClaudeCliReasoner>,
     draft_skill: String,
     wiki_root: Option<PathBuf>,
@@ -915,6 +1003,104 @@ impl ReplyApprover {
             .mark_email_processed(&action.email.message_id, TriageResult::Reply);
         ApprovalActionOutcome::Skipped
     }
+
+    async fn approve_slack(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        let Some(slack) = self.slack.as_ref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "Slack is not configured; run `augmentagent slack login`".into(),
+            };
+        };
+        let Some(channel_id) = action.email.thread_id.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no channel id on email; cannot send".into(),
+            };
+        };
+        let Some(body) = action.action.draft_body.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no draft body on action; cannot send".into(),
+            };
+        };
+        match slack.send_message(channel_id, body).await {
+            Ok(ts) => {
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Sent,
+                    Some(body),
+                    None,
+                );
+                let _ = self
+                    .store
+                    .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                tracing::info!(action_id, ts, "slack reply sent via approval handler");
+                ApprovalActionOutcome::Approved
+            }
+            Err(e) => {
+                let msg = format!("slack send_message: {e}");
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                ApprovalActionOutcome::Failed { message: msg }
+            }
+        }
+    }
+
+    async fn revise_slack(
+        &self,
+        action_id: &str,
+        feedback: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        let previous_draft = action.action.draft_body.clone().unwrap_or_default();
+        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
+        let prompt = augmentagent_channel_core::prompt::redraft_message(
+            &action.email,
+            &previous_draft,
+            feedback,
+        );
+        let redraft = match self.reasoner.call(&opts, &prompt).await {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("redraft call failed: {e}"),
+                };
+            }
+        };
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Pending,
+            Some(&redraft),
+            None,
+        );
+        tracing::info!(action_id, "slack revise: new draft persisted");
+        ApprovalActionOutcome::Revised {
+            email: action.email,
+            draft: redraft,
+        }
+    }
+
+    fn skip_slack(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Rejected,
+            None,
+            Some("skipped by approver"),
+        );
+        let _ = self
+            .store
+            .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+        ApprovalActionOutcome::Skipped
+    }
 }
 
 #[async_trait]
@@ -930,6 +1116,9 @@ impl ApprovalActionHandler for ReplyApprover {
         }
         if action.email.platform == "discord" {
             return self.approve_discord(action_id, action).await;
+        }
+        if action.email.platform == "slack" {
+            return self.approve_slack(action_id, action).await;
         }
         if is_linkedin_email(&action.email) {
             return self.approve_linkedin(action_id, action).await;
@@ -980,6 +1169,9 @@ impl ApprovalActionHandler for ReplyApprover {
         if action.email.platform == "discord" {
             return self.skip_discord(action_id, action);
         }
+        if action.email.platform == "slack" {
+            return self.skip_slack(action_id, action);
+        }
         if is_linkedin_email(&action.email) {
             return self.skip_linkedin(action_id, action);
         }
@@ -1015,6 +1207,9 @@ impl ApprovalActionHandler for ReplyApprover {
         }
         if action.email.platform == "discord" {
             return self.revise_discord(action_id, feedback, action).await;
+        }
+        if action.email.platform == "slack" {
+            return self.revise_slack(action_id, feedback, action).await;
         }
         if is_linkedin_email(&action.email) {
             return self.revise_linkedin(action_id, feedback, action).await;
@@ -1145,11 +1340,13 @@ async fn build_broker(
     let linkedin = load_linkedin_client(&repo_root);
 
     let discord = load_discord_client();
+    let slack = load_slack_client();
     let approver = Arc::new(ReplyApprover {
         store,
         gmail,
         linkedin,
         discord,
+        slack,
         reasoner: Arc::clone(&reasoner),
         draft_skill,
         wiki_root: cli.wiki_dir.clone(),
@@ -1541,6 +1738,197 @@ fn build_discord_channel(
         skill_dir: PathBuf::from("skills/discord-triage"),
     };
     Ok(DiscordChannel::new(
+        store,
+        client,
+        reasoner,
+        broker,
+        my_user_id,
+        config,
+        identity_index,
+    ))
+}
+
+// ================================================================
+// Slack (issue #7)
+// ================================================================
+
+async fn run_slack_login(auth_json: PathBuf) -> Result<()> {
+    use augmentagent_channel_slack::{SlackAuth, SlackClient};
+    let raw = std::fs::read_to_string(&auth_json)
+        .with_context(|| format!("read slack auth file at {}", auth_json.display()))?;
+    let auth: SlackAuth = serde_json::from_str(&raw).context("parse slack auth JSON")?;
+    auth.validate().context("missing required fields")?;
+
+    // Probe a lightweight Composio call to confirm credentials work before persisting.
+    let client = SlackClient::new(auth.clone()).context("build slack client")?;
+    let convs = client
+        .list_conversations("im", 1)
+        .await
+        .context("probe via SLACK_LIST_CONVERSATIONS failed")?;
+    info!(conversations_reachable = convs.len(), "slack auth probe ok");
+
+    auth.save_to_keychain()
+        .context("save slack auth to keychain")?;
+    println!(
+        "slack auth saved to keychain (augmentagent/slack/default)\nteam:    {} ({})\nuser_id: {}",
+        auth.team_name, auth.team_id, auth.user_id
+    );
+    Ok(())
+}
+
+fn load_slack_client() -> Option<Arc<augmentagent_channel_slack::SlackClient>> {
+    match augmentagent_channel_slack::SlackAuth::load_from_keychain() {
+        Ok(auth) => match augmentagent_channel_slack::SlackClient::new(auth) {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                warn!("slack client build failed: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            info!("slack auth not loaded: {e} (slack send disabled this run)");
+            None
+        }
+    }
+}
+
+async fn run_slack_list_conversations(types: String, limit: u32, json: bool) -> Result<()> {
+    let client =
+        load_slack_client().ok_or_else(|| anyhow::anyhow!("slack auth not configured"))?;
+    let convs = client
+        .list_conversations(&types, limit)
+        .await
+        .context("list conversations")?;
+    if json {
+        let rows: Vec<_> = convs
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.id,
+                    "name": c.name,
+                    "display_name": c.display_name(),
+                    "is_im": c.is_im,
+                    "is_mpim": c.is_mpim,
+                    "is_private": c.is_private,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&rows)?);
+    } else {
+        println!("{} conversations\n", convs.len());
+        for c in &convs {
+            let kind = if c.is_im {
+                "dm"
+            } else if c.is_mpim {
+                "group"
+            } else if c.is_private {
+                "private"
+            } else {
+                "public"
+            };
+            println!("  {}  [{}]  {}", c.id, kind, c.display_name());
+        }
+    }
+    Ok(())
+}
+
+fn run_slack_subscribe(
+    store: Arc<Store>,
+    channel_id: String,
+    mode: String,
+    name: Option<String>,
+) -> Result<()> {
+    use augmentagent_store::SubscriptionMode;
+    let parsed = SubscriptionMode::parse(&mode)
+        .ok_or_else(|| anyhow::anyhow!("invalid mode: {mode}"))?;
+    let display = name.unwrap_or_else(|| channel_id.clone());
+    let sub = store
+        .upsert_subscription(
+            augmentagent_channel_slack::PLATFORM,
+            &channel_id,
+            &display,
+            parsed,
+        )
+        .context("upsert subscription")?;
+    println!(
+        "subscription id={} platform={} channel_id={} mode={} name={}",
+        sub.id,
+        sub.platform,
+        sub.channel_id,
+        sub.mode.as_str(),
+        sub.display_name
+    );
+    Ok(())
+}
+
+fn run_slack_subscriptions(store: Arc<Store>, json: bool) -> Result<()> {
+    let subs = store
+        .list_active_subscriptions(augmentagent_channel_slack::PLATFORM)
+        .context("list subscriptions")?;
+    if json {
+        println!("{}", serde_json::to_string(&subs)?);
+    } else {
+        println!("{} active slack subscriptions\n", subs.len());
+        for s in &subs {
+            println!(
+                "  {}  mode={}  channel={}  last_seen={:?}  name={}",
+                s.id,
+                s.mode.as_str(),
+                s.channel_id,
+                s.last_seen_message_id,
+                s.display_name,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_slack_unsubscribe(store: Arc<Store>, id: String) -> Result<()> {
+    store
+        .delete_subscription(&id)
+        .context("delete subscription")?;
+    println!("subscription {id} deactivated");
+    Ok(())
+}
+
+fn build_slack_channel(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<augmentagent_channel_slack::SlackChannel<ClaudeCliReasoner>> {
+    use augmentagent_channel_slack::{SlackAuth, SlackChannel, SlackChannelConfig, SlackClient};
+    let auth = SlackAuth::load_from_keychain()
+        .context("load slack auth — run `augmentagent slack login --auth-json <file>`")?;
+    let my_user_id = auth.user_id.clone();
+    let client = Arc::new(SlackClient::new(auth).context("build slack client")?);
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+
+    let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
+        Some(root) => {
+            let schema = cli
+                .wiki_schema
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("schema/wiki-skill.md"));
+            (Some(root.clone()), Some(schema))
+        }
+        None => (None, None),
+    };
+    let identity_index = wiki_root.as_ref().and_then(|root| {
+        let layout = augmentagent_wiki::WikiLayout::new(root.clone());
+        augmentagent_wiki::IdentityIndex::build(&layout)
+            .ok()
+            .map(Arc::new)
+    });
+
+    let config = SlackChannelConfig {
+        poll_interval: Duration::from_secs(augmentagent_channel_slack::channel::DEFAULT_POLL_SECS),
+        dry_run,
+        wiki_root,
+        wiki_schema_path,
+        skill_dir: PathBuf::from("skills/slack-triage"),
+    };
+    Ok(SlackChannel::new(
         store,
         client,
         reasoner,
