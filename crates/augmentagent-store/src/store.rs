@@ -47,6 +47,26 @@ impl Store {
         if !column_exists(conn, "actions", "draftId")? {
             conn.execute("ALTER TABLE actions ADD COLUMN draftId TEXT", [])?;
         }
+        if !column_exists(conn, "actions", "nudgeCount")? {
+            conn.execute(
+                "ALTER TABLE actions ADD COLUMN nudgeCount INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !column_exists(conn, "actions", "nextNudgeAtMs")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN nextNudgeAtMs INTEGER", [])?;
+            // One-shot backfill: rows still in 'pending' from before the
+            // nudge-loop ship need a timer or they'll never get reminded.
+            // Seeded at createdAt + 6h, matching the steady-state invariant
+            // log_action maintains for fresh rows. Old backlog items will
+            // therefore fire on the first scheduler tick after upgrade.
+            conn.execute(
+                "UPDATE actions \
+                    SET nextNudgeAtMs = createdAt + ?1 \
+                  WHERE status = 'pending' AND nextNudgeAtMs IS NULL",
+                params![NUDGE_INTERVAL_MS],
+            )?;
+        }
         if !column_exists(conn, "emails", "platform")? {
             conn.execute(
                 "ALTER TABLE emails ADD COLUMN platform TEXT NOT NULL DEFAULT 'gmail'",
@@ -181,10 +201,14 @@ impl Store {
     ) -> StoreResult<String> {
         let id = Uuid::new_v4().to_string();
         let now = now_millis();
+        let next_nudge_at_ms = match status {
+            ActionStatus::Pending => Some(now + NUDGE_INTERVAL_MS),
+            _ => None,
+        };
         let guard = self.conn.lock().expect("store mutex poisoned");
         guard.execute(
-            "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9)",
+            "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9, 0, ?10)",
             params![
                 id,
                 message_id,
@@ -195,6 +219,7 @@ impl Store {
                 draft_body,
                 status.as_str(),
                 now,
+                next_nudge_at_ms,
             ],
         )?;
         Ok(id)
@@ -479,6 +504,113 @@ impl Store {
         Ok(new_count)
     }
 
+    // --- pending-action nudge loop (serial queue) ---
+
+    /// Count of pending actions currently in the nudge queue: rows whose
+    /// `nextNudgeAtMs` has fired (i.e. they're either active or due to be
+    /// promoted). Used by the scheduler to compute the X/Y queue counter.
+    pub fn count_pending_overdue(&self, now_ms: i64) -> StoreResult<i64> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM actions \
+              WHERE status = 'pending' \
+                AND nextNudgeAtMs IS NOT NULL \
+                AND nextNudgeAtMs <= ?1",
+            params![now_ms],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// The currently-active card in the nudge queue, if any. "Active" means a
+    /// pending row that has already been promoted (`nudgeCount > 0`) — the
+    /// card the user is currently looking at. There is at most one.
+    pub fn find_active_nudge(&self) -> StoreResult<Option<PendingNudge>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT \
+                   a.id, a.messageId, a.threadId, a.fromEmail, a.subject, \
+                   a.originalBody, a.draftBody, a.status, a.errorMessage, \
+                   a.createdAt, a.updatedAt, COALESCE(a.retryCount, 0), a.draftId, \
+                   COALESCE(a.nudgeCount, 0), a.nextNudgeAtMs, \
+                   e.body, e.receivedAt, e.accountEntityId, e.platform, e.kind \
+                 FROM actions a \
+                 JOIN emails e ON a.messageId = e.messageId \
+                 WHERE a.status = 'pending' AND COALESCE(a.nudgeCount, 0) > 0 \
+                 ORDER BY a.createdAt ASC \
+                 LIMIT 1",
+                [],
+                row_to_pending_nudge,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// The next pending row eligible for promotion to active: oldest pending
+    /// row with `nudgeCount = 0` whose `nextNudgeAtMs` has fired. Returns None
+    /// when the backlog is empty.
+    pub fn find_next_to_promote(&self, now_ms: i64) -> StoreResult<Option<PendingNudge>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT \
+                   a.id, a.messageId, a.threadId, a.fromEmail, a.subject, \
+                   a.originalBody, a.draftBody, a.status, a.errorMessage, \
+                   a.createdAt, a.updatedAt, COALESCE(a.retryCount, 0), a.draftId, \
+                   COALESCE(a.nudgeCount, 0), a.nextNudgeAtMs, \
+                   e.body, e.receivedAt, e.accountEntityId, e.platform, e.kind \
+                 FROM actions a \
+                 JOIN emails e ON a.messageId = e.messageId \
+                 WHERE a.status = 'pending' \
+                   AND COALESCE(a.nudgeCount, 0) = 0 \
+                   AND a.nextNudgeAtMs IS NOT NULL \
+                   AND a.nextNudgeAtMs <= ?1 \
+                 ORDER BY a.createdAt ASC \
+                 LIMIT 1",
+                params![now_ms],
+                row_to_pending_nudge,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Mark a nudge as delivered: bump `nudgeCount` and schedule the next
+    /// reminder at `next_at_ms`. Caller computes the next time (typically
+    /// `now + NUDGE_INTERVAL_MS`). Used both for initial promotion (count
+    /// goes 0 → 1) and re-nudges of the active card (1 → 2 → ...).
+    pub fn record_nudge(&self, action_id: &str, next_at_ms: i64) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE actions \
+                SET nudgeCount = COALESCE(nudgeCount, 0) + 1, \
+                    nextNudgeAtMs = ?2, \
+                    updatedAt = ?3 \
+              WHERE id = ?1",
+            params![action_id, next_at_ms, now],
+        )?;
+        Ok(())
+    }
+
+    /// Defer the next nudge when the user engages mid-flow (e.g. revises).
+    /// Pushes `nextNudgeAtMs` out by one full interval but **does not** zero
+    /// `nudgeCount` — under serial-queue mode that would kick the card back
+    /// into the backlog and yank the user between drafts. The card stays the
+    /// active one until the user finally approves or skips.
+    pub fn reset_nudge_schedule(&self, action_id: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE actions \
+                SET nextNudgeAtMs = ?2, \
+                    updatedAt = ?3 \
+              WHERE id = ?1",
+            params![action_id, now + NUDGE_INTERVAL_MS, now],
+        )?;
+        Ok(())
+    }
+
     // --- channel_subscriptions (issue #27) ---
 
     /// Create or update a subscription. Keyed on `(platform, channel_id)` so
@@ -694,6 +826,55 @@ pub struct RetryableReply {
     pub email: Email,
 }
 
+/// Fixed interval between nudges for a pending approval card. 6 hours.
+pub const NUDGE_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// A pending action in the nudge queue, packaged with the email body the
+/// approval card was rendered from. `nudge_count` is how many times this card
+/// has been surfaced (0 = still in backlog, ≥1 = currently active);
+/// `next_nudge_at_ms` is when it next becomes eligible for posting/re-posting.
+#[derive(Debug, Clone)]
+pub struct PendingNudge {
+    pub action: ActionWithEmail,
+    pub nudge_count: i64,
+    pub next_nudge_at_ms: Option<i64>,
+}
+
+fn row_to_pending_nudge(r: &rusqlite::Row) -> rusqlite::Result<PendingNudge> {
+    Ok(PendingNudge {
+        action: ActionWithEmail {
+            action: ActionRecord {
+                id: r.get(0)?,
+                message_id: r.get(1)?,
+                thread_id: r.get(2)?,
+                from_email: r.get(3)?,
+                subject: r.get(4)?,
+                original_body: r.get(5)?,
+                draft_body: r.get(6)?,
+                status: r.get(7)?,
+                error_message: r.get(8)?,
+                created_at: ms_to_rfc3339(r.get::<_, i64>(9)?),
+                updated_at: ms_to_rfc3339(r.get::<_, i64>(10)?),
+            },
+            retry_count: r.get::<_, i64>(11)?,
+            draft_id: r.get::<_, Option<String>>(12)?,
+            email: Email {
+                message_id: r.get(1)?,
+                thread_id: r.get(2)?,
+                from: r.get(3)?,
+                subject: r.get(4)?,
+                body: r.get::<_, Option<String>>(15)?.unwrap_or_default(),
+                date: r.get::<_, Option<String>>(16)?.unwrap_or_default(),
+                account_entity_id: r.get::<_, Option<String>>(17)?,
+                platform: r.get::<_, Option<String>>(18)?.unwrap_or_else(|| "gmail".into()),
+                kind: r.get::<_, Option<String>>(19)?.unwrap_or_else(|| "dm".into()),
+            },
+        },
+        nudge_count: r.get::<_, i64>(13)?,
+        next_nudge_at_ms: r.get::<_, Option<i64>>(14)?,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct ActionWithEmail {
     pub action: ActionRecord,
@@ -837,6 +1018,172 @@ mod tests {
         s.log_action("m1", None, "a@b.com", "s", None, None, ActionStatus::DryRun)
             .unwrap();
         assert!(s.is_message_processed("m1").unwrap());
+    }
+
+    // --- nudge loop ---
+
+    #[test]
+    fn pending_action_seeds_nudge_schedule() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("m1")).unwrap();
+        let id = s
+            .log_action("m1", None, "a@b.com", "s", None, Some("draft"), ActionStatus::Pending)
+            .unwrap();
+        // Next nudge is roughly 6h out — query directly to verify.
+        let conn = Connection::open(_f.path()).unwrap();
+        let next: Option<i64> = conn
+            .query_row(
+                "SELECT nextNudgeAtMs FROM actions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(next.is_some(), "pending action must have a nudge timer");
+        let count: i64 = conn
+            .query_row(
+                "SELECT nudgeCount FROM actions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn non_pending_action_skips_nudge_schedule() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("m1")).unwrap();
+        let id = s
+            .log_action("m1", None, "a@b.com", "s", None, None, ActionStatus::DryRun)
+            .unwrap();
+        let conn = Connection::open(_f.path()).unwrap();
+        let next: Option<i64> = conn
+            .query_row(
+                "SELECT nextNudgeAtMs FROM actions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(next.is_none(), "dry-run actions should never be nudged");
+    }
+
+    #[test]
+    fn find_next_to_promote_returns_oldest_due_unpromoted() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("m1")).unwrap();
+        s.upsert_email(&sample_email("m2")).unwrap();
+        let id1 = s
+            .log_action("m1", None, "a@b.com", "s1", None, Some("d1"), ActionStatus::Pending)
+            .unwrap();
+        // Slight delay so m2's createdAt > m1's.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _id2 = s
+            .log_action("m2", None, "a@b.com", "s2", None, Some("d2"), ActionStatus::Pending)
+            .unwrap();
+        // Not yet due — backfill is createdAt + 6h.
+        let nxt = s.find_next_to_promote(now_millis()).unwrap();
+        assert!(nxt.is_none(), "fresh actions shouldn't be due yet");
+        // Far future → both due. Oldest first.
+        let future = now_millis() + NUDGE_INTERVAL_MS + 1000;
+        let nxt = s.find_next_to_promote(future).unwrap().expect("expected next");
+        assert_eq!(nxt.action.action.id, id1, "oldest createdAt wins");
+        assert_eq!(nxt.nudge_count, 0);
+    }
+
+    #[test]
+    fn find_active_nudge_returns_promoted_pending() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("m1")).unwrap();
+        let id = s
+            .log_action("m1", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .unwrap();
+        assert!(s.find_active_nudge().unwrap().is_none());
+        s.record_nudge(&id, now_millis() + NUDGE_INTERVAL_MS).unwrap();
+        let active = s.find_active_nudge().unwrap().expect("expected active card");
+        assert_eq!(active.action.action.id, id);
+        assert_eq!(active.nudge_count, 1);
+        assert!(active.next_nudge_at_ms.is_some());
+    }
+
+    #[test]
+    fn find_active_nudge_excludes_terminal_status() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("m1")).unwrap();
+        let id = s
+            .log_action("m1", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .unwrap();
+        s.record_nudge(&id, now_millis() + NUDGE_INTERVAL_MS).unwrap();
+        s.update_action_status(&id, ActionStatus::Approved, None, None)
+            .unwrap();
+        assert!(
+            s.find_active_nudge().unwrap().is_none(),
+            "approved card should no longer be active"
+        );
+    }
+
+    #[test]
+    fn count_pending_overdue_counts_all_due() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("m1")).unwrap();
+        s.upsert_email(&sample_email("m2")).unwrap();
+        s.log_action("m1", None, "a@b.com", "s", None, None, ActionStatus::Pending)
+            .unwrap();
+        let id2 = s
+            .log_action("m2", None, "a@b.com", "s", None, None, ActionStatus::Pending)
+            .unwrap();
+        // Promote m2 so it's active. Both should still count as overdue when
+        // we query past the timer.
+        s.record_nudge(&id2, now_millis() + NUDGE_INTERVAL_MS).unwrap();
+        let future = now_millis() + 2 * NUDGE_INTERVAL_MS;
+        assert_eq!(s.count_pending_overdue(future).unwrap(), 2);
+    }
+
+    #[test]
+    fn record_nudge_bumps_count_and_pushes_next() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("m1")).unwrap();
+        let id = s
+            .log_action("m1", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .unwrap();
+        let now = now_millis();
+        s.record_nudge(&id, now + NUDGE_INTERVAL_MS).unwrap();
+        s.record_nudge(&id, now + 2 * NUDGE_INTERVAL_MS).unwrap();
+        let conn = Connection::open(_f.path()).unwrap();
+        let (count, next): (i64, i64) = conn
+            .query_row(
+                "SELECT nudgeCount, nextNudgeAtMs FROM actions WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(next, now + 2 * NUDGE_INTERVAL_MS);
+    }
+
+    #[test]
+    fn reset_nudge_schedule_defers_without_zeroing_count() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("m1")).unwrap();
+        let id = s
+            .log_action("m1", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .unwrap();
+        // Promote, then re-nudge once → count = 2.
+        s.record_nudge(&id, now_millis()).unwrap();
+        s.record_nudge(&id, now_millis()).unwrap();
+        // Revise: defer timer 6h, KEEP count (card stays the active one).
+        s.reset_nudge_schedule(&id).unwrap();
+        let conn = Connection::open(_f.path()).unwrap();
+        let (count, next): (i64, i64) = conn
+            .query_row(
+                "SELECT nudgeCount, nextNudgeAtMs FROM actions WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "revise must not zero nudgeCount");
+        let now = now_millis();
+        assert!(next >= now + NUDGE_INTERVAL_MS - 5_000);
+        assert!(next <= now + NUDGE_INTERVAL_MS + 5_000);
     }
 
     // --- channel_subscriptions ---

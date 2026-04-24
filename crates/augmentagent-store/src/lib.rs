@@ -11,4 +11,7 @@ pub use models::{
     Account, ActionRecord, ActionStatus, ChannelSubscription, Email, LearnedPattern,
     SubscriptionMode, TriageResult,
 };
-pub use store::{ActionWithEmail, RetryableReply, Store, StoreError, StoreResult};
+pub use store::{
+    ActionWithEmail, PendingNudge, RetryableReply, Store, StoreError, StoreResult,
+    NUDGE_INTERVAL_MS,
+};
