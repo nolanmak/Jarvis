@@ -33,6 +33,7 @@ import {
 } from "./db";
 import type { ActionStatus, SubscriptionMode } from "./types";
 import { listDms, listGuilds, listGuildChannels } from "./discordApi";
+import { listConversations as listSlackConversations } from "./slackApi";
 
 const router = Router();
 
@@ -108,7 +109,7 @@ router.get("/subscriptions", (_req, res) => {
 // --- Subscription CRUD ---
 
 const ALLOWED_MODES: SubscriptionMode[] = ["priority", "digest", "store_only"];
-const ALLOWED_PLATFORMS = new Set(["discord"]);
+const ALLOWED_PLATFORMS = new Set(["discord", "slack"]);
 
 router.get("/api/subscriptions", (_req, res) => {
   const subs = listSubscriptions();
@@ -180,6 +181,19 @@ router.get("/api/discord/guilds/:id/channels", async (req, res) => {
   try {
     const channels = await listGuildChannels(req.params.id);
     res.json(channels);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// --- Slack source-picker proxy (shells to Rust CLI) ---
+
+router.get("/api/slack/conversations", async (req, res) => {
+  try {
+    const types = (req.query.types as string | undefined) ||
+      "public_channel,private_channel,im,mpim";
+    const convs = await listSlackConversations(types);
+    res.json(convs);
   } catch (e) {
     res.status(500).json({ error: (e as Error).message });
   }
