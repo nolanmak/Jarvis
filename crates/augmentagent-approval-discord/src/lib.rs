@@ -12,9 +12,11 @@ mod broker;
 mod custom_id;
 mod event_handler;
 mod layout;
+mod nudge;
 
 pub use broker::{DiscordApprovalBroker, DiscordConfig};
 pub use event_handler::chunk_for_discord;
+pub use nudge::NudgeScheduler;
 
 use async_trait::async_trait;
 use augmentagent_store::Email;
