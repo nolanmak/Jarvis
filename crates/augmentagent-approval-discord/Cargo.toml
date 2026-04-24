@@ -10,6 +10,7 @@ repository.workspace = true
 augmentagent-store = { path = "../augmentagent-store" }
 
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
