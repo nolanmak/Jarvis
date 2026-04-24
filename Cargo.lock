@@ -361,6 +361,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-channel-slack"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-auth",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "augmentagent-wiki",
+ "mockito",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "augmentagent-cli"
 version = "0.1.0"
 dependencies = [
@@ -371,6 +395,7 @@ dependencies = [
  "augmentagent-channel-discord-dm",
  "augmentagent-channel-email",
  "augmentagent-channel-linkedin",
+ "augmentagent-channel-slack",
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",
