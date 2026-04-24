@@ -6,6 +6,7 @@ members = [
     "crates/augmentagent-channel-email",
     "crates/augmentagent-channel-linkedin",
     "crates/augmentagent-channel-discord-dm",
+    "crates/augmentagent-channel-slack",
     "crates/augmentagent-approval-discord",
     "crates/augmentagent-auth",
     "crates/augmentagent-wiki",
