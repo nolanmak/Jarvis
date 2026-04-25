@@ -715,6 +715,80 @@ router.get("/api/slack/workspaces", (_req, res) => {
   );
 });
 
+// Channels for a workspace, annotated with each one's current subscription
+// (if any) so the bulk-select UI can pre-check subscribed rows and show mode.
+router.get("/api/slack/workspaces/:teamId/channels", async (req, res) => {
+  const teamId = req.params.teamId;
+  const types = (req.query.types as string | undefined) ||
+    "public_channel,private_channel,im,mpim";
+  if (!getSlackWorkspaceByTeam(teamId)) {
+    return res.status(404).json({ error: "unknown workspace" });
+  }
+  try {
+    const convs = await listSlackConversations(types, teamId);
+    // Find existing subscriptions for this workspace so we can mark each
+    // channel as already-watched (and surface its mode for context).
+    const existing = listSubscriptions("slack", false).filter(
+      (s) => s.account_id === teamId
+    );
+    const subByChannel = new Map(existing.map((s) => [s.channel_id, s]));
+    return res.json(
+      convs.map((c) => {
+        const sub = subByChannel.get(c.id);
+        return {
+          id: c.id,
+          display_name: c.display_name,
+          is_im: c.is_im,
+          is_mpim: c.is_mpim,
+          is_private: c.is_private,
+          subscribed: !!sub && sub.active,
+          subscription_id: sub?.id ?? null,
+          mode: sub?.mode ?? null,
+        };
+      })
+    );
+  } catch (e) {
+    return res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+// Bulk subscribe / unsubscribe for a workspace. Body shape:
+// { mode: "priority"|"digest"|"store_only", channels: [{ id, display_name }] }
+// — upserts each, leaves channels not in the list alone unless `replace=true`,
+// in which case any current sub on this workspace not in the list gets soft-deleted.
+router.post("/api/slack/workspaces/:teamId/subscribe", (req, res) => {
+  const teamId = req.params.teamId;
+  if (!getSlackWorkspaceByTeam(teamId)) {
+    return res.status(404).json({ error: "unknown workspace" });
+  }
+  const { mode, channels, replace } = req.body as {
+    mode?: string;
+    channels?: { id: string; display_name: string }[];
+    replace?: boolean;
+  };
+  if (!mode || !ALLOWED_MODES.includes(mode as SubscriptionMode)) {
+    return res.status(400).json({ error: "invalid mode" });
+  }
+  if (!Array.isArray(channels)) {
+    return res.status(400).json({ error: "channels[] required" });
+  }
+  const wantIds = new Set(channels.map((c) => c.id));
+  for (const ch of channels) {
+    if (!ch.id || !ch.display_name) continue;
+    upsertSubscription("slack", ch.id, ch.display_name, mode as SubscriptionMode, teamId);
+  }
+  if (replace) {
+    const existing = listSubscriptions("slack", true).filter((s) => s.account_id === teamId);
+    for (const sub of existing) {
+      if (!wantIds.has(sub.channel_id)) {
+        deleteSubscription(sub.id);
+      }
+    }
+  }
+  const subs = listSubscriptions();
+  return res.render("partials/subscription-rows", { subs });
+});
+
 router.delete("/api/slack/workspaces/:teamId", async (req, res) => {
   const teamId = req.params.teamId;
   if (!getSlackWorkspaceByTeam(teamId)) {

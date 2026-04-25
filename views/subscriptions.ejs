@@ -37,7 +37,8 @@
           </a>
         </div>
         <p class="text-xs text-gray-500 mb-2">
-          OAuth via Composio. One row per connected workspace; each is keyed by Slack <code class="text-gray-400">team_id</code>.
+          OAuth via Composio. After connecting, click <span class="text-gray-300">Manage channels</span>
+          to bulk-subscribe with checkboxes (no per-channel modal).
         </p>
         <div id="slack-workspaces-list" class="text-sm text-gray-400">Loading…</div>
       </div>
@@ -81,6 +82,70 @@
       </table>
     </div>
   </section>
+</div>
+
+<!-- Channel-manager overlay: per-workspace bulk select with checkboxes -->
+<div id="channels-modal" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+     onclick="if(event.target===this) closeChannelManager()">
+  <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-2xl max-h-[85vh] flex flex-col">
+    <div class="flex items-center justify-between mb-3">
+      <div>
+        <h2 class="text-lg font-semibold">Channels in <span id="cm-workspace-name" class="text-accent"></span></h2>
+        <p class="text-xs text-gray-500">Check channels to subscribe. Already-subscribed rows are pre-checked.</p>
+      </div>
+      <button onclick="closeChannelManager()" class="text-gray-400 hover:text-white">✕</button>
+    </div>
+
+    <div class="flex flex-wrap gap-2 mb-3 text-xs">
+      <div class="flex items-center gap-1">
+        <label class="text-gray-400">Mode for new subs:</label>
+        <select id="cm-mode" class="bg-gray-900 border border-gray-700 rounded-md px-2 py-1">
+          <option value="priority">priority</option>
+          <option value="digest" selected>digest</option>
+          <option value="store_only">store_only</option>
+        </select>
+      </div>
+      <div class="flex items-center gap-1 ml-auto">
+        <label class="text-gray-400">Filter:</label>
+        <select id="cm-filter" class="bg-gray-900 border border-gray-700 rounded-md px-2 py-1" onchange="renderCmList()">
+          <option value="all" selected>All</option>
+          <option value="dms">DMs only</option>
+          <option value="channels">Channels only</option>
+          <option value="subscribed">Subscribed</option>
+        </select>
+        <input id="cm-search" type="text" placeholder="search…"
+               oninput="renderCmList()"
+               class="bg-gray-900 border border-gray-700 rounded-md px-2 py-1 w-32" />
+      </div>
+    </div>
+
+    <div class="flex gap-3 mb-2 text-xs">
+      <button type="button" onclick="cmSelectAll(true)" class="text-blue-400 hover:text-blue-300">Select all visible</button>
+      <button type="button" onclick="cmSelectAll(false)" class="text-blue-400 hover:text-blue-300">Clear all visible</button>
+      <span id="cm-count" class="ml-auto text-gray-500"></span>
+    </div>
+
+    <div id="cm-list" class="flex-1 overflow-y-auto border border-gray-800 rounded-md divide-y divide-gray-800 bg-gray-950">
+      <div class="p-4 text-center text-sm text-gray-400">Loading channels…</div>
+    </div>
+
+    <div id="cm-error" class="hidden text-sm text-red-400 mt-2"></div>
+
+    <div class="flex gap-2 justify-end mt-4">
+      <button type="button" onclick="closeChannelManager()"
+              class="px-3 py-1.5 rounded-md text-sm font-medium text-gray-400 hover:text-white hover:bg-gray-800">
+        Cancel
+      </button>
+      <button type="button" onclick="cmApply(false)"
+              class="px-3 py-1.5 rounded-md text-sm font-medium bg-accent text-white hover:bg-accent/90">
+        Subscribe selected
+      </button>
+      <button type="button" onclick="cmApply(true)" title="Subscribe checked + unsubscribe unchecked"
+              class="px-3 py-1.5 rounded-md text-sm font-medium bg-accent/70 text-white hover:bg-accent/80">
+        Sync (replace)
+      </button>
+    </div>
+  </div>
 </div>
 
 <!-- Subscribe-to-channel modal — sequential flow: platform → (workspace) → channel → mode -->
@@ -226,13 +291,18 @@
       } else {
         target.innerHTML = slackWorkspaces
           .map((w) =>
-            '<div class="flex items-center justify-between py-1"><span><span class="font-medium text-white">' +
-            escapeHtml(w.team_name) +
-            '</span> <span class="text-gray-500">(' +
-            escapeHtml(w.team_id) +
-            ')</span></span><button onclick="removeWorkspace(\'' +
-            escapeJs(w.team_id) +
-            '\')" class="text-xs text-red-400 hover:text-red-300">Disconnect</button></div>'
+            '<div class="flex items-center justify-between py-1.5 gap-2">' +
+              '<span class="min-w-0 truncate">' +
+                '<span class="font-medium text-white">' + escapeHtml(w.team_name) + '</span>' +
+                ' <span class="text-gray-500">(' + escapeHtml(w.team_id) + ')</span>' +
+              '</span>' +
+              '<span class="flex gap-2 shrink-0">' +
+                '<button onclick="openChannelManager(\'' + escapeJs(w.team_id) + '\',\'' + escapeJs(w.team_name) + '\')" ' +
+                  'class="text-xs px-2 py-0.5 rounded bg-accent text-white hover:bg-accent/90">Manage channels</button>' +
+                '<button onclick="removeWorkspace(\'' + escapeJs(w.team_id) + '\')" ' +
+                  'class="text-xs text-red-400 hover:text-red-300">Disconnect</button>' +
+              '</span>' +
+            '</div>'
           )
           .join('');
       }
@@ -505,6 +575,136 @@
     document.getElementById('sub-table-body').innerHTML = html;
     closeAddModal();
   });
+
+  // ==========================================================================
+  // Channel manager (bulk select with checkboxes)
+  // ==========================================================================
+  let cmTeamId = null;
+  let cmChannels = []; // { id, display_name, is_im, is_mpim, is_private, subscribed, mode }
+  let cmChecked = new Set();
+
+  async function openChannelManager(teamId, teamName) {
+    cmTeamId = teamId;
+    cmChannels = [];
+    cmChecked = new Set();
+    document.getElementById('cm-workspace-name').textContent = teamName;
+    document.getElementById('cm-error').classList.add('hidden');
+    document.getElementById('cm-list').innerHTML =
+      '<div class="p-4 text-center text-sm text-gray-400">Loading channels…</div>';
+    document.getElementById('channels-modal').classList.remove('hidden');
+    document.getElementById('cm-search').value = '';
+    document.getElementById('cm-filter').value = 'all';
+
+    try {
+      const res = await fetch('/api/slack/workspaces/' + encodeURIComponent(teamId) + '/channels');
+      if (!res.ok) {
+        const errBody = await res.text();
+        throw new Error(errBody);
+      }
+      cmChannels = await res.json();
+      // Pre-check anything already subscribed.
+      for (const c of cmChannels) {
+        if (c.subscribed) cmChecked.add(c.id);
+      }
+      renderCmList();
+    } catch (e) {
+      document.getElementById('cm-list').innerHTML = '';
+      const err = document.getElementById('cm-error');
+      err.textContent = 'Failed to load channels: ' + (e.message || e);
+      err.classList.remove('hidden');
+    }
+  }
+
+  function closeChannelManager() {
+    document.getElementById('channels-modal').classList.add('hidden');
+    cmTeamId = null;
+    cmChannels = [];
+    cmChecked = new Set();
+  }
+
+  function visibleChannels() {
+    const filter = document.getElementById('cm-filter').value;
+    const q = (document.getElementById('cm-search').value || '').toLowerCase().trim();
+    return cmChannels.filter((c) => {
+      if (filter === 'dms' && !(c.is_im || c.is_mpim)) return false;
+      if (filter === 'channels' && (c.is_im || c.is_mpim)) return false;
+      if (filter === 'subscribed' && !cmChecked.has(c.id)) return false;
+      if (q && !(c.display_name || '').toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }
+
+  function renderCmList() {
+    const list = document.getElementById('cm-list');
+    const visible = visibleChannels();
+    if (!cmChannels.length) {
+      list.innerHTML = '<div class="p-4 text-center text-sm text-gray-400">No channels visible to this workspace.</div>';
+    } else if (!visible.length) {
+      list.innerHTML = '<div class="p-4 text-center text-sm text-gray-400">No channels match your filter.</div>';
+    } else {
+      list.innerHTML = visible
+        .map((c) => {
+          const checked = cmChecked.has(c.id) ? 'checked' : '';
+          const kind = c.is_im ? 'DM' : c.is_mpim ? 'GROUP' : c.is_private ? 'PRIV' : 'CH';
+          const modeBadge = c.subscribed
+            ? '<span class="text-xs px-1.5 py-0.5 rounded bg-green-900/50 text-green-300 border border-green-700/50">' + escapeHtml(c.mode || 'sub') + '</span>'
+            : '';
+          return (
+            '<label class="flex items-center gap-3 px-3 py-2 hover:bg-gray-900 cursor-pointer">' +
+              '<input type="checkbox" data-id="' + escapeHtml(c.id) + '" ' + checked +
+                ' onchange="cmToggle(\'' + escapeJs(c.id) + '\', this.checked)" ' +
+                ' class="rounded border-gray-700 bg-gray-900 text-accent focus:ring-accent" />' +
+              '<span class="text-xs text-gray-500 font-mono w-12 shrink-0">' + kind + '</span>' +
+              '<span class="text-sm text-gray-200 flex-1 truncate">' + escapeHtml(c.display_name) + '</span>' +
+              modeBadge +
+            '</label>'
+          );
+        })
+        .join('');
+    }
+    document.getElementById('cm-count').textContent =
+      cmChecked.size + ' selected · ' + visible.length + ' shown · ' + cmChannels.length + ' total';
+  }
+
+  function cmToggle(id, on) {
+    if (on) cmChecked.add(id); else cmChecked.delete(id);
+    renderCmList();
+  }
+
+  function cmSelectAll(on) {
+    for (const c of visibleChannels()) {
+      if (on) cmChecked.add(c.id); else cmChecked.delete(c.id);
+    }
+    renderCmList();
+  }
+
+  async function cmApply(replace) {
+    if (!cmTeamId) return;
+    const mode = document.getElementById('cm-mode').value;
+    const channels = cmChannels
+      .filter((c) => cmChecked.has(c.id))
+      .map((c) => ({ id: c.id, display_name: c.display_name }));
+    const err = document.getElementById('cm-error');
+    err.classList.add('hidden');
+    if (!channels.length && !replace) {
+      err.textContent = 'Select at least one channel.';
+      err.classList.remove('hidden');
+      return;
+    }
+    const res = await fetch('/api/slack/workspaces/' + encodeURIComponent(cmTeamId) + '/subscribe', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode, channels, replace }),
+    });
+    if (!res.ok) {
+      err.textContent = 'Subscribe failed: ' + (await res.text());
+      err.classList.remove('hidden');
+      return;
+    }
+    const html = await res.text();
+    document.getElementById('sub-table-body').innerHTML = html;
+    closeChannelManager();
+  }
 
   // Boot: load both connection panels in parallel. Modal stays closed; opening
   // it triggers onPlatformChange() to set up the right step sequence based on
