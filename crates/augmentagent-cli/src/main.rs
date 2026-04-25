@@ -138,10 +138,18 @@ enum SlackOp {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         json: bool,
     },
-    /// Disconnect a workspace: deletes its Keychain slot and deactivates the
-    /// `slack_workspaces` row. Subscriptions on that workspace stay but stop
-    /// polling until re-connected.
+    /// Disconnect a workspace: hard-deletes the Keychain slot AND the
+    /// `slack_workspaces` row. Subscriptions on that workspace get soft-
+    /// deactivated. Reconnect via OAuth to start fresh.
     RemoveWorkspace { team_id: String },
+    /// Nuclear reset for Slack state — drops every workspace row, every
+    /// Slack subscription (hard delete), and every Keychain slot under
+    /// `augmentagent/slack/*`. Use when local state is hopelessly out of
+    /// sync with what Composio has on its side.
+    Reset {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        confirm: bool,
+    },
     /// List conversations the user can see.
     ListConversations {
         /// Slack workspace `team_id`. Required when multiple workspaces are
@@ -502,6 +510,7 @@ async fn main() -> Result<()> {
             SlackOp::RemoveWorkspace { team_id } => {
                 run_slack_remove_workspace(store, team_id.clone())
             }
+            SlackOp::Reset { confirm } => run_slack_reset(store, *confirm),
             SlackOp::ListConversations { team_id, types, limit, json } => {
                 run_slack_list_conversations(store, team_id.clone(), types.clone(), *limit, *json).await
             }
@@ -2082,13 +2091,49 @@ fn run_slack_workspaces(store: Arc<Store>, json: bool) -> Result<()> {
 
 fn run_slack_remove_workspace(store: Arc<Store>, team_id: String) -> Result<()> {
     use augmentagent_channel_slack::SlackAuth;
-    // Best-effort delete; ignore "not found" when the Keychain entry is
-    // already gone.
+    // Hard delete: drop both the Keychain slot and the workspace row so a
+    // subsequent OAuth reconnect creates clean state instead of reactivating
+    // a row that may have been written by an older buggy parser.
+    // Subscriptions tied to this workspace get soft-deactivated.
     let _ = SlackAuth::delete_from_keychain(&team_id);
     store
-        .deactivate_slack_workspace(&team_id)
-        .context("deactivate slack workspace row")?;
-    println!("slack workspace {team_id} disconnected");
+        .delete_slack_workspace(&team_id)
+        .context("delete slack workspace row")?;
+    println!("slack workspace {team_id} disconnected (hard delete)");
+    Ok(())
+}
+
+fn run_slack_reset(store: Arc<Store>, confirm: bool) -> Result<()> {
+    use augmentagent_channel_slack::SlackAuth;
+    if !confirm {
+        anyhow::bail!(
+            "refusing to reset Slack state without --confirm true. \
+             This drops every workspace row, every Slack subscription, and \
+             every Keychain slot. Pass --confirm true to proceed."
+        );
+    }
+    let workspaces = store
+        .list_active_slack_workspaces()
+        .context("list workspaces for reset")?;
+    let mut keychain_dropped = 0;
+    let mut rows_dropped = 0;
+    for ws in workspaces {
+        let _ = SlackAuth::delete_from_keychain(&ws.team_id);
+        keychain_dropped += 1;
+        store
+            .delete_slack_workspace(&ws.team_id)
+            .with_context(|| format!("delete workspace {}", ws.team_id))?;
+        rows_dropped += 1;
+    }
+    // Also drop the legacy single-slot Keychain entry left over from
+    // pre-multi-workspace days. Use the team-keyed delete with literal
+    // "default" since the legacy slot was at augmentagent/slack/default.
+    let _ = SlackAuth::delete_from_keychain("default");
+    println!(
+        "slack reset: dropped {} keychain slot(s), {} workspace row(s). \
+         Reconnect via dashboard.",
+        keychain_dropped, rows_dropped
+    );
     Ok(())
 }
 
