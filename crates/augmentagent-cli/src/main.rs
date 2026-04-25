@@ -1996,6 +1996,16 @@ async fn run_slack_persist_auth(
         .context("persist-auth: validation failed after team probe")?;
     auth.save_to_keychain()
         .context("save slack auth to keychain")?;
+    // Verify round-trip: catches silent Keychain backend issues (e.g. Linux
+    // Secret Service unavailable) where save reports OK but read fails.
+    augmentagent_channel_slack::SlackAuth::load_for_team(&auth.team_id)
+        .with_context(|| {
+            format!(
+                "Keychain round-trip failed for team {} — save reported ok but read returned err. \
+                 On Linux this usually means Secret Service (gnome-keyring/kwallet) isn't running for this user session.",
+                auth.team_id
+            )
+        })?;
     store
         .upsert_slack_workspace(
             &auth.team_id,
@@ -2096,8 +2106,33 @@ async fn run_slack_list_conversations(
     limit: u32,
     json: bool,
 ) -> Result<()> {
-    let client = load_single_slack_client(&store, team_id.as_deref())
-        .ok_or_else(|| anyhow::anyhow!("slack auth not configured for requested workspace"))?;
+    let client = match load_single_slack_client(&store, team_id.as_deref()) {
+        Some(c) => c,
+        None => {
+            // Diagnose so the user knows whether to reconnect via dashboard
+            // (Keychain slot missing) or pass --team-id (multi-workspace).
+            let msg = if let Some(tid) = team_id.as_deref() {
+                let row = store.get_slack_workspace_by_team(tid)?;
+                if row.is_some() {
+                    format!(
+                        "workspace {tid} is registered in slack_workspaces but its Keychain slot \
+                         is missing or unreadable. Click 'Disconnect' on that workspace in the \
+                         dashboard, then re-connect to refresh credentials."
+                    )
+                } else {
+                    format!("workspace {tid} not connected — connect it via the dashboard")
+                }
+            } else {
+                let workspaces = store.list_active_slack_workspaces()?;
+                match workspaces.len() {
+                    0 => "no slack workspaces connected — connect one via the dashboard".into(),
+                    1 => "single workspace registered but its Keychain slot is missing — disconnect + reconnect via the dashboard".into(),
+                    _ => "multiple workspaces registered — pass --team-id <T...> to disambiguate".into(),
+                }
+            };
+            anyhow::bail!(msg);
+        }
+    };
     let convs = client
         .list_conversations(&types, limit)
         .await

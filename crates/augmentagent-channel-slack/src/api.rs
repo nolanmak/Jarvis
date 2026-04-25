@@ -8,6 +8,10 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tracing::debug;
 
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
+}
+
 use crate::auth::SlackAuth;
 use crate::types::{Conversation, SlackMessage, SlackUser};
 
@@ -141,13 +145,48 @@ impl SlackClient {
 
     /// `SLACK_FETCH_TEAM_INFO` — workspace metadata (team id, name, domain).
     /// Used at OAuth time to learn which workspace a freshly-connected
-    /// account belongs to.
+    /// account belongs to. Drills specifically into `data.team.{id,name,domain}`
+    /// rather than a generic recursive search — Composio responses often
+    /// carry multiple `id` fields (auth config id, connection id, etc.) and
+    /// the first match would be wrong.
     pub async fn fetch_team_info(&self) -> Result<TeamInfo, SlackError> {
         let resp = self.execute("SLACK_FETCH_TEAM_INFO", json!({})).await?;
-        let team_id = find_string(&resp, &["id"])
-            .ok_or_else(|| SlackError::Slack("no team id in fetch_team_info response".into()))?;
-        let team_name = find_string(&resp, &["name"]).unwrap_or_else(|| team_id.clone());
-        let team_domain = find_string(&resp, &["domain"]);
+        // Try the most common Composio shapes in order:
+        //   data.team.{id,name,domain}
+        //   data.response_data.team.{...}
+        //   response_data.team.{...}
+        //   team.{...}
+        let team = resp
+            .pointer("/data/team")
+            .or_else(|| resp.pointer("/data/response_data/team"))
+            .or_else(|| resp.pointer("/response_data/team"))
+            .or_else(|| resp.get("team"))
+            .ok_or_else(|| {
+                SlackError::Slack(format!(
+                    "no team object in SLACK_FETCH_TEAM_INFO response: {}",
+                    truncate(&resp.to_string(), 400)
+                ))
+            })?;
+        let team_id = team
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SlackError::Slack(format!(
+                    "team object missing id: {}",
+                    truncate(&team.to_string(), 400)
+                ))
+            })?
+            .to_string();
+        let team_name = team
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| team_id.clone());
+        let team_domain = team
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        debug!(team_id = %team_id, team_name = %team_name, "fetch_team_info ok");
         Ok(TeamInfo {
             team_id,
             team_name,
