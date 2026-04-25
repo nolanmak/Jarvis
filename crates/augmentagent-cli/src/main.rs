@@ -117,19 +117,37 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum SlackOp {
-    /// Validate + persist Slack auth JSON to Keychain.
-    ///
-    /// JSON must contain entity_id, connection_id, team_id, team_name,
-    /// user_id, and composio_api_key. Get entity_id + connection_id by
-    /// connecting a Slack workspace through the dashboard Settings page
-    /// (OAuth flow); team_id + user_id come from the Composio connection
-    /// metadata after OAuth succeeds.
+    /// Validate + persist Slack auth JSON to Keychain. Keyed by team_id so
+    /// multiple workspaces can coexist.
     Login {
         #[arg(long)]
         auth_json: PathBuf,
     },
+    /// Persist a Slack auth bundle handed off from the dashboard OAuth
+    /// callback. Takes only the Composio handles — team_id/team_name/user_id
+    /// are derived server-side via SLACK_FETCH_TEAM_INFO + an auth-test call.
+    /// This mirrors Orchid's pattern: trust ACTIVE status, no channel-list
+    /// probe at OAuth time. Also upserts the row in `slack_workspaces`.
+    PersistAuth {
+        #[arg(long)] entity_id: String,
+        #[arg(long)] connection_id: String,
+        #[arg(long)] composio_api_key: String,
+    },
+    /// List connected Slack workspaces (from `slack_workspaces`).
+    Workspaces {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Disconnect a workspace: deletes its Keychain slot and deactivates the
+    /// `slack_workspaces` row. Subscriptions on that workspace stay but stop
+    /// polling until re-connected.
+    RemoveWorkspace { team_id: String },
     /// List conversations the user can see.
     ListConversations {
+        /// Slack workspace `team_id`. Required when multiple workspaces are
+        /// configured; defaults to the sole workspace when only one exists.
+        #[arg(long)]
+        team_id: Option<String>,
         /// Slack-style CSV of types to include.
         #[arg(long, default_value = "public_channel,private_channel,im,mpim")]
         types: String,
@@ -145,6 +163,10 @@ enum SlackOp {
         mode: String,
         #[arg(long)]
         name: Option<String>,
+        /// Slack workspace `team_id` the channel belongs to. Required when
+        /// multiple workspaces are configured.
+        #[arg(long)]
+        team_id: Option<String>,
     },
     /// List active subscriptions (platform='slack').
     Subscriptions {
@@ -169,6 +191,11 @@ enum DiscordOp {
     Login {
         #[arg(long)]
         creds_json: PathBuf,
+    },
+    /// Report whether Discord auth is loaded (used by dashboard status panel).
+    Status {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        json: bool,
     },
     /// List DM channels (id + display name).
     ListDms {
@@ -454,12 +481,27 @@ async fn main() -> Result<()> {
             LinkedinOp::Recent => run_linkedin_recent().await,
         },
         Cmd::Slack { ref op } => match op {
-            SlackOp::Login { auth_json } => run_slack_login(auth_json.clone()).await,
-            SlackOp::ListConversations { types, limit, json } => {
-                run_slack_list_conversations(types.clone(), *limit, *json).await
+            SlackOp::Login { auth_json } => run_slack_login(store, auth_json.clone()).await,
+            SlackOp::PersistAuth {
+                entity_id,
+                connection_id,
+                composio_api_key,
+            } => run_slack_persist_auth(
+                store,
+                entity_id.clone(),
+                connection_id.clone(),
+                composio_api_key.clone(),
+            )
+            .await,
+            SlackOp::Workspaces { json } => run_slack_workspaces(store, *json),
+            SlackOp::RemoveWorkspace { team_id } => {
+                run_slack_remove_workspace(store, team_id.clone())
             }
-            SlackOp::Subscribe { channel_id, mode, name } => {
-                run_slack_subscribe(store, channel_id.clone(), mode.clone(), name.clone())
+            SlackOp::ListConversations { team_id, types, limit, json } => {
+                run_slack_list_conversations(store, team_id.clone(), types.clone(), *limit, *json).await
+            }
+            SlackOp::Subscribe { channel_id, mode, name, team_id } => {
+                run_slack_subscribe(store, channel_id.clone(), mode.clone(), name.clone(), team_id.clone())
             }
             SlackOp::Subscriptions { json } => run_slack_subscriptions(store, *json),
             SlackOp::Unsubscribe { id } => run_slack_unsubscribe(store, id.clone()),
@@ -473,6 +515,7 @@ async fn main() -> Result<()> {
         },
         Cmd::Discord { ref op } => match op {
             DiscordOp::Login { creds_json } => run_discord_login(creds_json.clone()).await,
+            DiscordOp::Status { json } => run_discord_status(*json).await,
             DiscordOp::ListDms { json } => run_discord_list_dms(*json).await,
             DiscordOp::ListGuilds { json } => run_discord_list_guilds(*json).await,
             DiscordOp::ListGuildChannels { guild_id, json } => {
@@ -805,9 +848,10 @@ struct ReplyApprover {
     /// Optional Discord client. `None` = Discord disabled for this run
     /// (auth not loaded). Any discord-tagged action hits `Failed`.
     discord: Option<Arc<augmentagent_channel_discord_dm::DiscordClient>>,
-    /// Optional Slack client. `None` = Slack disabled for this run.
-    /// Slack-tagged actions surface `Failed` with a "run slack login" hint.
-    slack: Option<Arc<augmentagent_channel_slack::SlackClient>>,
+    /// Per-workspace Slack clients keyed by Slack `team_id`. Empty map =
+    /// Slack disabled for this run (no workspaces loaded). Slack-tagged
+    /// actions whose `team_id` isn't in the map surface as `Failed`.
+    slack: std::collections::HashMap<String, Arc<augmentagent_channel_slack::SlackClient>>,
     reasoner: Arc<ClaudeCliReasoner>,
     draft_skill: String,
     wiki_root: Option<PathBuf>,
@@ -1045,14 +1089,38 @@ impl ReplyApprover {
         ApprovalActionOutcome::Skipped
     }
 
+    /// Resolve the right SlackClient for this action. Priority:
+    /// 1. Parse `team_id` out of `email.account_entity_id` ("slack:team:TXX").
+    /// 2. If only one workspace is loaded, use it (back-compat for legacy rows).
+    fn resolve_slack_client(
+        &self,
+        email: &augmentagent_store::Email,
+    ) -> Option<Arc<augmentagent_channel_slack::SlackClient>> {
+        let team_id = email
+            .account_entity_id
+            .as_deref()
+            .and_then(|s| s.strip_prefix("slack:team:"))
+            .map(str::to_string);
+        if let Some(tid) = team_id {
+            if let Some(c) = self.slack.get(&tid) {
+                return Some(Arc::clone(c));
+            }
+            return None;
+        }
+        if self.slack.len() == 1 {
+            return self.slack.values().next().cloned();
+        }
+        None
+    }
+
     async fn approve_slack(
         &self,
         action_id: &str,
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
-        let Some(slack) = self.slack.as_ref() else {
+        let Some(slack) = self.resolve_slack_client(&action.email) else {
             return ApprovalActionOutcome::Failed {
-                message: "Slack is not configured; run `augmentagent slack login`".into(),
+                message: "Slack workspace not available; reconnect in dashboard or `augmentagent slack login`".into(),
             };
         };
         let Some(channel_id) = action.email.thread_id.as_deref() else {
@@ -1407,7 +1475,7 @@ async fn build_broker(
     let linkedin = load_linkedin_client(&repo_root);
 
     let discord = load_discord_client();
-    let slack = load_slack_client();
+    let slack = load_slack_clients(&store);
     let approver = Arc::new(ReplyApprover {
         store,
         gmail,
@@ -1644,6 +1712,28 @@ fn load_discord_client() -> Option<Arc<augmentagent_channel_discord_dm::DiscordC
     }
 }
 
+async fn run_discord_status(json: bool) -> Result<()> {
+    let auth = augmentagent_channel_discord_dm::DiscordAuth::load_with_migration(None);
+    if json {
+        match auth {
+            Ok(a) => println!(
+                "{}",
+                serde_json::json!({
+                    "connected": true,
+                    "user_id": a.user_id,
+                })
+            ),
+            Err(_) => println!("{}", serde_json::json!({ "connected": false })),
+        }
+    } else {
+        match auth {
+            Ok(a) => println!("discord connected: user_id={}", a.user_id),
+            Err(e) => println!("discord not connected: {e}"),
+        }
+    }
+    Ok(())
+}
+
 async fn run_discord_list_dms(json: bool) -> Result<()> {
     let client =
         load_discord_client().ok_or_else(|| anyhow::anyhow!("discord auth not configured"))?;
@@ -1713,7 +1803,13 @@ fn run_discord_subscribe(
         .ok_or_else(|| anyhow::anyhow!("invalid mode: {mode}"))?;
     let display = name.unwrap_or_else(|| channel_id.clone());
     let sub = store
-        .upsert_subscription(augmentagent_channel_discord_dm::PLATFORM, &channel_id, &display, parsed)
+        .upsert_subscription(
+            augmentagent_channel_discord_dm::PLATFORM,
+            &channel_id,
+            &display,
+            parsed,
+            None,
+        )
         .context("upsert subscription")?;
     println!(
         "subscription id={} platform={} channel_id={} mode={} name={}",
@@ -1821,7 +1917,7 @@ fn build_discord_channel(
 // Slack (issue #7)
 // ================================================================
 
-async fn run_slack_login(auth_json: PathBuf) -> Result<()> {
+async fn run_slack_login(store: Arc<Store>, auth_json: PathBuf) -> Result<()> {
     use augmentagent_channel_slack::{SlackAuth, SlackClient};
     let raw = std::fs::read_to_string(&auth_json)
         .with_context(|| format!("read slack auth file at {}", auth_json.display()))?;
@@ -1838,32 +1934,170 @@ async fn run_slack_login(auth_json: PathBuf) -> Result<()> {
 
     auth.save_to_keychain()
         .context("save slack auth to keychain")?;
+    store
+        .upsert_slack_workspace(
+            &auth.team_id,
+            &auth.team_name,
+            &auth.entity_id,
+            &auth.connection_id,
+            &auth.user_id,
+        )
+        .context("upsert slack workspace row")?;
     println!(
-        "slack auth saved to keychain (augmentagent/slack/default)\nteam:    {} ({})\nuser_id: {}",
-        auth.team_name, auth.team_id, auth.user_id
+        "slack auth saved to keychain (augmentagent/slack/{})\nteam:    {} ({})\nuser_id: {}",
+        auth.team_id, auth.team_name, auth.team_id, auth.user_id
     );
     Ok(())
 }
 
-fn load_slack_client() -> Option<Arc<augmentagent_channel_slack::SlackClient>> {
-    match augmentagent_channel_slack::SlackAuth::load_from_keychain() {
-        Ok(auth) => match augmentagent_channel_slack::SlackClient::new(auth) {
-            Ok(c) => Some(Arc::new(c)),
-            Err(e) => {
-                warn!("slack client build failed: {e}");
-                None
-            }
-        },
-        Err(e) => {
-            info!("slack auth not loaded: {e} (slack send disabled this run)");
-            None
-        }
-    }
+/// Persist a Slack auth bundle handed in from the dashboard OAuth callback.
+///
+/// Takes only the Composio handles. Resolves `team_id`/`team_name`/`user_id`
+/// server-side via SLACK_FETCH_TEAM_INFO + an auth-test action. Mirrors
+/// Orchid's pattern: no channel-list probe at OAuth time, just trust
+/// Composio's ACTIVE status and learn the workspace metadata via the API.
+async fn run_slack_persist_auth(
+    store: Arc<Store>,
+    entity_id: String,
+    connection_id: String,
+    composio_api_key: String,
+) -> Result<()> {
+    use augmentagent_channel_slack::{SlackAuth, SlackClient};
+    // Build a "probe" auth — only entity_id + composio_api_key matter for the
+    // execute() path — and use it to learn the workspace metadata.
+    let probe = SlackAuth {
+        entity_id: entity_id.clone(),
+        connection_id: connection_id.clone(),
+        team_id: String::new(),
+        team_name: String::new(),
+        user_id: String::new(),
+        composio_api_key: composio_api_key.clone(),
+    };
+    probe
+        .validate_for_execute()
+        .context("persist-auth: entity_id and composio_api_key required")?;
+    let client = SlackClient::new(probe).context("build slack client")?;
+    let team = client
+        .fetch_team_info()
+        .await
+        .context("SLACK_FETCH_TEAM_INFO probe failed — connection may not be ACTIVE yet")?;
+    // user_id is best-effort; missing just disables self-message filtering.
+    let user_id = client.fetch_authed_user_id().await.unwrap_or(None).unwrap_or_default();
+
+    let auth = SlackAuth {
+        entity_id,
+        connection_id,
+        team_id: team.team_id.clone(),
+        team_name: team.team_name.clone(),
+        user_id: user_id.clone(),
+        composio_api_key,
+    };
+    auth.validate()
+        .context("persist-auth: validation failed after team probe")?;
+    auth.save_to_keychain()
+        .context("save slack auth to keychain")?;
+    store
+        .upsert_slack_workspace(
+            &auth.team_id,
+            &auth.team_name,
+            &auth.entity_id,
+            &auth.connection_id,
+            &auth.user_id,
+        )
+        .context("upsert slack workspace row")?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": true,
+            "team_id": auth.team_id,
+            "team_name": auth.team_name,
+            "user_id": auth.user_id,
+        })
+    );
+    Ok(())
 }
 
-async fn run_slack_list_conversations(types: String, limit: u32, json: bool) -> Result<()> {
-    let client =
-        load_slack_client().ok_or_else(|| anyhow::anyhow!("slack auth not configured"))?;
+fn run_slack_workspaces(store: Arc<Store>, json: bool) -> Result<()> {
+    let workspaces = store
+        .list_active_slack_workspaces()
+        .context("list slack workspaces")?;
+    if json {
+        println!("{}", serde_json::to_string(&workspaces)?);
+    } else {
+        println!("{} slack workspace(s)\n", workspaces.len());
+        for w in &workspaces {
+            println!("  {}  {}  user={}", w.team_id, w.team_name, w.user_id);
+        }
+    }
+    Ok(())
+}
+
+fn run_slack_remove_workspace(store: Arc<Store>, team_id: String) -> Result<()> {
+    use augmentagent_channel_slack::SlackAuth;
+    // Best-effort delete; ignore "not found" when the Keychain entry is
+    // already gone.
+    let _ = SlackAuth::delete_from_keychain(&team_id);
+    store
+        .deactivate_slack_workspace(&team_id)
+        .context("deactivate slack workspace row")?;
+    println!("slack workspace {team_id} disconnected");
+    Ok(())
+}
+
+/// Build the per-workspace Slack client map consumed by `ReplyApprover`.
+/// Mirrors `SlackChannel::load_workspace_clients` — loads every active
+/// `slack_workspaces` row's Keychain entry and falls back to the legacy
+/// `augmentagent/slack/default` slot when the table is empty.
+fn load_slack_clients(
+    store: &Store,
+) -> std::collections::HashMap<String, Arc<augmentagent_channel_slack::SlackClient>> {
+    use augmentagent_channel_slack::{SlackAuth, SlackClient};
+    let mut map = std::collections::HashMap::new();
+    let workspaces = match store.list_active_slack_workspaces() {
+        Ok(w) => w,
+        Err(e) => {
+            warn!("list_active_slack_workspaces failed: {e:#}");
+            return map;
+        }
+    };
+    if workspaces.is_empty() {
+        match SlackAuth::load_from_default_slot() {
+            Ok(auth) => {
+                let team_id = auth.team_id.clone();
+                if let Ok(c) = SlackClient::new(auth) {
+                    map.insert(team_id, Arc::new(c));
+                    info!("slack: using legacy default-slot auth (one workspace)");
+                }
+            }
+            Err(e) => {
+                info!("slack auth not loaded: {e} (slack send disabled this run)");
+            }
+        }
+        return map;
+    }
+    for ws in workspaces {
+        match SlackAuth::load_for_team(&ws.team_id) {
+            Ok(auth) => match SlackClient::new(auth) {
+                Ok(c) => {
+                    map.insert(ws.team_id.clone(), Arc::new(c));
+                }
+                Err(e) => warn!(team_id = %ws.team_id, "slack client build failed: {e}"),
+            },
+            Err(e) => warn!(team_id = %ws.team_id, "slack auth load failed: {e}"),
+        }
+    }
+    map
+}
+
+async fn run_slack_list_conversations(
+    store: Arc<Store>,
+    team_id: Option<String>,
+    types: String,
+    limit: u32,
+    json: bool,
+) -> Result<()> {
+    let client = load_single_slack_client(&store, team_id.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("slack auth not configured for requested workspace"))?;
     let convs = client
         .list_conversations(&types, limit)
         .await
@@ -1906,10 +2140,31 @@ fn run_slack_subscribe(
     channel_id: String,
     mode: String,
     name: Option<String>,
+    team_id: Option<String>,
 ) -> Result<()> {
     use augmentagent_store::SubscriptionMode;
     let parsed = SubscriptionMode::parse(&mode)
         .ok_or_else(|| anyhow::anyhow!("invalid mode: {mode}"))?;
+    // Default to the sole configured workspace when --team-id is omitted;
+    // fail loudly if there are multiple so the user can't accidentally bind
+    // the sub to the wrong workspace.
+    let resolved_team = match team_id {
+        Some(t) => t,
+        None => {
+            let workspaces = store
+                .list_active_slack_workspaces()
+                .context("list slack workspaces")?;
+            match workspaces.as_slice() {
+                [w] => w.team_id.clone(),
+                [] => anyhow::bail!(
+                    "no slack workspaces connected — run `augmentagent slack login` or connect via dashboard"
+                ),
+                _ => anyhow::bail!(
+                    "multiple slack workspaces connected — pass --team-id <T...>"
+                ),
+            }
+        }
+    };
     let display = name.unwrap_or_else(|| channel_id.clone());
     let sub = store
         .upsert_subscription(
@@ -1917,15 +2172,17 @@ fn run_slack_subscribe(
             &channel_id,
             &display,
             parsed,
+            Some(&resolved_team),
         )
         .context("upsert subscription")?;
     println!(
-        "subscription id={} platform={} channel_id={} mode={} name={}",
+        "subscription id={} platform={} channel_id={} mode={} name={} account_id={}",
         sub.id,
         sub.platform,
         sub.channel_id,
         sub.mode.as_str(),
-        sub.display_name
+        sub.display_name,
+        resolved_team,
     );
     Ok(())
 }
@@ -1966,11 +2223,7 @@ fn build_slack_channel(
     broker: Arc<dyn ApprovalBroker>,
     dry_run: bool,
 ) -> Result<augmentagent_channel_slack::SlackChannel<ClaudeCliReasoner>> {
-    use augmentagent_channel_slack::{SlackAuth, SlackChannel, SlackChannelConfig, SlackClient};
-    let auth = SlackAuth::load_from_keychain()
-        .context("load slack auth — run `augmentagent slack login --auth-json <file>`")?;
-    let my_user_id = auth.user_id.clone();
-    let client = Arc::new(SlackClient::new(auth).context("build slack client")?);
+    use augmentagent_channel_slack::{SlackChannel, SlackChannelConfig};
     let reasoner = Arc::new(ClaudeCliReasoner::new());
 
     let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
@@ -1999,13 +2252,33 @@ fn build_slack_channel(
     };
     Ok(SlackChannel::new(
         store,
-        client,
         reasoner,
         broker,
-        my_user_id,
         config,
         identity_index,
     ))
+}
+
+/// Load a single SlackClient, picking by explicit `team_id` when given, or
+/// falling back to the sole configured workspace (or legacy default slot).
+fn load_single_slack_client(
+    store: &Store,
+    team_id: Option<&str>,
+) -> Option<Arc<augmentagent_channel_slack::SlackClient>> {
+    use augmentagent_channel_slack::{SlackAuth, SlackClient};
+    if let Some(tid) = team_id {
+        let auth = SlackAuth::load_for_team(tid).ok()?;
+        return SlackClient::new(auth).ok().map(Arc::new);
+    }
+    let clients = load_slack_clients(store);
+    if clients.len() == 1 {
+        return clients.into_values().next();
+    }
+    if clients.is_empty() {
+        return None;
+    }
+    warn!("multiple slack workspaces configured; pass --team-id to disambiguate");
+    None
 }
 
 /// Compile-fences to prove prefix constant is referenced (silence dead-code

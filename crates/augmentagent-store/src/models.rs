@@ -146,7 +146,7 @@ impl SubscriptionMode {
     }
 }
 
-/// A watched channel (Discord DM, Discord guild channel, future Slack channel)
+/// A watched channel (Discord DM, Discord guild channel, Slack channel/DM)
 /// and the mode it's polled under.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelSubscription {
@@ -156,6 +156,11 @@ pub struct ChannelSubscription {
     pub display_name: String,
     pub mode: SubscriptionMode,
     pub active: bool,
+    /// Platform-specific account this subscription belongs to. For Slack this
+    /// is the `team_id` (workspace); channels with the same `channel_id` can
+    /// coexist across workspaces. `None` for single-account platforms (Discord
+    /// user-token, legacy Gmail).
+    pub account_id: Option<String>,
     /// Snowflake of the newest message we've already seen — used for
     /// `GET /channels/{id}/messages?after=<this>` polling. `None` on a fresh
     /// subscription (next poll grabs the most recent `limit` messages).
@@ -166,4 +171,19 @@ pub struct ChannelSubscription {
     pub last_digest_at_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+/// A connected Slack workspace, persisted alongside `gmail_accounts`. One row
+/// per OAuth connection; the poller iterates these each tick to build a
+/// per-workspace `SlackClient` from its Keychain entry keyed by `team_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlackWorkspace {
+    pub id: String,
+    pub team_id: String,
+    pub team_name: String,
+    pub entity_id: String,
+    pub connection_id: String,
+    pub user_id: String,
+    pub active: bool,
+    pub created_at_ms: i64,
 }

@@ -2,11 +2,12 @@
 //! `platform='slack'`, fetches messages since `last_seen_message_id`, and
 //! dispatches each message by the subscription's mode.
 //!
-//! Mirrors the Discord channel's triage pipeline so behavior is consistent
-//! across platforms; where Slack differs (API paging via `oldest` instead of
-//! snowflakes, subtype filtering instead of message-type ints) the
-//! differences are isolated to this module.
+//! Multi-workspace aware: each tick refreshes the set of connected workspaces
+//! from `slack_workspaces`, builds one `SlackClient` per workspace's Keychain
+//! entry, and routes each subscription to the client matching its `account_id`
+//! (= Slack `team_id`).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,13 +22,23 @@ use augmentagent_channel_core::prompt::{draft_user_message, triage_user_message}
 use augmentagent_channel_core::reasoner::{draft_opts, triage_opts};
 use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{
-    ActionStatus, ChannelSubscription, Email, Store, SubscriptionMode, TriageResult,
+    ActionStatus, ChannelSubscription, Email, SlackWorkspace, Store, SubscriptionMode,
+    TriageResult,
 };
 use augmentagent_wiki::IdentityIndex;
 
 use crate::api::{SlackClient, SlackError};
+use crate::auth::SlackAuth;
 use crate::types::SlackMessage;
 use crate::{ACCOUNT_ENTITY_ID_PREFIX, PLATFORM};
+
+/// Per-workspace runtime handle: a `SlackClient` + the authenticated user id
+/// used to skip our own outbound messages.
+pub struct WorkspaceClient {
+    pub team_id: String,
+    pub client: Arc<SlackClient>,
+    pub my_user_id: String,
+}
 
 /// Mirror LinkedIn + Discord's 4h cadence; Slack's API has very generous
 /// rate limits so this is conservative.
@@ -72,24 +83,18 @@ pub struct PollOutcome {
 
 pub struct SlackChannel<R: Reasoner> {
     pub store: Arc<Store>,
-    pub client: Arc<SlackClient>,
     pub reasoner: Arc<R>,
     pub approvals: Arc<dyn ApprovalBroker>,
     pub config: SlackChannelConfig,
     pub identity_index: Option<Arc<IdentityIndex>>,
-    /// Slack user id of the authenticated account (from SlackAuth) — used to
-    /// skip our own outbound messages on ingest.
-    pub my_user_id: String,
     wiki_schema: Option<String>,
 }
 
 impl<R: Reasoner + 'static> SlackChannel<R> {
     pub fn new(
         store: Arc<Store>,
-        client: Arc<SlackClient>,
         reasoner: Arc<R>,
         approvals: Arc<dyn ApprovalBroker>,
-        my_user_id: String,
         config: SlackChannelConfig,
         identity_index: Option<Arc<IdentityIndex>>,
     ) -> Self {
@@ -110,14 +115,51 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
         };
         Self {
             store,
-            client,
             reasoner,
             approvals,
             config,
             identity_index,
-            my_user_id,
             wiki_schema,
         }
+    }
+
+    /// Build a per-workspace client map from the active rows in
+    /// `slack_workspaces`. Each row's Keychain slot is loaded; failures are
+    /// logged but don't abort the tick — other workspaces can still poll.
+    fn load_workspace_clients(&self) -> HashMap<String, WorkspaceClient> {
+        let mut map = HashMap::new();
+        let workspaces = match self.store.list_active_slack_workspaces() {
+            Ok(w) => w,
+            Err(e) => {
+                error!("list_active_slack_workspaces failed: {e:#}");
+                return map;
+            }
+        };
+        if workspaces.is_empty() {
+            // Legacy single-slot fallback: before multi-workspace shipped, one
+            // `SlackAuth` lived at `augmentagent/slack/default`. Let existing
+            // installs keep polling until they re-connect through the dashboard.
+            if let Ok(auth) = SlackAuth::load_from_default_slot() {
+                if let Some(ws) = build_workspace_client_from_auth(auth) {
+                    map.insert(ws.team_id.clone(), ws);
+                    info!("slack: using legacy default-slot auth (one workspace)");
+                    return map;
+                }
+            }
+            debug!("no active slack_workspaces rows — nothing to poll");
+            return map;
+        }
+        for ws in workspaces {
+            match load_workspace_client(&ws) {
+                Some(handle) => {
+                    map.insert(handle.team_id.clone(), handle);
+                }
+                None => {
+                    warn!(team_id = %ws.team_id, "skipping workspace: auth not available");
+                }
+            }
+        }
+        map
     }
 
     pub async fn run(&self, shutdown: CancellationToken) -> anyhow::Result<()> {
@@ -143,6 +185,11 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
 
     pub async fn poll_once(&self) -> anyhow::Result<PollOutcome> {
         let mut outcome = PollOutcome::default();
+        let clients = self.load_workspace_clients();
+        if clients.is_empty() {
+            debug!("no slack workspaces loaded; nothing to poll");
+            return Ok(outcome);
+        }
         let subs = self.store.list_active_subscriptions(PLATFORM)?;
         outcome.subscriptions_polled = subs.len();
         if subs.is_empty() {
@@ -150,7 +197,19 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
             return Ok(outcome);
         }
         for sub in subs {
-            if let Err(e) = self.poll_subscription(&sub, &mut outcome).await {
+            let workspace = match resolve_workspace(&sub, &clients) {
+                Some(w) => w,
+                None => {
+                    outcome.errors += 1;
+                    warn!(
+                        sub_id = %sub.id,
+                        account_id = ?sub.account_id,
+                        "no matching slack workspace loaded — skipping subscription"
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = self.poll_subscription(&sub, workspace, &mut outcome).await {
                 outcome.errors += 1;
                 error!(sub_id = %sub.id, channel_id = %sub.channel_id, "slack subscription poll failed: {e:#}");
             }
@@ -161,9 +220,10 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
     async fn poll_subscription(
         &self,
         sub: &ChannelSubscription,
+        workspace: &WorkspaceClient,
         outcome: &mut PollOutcome,
     ) -> anyhow::Result<()> {
-        let messages = match self
+        let messages = match workspace
             .client
             .fetch_messages(
                 &sub.channel_id,
@@ -174,7 +234,7 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
         {
             Ok(msgs) => msgs,
             Err(SlackError::Composio(msg)) if msg.contains("invalid_auth") => {
-                warn!("slack auth invalid — run `augmentagent slack login`");
+                warn!(team_id = %workspace.team_id, "slack auth invalid — reconnect via dashboard or `augmentagent slack login`");
                 anyhow::bail!("invalid_auth");
             }
             Err(e) => return Err(e.into()),
@@ -189,7 +249,7 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
         for msg in messages {
             newest_seen = Some(msg.ts.clone());
 
-            if msg.user.as_deref() == Some(self.my_user_id.as_str()) {
+            if msg.user.as_deref() == Some(workspace.my_user_id.as_str()) {
                 continue;
             }
             if !msg.is_default_user_message() {
@@ -199,7 +259,7 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
                 continue;
             }
 
-            if let Err(e) = self.handle_message(sub, msg, outcome).await {
+            if let Err(e) = self.handle_message(sub, workspace, msg, outcome).await {
                 outcome.errors += 1;
                 error!(sub_id = %sub.id, "handle_message failed: {e:#}");
             }
@@ -214,10 +274,11 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
     async fn handle_message(
         &self,
         sub: &ChannelSubscription,
+        workspace: &WorkspaceClient,
         msg: SlackMessage,
         outcome: &mut PollOutcome,
     ) -> anyhow::Result<()> {
-        let email = message_to_email(&msg, sub, &self.my_user_id);
+        let email = message_to_email(&msg, sub, &workspace.my_user_id);
         self.store.upsert_email(&email)?;
         if self.store.is_email_complete(&email.message_id)? {
             return Ok(());
@@ -437,6 +498,14 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
 }
 
 /// Convert a Slack message + its owning subscription into an `Email` row.
+///
+/// `my_user_id` identifies the authenticated Slack user in this workspace;
+/// it's embedded in the `from` tag when the message is from that user so
+/// downstream self-message filters match. `account_entity_id` is stamped with
+/// the subscription's `account_id` (Slack `team_id`) when present so the
+/// approver can route replies back to the correct workspace without another
+/// lookup. Falls back to stamping the user id when no account_id is set
+/// (legacy single-workspace rows).
 pub(crate) fn message_to_email(
     msg: &SlackMessage,
     sub: &ChannelSubscription,
@@ -453,6 +522,10 @@ pub(crate) fn message_to_email(
         SubscriptionMode::Priority => "dm",
         SubscriptionMode::Digest | SubscriptionMode::StoreOnly => "digest_item",
     };
+    let account_entity_id = match sub.account_id.as_deref() {
+        Some(team_id) => format!("{ACCOUNT_ENTITY_ID_PREFIX}:team:{team_id}"),
+        None => format!("{ACCOUNT_ENTITY_ID_PREFIX}:{my_user_id}"),
+    };
     Email {
         message_id: format!("{}:{}", sub.channel_id, msg.ts),
         thread_id: Some(sub.channel_id.clone()),
@@ -460,7 +533,7 @@ pub(crate) fn message_to_email(
         subject: String::new(),
         body: msg.text.clone(),
         date: msg.ts.clone(),
-        account_entity_id: Some(format!("{ACCOUNT_ENTITY_ID_PREFIX}:{my_user_id}")),
+        account_entity_id: Some(account_entity_id),
         platform: PLATFORM.to_string(),
         kind: kind.to_string(),
     }
@@ -483,6 +556,50 @@ fn jitter_secs() -> u64 {
     ns % (2 * JITTER_SECS + 1)
 }
 
+/// Pick the correct workspace client for a subscription. If the subscription
+/// names an `account_id` that we've loaded, use it. If the subscription's
+/// `account_id` is `None` (legacy rows from before multi-workspace) and
+/// there's exactly one loaded workspace, fall through to it so the poller
+/// keeps working without a manual DB fixup.
+fn resolve_workspace<'a>(
+    sub: &ChannelSubscription,
+    clients: &'a HashMap<String, WorkspaceClient>,
+) -> Option<&'a WorkspaceClient> {
+    if let Some(team_id) = sub.account_id.as_deref() {
+        return clients.get(team_id);
+    }
+    if clients.len() == 1 {
+        return clients.values().next();
+    }
+    None
+}
+
+fn load_workspace_client(ws: &SlackWorkspace) -> Option<WorkspaceClient> {
+    match SlackAuth::load_for_team(&ws.team_id) {
+        Ok(auth) => build_workspace_client_from_auth(auth),
+        Err(e) => {
+            warn!(team_id = %ws.team_id, "slack auth load failed: {e}");
+            None
+        }
+    }
+}
+
+fn build_workspace_client_from_auth(auth: SlackAuth) -> Option<WorkspaceClient> {
+    let team_id = auth.team_id.clone();
+    let user_id = auth.user_id.clone();
+    match SlackClient::new(auth) {
+        Ok(c) => Some(WorkspaceClient {
+            team_id,
+            client: Arc::new(c),
+            my_user_id: user_id,
+        }),
+        Err(e) => {
+            warn!(team_id = %team_id, "slack client build failed: {e}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +613,7 @@ mod tests {
             display_name: "#general".into(),
             mode,
             active: true,
+            account_id: Some("T1".into()),
             last_seen_message_id: None,
             last_digest_at_ms: None,
             created_at_ms: 1,
@@ -631,21 +749,10 @@ mod tests {
         reasoner: Arc<R>,
         approvals: Arc<dyn ApprovalBroker>,
     ) -> SlackChannel<R> {
-        let auth = crate::auth::SlackAuth {
-            entity_id: "eid".into(),
-            connection_id: "cid".into(),
-            team_id: "T1".into(),
-            team_name: "Test".into(),
-            user_id: "me".into(),
-            composio_api_key: "ckak_test".into(),
-        };
-        let client = Arc::new(SlackClient::new(auth).unwrap());
         SlackChannel::new(
             store,
-            client,
             reasoner,
             approvals,
-            "me".into(),
             SlackChannelConfig {
                 dry_run: false,
                 poll_interval: Duration::from_secs(1),
@@ -667,7 +774,7 @@ mod tests {
         let ch = build_channel(store.clone(), r, Arc::clone(&b));
         let sub = sub_with_mode(SubscriptionMode::Priority);
         let m = sample_msg("100.000001", "deal deal");
-        let e = message_to_email(&m, &sub, &ch.my_user_id);
+        let e = message_to_email(&m, &sub, "me");
         store.upsert_email(&e).unwrap();
 
         let mut out = PollOutcome::default();
@@ -688,7 +795,7 @@ mod tests {
 
         let sub = sub_with_mode(SubscriptionMode::Priority);
         let m = sample_msg("100.000001", "15 min tomorrow?");
-        let e = message_to_email(&m, &sub, &ch.my_user_id);
+        let e = message_to_email(&m, &sub, "me");
         store.upsert_email(&e).unwrap();
 
         let mut out = PollOutcome::default();
@@ -709,7 +816,7 @@ mod tests {
 
         let sub = sub_with_mode(SubscriptionMode::Priority);
         let m = sample_msg("100.000001", "hey");
-        let e = message_to_email(&m, &sub, &ch.my_user_id);
+        let e = message_to_email(&m, &sub, "me");
         store.upsert_email(&e).unwrap();
 
         let mut out = PollOutcome::default();

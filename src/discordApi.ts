@@ -82,6 +82,15 @@ export interface DiscordGuildChannelSummary {
   name: string;
 }
 
+export interface DiscordStatus {
+  connected: boolean;
+  user_id?: string;
+}
+
+export function discordStatus(): Promise<DiscordStatus> {
+  return runCliJson<DiscordStatus>(["discord", "status", "--json", "true"]);
+}
+
 export function listDms(): Promise<DiscordDmSummary[]> {
   return runCliJson<DiscordDmSummary[]>(["discord", "list-dms", "--json", "true"]);
 }

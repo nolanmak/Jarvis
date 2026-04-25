@@ -508,6 +508,7 @@ mod tests {
             display_name: "test dm".into(),
             mode,
             active: true,
+            account_id: None,
             last_seen_message_id: None,
             last_digest_at_ms: None,
             created_at_ms: 1,

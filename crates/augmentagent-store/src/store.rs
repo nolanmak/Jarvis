@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::models::{
     Account, ActionRecord, ActionStatus, ChannelSubscription, Email, LearnedPattern,
-    SubscriptionMode, TriageResult,
+    SlackWorkspace, SubscriptionMode, TriageResult,
 };
 
 #[derive(Debug, Error)]
@@ -90,6 +90,9 @@ impl Store {
         // Issue #27: per-channel subscription registry (platform-agnostic).
         // Rows control which Discord/Slack/etc channels the poller watches and
         // which mode (priority / digest / store_only) they route through.
+        // Uniqueness is enforced at the upsert layer (platform, channel_id,
+        // account_id) rather than via a SQL UNIQUE so multi-workspace Slack
+        // can carry the same channel id across teams.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS channel_subscriptions (\
                  id                   TEXT PRIMARY KEY,\
@@ -98,17 +101,78 @@ impl Store {
                  display_name         TEXT NOT NULL,\
                  mode                 TEXT NOT NULL,\
                  active               INTEGER NOT NULL DEFAULT 1,\
+                 account_id           TEXT,\
                  last_seen_message_id TEXT,\
                  last_digest_at_ms    INTEGER,\
                  created_at_ms        INTEGER NOT NULL,\
-                 updated_at_ms        INTEGER NOT NULL,\
-                 UNIQUE(platform, channel_id)\
+                 updated_at_ms        INTEGER NOT NULL\
              )",
             [],
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_channel_subs_active_mode \
                 ON channel_subscriptions(active, mode)",
+            [],
+        )?;
+        // Multi-workspace Slack: each subscription may belong to a specific
+        // account (for Slack, the workspace `team_id`). Nullable so existing
+        // Discord rows migrate cleanly.
+        if !column_exists(conn, "channel_subscriptions", "account_id")? {
+            conn.execute(
+                "ALTER TABLE channel_subscriptions ADD COLUMN account_id TEXT",
+                [],
+            )?;
+        }
+        // Older DBs still carry the legacy UNIQUE(platform, channel_id). Detect
+        // it and rebuild without the constraint so multi-workspace rows can
+        // coexist. SQLite can't ALTER away a constraint in place.
+        if table_has_unique(conn, "channel_subscriptions", "platform", "channel_id")? {
+            conn.execute_batch(
+                "BEGIN TRANSACTION;\n\
+                 CREATE TABLE channel_subscriptions_new (\
+                   id                   TEXT PRIMARY KEY,\
+                   platform             TEXT NOT NULL,\
+                   channel_id           TEXT NOT NULL,\
+                   display_name         TEXT NOT NULL,\
+                   mode                 TEXT NOT NULL,\
+                   active               INTEGER NOT NULL DEFAULT 1,\
+                   account_id           TEXT,\
+                   last_seen_message_id TEXT,\
+                   last_digest_at_ms    INTEGER,\
+                   created_at_ms        INTEGER NOT NULL,\
+                   updated_at_ms        INTEGER NOT NULL\
+                 );\n\
+                 INSERT INTO channel_subscriptions_new \
+                   (id, platform, channel_id, display_name, mode, active, \
+                    account_id, last_seen_message_id, last_digest_at_ms, \
+                    created_at_ms, updated_at_ms) \
+                   SELECT id, platform, channel_id, display_name, mode, active, \
+                          account_id, last_seen_message_id, last_digest_at_ms, \
+                          created_at_ms, updated_at_ms \
+                     FROM channel_subscriptions;\n\
+                 DROP TABLE channel_subscriptions;\n\
+                 ALTER TABLE channel_subscriptions_new RENAME TO channel_subscriptions;\n\
+                 CREATE INDEX IF NOT EXISTS idx_channel_subs_active_mode \
+                   ON channel_subscriptions(active, mode);\n\
+                 COMMIT;",
+            )?;
+        }
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS slack_workspaces (\
+                 id              TEXT PRIMARY KEY,\
+                 team_id         TEXT NOT NULL UNIQUE,\
+                 team_name       TEXT NOT NULL,\
+                 entity_id       TEXT NOT NULL,\
+                 connection_id   TEXT NOT NULL,\
+                 user_id         TEXT NOT NULL,\
+                 active          INTEGER NOT NULL DEFAULT 1,\
+                 created_at_ms   INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_slack_workspaces_active \
+                ON slack_workspaces(active)",
             [],
         )?;
         Ok(())
@@ -613,23 +677,26 @@ impl Store {
 
     // --- channel_subscriptions (issue #27) ---
 
-    /// Create or update a subscription. Keyed on `(platform, channel_id)` so
-    /// re-running a CLI `subscribe` command updates mode/display_name instead
-    /// of erroring.
+    /// Create or update a subscription. Keyed on `(platform, channel_id, account_id)`
+    /// so the same channel id can coexist across Slack workspaces. Re-running
+    /// with the same triple upserts in place.
     pub fn upsert_subscription(
         &self,
         platform: &str,
         channel_id: &str,
         display_name: &str,
         mode: SubscriptionMode,
+        account_id: Option<&str>,
     ) -> StoreResult<ChannelSubscription> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
+        // NULLs don't equate in SQL; IS is NULL-safe. Use it so lookup matches
+        // existing rows whose account_id is NULL (Discord, pre-migration).
         let existing: Option<String> = guard
             .query_row(
                 "SELECT id FROM channel_subscriptions \
-                 WHERE platform = ?1 AND channel_id = ?2",
-                params![platform, channel_id],
+                 WHERE platform = ?1 AND channel_id = ?2 AND account_id IS ?3",
+                params![platform, channel_id, account_id],
                 |r| r.get(0),
             )
             .optional()?;
@@ -648,14 +715,15 @@ impl Store {
                 guard.execute(
                     "INSERT INTO channel_subscriptions \
                         (id, platform, channel_id, display_name, mode, active, \
-                         created_at_ms, updated_at_ms) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)",
+                         account_id, created_at_ms, updated_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?7)",
                     params![
                         id,
                         platform,
                         channel_id,
                         display_name,
                         mode.as_str(),
+                        account_id,
                         now,
                     ],
                 )?;
@@ -672,7 +740,8 @@ impl Store {
         let row: Option<ChannelSubscription> = guard
             .query_row(
                 "SELECT id, platform, channel_id, display_name, mode, active, \
-                        last_seen_message_id, last_digest_at_ms, created_at_ms, updated_at_ms \
+                        account_id, last_seen_message_id, last_digest_at_ms, \
+                        created_at_ms, updated_at_ms \
                    FROM channel_subscriptions \
                   WHERE id = ?1",
                 params![id],
@@ -692,7 +761,8 @@ impl Store {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
             "SELECT id, platform, channel_id, display_name, mode, active, \
-                    last_seen_message_id, last_digest_at_ms, created_at_ms, updated_at_ms \
+                    account_id, last_seen_message_id, last_digest_at_ms, \
+                    created_at_ms, updated_at_ms \
                FROM channel_subscriptions \
               WHERE active = 1 AND platform = ?1 \
               ORDER BY created_at_ms ASC",
@@ -794,6 +864,116 @@ impl Store {
         )?;
         Ok(())
     }
+
+    // --- slack_workspaces ---
+
+    pub fn upsert_slack_workspace(
+        &self,
+        team_id: &str,
+        team_name: &str,
+        entity_id: &str,
+        connection_id: &str,
+        user_id: &str,
+    ) -> StoreResult<SlackWorkspace> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let existing: Option<String> = guard
+            .query_row(
+                "SELECT id FROM slack_workspaces WHERE team_id = ?1",
+                params![team_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(id) => {
+                guard.execute(
+                    "UPDATE slack_workspaces \
+                        SET team_name = ?2, entity_id = ?3, connection_id = ?4, \
+                            user_id = ?5, active = 1 \
+                      WHERE id = ?1",
+                    params![id, team_name, entity_id, connection_id, user_id],
+                )?;
+            }
+            None => {
+                let id = Uuid::new_v4().to_string();
+                guard.execute(
+                    "INSERT INTO slack_workspaces \
+                        (id, team_id, team_name, entity_id, connection_id, \
+                         user_id, active, created_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+                    params![
+                        id,
+                        team_id,
+                        team_name,
+                        entity_id,
+                        connection_id,
+                        user_id,
+                        now,
+                    ],
+                )?;
+            }
+        };
+        drop(guard);
+        self.get_slack_workspace_by_team(team_id)?
+            .ok_or_else(|| StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn list_active_slack_workspaces(&self) -> StoreResult<Vec<SlackWorkspace>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, team_id, team_name, entity_id, connection_id, \
+                    user_id, active, created_at_ms \
+               FROM slack_workspaces \
+              WHERE active = 1 \
+              ORDER BY created_at_ms ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_slack_workspace)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_slack_workspace_by_team(
+        &self,
+        team_id: &str,
+    ) -> StoreResult<Option<SlackWorkspace>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT id, team_id, team_name, entity_id, connection_id, \
+                        user_id, active, created_at_ms \
+                   FROM slack_workspaces \
+                  WHERE team_id = ?1",
+                params![team_id],
+                row_to_slack_workspace,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn deactivate_slack_workspace(&self, team_id: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE slack_workspaces SET active = 0 WHERE team_id = ?1",
+            params![team_id],
+        )?;
+        Ok(())
+    }
+}
+
+fn row_to_slack_workspace(r: &rusqlite::Row) -> rusqlite::Result<SlackWorkspace> {
+    Ok(SlackWorkspace {
+        id: r.get(0)?,
+        team_id: r.get(1)?,
+        team_name: r.get(2)?,
+        entity_id: r.get(3)?,
+        connection_id: r.get(4)?,
+        user_id: r.get(5)?,
+        active: r.get::<_, i64>(6)? != 0,
+        created_at_ms: r.get(7)?,
+    })
 }
 
 fn row_to_subscription(r: &rusqlite::Row) -> rusqlite::Result<ChannelSubscription> {
@@ -812,10 +992,11 @@ fn row_to_subscription(r: &rusqlite::Row) -> rusqlite::Result<ChannelSubscriptio
         display_name: r.get(3)?,
         mode,
         active: r.get::<_, i64>(5)? != 0,
-        last_seen_message_id: r.get::<_, Option<String>>(6)?,
-        last_digest_at_ms: r.get::<_, Option<i64>>(7)?,
-        created_at_ms: r.get(8)?,
-        updated_at_ms: r.get(9)?,
+        account_id: r.get::<_, Option<String>>(6)?,
+        last_seen_message_id: r.get::<_, Option<String>>(7)?,
+        last_digest_at_ms: r.get::<_, Option<i64>>(8)?,
+        created_at_ms: r.get(9)?,
+        updated_at_ms: r.get(10)?,
     })
 }
 
@@ -889,6 +1070,44 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> StoreResult<bo
     let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
     for name in rows {
         if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Detect whether `table` has a UNIQUE index covering exactly `(col_a, col_b)`.
+/// Uses sqlite's PRAGMA index_list + PRAGMA index_info to walk the schema.
+fn table_has_unique(
+    conn: &Connection,
+    table: &str,
+    col_a: &str,
+    col_b: &str,
+) -> StoreResult<bool> {
+    let index_list_sql = format!("PRAGMA index_list({table})");
+    let mut stmt = conn.prepare(&index_list_sql)?;
+    // index_list columns: seq, name, unique, origin, partial
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (index_name, is_unique, _origin) = row?;
+        if is_unique == 0 {
+            continue;
+        }
+        let info_sql = format!("PRAGMA index_info({index_name})");
+        let mut info = conn.prepare(&info_sql)?;
+        let cols: Vec<String> = info
+            .query_map([], |r| r.get::<_, String>(2))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if cols.len() == 2
+            && ((cols[0] == col_a && cols[1] == col_b)
+                || (cols[0] == col_b && cols[1] == col_a))
+        {
             return Ok(true);
         }
     }
@@ -1197,6 +1416,7 @@ mod tests {
                 "ch1",
                 "DM with alice",
                 SubscriptionMode::Priority,
+                None,
             )
             .unwrap();
         assert_eq!(sub.platform, "discord");
@@ -1211,6 +1431,7 @@ mod tests {
                 "ch1",
                 "DM with alice (renamed)",
                 SubscriptionMode::Digest,
+                None,
             )
             .unwrap();
         assert_eq!(updated.id, sub.id, "same (platform, channel_id) re-upserts in place");
@@ -1222,11 +1443,11 @@ mod tests {
     fn list_active_subscriptions_filters_by_platform_and_active() {
         let (s, _f) = fresh_store();
         let d1 = s
-            .upsert_subscription("discord", "d1", "d1", SubscriptionMode::Priority)
+            .upsert_subscription("discord", "d1", "d1", SubscriptionMode::Priority, None)
             .unwrap();
-        s.upsert_subscription("discord", "d2", "d2", SubscriptionMode::Digest)
+        s.upsert_subscription("discord", "d2", "d2", SubscriptionMode::Digest, None)
             .unwrap();
-        s.upsert_subscription("slack", "s1", "s1", SubscriptionMode::StoreOnly)
+        s.upsert_subscription("slack", "s1", "s1", SubscriptionMode::StoreOnly, Some("T1"))
             .unwrap();
 
         let discord_subs = s.list_active_subscriptions("discord").unwrap();
@@ -1243,7 +1464,7 @@ mod tests {
     fn update_subscription_mode_persists() {
         let (s, _f) = fresh_store();
         let sub = s
-            .upsert_subscription("discord", "ch1", "dm", SubscriptionMode::Priority)
+            .upsert_subscription("discord", "ch1", "dm", SubscriptionMode::Priority, None)
             .unwrap();
         s.update_subscription_mode(&sub.id, SubscriptionMode::StoreOnly)
             .unwrap();
@@ -1255,7 +1476,7 @@ mod tests {
     fn update_last_seen_message_persists() {
         let (s, _f) = fresh_store();
         let sub = s
-            .upsert_subscription("discord", "ch1", "dm", SubscriptionMode::Priority)
+            .upsert_subscription("discord", "ch1", "dm", SubscriptionMode::Priority, None)
             .unwrap();
         s.update_last_seen_message(&sub.id, "1234567890").unwrap();
         let reloaded = s.get_subscription(&sub.id).unwrap().unwrap();
@@ -1266,7 +1487,7 @@ mod tests {
     fn mark_digest_posted_persists() {
         let (s, _f) = fresh_store();
         let sub = s
-            .upsert_subscription("discord", "ch1", "dm", SubscriptionMode::Digest)
+            .upsert_subscription("discord", "ch1", "dm", SubscriptionMode::Digest, None)
             .unwrap();
         s.mark_digest_posted(&sub.id, 1776806000000).unwrap();
         let reloaded = s.get_subscription(&sub.id).unwrap().unwrap();
@@ -1275,20 +1496,50 @@ mod tests {
 
     #[test]
     fn delete_then_reupsert_restores_same_row() {
-        // Soft-delete preserves the (platform, channel_id) unique pair; a
-        // subsequent upsert should flip active back to 1 and overwrite fields.
+        // Soft-delete preserves the (platform, channel_id, account_id) unique
+        // triple; a subsequent upsert should flip active back to 1 and
+        // overwrite fields.
         let (s, _f) = fresh_store();
         let sub = s
-            .upsert_subscription("discord", "ch1", "first", SubscriptionMode::Priority)
+            .upsert_subscription("discord", "ch1", "first", SubscriptionMode::Priority, None)
             .unwrap();
         s.delete_subscription(&sub.id).unwrap();
         let restored = s
-            .upsert_subscription("discord", "ch1", "second", SubscriptionMode::Digest)
+            .upsert_subscription("discord", "ch1", "second", SubscriptionMode::Digest, None)
             .unwrap();
         assert_eq!(restored.id, sub.id);
         assert_eq!(restored.display_name, "second");
         assert_eq!(restored.mode, SubscriptionMode::Digest);
         assert!(restored.active);
+    }
+
+    #[test]
+    fn same_channel_distinct_workspaces_coexist() {
+        let (s, _f) = fresh_store();
+        let a = s
+            .upsert_subscription("slack", "C_SAME", "general@A", SubscriptionMode::Priority, Some("T_A"))
+            .unwrap();
+        let b = s
+            .upsert_subscription("slack", "C_SAME", "general@B", SubscriptionMode::Priority, Some("T_B"))
+            .unwrap();
+        assert_ne!(a.id, b.id, "same channel_id across workspaces yields distinct rows");
+        let list = s.list_active_subscriptions("slack").unwrap();
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn slack_workspace_upsert_is_idempotent() {
+        let (s, _f) = fresh_store();
+        let w1 = s
+            .upsert_slack_workspace("T1", "Team1", "e1", "c1", "U1")
+            .unwrap();
+        let w2 = s
+            .upsert_slack_workspace("T1", "Team1 renamed", "e1", "c1", "U1")
+            .unwrap();
+        assert_eq!(w1.id, w2.id);
+        assert_eq!(w2.team_name, "Team1 renamed");
+        let list = s.list_active_slack_workspaces().unwrap();
+        assert_eq!(list.len(), 1);
     }
 
     #[test]
