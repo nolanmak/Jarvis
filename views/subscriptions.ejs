@@ -601,6 +601,16 @@
         }
         const slackTypes = type === 'slack_dm' ? 'im,mpim' : 'public_channel,private_channel';
         const res = await fetch('/api/slack/conversations?types=' + encodeURIComponent(slackTypes) + '&team_id=' + encodeURIComponent(teamId));
+        if (res.status === 409) {
+          // Orphan workspace cleaned up server-side. Refresh the panel and
+          // tell the user to re-OAuth.
+          const body = await res.json();
+          status.innerHTML = body.error +
+            ' <a href="/oauth/slack/start" class="text-accent underline">Connect workspace</a>';
+          status.className = 'text-sm text-yellow-300 mb-1';
+          await renderSlackWorkspaces();
+          return;
+        }
         if (!res.ok) {
           const body = await res.text();
           throw new Error('Slack list failed: ' + body);
@@ -716,6 +726,16 @@
 
     try {
       const res = await fetch('/api/slack/workspaces/' + encodeURIComponent(teamId) + '/channels');
+      if (res.status === 409) {
+        const body = await res.json();
+        const err = document.getElementById('cm-error');
+        err.innerHTML = body.error +
+          ' <a href="/oauth/slack/start" class="text-accent underline">Reconnect</a>';
+        err.classList.remove('hidden');
+        document.getElementById('cm-list').innerHTML = '';
+        await renderSlackWorkspaces();
+        return;
+      }
       if (!res.ok) {
         const errBody = await res.text();
         throw new Error(errBody);
