@@ -11,6 +11,13 @@ use tracing::debug;
 use crate::auth::SlackAuth;
 use crate::types::{Conversation, SlackMessage, SlackUser};
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct TeamInfo {
+    pub team_id: String,
+    pub team_name: String,
+    pub team_domain: Option<String>,
+}
+
 const DEFAULT_BASE_URL: &str = "https://backend.composio.dev";
 
 #[derive(Debug, Error)]
@@ -130,6 +137,51 @@ impl SlackClient {
         // Slack's chat.postMessage returns { ok, ts, channel, message }.
         find_string(&resp, &["ts"])
             .ok_or_else(|| SlackError::Slack("send_message returned no ts".into()))
+    }
+
+    /// `SLACK_FETCH_TEAM_INFO` — workspace metadata (team id, name, domain).
+    /// Used at OAuth time to learn which workspace a freshly-connected
+    /// account belongs to.
+    pub async fn fetch_team_info(&self) -> Result<TeamInfo, SlackError> {
+        let resp = self.execute("SLACK_FETCH_TEAM_INFO", json!({})).await?;
+        let team_id = find_string(&resp, &["id"])
+            .ok_or_else(|| SlackError::Slack("no team id in fetch_team_info response".into()))?;
+        let team_name = find_string(&resp, &["name"]).unwrap_or_else(|| team_id.clone());
+        let team_domain = find_string(&resp, &["domain"]);
+        Ok(TeamInfo {
+            team_id,
+            team_name,
+            team_domain,
+        })
+    }
+
+    /// `SLACK_USERS_LOOKUP_BY_EMAIL` would require an email; instead use
+    /// `SLACK_RETRIEVE_CURRENT_USER_DETAILS` (Slack `auth.test`) which returns
+    /// the authenticated user_id without arguments. Falls back gracefully if
+    /// the action isn't available — user_id is only used for self-message
+    /// filtering, so a missing value just means we don't dedup own messages.
+    pub async fn fetch_authed_user_id(&self) -> Result<Option<String>, SlackError> {
+        // Try the most common Composio action names in order.
+        for action in [
+            "SLACK_RETRIEVE_CURRENT_USER_DETAILS",
+            "SLACK_AUTH_TEST",
+            "SLACK_USERS_INFO_OF_THE_AUTHED_USER",
+        ] {
+            match self.execute(action, json!({})).await {
+                Ok(resp) => {
+                    if let Some(uid) = find_string(&resp, &["user_id"])
+                        .or_else(|| find_string(&resp, &["id"]))
+                    {
+                        return Ok(Some(uid));
+                    }
+                }
+                Err(SlackError::Composio(msg)) if msg.contains("404") || msg.contains("not found") => {
+                    continue;
+                }
+                Err(_) => continue,
+            }
+        }
+        Ok(None)
     }
 
     /// `SLACK_RETRIEVE_DETAILED_USER_INFORMATION` — resolve a user id to

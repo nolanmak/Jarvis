@@ -1,54 +1,104 @@
 <%- include('partials/header', { page: 'subscriptions' }) %>
 
 <div class="space-y-6">
-  <div class="flex items-center justify-between">
-    <h1 class="text-xl font-semibold">Channel Subscriptions</h1>
-    <button
-      onclick="document.getElementById('add-modal').classList.remove('hidden')"
-      class="px-3 py-1.5 rounded-md text-sm font-medium bg-accent text-white hover:bg-accent/90 transition-colors">
-      Add subscription
-    </button>
-  </div>
+  <h1 class="text-xl font-semibold">Channel Subscriptions</h1>
 
-  <p class="text-sm text-gray-400">
-    Each subscription watches one Discord channel (DM or guild channel) and routes messages by mode.
-    <span class="font-medium text-white">priority</span> runs the full triage → draft → approval pipeline.
-    <span class="font-medium text-white">digest</span> stores messages for the daily digest.
-    <span class="font-medium text-white">store_only</span> persists without Claude.
-  </p>
+  <!-- ============================================================ -->
+  <!-- 1. CONNECTIONS — top-of-page status of each integration       -->
+  <!-- ============================================================ -->
+  <section>
+    <h2 class="text-sm font-semibold uppercase text-gray-400 mb-2">Connections</h2>
+    <p class="text-xs text-gray-500 mb-3">
+      Connect an integration first. Connecting <em>does not</em> auto-subscribe to anything —
+      add subscriptions individually below for the channels you want watched.
+    </p>
 
-  <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
-    <table class="w-full">
-      <thead>
-        <tr class="border-b border-gray-800 text-left">
-          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Platform</th>
-          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Channel</th>
-          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Mode</th>
-          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Last seen</th>
-          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Last digest</th>
-          <th class="px-4 py-2 text-xs text-gray-500 font-medium"></th>
-        </tr>
-      </thead>
-      <tbody id="sub-table-body">
-        <%- include('partials/subscription-rows', { subs: subs }) %>
-      </tbody>
-    </table>
-  </div>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <!-- Discord -->
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="text-sm font-semibold">Discord</h3>
+          <span id="discord-status-badge" class="text-xs px-2 py-0.5 rounded bg-gray-800">…</span>
+        </div>
+        <p class="text-xs text-gray-500 mb-2">
+          Discord uses your harvested cookies + super-properties (<code class="text-gray-400">scripts/discord-harvest.sh</code>).
+          Persisted in macOS Keychain on the host running the agent.
+        </p>
+        <div id="discord-status-body" class="text-sm text-gray-400">Checking…</div>
+      </div>
+
+      <!-- Slack -->
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="text-sm font-semibold">Slack</h3>
+          <a href="/oauth/slack/start"
+             class="px-3 py-1 rounded-md text-xs font-medium bg-accent text-white hover:bg-accent/90 transition-colors">
+            Connect workspace
+          </a>
+        </div>
+        <p class="text-xs text-gray-500 mb-2">
+          OAuth via Composio. One row per connected workspace; each is keyed by Slack <code class="text-gray-400">team_id</code>.
+        </p>
+        <div id="slack-workspaces-list" class="text-sm text-gray-400">Loading…</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================================================ -->
+  <!-- 2. SUBSCRIPTIONS — channels we actively watch                 -->
+  <!-- ============================================================ -->
+  <section>
+    <div class="flex items-center justify-between mb-2">
+      <h2 class="text-sm font-semibold uppercase text-gray-400">Subscriptions</h2>
+      <button
+        onclick="openAddModal()"
+        class="px-3 py-1.5 rounded-md text-sm font-medium bg-accent text-white hover:bg-accent/90 transition-colors">
+        Subscribe to a channel
+      </button>
+    </div>
+    <p class="text-xs text-gray-500 mb-3">
+      Each row watches ONE channel (DM or group). Modes:
+      <span class="font-medium text-white">priority</span> = triage → draft → approval ·
+      <span class="font-medium text-white">digest</span> = daily summary ·
+      <span class="font-medium text-white">store_only</span> = raw persistence.
+    </p>
+
+    <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+      <table class="w-full">
+        <thead>
+          <tr class="border-b border-gray-800 text-left">
+            <th class="px-4 py-2 text-xs text-gray-500 font-medium">Platform</th>
+            <th class="px-4 py-2 text-xs text-gray-500 font-medium">Channel</th>
+            <th class="px-4 py-2 text-xs text-gray-500 font-medium">Mode</th>
+            <th class="px-4 py-2 text-xs text-gray-500 font-medium">Last seen</th>
+            <th class="px-4 py-2 text-xs text-gray-500 font-medium">Last digest</th>
+            <th class="px-4 py-2 text-xs text-gray-500 font-medium"></th>
+          </tr>
+        </thead>
+        <tbody id="sub-table-body">
+          <%- include('partials/subscription-rows', { subs: subs }) %>
+        </tbody>
+      </table>
+    </div>
+  </section>
 </div>
 
-<!-- Add-subscription modal -->
+<!-- Subscribe-to-channel modal — sequential flow: platform → (workspace) → channel → mode -->
 <div id="add-modal" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
-     onclick="if(event.target===this) this.classList.add('hidden')">
+     onclick="if(event.target===this) closeAddModal()">
   <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-lg w-full">
     <div class="flex items-center justify-between mb-4">
-      <h2 class="text-lg font-semibold">Add subscription</h2>
-      <button onclick="document.getElementById('add-modal').classList.add('hidden')"
-              class="text-gray-400 hover:text-white">✕</button>
+      <div>
+        <h2 class="text-lg font-semibold">Subscribe to a channel</h2>
+        <p class="text-xs text-gray-500">Watch ONE channel. Connect platforms via the Connections panel above.</p>
+      </div>
+      <button onclick="closeAddModal()" class="text-gray-400 hover:text-white">✕</button>
     </div>
 
     <form id="add-form" class="space-y-4">
+      <!-- Step 1: Platform -->
       <div>
-        <label class="block text-xs uppercase text-gray-500 mb-1">Platform</label>
+        <label class="block text-xs uppercase text-gray-500 mb-1">1. Platform</label>
         <select id="platform-select" name="platform"
                 class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-sm"
                 onchange="onPlatformChange()">
@@ -57,11 +107,28 @@
         </select>
       </div>
 
-      <div>
-        <label class="block text-xs uppercase text-gray-500 mb-1">Source</label>
+      <!-- Step 2 (Slack only): Workspace -->
+      <div id="step-workspace" class="hidden">
+        <label class="block text-xs uppercase text-gray-500 mb-1">2. Slack workspace</label>
+        <div id="no-workspaces" class="hidden p-3 rounded-md border border-yellow-700/50 bg-yellow-900/20 text-sm">
+          <p class="text-yellow-200 mb-2">No Slack workspaces connected yet.</p>
+          <a href="/oauth/slack/start"
+             class="inline-block px-3 py-1 rounded-md text-xs font-medium bg-accent text-white hover:bg-accent/90 transition-colors">
+            Connect a Slack workspace
+          </a>
+        </div>
+        <select id="slack-workspace-select" name="account_id"
+                class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-sm"
+                onchange="onWorkspaceChange()">
+          <option value="">Select a workspace…</option>
+        </select>
+      </div>
+
+      <!-- Step 2/3: Source type (Discord) or auto-set (Slack) -->
+      <div id="step-source-type">
+        <label class="block text-xs uppercase text-gray-500 mb-1"><span id="source-step-num">2</span>. Source</label>
         <select id="source-type" class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-sm"
                 onchange="loadSources()">
-          <!-- Discord defaults; rewritten when platform changes -->
           <option value="dm">DM</option>
           <option value="guild">Guild channel</option>
         </select>
@@ -75,18 +142,21 @@
         </select>
       </div>
 
-      <div>
-        <label class="block text-xs uppercase text-gray-500 mb-1">Channel</label>
+      <!-- Step 3/4: Channel -->
+      <div id="step-channel" class="hidden">
+        <label class="block text-xs uppercase text-gray-500 mb-1"><span id="channel-step-num">3</span>. Channel</label>
+        <div id="channel-status" class="text-sm text-gray-500 mb-1 hidden"></div>
         <select id="channel-select" name="channel_id"
                 class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-sm"
                 onchange="onChannelPick()">
-          <option value="">Loading…</option>
+          <option value="">—</option>
         </select>
         <input type="hidden" id="display-name-hidden" name="display_name" />
       </div>
 
-      <div>
-        <label class="block text-xs uppercase text-gray-500 mb-1">Mode</label>
+      <!-- Step 4/5: Mode -->
+      <div id="step-mode" class="hidden">
+        <label class="block text-xs uppercase text-gray-500 mb-1"><span id="mode-step-num">4</span>. Mode</label>
         <select name="mode" class="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-sm">
           <option value="priority">priority — full triage + approval</option>
           <option value="digest" selected>digest — daily summary</option>
@@ -98,12 +168,12 @@
 
       <div class="flex gap-2 justify-end">
         <button type="button"
-                onclick="document.getElementById('add-modal').classList.add('hidden')"
+                onclick="closeAddModal()"
                 class="px-3 py-1.5 rounded-md text-sm font-medium text-gray-400 hover:text-white hover:bg-gray-800">
           Cancel
         </button>
-        <button type="submit"
-                class="px-3 py-1.5 rounded-md text-sm font-medium bg-accent text-white hover:bg-accent/90">
+        <button id="submit-btn" type="submit" disabled
+                class="px-3 py-1.5 rounded-md text-sm font-medium bg-accent text-white hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed">
           Add
         </button>
       </div>
@@ -112,71 +182,258 @@
 </div>
 
 <script>
-  const channelState = new Map(); // id -> display label for hidden display_name
+  // Channel id → display label so we can stash a human-readable name on submit.
+  const channelState = new Map();
+  // Cached after the panel + modal load so we don't re-fetch unnecessarily.
+  let slackWorkspaces = [];
+
+  // --- discord status panel -----------------------------------------------
+  let discordConnected = false;
+  async function renderDiscordStatus() {
+    const badge = document.getElementById('discord-status-badge');
+    const body = document.getElementById('discord-status-body');
+    try {
+      const res = await fetch('/api/discord/status');
+      const s = await res.json();
+      discordConnected = !!s.connected;
+      if (s.connected) {
+        badge.textContent = 'connected';
+        badge.className = 'text-xs px-2 py-0.5 rounded bg-green-900/50 text-green-300 border border-green-700/50';
+        body.innerHTML = '<span class="text-gray-300">Logged in as user_id <code class="text-gray-400">' +
+          escapeHtml(s.user_id || 'unknown') + '</code></span>';
+      } else {
+        badge.textContent = 'not connected';
+        badge.className = 'text-xs px-2 py-0.5 rounded bg-yellow-900/50 text-yellow-300 border border-yellow-700/50';
+        body.innerHTML =
+          '<p class="text-yellow-200 text-sm">Run <code class="text-gray-300">scripts/discord-harvest.sh</code> on the host, then ' +
+          '<code class="text-gray-300">augmentagent discord login --creds-json &lt;file&gt;</code> to register cookies + super-properties.</p>';
+      }
+    } catch (e) {
+      badge.textContent = 'error';
+      badge.className = 'text-xs px-2 py-0.5 rounded bg-red-900/50 text-red-300 border border-red-700/50';
+      body.innerHTML = '<p class="text-red-400">' + escapeHtml(e.message) + '</p>';
+    }
+  }
+
+  // --- workspace panel ----------------------------------------------------
+  async function renderSlackWorkspaces() {
+    const target = document.getElementById('slack-workspaces-list');
+    try {
+      const res = await fetch('/api/slack/workspaces');
+      slackWorkspaces = await res.json();
+      if (!slackWorkspaces.length) {
+        target.innerHTML = '<p class="text-gray-500 italic">No workspaces connected yet. Click <span class="font-medium">Connect workspace</span> above.</p>';
+      } else {
+        target.innerHTML = slackWorkspaces
+          .map((w) =>
+            '<div class="flex items-center justify-between py-1"><span><span class="font-medium text-white">' +
+            escapeHtml(w.team_name) +
+            '</span> <span class="text-gray-500">(' +
+            escapeHtml(w.team_id) +
+            ')</span></span><button onclick="removeWorkspace(\'' +
+            escapeJs(w.team_id) +
+            '\')" class="text-xs text-red-400 hover:text-red-300">Disconnect</button></div>'
+          )
+          .join('');
+      }
+      populateSlackWorkspaceSelect();
+    } catch (e) {
+      target.innerHTML = '<p class="text-red-400">Failed to load workspaces: ' + escapeHtml(e.message) + '</p>';
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s || '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function escapeJs(s) {
+    return String(s || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  }
+
+  async function removeWorkspace(teamId) {
+    if (!confirm('Disconnect workspace ' + teamId + '? Subscriptions on this workspace stop polling.')) return;
+    const res = await fetch('/api/slack/workspaces/' + encodeURIComponent(teamId), { method: 'DELETE' });
+    if (res.ok) { renderSlackWorkspaces(); }
+    else { alert('Failed to disconnect workspace'); }
+  }
+
+  function populateSlackWorkspaceSelect() {
+    const sel = document.getElementById('slack-workspace-select');
+    if (!sel) return;
+    sel.innerHTML =
+      '<option value="">Select a workspace…</option>' +
+      slackWorkspaces
+        .map((w) => '<option value="' + escapeHtml(w.team_id) + '">' + escapeHtml(w.team_name) + '</option>')
+        .join('');
+  }
+
+  // --- modal lifecycle ----------------------------------------------------
+  function openAddModal() {
+    document.getElementById('add-modal').classList.remove('hidden');
+    onPlatformChange(); // Reset state to current platform's flow.
+  }
+
+  function closeAddModal() {
+    document.getElementById('add-modal').classList.add('hidden');
+    document.getElementById('add-form').reset();
+    document.getElementById('add-error').classList.add('hidden');
+    document.getElementById('submit-btn').disabled = true;
+  }
+
+  // --- step orchestration -------------------------------------------------
+  function showStep(id, on) {
+    document.getElementById(id).classList.toggle('hidden', !on);
+  }
+
+  function setSubmitEnabled() {
+    const channel = document.getElementById('channel-select').value;
+    const platform = document.getElementById('platform-select').value;
+    let ready = !!channel;
+    if (platform === 'slack') {
+      const ws = document.getElementById('slack-workspace-select').value;
+      ready = ready && !!ws;
+    }
+    document.getElementById('submit-btn').disabled = !ready;
+  }
 
   function onPlatformChange() {
     const platform = document.getElementById('platform-select').value;
     const srcSel = document.getElementById('source-type');
+    document.getElementById('add-error').classList.add('hidden');
+
     if (platform === 'slack') {
+      // Step 2 = workspace (Slack-only).
+      showStep('step-workspace', true);
+      document.getElementById('source-step-num').textContent = '3';
+      document.getElementById('channel-step-num').textContent = '4';
+      document.getElementById('mode-step-num').textContent = '5';
+
       srcSel.innerHTML = [
-        '<option value="slack_dm">Slack: DM</option>',
-        '<option value="slack_channel">Slack: channel</option>',
+        '<option value="slack_dm">DMs / group DMs</option>',
+        '<option value="slack_channel">Public / private channels</option>',
       ].join('');
+
+      const hasWs = slackWorkspaces.length > 0;
+      showStep('no-workspaces', !hasWs);
+      document.getElementById('slack-workspace-select').classList.toggle('hidden', !hasWs);
+      // Defer source/channel/mode until a workspace is picked.
+      showStep('step-source-type', false);
+      showStep('step-channel', false);
+      showStep('step-mode', false);
+      showStep('guild-picker', false);
     } else {
+      // Discord: workspace step skipped, but still gate on connection status.
+      showStep('step-workspace', false);
+      document.getElementById('source-step-num').textContent = '2';
+      document.getElementById('channel-step-num').textContent = '3';
+      document.getElementById('mode-step-num').textContent = '4';
+
       srcSel.innerHTML = [
         '<option value="dm">DM</option>',
         '<option value="guild">Guild channel</option>',
       ].join('');
+      if (!discordConnected) {
+        showStep('step-source-type', false);
+        showStep('step-channel', false);
+        showStep('step-mode', false);
+        const err = document.getElementById('add-error');
+        err.textContent = 'Discord is not connected yet — see the Connections panel above.';
+        err.classList.remove('hidden');
+      } else {
+        showStep('step-source-type', true);
+        showStep('step-channel', true);
+        showStep('step-mode', true);
+        loadSources();
+      }
     }
+    setSubmitEnabled();
+  }
+
+  function onWorkspaceChange() {
+    const ws = document.getElementById('slack-workspace-select').value;
+    if (!ws) {
+      showStep('step-source-type', false);
+      showStep('step-channel', false);
+      showStep('step-mode', false);
+      setSubmitEnabled();
+      return;
+    }
+    // Workspace selected — reveal source-type → channel → mode.
+    showStep('step-source-type', true);
+    showStep('step-channel', true);
+    showStep('step-mode', true);
     loadSources();
   }
 
+  // --- channel loading ----------------------------------------------------
   async function loadSources() {
     const platform = document.getElementById('platform-select').value;
     const type = document.getElementById('source-type').value;
     const guildPicker = document.getElementById('guild-picker');
     const channelSel = document.getElementById('channel-select');
-    channelSel.innerHTML = '<option value="">Loading…</option>';
+    const status = document.getElementById('channel-status');
+
+    channelSel.innerHTML = '<option value="">—</option>';
     guildPicker.classList.add('hidden');
+    status.classList.remove('hidden');
+    status.textContent = 'Loading channels…';
+    status.className = 'text-sm text-gray-400 mb-1';
+    setSubmitEnabled();
 
     try {
       if (platform === 'discord' && type === 'dm') {
         const res = await fetch('/api/discord/dms');
+        if (!res.ok) throw new Error(await res.text());
         const dms = await res.json();
         channelState.clear();
-        channelSel.innerHTML = dms
-          .map((d) => {
+        channelSel.innerHTML = '<option value="">Select a DM…</option>' +
+          dms.map((d) => {
             const label = 'DM: ' + d.display_name;
             channelState.set(d.id, label);
-            return '<option value="' + d.id + '">' + label + '</option>';
-          })
-          .join('');
-        onChannelPick();
+            return '<option value="' + escapeHtml(d.id) + '">' + escapeHtml(label) + '</option>';
+          }).join('');
+        status.classList.add('hidden');
       } else if (platform === 'discord' && type === 'guild') {
         guildPicker.classList.remove('hidden');
         const res = await fetch('/api/discord/guilds');
+        if (!res.ok) throw new Error(await res.text());
         const guilds = await res.json();
         const gSel = document.getElementById('guild-select');
         gSel.innerHTML = guilds
-          .map((g) => '<option value="' + g.id + '" data-name="' + g.name + '">' + g.name + '</option>')
+          .map((g) => '<option value="' + escapeHtml(g.id) + '" data-name="' + escapeHtml(g.name) + '">' + escapeHtml(g.name) + '</option>')
           .join('');
         await loadGuildChannels();
+        status.classList.add('hidden');
       } else if (platform === 'slack') {
+        const teamId = document.getElementById('slack-workspace-select').value;
+        if (!teamId) {
+          status.textContent = 'Pick a workspace first.';
+          return;
+        }
         const slackTypes = type === 'slack_dm' ? 'im,mpim' : 'public_channel,private_channel';
-        const res = await fetch('/api/slack/conversations?types=' + encodeURIComponent(slackTypes));
+        const res = await fetch('/api/slack/conversations?types=' + encodeURIComponent(slackTypes) + '&team_id=' + encodeURIComponent(teamId));
+        if (!res.ok) {
+          const body = await res.text();
+          throw new Error('Slack list failed: ' + body);
+        }
         const convs = await res.json();
         channelState.clear();
-        channelSel.innerHTML = convs
-          .map((c) => {
-            const label = c.display_name;
-            channelState.set(c.id, label);
-            return '<option value="' + c.id + '">' + label + '</option>';
-          })
-          .join('');
-        onChannelPick();
+        if (!convs.length) {
+          status.textContent = 'No ' + (type === 'slack_dm' ? 'DMs' : 'channels') + ' visible to this workspace.';
+        } else {
+          status.classList.add('hidden');
+        }
+        channelSel.innerHTML = '<option value="">Select a channel…</option>' +
+          convs.map((c) => {
+            channelState.set(c.id, c.display_name);
+            return '<option value="' + escapeHtml(c.id) + '">' + escapeHtml(c.display_name) + '</option>';
+          }).join('');
       }
     } catch (e) {
-      channelSel.innerHTML = '<option>(error loading)</option>';
+      status.textContent = 'Error: ' + e.message;
+      status.className = 'text-sm text-red-400 mb-1';
+    } finally {
+      setSubmitEnabled();
     }
   }
 
@@ -194,16 +451,16 @@
       const res = await fetch('/api/discord/guilds/' + guildId + '/channels');
       const channels = await res.json();
       channelState.clear();
-      channelSel.innerHTML = channels
-        .map((c) => {
+      channelSel.innerHTML = '<option value="">Select a channel…</option>' +
+        channels.map((c) => {
           const label = '#' + c.name + ' in ' + guildName;
           channelState.set(c.id, label);
-          return '<option value="' + c.id + '">' + label + '</option>';
-        })
-        .join('');
-      onChannelPick();
+          return '<option value="' + escapeHtml(c.id) + '">' + escapeHtml(label) + '</option>';
+        }).join('');
     } catch (e) {
       channelSel.innerHTML = '<option>(error)</option>';
+    } finally {
+      setSubmitEnabled();
     }
   }
 
@@ -211,8 +468,10 @@
     const sel = document.getElementById('channel-select');
     const label = channelState.get(sel.value) || sel.value;
     document.getElementById('display-name-hidden').value = label;
+    setSubmitEnabled();
   }
 
+  // --- submit -------------------------------------------------------------
   document.getElementById('add-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const form = e.target;
@@ -224,6 +483,14 @@
       display_name: form.display_name.value,
       mode: form.mode.value,
     };
+    if (form.platform.value === 'slack') {
+      body.account_id = document.getElementById('slack-workspace-select').value;
+    }
+    if (!body.channel_id || !body.display_name) {
+      err.textContent = 'Pick a channel before submitting.';
+      err.classList.remove('hidden');
+      return;
+    }
     const res = await fetch('/api/subscriptions', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -236,12 +503,14 @@
     }
     const html = await res.text();
     document.getElementById('sub-table-body').innerHTML = html;
-    document.getElementById('add-modal').classList.add('hidden');
-    form.reset();
+    closeAddModal();
   });
 
-  // Prime dropdowns on load so the modal shows data when opened.
-  loadSources();
+  // Boot: load both connection panels in parallel. Modal stays closed; opening
+  // it triggers onPlatformChange() to set up the right step sequence based on
+  // current connection state.
+  renderSlackWorkspaces();
+  renderDiscordStatus();
 </script>
 
 <%- include('partials/footer') %>

@@ -9,7 +9,7 @@ mod store;
 
 pub use models::{
     Account, ActionRecord, ActionStatus, ChannelSubscription, Email, LearnedPattern,
-    SubscriptionMode, TriageResult,
+    SlackWorkspace, SubscriptionMode, TriageResult,
 };
 pub use store::{
     ActionWithEmail, PendingNudge, RetryableReply, Store, StoreError, StoreResult,

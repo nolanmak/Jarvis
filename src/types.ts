@@ -66,6 +66,10 @@ export interface ChannelSubscription {
   display_name: string;
   mode: SubscriptionMode;
   active: boolean;
+  /// For multi-account platforms, identifies which connected account this
+  /// subscription lives under (Slack team_id). NULL for single-account
+  /// platforms (Discord user-token).
+  account_id?: string | null;
   last_seen_message_id?: string | null;
   last_digest_at_ms?: number | null;
   created_at_ms: number;
