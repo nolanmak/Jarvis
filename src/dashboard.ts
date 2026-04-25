@@ -202,6 +202,71 @@ router.get("/api/discord/status", async (_req, res) => {
   }
 });
 
+// --- Discord credential ingest (bookmarklet target) ---
+//
+// The bookmarklet runs on https://discord.com, hooks fetch/XHR to capture the
+// `authorization` and `x-super-properties` headers from any outgoing request
+// the Discord client makes (heartbeats, presence updates, channel switches),
+// then POSTs the four credential fields here. We CORS-allow only discord.com.
+const DISCORD_CREDS_ALLOW_ORIGIN = "https://discord.com";
+
+router.options("/api/discord/creds", (_req, res) => {
+  res.header("Access-Control-Allow-Origin", DISCORD_CREDS_ALLOW_ORIGIN);
+  res.header("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Max-Age", "600");
+  res.sendStatus(204);
+});
+
+router.post("/api/discord/creds", (req, res) => {
+  res.header("Access-Control-Allow-Origin", DISCORD_CREDS_ALLOW_ORIGIN);
+  const { user_id, token, super_properties_b64, user_agent } = (req.body || {}) as {
+    user_id?: unknown;
+    token?: unknown;
+    super_properties_b64?: unknown;
+    user_agent?: unknown;
+  };
+  const missing: string[] = [];
+  if (typeof user_id !== "string" || !/^\d{15,25}$/.test(user_id)) missing.push("user_id");
+  if (typeof token !== "string" || token.length < 20) missing.push("token");
+  if (typeof super_properties_b64 !== "string" || super_properties_b64.length < 20)
+    missing.push("super_properties_b64");
+  if (typeof user_agent !== "string" || user_agent.length < 10) missing.push("user_agent");
+  if (missing.length) return res.status(400).json({ error: `bad/missing fields: ${missing.join(", ")}` });
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "aa-discord-"));
+  const file = path.join(dir, "creds.json");
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ user_id, token, super_properties_b64, user_agent }),
+    { mode: 0o600 },
+  );
+  const cli = fs.existsSync(path.resolve(process.cwd(), "target/release/augmentagent"))
+    ? path.resolve(process.cwd(), "target/release/augmentagent")
+    : path.resolve(process.cwd(), "target/debug/augmentagent");
+
+  const child = spawn(cli, ["discord", "login", "--creds-json", file], { stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (d) => (stdout += d.toString()));
+  child.stderr.on("data", (d) => (stderr += d.toString()));
+  const cleanup = () => {
+    try { fs.unlinkSync(file); } catch (_) { /* ignore */ }
+    try { fs.rmdirSync(dir); } catch (_) { /* ignore */ }
+  };
+  child.on("error", (err) => {
+    cleanup();
+    res.status(500).json({ error: `spawn failed: ${err.message}` });
+  });
+  child.on("exit", (code) => {
+    cleanup();
+    if (code !== 0) {
+      return res.status(500).json({ error: stderr.trim() || stdout.trim() || `discord login exited ${code}` });
+    }
+    res.json({ ok: true, user_id });
+  });
+});
+
 router.get("/api/discord/dms", async (_req, res) => {
   try {
     const dms = await listDms();

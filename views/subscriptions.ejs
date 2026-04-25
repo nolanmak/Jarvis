@@ -18,11 +18,18 @@
       <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
         <div class="flex items-center justify-between mb-2">
           <h3 class="text-sm font-semibold">Discord</h3>
-          <span id="discord-status-badge" class="text-xs px-2 py-0.5 rounded bg-gray-800">…</span>
+          <div class="flex items-center gap-2">
+            <span id="discord-status-badge" class="text-xs px-2 py-0.5 rounded bg-gray-800">…</span>
+            <button id="discord-connect-btn"
+                    onclick="openDiscordConnectModal()"
+                    class="hidden px-3 py-1 rounded-md text-xs font-medium bg-accent text-white hover:bg-accent/90 transition-colors">
+              Connect Discord
+            </button>
+          </div>
         </div>
         <p class="text-xs text-gray-500 mb-2">
-          Discord uses your harvested cookies + super-properties (<code class="text-gray-400">scripts/discord-harvest.sh</code>).
-          Persisted in macOS Keychain on the host running the agent.
+          Discord has no OAuth that allows DM polling, so the agent uses your real browser session.
+          One-click capture via the bookmarklet — no DevTools required.
         </p>
         <div id="discord-status-body" class="text-sm text-gray-400">Checking…</div>
       </div>
@@ -148,6 +155,55 @@
   </div>
 </div>
 
+<!-- Discord-connect modal: bookmarklet + open-Discord button + live status poller -->
+<div id="discord-connect-modal" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+     onclick="if(event.target===this) closeDiscordConnectModal()">
+  <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-xl">
+    <div class="flex items-center justify-between mb-4">
+      <div>
+        <h2 class="text-lg font-semibold">Connect Discord</h2>
+        <p class="text-xs text-gray-500">One-click capture from a logged-in Discord browser tab.</p>
+      </div>
+      <button onclick="closeDiscordConnectModal()" class="text-gray-400 hover:text-white">✕</button>
+    </div>
+
+    <ol class="text-sm text-gray-300 space-y-3 list-decimal pl-5 mb-4">
+      <li>
+        Drag this link to your bookmarks bar:
+        <a id="discord-bookmarklet-link" href="#"
+           class="ml-1 inline-block px-3 py-1 bg-accent text-white rounded-md text-xs font-medium hover:bg-accent/90"
+           onclick="event.preventDefault(); alert('Drag this to your bookmarks bar (don’t click)')">
+          augmentagent · grab Discord creds
+        </a>
+        <span class="text-xs text-gray-500 block mt-1">
+          (browsers block clicking <code class="text-gray-400">javascript:</code> URLs directly — drag-only)
+        </span>
+      </li>
+      <li>
+        Open Discord and make sure you're logged in:
+        <a href="https://discord.com/app" target="_blank" rel="noopener"
+           class="ml-1 inline-block px-3 py-1 bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-md text-xs font-medium">
+          Open discord.com →
+        </a>
+      </li>
+      <li>
+        On the Discord tab, click the bookmarklet. A toast will appear top-right; once it turns green, you're done.
+        Click any channel if it stays "waiting" past 30s — that fires a request the bookmarklet can capture.
+      </li>
+    </ol>
+
+    <div id="discord-connect-status" class="text-sm text-gray-400 bg-gray-950 border border-gray-800 rounded-md p-3 text-center">
+      Waiting for credentials…
+    </div>
+
+    <details class="mt-3 text-xs text-gray-500">
+      <summary class="cursor-pointer hover:text-gray-300">Show bookmarklet code (paste into a manual bookmark)</summary>
+      <textarea id="discord-bookmarklet-code" readonly
+                class="mt-2 w-full h-28 bg-gray-950 border border-gray-800 rounded-md p-2 font-mono text-[10px] text-gray-400 select-all"></textarea>
+    </details>
+  </div>
+</div>
+
 <!-- Subscribe-to-channel modal — sequential flow: platform → (workspace) → channel → mode -->
 <div id="add-modal" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
      onclick="if(event.target===this) closeAddModal()">
@@ -257,6 +313,7 @@
   async function renderDiscordStatus() {
     const badge = document.getElementById('discord-status-badge');
     const body = document.getElementById('discord-status-body');
+    const btn = document.getElementById('discord-connect-btn');
     try {
       const res = await fetch('/api/discord/status');
       const s = await res.json();
@@ -266,17 +323,79 @@
         badge.className = 'text-xs px-2 py-0.5 rounded bg-green-900/50 text-green-300 border border-green-700/50';
         body.innerHTML = '<span class="text-gray-300">Logged in as user_id <code class="text-gray-400">' +
           escapeHtml(s.user_id || 'unknown') + '</code></span>';
+        if (btn) btn.classList.add('hidden');
       } else {
         badge.textContent = 'not connected';
         badge.className = 'text-xs px-2 py-0.5 rounded bg-yellow-900/50 text-yellow-300 border border-yellow-700/50';
         body.innerHTML =
-          '<p class="text-yellow-200 text-sm">Run <code class="text-gray-300">scripts/discord-harvest.sh</code> on the host, then ' +
-          '<code class="text-gray-300">augmentagent discord login --creds-json &lt;file&gt;</code> to register cookies + super-properties.</p>';
+          '<p class="text-yellow-200 text-sm">Click <span class="text-gray-200 font-medium">Connect Discord</span> to grab your session via the bookmarklet — no terminal required.</p>';
+        if (btn) btn.classList.remove('hidden');
       }
     } catch (e) {
       badge.textContent = 'error';
       badge.className = 'text-xs px-2 py-0.5 rounded bg-red-900/50 text-red-300 border border-red-700/50';
       body.innerHTML = '<p class="text-red-400">' + escapeHtml(e.message) + '</p>';
+    }
+  }
+
+  // --- discord connect modal: bookmarklet + live status poll --------------
+  // Bookmarklet runs on https://discord.com/*. It hooks fetch+XHR to capture
+  // `authorization` and `x-super-properties` headers from any Discord-internal
+  // request (heartbeat, channel switch, etc.), then POSTs four fields to our
+  // /api/discord/creds endpoint. The dashboard server runs `augmentagent
+  // discord login` to validate + persist to Keychain.
+  const DISCORD_BOOKMARKLET = (function() {
+    const src = '(function(){if(window.__aaDiscord)return;window.__aaDiscord=1;var ENDPOINT="' +
+      window.location.origin + '/api/discord/creds";var MAX=60;var c={};var n=["authorization","x-super-properties"];' +
+      'var box=document.createElement("div");box.style.cssText="position:fixed;top:20px;right:20px;background:#5865F2;color:#fff;padding:14px 18px;border-radius:8px;z-index:2147483647;font-family:system-ui,sans-serif;font-size:14px;max-width:340px;box-shadow:0 4px 14px rgba(0,0,0,.35);line-height:1.4";' +
+      'box.innerHTML="<b>augmentagent</b> · capturing Discord credentials…<div id=\\"aa-msg\\" style=\\"margin-top:6px;font-size:12px;opacity:.85\\">Click any channel to fire a request faster.</div>";' +
+      'document.body.appendChild(box);var msg=box.querySelector("#aa-msg");' +
+      'var oX=XMLHttpRequest.prototype.setRequestHeader;XMLHttpRequest.prototype.setRequestHeader=function(k,v){var lk=(k||"").toLowerCase();if(n.indexOf(lk)>=0)c[lk]=v;return oX.apply(this,arguments)};' +
+      'var oF=window.fetch;window.fetch=function(u,i){try{var h=i&&i.headers;if(h){if(h.get){n.forEach(function(k){var v=h.get(k);if(v)c[k]=v})}else if(Array.isArray(h)){h.forEach(function(p){var lk=(p[0]||"").toLowerCase();if(n.indexOf(lk)>=0)c[lk]=p[1]})}else if(typeof h==="object"){Object.keys(h).forEach(function(k){var lk=k.toLowerCase();if(n.indexOf(lk)>=0)c[lk]=h[k]})}}}catch(e){}return oF.apply(this,arguments)};' +
+      'var t=0;var iv=setInterval(function(){t++;if(t>MAX){clearInterval(iv);box.style.background="#FAA61A";box.innerHTML="<b>augmentagent</b> · timed out. Click a channel and re-run the bookmarklet.";setTimeout(function(){box.remove()},8000);return}msg.textContent="Waiting ("+t+"s). Click any channel to fire a request faster.";' +
+      'if(c["authorization"]&&c["x-super-properties"]){clearInterval(iv);(async function(){try{var ur=await oF("/api/v9/users/@me",{credentials:"include",headers:{authorization:c["authorization"]}});var u=await ur.json();var p={user_id:u.id,token:c["authorization"],super_properties_b64:c["x-super-properties"],user_agent:navigator.userAgent};var r=await oF(ENDPOINT,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(p),mode:"cors"});if(!r.ok){var et=await r.text();throw new Error("HTTP "+r.status+": "+et)}box.style.background="#3BA55D";box.innerHTML="<b>augmentagent</b> · ✅ connected. You can close this tab.";setTimeout(function(){box.remove()},6000)}catch(e){box.style.background="#ED4245";box.innerHTML="<b>augmentagent</b> · ❌ "+(e.message||e);setTimeout(function(){box.remove()},12000)}})()}},1000)})();';
+    return 'javascript:' + encodeURIComponent(src);
+  })();
+
+  let discordConnectPoller = null;
+  function openDiscordConnectModal() {
+    const modal = document.getElementById('discord-connect-modal');
+    const link = document.getElementById('discord-bookmarklet-link');
+    const code = document.getElementById('discord-bookmarklet-code');
+    const status = document.getElementById('discord-connect-status');
+    if (link) link.setAttribute('href', DISCORD_BOOKMARKLET);
+    if (code) code.value = DISCORD_BOOKMARKLET;
+    if (status) {
+      status.className = 'text-sm text-gray-400 bg-gray-950 border border-gray-800 rounded-md p-3 text-center';
+      status.textContent = 'Waiting for credentials…';
+    }
+    modal.classList.remove('hidden');
+    // Poll status every 2s; auto-close on success.
+    discordConnectPoller = setInterval(async () => {
+      try {
+        const res = await fetch('/api/discord/status');
+        const s = await res.json();
+        if (s.connected) {
+          if (status) {
+            status.className = 'text-sm text-green-300 bg-green-900/30 border border-green-700/50 rounded-md p-3 text-center';
+            status.innerHTML = '✅ Connected as <code class="text-green-200">' + escapeHtml(s.user_id || 'unknown') + '</code>. Closing in a moment…';
+          }
+          clearInterval(discordConnectPoller);
+          discordConnectPoller = null;
+          setTimeout(() => {
+            closeDiscordConnectModal();
+            renderDiscordStatus();
+          }, 1500);
+        }
+      } catch (_) { /* keep polling */ }
+    }, 2000);
+  }
+
+  function closeDiscordConnectModal() {
+    document.getElementById('discord-connect-modal').classList.add('hidden');
+    if (discordConnectPoller) {
+      clearInterval(discordConnectPoller);
+      discordConnectPoller = null;
     }
   }
 
