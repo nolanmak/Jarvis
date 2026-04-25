@@ -77,40 +77,75 @@ impl DiscordAuth {
         Ok(())
     }
 
-    /// Keychain-first, optional legacy-file fallback for a one-time import.
-    /// No legacy file exists today (this is a new integration), but keeping
-    /// the same shape as LinkedIn's `load_with_migration` makes the CLI
-    /// callers uniform and leaves the door open for future bulk-imports.
-    pub fn load_with_migration(file_fallback: Option<&Path>) -> Result<Self, AuthError> {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, AuthError> {
+        let raw = std::fs::read_to_string(path)?;
+        let parsed: DiscordAuth = serde_json::from_str(&raw)?;
+        parsed.validate()?;
+        Ok(parsed)
+    }
+
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), AuthError> {
+        self.validate()?;
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let raw = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, raw)?;
+        Ok(())
+    }
+
+    /// Keychain-first, file-fallback for cross-host portability — same shape
+    /// as LinkedIn's `load_with_migration`. On a fallback hit the credentials
+    /// are auto-promoted into Keychain so subsequent loads skip the file.
+    ///
+    /// Resolution order:
+    /// 1. macOS Keychain at `augmentagent/discord/default`
+    /// 2. `default_creds_path(repo_root)` — vault on `/Volumes/augmentagent/`
+    ///    or `<repo>/discord-creds.json`, env override via
+    ///    `AUGMENTAGENT_DISCORD_CREDS`
+    pub fn load_with_migration(repo_root: &Path) -> Result<Self, AuthError> {
         match Self::load_from_keychain() {
-            Ok(a) => Ok(a),
+            Ok(a) => {
+                tracing::debug!("discord auth loaded from keychain");
+                Ok(a)
+            }
             Err(AuthError::Keychain(KeychainError::NotFound { .. })) => {
-                if let Some(path) = file_fallback {
-                    let raw = std::fs::read_to_string(path)?;
-                    let a: DiscordAuth = serde_json::from_str(&raw)?;
-                    a.validate()?;
-                    if let Err(e) = a.save_to_keychain() {
-                        tracing::warn!(error = %e, "file->keychain promote failed");
-                    }
-                    Ok(a)
-                } else {
-                    Err(AuthError::Keychain(KeychainError::NotFound {
-                        platform: KEYCHAIN_PLATFORM.into(),
-                        account: DEFAULT_ACCOUNT.into(),
-                    }))
+                let path = default_creds_path(repo_root);
+                let auth = Self::load(&path)?;
+                match auth.save_to_keychain() {
+                    Ok(()) => tracing::info!(
+                        from = %path.display(),
+                        "discord auth migrated to keychain from file",
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "discord auth loaded from file but keychain write failed; will retry next boot",
+                    ),
                 }
+                Ok(auth)
             }
             Err(e) => Err(e),
         }
     }
 }
 
-/// Default path used by `augmentagent discord login --creds-json <path>` —
-/// the user-facing harvested file. Not automatically consumed; the CLI
-/// explicitly passes this path.
+/// Default on-disk location for the Discord creds file. Mirrors LinkedIn:
+/// 1. `AUGMENTAGENT_DISCORD_CREDS` env override
+/// 2. `/Volumes/augmentagent/discord-creds.json` (encrypted vault) if mounted
+/// 3. `<repo_root>/discord-creds.json` (dev / single-host fallback)
+///
+/// Mount the vault on additional hosts so a fresh deploy auto-imports on the
+/// daemon's first poll without needing an SSH session.
 pub fn default_creds_path(repo_root: &Path) -> PathBuf {
     if let Ok(custom) = std::env::var("AUGMENTAGENT_DISCORD_CREDS") {
         return PathBuf::from(custom);
+    }
+    let vault = PathBuf::from("/Volumes/augmentagent");
+    if vault.is_dir() {
+        return vault.join("discord-creds.json");
     }
     repo_root.join("discord-creds.json")
 }
@@ -174,5 +209,30 @@ mod tests {
             PathBuf::from("/tmp/custom-discord.json"),
         );
         std::env::remove_var("AUGMENTAGENT_DISCORD_CREDS");
+    }
+
+    #[test]
+    fn default_creds_path_falls_back_to_repo() {
+        // Ensure no env override interferes; vault dir won't exist on CI.
+        std::env::remove_var("AUGMENTAGENT_DISCORD_CREDS");
+        let repo = tempfile::tempdir().unwrap();
+        // Vault path probe: only kicks in when /Volumes/augmentagent exists.
+        // On CI / fresh dev box this falls through to <repo>/discord-creds.json.
+        if !PathBuf::from("/Volumes/augmentagent").is_dir() {
+            assert_eq!(
+                default_creds_path(repo.path()),
+                repo.path().join("discord-creds.json"),
+            );
+        }
+    }
+
+    #[test]
+    fn save_then_load_round_trips_via_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("discord-creds.json");
+        sample().save(&path).unwrap();
+        let loaded = DiscordAuth::load(&path).unwrap();
+        assert_eq!(loaded.user_id, sample().user_id);
+        assert_eq!(loaded.token, sample().token);
     }
 }
