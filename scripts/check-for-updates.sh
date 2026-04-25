@@ -26,6 +26,8 @@ mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/update.log"
 LABEL="com.nolanmak.augmentagent"
 SYSTEMD_UNIT="augmentagent.service"
+DASHBOARD_LABEL="com.nolanmak.augmentagent-dashboard"
+DASHBOARD_SYSTEMD_UNIT="augmentagent-dashboard.service"
 
 stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s [update] %s\n' "$(stamp)" "$*" >> "$LOG"; }
@@ -62,11 +64,17 @@ fi
 
 log "update available: $LOCAL -> $REMOTE"
 
-# What changed? Decide whether a rebuild is needed.
+# What changed? Decide whether each side needs a rebuild.
 CHANGED_FILES=$(git diff --name-only "$LOCAL" "$REMOTE")
 NEEDS_REBUILD=0
+NEEDS_DASHBOARD_REBUILD=0
 if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(crates/|Cargo\.(toml|lock)|rust-toolchain\.toml)'; then
   NEEDS_REBUILD=1
+fi
+# Dashboard rebuild needed when TS sources, EJS views, or package.json change.
+# tsconfig.json and tailwind.config.js also gate compiled output.
+if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(src/|views/|package(-lock)?\.json|tsconfig\.json|tailwind\.config\.js)'; then
+  NEEDS_DASHBOARD_REBUILD=1
 fi
 
 log "pulling"
@@ -76,36 +84,69 @@ if ! git pull --ff-only origin main >> "$LOG" 2>&1; then
 fi
 
 if [ "$NEEDS_REBUILD" -eq 1 ]; then
-  log "rebuilding (changed files touched crates/ or Cargo)"
+  log "rebuilding rust (changed files touched crates/ or Cargo)"
   if ! cargo build --release -p augmentagent-cli >> "$LOG" 2>&1; then
-    log "BUILD FAILED — not restarting; daemon stays on previous binary"
+    log "RUST BUILD FAILED — not restarting; daemon stays on previous binary"
     exit 1
   fi
-  log "build ok"
+  log "rust build ok"
 else
-  log "no rust code changed; skipping rebuild"
+  log "no rust code changed; skipping rust rebuild"
 fi
 
-# Restart daemon so the new binary / config takes effect.
+if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
+  log "rebuilding dashboard (changed files touched src/, views/, or package.json)"
+  if ! command -v npm >/dev/null 2>&1; then
+    log "npm not found on PATH; skipping dashboard rebuild — UI will be stale until manual rebuild"
+  elif ! (npm install --production=false >> "$LOG" 2>&1 && npm run build >> "$LOG" 2>&1); then
+    log "DASHBOARD BUILD FAILED — leaving previous build in place"
+  else
+    log "dashboard build ok"
+  fi
+else
+  log "no dashboard code changed; skipping dashboard rebuild"
+fi
+
+# Restart the Rust daemon so the new binary / config takes effect.
 case "$(uname -s)" in
   Darwin)
-    if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
-      log "restarting daemon via launchctl kickstart"
-      launchctl kickstart -k "gui/$(id -u)/$LABEL" >> "$LOG" 2>&1 || log "kickstart failed"
-    else
-      log "daemon not registered under launchd ($LABEL) — run install-autostart.sh manually"
+    if [ "$NEEDS_REBUILD" -eq 1 ]; then
+      if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+        log "restarting daemon via launchctl kickstart"
+        launchctl kickstart -k "gui/$(id -u)/$LABEL" >> "$LOG" 2>&1 || log "kickstart failed"
+      else
+        log "daemon not registered under launchd ($LABEL) — run install-autostart.sh manually"
+      fi
+    fi
+    if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
+      if launchctl print "gui/$(id -u)/$DASHBOARD_LABEL" >/dev/null 2>&1; then
+        log "restarting dashboard via launchctl kickstart"
+        launchctl kickstart -k "gui/$(id -u)/$DASHBOARD_LABEL" >> "$LOG" 2>&1 || log "dashboard kickstart failed"
+      else
+        log "dashboard not registered under launchd ($DASHBOARD_LABEL) — run install-dashboard.sh manually"
+      fi
     fi
     ;;
   Linux)
-    if systemctl --user list-unit-files "$SYSTEMD_UNIT" 2>/dev/null | grep -q "$SYSTEMD_UNIT"; then
-      log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
-      systemctl --user restart "$SYSTEMD_UNIT" >> "$LOG" 2>&1 || log "systemctl restart failed"
-    else
-      log "daemon not registered under systemd ($SYSTEMD_UNIT) — run install-autostart.sh manually"
+    if [ "$NEEDS_REBUILD" -eq 1 ]; then
+      if systemctl --user list-unit-files "$SYSTEMD_UNIT" 2>/dev/null | grep -q "$SYSTEMD_UNIT"; then
+        log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
+        systemctl --user restart "$SYSTEMD_UNIT" >> "$LOG" 2>&1 || log "systemctl restart failed"
+      else
+        log "daemon not registered under systemd ($SYSTEMD_UNIT) — run install-autostart.sh manually"
+      fi
+    fi
+    if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
+      if systemctl --user list-unit-files "$DASHBOARD_SYSTEMD_UNIT" 2>/dev/null | grep -q "$DASHBOARD_SYSTEMD_UNIT"; then
+        log "restarting dashboard via systemctl --user restart $DASHBOARD_SYSTEMD_UNIT"
+        systemctl --user restart "$DASHBOARD_SYSTEMD_UNIT" >> "$LOG" 2>&1 || log "systemctl dashboard restart failed"
+      else
+        log "dashboard not registered under systemd ($DASHBOARD_SYSTEMD_UNIT) — run install-dashboard.sh manually"
+      fi
     fi
     ;;
   *)
-    log "no restart strategy for $(uname -s) — restart the daemon manually"
+    log "no restart strategy for $(uname -s) — restart the daemon + dashboard manually"
     ;;
 esac
 
