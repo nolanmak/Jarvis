@@ -305,11 +305,16 @@ enum WikiOp {
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
+    // Send tracing to stderr so JSON-mode subcommands (consumed by the
+    // dashboard via shell-out) don't get their stdout polluted with log
+    // lines. Production systemd captures both streams to log files; in dev
+    // you still see logs alongside data in the terminal.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
