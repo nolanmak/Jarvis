@@ -297,14 +297,37 @@ router.get("/api/discord/guilds/:id/channels", async (req, res) => {
 // --- Slack source-picker proxy (shells to Rust CLI) ---
 
 router.get("/api/slack/conversations", async (req, res) => {
+  const types = (req.query.types as string | undefined) ||
+    "public_channel,private_channel,im,mpim";
+  const teamId = req.query.team_id as string | undefined;
   try {
-    const types = (req.query.types as string | undefined) ||
-      "public_channel,private_channel,im,mpim";
-    const teamId = req.query.team_id as string | undefined;
     const convs = await listSlackConversations(types, teamId);
-    res.json(convs);
+    return res.json(convs);
   } catch (e) {
-    res.status(500).json({ error: (e as Error).message });
+    const msg = (e as Error).message || "";
+    // Orphan-state recovery: the Rust CLI's "registered ... but its Keychain
+    // slot is missing" diagnostic means a stale workspace row is blocking
+    // reconnect. Auto-cleanup so the user can hit Connect and start fresh.
+    const isOrphan = msg.includes("Keychain slot is missing") ||
+      msg.includes("Keychain slot is missing or unreadable");
+    if (isOrphan && teamId) {
+      try {
+        await runCli(["slack", "remove-workspace", teamId]);
+        return res.status(409).json({
+          error:
+            "This workspace's credentials are out of sync (legacy bug). " +
+            "We've cleared the orphaned row — click 'Connect workspace' to re-OAuth.",
+          cleanedUp: true,
+        });
+      } catch (cleanupErr) {
+        return res.status(500).json({
+          error:
+            "Workspace credentials missing AND auto-cleanup failed: " +
+            (cleanupErr as Error).message,
+        });
+      }
+    }
+    return res.status(500).json({ error: msg });
   }
 });
 
@@ -813,7 +836,21 @@ router.get("/api/slack/workspaces/:teamId/channels", async (req, res) => {
       })
     );
   } catch (e) {
-    return res.status(500).json({ error: (e as Error).message });
+    const msg = (e as Error).message || "";
+    if (msg.includes("Keychain slot is missing")) {
+      try {
+        await runCli(["slack", "remove-workspace", teamId]);
+        return res.status(409).json({
+          error:
+            "This workspace's credentials are out of sync. We've cleared " +
+            "the orphan row — click 'Connect workspace' to re-OAuth.",
+          cleanedUp: true,
+        });
+      } catch {
+        // fall through to generic error
+      }
+    }
+    return res.status(500).json({ error: msg });
   }
 });
 

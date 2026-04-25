@@ -961,6 +961,26 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Hard delete — used by Disconnect so a subsequent OAuth re-creates a
+    /// fresh row instead of reactivating a stale one. We also soft-delete
+    /// any subscriptions tied to this workspace so the poll loop stops
+    /// trying to read them with credentials that just got nuked.
+    pub fn delete_slack_workspace(&self, team_id: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE channel_subscriptions \
+                SET active = 0, updated_at_ms = ?2 \
+              WHERE platform = 'slack' AND account_id = ?1",
+            params![team_id, now],
+        )?;
+        guard.execute(
+            "DELETE FROM slack_workspaces WHERE team_id = ?1",
+            params![team_id],
+        )?;
+        Ok(())
+    }
 }
 
 fn row_to_slack_workspace(r: &rusqlite::Row) -> rusqlite::Result<SlackWorkspace> {
