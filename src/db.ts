@@ -80,11 +80,22 @@ export function initDb(dbPath?: string): Database.Database {
       display_name         TEXT NOT NULL,
       mode                 TEXT NOT NULL,
       active               INTEGER NOT NULL DEFAULT 1,
+      account_id           TEXT,
       last_seen_message_id TEXT,
       last_digest_at_ms    INTEGER,
       created_at_ms        INTEGER NOT NULL,
-      updated_at_ms        INTEGER NOT NULL,
-      UNIQUE(platform, channel_id)
+      updated_at_ms        INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS slack_workspaces (
+      id              TEXT PRIMARY KEY,
+      team_id         TEXT NOT NULL UNIQUE,
+      team_name       TEXT NOT NULL,
+      entity_id       TEXT NOT NULL,
+      connection_id   TEXT NOT NULL,
+      user_id         TEXT NOT NULL,
+      active          INTEGER NOT NULL DEFAULT 1,
+      created_at_ms   INTEGER NOT NULL
     );
 
     CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);
@@ -95,6 +106,7 @@ export function initDb(dbPath?: string): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_emails_seen ON emails(firstSeenAt);
     CREATE INDEX IF NOT EXISTS idx_emails_platform ON emails(platform);
     CREATE INDEX IF NOT EXISTS idx_channel_subs_active_mode ON channel_subscriptions(active, mode);
+    CREATE INDEX IF NOT EXISTS idx_slack_workspaces_active ON slack_workspaces(active);
   `);
 
   // Additive migrations for existing DBs created before the platform/kind columns landed.
@@ -109,6 +121,41 @@ export function initDb(dbPath?: string): Database.Database {
   }
   if (!hasKind) {
     db.exec("ALTER TABLE emails ADD COLUMN kind TEXT NOT NULL DEFAULT 'dm'");
+  }
+
+  // Multi-workspace Slack: drop the old (platform, channel_id) UNIQUE when we
+  // add account_id. SQLite can't ALTER constraints, so on old DBs that still
+  // carry it we rebuild the table.
+  const subCols = db.prepare("PRAGMA table_info(channel_subscriptions)").all() as { name: string }[];
+  const hasAccountId = subCols.some((c) => c.name === "account_id");
+  if (subCols.length > 0 && !hasAccountId) {
+    db.exec(`
+      BEGIN TRANSACTION;
+      CREATE TABLE channel_subscriptions_new (
+        id                   TEXT PRIMARY KEY,
+        platform             TEXT NOT NULL,
+        channel_id           TEXT NOT NULL,
+        display_name         TEXT NOT NULL,
+        mode                 TEXT NOT NULL,
+        active               INTEGER NOT NULL DEFAULT 1,
+        account_id           TEXT,
+        last_seen_message_id TEXT,
+        last_digest_at_ms    INTEGER,
+        created_at_ms        INTEGER NOT NULL,
+        updated_at_ms        INTEGER NOT NULL
+      );
+      INSERT INTO channel_subscriptions_new
+        (id, platform, channel_id, display_name, mode, active,
+         last_seen_message_id, last_digest_at_ms, created_at_ms, updated_at_ms)
+        SELECT id, platform, channel_id, display_name, mode, active,
+               last_seen_message_id, last_digest_at_ms, created_at_ms, updated_at_ms
+          FROM channel_subscriptions;
+      DROP TABLE channel_subscriptions;
+      ALTER TABLE channel_subscriptions_new RENAME TO channel_subscriptions;
+      CREATE INDEX IF NOT EXISTS idx_channel_subs_active_mode
+        ON channel_subscriptions(active, mode);
+      COMMIT;
+    `);
   }
 
   return db;
@@ -358,6 +405,87 @@ export function hasAnyGmailAccount(): boolean {
   return !!row;
 }
 
+// --- Slack Workspaces ---
+
+export interface SlackWorkspace {
+  id: string;
+  teamId: string;
+  teamName: string;
+  entityId: string;
+  connectionId: string;
+  userId: string;
+  active: boolean;
+  createdAt: number;
+}
+
+function rowToWorkspace(row: any): SlackWorkspace {
+  return {
+    id: row.id,
+    teamId: row.team_id,
+    teamName: row.team_name,
+    entityId: row.entity_id,
+    connectionId: row.connection_id,
+    userId: row.user_id,
+    active: !!row.active,
+    createdAt: row.created_at_ms,
+  };
+}
+
+export function getSlackWorkspaces(): SlackWorkspace[] {
+  return getDb()
+    .prepare("SELECT * FROM slack_workspaces ORDER BY created_at_ms ASC")
+    .all()
+    .map(rowToWorkspace);
+}
+
+export function getActiveSlackWorkspaces(): SlackWorkspace[] {
+  return getDb()
+    .prepare("SELECT * FROM slack_workspaces WHERE active = 1 ORDER BY created_at_ms ASC")
+    .all()
+    .map(rowToWorkspace);
+}
+
+export function getSlackWorkspaceByTeam(teamId: string): SlackWorkspace | undefined {
+  const row = getDb()
+    .prepare("SELECT * FROM slack_workspaces WHERE team_id = ?")
+    .get(teamId);
+  return row ? rowToWorkspace(row) : undefined;
+}
+
+export function upsertSlackWorkspace(
+  teamId: string,
+  teamName: string,
+  entityId: string,
+  connectionId: string,
+  userId: string
+): SlackWorkspace {
+  const existing = getSlackWorkspaceByTeam(teamId);
+  const now = Date.now();
+  if (existing) {
+    getDb()
+      .prepare(
+        "UPDATE slack_workspaces SET team_name = ?, entity_id = ?, connection_id = ?, user_id = ?, active = 1 WHERE id = ?"
+      )
+      .run(teamName, entityId, connectionId, userId, existing.id);
+    return getSlackWorkspaceByTeam(teamId)!;
+  }
+  const id = crypto.randomUUID();
+  getDb()
+    .prepare(
+      `INSERT INTO slack_workspaces
+         (id, team_id, team_name, entity_id, connection_id, user_id, active, created_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?, 1, ?)`
+    )
+    .run(id, teamId, teamName, entityId, connectionId, userId, now);
+  return getSlackWorkspaceByTeam(teamId)!;
+}
+
+export function deactivateSlackWorkspace(teamId: string): void {
+  getDb()
+    .prepare("UPDATE slack_workspaces SET active = 0 WHERE team_id = ?")
+    .run(teamId);
+}
+
 // --- Config ---
 
 export function getConfig(key: string): string | null {
@@ -495,7 +623,7 @@ export function listSubscriptions(
   activeOnly: boolean = true
 ): ChannelSubscription[] {
   let sql =
-    "SELECT id, platform, channel_id, display_name, mode, active, last_seen_message_id, last_digest_at_ms, created_at_ms, updated_at_ms FROM channel_subscriptions";
+    "SELECT id, platform, channel_id, display_name, mode, active, account_id, last_seen_message_id, last_digest_at_ms, created_at_ms, updated_at_ms FROM channel_subscriptions";
   const where: string[] = [];
   const params: unknown[] = [];
   if (activeOnly) {
@@ -514,7 +642,7 @@ export function listSubscriptions(
 export function getSubscription(id: string): ChannelSubscription | null {
   const row = getDb()
     .prepare(
-      "SELECT id, platform, channel_id, display_name, mode, active, last_seen_message_id, last_digest_at_ms, created_at_ms, updated_at_ms FROM channel_subscriptions WHERE id = ?"
+      "SELECT id, platform, channel_id, display_name, mode, active, account_id, last_seen_message_id, last_digest_at_ms, created_at_ms, updated_at_ms FROM channel_subscriptions WHERE id = ?"
     )
     .get(id) as (Omit<ChannelSubscription, "active"> & { active: number }) | undefined;
   return row ? { ...row, active: !!row.active } : null;
@@ -524,12 +652,16 @@ export function upsertSubscription(
   platform: string,
   channelId: string,
   displayName: string,
-  mode: SubscriptionMode
+  mode: SubscriptionMode,
+  accountId: string | null = null
 ): ChannelSubscription {
   const now = Date.now();
+  // IS is NULL-safe so the lookup matches Discord rows whose account_id is NULL.
   const existing = getDb()
-    .prepare("SELECT id FROM channel_subscriptions WHERE platform = ? AND channel_id = ?")
-    .get(platform, channelId) as { id: string } | undefined;
+    .prepare(
+      "SELECT id FROM channel_subscriptions WHERE platform = ? AND channel_id = ? AND account_id IS ?"
+    )
+    .get(platform, channelId, accountId) as { id: string } | undefined;
   if (existing) {
     getDb()
       .prepare(
@@ -542,10 +674,10 @@ export function upsertSubscription(
   getDb()
     .prepare(
       `INSERT INTO channel_subscriptions
-         (id, platform, channel_id, display_name, mode, active, created_at_ms, updated_at_ms)
-       VALUES (?, ?, ?, ?, ?, 1, ?, ?)`
+         (id, platform, channel_id, display_name, mode, active, account_id, created_at_ms, updated_at_ms)
+       VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)`
     )
-    .run(id, platform, channelId, displayName, mode, now, now);
+    .run(id, platform, channelId, displayName, mode, accountId, now, now);
   return getSubscription(id)!;
 }
 

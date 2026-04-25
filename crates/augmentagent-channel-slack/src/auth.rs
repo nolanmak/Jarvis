@@ -1,5 +1,9 @@
 //! Slack auth persisted via `augmentagent-auth` (macOS Keychain).
 //!
+//! One slot per connected workspace, keyed by Slack `team_id`:
+//! `augmentagent/slack/<team_id>`. The `slack_workspaces` table in the shared
+//! SQLite DB is the index; Keychain only holds credentials.
+//!
 //! Stored payload shape (JSON):
 //!
 //! ```json
@@ -12,8 +16,6 @@
 //!   "composio_api_key": "<composio api key>"
 //! }
 //! ```
-//!
-//! Keychain key: service=`augmentagent/slack`, account=`default`.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -53,6 +55,8 @@ pub struct SlackAuth {
 }
 
 impl SlackAuth {
+    /// Full validation, called before persisting to Keychain. team_id is
+    /// required since it's the slot key.
     pub fn validate(&self) -> Result<(), AuthError> {
         if self.entity_id.is_empty() {
             return Err(AuthError::Invalid("empty entity_id".into()));
@@ -63,8 +67,21 @@ impl SlackAuth {
         if self.team_id.is_empty() {
             return Err(AuthError::Invalid("empty team_id".into()));
         }
-        if self.user_id.is_empty() {
-            return Err(AuthError::Invalid("empty user_id".into()));
+        if self.composio_api_key.is_empty() {
+            return Err(AuthError::Invalid("empty composio_api_key".into()));
+        }
+        // user_id is optional (back-compat for accounts where Composio doesn't
+        // expose authed_user). Only used to skip self-messages on ingest.
+        Ok(())
+    }
+
+    /// Loose validation for callers that just need to make Composio calls
+    /// (entity_id + composio_api_key are the only fields execute() actually
+    /// reads). Used during OAuth callback to probe team info before we know
+    /// the team_id.
+    pub fn validate_for_execute(&self) -> Result<(), AuthError> {
+        if self.entity_id.is_empty() {
+            return Err(AuthError::Invalid("empty entity_id".into()));
         }
         if self.composio_api_key.is_empty() {
             return Err(AuthError::Invalid("empty composio_api_key".into()));
@@ -72,17 +89,36 @@ impl SlackAuth {
         Ok(())
     }
 
-    pub fn load_from_keychain() -> Result<Self, AuthError> {
+    /// Load a workspace's auth by its Slack `team_id`. Each workspace lives in
+    /// its own Keychain slot; the caller is expected to iterate known teams
+    /// (from the `slack_workspaces` table) and call this once per team.
+    pub fn load_for_team(team_id: &str) -> Result<Self, AuthError> {
+        let bytes = KeychainAuth::get(KEYCHAIN_PLATFORM, team_id)?;
+        let parsed: SlackAuth = serde_json::from_slice(&bytes)?;
+        parsed.validate()?;
+        Ok(parsed)
+    }
+
+    /// Back-compat: loads the legacy single-account slot, used as a fallback
+    /// the first time the multi-workspace code runs against a pre-migration
+    /// Keychain. Callers should prefer `load_for_team`.
+    pub fn load_from_default_slot() -> Result<Self, AuthError> {
         let bytes = KeychainAuth::get(KEYCHAIN_PLATFORM, DEFAULT_ACCOUNT)?;
         let parsed: SlackAuth = serde_json::from_slice(&bytes)?;
         parsed.validate()?;
         Ok(parsed)
     }
 
+    /// Persist into the workspace-keyed slot derived from `self.team_id`.
     pub fn save_to_keychain(&self) -> Result<(), AuthError> {
         self.validate()?;
         let bytes = serde_json::to_vec(self)?;
-        KeychainAuth::put(KEYCHAIN_PLATFORM, DEFAULT_ACCOUNT, &bytes)?;
+        KeychainAuth::put(KEYCHAIN_PLATFORM, &self.team_id, &bytes)?;
+        Ok(())
+    }
+
+    pub fn delete_from_keychain(team_id: &str) -> Result<(), AuthError> {
+        KeychainAuth::delete(KEYCHAIN_PLATFORM, team_id)?;
         Ok(())
     }
 }

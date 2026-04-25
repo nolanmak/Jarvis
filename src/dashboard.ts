@@ -30,10 +30,18 @@ import {
   upsertSubscription,
   updateSubscriptionMode,
   deleteSubscription,
+  getActiveSlackWorkspaces,
+  getSlackWorkspaces,
+  getSlackWorkspaceByTeam,
+  deactivateSlackWorkspace,
 } from "./db";
 import type { ActionStatus, SubscriptionMode } from "./types";
-import { listDms, listGuilds, listGuildChannels } from "./discordApi";
-import { listConversations as listSlackConversations } from "./slackApi";
+import { listDms, listGuilds, listGuildChannels, discordStatus } from "./discordApi";
+import {
+  listConversations as listSlackConversations,
+  persistSlackAuth,
+  runCli,
+} from "./slackApi";
 
 const router = Router();
 
@@ -117,11 +125,12 @@ router.get("/api/subscriptions", (_req, res) => {
 });
 
 router.post("/api/subscriptions", (req, res) => {
-  const { platform, channel_id, display_name, mode } = req.body as {
+  const { platform, channel_id, display_name, mode, account_id } = req.body as {
     platform?: string;
     channel_id?: string;
     display_name?: string;
     mode?: string;
+    account_id?: string;
   };
   if (!platform || !ALLOWED_PLATFORMS.has(platform)) {
     return res.status(400).send("invalid platform");
@@ -132,7 +141,32 @@ router.post("/api/subscriptions", (req, res) => {
   if (!mode || !ALLOWED_MODES.includes(mode as SubscriptionMode)) {
     return res.status(400).send("invalid mode");
   }
-  upsertSubscription(platform, channel_id, display_name, mode as SubscriptionMode);
+  // Slack requires an account_id (team_id) so cross-workspace channel collisions
+  // don't alias. Default to the sole connected workspace when the UI omits it.
+  let resolvedAccountId: string | null = account_id ?? null;
+  if (platform === "slack") {
+    if (!resolvedAccountId) {
+      const workspaces = getActiveSlackWorkspaces();
+      if (workspaces.length === 1) {
+        resolvedAccountId = workspaces[0].teamId;
+      } else if (workspaces.length === 0) {
+        return res
+          .status(400)
+          .send("no slack workspace connected — connect one in Subscriptions first");
+      } else {
+        return res.status(400).send("account_id (team_id) required for slack");
+      }
+    }
+  } else {
+    resolvedAccountId = null;
+  }
+  upsertSubscription(
+    platform,
+    channel_id,
+    display_name,
+    mode as SubscriptionMode,
+    resolvedAccountId
+  );
   const subs = listSubscriptions();
   return res.render("partials/subscription-rows", { subs });
 });
@@ -158,6 +192,15 @@ router.delete("/api/subscriptions/:id", (req, res) => {
 });
 
 // --- Discord source-picker proxies (shell out to Rust CLI) ---
+
+router.get("/api/discord/status", async (_req, res) => {
+  try {
+    const s = await discordStatus();
+    res.json(s);
+  } catch (e) {
+    res.json({ connected: false, error: (e as Error).message });
+  }
+});
 
 router.get("/api/discord/dms", async (_req, res) => {
   try {
@@ -192,7 +235,8 @@ router.get("/api/slack/conversations", async (req, res) => {
   try {
     const types = (req.query.types as string | undefined) ||
       "public_channel,private_channel,im,mpim";
-    const convs = await listSlackConversations(types);
+    const teamId = req.query.team_id as string | undefined;
+    const convs = await listSlackConversations(types, teamId);
     res.json(convs);
   } catch (e) {
     res.status(500).json({ error: (e as Error).message });
@@ -536,6 +580,155 @@ router.delete("/api/oauth/gmail/:id", async (req, res) => {
 
   const configStatus = getConfigStatus();
   res.render("partials/config-status", { configStatus });
+});
+
+// --- Composio OAuth for Slack (multi-workspace) ---
+// Mirrors the Gmail flow: start → Composio hosted consent → callback polls for
+// ACTIVE status → shell to Rust CLI to persist auth in Keychain + DB.
+
+router.get("/oauth/slack/start", async (_req, res) => {
+  try {
+    const client = getComposioClient();
+    if (!client) {
+      res.status(400).send("Composio API key not configured. Add it in Settings first.");
+      return;
+    }
+
+    const authConfigId = await getOrCreateAuthConfig(client, "slack");
+    const entityId = generateEntityId();
+
+    const dashboardPort = process.env.DASHBOARD_PORT || "3000";
+    const callbackUrl = `http://localhost:${dashboardPort}/oauth/slack/callback`;
+
+    const linkResponse = await client.link.create({
+      user_id: entityId,
+      auth_config_id: authConfigId,
+      callback_url: callbackUrl,
+    });
+
+    if (!linkResponse.redirect_url) {
+      throw new Error("No redirect URL returned from Composio");
+    }
+
+    if (linkResponse.connected_account_id) {
+      setConfig("slack_pending_connection_id", linkResponse.connected_account_id);
+      setConfig("slack_pending_entity_id", entityId);
+    }
+
+    console.log(`[oauth] Slack OAuth initiated for entity ${entityId}, redirecting to consent...`);
+    res.redirect(linkResponse.redirect_url);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[oauth] Slack OAuth start failed:", msg);
+    res.status(500).send(`
+      <div class="p-4 bg-gray-950 text-gray-100 min-h-screen">
+        <h2 class="text-lg font-semibold text-red-400 mb-2">OAuth Error</h2>
+        <p class="text-sm text-gray-300 mb-4">${msg}</p>
+        <a href="/subscriptions" class="text-blue-400 hover:underline">Back to Subscriptions</a>
+      </div>
+    `);
+  }
+});
+
+router.get("/oauth/slack/callback", async (req, res) => {
+  console.log("[oauth] Slack callback hit. Query params:", JSON.stringify(req.query));
+  try {
+    const connectionId = getConfig("slack_pending_connection_id");
+    const entityId = getConfig("slack_pending_entity_id");
+    const client = getComposioClient();
+    const composioApiKey =
+      getConfig("composio_api_key") || process.env.COMPOSIO_API_KEY || "";
+
+    if (!connectionId || !entityId || !client) {
+      res.redirect("/subscriptions?slack=error&reason=missing_pending_state");
+      return;
+    }
+
+    // Mirror Orchid: only verify Composio reports ACTIVE. Don't try to dig
+    // team metadata out of connection_data — Rust will call
+    // SLACK_FETCH_TEAM_INFO at persist time to learn it. This makes the
+    // callback resilient to Composio shape changes.
+    let status = "unknown";
+    let retries = 4;
+    while (retries > 0) {
+      try {
+        const account = (await client.connectedAccounts.retrieve(connectionId)) as any;
+        status = account.status || "unknown";
+        if (status === "ACTIVE") break;
+      } catch (err) {
+        console.log(
+          "[oauth] slack retrieve failed (retries left:",
+          retries - 1,
+          "):",
+          err instanceof Error ? err.message : err
+        );
+      }
+      retries--;
+      if (retries > 0) await new Promise((r) => setTimeout(r, 2000));
+    }
+
+    if (status !== "ACTIVE") {
+      console.error(`[oauth] Slack connection not active: status=${status}`);
+      res.redirect(`/subscriptions?slack=error&reason=${encodeURIComponent(status)}`);
+      return;
+    }
+
+    // Hand off to Rust: probes SLACK_FETCH_TEAM_INFO to learn team_id +
+    // team_name, persists Keychain slot at augmentagent/slack/<team_id>,
+    // upserts the slack_workspaces row.
+    const persistResult = await persistSlackAuth({
+      entityId,
+      connectionId,
+      composioApiKey,
+    });
+
+    deleteConfig("slack_pending_connection_id");
+    deleteConfig("slack_pending_entity_id");
+
+    if (!persistResult.ok) {
+      console.error("[oauth] Slack persist failed:", persistResult.error);
+      res.redirect(
+        `/subscriptions?slack=error&reason=${encodeURIComponent(persistResult.error || "persist_failed")}`
+      );
+      return;
+    }
+
+    console.log(
+      `[oauth] Slack workspace connected: team_id=${persistResult.team_id} (${persistResult.team_name})`
+    );
+    res.redirect("/subscriptions?slack=connected");
+  } catch (err) {
+    console.error("[oauth] Slack OAuth callback error:", err);
+    res.redirect("/subscriptions?slack=error");
+  }
+});
+
+router.get("/api/slack/workspaces", (_req, res) => {
+  const rows = getActiveSlackWorkspaces();
+  res.json(
+    rows.map((w) => ({
+      id: w.id,
+      team_id: w.teamId,
+      team_name: w.teamName,
+      user_id: w.userId,
+    }))
+  );
+});
+
+router.delete("/api/slack/workspaces/:teamId", async (req, res) => {
+  const teamId = req.params.teamId;
+  if (!getSlackWorkspaceByTeam(teamId)) {
+    return res.status(404).json({ error: "unknown workspace" });
+  }
+  // Best-effort: tell Rust to drop the Keychain slot + deactivate the row.
+  try {
+    await runCli(["slack", "remove-workspace", teamId]);
+  } catch (e) {
+    // If the CLI call failed, still flip the DB row so the dashboard is consistent.
+    deactivateSlackWorkspace(teamId);
+    console.warn(`[slack] remove-workspace CLI failed, DB deactivated anyway: ${(e as Error).message}`);
+  }
+  return res.json({ ok: true });
 });
 
 // --- GitHub Webhook (auto-update on push) ---

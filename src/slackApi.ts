@@ -65,14 +65,15 @@ export interface SlackConversationSummary {
 }
 
 /**
- * List conversations the authenticated Slack user can see. `types` filters
- * which kinds to include; the dashboard typically splits this call into two
- * (DMs vs channels) for the picker UI.
+ * List conversations in a specific workspace. `teamId` scopes the Composio
+ * call to that workspace's connected account; omit only when a single
+ * workspace is configured.
  */
 export function listConversations(
-  types: string = "public_channel,private_channel,im,mpim"
+  types: string = "public_channel,private_channel,im,mpim",
+  teamId?: string
 ): Promise<SlackConversationSummary[]> {
-  return runCliJson<SlackConversationSummary[]>([
+  const args = [
     "slack",
     "list-conversations",
     "--types",
@@ -81,5 +82,65 @@ export function listConversations(
     "200",
     "--json",
     "true",
-  ]);
+  ];
+  if (teamId) {
+    args.push("--team-id", teamId);
+  }
+  return runCliJson<SlackConversationSummary[]>(args);
+}
+
+export interface SlackPersistArgs {
+  entityId: string;
+  connectionId: string;
+  composioApiKey: string;
+}
+
+/**
+ * Persist a freshly-OAuthed Slack workspace via the Rust CLI. Runs
+ * `augmentagent slack persist-auth ...`, which probes
+ * `SLACK_FETCH_TEAM_INFO` to learn the team_id/team_name, writes the Keychain
+ * slot, and upserts the `slack_workspaces` row.
+ */
+export async function persistSlackAuth(
+  a: SlackPersistArgs
+): Promise<{ ok: boolean; team_id?: string; team_name?: string; user_id?: string; error?: string }> {
+  try {
+    const result = await runCliJson<{ ok: boolean; team_id: string; team_name: string; user_id: string }>([
+      "slack",
+      "persist-auth",
+      "--entity-id",
+      a.entityId,
+      "--connection-id",
+      a.connectionId,
+      "--composio-api-key",
+      a.composioApiKey,
+    ]);
+    return result;
+  } catch (e) {
+    return { ok: false, error: (e as Error).message };
+  }
+}
+
+/**
+ * Raw CLI escape hatch. Swallows stdout — callers that need the JSON should
+ * go through `runCliJson` via a dedicated helper.
+ */
+export function runCli(args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cliPath(), args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+    });
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    child.stdout.on("data", () => {});
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code !== 0) {
+        reject(new Error(`slack CLI exited ${code}: ${stderr.trim()}`));
+        return;
+      }
+      resolve();
+    });
+  });
 }
