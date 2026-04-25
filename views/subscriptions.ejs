@@ -155,52 +155,74 @@
   </div>
 </div>
 
-<!-- Discord-connect modal: bookmarklet + open-Discord button + live status poller -->
+<!-- Discord-connect modal: bookmarklet (copy-paste primary, drag fallback) + live status poller -->
 <div id="discord-connect-modal" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
      onclick="if(event.target===this) closeDiscordConnectModal()">
-  <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-xl">
+  <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-full max-w-xl max-h-[90vh] overflow-y-auto">
     <div class="flex items-center justify-between mb-4">
       <div>
         <h2 class="text-lg font-semibold">Connect Discord</h2>
-        <p class="text-xs text-gray-500">One-click capture from a logged-in Discord browser tab.</p>
+        <p class="text-xs text-gray-500">Bookmarklet — captures session creds when run on a logged-in Discord tab.</p>
       </div>
       <button onclick="closeDiscordConnectModal()" class="text-gray-400 hover:text-white">✕</button>
     </div>
 
-    <ol class="text-sm text-gray-300 space-y-3 list-decimal pl-5 mb-4">
-      <li>
-        Drag this link to your bookmarks bar:
-        <a id="discord-bookmarklet-link" href="#"
-           class="ml-1 inline-block px-3 py-1 bg-accent text-white rounded-md text-xs font-medium hover:bg-accent/90"
-           onclick="event.preventDefault(); alert('Drag this to your bookmarks bar (don’t click)')">
-          augmentagent · grab Discord creds
-        </a>
-        <span class="text-xs text-gray-500 block mt-1">
-          (browsers block clicking <code class="text-gray-400">javascript:</code> URLs directly — drag-only)
-        </span>
-      </li>
-      <li>
-        Open Discord and make sure you're logged in:
-        <a href="https://discord.com/app" target="_blank" rel="noopener"
-           class="ml-1 inline-block px-3 py-1 bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-md text-xs font-medium">
-          Open discord.com →
-        </a>
-      </li>
-      <li>
-        On the Discord tab, click the bookmarklet. A toast will appear top-right; once it turns green, you're done.
-        Click any channel if it stays "waiting" past 30s — that fires a request the bookmarklet can capture.
-      </li>
-    </ol>
+    <!-- Step 1: copy bookmarklet -->
+    <div class="mb-4">
+      <div class="flex items-center justify-between mb-1">
+        <label class="block text-xs uppercase text-gray-500">1. Copy bookmarklet</label>
+        <button type="button" onclick="copyDiscordBookmarklet(this)"
+                class="px-3 py-1 rounded-md text-xs font-medium bg-accent text-white hover:bg-accent/90">
+          Copy
+        </button>
+      </div>
+      <textarea id="discord-bookmarklet-code" readonly
+                class="w-full h-24 bg-gray-950 border border-gray-800 rounded-md p-2 font-mono text-[10px] text-gray-400 select-all"></textarea>
+    </div>
 
+    <!-- Step 2: install as bookmark -->
+    <div class="mb-4">
+      <label class="block text-xs uppercase text-gray-500 mb-1">2. Save it as a bookmark</label>
+      <details class="text-sm text-gray-300 bg-gray-950 border border-gray-800 rounded-md p-3" open>
+        <summary class="cursor-pointer text-gray-200 font-medium">How (browser-specific)</summary>
+        <div class="mt-2 space-y-2 text-xs text-gray-400">
+          <p><b class="text-gray-300">Chrome/Edge/Brave:</b> press <kbd class="bg-gray-800 px-1 rounded">Ctrl+D</kbd>, click <em>More</em>, replace the URL field with the copied code, name it anything, Save.</p>
+          <p><b class="text-gray-300">Firefox:</b> right-click bookmarks toolbar → <em>New Bookmark…</em> → paste copied code as URL → save.</p>
+          <p><b class="text-gray-300">Drag fallback:</b>
+            <a id="discord-bookmarklet-link" href="#" draggable="true"
+               class="ml-1 inline-block px-2 py-0.5 bg-accent text-white rounded-md font-medium hover:bg-accent/90"
+               onclick="event.preventDefault();">
+              augmentagent · grab Discord creds
+            </a>
+            (drag onto bookmarks bar; clicking does nothing).
+          </p>
+        </div>
+      </details>
+    </div>
+
+    <!-- Step 3: open discord -->
+    <div class="mb-4">
+      <label class="block text-xs uppercase text-gray-500 mb-1">3. Open Discord</label>
+      <a href="https://discord.com/app" target="_blank" rel="noopener"
+         class="inline-block px-3 py-1.5 rounded-md text-sm font-medium bg-gray-800 hover:bg-gray-700 text-gray-100">
+        Open discord.com →
+      </a>
+      <p class="text-xs text-gray-500 mt-1">Make sure you're logged in.</p>
+    </div>
+
+    <!-- Step 4: run bookmark on discord -->
+    <div class="mb-4">
+      <label class="block text-xs uppercase text-gray-500 mb-1">4. Click the bookmark from the Discord tab</label>
+      <p class="text-xs text-gray-400">
+        A blue toast appears top-right. If it stays "waiting" &gt; 30s, click any channel
+        in Discord — that fires a request the bookmarklet can capture. Toast turns green when done.
+      </p>
+    </div>
+
+    <!-- live status -->
     <div id="discord-connect-status" class="text-sm text-gray-400 bg-gray-950 border border-gray-800 rounded-md p-3 text-center">
       Waiting for credentials…
     </div>
-
-    <details class="mt-3 text-xs text-gray-500">
-      <summary class="cursor-pointer hover:text-gray-300">Show bookmarklet code (paste into a manual bookmark)</summary>
-      <textarea id="discord-bookmarklet-code" readonly
-                class="mt-2 w-full h-28 bg-gray-950 border border-gray-800 rounded-md p-2 font-mono text-[10px] text-gray-400 select-all"></textarea>
-    </details>
   </div>
 </div>
 
@@ -397,6 +419,24 @@
       clearInterval(discordConnectPoller);
       discordConnectPoller = null;
     }
+  }
+
+  async function copyDiscordBookmarklet(btn) {
+    const code = document.getElementById('discord-bookmarklet-code');
+    const original = btn.textContent;
+    try {
+      // Modern path; works on http://localhost over secure-context exemption.
+      await navigator.clipboard.writeText(code.value);
+      btn.textContent = 'Copied ✓';
+    } catch (_) {
+      // Fallback: select + execCommand (older browsers / clipboard-blocked contexts).
+      code.removeAttribute('readonly');
+      code.select();
+      try { document.execCommand('copy'); btn.textContent = 'Copied ✓'; }
+      catch (e) { btn.textContent = 'Select-all + Ctrl+C'; }
+      code.setAttribute('readonly', 'readonly');
+    }
+    setTimeout(() => { btn.textContent = original; }, 2000);
   }
 
   // --- workspace panel ----------------------------------------------------
