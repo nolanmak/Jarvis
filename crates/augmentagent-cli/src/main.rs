@@ -1677,14 +1677,14 @@ async fn run_linkedin_recent() -> Result<()> {
 // ================================================================
 
 async fn run_discord_login(creds_json: PathBuf) -> Result<()> {
-    use augmentagent_channel_discord_dm::{DiscordAuth, DiscordClient};
+    use augmentagent_channel_discord_dm::{auth::default_creds_path, DiscordAuth, DiscordClient};
     let raw = std::fs::read_to_string(&creds_json)
         .with_context(|| format!("read creds file at {}", creds_json.display()))?;
     let auth: DiscordAuth = serde_json::from_str(&raw).context("parse discord creds JSON")?;
     auth.validate().context("creds missing required fields")?;
 
-    // Probe GET /users/@me to confirm the token is accepted before we
-    // persist. Avoids saving a broken auth blob that'd fail at poll time.
+    // Probe GET /users/@me/channels to confirm the token is accepted before
+    // we persist. Avoids saving a broken auth blob that'd fail at poll time.
     let client = DiscordClient::new(auth.clone()).context("build discord client")?;
     let dms = client
         .list_dm_channels()
@@ -1694,15 +1694,46 @@ async fn run_discord_login(creds_json: PathBuf) -> Result<()> {
 
     auth.save_to_keychain()
         .context("save discord auth to keychain")?;
+
+    // Also write the file to the vault/repo path so additional hosts mounting
+    // the same vault auto-pick-up on next deploy. Skipped if the destination
+    // is the source (writing to the same file we just read).
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let vault_path = default_creds_path(&repo_root);
+    let mirrored = match (
+        creds_json.canonicalize(),
+        vault_path.canonicalize(),
+    ) {
+        (Ok(a), Ok(b)) if a == b => false,
+        _ => {
+            match auth.save(&vault_path) {
+                Ok(()) => {
+                    info!(to = %vault_path.display(), "discord creds mirrored to vault path");
+                    true
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        to = %vault_path.display(),
+                        "vault mirror failed; keychain still saved"
+                    );
+                    false
+                }
+            }
+        }
+    };
+
     println!(
-        "discord auth saved to keychain (augmentagent/discord/default)\nuser_id: {}",
-        auth.user_id
+        "discord auth saved to keychain (augmentagent/discord/default)\nuser_id: {}\nvault mirror: {}",
+        auth.user_id,
+        if mirrored { vault_path.display().to_string() } else { "(skipped — source is already at vault path)".into() },
     );
     Ok(())
 }
 
 fn load_discord_client() -> Option<Arc<augmentagent_channel_discord_dm::DiscordClient>> {
-    match augmentagent_channel_discord_dm::DiscordAuth::load_with_migration(None) {
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match augmentagent_channel_discord_dm::DiscordAuth::load_with_migration(&repo_root) {
         Ok(auth) => match augmentagent_channel_discord_dm::DiscordClient::new(auth) {
             Ok(c) => Some(Arc::new(c)),
             Err(e) => {
@@ -1718,7 +1749,8 @@ fn load_discord_client() -> Option<Arc<augmentagent_channel_discord_dm::DiscordC
 }
 
 async fn run_discord_status(json: bool) -> Result<()> {
-    let auth = augmentagent_channel_discord_dm::DiscordAuth::load_with_migration(None);
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let auth = augmentagent_channel_discord_dm::DiscordAuth::load_with_migration(&repo_root);
     if json {
         match auth {
             Ok(a) => println!(
@@ -1873,8 +1905,9 @@ fn build_discord_channel(
     dry_run: bool,
 ) -> Result<augmentagent_channel_discord_dm::DiscordChannel<ClaudeCliReasoner>> {
     use augmentagent_channel_discord_dm::{DiscordAuth, DiscordChannel, DiscordChannelConfig};
-    let auth = DiscordAuth::load_with_migration(None).context(
-        "load discord auth — run `augmentagent discord login --creds-json <file>`",
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let auth = DiscordAuth::load_with_migration(&repo_root).context(
+        "load discord auth — run `augmentagent discord login --creds-json <file>` or place creds at default_creds_path",
     )?;
     let my_user_id = auth.user_id.clone();
     let client = Arc::new(
