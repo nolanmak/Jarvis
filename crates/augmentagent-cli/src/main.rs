@@ -260,6 +260,80 @@ enum GmailOp {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         full: bool,
     },
+    /// List active Gmail accounts (so the chat agent can pick `--account`).
+    Accounts {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Create a new draft in Gmail. Returns the draft id (and a Gmail URL
+    /// to open it in the web UI). Use `--thread-id` for a reply draft.
+    Compose {
+        /// Email address (e.g. `me@example.com`) or Composio entity_id of the
+        /// sending account. Required when more than one account is connected.
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        subject: String,
+        /// Body text. Use `--body-file -` to read from stdin instead.
+        #[arg(long)]
+        body: Option<String>,
+        /// Path to a file containing the body. Use `-` for stdin. Mutually
+        /// exclusive with `--body`.
+        #[arg(long)]
+        body_file: Option<String>,
+        /// Thread to attach the draft to (makes it a reply).
+        #[arg(long)]
+        thread_id: Option<String>,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Replace the body of an existing draft.
+    UpdateDraft {
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        draft_id: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        body_file: Option<String>,
+    },
+    /// Send an existing draft.
+    Send {
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        draft_id: String,
+    },
+    /// Delete an unsent draft.
+    DeleteDraft {
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        draft_id: String,
+    },
+    /// Compose AND send in one shot. Use only when the user has explicitly
+    /// confirmed the recipient/subject/body — there's no approval card.
+    SendNow {
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        body_file: Option<String>,
+        #[arg(long)]
+        thread_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -478,6 +552,56 @@ async fn main() -> Result<()> {
             GmailOp::Search { query, limit, full } => {
                 run_gmail_search(store, query.clone(), *limit, *full).await
             }
+            GmailOp::Accounts { json } => run_gmail_accounts(store, *json).await,
+            GmailOp::Compose {
+                account, to, subject, body, body_file, thread_id, json,
+            } => {
+                run_gmail_compose(
+                    store,
+                    account.clone(),
+                    to.clone(),
+                    subject.clone(),
+                    body.clone(),
+                    body_file.clone(),
+                    thread_id.clone(),
+                    *json,
+                )
+                .await
+            }
+            GmailOp::UpdateDraft {
+                account, draft_id, to, subject, body, body_file,
+            } => {
+                run_gmail_update_draft(
+                    store,
+                    account.clone(),
+                    draft_id.clone(),
+                    to.clone(),
+                    subject.clone(),
+                    body.clone(),
+                    body_file.clone(),
+                )
+                .await
+            }
+            GmailOp::Send { account, draft_id } => {
+                run_gmail_send_draft(store, account.clone(), draft_id.clone()).await
+            }
+            GmailOp::DeleteDraft { account, draft_id } => {
+                run_gmail_delete_draft(store, account.clone(), draft_id.clone()).await
+            }
+            GmailOp::SendNow {
+                account, to, subject, body, body_file, thread_id,
+            } => {
+                run_gmail_send_now(
+                    store,
+                    account.clone(),
+                    to.clone(),
+                    subject.clone(),
+                    body.clone(),
+                    body_file.clone(),
+                    thread_id.clone(),
+                )
+                .await
+            }
         },
         Cmd::Resume { ref op } => match op {
             ResumeOp::Ingest { file } => run_resume_ingest(&cli, file.clone()).await,
@@ -614,6 +738,214 @@ fn indent_body(body: &str, cols: usize) -> String {
         .map(|l| format!("{pad}{l}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Resolve the user-supplied `--account` flag (email address OR Composio
+/// entity_id) to a concrete entity_id. If `selector` is None and there's
+/// exactly one active Gmail account, return that account's entity_id.
+/// Otherwise error with a helpful message listing options.
+fn resolve_gmail_entity_id(
+    store: &Store,
+    selector: Option<String>,
+) -> Result<(String, String)> {
+    let accounts = store.get_active_gmail_accounts()?;
+    if accounts.is_empty() {
+        anyhow::bail!("no active gmail accounts; connect one first");
+    }
+    if let Some(s) = selector {
+        // email match (case-insensitive) takes priority over entity_id match.
+        let lower = s.to_ascii_lowercase();
+        if let Some(a) = accounts
+            .iter()
+            .find(|a| a.email.to_ascii_lowercase() == lower)
+        {
+            return Ok((a.entity_id.clone(), a.email.clone()));
+        }
+        if let Some(a) = accounts.iter().find(|a| a.entity_id == s) {
+            return Ok((a.entity_id.clone(), a.email.clone()));
+        }
+        let known: Vec<String> = accounts
+            .iter()
+            .map(|a| format!("{} ({})", a.email, a.entity_id))
+            .collect();
+        anyhow::bail!(
+            "no active gmail account matches '{s}'. Known accounts:\n  - {}",
+            known.join("\n  - ")
+        );
+    }
+    if accounts.len() == 1 {
+        let a = &accounts[0];
+        return Ok((a.entity_id.clone(), a.email.clone()));
+    }
+    let known: Vec<String> = accounts.iter().map(|a| a.email.clone()).collect();
+    anyhow::bail!(
+        "--account required (multiple gmail accounts active): {}",
+        known.join(", ")
+    );
+}
+
+fn read_body(body: Option<String>, body_file: Option<String>) -> Result<String> {
+    match (body, body_file) {
+        (Some(_), Some(_)) => anyhow::bail!("pass --body OR --body-file, not both"),
+        (Some(b), None) => Ok(b),
+        (None, Some(p)) => {
+            if p == "-" {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+                    .context("read body from stdin")?;
+                Ok(buf)
+            } else {
+                std::fs::read_to_string(&p).with_context(|| format!("read body file {p}"))
+            }
+        }
+        (None, None) => anyhow::bail!("either --body or --body-file is required"),
+    }
+}
+
+async fn run_gmail_accounts(store: Arc<Store>, json: bool) -> Result<()> {
+    let accounts = store.get_active_gmail_accounts()?;
+    if json {
+        let rows: Vec<_> = accounts
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "email": a.email,
+                    "entity_id": a.entity_id,
+                    "active": a.active,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if accounts.is_empty() {
+        println!("(no active gmail accounts)");
+        return Ok(());
+    }
+    for a in &accounts {
+        println!("{}\t{}", a.email, a.entity_id);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_gmail_compose(
+    store: Arc<Store>,
+    account: Option<String>,
+    to: String,
+    subject: String,
+    body: Option<String>,
+    body_file: Option<String>,
+    thread_id: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let body_str = read_body(body, body_file)?;
+    let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
+    let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
+    let gmail = ComposioClient::new(api_key);
+    let draft_id = gmail
+        .create_draft(&entity_id, &to, &subject, &body_str, thread_id.as_deref())
+        .await
+        .context("create_draft via Composio failed")?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "draft_id": draft_id,
+                "account": email,
+                "entity_id": entity_id,
+                "to": to,
+                "subject": subject,
+                "thread_id": thread_id,
+                "open_in_gmail": format!("https://mail.google.com/mail/u/0/#drafts?compose={draft_id}"),
+            })
+        );
+    } else {
+        println!("draft created: id={draft_id}");
+        println!("account: {email}");
+        println!("to:      {to}");
+        println!("subject: {subject}");
+        println!("open in gmail: https://mail.google.com/mail/u/0/#drafts?compose={draft_id}");
+    }
+    Ok(())
+}
+
+async fn run_gmail_update_draft(
+    store: Arc<Store>,
+    account: Option<String>,
+    draft_id: String,
+    to: String,
+    subject: String,
+    body: Option<String>,
+    body_file: Option<String>,
+) -> Result<()> {
+    let body_str = read_body(body, body_file)?;
+    let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
+    let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
+    let gmail = ComposioClient::new(api_key);
+    gmail
+        .update_draft(&entity_id, &draft_id, &to, &subject, &body_str)
+        .await
+        .context("update_draft via Composio failed")?;
+    println!("draft updated: id={draft_id} account={email}");
+    Ok(())
+}
+
+async fn run_gmail_send_draft(
+    store: Arc<Store>,
+    account: Option<String>,
+    draft_id: String,
+) -> Result<()> {
+    let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
+    let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
+    let gmail = ComposioClient::new(api_key);
+    gmail
+        .send_draft(&entity_id, &draft_id)
+        .await
+        .context("send_draft via Composio failed")?;
+    println!("sent: draft={draft_id} account={email}");
+    Ok(())
+}
+
+async fn run_gmail_delete_draft(
+    store: Arc<Store>,
+    account: Option<String>,
+    draft_id: String,
+) -> Result<()> {
+    let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
+    let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
+    let gmail = ComposioClient::new(api_key);
+    gmail
+        .delete_draft(&entity_id, &draft_id)
+        .await
+        .context("delete_draft via Composio failed")?;
+    println!("deleted: draft={draft_id} account={email}");
+    Ok(())
+}
+
+async fn run_gmail_send_now(
+    store: Arc<Store>,
+    account: Option<String>,
+    to: String,
+    subject: String,
+    body: Option<String>,
+    body_file: Option<String>,
+    thread_id: Option<String>,
+) -> Result<()> {
+    let body_str = read_body(body, body_file)?;
+    let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
+    let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
+    let gmail = ComposioClient::new(api_key);
+    let draft_id = gmail
+        .create_draft(&entity_id, &to, &subject, &body_str, thread_id.as_deref())
+        .await
+        .context("create_draft (send-now) failed")?;
+    gmail
+        .send_draft(&entity_id, &draft_id)
+        .await
+        .context("send_draft (send-now) failed")?;
+    println!("sent: account={email} to={to} subject=\"{subject}\" draft_id={draft_id}");
+    Ok(())
 }
 
 async fn run_digest(
