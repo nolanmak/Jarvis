@@ -23,7 +23,7 @@ use augmentagent_channel_core::reasoner::{draft_opts, triage_opts};
 use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{
     ActionStatus, ChannelSubscription, Email, SlackWorkspace, Store, SubscriptionMode,
-    TriageResult,
+    TriageResult, NUDGE_INTERVAL_MS,
 };
 use augmentagent_wiki::IdentityIndex;
 
@@ -449,6 +449,14 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
                     )?;
                     return Err(anyhow::anyhow!("post_approval: {e}"));
                 }
+                // Mark the freshly-posted card as the active nudge so the
+                // serial-queue scheduler won't re-post it on the next tick.
+                if let Err(e) = self
+                    .store
+                    .record_nudge(&action_id, now_millis() + NUDGE_INTERVAL_MS)
+                {
+                    warn!(action_id, "record_nudge after post_approval failed: {e}");
+                }
                 info!(action_id, message_id = %email.message_id, "slack approval card posted");
                 outcome.priority_awaiting_approval += 1;
                 Ok(())
@@ -554,6 +562,14 @@ fn jitter_secs() -> u64 {
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
     ns % (2 * JITTER_SECS + 1)
+}
+
+fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Pick the correct workspace client for a subscription. If the subscription

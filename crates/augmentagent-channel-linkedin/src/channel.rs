@@ -19,7 +19,7 @@ use augmentagent_channel_core::ingest::{spawn_ingest, IngestTrigger};
 use augmentagent_channel_core::prompt::{draft_user_message, triage_user_message};
 use augmentagent_channel_core::reasoner::{draft_opts, triage_opts};
 use augmentagent_channel_core::Reasoner;
-use augmentagent_store::{ActionStatus, Store, TriageResult};
+use augmentagent_store::{ActionStatus, Store, TriageResult, NUDGE_INTERVAL_MS};
 
 use crate::api::{LinkedInApi, LinkedInError};
 use crate::types::Dm;
@@ -332,6 +332,14 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                     )?;
                     return Err(anyhow::anyhow!("post_approval: {e}"));
                 }
+                // Mark the freshly-posted card as the active nudge so the
+                // serial-queue scheduler won't re-post it on the next tick.
+                if let Err(e) = self
+                    .store
+                    .record_nudge(&action_id, now_millis() + NUDGE_INTERVAL_MS)
+                {
+                    warn!(action_id, "record_nudge after post_approval failed: {e}");
+                }
                 info!(action_id, message_id = %email.message_id, "linkedin approval card posted");
                 Ok(Some(DispatchOutcome::AwaitingApproval))
             }
@@ -371,6 +379,14 @@ fn jitter_secs() -> u64 {
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
     ns % (2 * JITTER_SECS + 1)
+}
+
+fn now_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy)]

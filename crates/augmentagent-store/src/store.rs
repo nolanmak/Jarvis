@@ -612,9 +612,14 @@ impl Store {
     }
 
     /// The next pending row eligible for promotion to active: oldest pending
-    /// row with `nudgeCount = 0` whose `nextNudgeAtMs` has fired. Returns None
-    /// when the backlog is empty.
-    pub fn find_next_to_promote(&self, now_ms: i64) -> StoreResult<Option<PendingNudge>> {
+    /// row with `nudgeCount = 0`. Returns None when the backlog is empty.
+    ///
+    /// The 6h `nextNudgeAtMs` interval only throttles *re-nudges* of the
+    /// already-active card (see `find_active_nudge` + `record_nudge`). Initial
+    /// promotion has no throttle — when the user resolves a card we want the
+    /// next one surfaced immediately, regardless of its age. `now_ms` is
+    /// retained for API stability and possible future filters.
+    pub fn find_next_to_promote(&self, _now_ms: i64) -> StoreResult<Option<PendingNudge>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let row = guard
             .query_row(
@@ -628,11 +633,9 @@ impl Store {
                  JOIN emails e ON a.messageId = e.messageId \
                  WHERE a.status = 'pending' \
                    AND COALESCE(a.nudgeCount, 0) = 0 \
-                   AND a.nextNudgeAtMs IS NOT NULL \
-                   AND a.nextNudgeAtMs <= ?1 \
                  ORDER BY a.createdAt ASC \
                  LIMIT 1",
-                params![now_ms],
+                [],
                 row_to_pending_nudge,
             )
             .optional()?;
@@ -1307,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn find_next_to_promote_returns_oldest_due_unpromoted() {
+    fn find_next_to_promote_returns_oldest_unpromoted_immediately() {
         let (s, _f) = fresh_store();
         s.upsert_email(&sample_email("m1")).unwrap();
         s.upsert_email(&sample_email("m2")).unwrap();
@@ -1319,14 +1322,35 @@ mod tests {
         let _id2 = s
             .log_action("m2", None, "a@b.com", "s2", None, Some("d2"), ActionStatus::Pending)
             .unwrap();
-        // Not yet due — backfill is createdAt + 6h.
-        let nxt = s.find_next_to_promote(now_millis()).unwrap();
-        assert!(nxt.is_none(), "fresh actions shouldn't be due yet");
-        // Far future → both due. Oldest first.
-        let future = now_millis() + NUDGE_INTERVAL_MS + 1000;
-        let nxt = s.find_next_to_promote(future).unwrap().expect("expected next");
+        // Initial promotion is no longer gated by the 6h timer — fresh
+        // backlog rows are eligible immediately. Oldest createdAt wins.
+        let nxt = s
+            .find_next_to_promote(now_millis())
+            .unwrap()
+            .expect("expected next");
         assert_eq!(nxt.action.action.id, id1, "oldest createdAt wins");
         assert_eq!(nxt.nudge_count, 0);
+    }
+
+    #[test]
+    fn find_next_to_promote_skips_promoted_rows() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("m1")).unwrap();
+        s.upsert_email(&sample_email("m2")).unwrap();
+        let id1 = s
+            .log_action("m1", None, "a@b.com", "s1", None, Some("d1"), ActionStatus::Pending)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let id2 = s
+            .log_action("m2", None, "a@b.com", "s2", None, Some("d2"), ActionStatus::Pending)
+            .unwrap();
+        // m1 is the active card (nudgeCount=1); next promotion should pick m2.
+        s.record_nudge(&id1, now_millis() + NUDGE_INTERVAL_MS).unwrap();
+        let nxt = s
+            .find_next_to_promote(now_millis())
+            .unwrap()
+            .expect("expected next");
+        assert_eq!(nxt.action.action.id, id2);
     }
 
     #[test]
