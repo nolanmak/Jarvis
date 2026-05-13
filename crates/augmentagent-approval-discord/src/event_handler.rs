@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serenity::all::{
-    Attachment, ChannelId, Context, CreateInteractionResponse, CreateInteractionResponseFollowup,
-    CreateInteractionResponseMessage, CreateMessage, EventHandler, GetMessages, Interaction,
-    Message, MessageId, MessageReference, Ready, UserId,
+    ActionRowComponent, Attachment, ButtonKind, ChannelId, Context, CreateInteractionResponse,
+    CreateInteractionResponseFollowup, CreateInteractionResponseMessage, CreateMessage,
+    EventHandler, GetMessages, Interaction, Message, MessageId, MessageReference, Ready, UserId,
 };
 use tracing::{debug, info, warn};
 
@@ -30,13 +30,25 @@ pub struct Handler {
 
 #[serenity::async_trait]
 impl EventHandler for Handler {
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         info!("discord broker ready as {}", ready.user.name);
         // Stash the bot's own user id so `message()` can tell the bot's prior
         // replies apart from the user's questions when building conversation
         // context for follow-ups.
-        let _ = self.state.bot_user_id.set(ready.user.id);
+        let bot_user_id = ready.user.id;
+        let _ = self.state.bot_user_id.set(bot_user_id);
         self.state.mark_ready();
+
+        // One-shot scrollback sweep: delete approval cards whose actions are
+        // already resolved. Catches cards left from previous runs or from
+        // sends that crashed before the active-path cleanup ran.
+        if let Some(handler) = self.state.action_handler.clone() {
+            let channel_id = self.state.approval_channel_id;
+            let ctx_clone = ctx.clone();
+            tokio::spawn(async move {
+                sweep_resolved_cards(&ctx_clone, channel_id, bot_user_id, handler).await;
+            });
+        }
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
@@ -175,6 +187,15 @@ impl EventHandler for Handler {
                                 },
                             };
                             followup(&ctx_clone, &comp_clone, &describe(&outcome)).await;
+                            if should_delete_source(&outcome) {
+                                delete_source_message(
+                                    &ctx_clone,
+                                    comp_clone.channel_id,
+                                    comp_clone.message.id,
+                                    &action_id,
+                                )
+                                .await;
+                            }
                         });
                     }
                     Verb::Skip => {
@@ -194,6 +215,15 @@ impl EventHandler for Handler {
                                 },
                             };
                             followup(&ctx_clone, &comp_clone, &describe(&outcome)).await;
+                            if should_delete_source(&outcome) {
+                                delete_source_message(
+                                    &ctx_clone,
+                                    comp_clone.channel_id,
+                                    comp_clone.message.id,
+                                    &action_id,
+                                )
+                                .await;
+                            }
                         });
                     }
                     Verb::Revise => {
@@ -286,13 +316,39 @@ impl EventHandler for Handler {
                         warn!(action_id = %action_id, "revise: followup failed: {e}");
                     }
 
+                    // Post the new card BEFORE deleting the old one. If the
+                    // re-post fails the old card stays as a fallback so the
+                    // user isn't left without a card to act on.
+                    let mut new_card_posted = false;
                     if let Some((email, draft)) = repost {
                         let msg = approval_message(&action_id, &email, &draft);
-                        if let Err(e) = approval_channel.send_message(&ctx_clone.http, msg).await {
-                            warn!(
+                        match approval_channel.send_message(&ctx_clone.http, msg).await {
+                            Ok(_) => new_card_posted = true,
+                            Err(e) => warn!(
                                 action_id = %action_id,
                                 "revise: failed to re-post approval card: {e}"
-                            );
+                            ),
+                        }
+                    }
+
+                    // Delete the original card the modal was opened from. On
+                    // Revised, only delete if the replacement actually posted.
+                    // On AlreadyResolved, delete unconditionally — the card is
+                    // stale and there's nothing to replace it with.
+                    let delete_old = match &outcome {
+                        ApprovalActionOutcome::Revised { .. } => new_card_posted,
+                        ApprovalActionOutcome::AlreadyResolved { .. } => true,
+                        _ => false,
+                    };
+                    if delete_old {
+                        if let Some(src) = modal_clone.message.as_ref() {
+                            delete_source_message(
+                                &ctx_clone,
+                                modal_clone.channel_id,
+                                src.id,
+                                &action_id,
+                            )
+                            .await;
                         }
                     }
                 });
@@ -371,6 +427,105 @@ fn describe(outcome: &ApprovalActionOutcome) -> String {
         ApprovalActionOutcome::Revised { .. } => "Revising — new draft posted below.".into(),
         ApprovalActionOutcome::Failed { message } => format!("Failed: {message}"),
     }
+}
+
+/// Should the source approval card be deleted after this outcome?
+///
+/// Approved / Skipped / Revised: yes — the card is now stale or superseded.
+/// AlreadyResolved: yes — this is, by definition, a stale card.
+/// NotFound / Failed: no — leave the card so the user can investigate / retry.
+fn should_delete_source(outcome: &ApprovalActionOutcome) -> bool {
+    matches!(
+        outcome,
+        ApprovalActionOutcome::Approved
+            | ApprovalActionOutcome::Skipped
+            | ApprovalActionOutcome::Revised { .. }
+            | ApprovalActionOutcome::AlreadyResolved { .. }
+    )
+}
+
+/// Best-effort deletion of an approval card. Failures are cosmetic (the
+/// product-side action already succeeded), so we just warn.
+async fn delete_source_message(
+    ctx: &Context,
+    channel_id: ChannelId,
+    message_id: MessageId,
+    action_id: &str,
+) {
+    if let Err(e) = channel_id.delete_message(&ctx.http, message_id).await {
+        warn!(
+            action_id = %action_id,
+            "failed to delete resolved approval card: {e}"
+        );
+    }
+}
+
+/// On startup, scan the most recent ~100 messages in the approval channel and
+/// delete any approval cards whose underlying action is already resolved
+/// (sent / rejected / etc). This handles cards left over from prior runs or
+/// from interactions that crashed before the active-path cleanup ran.
+async fn sweep_resolved_cards(
+    ctx: &Context,
+    channel_id: ChannelId,
+    bot_user_id: UserId,
+    handler: std::sync::Arc<dyn crate::ApprovalActionHandler>,
+) {
+    let messages = match channel_id
+        .messages(&ctx.http, GetMessages::new().limit(100))
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("startup sweep: failed to fetch approval channel history: {e}");
+            return;
+        }
+    };
+
+    let mut deleted = 0usize;
+    let mut scanned = 0usize;
+    for msg in messages {
+        if msg.author.id != bot_user_id {
+            continue;
+        }
+        let Some(action_id) = action_id_from_message(&msg) else {
+            continue;
+        };
+        scanned += 1;
+        if !handler.is_resolved(&action_id).await {
+            continue;
+        }
+        if let Err(e) = channel_id.delete_message(&ctx.http, msg.id).await {
+            warn!(
+                action_id = %action_id,
+                "startup sweep: failed to delete stale card: {e}"
+            );
+        } else {
+            deleted += 1;
+        }
+    }
+    info!(
+        scanned = scanned,
+        deleted = deleted,
+        "startup sweep: cleaned up resolved approval cards"
+    );
+}
+
+/// Walk a message's components looking for the first parseable approval-card
+/// button `custom_id`. Returns the `action_id` if found; `None` for any
+/// message that isn't one of our cards.
+fn action_id_from_message(msg: &Message) -> Option<String> {
+    for row in &msg.components {
+        for component in &row.components {
+            if let ActionRowComponent::Button(button) = component {
+                if let ButtonKind::NonLink { custom_id, .. } = &button.data {
+                    if let Some(parsed) = crate::custom_id::CustomId::parse(custom_id) {
+                        return Some(parsed.action_id);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Keep only attachments whose Discord-reported `content_type` looks like an
