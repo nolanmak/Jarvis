@@ -342,6 +342,13 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         if self.store.is_email_complete(&email.message_id)? {
             return Ok(None);
         }
+        // If a prior dispatch already produced a pending or errored action for
+        // this email, leave it alone — the existing Discord card or the retry
+        // tick will carry it forward. Without this gate, every poll cycle on
+        // an unread email would spawn a fresh draft + approval card.
+        if self.store.has_open_action(&email.message_id)? {
+            return Ok(None);
+        }
 
         // --- 1. TRIAGE call (Opus, wiki read-only, returns {decision, reason})
         let triage_opts = crate::reasoner::triage_opts(self.config.wiki_root.clone());
@@ -525,7 +532,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         initial_draft: String,
         existing_action_id: Option<String>,
     ) -> anyhow::Result<Option<DispatchOutcome>> {
-        let action_id = match existing_action_id {
+        let (action_id, existing_draft_id) = match existing_action_id {
             Some(id) => {
                 self.store.update_action_status(
                     &id,
@@ -533,42 +540,57 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     Some(&initial_draft),
                     None,
                 )?;
-                id
+                // Reuse any Gmail draft from a prior attempt — only the
+                // post_approval step can have failed after create_draft set the
+                // draftId, so we shouldn't ask Composio for a second draft.
+                let prior = self
+                    .store
+                    .get_action_with_email(&id)?
+                    .and_then(|a| a.draft_id);
+                (id, prior)
             }
-            None => self.store.log_action(
-                &email.message_id,
-                email.thread_id.as_deref(),
-                &email.from,
-                &email.subject,
-                Some(&email.body),
-                Some(&initial_draft),
-                ActionStatus::Pending,
-            )?,
+            None => (
+                self.store.log_action(
+                    &email.message_id,
+                    email.thread_id.as_deref(),
+                    &email.from,
+                    &email.subject,
+                    Some(&email.body),
+                    Some(&initial_draft),
+                    ActionStatus::Pending,
+                )?,
+                None,
+            ),
         };
 
-        let draft_id = match self
-            .gmail
-            .create_draft(
-                entity_id,
-                &email.from,
-                &reply_subject(&email.subject),
-                &initial_draft,
-                email.thread_id.as_deref(),
-            )
-            .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                self.store.update_action_status(
-                    &action_id,
-                    ActionStatus::Error,
-                    None,
-                    Some(&format!("create_draft: {e}")),
-                )?;
-                return Err(e.into());
-            }
+        let draft_id = match existing_draft_id {
+            Some(d) => d,
+            None => match self
+                .gmail
+                .create_draft(
+                    entity_id,
+                    &email.from,
+                    &reply_subject(&email.subject),
+                    &initial_draft,
+                    email.thread_id.as_deref(),
+                )
+                .await
+            {
+                Ok(id) => {
+                    self.store.set_action_draft_id(&action_id, &id)?;
+                    id
+                }
+                Err(e) => {
+                    self.store.update_action_status(
+                        &action_id,
+                        ActionStatus::Error,
+                        None,
+                        Some(&format!("create_draft: {e}")),
+                    )?;
+                    return Err(e.into());
+                }
+            },
         };
-        self.store.set_action_draft_id(&action_id, &draft_id)?;
 
         if let Err(e) = self
             .approvals
@@ -593,6 +615,13 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         {
             warn!(action_id, "record_nudge after post_approval failed: {e}");
         }
+
+        // Mark the email processed only after a card is up. Failures earlier
+        // leave agentProcessedAt NULL so the retry tick can pick the action
+        // up; the has_open_action gate in handle_email keeps the poll loop
+        // from spawning a duplicate in the meantime.
+        self.store
+            .mark_email_processed(&email.message_id, TriageResult::Reply)?;
 
         info!(action_id, draft_id = %draft_id, "approval card posted");
         Ok(Some(DispatchOutcome::AwaitingApproval))
@@ -956,8 +985,16 @@ mod tests {
         let out = ch.poll_once().await.unwrap();
         assert_eq!(out.awaiting_approval, 1);
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
-        // Email is NOT complete — awaiting the user's Discord click.
-        assert!(!store.is_email_complete("m3").unwrap());
+        // Email IS complete: dispatching a Reply marks the email processed so
+        // the next poll cycle won't spawn a duplicate draft + card while the
+        // user is deciding. Final outcome (sent/rejected/timed_out) flows
+        // through the action's status, not the email's gate.
+        assert!(store.is_email_complete("m3").unwrap());
+
+        // Re-polling the same unread email must not spawn a second action.
+        let out2 = ch.poll_once().await.unwrap();
+        assert_eq!(out2.awaiting_approval, 0);
+        assert_eq!(broker.posts.lock().unwrap().len(), 1);
     }
 
     /// A Gmail stub that fails create_draft the first N times, then succeeds.
@@ -1055,7 +1092,7 @@ mod tests {
         );
 
         // First pass: triage OK, draft OK, create_draft FAILS, action recorded
-        // as Error; not marked complete.
+        // as Error; not marked complete (so the retry tick can pick it up).
         let out1 = ch.poll_once().await.unwrap();
         assert_eq!(out1.awaiting_approval, 0);
         assert_eq!(out1.errors, 1);
@@ -1066,7 +1103,126 @@ mod tests {
         let retried = ch.retry_once().await.unwrap();
         assert_eq!(retried, 1);
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
-        // Email still NOT complete (user hasn't clicked Approve yet).
-        assert!(!store.is_email_complete("m-retry").unwrap());
+        // Successful dispatch on the retry path marks the email processed.
+        assert!(store.is_email_complete("m-retry").unwrap());
+    }
+
+    /// Counts create_draft invocations so the retry-no-double-draft test can
+    /// assert Gmail isn't asked for a second draft when the prior attempt
+    /// already succeeded at create_draft and only failed at post_approval.
+    struct CountingGmail {
+        emails: Vec<Email>,
+        create_calls: std::sync::atomic::AtomicU32,
+    }
+    #[async_trait]
+    impl GmailApi for CountingGmail {
+        async fn fetch_unread(&self, _e: &str, _l: u32) -> Result<Vec<Email>, crate::gmail::GmailError> {
+            Ok(self.emails.clone())
+        }
+        async fn fetch_with_query(&self, _e: &str, _q: &str, _l: u32) -> Result<Vec<Email>, crate::gmail::GmailError> {
+            Ok(self.emails.clone())
+        }
+        async fn update_draft(&self, _e: &str, _d: &str, _t: &str, _s: &str, _b: &str) -> Result<(), crate::gmail::GmailError> {
+            Ok(())
+        }
+        async fn create_draft(&self, _e: &str, _t: &str, _s: &str, _b: &str, _th: Option<&str>) -> Result<String, crate::gmail::GmailError> {
+            self.create_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("draft-once".into())
+        }
+        async fn send_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
+            Ok(())
+        }
+        async fn delete_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
+            Ok(())
+        }
+    }
+
+    /// Broker that fails post_approval the first N times, then succeeds. Used
+    /// to simulate Discord transient outages.
+    struct FlakyBroker {
+        posts: std::sync::Mutex<Vec<String>>,
+        fail_remaining: std::sync::Mutex<u32>,
+    }
+    #[async_trait]
+    impl ApprovalBroker for FlakyBroker {
+        async fn post_approval(
+            &self,
+            action_id: &str,
+            _email: &Email,
+            _draft: &str,
+        ) -> Result<(), augmentagent_approval_discord::ApprovalError> {
+            let mut lock = self.fail_remaining.lock().unwrap();
+            if *lock > 0 {
+                *lock -= 1;
+                return Err(augmentagent_approval_discord::ApprovalError::Discord(
+                    "synthetic broker outage".into(),
+                ));
+            }
+            self.posts.lock().unwrap().push(action_id.to_string());
+            Ok(())
+        }
+        async fn post_flag_notice(
+            &self,
+            _email: &Email,
+            _reason: &str,
+        ) -> Result<(), augmentagent_approval_discord::ApprovalError> {
+            Ok(())
+        }
+    }
+
+    /// When create_draft already succeeded on a prior attempt and only
+    /// post_approval failed, the retry tick must NOT call create_draft again
+    /// (which would orphan a duplicate Gmail draft).
+    #[tokio::test]
+    async fn retry_after_post_approval_failure_reuses_existing_draft() {
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(CountingGmail {
+            emails: vec![Email {
+                message_id: "m-broker-fail".into(),
+                thread_id: Some("t1".into()),
+                from: "user@client.com".into(),
+                subject: "ping".into(),
+                body: "free Friday?".into(),
+                date: "2026-04-20".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+            create_calls: std::sync::atomic::AtomicU32::new(0),
+        });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"actionable"}"#,
+            "Friday 2pm works.",
+        ]));
+        let broker = Arc::new(FlakyBroker {
+            posts: std::sync::Mutex::new(Vec::new()),
+            fail_remaining: std::sync::Mutex::new(1),
+        });
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail.clone(),
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                retry_min_gap: Duration::from_millis(0),
+                ..Default::default()
+            },
+        );
+
+        // First pass: triage + draft + create_draft OK, post_approval FAILS.
+        let out1 = ch.poll_once().await.unwrap();
+        assert_eq!(out1.errors, 1);
+        assert_eq!(gmail.create_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+
+        // Retry tick: post_approval succeeds. create_draft must NOT be called
+        // a second time — the action already has a draftId from the first pass.
+        let retried = ch.retry_once().await.unwrap();
+        assert_eq!(retried, 1);
+        assert_eq!(gmail.create_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(broker.posts.lock().unwrap().len(), 1);
+        assert!(store.is_email_complete("m-broker-fail").unwrap());
     }
 }
