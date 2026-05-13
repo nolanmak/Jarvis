@@ -142,6 +142,10 @@ pub trait ApprovalActionHandler: Send + Sync {
     async fn approve(&self, action_id: &str) -> ApprovalActionOutcome;
     async fn revise(&self, action_id: &str, feedback: &str) -> ApprovalActionOutcome;
     async fn skip(&self, action_id: &str) -> ApprovalActionOutcome;
+    /// True if the action exists and is in a terminal state (anything other
+    /// than `Pending` / `DryRun`). Backs the startup scrollback sweep that
+    /// deletes stale approval cards from previous runs.
+    async fn is_resolved(&self, action_id: &str) -> bool;
 }
 
 /// Plugged into the broker to answer wiki queries that arrive as Discord messages.

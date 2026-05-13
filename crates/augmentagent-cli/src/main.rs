@@ -1582,6 +1582,13 @@ impl ApprovalActionHandler for ReplyApprover {
         // handled by the broker's event handler from the Revised outcome.
         self.run_revise(action_id, feedback).await
     }
+
+    async fn is_resolved(&self, action_id: &str) -> bool {
+        match self.handle_load(action_id) {
+            Some(a) => a.action.status != "pending",
+            None => false,
+        }
+    }
 }
 
 impl ReplyApprover {
