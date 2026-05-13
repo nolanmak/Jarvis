@@ -20,7 +20,7 @@ use augmentagent_channel_core::decision::{parse as parse_decision, DecisionKind}
 use augmentagent_channel_core::ingest::{spawn_ingest, IngestTrigger};
 use augmentagent_channel_core::prompt::{draft_user_message, triage_user_message, SkillPrompt, TRIAGE_SYSTEM};
 use augmentagent_channel_core::Reasoner;
-use augmentagent_store::{ActionStatus, RetryableReply, Store, TriageResult};
+use augmentagent_store::{ActionStatus, RetryableReply, Store, TriageResult, NUDGE_INTERVAL_MS};
 
 use crate::gmail::GmailApi;
 
@@ -582,6 +582,16 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 Some(&format!("post_approval: {e}")),
             )?;
             return Err(anyhow::anyhow!("post_approval: {e}"));
+        }
+
+        // Mark this row as the active nudge so the scheduler's serial-queue
+        // logic (`find_active_nudge`/`find_next_to_promote`) treats it as
+        // "currently being shown" and won't re-post it on the next 60s tick.
+        if let Err(e) = self
+            .store
+            .record_nudge(&action_id, now_millis() + NUDGE_INTERVAL_MS)
+        {
+            warn!(action_id, "record_nudge after post_approval failed: {e}");
         }
 
         info!(action_id, draft_id = %draft_id, "approval card posted");
