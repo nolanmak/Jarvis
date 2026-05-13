@@ -252,6 +252,24 @@ impl Store {
         Ok(row.is_some())
     }
 
+    /// True iff there's already an in-flight action for this message — either
+    /// `pending` (awaiting Discord approval) or `error` (will be picked up by
+    /// the retry tick). The poll loop uses this to avoid spawning duplicate
+    /// actions for the same email while one is still mid-flight.
+    pub fn has_open_action(&self, message_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM actions \
+                 WHERE messageId = ?1 AND status IN ('pending', 'error') \
+                 LIMIT 1",
+                params![message_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row.is_some())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn log_action(
         &self,
