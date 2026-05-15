@@ -9,7 +9,8 @@ mod store;
 
 pub use models::{
     Account, ActionRecord, ActionStatus, ChannelSubscription, Email, LearnedPattern, RateAuditRow,
-    RateEvent, RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TriageResult,
+    RateEvent, RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, ToneExample, ToneProfile,
+    TriageResult,
 };
 pub use store::{
     ActionWithEmail, PendingNudge, RetryableReply, RevisionRecord, Store, StoreError,

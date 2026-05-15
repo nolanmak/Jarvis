@@ -320,6 +320,21 @@ pub fn digest_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
     }
 }
 
+/// Preset for the tone-mirroring summarizer (#73). Pure transform from a
+/// corpus of sent-mail bodies to a ~120-token JSON voice descriptor — no
+/// tools, no wiki access, Haiku for cost (per-recipient refresh is ~$0.001).
+pub fn tone_summarize_opts() -> ReasonerOpts {
+    ReasonerOpts {
+        system_prompt: include_str!("../../../schema/tone-summarize.md").to_string(),
+        model: Some("claude-haiku-4-5-20251001".into()),
+        allowed_tools: vec![],
+        add_dirs: vec![],
+        permission_mode: "default".into(),
+        cwd: None,
+        env: vec![],
+    }
+}
+
 pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
     ReasonerOpts {
         system_prompt,

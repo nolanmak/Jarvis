@@ -6,6 +6,7 @@
 //! `augmentagent-channel-core`; this crate owns only Gmail-specific transport.
 
 pub mod gmail;
+pub mod tone;
 mod channel;
 
 pub use channel::{GmailChannel, GmailChannelConfig, PollOutcome};
