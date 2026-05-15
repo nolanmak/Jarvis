@@ -547,6 +547,7 @@ dependencies = [
  "augmentagent-channel-linkedin",
  "augmentagent-channel-slack",
  "augmentagent-channel-telegram-bot",
+ "augmentagent-renderer-client",
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",
@@ -594,6 +595,21 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "augmentagent-renderer-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dashmap 6.1.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "uuid",
 ]
