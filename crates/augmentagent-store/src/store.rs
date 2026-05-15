@@ -7,8 +7,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::models::{
-    Account, ActionRecord, ActionStatus, ChannelSubscription, Email, LearnedPattern,
-    SlackWorkspace, SubscriptionMode, TriageResult,
+    Account, ActionRecord, ActionStatus, ChannelSubscription, Email, LearnedPattern, RateAuditRow,
+    RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TriageResult,
 };
 
 #[derive(Debug, Error)]
@@ -1286,6 +1286,319 @@ impl Store {
             params![team_id],
         )?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // #83 — RateGovernor helpers (rate_events / rate_halts / rate_warmup).
+    //
+    // These are the store-side primitives the SqliteGovernor in
+    // augmentagent-channel-core leans on. Kept here (and not on a separate
+    // RateStore facade) so the single Mutex<Connection> still serializes
+    // all rate writes against everything else hitting the same `data.db`.
+    // The governor module owns the cap math; this layer just talks to SQL.
+    // -----------------------------------------------------------------
+
+    /// Insert a rate-event row. `status` is the snake-case form of the
+    /// outcome (`ok` | `failed` | `rolled_back` | `suspicion`).
+    /// `RolledBack` rows are still persisted (audit) but the count helpers
+    /// below filter them out so they don't burn quota.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_rate_event(
+        &self,
+        id: &str,
+        platform: &str,
+        action_kind: &str,
+        account_id: &str,
+        occurred_at_ms: i64,
+        status: &str,
+        cause: &str,
+        target_id: Option<&str>,
+        meta_json: Option<&str>,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO rate_events \
+                 (id, platform, action_kind, account_id, occurred_at_ms, \
+                  status, cause, target_id, meta_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                id,
+                platform,
+                action_kind,
+                account_id,
+                occurred_at_ms,
+                status,
+                cause,
+                target_id,
+                meta_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Sliding-window count of "quota-burning" events for a (platform,
+    /// action, account) tuple in `[since_ms, now_ms]`. Excludes
+    /// `rolled_back` rows by definition (the action never executed).
+    pub fn rate_event_count_in_window(
+        &self,
+        platform: &str,
+        action_kind: &str,
+        account_id: &str,
+        since_ms: i64,
+        now_ms: i64,
+    ) -> StoreResult<u32> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM rate_events \
+              WHERE platform = ?1 \
+                AND action_kind = ?2 \
+                AND account_id = ?3 \
+                AND occurred_at_ms >= ?4 \
+                AND occurred_at_ms <= ?5 \
+                AND status != 'rolled_back'",
+            params![platform, action_kind, account_id, since_ms, now_ms],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
+    /// Most recent quota-burning event timestamp for the (platform, action,
+    /// account) tuple — drives min-gap enforcement. Returns `None` when no
+    /// such event has ever happened.
+    pub fn rate_last_event_at(
+        &self,
+        platform: &str,
+        action_kind: &str,
+        account_id: &str,
+    ) -> StoreResult<Option<i64>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let v: Option<i64> = guard
+            .query_row(
+                "SELECT MAX(occurred_at_ms) FROM rate_events \
+                  WHERE platform = ?1 \
+                    AND action_kind = ?2 \
+                    AND account_id = ?3 \
+                    AND status != 'rolled_back'",
+                params![platform, action_kind, account_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(v)
+    }
+
+    /// Read the active halt row for a platform, if any. Caller compares
+    /// `paused_until_ms` against the clock to decide whether the halt is
+    /// still in effect.
+    pub fn rate_halt_state(&self, platform: &str) -> StoreResult<Option<RateHalt>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT platform, paused_until_ms, reason, triggered_by_event_id, \
+                        created_at_ms, acknowledged_at_ms \
+                   FROM rate_halts WHERE platform = ?1",
+                params![platform],
+                |r| {
+                    Ok(RateHalt {
+                        platform: r.get(0)?,
+                        paused_until_ms: r.get(1)?,
+                        reason: r.get(2)?,
+                        triggered_by_event_id: r.get(3)?,
+                        created_at_ms: r.get(4)?,
+                        acknowledged_at_ms: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Upsert a halt for `platform`. Replaces any existing row — `permit()`
+    /// only ever cares about the most recent halt window per platform.
+    pub fn rate_set_halt(
+        &self,
+        platform: &str,
+        paused_until_ms: i64,
+        reason: &str,
+        triggered_by_event_id: Option<&str>,
+        now_ms: i64,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO rate_halts \
+                 (platform, paused_until_ms, reason, triggered_by_event_id, \
+                  created_at_ms, acknowledged_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL) \
+             ON CONFLICT(platform) DO UPDATE SET \
+                 paused_until_ms = excluded.paused_until_ms, \
+                 reason = excluded.reason, \
+                 triggered_by_event_id = excluded.triggered_by_event_id, \
+                 created_at_ms = excluded.created_at_ms, \
+                 acknowledged_at_ms = NULL",
+            params![
+                platform,
+                paused_until_ms,
+                reason,
+                triggered_by_event_id,
+                now_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Mark the active halt as acknowledged by the user (Discord button /
+    /// dashboard). Doesn't lift the halt — the halt stays until
+    /// `paused_until_ms` passes — but suppresses re-pinging the user.
+    pub fn rate_acknowledge_halt(&self, platform: &str, now_ms: i64) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE rate_halts SET acknowledged_at_ms = ?2 WHERE platform = ?1",
+            params![platform, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Read the warmup-start timestamp for a (platform, account) pair, if
+    /// it has been seeded.
+    pub fn rate_get_warmup(
+        &self,
+        platform: &str,
+        account_id: &str,
+    ) -> StoreResult<Option<RateWarmup>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT platform, account_id, warmup_started_at_ms \
+                   FROM rate_warmup WHERE platform = ?1 AND account_id = ?2",
+                params![platform, account_id],
+                |r| {
+                    Ok(RateWarmup {
+                        platform: r.get(0)?,
+                        account_id: r.get(1)?,
+                        warmup_started_at_ms: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Idempotently seed (platform, account) → `warmup_started_at_ms = now`.
+    /// Existing rows are left alone so warmup math doesn't get reset by a
+    /// repeated `permit()` call on a known account.
+    pub fn rate_seed_warmup(
+        &self,
+        platform: &str,
+        account_id: &str,
+        warmup_started_at_ms: i64,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO rate_warmup (platform, account_id, warmup_started_at_ms) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(platform, account_id) DO NOTHING",
+            params![platform, account_id, warmup_started_at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Override a warmup start time. Used by the dashboard's
+    /// "skip warmup, this account is well-aged" button (sets the timestamp
+    /// 28 days into the past so the multiplier reads 1.0).
+    pub fn rate_override_warmup(
+        &self,
+        platform: &str,
+        account_id: &str,
+        warmup_started_at_ms: i64,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO rate_warmup (platform, account_id, warmup_started_at_ms) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(platform, account_id) DO UPDATE SET \
+                 warmup_started_at_ms = excluded.warmup_started_at_ms",
+            params![platform, account_id, warmup_started_at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// `[since_ms, until_ms]` audit dump for one account. Optional
+    /// `platform` filter narrows to a single platform; `None` returns all
+    /// platforms for the account (useful for an "everything I did" query).
+    /// Ordered newest-first so the dashboard table renders without a sort.
+    pub fn rate_audit_query(
+        &self,
+        account_id: &str,
+        platform: Option<&str>,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> StoreResult<Vec<RateAuditRow>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let rows = match platform {
+            Some(p) => {
+                let mut stmt = guard.prepare(
+                    "SELECT id, platform, action_kind, account_id, occurred_at_ms, \
+                            status, cause, target_id, meta_json \
+                       FROM rate_events \
+                      WHERE account_id = ?1 \
+                        AND platform = ?2 \
+                        AND occurred_at_ms >= ?3 \
+                        AND occurred_at_ms <= ?4 \
+                      ORDER BY occurred_at_ms DESC",
+                )?;
+                let it = stmt.query_map(params![account_id, p, since_ms, until_ms], |r| {
+                    Ok(RateAuditRow {
+                        id: r.get(0)?,
+                        platform: r.get(1)?,
+                        action_kind: r.get(2)?,
+                        account_id: r.get(3)?,
+                        occurred_at_ms: r.get(4)?,
+                        status: r.get(5)?,
+                        cause: r.get(6)?,
+                        target_id: r.get(7)?,
+                        meta_json: r.get(8)?,
+                    })
+                })?;
+                it.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+            None => {
+                let mut stmt = guard.prepare(
+                    "SELECT id, platform, action_kind, account_id, occurred_at_ms, \
+                            status, cause, target_id, meta_json \
+                       FROM rate_events \
+                      WHERE account_id = ?1 \
+                        AND occurred_at_ms >= ?2 \
+                        AND occurred_at_ms <= ?3 \
+                      ORDER BY occurred_at_ms DESC",
+                )?;
+                let it = stmt.query_map(params![account_id, since_ms, until_ms], |r| {
+                    Ok(RateAuditRow {
+                        id: r.get(0)?,
+                        platform: r.get(1)?,
+                        action_kind: r.get(2)?,
+                        account_id: r.get(3)?,
+                        occurred_at_ms: r.get(4)?,
+                        status: r.get(5)?,
+                        cause: r.get(6)?,
+                        target_id: r.get(7)?,
+                        meta_json: r.get(8)?,
+                    })
+                })?;
+                it.collect::<rusqlite::Result<Vec<_>>>()?
+            }
+        };
+        Ok(rows)
+    }
+
+    /// Housekeeping helper — prune rate_events older than `older_than_ms`
+    /// (90d retention per #83). Returns rows deleted for logging.
+    pub fn rate_prune_events(&self, older_than_ms: i64) -> StoreResult<usize> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "DELETE FROM rate_events WHERE occurred_at_ms < ?1",
+            params![older_than_ms],
+        )?;
+        Ok(n)
     }
 }
 

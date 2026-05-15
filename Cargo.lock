@@ -275,13 +275,38 @@ dependencies = [
 ]
 
 [[package]]
-name = "augmentagent-channel-core"
+name = "augmentagent-browser-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "augmentagent-auth",
+ "augmentagent-store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "augmentagent-channel-calendar"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-auth",
+ "augmentagent-channel-core",
  "augmentagent-store",
  "augmentagent-wiki",
+ "chrono",
+ "mockito",
+ "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -289,6 +314,28 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "augmentagent-channel-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-store",
+ "augmentagent-wiki",
+ "chrono",
+ "futures",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -335,6 +382,30 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "augmentagent-channel-github"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-auth",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "augmentagent-wiki",
+ "mockito",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -386,6 +457,78 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-channel-telegram-bot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-auth",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "augmentagent-wiki",
+ "mockito",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "augmentagent-channel-voice"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-auth",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "augmentagent-wiki",
+ "mockito",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "augmentagent-channel-whatsapp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-auth",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "augmentagent-wiki",
+ "mockito",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "augmentagent-cli"
 version = "0.1.0"
 dependencies = [
@@ -411,6 +554,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-content-adapter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "augmentagent-proactive"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "augmentagent-wiki",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "augmentagent-store"
 version = "0.1.0"
 dependencies = [
@@ -430,6 +611,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "augmentagent-store",
+ "dashmap 6.1.0",
  "serde",
  "serde_yaml_ng",
  "tempfile",
@@ -913,6 +1095,7 @@ checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
 dependencies = [
  "futures-channel",
  "futures-core",
+ "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -934,6 +1117,17 @@ name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
+
+[[package]]
+name = "futures-executor"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baf29c38818342a3b26b5b923639e7b1f4a61fc5e76102d4b1981c6dc7a7579d"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
 
 [[package]]
 name = "futures-io"

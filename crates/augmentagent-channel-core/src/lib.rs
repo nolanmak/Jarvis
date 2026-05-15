@@ -8,12 +8,19 @@
 //! one work-source contract instead of inventing their own per platform.
 
 pub mod decision;
+pub mod governor;
 pub mod ingest;
 pub mod prompt;
 pub mod reasoner;
 pub mod trigger;
 
 pub use decision::{Decision, DecisionKind};
+pub use governor::{
+    lookup_limit, next_action_delay, quiet_hours_until, requires_approval, scale_cap,
+    warmup_curve, ActionKind, ActionRequest, Clock, Denial, HaltReason, HaltState, Outcome,
+    Permit, Platform, RateCaps, RateGovernor, RateLimit, Risk, SqliteGovernor, SystemClock,
+    TargetAttrs, WindowedCounter, RATE_TABLE,
+};
 pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerOpts};
 pub use trigger::{
     DigestSource, FriendFeedSource, InboundMessageTrigger, InboundSource, Trigger, WorkItem,
