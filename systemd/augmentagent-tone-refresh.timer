@@ -1,0 +1,14 @@
+# Nightly trigger for augmentagent-tone-refresh.service.
+#
+# 03:30 local — well clear of the overnight digest run (07:00) and any
+# routine cron jitter. Persistent=true so a missed run (e.g. host asleep)
+# fires on next boot.
+[Unit]
+Description=Nightly tone-profile refresh
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
