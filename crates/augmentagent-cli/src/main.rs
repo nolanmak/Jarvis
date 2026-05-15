@@ -355,6 +355,7 @@ enum WhatsappOp {
 #[derive(Subcommand)]
 enum CalendarOp {
     /// One-shot historical event ingest into the wiki Meeting log.
+    /// Phase 2 — Phase 1 ships PollOnce only.
     Backfill {
         #[arg(long, default_value_t = 365)]
         days: u32,
@@ -365,6 +366,13 @@ enum CalendarOp {
     PollOnce {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+    },
+    /// Inspect Calendar "subscriptions" — Phase 1 reuses gmail accounts as
+    /// the Calendar entity list, so this prints the same accounts the
+    /// Calendar poll iterates.
+    Subscriptions {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
     },
 }
 
@@ -1089,8 +1097,18 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Calendar { op } => match op {
-            CalendarOp::Backfill { .. } | CalendarOp::PollOnce { .. } => {
-                unimplemented!("see issue #82 (calendar feature PR)")
+            CalendarOp::Backfill { .. } => {
+                anyhow::bail!(
+                    "calendar backfill is Phase 2 — see issue #82 §12 ('In' / 'Out')"
+                )
+            }
+            CalendarOp::PollOnce { dry_run } => {
+                run_calendar_poll_once(cli.wiki_dir.clone(), store, dry_run).await?;
+                Ok(())
+            }
+            CalendarOp::Subscriptions { json } => {
+                run_calendar_subscriptions(store, json)?;
+                Ok(())
             }
         },
         Cmd::Voice { op } => match op {
@@ -3400,6 +3418,75 @@ fn load_single_slack_client(
 /// warning in the unlikely event it's not pulled in elsewhere).
 #[allow(dead_code)]
 const _LINKEDIN_PREFIX: &str = ACCOUNT_PREFIX;
+
+// ---------------------------------------------------------------------------
+// Calendar (#82) — Phase 1 CLI helpers.
+// ---------------------------------------------------------------------------
+
+async fn run_calendar_poll_once(
+    wiki_dir: Option<PathBuf>,
+    store: Arc<Store>,
+    dry_run: bool,
+) -> Result<()> {
+    use augmentagent_channel_calendar::{
+        CalendarChannel, CalendarChannelConfig, ComposioCalendarClient,
+    };
+
+    let api_key =
+        std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
+    let gcal = Arc::new(ComposioCalendarClient::new(api_key));
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+
+    // Wiki schema path defaults next to wiki_dir, mirroring gmail's wiring.
+    let wiki_schema_path = wiki_dir
+        .as_ref()
+        .map(|_| PathBuf::from("schema/wiki-skill.md"));
+
+    let config = CalendarChannelConfig {
+        dry_run,
+        wiki_root: wiki_dir,
+        wiki_schema_path,
+        ..Default::default()
+    };
+    let channel = CalendarChannel::new(store, gcal, reasoner, config);
+    let outcome = channel.poll_once().await?;
+    println!("{:#?}", outcome);
+    Ok(())
+}
+
+fn run_calendar_subscriptions(store: Arc<Store>, json: bool) -> Result<()> {
+    let accounts = store
+        .get_active_gmail_accounts()
+        .context("read gmail accounts (calendar Phase 1 reuses these as Calendar entities)")?;
+    if json {
+        let rows: Vec<_> = accounts
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "platform": "gcal",
+                    "calendar_id": "primary",
+                    "entity_id": a.entity_id,
+                    "email": a.email,
+                    "active": a.active,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&rows)?);
+    } else {
+        println!(
+            "{} active Calendar entit{} (Phase 1 reuses gmail_accounts)\n",
+            accounts.len(),
+            if accounts.len() == 1 { "y" } else { "ies" }
+        );
+        for a in &accounts {
+            println!(
+                "  entity_id={}  email={}  calendar=primary  active={}",
+                a.entity_id, a.email, a.active
+            );
+        }
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Tone-mirroring v1 (#73) — backfill, refresh, refresh-stale.

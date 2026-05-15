@@ -1,0 +1,26 @@
+{
+  "id": "evt-meeting-1",
+  "iCalUID": "evt-meeting-1@google.com",
+  "status": "confirmed",
+  "summary": "Q3 planning",
+  "start": { "dateTime": "2026-05-14T15:00:00Z" },
+  "end":   { "dateTime": "2026-05-14T15:45:00Z" },
+  "transparency": "opaque",
+  "visibility": "default",
+  "eventType": "default",
+  "attendees": [
+    { "email": "me@x.com", "self": true, "responseStatus": "accepted" },
+    { "email": "sarah@acme.com", "displayName": "Sarah", "responseStatus": "accepted" },
+    { "email": "ben@acme.com",   "displayName": "Ben",   "responseStatus": "tentative" }
+  ],
+  "organizer": { "email": "me@x.com", "self": true },
+  "conferenceData": {
+    "conferenceSolution": {
+      "name": "Google Meet",
+      "key": { "type": "hangoutsMeet" }
+    },
+    "entryPoints": [
+      { "entryPointType": "video", "uri": "https://meet.google.com/abc-defg-hij" }
+    ]
+  }
+}
