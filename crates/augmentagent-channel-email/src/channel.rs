@@ -469,7 +469,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                         augmentagent_wiki::WikiReader::new(&layout).draft_hint(&email)
                     })
                     .unwrap_or_default();
-                let draft_prompt = draft_user_message(&email, &wiki_hint);
+                let draft_prompt = draft_user_message(&email, &wiki_hint, "");
                 let draft = match self.reasoner.call(&draft_opts, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
                     Err(e) => {
@@ -514,6 +514,20 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     return Ok(Some(DispatchOutcome::DryRun));
                 }
                 self.dispatch_reply(entity_id, email, draft, None).await
+            }
+            // Capture / Meeting are wave-A wiki-ingest-only kinds emitted by
+            // the voice and gcal channels respectively. The email triage
+            // model is not allowed to return them; if one shows up it's a
+            // model bug, so we log and skip rather than crash.
+            DecisionKind::Capture | DecisionKind::Meeting => {
+                warn!(
+                    message_id = %email.message_id,
+                    decision = ?decision.decision,
+                    "email triage returned non-email decision kind; treating as skip"
+                );
+                self.store
+                    .mark_email_processed(&email.message_id, TriageResult::Skip)?;
+                Ok(Some(DispatchOutcome::Skipped))
             }
         }
     }
