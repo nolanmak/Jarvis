@@ -871,6 +871,18 @@ async fn main() -> Result<()> {
                     None
                 }
             };
+            let github_ch = match build_github_channel(
+                &cli,
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                dry_run,
+            ) {
+                Ok(ch) => Some(ch),
+                Err(e) => {
+                    warn!("github channel disabled: {e:#}");
+                    None
+                }
+            };
             let shutdown = CancellationToken::new();
             let s2 = shutdown.clone();
             tokio::spawn(async move {
@@ -904,6 +916,10 @@ async fn main() -> Result<()> {
             if let Some(sc) = slack_ch {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { sc.run(sd).await }));
+            }
+            if let Some(gh) = github_ch {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { gh.run(sd).await }));
             }
             // Nudge scheduler — surfaces pending approval cards one at a time
             // (serial queue). Cross-channel: any pending action (gmail /
@@ -1141,13 +1157,21 @@ async fn main() -> Result<()> {
                 unimplemented!("see voice-channel feature PR")
             }
         },
-        Cmd::Github { op } => match op {
-            GithubOp::Login { .. }
-            | GithubOp::Subscribe { .. }
-            | GithubOp::Subscriptions { .. }
-            | GithubOp::Unsubscribe { .. }
-            | GithubOp::PollOnce { .. } => {
-                unimplemented!("see github-channel feature PR")
+        Cmd::Github { ref op } => match op {
+            GithubOp::Login { token, login } => {
+                run_github_login(token.clone(), login.clone()).await
+            }
+            GithubOp::Subscribe { repo, mode } => {
+                run_github_subscribe(store, repo.clone(), mode.clone())
+            }
+            GithubOp::Subscriptions { json } => run_github_subscriptions(store, *json),
+            GithubOp::Unsubscribe { id } => run_github_unsubscribe(store, id.clone()),
+            GithubOp::PollOnce { dry_run } => {
+                let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
+                let ch = build_github_channel(&cli, store, broker, *dry_run)?;
+                let out = ch.poll_once().await?;
+                println!("{out:#?}");
+                Ok(())
             }
         },
         Cmd::Compose { op } => match op {
@@ -1891,6 +1915,9 @@ struct ReplyApprover {
     /// Telegram disabled for this run. Telegram-tagged actions whose
     /// `bot_id` isn't in the map surface as `Failed`.
     telegram: std::collections::HashMap<i64, Arc<augmentagent_channel_telegram_bot::TelegramBotClient>>,
+    /// Optional GitHub REST client. `None` = no PAT in keyring; any
+    /// github-tagged action hits `Failed`.
+    github: Option<Arc<augmentagent_channel_github::GithubClient>>,
     reasoner: Arc<ClaudeCliReasoner>,
     draft_skill: String,
     wiki_root: Option<PathBuf>,
@@ -2393,6 +2420,116 @@ impl ReplyApprover {
             .mark_email_processed(&action.email.message_id, TriageResult::Reply);
         ApprovalActionOutcome::Skipped
     }
+
+    async fn approve_github(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        use augmentagent_channel_github::api::GithubApi;
+        let Some(github) = self.github.as_ref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "GitHub PAT not loaded; run `augmentagent github login`".into(),
+            };
+        };
+        let Some(locator) = augmentagent_channel_github::outbound_target(&action.email) else {
+            return ApprovalActionOutcome::Failed {
+                message: "no <owner>/<repo>#<n> on email; cannot post comment".into(),
+            };
+        };
+        let Some(body) = action.action.draft_body.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no draft body on action; cannot send".into(),
+            };
+        };
+        match github
+            .post_issue_comment(&locator.owner, &locator.repo, locator.number, body)
+            .await
+        {
+            Ok(comment_id) => {
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Sent,
+                    Some(body),
+                    None,
+                );
+                let _ = self
+                    .store
+                    .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                tracing::info!(
+                    action_id,
+                    comment_id,
+                    "github comment posted via approval handler"
+                );
+                ApprovalActionOutcome::Approved
+            }
+            Err(e) => {
+                let msg = format!("github post_issue_comment: {e}");
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                ApprovalActionOutcome::Failed { message: msg }
+            }
+        }
+    }
+
+    async fn revise_github(
+        &self,
+        action_id: &str,
+        feedback: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        let previous_draft = action.action.draft_body.clone().unwrap_or_default();
+        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
+        let prompt = augmentagent_channel_core::prompt::redraft_message(
+            &action.email,
+            &previous_draft,
+            feedback,
+        );
+        let redraft = match self.reasoner.call(&opts, &prompt).await {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("redraft call failed: {e}"),
+                };
+            }
+        };
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Pending,
+            Some(&redraft),
+            None,
+        );
+        let _ = self.store.reset_nudge_schedule(action_id);
+        tracing::info!(action_id, "github revise: new draft persisted");
+        ApprovalActionOutcome::Revised {
+            email: action.email,
+            draft: redraft,
+        }
+    }
+
+    fn skip_github(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        // Best-effort: nothing to delete server-side. (Marking the
+        // notification thread read happens at the channel layer on dispatch;
+        // here we just close out the action row.)
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Rejected,
+            None,
+            Some("skipped by approver"),
+        );
+        let _ = self
+            .store
+            .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+        ApprovalActionOutcome::Skipped
+    }
 }
 
 #[async_trait]
@@ -2446,6 +2583,9 @@ impl ReplyApprover {
         }
         if action.email.platform == "telegram" {
             return self.approve_telegram(action_id, action).await;
+        }
+        if action.email.platform == "github" {
+            return self.approve_github(action_id, action).await;
         }
         if is_linkedin_email(&action.email) {
             return self.approve_linkedin(action_id, action).await;
@@ -2512,6 +2652,9 @@ impl ReplyApprover {
         if action.email.platform == "telegram" {
             return self.skip_telegram(action_id, action);
         }
+        if action.email.platform == "github" {
+            return self.skip_github(action_id, action);
+        }
         if is_linkedin_email(&action.email) {
             return self.skip_linkedin(action_id, action);
         }
@@ -2553,6 +2696,9 @@ impl ReplyApprover {
         }
         if action.email.platform == "telegram" {
             return self.revise_telegram(action_id, feedback, action).await;
+        }
+        if action.email.platform == "github" {
+            return self.revise_github(action_id, feedback, action).await;
         }
         if is_linkedin_email(&action.email) {
             return self.revise_linkedin(action_id, feedback, action).await;
@@ -2686,6 +2832,7 @@ async fn build_broker(
     let discord = load_discord_client();
     let slack = load_slack_clients(&store);
     let telegram = load_telegram_bot_clients(&store);
+    let github = load_github_client();
     let store_for_broker = Arc::clone(&store);
     let approver = Arc::new(ReplyApprover {
         store,
@@ -2694,6 +2841,7 @@ async fn build_broker(
         discord,
         slack,
         telegram,
+        github,
         reasoner: Arc::clone(&reasoner),
         draft_skill,
         wiki_root: cli.wiki_dir.clone(),
@@ -2951,6 +3099,24 @@ fn load_discord_client() -> Option<Arc<augmentagent_channel_discord_dm::DiscordC
         },
         Err(e) => {
             info!("discord auth not loaded: {e} (discord send disabled this run)");
+            None
+        }
+    }
+}
+
+/// Best-effort GitHub PAT load for the approver. `None` ⇒ github outbound
+/// disabled this run. Mirrors `load_discord_client` shape.
+fn load_github_client() -> Option<Arc<augmentagent_channel_github::GithubClient>> {
+    match load_any_github_auth() {
+        Ok(auth) => match augmentagent_channel_github::GithubClient::new(auth) {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                warn!("github client build failed: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            info!("github auth not loaded: {e:#} (github outbound disabled this run)");
             None
         }
     }
@@ -3913,6 +4079,160 @@ fn load_telegram_bot_clients(
 /// warning in the unlikely event it's not pulled in elsewhere).
 #[allow(dead_code)]
 const _LINKEDIN_PREFIX: &str = ACCOUNT_PREFIX;
+
+// ================================================================
+// GitHub (issue #49)
+// ================================================================
+
+/// Validate the PAT against `GET /user`, then persist into the keyring slot
+/// `augmentagent/github/<login>` using the *server-confirmed* login (the
+/// `--login` arg is only a safety hint we cross-check).
+async fn run_github_login(token: String, login_hint: String) -> Result<()> {
+    use augmentagent_channel_github::api::whoami;
+    use augmentagent_channel_github::auth::GithubAuth;
+    if token.trim().is_empty() {
+        anyhow::bail!("--token is empty");
+    }
+    let resolved = whoami(&token).await.context("validate PAT via GET /user")?;
+    if !login_hint.is_empty() && !login_hint.eq_ignore_ascii_case(&resolved) {
+        warn!(
+            "--login {login_hint} does not match server-reported login {resolved}; using {resolved}"
+        );
+    }
+    let auth = GithubAuth {
+        username: resolved.clone(),
+        token,
+        fetched_at_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    auth.save_to_keychain()
+        .context("save github auth to keychain")?;
+    println!("github auth saved to keychain (augmentagent/github/{resolved})");
+    Ok(())
+}
+
+fn run_github_subscribe(store: Arc<Store>, repo: String, mode: String) -> Result<()> {
+    use augmentagent_store::SubscriptionMode;
+    let parsed =
+        SubscriptionMode::parse(&mode).ok_or_else(|| anyhow::anyhow!("invalid mode: {mode}"))?;
+    if !repo.contains('/') {
+        anyhow::bail!("repo must be `<owner>/<repo>`, got {repo:?}");
+    }
+    let normalized = repo.to_ascii_lowercase();
+    let sub = store
+        .upsert_subscription(
+            augmentagent_channel_github::PLATFORM,
+            &normalized,
+            &repo,
+            parsed,
+            None,
+        )
+        .context("upsert github subscription")?;
+    println!(
+        "subscription id={} platform={} repo={} mode={}",
+        sub.id,
+        sub.platform,
+        sub.channel_id,
+        sub.mode.as_str()
+    );
+    Ok(())
+}
+
+fn run_github_subscriptions(store: Arc<Store>, json: bool) -> Result<()> {
+    let subs = store
+        .list_active_subscriptions(augmentagent_channel_github::PLATFORM)
+        .context("list github subscriptions")?;
+    if json {
+        println!("{}", serde_json::to_string(&subs)?);
+    } else {
+        println!("{} active github subscriptions\n", subs.len());
+        for s in &subs {
+            println!(
+                "  {}  mode={}  repo={}  display={}",
+                s.id,
+                s.mode.as_str(),
+                s.channel_id,
+                s.display_name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_github_unsubscribe(store: Arc<Store>, id: String) -> Result<()> {
+    store.delete_subscription(&id).context("delete subscription")?;
+    println!("subscription {id} deactivated");
+    Ok(())
+}
+
+/// Build a `GithubChannel` for `serve` / `poll-once`. Returns `Err` when no
+/// PAT has been persisted yet — the caller in `serve` downgrades that to a
+/// warning so the rest of the daemon still boots.
+fn build_github_channel(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<
+    augmentagent_channel_github::GithubChannel<
+        augmentagent_channel_github::GithubClient,
+        ClaudeCliReasoner,
+    >,
+> {
+    use augmentagent_channel_github::{
+        channel::{GithubChannel, GithubChannelConfig, DEFAULT_POLL_SECS},
+        GithubClient,
+    };
+    let auth = load_any_github_auth().context(
+        "no github auth in keychain — run `augmentagent github login --token <PAT> --login <user>`",
+    )?;
+    let my_login = auth.username.clone();
+    let client = Arc::new(GithubClient::new(auth).context("build github client")?);
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+
+    let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
+        Some(root) => {
+            let schema = cli
+                .wiki_schema
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("schema/wiki-skill.md"));
+            (Some(root.clone()), Some(schema))
+        }
+        None => (None, None),
+    };
+
+    let config = GithubChannelConfig {
+        poll_interval: Duration::from_secs(DEFAULT_POLL_SECS),
+        dry_run,
+        wiki_root,
+        wiki_schema_path,
+        skill_dir: cli.skill_dir.clone(),
+        ..Default::default()
+    };
+    Ok(GithubChannel::new(
+        store, client, reasoner, broker, my_login, config,
+    ))
+}
+
+/// Pull *any* persisted github PAT from the keyring. We don't yet maintain a
+/// per-host index of github logins (Linux Secret Service can't enumerate
+/// without the account name), so the CLI accepts an explicit `--login` on
+/// every operation that needs the credentials. For `serve` / `poll-once` we
+/// honor a `AUGMENTAGENT_GITHUB_LOGIN` env override; otherwise the user must
+/// re-run `augmentagent github login` to (re)populate the slot under a known
+/// name.
+fn load_any_github_auth() -> Result<augmentagent_channel_github::GithubAuth> {
+    use augmentagent_channel_github::GithubAuth;
+    let login = std::env::var("AUGMENTAGENT_GITHUB_LOGIN").ok();
+    if let Some(name) = login {
+        return GithubAuth::load_for_user(&name)
+            .with_context(|| format!("load github auth for {name}"));
+    }
+    // Fallback: try `default` so single-machine deployments that exported
+    // `AUGMENTAGENT_GITHUB_LOGIN=` after `login` still boot. Without an
+    // override we can't enumerate keyring slots, so this is best-effort.
+    GithubAuth::load_for_user(augmentagent_auth::DEFAULT_ACCOUNT)
+        .with_context(|| "load github auth (set AUGMENTAGENT_GITHUB_LOGIN=<user>)".to_string())
+}
 
 // ---------------------------------------------------------------------------
 // Calendar (#82) — Phase 1 CLI helpers.

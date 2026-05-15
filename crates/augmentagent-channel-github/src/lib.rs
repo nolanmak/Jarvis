@@ -7,6 +7,11 @@ pub mod auth;
 pub mod channel;
 pub mod types;
 
+pub use api::{whoami, GithubApi, GithubClient, GithubError};
+pub use auth::{GithubAuth, KEYCHAIN_PLATFORM};
+pub use channel::{outbound_target, GithubChannel, GithubChannelConfig};
+pub use types::{is_github_email, ThreadLocator, ACCOUNT_PREFIX};
+
 /// Platform discriminator used in `Email::platform` and
 /// `channel_subscriptions.platform` rows.
 pub const PLATFORM: &str = "github";
