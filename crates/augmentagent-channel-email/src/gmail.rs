@@ -33,6 +33,31 @@ pub trait GmailApi: Send + Sync {
         limit: u32,
     ) -> Result<Vec<Email>, GmailError>;
 
+    /// Fetch sent-mail history for tone-mirroring backfill (#73).
+    ///
+    /// Wraps `in:sent` with an optional `after:<since_iso>` (YYYY/MM/DD)
+    /// clause and walks pages up to `max_total` messages. Implementations
+    /// SHOULD insert a small inter-page sleep to stay under Composio's
+    /// observed ~5 req/s rate limit; the default `ComposioClient` impl uses
+    /// 200ms per page.
+    ///
+    /// Default impl delegates to `fetch_with_query` so test fakes that
+    /// override only one method still work; `ComposioClient` overrides this
+    /// to lift the page cap from 10 → 25 (500 / 20).
+    async fn fetch_sent_history(
+        &self,
+        entity_id: &str,
+        since_iso: Option<&str>,
+        max_total: u32,
+    ) -> Result<Vec<Email>, GmailError> {
+        let mut q = String::from("in:sent");
+        if let Some(d) = since_iso {
+            q.push_str(" after:");
+            q.push_str(d);
+        }
+        self.fetch_with_query(entity_id, &q, max_total).await
+    }
+
     /// Create a reply draft. Returns the draft ID.
     async fn create_draft(
         &self,
@@ -143,7 +168,7 @@ fn is_transient_reqwest(e: &reqwest::Error) -> bool {
 
 /// Extract the bare email address from an RFC 5322 header-style string.
 /// `Name <x@y.com>` → `x@y.com`. Already-bare addresses pass through.
-fn extract_bare_email(raw: &str) -> String {
+pub(crate) fn extract_bare_email(raw: &str) -> String {
     if let (Some(open), Some(close)) = (raw.find('<'), raw.rfind('>')) {
         if open < close {
             return raw[open + 1..close].trim().to_string();
@@ -331,6 +356,71 @@ impl GmailApi for ComposioClient {
             }
         }
 
+        Ok(collected)
+    }
+
+    async fn fetch_sent_history(
+        &self,
+        entity_id: &str,
+        since_iso: Option<&str>,
+        max_total: u32,
+    ) -> Result<Vec<Email>, GmailError> {
+        // Same paginated loop as `fetch_with_query`, but with a higher page
+        // cap so the backfill caller can pull up to ~500 messages in one
+        // shot (25 pages × 20 per page). Inter-page sleep stays under the
+        // observed ~5 req/s ceiling on Composio's GMAIL_FETCH_EMAILS path.
+        const PAGE_SIZE: u32 = 20;
+        const MAX_PAGES: u32 = 25;
+
+        let mut query = String::from("in:sent");
+        if let Some(d) = since_iso {
+            query.push_str(" after:");
+            query.push_str(d);
+        }
+
+        let mut collected: Vec<Email> = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        for page in 0..MAX_PAGES {
+            let want = (max_total as usize).saturating_sub(collected.len());
+            if want == 0 {
+                break;
+            }
+            let this_page = (want as u32).min(PAGE_SIZE);
+
+            let mut args = serde_json::json!({
+                "query": &query,
+                "max_results": this_page,
+            });
+            if let Some(tok) = &page_token {
+                args["page_token"] = serde_json::Value::String(tok.clone());
+            }
+
+            let v = self.execute("GMAIL_FETCH_EMAILS", entity_id, args).await?;
+            let parsed: FetchResp =
+                serde_json::from_value(v).map_err(|e| GmailError::Decode(e.to_string()))?;
+
+            let page_emails: Vec<Email> = parsed
+                .data
+                .messages
+                .into_iter()
+                .filter_map(|m| m.into_email(entity_id))
+                .collect();
+
+            if page_emails.is_empty() && parsed.data.next_page_token.is_none() {
+                break;
+            }
+            collected.extend(page_emails);
+            page_token = parsed.data.next_page_token;
+            if page_token.is_none() {
+                break;
+            }
+            // Be polite to Composio between pages — observed limit is ~5 req/s.
+            // Skip the sleep on the last page to keep wallclock tight.
+            if page + 1 < MAX_PAGES {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
         Ok(collected)
     }
 

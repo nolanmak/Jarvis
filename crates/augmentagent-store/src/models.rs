@@ -173,6 +173,52 @@ pub struct ChannelSubscription {
     pub updated_at_ms: i64,
 }
 
+/// One row per `(scope_kind, scope_value, account_entity_id)` — the
+/// summarized voice profile injected into `draft_user_message` as a
+/// `<tone_profile>` block. See issue #73.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToneProfile {
+    pub id: String,
+    /// `global` | `domain` | `recipient`.
+    pub scope_kind: String,
+    /// `*` for global, `acme.com` for domain, `jeremy@acme.com` for recipient.
+    pub scope_value: String,
+    /// Per-account so distinct Gmail identities don't blend voices. `None`
+    /// means cross-account (only meaningful for `global`).
+    pub account_entity_id: Option<String>,
+    /// The Haiku-distilled descriptor (~120 tokens, JSON).
+    pub summary: String,
+    /// JSON array of `tone_examples.id` used in the last summarization.
+    pub exemplar_ids: String,
+    pub sample_count: i64,
+    /// Snapshot of `sample_count` at last refresh; refresh fires when the
+    /// delta crosses the staleness threshold (default 5).
+    pub sample_count_at_refresh: i64,
+    pub last_refreshed_at: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// One row per ingested sent-mail body (or per user-edit captured from a
+/// `Sent` action). Feeds the per-scope summarizer in #73.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToneExample {
+    pub id: String,
+    /// `sent_backfill` | `user_edit` | `approved_clean`.
+    pub source: String,
+    pub action_id: Option<String>,
+    pub message_id: Option<String>,
+    pub account_entity_id: String,
+    pub recipient_email: String,
+    pub recipient_domain: String,
+    pub subject: Option<String>,
+    pub body: String,
+    pub body_chars: i64,
+    pub sent_at_ms: i64,
+    pub ingested_at_ms: i64,
+    pub weight: f64,
+}
+
 /// One row in `rate_events`. Persisted by the RateGovernor (#83) on every
 /// outbound platform action — both the durable audit log and the source of
 /// truth for sliding-window cap math after restart.

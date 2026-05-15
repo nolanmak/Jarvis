@@ -1,0 +1,17 @@
+# Per-recipient tone-mirroring v1 (#73): nightly re-summarization sweep.
+#
+# Walks tone_profiles, recomputes any whose sample_count has crept past
+# the staleness threshold, and re-pins last_refreshed_at. Idempotent —
+# the next night picks up whatever this run skipped.
+#
+# Install: copy to ~/.config/systemd/user/ and `systemctl --user daemon-reload`.
+[Unit]
+Description=AugmentAgent tone-profile refresh
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/nolan-makatche/AugmentAgent/target/release/augmentagent tone refresh-stale --threshold 5
+Environment=AUGMENTAGENT_DB=/home/nolan-makatche/AugmentAgent/data.db
+StandardOutput=append:/home/nolan-makatche/.local/state/augmentagent/tone-refresh.log
+StandardError=append:/home/nolan-makatche/.local/state/augmentagent/tone-refresh.log
