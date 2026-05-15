@@ -24,6 +24,7 @@ augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-auth = { path = "../augmentagent-auth" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
 augmentagent-browser-client = { path = "../augmentagent-browser-client" }
+augmentagent-renderer-client = { path = "../augmentagent-renderer-client" }
 
 async-trait = { workspace = true }
 serenity = { workspace = true }
