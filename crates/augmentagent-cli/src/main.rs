@@ -164,6 +164,13 @@ enum Cmd {
         #[command(subcommand)]
         op: BrowserOp,
     },
+    /// RateGovernor (#83) audit + dump tooling. Reads `rate_events`,
+    /// `rate_halts`, and `rate_warmup`. Channels write to these tables
+    /// when they adopt the governor (sibling/feature PRs).
+    Ratelimit {
+        #[command(subcommand)]
+        op: RatelimitOp,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +673,35 @@ enum WikiOp {
     },
 }
 
+#[derive(Subcommand)]
+enum RatelimitOp {
+    /// Dump rate_events for one account in `[since, until]`. The artifact
+    /// you'd attach to a LinkedIn / X appeal. Defaults to the last 7 days
+    /// when `--since` is omitted.
+    Audit {
+        /// Account id (LinkedIn URN, X user id, IG handle). Required.
+        #[arg(long)]
+        account: String,
+        /// Optional platform filter (`instagram`, `linkedin`, `twitter`).
+        #[arg(long)]
+        platform: Option<String>,
+        /// ISO 8601 start. Default: now − 7 days.
+        #[arg(long)]
+        since: Option<String>,
+        /// ISO 8601 end. Default: now.
+        #[arg(long)]
+        until: Option<String>,
+        /// Emit JSON instead of a human table.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Print the active circuit-breaker halts (if any). Always JSON.
+    Halts,
+    /// Print the static cap-matrix (#83 §3) as JSON. Useful for verifying
+    /// what the daemon thinks the caps are without grepping source.
+    Caps,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
@@ -1026,7 +1062,114 @@ async fn main() -> Result<()> {
                 unimplemented!("see browser-client feature PR")
             }
         },
+        Cmd::Ratelimit { op } => match op {
+            RatelimitOp::Audit {
+                account,
+                platform,
+                since,
+                until,
+                json,
+            } => run_ratelimit_audit(store, account, platform, since, until, json),
+            RatelimitOp::Halts => run_ratelimit_halts(store),
+            RatelimitOp::Caps => run_ratelimit_caps(),
+        },
     }
+}
+
+fn parse_iso_or_now_offset(s: Option<String>, default_offset_ms: i64) -> Result<i64> {
+    match s {
+        Some(raw) => {
+            // Accept full RFC3339 ("2026-05-14T00:00:00Z") or just a date
+            // ("2026-05-14"); the latter is interpreted as UTC midnight.
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&raw) {
+                Ok(dt.timestamp_millis())
+            } else if let Ok(d) = chrono::NaiveDate::parse_from_str(&raw, "%Y-%m-%d") {
+                let dt = d.and_hms_opt(0, 0, 0).unwrap().and_utc();
+                Ok(dt.timestamp_millis())
+            } else {
+                anyhow::bail!("could not parse {raw:?} as ISO date or RFC3339 timestamp");
+            }
+        }
+        None => Ok(chrono::Utc::now().timestamp_millis() + default_offset_ms),
+    }
+}
+
+fn run_ratelimit_audit(
+    store: Arc<Store>,
+    account: String,
+    platform: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let since_ms = parse_iso_or_now_offset(since, -7 * 24 * 3600 * 1000)?;
+    let until_ms = parse_iso_or_now_offset(until, 0)?;
+    let rows = store
+        .rate_audit_query(&account, platform.as_deref(), since_ms, until_ms)
+        .context("rate_audit_query")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else if rows.is_empty() {
+        println!(
+            "no rate_events for account={account} platform={:?} in [{since_ms}, {until_ms}]",
+            platform
+        );
+    } else {
+        println!("{} rate_events:\n", rows.len());
+        println!(
+            "  {:<24}  {:<10}  {:<18}  {:<10}  {:<14}  {}",
+            "occurred_at_ms", "platform", "action", "status", "target", "cause"
+        );
+        for r in &rows {
+            let target = r.target_id.as_deref().unwrap_or("-");
+            println!(
+                "  {:<24}  {:<10}  {:<18}  {:<10}  {:<14}  {}",
+                r.occurred_at_ms, r.platform, r.action_kind, r.status, target, r.cause
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_ratelimit_halts(store: Arc<Store>) -> Result<()> {
+    use augmentagent_channel_core::governor::Platform;
+    let mut active = Vec::new();
+    for p in [
+        Platform::Instagram,
+        Platform::LinkedIn,
+        Platform::Twitter,
+        Platform::TikTok,
+        Platform::Bluesky,
+    ] {
+        if let Some(h) = store
+            .rate_halt_state(p.as_str())
+            .context("rate_halt_state")?
+        {
+            active.push(h);
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&active)?);
+    Ok(())
+}
+
+fn run_ratelimit_caps() -> Result<()> {
+    use augmentagent_channel_core::governor::RATE_TABLE;
+    let rows: Vec<_> = RATE_TABLE
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "platform": r.platform.as_str(),
+                "action": r.action.as_str(),
+                "day": r.day,
+                "hour": r.hour,
+                "burst_5m": r.burst_5m,
+                "min_gap_secs": r.min_gap.as_secs(),
+                "source_url": r.source_url,
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&rows)?);
+    Ok(())
 }
 
 async fn run_gmail_search(
