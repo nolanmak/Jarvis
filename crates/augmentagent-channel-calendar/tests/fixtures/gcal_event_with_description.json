@@ -1,0 +1,16 @@
+{
+  "id": "evt-with-desc",
+  "iCalUID": "evt-with-desc@google.com",
+  "status": "confirmed",
+  "summary": "Acme partnership review",
+  "description": "TOP SECRET\nZoom passcode: 12345\nNDA terms attached. Do not share.",
+  "location": "221B Baker Street, London NW1 6XE",
+  "start": { "dateTime": "2026-05-14T18:00:00Z" },
+  "end":   { "dateTime": "2026-05-14T19:00:00Z" },
+  "attendees": [
+    { "email": "me@x.com", "self": true, "responseStatus": "accepted" },
+    { "email": "ben@acme.com", "displayName": "Ben", "responseStatus": "accepted" },
+    { "email": "carol@acme.com", "displayName": "Carol", "responseStatus": "accepted" }
+  ],
+  "organizer": { "email": "me@x.com", "self": true }
+}
