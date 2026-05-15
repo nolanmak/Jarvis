@@ -16,6 +16,7 @@ tracing = { workspace = true }
 time = { workspace = true }
 serde = { workspace = true }
 serde_yaml_ng = "0.10"
+dashmap = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
