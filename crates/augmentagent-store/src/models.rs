@@ -295,3 +295,18 @@ pub struct SlackWorkspace {
     pub active: bool,
     pub created_at_ms: i64,
 }
+
+/// A connected Telegram bot (#74). One row per bot the user has registered
+/// via `augmentagent telegram-bot login`; the poller iterates active rows
+/// each tick, loads each one's keyring slot, and long-polls `getUpdates` per
+/// bot. `last_update_id` is the offset cursor handed to the next call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramBot {
+    pub id: String,
+    pub bot_id: i64,
+    pub bot_username: String,
+    pub owner_chat_id: i64,
+    pub last_update_id: i64,
+    pub active: bool,
+    pub created_at_ms: i64,
+}

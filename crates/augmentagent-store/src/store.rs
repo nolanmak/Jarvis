@@ -8,7 +8,8 @@ use uuid::Uuid;
 
 use crate::models::{
     Account, ActionRecord, ActionStatus, ChannelSubscription, Email, LearnedPattern, RateAuditRow,
-    RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, ToneExample, ToneProfile, TriageResult,
+    RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TelegramBot, ToneExample, ToneProfile,
+    TriageResult,
 };
 
 #[derive(Debug, Error)]
@@ -1409,6 +1410,140 @@ impl Store {
         Ok(())
     }
 
+    // --- telegram_bots (#74) ---
+
+    /// Insert a fresh `telegram_bots` row, or — if a row with this `bot_id`
+    /// already exists — update its `bot_username` / `owner_chat_id` and
+    /// re-activate it. `last_update_id` is preserved on update so a re-login
+    /// doesn't reset the long-poll cursor.
+    pub fn upsert_telegram_bot(
+        &self,
+        bot_id: i64,
+        bot_username: &str,
+        owner_chat_id: i64,
+    ) -> StoreResult<TelegramBot> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let existing: Option<String> = guard
+            .query_row(
+                "SELECT id FROM telegram_bots WHERE bot_id = ?1",
+                params![bot_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(id) => {
+                guard.execute(
+                    "UPDATE telegram_bots \
+                        SET bot_username = ?2, owner_chat_id = ?3, active = 1 \
+                      WHERE id = ?1",
+                    params![id, bot_username, owner_chat_id],
+                )?;
+            }
+            None => {
+                let id = Uuid::new_v4().to_string();
+                guard.execute(
+                    "INSERT INTO telegram_bots \
+                        (id, bot_id, bot_username, owner_chat_id, last_update_id, \
+                         active, created_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, 0, 1, ?5)",
+                    params![id, bot_id, bot_username, owner_chat_id, now],
+                )?;
+            }
+        };
+        drop(guard);
+        self.get_telegram_bot_by_id(bot_id)?
+            .ok_or_else(|| StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn list_active_telegram_bots(&self) -> StoreResult<Vec<TelegramBot>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, bot_id, bot_username, owner_chat_id, last_update_id, \
+                    active, created_at_ms \
+               FROM telegram_bots \
+              WHERE active = 1 \
+              ORDER BY created_at_ms ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_telegram_bot)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_telegram_bot_by_id(&self, bot_id: i64) -> StoreResult<Option<TelegramBot>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT id, bot_id, bot_username, owner_chat_id, last_update_id, \
+                        active, created_at_ms \
+                   FROM telegram_bots \
+                  WHERE bot_id = ?1",
+                params![bot_id],
+                row_to_telegram_bot,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn get_telegram_bot_by_username(
+        &self,
+        bot_username: &str,
+    ) -> StoreResult<Option<TelegramBot>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT id, bot_id, bot_username, owner_chat_id, last_update_id, \
+                        active, created_at_ms \
+                   FROM telegram_bots \
+                  WHERE bot_username = ?1 \
+                  ORDER BY created_at_ms DESC \
+                  LIMIT 1",
+                params![bot_username],
+                row_to_telegram_bot,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Bump the long-poll cursor. Called once per successful `getUpdates`
+    /// batch with the largest `update_id` returned in that batch.
+    pub fn update_telegram_bot_last_update_id(
+        &self,
+        bot_id: i64,
+        last_update_id: i64,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE telegram_bots \
+                SET last_update_id = ?2 \
+              WHERE bot_id = ?1 AND last_update_id < ?2",
+            params![bot_id, last_update_id],
+        )?;
+        Ok(())
+    }
+
+    /// Hard delete + soft-deactivate all subscriptions tied to this bot, so
+    /// the poll loop stops trying to read with credentials we just nuked.
+    pub fn delete_telegram_bot(&self, bot_id: i64) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let bot_id_str = bot_id.to_string();
+        guard.execute(
+            "UPDATE channel_subscriptions \
+                SET active = 0, updated_at_ms = ?2 \
+              WHERE platform = 'telegram' AND account_id = ?1",
+            params![bot_id_str, now],
+        )?;
+        guard.execute(
+            "DELETE FROM telegram_bots WHERE bot_id = ?1",
+            params![bot_id],
+        )?;
+        Ok(())
+    }
+
     // --- tone profiles & examples (issue #73) ---
 
     /// Insert one tone example. Returns the new row's `id` (uuid).
@@ -2116,6 +2251,18 @@ fn row_to_slack_workspace(r: &rusqlite::Row) -> rusqlite::Result<SlackWorkspace>
     })
 }
 
+fn row_to_telegram_bot(r: &rusqlite::Row) -> rusqlite::Result<TelegramBot> {
+    Ok(TelegramBot {
+        id: r.get(0)?,
+        bot_id: r.get(1)?,
+        bot_username: r.get(2)?,
+        owner_chat_id: r.get(3)?,
+        last_update_id: r.get(4)?,
+        active: r.get::<_, i64>(5)? != 0,
+        created_at_ms: r.get(6)?,
+    })
+}
+
 fn row_to_subscription(r: &rusqlite::Row) -> rusqlite::Result<ChannelSubscription> {
     let mode_str: String = r.get(4)?;
     let mode = SubscriptionMode::parse(&mode_str).ok_or_else(|| {
@@ -2804,6 +2951,45 @@ mod tests {
         // A zero-window query excludes everything.
         let none = s.list_recent_feedback(0).unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn telegram_bot_upsert_preserves_last_update_id_on_relogin() {
+        let (s, _f) = fresh_store();
+        let bot = s
+            .upsert_telegram_bot(99, "triage_bot", 5555)
+            .unwrap();
+        assert_eq!(bot.last_update_id, 0);
+        s.update_telegram_bot_last_update_id(99, 4242).unwrap();
+        // Re-login should not reset the cursor.
+        let bot2 = s
+            .upsert_telegram_bot(99, "triage_bot_renamed", 5555)
+            .unwrap();
+        assert_eq!(bot2.last_update_id, 4242);
+        assert_eq!(bot2.bot_username, "triage_bot_renamed");
+    }
+
+    #[test]
+    fn telegram_bot_update_last_update_id_is_monotonic() {
+        let (s, _f) = fresh_store();
+        s.upsert_telegram_bot(7, "b", 1).unwrap();
+        s.update_telegram_bot_last_update_id(7, 100).unwrap();
+        // A stale write (lower id) must not move the cursor backward.
+        s.update_telegram_bot_last_update_id(7, 50).unwrap();
+        let bot = s.get_telegram_bot_by_id(7).unwrap().unwrap();
+        assert_eq!(bot.last_update_id, 100);
+    }
+
+    #[test]
+    fn telegram_bot_delete_deactivates_subscriptions() {
+        let (s, _f) = fresh_store();
+        s.upsert_telegram_bot(7, "b", 1).unwrap();
+        s.upsert_subscription("telegram", "12345", "alice", SubscriptionMode::Priority, Some("7"))
+            .unwrap();
+        s.delete_telegram_bot(7).unwrap();
+        let subs = s.list_active_subscriptions("telegram").unwrap();
+        assert!(subs.is_empty());
+        assert!(s.get_telegram_bot_by_id(7).unwrap().is_none());
     }
 
     #[test]
