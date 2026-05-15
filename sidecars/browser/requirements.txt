@@ -1,0 +1,11 @@
+# AugmentAgent browser sidecar — pinned deps.
+#
+# playwright 1.49.x is the latest stable line as of 2026-05; pinned to a
+# minor so security patches still apply but DOM-capture API doesn't shift
+# under us.
+playwright==1.49.1
+#
+# browser-use 0.12.6 — DOM-capture O(n^2) fix + daemon orphaning fix +
+# MCP schema fix (see #75 §0 references). Verify before publish: if the
+# pin no longer resolves on PyPI, bump to current latest 0.12.x.
+browser-use==0.12.6

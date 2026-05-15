@@ -23,6 +23,7 @@ augmentagent-channel-calendar = { path = "../augmentagent-channel-calendar" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-auth = { path = "../augmentagent-auth" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
+augmentagent-browser-client = { path = "../augmentagent-browser-client" }
 
 async-trait = { workspace = true }
 serenity = { workspace = true }
