@@ -1,0 +1,23 @@
+{
+  "name": "augmentagent-renderer-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Remotion render sidecar for the AugmentAgent Rust daemon. NDJSON over a Unix socket; vertical 1080x1920 branded short-card composition.",
+  "scripts": {
+    "server": "node server.mjs",
+    "studio": "remotion studio src/index.ts",
+    "ensure-browser": "remotion browser ensure"
+  },
+  "dependencies": {
+    "@remotion/bundler": "4.0.462",
+    "@remotion/renderer": "4.0.462",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "remotion": "4.0.462"
+  },
+  "devDependencies": {
+    "@types/react": "19.1.0",
+    "typescript": "5.6.3"
+  }
+}

@@ -164,6 +164,21 @@ enum Cmd {
         #[command(subcommand)]
         op: BrowserOp,
     },
+    /// Render a vertical (1080x1920) branded short-card mp4 from JSON props
+    /// via the Remotion renderer sidecar (Phase 0 — see docs/REMOTION.md).
+    /// Manually triggerable; no scheduler/governor/posting wiring yet.
+    Render {
+        /// inputProps as a JSON string, or `@path` to read JSON from a file.
+        /// Shape: {title, body, accent?, durationSec}.
+        #[arg(long)]
+        props: String,
+        /// Output mp4 path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Video codec.
+        #[arg(long, default_value = "h264")]
+        codec: String,
+    },
     /// Per-recipient tone-mirroring (#73): backfill sent history, refresh
     /// per-scope voice profiles, and sweep stale rows on a schedule.
     Tone {
@@ -1254,6 +1269,7 @@ async fn main() -> Result<()> {
                 unimplemented!("cookie import deferred — see follow-up to #75")
             }
         },
+        Cmd::Render { props, out, codec } => run_render(props, out, codec).await,
         Cmd::Tone { op } => match op {
             ToneOp::Backfill { account, limit, since } => {
                 run_tone_backfill(store, account, limit, since).await
@@ -1674,6 +1690,61 @@ async fn run_browser_acceptance(out_path: PathBuf) -> Result<()> {
         );
         Err(anyhow::anyhow!("not logged in"))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Renderer sidecar CLI handler (Remotion Phase 0 — see docs/REMOTION.md).
+//
+// Manually triggerable: connect to the renderer sidecar, render the
+// ShortCard composition from JSON props, print the output path + bytes.
+// No scheduler / governor / posting wiring (later phases).
+// ---------------------------------------------------------------------------
+
+async fn run_render(props: String, out: PathBuf, codec: String) -> Result<()> {
+    use augmentagent_renderer_client::{default_socket_path, RendererClient};
+
+    // `--props` accepts an inline JSON string or `@path` to a JSON file.
+    let raw = if let Some(path) = props.strip_prefix('@') {
+        std::fs::read_to_string(path)
+            .with_context(|| format!("read props file {path}"))?
+    } else {
+        props
+    };
+    let props_json: serde_json::Value =
+        serde_json::from_str(raw.trim()).context("--props is not valid JSON")?;
+
+    let sock = default_socket_path();
+    println!("connecting to renderer sidecar at {}", sock.display());
+    let client = RendererClient::connect(&sock).await.with_context(|| {
+        format!(
+            "connect failed — is augmentagent-renderer.service running? socket: {}",
+            sock.display()
+        )
+    })?;
+
+    println!("ping...");
+    client.ping().await.context("ping failed")?;
+
+    println!(
+        "render -> {} (codec={codec})\nprops: {}",
+        out.display(),
+        serde_json::to_string(&props_json).unwrap_or_default()
+    );
+    let result = client
+        .render_with(
+            props_json,
+            &out,
+            &codec,
+            augmentagent_renderer_client::DEFAULT_RENDER_TIMEOUT_MS,
+        )
+        .await
+        .context("render failed")?;
+
+    println!(
+        "OK — {} ({} bytes, {} ms server-side)",
+        result.path, result.bytes, result.duration_ms
+    );
+    Ok(())
 }
 
 /// Resolve the user-supplied `--account` flag (email address OR Composio

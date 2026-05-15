@@ -1,0 +1,20 @@
+[Unit]
+Description=AugmentAgent Node renderer sidecar (Remotion)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nolan-makatche/AugmentAgent/sidecars/renderer
+Environment=NODE_ENV=production
+Environment=AUGMENTAGENT_RENDERER_SOCK=%t/augmentagent/renderer.sock
+ExecStartPre=/usr/bin/mkdir -p %t/augmentagent
+ExecStart=/usr/bin/node /home/nolan-makatche/AugmentAgent/sidecars/renderer/server.mjs
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+StandardOutput=append:%S/augmentagent/renderer.stdout.log
+StandardError=append:%S/augmentagent/renderer.stderr.log
+
+[Install]
+WantedBy=default.target
