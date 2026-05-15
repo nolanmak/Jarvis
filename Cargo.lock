@@ -535,11 +535,13 @@ dependencies = [
  "anyhow",
  "async-trait",
  "augmentagent-approval-discord",
+ "augmentagent-channel-calendar",
  "augmentagent-channel-core",
  "augmentagent-channel-discord-dm",
  "augmentagent-channel-email",
  "augmentagent-channel-linkedin",
  "augmentagent-channel-slack",
+ "augmentagent-channel-telegram-bot",
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",
@@ -603,6 +605,19 @@ dependencies = [
  "time",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "augmentagent-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "augmentagent-store",
+ "clap",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

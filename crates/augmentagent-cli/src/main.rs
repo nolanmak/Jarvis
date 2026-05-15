@@ -1067,16 +1067,41 @@ async fn main() -> Result<()> {
         // ----- wave-A foundation stubs --------------------------------
         // Each arm calls unimplemented! pointing at the relevant issue so
         // feature PRs know exactly which arm to fill.
-        Cmd::TelegramBot { op } => match op {
-            TelegramBotOp::Login { .. }
-            | TelegramBotOp::Bots { .. }
-            | TelegramBotOp::RemoveBot { .. }
-            | TelegramBotOp::ListChats { .. }
-            | TelegramBotOp::Subscribe { .. }
-            | TelegramBotOp::Subscriptions { .. }
-            | TelegramBotOp::Unsubscribe { .. }
-            | TelegramBotOp::PollOnce { .. } => {
-                unimplemented!("see issue #74 (telegram-bot feature PR)")
+        Cmd::TelegramBot { ref op } => match op {
+            TelegramBotOp::Login { token } => {
+                run_telegram_bot_login(store, token.clone()).await
+            }
+            TelegramBotOp::Bots { json } => run_telegram_bot_bots(store, *json),
+            TelegramBotOp::RemoveBot { bot_username } => {
+                run_telegram_bot_remove(store, bot_username.clone())
+            }
+            TelegramBotOp::ListChats { bot_username, json } => {
+                run_telegram_bot_list_chats(store, bot_username.clone(), *json)
+            }
+            TelegramBotOp::Subscribe {
+                chat_id,
+                mode,
+                name,
+                bot_username,
+            } => run_telegram_bot_subscribe(
+                store,
+                chat_id.clone(),
+                mode.clone(),
+                name.clone(),
+                bot_username.clone(),
+            ),
+            TelegramBotOp::Subscriptions { json } => {
+                run_telegram_bot_subscriptions(store, *json)
+            }
+            TelegramBotOp::Unsubscribe { id } => {
+                run_telegram_bot_unsubscribe(store, id.clone())
+            }
+            TelegramBotOp::PollOnce { dry_run } => {
+                let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
+                let ch = build_telegram_bot_channel(&cli, store, broker, *dry_run)?;
+                let out = ch.poll_once().await?;
+                println!("{out:#?}");
+                Ok(())
             }
         },
         Cmd::Whatsapp { op } => match op {
@@ -1862,6 +1887,10 @@ struct ReplyApprover {
     /// Slack disabled for this run (no workspaces loaded). Slack-tagged
     /// actions whose `team_id` isn't in the map surface as `Failed`.
     slack: std::collections::HashMap<String, Arc<augmentagent_channel_slack::SlackClient>>,
+    /// Per-bot Telegram clients keyed by numeric `bot_id`. Empty map =
+    /// Telegram disabled for this run. Telegram-tagged actions whose
+    /// `bot_id` isn't in the map surface as `Failed`.
+    telegram: std::collections::HashMap<i64, Arc<augmentagent_channel_telegram_bot::TelegramBotClient>>,
     reasoner: Arc<ClaudeCliReasoner>,
     draft_skill: String,
     wiki_root: Option<PathBuf>,
@@ -2099,6 +2128,150 @@ impl ReplyApprover {
         ApprovalActionOutcome::Skipped
     }
 
+    async fn approve_telegram(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        let Some(client) = self.resolve_telegram_client(&action.email) else {
+            return ApprovalActionOutcome::Failed {
+                message: "Telegram bot not available; reconnect via `augmentagent telegram-bot login`".into(),
+            };
+        };
+        // `thread_id` carries the chat_id (set by `message_to_email`).
+        let Some(chat_id) = action
+            .email
+            .thread_id
+            .as_deref()
+            .and_then(|s| s.parse::<i64>().ok())
+        else {
+            return ApprovalActionOutcome::Failed {
+                message: "no chat_id on email; cannot send".into(),
+            };
+        };
+        let Some(body) = action.action.draft_body.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no draft body on action; cannot send".into(),
+            };
+        };
+        // `message_id` shape is "tg:<chat>:<msg_id>" — use it as the
+        // reply_to target so the bot's response is threaded under the
+        // original message in Telegram's UI.
+        let reply_to: Option<i64> = action
+            .email
+            .message_id
+            .strip_prefix("tg:")
+            .and_then(|s| s.rsplit_once(':'))
+            .and_then(|(_chat, mid)| mid.parse::<i64>().ok());
+        match client.send_message(chat_id, body, reply_to).await {
+            Ok(sent) => {
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Sent,
+                    Some(body),
+                    None,
+                );
+                let _ = self
+                    .store
+                    .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                tracing::info!(
+                    action_id,
+                    sent_message_id = sent.message_id,
+                    "telegram reply sent via approval handler"
+                );
+                ApprovalActionOutcome::Approved
+            }
+            Err(e) => {
+                let msg = format!("telegram send_message: {e}");
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                ApprovalActionOutcome::Failed { message: msg }
+            }
+        }
+    }
+
+    async fn revise_telegram(
+        &self,
+        action_id: &str,
+        feedback: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        // Telegram has no server-side draft — just regenerate locally and
+        // bounce the action row back to Pending so the broker re-renders.
+        let previous_draft = action.action.draft_body.clone().unwrap_or_default();
+        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
+        let prompt = augmentagent_channel_core::prompt::redraft_message(
+            &action.email,
+            &previous_draft,
+            feedback,
+        );
+        let redraft = match self.reasoner.call(&opts, &prompt).await {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("redraft call failed: {e}"),
+                };
+            }
+        };
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Pending,
+            Some(&redraft),
+            None,
+        );
+        tracing::info!(action_id, "telegram revise: new draft persisted");
+        ApprovalActionOutcome::Revised {
+            email: action.email,
+            draft: redraft,
+        }
+    }
+
+    fn skip_telegram(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Rejected,
+            None,
+            Some("skipped by approver"),
+        );
+        let _ = self
+            .store
+            .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+        ApprovalActionOutcome::Skipped
+    }
+
+    /// Resolve the right `TelegramBotClient` for this action.
+    /// 1. Parse `bot_id` out of `email.account_entity_id`
+    ///    (`telegram:bot:<bot_id>`).
+    /// 2. If only one bot is loaded, use it (back-compat for rows lacking
+    ///    a `bot:` tag).
+    fn resolve_telegram_client(
+        &self,
+        email: &augmentagent_store::Email,
+    ) -> Option<Arc<augmentagent_channel_telegram_bot::TelegramBotClient>> {
+        let bot_id = email
+            .account_entity_id
+            .as_deref()
+            .and_then(augmentagent_channel_telegram_bot::extract_bot_id);
+        if let Some(bid) = bot_id {
+            if let Some(c) = self.telegram.get(&bid) {
+                return Some(Arc::clone(c));
+            }
+            return None;
+        }
+        if self.telegram.len() == 1 {
+            return self.telegram.values().next().cloned();
+        }
+        None
+    }
+
     /// Resolve the right SlackClient for this action. Priority:
     /// 1. Parse `team_id` out of `email.account_entity_id` ("slack:team:TXX").
     /// 2. If only one workspace is loaded, use it (back-compat for legacy rows).
@@ -2271,6 +2444,9 @@ impl ReplyApprover {
         if action.email.platform == "slack" {
             return self.approve_slack(action_id, action).await;
         }
+        if action.email.platform == "telegram" {
+            return self.approve_telegram(action_id, action).await;
+        }
         if is_linkedin_email(&action.email) {
             return self.approve_linkedin(action_id, action).await;
         }
@@ -2333,6 +2509,9 @@ impl ReplyApprover {
         if action.email.platform == "slack" {
             return self.skip_slack(action_id, action);
         }
+        if action.email.platform == "telegram" {
+            return self.skip_telegram(action_id, action);
+        }
         if is_linkedin_email(&action.email) {
             return self.skip_linkedin(action_id, action);
         }
@@ -2371,6 +2550,9 @@ impl ReplyApprover {
         }
         if action.email.platform == "slack" {
             return self.revise_slack(action_id, feedback, action).await;
+        }
+        if action.email.platform == "telegram" {
+            return self.revise_telegram(action_id, feedback, action).await;
         }
         if is_linkedin_email(&action.email) {
             return self.revise_linkedin(action_id, feedback, action).await;
@@ -2503,6 +2685,7 @@ async fn build_broker(
 
     let discord = load_discord_client();
     let slack = load_slack_clients(&store);
+    let telegram = load_telegram_bot_clients(&store);
     let store_for_broker = Arc::clone(&store);
     let approver = Arc::new(ReplyApprover {
         store,
@@ -2510,6 +2693,7 @@ async fn build_broker(
         linkedin,
         discord,
         slack,
+        telegram,
         reasoner: Arc::clone(&reasoner),
         draft_skill,
         wiki_root: cli.wiki_dir.clone(),
@@ -3412,6 +3596,317 @@ fn load_single_slack_client(
     }
     warn!("multiple slack workspaces configured; pass --team-id to disambiguate");
     None
+}
+
+// ---------------------------------------------------------------------------
+// Telegram-bot CLI handlers (#74)
+// ---------------------------------------------------------------------------
+
+/// `telegram-bot login --token …` — validates the token via getMe, persists
+/// to keychain, and writes/updates the `telegram_bots` row.
+async fn run_telegram_bot_login(store: Arc<Store>, token: String) -> Result<()> {
+    use augmentagent_channel_telegram_bot::{TelegramBotAuth, TelegramBotClient};
+    let token = token.trim().to_string();
+    if !token.contains(':') {
+        anyhow::bail!("token doesn't look like a BotFather token (`<id>:<secret>`)");
+    }
+    // Probe getMe before persisting so a fat-fingered token surfaces now,
+    // not on first poll.
+    let probe = TelegramBotClient::new(token.clone()).context("build telegram bot client")?;
+    let me = probe.get_me().await.context("getMe probe failed (token invalid?)")?;
+    if me.username.is_empty() {
+        anyhow::bail!("getMe returned an empty username — refusing to persist");
+    }
+    // owner_chat_id seed: read from env so `telegram-bot login` works
+    // headless. The user resolves the value once via @userinfobot in
+    // Telegram and passes it as `AUGMENTAGENT_TELEGRAM_OWNER_CHAT_ID`.
+    let owner_chat_id: i64 = std::env::var("AUGMENTAGENT_TELEGRAM_OWNER_CHAT_ID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if owner_chat_id == 0 {
+        warn!(
+            "AUGMENTAGENT_TELEGRAM_OWNER_CHAT_ID not set — owner-DM auto-subscribe disabled. \
+             Set it to your numeric Telegram user id (DM @userinfobot) and re-run login."
+        );
+    }
+    let auth = TelegramBotAuth {
+        bot_token: token,
+        bot_username: me.username.clone(),
+        bot_id: me.id,
+        owner_chat_id: owner_chat_id.max(1),
+    };
+    auth.save_to_keychain().context("save telegram bot auth to keychain")?;
+    // Round-trip read so silent keychain failures (Linux Secret Service
+    // unavailable) surface here.
+    augmentagent_channel_telegram_bot::TelegramBotAuth::load_from_keychain(&auth.bot_username)
+        .context("keychain round-trip after save failed")?;
+    store
+        .upsert_telegram_bot(auth.bot_id, &auth.bot_username, auth.owner_chat_id)
+        .context("upsert telegram_bots row")?;
+    println!(
+        "telegram bot saved to keychain (augmentagent/telegram-bot/{})\nbot:           @{} (id {})\nowner_chat_id: {}",
+        auth.bot_username, auth.bot_username, auth.bot_id, auth.owner_chat_id
+    );
+    Ok(())
+}
+
+fn run_telegram_bot_bots(store: Arc<Store>, json: bool) -> Result<()> {
+    let bots = store.list_active_telegram_bots().context("list bots")?;
+    if json {
+        println!("{}", serde_json::to_string(&bots)?);
+    } else {
+        println!("{} active telegram bot(s)\n", bots.len());
+        for b in &bots {
+            println!(
+                "  @{}  id={}  owner_chat_id={}  last_update_id={}",
+                b.bot_username, b.bot_id, b.owner_chat_id, b.last_update_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_telegram_bot_remove(store: Arc<Store>, bot_username: String) -> Result<()> {
+    use augmentagent_channel_telegram_bot::TelegramBotAuth;
+    let row = store
+        .get_telegram_bot_by_username(&bot_username)
+        .context("look up bot")?
+        .ok_or_else(|| anyhow::anyhow!("no telegram bot row for @{bot_username}"))?;
+    // Best-effort keychain delete — proceed even if the slot is already gone.
+    if let Err(e) = TelegramBotAuth::delete_from_keychain(&bot_username) {
+        warn!(bot_username, "telegram bot keychain delete failed: {e}");
+    }
+    store.delete_telegram_bot(row.bot_id).context("delete bot row")?;
+    println!("telegram bot @{bot_username} removed (subscriptions deactivated)");
+    Ok(())
+}
+
+fn run_telegram_bot_list_chats(
+    store: Arc<Store>,
+    bot_username: Option<String>,
+    json: bool,
+) -> Result<()> {
+    // Bot API exposes no `getDialogs`; we surface the union of (a) explicit
+    // subscriptions and (b) the bot's own owner_chat_id. Production clients
+    // should prefer the dashboard which mines `emails` for ad-hoc chat ids.
+    let bots = match bot_username.as_deref() {
+        Some(u) => store
+            .get_telegram_bot_by_username(u)?
+            .map(|b| vec![b])
+            .unwrap_or_default(),
+        None => store.list_active_telegram_bots()?,
+    };
+    let subs = store.list_active_subscriptions("telegram")?;
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for b in &bots {
+        rows.push(serde_json::json!({
+            "kind": "owner_dm",
+            "bot_username": b.bot_username,
+            "bot_id": b.bot_id,
+            "chat_id": b.owner_chat_id,
+            "label": format!("DM with owner ({})", b.owner_chat_id),
+        }));
+    }
+    for s in &subs {
+        if let Some(u) = bot_username.as_deref() {
+            // Filter to subs tied to this bot's id.
+            let matches = bots
+                .iter()
+                .any(|b| b.bot_username == u && Some(b.bot_id.to_string()) == s.account_id);
+            if !matches {
+                continue;
+            }
+        }
+        rows.push(serde_json::json!({
+            "kind": "subscription",
+            "subscription_id": s.id,
+            "chat_id": s.channel_id,
+            "label": s.display_name,
+            "mode": s.mode.as_str(),
+            "account_id": s.account_id,
+        }));
+    }
+    if json {
+        println!("{}", serde_json::to_string(&rows)?);
+    } else {
+        println!("{} known chat row(s)\n", rows.len());
+        for r in &rows {
+            println!("  {}", r);
+        }
+    }
+    Ok(())
+}
+
+fn run_telegram_bot_subscribe(
+    store: Arc<Store>,
+    chat_id: String,
+    mode: String,
+    name: Option<String>,
+    bot_username: Option<String>,
+) -> Result<()> {
+    use augmentagent_store::SubscriptionMode;
+    let parsed = SubscriptionMode::parse(&mode)
+        .ok_or_else(|| anyhow::anyhow!("invalid mode: {mode}"))?;
+    // Resolve account_id (= bot_id) from --bot-username, or from the sole
+    // configured bot when omitted; bail if there are multiple bots and the
+    // user didn't disambiguate.
+    let resolved_bot_id = match bot_username {
+        Some(u) => store
+            .get_telegram_bot_by_username(&u)?
+            .ok_or_else(|| anyhow::anyhow!("no telegram bot for @{u}"))?
+            .bot_id,
+        None => {
+            let bots = store
+                .list_active_telegram_bots()
+                .context("list telegram bots")?;
+            match bots.as_slice() {
+                [b] => b.bot_id,
+                [] => anyhow::bail!(
+                    "no telegram bots connected — run `augmentagent telegram-bot login --token …`"
+                ),
+                _ => anyhow::bail!(
+                    "multiple telegram bots connected — pass --bot-username @<name>"
+                ),
+            }
+        }
+    };
+    let display = name.unwrap_or_else(|| chat_id.clone());
+    let sub = store
+        .upsert_subscription(
+            augmentagent_channel_telegram_bot::PLATFORM,
+            &chat_id,
+            &display,
+            parsed,
+            Some(&resolved_bot_id.to_string()),
+        )
+        .context("upsert subscription")?;
+    println!(
+        "subscription id={} platform={} chat_id={} mode={} name={} account_id={}",
+        sub.id,
+        sub.platform,
+        sub.channel_id,
+        sub.mode.as_str(),
+        sub.display_name,
+        resolved_bot_id,
+    );
+    Ok(())
+}
+
+fn run_telegram_bot_subscriptions(store: Arc<Store>, json: bool) -> Result<()> {
+    let subs = store
+        .list_active_subscriptions(augmentagent_channel_telegram_bot::PLATFORM)
+        .context("list subscriptions")?;
+    if json {
+        println!("{}", serde_json::to_string(&subs)?);
+    } else {
+        println!("{} active telegram subscriptions\n", subs.len());
+        for s in &subs {
+            println!(
+                "  {}  mode={}  chat_id={}  bot_id={:?}  name={}",
+                s.id,
+                s.mode.as_str(),
+                s.channel_id,
+                s.account_id,
+                s.display_name,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_telegram_bot_unsubscribe(store: Arc<Store>, id: String) -> Result<()> {
+    store
+        .delete_subscription(&id)
+        .context("delete subscription")?;
+    println!("subscription {id} deactivated");
+    Ok(())
+}
+
+fn build_telegram_bot_channel(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<augmentagent_channel_telegram_bot::TelegramBotChannel<ClaudeCliReasoner>> {
+    use augmentagent_channel_telegram_bot::{TelegramBotChannel, TelegramBotChannelConfig};
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+
+    let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
+        Some(root) => {
+            let schema = cli
+                .wiki_schema
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("schema/wiki-skill.md"));
+            (Some(root.clone()), Some(schema))
+        }
+        None => (None, None),
+    };
+    let identity_index = wiki_root.as_ref().and_then(|root| {
+        let layout = augmentagent_wiki::WikiLayout::new(root.clone());
+        augmentagent_wiki::IdentityIndex::build(&layout)
+            .ok()
+            .map(Arc::new)
+    });
+
+    let config = TelegramBotChannelConfig {
+        poll_interval: Duration::from_secs(
+            augmentagent_channel_telegram_bot::channel::DEFAULT_POLL_SECS,
+        ),
+        dry_run,
+        wiki_root,
+        wiki_schema_path,
+        skill_dir: PathBuf::from("skills/telegram-triage"),
+        // PollOnce in dry-run mode should never block on long-poll — short
+        // poll lets the CLI exit cleanly even when the inbox is empty.
+        long_poll_secs: if dry_run { 0 } else { augmentagent_channel_telegram_bot::api::DEFAULT_LONG_POLL_SECS },
+    };
+    Ok(TelegramBotChannel::new(
+        store,
+        reasoner,
+        broker,
+        config,
+        identity_index,
+    ))
+}
+
+/// Build the per-bot Telegram client map consumed by `ReplyApprover`.
+/// Mirrors `load_slack_clients` — loads every active `telegram_bots` row's
+/// keychain entry and yields a `bot_id → Arc<TelegramBotClient>` map.
+fn load_telegram_bot_clients(
+    store: &Store,
+) -> std::collections::HashMap<i64, Arc<augmentagent_channel_telegram_bot::TelegramBotClient>> {
+    use augmentagent_channel_telegram_bot::{TelegramBotAuth, TelegramBotClient};
+    let mut map = std::collections::HashMap::new();
+    let bots = match store.list_active_telegram_bots() {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("list_active_telegram_bots failed: {e:#}");
+            return map;
+        }
+    };
+    if bots.is_empty() {
+        info!("no telegram bots configured; telegram outbound disabled this run");
+        return map;
+    }
+    for bot in bots {
+        match TelegramBotAuth::load_with_file_fallback(&bot.bot_username) {
+            Ok(auth) => match TelegramBotClient::new(auth.bot_token) {
+                Ok(c) => {
+                    map.insert(bot.bot_id, Arc::new(c));
+                }
+                Err(e) => warn!(
+                    bot_username = %bot.bot_username,
+                    "telegram client build failed: {e}"
+                ),
+            },
+            Err(e) => warn!(
+                bot_username = %bot.bot_username,
+                "telegram auth load failed: {e}"
+            ),
+        }
+    }
+    map
 }
 
 /// Compile-fences to prove prefix constant is referenced (silence dead-code
