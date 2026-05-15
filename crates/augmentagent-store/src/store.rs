@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::models::{
     Account, ActionRecord, ActionStatus, ChannelSubscription, Email, LearnedPattern, RateAuditRow,
-    RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TriageResult,
+    RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, ToneExample, ToneProfile, TriageResult,
 };
 
 #[derive(Debug, Error)]
@@ -1409,6 +1409,83 @@ impl Store {
         Ok(())
     }
 
+    // --- tone profiles & examples (issue #73) ---
+
+    /// Insert one tone example. Returns the new row's `id` (uuid).
+    ///
+    /// All filtering — empty body, too short, no-reply recipient — is the
+    /// caller's responsibility (see `tone::should_keep_for_tone` in
+    /// `augmentagent-channel-email`). This helper is a dumb writer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_tone_example(
+        &self,
+        source: &str,
+        action_id: Option<&str>,
+        message_id: Option<&str>,
+        account_entity_id: &str,
+        recipient_email: &str,
+        recipient_domain: &str,
+        subject: Option<&str>,
+        body: &str,
+        sent_at_ms: i64,
+        weight: f64,
+    ) -> StoreResult<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let body_chars = body.chars().count() as i64;
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO tone_examples \
+                (id, source, action_id, message_id, account_entity_id, \
+                 recipient_email, recipient_domain, subject, body, body_chars, \
+                 sent_at_ms, ingested_at_ms, weight) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                id,
+                source,
+                action_id,
+                message_id,
+                account_entity_id,
+                recipient_email,
+                recipient_domain,
+                subject,
+                body,
+                body_chars,
+                sent_at_ms,
+                now,
+                weight,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Look up a tone profile by `(scope_kind, scope_value, account_entity_id)`.
+    /// `account_entity_id = None` matches the `NULL` cross-account row used
+    /// for the global scope when no per-account split is needed.
+    pub fn get_tone_profile(
+        &self,
+        scope_kind: &str,
+        scope_value: &str,
+        account_entity_id: Option<&str>,
+    ) -> StoreResult<Option<ToneProfile>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        // `IS` is NULL-safe (`= NULL` would never match), matching the same
+        // pattern `upsert_subscription` uses for the optional account_id key.
+        let row = guard
+            .query_row(
+                "SELECT id, scope_kind, scope_value, account_entity_id, summary, \
+                        exemplar_ids, sample_count, sample_count_at_refresh, \
+                        last_refreshed_at, created_at_ms, updated_at_ms \
+                   FROM tone_profiles \
+                  WHERE scope_kind = ?1 AND scope_value = ?2 \
+                    AND account_entity_id IS ?3",
+                params![scope_kind, scope_value, account_entity_id],
+                row_to_tone_profile,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     // -----------------------------------------------------------------
     // #83 — RateGovernor helpers (rate_events / rate_halts / rate_warmup).
     //
@@ -1532,6 +1609,262 @@ impl Store {
             )
             .optional()?;
         Ok(row)
+    }
+
+    /// Upsert a tone profile keyed on `(scope_kind, scope_value, account_entity_id)`.
+    ///
+    /// On insert: stores all fields and stamps timestamps.
+    /// On update: refreshes summary/exemplar_ids/sample_count plus the
+    /// `sample_count_at_refresh` snapshot so the staleness predicate
+    /// (`sample_count - sample_count_at_refresh >= threshold`) resets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_tone_profile(
+        &self,
+        scope_kind: &str,
+        scope_value: &str,
+        account_entity_id: Option<&str>,
+        summary: &str,
+        exemplar_ids: &str,
+        sample_count: i64,
+    ) -> StoreResult<ToneProfile> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let existing: Option<String> = guard
+            .query_row(
+                "SELECT id FROM tone_profiles \
+                 WHERE scope_kind = ?1 AND scope_value = ?2 \
+                   AND account_entity_id IS ?3",
+                params![scope_kind, scope_value, account_entity_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(id) => {
+                guard.execute(
+                    "UPDATE tone_profiles \
+                        SET summary = ?2, exemplar_ids = ?3, sample_count = ?4, \
+                            sample_count_at_refresh = ?4, last_refreshed_at = ?5, \
+                            updated_at_ms = ?5 \
+                      WHERE id = ?1",
+                    params![id, summary, exemplar_ids, sample_count, now],
+                )?;
+            }
+            None => {
+                let id = Uuid::new_v4().to_string();
+                guard.execute(
+                    "INSERT INTO tone_profiles \
+                        (id, scope_kind, scope_value, account_entity_id, summary, \
+                         exemplar_ids, sample_count, sample_count_at_refresh, \
+                         last_refreshed_at, created_at_ms, updated_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?8, ?8)",
+                    params![
+                        id,
+                        scope_kind,
+                        scope_value,
+                        account_entity_id,
+                        summary,
+                        exemplar_ids,
+                        sample_count,
+                        now,
+                    ],
+                )?;
+            }
+        }
+        drop(guard);
+        self.get_tone_profile(scope_kind, scope_value, account_entity_id)?
+            .ok_or_else(|| StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    /// Capture the post-edit body of a `Sent` action as a tone example.
+    ///
+    /// This is the gold-standard signal: the user's voice corrected on top of
+    /// the model's draft. Called from the email channel adapter right after
+    /// `send_draft` succeeds. Source is `user_edit`, weight=1.5 to bias the
+    /// summarizer toward these over backfilled history. No-op (Ok) if the
+    /// action doesn't exist or is missing `draftBody`.
+    pub fn record_user_edit_as_tone_example(&self, action_id: &str) -> StoreResult<Option<String>> {
+        let row: Option<(
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        )>;
+        {
+            let guard = self.conn.lock().expect("store mutex poisoned");
+            row = guard
+                .query_row(
+                    "SELECT a.draftBody, a.fromEmail, a.threadId, a.messageId, a.subject, \
+                            e.body, e.accountEntityId, e.firstSeenAt \
+                       FROM actions a \
+                       LEFT JOIN emails e ON a.messageId = e.messageId \
+                      WHERE a.id = ?1 AND a.status = 'sent'",
+                    params![action_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<String>>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                            r.get::<_, Option<i64>>(7)?,
+                        ))
+                    },
+                )
+                .optional()?;
+        }
+        let Some((
+            draft_body,
+            from_email,
+            _thread_id,
+            message_id,
+            subject,
+            _orig_body,
+            account_entity_id,
+            received_at_ms,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let Some(body) = draft_body.filter(|b| !b.trim().is_empty()) else {
+            return Ok(None);
+        };
+        let Some(account) = account_entity_id else {
+            // Fallback for actions without account context — skip silently;
+            // the per-account scoping invariant on tone_examples is intentional.
+            return Ok(None);
+        };
+        // Recipient is the row we replied TO. `actions.fromEmail` is the
+        // sender of the inbound mail; that IS the address we just replied to.
+        let recipient_email = bare_lower(&from_email);
+        let recipient_domain = recipient_email
+            .split_once('@')
+            .map(|(_, d)| d.to_string())
+            .unwrap_or_default();
+        if recipient_email.is_empty() || recipient_domain.is_empty() {
+            return Ok(None);
+        }
+        let sent_at_ms = received_at_ms.unwrap_or_else(now_millis);
+        let id = self.insert_tone_example(
+            "user_edit",
+            Some(action_id),
+            Some(&message_id),
+            &account,
+            &recipient_email,
+            &recipient_domain,
+            Some(&subject),
+            &body,
+            sent_at_ms,
+            1.5,
+        )?;
+        Ok(Some(id))
+    }
+
+    /// Pull the most-recent N example bodies for a scope, oldest→newest.
+    /// Used by the summarizer to assemble the corpus prompt.
+    pub fn recent_tone_examples(
+        &self,
+        scope_kind: &str,
+        scope_value: &str,
+        account_entity_id: Option<&str>,
+        limit: i64,
+    ) -> StoreResult<Vec<ToneExample>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        // Branch on scope_kind to use the right index. All three queries
+        // return the same column order so they share `row_to_tone_example`.
+        let sql = match scope_kind {
+            "recipient" => {
+                "SELECT id, source, action_id, message_id, account_entity_id, \
+                        recipient_email, recipient_domain, subject, body, body_chars, \
+                        sent_at_ms, ingested_at_ms, weight \
+                   FROM tone_examples \
+                  WHERE recipient_email = ?1 AND account_entity_id IS ?2 \
+                  ORDER BY sent_at_ms DESC LIMIT ?3"
+            }
+            "domain" => {
+                "SELECT id, source, action_id, message_id, account_entity_id, \
+                        recipient_email, recipient_domain, subject, body, body_chars, \
+                        sent_at_ms, ingested_at_ms, weight \
+                   FROM tone_examples \
+                  WHERE recipient_domain = ?1 AND account_entity_id IS ?2 \
+                  ORDER BY sent_at_ms DESC LIMIT ?3"
+            }
+            // global / anything else: filter only by account.
+            _ => {
+                "SELECT id, source, action_id, message_id, account_entity_id, \
+                        recipient_email, recipient_domain, subject, body, body_chars, \
+                        sent_at_ms, ingested_at_ms, weight \
+                   FROM tone_examples \
+                  WHERE account_entity_id IS ?2 \
+                  ORDER BY sent_at_ms DESC LIMIT ?3"
+            }
+        };
+        let mut stmt = guard.prepare(sql)?;
+        let rows = stmt.query_map(
+            params![scope_value, account_entity_id, limit],
+            row_to_tone_example,
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// List every tone profile, ordered by `last_refreshed_at` ascending so
+    /// the staleness scan in `tone refresh-stale` walks the oldest first.
+    pub fn list_tone_profiles(&self) -> StoreResult<Vec<ToneProfile>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, scope_kind, scope_value, account_entity_id, summary, \
+                    exemplar_ids, sample_count, sample_count_at_refresh, \
+                    last_refreshed_at, created_at_ms, updated_at_ms \
+               FROM tone_profiles \
+              ORDER BY last_refreshed_at ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_tone_profile)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Count of tone_examples rows currently keyed against a scope. Used by
+    /// the staleness predicate to refresh `sample_count` to ground truth
+    /// before comparing against the snapshot.
+    pub fn count_tone_examples(
+        &self,
+        scope_kind: &str,
+        scope_value: &str,
+        account_entity_id: Option<&str>,
+    ) -> StoreResult<i64> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = match scope_kind {
+            "recipient" => guard.query_row(
+                "SELECT COUNT(*) FROM tone_examples \
+                  WHERE recipient_email = ?1 AND account_entity_id IS ?2",
+                params![scope_value, account_entity_id],
+                |r| r.get(0),
+            )?,
+            "domain" => guard.query_row(
+                "SELECT COUNT(*) FROM tone_examples \
+                  WHERE recipient_domain = ?1 AND account_entity_id IS ?2",
+                params![scope_value, account_entity_id],
+                |r| r.get(0),
+            )?,
+            _ => guard.query_row(
+                "SELECT COUNT(*) FROM tone_examples WHERE account_entity_id IS ?1",
+                params![account_entity_id],
+                |r| r.get(0),
+            )?,
+        };
+        Ok(n)
     }
 
     /// Upsert a halt for `platform`. Replaces any existing row — `permit()`
@@ -1721,6 +2054,53 @@ impl Store {
         )?;
         Ok(n)
     }
+}
+
+fn row_to_tone_profile(r: &rusqlite::Row) -> rusqlite::Result<ToneProfile> {
+    Ok(ToneProfile {
+        id: r.get(0)?,
+        scope_kind: r.get(1)?,
+        scope_value: r.get(2)?,
+        account_entity_id: r.get::<_, Option<String>>(3)?,
+        summary: r.get(4)?,
+        exemplar_ids: r.get(5)?,
+        sample_count: r.get(6)?,
+        sample_count_at_refresh: r.get(7)?,
+        last_refreshed_at: r.get(8)?,
+        created_at_ms: r.get(9)?,
+        updated_at_ms: r.get(10)?,
+    })
+}
+
+fn row_to_tone_example(r: &rusqlite::Row) -> rusqlite::Result<ToneExample> {
+    Ok(ToneExample {
+        id: r.get(0)?,
+        source: r.get(1)?,
+        action_id: r.get::<_, Option<String>>(2)?,
+        message_id: r.get::<_, Option<String>>(3)?,
+        account_entity_id: r.get(4)?,
+        recipient_email: r.get(5)?,
+        recipient_domain: r.get(6)?,
+        subject: r.get::<_, Option<String>>(7)?,
+        body: r.get(8)?,
+        body_chars: r.get(9)?,
+        sent_at_ms: r.get(10)?,
+        ingested_at_ms: r.get(11)?,
+        weight: r.get(12)?,
+    })
+}
+
+fn bare_lower(raw: &str) -> String {
+    let s = if let (Some(open), Some(close)) = (raw.find('<'), raw.rfind('>')) {
+        if open < close {
+            &raw[open + 1..close]
+        } else {
+            raw
+        }
+    } else {
+        raw
+    };
+    s.trim().to_ascii_lowercase()
 }
 
 fn row_to_slack_workspace(r: &rusqlite::Row) -> rusqlite::Result<SlackWorkspace> {
@@ -2436,5 +2816,226 @@ mod tests {
             assert_eq!(SubscriptionMode::parse(m.as_str()), Some(m));
         }
         assert_eq!(SubscriptionMode::parse("garbage"), None);
+    }
+
+    // --- tone profiles & examples (issue #73) ---
+
+    #[test]
+    fn insert_and_query_tone_example() {
+        let (s, _f) = fresh_store();
+        let id = s
+            .insert_tone_example(
+                "sent_backfill",
+                None,
+                Some("gmail-msg-1"),
+                "acc1",
+                "jeremy@acme.com",
+                "acme.com",
+                Some("Re: stuff"),
+                "Hey — quick reply.",
+                1_700_000_000_000,
+                1.0,
+            )
+            .unwrap();
+        assert!(!id.is_empty(), "insert returns a non-empty uuid");
+        let recents = s
+            .recent_tone_examples("recipient", "jeremy@acme.com", Some("acc1"), 10)
+            .unwrap();
+        assert_eq!(recents.len(), 1);
+        assert_eq!(recents[0].source, "sent_backfill");
+        assert_eq!(recents[0].body, "Hey — quick reply.");
+        // body_chars is character count, not byte count.
+        assert_eq!(recents[0].body_chars, "Hey — quick reply.".chars().count() as i64);
+    }
+
+    #[test]
+    fn get_tone_profile_returns_none_for_missing() {
+        let (s, _f) = fresh_store();
+        let p = s.get_tone_profile("global", "*", Some("acc1")).unwrap();
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn upsert_tone_profile_inserts_then_updates_in_place() {
+        let (s, _f) = fresh_store();
+        let p1 = s
+            .upsert_tone_profile(
+                "global",
+                "*",
+                Some("acc1"),
+                "{\"register\":\"casual\"}",
+                "[]",
+                10,
+            )
+            .unwrap();
+        assert_eq!(p1.scope_kind, "global");
+        assert_eq!(p1.sample_count, 10);
+        assert_eq!(p1.sample_count_at_refresh, 10);
+
+        // Re-upsert with new summary and higher sample_count: SAME id, fields refresh.
+        let p2 = s
+            .upsert_tone_profile(
+                "global",
+                "*",
+                Some("acc1"),
+                "{\"register\":\"professional\"}",
+                "[\"x\"]",
+                25,
+            )
+            .unwrap();
+        assert_eq!(p1.id, p2.id, "upsert is in-place keyed by (scope,scope_value,acct)");
+        assert_eq!(p2.summary, "{\"register\":\"professional\"}");
+        assert_eq!(p2.sample_count, 25);
+        // Snapshot is reset to current sample_count on refresh — caller can
+        // then compare future inserts against this for staleness.
+        assert_eq!(p2.sample_count_at_refresh, 25);
+    }
+
+    #[test]
+    fn upsert_tone_profile_keys_account_distinctly() {
+        let (s, _f) = fresh_store();
+        let p_a = s
+            .upsert_tone_profile("global", "*", Some("acc-A"), "A", "[]", 1)
+            .unwrap();
+        let p_b = s
+            .upsert_tone_profile("global", "*", Some("acc-B"), "B", "[]", 1)
+            .unwrap();
+        assert_ne!(p_a.id, p_b.id, "different accounts → different rows");
+        let all = s.list_tone_profiles().unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn recent_tone_examples_orders_newest_first_and_limits() {
+        let (s, _f) = fresh_store();
+        for (i, ts) in [1_000_i64, 3_000, 2_000].iter().enumerate() {
+            s.insert_tone_example(
+                "sent_backfill",
+                None,
+                Some(&format!("m{i}")),
+                "acc1",
+                "x@y.com",
+                "y.com",
+                None,
+                "body",
+                *ts,
+                1.0,
+            )
+            .unwrap();
+        }
+        let recents = s
+            .recent_tone_examples("recipient", "x@y.com", Some("acc1"), 2)
+            .unwrap();
+        assert_eq!(recents.len(), 2);
+        assert_eq!(recents[0].sent_at_ms, 3000);
+        assert_eq!(recents[1].sent_at_ms, 2000);
+    }
+
+    #[test]
+    fn count_tone_examples_per_scope() {
+        let (s, _f) = fresh_store();
+        for to in ["a@acme.com", "b@acme.com", "c@other.com"] {
+            let domain = to.split('@').nth(1).unwrap();
+            s.insert_tone_example(
+                "sent_backfill",
+                None,
+                None,
+                "acc1",
+                to,
+                domain,
+                None,
+                "body body body",
+                1_000,
+                1.0,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            s.count_tone_examples("recipient", "a@acme.com", Some("acc1")).unwrap(),
+            1
+        );
+        assert_eq!(
+            s.count_tone_examples("domain", "acme.com", Some("acc1")).unwrap(),
+            2
+        );
+        assert_eq!(
+            s.count_tone_examples("global", "*", Some("acc1")).unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn record_user_edit_as_tone_example_captures_sent_draft() {
+        let (s, _f) = fresh_store();
+        // Seed an email + an action that's been transitioned to Sent.
+        let mut email = sample_email("m-edit");
+        email.from = "Alex <alex@startup.io>".into();
+        email.subject = "Re: launch".into();
+        s.upsert_email(&email).unwrap();
+        let action_id = s
+            .log_action(
+                "m-edit",
+                None,
+                "Alex <alex@startup.io>",
+                "Re: launch",
+                Some("inbound body"),
+                Some("This is the post-edit draft the user actually sent."),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        s.update_action_status(&action_id, ActionStatus::Sent, None, None)
+            .unwrap();
+
+        let new_id = s.record_user_edit_as_tone_example(&action_id).unwrap();
+        assert!(new_id.is_some(), "expected a tone example to be recorded");
+        let recents = s
+            .recent_tone_examples("recipient", "alex@startup.io", Some("acc"), 10)
+            .unwrap();
+        assert_eq!(recents.len(), 1);
+        assert_eq!(recents[0].source, "user_edit");
+        assert!((recents[0].weight - 1.5).abs() < f64::EPSILON);
+        assert_eq!(recents[0].recipient_domain, "startup.io");
+        assert_eq!(
+            recents[0].body,
+            "This is the post-edit draft the user actually sent."
+        );
+    }
+
+    #[test]
+    fn record_user_edit_skips_non_sent_or_empty_draft() {
+        let (s, _f) = fresh_store();
+        let email = sample_email("m-pending");
+        s.upsert_email(&email).unwrap();
+        let id = s
+            .log_action(
+                "m-pending",
+                None,
+                "a@b.com",
+                "subj",
+                None,
+                Some("draft"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        // Status is Pending, not Sent → no-op.
+        assert!(s.record_user_edit_as_tone_example(&id).unwrap().is_none());
+        // Now flip to Sent but with no draftBody on a separate action.
+        let id2 = s
+            .log_action(
+                "m-pending",
+                None,
+                "a@b.com",
+                "subj",
+                None,
+                None,
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        s.update_action_status(&id2, ActionStatus::Sent, None, None)
+            .unwrap();
+        assert!(
+            s.record_user_edit_as_tone_example(&id2).unwrap().is_none(),
+            "missing draftBody → skip"
+        );
     }
 }

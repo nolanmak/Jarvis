@@ -164,6 +164,12 @@ enum Cmd {
         #[command(subcommand)]
         op: BrowserOp,
     },
+    /// Per-recipient tone-mirroring (#73): backfill sent history, refresh
+    /// per-scope voice profiles, and sweep stale rows on a schedule.
+    Tone {
+        #[command(subcommand)]
+        op: ToneOp,
+    },
     /// Draft-quality eval tooling backed by `draft_revisions` (#37).
     Drafts {
         #[command(subcommand)]
@@ -175,6 +181,46 @@ enum Cmd {
     Ratelimit {
         #[command(subcommand)]
         op: RatelimitOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum ToneOp {
+    /// One-shot Composio backfill of `in:sent` history into `tone_examples`.
+    /// Rows survive the cleaning + filter pipeline before insert.
+    Backfill {
+        /// Account entity_id to back-fill against. Defaults to all active
+        /// gmail accounts in the store when omitted.
+        #[arg(long)]
+        account: Option<String>,
+        /// Cap on messages pulled per account (Composio paginates 20/page).
+        #[arg(long, default_value_t = 500)]
+        limit: u32,
+        /// Optional `after:YYYY/MM/DD` clause for the Gmail query. None = all-time.
+        #[arg(long)]
+        since: Option<String>,
+    },
+    /// Re-summarize one tone profile via Haiku and persist the result.
+    Refresh {
+        /// Scope to refresh. Accepts `global`, `domain:<domain>`, or
+        /// `recipient:<bare_email>`.
+        #[arg(long)]
+        scope: String,
+        /// Account entity_id the profile is keyed under.
+        #[arg(long)]
+        account: String,
+    },
+    /// Walk every tone profile and re-summarize any whose
+    /// `sample_count - sample_count_at_refresh >= threshold`. Run from the
+    /// systemd nightly timer (see `systemd/augmentagent-tone-refresh.*`).
+    RefreshStale {
+        #[arg(long, default_value_t = 5)]
+        threshold: i64,
+        /// Hard wallclock budget. Default 5min — matches the systemd timer's
+        /// expectation. Bail with a warn log if exceeded; the next run picks
+        /// up the leftovers because the staleness predicate is idempotent.
+        #[arg(long, default_value_t = 300)]
+        budget_secs: u64,
     },
 }
 
@@ -1080,6 +1126,17 @@ async fn main() -> Result<()> {
             | BrowserOp::ImportCookies { .. }
             | BrowserOp::Status { .. } => {
                 unimplemented!("see browser-client feature PR")
+            }
+        },
+        Cmd::Tone { op } => match op {
+            ToneOp::Backfill { account, limit, since } => {
+                run_tone_backfill(store, account, limit, since).await
+            }
+            ToneOp::Refresh { scope, account } => {
+                run_tone_refresh(store, scope, account).await
+            }
+            ToneOp::RefreshStale { threshold, budget_secs } => {
+                run_tone_refresh_stale(store, threshold, budget_secs).await
             }
         },
         Cmd::Drafts { op } => match op {
@@ -2229,6 +2286,16 @@ impl ReplyApprover {
         let _ = self
             .store
             .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+        // Tone-mirroring v1 (#73): the post-edit body the user actually
+        // approved is gold for the voice profile. Best-effort — failures
+        // here must NOT change the user-visible Approved outcome.
+        match self.store.record_user_edit_as_tone_example(action_id) {
+            Ok(Some(id)) => {
+                tracing::debug!(action_id, tone_example_id = %id, "captured user_edit tone example")
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(action_id, "record_user_edit_as_tone_example failed: {e}"),
+        }
         tracing::info!(action_id, "reply sent via approval handler");
         ApprovalActionOutcome::Approved
     }
@@ -3333,3 +3400,333 @@ fn load_single_slack_client(
 /// warning in the unlikely event it's not pulled in elsewhere).
 #[allow(dead_code)]
 const _LINKEDIN_PREFIX: &str = ACCOUNT_PREFIX;
+
+// ---------------------------------------------------------------------------
+// Tone-mirroring v1 (#73) — backfill, refresh, refresh-stale.
+// ---------------------------------------------------------------------------
+
+async fn run_tone_backfill(
+    store: Arc<Store>,
+    account: Option<String>,
+    limit: u32,
+    since: Option<String>,
+) -> Result<()> {
+    use augmentagent_channel_email::tone::{
+        clean_sent_body, recipient_from_sent, should_keep_for_tone, ToneFilter,
+    };
+
+    let api_key = std::env::var("COMPOSIO_API_KEY")
+        .context("COMPOSIO_API_KEY env var required for tone backfill")?;
+    let gmail = ComposioClient::new(api_key);
+
+    let accounts = match account {
+        Some(a) => vec![a],
+        None => store
+            .get_active_gmail_accounts()?
+            .into_iter()
+            .map(|a| a.entity_id)
+            .collect(),
+    };
+    if accounts.is_empty() {
+        println!("(no active gmail accounts; nothing to backfill)");
+        return Ok(());
+    }
+
+    // Self-address set: drop replies whose recipient IS one of our own accounts.
+    let self_addrs: Vec<String> = store
+        .get_active_gmail_accounts()?
+        .iter()
+        .filter(|a| !a.email.is_empty())
+        .map(|a| a.email.to_ascii_lowercase())
+        .collect();
+
+    let mut total_seen = 0usize;
+    let mut total_kept = 0usize;
+    let mut total_dropped = 0usize;
+
+    for entity_id in accounts {
+        info!(account = %entity_id, "tone backfill: fetching sent history");
+        let messages = match gmail
+            .fetch_sent_history(&entity_id, since.as_deref(), limit)
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("account {entity_id} fetch_sent_history failed: {e}");
+                continue;
+            }
+        };
+        total_seen += messages.len();
+        let mut kept = 0usize;
+        let mut dropped = 0usize;
+        for email in messages {
+            let cleaned = clean_sent_body(&email.body);
+            let (recipient_bare, recipient_domain) = recipient_from_sent(&email);
+            match should_keep_for_tone(&cleaned, &recipient_bare, &self_addrs) {
+                ToneFilter::Keep => {
+                    let sent_at_ms = parse_date_ms(&email.date);
+                    let _id = store.insert_tone_example(
+                        "sent_backfill",
+                        None,
+                        Some(&email.message_id),
+                        &entity_id,
+                        &recipient_bare,
+                        &recipient_domain,
+                        Some(&email.subject),
+                        &cleaned,
+                        sent_at_ms,
+                        1.0,
+                    )?;
+                    kept += 1;
+                }
+                _ => dropped += 1,
+            }
+        }
+        println!(
+            "account {entity_id}: fetched={total_fetched} kept={kept} dropped={dropped}",
+            total_fetched = kept + dropped,
+        );
+        total_kept += kept;
+        total_dropped += dropped;
+    }
+    println!(
+        "tone backfill complete: seen={total_seen} kept={total_kept} dropped={total_dropped}"
+    );
+    Ok(())
+}
+
+async fn run_tone_refresh(
+    store: Arc<Store>,
+    scope: String,
+    account: String,
+) -> Result<()> {
+    let (kind, value) = parse_tone_scope(&scope)?;
+    refresh_one_tone_profile(&store, &kind, &value, Some(&account)).await
+}
+
+async fn run_tone_refresh_stale(
+    store: Arc<Store>,
+    threshold: i64,
+    budget_secs: u64,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_secs(budget_secs);
+    // 30-day floor for time-based staleness — even if no new examples have
+    // arrived, profiles older than this get a refresh so the descriptor
+    // doesn't drift behind the user's evolving voice.
+    const MAX_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    let mut profiles = store.list_tone_profiles()?;
+    // Process per-recipient first (cheap), then domain, then global (the one
+    // big call). Stable secondary sort by last_refreshed_at ASC keeps the
+    // oldest in each tier first.
+    profiles.sort_by(|a, b| {
+        let rank = |k: &str| match k {
+            "recipient" => 0,
+            "domain" => 1,
+            _ => 2,
+        };
+        rank(&a.scope_kind)
+            .cmp(&rank(&b.scope_kind))
+            .then(a.last_refreshed_at.cmp(&b.last_refreshed_at))
+    });
+
+    let mut refreshed = 0usize;
+    let mut skipped = 0usize;
+    for p in profiles {
+        if started.elapsed() > budget {
+            warn!(
+                "tone refresh-stale: wallclock budget exceeded ({}s); leaving rest for next run",
+                budget_secs
+            );
+            break;
+        }
+        let live_count = store.count_tone_examples(
+            &p.scope_kind,
+            &p.scope_value,
+            p.account_entity_id.as_deref(),
+        )?;
+        let stale_by_count = live_count - p.sample_count_at_refresh >= threshold;
+        let stale_by_age = now_ms - p.last_refreshed_at >= MAX_AGE_MS;
+        if !stale_by_count && !stale_by_age {
+            skipped += 1;
+            continue;
+        }
+        info!(
+            scope_kind = %p.scope_kind,
+            scope_value = %p.scope_value,
+            live_count,
+            snapshot = p.sample_count_at_refresh,
+            "refreshing stale tone profile"
+        );
+        if let Err(e) = refresh_one_tone_profile(
+            &store,
+            &p.scope_kind,
+            &p.scope_value,
+            p.account_entity_id.as_deref(),
+        )
+        .await
+        {
+            warn!(
+                scope_kind = %p.scope_kind,
+                scope_value = %p.scope_value,
+                "tone refresh failed: {e:#}"
+            );
+            continue;
+        }
+        refreshed += 1;
+    }
+    println!("tone refresh-stale: refreshed={refreshed} skipped={skipped}");
+    Ok(())
+}
+
+/// Parse a CLI-style scope string into `(scope_kind, scope_value)`.
+/// Accepted forms: `global`, `domain:<domain>`, `recipient:<email>`.
+fn parse_tone_scope(raw: &str) -> Result<(String, String)> {
+    if raw == "global" {
+        return Ok(("global".into(), "*".into()));
+    }
+    if let Some(rest) = raw.strip_prefix("domain:") {
+        if rest.is_empty() {
+            anyhow::bail!("scope `domain:` requires a domain after the colon");
+        }
+        return Ok(("domain".into(), rest.to_ascii_lowercase()));
+    }
+    if let Some(rest) = raw.strip_prefix("recipient:") {
+        if rest.is_empty() {
+            anyhow::bail!("scope `recipient:` requires a bare email after the colon");
+        }
+        return Ok(("recipient".into(), rest.to_ascii_lowercase()));
+    }
+    anyhow::bail!(
+        "unknown scope `{raw}` — expected one of: global, domain:<d>, recipient:<email>"
+    )
+}
+
+/// Pull the most-recent N examples for a scope, run them through the Haiku
+/// summarizer, and upsert the result. N is per-spec: 80 / 15 / 8 for
+/// global / domain / recipient — small N is fine because Haiku does the
+/// compression.
+async fn refresh_one_tone_profile(
+    store: &Store,
+    scope_kind: &str,
+    scope_value: &str,
+    account_entity_id: Option<&str>,
+) -> Result<()> {
+    use augmentagent_channel_core::reasoner::tone_summarize_opts;
+
+    let n: i64 = match scope_kind {
+        "recipient" => 8,
+        "domain" => 15,
+        _ => 80,
+    };
+    let examples = store.recent_tone_examples(scope_kind, scope_value, account_entity_id, n)?;
+    if examples.is_empty() {
+        anyhow::bail!(
+            "no tone_examples for scope_kind={scope_kind} scope_value={scope_value} account={account_entity_id:?}; run `augmentagent tone backfill` first"
+        );
+    }
+
+    let mut corpus = String::from("<corpus>\n");
+    let mut exemplar_ids: Vec<String> = Vec::with_capacity(examples.len());
+    for ex in &examples {
+        corpus.push_str(&format!(
+            "<example to=\"{}\" date=\"{}\">\n{}\n</example>\n",
+            ex.recipient_email, ex.sent_at_ms, ex.body
+        ));
+        exemplar_ids.push(ex.id.clone());
+    }
+    corpus.push_str("</corpus>\n");
+
+    let reasoner = ClaudeCliReasoner::new();
+    let opts = tone_summarize_opts();
+    let summary = reasoner
+        .call(&opts, &corpus)
+        .await
+        .context("tone summarizer call failed")?;
+
+    let live_count = store.count_tone_examples(scope_kind, scope_value, account_entity_id)?;
+    let exemplar_json = serde_json::to_string(&exemplar_ids).unwrap_or_else(|_| "[]".into());
+    store.upsert_tone_profile(
+        scope_kind,
+        scope_value,
+        account_entity_id,
+        summary.trim(),
+        &exemplar_json,
+        live_count,
+    )?;
+    println!(
+        "tone refresh: scope={scope_kind}:{scope_value} account={} samples={live_count}",
+        account_entity_id.unwrap_or("(any)")
+    );
+    Ok(())
+}
+
+/// Best-effort RFC 2822 / RFC 3339 / Gmail-internalDate-string → epoch ms.
+/// Falls back to `0` when nothing parses; downstream consumers tolerate that
+/// (sent_at_ms only drives sort order in `recent_tone_examples`).
+fn parse_date_ms(s: &str) -> i64 {
+    if let Ok(n) = s.parse::<i64>() {
+        // Gmail internalDate is already epoch ms.
+        return n;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(s) {
+        return dt.timestamp_millis();
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return dt.timestamp_millis();
+    }
+    0
+}
+
+#[cfg(test)]
+mod tone_cli_tests {
+    use super::*;
+
+    #[test]
+    fn parse_tone_scope_global() {
+        assert_eq!(parse_tone_scope("global").unwrap(), ("global".into(), "*".into()));
+    }
+
+    #[test]
+    fn parse_tone_scope_domain_lowercases() {
+        assert_eq!(
+            parse_tone_scope("domain:Acme.COM").unwrap(),
+            ("domain".into(), "acme.com".into())
+        );
+    }
+
+    #[test]
+    fn parse_tone_scope_recipient_lowercases() {
+        assert_eq!(
+            parse_tone_scope("recipient:Alex@Startup.IO").unwrap(),
+            ("recipient".into(), "alex@startup.io".into())
+        );
+    }
+
+    #[test]
+    fn parse_tone_scope_rejects_garbage() {
+        assert!(parse_tone_scope("nope").is_err());
+        assert!(parse_tone_scope("domain:").is_err());
+        assert!(parse_tone_scope("recipient:").is_err());
+    }
+
+    #[test]
+    fn parse_date_ms_handles_internaldate() {
+        assert_eq!(parse_date_ms("1700000000000"), 1_700_000_000_000);
+    }
+
+    #[test]
+    fn parse_date_ms_handles_rfc2822() {
+        // 2026-04-13 12:00:00 UTC
+        let ms = parse_date_ms("Mon, 13 Apr 2026 12:00:00 +0000");
+        assert!(ms > 1_770_000_000_000);
+    }
+
+    #[test]
+    fn parse_date_ms_returns_zero_for_garbage() {
+        assert_eq!(parse_date_ms(""), 0);
+        assert_eq!(parse_date_ms("not a date"), 0);
+    }
+}

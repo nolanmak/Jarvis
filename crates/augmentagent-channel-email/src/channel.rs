@@ -22,7 +22,7 @@ use augmentagent_channel_core::prompt::{draft_user_message, triage_user_message,
 use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{ActionStatus, RetryableReply, Store, TriageResult, NUDGE_INTERVAL_MS};
 
-use crate::gmail::GmailApi;
+use crate::gmail::{extract_bare_email, GmailApi};
 
 #[derive(Clone, Debug)]
 pub struct GmailChannelConfig {
@@ -469,7 +469,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                         augmentagent_wiki::WikiReader::new(&layout).draft_hint(&email)
                     })
                     .unwrap_or_default();
-                let draft_prompt = draft_user_message(&email, &wiki_hint, "");
+                let tone_block =
+                    pick_tone_block(&self.store, entity_id, &email.from);
+                let draft_prompt = draft_user_message(&email, &wiki_hint, &tone_block);
                 let draft = match self.reasoner.call(&draft_opts, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
                     Err(e) => {
@@ -640,6 +642,53 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         info!(action_id, draft_id = %draft_id, "approval card posted");
         Ok(Some(DispatchOutcome::AwaitingApproval))
     }
+}
+
+/// Resolve the tone block for `to_addr` against the user's `account` profiles.
+///
+/// Lookup order (per #73 §6 bootstrap thresholds):
+///   1. per-recipient profile (use when `sample_count >= 3`)
+///   2. per-domain profile    (use when `sample_count >= 5`)
+///   3. global profile        (always, if it exists)
+///
+/// Each tier is also rejected when its summary marks `register` as
+/// `insufficient_sample` (the summarizer's signal that the corpus was too
+/// thin) — we fall through to the parent scope rather than inject a
+/// degraded descriptor. Returns `String::new()` when nothing usable exists,
+/// which `draft_user_message` interprets as "no tone injection".
+pub(crate) fn pick_tone_block(store: &Store, account: &str, to_addr: &str) -> String {
+    let bare = extract_bare_email(to_addr).to_ascii_lowercase();
+    let domain = bare
+        .split_once('@')
+        .map(|(_, d)| d.to_string())
+        .unwrap_or_default();
+
+    if let Ok(Some(p)) = store.get_tone_profile("recipient", &bare, Some(account)) {
+        if p.sample_count >= 3 && !is_insufficient_sample(&p.summary) {
+            return p.summary;
+        }
+    }
+    if !domain.is_empty() {
+        if let Ok(Some(p)) = store.get_tone_profile("domain", &domain, Some(account)) {
+            if p.sample_count >= 5 && !is_insufficient_sample(&p.summary) {
+                return p.summary;
+            }
+        }
+    }
+    if let Ok(Some(p)) = store.get_tone_profile("global", "*", Some(account)) {
+        if !is_insufficient_sample(&p.summary) {
+            return p.summary;
+        }
+    }
+    String::new()
+}
+
+/// True when the summarizer JSON signaled that it didn't have enough samples
+/// to produce a useful descriptor. We do a substring check on the raw text
+/// rather than parse the JSON because any parser hiccup should not silently
+/// promote a degraded descriptor into a draft prompt.
+fn is_insufficient_sample(summary: &str) -> bool {
+    summary.contains("\"insufficient_sample\"")
 }
 
 fn now_millis() -> i64 {
@@ -1238,5 +1287,118 @@ mod tests {
         assert_eq!(gmail.create_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
         assert!(store.is_email_complete("m-broker-fail").unwrap());
+    }
+
+    // --- tone-mirror lookup (#73 §4) ---
+
+    #[test]
+    fn pick_tone_block_returns_empty_when_no_profiles() {
+        let (store, _f) = tmp_store();
+        let out = super::pick_tone_block(&store, "acc1", "alex@startup.io");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn pick_tone_block_prefers_recipient_above_threshold() {
+        let (store, _f) = tmp_store();
+        store
+            .upsert_tone_profile("global", "*", Some("acc1"), "GLOBAL", "[]", 50)
+            .unwrap();
+        store
+            .upsert_tone_profile(
+                "domain",
+                "startup.io",
+                Some("acc1"),
+                "DOMAIN",
+                "[]",
+                10,
+            )
+            .unwrap();
+        store
+            .upsert_tone_profile(
+                "recipient",
+                "alex@startup.io",
+                Some("acc1"),
+                "RECIPIENT",
+                "[]",
+                4,
+            )
+            .unwrap();
+        let out = super::pick_tone_block(&store, "acc1", "Alex <alex@startup.io>");
+        assert_eq!(out, "RECIPIENT");
+    }
+
+    #[test]
+    fn pick_tone_block_falls_through_when_recipient_under_threshold() {
+        let (store, _f) = tmp_store();
+        store
+            .upsert_tone_profile("global", "*", Some("acc1"), "GLOBAL", "[]", 50)
+            .unwrap();
+        store
+            .upsert_tone_profile(
+                "domain",
+                "startup.io",
+                Some("acc1"),
+                "DOMAIN",
+                "[]",
+                10,
+            )
+            .unwrap();
+        // sample_count=2 → below the 3-message recipient threshold.
+        store
+            .upsert_tone_profile(
+                "recipient",
+                "alex@startup.io",
+                Some("acc1"),
+                "RECIPIENT",
+                "[]",
+                2,
+            )
+            .unwrap();
+        let out = super::pick_tone_block(&store, "acc1", "alex@startup.io");
+        assert_eq!(out, "DOMAIN");
+    }
+
+    #[test]
+    fn pick_tone_block_falls_through_to_global_when_domain_thin() {
+        let (store, _f) = tmp_store();
+        store
+            .upsert_tone_profile("global", "*", Some("acc1"), "GLOBAL", "[]", 50)
+            .unwrap();
+        // sample_count=3 → below the 5-message domain threshold.
+        store
+            .upsert_tone_profile(
+                "domain",
+                "startup.io",
+                Some("acc1"),
+                "DOMAIN",
+                "[]",
+                3,
+            )
+            .unwrap();
+        let out = super::pick_tone_block(&store, "acc1", "alex@startup.io");
+        assert_eq!(out, "GLOBAL");
+    }
+
+    #[test]
+    fn pick_tone_block_skips_insufficient_sample_markers() {
+        let (store, _f) = tmp_store();
+        store
+            .upsert_tone_profile("global", "*", Some("acc1"), "GLOBAL", "[]", 50)
+            .unwrap();
+        // Per-recipient row exists with enough samples but the summarizer
+        // came back with "insufficient_sample" — we must fall through.
+        store
+            .upsert_tone_profile(
+                "recipient",
+                "alex@startup.io",
+                Some("acc1"),
+                "{\"register\":\"insufficient_sample\"}",
+                "[]",
+                4,
+            )
+            .unwrap();
+        let out = super::pick_tone_block(&store, "acc1", "alex@startup.io");
+        assert_eq!(out, "GLOBAL");
     }
 }

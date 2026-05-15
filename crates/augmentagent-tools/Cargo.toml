@@ -1,0 +1,29 @@
+[package]
+name = "augmentagent-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Operator-side utilities — tone-eval, etc. Each binary is a one-shot script
+# the human runs to inspect or calibrate a feature; not part of the daemon
+# call graph. Lives in its own crate so the daemon's release artifact
+# doesn't pull in eval-only deps.
+
+[dependencies]
+augmentagent-store = { path = "../augmentagent-store" }
+
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "tone-eval"
+path = "src/bin/tone-eval.rs"
+
+[lib]
+path = "src/lib.rs"

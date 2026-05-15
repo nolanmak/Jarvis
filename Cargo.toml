@@ -19,6 +19,7 @@ members = [
     "crates/augmentagent-auth",
     "crates/augmentagent-wiki",
     "crates/augmentagent-cli",
+    "crates/augmentagent-tools",
 ]
 
 [workspace.package]
