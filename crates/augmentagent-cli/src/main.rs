@@ -164,12 +164,32 @@ enum Cmd {
         #[command(subcommand)]
         op: BrowserOp,
     },
+    /// Draft-quality eval tooling backed by `draft_revisions` (#37).
+    Drafts {
+        #[command(subcommand)]
+        op: DraftsOp,
+    },
     /// RateGovernor (#83) audit + dump tooling. Reads `rate_events`,
     /// `rate_halts`, and `rate_warmup`. Channels write to these tables
     /// when they adopt the governor (sibling/feature PRs).
     Ratelimit {
         #[command(subcommand)]
         op: RatelimitOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum DraftsOp {
+    /// Cluster recent Revise feedback by overlapping keywords. Surfaces
+    /// recurring complaints ("shorter", "less formal", "fix tone") so the
+    /// user can decide whether to bake the fix into the drafter prompt.
+    FeedbackClusters {
+        /// Look back this many days. Default 30.
+        #[arg(long, default_value_t = 30u32)]
+        since_days: u32,
+        /// How many top patterns to print. Default 5.
+        #[arg(long, default_value_t = 5usize)]
+        top: usize,
     },
 }
 
@@ -1062,6 +1082,11 @@ async fn main() -> Result<()> {
                 unimplemented!("see browser-client feature PR")
             }
         },
+        Cmd::Drafts { op } => match op {
+            DraftsOp::FeedbackClusters { since_days, top } => {
+                run_drafts_feedback_clusters(store, since_days, top)
+            }
+        },
         Cmd::Ratelimit { op } => match op {
             RatelimitOp::Audit {
                 account,
@@ -1074,6 +1099,73 @@ async fn main() -> Result<()> {
             RatelimitOp::Caps => run_ratelimit_caps(),
         },
     }
+}
+
+/// Lightweight recurring-feedback surfacing for `draft_revisions` (#37 Phase 2
+/// scaffolding). Tokenizes feedback strings into lowercase 1-grams + 2-grams,
+/// drops a small stop-list, ranks by document frequency, and prints the top
+/// `top` patterns with one example feedback per cluster.
+///
+/// Embedding-based clustering (HDBSCAN over Voyage / local embeddings) is the
+/// long-term plan; this is a deliberately dumb v0 that ships value while we
+/// gather enough rows to justify the heavier stack.
+fn run_drafts_feedback_clusters(
+    store: Arc<Store>,
+    since_days: u32,
+    top: usize,
+) -> Result<()> {
+    use std::collections::HashMap;
+    let since_ms = i64::from(since_days) * 24 * 60 * 60 * 1000;
+    let rows = store.list_recent_feedback(since_ms)?;
+    if rows.is_empty() {
+        println!("(no feedback in the last {since_days} days)");
+        return Ok(());
+    }
+    let stop: std::collections::HashSet<&str> = [
+        "the", "a", "an", "is", "it", "to", "of", "and", "or", "in", "on", "for",
+        "be", "this", "that", "but", "not", "with", "as", "at", "by", "i", "me",
+        "my", "we", "our", "you", "your", "should", "would", "could", "make",
+        "please", "less", "more",
+    ]
+    .into_iter()
+    .collect();
+    let mut counts: HashMap<String, (usize, String)> = HashMap::new();
+    for row in &rows {
+        let Some(fb) = row.feedback_text.as_deref() else { continue };
+        let lower = fb.to_lowercase();
+        let words: Vec<&str> = lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty() && w.len() > 2 && !stop.contains(w))
+            .collect();
+        // Count unique terms per row so a single very long feedback doesn't
+        // dominate.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for w in &words {
+            seen.insert((*w).to_string());
+        }
+        for pair in words.windows(2) {
+            seen.insert(format!("{} {}", pair[0], pair[1]));
+        }
+        for term in seen {
+            let entry = counts.entry(term).or_insert((0, fb.to_string()));
+            entry.0 += 1;
+        }
+    }
+    let mut ranked: Vec<(String, usize, String)> = counts
+        .into_iter()
+        .filter(|(_, (n, _))| *n >= 2)
+        .map(|(t, (n, ex))| (t, n, ex))
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    println!(
+        "Top {} feedback patterns over last {since_days}d ({} total revisions):",
+        top.min(ranked.len()),
+        rows.len()
+    );
+    for (term, count, example) in ranked.into_iter().take(top) {
+        println!("  {count:>3}x  \"{term}\"  e.g. {}", truncate(&example, 80));
+    }
+    Ok(())
 }
 
 fn parse_iso_or_now_offset(s: Option<String>, default_offset_ms: i64) -> Result<i64> {
@@ -2326,6 +2418,7 @@ async fn build_broker(
 
     let discord = load_discord_client();
     let slack = load_slack_clients(&store);
+    let store_for_broker = Arc::clone(&store);
     let approver = Arc::new(ReplyApprover {
         store,
         gmail,
@@ -2346,6 +2439,7 @@ async fn build_broker(
         allowed_user_id,
         query_handler,
         action_handler: Some(approver_for_broker),
+        store: Some(store_for_broker),
     })
     .await
     .context("start discord broker")?;

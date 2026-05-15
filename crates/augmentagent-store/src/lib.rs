@@ -12,6 +12,6 @@ pub use models::{
     RateEvent, RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TriageResult,
 };
 pub use store::{
-    ActionWithEmail, PendingNudge, RetryableReply, Store, StoreError, StoreResult,
-    NUDGE_INTERVAL_MS,
+    ActionWithEmail, PendingNudge, RetryableReply, RevisionRecord, Store, StoreError,
+    StoreResult, NUDGE_INTERVAL_MS,
 };

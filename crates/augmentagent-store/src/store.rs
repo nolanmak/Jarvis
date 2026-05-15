@@ -608,6 +608,127 @@ impl Store {
         Ok(())
     }
 
+    /// Persist a (draft, feedback, revised_draft) triple for action `action_id`
+    /// (#37 — draft-quality feedback loop).
+    ///
+    /// Writes two rows to `draft_revisions` in a single transaction:
+    /// 1. The pre-Revise draft as iteration N with `outcome = 'superseded'`
+    ///    and `feedbackText = NULL`.
+    /// 2. The post-Revise draft as iteration N+1 with `outcome = 'pending'`
+    ///    and `feedbackText = feedback`.
+    ///
+    /// Iteration numbering is contiguous per action: it picks `MAX(iteration)+1`
+    /// from existing rows, defaulting to 0 when this is the first revise on a
+    /// fresh action. Using two rows keeps the schema's `(actionId, iteration)`
+    /// invariant clean and lets downstream consumers read the chronology
+    /// without inferring it.
+    ///
+    /// Returns the id of the **revised** (newest) row — that's the one
+    /// downstream tone-mirror / clusterer code refers to.
+    pub fn record_revision_triple(
+        &self,
+        action_id: &str,
+        original_draft: &str,
+        feedback: &str,
+        revised_draft: &str,
+    ) -> StoreResult<String> {
+        let now = now_millis();
+        let revised_id = Uuid::new_v4().to_string();
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction()?;
+        // Pick the next iteration. If no prior rows exist for this action the
+        // pre-Revise draft is iteration 0 and the revised one is iteration 1.
+        let max_iter: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(iteration) FROM draft_revisions WHERE actionId = ?1",
+                params![action_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        let next_iter = max_iter.map(|i| i + 1).unwrap_or(0);
+        // The pre-Revise draft is only inserted when there is no existing row
+        // at iteration `next_iter - 0` for this action — i.e. on the first
+        // Revise. On subsequent revises the previous iteration's row is
+        // already there (with outcome = 'pending'); we just flip it to
+        // 'superseded' so the chain stays consistent.
+        if next_iter == 0 {
+            let original_id = Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO draft_revisions \
+                   (id, actionId, iteration, draftBody, feedbackText, presetId, \
+                    outcome, modelId, promptTokens, completionTokens, createdAt) \
+                 VALUES (?1, ?2, 0, ?3, NULL, NULL, 'superseded', '', NULL, NULL, ?4)",
+                params![original_id, action_id, original_draft, now],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE draft_revisions \
+                    SET outcome = 'superseded' \
+                  WHERE actionId = ?1 AND iteration = ?2 AND outcome = 'pending'",
+                params![action_id, next_iter - 1],
+            )?;
+        }
+        let revised_iter = if next_iter == 0 { 1 } else { next_iter };
+        tx.execute(
+            "INSERT INTO draft_revisions \
+               (id, actionId, iteration, draftBody, feedbackText, presetId, \
+                outcome, modelId, promptTokens, completionTokens, createdAt) \
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'pending', '', NULL, NULL, ?6)",
+            params![revised_id, action_id, revised_iter, revised_draft, feedback, now],
+        )?;
+        tx.commit()?;
+        Ok(revised_id)
+    }
+
+    /// All revision rows for `action_id`, oldest iteration first. Backs the
+    /// downstream tone-mirror corpus (#73) and the recurring-feedback
+    /// clusterer (#37 Phase 3).
+    pub fn list_revisions_for_action(
+        &self,
+        action_id: &str,
+    ) -> StoreResult<Vec<RevisionRecord>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, actionId, iteration, draftBody, feedbackText, presetId, \
+                    outcome, modelId, promptTokens, completionTokens, createdAt \
+               FROM draft_revisions \
+              WHERE actionId = ?1 \
+              ORDER BY iteration ASC",
+        )?;
+        let rows = stmt.query_map(params![action_id], row_to_revision_record)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Revision rows whose `feedbackText` is non-NULL, created within the last
+    /// `since_ms` milliseconds. Backs the recurring-feedback clusterer
+    /// (`augmentagent drafts feedback-clusters`).
+    pub fn list_recent_feedback(
+        &self,
+        since_ms: i64,
+    ) -> StoreResult<Vec<RevisionRecord>> {
+        let cutoff = now_millis() - since_ms;
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, actionId, iteration, draftBody, feedbackText, presetId, \
+                    outcome, modelId, promptTokens, completionTokens, createdAt \
+               FROM draft_revisions \
+              WHERE feedbackText IS NOT NULL \
+                AND createdAt >= ?1 \
+              ORDER BY createdAt DESC",
+        )?;
+        let rows = stmt.query_map(params![cutoff], row_to_revision_record)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn mark_email_processed(&self, message_id: &str, triage: TriageResult) -> StoreResult<()> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
@@ -1646,6 +1767,42 @@ pub struct RetryableReply {
     pub email: Email,
 }
 
+/// One row from `draft_revisions` (#37). The full chain for a given action is
+/// `iteration = 0, 1, 2, ...` with `outcome ∈ { superseded, pending, approved,
+/// skipped }`. `feedbackText` is the user's Revise feedback for this draft;
+/// it's NULL on the iteration-0 (auto-generated) draft and Some on every
+/// revised draft thereafter.
+#[derive(Debug, Clone)]
+pub struct RevisionRecord {
+    pub id: String,
+    pub action_id: String,
+    pub iteration: i64,
+    pub draft_body: String,
+    pub feedback_text: Option<String>,
+    pub preset_id: Option<String>,
+    pub outcome: String,
+    pub model_id: String,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub created_at_ms: i64,
+}
+
+fn row_to_revision_record(r: &rusqlite::Row) -> rusqlite::Result<RevisionRecord> {
+    Ok(RevisionRecord {
+        id: r.get(0)?,
+        action_id: r.get(1)?,
+        iteration: r.get(2)?,
+        draft_body: r.get(3)?,
+        feedback_text: r.get::<_, Option<String>>(4)?,
+        preset_id: r.get::<_, Option<String>>(5)?,
+        outcome: r.get(6)?,
+        model_id: r.get(7)?,
+        prompt_tokens: r.get::<_, Option<i64>>(8)?,
+        completion_tokens: r.get::<_, Option<i64>>(9)?,
+        created_at_ms: r.get(10)?,
+    })
+}
+
 /// Fixed interval between nudges for a pending approval card. 6 hours.
 pub const NUDGE_INTERVAL_MS: i64 = 6 * 60 * 60 * 1000;
 
@@ -2200,6 +2357,73 @@ mod tests {
         assert_eq!(w2.team_name, "Team1 renamed");
         let list = s.list_active_slack_workspaces().unwrap();
         assert_eq!(list.len(), 1);
+    }
+
+    // --- draft_revisions (#37) ---
+
+    #[test]
+    fn record_revision_triple_writes_two_rows_first_time() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("m1")).unwrap();
+        let action_id = s
+            .log_action("m1", None, "a@b.com", "s", None, Some("v0"), ActionStatus::Pending)
+            .unwrap();
+        let revised_id = s
+            .record_revision_triple(&action_id, "v0", "less formal please", "v1")
+            .unwrap();
+        let rows = s.list_revisions_for_action(&action_id).unwrap();
+        assert_eq!(rows.len(), 2, "first revise writes original + revised rows");
+        assert_eq!(rows[0].iteration, 0);
+        assert_eq!(rows[0].draft_body, "v0");
+        assert_eq!(rows[0].feedback_text, None);
+        assert_eq!(rows[0].outcome, "superseded");
+        assert_eq!(rows[1].iteration, 1);
+        assert_eq!(rows[1].draft_body, "v1");
+        assert_eq!(rows[1].feedback_text.as_deref(), Some("less formal please"));
+        assert_eq!(rows[1].outcome, "pending");
+        assert_eq!(rows[1].id, revised_id);
+    }
+
+    #[test]
+    fn record_revision_triple_chains_subsequent_revises() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("m1")).unwrap();
+        let action_id = s
+            .log_action("m1", None, "a@b.com", "s", None, Some("v0"), ActionStatus::Pending)
+            .unwrap();
+        s.record_revision_triple(&action_id, "v0", "less formal", "v1")
+            .unwrap();
+        s.record_revision_triple(&action_id, "v1", "shorter", "v2")
+            .unwrap();
+        let rows = s.list_revisions_for_action(&action_id).unwrap();
+        assert_eq!(rows.len(), 3, "second revise appends one row, supersedes prior pending");
+        assert_eq!(rows[0].outcome, "superseded");
+        assert_eq!(rows[1].outcome, "superseded", "prior pending flips to superseded");
+        assert_eq!(rows[1].draft_body, "v1");
+        assert_eq!(rows[2].outcome, "pending");
+        assert_eq!(rows[2].draft_body, "v2");
+        assert_eq!(rows[2].feedback_text.as_deref(), Some("shorter"));
+        // Iterations stay contiguous + UNIQUE.
+        assert_eq!(rows[0].iteration, 0);
+        assert_eq!(rows[1].iteration, 1);
+        assert_eq!(rows[2].iteration, 2);
+    }
+
+    #[test]
+    fn list_recent_feedback_filters_by_age_and_skips_iteration_zero() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("m1")).unwrap();
+        let action_id = s
+            .log_action("m1", None, "a@b.com", "s", None, Some("v0"), ActionStatus::Pending)
+            .unwrap();
+        s.record_revision_triple(&action_id, "v0", "less formal", "v1")
+            .unwrap();
+        let recent = s.list_recent_feedback(60_000).unwrap();
+        assert_eq!(recent.len(), 1, "only the iteration-1 row has feedback text");
+        assert_eq!(recent[0].feedback_text.as_deref(), Some("less formal"));
+        // A zero-window query excludes everything.
+        let none = s.list_recent_feedback(0).unwrap();
+        assert!(none.is_empty());
     }
 
     #[test]
