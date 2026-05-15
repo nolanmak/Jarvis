@@ -1,0 +1,29 @@
+[
+  {
+    "id": "19874442",
+    "unread": true,
+    "reason": "mention",
+    "updated_at": "2026-05-14T12:34:56Z",
+    "last_read_at": null,
+    "subject": {
+      "title": "Triage workflow misroutes review_request",
+      "url": "https://api.github.com/repos/octocat/Hello-World/issues/42",
+      "latest_comment_url": "https://api.github.com/repos/octocat/Hello-World/issues/comments/9876543",
+      "type": "Issue"
+    },
+    "repository": {
+      "id": 1296269,
+      "name": "Hello-World",
+      "full_name": "octocat/Hello-World",
+      "owner": {
+        "login": "octocat",
+        "id": 1
+      },
+      "private": false,
+      "html_url": "https://github.com/octocat/Hello-World",
+      "description": "This your first repo!"
+    },
+    "url": "https://api.github.com/notifications/threads/19874442",
+    "subscription_url": "https://api.github.com/notifications/threads/19874442/subscription"
+  }
+]
