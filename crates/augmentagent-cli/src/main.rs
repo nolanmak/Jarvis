@@ -745,6 +745,33 @@ enum WikiOp {
         /// The question. Wrap in quotes if multi-word.
         question: String,
     },
+    /// Backfill v2 schema fields onto cold person pages via Haiku. See #78.
+    ///
+    /// Re-runnable; per-page idempotent via the `migrated:` marker. Writes
+    /// per-batch git commits authored as Nolan Makatche.
+    Migrate {
+        /// Schema version target. Only `v2` is supported today.
+        #[arg(long, default_value = "v2")]
+        to: String,
+        /// Don't write to disk or commit; print what would change.
+        #[arg(long)]
+        dry_run: bool,
+        /// Bounded parallel Haiku calls. Default 4 (well under 50 RPM).
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+        /// Only process the first N eligible pages. Useful for sample runs.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Git branch label recorded in the run summary (the CLI does NOT
+        /// switch branches — operator must check out the desired branch
+        /// first). Default `migration/wiki-v2`.
+        #[arg(long, default_value = "migration/wiki-v2")]
+        branch: String,
+        /// Run even if the daemon systemd unit is active. Default refuses
+        /// to avoid races against live ingest writes.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -951,6 +978,25 @@ async fn main() -> Result<()> {
         Cmd::Wiki { ref op } => match op {
             WikiOp::Lint { out } => run_wiki_lint(&cli, out.clone()).await,
             WikiOp::Ask { question } => run_wiki_ask(&cli, question.clone()).await,
+            WikiOp::Migrate {
+                to,
+                dry_run,
+                concurrency,
+                limit,
+                branch,
+                force,
+            } => {
+                run_wiki_migrate(
+                    &cli,
+                    to.clone(),
+                    *dry_run,
+                    *concurrency,
+                    *limit,
+                    branch.clone(),
+                    *force,
+                )
+                .await
+            }
         },
         Cmd::Digest {
             since,
@@ -1870,6 +1916,342 @@ async fn run_wiki_lint(cli: &Cli, out: Option<PathBuf>) -> Result<()> {
         None => {
             println!("{report}");
         }
+    }
+    Ok(())
+}
+
+/// Per-page outcome for stderr progress + final summary. Local to the
+/// migration runner — not surfaced anywhere else.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Failed payload is for future structured-error reporting.
+enum MigrateOutcome {
+    Migrated { dropped: usize },
+    Skipped(&'static str),
+    Failed(String),
+}
+
+/// Build the model wrapper prompt from the schema doc + the citation rule.
+/// Centralised so tests on the migrate module are not coupled to the prose.
+fn migration_system_prompt(schema_body: &str) -> String {
+    format!(
+        "{schema_body}\n\n## Migration task\n\nYou are running a one-shot v2 migration over a single person page. Read its existing content carefully and infer ONLY the v2 fields (`affiliations`, `events`, `introduced_by`) that are EXPLICITLY supported by the page body. Do NOT invent. Do NOT write `cadence`, `trust`, `topics`, or `strength` — those fields are user/derived.\n\nFor every `events` and `affiliations` entry, include `source_message_id: <id>` citing a messageId from the page's existing `sources:` list. Entries without a citation will be dropped.\n\nIf you cannot infer any v2 field with confidence, return an empty YAML mapping. That's the right answer for thin pages.\n\nOutput ONLY a YAML mapping (or a fenced ```yaml block). No prose. No explanation."
+    )
+}
+
+/// Build the per-page user prompt: full page contents.
+fn migration_user_prompt(slug: &str, page: &str) -> String {
+    format!("Page: people/{slug}.md\n\n{page}")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_wiki_migrate(
+    cli: &Cli,
+    to: String,
+    dry_run: bool,
+    concurrency: usize,
+    limit: Option<usize>,
+    branch: String,
+    force: bool,
+) -> Result<()> {
+    use augmentagent_channel_core::reasoner::wiki_migrate_opts;
+    use augmentagent_wiki::migrate::{
+        apply_patch, classify, parse_patch, parse_sources, render_patch_lines,
+        split_frontmatter, validate_citations, MigrationDecision,
+    };
+    use augmentagent_wiki::with_page_lock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Semaphore;
+
+    if to != "v2" {
+        anyhow::bail!("--to must be `v2` (only v2 is supported today, got {to:?})");
+    }
+
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for wiki migrate")?;
+    let schema_path = cli
+        .wiki_schema
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("schema/wiki-skill.md"));
+    let schema = std::fs::read_to_string(&schema_path)
+        .with_context(|| format!("read schema at {}", schema_path.display()))?;
+
+    // §7 pre-flight: refuse to run while the daemon could be writing pages.
+    if !force {
+        match tokio::process::Command::new("systemctl")
+            .args(["--user", "is-active", "augmentagent.service"])
+            .output()
+            .await
+        {
+            Ok(out) => {
+                let s = String::from_utf8_lossy(&out.stdout);
+                if s.trim() == "active" {
+                    anyhow::bail!(
+                        "augmentagent.service is active — pause it first to avoid racing live ingest writes:\n  systemctl --user stop augmentagent.service\nThen re-run, and resume after merge:\n  systemctl --user start augmentagent.service\nOr override with --force (NOT RECOMMENDED for the live wiki)."
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("systemctl pre-flight check failed: {e}; continuing");
+            }
+        }
+    }
+
+    let layout = augmentagent_wiki::WikiLayout::new(wiki_root.clone());
+    let people_dir = layout.people_dir();
+    if !people_dir.is_dir() {
+        anyhow::bail!("people dir missing: {}", people_dir.display());
+    }
+
+    let mut all_paths: Vec<PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(&people_dir)
+        .with_context(|| format!("read people dir {}", people_dir.display()))?
+    {
+        let e = entry?;
+        let p = e.path();
+        if p.extension().and_then(|s| s.to_str()) == Some("md") {
+            all_paths.push(p);
+        }
+    }
+    all_paths.sort();
+    let total = all_paths.len();
+
+    // Pre-classify (no model spend) and partition.
+    let mut eligible: Vec<PathBuf> = Vec::new();
+    let mut skipped_v2: usize = 0;
+    let mut skipped_migrated: usize = 0;
+    let mut skipped_garbage: usize = 0;
+    for p in &all_paths {
+        let body = match std::fs::read_to_string(p) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("read {} failed: {e}", p.display());
+                continue;
+            }
+        };
+        match classify(&body) {
+            MigrationDecision::Eligible => eligible.push(p.clone()),
+            MigrationDecision::AlreadyV2 => skipped_v2 += 1,
+            MigrationDecision::AlreadyMigrated => skipped_migrated += 1,
+            MigrationDecision::NoFrontmatter => {
+                skipped_garbage += 1;
+                eprintln!("[skip:no-fm] {}", relpath(p, &wiki_root));
+            }
+        }
+    }
+
+    if let Some(n) = limit {
+        eligible.truncate(n);
+    }
+
+    eprintln!(
+        "wiki migrate: total={total} eligible={} already_v2={} already_migrated={} no_fm={} concurrency={} branch={} dry_run={}",
+        eligible.len(),
+        skipped_v2,
+        skipped_migrated,
+        skipped_garbage,
+        concurrency,
+        branch,
+        dry_run,
+    );
+
+    if eligible.is_empty() {
+        eprintln!("nothing to migrate");
+        return Ok(());
+    }
+
+    let today_iso = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let system_prompt = migration_system_prompt(&schema);
+    let opts = std::sync::Arc::new(wiki_migrate_opts(system_prompt, wiki_root.clone()));
+    let reasoner = std::sync::Arc::new(ClaudeCliReasoner::new());
+    let sem = std::sync::Arc::new(Semaphore::new(concurrency.max(1)));
+
+    let migrated = std::sync::Arc::new(AtomicUsize::new(0));
+    let dropped_total = std::sync::Arc::new(AtomicUsize::new(0));
+    let failed = std::sync::Arc::new(AtomicUsize::new(0));
+
+    // Per-task: returns (path, outcome) so the orchestrator can stage the
+    // exact set of pages it wrote without re-walking the directory.
+    let mut set: tokio::task::JoinSet<(PathBuf, MigrateOutcome)> = tokio::task::JoinSet::new();
+    for path in eligible.clone() {
+        let opts = std::sync::Arc::clone(&opts);
+        let reasoner = std::sync::Arc::clone(&reasoner);
+        let sem = std::sync::Arc::clone(&sem);
+        let migrated = std::sync::Arc::clone(&migrated);
+        let dropped_total = std::sync::Arc::clone(&dropped_total);
+        let failed = std::sync::Arc::clone(&failed);
+        let today_iso = today_iso.clone();
+        let wiki_root_for_log = wiki_root.clone();
+        let path_for_task = path.clone();
+
+        set.spawn(async move {
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    failed.fetch_add(1, Ordering::SeqCst);
+                    return (
+                        path_for_task,
+                        MigrateOutcome::Failed("semaphore closed".into()),
+                    );
+                }
+            };
+            let slug = path_for_task
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let display = relpath(&path_for_task, &wiki_root_for_log);
+
+            let result: anyhow::Result<MigrateOutcome> =
+                with_page_lock(&path_for_task, || async {
+                    let body = tokio::fs::read_to_string(&path_for_task).await?;
+                    // Re-check classification under the lock — another task
+                    // could have flipped state since the pre-scan.
+                    match classify(&body) {
+                        MigrationDecision::AlreadyMigrated => {
+                            return Ok(MigrateOutcome::Skipped("already-migrated"));
+                        }
+                        MigrationDecision::AlreadyV2 => {
+                            return Ok(MigrateOutcome::Skipped("already-v2"));
+                        }
+                        MigrationDecision::NoFrontmatter => {
+                            return Ok(MigrateOutcome::Skipped("no-frontmatter"));
+                        }
+                        MigrationDecision::Eligible => {}
+                    }
+                    let user = migration_user_prompt(&slug, &body);
+                    let raw = reasoner.call(&opts, &user).await?;
+                    let patch = parse_patch(&raw)?;
+                    let (fm, _) = split_frontmatter(&body)
+                        .ok_or_else(|| anyhow::anyhow!("frontmatter vanished mid-flight"))?;
+                    let allowed = parse_sources(fm);
+                    let filt = validate_citations(patch, &allowed);
+                    let rendered = render_patch_lines(&filt.filtered, &today_iso)?;
+                    let next = apply_patch(&body, &rendered)?;
+                    if !dry_run {
+                        tokio::fs::write(&path_for_task, next.as_bytes()).await?;
+                    }
+                    Ok(MigrateOutcome::Migrated {
+                        dropped: filt.dropped,
+                    })
+                })
+                .await;
+
+            let outcome = match result {
+                Ok(o @ MigrateOutcome::Migrated { dropped }) => {
+                    migrated.fetch_add(1, Ordering::SeqCst);
+                    dropped_total.fetch_add(dropped, Ordering::SeqCst);
+                    eprintln!("[migrated] {display} dropped={dropped}");
+                    o
+                }
+                Ok(o @ MigrateOutcome::Skipped(reason)) => {
+                    eprintln!("[skip:{reason}] {display}");
+                    o
+                }
+                Ok(o) => o,
+                Err(e) => {
+                    failed.fetch_add(1, Ordering::SeqCst);
+                    eprintln!("[fail] {display}: {e:#}");
+                    MigrateOutcome::Failed(format!("{e:#}"))
+                }
+            };
+            (path_for_task, outcome)
+        });
+    }
+
+    // Drain results, batching commits of *successfully migrated* paths
+    // every 25. JoinSet preserves no order — we batch by completion order.
+    let mut pending_batch: Vec<PathBuf> = Vec::new();
+    let mut batch_counter: usize = 0;
+    while let Some(joined) = set.join_next().await {
+        let (path, outcome) = joined.context("migrate task join")?;
+        if matches!(outcome, MigrateOutcome::Migrated { .. }) {
+            pending_batch.push(path);
+            if !dry_run && pending_batch.len() >= 25 {
+                let pending = std::mem::take(&mut pending_batch);
+                batch_counter += 1;
+                git_commit_batch(&wiki_root, &pending, batch_counter).await?;
+            }
+        }
+    }
+    if !dry_run && !pending_batch.is_empty() {
+        batch_counter += 1;
+        git_commit_batch(&wiki_root, &pending_batch, batch_counter).await?;
+    }
+
+    let migrated_n = migrated.load(Ordering::SeqCst);
+    let dropped_n = dropped_total.load(Ordering::SeqCst);
+    let failed_n = failed.load(Ordering::SeqCst);
+    // §7 cost estimate: ~$0.009 per migrated page (Haiku, ~4k in / 1k out).
+    let cost_est = migrated_n as f64 * 0.009;
+
+    eprintln!("---");
+    eprintln!("wiki migrate summary");
+    eprintln!("  total pages          : {total}");
+    eprintln!("  migrated             : {migrated_n}");
+    eprintln!("  skipped (already v2) : {skipped_v2}");
+    eprintln!("  skipped (marker)     : {skipped_migrated}");
+    eprintln!("  skipped (no fm)      : {skipped_garbage}");
+    eprintln!("  failed               : {failed_n}");
+    eprintln!("  dropped uncited      : {dropped_n}");
+    eprintln!("  est. Haiku cost      : ${:.2}", cost_est);
+    eprintln!("  commits              : {batch_counter}");
+    if dry_run {
+        eprintln!("  (dry run — no writes, no commits)");
+    }
+    Ok(())
+}
+
+/// Render a wiki path relative to `wiki_root` for human-readable logs.
+fn relpath(p: &std::path::Path, wiki_root: &std::path::Path) -> String {
+    p.strip_prefix(wiki_root)
+        .unwrap_or(p)
+        .display()
+        .to_string()
+}
+
+/// Stage and commit a batch of migrated pages. Authored as Nolan Makatche
+/// per project convention; per-command `-c user.name/email` to avoid
+/// requiring global git config.
+async fn git_commit_batch(
+    wiki_root: &std::path::Path,
+    paths: &[PathBuf],
+    batch_no: usize,
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut add = tokio::process::Command::new("git");
+    add.arg("-C").arg(wiki_root).arg("add").arg("--");
+    for p in paths {
+        let rel = p.strip_prefix(wiki_root).unwrap_or(p);
+        add.arg(rel);
+    }
+    let st = add.status().await.context("git add")?;
+    if !st.success() {
+        anyhow::bail!("git add failed: {st:?}");
+    }
+
+    let msg = format!("wiki: migrate batch {batch_no} to v2");
+    let st = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(wiki_root)
+        .arg("-c")
+        .arg("user.name=Nolan Makatche")
+        .arg("-c")
+        .arg("user.email=REDACTED")
+        .arg("commit")
+        .arg("-m")
+        .arg(&msg)
+        .status()
+        .await
+        .context("git commit")?;
+    if !st.success() {
+        // Tolerate "nothing to commit" so the migration doesn't abort.
+        eprintln!("git commit batch {batch_no} returned {st:?}; continuing");
+    } else {
+        eprintln!("[commit] batch {batch_no}: {} pages", paths.len());
     }
     Ok(())
 }
