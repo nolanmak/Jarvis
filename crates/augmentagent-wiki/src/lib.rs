@@ -8,6 +8,7 @@
 pub mod identity;
 pub mod layout;
 pub mod locks;
+pub mod migrate;
 pub mod reader;
 pub mod slug;
 
