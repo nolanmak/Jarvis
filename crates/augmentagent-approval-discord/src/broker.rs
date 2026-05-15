@@ -9,7 +9,7 @@ use serenity::all::{ChannelId, GatewayIntents, UserId};
 use tokio::sync::Notify;
 use tracing::{error, info};
 
-use augmentagent_store::Email;
+use augmentagent_store::{Email, Store};
 
 use crate::event_handler::Handler;
 use crate::layout::{approval_message, flag_notice_message};
@@ -30,6 +30,10 @@ pub struct DiscordConfig {
     pub query_handler: Option<Arc<dyn QueryHandler>>,
     /// Handles Approve / Revise / Skip clicks. `None` silently ignores.
     pub action_handler: Option<Arc<dyn ApprovalActionHandler>>,
+    /// Store handle so the event handler can persist (draft, feedback, revised)
+    /// triples to `draft_revisions` after a Revise (#37). `None` disables
+    /// persistence — the broker still works, the data just isn't captured.
+    pub store: Option<Arc<Store>>,
 }
 
 pub(crate) struct BrokerState {
@@ -40,6 +44,8 @@ pub(crate) struct BrokerState {
     pub(crate) query_handler: Option<Arc<dyn QueryHandler>>,
     pub(crate) action_handler: Option<Arc<dyn ApprovalActionHandler>>,
     pub(crate) approval_channel_id: ChannelId,
+    /// Store handle for persisting Revise triples to `draft_revisions` (#37).
+    pub(crate) store: Option<Arc<Store>>,
     /// Populated once, from the first `Ready` event. Used to distinguish the
     /// bot's own messages from the user's when building conversation context.
     pub(crate) bot_user_id: std::sync::OnceLock<UserId>,
@@ -52,6 +58,7 @@ impl BrokerState {
         allowed_user_id: Option<UserId>,
         query_handler: Option<Arc<dyn QueryHandler>>,
         action_handler: Option<Arc<dyn ApprovalActionHandler>>,
+        store: Option<Arc<Store>>,
     ) -> Self {
         Self {
             ready: Arc::new(Notify::new()),
@@ -61,6 +68,7 @@ impl BrokerState {
             query_handler,
             action_handler,
             approval_channel_id,
+            store,
             bot_user_id: std::sync::OnceLock::new(),
         }
     }
@@ -96,6 +104,7 @@ impl DiscordApprovalBroker {
             config.allowed_user_id.map(UserId::new),
             config.query_handler.clone(),
             config.action_handler.clone(),
+            config.store.clone(),
         ));
 
         let mut intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES;
