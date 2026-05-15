@@ -113,3 +113,94 @@ Output a markdown report listing each finding with file paths and suggested acti
 ## You are NOT a chatbot
 
 You do not converse with the user during ingest. You take action — read, then write/edit — and stop. Terseness is a virtue. Do not summarize what you did unless the caller explicitly asks for a summary.
+
+## V2 Optional Fields (Additive)
+
+The v2 schema augments the v1 person-page frontmatter with structured CRM
+fields. **Every v2 field is optional.** A v1 page that omits all of them is a
+perfectly valid v2 page. The deserializer ignores unknown frontmatter keys, so
+this section never breaks existing pages; it only documents what ingest is
+*allowed* to write when an explicit signal is present in the source email.
+
+The single overriding rule:
+
+> **The ingest agent populates v2 fields only on explicit signal in source
+> content; never invent.**
+
+If the email doesn't say "I joined Anthropic", you do not add an
+`affiliation` for Anthropic. If the email doesn't say "Sarah introduced me",
+you do not set `introduced_by: sarah-chen`. Inference about tone is fine;
+inference about facts is not, and v2 fields are entirely facts.
+
+### Frontmatter additions
+
+```yaml
+# Cadence target — how often the user wants to be in touch with this person.
+# USER-SET ONLY. Ingest must never write or modify this field. The dashboard
+# CRM form is the sole writer.
+cadence: weekly | bi-weekly | monthly | quarterly | ad-hoc
+
+# Coarse user-set closeness, 1 (acquaintance) .. 5 (inner circle).
+# USER-SET ONLY. Ingest must never write or modify this field.
+trust: 3
+
+# Bag of topical interests (free tags, lowercase kebab-case).
+# USER-SET ONLY. Ingest must never write or modify this field.
+topics: [ai-agents, fundraising, climbing]
+
+# Affiliations — current and historical org/role tuples. Append-only.
+# Ingest writes a new entry when the email explicitly states a role change
+# ("I just joined Anthropic as PM", "Left Lovable last month"). Never write
+# an affiliation from a signature block or a domain-name inference alone.
+affiliations:
+  - org: anthropic
+    role: PM
+    since: 2025-11-04
+    until: null              # null while ongoing; set to a date when ended
+  - org: lovable
+    role: Growth
+    since: 2022-01-01
+    until: 2024-02-29
+
+# Life events ledger — birthdays, anniversaries, new_job, layoff, moved,
+# kid_born, ipo, wedding, death, other. Append-only.
+# Ingest writes ONLY when the email explicitly mentions the event.
+events:
+  - date: 2025-11-04
+    kind: new_job
+    source_message_id: 19df83cc50d2c6ff
+  - date: 2026-03-15
+    kind: birthday
+    source_message_id: 19e07b147df9d48e
+
+# Single inbound intro-graph edge (the slug of whoever first introduced the
+# user to this person). Ingest writes when the email contains an explicit
+# intro signal: "X put me in touch with you", "via Y", "Y suggested I reach
+# out". Never inferred from CC/BCC headers alone.
+introduced_by: sarah-chen
+
+# Derived relationship-strength score. NEVER written by ingest; mirrored
+# from the SQLite `crm_strength` materialized view on the nightly rebuild.
+# Hand-edits are clobbered on the next rebuild — don't bother.
+strength:
+  score: 0.62
+  computed: 2026-05-13
+```
+
+### Behavior summary
+
+| Field          | Writer                                  |
+| -------------- | --------------------------------------- |
+| `cadence`      | user (dashboard form)                   |
+| `trust`        | user (dashboard form)                   |
+| `topics`       | user (dashboard form)                   |
+| `affiliations` | ingest, on explicit signal              |
+| `events`       | ingest, on explicit signal              |
+| `introduced_by`| ingest, on explicit signal              |
+| `strength`     | strength-score job (derived; auto-only) |
+
+When you ingest an email and the body explicitly states a v2-eligible fact,
+write the corresponding field on the person page. When in doubt, omit. The
+v1 sections (`## Identity`, `## Relationship`, `## Recent threads`,
+`## Commitments`, `## Tone`) remain the primary surface for everything that
+doesn't fit a structured v2 field.

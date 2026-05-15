@@ -7,10 +7,12 @@
 
 pub mod identity;
 pub mod layout;
+pub mod locks;
 pub mod reader;
 pub mod slug;
 
 pub use identity::{Identities, IdentityIndex, PersonPage};
 pub use layout::WikiLayout;
+pub use locks::{with_page_lock, LOCK_TIMEOUT};
 pub use reader::WikiReader;
 pub use slug::slug_from_email;

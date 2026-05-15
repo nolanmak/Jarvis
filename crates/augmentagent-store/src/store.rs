@@ -175,6 +175,291 @@ impl Store {
                 ON slack_workspaces(active)",
             [],
         )?;
+
+        // ----------------------------------------------------------------
+        // Wave-A foundation: tables for the parallel feature PRs branching
+        // off `foundation/swarm-v1`. Schemas are pulled verbatim from each
+        // research issue body. Tables are independent — order doesn't matter.
+        // Every CREATE is `IF NOT EXISTS`, so re-running migrate is a no-op.
+        // ----------------------------------------------------------------
+
+        // #73 — per-recipient tone-mirroring v1.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tone_profiles (\
+                 id                       TEXT PRIMARY KEY,\
+                 scope_kind               TEXT NOT NULL CHECK (scope_kind IN ('global','domain','recipient')),\
+                 scope_value              TEXT NOT NULL,\
+                 account_entity_id        TEXT,\
+                 summary                  TEXT NOT NULL,\
+                 exemplar_ids             TEXT NOT NULL DEFAULT '[]',\
+                 sample_count             INTEGER NOT NULL DEFAULT 0,\
+                 sample_count_at_refresh  INTEGER NOT NULL DEFAULT 0,\
+                 last_refreshed_at        INTEGER NOT NULL,\
+                 created_at_ms            INTEGER NOT NULL,\
+                 updated_at_ms            INTEGER NOT NULL,\
+                 UNIQUE(scope_kind, scope_value, account_entity_id)\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tone_profiles_scope \
+                ON tone_profiles(scope_kind, scope_value)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tone_examples (\
+                 id                  TEXT PRIMARY KEY,\
+                 source              TEXT NOT NULL CHECK (source IN ('sent_backfill','user_edit','approved_clean')),\
+                 action_id           TEXT,\
+                 message_id          TEXT,\
+                 account_entity_id   TEXT NOT NULL,\
+                 recipient_email     TEXT NOT NULL,\
+                 recipient_domain    TEXT NOT NULL,\
+                 subject             TEXT,\
+                 body                TEXT NOT NULL,\
+                 body_chars          INTEGER NOT NULL,\
+                 sent_at_ms          INTEGER NOT NULL,\
+                 ingested_at_ms      INTEGER NOT NULL,\
+                 weight              REAL NOT NULL DEFAULT 1.0,\
+                 FOREIGN KEY (action_id) REFERENCES actions(id) ON DELETE SET NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tone_examples_recipient \
+                ON tone_examples(recipient_email, sent_at_ms DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tone_examples_domain \
+                ON tone_examples(recipient_domain, sent_at_ms DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tone_examples_account_recent \
+                ON tone_examples(account_entity_id, sent_at_ms DESC)",
+            [],
+        )?;
+
+        // #37 — draft revision history for tone learning + eval.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS draft_revisions (\
+                 id                 TEXT PRIMARY KEY,\
+                 actionId           TEXT NOT NULL REFERENCES actions(id) ON DELETE CASCADE,\
+                 iteration          INTEGER NOT NULL,\
+                 draftBody          TEXT NOT NULL,\
+                 feedbackText       TEXT,\
+                 presetId           TEXT,\
+                 outcome            TEXT NOT NULL,\
+                 modelId            TEXT NOT NULL,\
+                 promptTokens       INTEGER,\
+                 completionTokens   INTEGER,\
+                 createdAt          INTEGER NOT NULL,\
+                 UNIQUE(actionId, iteration)\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_draft_revisions_outcome \
+                ON draft_revisions(outcome, createdAt)",
+            [],
+        )?;
+
+        // #83 — RateGovernor (per-platform rate events, halts, warmup).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS rate_events (\
+                 id              TEXT PRIMARY KEY,\
+                 platform        TEXT NOT NULL,\
+                 action_kind     TEXT NOT NULL,\
+                 account_id      TEXT NOT NULL,\
+                 occurred_at_ms  INTEGER NOT NULL,\
+                 status          TEXT NOT NULL,\
+                 cause           TEXT NOT NULL,\
+                 target_id       TEXT,\
+                 meta_json       TEXT\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rate_events_window \
+                ON rate_events(platform, action_kind, account_id, occurred_at_ms)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rate_events_audit \
+                ON rate_events(platform, occurred_at_ms)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS rate_halts (\
+                 platform               TEXT PRIMARY KEY,\
+                 paused_until_ms        INTEGER NOT NULL,\
+                 reason                 TEXT NOT NULL,\
+                 triggered_by_event_id  TEXT,\
+                 created_at_ms          INTEGER NOT NULL,\
+                 acknowledged_at_ms     INTEGER\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS rate_warmup (\
+                 platform              TEXT NOT NULL,\
+                 account_id            TEXT NOT NULL,\
+                 warmup_started_at_ms  INTEGER NOT NULL,\
+                 PRIMARY KEY (platform, account_id)\
+             )",
+            [],
+        )?;
+
+        // #74 — Telegram Bot API per-bot state (long-poll cursor).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS telegram_bots (\
+                 id              TEXT PRIMARY KEY,\
+                 bot_id          INTEGER NOT NULL UNIQUE,\
+                 bot_username    TEXT NOT NULL,\
+                 owner_chat_id   INTEGER NOT NULL,\
+                 last_update_id  INTEGER NOT NULL DEFAULT 0,\
+                 active          INTEGER NOT NULL DEFAULT 1,\
+                 created_at_ms   INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_telegram_bots_active \
+                ON telegram_bots(active)",
+            [],
+        )?;
+
+        // #74 — WhatsApp linked devices + per-chat outbound/inbound allowlists.
+        // Inbound allowlist comes from review feedback: even reading a chat
+        // requires explicit opt-in for ban-risk reasons.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS whatsapp_devices (\
+                 id                TEXT PRIMARY KEY,\
+                 phone             TEXT NOT NULL UNIQUE,\
+                 device_jid        TEXT NOT NULL,\
+                 user_jid          TEXT NOT NULL,\
+                 paired_at_ms      INTEGER NOT NULL,\
+                 last_event_at_ms  INTEGER NOT NULL DEFAULT 0,\
+                 session_status    TEXT NOT NULL DEFAULT 'paired',\
+                 active            INTEGER NOT NULL DEFAULT 1,\
+                 created_at_ms     INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_whatsapp_devices_active \
+                ON whatsapp_devices(active)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS whatsapp_outbound_allowlist (\
+                 chat_jid       TEXT PRIMARY KEY,\
+                 enabled_at_ms  INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS whatsapp_inbound_allowlist (\
+                 chat_jid       TEXT PRIMARY KEY,\
+                 enabled_at_ms  INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
+        // #81 — Proactive CRM signals + per-scan run cursor.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS proactive_signals (\
+                 id                     TEXT PRIMARY KEY,\
+                 kind                   TEXT NOT NULL,\
+                 person_slug            TEXT,\
+                 urgency                TEXT NOT NULL,\
+                 headline               TEXT NOT NULL,\
+                 detail                 TEXT NOT NULL,\
+                 suggested_action_json  TEXT,\
+                 status                 TEXT NOT NULL,\
+                 snooze_until_ms        INTEGER,\
+                 dedup_key              TEXT NOT NULL,\
+                 created_at_ms          INTEGER NOT NULL,\
+                 dispatched_at_ms       INTEGER\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proactive_signals_status_created \
+                ON proactive_signals(status, created_at_ms)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proactive_signals_dedup_recent \
+                ON proactive_signals(dedup_key, created_at_ms)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proactive_signals_person \
+                ON proactive_signals(person_slug)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS proactive_scan_runs (\
+                 scan_id         TEXT PRIMARY KEY,\
+                 last_run_at_ms  INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
+        // #79 — Twitter/X GraphQL queryId cache (rotated by X every 2-6 wk).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS twitter_query_ids (\
+                 operation      TEXT PRIMARY KEY,\
+                 query_id       TEXT NOT NULL,\
+                 last_seen_at   INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
+        // #77 — LinkedIn outbound action audit log (post / comment / like /
+        // connection_invite / dm / profile_view), drives daily/hourly caps.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS linkedin_action_log (\
+                 id              TEXT PRIMARY KEY,\
+                 action_kind     TEXT NOT NULL,\
+                 target_urn      TEXT,\
+                 status          TEXT NOT NULL,\
+                 occurred_at_ms  INTEGER NOT NULL,\
+                 meta_json       TEXT\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_linkedin_action_log_window \
+                ON linkedin_action_log(action_kind, occurred_at_ms)",
+            [],
+        )?;
+
+        // #58 / #74-engagement — scheduled outbound posts (cross-platform).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS scheduled_posts (\
+                 id              TEXT PRIMARY KEY,\
+                 platform        TEXT NOT NULL,\
+                 body            TEXT NOT NULL,\
+                 media_paths     TEXT,\
+                 fire_at_ms      INTEGER NOT NULL,\
+                 status          TEXT NOT NULL,\
+                 approval_msg    TEXT,\
+                 posted_at_ms    INTEGER,\
+                 external_id     TEXT,\
+                 thread_parent   TEXT REFERENCES scheduled_posts(id) ON DELETE SET NULL,\
+                 created_at_ms   INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scheduled_posts_fire \
+                ON scheduled_posts(status, fire_at_ms)",
+            [],
+        )?;
+
         Ok(())
     }
 
