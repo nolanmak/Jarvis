@@ -334,7 +334,7 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
                     std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
                         .unwrap_or_default();
                 let draft = draft_opts(skill_system, self.config.wiki_root.clone());
-                let draft_prompt = draft_user_message(&email, "");
+                let draft_prompt = draft_user_message(&email, "", "");
                 let drafted = match self.reasoner.call(&draft, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
                     Err(e) => {
@@ -413,6 +413,20 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
                 }
                 info!(action_id, message_id = %email.message_id, "discord approval card posted");
                 outcome.priority_awaiting_approval += 1;
+                Ok(())
+            }
+            // Capture / Meeting are wave-A wiki-ingest-only kinds emitted by
+            // the voice and gcal channels respectively — discord triage must
+            // never produce them. Defensive skip if the model misbehaves.
+            DecisionKind::Capture | DecisionKind::Meeting => {
+                warn!(
+                    message_id = %email.message_id,
+                    decision = ?decision.decision,
+                    "discord triage returned non-message decision kind; treating as skip"
+                );
+                self.store
+                    .mark_email_processed(&email.message_id, TriageResult::Skip)?;
+                outcome.priority_skipped += 1;
                 Ok(())
             }
         }
