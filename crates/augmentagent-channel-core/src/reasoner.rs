@@ -260,9 +260,12 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
 /// Write/Edit cannot escape into the source tree.
 pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     let bin = repo_root.join("target/release/augmentagent");
-    // Scoped Bash pattern: Claude can ONLY invoke our gmail subcommand via
-    // the release binary's absolute path. Anything else is denied by claude CLI.
-    let bash_allow = format!("Bash({} gmail *)", bin.display());
+    // Scoped Bash patterns: Claude can invoke our gmail subcommand via the
+    // release binary's absolute path, plus `gh issue {create,list,view,comment}`
+    // for filing AugmentAgent self-feedback issues. `/snap/bin/gh` is an
+    // absolute path because the systemd unit's PATH does not include /snap/bin.
+    // Anything else is denied by claude CLI.
+    let bash_gmail = format!("Bash({} gmail *)", bin.display());
     // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
     // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
     // resolves the db regardless of cwd.
@@ -278,7 +281,11 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             "Edit".into(),
             "WebSearch".into(),
             "WebFetch".into(),
-            bash_allow,
+            bash_gmail,
+            "Bash(/snap/bin/gh issue create *)".into(),
+            "Bash(/snap/bin/gh issue list *)".into(),
+            "Bash(/snap/bin/gh issue view *)".into(),
+            "Bash(/snap/bin/gh issue comment *)".into(),
         ],
         add_dirs: vec![wiki_root.clone()],
         permission_mode: "acceptEdits".into(),
