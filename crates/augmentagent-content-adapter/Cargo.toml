@@ -1,5 +1,5 @@
 [package]
-name = "augmentagent-wiki"
+name = "augmentagent-content-adapter"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,15 +8,16 @@ repository.workspace = true
 
 [dependencies]
 augmentagent-store = { path = "../augmentagent-store" }
+augmentagent-channel-core = { path = "../augmentagent-channel-core" }
 
 tokio = { workspace = true }
+async-trait = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-time = { workspace = true }
 serde = { workspace = true }
-serde_yaml_ng = "0.10"
-dashmap = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
