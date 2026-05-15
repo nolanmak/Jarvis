@@ -22,6 +22,12 @@ pub enum IngestTrigger {
     DryRunDrafted, // draft created in dry-run
     Sent,          // approved + sent
     Rejected,      // approver skipped or timeout
+    /// Voice memo / drop-folder transcript flowed straight to wiki ingest.
+    /// Wave-A: voice channel.
+    VoiceMemo,
+    /// Calendar event observation logged to attendee wiki pages. Pairs with
+    /// `DecisionKind::Meeting`. Wave-A: gcal channel (#82).
+    Meeting,
 }
 
 impl IngestTrigger {
@@ -32,6 +38,8 @@ impl IngestTrigger {
             Self::DryRunDrafted => "dry-run-drafted",
             Self::Sent => "sent",
             Self::Rejected => "rejected",
+            Self::VoiceMemo => "voice-memo",
+            Self::Meeting => "meeting",
         }
     }
 }
@@ -48,6 +56,8 @@ pub fn ingest_user_message(
         DecisionKind::Reply => "reply",
         DecisionKind::Skip => "skip",
         DecisionKind::Flag => "flag",
+        DecisionKind::Capture => "capture",
+        DecisionKind::Meeting => "meeting",
     };
     let draft_block = match draft {
         Some(d) if !d.trim().is_empty() => format!("\n\n<draft>\n{d}\n</draft>"),
