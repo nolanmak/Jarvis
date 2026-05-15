@@ -263,7 +263,7 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                 let skill_system = std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
                     .unwrap_or_default();
                 let draft_opts = draft_opts(skill_system, self.config.wiki_root.clone());
-                let draft_prompt = draft_user_message(&email, "");
+                let draft_prompt = draft_user_message(&email, "", "");
                 let draft = match self.reasoner.call(&draft_opts, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
                     Err(e) => {
@@ -342,6 +342,19 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                 }
                 info!(action_id, message_id = %email.message_id, "linkedin approval card posted");
                 Ok(Some(DispatchOutcome::AwaitingApproval))
+            }
+            // Capture / Meeting are wave-A wiki-ingest-only kinds emitted by
+            // the voice and gcal channels respectively — linkedin triage must
+            // never produce them. Defensive skip if the model misbehaves.
+            DecisionKind::Capture | DecisionKind::Meeting => {
+                warn!(
+                    message_id = %email.message_id,
+                    decision = ?decision.decision,
+                    "linkedin triage returned non-message decision kind; treating as skip"
+                );
+                self.store
+                    .mark_email_processed(&email.message_id, TriageResult::Skip)?;
+                Ok(Some(DispatchOutcome::Skipped))
             }
         }
     }
