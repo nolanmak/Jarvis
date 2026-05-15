@@ -111,14 +111,29 @@ pub fn triage_user_message(email: &Email, learned: &str, wiki_hint: &str) -> Str
 
 /// Build the draft user message. `wiki_hint` is an optional pre-built string
 /// naming wiki pages Claude may open; empty string disables the hint.
-pub fn draft_user_message(email: &Email, wiki_hint: &str) -> String {
+///
+/// `tone_block` is the per-recipient/domain/global tone descriptor injected
+/// into the draft prompt as a stable prefix (cache-friendly). Empty string =
+/// no tone injection (today's behavior). Real injection lands in #73.
+pub fn draft_user_message(email: &Email, wiki_hint: &str, tone_block: &str) -> String {
     let hint_block = if wiki_hint.trim().is_empty() {
         String::new()
     } else {
         format!("\n\n{wiki_hint}\n")
     };
+    // IMPORTANT: tone block sits BEFORE the email body so it occupies a stable
+    // prefix position. Claude prompt-caching keys on prefix; keeping the tone
+    // block fixed-position across drafts lets the cache hit on subsequent
+    // drafts within the same session.
+    let tone = if tone_block.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n<tone_profile>\n{tone_block}\n</tone_profile>\n\nMatch the voice in <tone_profile>. When verbatim opener/closer examples appear, weight them heavily — sign off the way the user actually signs off to this recipient.\n"
+        )
+    };
     format!(
-        r#"Draft a reply to this email. Follow the writing-style rules in your system prompt strictly.{hint_block}
+        r#"Draft a reply to this email. Follow the writing-style rules in your system prompt strictly.{tone}{hint_block}
 
 <email>
 From: {from}
