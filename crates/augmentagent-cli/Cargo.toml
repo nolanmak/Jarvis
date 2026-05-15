@@ -17,9 +17,11 @@ augmentagent-channel-email = { path = "../augmentagent-channel-email" }
 augmentagent-channel-linkedin = { path = "../augmentagent-channel-linkedin" }
 augmentagent-channel-discord-dm = { path = "../augmentagent-channel-discord-dm" }
 augmentagent-channel-slack = { path = "../augmentagent-channel-slack" }
+augmentagent-channel-github = { path = "../augmentagent-channel-github" }
 augmentagent-channel-telegram-bot = { path = "../augmentagent-channel-telegram-bot" }
 augmentagent-channel-calendar = { path = "../augmentagent-channel-calendar" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
+augmentagent-auth = { path = "../augmentagent-auth" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
 
 async-trait = { workspace = true }
