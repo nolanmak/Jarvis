@@ -173,6 +173,68 @@ pub struct ChannelSubscription {
     pub updated_at_ms: i64,
 }
 
+/// One row in `rate_events`. Persisted by the RateGovernor (#83) on every
+/// outbound platform action — both the durable audit log and the source of
+/// truth for sliding-window cap math after restart.
+///
+/// `status` is the snake-case form of the rate-governor outcome (`ok` |
+/// `failed` | `rolled_back` | `suspicion`). `rolled_back` rows are
+/// *excluded* from cap counting (the action never executed); the others
+/// all burn quota.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateEvent {
+    pub id: String,
+    pub platform: String,
+    pub action_kind: String,
+    pub account_id: String,
+    pub occurred_at_ms: i64,
+    pub status: String,
+    pub cause: String,
+    pub target_id: Option<String>,
+    pub meta_json: Option<String>,
+}
+
+/// One row in `rate_halts`. Per-platform circuit breaker, written when the
+/// channel surfaces a suspicion signal (captcha, login challenge, 429, …).
+/// `permit()` consults this before any cap math: while `paused_until_ms` is in
+/// the future, every action on that platform is denied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateHalt {
+    pub platform: String,
+    pub paused_until_ms: i64,
+    pub reason: String,
+    pub triggered_by_event_id: Option<String>,
+    pub created_at_ms: i64,
+    pub acknowledged_at_ms: Option<i64>,
+}
+
+/// One row in `rate_warmup`. Tracks when a `(platform, account_id)` pair
+/// first started ramping. The warmup multiplier (#83 §4) is a pure function
+/// of `now - warmup_started_at_ms`; the row is created lazily on first
+/// `permit()` for an unknown account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateWarmup {
+    pub platform: String,
+    pub account_id: String,
+    pub warmup_started_at_ms: i64,
+}
+
+/// Aggregated audit row returned by `Store::rate_audit_query` (#83 §8).
+/// One per `rate_events` row; the dashboard table / Discord embed render
+/// directly from this shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateAuditRow {
+    pub id: String,
+    pub platform: String,
+    pub action_kind: String,
+    pub account_id: String,
+    pub occurred_at_ms: i64,
+    pub status: String,
+    pub cause: String,
+    pub target_id: Option<String>,
+    pub meta_json: Option<String>,
+}
+
 /// A connected Slack workspace, persisted alongside `gmail_accounts`. One row
 /// per OAuth connection; the poller iterates these each tick to build a
 /// per-workspace `SlackClient` from its Keychain entry keyed by `team_id`.

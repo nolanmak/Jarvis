@@ -8,8 +8,8 @@ pub mod models;
 mod store;
 
 pub use models::{
-    Account, ActionRecord, ActionStatus, ChannelSubscription, Email, LearnedPattern,
-    SlackWorkspace, SubscriptionMode, TriageResult,
+    Account, ActionRecord, ActionStatus, ChannelSubscription, Email, LearnedPattern, RateAuditRow,
+    RateEvent, RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TriageResult,
 };
 pub use store::{
     ActionWithEmail, PendingNudge, RetryableReply, Store, StoreError, StoreResult,
