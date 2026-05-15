@@ -462,19 +462,29 @@ enum ProactiveOp {
 
 #[derive(Subcommand)]
 enum BrowserOp {
-    /// Spawn a headless Chromium and report its CDP endpoint.
+    /// Start the browser sidecar stack (Xvfb + Chromium + Python sidecar)
+    /// via systemd. Thin wrapper over `systemctl --user start` for the
+    /// three units in `systemd/`. Idempotent.
     Start,
-    /// Stop the running headless Chromium.
+    /// Stop the browser sidecar stack via systemd.
     Stop,
     /// Import cookies from the local Chrome profile into the managed jar.
+    /// Stub — wire when the cookie-jar story lands (out of scope for #75 v0).
     ImportCookies {
         #[arg(long)]
         profile: Option<String>,
     },
-    /// Print connection info (CDP endpoint, jar slot, last heartbeat).
+    /// Probe the sidecar (`ping`) and print connection info.
     Status {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         json: bool,
+    },
+    /// Run the §10 acceptance test: navigate twitter.com, screenshot, and
+    /// check for a logged-in DOM marker. Pass criterion = the spike works.
+    AcceptanceTest {
+        /// Where to save the screenshot.
+        #[arg(long, default_value = "/tmp/twitter-acceptance.png")]
+        out: PathBuf,
     },
 }
 
@@ -1234,11 +1244,14 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Browser { op } => match op {
-            BrowserOp::Start
-            | BrowserOp::Stop
-            | BrowserOp::ImportCookies { .. }
-            | BrowserOp::Status { .. } => {
-                unimplemented!("see browser-client feature PR")
+            BrowserOp::Start => run_browser_start().await,
+            BrowserOp::Stop => run_browser_stop().await,
+            BrowserOp::Status { json } => run_browser_status(json).await,
+            BrowserOp::AcceptanceTest { out } => run_browser_acceptance(out).await,
+            BrowserOp::ImportCookies { .. } => {
+                // Out of scope for #75 v0 — cookie jar lands later (depends
+                // on the persistent profile having been logged-in via VNC).
+                unimplemented!("cookie import deferred — see follow-up to #75")
             }
         },
         Cmd::Tone { op } => match op {
@@ -1497,6 +1510,170 @@ fn indent_body(body: &str, cols: usize) -> String {
         .map(|l| format!("{pad}{l}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Browser sidecar CLI handlers (issue #75 v0).
+//
+// `start`/`stop`/`status` are thin systemd wrappers; `acceptance-test` does
+// the §10 round-trip through the sidecar. `import-cookies` is unimplemented
+// — deferred to a follow-up issue.
+// ---------------------------------------------------------------------------
+
+const BROWSER_UNITS: &[&str] = &[
+    "augmentagent-xvfb.service",
+    "augmentagent-chromium.service",
+    "augmentagent-browser-sidecar.service",
+];
+
+fn run_systemctl(args: &[&str]) -> Result<std::process::Output> {
+    use std::process::Command;
+    let out = Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to spawn systemctl --user {}", args.join(" ")))?;
+    Ok(out)
+}
+
+async fn run_browser_start() -> Result<()> {
+    for unit in BROWSER_UNITS {
+        let out = run_systemctl(&["start", unit])?;
+        if !out.status.success() {
+            eprintln!(
+                "systemctl start {unit} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return Err(anyhow::anyhow!("systemctl start {unit} failed"));
+        }
+        println!("started {unit}");
+    }
+    println!(
+        "\nall three units up. socket: {:?}",
+        augmentagent_browser_client::default_socket_path()
+    );
+    println!("if this is a fresh profile: complete one-time login per sidecars/browser/README.md");
+    Ok(())
+}
+
+async fn run_browser_stop() -> Result<()> {
+    // Stop in reverse order so dependents go down first.
+    for unit in BROWSER_UNITS.iter().rev() {
+        let out = run_systemctl(&["stop", unit])?;
+        if !out.status.success() {
+            eprintln!(
+                "systemctl stop {unit} failed (continuing): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        } else {
+            println!("stopped {unit}");
+        }
+    }
+    Ok(())
+}
+
+async fn run_browser_status(json: bool) -> Result<()> {
+    use augmentagent_browser_client::{default_socket_path, BrowserClient};
+
+    let mut units_state = Vec::new();
+    for unit in BROWSER_UNITS {
+        let out = run_systemctl(&["is-active", unit])?;
+        let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        units_state.push((*unit, state));
+    }
+
+    let sock = default_socket_path();
+    let sock_exists = sock.exists();
+    let mut ping_ok = false;
+    let mut ping_err: Option<String> = None;
+    if sock_exists {
+        match BrowserClient::connect(&sock).await {
+            Ok(client) => match client.ping().await {
+                Ok(()) => ping_ok = true,
+                Err(e) => ping_err = Some(e.to_string()),
+            },
+            Err(e) => ping_err = Some(e.to_string()),
+        }
+    } else {
+        ping_err = Some(format!("socket not present at {:?}", sock));
+    }
+
+    if json {
+        let body = serde_json::json!({
+            "units": units_state.iter().map(|(u, s)| {
+                serde_json::json!({"unit": u, "state": s})
+            }).collect::<Vec<_>>(),
+            "socket": sock.to_string_lossy(),
+            "socket_exists": sock_exists,
+            "ping_ok": ping_ok,
+            "ping_error": ping_err,
+        });
+        println!("{}", serde_json::to_string_pretty(&body)?);
+    } else {
+        for (u, s) in &units_state {
+            println!("{u}: {s}");
+        }
+        println!("socket: {} (exists={})", sock.display(), sock_exists);
+        if ping_ok {
+            println!("ping: OK");
+        } else if let Some(e) = ping_err {
+            println!("ping: FAIL — {e}");
+        }
+    }
+    Ok(())
+}
+
+async fn run_browser_acceptance(out_path: PathBuf) -> Result<()> {
+    use augmentagent_browser_client::{default_socket_path, BrowserClient};
+
+    let sock = default_socket_path();
+    println!("connecting to sidecar at {}", sock.display());
+    let client = BrowserClient::connect(&sock).await.with_context(|| {
+        format!(
+            "connect failed — is augmentagent-browser-sidecar.service running? socket: {}",
+            sock.display()
+        )
+    })?;
+
+    println!("ping...");
+    client.ping().await.context("ping failed")?;
+
+    println!("navigate https://twitter.com");
+    if let Err(e) = client.navigate("https://twitter.com").await {
+        if e.is_auth_required() {
+            println!(
+                "FAIL — AuthRequired: complete one-time login per sidecars/browser/README.md"
+            );
+            return Err(anyhow::anyhow!("auth required"));
+        }
+        return Err(e).context("navigate failed");
+    }
+
+    println!("screenshot -> {}", out_path.display());
+    let _bytes = client
+        .screenshot(&out_path)
+        .await
+        .context("screenshot failed")?;
+
+    println!("evaluate logged-in DOM marker");
+    let v = client
+        .evaluate(
+            "!!document.querySelector(\"[data-testid='SideNav_AccountSwitcher_Button']\")",
+        )
+        .await
+        .context("evaluate failed")?;
+    let logged_in = v.as_bool().unwrap_or(false);
+    if logged_in {
+        println!("PASS — screenshot at {}", out_path.display());
+        Ok(())
+    } else {
+        println!(
+            "FAIL — logged-out DOM. Complete one-time login per sidecars/browser/README.md\n\
+             screenshot saved to {} for inspection.",
+            out_path.display()
+        );
+        Err(anyhow::anyhow!("not logged in"))
+    }
 }
 
 /// Resolve the user-supplied `--account` flag (email address OR Composio

@@ -1,0 +1,21 @@
+[Unit]
+Description=AugmentAgent Python browser sidecar (Playwright + browser-use)
+After=augmentagent-chromium.service
+Requires=augmentagent-chromium.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nolan-makatche/AugmentAgent/sidecars/browser
+Environment=DISPLAY=:99
+Environment=PYTHONUNBUFFERED=1
+Environment=AUGMENTAGENT_BROWSER_CDP=http://127.0.0.1:9223
+Environment=AUGMENTAGENT_BROWSER_SOCK=%t/augmentagent/browser.sock
+ExecStartPre=/usr/bin/mkdir -p %t/augmentagent
+ExecStart=/home/nolan-makatche/AugmentAgent/sidecars/browser/.venv/bin/python /home/nolan-makatche/AugmentAgent/sidecars/browser/sidecar.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:%S/augmentagent/browser-sidecar.log
+StandardError=append:%S/augmentagent/browser-sidecar.log
+
+[Install]
+WantedBy=default.target
