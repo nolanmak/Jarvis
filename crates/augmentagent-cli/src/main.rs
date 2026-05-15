@@ -113,6 +113,288 @@ enum Cmd {
         #[command(subcommand)]
         op: SlackOp,
     },
+    /// Telegram Bot API channel (#74). Long-poll getUpdates, dispatch through
+    /// channel_subscriptions. All ops are stubs in foundation/swarm-v1; impls
+    /// land in the telegram-bot feature PR.
+    TelegramBot {
+        #[command(subcommand)]
+        op: TelegramBotOp,
+    },
+    /// WhatsApp channel via whatsmeow Go sidecar (#74). All ops are stubs in
+    /// foundation/swarm-v1; impls land in the whatsapp feature PR.
+    Whatsapp {
+        #[command(subcommand)]
+        op: WhatsappOp,
+    },
+    /// Google Calendar -> wiki Meeting log ingestion (#82). All ops are
+    /// stubs in foundation/swarm-v1; impls land in the calendar feature PR.
+    Calendar {
+        #[command(subcommand)]
+        op: CalendarOp,
+    },
+    /// Voice memo capture: drop-folder watcher + Whisper transcription ->
+    /// wiki ingest. All ops stubs in foundation/swarm-v1.
+    Voice {
+        #[command(subcommand)]
+        op: VoiceOp,
+    },
+    /// GitHub channel: notification + review-request triage. All ops stubs
+    /// in foundation/swarm-v1.
+    Github {
+        #[command(subcommand)]
+        op: GithubOp,
+    },
+    /// Cross-platform compose-once content adapter (#53). One source draft
+    /// fans out into per-platform variants. All ops stubs in
+    /// foundation/swarm-v1.
+    Compose {
+        #[command(subcommand)]
+        op: ComposeOp,
+    },
+    /// Proactive CRM scanner (#81): stale-contact / stale-commitment /
+    /// event-reminder rules over wiki + sqlite. All ops stubs in
+    /// foundation/swarm-v1.
+    Proactive {
+        #[command(subcommand)]
+        op: ProactiveOp,
+    },
+    /// Headless-browser client (CDP-driven Chromium) for channels that fall
+    /// back to DOM automation. All ops stubs in foundation/swarm-v1.
+    Browser {
+        #[command(subcommand)]
+        op: BrowserOp,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Wave-A Cmd subcommand stubs (foundation/swarm-v1).
+// Each *Op enum mirrors SlackOp's shape (Login / List / Subscribe / Unsub /
+// Subscriptions / PollOnce where applicable). Match arms call unimplemented!
+// pointing at the relevant issue so the feature PRs know exactly which arm
+// to fill.
+// ---------------------------------------------------------------------------
+
+#[derive(Subcommand)]
+enum TelegramBotOp {
+    /// Persist bot token to keyring (issue #74).
+    Login {
+        #[arg(long)]
+        token: String,
+    },
+    /// List connected bots from telegram_bots.
+    Bots {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Disconnect a bot.
+    RemoveBot { bot_username: String },
+    /// List chats the bot has seen so far.
+    ListChats {
+        #[arg(long)]
+        bot_username: Option<String>,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Add or update a subscription for a chat the bot can see.
+    Subscribe {
+        chat_id: String,
+        #[arg(long, value_parser = ["priority", "digest", "store_only"])]
+        mode: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        bot_username: Option<String>,
+    },
+    Subscriptions {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    Unsubscribe {
+        id: String,
+    },
+    PollOnce {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum WhatsappOp {
+    /// Pair a new linked device. Spawns sidecar, prints QR, blocks until
+    /// paired or timeout. Persists session to keyring + whatsapp_devices.
+    Login {
+        #[arg(long)]
+        phone: String,
+        #[arg(long, default_value_t = 60)]
+        timeout_secs: u64,
+    },
+    Status {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    Devices {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    Unlink {
+        phone: String,
+    },
+    ListChats {
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    Subscribe {
+        chat_jid: String,
+        #[arg(long, value_parser = ["priority", "digest", "store_only"])]
+        mode: String,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    Subscriptions {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    Unsubscribe {
+        id: String,
+    },
+    /// Opt a chat into outbound sends (whatsapp_outbound_allowlist).
+    AllowOutbound {
+        chat_jid: String,
+    },
+    DenyOutbound {
+        chat_jid: String,
+    },
+    /// Opt a chat into inbound triage (whatsapp_inbound_allowlist).
+    AllowInbound {
+        chat_jid: String,
+    },
+    DenyInbound {
+        chat_jid: String,
+    },
+    PollOnce {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CalendarOp {
+    /// One-shot historical event ingest into the wiki Meeting log.
+    Backfill {
+        #[arg(long, default_value_t = 365)]
+        days: u32,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+    /// Run one Calendar poll cycle and exit.
+    PollOnce {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum VoiceOp {
+    /// Run one drop-folder scan + transcription pass.
+    PollOnce {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+    /// Manually ingest a single audio file.
+    Ingest {
+        path: PathBuf,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum GithubOp {
+    /// Persist a personal-access token (or gh-cli token) to keyring.
+    Login {
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        login: String,
+    },
+    Subscribe {
+        repo: String,
+        #[arg(long, value_parser = ["priority", "digest", "store_only"])]
+        mode: String,
+    },
+    Subscriptions {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    Unsubscribe {
+        id: String,
+    },
+    PollOnce {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ComposeOp {
+    /// Fan a single source draft out into per-platform variants. Each
+    /// variant is approval-gated independently.
+    FanOut {
+        /// Path to a markdown/text file containing the source draft.
+        #[arg(long)]
+        source: PathBuf,
+        /// CSV of target platforms. Defaults to "twitter,linkedin,instagram".
+        #[arg(long, default_value = "twitter,linkedin,instagram")]
+        platforms: String,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProactiveOp {
+    /// Run all enabled scans once and print/dispatch the resulting signals.
+    ScanOnce {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+    /// List recent ProactiveSignals from sqlite.
+    Signals {
+        #[arg(long, default_value_t = 25)]
+        limit: u32,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Snooze a signal by id.
+    Snooze {
+        id: String,
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+    },
+    /// Dismiss a signal by id.
+    Dismiss {
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum BrowserOp {
+    /// Spawn a headless Chromium and report its CDP endpoint.
+    Start,
+    /// Stop the running headless Chromium.
+    Stop,
+    /// Import cookies from the local Chrome profile into the managed jar.
+    ImportCookies {
+        #[arg(long)]
+        profile: Option<String>,
+    },
+    /// Print connection info (CDP endpoint, jar slot, last heartbeat).
+    Status {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -670,6 +952,78 @@ async fn main() -> Result<()> {
                 let out = ch.poll_once().await?;
                 println!("{out:#?}");
                 Ok(())
+            }
+        },
+        // ----- wave-A foundation stubs --------------------------------
+        // Each arm calls unimplemented! pointing at the relevant issue so
+        // feature PRs know exactly which arm to fill.
+        Cmd::TelegramBot { op } => match op {
+            TelegramBotOp::Login { .. }
+            | TelegramBotOp::Bots { .. }
+            | TelegramBotOp::RemoveBot { .. }
+            | TelegramBotOp::ListChats { .. }
+            | TelegramBotOp::Subscribe { .. }
+            | TelegramBotOp::Subscriptions { .. }
+            | TelegramBotOp::Unsubscribe { .. }
+            | TelegramBotOp::PollOnce { .. } => {
+                unimplemented!("see issue #74 (telegram-bot feature PR)")
+            }
+        },
+        Cmd::Whatsapp { op } => match op {
+            WhatsappOp::Login { .. }
+            | WhatsappOp::Status { .. }
+            | WhatsappOp::Devices { .. }
+            | WhatsappOp::Unlink { .. }
+            | WhatsappOp::ListChats { .. }
+            | WhatsappOp::Subscribe { .. }
+            | WhatsappOp::Subscriptions { .. }
+            | WhatsappOp::Unsubscribe { .. }
+            | WhatsappOp::AllowOutbound { .. }
+            | WhatsappOp::DenyOutbound { .. }
+            | WhatsappOp::AllowInbound { .. }
+            | WhatsappOp::DenyInbound { .. }
+            | WhatsappOp::PollOnce { .. } => {
+                unimplemented!("see issue #74 (whatsapp feature PR)")
+            }
+        },
+        Cmd::Calendar { op } => match op {
+            CalendarOp::Backfill { .. } | CalendarOp::PollOnce { .. } => {
+                unimplemented!("see issue #82 (calendar feature PR)")
+            }
+        },
+        Cmd::Voice { op } => match op {
+            VoiceOp::PollOnce { .. } | VoiceOp::Ingest { .. } => {
+                unimplemented!("see voice-channel feature PR")
+            }
+        },
+        Cmd::Github { op } => match op {
+            GithubOp::Login { .. }
+            | GithubOp::Subscribe { .. }
+            | GithubOp::Subscriptions { .. }
+            | GithubOp::Unsubscribe { .. }
+            | GithubOp::PollOnce { .. } => {
+                unimplemented!("see github-channel feature PR")
+            }
+        },
+        Cmd::Compose { op } => match op {
+            ComposeOp::FanOut { .. } => {
+                unimplemented!("see issue #53 (content-adapter feature PR)")
+            }
+        },
+        Cmd::Proactive { op } => match op {
+            ProactiveOp::ScanOnce { .. }
+            | ProactiveOp::Signals { .. }
+            | ProactiveOp::Snooze { .. }
+            | ProactiveOp::Dismiss { .. } => {
+                unimplemented!("see issue #81 (proactive feature PR)")
+            }
+        },
+        Cmd::Browser { op } => match op {
+            BrowserOp::Start
+            | BrowserOp::Stop
+            | BrowserOp::ImportCookies { .. }
+            | BrowserOp::Status { .. } => {
+                unimplemented!("see browser-client feature PR")
             }
         },
     }
