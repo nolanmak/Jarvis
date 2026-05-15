@@ -17,6 +17,7 @@ augmentagent-channel-email = { path = "../augmentagent-channel-email" }
 augmentagent-channel-linkedin = { path = "../augmentagent-channel-linkedin" }
 augmentagent-channel-discord-dm = { path = "../augmentagent-channel-discord-dm" }
 augmentagent-channel-slack = { path = "../augmentagent-channel-slack" }
+augmentagent-channel-calendar = { path = "../augmentagent-channel-calendar" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
 
