@@ -283,10 +283,19 @@ impl EventHandler for Handler {
                 let handler = self.state.action_handler.clone();
                 let action_id = cid.action_id.clone();
                 let approval_channel = self.state.approval_channel_id;
+                let store_for_capture = self.state.store.clone();
                 let ctx_clone = ctx.clone();
                 let modal_clone = modal.clone();
 
                 tokio::spawn(async move {
+                    // Snapshot the pre-Revise draft BEFORE calling revise — the
+                    // revise call mutates `actions.draftBody` in-place, so a
+                    // post-call read would return the new draft. (#37)
+                    let original_draft = store_for_capture
+                        .as_ref()
+                        .and_then(|s| s.get_action_with_email(&action_id).ok().flatten())
+                        .map(|a| a.action.draft_body.unwrap_or_default());
+
                     let outcome = match handler {
                         Some(h) => h.revise(&action_id, &feedback).await,
                         None => ApprovalActionOutcome::Failed {
@@ -297,6 +306,30 @@ impl EventHandler for Handler {
                     let repost = if let ApprovalActionOutcome::Revised { email, draft } =
                         &outcome
                     {
+                        // Capture the (original, feedback, revised) triple for
+                        // the draft-quality eval corpus (#37). Best-effort: a
+                        // store error here must not break the user-facing
+                        // Revise flow, so we just log and move on.
+                        if let (Some(store), Some(orig)) =
+                            (store_for_capture.as_ref(), original_draft.as_ref())
+                        {
+                            match store.record_revision_triple(
+                                &action_id,
+                                orig,
+                                &feedback,
+                                draft,
+                            ) {
+                                Ok(rev_id) => debug!(
+                                    action_id = %action_id,
+                                    revision_id = %rev_id,
+                                    "revise: captured triple"
+                                ),
+                                Err(e) => warn!(
+                                    action_id = %action_id,
+                                    "revise: failed to record triple: {e}"
+                                ),
+                            }
+                        }
                         Some((email.clone(), draft.clone()))
                     } else {
                         None
