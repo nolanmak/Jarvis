@@ -1,0 +1,27 @@
+[Unit]
+Description=AugmentAgent dedicated Chromium (headed, on Xvfb :99)
+After=augmentagent-xvfb.service
+Requires=augmentagent-xvfb.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:99
+Environment=XAUTHORITY=
+ExecStart=/usr/bin/chromium \
+    --remote-debugging-port=9223 \
+    --remote-debugging-address=127.0.0.1 \
+    --user-data-dir=/home/nolan-makatche/.local/state/augmentagent/browser-profile \
+    --no-first-run \
+    --no-default-browser-check \
+    --disable-features=IsolateOrigins,site-per-process \
+    --window-size=1600,1200 \
+    --start-maximized
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=3
+StartLimitIntervalSec=300
+StandardOutput=append:%S/augmentagent/chromium.log
+StandardError=append:%S/augmentagent/chromium.log
+
+[Install]
+WantedBy=default.target

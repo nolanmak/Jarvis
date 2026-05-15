@@ -1,0 +1,16 @@
+[Unit]
+Description=AugmentAgent Xvfb display :99
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1600x1200x24 -ac -nolisten tcp
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+StandardOutput=append:%S/augmentagent/xvfb.log
+StandardError=append:%S/augmentagent/xvfb.log
+
+[Install]
+WantedBy=default.target
