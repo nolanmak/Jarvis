@@ -353,6 +353,25 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
     }
 }
 
+/// Preset for the one-shot v2 wiki migration tool (`wiki migrate --to v2`).
+///
+/// Haiku for cost — full 562-page corpus runs ~$5. Read-only against the
+/// wiki: the migration tool parses the model's text response and applies
+/// the patch via Rust IO so v1 keys are preserved byte-for-byte (#78 §2
+/// step 6 + §8 risk register forbid round-tripping the whole frontmatter).
+/// cwd pinned so any accidental Bash escapes are scoped to the wiki tree.
+pub fn wiki_migrate_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
+    ReasonerOpts {
+        system_prompt,
+        model: Some("claude-haiku-4-5-20251001".into()),
+        allowed_tools: vec!["Read".into(), "Grep".into(), "Glob".into()],
+        add_dirs: vec![wiki_root.clone()],
+        permission_mode: "acceptEdits".into(),
+        cwd: Some(wiki_root),
+        env: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
