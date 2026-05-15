@@ -1,0 +1,14 @@
+{
+  "id": "evt-instance-2026-05-14",
+  "iCalUID": "rrr-master@google.com",
+  "recurringEventId": "rrr-master",
+  "status": "confirmed",
+  "summary": "Sarah 1:1",
+  "start": { "dateTime": "2026-05-14T17:00:00Z" },
+  "end":   { "dateTime": "2026-05-14T17:30:00Z" },
+  "attendees": [
+    { "email": "me@x.com", "self": true, "responseStatus": "accepted" },
+    { "email": "sarah@acme.com", "displayName": "Sarah", "responseStatus": "accepted" }
+  ],
+  "organizer": { "email": "me@x.com", "self": true }
+}
