@@ -24,6 +24,8 @@ use augmentagent_channel_linkedin::{
 use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
+mod invoice;
+
 #[derive(Parser)]
 #[command(name = "augmentagent", version, about = "AugmentAgent Rust daemon")]
 struct Cli {
@@ -113,6 +115,11 @@ enum Cmd {
         #[command(subcommand)]
         op: SlackOp,
     },
+    /// Weekly Orchid invoice automation (generate + email the PDF).
+    Invoice {
+        #[command(subcommand)]
+        op: InvoiceOp,
+    },
     /// Telegram Bot API channel (#74). Long-poll getUpdates, dispatch through
     /// channel_subscriptions. All ops are stubs in foundation/swarm-v1; impls
     /// land in the telegram-bot feature PR.
@@ -196,6 +203,48 @@ enum Cmd {
     Ratelimit {
         #[command(subcommand)]
         op: RatelimitOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum InvoiceOp {
+    /// Show recipient, next invoice number, sending entity, last billed week.
+    Status,
+    /// Set the recipient email (the Discord command writes the same row).
+    SetRecipient {
+        #[arg(long)]
+        email: String,
+    },
+    /// Set the Composio sending entity (account that sends the email).
+    SetEntity {
+        #[arg(long)]
+        entity: String,
+    },
+    /// Master kill switch for the weekly scheduler. Seeded OFF — the
+    /// scheduler never auto-sends until this is explicitly turned on.
+    SetAutoSend {
+        /// true = let the Sunday scheduler send; false = generate-only/no-op.
+        #[arg(long, action = clap::ArgAction::Set)]
+        on: bool,
+    },
+    /// Mark a week (ending Sunday, YYYY-MM-DD) as already billed so the
+    /// scheduler won't (re)send it. Use at cutover: the backlog covered
+    /// through 2026-05-17, so seed that to make the first auto-send 05/24.
+    MarkBilled {
+        #[arg(long)]
+        week_end: String,
+    },
+    /// List Composio-connected Gmail accounts (email → entity).
+    ListAccounts,
+    /// Generate (and unless --dry-run, send) the invoice for a Sun→Sun week.
+    /// Defaults to the most recent Sunday. Dry-run is the default.
+    Run {
+        /// Week-ending Sunday, YYYY-MM-DD. Omit for the most recent Sunday.
+        #[arg(long)]
+        week_end: Option<String>,
+        /// true (default) = generate only; `--dry-run false` actually sends.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
     },
 }
 
@@ -994,6 +1043,13 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 let nudge_for_task = Arc::clone(&nudge);
                 tasks.push(tokio::spawn(async move { nudge_for_task.run(sd).await }));
+
+                // Weekly Orchid invoice scheduler — Sundays only, idempotent.
+                // Gated on !dry_run for the same reason as nudge: it performs
+                // a real outbound send.
+                let inv = Arc::new(invoice::InvoiceScheduler::new(Arc::clone(&store)));
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { inv.run(sd).await }));
             }
             for handle in tasks {
                 handle.await??;
@@ -1148,6 +1204,70 @@ async fn main() -> Result<()> {
                 let ch = build_discord_channel(&cli, store, broker, *dry_run)?;
                 let out = ch.poll_once().await?;
                 println!("{out:#?}");
+                Ok(())
+            }
+        },
+        Cmd::Invoice { ref op } => match op {
+            InvoiceOp::Status => {
+                let g = |k: &str| store.get_invoice_config(k).ok().flatten().unwrap_or_default();
+                println!("recipient_email     : {}", g("recipient_email"));
+                println!("invoice_counter     : {}", store.invoice_counter()?);
+                println!("from_entity         : {}", {
+                    let e = g("from_entity");
+                    if e.is_empty() { "(unset)".into() } else { e }
+                });
+                println!("last_billed_week_end: {}", {
+                    let w = g("last_billed_week_end");
+                    if w.is_empty() { "(never)".into() } else { w }
+                });
+                println!("auto_send_enabled   : {}", {
+                    if g("auto_send_enabled") == "true" {
+                        "ON"
+                    } else {
+                        "OFF (scheduler will not send)"
+                    }
+                });
+                Ok(())
+            }
+            InvoiceOp::SetRecipient { email } => {
+                store.set_invoice_config("recipient_email", email)?;
+                println!("invoice recipient set to {email}");
+                Ok(())
+            }
+            InvoiceOp::SetEntity { entity } => {
+                store.set_invoice_config("from_entity", entity)?;
+                println!("invoice sending entity set to {entity}");
+                Ok(())
+            }
+            InvoiceOp::SetAutoSend { on } => {
+                store.set_invoice_config("auto_send_enabled", if *on { "true" } else { "false" })?;
+                println!(
+                    "invoice auto-send {}",
+                    if *on { "ENABLED — scheduler will send on Sundays" } else { "DISABLED" }
+                );
+                Ok(())
+            }
+            InvoiceOp::MarkBilled { week_end } => {
+                chrono::NaiveDate::parse_from_str(week_end, "%Y-%m-%d")
+                    .context("--week-end must be YYYY-MM-DD")?;
+                store.set_invoice_config("last_billed_week_end", week_end)?;
+                println!("marked {week_end} as already billed (scheduler will skip it)");
+                Ok(())
+            }
+            InvoiceOp::ListAccounts => {
+                println!("{}", invoice::list_accounts().await?);
+                Ok(())
+            }
+            InvoiceOp::Run { week_end, dry_run } => {
+                let we = match week_end {
+                    Some(s) => Some(
+                        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                            .context("--week-end must be YYYY-MM-DD")?,
+                    ),
+                    None => None,
+                };
+                let msg = invoice::run_invoice(&store, we, *dry_run).await?;
+                println!("{msg}");
                 Ok(())
             }
         },
@@ -3463,6 +3583,9 @@ async fn build_broker(
     let slack = load_slack_clients(&store);
     let telegram = load_telegram_bot_clients(&store);
     let github = load_github_client();
+    // Keep handles for the broker before `store` is moved into the approver:
+    // the `!invoice` config command and #37 Revise-triple capture.
+    let invoice_store = Arc::clone(&store);
     let store_for_broker = Arc::clone(&store);
     let approver = Arc::new(ReplyApprover {
         store,
@@ -3486,6 +3609,7 @@ async fn build_broker(
         allowed_user_id,
         query_handler,
         action_handler: Some(approver_for_broker),
+        invoice_store: Some(invoice_store),
         store: Some(store_for_broker),
     })
     .await

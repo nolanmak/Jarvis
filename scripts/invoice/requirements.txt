@@ -1,0 +1,2 @@
+reportlab>=4.0
+composio>=0.7

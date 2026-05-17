@@ -1,0 +1,27 @@
+<div class="space-y-3">
+  <div class="flex items-center justify-between py-2">
+    <div class="flex items-center gap-2">
+      <span class="w-2 h-2 rounded-full <%= invoice.autoSendEnabled ? 'bg-green-400' : 'bg-amber-500' %>"></span>
+      <span class="text-sm">Automatic sending</span>
+    </div>
+    <span class="text-xs font-medium <%= invoice.autoSendEnabled ? 'text-green-400' : 'text-amber-500' %>">
+      <%= invoice.autoSendEnabled ? 'ON — sends every Sunday' : 'OFF — scheduler will not send' %>
+    </span>
+  </div>
+  <div class="flex items-center justify-between py-2">
+    <span class="text-sm text-gray-400">Recipient</span>
+    <span class="text-xs text-gray-300"><%= invoice.recipientEmail %></span>
+  </div>
+  <div class="flex items-center justify-between py-2">
+    <span class="text-sm text-gray-400">Next invoice #</span>
+    <span class="text-xs text-gray-300"><%= invoice.nextNumber %></span>
+  </div>
+  <div class="flex items-center justify-between py-2">
+    <span class="text-sm text-gray-400">Sending account (Composio entity)</span>
+    <span class="text-xs text-gray-300"><%= invoice.fromEntity || '(unset — set via Discord !invoice entity)' %></span>
+  </div>
+  <div class="flex items-center justify-between py-2">
+    <span class="text-sm text-gray-400">Last billed week ending</span>
+    <span class="text-xs text-gray-300"><%= invoice.lastBilledWeekEnd || '(never)' %></span>
+  </div>
+</div>

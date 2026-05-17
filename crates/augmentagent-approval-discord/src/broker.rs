@@ -30,6 +30,9 @@ pub struct DiscordConfig {
     pub query_handler: Option<Arc<dyn QueryHandler>>,
     /// Handles Approve / Revise / Skip clicks. `None` silently ignores.
     pub action_handler: Option<Arc<dyn ApprovalActionHandler>>,
+    /// Store for the `!invoice` config command (recipient / sending entity).
+    /// `None` disables the command.
+    pub invoice_store: Option<Arc<Store>>,
     /// Store handle so the event handler can persist (draft, feedback, revised)
     /// triples to `draft_revisions` after a Revise (#37). `None` disables
     /// persistence — the broker still works, the data just isn't captured.
@@ -44,6 +47,7 @@ pub(crate) struct BrokerState {
     pub(crate) query_handler: Option<Arc<dyn QueryHandler>>,
     pub(crate) action_handler: Option<Arc<dyn ApprovalActionHandler>>,
     pub(crate) approval_channel_id: ChannelId,
+    pub(crate) invoice_store: Option<Arc<Store>>,
     /// Store handle for persisting Revise triples to `draft_revisions` (#37).
     pub(crate) store: Option<Arc<Store>>,
     /// Populated once, from the first `Ready` event. Used to distinguish the
@@ -58,6 +62,7 @@ impl BrokerState {
         allowed_user_id: Option<UserId>,
         query_handler: Option<Arc<dyn QueryHandler>>,
         action_handler: Option<Arc<dyn ApprovalActionHandler>>,
+        invoice_store: Option<Arc<Store>>,
         store: Option<Arc<Store>>,
     ) -> Self {
         Self {
@@ -68,6 +73,7 @@ impl BrokerState {
             query_handler,
             action_handler,
             approval_channel_id,
+            invoice_store,
             store,
             bot_user_id: std::sync::OnceLock::new(),
         }
@@ -104,6 +110,7 @@ impl DiscordApprovalBroker {
             config.allowed_user_id.map(UserId::new),
             config.query_handler.clone(),
             config.action_handler.clone(),
+            config.invoice_store.clone(),
             config.store.clone(),
         ));
 
