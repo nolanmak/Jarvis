@@ -17,6 +17,8 @@ use serenity::all::{
 };
 use tracing::{debug, info, warn};
 
+use augmentagent_store::Store;
+
 use crate::broker::BrokerState;
 use crate::custom_id::{CustomId, Verb};
 use crate::layout::{approval_message, extract_feedback, revise_modal};
@@ -81,6 +83,19 @@ impl EventHandler for Handler {
         let user_text = msg.content.trim().to_string();
         let images = filter_image_attachments(&msg.attachments);
         if user_text.is_empty() && images.is_empty() {
+            return;
+        }
+
+        // Invoice config command — handled inline, not routed to the wiki
+        // query handler. Allowlist was already enforced above.
+        if user_text.starts_with("!invoice") {
+            let reply = handle_invoice_command(self.state.invoice_store.as_deref(), &user_text);
+            let builder = CreateMessage::new()
+                .content(reply)
+                .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+            if let Err(e) = msg.channel_id.send_message(&ctx.http, builder).await {
+                warn!("failed to post invoice command reply: {e}");
+            }
             return;
         }
 
@@ -564,6 +579,74 @@ fn action_id_from_message(msg: &Message) -> Option<String> {
 /// Keep only attachments whose Discord-reported `content_type` looks like an
 /// image. Discord populates this from the upload, so it's reliable enough to
 /// gate which attachments we hand to the vision model.
+/// Handle a `!invoice …` config command. Pure: reads/writes the invoice_config
+/// store rows and returns the text to reply with. Recognized:
+///   `!invoice status`
+///   `!invoice recipient <email>`
+///   `!invoice entity <composio_entity_id>`
+///   `!invoice autosend on|off`
+fn handle_invoice_command(store: Option<&Store>, text: &str) -> String {
+    let Some(store) = store else {
+        return "invoice config unavailable (store not wired)".to_string();
+    };
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    let g = |k: &str| store.get_invoice_config(k).ok().flatten().unwrap_or_default();
+    match parts.get(1).copied() {
+        Some("status") => {
+            let recipient = {
+                let r = g("recipient_email");
+                if r.is_empty() { "REDACTED".to_string() } else { r }
+            };
+            let entity = g("from_entity");
+            let last = g("last_billed_week_end");
+            let autosend = g("auto_send_enabled") == "true";
+            format!(
+                "📄 **Invoice config**\n• auto-send: **{}**\n• recipient: `{}`\n• next #: `{}`\n• sending entity: `{}`\n• last billed week: `{}`",
+                if autosend { "ON" } else { "OFF (scheduler will not send)" },
+                recipient,
+                store.invoice_counter().unwrap_or(35),
+                if entity.is_empty() { "(unset)".to_string() } else { entity },
+                if last.is_empty() { "(never)".to_string() } else { last },
+            )
+        }
+        Some("recipient") => match parts.get(2) {
+            Some(email) if email.contains('@') && email.contains('.') => {
+                match store.set_invoice_config("recipient_email", email) {
+                    Ok(()) => format!("✅ invoice recipient set to `{email}`"),
+                    Err(e) => format!("⚠️ failed to set recipient: {e}"),
+                }
+            }
+            _ => "usage: `!invoice recipient you@example.com`".to_string(),
+        },
+        Some("entity") => match parts.get(2) {
+            Some(ent) if !ent.is_empty() => {
+                match store.set_invoice_config("from_entity", ent) {
+                    Ok(()) => format!("✅ sending entity set to `{ent}`"),
+                    Err(e) => format!("⚠️ failed to set entity: {e}"),
+                }
+            }
+            _ => "usage: `!invoice entity <composio_entity_id>`".to_string(),
+        },
+        Some("autosend") => match parts.get(2).map(|s| s.to_ascii_lowercase()) {
+            Some(v) if v == "on" || v == "true" => {
+                match store.set_invoice_config("auto_send_enabled", "true") {
+                    Ok(()) => "✅ invoice auto-send **ON** — the scheduler will send on Sundays".to_string(),
+                    Err(e) => format!("⚠️ failed to enable auto-send: {e}"),
+                }
+            }
+            Some(v) if v == "off" || v == "false" => {
+                match store.set_invoice_config("auto_send_enabled", "false") {
+                    Ok(()) => "🛑 invoice auto-send **OFF** — the scheduler will not send".to_string(),
+                    Err(e) => format!("⚠️ failed to disable auto-send: {e}"),
+                }
+            }
+            _ => "usage: `!invoice autosend on|off`".to_string(),
+        },
+        _ => "invoice commands:\n• `!invoice status`\n• `!invoice recipient <email>`\n• `!invoice entity <composio_entity_id>`\n• `!invoice autosend on|off`"
+            .to_string(),
+    }
+}
+
 fn filter_image_attachments(attachments: &[Attachment]) -> Vec<Attachment> {
     attachments
         .iter()

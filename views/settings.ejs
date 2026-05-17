@@ -41,6 +41,56 @@
     </p>
   </div>
 
+  <!-- Invoice Automation -->
+  <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
+    <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-4">Invoice Automation</h2>
+    <p class="text-xs text-gray-500 mb-4">
+      Generates and emails the weekly Orchid invoice PDF every Sunday at 9am.
+      <span class="text-amber-500 font-medium">Off by default</span> — turn it on
+      only after the recipient and the sending Gmail account are set. The first
+      automated send is invoice #35 for the week ending 2026-05-24.
+    </p>
+
+    <div id="invoice-config" class="mb-4">
+      <%- include('partials/invoice-config', { invoice: invoice }) %>
+    </div>
+
+    <form hx-post="/api/invoice-config" hx-target="#invoice-config" hx-swap="innerHTML"
+          class="flex gap-3 items-end mb-3">
+      <input type="hidden" name="key" value="auto_send_enabled" />
+      <div class="flex-1">
+        <label class="block text-sm text-gray-400 mb-1">Automatic sending</label>
+        <select name="value"
+                class="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
+          <option value="false" <%= invoice.autoSendEnabled ? '' : 'selected' %>>Off — do not send (default)</option>
+          <option value="true" <%= invoice.autoSendEnabled ? 'selected' : '' %>>On — send every Sunday</option>
+        </select>
+      </div>
+      <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-md text-sm font-medium transition-colors">
+        Save
+      </button>
+    </form>
+
+    <form hx-post="/api/invoice-config" hx-target="#invoice-config" hx-swap="innerHTML"
+          class="flex gap-3 items-end">
+      <input type="hidden" name="key" value="recipient_email" />
+      <div class="flex-1">
+        <label class="block text-sm text-gray-400 mb-1">Recipient email</label>
+        <input type="email" name="value" value="<%= invoice.recipientEmail %>"
+               placeholder="billing@example.com"
+               class="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500" />
+      </div>
+      <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-md text-sm font-medium transition-colors">
+        Save
+      </button>
+    </form>
+    <p class="text-xs text-gray-600 mt-2">
+      The sending Gmail account (Composio entity) is set over Discord with
+      <code class="text-gray-400">!invoice entity &lt;id&gt;</code>. Until automatic
+      sending is On, the Sunday scheduler ticks but performs no send.
+    </p>
+  </div>
+
   <!-- API Keys -->
   <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
     <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-4">API Configuration</h2>
