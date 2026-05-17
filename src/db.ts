@@ -507,6 +507,59 @@ export function deleteConfig(key: string): void {
   getDb().prepare("DELETE FROM config WHERE key = ?").run(key);
 }
 
+// --- Invoice config (shared with the Rust daemon's `invoice_config` table) ---
+//
+// The Rust daemon owns this table (created + seeded in its migration). The
+// dashboard unit can boot before the daemon has ever migrated, so every
+// accessor first ensures the table exists with the same shape — additive and
+// idempotent, never clobbering daemon-written rows. Note the column is
+// `updated_at` (snake_case) here, not `updatedAt` like the `config` table.
+
+function ensureInvoiceConfigTable(): void {
+  getDb()
+    .prepare(
+      "CREATE TABLE IF NOT EXISTS invoice_config (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL)"
+    )
+    .run();
+}
+
+export function getInvoiceConfig(key: string): string | null {
+  ensureInvoiceConfigTable();
+  const row = getDb()
+    .prepare("SELECT value FROM invoice_config WHERE key = ?")
+    .get(key) as { value: string } | undefined;
+  return row?.value ?? null;
+}
+
+export function setInvoiceConfig(key: string, value: string): void {
+  ensureInvoiceConfigTable();
+  getDb()
+    .prepare(
+      "INSERT INTO invoice_config (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = ?, updated_at = ?"
+    )
+    .run(key, value, Date.now(), value, Date.now());
+}
+
+export interface InvoiceSettings {
+  autoSendEnabled: boolean;
+  recipientEmail: string;
+  nextNumber: number;
+  fromEntity: string;
+  lastBilledWeekEnd: string;
+}
+
+/** Bundle for the settings page. Applies the same defaults the Rust seed
+ *  would, so the UI is coherent even before the daemon has migrated. */
+export function getInvoiceSettings(): InvoiceSettings {
+  return {
+    autoSendEnabled: getInvoiceConfig("auto_send_enabled") === "true",
+    recipientEmail: getInvoiceConfig("recipient_email") || "REDACTED",
+    nextNumber: parseInt(getInvoiceConfig("invoice_counter") || "35", 10) || 35,
+    fromEntity: getInvoiceConfig("from_entity") || "",
+    lastBilledWeekEnd: getInvoiceConfig("last_billed_week_end") || "",
+  };
+}
+
 // --- Emails (ETL) ---
 
 import type { Email } from "./types";
