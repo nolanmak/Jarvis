@@ -148,6 +148,12 @@ trust: 3
 # USER-SET ONLY. Ingest must never write or modify this field.
 topics: [ai-agents, fundraising, climbing]
 
+# LinkedIn friend-post engagement opt-in (#13). When true AND this page has
+# an `identities.linkedin` urn, the daemon watches this person's LinkedIn
+# feed and drafts supportive comments for Discord approval.
+# USER-SET ONLY. Ingest must never write or modify this field.
+close: true
+
 # Affiliations — current and historical org/role tuples. Append-only.
 # Ingest writes a new entry when the email explicitly states a role change
 # ("I just joined Anthropic as PM", "Left Lovable last month"). Never write

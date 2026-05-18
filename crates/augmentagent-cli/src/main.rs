@@ -18,8 +18,10 @@ use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
 use augmentagent_channel_email::gmail::{ComposioClient, GmailApi};
 use augmentagent_channel_email::{GmailChannel, GmailChannelConfig};
 use augmentagent_channel_linkedin::{
-    default_auth_path, is_linkedin_email, LinkedInApi, LinkedInAuth, LinkedInChannel,
-    LinkedInChannelConfig, VoyagerClient, ACCOUNT_PREFIX, DEFAULT_POLL_SECS,
+    build_normshares_body, default_auth_path, is_linkedin_email, LinkedInApi, LinkedInAuth,
+    LinkedInChannel, LinkedInChannelConfig, LinkedInFeedEngagement, PostDraft, VoyagerClient,
+    Visibility, ACCOUNT_PREFIX, DEFAULT_FEED_POLL_SECS, DEFAULT_MAX_ENGAGEMENTS_PER_DAY,
+    DEFAULT_POLL_SECS,
 };
 use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
@@ -846,6 +848,23 @@ enum LinkedinOp {
     /// Quick read-only check: list recent threads + print peer + snippet.
     /// Good smoke test after `login` to confirm cookies work.
     Recent,
+    /// Publish a feed post via Voyager `normShares` (#51/#77). Phase 1:
+    /// text + optional single image. Manual/test path — the daemon posts
+    /// through the approval pipeline, not this command.
+    Post {
+        /// Post body (≤3000 chars; ~140 visible before the "see more" fold).
+        #[arg(long)]
+        text: String,
+        /// Optional single image to attach.
+        #[arg(long)]
+        image: Option<PathBuf>,
+        /// Audience: `public` (default) or `connections`.
+        #[arg(long, default_value = "public")]
+        visibility: String,
+        /// Build + print the request body, don't send.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1026,6 +1045,21 @@ async fn main() -> Result<()> {
                         None
                     }
                 };
+            // LinkedIn friend-post engagement (#13). Independent 6h cadence;
+            // self-disables when LinkedIn auth is absent (same gate as the
+            // DM channel) or when no wiki is configured.
+            let linkedin_feed = match build_linkedin_feed_engagement(
+                &cli,
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                dry_run,
+            ) {
+                Ok(ch) => Some(ch),
+                Err(e) => {
+                    warn!("linkedin feed engagement disabled: {e:#}");
+                    None
+                }
+            };
             // Discord is optional too — builds only if creds are in Keychain.
             let discord_ch = match build_discord_channel(
                 &cli,
@@ -1107,6 +1141,10 @@ async fn main() -> Result<()> {
             if let Some(li) = linkedin_ch {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { li.run(sd).await }));
+            }
+            if let Some(lf) = linkedin_feed {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { lf.run(sd).await }));
             }
             if let Some(dc) = discord_ch {
                 let sd = shutdown.clone();
@@ -1287,6 +1325,21 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             LinkedinOp::Recent => run_linkedin_recent().await,
+            LinkedinOp::Post {
+                text,
+                image,
+                visibility,
+                dry_run,
+            } => {
+                run_linkedin_post(
+                    Arc::clone(&store),
+                    text.clone(),
+                    image.clone(),
+                    visibility.clone(),
+                    *dry_run,
+                )
+                .await
+            }
         },
         Cmd::Slack { ref op } => match op {
             SlackOp::Login { auth_json } => run_slack_login(store, auth_json.clone()).await,
@@ -2905,39 +2958,86 @@ impl ReplyApprover {
                 message: "LinkedIn is not configured (no cookies); run `linkedin login`".into(),
             };
         };
-        let Some(conv_urn) = action.email.thread_id.as_deref() else {
-            return ApprovalActionOutcome::Failed {
-                message: "no conversationUrn on email; cannot send".into(),
-            };
-        };
         let Some(body) = action.action.draft_body.as_deref() else {
             return ApprovalActionOutcome::Failed {
                 message: "no draft body on action; cannot send".into(),
             };
         };
-        match linkedin.send_message(conv_urn, body).await {
-            Ok(_) => {
-                let _ = self.store.update_action_status(
-                    action_id,
-                    ActionStatus::Sent,
-                    Some(body),
-                    None,
-                );
-                let _ = self
-                    .store
-                    .mark_email_processed(&action.email.message_id, TriageResult::Reply);
-                tracing::info!(action_id, "linkedin reply sent via approval handler");
-                ApprovalActionOutcome::Approved
+
+        // Two LinkedIn dispatch shapes share this handler, distinguished by
+        // the email row's `kind`:
+        //  - `post_engagement` (#13): message_id IS the post urn; the
+        //    approved draft is a supportive comment → `post_comment`.
+        //  - everything else (DM reply): thread_id is the conversationUrn →
+        //    `send_message`.
+        if action.email.kind == "post_engagement" {
+            let post_urn = action.email.message_id.as_str();
+            match linkedin.post_comment(post_urn, body).await {
+                Ok(_) => {
+                    let _ = self.store.update_action_status(
+                        action_id,
+                        ActionStatus::Sent,
+                        Some(body),
+                        None,
+                    );
+                    let _ = self
+                        .store
+                        .mark_email_processed(post_urn, TriageResult::Reply);
+                    // Durable cap accounting (#13): record the successful
+                    // engagement so the feed trigger's daily cap survives
+                    // restarts and we never double-comment the same post.
+                    let _ = self.store.log_linkedin_action(
+                        &uuid::Uuid::new_v4().to_string(),
+                        "post_engagement",
+                        Some(post_urn),
+                        "ok",
+                        chrono::Utc::now().timestamp_millis(),
+                        None,
+                    );
+                    tracing::info!(action_id, "linkedin comment posted via approval handler");
+                    ApprovalActionOutcome::Approved
+                }
+                Err(e) => {
+                    let msg = format!("linkedin post_comment: {e}");
+                    let _ = self.store.update_action_status(
+                        action_id,
+                        ActionStatus::Error,
+                        None,
+                        Some(&msg),
+                    );
+                    ApprovalActionOutcome::Failed { message: msg }
+                }
             }
-            Err(e) => {
-                let msg = format!("linkedin send_message: {e}");
-                let _ = self.store.update_action_status(
-                    action_id,
-                    ActionStatus::Error,
-                    None,
-                    Some(&msg),
-                );
-                ApprovalActionOutcome::Failed { message: msg }
+        } else {
+            let Some(conv_urn) = action.email.thread_id.as_deref() else {
+                return ApprovalActionOutcome::Failed {
+                    message: "no conversationUrn on email; cannot send".into(),
+                };
+            };
+            match linkedin.send_message(conv_urn, body).await {
+                Ok(_) => {
+                    let _ = self.store.update_action_status(
+                        action_id,
+                        ActionStatus::Sent,
+                        Some(body),
+                        None,
+                    );
+                    let _ = self
+                        .store
+                        .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                    tracing::info!(action_id, "linkedin reply sent via approval handler");
+                    ApprovalActionOutcome::Approved
+                }
+                Err(e) => {
+                    let msg = format!("linkedin send_message: {e}");
+                    let _ = self.store.update_action_status(
+                        action_id,
+                        ActionStatus::Error,
+                        None,
+                        Some(&msg),
+                    );
+                    ApprovalActionOutcome::Failed { message: msg }
+                }
             }
         }
     }
@@ -3892,6 +3992,82 @@ fn build_linkedin_channel(
     ))
 }
 
+/// Build the friend-post engagement runner (#13). Shares the DM channel's
+/// auth gate (errors if LinkedIn isn't configured). Uses the
+/// `skills/linkedin-triage` rubric, a 6h-with-jitter cadence
+/// (`AUGMENTAGENT_LINKEDIN_FEED_POLL_SECS` override), and a default daily
+/// engagement cap of 5 (`AUGMENTAGENT_LINKEDIN_MAX_ENGAGEMENTS` override).
+fn build_linkedin_feed_engagement(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<LinkedInFeedEngagement<VoyagerClient, ClaudeCliReasoner>> {
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = LinkedInAuth::load_with_migration(&repo_root)
+        .context("load linkedin auth (feed engagement)")?;
+    let member_urn = auth.member_urn.clone();
+    let voyager = Arc::new(VoyagerClient::new(auth));
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+
+    let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
+        Some(root) => {
+            let schema = cli
+                .wiki_schema
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("schema/wiki-skill.md"));
+            (Some(root.clone()), Some(schema))
+        }
+        None => (None, None),
+    };
+
+    // Engagement-specific rubric sits alongside the email-triage skill dir.
+    let triage_skill_dir = cli
+        .skill_dir
+        .parent()
+        .map(|p| p.join("linkedin-triage"))
+        .unwrap_or_else(|| PathBuf::from("skills/linkedin-triage"));
+
+    let poll_secs = std::env::var("AUGMENTAGENT_LINKEDIN_FEED_POLL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FEED_POLL_SECS);
+    let max_per_day = std::env::var("AUGMENTAGENT_LINKEDIN_MAX_ENGAGEMENTS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MAX_ENGAGEMENTS_PER_DAY);
+
+    let trigger = Arc::new(augmentagent_channel_linkedin::LinkedInFeedTrigger::new(
+        Arc::clone(&voyager),
+        Arc::clone(&store),
+        wiki_root.clone(),
+        max_per_day,
+    ));
+
+    let config = LinkedInChannelConfig {
+        poll_interval: Duration::from_secs(poll_secs),
+        dry_run,
+        wiki_root,
+        wiki_schema_path,
+        skill_dir: triage_skill_dir,
+    };
+    info!(
+        member = %member_urn,
+        interval_secs = poll_secs,
+        max_per_day,
+        "linkedin feed engagement ready"
+    );
+    Ok(LinkedInFeedEngagement {
+        store,
+        reasoner,
+        approvals: broker,
+        trigger,
+        member_urn,
+        config,
+        poll_interval: Duration::from_secs(poll_secs),
+    })
+}
+
 /// Best-effort load of the voyager client. None when neither Keychain nor the
 /// legacy file has credentials — callers treat this as "LinkedIn disabled for
 /// this run".
@@ -3971,6 +4147,120 @@ async fn run_linkedin_recent() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Manual / test feed-post path (#51/#77). The daemon publishes through the
+/// approval pipeline; this command is for one-shots and smoke tests. It
+/// enforces the same rolling-24h cap (3 posts/day) the daemon path does, a
+/// first-N-posts second-confirmation guard, and a `--dry-run` that prints
+/// the request body without sending.
+async fn run_linkedin_post(
+    store: Arc<Store>,
+    text: String,
+    image: Option<PathBuf>,
+    visibility: String,
+    dry_run: bool,
+) -> Result<()> {
+    let vis = Visibility::parse(&visibility)
+        .ok_or_else(|| anyhow::anyhow!("invalid --visibility (use public|connections)"))?;
+
+    // Dry-run: build + print the canonical body, no auth, no send.
+    if dry_run {
+        let body = build_normshares_body(&text, vis, image.as_ref().map(|_| "<image-urn>"));
+        println!(
+            "[linkedin post dry-run] visibility={visibility} image={}\n{}",
+            image.is_some(),
+            serde_json::to_string_pretty(&body)?
+        );
+        return Ok(());
+    }
+
+    // --- rolling-24h cap preflight (3 posts/day per #77 §7) ---
+    const POST_DAILY_CAP: u32 = 3;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let used = store
+        .linkedin_action_count_since("post", now_ms - 24 * 3600 * 1000)
+        .context("read linkedin_action_log")?;
+    if used >= POST_DAILY_CAP {
+        anyhow::bail!(
+            "linkedin post cap reached: {used}/{POST_DAILY_CAP} in the last 24h; deferring"
+        );
+    }
+
+    // --- first-N-posts second-confirmation guard ---
+    // Posting to the user's professional surface is the highest-blast-radius
+    // action in the system. For the first few posts ever made by this tool,
+    // require an explicit AUGMENTAGENT_LINKEDIN_POST_CONFIRM=yes so a stray
+    // command can't quietly publish.
+    const GUARDED_FIRST_N: u32 = 3;
+    let lifetime = store
+        .linkedin_action_count_since("post", 0)
+        .context("read lifetime linkedin posts")?;
+    if lifetime < GUARDED_FIRST_N {
+        let confirmed = std::env::var("AUGMENTAGENT_LINKEDIN_POST_CONFIRM")
+            .map(|v| v.eq_ignore_ascii_case("yes"))
+            .unwrap_or(false);
+        if !confirmed {
+            anyhow::bail!(
+                "second-confirmation required for the first {GUARDED_FIRST_N} posts \
+                 (post #{} lifetime): re-run with AUGMENTAGENT_LINKEDIN_POST_CONFIRM=yes",
+                lifetime + 1
+            );
+        }
+    }
+
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = LinkedInAuth::load_with_migration(&repo_root)
+        .context("load linkedin auth from keychain or legacy file")?;
+    let voyager = VoyagerClient::new(auth);
+
+    let image_bytes = match &image {
+        Some(p) => Some(
+            std::fs::read(p).with_context(|| format!("read image {}", p.display()))?,
+        ),
+        None => None,
+    };
+    let image_filename = image
+        .as_ref()
+        .and_then(|p| p.file_name().and_then(|n| n.to_str()));
+
+    let draft = PostDraft {
+        text: &text,
+        image: image_bytes.as_deref(),
+        image_filename,
+        visibility: vis,
+    };
+
+    let log_id = uuid::Uuid::new_v4().to_string();
+    match voyager.create_share(draft).await {
+        Ok(urn) => {
+            store
+                .log_linkedin_action(
+                    &log_id,
+                    "post",
+                    Some(&urn.0),
+                    "ok",
+                    now_ms,
+                    None,
+                )
+                .ok();
+            println!("posted: {}", urn.0);
+            Ok(())
+        }
+        Err(e) => {
+            store
+                .log_linkedin_action(
+                    &uuid::Uuid::new_v4().to_string(),
+                    "post",
+                    None,
+                    "failed",
+                    now_ms,
+                    Some(&format!("{e}")),
+                )
+                .ok();
+            Err(anyhow::anyhow!("linkedin create_share: {e}"))
+        }
+    }
 }
 
 // ================================================================
