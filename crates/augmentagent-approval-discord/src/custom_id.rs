@@ -16,6 +16,14 @@ pub enum Verb {
     /// preset id arrives as the select's value, not in the custom_id, so this
     /// verb carries no extra payload.
     QuickRefine,
+    /// "Provide missing info" button on the approval card (#35 Phase 5).
+    /// Opens a modal that collects values for the asks a resolver could not
+    /// auto-fill. Only present when the persisted draft carries a
+    /// needs-input marker (live ask-resolve only) — never on the off path.
+    FillAsk,
+    /// Submission of the FillAsk modal. Routed through the existing Revise
+    /// plumbing (the supplied values become structured feedback).
+    FillAskModal,
 }
 
 impl Verb {
@@ -26,6 +34,8 @@ impl Verb {
             Self::Skip => "skip",
             Self::ReviseModal => "revise_modal",
             Self::QuickRefine => "quick_refine",
+            Self::FillAsk => "fill_ask",
+            Self::FillAskModal => "fill_ask_modal",
         }
     }
 
@@ -36,6 +46,8 @@ impl Verb {
             "skip" => Self::Skip,
             "revise_modal" => Self::ReviseModal,
             "quick_refine" => Self::QuickRefine,
+            "fill_ask" => Self::FillAsk,
+            "fill_ask_modal" => Self::FillAskModal,
             _ => return None,
         })
     }
@@ -85,6 +97,8 @@ mod tests {
             Verb::Skip,
             Verb::ReviseModal,
             Verb::QuickRefine,
+            Verb::FillAsk,
+            Verb::FillAskModal,
         ] {
             let cid = CustomId::new("550e8400-e29b-41d4-a716-446655440000", v);
             let s = cid.to_string();

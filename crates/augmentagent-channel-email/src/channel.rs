@@ -522,13 +522,18 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                         "reply",
                     )
                     .await;
-                // #35 Phase 2: pre-resolve structured asks (scheduling /
-                // calendly / share_doc / intro) and inject concrete values.
-                // Gated by AUGMENTAGENT_ASK_RESOLVE=live + per-resolver flags;
-                // empty string (today's behavior) for off/shadow or when no
-                // ask clears the confidence floor.
-                let resolved_asks_block =
-                    augmentagent_channel_core::resolve_asks_block(
+                // #35 Phase 2/3/5: pre-resolve structured asks (scheduling /
+                // calendly / meeting_link / share_doc / intro) and inject
+                // concrete values. Gated by AUGMENTAGENT_ASK_RESOLVE=live +
+                // per-resolver flags; an empty outcome (today's behavior) for
+                // off/shadow or when no ask clears the confidence floor.
+                // `unresolved` carries asks the resolver couldn't fill — they
+                // ride along on the persisted draft as a needs-input marker
+                // so the Discord card can surface a "Needs your input" field
+                // (#35 Phase 5). Empty `unresolved` ⇒ marker is never
+                // appended ⇒ draft + card stay byte-identical to pre-#35.
+                let resolve_outcome =
+                    augmentagent_channel_core::resolve_asks(
                         &self.reasoner,
                         augmentagent_channel_core::AskResolveMode::from_env(),
                         &email.body,
@@ -541,10 +546,22 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     &tone_block,
                     &thread_block,
                     &archetype_block,
-                    &resolved_asks_block,
+                    &resolve_outcome.block,
                 );
                 let draft = match self.reasoner.call(&draft_opts, &draft_prompt).await {
-                    Ok(s) => s.trim().to_string(),
+                    Ok(s) => {
+                        let body = s.trim().to_string();
+                        // Attach the needs-input marker (no-op when there are
+                        // no unresolved asks → byte-identical persisted draft).
+                        let pairs: Vec<(String, String)> = resolve_outcome
+                            .unresolved
+                            .iter()
+                            .map(|u| (u.kind.as_str().to_string(), u.text.clone()))
+                            .collect();
+                        augmentagent_approval_discord::append_needs_input_marker(
+                            &body, &pairs,
+                        )
+                    }
                     Err(e) => {
                         error!(message_id = %email.message_id, "draft call failed: {e}");
                         self.store.log_action(
@@ -739,6 +756,12 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             ),
         };
 
+        // The Gmail draft must be the clean reply text — strip any #35
+        // needs-input marker (the marker is a Discord-card-only carrier; it
+        // lives in `actions.draftBody` so the card can render the field, but
+        // it must never reach Gmail). No marker ⇒ unchanged (pre-#35 bytes).
+        let gmail_body =
+            augmentagent_approval_discord::split_needs_input(&initial_draft).0;
         let draft_id = match existing_draft_id {
             Some(d) => d,
             None => match self
@@ -747,7 +770,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     entity_id,
                     &email.from,
                     &reply_subject(&email.subject),
-                    &initial_draft,
+                    &gmail_body,
                     email.thread_id.as_deref(),
                 )
                 .await
