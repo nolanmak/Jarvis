@@ -13,17 +13,30 @@
 //! - `platform`   ← `"deft"`
 //! - `kind`       ← `"dm"` (a C&C instruction routes like a control DM)
 //!
-//! ## Wire shape is `REQUIRES LIVE VALIDATION`
+//! ## Wire shape — webhook envelope (§4) is now the authority
 //!
 //! The vendor docs confirm the `label`/`response`/`uuid`/`custom_key` field
-//! quartet and that submissions carry a `data[]` plus a submission id + uuid,
-//! but do **not** pin the exact JSON envelope for `GET /responses/{formId}`
-//! or the webhook body. We therefore decode **defensively**: `#[serde(default)]`
-//! everywhere, unknown fields ignored, multiple plausible key spellings
-//! accepted. See `docs/deft-protocol.md` §3–§4. The TODO: capture a real
-//! payload (live token or webhook.site "Send test") and tighten this.
+//! quartet and that submissions carry a `data[]` plus a submission id + uuid.
+//! As of #116 the **webhook payload (`docs/deft-protocol.md` §4) is the
+//! canonical shape**: the receiver forwards each submission object verbatim
+//! and the handler decodes it here. The canonical spellings are therefore
+//! `submission_id` / `uuid` / `form_id` / `data[]` of
+//! `{label,response,uuid,custom_key}`. The token-level token validation
+//! against a live Deftform workspace remains a documented operator step
+//! (`docs/deft-protocol.md` §7 Go/No-Go) — that does **not** change the JSON
+//! shape, only confirms the running token works.
+//!
+//! We still decode **defensively** (`#[serde(default)]` everywhere, unknown
+//! fields ignored, the small set of plausible alternate spellings the docs
+//! leave unpinned still accepted) so a `/api/v1`→`v2` envelope drift degrades
+//! gracefully instead of dropping a C&C instruction. [`webhook_submissions`]
+//! extracts submissions from whichever frame Deftform's webhook uses (bare
+//! object, `data[]`-of-submissions, or `submissions[]` wrapper) — it mirrors
+//! the Express receiver's `extractDeftSubmissions` exactly so the webhook and
+//! poll paths converge on identical `DeftSubmission`s.
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use augmentagent_store::Email;
 
@@ -31,18 +44,41 @@ use crate::{ACCOUNT_ENTITY_ID_PREFIX, PLATFORM};
 
 /// One field of a submission. `custom_key` is the operator-chosen, form-unique
 /// anchor we map commands on (labels can be reworded; `uuid` is opaque).
+///
+/// Canonical spelling per the §4 webhook payload is `custom_key`; the
+/// `customKey` camelCase alternate is accepted defensively against envelope
+/// drift. `response` may arrive as a non-string (number/bool for
+/// numeric/checkbox fields); it is coerced to its display string so the
+/// command parser always sees text.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DeftField {
     #[serde(default)]
     pub label: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_stringy")]
     pub response: String,
     #[serde(default)]
     pub uuid: String,
     /// Optional operator-defined key. May be absent on forms that don't set
     /// custom keys — the mapping falls back to a label match then.
-    #[serde(default)]
+    #[serde(default, alias = "customKey")]
     pub custom_key: Option<String>,
+}
+
+/// Coerce a JSON scalar to its display string. Deftform number/checkbox
+/// fields can serialize `response` as `42` / `true`; the C&C parser only
+/// works on text, so normalize here rather than dropping the field.
+fn de_stringy<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Value::deserialize(d)?;
+    Ok(match v {
+        Value::String(s) => s,
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    })
 }
 
 /// One form submission. Decoded defensively — see module docs.
@@ -90,6 +126,59 @@ impl DeftSubmission {
             format!("deft:{}:{}", self.form_id, self.submission_id)
         }
     }
+}
+
+/// Extract the submission(s) from a Deftform **webhook** body.
+///
+/// Mirrors the Express receiver's `extractDeftSubmissions` (src/webhooks.ts)
+/// so the webhook and poll paths converge on identical [`DeftSubmission`]s.
+/// The §4 docs confirm the field quartet + that a body carries a `data[]`
+/// and submission meta, but do not literally pin the outer frame, so accept:
+///
+/// 1. a bare submission object (`{ uuid, data:[fields] }`),
+/// 2. a `{ "submissions": [ <submission>, ... ] }` wrapper,
+/// 3. a `{ "data": [ <submission>, ... ] }` wrapper — disambiguated from a
+///    bare submission (whose `data[]` holds *fields*) by whether the array
+///    elements look like submissions (`uuid`/`data`, no `response`).
+///
+/// Anything undecodable yields an empty vec (the poll path is the safety
+/// net; a malformed push is dropped, never crashes the receiver-side
+/// handler). `form_id` is back-filled from `route_form_id` when the body
+/// omits it (the webhook is attached per form, so the receiver knows it).
+pub fn webhook_submissions(body: &Value, route_form_id: &str) -> Vec<DeftSubmission> {
+    fn looks_like_submission(v: &Value) -> bool {
+        v.get("response").is_none()
+            && (v.get("uuid").is_some() || v.get("data").is_some())
+    }
+    let obj = match body.as_object() {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+
+    let arr: Option<&Vec<Value>> = obj
+        .get("submissions")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            obj.get("data").and_then(Value::as_array).filter(|a| {
+                a.iter().any(looks_like_submission)
+            })
+        });
+
+    let raw_subs: Vec<&Value> = match arr {
+        Some(a) => a.iter().collect(),
+        None => vec![body],
+    };
+
+    raw_subs
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<DeftSubmission>(v.clone()).ok())
+        .map(|mut s| {
+            if s.form_id.is_empty() {
+                s.form_id = route_form_id.to_string();
+            }
+            s
+        })
+        .collect()
 }
 
 /// Which form fields encode the command / argument / free-text query.
@@ -314,6 +403,118 @@ mod tests {
         assert_eq!(e.body, "revise less formal");
         assert!(e.subject.starts_with("[deft:revise]"));
         assert!(is_deft_email(&e));
+    }
+
+    #[test]
+    fn field_accepts_camelcase_custom_key_alias() {
+        // §4 canonical is `custom_key`; `customKey` accepted defensively.
+        let f: DeftField = serde_json::from_str(
+            r#"{"label":"Command","response":"approve","uuid":"f","customKey":"agent_command"}"#,
+        )
+        .unwrap();
+        assert_eq!(f.custom_key.as_deref(), Some("agent_command"));
+    }
+
+    #[test]
+    fn field_coerces_nonstring_response_to_text() {
+        // Numeric / checkbox fields can serialize response as a non-string;
+        // the C&C parser only works on text, so it must be coerced.
+        let n: DeftField =
+            serde_json::from_str(r#"{"label":"Count","response":42,"uuid":"f"}"#).unwrap();
+        assert_eq!(n.response, "42");
+        let b: DeftField =
+            serde_json::from_str(r#"{"label":"Agree","response":true,"uuid":"f"}"#).unwrap();
+        assert_eq!(b.response, "true");
+        let z: DeftField =
+            serde_json::from_str(r#"{"label":"Empty","response":null,"uuid":"f"}"#).unwrap();
+        assert_eq!(z.response, "");
+    }
+
+    #[test]
+    fn webhook_submissions_bare_object() {
+        // Frame 1: the body IS one submission (its `data[]` are fields).
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"uuid":"u1","submission_id":"s1","data":[
+                {"label":"Command","response":"approve","uuid":"f","custom_key":"agent_command"}
+            ]}"#,
+        )
+        .unwrap();
+        let subs = webhook_submissions(&body, "ROUTEFORM");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].uuid, "u1");
+        // form_id back-filled from the route since the body omitted it.
+        assert_eq!(subs[0].form_id, "ROUTEFORM");
+        assert_eq!(
+            command_from_submission(&subs[0], &CommandFieldMap::default()),
+            DeftCommand::Approve
+        );
+    }
+
+    #[test]
+    fn webhook_submissions_data_array_of_submissions() {
+        // Frame 3: `data[]` holds submissions (each has uuid/data, no
+        // top-level `response`) — must NOT be mistaken for a field list.
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"data":[
+                {"uuid":"u1","formId":"F1","data":[
+                    {"label":"Command","response":"approve","custom_key":"agent_command"}]},
+                {"uuid":"u2","data":[
+                    {"label":"Command","response":"skip","custom_key":"agent_command"}]}
+            ]}"#,
+        )
+        .unwrap();
+        let subs = webhook_submissions(&body, "ROUTEFORM");
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].uuid, "u1");
+        assert_eq!(subs[0].form_id, "F1"); // body's own form id wins
+        assert_eq!(subs[1].uuid, "u2");
+        assert_eq!(subs[1].form_id, "ROUTEFORM"); // back-filled
+        assert_eq!(
+            command_from_submission(&subs[1], &CommandFieldMap::default()),
+            DeftCommand::Decline
+        );
+    }
+
+    #[test]
+    fn webhook_submissions_explicit_submissions_wrapper() {
+        // Frame 2: explicit `submissions[]` wrapper.
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"submissions":[{"uuid":"u9","data":[
+                {"label":"Q","response":"who is X?","custom_key":"agent_query"}]}]}"#,
+        )
+        .unwrap();
+        let subs = webhook_submissions(&body, "RF");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(
+            command_from_submission(&subs[0], &CommandFieldMap::default()),
+            DeftCommand::Query("who is X?".into())
+        );
+    }
+
+    #[test]
+    fn webhook_submissions_field_only_body_is_one_submission_not_split() {
+        // A bare submission whose `data[]` are fields (have `response`) must
+        // collapse to ONE submission, not be exploded per field.
+        let body: serde_json::Value = serde_json::from_str(
+            r#"{"uuid":"u1","data":[
+                {"label":"Command","response":"revise","custom_key":"agent_command"},
+                {"label":"Arg","response":"warmer","custom_key":"agent_arg"}
+            ]}"#,
+        )
+        .unwrap();
+        let subs = webhook_submissions(&body, "RF");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(
+            command_from_submission(&subs[0], &CommandFieldMap::default()),
+            DeftCommand::Revise("warmer".into())
+        );
+    }
+
+    #[test]
+    fn webhook_submissions_non_object_yields_empty() {
+        assert!(webhook_submissions(&serde_json::json!([1, 2, 3]), "RF").is_empty());
+        assert!(webhook_submissions(&serde_json::json!("nope"), "RF").is_empty());
+        assert!(webhook_submissions(&serde_json::Value::Null, "RF").is_empty());
     }
 
     #[test]
