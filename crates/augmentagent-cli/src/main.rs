@@ -1288,6 +1288,20 @@ async fn main() -> Result<()> {
                     None
                 }
             };
+            // Deft (#116) spike scaffold: linked but INERT. We deliberately
+            // do NOT build/spawn a DeftChannel here — the doc's live-validation
+            // TODOs (real submission/webhook JSON, confirmed product, token)
+            // must clear first. This line just surfaces the arming-gate state
+            // in logs and keeps the dep genuinely used. See
+            // docs/deft-protocol.md §6/§7.
+            if augmentagent_channel_deft::deft_enabled() {
+                warn!(
+                    "AUGMENTAGENT_DEFT_ENABLED is set but the deft channel is a \
+                     spike scaffold and is intentionally not spawned (see \
+                     docs/deft-protocol.md §7 go/no-go)"
+                );
+            }
+
             // Meetup self-gates on having ≥1 subscription, exactly like
             // github gates on a PAT — prod's db has none ⇒ never spawned.
             let meetup_ch = match build_meetup_channel(

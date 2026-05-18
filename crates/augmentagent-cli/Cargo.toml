@@ -23,6 +23,11 @@ augmentagent-channel-github = { path = "../augmentagent-channel-github" }
 augmentagent-channel-meetup = { path = "../augmentagent-channel-meetup" }
 augmentagent-channel-gdrive = { path = "../augmentagent-channel-gdrive" }
 augmentagent-channel-contacts = { path = "../augmentagent-channel-contacts" }
+# Spike scaffold (#116). Linked so it builds with the workspace; INERT in
+# prod — no `serve` spawn until AUGMENTAGENT_DEFT_ENABLED + a persisted token
+# AND the docs/deft-protocol.md live-validation TODOs clear (mirrors the
+# github "gates on a PAT ⇒ never spawned" pattern).
+augmentagent-channel-deft = { path = "../augmentagent-channel-deft" }
 augmentagent-channel-telegram-bot = { path = "../augmentagent-channel-telegram-bot" }
 augmentagent-channel-calendar = { path = "../augmentagent-channel-calendar" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
