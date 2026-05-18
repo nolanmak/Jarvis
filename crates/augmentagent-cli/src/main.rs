@@ -25,6 +25,7 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod invoice;
+mod self_improve;
 
 #[derive(Parser)]
 #[command(name = "augmentagent", version, about = "AugmentAgent Rust daemon")]
@@ -81,6 +82,14 @@ enum Cmd {
     /// `GMAIL_GET_PROFILE`, so the dashboard + invoice entity picker show
     /// who's who instead of opaque IDs. Safe to re-run.
     AccountsBackfillEmails,
+    /// #103 — self-improvement loop: pick an `agent-fixable` GitHub issue,
+    /// fix it on an isolated worktree/branch (never main), run the
+    /// verification gate, and open a DRAFT PR. Never auto-merges.
+    SelfImprove {
+        /// Dry-run (default true): run the gate but stop before opening a PR.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
     /// Wiki maintenance.
     Wiki {
         #[command(subcommand)]
@@ -972,6 +981,12 @@ async fn main() -> Result<()> {
                     );
                 }
             }
+            Ok(())
+        }
+        Cmd::SelfImprove { dry_run } => {
+            let repo_root = std::env::current_dir().context("current_dir")?;
+            let msg = self_improve::run_once(&repo_root, dry_run).await?;
+            println!("{msg}");
             Ok(())
         }
         Cmd::AccountsBackfillEmails => {
