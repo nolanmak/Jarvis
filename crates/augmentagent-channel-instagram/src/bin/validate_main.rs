@@ -19,6 +19,25 @@
 //! not fail the run — the detector working is itself a pass).
 //!
 //! JSON report → stdout (CI / runbook checkbox); human table → stderr.
+//!
+//! ## `selectors` subcommand (#76 — no cookies, no network, no browser)
+//!
+//! The live-DOM half of #76 (does each selector still resolve against
+//! Instagram's UI?) is operator-gated and intentionally not automated. The
+//! *registry-shape* half is fully autonomous: a dry-run audit that the
+//! layered selector registry is structurally sound (every target has
+//! fallbacks, layers are in resilience order, file-input targets only target
+//! file inputs, load-bearing terminals keep a text backstop, the
+//! reel/carousel/story surfaces are all wired in). Run it in CI / a pre-merge
+//! checkbox so a selector edit can't silently rot the registry shape:
+//!
+//! ```text
+//! augmentagent-instagram-validate selectors
+//! ```
+//!
+//! Exit 0 = shape clean; exit 1 = a shape defect (NOT a live-DOM verdict).
+//! Backward compatible: invoked with no subcommand (legacy flag form) it
+//! still runs the protocol harness.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -26,18 +45,27 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use augmentagent_channel_instagram::{
-    run_validation, InstagramAuth, ValidateOpts, WebClient,
+    run_validation, selector_registry_report, validate_selector_registry,
+    InstagramAuth, ValidateOpts, WebClient,
 };
 
 #[derive(Parser)]
 #[command(
     name = "augmentagent-instagram-validate",
-    about = "Live operator validation of docs/instagram-protocol.md (#17)"
+    about = "Instagram validation: live protocol harness (#17) + offline \
+             selector-registry shape audit (#76)"
 )]
 struct Args {
+    /// Offline selector-registry shape audit (#76). No cookies / network /
+    /// browser. Subcommand form: `... selectors`. When omitted, the legacy
+    /// flag form runs the live protocol harness (back-compat).
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to the harvested cookie JSON (the `instagram login` file shape).
+    /// Required for the live protocol harness (legacy flag form).
     #[arg(long)]
-    cookies: PathBuf,
+    cookies: Option<PathBuf>,
 
     /// Numeric user id of a contact to exercise the feed-by-user read.
     /// Without it the feed probe is skipped (not failed).
@@ -61,6 +89,57 @@ struct Args {
     exercise_writes: bool,
 }
 
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Dry-run audit of the layered selector registry (#76). Proves the
+    /// registry is *structurally* sound; does NOT check live-DOM resolution
+    /// (that is operator-gated and out of scope for an offline tool).
+    Selectors,
+}
+
+/// The offline selector-registry dry-run. Emits a JSON `{ok, ...}` doc to
+/// stdout (CI-greppable) and a human line to stderr; exit 1 on a shape defect.
+fn run_selector_audit() -> ExitCode {
+    let defects = validate_selector_registry();
+    match selector_registry_report() {
+        Ok(msg) => {
+            eprintln!("{msg}");
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": true,
+                    "kind": "selector_registry_shape",
+                    "defects": [],
+                    "note": "live-DOM resolution is operator-gated and NOT \
+                             verified by this dry-run",
+                })
+            );
+            ExitCode::SUCCESS
+        }
+        Err(report) => {
+            eprintln!("{report}");
+            let defect_json: Vec<_> = defects
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "target": d.target,
+                        "detail": d.detail,
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ok": false,
+                    "kind": "selector_registry_shape",
+                    "defects": defect_json,
+                })
+            );
+            ExitCode::from(1)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -73,12 +152,29 @@ async fn main() -> ExitCode {
 
     let args = Args::parse();
 
-    let auth = match InstagramAuth::load(&args.cookies) {
+    if let Some(Command::Selectors) = args.command {
+        // Fully offline; no auth load, no network.
+        return run_selector_audit();
+    }
+
+    let cookies = match args.cookies {
+        Some(p) => p,
+        None => {
+            eprintln!(
+                "no subcommand and no --cookies: pass `selectors` for the \
+                 offline registry audit, or --cookies <file> for the live \
+                 protocol harness"
+            );
+            return ExitCode::from(2);
+        }
+    };
+
+    let auth = match InstagramAuth::load(&cookies) {
         Ok(a) => a,
         Err(e) => {
             eprintln!(
                 "failed to load cookies from {}: {e}",
-                args.cookies.display()
+                cookies.display()
             );
             return ExitCode::from(2);
         }
