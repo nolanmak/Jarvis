@@ -24,6 +24,9 @@ use augmentagent_channel_linkedin::{
 use augmentagent_channel_linkedin::connections::{
     ConnectionSyncer, SyncMode, VoyagerConnectionsClient,
 };
+use augmentagent_channel_contacts::{
+    CardDavSource, ContactsSource, ContactsSyncer, GooglePeopleSource,
+};
 use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
@@ -171,6 +174,12 @@ enum Cmd {
     Gdrive {
         #[command(subcommand)]
         op: GdriveOp,
+    },
+    /// Contacts → phone+address identity index (#62). Google People (via
+    /// the Composio Google grant) and/or generic CardDAV.
+    Contacts {
+        #[command(subcommand)]
+        op: ContactsOp,
     },
     /// Cross-platform compose-once content adapter (#53). One source draft
     /// fans out into per-platform variants. All ops stubs in
@@ -535,6 +544,24 @@ enum GdriveOp {
     PollOnce {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContactsOp {
+    /// Sync contacts → wiki + phone index. Dry-run JSON by default; pass
+    /// `--apply` to write fill-blanks pages + index phones.
+    Sync {
+        /// Backend: `google` (Composio People) or `carddav` (env-configured).
+        #[arg(long, default_value = "google")]
+        backend: String,
+        /// Composio entity id for the `google` backend (the connected
+        /// Google account). Ignored for `carddav`.
+        #[arg(long, default_value = "default")]
+        entity_id: String,
+        /// Write wiki pages + phone index (default: dry-run only).
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -1544,6 +1571,17 @@ async fn main() -> Result<()> {
                 let out = ch.poll_once().await?;
                 println!("{out:#?}");
                 Ok(())
+            }
+        },
+        Cmd::Contacts { ref op } => match op {
+            ContactsOp::Sync {
+                backend,
+                entity_id,
+                apply,
+            } => {
+                let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
+                run_contacts_sync(&cli, store, broker, backend, entity_id, *apply)
+                    .await
             }
         },
         Cmd::Compose { op } => match op {
@@ -4105,6 +4143,73 @@ async fn run_linkedin_connections_sync(
         }
     }
 
+    Ok(())
+}
+
+/// #62 — contacts sync. `backend` is `google` (Composio People) or
+/// `carddav` (env-configured). Dry-run JSON by default; `--apply` writes
+/// fill-blanks wiki pages, indexes phones, persists the sync cursor, and
+/// posts a Discord summary.
+async fn run_contacts_sync(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    backend: &str,
+    entity_id: &str,
+    apply: bool,
+) -> Result<()> {
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for contacts sync")?;
+    let layout = augmentagent_wiki::WikiLayout::new(wiki_root);
+    layout.bootstrap().context("wiki bootstrap")?;
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    let (source, account_id): (Box<dyn ContactsSource>, String) = match backend {
+        "google" => {
+            let api_key = std::env::var("COMPOSIO_API_KEY")
+                .context("COMPOSIO_API_KEY env var required for the google backend")?;
+            (
+                Box::new(GooglePeopleSource::new(api_key, entity_id.to_string())),
+                entity_id.to_string(),
+            )
+        }
+        "carddav" => {
+            let src = CardDavSource::from_env().context(
+                "CardDAV not configured — set AUGMENTAGENT_CARDDAV_URL / _USER / _PASS",
+            )?;
+            (Box::new(src), "default".to_string())
+        }
+        other => anyhow::bail!("unknown contacts backend '{other}' (use google|carddav)"),
+    };
+
+    let syncer = ContactsSyncer {
+        source: source.as_ref(),
+        layout: &layout,
+        store: &store,
+        today,
+        apply,
+    };
+    info!(backend, account = %account_id, apply, "starting contacts sync");
+    let report = syncer
+        .run(&account_id)
+        .await
+        .context("contacts sync run")?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+
+    if report.created > 0 || report.updated > 0 {
+        if let Err(e) = broker
+            .post_digest("Contacts sync", &report.discord_summary())
+            .await
+        {
+            warn!("failed to post contacts summary to discord: {e}");
+        }
+    }
     Ok(())
 }
 
