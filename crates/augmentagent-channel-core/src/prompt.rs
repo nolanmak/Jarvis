@@ -109,13 +109,79 @@ pub fn triage_user_message(email: &Email, learned: &str, wiki_hint: &str) -> Str
     )
 }
 
+/// Hard character cap on the rendered `<thread_history>` block (#32 Phase 1).
+/// ~12k chars ≈ 3k tokens — generous for "last ~5 messages" without blowing
+/// the per-draft budget. The fetch layer already trims to the last K messages;
+/// this is the belt-and-suspenders byte ceiling the issue calls for.
+pub const THREAD_HISTORY_CHAR_CAP: usize = 12_000;
+
+/// Render a verbatim `<thread_history>` block from prior messages in the same
+/// Gmail thread (oldest-first), newest-biased truncation.
+///
+/// `messages` is `(from, date, body)` tuples, chronological. We emit them in
+/// order but, when over `THREAD_HISTORY_CHAR_CAP`, drop the OLDEST entries
+/// first — recent turns carry the most signal for "what was already said".
+/// Returns `String::new()` when there's nothing to show (no prior messages),
+/// which `draft_user_message` interprets as "no thread block" — keeping the
+/// prompt byte-identical to today's single-message behavior.
+pub fn format_thread_history(messages: &[(String, String, String)]) -> String {
+    if messages.is_empty() {
+        return String::new();
+    }
+    // Build per-message chunks, then keep as many of the most-recent as fit.
+    let chunks: Vec<String> = messages
+        .iter()
+        .map(|(from, date, body)| {
+            format!("--- message ---\nFrom: {from}\nDate: {date}\n\n{}\n", body.trim())
+        })
+        .collect();
+    let mut kept: Vec<&String> = Vec::new();
+    let mut total = 0usize;
+    for chunk in chunks.iter().rev() {
+        if total + chunk.len() > THREAD_HISTORY_CHAR_CAP {
+            break;
+        }
+        total += chunk.len();
+        kept.push(chunk);
+    }
+    if kept.is_empty() {
+        return String::new();
+    }
+    kept.reverse();
+    let mut out = String::with_capacity(total + 48);
+    out.push_str("<thread_history>\n");
+    for chunk in kept {
+        out.push_str(chunk);
+    }
+    out.push_str("</thread_history>\n");
+    out
+}
+
 /// Build the draft user message. `wiki_hint` is an optional pre-built string
 /// naming wiki pages Claude may open; empty string disables the hint.
 ///
 /// `tone_block` is the per-recipient/domain/global tone descriptor injected
 /// into the draft prompt as a stable prefix (cache-friendly). Empty string =
-/// no tone injection (today's behavior). Real injection lands in #73.
-pub fn draft_user_message(email: &Email, wiki_hint: &str, tone_block: &str) -> String {
+/// no tone injection (today's behavior).
+///
+/// `thread_block` is a pre-rendered `<thread_history>` string (see
+/// [`format_thread_history`]) or empty for no thread context (#32). It sits at
+/// a STABLE position right after the tone block and before the wiki hint —
+/// the prompt-cache prefix (system + tone) is unaffected, and an empty
+/// `thread_block` makes the rendered prompt byte-identical to pre-#32 output.
+///
+/// `archetype_block` is a pre-rendered `<draft_archetype>` fragment (see
+/// [`crate::archetype::fragment_block`]) or empty for none (#36). It is
+/// composed AFTER tone and thread history — closest to the new inbound
+/// message so it anchors the reply structure without disturbing the
+/// tone+system cache prefix. Empty = byte-identical to pre-#36 output.
+pub fn draft_user_message(
+    email: &Email,
+    wiki_hint: &str,
+    tone_block: &str,
+    thread_block: &str,
+    archetype_block: &str,
+) -> String {
     let hint_block = if wiki_hint.trim().is_empty() {
         String::new()
     } else {
@@ -132,8 +198,28 @@ pub fn draft_user_message(email: &Email, wiki_hint: &str, tone_block: &str) -> S
             "\n<tone_profile>\n{tone_block}\n</tone_profile>\n\nMatch the voice in <tone_profile>. When verbatim opener/closer examples appear, weight them heavily — sign off the way the user actually signs off to this recipient.\n"
         )
     };
+    // Thread history sits AFTER the tone block (so the cache prefix stays
+    // tone+system) and BEFORE the wiki hint / new inbound message. Empty =
+    // nothing emitted, exactly today's output.
+    let thread = if thread_block.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n{thread_block}\nThe block above is the prior conversation in this thread, oldest first. Do not repeat questions already answered, honor commitments the user already made, and acknowledge anything already sent.\n"
+        )
+    };
+    // Archetype fragment is composed last among the context blocks — closest
+    // to the inbound message so it anchors structure. Empty = byte-identical
+    // to pre-#36 output.
+    let archetype = if archetype_block.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n{archetype_block}\nUse the archetype above to anchor the STRUCTURE and intent of the reply. Write natural prose in the user's voice — do not output the slot placeholders literally; fill them from the email, or omit cleanly if unknown.\n"
+        )
+    };
     format!(
-        r#"Draft a reply to this email. Follow the writing-style rules in your system prompt strictly.{tone}{hint_block}
+        r#"Draft a reply to this email. Follow the writing-style rules in your system prompt strictly.{tone}{thread}{archetype}{hint_block}
 
 <email>
 From: {from}
@@ -182,4 +268,104 @@ Write the revised draft now.
         subject = email.subject,
         body = email.body,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn email() -> Email {
+        Email {
+            message_id: "m1".into(),
+            thread_id: Some("t1".into()),
+            from: "a@b.com".into(),
+            subject: "Re: hi".into(),
+            body: "the inbound message".into(),
+            date: "2026-05-18T00:00:00Z".into(),
+            account_entity_id: Some("acc".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        }
+    }
+
+    #[test]
+    fn empty_blocks_are_byte_identical_to_legacy_output() {
+        // The whole cache-safety argument rests on this: empty tone/thread/
+        // archetype must produce exactly the pre-#32/#36 prompt.
+        let got = draft_user_message(&email(), "", "", "", "");
+        assert!(got.starts_with(
+            "Draft a reply to this email. Follow the writing-style rules in your system prompt strictly.\n\n<email>"
+        ));
+        assert!(!got.contains("<tone_profile>"));
+        assert!(!got.contains("<thread_history>"));
+        assert!(!got.contains("<draft_archetype"));
+        assert!(got.contains("the inbound message"));
+    }
+
+    #[test]
+    fn tone_prefix_is_stable_regardless_of_thread_or_archetype() {
+        // Prompt-cache keys on prefix. The bytes from the start through the
+        // end of <tone_profile> must be invariant whether or not thread /
+        // archetype blocks are present.
+        let tone = "voice: terse";
+        let a = draft_user_message(&email(), "", tone, "", "");
+        let b = draft_user_message(
+            &email(),
+            "",
+            tone,
+            "<thread_history>\n--- message ---\nx\n</thread_history>\n",
+            "<draft_archetype id=\"decline\">\nintent\n</draft_archetype>",
+        );
+        let marker = "</tone_profile>";
+        let a_pre = &a[..a.find(marker).unwrap() + marker.len()];
+        let b_pre = &b[..b.find(marker).unwrap() + marker.len()];
+        assert_eq!(a_pre, b_pre, "tone+system prefix must be cache-stable");
+    }
+
+    #[test]
+    fn thread_then_archetype_order_after_tone() {
+        let out = draft_user_message(
+            &email(),
+            "",
+            "voice",
+            "<thread_history>\nT\n</thread_history>\n",
+            "<draft_archetype id=\"fyi\">\nF\n</draft_archetype>",
+        );
+        let i_tone = out.find("<tone_profile>").unwrap();
+        let i_thread = out.find("<thread_history>").unwrap();
+        let i_arch = out.find("<draft_archetype").unwrap();
+        let i_email = out.find("<email>").unwrap();
+        assert!(i_tone < i_thread && i_thread < i_arch && i_arch < i_email);
+    }
+
+    #[test]
+    fn format_thread_history_empty_for_no_messages() {
+        assert_eq!(format_thread_history(&[]), "");
+    }
+
+    #[test]
+    fn format_thread_history_drops_oldest_over_cap() {
+        let big = "x".repeat(8_000);
+        let msgs = vec![
+            ("old@x.com".into(), "d1".into(), big.clone()),
+            ("mid@x.com".into(), "d2".into(), big.clone()),
+            ("new@x.com".into(), "d3".into(), big.clone()),
+        ];
+        let out = format_thread_history(&msgs);
+        assert!(out.len() <= THREAD_HISTORY_CHAR_CAP + 64);
+        // Newest must survive; oldest dropped.
+        assert!(out.contains("new@x.com"));
+        assert!(!out.contains("old@x.com"));
+        assert!(out.starts_with("<thread_history>"));
+    }
+
+    #[test]
+    fn format_thread_history_preserves_chronology() {
+        let msgs = vec![
+            ("first@x.com".into(), "d1".into(), "earliest".into()),
+            ("second@x.com".into(), "d2".into(), "latest".into()),
+        ];
+        let out = format_thread_history(&msgs);
+        assert!(out.find("first@x.com").unwrap() < out.find("second@x.com").unwrap());
+    }
 }
