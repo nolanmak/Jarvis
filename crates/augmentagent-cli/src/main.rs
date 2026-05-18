@@ -70,6 +70,10 @@ enum Cmd {
         /// Dry-run (default true). Flip with `--dry-run false` after Phase 2 cutover.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+        /// Run without the Gmail/email channel (multi-tenant non-email agent).
+        /// Default false ⇒ byte-identical to the single-tenant prod path.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        no_email: bool,
     },
     /// List active gmail accounts from the shared db.
     AccountsList,
@@ -154,6 +158,16 @@ enum Cmd {
     Github {
         #[command(subcommand)]
         op: GithubOp,
+    },
+    /// Meetup.com group events → Discord digest (multi-tenant; no email).
+    Meetup {
+        #[command(subcommand)]
+        op: MeetupOp,
+    },
+    /// Google Drive (via Composio) change feed → Discord (multi-tenant).
+    Gdrive {
+        #[command(subcommand)]
+        op: GdriveOp,
     },
     /// Cross-platform compose-once content adapter (#53). One source draft
     /// fans out into per-platform variants. All ops stubs in
@@ -479,6 +493,41 @@ enum GithubOp {
     },
     Unsubscribe {
         id: String,
+    },
+    PollOnce {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum MeetupOp {
+    /// Watch a Meetup group's upcoming events (channel_id = group urlname).
+    Subscribe {
+        /// Group url-name slug, e.g. `code-coffee-philly`.
+        urlname: String,
+        #[arg(long, value_parser = ["digest", "store_only"], default_value = "digest")]
+        mode: String,
+    },
+    Subscriptions {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    Unsubscribe {
+        id: String,
+    },
+    PollOnce {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum GdriveOp {
+    /// List connected Drive accounts (entity → email) in this db.
+    Accounts {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
     },
     PollOnce {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
@@ -947,15 +996,24 @@ async fn main() -> Result<()> {
         Cmd::Serve {
             interval_secs,
             dry_run,
+            no_email,
         } => {
             let (broker, approver) = build_broker(&cli, Arc::clone(&store), dry_run).await?;
-            let gmail_ch = build_channel(
-                &cli,
-                Arc::clone(&store),
-                Arc::clone(&broker),
-                dry_run,
-                interval_secs,
-            )?;
+            // Default (no_email=false) keeps the exact prod path: build + `?`
+            // propagate + unconditional spawn. `--no-email true` makes a
+            // tenant agent that runs Discord/GitHub/Meetup/Drive only.
+            let gmail_ch = if no_email {
+                info!("--no-email set: Gmail channel disabled (multi-tenant mode)");
+                None
+            } else {
+                Some(build_channel(
+                    &cli,
+                    Arc::clone(&store),
+                    Arc::clone(&broker),
+                    dry_run,
+                    interval_secs,
+                )?)
+            };
             // LinkedIn is optional — builds only if cookies exist; an absent
             // or invalid auth file downgrades the daemon to Gmail-only with
             // a warning, no crash.
@@ -1005,6 +1063,33 @@ async fn main() -> Result<()> {
                     None
                 }
             };
+            // Meetup self-gates on having ≥1 subscription, exactly like
+            // github gates on a PAT — prod's db has none ⇒ never spawned.
+            let meetup_ch = match build_meetup_channel(
+                &cli,
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                dry_run,
+            ) {
+                Ok(ch) => Some(ch),
+                Err(e) => {
+                    warn!("meetup channel disabled: {e:#}");
+                    None
+                }
+            };
+            // Drive self-gates on having ≥1 connected account + a Composio
+            // key — prod has neither ⇒ never spawned.
+            let gdrive_ch = match build_gdrive_channel(
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                dry_run,
+            ) {
+                Ok(ch) => Some(ch),
+                Err(e) => {
+                    warn!("gdrive channel disabled: {e:#}");
+                    None
+                }
+            };
             let shutdown = CancellationToken::new();
             let s2 = shutdown.clone();
             tokio::spawn(async move {
@@ -1015,8 +1100,10 @@ async fn main() -> Result<()> {
             });
             // Collect the enabled channels' runners + optional digest scheduler.
             let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
-            let sd = shutdown.clone();
-            tasks.push(tokio::spawn(async move { gmail_ch.run(sd).await }));
+            if let Some(gmail_ch) = gmail_ch {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { gmail_ch.run(sd).await }));
+            }
             if let Some(li) = linkedin_ch {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { li.run(sd).await }));
@@ -1042,6 +1129,14 @@ async fn main() -> Result<()> {
             if let Some(gh) = github_ch {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { gh.run(sd).await }));
+            }
+            if let Some(mc) = meetup_ch {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { mc.run(sd).await }));
+            }
+            if let Some(gd) = gdrive_ch {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { gd.run(sd).await }));
             }
             // Nudge scheduler — surfaces pending approval cards one at a time
             // (serial queue). Cross-channel: any pending action (gmail /
@@ -1077,8 +1172,10 @@ async fn main() -> Result<()> {
             // never surfaced on the connection, so the dashboard + invoice
             // entity picker show real emails. Detached + best-effort — a
             // flaky lookup must never take the daemon down, so this is
-            // deliberately not awaited in `tasks`.
-            {
+            // deliberately not awaited in `tasks`. Skipped for non-email
+            // tenants (no Gmail accounts to backfill; avoids a needless
+            // Composio call + warn log).
+            if !no_email {
                 let store_bf = Arc::clone(&store);
                 tokio::spawn(async move {
                     match backfill_gmail_emails(&store_bf, true).await {
@@ -1399,6 +1496,30 @@ async fn main() -> Result<()> {
             GithubOp::PollOnce { dry_run } => {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
                 let ch = build_github_channel(&cli, store, broker, *dry_run)?;
+                let out = ch.poll_once().await?;
+                println!("{out:#?}");
+                Ok(())
+            }
+        },
+        Cmd::Meetup { ref op } => match op {
+            MeetupOp::Subscribe { urlname, mode } => {
+                run_meetup_subscribe(store, urlname.clone(), mode.clone())
+            }
+            MeetupOp::Subscriptions { json } => run_meetup_subscriptions(store, *json),
+            MeetupOp::Unsubscribe { id } => run_meetup_unsubscribe(store, id.clone()),
+            MeetupOp::PollOnce { dry_run } => {
+                let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
+                let ch = build_meetup_channel(&cli, store, broker, *dry_run)?;
+                let out = ch.poll_once().await?;
+                println!("{out:#?}");
+                Ok(())
+            }
+        },
+        Cmd::Gdrive { ref op } => match op {
+            GdriveOp::Accounts { json } => run_gdrive_accounts(store, *json),
+            GdriveOp::PollOnce { dry_run } => {
+                let (broker, _) = build_broker(&cli, Arc::clone(&store), *dry_run).await?;
+                let ch = build_gdrive_channel(store, broker, *dry_run)?;
                 let out = ch.poll_once().await?;
                 println!("{out:#?}");
                 Ok(())
@@ -4986,6 +5107,152 @@ fn run_github_unsubscribe(store: Arc<Store>, id: String) -> Result<()> {
     store.delete_subscription(&id).context("delete subscription")?;
     println!("subscription {id} deactivated");
     Ok(())
+}
+
+fn run_meetup_subscribe(store: Arc<Store>, urlname: String, mode: String) -> Result<()> {
+    use augmentagent_store::SubscriptionMode;
+    let parsed =
+        SubscriptionMode::parse(&mode).ok_or_else(|| anyhow::anyhow!("invalid mode: {mode}"))?;
+    let normalized = urlname.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        anyhow::bail!("urlname (group slug) is required");
+    }
+    let sub = store
+        .upsert_subscription(
+            augmentagent_channel_meetup::PLATFORM,
+            &normalized,
+            &normalized,
+            parsed,
+            None,
+        )
+        .context("upsert meetup subscription")?;
+    println!(
+        "subscription id={} platform={} group={} mode={}",
+        sub.id,
+        sub.platform,
+        sub.channel_id,
+        sub.mode.as_str()
+    );
+    Ok(())
+}
+
+fn run_meetup_subscriptions(store: Arc<Store>, json: bool) -> Result<()> {
+    let subs = store
+        .list_active_subscriptions(augmentagent_channel_meetup::PLATFORM)
+        .context("list meetup subscriptions")?;
+    if json {
+        println!("{}", serde_json::to_string(&subs)?);
+    } else {
+        println!("{} active meetup subscriptions\n", subs.len());
+        for s in &subs {
+            println!(
+                "  {}  mode={}  group={}",
+                s.id,
+                s.mode.as_str(),
+                s.channel_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_meetup_unsubscribe(store: Arc<Store>, id: String) -> Result<()> {
+    store.delete_subscription(&id).context("delete subscription")?;
+    println!("subscription {id} deactivated");
+    Ok(())
+}
+
+/// Build a `MeetupChannel` for `serve` / `poll-once`. Returns `Err` when no
+/// meetup subscription exists yet, so `serve` downgrades it to a warning and
+/// the prod agent (zero meetup subs) never spawns it.
+fn build_meetup_channel(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<augmentagent_channel_meetup::MeetupChannel> {
+    use augmentagent_channel_meetup::{
+        MeetupChannel, MeetupChannelConfig, DEFAULT_POLL_SECS, PLATFORM,
+    };
+    let subs = store
+        .list_active_subscriptions(PLATFORM)
+        .context("list meetup subscriptions")?;
+    if subs.is_empty() {
+        anyhow::bail!("no meetup subscriptions — run `augmentagent meetup subscribe <urlname>`");
+    }
+    // The daemon's CWD is the repo root (systemd WorkingDirectory); that's
+    // where scripts/meetup-events.mjs lives. `--skill-dir`'s parent is a
+    // stable repo-root handle that doesn't depend on an env var.
+    let repo_root = std::env::current_dir().context("resolve repo root (cwd)")?;
+    let config = MeetupChannelConfig {
+        poll_interval: Duration::from_secs(DEFAULT_POLL_SECS),
+        dry_run,
+        ..Default::default()
+    };
+    let _ = cli; // wiki/skill dirs unused: meetup is notification-only
+    Ok(MeetupChannel::new(repo_root, store, broker, config))
+}
+
+fn run_gdrive_accounts(store: Arc<Store>, json: bool) -> Result<()> {
+    let accts = store
+        .get_active_drive_accounts()
+        .context("list drive accounts")?;
+    if json {
+        let rows: Vec<_> = accts
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "entity_id": a.entity_id,
+                    "email": a.email,
+                    "connection_id": a.connection_id,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&rows)?);
+    } else if accts.is_empty() {
+        println!("(no connected Google Drive accounts — connect one via the dashboard)");
+    } else {
+        for a in &accts {
+            let email = if a.email.is_empty() {
+                "(unknown)"
+            } else {
+                &a.email
+            };
+            println!("{}\tentity={}\temail={}", a.id, a.entity_id, email);
+        }
+    }
+    Ok(())
+}
+
+/// Build a `GDriveChannel` for `serve` / `poll-once`. Returns `Err` when no
+/// Drive account is connected or `COMPOSIO_API_KEY` is unset, so `serve`
+/// downgrades it to a warning and the prod agent (neither present) never
+/// spawns it.
+fn build_gdrive_channel(
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<augmentagent_channel_gdrive::GDriveChannel> {
+    use augmentagent_channel_gdrive::{
+        ComposioClient, GDriveChannel, GDriveChannelConfig, DEFAULT_POLL_SECS,
+    };
+    if store
+        .get_active_drive_accounts()
+        .context("list drive accounts")?
+        .is_empty()
+    {
+        anyhow::bail!("no connected Google Drive accounts (connect one via the dashboard)");
+    }
+    let api_key = std::env::var("COMPOSIO_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .context("COMPOSIO_API_KEY unset — required for the Google Drive channel")?;
+    let composio = Arc::new(ComposioClient::new(api_key));
+    let config = GDriveChannelConfig {
+        poll_interval: Duration::from_secs(DEFAULT_POLL_SECS),
+        dry_run,
+    };
+    Ok(GDriveChannel::new(store, composio, broker, config))
 }
 
 /// Build a `GithubChannel` for `serve` / `poll-once`. Returns `Err` when no

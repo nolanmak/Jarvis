@@ -24,6 +24,10 @@ import {
   getActiveGmailAccounts,
   addGmailAccount,
   removeGmailAccount,
+  getDriveAccounts,
+  getActiveDriveAccounts,
+  addDriveAccount,
+  removeDriveAccount,
   hasAnyGmailAccount,
   getEmailCount,
   purgeOldEmails,
@@ -734,6 +738,132 @@ router.delete("/api/oauth/gmail/:id", async (req, res) => {
 
   const configStatus = getConfigStatus();
   res.render("partials/config-status", { configStatus });
+});
+
+// --- Composio OAuth for Google Drive (multi-tenant) ---
+// Byte-for-byte mirror of the Gmail flow with toolkit "googledrive". Writes to
+// the `drive_accounts` table in whatever db this dashboard is pointed at
+// (run with AUGMENTAGENT_DB=<tenant db> to connect a tenant's Drive).
+
+router.get("/oauth/googledrive/start", async (_req, res) => {
+  try {
+    const client = getComposioClient();
+    if (!client) {
+      res.status(400).send("Composio API key not configured. Add it in Settings first.");
+      return;
+    }
+    const authConfigId = await getOrCreateAuthConfig(client, "googledrive");
+    const entityId = generateEntityId();
+    const dashboardPort = process.env.DASHBOARD_PORT || "3000";
+    const callbackUrl = `http://localhost:${dashboardPort}/oauth/googledrive/callback`;
+    const linkResponse = await client.link.create({
+      user_id: entityId,
+      auth_config_id: authConfigId,
+      callback_url: callbackUrl,
+    });
+    if (!linkResponse.redirect_url) {
+      throw new Error("No redirect URL returned from Composio");
+    }
+    if (linkResponse.connected_account_id) {
+      setConfig("gdrive_pending_connection_id", linkResponse.connected_account_id);
+      setConfig("gdrive_pending_entity_id", entityId);
+    }
+    console.log(`[oauth] Google Drive OAuth initiated for entity ${entityId}`);
+    res.redirect(linkResponse.redirect_url);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[oauth] Google Drive OAuth start failed:", msg);
+    res.status(500).send(`
+      <div class="p-4 bg-gray-950 text-gray-100 min-h-screen">
+        <h2 class="text-lg font-semibold text-red-400 mb-2">OAuth Error</h2>
+        <p class="text-sm text-gray-300 mb-4">${msg}</p>
+        <a href="/settings" class="text-blue-400 hover:underline">Back to Settings</a>
+      </div>
+    `);
+  }
+});
+
+router.get("/oauth/googledrive/callback", async (req, res) => {
+  console.log("[oauth] gdrive callback. Query:", JSON.stringify(req.query));
+  try {
+    const connectionId = getConfig("gdrive_pending_connection_id");
+    const entityId = getConfig("gdrive_pending_entity_id");
+    const client = getComposioClient();
+
+    if (connectionId && entityId && client) {
+      let status = "unknown";
+      let email: string | null = null;
+      let retries = 3;
+      while (retries > 0) {
+        try {
+          const account = await client.connectedAccounts.retrieve(connectionId);
+          status = (account as any).status || "unknown";
+          email = (account as any).member_email || (account as any).email || null;
+          if (status === "ACTIVE") break;
+        } catch (err) {
+          console.log("[oauth] gdrive retrieve failed:", err instanceof Error ? err.message : err);
+        }
+        retries--;
+        if (retries > 0) await new Promise((r) => setTimeout(r, 2000));
+      }
+      addDriveAccount(connectionId, entityId, email || undefined, email || `Connection (${status})`);
+      console.log(`[oauth] Drive account stored: ${connectionId}, status=${status}, email=${email}`);
+      deleteConfig("gdrive_pending_connection_id");
+      deleteConfig("gdrive_pending_entity_id");
+    } else if (client) {
+      try {
+        const connections = await client.connectedAccounts.list({
+          toolkit_slugs: ["googledrive"],
+        });
+        const existing = new Set(getDriveAccounts().map((a) => a.connection_id));
+        for (const conn of connections.items) {
+          if (conn.status === "ACTIVE" && !existing.has(conn.id)) {
+            const email = (conn as any).member_email || (conn as any).email || null;
+            const userId =
+              (conn as any).user_id || (conn as any).entity_id || `discovered-${Date.now()}`;
+            addDriveAccount(conn.id, userId, email || undefined, email || "Discovered account");
+          }
+        }
+      } catch (err) {
+        console.error("[oauth] gdrive discovery failed:", err instanceof Error ? err.message : err);
+      }
+    }
+    res.redirect("/settings?googledrive=connected");
+  } catch (err) {
+    console.error("[oauth] Google Drive OAuth callback error:", err);
+    res.redirect("/settings?googledrive=error");
+  }
+});
+
+router.get("/api/oauth/googledrive/status", (_req, res) => {
+  const accounts = getActiveDriveAccounts();
+  res.json({
+    isConnected: accounts.length > 0,
+    accountCount: accounts.length,
+    accounts: accounts.map((a) => ({
+      id: a.id,
+      email: a.email,
+      entityId: a.entity_id,
+    })),
+  });
+});
+
+router.delete("/api/oauth/googledrive/:id", async (req, res) => {
+  try {
+    const client = getComposioClient();
+    const account = getDriveAccounts().find((a) => a.id === req.params.id);
+    if (account && client) {
+      try {
+        await client.connectedAccounts.delete(account.connection_id);
+      } catch {
+        // Ignore — may already be deleted on Composio side
+      }
+    }
+    removeDriveAccount(req.params.id);
+  } catch {
+    removeDriveAccount(req.params.id);
+  }
+  res.json({ ok: true });
 });
 
 // --- Composio OAuth for Slack (multi-workspace) ---

@@ -107,6 +107,25 @@ export function initDb(dbPath?: string): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_emails_platform ON emails(platform);
     CREATE INDEX IF NOT EXISTS idx_channel_subs_active_mode ON channel_subscriptions(active, mode);
     CREATE INDEX IF NOT EXISTS idx_slack_workspaces_active ON slack_workspaces(active);
+
+    -- Multi-tenant Google Drive (Composio). Schema MUST match the Rust
+    -- daemon's migrate() (snake_case) since both share the tenant's data.db.
+    -- Empty + unread in prod (no Drive connected) — proven-safe pattern.
+    CREATE TABLE IF NOT EXISTS drive_accounts (
+      id            TEXT PRIMARY KEY,
+      connection_id TEXT NOT NULL,
+      entity_id     TEXT NOT NULL,
+      email         TEXT,
+      label         TEXT,
+      active        INTEGER NOT NULL DEFAULT 1,
+      created_at_ms INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_drive_accounts_active ON drive_accounts(active);
+    CREATE TABLE IF NOT EXISTS drive_sync_state (
+      entity_id     TEXT PRIMARY KEY,
+      page_token    TEXT NOT NULL,
+      updated_at_ms INTEGER NOT NULL
+    );
   `);
 
   // Additive migrations for existing DBs created before the platform/kind columns landed.
@@ -396,6 +415,54 @@ export function getGmailAccountByConnectionId(connectionId: string): GmailAccoun
     .get(connectionId) as any;
   if (!row) return undefined;
   return { ...row, active: !!row.active };
+}
+
+// --- Multi-tenant Google Drive accounts (Composio) ---
+// Shares the `drive_accounts` table with the Rust daemon (snake_case columns).
+// `id` is deterministic (`drive-<connectionId>`) so Node and Rust dedupe the
+// same connection identically.
+
+export interface DriveAccount {
+  id: string;
+  connection_id: string;
+  entity_id: string;
+  email: string | null;
+  label: string | null;
+  active: boolean;
+  created_at_ms: number;
+}
+
+export function getDriveAccounts(): DriveAccount[] {
+  return getDb()
+    .prepare("SELECT * FROM drive_accounts ORDER BY created_at_ms DESC")
+    .all()
+    .map((row: any) => ({ ...row, active: !!row.active })) as DriveAccount[];
+}
+
+export function getActiveDriveAccounts(): DriveAccount[] {
+  return getDb()
+    .prepare("SELECT * FROM drive_accounts WHERE active = 1 ORDER BY created_at_ms DESC")
+    .all()
+    .map((row: any) => ({ ...row, active: !!row.active })) as DriveAccount[];
+}
+
+export function addDriveAccount(
+  connectionId: string,
+  entityId: string,
+  email?: string,
+  label?: string
+): string {
+  const id = `drive-${connectionId}`;
+  getDb()
+    .prepare(
+      "INSERT OR REPLACE INTO drive_accounts (id, connection_id, entity_id, email, label, active, created_at_ms) VALUES (?, ?, ?, ?, ?, 1, ?)"
+    )
+    .run(id, connectionId, entityId, email || null, label || null, Date.now());
+  return id;
+}
+
+export function removeDriveAccount(id: string): void {
+  getDb().prepare("DELETE FROM drive_accounts WHERE id = ?").run(id);
 }
 
 export function hasAnyGmailAccount(): boolean {
