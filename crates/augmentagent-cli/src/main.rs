@@ -101,10 +101,36 @@ enum Cmd {
     /// #103 — self-improvement loop: pick an `agent-fixable` GitHub issue,
     /// fix it on an isolated worktree/branch (never main), run the
     /// verification gate, and open a DRAFT PR. Never auto-merges.
+    ///
+    /// #117 — `--multi-repo true` switches to the allowlisted multi-repo
+    /// path: clone each enabled `agent_repos` entry into an isolated
+    /// workspace, run its per-repo gate, and queue a *prompted* draft PR
+    /// (Discord + dashboard approval) instead of opening one directly.
+    /// `--approve/--reject <run-id>` resolves a queued gate row; the next
+    /// `--approve-open true` pass opens the draft PR for approved rows.
     SelfImprove {
         /// Dry-run (default true): run the gate but stop before opening a PR.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+        /// #117: run the allowlisted multi-repo prompted-PR path instead of
+        /// the single-repo issue-pickup path.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        multi_repo: bool,
+        /// #117: approve a queued gate row by id (flips it to `approved`).
+        #[arg(long)]
+        approve: Option<String>,
+        /// #117: reject a queued gate row by id.
+        #[arg(long)]
+        reject: Option<String>,
+        /// #117: open draft PRs for every already-`approved` gate row.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        approve_open: bool,
+    },
+    /// #117 — manage the multi-repo agent-coding allowlist from the CLI
+    /// (parity with the dashboard /repos admin view).
+    Repos {
+        #[command(subcommand)]
+        op: ReposOp,
     },
     /// Wiki maintenance.
     Wiki {
@@ -288,6 +314,38 @@ enum Cmd {
         #[command(subcommand)]
         op: RatelimitOp,
     },
+    /// #58 — engagement-automation scheduled posts. Queue / list / cancel an
+    /// outbound post; the serve-tick fire loop previews it at T-30min and
+    /// publishes it at T-0 via the per-platform poster.
+    SchedulePost {
+        #[command(subcommand)]
+        op: SchedulePostOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum SchedulePostOp {
+    /// Queue an outbound post for `--platform` at `--at` (RFC3339 / unix
+    /// seconds). Status starts `queued`; serve drives it through the
+    /// preview → posted lifecycle.
+    Add {
+        /// `linkedin` | `twitter` | `instagram`.
+        #[arg(long)]
+        platform: String,
+        /// Post body.
+        #[arg(long)]
+        body: String,
+        /// Fire time: RFC3339 (`2026-05-20T15:00:00Z`) or unix seconds.
+        #[arg(long)]
+        at: String,
+    },
+    /// List not-yet-terminal scheduled posts (the queue).
+    List,
+    /// Cancel a queued / previewed post by id.
+    Cancel {
+        #[arg(long)]
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -329,6 +387,49 @@ enum InvoiceOp {
         /// true (default) = generate only; `--dry-run false` actually sends.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+    },
+}
+
+/// #117 — multi-repo agent-coding allowlist management (CLI parity with the
+/// dashboard /repos admin view). Default-deny: a repo is untouchable until
+/// it is `add`ed here (or via the dashboard).
+#[derive(Subcommand)]
+enum ReposOp {
+    /// List allowlisted repos (`--all true` also shows revoked ones).
+    List {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        all: bool,
+    },
+    /// Allowlist (or re-grant / update) a repo.
+    Add {
+        /// `owner/name` GitHub full-name.
+        #[arg(long)]
+        full_name: String,
+        /// Branch PRs target. Defaults to `main`.
+        #[arg(long, default_value = "main")]
+        base_branch: String,
+        /// Per-repo verification-gate command (run with `bash -lc`).
+        /// Empty ⇒ gate skipped (still prompt-gated, so safe).
+        #[arg(long, default_value = "")]
+        build_cmd: String,
+        /// Comma-separated extra blast-radius path fragments for this repo.
+        #[arg(long, default_value = "")]
+        blast_radius_extra: String,
+        /// Max changed lines accepted in one agent diff for this repo.
+        #[arg(long, default_value_t = 600)]
+        max_diff_lines: i64,
+    },
+    /// Revoke a repo (soft-disable + auto-reject its in-flight gate rows).
+    Remove {
+        #[arg(long)]
+        full_name: String,
+    },
+    /// Show recent agent-PR run history (optionally for one repo).
+    History {
+        #[arg(long)]
+        full_name: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        limit: i64,
     },
 }
 
@@ -1203,11 +1304,120 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::SelfImprove { dry_run } => {
+        Cmd::SelfImprove {
+            dry_run,
+            multi_repo,
+            ref approve,
+            ref reject,
+            approve_open,
+        } => {
+            // Gate resolution + PR-opening are pure store/gh ops (no repo
+            // pass). Handle them first so they short-circuit.
+            if let Some(run_id) = approve {
+                match store.approve_agent_pr_run(run_id)? {
+                    Some(r) => println!(
+                        "approved run {} ({} #{}); run `self-improve --approve-open true` to open the draft PR",
+                        r.id, r.repo_full_name, r.issue_number
+                    ),
+                    None => println!("run {run_id}: not pending (already resolved or unknown)"),
+                }
+                return Ok(());
+            }
+            if let Some(run_id) = reject {
+                match store.reject_agent_pr_run(run_id)? {
+                    Some(r) => println!("rejected run {} ({})", r.id, r.repo_full_name),
+                    None => println!("run {run_id}: not pending (already resolved or unknown)"),
+                }
+                return Ok(());
+            }
+            if approve_open {
+                let msg = self_improve::open_approved_runs(&store).await?;
+                println!("{msg}");
+                return Ok(());
+            }
+            if multi_repo {
+                let deploy_root = std::env::current_dir().context("current_dir")?;
+                let (broker, _) =
+                    build_broker(&cli, Arc::clone(&store), dry_run).await?;
+                let msg = self_improve::run_multi_repo_once(
+                    &store,
+                    broker.as_ref(),
+                    &deploy_root,
+                    dry_run,
+                )
+                .await?;
+                println!("{msg}");
+                return Ok(());
+            }
             let repo_root = std::env::current_dir().context("current_dir")?;
             let msg = self_improve::run_once(&repo_root, dry_run).await?;
             println!("{msg}");
             Ok(())
+        }
+        Cmd::Repos { op } => {
+            match op {
+                ReposOp::List { all } => {
+                    let repos = store.list_agent_repos(!all)?;
+                    if repos.is_empty() {
+                        println!("(no allowlisted repos — default-deny)");
+                    } else {
+                        for r in repos {
+                            println!(
+                                "{}\tbase={}\tbuild={:?}\tcap={}\tenabled={}",
+                                r.full_name,
+                                r.base_branch,
+                                r.build_cmd,
+                                r.max_diff_lines,
+                                r.enabled
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                ReposOp::Add {
+                    full_name,
+                    base_branch,
+                    build_cmd,
+                    blast_radius_extra,
+                    max_diff_lines,
+                } => {
+                    let r = store.upsert_agent_repo(
+                        &full_name,
+                        &base_branch,
+                        &build_cmd,
+                        &blast_radius_extra,
+                        max_diff_lines,
+                    )?;
+                    println!("allowlisted {} (base {})", r.full_name, r.base_branch);
+                    Ok(())
+                }
+                ReposOp::Remove { full_name } => {
+                    let cancelled = store.revoke_agent_repo(&full_name)?;
+                    println!(
+                        "revoked {full_name} ({cancelled} in-flight gate row(s) auto-rejected)"
+                    );
+                    Ok(())
+                }
+                ReposOp::History { full_name, limit } => {
+                    let rows =
+                        store.list_agent_pr_runs(full_name.as_deref(), limit)?;
+                    if rows.is_empty() {
+                        println!("(no agent-PR runs)");
+                    } else {
+                        for r in rows {
+                            println!(
+                                "{}\t#{}\t{}\t{}\t{}",
+                                r.repo_full_name,
+                                r.issue_number,
+                                r.status,
+                                r.pr_url.unwrap_or_else(|| "-".into()),
+                                r.id
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+            }
         }
         Cmd::AccountsBackfillEmails => {
             let lines = backfill_gmail_emails(&store, false).await?;
@@ -1313,6 +1523,20 @@ async fn main() -> Result<()> {
                     None
                 }
             };
+            // Deft (#116) spike scaffold: linked but INERT. We deliberately
+            // do NOT build/spawn a DeftChannel here — the doc's live-validation
+            // TODOs (real submission/webhook JSON, confirmed product, token)
+            // must clear first. This line just surfaces the arming-gate state
+            // in logs and keeps the dep genuinely used. See
+            // docs/deft-protocol.md §6/§7.
+            if augmentagent_channel_deft::deft_enabled() {
+                warn!(
+                    "AUGMENTAGENT_DEFT_ENABLED is set but the deft channel is a \
+                     spike scaffold and is intentionally not spawned (see \
+                     docs/deft-protocol.md §7 go/no-go)"
+                );
+            }
+
             // Meetup self-gates on having ≥1 subscription, exactly like
             // github gates on a PAT — prod's db has none ⇒ never spawned.
             let meetup_ch = match build_meetup_channel(
@@ -1379,13 +1603,51 @@ async fn main() -> Result<()> {
             } else {
                 info!("proactive runner disabled: --wiki-dir not set");
             }
+            // #58 — scheduled-post fire loop. 1-min serve tick: T-30min
+            // preview card → T-0 publish via the per-platform poster, every
+            // step gated by the merged RateGovernor (#83). Inert until a
+            // post is queued (`augmentagent schedule-post add …`), so this
+            // is safe to always spawn — empty queue == zero-cost tick. The
+            // engine itself honours dry_run (mutes cards + real publish).
+            {
+                let governor: Arc<dyn augmentagent_channel_core::RateGovernor> =
+                    Arc::new(
+                        augmentagent_channel_core::SqliteGovernor::with_system_clock(
+                            Arc::clone(&store),
+                        ),
+                    );
+                let publisher: Arc<dyn augmentagent_channel_core::PostPublisher> =
+                    Arc::new(MultiPlatformPublisher {
+                        store: Arc::clone(&store),
+                        repo_root: std::env::current_dir()
+                            .unwrap_or_else(|_| PathBuf::from(".")),
+                        dry_run,
+                    });
+                let engine = augmentagent_channel_core::ScheduledPostEngine::new(
+                    Arc::clone(&store),
+                    Arc::clone(&broker),
+                    governor,
+                    publisher,
+                    dry_run,
+                );
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { engine.run(sd).await }));
+            }
+            // #25: Gmail + LinkedIn now run through the generic
+            // `ChannelRunner` (`run_arc`) instead of bespoke poll loops.
+            // Behavior is unchanged — `run_arc` drives the same per-message
+            // `process_email` pipeline via a `WorkItemHandler`; Gmail keeps
+            // its independent retry ticker, LinkedIn keeps its 4h±10min
+            // jittered cadence.
             if let Some(gmail_ch) = gmail_ch {
                 let sd = shutdown.clone();
-                tasks.push(tokio::spawn(async move { gmail_ch.run(sd).await }));
+                let gmail_arc = Arc::new(gmail_ch);
+                tasks.push(tokio::spawn(async move { gmail_arc.run_arc(sd).await }));
             }
             if let Some(li) = linkedin_ch {
                 let sd = shutdown.clone();
-                tasks.push(tokio::spawn(async move { li.run(sd).await }));
+                let li_arc = Arc::new(li);
+                tasks.push(tokio::spawn(async move { li_arc.run_arc(sd).await }));
             }
             if let Some(lf) = linkedin_feed {
                 let sd = shutdown.clone();
@@ -2073,6 +2335,7 @@ async fn main() -> Result<()> {
             RatelimitOp::Halts => run_ratelimit_halts(store),
             RatelimitOp::Caps => run_ratelimit_caps(),
         },
+        Cmd::SchedulePost { ref op } => run_schedule_post(store, op).await,
     }
 }
 
@@ -5179,6 +5442,146 @@ async fn run_backfill_signatures(
 /// enforces the same rolling-24h cap (3 posts/day) the daemon path does, a
 /// first-N-posts second-confirmation guard, and a `--dry-run` that prints
 /// the request body without sending.
+// ================================================================
+// #58 — engagement-automation scheduled posts
+// ================================================================
+
+/// Routes a [`ScheduledPost`] to the right per-platform poster. Keeps
+/// `channel-core`'s `PostPublisher` trait satisfied without that crate
+/// depending on the platform crates. Auth is loaded lazily per publish so a
+/// missing LinkedIn/Twitter session degrades to a `Failed` outcome (the
+/// engine marks the row failed + alerts) rather than panicking the daemon.
+struct MultiPlatformPublisher {
+    store: Arc<Store>,
+    repo_root: PathBuf,
+    dry_run: bool,
+}
+
+#[async_trait]
+impl augmentagent_channel_core::PostPublisher for MultiPlatformPublisher {
+    async fn publish(
+        &self,
+        post: &augmentagent_store::ScheduledPost,
+    ) -> augmentagent_channel_core::PublishOutcome {
+        use augmentagent_channel_core::PublishOutcome;
+        match post.platform.as_str() {
+            "linkedin" => {
+                let auth = match LinkedInAuth::load_with_migration(&self.repo_root) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return PublishOutcome::Failed {
+                            message: format!("linkedin auth: {e}"),
+                        }
+                    }
+                };
+                if self.dry_run {
+                    return PublishOutcome::DryRun;
+                }
+                let voyager = VoyagerClient::new(auth);
+                let draft = PostDraft::text(&post.body);
+                match voyager.create_share(draft).await {
+                    Ok(urn) => PublishOutcome::Posted { external_id: urn.0 },
+                    Err(e) => PublishOutcome::Failed {
+                        message: format!("linkedin create_share: {e}"),
+                    },
+                }
+            }
+            "twitter" | "x" => {
+                let auth = match TwitterAuth::load_with_migration(&self.repo_root) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return PublishOutcome::Failed {
+                            message: format!("twitter auth: {e}"),
+                        }
+                    }
+                };
+                let api = Arc::new(TwitterClient::new(auth));
+                let client = CreateTweetClient::new(
+                    api,
+                    Arc::clone(&self.store),
+                    self.dry_run,
+                );
+                match client.create(&post.body, None, &[]).await {
+                    Ok(augmentagent_channel_twitter::PostOutcome::DryRun) => {
+                        PublishOutcome::DryRun
+                    }
+                    Ok(out) => PublishOutcome::Posted {
+                        external_id: format!("{out:?}"),
+                    },
+                    Err(e) => PublishOutcome::Failed {
+                        message: format!("twitter create: {e}"),
+                    },
+                }
+            }
+            other => PublishOutcome::Failed {
+                message: format!(
+                    "no scheduled-post publisher wired for platform '{other}' \
+                     (linkedin + twitter supported; instagram deferred)"
+                ),
+            },
+        }
+    }
+}
+
+async fn run_schedule_post(store: Arc<Store>, op: &SchedulePostOp) -> Result<()> {
+    match op {
+        SchedulePostOp::Add {
+            platform,
+            body,
+            at,
+        } => {
+            let fire_at_ms = parse_fire_at(at)?;
+            let id = store.enqueue_scheduled_post(
+                platform,
+                body,
+                None,
+                fire_at_ms,
+                None,
+            )?;
+            println!(
+                "queued scheduled post {id} for {platform} at {} (unix ms {fire_at_ms})",
+                at
+            );
+            Ok(())
+        }
+        SchedulePostOp::List => {
+            let rows = store.list_pending_scheduled_posts()?;
+            if rows.is_empty() {
+                println!("no pending scheduled posts");
+            }
+            for r in rows {
+                println!(
+                    "{}  {:<9}  {:<9}  fire@{}  {}",
+                    r.id,
+                    r.platform,
+                    r.status,
+                    r.fire_at_ms,
+                    r.body.chars().take(60).collect::<String>()
+                );
+            }
+            Ok(())
+        }
+        SchedulePostOp::Cancel { id } => {
+            if store.cancel_scheduled_post(id)? {
+                println!("cancelled {id}");
+            } else {
+                println!("not cancellable (already fired / unknown id): {id}");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Accept either an RFC3339 timestamp or raw unix seconds for `--at`.
+fn parse_fire_at(s: &str) -> Result<i64> {
+    if let Ok(secs) = s.parse::<i64>() {
+        return Ok(secs * 1000);
+    }
+    let dt = chrono::DateTime::parse_from_rfc3339(s)
+        .with_context(|| format!("--at must be RFC3339 or unix seconds, got {s:?}"))?;
+    Ok(dt.timestamp_millis())
+}
+
 async fn run_linkedin_post(
     store: Arc<Store>,
     text: String,

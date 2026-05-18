@@ -7,9 +7,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::models::{
-    Account, ActionRecord, ActionStatus, ChannelSubscription, DriveAccount, Email, LearnedPattern,
-    LinkedInConnectionSync, PhoneIdentity, RateAuditRow, RateHalt, RateWarmup, SlackWorkspace,
-    SubscriptionMode, TelegramBot, ToneExample, ToneProfile, TriageResult, UserLoop, WhatsappDevice,
+    Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription, DriveAccount,
+    Email, LearnedPattern, LinkedInConnectionSync, PhoneIdentity, RateAuditRow, RateHalt,
+    RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace, SubscriptionMode, TelegramBot,
+    ToneExample, ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 
 #[derive(Debug, Error)]
@@ -672,6 +673,118 @@ impl Store {
                 ON scheduled_posts(status, fire_at_ms)",
             [],
         )?;
+
+        // ----------------------------------------------------------------
+        // #58 — engagement-automation spine. Additive + dormant in prod:
+        // empty + unwritten unless the engagement loops / CLI populate them.
+        // Same proven-safe pattern as the wave-A tables above. Schemas
+        // mirror the #58 research-issue body.
+        // ----------------------------------------------------------------
+
+        // #58.2 — the user's own watched posts + already-seen comment ids.
+        // `OwnPostsSource` polls the last N posts and diffs incoming
+        // comments against `seen_comments` so a new comment becomes one
+        // `own_post_comment` WorkItem exactly once.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS own_posts (\
+                 id            TEXT PRIMARY KEY,\
+                 platform      TEXT NOT NULL,\
+                 external_id   TEXT NOT NULL,\
+                 posted_at_ms  INTEGER NOT NULL,\
+                 poll_until_ms INTEGER NOT NULL,\
+                 last_polled_ms INTEGER,\
+                 created_at_ms INTEGER NOT NULL,\
+                 UNIQUE (platform, external_id)\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_own_posts_poll \
+                ON own_posts(platform, poll_until_ms)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS seen_comments (\
+                 id            TEXT PRIMARY KEY,\
+                 own_post_id   TEXT NOT NULL REFERENCES own_posts(id) ON DELETE CASCADE,\
+                 external_id   TEXT NOT NULL,\
+                 author_handle TEXT,\
+                 body          TEXT,\
+                 triage_id     TEXT,\
+                 created_at_ms INTEGER NOT NULL,\
+                 UNIQUE (own_post_id, external_id)\
+             )",
+            [],
+        )?;
+
+        // #58.3 — friend watchlist + seen friend posts. `engagement` is
+        // 'high' (every post) | 'medium' (weekly digest) | 'low' (only on
+        // milestone keywords). `wiki_slug` grounds the draft prompt.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS friend_watchlist (\
+                 id            TEXT PRIMARY KEY,\
+                 platform      TEXT NOT NULL,\
+                 handle        TEXT NOT NULL,\
+                 wiki_slug     TEXT,\
+                 engagement    TEXT NOT NULL DEFAULT 'medium',\
+                 added_at_ms   INTEGER NOT NULL,\
+                 paused_until_ms INTEGER,\
+                 UNIQUE (platform, handle)\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS friend_posts_seen (\
+                 id            TEXT PRIMARY KEY,\
+                 watchlist_id  TEXT NOT NULL REFERENCES friend_watchlist(id) ON DELETE CASCADE,\
+                 external_id   TEXT NOT NULL,\
+                 posted_at_ms  INTEGER NOT NULL,\
+                 triage_id     TEXT,\
+                 UNIQUE (watchlist_id, external_id)\
+             )",
+            [],
+        )?;
+
+        // #58.4 — inbound LinkedIn (and future-platform) connection-request
+        // triage queue. `decision` is one of
+        // accept|decline|accept_and_dm|pending.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS connection_requests (\
+                 id              TEXT PRIMARY KEY,\
+                 platform        TEXT NOT NULL,\
+                 external_id     TEXT NOT NULL,\
+                 requester_name  TEXT,\
+                 requester_url   TEXT,\
+                 message         TEXT,\
+                 decision        TEXT NOT NULL DEFAULT 'pending',\
+                 decided_at_ms   INTEGER,\
+                 triage_id       TEXT,\
+                 created_at_ms   INTEGER NOT NULL,\
+                 UNIQUE (platform, external_id)\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_connection_requests_decision \
+                ON connection_requests(decision, created_at_ms)",
+            [],
+        )?;
+
+        // #58.5 — warm-touch per-contact state. The actual cadence scoring
+        // is the merged #81 proactive `StaleContactScan`; this table only
+        // carries the per-slug nudge/snooze bookkeeping the #58 card needs
+        // (so we never duplicate the proactive scoring engine).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS warm_touch_state (\
+                 wiki_slug            TEXT PRIMARY KEY,\
+                 last_interaction_ms  INTEGER,\
+                 last_nudged_ms       INTEGER,\
+                 snoozed_until_ms     INTEGER,\
+                 cadence_days         INTEGER\
+             )",
+            [],
+        )?;
+
         // Multi-tenant Google Drive (Composio). Inert in prod: empty + unread
         // unless a tenant connects a Drive account. Same proven-safe pattern
         // as the dormant wave-A tables already shipping in prod.
@@ -836,6 +949,62 @@ impl Store {
                 ON identity_phone(person_slug)",
             [],
         )?;
+
+        // #117 — multi-repo agent-coding allowlist + audit. Both additive +
+        // dormant in prod until a repo is granted via the dashboard; same
+        // proven-safe pattern as the wave-A tables above. `full_name` is
+        // UNIQUE NOCASE so `Owner/Repo` and `owner/repo` can't both be
+        // allowlisted. Default-deny: an empty table means the loop touches
+        // nothing.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_repos (\
+                 id                 TEXT PRIMARY KEY,\
+                 full_name          TEXT NOT NULL UNIQUE COLLATE NOCASE,\
+                 base_branch        TEXT NOT NULL DEFAULT 'main',\
+                 build_cmd          TEXT NOT NULL DEFAULT '',\
+                 blast_radius_extra TEXT NOT NULL DEFAULT '',\
+                 max_diff_lines     INTEGER NOT NULL DEFAULT 600,\
+                 enabled            INTEGER NOT NULL DEFAULT 1,\
+                 created_at_ms      INTEGER NOT NULL,\
+                 updated_at_ms      INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_repos_enabled \
+                ON agent_repos(enabled)",
+            [],
+        )?;
+        // One row per attempt. The gate (`pending_approval`) lives here so a
+        // daemon restart never loses an awaiting-approval PR and the
+        // dashboard can render full per-repo history.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_pr_runs (\
+                 id             TEXT PRIMARY KEY,\
+                 repo_full_name TEXT NOT NULL,\
+                 issue_number   INTEGER NOT NULL,\
+                 branch         TEXT NOT NULL,\
+                 summary        TEXT NOT NULL DEFAULT '',\
+                 diff_lines     INTEGER NOT NULL DEFAULT 0,\
+                 status         TEXT NOT NULL,\
+                 pr_url         TEXT,\
+                 error          TEXT,\
+                 created_at_ms  INTEGER NOT NULL,\
+                 updated_at_ms  INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_pr_runs_repo \
+                ON agent_pr_runs(repo_full_name, created_at_ms)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_pr_runs_status \
+                ON agent_pr_runs(status)",
+            [],
+        )?;
+
         Ok(())
     }
 
@@ -3659,6 +3828,572 @@ impl Store {
             .optional()?;
         Ok(found.is_some())
     }
+
+    // --- #117 multi-repo agent-coding allowlist + audit ----------------
+
+    /// Allowlist (or update) a repo. Idempotent on `full_name` (case-insens):
+    /// re-granting an existing repo updates its config + re-enables it
+    /// without resetting its PR-run history.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_agent_repo(
+        &self,
+        full_name: &str,
+        base_branch: &str,
+        build_cmd: &str,
+        blast_radius_extra: &str,
+        max_diff_lines: i64,
+    ) -> StoreResult<AgentRepo> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let existing: Option<String> = guard
+            .query_row(
+                "SELECT id FROM agent_repos WHERE full_name = ?1 COLLATE NOCASE",
+                params![full_name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(id) => {
+                guard.execute(
+                    "UPDATE agent_repos SET base_branch = ?2, build_cmd = ?3, \
+                            blast_radius_extra = ?4, max_diff_lines = ?5, \
+                            enabled = 1, updated_at_ms = ?6 \
+                      WHERE id = ?1",
+                    params![
+                        id,
+                        base_branch,
+                        build_cmd,
+                        blast_radius_extra,
+                        max_diff_lines,
+                        now
+                    ],
+                )?;
+            }
+            None => {
+                let id = Uuid::new_v4().to_string();
+                guard.execute(
+                    "INSERT INTO agent_repos \
+                        (id, full_name, base_branch, build_cmd, \
+                         blast_radius_extra, max_diff_lines, enabled, \
+                         created_at_ms, updated_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)",
+                    params![
+                        id,
+                        full_name,
+                        base_branch,
+                        build_cmd,
+                        blast_radius_extra,
+                        max_diff_lines,
+                        now
+                    ],
+                )?;
+            }
+        }
+        drop(guard);
+        self.get_agent_repo(full_name)?
+            .ok_or(StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn get_agent_repo(&self, full_name: &str) -> StoreResult<Option<AgentRepo>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT id, full_name, base_branch, build_cmd, \
+                        blast_radius_extra, max_diff_lines, enabled, \
+                        created_at_ms, updated_at_ms \
+                   FROM agent_repos WHERE full_name = ?1 COLLATE NOCASE",
+                params![full_name],
+                row_to_agent_repo,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// List allowlisted repos. `enabled_only` filters to active grants — the
+    /// loop always passes `true` (default-deny); the dashboard passes `false`
+    /// to also show revoked rows.
+    pub fn list_agent_repos(&self, enabled_only: bool) -> StoreResult<Vec<AgentRepo>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let sql = if enabled_only {
+            "SELECT id, full_name, base_branch, build_cmd, blast_radius_extra, \
+                    max_diff_lines, enabled, created_at_ms, updated_at_ms \
+               FROM agent_repos WHERE enabled = 1 ORDER BY full_name ASC"
+        } else {
+            "SELECT id, full_name, base_branch, build_cmd, blast_radius_extra, \
+                    max_diff_lines, enabled, created_at_ms, updated_at_ms \
+               FROM agent_repos ORDER BY full_name ASC"
+        };
+        let mut stmt = guard.prepare(sql)?;
+        let rows = stmt.query_map([], row_to_agent_repo)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Revoke a repo (soft: `enabled = 0`) AND auto-reject any of its
+    /// in-flight `pending_approval` gate rows so a revoked repo can never get
+    /// a PR opened from a stale awaiting-approval card. Returns the number of
+    /// gate rows that were cancelled.
+    pub fn revoke_agent_repo(&self, full_name: &str) -> StoreResult<usize> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE agent_repos SET enabled = 0, updated_at_ms = ?2 \
+              WHERE full_name = ?1 COLLATE NOCASE",
+            params![full_name, now],
+        )?;
+        let cancelled = guard.execute(
+            "UPDATE agent_pr_runs \
+                SET status = 'rejected', \
+                    error = 'repo access revoked', \
+                    updated_at_ms = ?2 \
+              WHERE repo_full_name = ?1 COLLATE NOCASE \
+                AND status = 'pending_approval'",
+            params![full_name, now],
+        )?;
+        Ok(cancelled)
+    }
+
+    /// Insert a fresh PR-run audit row (called once the verification gate
+    /// passes, in `pending_approval`).
+    pub fn insert_agent_pr_run(
+        &self,
+        repo_full_name: &str,
+        issue_number: i64,
+        branch: &str,
+        summary: &str,
+        diff_lines: i64,
+        status: &str,
+    ) -> StoreResult<AgentPrRun> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO agent_pr_runs \
+                (id, repo_full_name, issue_number, branch, summary, \
+                 diff_lines, status, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![
+                id,
+                repo_full_name,
+                issue_number,
+                branch,
+                summary,
+                diff_lines,
+                status,
+                now
+            ],
+        )?;
+        drop(guard);
+        self.get_agent_pr_run(&id)?
+            .ok_or(StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn get_agent_pr_run(&self, id: &str) -> StoreResult<Option<AgentPrRun>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT id, repo_full_name, issue_number, branch, summary, \
+                        diff_lines, status, pr_url, error, created_at_ms, \
+                        updated_at_ms \
+                   FROM agent_pr_runs WHERE id = ?1",
+                params![id],
+                row_to_agent_pr_run,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Approve a `pending_approval` gate row. Returns the freshly-approved
+    /// row, or `None` if it wasn't pending (already resolved / not found) so
+    /// callers can render a 409-style "already resolved" without racing two
+    /// surfaces (mirrors the reply-approval CAS guard).
+    pub fn approve_agent_pr_run(&self, id: &str) -> StoreResult<Option<AgentPrRun>> {
+        self.transition_gate(id, "approved", None, None)
+    }
+
+    /// Reject a `pending_approval` gate row. Same CAS semantics as approve.
+    pub fn reject_agent_pr_run(&self, id: &str) -> StoreResult<Option<AgentPrRun>> {
+        self.transition_gate(id, "rejected", None, Some("rejected by reviewer"))
+    }
+
+    /// Mark a gate row `pr_opened` with its URL (terminal). Unconditional —
+    /// only the loop calls this, right after it opens the draft PR.
+    pub fn mark_agent_pr_opened(&self, id: &str, pr_url: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE agent_pr_runs SET status = 'pr_opened', pr_url = ?2, \
+                    updated_at_ms = ?3 WHERE id = ?1",
+            params![id, pr_url, now],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a gate row `failed` with an error (terminal).
+    pub fn mark_agent_pr_failed(&self, id: &str, error: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE agent_pr_runs SET status = 'failed', error = ?2, \
+                    updated_at_ms = ?3 WHERE id = ?1",
+            params![id, error, now],
+        )?;
+        Ok(())
+    }
+
+    /// CAS-style transition: only mutate when still `pending_approval`.
+    fn transition_gate(
+        &self,
+        id: &str,
+        new_status: &str,
+        pr_url: Option<&str>,
+        error: Option<&str>,
+    ) -> StoreResult<Option<AgentPrRun>> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE agent_pr_runs \
+                SET status = ?2, pr_url = COALESCE(?3, pr_url), \
+                    error = COALESCE(?4, error), updated_at_ms = ?5 \
+              WHERE id = ?1 AND status = 'pending_approval'",
+            params![id, new_status, pr_url, error, now],
+        )?;
+        drop(guard);
+        if n == 0 {
+            return Ok(None);
+        }
+        self.get_agent_pr_run(id)
+    }
+
+    /// True if an open (non-terminal) gate row already exists for this
+    /// (repo, issue). Dedup guard so the loop doesn't queue two approval
+    /// cards for the same issue. `pending_approval` + `approved` (queued for
+    /// the open-PR step) both count as open.
+    pub fn has_open_agent_pr_run(
+        &self,
+        repo_full_name: &str,
+        issue_number: i64,
+    ) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let found: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM agent_pr_runs \
+                  WHERE repo_full_name = ?1 COLLATE NOCASE \
+                    AND issue_number = ?2 \
+                    AND status IN ('pending_approval','approved') \
+                  LIMIT 1",
+                params![repo_full_name, issue_number],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Per-repo PR-run history, newest first (dashboard audit view).
+    pub fn list_agent_pr_runs(
+        &self,
+        repo_full_name: Option<&str>,
+        limit: i64,
+    ) -> StoreResult<Vec<AgentPrRun>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut out = Vec::new();
+        match repo_full_name {
+            Some(repo) => {
+                let mut stmt = guard.prepare(
+                    "SELECT id, repo_full_name, issue_number, branch, summary, \
+                            diff_lines, status, pr_url, error, created_at_ms, \
+                            updated_at_ms \
+                       FROM agent_pr_runs \
+                      WHERE repo_full_name = ?1 COLLATE NOCASE \
+                      ORDER BY created_at_ms DESC LIMIT ?2",
+                )?;
+                let rows =
+                    stmt.query_map(params![repo, limit], row_to_agent_pr_run)?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+            None => {
+                let mut stmt = guard.prepare(
+                    "SELECT id, repo_full_name, issue_number, branch, summary, \
+                            diff_lines, status, pr_url, error, created_at_ms, \
+                            updated_at_ms \
+                       FROM agent_pr_runs \
+                      ORDER BY created_at_ms DESC LIMIT ?1",
+                )?;
+                let rows = stmt.query_map(params![limit], row_to_agent_pr_run)?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    // =====================================================================
+    // #58.1 — scheduled outbound posts (cross-platform queue)
+    // =====================================================================
+
+    /// Queue a new outbound post. `media_paths` is a JSON array string or
+    /// `None` for a text post. Returns the generated row id. Status starts
+    /// at `queued`; the serve-tick fire loop drives it through the
+    /// `previewed` → `posted`/`failed`/`cancelled` lifecycle.
+    pub fn enqueue_scheduled_post(
+        &self,
+        platform: &str,
+        body: &str,
+        media_paths: Option<&str>,
+        fire_at_ms: i64,
+        thread_parent: Option<&str>,
+    ) -> StoreResult<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO scheduled_posts \
+                (id, platform, body, media_paths, fire_at_ms, status, \
+                 thread_parent, created_at_ms) \
+             VALUES (?1,?2,?3,?4,?5,'queued',?6,?7)",
+            params![id, platform, body, media_paths, fire_at_ms, thread_parent, now],
+        )?;
+        Ok(id)
+    }
+
+    /// Posts that are `queued` and within `horizon_ms` of firing but have no
+    /// preview card yet — the T-30min preview batch.
+    pub fn scheduled_posts_due_for_preview(
+        &self,
+        now_ms: i64,
+        horizon_ms: i64,
+    ) -> StoreResult<Vec<ScheduledPost>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, platform, body, media_paths, fire_at_ms, status, \
+                    approval_msg, posted_at_ms, external_id, thread_parent, \
+                    created_at_ms \
+               FROM scheduled_posts \
+              WHERE status = 'queued' AND approval_msg IS NULL \
+                AND fire_at_ms <= ?1 \
+              ORDER BY fire_at_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![now_ms + horizon_ms], row_to_scheduled_post)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Posts whose `fire_at_ms` has arrived and are still `previewed`
+    /// (user did not cancel) or `queued` (post-silently mode skipped the
+    /// preview) — the T-0 publish batch.
+    pub fn scheduled_posts_due_to_fire(
+        &self,
+        now_ms: i64,
+    ) -> StoreResult<Vec<ScheduledPost>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, platform, body, media_paths, fire_at_ms, status, \
+                    approval_msg, posted_at_ms, external_id, thread_parent, \
+                    created_at_ms \
+               FROM scheduled_posts \
+              WHERE status IN ('previewed','queued') AND fire_at_ms <= ?1 \
+              ORDER BY fire_at_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![now_ms], row_to_scheduled_post)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Move a post to `previewed` and record the Discord preview message id.
+    pub fn mark_scheduled_post_previewed(
+        &self,
+        id: &str,
+        approval_msg: Option<&str>,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE scheduled_posts SET status = 'previewed', approval_msg = ?2 \
+              WHERE id = ?1",
+            params![id, approval_msg],
+        )?;
+        Ok(())
+    }
+
+    /// Terminal transition: `posted` (with the platform's external id) or a
+    /// non-ok status (`failed` / `cancelled`).
+    pub fn mark_scheduled_post_status(
+        &self,
+        id: &str,
+        status: ScheduledPostStatus,
+        external_id: Option<&str>,
+    ) -> StoreResult<()> {
+        let posted_at = if status == ScheduledPostStatus::Posted {
+            Some(now_millis())
+        } else {
+            None
+        };
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE scheduled_posts \
+                SET status = ?2, external_id = COALESCE(?3, external_id), \
+                    posted_at_ms = COALESCE(?4, posted_at_ms) \
+              WHERE id = ?1",
+            params![id, status.as_str(), external_id, posted_at],
+        )?;
+        Ok(())
+    }
+
+    /// Cancel a still-pending (`queued`/`previewed`) post. No-op (returns
+    /// `false`) if it already fired or was cancelled.
+    pub fn cancel_scheduled_post(&self, id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE scheduled_posts SET status = 'cancelled' \
+              WHERE id = ?1 AND status IN ('queued','previewed')",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// All not-yet-terminal posts, soonest first — the dashboard / CLI queue.
+    pub fn list_pending_scheduled_posts(&self) -> StoreResult<Vec<ScheduledPost>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, platform, body, media_paths, fire_at_ms, status, \
+                    approval_msg, posted_at_ms, external_id, thread_parent, \
+                    created_at_ms \
+               FROM scheduled_posts \
+              WHERE status IN ('queued','previewed') \
+              ORDER BY fire_at_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_scheduled_post)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // =====================================================================
+    // #58.2-.4 — spine accessors (own-post comments, friend feed,
+    // connection-request queue). Minimal dedup-key surface so the sources
+    // can be implemented incrementally without further migrations.
+    // =====================================================================
+
+    /// Register one of the user's own posts to watch for comments. Idempotent
+    /// on `(platform, external_id)`.
+    pub fn upsert_own_post(
+        &self,
+        platform: &str,
+        external_id: &str,
+        posted_at_ms: i64,
+        poll_until_ms: i64,
+    ) -> StoreResult<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO own_posts \
+                (id, platform, external_id, posted_at_ms, poll_until_ms, created_at_ms) \
+             VALUES (?1,?2,?3,?4,?5,?6) \
+             ON CONFLICT(platform, external_id) DO UPDATE SET \
+                poll_until_ms = MAX(poll_until_ms, excluded.poll_until_ms)",
+            params![id, platform, external_id, posted_at_ms, poll_until_ms, now],
+        )?;
+        let row_id: String = guard.query_row(
+            "SELECT id FROM own_posts WHERE platform = ?1 AND external_id = ?2",
+            params![platform, external_id],
+            |r| r.get(0),
+        )?;
+        Ok(row_id)
+    }
+
+    /// Record a freshly-seen comment. Returns `false` if it was already seen
+    /// (the `(own_post_id, external_id)` unique guard tripped) so the caller
+    /// only synthesizes a WorkItem for genuinely new comments.
+    pub fn record_seen_comment(
+        &self,
+        own_post_id: &str,
+        external_id: &str,
+        author_handle: Option<&str>,
+        body: Option<&str>,
+    ) -> StoreResult<bool> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "INSERT OR IGNORE INTO seen_comments \
+                (id, own_post_id, external_id, author_handle, body, created_at_ms) \
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![id, own_post_id, external_id, author_handle, body, now],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Add (or refresh) a friend to the engagement watchlist.
+    pub fn upsert_friend_watch(
+        &self,
+        platform: &str,
+        handle: &str,
+        wiki_slug: Option<&str>,
+        engagement: &str,
+    ) -> StoreResult<()> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO friend_watchlist \
+                (id, platform, handle, wiki_slug, engagement, added_at_ms) \
+             VALUES (?1,?2,?3,?4,?5,?6) \
+             ON CONFLICT(platform, handle) DO UPDATE SET \
+                wiki_slug = excluded.wiki_slug, \
+                engagement = excluded.engagement",
+            params![id, platform, handle, wiki_slug, engagement, now],
+        )?;
+        Ok(())
+    }
+
+    /// Queue an inbound connection request for triage. Idempotent on
+    /// `(platform, external_id)`; returns `false` if already queued.
+    pub fn record_connection_request(
+        &self,
+        platform: &str,
+        external_id: &str,
+        requester_name: Option<&str>,
+        requester_url: Option<&str>,
+        message: Option<&str>,
+    ) -> StoreResult<bool> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "INSERT OR IGNORE INTO connection_requests \
+                (id, platform, external_id, requester_name, requester_url, \
+                 message, created_at_ms) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                id, platform, external_id, requester_name, requester_url, message, now
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Resolve a queued connection request to a terminal decision.
+    pub fn decide_connection_request(
+        &self,
+        id: &str,
+        decision: &str,
+    ) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE connection_requests \
+                SET decision = ?2, decided_at_ms = ?3 WHERE id = ?1",
+            params![id, decision, now],
+        )?;
+        Ok(())
+    }
 }
 
 fn row_to_tone_profile(r: &rusqlite::Row) -> rusqlite::Result<ToneProfile> {
@@ -3761,6 +4496,52 @@ fn row_to_user_loop(r: &rusqlite::Row) -> rusqlite::Result<UserLoop> {
         fail_count: r.get(9)?,
         created_at_ms: r.get(10)?,
         updated_at_ms: r.get(11)?,
+    })
+}
+
+fn row_to_agent_repo(r: &rusqlite::Row) -> rusqlite::Result<AgentRepo> {
+    Ok(AgentRepo {
+        id: r.get(0)?,
+        full_name: r.get(1)?,
+        base_branch: r.get(2)?,
+        build_cmd: r.get(3)?,
+        blast_radius_extra: r.get(4)?,
+        max_diff_lines: r.get(5)?,
+        enabled: r.get::<_, i64>(6)? != 0,
+        created_at_ms: r.get(7)?,
+        updated_at_ms: r.get(8)?,
+    })
+}
+
+fn row_to_agent_pr_run(r: &rusqlite::Row) -> rusqlite::Result<AgentPrRun> {
+    Ok(AgentPrRun {
+        id: r.get(0)?,
+        repo_full_name: r.get(1)?,
+        issue_number: r.get(2)?,
+        branch: r.get(3)?,
+        summary: r.get(4)?,
+        diff_lines: r.get(5)?,
+        status: r.get(6)?,
+        pr_url: r.get(7)?,
+        error: r.get(8)?,
+        created_at_ms: r.get(9)?,
+        updated_at_ms: r.get(10)?,
+    })
+}
+
+fn row_to_scheduled_post(r: &rusqlite::Row) -> rusqlite::Result<ScheduledPost> {
+    Ok(ScheduledPost {
+        id: r.get(0)?,
+        platform: r.get(1)?,
+        body: r.get(2)?,
+        media_paths: r.get::<_, Option<String>>(3)?,
+        fire_at_ms: r.get(4)?,
+        status: r.get(5)?,
+        approval_msg: r.get::<_, Option<String>>(6)?,
+        posted_at_ms: r.get::<_, Option<i64>>(7)?,
+        external_id: r.get::<_, Option<String>>(8)?,
+        thread_parent: r.get::<_, Option<String>>(9)?,
+        created_at_ms: r.get(10)?,
     })
 }
 
@@ -5034,5 +5815,78 @@ mod tests {
         assert!(!s.mark_pending_approved(&id).unwrap());
         let a = s.get_action_with_email(&id).unwrap().unwrap();
         assert_eq!(a.action.status, "approved");
+    }
+
+    // --- #117 multi-repo allowlist + gate -----------------------------
+
+    #[test]
+    fn agent_repo_allowlist_is_default_deny_and_idempotent() {
+        let (s, _f) = fresh_store();
+        // Default-deny: nothing allowlisted out of the box.
+        assert!(s.list_agent_repos(true).unwrap().is_empty());
+        assert!(s.get_agent_repo("acme/widgets").unwrap().is_none());
+
+        let r = s
+            .upsert_agent_repo("acme/widgets", "main", "cargo test", "infra/", 400)
+            .unwrap();
+        assert_eq!(r.full_name, "acme/widgets");
+        assert!(r.enabled);
+        assert_eq!(r.max_diff_lines, 400);
+
+        // Case-insensitive uniqueness: re-granting updates in place, no dup.
+        let r2 = s
+            .upsert_agent_repo("ACME/Widgets", "develop", "make test", "", 999)
+            .unwrap();
+        assert_eq!(r2.id, r.id);
+        assert_eq!(r2.base_branch, "develop");
+        assert_eq!(s.list_agent_repos(false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn revoking_repo_cancels_inflight_gate_rows() {
+        let (s, _f) = fresh_store();
+        s.upsert_agent_repo("acme/widgets", "main", "", "", 600)
+            .unwrap();
+        let run = s
+            .insert_agent_pr_run("acme/widgets", 42, "agent-fix/issue-42", "fix", 12, "pending_approval")
+            .unwrap();
+        assert!(s.has_open_agent_pr_run("acme/widgets", 42).unwrap());
+
+        let cancelled = s.revoke_agent_repo("acme/widgets").unwrap();
+        assert_eq!(cancelled, 1);
+        assert!(!s.get_agent_repo("acme/widgets").unwrap().unwrap().enabled);
+        let after = s.get_agent_pr_run(&run.id).unwrap().unwrap();
+        assert_eq!(after.status, "rejected");
+        // Loop default-deny no longer sees it.
+        assert!(s.list_agent_repos(true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gate_approve_is_cas_guarded() {
+        let (s, _f) = fresh_store();
+        s.upsert_agent_repo("acme/widgets", "main", "", "", 600)
+            .unwrap();
+        let run = s
+            .insert_agent_pr_run("acme/widgets", 7, "agent-fix/issue-7", "sum", 3, "pending_approval")
+            .unwrap();
+
+        let approved = s.approve_agent_pr_run(&run.id).unwrap();
+        assert_eq!(approved.unwrap().status, "approved");
+        // Second transition is rejected (no longer pending) — no double-fire.
+        assert!(s.approve_agent_pr_run(&run.id).unwrap().is_none());
+        assert!(s.reject_agent_pr_run(&run.id).unwrap().is_none());
+
+        s.mark_agent_pr_opened(&run.id, "https://github.com/acme/widgets/pull/9")
+            .unwrap();
+        let done = s.get_agent_pr_run(&run.id).unwrap().unwrap();
+        assert_eq!(done.status, "pr_opened");
+        assert_eq!(
+            done.pr_url.as_deref(),
+            Some("https://github.com/acme/widgets/pull/9")
+        );
+
+        let hist = s.list_agent_pr_runs(Some("acme/widgets"), 10).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(s.list_agent_pr_runs(None, 10).unwrap().len(), 1);
     }
 }

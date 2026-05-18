@@ -49,6 +49,17 @@ pub const DEFAULT_USER_AGENT: &str =
 /// to form the credential slot `augmentagent/instagram/<ds_user_id>`.
 pub const KEYCHAIN_PLATFORM: &str = "instagram";
 
+/// Cookies that aren't strictly required to make a request but whose absence
+/// materially raises `checkpoint_required` risk (the web client always sends
+/// them). The validation harness warns on these; it does not hard-fail.
+pub const RECOMMENDED_COOKIES: &[&str] = &["ds_user_id", "mid", "ig_did", "rur"];
+
+/// A harvested session older than this is likely close to expiry / drift —
+/// the harness flags it so the operator re-harvests proactively rather than
+/// discovering it via a mid-poll `login_required`. IG web sessions are
+/// long-lived but not indefinite; 60d is a conservative re-harvest nudge.
+pub const SESSION_STALE_MS: i64 = 60 * 24 * 3600 * 1000;
+
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("io: {0}")]
@@ -82,6 +93,24 @@ fn default_user_agent() -> String {
     DEFAULT_USER_AGENT.to_string()
 }
 
+/// Soft session-hygiene report (see [`InstagramAuth::health`]). Serialized
+/// into the `instagram validate` JSON output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthHealth {
+    /// `validate()` passed — a request can actually be constructed.
+    pub hard_ok: bool,
+    /// `sessionid` numeric prefix matches `ds_user_id`.
+    pub sessionid_matches: bool,
+    /// Recommended-but-not-required cookies that are absent.
+    pub missing_recommended: Vec<String>,
+    /// Age of the harvest in ms (0 if `harvested_at_ms` was unset).
+    pub age_ms: i64,
+    /// Harvest is older than [`SESSION_STALE_MS`].
+    pub stale: bool,
+    /// Human-readable advisories (empty ⇒ clean bill of health).
+    pub warnings: Vec<String>,
+}
+
 impl InstagramAuth {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, AuthError> {
         let raw = std::fs::read_to_string(path)?;
@@ -112,6 +141,78 @@ impl InstagramAuth {
             return Err(AuthError::MissingCookie("csrftoken"));
         }
         Ok(())
+    }
+
+    /// Non-fatal session hygiene report consumed by `instagram validate`.
+    /// `validate()` is the hard gate (request can't be built without it);
+    /// this layers the soft signals (recommended-cookie coverage, harvest
+    /// staleness, ds_user_id↔sessionid consistency) so the operator can
+    /// re-harvest *before* a mid-poll `login_required`.
+    pub fn health(&self, now_ms: i64) -> AuthHealth {
+        let mut warnings = Vec::new();
+        let hard_ok = self.validate().is_ok();
+        if let Err(e) = self.validate() {
+            warnings.push(format!("HARD: {e}"));
+        }
+
+        let missing_recommended: Vec<String> = RECOMMENDED_COOKIES
+            .iter()
+            .filter(|c| !self.cookies.contains_key(**c))
+            .map(|c| c.to_string())
+            .collect();
+        if !missing_recommended.is_empty() {
+            warnings.push(format!(
+                "missing recommended cookies {missing_recommended:?} — raises checkpoint risk; \
+                 re-harvest with a full cookie jar"
+            ));
+        }
+
+        // `sessionid` is URL-encoded `<ds_user_id>%3A...`; the prefix must
+        // match the declared account id or the cookie is for another login.
+        let sessionid_matches = self
+            .cookies
+            .get("sessionid")
+            .map(|s| {
+                let head: String =
+                    s.chars().take_while(|c| c.is_ascii_digit()).collect();
+                !head.is_empty() && head == self.ds_user_id
+            })
+            .unwrap_or(false);
+        if self.cookies.contains_key("sessionid") && !sessionid_matches {
+            warnings.push(
+                "sessionid prefix does not match ds_user_id — cookie jar is \
+                 for a different account or malformed"
+                    .into(),
+            );
+        }
+
+        let age_ms = if self.harvested_at_ms > 0 {
+            (now_ms - self.harvested_at_ms).max(0)
+        } else {
+            warnings.push(
+                "harvested_at_ms is 0 — cannot assess session age; \
+                 re-run `instagram login` to stamp it"
+                    .into(),
+            );
+            0
+        };
+        let stale = self.harvested_at_ms > 0 && age_ms > SESSION_STALE_MS;
+        if stale {
+            warnings.push(format!(
+                "session harvested {}d ago (>{}d) — re-harvest proactively",
+                age_ms / (24 * 3600 * 1000),
+                SESSION_STALE_MS / (24 * 3600 * 1000)
+            ));
+        }
+
+        AuthHealth {
+            hard_ok,
+            sessionid_matches,
+            missing_recommended,
+            age_ms,
+            stale,
+            warnings,
+        }
     }
 
     /// The `x-csrftoken` header value Instagram expects — the raw value of
@@ -316,6 +417,70 @@ mod tests {
         assert_eq!(ig_app_id(), "999");
         std::env::remove_var("AUGMENTAGENT_INSTAGRAM_APP_ID");
         assert_eq!(ig_app_id(), DEFAULT_IG_APP_ID);
+    }
+
+    #[test]
+    fn health_clean_session_has_no_warnings() {
+        let mut a = sample();
+        // sessionid prefix must match ds_user_id ("456") for a clean bill.
+        a.cookies
+            .insert("sessionid".into(), "456%3Aabc%3A12".into());
+        a.cookies.insert("rur".into(), "EAG".into());
+        let now = a.harvested_at_ms + 1000;
+        let h = a.health(now);
+        assert!(h.hard_ok);
+        assert!(h.sessionid_matches);
+        assert!(h.missing_recommended.is_empty());
+        assert!(!h.stale);
+        assert!(h.warnings.is_empty(), "warnings: {:?}", h.warnings);
+    }
+
+    #[test]
+    fn health_flags_missing_recommended_cookies() {
+        let mut a = sample();
+        a.cookies.remove("mid");
+        a.cookies.remove("ig_did");
+        let h = a.health(a.harvested_at_ms + 1000);
+        assert!(h.hard_ok); // sessionid + csrftoken still present
+        assert!(h.missing_recommended.contains(&"mid".to_string()));
+        assert!(h.missing_recommended.contains(&"ig_did".to_string()));
+        assert!(h.warnings.iter().any(|w| w.contains("checkpoint risk")));
+    }
+
+    #[test]
+    fn health_flags_stale_harvest_and_mismatched_sessionid() {
+        let mut a = sample();
+        a.cookies
+            .insert("sessionid".into(), "999%3Awrong%3A1".into());
+        a.harvested_at_ms = 1;
+        let now = SESSION_STALE_MS + 10 * 24 * 3600 * 1000;
+        let h = a.health(now);
+        assert!(h.stale);
+        assert!(!h.sessionid_matches);
+        assert!(h.warnings.iter().any(|w| w.contains("re-harvest")));
+        assert!(h
+            .warnings
+            .iter()
+            .any(|w| w.contains("different account")));
+    }
+
+    #[test]
+    fn health_flags_unstamped_harvest() {
+        let mut a = sample();
+        a.harvested_at_ms = 0;
+        let h = a.health(1_000_000);
+        assert_eq!(h.age_ms, 0);
+        assert!(!h.stale);
+        assert!(h.warnings.iter().any(|w| w.contains("cannot assess")));
+    }
+
+    #[test]
+    fn health_reports_hard_failure_for_missing_sessionid() {
+        let mut a = sample();
+        a.cookies.remove("sessionid");
+        let h = a.health(a.harvested_at_ms + 1);
+        assert!(!h.hard_ok);
+        assert!(h.warnings.iter().any(|w| w.starts_with("HARD:")));
     }
 
     #[test]
