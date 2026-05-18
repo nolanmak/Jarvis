@@ -238,8 +238,21 @@ Two layers of throttle protect the account:
 The spike (#14) could not run a live `/intercept` capture (no operator X
 session). Instead of a manual proxy session, validation is now **one
 command**: `augmentagent twitter validate`. It exercises every endpoint above
-against a real session and prints a pass/fail grid mapped to the section
-numbers in this doc. Run it from a host that has the X session cookies.
+against a real session and prints a pass/fail grid (plus a content-free
+per-probe **response-shape fingerprint** you can diff across runs) mapped to
+the section numbers in this doc. Run it from a host that has the X session
+cookies.
+
+> **This build ships mock-only.** `twitter validate` makes **NO live x.com
+> call** unless you pass `--allow-live` (or point
+> `AUGMENTAGENT_TWITTER_BASE_URL` at a local capture proxy). Without that the
+> read probes report `SKIP` with reason "mock-only build", the report is
+> flagged `[MOCK-ONLY BUILD]`, and `all_passed` is forced false — a mock run
+> can never be mistaken for a sign-off. The harness logic + every protocol-
+> hardening error/rotation branch are fully exercised by the crate's
+> wiremock-backed unit tests (`cargo test -p augmentagent-channel-twitter`);
+> **issuing the live calls is the operator's responsibility**, gated behind
+> `--allow-live` on a real session.
 
 ### Step 1 — capture cookies from a logged-in browser
 
@@ -275,23 +288,34 @@ the OS keychain (`augmentagent/twitter/default`) with the legacy
 ### Step 3 — run the validation harness
 
 ```sh
-# read-only: exercises auth, UserTweets, DM inbox; shape-validates the
-# CreateTweet / DM-send bodies WITHOUT sending anything.
+# MOCK-ONLY (default): exercises the harness wiring + dry-run write contracts
+# but makes NO live x.com call. Use this to smoke the build; it never signs
+# off.
 augmentagent twitter validate
 
+# LIVE read-only sign-off run (operator responsibility): exercises auth,
+# UserTweets, DM inbox against real x.com; still shape-validates the
+# CreateTweet / DM-send bodies WITHOUT sending anything.
+augmentagent twitter validate --allow-live true
+
 # machine-readable artifact (attach to the #14 sign-off):
-augmentagent twitter validate --json true > twitter-validation.json
+augmentagent twitter validate --allow-live true --json true > twitter-validation.json
 ```
 
-The harness prints a grid like:
+The live harness prints a grid like (`§` = doc section, then the response-
+shape fingerprint, then detail):
 
 ```
-  [PASS] auth                  §1         cookies + bearer + csrf + xctid accepted (200 on UserTweets)
-  [PASS] user_tweets           §2         parsed 18 tweet(s) from the documented timeline_v2 shape
-  [PASS] create_tweet_dry_run  §3         request body matches docs §3 contract (NOT sent ...)
-  [PASS] dm_inbox              §4         parsed 4 inbound DM(s) from inbox_initial_state.json
-  [PASS] dm_send_dry_run       §5         new2.json body matches docs §5 contract (NOT sent ...)
+  [PASS] auth                  §1     age=3d;http=200       cookies + bearer + csrf + xctid accepted (200 on UserTweets)
+  [PASS] user_tweets           §2     tweets=18             parsed 18 tweet(s) from the documented timeline_v2 shape
+  [PASS] create_tweet_dry_run  §3     body=contract-ok;dry_run  request body matches docs §3 contract (NOT sent ...)
+  [PASS] dm_inbox              §4     dms=4                 parsed 4 inbound DM(s) from inbox_initial_state.json
+  [PASS] dm_send_dry_run       §5     body=contract-ok;dry_run  new2.json body matches docs §5 contract (NOT sent ...)
 ```
+
+A mock-only run instead prints `[MOCK-ONLY BUILD — no live x.com call was
+made]` in the header and `SKIP` rows for the read probes — that is expected
+and is **not** a sign-off.
 
 Interpreting failures (the harness exits non-zero on any FAIL):
 
@@ -324,12 +348,23 @@ clone starts from a known-good id.
 
 ### Step 5 — sign-off
 
-When `twitter validate` is **all green** against a live session, the
+When `twitter validate --allow-live true` is **all green** against a live
+session (`mock_only: false` in the JSON, `all_passed: true`), the
 `REQUIRES LIVE OPERATOR VALIDATION` banners for the validated sections (§1–§5)
 may be downgraded to "validated `<date>`" and non-dry-run posting enabled.
 Attach the `--json true` artifact to issue #14. The harness only ever
-*validates* — it never enables posting on its own; that remains a deliberate
-operator action.
+*validates* — it never enables posting on its own, and a mock-only run is
+never a sign-off; clearing the flags remains a deliberate operator action on
+a real session.
+
+> **#14 status — `Refs #14`: harness + hardening complete; final sign-off
+> requires the operator to run `twitter validate --allow-live true` on a live
+> session.** Everything below the live HTTP boundary (typed
+> 401/403/429/queryId-rotation/schema-drift errors, the queryId fallback-chain
+> walk, exponential backoff via `with_retry`, the mock-only safety gate, and
+> the full validate grid) is implemented and covered by wiremock-backed unit
+> tests. The only thing the autonomous build cannot do is issue the live
+> calls — that boundary is deliberate.
 
 > Live write probes (`--allow-write` + `--probe-reply-to <id>` /
 > `--probe-conversation-id <id>`) confirm §3/§5 end-to-end against throwaway
