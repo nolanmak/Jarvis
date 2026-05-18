@@ -14,6 +14,16 @@ doc the first time an operator runs a live `/intercept` session on
 instagram.com (symptoms of drift: anomalous 400/401, `feedback_required`
 bodies, `checkpoint_required` redirects).
 
+**Validation is automated** — see the "Operator validation runbook" section
+below. An operator runs `augmentagent-instagram-validate` once on a live
+logged-in session; it exercises every endpoint here and reports per-probe
+pass / drift, turning this banner into a single command + a recorded JSON
+artifact on #17. The HTTP error/auth/schema-drift handling described here is
+implemented and unit-tested against a mocked server in
+`crates/augmentagent-channel-instagram` (`src/api.rs`, `src/failure.rs`,
+`src/auth.rs`, `src/validate.rs`); only the live wire shapes await operator
+sign-off.
+
 ---
 
 ## Auth
@@ -238,6 +248,86 @@ throttle is an expected steady-state event, not an error.
 
 Risk accepted per the project's "unofficial API" posture, same as the
 Discord channel. Losing the primary Instagram account is not appealable.
+
+---
+
+## Operator validation runbook (#17)
+
+This spec is reconstructed, not captured. The `augmentagent-instagram-validate`
+binary (crate `augmentagent-channel-instagram`, `src/validate.rs`) is the
+single command that discharges the **REQUIRES LIVE OPERATOR VALIDATION**
+banner. Run it once on a logged-in session; it exercises every documented
+endpoint and reports, per probe, whether the reconstructed shape held.
+
+### Prerequisites
+
+1. A real, logged-in `www.instagram.com` browser session for the agent's
+   Instagram account (the throwaway/automation account, never a personal
+   primary — losing it is not appealable).
+2. Harvested cookies in the `instagram login` JSON shape (see the file shape
+   at the top of `src/auth.rs`): `scripts/instagram-harvest.sh` or a manual
+   devtools export. Must include `sessionid` + `csrftoken`; should include
+   `ds_user_id`, `mid`, `ig_did`, `rur` (the harness warns on missing
+   recommended cookies — they materially raise checkpoint risk).
+3. The `user-agent` in the JSON **must** match the browser the cookies came
+   from, or Instagram escalates to `checkpoint_required`.
+
+### Steps
+
+```bash
+# 1. Read-only smoke (default — side-effect-free; no POSTs):
+augmentagent-instagram-validate \
+  --cookies instagram-auth.json \
+  --feed-user <numeric user id of a close:true contact>
+
+# 2. (optional) Exercise the write endpoints. Sends a FIXED recognizable
+#    marker string, never an LLM draft, and only when BOTH the target id and
+#    --exercise-writes are passed. Tell the recipient first.
+augmentagent-instagram-validate \
+  --cookies instagram-auth.json \
+  --thread <existing 1:1 thread id> \
+  --media  <a media id you own> \
+  --exercise-writes true
+```
+
+The human table goes to **stderr**; a machine-readable JSON report goes to
+**stdout** (so a CI step / this runbook checkbox can assert on it):
+`augmentagent-instagram-validate --cookies ig.json | jq '.probes[].status'`.
+
+### Reading the result
+
+| Probe status | Meaning | Action |
+|---|---|---|
+| `pass` | Endpoint answered with the documented shape. | none |
+| `skip(dry-run)` | Write probe built but not sent (default). | pass `--exercise-writes` + target to actually send |
+| `skip(no target)` | No `--feed-user` / `--thread` / `--media` given. | supply the id to cover that probe |
+| `blocked` | A live soft-block / challenge / `login_required` came back. **Not a harness failure** — it proves the detector works. | follow the per-row hint: back off 1h, clear the in-app checkpoint, or re-harvest cookies, then re-run |
+| `fail` | Response shape / classification disagrees with this doc — **protocol drift**. | re-capture the affected endpoint here, update `src/api.rs` response structs, re-run |
+
+**Exit code is non-zero iff any probe `fail`ed** (drift). A `blocked` run
+still exits 0 — a throttle during validation is an expected steady-state
+signal, and the detection path firing is itself a pass.
+
+### Sign-off
+
+The spec stays marked *REQUIRES LIVE OPERATOR VALIDATION* until an operator
+has run step 1 (and ideally step 2) on a live session with **all probes
+`pass`/`skip` and zero `fail`**. Record the run's JSON report against this
+issue (#17) as the sign-off artifact. If any probe `fail`s, the wire detail
+for that endpoint above is wrong — fix it before trusting the channel in
+non-dry-run mode.
+
+### Re-validation triggers
+
+Re-run the harness when any of these appear in the daemon logs (all are
+emitted by the hardened `src/api.rs` with a `body_sample` fingerprint):
+
+- `possible SCHEMA DRIFT` / `payload shape mismatch` (an `InstagramError::Decode`).
+- A spike of `instagram unrecognized non-2xx`.
+- `instagram session dead (login_required)` (cookie re-harvest needed).
+- Any `x-ig-app-id` / `x-asbd-id` rotation rumor — those are the most
+  load-bearing non-cookie headers; both are env-overridable
+  (`AUGMENTAGENT_INSTAGRAM_APP_ID` / `_ASBD_ID`) for a no-recompile patch.
 
 ---
 

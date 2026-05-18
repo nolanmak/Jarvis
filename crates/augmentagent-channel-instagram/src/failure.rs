@@ -16,6 +16,11 @@ use augmentagent_channel_core::HaltReason;
 /// What the agent observed. Ordered roughly worst → least-bad.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
+    /// `login_required` body (HTTP 403/400 with no 401) or an explicit
+    /// `"logged_out"` flag — the *session cookie* is dead. Distinct from
+    /// `Challenge`: re-harvesting cookies fixes it without a human clearing
+    /// an in-app checkpoint. Maps to [`InstagramError::AuthExpired`].
+    LoginRequired,
     /// `checkpoint_required` / `challenge_required` — the *account* is
     /// flagged. Terminal until a human clears it in the app.
     Challenge,
@@ -38,6 +43,10 @@ impl FailureKind {
     /// failure trips the shared circuit breaker.
     pub fn halt_reason(self) -> HaltReason {
         match self {
+            // A dead session is the closest cousin of a login challenge from
+            // the governor's perspective — both block the channel until the
+            // operator re-authenticates.
+            FailureKind::LoginRequired => HaltReason::LoginChallenge,
             FailureKind::Challenge => HaltReason::LoginChallenge,
             FailureKind::Captcha => HaltReason::Captcha,
             FailureKind::ActionBlocked => HaltReason::ActionBlocked,
@@ -53,6 +62,10 @@ impl FailureKind {
     /// rate-limit / action-block self-clear faster (1h per #18).
     pub fn pause_ms(self) -> i64 {
         match self {
+            // Re-harvesting cookies is a quick operator action; don't sit on
+            // a 24h halt for a dead session — surface it loudly and let the
+            // next poll retry once cookies are refreshed (1h backstop).
+            FailureKind::LoginRequired => 3600 * 1000,
             FailureKind::Challenge | FailureKind::Captcha => 24 * 3600 * 1000,
             FailureKind::ActionBlocked | FailureKind::RateLimit => 3600 * 1000,
             FailureKind::CookieBanner => 3600 * 1000,
@@ -61,6 +74,7 @@ impl FailureKind {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            FailureKind::LoginRequired => "login_required",
             FailureKind::Challenge => "challenge",
             FailureKind::Captcha => "captcha",
             FailureKind::ActionBlocked => "action_blocked",
@@ -75,11 +89,25 @@ impl FailureKind {
 /// detected (caller treats as a generic API error).
 pub fn classify_body(status: u16, body: &str) -> Option<FailureKind> {
     let lower = body.to_ascii_lowercase();
+    // Order matters: a checkpoint/challenge body is the worst case and
+    // sometimes co-occurs with `login_required`-ish phrasing — classify it
+    // first so we never under-react.
     if lower.contains("checkpoint_required")
         || lower.contains("challenge_required")
         || lower.contains("checkpoint_url")
     {
         return Some(FailureKind::Challenge);
+    }
+    // Dead session: IG signals this as a `login_required` message body
+    // (often HTTP 403/400 — NOT always a clean 401), or a top-level
+    // `"logged_in_user": null` / `"logged_out"` marker on the inbox probe.
+    if lower.contains("login_required")
+        || lower.contains("\"logged_out\"")
+        || lower.contains("\"logged_in_user\":null")
+        || lower.contains("\"logged_in_user\": null")
+        || lower.contains("please log in")
+    {
+        return Some(FailureKind::LoginRequired);
     }
     if lower.contains("feedback_required") || lower.contains("\"spam\"") {
         return Some(FailureKind::ActionBlocked);
@@ -87,7 +115,11 @@ pub fn classify_body(status: u16, body: &str) -> Option<FailureKind> {
     if lower.contains("\"lock\"") || lower.contains("please wait a few minutes") {
         return Some(FailureKind::ActionBlocked);
     }
-    if status == 429 || lower.contains("rate limit") {
+    if status == 429
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many requests")
+    {
         return Some(FailureKind::RateLimit);
     }
     None
@@ -155,6 +187,54 @@ mod tests {
     #[test]
     fn body_429_is_rate_limit() {
         assert_eq!(classify_body(429, "{}"), Some(FailureKind::RateLimit));
+    }
+
+    #[test]
+    fn body_login_required_is_login_required() {
+        // The classic dead-session body — often HTTP 403, not 401.
+        assert_eq!(
+            classify_body(403, r#"{"message":"login_required","status":"fail"}"#),
+            Some(FailureKind::LoginRequired)
+        );
+        // The inbox-probe variant: a 200 with a null viewer.
+        assert_eq!(
+            classify_body(200, r#"{"logged_in_user": null, "status":"ok"}"#),
+            Some(FailureKind::LoginRequired)
+        );
+        assert_eq!(
+            classify_body(400, r#"{"message":"Please log in to continue."}"#),
+            Some(FailureKind::LoginRequired)
+        );
+    }
+
+    #[test]
+    fn login_required_outranks_feedback_in_same_body() {
+        // A body that mentions both must classify as the worse re-auth case,
+        // not a soft action-block.
+        assert_eq!(
+            classify_body(403, r#"{"message":"login_required","feedback_required":true}"#),
+            Some(FailureKind::LoginRequired)
+        );
+    }
+
+    #[test]
+    fn body_too_many_requests_phrase_is_rate_limit() {
+        assert_eq!(
+            classify_body(400, r#"{"message":"Too many requests, try later"}"#),
+            Some(FailureKind::RateLimit)
+        );
+    }
+
+    #[test]
+    fn login_required_halt_and_pause_mapping() {
+        assert!(matches!(
+            FailureKind::LoginRequired.halt_reason(),
+            HaltReason::LoginChallenge
+        ));
+        // Quick operator fix (re-harvest) ⇒ 1h backstop, not the 24h
+        // checkpoint hold.
+        assert_eq!(FailureKind::LoginRequired.pause_ms(), 3600 * 1000);
+        assert_eq!(FailureKind::LoginRequired.as_str(), "login_required");
     }
 
     #[test]

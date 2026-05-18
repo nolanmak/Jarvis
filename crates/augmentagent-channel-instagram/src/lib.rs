@@ -36,11 +36,17 @@ pub mod feed;
 pub mod selectors;
 pub mod types;
 pub mod upload;
+pub mod validate;
 
 pub use api::{InstagramApi, InstagramError, WebClient};
 pub use auth::{
-    asbd_id, default_auth_path, ig_app_id, AuthError, InstagramAuth,
+    asbd_id, default_auth_path, ig_app_id, AuthError, AuthHealth, InstagramAuth,
     DEFAULT_ASBD_ID, DEFAULT_IG_APP_ID, DEFAULT_USER_AGENT, KEYCHAIN_PLATFORM,
+    RECOMMENDED_COOKIES, SESSION_STALE_MS,
+};
+pub use validate::{
+    run_validation, ProbeResult, ProbeStatus, ValidateOpts, ValidationReport,
+    WRITE_PROBE_MARKER,
 };
 pub use channel::{
     InstagramChannel, InstagramChannelConfig, InstagramDmTrigger, PollOutcome,
