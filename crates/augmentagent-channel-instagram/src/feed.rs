@@ -164,7 +164,16 @@ pub struct InstagramFeedTrigger<A: InstagramApi> {
     handle_pk: tokio::sync::Mutex<BTreeMap<String, String>>,
 }
 
-impl<A: InstagramApi> FriendFeedSource for InstagramFeedTrigger<A> {}
+#[async_trait]
+impl<A: InstagramApi + 'static> FriendFeedSource for InstagramFeedTrigger<A> {
+    async fn fetch_new_friend_posts(&self) -> anyhow::Result<Vec<WorkItem>> {
+        // Drive the same wiki-`close:`-driven scan as the `Trigger` path; the
+        // per-contact dedup (newest-post-only-per-tick + caption-only context)
+        // is the scan's responsibility, matching the `FriendFeedSource`
+        // contract. Use a fresh, never-cancelled token for the one-shot pull.
+        self.scan(&CancellationToken::new()).await
+    }
+}
 
 impl<A: InstagramApi> InstagramFeedTrigger<A> {
     pub fn new(
@@ -237,12 +246,11 @@ impl<A: InstagramApi> InstagramFeedTrigger<A> {
     }
 }
 
-#[async_trait]
-impl<A: InstagramApi + 'static> Trigger for InstagramFeedTrigger<A> {
-    async fn next_work_items(
-        &self,
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<Vec<WorkItem>> {
+impl<A: InstagramApi + 'static> InstagramFeedTrigger<A> {
+    /// One scan pass over wiki `close: true` instagram contacts. Shared by the
+    /// generic [`Trigger`] path and the [`FriendFeedSource`] contract so both
+    /// drive identical, dedup-respecting logic.
+    async fn scan(&self, cancel: &CancellationToken) -> anyhow::Result<Vec<WorkItem>> {
         let Some(root) = &self.config.wiki_root else {
             debug!("instagram feed trigger: no wiki root; nothing to scan");
             return Ok(Vec::new());
@@ -285,6 +293,16 @@ impl<A: InstagramApi + 'static> Trigger for InstagramFeedTrigger<A> {
             }
         }
         Ok(items)
+    }
+}
+
+#[async_trait]
+impl<A: InstagramApi + 'static> Trigger for InstagramFeedTrigger<A> {
+    async fn next_work_items(
+        &self,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<Vec<WorkItem>> {
+        self.scan(cancel).await
     }
 }
 
