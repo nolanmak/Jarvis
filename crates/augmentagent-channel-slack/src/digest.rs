@@ -58,10 +58,48 @@ pub fn slack_digest_scheduler<R: Reasoner + 'static>(
 mod tests {
     use super::*;
 
+    fn mk_store() -> (Arc<Store>, tempfile::NamedTempFile) {
+        use rusqlite::Connection;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(file.path()).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE actions (
+                    id TEXT PRIMARY KEY,
+                    messageId TEXT NOT NULL,
+                    threadId TEXT,
+                    fromEmail TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    originalBody TEXT,
+                    draftBody TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    errorMessage TEXT,
+                    createdAt INTEGER NOT NULL,
+                    updatedAt INTEGER NOT NULL
+                );
+                CREATE TABLE emails (
+                    messageId TEXT PRIMARY KEY,
+                    threadId TEXT,
+                    fromEmail TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body TEXT,
+                    receivedAt TEXT,
+                    accountEntityId TEXT,
+                    firstSeenAt INTEGER NOT NULL,
+                    triageResult TEXT,
+                    agentProcessedAt INTEGER
+                );
+                "#,
+            )
+            .unwrap();
+        }
+        (Arc::new(Store::open(file.path()).unwrap()), file)
+    }
+
     #[test]
     fn slack_scheduler_filters_on_slack_platform() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dir.path().join("t.db")).unwrap());
+        let (store, _f) = mk_store();
         let reasoner = Arc::new(augmentagent_channel_core::ClaudeCliReasoner::new());
         let broker: Arc<dyn ApprovalBroker> =
             Arc::new(augmentagent_approval_discord::NoopBroker);
