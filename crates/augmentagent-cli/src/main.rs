@@ -4717,7 +4717,13 @@ impl ReplyApprover {
                 message: "no accountEntityId on email; cannot revise".into(),
             };
         };
-        let previous_draft = action.action.draft_body.clone().unwrap_or_default();
+        // Strip any #35 needs-input marker so the redraft model sees the
+        // clean reply text, not the `<!--aa:needs-input …-->` carrier. No
+        // marker ⇒ the draft is returned unchanged (pre-#35 behavior).
+        let previous_draft = augmentagent_approval_discord::split_needs_input(
+            &action.action.draft_body.clone().unwrap_or_default(),
+        )
+        .0;
 
         // 1. Generate revised draft via reasoner.
         let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());

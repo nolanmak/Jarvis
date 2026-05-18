@@ -20,6 +20,10 @@ mod presets;
 
 pub use broker::{DiscordApprovalBroker, DiscordConfig};
 pub use event_handler::chunk_for_discord;
+// #35 Phase 5: the email channel appends the needs-input marker to the
+// persisted draft via this; the card decodes it on render. `NeedsInput` is
+// re-exported for the channel/test surface.
+pub use layout::{append_needs_input_marker, split_needs_input, NeedsInput};
 pub use loops::{
     handle_loop_command, parse_interval, LoopPoster, LoopRunner, LoopScheduler,
     MAX_ACTIVE_PER_USER, MIN_INTERVAL_SECS, PAUSE_AFTER_FAILURES,

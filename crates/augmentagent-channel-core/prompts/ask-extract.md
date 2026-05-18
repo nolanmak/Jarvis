@@ -14,7 +14,7 @@ Reply with a single JSON object, nothing else:
   "asks": [
     {
       "text": "the ask, quoted or tightly paraphrased",
-      "resolver_kind": "scheduling | calendly | share_doc | intro | none",
+      "resolver_kind": "scheduling | calendly | meeting_link | share_doc | intro | none",
       "auto_fillable": true,
       "confidence": 0.0
     }
@@ -26,6 +26,8 @@ Reply with a single JSON object, nothing else:
 
 - `scheduling`  — "can we meet", "what's your availability", "let's find time"
 - `calendly`    — explicitly asks for a booking link / to book time
+- `meeting_link`— asks for the join link to an existing call ("send the Zoom",
+  "what's the Meet link?") — a room to join, NOT a booking page or new times
 - `share_doc`   — asks for a document, deck, file, or access to one
 - `intro`       — asks to be connected/introduced to a third party
 - `none`        — a real ask, but none of the above resolvers fit
