@@ -9,16 +9,16 @@ mod store;
 
 pub use models::{
     Account, ActionRecord, ActionStatus, ChannelSubscription, DriveAccount, Email, LearnedPattern,
-    RateAuditRow,
+    LinkedInConnectionSync, PhoneIdentity, RateAuditRow,
     RateEvent, RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TelegramBot, ToneExample,
-    ToneProfile, TriageResult,
+    ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 pub use store::{
     ActionWithEmail, PendingNudge, RetryableReply, RevisionRecord, Store, StoreError,
     StoreResult, NUDGE_INTERVAL_MS,
 };
 
-/// Re-exported so extension crates (`augmentagent-proactive`, ...) can write
+/// Re-exported so extension crates (`augmentagent-proactive`, …) can write
 /// `Store::with_conn` closures without taking a direct `rusqlite` dep that
 /// could drift from the version this crate links.
 pub use rusqlite;

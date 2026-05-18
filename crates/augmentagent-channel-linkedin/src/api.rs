@@ -20,7 +20,14 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::auth::LinkedInAuth;
-use crate::types::{Dm, MemberUrn};
+use crate::posting::{PostDraft, ShareUrn};
+use crate::types::{Dm, FeedPost, MemberUrn};
+
+/// Feed-fetch GraphQL queryId for a member's recent activity. Like the
+/// conversations id this rotates on LinkedIn deploys; override via
+/// `AUGMENTAGENT_LINKEDIN_FEED_QUERY_ID` without a recompile.
+pub const DEFAULT_FEED_QUERY_ID: &str =
+    "voyagerFeedDashProfileUpdates.6d8c3d3f6b3e4c8a9f2e1d0c7b6a5948";
 
 /// Cold-start queryId (no `syncToken` variable needed). Observed in captures
 /// on 2026-04-19. LinkedIn has a *separate* queryId for incremental-sync
@@ -59,18 +66,56 @@ pub trait LinkedInApi: Send + Sync {
         conversation_urn: &str,
         text: &str,
     ) -> Result<String, LinkedInError>;
+
+    /// (#13) Fetch the recent feed posts authored by `author_urn`. Only
+    /// posts with non-empty text are returned — pure-media posts aren't
+    /// commentable in v1. Newest first.
+    async fn fetch_feed_posts_by_author(
+        &self,
+        author_urn: &str,
+    ) -> Result<Vec<FeedPost>, LinkedInError>;
+
+    /// (#13) Post a top-level comment on `post_urn`. Returns the new
+    /// comment's urn on success.
+    async fn post_comment(
+        &self,
+        post_urn: &str,
+        text: &str,
+    ) -> Result<String, LinkedInError>;
+
+    /// (#13) React to `post_urn`. `reaction` is one of LinkedIn's reaction
+    /// verbs (`LIKE` | `PRAISE` | `EMPATHY` | `INTEREST` | `APPRECIATION` |
+    /// `ENTERTAINMENT`). Comment-only is the v1 engagement path; this is
+    /// wired for completeness + Phase-2 use but is not called by the feed
+    /// trigger.
+    async fn react(
+        &self,
+        post_urn: &str,
+        reaction: &str,
+    ) -> Result<(), LinkedInError>;
+
+    /// (#51 / #77) Create a feed share (text or text+single-image post).
+    /// Goes through the approval pipeline at the channel layer; this is the
+    /// raw wire call.
+    async fn create_share(
+        &self,
+        draft: PostDraft<'_>,
+    ) -> Result<ShareUrn, LinkedInError>;
 }
 
 pub struct VoyagerClient {
-    http: reqwest::Client,
-    auth: LinkedInAuth,
+    pub(crate) http: reqwest::Client,
+    pub(crate) auth: LinkedInAuth,
     conversations_query_id: String,
+    feed_query_id: String,
 }
 
 impl VoyagerClient {
     pub fn new(auth: LinkedInAuth) -> Self {
         let query_id = std::env::var("AUGMENTAGENT_LINKEDIN_CONVERSATIONS_QUERY_ID")
             .unwrap_or_else(|_| DEFAULT_CONVERSATIONS_QUERY_ID.to_string());
+        let feed_query_id = std::env::var("AUGMENTAGENT_LINKEDIN_FEED_QUERY_ID")
+            .unwrap_or_else(|_| DEFAULT_FEED_QUERY_ID.to_string());
         let http = reqwest::Client::builder()
             .user_agent(auth.user_agent.clone())
             .build()
@@ -79,10 +124,11 @@ impl VoyagerClient {
             http,
             auth,
             conversations_query_id: query_id,
+            feed_query_id,
         }
     }
 
-    fn base_headers(&self) -> Result<reqwest::header::HeaderMap, LinkedInError> {
+    pub(crate) fn base_headers(&self) -> Result<reqwest::header::HeaderMap, LinkedInError> {
         use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
         let mut h = HeaderMap::new();
         let mut set = |name: &'static str, val: String| -> Result<(), LinkedInError> {
@@ -217,6 +263,208 @@ impl LinkedInApi for VoyagerClient {
             .map_err(|e| LinkedInError::Decode(format!("send json: {e}")))?;
         Ok(find_string_field(&v, "backendUrn").unwrap_or_default())
     }
+
+    async fn fetch_feed_posts_by_author(
+        &self,
+        author_urn: &str,
+    ) -> Result<Vec<FeedPost>, LinkedInError> {
+        // Profile-updates GraphQL: a member's own recent shares. The
+        // `profileUrn` variable is the author's fsd_profile urn.
+        let url = format!(
+            "https://www.linkedin.com/voyager/api/graphql\
+             ?queryId={qid}&variables=(profileUrn:{urn},count:10,start:0)",
+            qid = self.feed_query_id,
+            urn = urlencode_restli(author_urn),
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .headers(self.base_headers()?)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(LinkedInError::AuthExpired);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LinkedInError::Voyager {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| LinkedInError::Decode(format!("feed json: {e}")))?;
+        Ok(parse_feed_posts(&v, author_urn))
+    }
+
+    async fn post_comment(
+        &self,
+        post_urn: &str,
+        text: &str,
+    ) -> Result<String, LinkedInError> {
+        // Voyager comments endpoint: the threadUrn / parent is the post's
+        // activity urn. `commentary` carries the text + (empty) attributes.
+        let url = format!(
+            "https://www.linkedin.com/voyager/api/feed/comments?action=create&threadUrn={}",
+            urlencode_restli(post_urn),
+        );
+        let body = serde_json::json!({
+            "comment": { "values": [ { "value": { "text": text } } ] },
+            "threadUrn": post_urn,
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.base_headers()?)
+            .header("content-type", "application/json; charset=UTF-8")
+            .body(serde_json::to_vec(&body).expect("serialize comment body"))
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(LinkedInError::AuthExpired);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LinkedInError::Voyager {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| LinkedInError::Decode(format!("comment json: {e}")))?;
+        Ok(find_string_field(&v, "urn")
+            .or_else(|| find_string_field(&v, "entityUrn"))
+            .unwrap_or_default())
+    }
+
+    async fn react(
+        &self,
+        post_urn: &str,
+        reaction: &str,
+    ) -> Result<(), LinkedInError> {
+        let url = format!(
+            "https://www.linkedin.com/voyager/api/voyagerSocialDashReactions?action=react&threadUrn={}",
+            urlencode_restli(post_urn),
+        );
+        let body = serde_json::json!({
+            "reactionType": reaction,
+            "threadUrn": post_urn,
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.base_headers()?)
+            .header("content-type", "application/json; charset=UTF-8")
+            .body(serde_json::to_vec(&body).expect("serialize react body"))
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(LinkedInError::AuthExpired);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LinkedInError::Voyager {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(())
+    }
+
+    async fn create_share(
+        &self,
+        draft: PostDraft<'_>,
+    ) -> Result<ShareUrn, LinkedInError> {
+        // Delegated to the posting module; kept off the trait surface here
+        // so api.rs stays the wire layer and posting.rs owns the
+        // media-dance + body-shape logic.
+        crate::posting::create_share_impl(self, draft).await
+    }
+}
+
+/// Parse the profile-updates GraphQL response into [`FeedPost`]s. The
+/// Voyager feed payload is deeply nested and rotates field names across
+/// deploys, so we walk it defensively: collect every object that carries
+/// both an activity-ish urn and a `commentary.text`, and skip the rest.
+/// Pure-media posts (no text) are dropped — v1 only comments on text.
+fn parse_feed_posts(v: &serde_json::Value, author_urn: &str) -> Vec<FeedPost> {
+    let mut out = Vec::new();
+    collect_feed_posts(v, author_urn, &mut out);
+    out
+}
+
+fn collect_feed_posts(v: &serde_json::Value, author_urn: &str, out: &mut Vec<FeedPost>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            if let Some(post) = try_feed_post(m, author_urn) {
+                out.push(post);
+            }
+            for (_, vv) in m {
+                collect_feed_posts(vv, author_urn, out);
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for vv in a {
+                collect_feed_posts(vv, author_urn, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Try to read an object as a feed update. Recognizes the common
+/// `{ entityUrn|updateMetadata.urn, commentary{ text }, actor }` shape.
+fn try_feed_post(
+    m: &serde_json::Map<String, serde_json::Value>,
+    author_urn: &str,
+) -> Option<FeedPost> {
+    // Find an activity/ugcPost urn on this node.
+    let post_urn = m
+        .get("entityUrn")
+        .or_else(|| m.get("urn"))
+        .or_else(|| m.get("backendUrn"))
+        .and_then(|x| x.as_str())
+        .filter(|s| s.contains(":activity:") || s.contains(":ugcPost:") || s.contains(":share:"))?
+        .to_string();
+
+    // Commentary text — either `commentary.text` or a flatter `text`.
+    let text = m
+        .get("commentary")
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str())
+        .or_else(|| m.get("commentaryText").and_then(|t| t.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return None;
+    }
+
+    // Author name best-effort from any nested actor name field.
+    let author_name = find_string_field(&serde_json::Value::Object(m.clone()), "name")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(connection)".to_string());
+
+    let created_at_ms = m
+        .get("createdAt")
+        .or_else(|| m.get("publishedAt"))
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+
+    Some(FeedPost {
+        post_urn,
+        author_name,
+        author_urn: MemberUrn(author_urn.to_string()),
+        text,
+        created_at_ms,
+    })
 }
 
 /// URL-encode only the rest.li tuple punctuation. The urn slugs are already
@@ -228,7 +476,7 @@ fn urlencode_restli(s: &str) -> String {
         .replace(',', "%2C")
 }
 
-fn find_string_field(v: &serde_json::Value, key: &str) -> Option<String> {
+pub(crate) fn find_string_field(v: &serde_json::Value, key: &str) -> Option<String> {
     match v {
         serde_json::Value::Object(m) => {
             if let Some(serde_json::Value::String(s)) = m.get(key) {

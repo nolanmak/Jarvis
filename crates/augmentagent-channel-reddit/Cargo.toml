@@ -1,0 +1,21 @@
+[package]
+name = "augmentagent-channel-reddit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+augmentagent-channel-core = { path = "../augmentagent-channel-core" }
+augmentagent-auth = { path = "../augmentagent-auth" }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
