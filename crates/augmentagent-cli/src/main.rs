@@ -1154,15 +1154,25 @@ enum TwitterOp {
     PollOnce,
     /// #14 operator validation harness. Given an already-harvested session
     /// (keychain / legacy file — run `twitter login` first), exercise every
-    /// documented endpoint and print a pass/fail grid mapping to the
-    /// `REQUIRES LIVE OPERATOR VALIDATION` flags in docs/twitter-protocol.md.
-    /// Read-only by default — the CreateTweet / DM-send checks are
-    /// shape-validated, never sent, unless `--allow-write` is passed.
+    /// documented endpoint and print a pass/fail grid + per-probe response-
+    /// shape fingerprint mapping to the `REQUIRES LIVE OPERATOR VALIDATION`
+    /// flags in docs/twitter-protocol.md.
+    ///
+    /// **Mock-only by default**: without `--allow-live` (and no
+    /// `AUGMENTAGENT_TWITTER_BASE_URL` capture-proxy override) the harness
+    /// makes NO live x.com call — read probes are skipped and the report is
+    /// flagged mock-only. A live sign-off REQUIRES `--allow-live` on a real
+    /// session. Even when live it is read-only unless `--allow-write` is set.
     Validate {
         /// Emit the report as JSON (an attachable validation artifact)
         /// instead of the human table.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         json: bool,
+        /// Permit live x.com calls. OFF by default (mock-only build) — the
+        /// harness never reaches x.com without this (or a capture-proxy
+        /// base-url override).
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        allow_live: bool,
         /// Permit the live write probes (CreateTweet / DM send). OFF by
         /// default — the harness never posts public content without this.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
@@ -1936,12 +1946,14 @@ async fn main() -> Result<()> {
             TwitterOp::PollOnce => run_twitter_poll_once(&cli).await,
             TwitterOp::Validate {
                 json,
+                allow_live,
                 allow_write,
                 probe_reply_to,
                 probe_conversation_id,
             } => {
                 run_twitter_validate(
                     *json,
+                    *allow_live,
                     *allow_write,
                     probe_reply_to.clone(),
                     probe_conversation_id.clone(),
@@ -5782,6 +5794,7 @@ async fn run_twitter_poll_once(cli: &Cli) -> Result<()> {
 /// `REQUIRES LIVE OPERATOR VALIDATION` flags in docs/twitter-protocol.md.
 async fn run_twitter_validate(
     json: bool,
+    allow_live: bool,
     allow_write: bool,
     probe_reply_to: Option<String>,
     probe_conversation_id: Option<String>,
@@ -5791,10 +5804,17 @@ async fn run_twitter_validate(
         "load twitter auth from keychain or legacy file — run `augmentagent twitter login` first",
     )?;
     let opts = TwitterValidateOptions {
+        allow_live,
         allow_write,
         probe_reply_to,
         probe_conversation_id,
     };
+    if !allow_live && std::env::var("AUGMENTAGENT_TWITTER_BASE_URL").is_err() {
+        warn!(
+            "twitter validate: MOCK-ONLY build — no live x.com call will be made. \
+             Pass --allow-live on a real session for a sign-off run."
+        );
+    }
     if allow_write {
         warn!(
             "twitter validate: --allow-write set — live write probes are enabled \
@@ -5811,7 +5831,13 @@ async fn run_twitter_validate(
     } else {
         print!("{}", report.render_table());
     }
-    if report.all_passed {
+    if report.mock_only {
+        // A mock-only run is informational, not a pass — but it's not a
+        // failure either (nothing was actually probed). Exit 0 so a CI step
+        // that just exercises the harness wiring doesn't break, while the
+        // banner makes clear no sign-off was produced.
+        Ok(())
+    } else if report.all_passed {
         Ok(())
     } else {
         // Non-zero exit so a CI / scripted runbook step fails loudly.

@@ -27,13 +27,13 @@ pub mod types;
 pub mod validate;
 
 pub use api::{
-    base_url, EnvQueryIdResolver, QueryIdResolver, TwitterApi, TwitterClient,
-    TwitterError, DEFAULT_CREATE_TWEET_QUERY_ID,
+    base_url, with_retry, EnvQueryIdResolver, QueryIdResolver, TwitterApi,
+    TwitterClient, TwitterError, DEFAULT_CREATE_TWEET_QUERY_ID,
     DEFAULT_RATE_LIMIT_BACKOFF_SECS, DEFAULT_USER_TWEETS_QUERY_ID,
 };
 pub use validate::{
-    validate as validate_session, CheckResult, CheckStatus, ValidateOptions,
-    ValidationReport,
+    validate as validate_session, validate_with_api, CheckResult, CheckStatus,
+    ValidateOptions, ValidationReport,
 };
 pub use auth::{
     default_auth_path, AuthError, TwitterAuth, DEFAULT_PUBLIC_BEARER, DEFAULT_USER_AGENT,
