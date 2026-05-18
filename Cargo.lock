@@ -375,6 +375,7 @@ dependencies = [
  "augmentagent-wiki",
  "chrono",
  "futures",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

@@ -545,12 +545,26 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                         "reply",
                     )
                     .await;
+                // #35 Phase 2: pre-resolve structured asks (scheduling /
+                // calendly / share_doc / intro) and inject concrete values.
+                // Gated by AUGMENTAGENT_ASK_RESOLVE=live + per-resolver flags;
+                // empty string (today's behavior) for off/shadow or when no
+                // ask clears the confidence floor.
+                let resolved_asks_block =
+                    augmentagent_channel_core::resolve_asks_block(
+                        &self.reasoner,
+                        augmentagent_channel_core::AskResolveMode::from_env(),
+                        &email.body,
+                        self.build_resolve_ctx(entity_id),
+                    )
+                    .await;
                 let draft_prompt = draft_user_message(
                     &email,
                     &wiki_hint,
                     &tone_block,
                     &thread_block,
                     &archetype_block,
+                    &resolved_asks_block,
                 );
                 let draft = match self.reasoner.call(&draft_opts, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
@@ -612,6 +626,37 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 Ok(Some(DispatchOutcome::Skipped))
             }
         }
+    }
+
+    /// Build the resolver context for #35 Phase 2 ask resolution.
+    ///
+    /// `entity_id` scopes calendar/Drive lookups to the current account.
+    /// Composio-backed free/busy + Drive clients are constructed ONLY when
+    /// `COMPOSIO_API_KEY` is present; absent it, `freebusy`/`drive` stay
+    /// `None` and the scheduling/share_doc resolvers self-gate to no-ops
+    /// (calendly/intro need no network). `resolve_asks_block` itself is gated
+    /// on `AUGMENTAGENT_ASK_RESOLVE=live`, so this is never reached otherwise.
+    fn build_resolve_ctx(
+        &self,
+        entity_id: &str,
+    ) -> augmentagent_channel_core::ResolveCtx {
+        let mut ctx = augmentagent_channel_core::ResolveCtx {
+            entity_id: Some(entity_id.to_string()),
+            calendar_id: "primary".into(),
+            wiki_root: self.config.wiki_root.clone(),
+            freebusy: None,
+            drive: None,
+        };
+        if let Ok(key) = std::env::var("COMPOSIO_API_KEY") {
+            if !key.trim().is_empty() {
+                let client = std::sync::Arc::new(
+                    augmentagent_channel_core::ComposioResolveClient::new(key),
+                );
+                ctx.freebusy = Some(client.clone());
+                ctx.drive = Some(client);
+            }
+        }
+        ctx
     }
 
     /// Build the `<thread_history>` block for thread-aware drafting (#32).

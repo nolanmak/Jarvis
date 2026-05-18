@@ -1,21 +1,62 @@
-//! Structured ask-detection + (future) auto-fill. **Phase 1 is telemetry
-//! only** (#35): a shadow-mode extractor logs detected asks; nothing is
-//! injected into drafts and no resolver runs. The resolver trait + stubs are
-//! scaffolded so the deferred Phase 2 has a stable seam to fill.
+//! Structured ask-detection + auto-fill.
 //!
-//! Gating: the shadow extractor runs only when `AUGMENTAGENT_ASK_RESOLVE` is
-//! set to `shadow`. Any other value (or unset) ⇒ no extra Haiku call, zero
-//! cost, byte-identical pipeline.
+//! **Phase 1** (merged) is telemetry only: a shadow extractor logs detected
+//! asks; nothing is injected, no resolver runs.
+//!
+//! **Phase 2** (this module, #35): four *live* deterministic resolvers and a
+//! draft-injection path. Gating is layered and conservative — this code path
+//! costs a per-message Haiku call plus external API calls, so every stage is
+//! behind an explicit env flag and the default is byte-identical to today.
+//!
+//! Gating model:
+//! - `AUGMENTAGENT_ASK_RESOLVE` — `off` (default), `shadow`, or `live`.
+//!   - `off`   ⇒ no extractor call, no resolvers, empty injection.
+//!   - `shadow`⇒ extractor runs + logs telemetry, NO resolve, NO injection.
+//!   - `live`  ⇒ extractor runs, resolvers run, `<resolved_asks>` injected.
+//! - Each resolver ALSO has its own flag (e.g.
+//!   `AUGMENTAGENT_ASK_RESOLVE_SCHEDULING=1`). A resolver whose flag is unset
+//!   short-circuits to `Ok(None)` and makes zero network calls — so `live`
+//!   with no per-resolver flags set is a safe no-op (empty injection ⇒
+//!   byte-identical draft prompt).
+//! - Confidence threshold ([`INJECT_CONFIDENCE_FLOOR`], default 0.7): asks
+//!   below the floor are never resolved or injected.
+//!
+//! The intro resolver NEVER auto-executes — it only surfaces a suggestion
+//! string for the drafter; sending an intro stays a human decision.
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{Datelike, Duration as ChronoDuration, Utc, Weekday};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::reasoner::{Reasoner, ReasonerOpts};
 
 const ASK_EXTRACT_PROMPT: &str = include_str!("../prompts/ask-extract.md");
+
+/// Total wall-clock budget for the parallel resolve stage. The issue caps
+/// this at <3s; resolvers run concurrently under `tokio::join!` so the budget
+/// is per-stage, not per-resolver.
+pub const RESOLVE_BUDGET: Duration = Duration::from_secs(3);
+
+/// Asks scoring below this are neither resolved nor injected. Issue default
+/// is 0.7; override via `AUGMENTAGENT_ASK_RESOLVE_MIN_CONFIDENCE`.
+pub const INJECT_CONFIDENCE_FLOOR: f64 = 0.7;
+
+fn confidence_floor() -> f64 {
+    std::env::var("AUGMENTAGENT_ASK_RESOLVE_MIN_CONFIDENCE")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(|f| f.clamp(0.0, 1.0))
+        .unwrap_or(INJECT_CONFIDENCE_FLOOR)
+}
+
+fn flag_on(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
+}
 
 /// Which deterministic resolver *would* handle an ask. Phase 1 only records
 /// this; Phase 2 dispatches on it.
@@ -66,6 +107,11 @@ impl DetectedAsk {
     pub fn kind(&self) -> ResolverKind {
         ResolverKind::parse(&self.resolver_kind)
     }
+    /// Confidence with a conservative default (treat unscored asks as just
+    /// at the floor so an extractor that omits the field still resolves).
+    pub fn conf(&self) -> f64 {
+        self.confidence.unwrap_or(0.0)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -81,16 +127,24 @@ pub enum AskResolveMode {
     Off,
     /// Shadow: extract + log telemetry, never inject / resolve.
     Shadow,
+    /// Live: extract, resolve, inject `<resolved_asks>` into the draft.
+    Live,
 }
 
 impl AskResolveMode {
-    /// Read from the environment. Only the exact value `shadow` enables it —
-    /// conservative on purpose (this gates a per-message Haiku call).
+    /// Read from the environment. Only the exact values `shadow` / `live`
+    /// enable the corresponding mode — conservative on purpose (this gates a
+    /// per-message Haiku call and external API traffic).
     pub fn from_env() -> Self {
         match std::env::var("AUGMENTAGENT_ASK_RESOLVE").ok().as_deref() {
             Some("shadow") => Self::Shadow,
+            Some("live") => Self::Live,
             _ => Self::Off,
         }
+    }
+    /// Both `shadow` and `live` run the extractor.
+    pub fn runs_extractor(self) -> bool {
+        matches!(self, Self::Shadow | Self::Live)
     }
 }
 
@@ -115,16 +169,20 @@ fn parse_blob(s: &str) -> Option<AskEnvelope> {
     serde_json::from_str::<AskEnvelope>(&s[start..=end]).ok()
 }
 
-/// Run the shadow extractor over one message body. Returns the detected asks
-/// (possibly empty). Never errors to the caller — shadow mode must never
-/// affect the real pipeline. Returns an empty vec when the mode is `Off`
-/// WITHOUT making any model call.
+/// Run the extractor over one message body. Returns the detected asks
+/// (possibly empty). Never errors to the caller — ask-detect must never
+/// affect the real pipeline. Returns an empty vec WITHOUT a model call when
+/// the mode does not run the extractor (`Off`).
+///
+/// Named `_shadow` for back-compat with Phase 1 callers; it now also serves
+/// the `live` path (same extractor, the caller decides what to do with the
+/// result).
 pub async fn detect_asks_shadow<R: Reasoner + ?Sized>(
     reasoner: &Arc<R>,
     mode: AskResolveMode,
     message_body: &str,
 ) -> Vec<DetectedAsk> {
-    if mode == AskResolveMode::Off || message_body.trim().is_empty() {
+    if !mode.runs_extractor() || message_body.trim().is_empty() {
         return Vec::new();
     }
     let opts = extract_opts();
@@ -132,27 +190,27 @@ pub async fn detect_asks_shadow<R: Reasoner + ?Sized>(
     match reasoner.call(&opts, &user).await {
         Ok(reply) => match parse_blob(&reply) {
             Some(env) => {
-                debug!(n = env.asks.len(), "ask-detect shadow: extracted");
+                debug!(n = env.asks.len(), "ask-detect: extracted");
                 env.asks
             }
             None => {
-                warn!("ask-detect shadow: unparseable reply");
+                warn!("ask-detect: unparseable reply");
                 Vec::new()
             }
         },
         Err(e) => {
-            warn!("ask-detect shadow call failed: {e:#}");
+            warn!("ask-detect call failed: {e:#}");
             Vec::new()
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2 resolver seam (deferred — Refs #35).
+// Resolver trait + result type.
 // ---------------------------------------------------------------------------
 
 /// What a resolver produces when it can satisfy an ask deterministically.
-/// Phase 2 will feed this into the drafter as a pre-filled fragment.
+/// Fed into the drafter as a pre-filled fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFill {
     /// The resolver kind that produced this.
@@ -161,81 +219,925 @@ pub struct ResolvedFill {
     pub fill: String,
 }
 
-/// A deterministic ask resolver. Phase 1 ships only stubs — every
-/// `try_resolve` returns `Ok(None)` ("I can't fill this"), so even if Phase 2
-/// wiring were flipped on early, the behavior is a safe no-op.
+/// A deterministic ask resolver. `try_resolve` returns `Ok(None)` when this
+/// resolver can't (or is disabled by its env flag) fill the ask — that's the
+/// safe no-op. `Err` = tried and failed (logged, never fatal).
 #[async_trait]
 pub trait AskResolver: Send + Sync {
     fn kind(&self) -> ResolverKind;
-    /// Attempt to resolve. `Ok(None)` = not resolvable by me; `Err` = tried
-    /// and failed (logged, never fatal).
     async fn try_resolve(&self, ask: &DetectedAsk) -> anyhow::Result<Option<ResolvedFill>>;
 }
 
-macro_rules! stub_resolver {
-    ($name:ident, $kind:expr, $doc:literal) => {
-        #[doc = $doc]
-        pub struct $name;
-        #[async_trait]
-        impl AskResolver for $name {
-            fn kind(&self) -> ResolverKind {
-                $kind
-            }
-            async fn try_resolve(
-                &self,
-                _ask: &DetectedAsk,
-            ) -> anyhow::Result<Option<ResolvedFill>> {
-                // Refs #35 — deferred. Phase 1 never resolves.
-                Ok(None)
-            }
-        }
-    };
+// ---------------------------------------------------------------------------
+// External-service seams. Narrow async traits so resolvers are unit-testable
+// with in-memory fakes; the Composio-backed impls live below.
+// ---------------------------------------------------------------------------
+
+/// A free/busy interval (UTC) returned by Google Calendar `freebusy.query`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusyInterval {
+    pub start: chrono::DateTime<Utc>,
+    pub end: chrono::DateTime<Utc>,
 }
 
-stub_resolver!(
-    SchedulingResolver,
-    ResolverKind::Scheduling,
-    "Stub. Phase 2: read free/busy, propose slots. Refs #35 — deferred."
-);
-stub_resolver!(
-    CalendlyResolver,
-    ResolverKind::Calendly,
-    "Stub. Phase 2: surface the user's booking link. Refs #35 — deferred."
-);
-stub_resolver!(
-    ShareDocResolver,
-    ResolverKind::ShareDoc,
-    "Stub. Phase 2: locate + share-link the requested doc. Refs #35 — deferred."
-);
-stub_resolver!(
-    IntroResolver,
-    ResolverKind::Intro,
-    "Stub. Phase 2: draft a double-opt-in intro. Refs #35 — deferred."
-);
+/// Google Calendar free/busy query seam (Composio `GOOGLECALENDAR_FREE_BUSY`).
+#[async_trait]
+pub trait FreeBusyApi: Send + Sync {
+    async fn busy(
+        &self,
+        entity_id: &str,
+        calendar_id: &str,
+        time_min: chrono::DateTime<Utc>,
+        time_max: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<Vec<BusyInterval>>;
+}
 
-/// The Phase-2 resolver registry (all stubs in Phase 1).
-pub fn default_resolvers() -> Vec<Arc<dyn AskResolver>> {
+/// One Drive search hit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriveHit {
+    pub name: String,
+    pub web_view_link: String,
+}
+
+/// Google Drive search seam (Composio `GOOGLEDRIVE_FIND_FILE` /
+/// `GOOGLEDRIVE_FIND_FOLDER`-style fulltext query).
+#[async_trait]
+pub trait DriveSearchApi: Send + Sync {
+    async fn search(&self, entity_id: &str, query: &str) -> anyhow::Result<Vec<DriveHit>>;
+}
+
+// ---------------------------------------------------------------------------
+// Resolver context: everything the live resolvers need, all optional so a
+// partially-configured deployment degrades to no-op resolvers rather than
+// erroring.
+// ---------------------------------------------------------------------------
+
+/// Shared, cheaply-cloneable inputs for the resolver registry.
+#[derive(Clone)]
+pub struct ResolveCtx {
+    /// Composio entity / account id for the calendar + drive owner.
+    pub entity_id: Option<String>,
+    /// Calendar id for free/busy (defaults to `primary`).
+    pub calendar_id: String,
+    /// Wiki root for people-page + Calendly/index lookups.
+    pub wiki_root: Option<PathBuf>,
+    /// Free/busy client (Composio-backed in prod, fake in tests).
+    pub freebusy: Option<Arc<dyn FreeBusyApi>>,
+    /// Drive search client.
+    pub drive: Option<Arc<dyn DriveSearchApi>>,
+}
+
+impl Default for ResolveCtx {
+    fn default() -> Self {
+        Self {
+            entity_id: None,
+            calendar_id: "primary".into(),
+            wiki_root: None,
+            freebusy: None,
+            drive: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for ResolveCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolveCtx")
+            .field("entity_id", &self.entity_id)
+            .field("calendar_id", &self.calendar_id)
+            .field("wiki_root", &self.wiki_root)
+            .field("freebusy", &self.freebusy.is_some())
+            .field("drive", &self.drive.is_some())
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scheduling resolver: freebusy.query → 3 open business-hours slots.
+// ---------------------------------------------------------------------------
+
+/// Reads the next 7 business days of free/busy and proposes up to 3 open
+/// 30-min slots inside 09:00–17:00 UTC. Gated by
+/// `AUGMENTAGENT_ASK_RESOLVE_SCHEDULING=1`.
+pub struct SchedulingResolver {
+    ctx: ResolveCtx,
+}
+
+impl SchedulingResolver {
+    pub fn new(ctx: ResolveCtx) -> Self {
+        Self { ctx }
+    }
+}
+
+const WORK_START_HOUR: u32 = 9;
+const WORK_END_HOUR: u32 = 17;
+const SLOT_MIN: i64 = 30;
+const MAX_SLOTS: usize = 3;
+
+/// Pure slot-finder: given busy intervals, walk the next `days` business days
+/// in 30-min steps inside working hours and return up to `MAX_SLOTS` free
+/// starts. Extracted for deterministic testing (no clock/network).
+fn first_open_slots(
+    now: chrono::DateTime<Utc>,
+    busy: &[BusyInterval],
+    days: i64,
+) -> Vec<chrono::DateTime<Utc>> {
+    let mut out = Vec::new();
+    let step = ChronoDuration::minutes(SLOT_MIN);
+    let mut cursor = now;
+    let horizon = now + ChronoDuration::days(days);
+    // Round the cursor up to the next 30-min boundary.
+    let minute = cursor.format("%M").to_string().parse::<i64>().unwrap_or(0);
+    let bump = (SLOT_MIN - (minute % SLOT_MIN)) % SLOT_MIN;
+    cursor += ChronoDuration::minutes(bump);
+    cursor = cursor
+        - ChronoDuration::seconds(cursor.format("%S").to_string().parse().unwrap_or(0));
+    while cursor < horizon && out.len() < MAX_SLOTS {
+        let wd = cursor.weekday();
+        let hour = cursor.hour_u32();
+        let is_business = !matches!(wd, Weekday::Sat | Weekday::Sun);
+        let in_hours = (WORK_START_HOUR..WORK_END_HOUR).contains(&hour);
+        if is_business && in_hours {
+            let slot_end = cursor + step;
+            let clashes = busy
+                .iter()
+                .any(|b| cursor < b.end && slot_end > b.start);
+            if !clashes {
+                out.push(cursor);
+            }
+        }
+        cursor += step;
+    }
+    out
+}
+
+trait HourU32 {
+    fn hour_u32(&self) -> u32;
+}
+impl HourU32 for chrono::DateTime<Utc> {
+    fn hour_u32(&self) -> u32 {
+        use chrono::Timelike;
+        self.hour()
+    }
+}
+
+#[async_trait]
+impl AskResolver for SchedulingResolver {
+    fn kind(&self) -> ResolverKind {
+        ResolverKind::Scheduling
+    }
+    async fn try_resolve(&self, ask: &DetectedAsk) -> anyhow::Result<Option<ResolvedFill>> {
+        if !flag_on("AUGMENTAGENT_ASK_RESOLVE_SCHEDULING") {
+            return Ok(None);
+        }
+        if ask.kind() != ResolverKind::Scheduling {
+            return Ok(None);
+        }
+        let (Some(entity), Some(fb)) = (self.ctx.entity_id.as_deref(), self.ctx.freebusy.as_ref())
+        else {
+            debug!("scheduling resolver: no entity/freebusy client configured");
+            return Ok(None);
+        };
+        let now = Utc::now();
+        let horizon = now + ChronoDuration::days(9);
+        let busy = fb
+            .busy(entity, &self.ctx.calendar_id, now, horizon)
+            .await?;
+        let slots = first_open_slots(now, &busy, 9);
+        if slots.is_empty() {
+            return Ok(None);
+        }
+        let rendered = slots
+            .iter()
+            .map(|s| s.format("%a %b %-d, %H:%M UTC").to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        Ok(Some(ResolvedFill {
+            kind: ResolverKind::Scheduling,
+            fill: format!(
+                "Open {SLOT_MIN}-min slots on the user's calendar (UTC): {rendered}. \
+                 Offer these concrete times; do not invent others."
+            ),
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Calendly resolver: config / wiki lookup. No network.
+// ---------------------------------------------------------------------------
+
+/// Surfaces the user's stored booking link. Lookup order:
+/// 1. `AUGMENTAGENT_CALENDLY_URL` env var.
+/// 2. First `https://calendly.com/...` (or `cal.com`) URL found in the wiki
+///    `index.md`.
+///
+/// Gated by `AUGMENTAGENT_ASK_RESOLVE_CALENDLY=1`.
+pub struct CalendlyResolver {
+    ctx: ResolveCtx,
+}
+
+impl CalendlyResolver {
+    pub fn new(ctx: ResolveCtx) -> Self {
+        Self { ctx }
+    }
+}
+
+fn find_booking_url(haystack: &str) -> Option<String> {
+    for token in haystack.split(|c: char| c.is_whitespace() || c == '(' || c == ')' || c == '<' || c == '>' || c == '"') {
+        let t = token.trim_end_matches(['.', ',', ';', ']', ')']);
+        let low = t.to_ascii_lowercase();
+        if (low.starts_with("https://calendly.com/")
+            || low.starts_with("https://cal.com/")
+            || low.starts_with("http://calendly.com/"))
+            && t.len() > "https://calendly.com/".len()
+        {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
+#[async_trait]
+impl AskResolver for CalendlyResolver {
+    fn kind(&self) -> ResolverKind {
+        ResolverKind::Calendly
+    }
+    async fn try_resolve(&self, ask: &DetectedAsk) -> anyhow::Result<Option<ResolvedFill>> {
+        if !flag_on("AUGMENTAGENT_ASK_RESOLVE_CALENDLY") {
+            return Ok(None);
+        }
+        if ask.kind() != ResolverKind::Calendly {
+            return Ok(None);
+        }
+        if let Ok(url) = std::env::var("AUGMENTAGENT_CALENDLY_URL") {
+            let url = url.trim();
+            if !url.is_empty() {
+                return Ok(Some(ResolvedFill {
+                    kind: ResolverKind::Calendly,
+                    fill: format!("The user's booking link is: {url}"),
+                }));
+            }
+        }
+        if let Some(root) = &self.ctx.wiki_root {
+            let index = root.join("index.md");
+            if let Ok(body) = std::fs::read_to_string(&index) {
+                if let Some(url) = find_booking_url(&body) {
+                    return Ok(Some(ResolvedFill {
+                        kind: ResolverKind::Calendly,
+                        fill: format!("The user's booking link is: {url}"),
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Share-doc resolver: wiki grep + Drive fulltext search.
+// ---------------------------------------------------------------------------
+
+/// Locates a requested document. Tries Drive fulltext search first (most
+/// likely to yield a shareable link), then falls back to scanning the wiki
+/// for a markdown link whose text matches the doc hint. Gated by
+/// `AUGMENTAGENT_ASK_RESOLVE_SHARE_DOC=1`.
+pub struct ShareDocResolver {
+    ctx: ResolveCtx,
+}
+
+impl ShareDocResolver {
+    pub fn new(ctx: ResolveCtx) -> Self {
+        Self { ctx }
+    }
+}
+
+/// Pull a short keyword query out of the ask text — strip stopwords, keep the
+/// most content-bearing tokens. Deterministic; the extractor already gave us
+/// a tight paraphrase so this is mostly cleanup.
+fn doc_query(ask_text: &str) -> String {
+    const STOP: &[&str] = &[
+        "can", "you", "the", "a", "an", "me", "please", "send", "share", "get",
+        "could", "would", "i", "to", "of", "for", "with", "your", "my", "do",
+        "have", "is", "it", "that", "this", "and", "or", "over", "us",
+    ];
+    let kept: Vec<&str> = ask_text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .filter(|w| !STOP.contains(&w.to_ascii_lowercase().as_str()))
+        .take(6)
+        .collect();
+    kept.join(" ")
+}
+
+#[async_trait]
+impl AskResolver for ShareDocResolver {
+    fn kind(&self) -> ResolverKind {
+        ResolverKind::ShareDoc
+    }
+    async fn try_resolve(&self, ask: &DetectedAsk) -> anyhow::Result<Option<ResolvedFill>> {
+        if !flag_on("AUGMENTAGENT_ASK_RESOLVE_SHARE_DOC") {
+            return Ok(None);
+        }
+        if ask.kind() != ResolverKind::ShareDoc {
+            return Ok(None);
+        }
+        let query = doc_query(&ask.text);
+        if query.trim().is_empty() {
+            return Ok(None);
+        }
+        // 1. Drive fulltext.
+        if let (Some(entity), Some(drive)) =
+            (self.ctx.entity_id.as_deref(), self.ctx.drive.as_ref())
+        {
+            match drive.search(entity, &query).await {
+                Ok(hits) if !hits.is_empty() => {
+                    let h = &hits[0];
+                    return Ok(Some(ResolvedFill {
+                        kind: ResolverKind::ShareDoc,
+                        fill: format!(
+                            "Matching Drive doc: \"{}\" → {}. Offer this link.",
+                            h.name, h.web_view_link
+                        ),
+                    }));
+                }
+                Ok(_) => {}
+                Err(e) => warn!("share_doc: drive search failed: {e:#}"),
+            }
+        }
+        // 2. Wiki markdown-link fallback.
+        if let Some(root) = &self.ctx.wiki_root {
+            if let Some(link) = grep_wiki_link(root, &query) {
+                return Ok(Some(ResolvedFill {
+                    kind: ResolverKind::ShareDoc,
+                    fill: format!("Likely doc from the wiki: {link}. Offer this link."),
+                }));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Shallow scan of `index.md` + `projects/*.md` for a `[text](url)` link whose
+/// text contains any query word (case-insensitive). Bounded — wiki is small.
+fn grep_wiki_link(root: &std::path::Path, query: &str) -> Option<String> {
+    let words: Vec<String> = query
+        .split_whitespace()
+        .map(|w| w.to_ascii_lowercase())
+        .collect();
+    if words.is_empty() {
+        return None;
+    }
+    let mut files: Vec<PathBuf> = vec![root.join("index.md")];
+    if let Ok(rd) = std::fs::read_dir(root.join("projects")) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("md") {
+                files.push(p);
+            }
+        }
+    }
+    for f in files {
+        let Ok(body) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        for (text, url) in markdown_links(&body) {
+            let low = text.to_ascii_lowercase();
+            if words.iter().any(|w| low.contains(w.as_str()))
+                && (url.starts_with("http://") || url.starts_with("https://"))
+            {
+                return Some(url);
+            }
+        }
+    }
+    None
+}
+
+/// Minimal `[text](url)` extractor — good enough for the wiki's controlled
+/// markdown; not a general parser.
+fn markdown_links(body: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            if let Some(close) = body[i + 1..].find(']') {
+                let text_end = i + 1 + close;
+                if text_end + 1 < bytes.len() && bytes[text_end + 1] == b'(' {
+                    if let Some(pclose) = body[text_end + 2..].find(')') {
+                        let url_end = text_end + 2 + pclose;
+                        out.push((
+                            body[i + 1..text_end].to_string(),
+                            body[text_end + 2..url_end].to_string(),
+                        ));
+                        i = url_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Intro resolver: wiki people-page lookup. SUGGESTION ONLY — never executes.
+// ---------------------------------------------------------------------------
+
+/// Looks up the intro target in the wiki identity index. Returns a *suggestion*
+/// fill that explicitly tells the drafter the intro is gated on the user's
+/// explicit OK — it never produces a "send the intro" instruction. Gated by
+/// `AUGMENTAGENT_ASK_RESOLVE_INTRO=1`.
+pub struct IntroResolver {
+    ctx: ResolveCtx,
+}
+
+impl IntroResolver {
+    pub fn new(ctx: ResolveCtx) -> Self {
+        Self { ctx }
+    }
+}
+
+/// Pull a candidate person name out of the ask text. The extractor's
+/// paraphrase usually contains it; we take the longest run of Capitalized
+/// words as the name heuristic.
+fn guess_target_name(ask_text: &str) -> Option<String> {
+    let mut best: Vec<&str> = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    for tok in ask_text.split_whitespace() {
+        let clean = tok.trim_matches(|c: char| !c.is_alphanumeric());
+        let is_cap = clean
+            .chars()
+            .next()
+            .map(|c| c.is_uppercase())
+            .unwrap_or(false)
+            && clean.len() > 1;
+        if is_cap {
+            cur.push(clean);
+        } else {
+            if cur.len() > best.len() {
+                best = cur.clone();
+            }
+            cur.clear();
+        }
+    }
+    if cur.len() > best.len() {
+        best = cur;
+    }
+    if best.is_empty() {
+        None
+    } else {
+        Some(best.join(" "))
+    }
+}
+
+#[async_trait]
+impl AskResolver for IntroResolver {
+    fn kind(&self) -> ResolverKind {
+        ResolverKind::Intro
+    }
+    async fn try_resolve(&self, ask: &DetectedAsk) -> anyhow::Result<Option<ResolvedFill>> {
+        if !flag_on("AUGMENTAGENT_ASK_RESOLVE_INTRO") {
+            return Ok(None);
+        }
+        if ask.kind() != ResolverKind::Intro {
+            return Ok(None);
+        }
+        let Some(root) = &self.ctx.wiki_root else {
+            return Ok(None);
+        };
+        let Some(name) = guess_target_name(&ask.text) else {
+            return Ok(None);
+        };
+        let layout = augmentagent_wiki::WikiLayout::new(root.clone());
+        let index = match augmentagent_wiki::IdentityIndex::build(&layout) {
+            Ok(i) => i,
+            Err(e) => {
+                warn!("intro resolver: identity index build failed: {e:#}");
+                return Ok(None);
+            }
+        };
+        // Match a people page whose slug contains the lowercased name tokens.
+        let needle: Vec<String> = name
+            .split_whitespace()
+            .map(|w| w.to_ascii_lowercase())
+            .collect();
+        let hit = index.pages().iter().find(|p| {
+            let slug = p.slug.to_ascii_lowercase();
+            needle.iter().all(|w| slug.contains(w.as_str()))
+        });
+        let Some(page) = hit else {
+            return Ok(None);
+        };
+        let email = page.identities.email.first().cloned();
+        // NOTE: suggestion only. The drafter is told the user must explicitly
+        // approve before any intro is actually sent — intros are reputational
+        // and never auto-execute (issue #35 open question, settled).
+        let who = match email {
+            Some(e) => format!("{name} (on file: {e})"),
+            None => format!("{name} (in the wiki, no email on file)"),
+        };
+        Ok(Some(ResolvedFill {
+            kind: ResolverKind::Intro,
+            fill: format!(
+                "SUGGESTION (do NOT commit to or send an intro): {who} appears to be \
+                 the intro target and is known to the user. You may acknowledge the \
+                 request and say the user will consider it — but you MUST NOT promise \
+                 or perform the introduction. Intros require the user's explicit \
+                 separate approval."
+            ),
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry + orchestration.
+// ---------------------------------------------------------------------------
+
+/// Build the live resolver registry from a context. All four are always
+/// constructed; each self-gates on its own env flag inside `try_resolve`, so
+/// an unconfigured/flag-off resolver is a guaranteed no-op.
+pub fn live_resolvers(ctx: ResolveCtx) -> Vec<Arc<dyn AskResolver>> {
     vec![
-        Arc::new(SchedulingResolver),
-        Arc::new(CalendlyResolver),
-        Arc::new(ShareDocResolver),
-        Arc::new(IntroResolver),
+        Arc::new(SchedulingResolver::new(ctx.clone())),
+        Arc::new(CalendlyResolver::new(ctx.clone())),
+        Arc::new(ShareDocResolver::new(ctx.clone())),
+        Arc::new(IntroResolver::new(ctx)),
     ]
+}
+
+/// Back-compat alias for Phase 1 callers/tests. Equivalent to
+/// `live_resolvers(ResolveCtx::default())` — every resolver self-gates so
+/// these are all no-ops without env flags + a configured context.
+pub fn default_resolvers() -> Vec<Arc<dyn AskResolver>> {
+    live_resolvers(ResolveCtx::default())
+}
+
+/// Run one ask against the resolver whose `kind()` matches it. Errors are
+/// logged and swallowed (returns `None`) — a resolver failure must never
+/// break drafting.
+async fn resolve_one(
+    resolvers: &[Arc<dyn AskResolver>],
+    ask: &DetectedAsk,
+) -> Option<ResolvedFill> {
+    let kind = ask.kind();
+    if kind == ResolverKind::None {
+        return None;
+    }
+    for r in resolvers {
+        if r.kind() == kind {
+            match r.try_resolve(ask).await {
+                Ok(Some(f)) => return Some(f),
+                Ok(None) => return None,
+                Err(e) => {
+                    warn!(kind = kind.as_str(), "resolver failed: {e:#}");
+                    return None;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Render the `<resolved_asks>` block from successful fills. Empty input ⇒
+/// empty string (caller treats that as "inject nothing", byte-identical
+/// draft prompt).
+pub fn resolved_asks_block(fills: &[ResolvedFill]) -> String {
+    if fills.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("<resolved_asks>\n");
+    for f in fills {
+        s.push_str("- [");
+        s.push_str(f.kind.as_str());
+        s.push_str("] ");
+        s.push_str(f.fill.trim());
+        s.push('\n');
+    }
+    s.push_str("</resolved_asks>");
+    s
+}
+
+/// End-to-end Phase-2 entry point: extract asks, resolve the high-confidence
+/// ones in parallel under a wall-clock budget, and return a composed
+/// `<resolved_asks>` block ready for `draft_user_message`.
+///
+/// Returns `String::new()` — meaning "inject nothing, today's behavior" —
+/// when: mode is not `Live`, no asks clear the confidence floor, or no
+/// resolver could fill any ask. The whole stage is best-effort: a timeout or
+/// error degrades to the empty block, never an error to the caller.
+pub async fn resolve_asks_block<R: Reasoner + ?Sized>(
+    reasoner: &Arc<R>,
+    mode: AskResolveMode,
+    message_body: &str,
+    ctx: ResolveCtx,
+) -> String {
+    if mode != AskResolveMode::Live {
+        return String::new();
+    }
+    let asks = detect_asks_shadow(reasoner, mode, message_body).await;
+    if asks.is_empty() {
+        return String::new();
+    }
+    let floor = confidence_floor();
+    let eligible: Vec<DetectedAsk> = asks
+        .into_iter()
+        .filter(|a| a.kind() != ResolverKind::None && a.conf() >= floor)
+        .collect();
+    if eligible.is_empty() {
+        debug!("ask-resolve: no asks cleared the confidence floor");
+        return String::new();
+    }
+    let resolvers = live_resolvers(ctx);
+    let fills = match tokio::time::timeout(
+        RESOLVE_BUDGET,
+        resolve_all(&resolvers, &eligible),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(_) => {
+            warn!("ask-resolve: budget exceeded, drafting without resolved asks");
+            return String::new();
+        }
+    };
+    if fills.is_empty() {
+        return String::new();
+    }
+    info!(n = fills.len(), "ask-resolve: injecting <resolved_asks>");
+    resolved_asks_block(&fills)
+}
+
+/// Resolve every eligible ask concurrently. Uses `tokio::join!` for the
+/// common small fan-out (≤4) and falls back to `join_all` for larger sets.
+async fn resolve_all(
+    resolvers: &[Arc<dyn AskResolver>],
+    asks: &[DetectedAsk],
+) -> Vec<ResolvedFill> {
+    // De-dupe by kind: at most one fill per resolver kind keeps the block
+    // tight and avoids redundant external calls when the extractor emits two
+    // near-identical asks.
+    let mut by_kind: Vec<&DetectedAsk> = Vec::new();
+    for a in asks {
+        if !by_kind.iter().any(|x| x.kind() == a.kind()) {
+            by_kind.push(a);
+        }
+    }
+    match by_kind.as_slice() {
+        [] => Vec::new(),
+        [a] => resolve_one(resolvers, a).await.into_iter().collect(),
+        [a, b] => {
+            let (ra, rb) =
+                tokio::join!(resolve_one(resolvers, a), resolve_one(resolvers, b));
+            [ra, rb].into_iter().flatten().collect()
+        }
+        [a, b, c] => {
+            let (ra, rb, rc) = tokio::join!(
+                resolve_one(resolvers, a),
+                resolve_one(resolvers, b),
+                resolve_one(resolvers, c),
+            );
+            [ra, rb, rc].into_iter().flatten().collect()
+        }
+        [a, b, c, d] => {
+            let (ra, rb, rc, rd) = tokio::join!(
+                resolve_one(resolvers, a),
+                resolve_one(resolvers, b),
+                resolve_one(resolvers, c),
+                resolve_one(resolvers, d),
+            );
+            [ra, rb, rc, rd].into_iter().flatten().collect()
+        }
+        many => {
+            // ≥5 distinct resolver kinds is impossible today (4 kinds), but
+            // keep a correct fallback: spawn each onto the runtime and join.
+            let mut handles = Vec::with_capacity(many.len());
+            for a in many {
+                let rs = resolvers.to_vec();
+                let ask = (*a).clone();
+                handles.push(tokio::spawn(async move {
+                    resolve_one(&rs, &ask).await
+                }));
+            }
+            let mut out = Vec::new();
+            for h in handles {
+                if let Ok(Some(f)) = h.await {
+                    out.push(f);
+                }
+            }
+            out
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Composio-backed client impls. Self-contained reqwest clients mirroring the
+// INTENTIONAL duplication endorsed in
+// `crates/augmentagent-channel-gdrive/src/composio.rs` (extracting a shared
+// crate would force edits to the prod email path).
+// ---------------------------------------------------------------------------
+
+/// Composio v3 client used by the free/busy + drive seams. 3 attempts,
+/// 429/5xx/transient retried with exponential backoff (same policy as the
+/// calendar/gdrive crates).
+pub struct ComposioResolveClient {
+    http: reqwest::Client,
+    base_url: String,
+    api_key: String,
+}
+
+impl ComposioResolveClient {
+    pub fn new(api_key: String) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base_url: "https://backend.composio.dev".into(),
+            api_key,
+        }
+    }
+    pub fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url;
+        self
+    }
+
+    async fn execute(
+        &self,
+        action: &str,
+        entity_id: &str,
+        arguments: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}/api/v3/tools/execute/{}", self.base_url, action);
+        let body = serde_json::json!({ "user_id": entity_id, "arguments": arguments });
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match self
+                .http
+                .post(&url)
+                .header("x-api-key", &self.api_key)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() {
+                        return Ok(resp.json::<serde_json::Value>().await?);
+                    }
+                    let retryable =
+                        status.as_u16() == 429 || status.is_server_error();
+                    let text = resp.text().await.unwrap_or_default();
+                    if retryable && attempt < MAX_ATTEMPTS {
+                        warn!(action, %status, attempt, "composio retryable; backing off");
+                        backoff(attempt).await;
+                        continue;
+                    }
+                    anyhow::bail!("{action} → {status}: {text}");
+                }
+                Err(e)
+                    if attempt < MAX_ATTEMPTS
+                        && (e.is_timeout() || e.is_connect() || e.is_request()) =>
+                {
+                    warn!(action, attempt, "composio transport error; retrying: {e}");
+                    backoff(attempt).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+}
+
+async fn backoff(attempt: u32) {
+    let base_ms: u64 = 300;
+    let mult: u64 = 1 << attempt.min(5);
+    tokio::time::sleep(Duration::from_millis(base_ms * mult)).await;
+}
+
+/// Recursively find the first array under any of `keys` (tolerates Composio's
+/// variable `data` / `data.response_data` nesting).
+fn find_array<'a>(
+    v: &'a serde_json::Value,
+    keys: &[&str],
+) -> Option<&'a Vec<serde_json::Value>> {
+    match v {
+        serde_json::Value::Object(m) => {
+            for k in keys {
+                if let Some(serde_json::Value::Array(a)) = m.get(*k) {
+                    return Some(a);
+                }
+            }
+            m.values().find_map(|x| find_array(x, keys))
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(|x| find_array(x, keys)),
+        _ => None,
+    }
+}
+
+#[async_trait]
+impl FreeBusyApi for ComposioResolveClient {
+    async fn busy(
+        &self,
+        entity_id: &str,
+        calendar_id: &str,
+        time_min: chrono::DateTime<Utc>,
+        time_max: chrono::DateTime<Utc>,
+    ) -> anyhow::Result<Vec<BusyInterval>> {
+        let args = serde_json::json!({
+            "timeMin": time_min.to_rfc3339(),
+            "timeMax": time_max.to_rfc3339(),
+            "items": [{ "id": calendar_id }],
+        });
+        let v = self
+            .execute("GOOGLECALENDAR_FREE_BUSY", entity_id, args)
+            .await?;
+        // Response shape: calendars.<id>.busy = [{start,end}]. Composio may
+        // nest under data/response_data — search recursively for any `busy`
+        // array of {start,end}.
+        let mut out = Vec::new();
+        if let Some(arr) = find_array(&v, &["busy"]) {
+            for it in arr {
+                let s = it.get("start").and_then(|x| x.as_str());
+                let e = it.get("end").and_then(|x| x.as_str());
+                if let (Some(s), Some(e)) = (s, e) {
+                    if let (Ok(s), Ok(e)) = (
+                        chrono::DateTime::parse_from_rfc3339(s),
+                        chrono::DateTime::parse_from_rfc3339(e),
+                    ) {
+                        out.push(BusyInterval {
+                            start: s.with_timezone(&Utc),
+                            end: e.with_timezone(&Utc),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl DriveSearchApi for ComposioResolveClient {
+    async fn search(
+        &self,
+        entity_id: &str,
+        query: &str,
+    ) -> anyhow::Result<Vec<DriveHit>> {
+        // Composio's GOOGLEDRIVE_FIND_FILE takes a `query` (Drive `q` syntax
+        // or fulltext). We pass a fulltext `name contains` style query.
+        let args = serde_json::json!({
+            "query": format!("fullText contains '{}'", query.replace('\'', " ")),
+        });
+        let v = self
+            .execute("GOOGLEDRIVE_FIND_FILE", entity_id, args)
+            .await?;
+        let mut out = Vec::new();
+        if let Some(arr) = find_array(&v, &["files", "data"]) {
+            for f in arr {
+                let name = f
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let link = f
+                    .get("webViewLink")
+                    .or_else(|| f.get("web_view_link"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if !name.is_empty() && !link.is_empty() {
+                    out.push(DriveHit {
+                        name,
+                        web_view_link: link,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use chrono::TimeZone;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Env vars are process-global; cargo runs tests in parallel threads. Any
+    /// test that mutates `AUGMENTAGENT_*` must hold this lock for its whole
+    /// body so reads/writes don't race across tests. Poison-tolerant: a
+    /// panicking test must not wedge the rest of the suite.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static L: OnceLock<Mutex<()>> = OnceLock::new();
+        match L.get_or_init(|| Mutex::new(())).lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
 
     struct CannedReasoner(Mutex<Option<String>>);
     #[async_trait]
     impl Reasoner for CannedReasoner {
-        async fn call(
-            &self,
-            _o: &ReasonerOpts,
-            _u: &str,
-        ) -> anyhow::Result<String> {
+        async fn call(&self, _o: &ReasonerOpts, _u: &str) -> anyhow::Result<String> {
             match self.0.lock().unwrap().take() {
                 Some(s) => Ok(s),
                 None => anyhow::bail!("no canned reply"),
@@ -246,20 +1148,44 @@ mod tests {
         Arc::new(CannedReasoner(Mutex::new(reply.map(String::from))))
     }
 
+    struct EnvGuard(&'static str);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+    fn set(k: &'static str, v: &str) -> EnvGuard {
+        std::env::set_var(k, v);
+        EnvGuard(k)
+    }
+
+    fn ask(kind: &str, conf: f64) -> DetectedAsk {
+        DetectedAsk {
+            text: "the ask".into(),
+            resolver_kind: kind.into(),
+            auto_fillable: true,
+            confidence: Some(conf),
+        }
+    }
+
     #[test]
-    fn mode_from_env_only_exact_shadow() {
+    fn mode_from_env_off_shadow_live() {
+        let _env = env_lock();
         std::env::remove_var("AUGMENTAGENT_ASK_RESOLVE");
         assert_eq!(AskResolveMode::from_env(), AskResolveMode::Off);
-        std::env::set_var("AUGMENTAGENT_ASK_RESOLVE", "shadow");
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE", "shadow");
         assert_eq!(AskResolveMode::from_env(), AskResolveMode::Shadow);
-        std::env::set_var("AUGMENTAGENT_ASK_RESOLVE", "on");
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE", "live");
+        assert_eq!(AskResolveMode::from_env(), AskResolveMode::Live);
+        assert!(AskResolveMode::Live.runs_extractor());
+        assert!(AskResolveMode::Shadow.runs_extractor());
+        assert!(!AskResolveMode::Off.runs_extractor());
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE", "on");
         assert_eq!(AskResolveMode::from_env(), AskResolveMode::Off);
-        std::env::remove_var("AUGMENTAGENT_ASK_RESOLVE");
     }
 
     #[tokio::test]
     async fn off_mode_makes_no_call_and_returns_empty() {
-        // Reasoner would error if called; Off must short-circuit.
         let r = reasoner(None);
         let asks = detect_asks_shadow(&r, AskResolveMode::Off, "can we meet tuesday?").await;
         assert!(asks.is_empty());
@@ -285,16 +1211,297 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stub_resolvers_never_resolve() {
-        let ask = DetectedAsk {
-            text: "book time".into(),
-            resolver_kind: "calendly".into(),
-            auto_fillable: true,
-            confidence: Some(0.9),
-        };
-        for r in default_resolvers() {
-            assert!(r.try_resolve(&ask).await.unwrap().is_none());
+    async fn resolvers_noop_without_flags() {
+        let _env = env_lock();
+        // No per-resolver env flags ⇒ every live resolver is a guaranteed
+        // no-op even with a fully-populated context.
+        std::env::remove_var("AUGMENTAGENT_ASK_RESOLVE_SCHEDULING");
+        std::env::remove_var("AUGMENTAGENT_ASK_RESOLVE_CALENDLY");
+        std::env::remove_var("AUGMENTAGENT_ASK_RESOLVE_SHARE_DOC");
+        std::env::remove_var("AUGMENTAGENT_ASK_RESOLVE_INTRO");
+        let ctx = ResolveCtx::default();
+        for r in live_resolvers(ctx) {
+            assert!(r
+                .try_resolve(&ask(r.kind().as_str(), 0.9))
+                .await
+                .unwrap()
+                .is_none());
         }
+    }
+
+    #[test]
+    fn first_open_slots_skips_busy_and_weekends() {
+        // Friday 2026-05-15 08:00 UTC. Slots should land Fri >=09:00 then,
+        // skipping the weekend, Monday.
+        let now = Utc.with_ymd_and_hms(2026, 5, 15, 8, 0, 0).unwrap();
+        let busy = vec![BusyInterval {
+            start: Utc.with_ymd_and_hms(2026, 5, 15, 9, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 5, 15, 16, 0, 0).unwrap(),
+        }];
+        let slots = first_open_slots(now, &busy, 9);
+        assert_eq!(slots.len(), 3);
+        // First free slot is Fri 16:00 (after the busy block, before 17:00).
+        assert_eq!(slots[0], Utc.with_ymd_and_hms(2026, 5, 15, 16, 0, 0).unwrap());
+        // No slot may fall on Sat/Sun.
+        for s in &slots {
+            assert!(!matches!(s.weekday(), Weekday::Sat | Weekday::Sun));
+        }
+    }
+
+    #[test]
+    fn first_open_slots_all_busy_returns_empty() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 18, 8, 0, 0).unwrap(); // Monday
+        let busy = vec![BusyInterval {
+            start: Utc.with_ymd_and_hms(2026, 5, 18, 0, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 5, 30, 0, 0, 0).unwrap(),
+        }];
+        assert!(first_open_slots(now, &busy, 9).is_empty());
+    }
+
+    struct FakeFb(Vec<BusyInterval>);
+    #[async_trait]
+    impl FreeBusyApi for FakeFb {
+        async fn busy(
+            &self,
+            _e: &str,
+            _c: &str,
+            _a: chrono::DateTime<Utc>,
+            _b: chrono::DateTime<Utc>,
+        ) -> anyhow::Result<Vec<BusyInterval>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduling_resolver_live_path() {
+        let _env = env_lock();
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_SCHEDULING", "1");
+        let ctx = ResolveCtx {
+            entity_id: Some("ent".into()),
+            freebusy: Some(Arc::new(FakeFb(vec![]))),
+            ..Default::default()
+        };
+        let r = SchedulingResolver::new(ctx);
+        let out = r.try_resolve(&ask("scheduling", 0.9)).await.unwrap();
+        let f = out.expect("should resolve with empty calendar");
+        assert_eq!(f.kind, ResolverKind::Scheduling);
+        assert!(f.fill.contains("UTC"));
+    }
+
+    #[tokio::test]
+    async fn scheduling_resolver_wrong_kind_is_none() {
+        let _env = env_lock();
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_SCHEDULING", "1");
+        let ctx = ResolveCtx {
+            entity_id: Some("ent".into()),
+            freebusy: Some(Arc::new(FakeFb(vec![]))),
+            ..Default::default()
+        };
+        let r = SchedulingResolver::new(ctx);
+        assert!(r.try_resolve(&ask("intro", 0.9)).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn calendly_resolver_env_then_wiki() {
+        let _env = env_lock();
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_CALENDLY", "1");
+        let _u = set("AUGMENTAGENT_CALENDLY_URL", "https://calendly.com/nolan/30min");
+        let r = CalendlyResolver::new(ResolveCtx::default());
+        let f = r.try_resolve(&ask("calendly", 0.9)).await.unwrap().unwrap();
+        assert!(f.fill.contains("calendly.com/nolan/30min"));
+    }
+
+    #[tokio::test]
+    async fn calendly_resolver_from_wiki_index() {
+        let _env = env_lock();
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_CALENDLY", "1");
+        std::env::remove_var("AUGMENTAGENT_CALENDLY_URL");
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("index.md"),
+            "# Wiki\n\nBook me: https://calendly.com/team/intro-chat (15 min)\n",
+        )
+        .unwrap();
+        let ctx = ResolveCtx {
+            wiki_root: Some(d.path().to_path_buf()),
+            ..Default::default()
+        };
+        let r = CalendlyResolver::new(ctx);
+        let f = r.try_resolve(&ask("calendly", 0.9)).await.unwrap().unwrap();
+        assert!(f.fill.contains("calendly.com/team/intro-chat"));
+    }
+
+    struct FakeDrive(Vec<DriveHit>);
+    #[async_trait]
+    impl DriveSearchApi for FakeDrive {
+        async fn search(&self, _e: &str, _q: &str) -> anyhow::Result<Vec<DriveHit>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn share_doc_drive_hit() {
+        let _env = env_lock();
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_SHARE_DOC", "1");
+        let ctx = ResolveCtx {
+            entity_id: Some("ent".into()),
+            drive: Some(Arc::new(FakeDrive(vec![DriveHit {
+                name: "Q4 Investor Deck".into(),
+                web_view_link: "https://drive.google.com/file/Q4".into(),
+            }]))),
+            ..Default::default()
+        };
+        let r = ShareDocResolver::new(ctx);
+        let mut a = ask("share_doc", 0.9);
+        a.text = "can you send me the Q4 investor deck".into();
+        let f = r.try_resolve(&a).await.unwrap().unwrap();
+        assert!(f.fill.contains("drive.google.com/file/Q4"));
+    }
+
+    #[tokio::test]
+    async fn share_doc_wiki_link_fallback() {
+        let _env = env_lock();
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_SHARE_DOC", "1");
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("index.md"),
+            "# Wiki\n\nThe [Q4 deck](https://docs.example.com/q4) is here.\n",
+        )
+        .unwrap();
+        let ctx = ResolveCtx {
+            wiki_root: Some(d.path().to_path_buf()),
+            ..Default::default()
+        };
+        let r = ShareDocResolver::new(ctx);
+        let mut a = ask("share_doc", 0.9);
+        a.text = "share the Q4 deck".into();
+        let f = r.try_resolve(&a).await.unwrap().unwrap();
+        assert!(f.fill.contains("docs.example.com/q4"));
+    }
+
+    #[tokio::test]
+    async fn intro_resolver_is_suggestion_only_and_never_executes() {
+        let _env = env_lock();
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_INTRO", "1");
+        let d = tempfile::tempdir().unwrap();
+        let people = d.path().join("people");
+        std::fs::create_dir_all(&people).unwrap();
+        std::fs::write(
+            people.join("sarah_chen_at_acme_com.md"),
+            "---\nkind: person\nkey: sarah\nidentities:\n  email: [sarah.chen@acme.com]\n---\n\n# Sarah Chen\n",
+        )
+        .unwrap();
+        let ctx = ResolveCtx {
+            wiki_root: Some(d.path().to_path_buf()),
+            ..Default::default()
+        };
+        let r = IntroResolver::new(ctx);
+        let mut a = ask("intro", 0.9);
+        a.text = "can you intro me to Sarah Chen who runs AI infra".into();
+        let f = r.try_resolve(&a).await.unwrap().unwrap();
+        assert_eq!(f.kind, ResolverKind::Intro);
+        // Hard guarantee: never an execution instruction.
+        assert!(f.fill.contains("SUGGESTION"));
+        assert!(f.fill.contains("MUST NOT"));
+        assert!(f.fill.contains("explicit"));
+        assert!(f.fill.contains("sarah.chen@acme.com"));
+    }
+
+    #[tokio::test]
+    async fn intro_resolver_unknown_person_is_none() {
+        let _env = env_lock();
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_INTRO", "1");
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("people")).unwrap();
+        let ctx = ResolveCtx {
+            wiki_root: Some(d.path().to_path_buf()),
+            ..Default::default()
+        };
+        let r = IntroResolver::new(ctx);
+        let mut a = ask("intro", 0.9);
+        a.text = "intro me to Nobody Here".into();
+        assert!(r.try_resolve(&a).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn resolved_asks_block_empty_is_empty_string() {
+        assert_eq!(resolved_asks_block(&[]), "");
+    }
+
+    #[test]
+    fn resolved_asks_block_renders_kinds() {
+        let b = resolved_asks_block(&[
+            ResolvedFill {
+                kind: ResolverKind::Calendly,
+                fill: "link: x".into(),
+            },
+            ResolvedFill {
+                kind: ResolverKind::Scheduling,
+                fill: "slots: y".into(),
+            },
+        ]);
+        assert!(b.starts_with("<resolved_asks>\n"));
+        assert!(b.trim_end().ends_with("</resolved_asks>"));
+        assert!(b.contains("[calendly] link: x"));
+        assert!(b.contains("[scheduling] slots: y"));
+    }
+
+    #[tokio::test]
+    async fn resolve_asks_block_off_and_shadow_inject_nothing() {
+        let _env = env_lock();
+        let r = reasoner(Some(
+            r#"{"asks":[{"text":"x","resolver_kind":"calendly","confidence":0.9}]}"#,
+        ));
+        // Off: empty regardless.
+        assert_eq!(
+            resolve_asks_block(&r, AskResolveMode::Off, "book me", ResolveCtx::default()).await,
+            ""
+        );
+        // Shadow: extractor may run but injection is suppressed.
+        let r2 = reasoner(Some(
+            r#"{"asks":[{"text":"x","resolver_kind":"calendly","confidence":0.9}]}"#,
+        ));
+        assert_eq!(
+            resolve_asks_block(&r2, AskResolveMode::Shadow, "book me", ResolveCtx::default())
+                .await,
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_asks_block_below_floor_injects_nothing() {
+        let _env = env_lock();
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_CALENDLY", "1");
+        let _u = set("AUGMENTAGENT_CALENDLY_URL", "https://calendly.com/x/y");
+        let r = reasoner(Some(
+            r#"{"asks":[{"text":"got a calendly?","resolver_kind":"calendly","confidence":0.4}]}"#,
+        ));
+        // 0.4 < 0.7 floor ⇒ nothing.
+        assert_eq!(
+            resolve_asks_block(&r, AskResolveMode::Live, "got a calendly?", ResolveCtx::default())
+                .await,
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_asks_block_live_end_to_end() {
+        let _env = env_lock();
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_CALENDLY", "1");
+        let _u = set("AUGMENTAGENT_CALENDLY_URL", "https://calendly.com/nolan/30");
+        let r = reasoner(Some(
+            r#"{"asks":[{"text":"got a calendly?","resolver_kind":"calendly","confidence":0.92}]}"#,
+        ));
+        let block = resolve_asks_block(
+            &r,
+            AskResolveMode::Live,
+            "Hey, got a Calendly link?",
+            ResolveCtx::default(),
+        )
+        .await;
+        assert!(block.contains("<resolved_asks>"));
+        assert!(block.contains("calendly.com/nolan/30"));
+        assert!(block.contains("[calendly]"));
     }
 
     #[test]
@@ -309,5 +1516,27 @@ mod tests {
             assert_eq!(ResolverKind::parse(k.as_str()), k);
         }
         assert_eq!(ResolverKind::parse("weird"), ResolverKind::None);
+    }
+
+    #[test]
+    fn doc_query_strips_stopwords() {
+        assert_eq!(doc_query("can you send me the Q4 investor deck"), "Q4 investor deck");
+    }
+
+    #[test]
+    fn guess_target_name_picks_capitalized_run() {
+        assert_eq!(
+            guess_target_name("can you intro me to Sarah Chen about infra").as_deref(),
+            Some("Sarah Chen")
+        );
+    }
+
+    #[test]
+    fn find_booking_url_handles_markdown_and_trailing_punct() {
+        assert_eq!(
+            find_booking_url("book here (https://calendly.com/a/b)."),
+            Some("https://calendly.com/a/b".to_string())
+        );
+        assert_eq!(find_booking_url("no link here"), None);
     }
 }
