@@ -27,8 +27,66 @@ use uuid::Uuid;
 use augmentagent_store::Store;
 
 use crate::api::{
-    TwitterApi, TwitterError, DEFAULT_CREATE_TWEET_QUERY_ID,
+    QueryIdResolver, TwitterApi, TwitterError, DEFAULT_CREATE_TWEET_QUERY_ID,
+    DEFAULT_USER_TWEETS_QUERY_ID,
 };
+
+/// The store-backed [`QueryIdResolver`]: full cache → env → static-default
+/// chain, in trust order. Injected into [`crate::api::TwitterClient`] via
+/// `with_resolver` so the live API client survives an X queryId rotation —
+/// it walks every candidate before surfacing
+/// [`TwitterError::QueryIdRotated`], at which point the operator captures a
+/// fresh id (see docs/twitter-protocol.md runbook) and `put_twitter_query_id`
+/// caches it for the next boot with no recompile.
+pub struct StoreQueryIdResolver {
+    store: Arc<Store>,
+}
+
+impl StoreQueryIdResolver {
+    pub fn new(store: Arc<Store>) -> Self {
+        Self { store }
+    }
+}
+
+impl QueryIdResolver for StoreQueryIdResolver {
+    fn candidates(&self, op: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let push = |v: String, out: &mut Vec<String>| {
+            if !v.is_empty() && !out.contains(&v) {
+                out.push(v);
+            }
+        };
+        // 1. store cache (operation name as stored, e.g. `CreateTweet`)
+        if let Ok(Some(qid)) = self.store.twitter_query_id(op) {
+            push(qid, &mut out);
+        }
+        // 2. env override (`AUGMENTAGENT_TWITTER_<OP>_QUERY_ID`)
+        let env_key = format!(
+            "AUGMENTAGENT_TWITTER_{}_QUERY_ID",
+            op.chars()
+                .enumerate()
+                .flat_map(|(i, c)| {
+                    if c.is_ascii_uppercase() && i != 0 {
+                        vec!['_', c]
+                    } else {
+                        vec![c.to_ascii_uppercase()]
+                    }
+                })
+                .collect::<String>()
+        );
+        if let Ok(v) = std::env::var(&env_key) {
+            push(v, &mut out);
+        }
+        // 3. static default
+        let default = match op {
+            "UserTweets" => DEFAULT_USER_TWEETS_QUERY_ID,
+            "CreateTweet" => DEFAULT_CREATE_TWEET_QUERY_ID,
+            _ => "",
+        };
+        push(default.to_string(), &mut out);
+        out
+    }
+}
 
 /// Hard daily ceiling on agent-initiated posts (#79). Deliberately far below
 /// X's published free-tier cap — the user should own most of their own

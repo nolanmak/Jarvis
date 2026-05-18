@@ -35,6 +35,74 @@ use crate::types::{Tweet, TwitterDm};
 pub const DEFAULT_USER_TWEETS_QUERY_ID: &str = "E3opETHurmVJflFsUBVuUQ";
 pub const DEFAULT_CREATE_TWEET_QUERY_ID: &str = "SoVnbfCycZ7fkQT1yYP3Lw";
 
+/// Origin for every X internal-API call. Defaults to `https://x.com`; the
+/// `AUGMENTAGENT_TWITTER_BASE_URL` override lets the wiremock-backed
+/// validation/error tests + the `twitter validate` harness's self-test point
+/// the client at a local mock with no network call. Production never sets it.
+pub fn base_url() -> String {
+    std::env::var("AUGMENTAGENT_TWITTER_BASE_URL")
+        .unwrap_or_else(|_| "https://x.com".to_string())
+}
+
+/// Conservative default backoff (seconds) when X 429s without a parseable
+/// `Retry-After` or `x-rate-limit-reset`.
+pub const DEFAULT_RATE_LIMIT_BACKOFF_SECS: u64 = 15 * 60;
+
+/// A resolver for GraphQL `queryId`s. The client owns the
+/// store→env→default fallback chain through this trait so it stays
+/// store-free and trivially mockable (the store-backed impl lives behind a
+/// blanket `dyn` in the channel layer). On a [`TwitterError::QueryIdRotated`]
+/// the client asks the resolver to *skip* the failing id and produce the
+/// next candidate, so a single redeploy doesn't wedge the channel.
+pub trait QueryIdResolver: Send + Sync {
+    /// The candidate chain for `op` (a GraphQL operation name like
+    /// `UserTweets`), most-trusted first. The client tries them in order on
+    /// a `QueryIdRotated` until one resolves or the chain is exhausted.
+    fn candidates(&self, op: &str) -> Vec<String>;
+}
+
+/// The default, store-free resolver: env override → static default. Mirrors
+/// the legacy [`TwitterClient::query_id_for`] behavior but exposes the full
+/// chain so the client can fall through on rotation.
+pub struct EnvQueryIdResolver;
+
+impl QueryIdResolver for EnvQueryIdResolver {
+    fn candidates(&self, op: &str) -> Vec<String> {
+        let default = match op {
+            "UserTweets" => DEFAULT_USER_TWEETS_QUERY_ID,
+            "CreateTweet" => DEFAULT_CREATE_TWEET_QUERY_ID,
+            _ => "",
+        };
+        let env_key = format!(
+            "AUGMENTAGENT_TWITTER_{}_QUERY_ID",
+            op_to_env(op)
+        );
+        let mut out = Vec::new();
+        if let Ok(v) = std::env::var(&env_key) {
+            if !v.is_empty() {
+                out.push(v);
+            }
+        }
+        if !default.is_empty() && !out.iter().any(|c| c == default) {
+            out.push(default.to_string());
+        }
+        out
+    }
+}
+
+/// `UserTweets` → `USER_TWEETS`, `CreateTweet` → `CREATE_TWEET`. Splits on
+/// camel-case humps for the env-var convention used since #79.
+fn op_to_env(op: &str) -> String {
+    let mut s = String::with_capacity(op.len() + 4);
+    for (i, c) in op.chars().enumerate() {
+        if c.is_ascii_uppercase() && i != 0 {
+            s.push('_');
+        }
+        s.push(c.to_ascii_uppercase());
+    }
+    s
+}
+
 /// The boolean `features` map X requires on `UserTweets` / `CreateTweet`
 /// GraphQL calls. Stale entries here are the #1 cause of HTTP 400 from X;
 /// REQUIRES LIVE OPERATOR VALIDATION (see docs/twitter-protocol.md §2,§3).
@@ -71,8 +139,38 @@ fn graphql_features() -> serde_json::Value {
 pub enum TwitterError {
     #[error("http: {0}")]
     Http(#[from] reqwest::Error),
+    /// Terminal session failure (401/403). The caller must halt polling and
+    /// re-harvest cookies — backoff does not help here.
     #[error("auth expired (401/403); re-run `augmentagent twitter login`")]
     AuthExpired,
+    /// HTTP 429 — rate limited. `retry_after_secs` is the best estimate of
+    /// when it's safe to retry (from `Retry-After`, else `x-rate-limit-reset`,
+    /// else a conservative default). Transient: the caller may back off and
+    /// retry rather than treating it as terminal.
+    #[error("rate limited on {op}; retry after ~{retry_after_secs}s (limit {limit:?}, remaining {remaining:?})")]
+    RateLimited {
+        op: String,
+        retry_after_secs: u64,
+        limit: Option<u64>,
+        remaining: Option<u64>,
+    },
+    /// HTTP 404/400 on a GraphQL op — the classic signature of a rotated
+    /// `queryId` (X redeployed and the hashed id we used no longer resolves).
+    /// Recoverable by re-resolving the id from a fresher source (capture /
+    /// env / a new default) and retrying — distinct from a hard API error.
+    #[error("queryId rotated on {op} (status {status}); refresh the queryId — see docs/twitter-protocol.md §2")]
+    QueryIdRotated { op: String, status: u16 },
+    /// The HTTP call succeeded (2xx) but the body didn't match the documented
+    /// shape — yielded zero parsed records from a non-empty payload. The raw
+    /// body is logged at WARN before this is returned so the operator can
+    /// diff it against the spec; `body_excerpt` is a short prefix for the
+    /// error chain.
+    #[error("schema drift on {op}: parsed 0 records from a {body_len}B body; raw logged at WARN. excerpt: {body_excerpt}")]
+    SchemaDrift {
+        op: String,
+        body_len: usize,
+        body_excerpt: String,
+    },
     #[error("graphql/{op}: {status}: {body}")]
     Api {
         op: String,
@@ -83,6 +181,32 @@ pub enum TwitterError {
     Decode(String),
     #[error("config: {0}")]
     Config(String),
+}
+
+impl TwitterError {
+    /// True for errors where a bounded retry (after [`Self::backoff`]) is
+    /// sane. `AuthExpired` is terminal; `QueryIdRotated` is recoverable only
+    /// after the caller refreshes the id, so it is *not* a blind-retry case.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, TwitterError::RateLimited { .. } | TwitterError::Http(_))
+    }
+
+    /// Suggested backoff before a retry of a [`Self::is_transient`] error.
+    /// Honors the server's retry hint on `RateLimited`; otherwise an
+    /// exponential schedule capped at 5min keyed off `attempt` (0-based).
+    pub fn backoff(&self, attempt: u32) -> std::time::Duration {
+        use std::time::Duration;
+        if let TwitterError::RateLimited {
+            retry_after_secs, ..
+        } = self
+        {
+            // Respect the server hint but never sleep more than 15min.
+            return Duration::from_secs((*retry_after_secs).min(15 * 60));
+        }
+        // 2^attempt seconds, jitter-free, capped at 300s.
+        let secs = 1u64.checked_shl(attempt).unwrap_or(u64::MAX).min(300);
+        Duration::from_secs(secs)
+    }
 }
 
 /// Friend-post engagement surface (#15).
@@ -122,23 +246,54 @@ pub trait TwitterApi: Send + Sync {
 pub struct TwitterClient {
     http: reqwest::Client,
     auth: TwitterAuth,
+    resolver: std::sync::Arc<dyn QueryIdResolver>,
 }
 
 impl TwitterClient {
     pub fn new(auth: TwitterAuth) -> Self {
+        Self::with_resolver(auth, std::sync::Arc::new(EnvQueryIdResolver))
+    }
+
+    /// Construct with a custom [`QueryIdResolver`] — used by the channel to
+    /// inject the store-backed (cache → env → default) chain, and by tests
+    /// to feed a deterministic rotation chain.
+    pub fn with_resolver(
+        auth: TwitterAuth,
+        resolver: std::sync::Arc<dyn QueryIdResolver>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(auth.user_agent.clone())
             .build()
             .expect("reqwest client build");
-        Self { http, auth }
+        Self {
+            http,
+            auth,
+            resolver,
+        }
     }
 
     /// Resolve a queryId for an operation: env override → static default.
-    /// (The store cache layer is consulted by the channel, not here, to keep
-    /// the client store-free and trivially mockable.)
+    /// Retained for back-compat with #79 callers; new code should go through
+    /// the [`QueryIdResolver`] chain (rotation-tolerant).
     pub fn query_id_for(op: &str, default: &str) -> String {
         let env_key = format!("AUGMENTAGENT_TWITTER_{}_QUERY_ID", op.to_uppercase());
         std::env::var(env_key).unwrap_or_else(|_| default.to_string())
+    }
+
+    /// Ordered queryId candidates for `op` from the injected resolver, with
+    /// the static default appended as a last-ditch entry so the chain is
+    /// never empty even if the resolver returns nothing.
+    fn query_id_chain(&self, op: &str) -> Vec<String> {
+        let mut chain = self.resolver.candidates(op);
+        let default = match op {
+            "UserTweets" => DEFAULT_USER_TWEETS_QUERY_ID,
+            "CreateTweet" => DEFAULT_CREATE_TWEET_QUERY_ID,
+            _ => "",
+        };
+        if !default.is_empty() && !chain.iter().any(|c| c == default) {
+            chain.push(default.to_string());
+        }
+        chain
     }
 
     fn base_headers(&self) -> Result<reqwest::header::HeaderMap, TwitterError> {
@@ -172,16 +327,113 @@ impl TwitterClient {
         Ok(h)
     }
 
-    fn map_status(op: &str, status: reqwest::StatusCode, body: String) -> TwitterError {
-        if status.as_u16() == 401 || status.as_u16() == 403 {
+    /// Classify a non-2xx response into a typed error. `headers` is consulted
+    /// for the rate-limit window on 429. `graphql` flags GraphQL ops, where a
+    /// 400/404 is the queryId-rotation signature (REST DM endpoints 400 for
+    /// other reasons, so they fall through to the generic `Api` error).
+    fn map_status(
+        op: &str,
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+        body: String,
+        graphql: bool,
+    ) -> TwitterError {
+        let code = status.as_u16();
+        if code == 401 || code == 403 {
             return TwitterError::AuthExpired;
+        }
+        if code == 429 {
+            let (retry_after_secs, limit, remaining) = parse_rate_limit(headers);
+            return TwitterError::RateLimited {
+                op: op.into(),
+                retry_after_secs,
+                limit,
+                remaining,
+            };
+        }
+        if graphql && (code == 404 || code == 400) {
+            // 404 = unknown queryId path; 400 on a GraphQL op is most often a
+            // stale id/features map. Both are the rotation signature — the
+            // caller walks the next candidate rather than hard-failing.
+            return TwitterError::QueryIdRotated {
+                op: op.into(),
+                status: code,
+            };
         }
         TwitterError::Api {
             op: op.into(),
-            status: status.as_u16(),
+            status: code,
             body,
         }
     }
+}
+
+/// Pull `(retry_after_secs, x-rate-limit-limit, x-rate-limit-remaining)` off
+/// a 429 response. Priority for the retry estimate:
+/// 1. `retry-after` (RFC 7231 delta-seconds — X sends this on hard limits)
+/// 2. `x-rate-limit-reset` (unix seconds) minus now, floored at 1s
+/// 3. [`DEFAULT_RATE_LIMIT_BACKOFF_SECS`]
+fn parse_rate_limit(
+    headers: &reqwest::header::HeaderMap,
+) -> (u64, Option<u64>, Option<u64>) {
+    let h = |name: &str| -> Option<u64> {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
+    let limit = h("x-rate-limit-limit");
+    let remaining = h("x-rate-limit-remaining");
+    let retry = if let Some(ra) = h("retry-after") {
+        ra
+    } else if let Some(reset) = h("x-rate-limit-reset") {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        reset.saturating_sub(now).max(1)
+    } else {
+        DEFAULT_RATE_LIMIT_BACKOFF_SECS
+    };
+    (retry, limit, remaining)
+}
+
+/// Emit the raw body at WARN and build a [`TwitterError::SchemaDrift`]. Called
+/// when a 2xx response parsed to zero records — so an X web deploy that
+/// reshapes the JSON surfaces loudly (with the body to diff) instead of the
+/// channel silently going quiet.
+fn schema_drift(op: &str, body: &str) -> TwitterError {
+    tracing::warn!(
+        op,
+        body_len = body.len(),
+        raw_body = %body,
+        "twitter schema drift: 2xx response parsed to 0 records — \
+         X may have reshaped the response; diff against docs/twitter-protocol.md"
+    );
+    let excerpt: String = body.chars().take(200).collect();
+    TwitterError::SchemaDrift {
+        op: op.into(),
+        body_len: body.len(),
+        body_excerpt: excerpt,
+    }
+}
+
+/// Heuristic: does this 2xx body look like a populated timeline/inbox (so an
+/// empty parse is genuinely "no new items") vs. an error/shape we don't
+/// recognize (schema drift)? X returns `{ "errors": [...] }` with a 200 for
+/// some GraphQL faults, and a reshaped success body won't carry our anchor
+/// keys. We only flag drift when the body is non-trivial AND lacks every
+/// known anchor for the op.
+fn looks_like_drift(op: &str, body: &str) -> bool {
+    if body.trim().len() < 16 {
+        return false; // genuinely-empty / `{}` style — treat as "no items"
+    }
+    let anchors: &[&str] = match op {
+        "UserTweets" => &["timeline", "instructions", "\"errors\"", "tweet_results"],
+        "dm_inbox" => &["inbox_initial_state", "entries", "\"errors\"", "conversations"],
+        _ => return false,
+    };
+    !anchors.iter().any(|a| body.contains(a))
 }
 
 #[async_trait]
@@ -191,7 +443,6 @@ impl TwitterApi for TwitterClient {
         user_id: &str,
         since_id: Option<&str>,
     ) -> Result<Vec<Tweet>, TwitterError> {
-        let qid = Self::query_id_for("USER_TWEETS", DEFAULT_USER_TWEETS_QUERY_ID);
         let variables = serde_json::json!({
             "userId": user_id,
             "count": 20,
@@ -200,29 +451,60 @@ impl TwitterApi for TwitterClient {
             "withVoice": true,
             "withV2Timeline": true,
         });
-        let url = format!(
-            "https://x.com/i/api/graphql/{qid}/UserTweets?variables={}&features={}",
-            urlencoding(&variables.to_string()),
-            urlencoding(&graphql_features().to_string()),
-        );
+        let features = graphql_features().to_string();
+        let vars = variables.to_string();
 
-        let resp = self
-            .http
-            .get(&url)
-            .headers(self.base_headers()?)
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Self::map_status("UserTweets", status, body));
+        // Walk the queryId chain: on a rotation signal (404/400) drop to the
+        // next candidate; on any other outcome (success or hard error) stop.
+        let chain = self.query_id_chain("UserTweets");
+        let mut last_rotation: Option<TwitterError> = None;
+        for (i, qid) in chain.iter().enumerate() {
+            let url = format!(
+                "{}/i/api/graphql/{qid}/UserTweets?variables={}&features={}",
+                base_url(),
+                urlencoding(&vars),
+                urlencoding(&features),
+            );
+            let resp = self
+                .http
+                .get(&url)
+                .headers(self.base_headers()?)
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let headers = resp.headers().clone();
+                let body = resp.text().await.unwrap_or_default();
+                let err = Self::map_status("UserTweets", status, &headers, body, true);
+                if matches!(err, TwitterError::QueryIdRotated { .. }) {
+                    tracing::warn!(
+                        op = "UserTweets",
+                        attempted_query_id = %qid,
+                        next = i + 1 < chain.len(),
+                        "twitter queryId rotated; trying next candidate"
+                    );
+                    last_rotation = Some(err);
+                    continue;
+                }
+                return Err(err);
+            }
+            let raw = resp
+                .text()
+                .await
+                .map_err(|e| TwitterError::Decode(format!("UserTweets body: {e}")))?;
+            let payload: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|e| TwitterError::Decode(format!("UserTweets json: {e}")))?;
+            let tweets = parse_user_tweets(&payload, user_id);
+            if tweets.is_empty() && looks_like_drift("UserTweets", &raw) {
+                return Err(schema_drift("UserTweets", &raw));
+            }
+            return Ok(filter_since(tweets, since_id));
         }
-        let payload: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| TwitterError::Decode(format!("UserTweets json: {e}")))?;
-        let tweets = parse_user_tweets(&payload, user_id);
-        Ok(filter_since(tweets, since_id))
+        // Exhausted every candidate, all rotated.
+        Err(last_rotation.unwrap_or(TwitterError::QueryIdRotated {
+            op: "UserTweets".into(),
+            status: 404,
+        }))
     }
 
     async fn reply_to_tweet(
@@ -230,46 +512,67 @@ impl TwitterApi for TwitterClient {
         tweet_id: &str,
         text: &str,
     ) -> Result<String, TwitterError> {
-        let qid = Self::query_id_for("CREATE_TWEET", DEFAULT_CREATE_TWEET_QUERY_ID);
-        let url = format!("https://x.com/i/api/graphql/{qid}/CreateTweet");
-        let body = serde_json::json!({
-            "variables": {
-                "tweet_text": text,
-                "reply": { "in_reply_to_tweet_id": tweet_id, "exclude_reply_user_ids": [] },
-                "dark_request": false,
-                "media": { "media_entities": [], "possibly_sensitive": false },
-                "semantic_annotation_ids": [],
-            },
-            "features": graphql_features(),
-            "queryId": qid,
-        });
-        let resp = self
-            .http
-            .post(&url)
-            .headers(self.base_headers()?)
-            .body(serde_json::to_vec(&body).expect("serialize CreateTweet"))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Self::map_status("CreateTweet", status, body));
+        let chain = self.query_id_chain("CreateTweet");
+        let mut last_rotation: Option<TwitterError> = None;
+        for (i, qid) in chain.iter().enumerate() {
+            let url =
+                format!("{}/i/api/graphql/{qid}/CreateTweet", base_url());
+            let body = serde_json::json!({
+                "variables": {
+                    "tweet_text": text,
+                    "reply": { "in_reply_to_tweet_id": tweet_id, "exclude_reply_user_ids": [] },
+                    "dark_request": false,
+                    "media": { "media_entities": [], "possibly_sensitive": false },
+                    "semantic_annotation_ids": [],
+                },
+                "features": graphql_features(),
+                "queryId": qid,
+            });
+            let resp = self
+                .http
+                .post(&url)
+                .headers(self.base_headers()?)
+                .body(serde_json::to_vec(&body).expect("serialize CreateTweet"))
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let headers = resp.headers().clone();
+                let body = resp.text().await.unwrap_or_default();
+                let err = Self::map_status("CreateTweet", status, &headers, body, true);
+                if matches!(err, TwitterError::QueryIdRotated { .. }) {
+                    tracing::warn!(
+                        op = "CreateTweet",
+                        attempted_query_id = %qid,
+                        next = i + 1 < chain.len(),
+                        "twitter queryId rotated; trying next candidate"
+                    );
+                    last_rotation = Some(err);
+                    continue;
+                }
+                return Err(err);
+            }
+            let v: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| TwitterError::Decode(format!("CreateTweet json: {e}")))?;
+            return Ok(find_string_field(&v, "rest_id").unwrap_or_default());
         }
-        let v: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| TwitterError::Decode(format!("CreateTweet json: {e}")))?;
-        Ok(find_string_field(&v, "rest_id").unwrap_or_default())
+        Err(last_rotation.unwrap_or(TwitterError::QueryIdRotated {
+            op: "CreateTweet".into(),
+            status: 404,
+        }))
     }
 
     async fn fetch_dm_inbox(
         &self,
         cursor: Option<&str>,
     ) -> Result<Vec<TwitterDm>, TwitterError> {
-        let mut url = String::from(
-            "https://x.com/i/api/1.1/dm/inbox_initial_state.json\
+        let mut url = format!(
+            "{}/i/api/1.1/dm/inbox_initial_state.json\
              ?nsfw_filtering_enabled=false&filter_low_quality=false\
              &include_quality=all&dm_secret_conversations_enabled=false",
+            base_url(),
         );
         if let Some(c) = cursor {
             url.push_str(&format!("&max_id={}", urlencoding(c)));
@@ -282,14 +585,21 @@ impl TwitterApi for TwitterClient {
             .await?;
         let status = resp.status();
         if !status.is_success() {
+            let headers = resp.headers().clone();
             let body = resp.text().await.unwrap_or_default();
-            return Err(Self::map_status("dm_inbox", status, body));
+            return Err(Self::map_status("dm_inbox", status, &headers, body, false));
         }
-        let payload: serde_json::Value = resp
-            .json()
+        let raw = resp
+            .text()
             .await
+            .map_err(|e| TwitterError::Decode(format!("dm_inbox body: {e}")))?;
+        let payload: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| TwitterError::Decode(format!("dm_inbox json: {e}")))?;
-        Ok(parse_dm_inbox(&payload))
+        let dms = parse_dm_inbox(&payload);
+        if dms.is_empty() && looks_like_drift("dm_inbox", &raw) {
+            return Err(schema_drift("dm_inbox", &raw));
+        }
+        Ok(dms)
     }
 
     async fn send_dm(
@@ -297,7 +607,7 @@ impl TwitterApi for TwitterClient {
         conversation_id: &str,
         text: &str,
     ) -> Result<String, TwitterError> {
-        let url = "https://x.com/i/api/1.1/dm/new2.json";
+        let url = format!("{}/i/api/1.1/dm/new2.json", base_url());
         let body = serde_json::json!({
             "conversation_id": conversation_id,
             "recipient_ids": false,
@@ -310,15 +620,16 @@ impl TwitterApi for TwitterClient {
         });
         let resp = self
             .http
-            .post(url)
+            .post(&url)
             .headers(self.base_headers()?)
             .body(serde_json::to_vec(&body).expect("serialize new2"))
             .send()
             .await?;
         let status = resp.status();
         if !status.is_success() {
+            let headers = resp.headers().clone();
             let body = resp.text().await.unwrap_or_default();
-            return Err(Self::map_status("dm_new2", status, body));
+            return Err(Self::map_status("dm_new2", status, &headers, body, false));
         }
         let v: serde_json::Value = resp
             .json()
