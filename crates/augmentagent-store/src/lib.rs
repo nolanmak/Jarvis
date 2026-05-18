@@ -8,8 +8,8 @@ pub mod models;
 mod store;
 
 pub use models::{
-    Account, ActionRecord, ActionStatus, ChannelSubscription, DriveAccount, Email, LearnedPattern,
-    LinkedInConnectionSync, PhoneIdentity, RateAuditRow,
+    Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription, DriveAccount,
+    Email, LearnedPattern, LinkedInConnectionSync, PhoneIdentity, RateAuditRow,
     RateEvent, RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TelegramBot, ToneExample,
     ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };

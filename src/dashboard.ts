@@ -49,6 +49,13 @@ import {
   clearProactiveUserAction,
   listActiveProactiveUserActions,
 } from "./db";
+import {
+  listAgentRepos,
+  upsertAgentRepo,
+  revokeAgentRepo,
+  listAgentPrRuns,
+  resolveAgentPrRun,
+} from "./db";
 import type { ActionStatus, SubscriptionMode } from "./types";
 import { runAgentQuery } from "./agent";
 import { listDms, listGuilds, listGuildChannels, discordStatus } from "./discordApi";
@@ -57,6 +64,7 @@ import {
   persistSlackAuth,
   runCli,
 } from "./slackApi";
+import { requireApiKey } from "./apiV1";
 
 const router = Router();
 
@@ -135,6 +143,93 @@ router.get("/settings", (_req, res) => {
 router.get("/subscriptions", (_req, res) => {
   const subs = listSubscriptions();
   res.render("subscriptions", { subs, page: "subscriptions" });
+});
+
+// --- #117 Multi-repo agent-coding access controls ---
+//
+// `/repos` is the admin view for the allowlist (#117). The page shell
+// itself is just a UI scaffold; every mutating + data route below is gated
+// by `requireApiKey` (the SAME middleware the v1 machine API uses). The
+// dashboard process doesn't mount the v1 router, so the guard is applied
+// per-route here. Default-deny: an empty `agent_repos` table = the agent
+// can touch nothing.
+
+function fullNameValid(s: unknown): s is string {
+  return typeof s === "string" && /^[\w.-]+\/[\w.-]+$/.test(s.trim());
+}
+
+router.get("/repos", (_req, res) => {
+  res.render("repos", { page: "repos" });
+});
+
+// JSON: allowlist + recent run history (key-gated).
+router.get("/api/repos", requireApiKey, (_req, res) => {
+  const repos = listAgentRepos(false).map((r) => ({
+    ...r,
+    enabled: !!r.enabled,
+  }));
+  res.json(repos);
+});
+
+router.get("/api/repos/runs", requireApiKey, (req, res) => {
+  const repo = (req.query.full_name as string) || undefined;
+  const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+  res.json(listAgentPrRuns(repo, limit));
+});
+
+// Allowlist (or re-grant / update) a repo.
+router.post("/api/repos", requireApiKey, (req, res) => {
+  const {
+    full_name,
+    base_branch,
+    build_cmd,
+    blast_radius_extra,
+    max_diff_lines,
+  } = req.body || {};
+  if (!fullNameValid(full_name)) {
+    res.status(400).json({ error: "full_name must be 'owner/name'" });
+    return;
+  }
+  const cap = parseInt(max_diff_lines) || 600;
+  const row = upsertAgentRepo(
+    String(full_name).trim(),
+    (base_branch && String(base_branch).trim()) || "main",
+    build_cmd ? String(build_cmd) : "",
+    blast_radius_extra ? String(blast_radius_extra) : "",
+    cap > 0 ? cap : 600
+  );
+  res.status(201).json({ ...row, enabled: !!row.enabled });
+});
+
+// Revoke a repo (soft-disable + auto-reject in-flight gate rows). The
+// `owner/name` slug carries a slash, so it's sent as two path segments.
+router.delete("/api/repos/:owner/:name", requireApiKey, (req, res) => {
+  const fullName = `${String(req.params.owner)}/${String(req.params.name)}`;
+  if (!fullNameValid(fullName)) {
+    res.status(400).json({ error: "invalid full_name" });
+    return;
+  }
+  const cancelled = revokeAgentRepo(fullName);
+  res.json({ revoked: fullName, cancelled_runs: cancelled });
+});
+
+// Approve / reject a queued gate row. The Rust loop's `--approve-open`
+// pass opens the draft PR for `approved` rows; nothing is auto-merged.
+router.post("/api/repos/runs/:id/:decision", requireApiKey, (req, res) => {
+  const id = String(req.params.id);
+  const decision = String(req.params.decision);
+  if (decision !== "approved" && decision !== "rejected") {
+    res.status(400).json({ error: "decision must be approved|rejected" });
+    return;
+  }
+  const row = resolveAgentPrRun(id, decision);
+  if (!row) {
+    res
+      .status(409)
+      .json({ error: "run not pending (already resolved or unknown)" });
+    return;
+  }
+  res.json(row);
 });
 
 // --- Subscription CRUD ---
