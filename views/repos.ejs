@@ -1,0 +1,258 @@
+<%- include('partials/header', { page: 'repos' }) %>
+
+<div class="space-y-6">
+  <div>
+    <h1 class="text-xl font-semibold">Agent-coding repo access</h1>
+    <p class="text-xs text-gray-500 mt-1">
+      #117 — repos the agent may branch + open <span class="text-gray-300">draft</span> PRs on
+      when prompted. <span class="text-gray-300">Default-deny</span>: an empty list means the
+      agent can touch nothing. PRs are <span class="text-gray-300">never auto-merged</span> and
+      never pushed to a default branch — every PR is gated by an approval prompt.
+    </p>
+  </div>
+
+  <!-- API key gate: these admin routes are behind the same x-api-key
+       middleware the v1 machine API uses. -->
+  <section id="key-gate" class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+    <label class="block text-xs uppercase text-gray-500 mb-1">Admin API key</label>
+    <p class="text-xs text-gray-500 mb-2">
+      Required to view / change access. Matches <code class="text-gray-400">AUGMENTAGENT_API_KEY</code>.
+      In local mode with no key set, leave blank.
+    </p>
+    <div class="flex gap-2">
+      <input id="api-key" type="password" placeholder="x-api-key"
+             class="flex-1 bg-gray-950 border border-gray-700 rounded-md px-3 py-2 text-sm" />
+      <button onclick="saveKeyAndLoad()"
+              class="px-3 py-1.5 rounded-md text-sm font-medium bg-accent text-white hover:bg-accent/90">
+        Unlock
+      </button>
+    </div>
+    <div id="key-error" class="hidden text-sm text-red-400 mt-2"></div>
+  </section>
+
+  <div id="admin-body" class="hidden space-y-6">
+    <!-- Allowlist -->
+    <section>
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="text-sm font-semibold uppercase text-gray-400">Allowlisted repos</h2>
+        <button onclick="document.getElementById('add-repo-form').classList.toggle('hidden')"
+                class="px-3 py-1.5 rounded-md text-sm font-medium bg-accent text-white hover:bg-accent/90">
+          Add repo
+        </button>
+      </div>
+
+      <form id="add-repo-form" class="hidden bg-gray-900 border border-gray-800 rounded-lg p-4 mb-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div>
+          <label class="block text-xs uppercase text-gray-500 mb-1">Full name (owner/name)</label>
+          <input name="full_name" placeholder="acme/widgets"
+                 class="w-full bg-gray-950 border border-gray-700 rounded-md px-3 py-2 text-sm" />
+        </div>
+        <div>
+          <label class="block text-xs uppercase text-gray-500 mb-1">Base branch</label>
+          <input name="base_branch" value="main"
+                 class="w-full bg-gray-950 border border-gray-700 rounded-md px-3 py-2 text-sm" />
+        </div>
+        <div>
+          <label class="block text-xs uppercase text-gray-500 mb-1">Build / test command (verification gate)</label>
+          <input name="build_cmd" placeholder="cargo test --workspace"
+                 class="w-full bg-gray-950 border border-gray-700 rounded-md px-3 py-2 text-sm" />
+        </div>
+        <div>
+          <label class="block text-xs uppercase text-gray-500 mb-1">Extra blast-radius paths (comma-sep)</label>
+          <input name="blast_radius_extra" placeholder="infra/, terraform/"
+                 class="w-full bg-gray-950 border border-gray-700 rounded-md px-3 py-2 text-sm" />
+        </div>
+        <div>
+          <label class="block text-xs uppercase text-gray-500 mb-1">Max diff lines</label>
+          <input name="max_diff_lines" type="number" value="600"
+                 class="w-full bg-gray-950 border border-gray-700 rounded-md px-3 py-2 text-sm" />
+        </div>
+        <div class="flex items-end">
+          <button type="submit"
+                  class="px-3 py-1.5 rounded-md text-sm font-medium bg-accent text-white hover:bg-accent/90">
+            Allowlist repo
+          </button>
+        </div>
+        <div id="add-error" class="hidden md:col-span-2 text-sm text-red-400"></div>
+      </form>
+
+      <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="border-b border-gray-800 text-left">
+              <th class="px-4 py-2 text-xs text-gray-500 font-medium">Repo</th>
+              <th class="px-4 py-2 text-xs text-gray-500 font-medium">Base</th>
+              <th class="px-4 py-2 text-xs text-gray-500 font-medium">Build cmd</th>
+              <th class="px-4 py-2 text-xs text-gray-500 font-medium">Cap</th>
+              <th class="px-4 py-2 text-xs text-gray-500 font-medium">State</th>
+              <th class="px-4 py-2 text-xs text-gray-500 font-medium"></th>
+            </tr>
+          </thead>
+          <tbody id="repo-rows">
+            <tr><td colspan="6" class="px-4 py-6 text-center text-gray-500">Unlock to load.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- PR run history / pending approvals -->
+    <section>
+      <h2 class="text-sm font-semibold uppercase text-gray-400 mb-2">Agent-PR history &amp; pending approvals</h2>
+      <p class="text-xs text-gray-500 mb-3">
+        Rows in <span class="text-yellow-300">pending_approval</span> are awaiting your OK.
+        Approving lets the next daemon pass open a <span class="text-gray-300">draft</span> PR.
+      </p>
+      <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="border-b border-gray-800 text-left">
+              <th class="px-4 py-2 text-xs text-gray-500 font-medium">Repo</th>
+              <th class="px-4 py-2 text-xs text-gray-500 font-medium">Issue</th>
+              <th class="px-4 py-2 text-xs text-gray-500 font-medium">Lines</th>
+              <th class="px-4 py-2 text-xs text-gray-500 font-medium">Status</th>
+              <th class="px-4 py-2 text-xs text-gray-500 font-medium">PR</th>
+              <th class="px-4 py-2 text-xs text-gray-500 font-medium"></th>
+            </tr>
+          </thead>
+          <tbody id="run-rows">
+            <tr><td colspan="6" class="px-4 py-6 text-center text-gray-500">Unlock to load.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script>
+  function apiKey() { return sessionStorage.getItem('aa_api_key') || ''; }
+  function hdrs(extra) {
+    const h = Object.assign({}, extra || {});
+    const k = apiKey();
+    if (k) h['x-api-key'] = k;
+    return h;
+  }
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  async function saveKeyAndLoad() {
+    sessionStorage.setItem('aa_api_key', document.getElementById('api-key').value);
+    const err = document.getElementById('key-error');
+    err.classList.add('hidden');
+    try {
+      const res = await fetch('/api/repos', { headers: hdrs() });
+      if (res.status === 401 || res.status === 503) {
+        err.textContent = 'Key rejected (' + res.status + '). Check AUGMENTAGENT_API_KEY.';
+        err.classList.remove('hidden');
+        return;
+      }
+      document.getElementById('admin-body').classList.remove('hidden');
+      await Promise.all([loadRepos(), loadRuns()]);
+    } catch (e) {
+      err.textContent = 'Failed: ' + e.message;
+      err.classList.remove('hidden');
+    }
+  }
+
+  async function loadRepos() {
+    const res = await fetch('/api/repos', { headers: hdrs() });
+    const repos = await res.json();
+    const tb = document.getElementById('repo-rows');
+    if (!repos.length) {
+      tb.innerHTML = '<tr><td colspan="6" class="px-4 py-6 text-center text-gray-500">No repos allowlisted — default-deny (agent can touch nothing).</td></tr>';
+      return;
+    }
+    tb.innerHTML = repos.map((r) =>
+      '<tr class="border-b border-gray-800/50">' +
+        '<td class="px-4 py-2 font-mono">' + esc(r.full_name) + '</td>' +
+        '<td class="px-4 py-2 text-gray-400">' + esc(r.base_branch) + '</td>' +
+        '<td class="px-4 py-2 text-gray-400 font-mono text-xs">' + (esc(r.build_cmd) || '<span class="text-gray-600">(gate skipped)</span>') + '</td>' +
+        '<td class="px-4 py-2 text-gray-400">' + esc(r.max_diff_lines) + '</td>' +
+        '<td class="px-4 py-2">' + (r.enabled
+          ? '<span class="text-xs px-2 py-0.5 rounded bg-green-900/50 text-green-300 border border-green-700/50">enabled</span>'
+          : '<span class="text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-400">revoked</span>') + '</td>' +
+        '<td class="px-4 py-2 text-right">' + (r.enabled
+          ? '<button onclick="revokeRepo(\'' + esc(r.full_name) + '\')" class="text-xs text-red-400 hover:text-red-300">Revoke</button>'
+          : '') + '</td>' +
+      '</tr>'
+    ).join('');
+  }
+
+  async function loadRuns() {
+    const res = await fetch('/api/repos/runs?limit=100', { headers: hdrs() });
+    const runs = await res.json();
+    const tb = document.getElementById('run-rows');
+    if (!runs.length) {
+      tb.innerHTML = '<tr><td colspan="6" class="px-4 py-6 text-center text-gray-500">No agent-PR runs yet.</td></tr>';
+      return;
+    }
+    tb.innerHTML = runs.map((r) => {
+      const pending = r.status === 'pending_approval';
+      const statusCls = pending ? 'bg-yellow-900/50 text-yellow-300 border border-yellow-700/50'
+        : r.status === 'pr_opened' ? 'bg-green-900/50 text-green-300 border border-green-700/50'
+        : r.status === 'rejected' || r.status === 'failed' ? 'bg-red-900/40 text-red-300 border border-red-700/40'
+        : 'bg-gray-800 text-gray-300';
+      return '<tr class="border-b border-gray-800/50">' +
+        '<td class="px-4 py-2 font-mono">' + esc(r.repo_full_name) + '</td>' +
+        '<td class="px-4 py-2">#' + esc(r.issue_number) + '</td>' +
+        '<td class="px-4 py-2 text-gray-400">' + esc(r.diff_lines) + '</td>' +
+        '<td class="px-4 py-2"><span class="text-xs px-2 py-0.5 rounded ' + statusCls + '">' + esc(r.status) + '</span></td>' +
+        '<td class="px-4 py-2">' + (r.pr_url
+          ? '<a href="' + esc(r.pr_url) + '" target="_blank" rel="noopener" class="text-accent underline text-xs">PR</a>'
+          : '<span class="text-gray-600">—</span>') + '</td>' +
+        '<td class="px-4 py-2 text-right">' + (pending
+          ? '<button onclick="resolveRun(\'' + esc(r.id) + '\',\'approved\')" class="text-xs text-green-400 hover:text-green-300 mr-3">Approve</button>' +
+            '<button onclick="resolveRun(\'' + esc(r.id) + '\',\'rejected\')" class="text-xs text-red-400 hover:text-red-300">Reject</button>'
+          : '') + '</td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  async function revokeRepo(fullName) {
+    if (!confirm('Revoke ' + fullName + '? In-flight pending approvals are auto-rejected.')) return;
+    const res = await fetch('/api/repos/' + fullName, { method: 'DELETE', headers: hdrs() });
+    if (!res.ok) { alert('Revoke failed: ' + (await res.text())); return; }
+    await Promise.all([loadRepos(), loadRuns()]);
+  }
+
+  async function resolveRun(id, decision) {
+    const res = await fetch('/api/repos/runs/' + encodeURIComponent(id) + '/' + decision, {
+      method: 'POST', headers: hdrs(),
+    });
+    if (!res.ok) { alert('Failed: ' + (await res.text())); return; }
+    await loadRuns();
+  }
+
+  document.getElementById('add-repo-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const err = document.getElementById('add-error');
+    err.classList.add('hidden');
+    const body = {
+      full_name: f.full_name.value,
+      base_branch: f.base_branch.value,
+      build_cmd: f.build_cmd.value,
+      blast_radius_extra: f.blast_radius_extra.value,
+      max_diff_lines: f.max_diff_lines.value,
+    };
+    const res = await fetch('/api/repos', {
+      method: 'POST',
+      headers: hdrs({ 'content-type': 'application/json' }),
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      err.textContent = (await res.json()).error || 'failed';
+      err.classList.remove('hidden');
+      return;
+    }
+    f.reset();
+    f.classList.add('hidden');
+    await loadRepos();
+  });
+
+  // Auto-unlock if a key is already cached this session.
+  if (apiKey()) { saveKeyAndLoad(); }
+</script>
+
+<%- include('partials/footer') %>

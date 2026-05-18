@@ -100,10 +100,36 @@ enum Cmd {
     /// #103 — self-improvement loop: pick an `agent-fixable` GitHub issue,
     /// fix it on an isolated worktree/branch (never main), run the
     /// verification gate, and open a DRAFT PR. Never auto-merges.
+    ///
+    /// #117 — `--multi-repo true` switches to the allowlisted multi-repo
+    /// path: clone each enabled `agent_repos` entry into an isolated
+    /// workspace, run its per-repo gate, and queue a *prompted* draft PR
+    /// (Discord + dashboard approval) instead of opening one directly.
+    /// `--approve/--reject <run-id>` resolves a queued gate row; the next
+    /// `--approve-open true` pass opens the draft PR for approved rows.
     SelfImprove {
         /// Dry-run (default true): run the gate but stop before opening a PR.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+        /// #117: run the allowlisted multi-repo prompted-PR path instead of
+        /// the single-repo issue-pickup path.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        multi_repo: bool,
+        /// #117: approve a queued gate row by id (flips it to `approved`).
+        #[arg(long)]
+        approve: Option<String>,
+        /// #117: reject a queued gate row by id.
+        #[arg(long)]
+        reject: Option<String>,
+        /// #117: open draft PRs for every already-`approved` gate row.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        approve_open: bool,
+    },
+    /// #117 — manage the multi-repo agent-coding allowlist from the CLI
+    /// (parity with the dashboard /repos admin view).
+    Repos {
+        #[command(subcommand)]
+        op: ReposOp,
     },
     /// Wiki maintenance.
     Wiki {
@@ -360,6 +386,49 @@ enum InvoiceOp {
         /// true (default) = generate only; `--dry-run false` actually sends.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+    },
+}
+
+/// #117 — multi-repo agent-coding allowlist management (CLI parity with the
+/// dashboard /repos admin view). Default-deny: a repo is untouchable until
+/// it is `add`ed here (or via the dashboard).
+#[derive(Subcommand)]
+enum ReposOp {
+    /// List allowlisted repos (`--all true` also shows revoked ones).
+    List {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        all: bool,
+    },
+    /// Allowlist (or re-grant / update) a repo.
+    Add {
+        /// `owner/name` GitHub full-name.
+        #[arg(long)]
+        full_name: String,
+        /// Branch PRs target. Defaults to `main`.
+        #[arg(long, default_value = "main")]
+        base_branch: String,
+        /// Per-repo verification-gate command (run with `bash -lc`).
+        /// Empty ⇒ gate skipped (still prompt-gated, so safe).
+        #[arg(long, default_value = "")]
+        build_cmd: String,
+        /// Comma-separated extra blast-radius path fragments for this repo.
+        #[arg(long, default_value = "")]
+        blast_radius_extra: String,
+        /// Max changed lines accepted in one agent diff for this repo.
+        #[arg(long, default_value_t = 600)]
+        max_diff_lines: i64,
+    },
+    /// Revoke a repo (soft-disable + auto-reject its in-flight gate rows).
+    Remove {
+        #[arg(long)]
+        full_name: String,
+    },
+    /// Show recent agent-PR run history (optionally for one repo).
+    History {
+        #[arg(long)]
+        full_name: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        limit: i64,
     },
 }
 
@@ -1210,11 +1279,120 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::SelfImprove { dry_run } => {
+        Cmd::SelfImprove {
+            dry_run,
+            multi_repo,
+            ref approve,
+            ref reject,
+            approve_open,
+        } => {
+            // Gate resolution + PR-opening are pure store/gh ops (no repo
+            // pass). Handle them first so they short-circuit.
+            if let Some(run_id) = approve {
+                match store.approve_agent_pr_run(run_id)? {
+                    Some(r) => println!(
+                        "approved run {} ({} #{}); run `self-improve --approve-open true` to open the draft PR",
+                        r.id, r.repo_full_name, r.issue_number
+                    ),
+                    None => println!("run {run_id}: not pending (already resolved or unknown)"),
+                }
+                return Ok(());
+            }
+            if let Some(run_id) = reject {
+                match store.reject_agent_pr_run(run_id)? {
+                    Some(r) => println!("rejected run {} ({})", r.id, r.repo_full_name),
+                    None => println!("run {run_id}: not pending (already resolved or unknown)"),
+                }
+                return Ok(());
+            }
+            if approve_open {
+                let msg = self_improve::open_approved_runs(&store).await?;
+                println!("{msg}");
+                return Ok(());
+            }
+            if multi_repo {
+                let deploy_root = std::env::current_dir().context("current_dir")?;
+                let (broker, _) =
+                    build_broker(&cli, Arc::clone(&store), dry_run).await?;
+                let msg = self_improve::run_multi_repo_once(
+                    &store,
+                    broker.as_ref(),
+                    &deploy_root,
+                    dry_run,
+                )
+                .await?;
+                println!("{msg}");
+                return Ok(());
+            }
             let repo_root = std::env::current_dir().context("current_dir")?;
             let msg = self_improve::run_once(&repo_root, dry_run).await?;
             println!("{msg}");
             Ok(())
+        }
+        Cmd::Repos { op } => {
+            match op {
+                ReposOp::List { all } => {
+                    let repos = store.list_agent_repos(!all)?;
+                    if repos.is_empty() {
+                        println!("(no allowlisted repos — default-deny)");
+                    } else {
+                        for r in repos {
+                            println!(
+                                "{}\tbase={}\tbuild={:?}\tcap={}\tenabled={}",
+                                r.full_name,
+                                r.base_branch,
+                                r.build_cmd,
+                                r.max_diff_lines,
+                                r.enabled
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                ReposOp::Add {
+                    full_name,
+                    base_branch,
+                    build_cmd,
+                    blast_radius_extra,
+                    max_diff_lines,
+                } => {
+                    let r = store.upsert_agent_repo(
+                        &full_name,
+                        &base_branch,
+                        &build_cmd,
+                        &blast_radius_extra,
+                        max_diff_lines,
+                    )?;
+                    println!("allowlisted {} (base {})", r.full_name, r.base_branch);
+                    Ok(())
+                }
+                ReposOp::Remove { full_name } => {
+                    let cancelled = store.revoke_agent_repo(&full_name)?;
+                    println!(
+                        "revoked {full_name} ({cancelled} in-flight gate row(s) auto-rejected)"
+                    );
+                    Ok(())
+                }
+                ReposOp::History { full_name, limit } => {
+                    let rows =
+                        store.list_agent_pr_runs(full_name.as_deref(), limit)?;
+                    if rows.is_empty() {
+                        println!("(no agent-PR runs)");
+                    } else {
+                        for r in rows {
+                            println!(
+                                "{}\t#{}\t{}\t{}\t{}",
+                                r.repo_full_name,
+                                r.issue_number,
+                                r.status,
+                                r.pr_url.unwrap_or_else(|| "-".into()),
+                                r.id
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+            }
         }
         Cmd::AccountsBackfillEmails => {
             let lines = backfill_gmail_emails(&store, false).await?;
