@@ -121,6 +121,32 @@ mod tests {
         ) -> Result<String, LinkedInError> {
             Ok("urn:li:msg:sent".into())
         }
+        async fn fetch_feed_posts_by_author(
+            &self,
+            _author_urn: &str,
+        ) -> Result<Vec<crate::types::FeedPost>, LinkedInError> {
+            Ok(Vec::new())
+        }
+        async fn post_comment(
+            &self,
+            _post_urn: &str,
+            _text: &str,
+        ) -> Result<String, LinkedInError> {
+            Ok("urn:li:comment:fake".into())
+        }
+        async fn react(
+            &self,
+            _post_urn: &str,
+            _reaction: &str,
+        ) -> Result<(), LinkedInError> {
+            Ok(())
+        }
+        async fn create_share(
+            &self,
+            _draft: crate::posting::PostDraft<'_>,
+        ) -> Result<crate::posting::ShareUrn, LinkedInError> {
+            Ok(crate::posting::ShareUrn("urn:li:share:fake".into()))
+        }
     }
 
     fn mk_dm(id: &str, sender: &str) -> Dm {

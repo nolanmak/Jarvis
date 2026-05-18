@@ -16,6 +16,9 @@ use augmentagent_approval_discord::{
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
 use augmentagent_channel_email::gmail::{ComposioClient, GmailApi};
+use augmentagent_channel_email::sigextract::{
+    detect_signature_block, signature_patch, strip_quoted_reply, SignatureExtractor,
+};
 use augmentagent_channel_email::{GmailChannel, GmailChannelConfig};
 use augmentagent_channel_linkedin::{
     build_normshares_body, default_auth_path, is_linkedin_email, LinkedInApi, LinkedInAuth,
@@ -26,6 +29,12 @@ use augmentagent_channel_linkedin::{
 use augmentagent_channel_twitter::{
     default_auth_path as twitter_default_auth_path, CreateTweetClient, TwitterApi, TwitterAuth,
     TwitterClient, TwitterDmSource, TwitterFeedTrigger,
+};
+use augmentagent_channel_linkedin::connections::{
+    ConnectionSyncer, SyncMode, VoyagerConnectionsClient,
+};
+use augmentagent_channel_contacts::{
+    CardDavSource, ContactsSource, ContactsSyncer, GooglePeopleSource,
 };
 use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
@@ -181,6 +190,12 @@ enum Cmd {
         #[command(subcommand)]
         op: GdriveOp,
     },
+    /// Contacts → phone+address identity index (#62). Google People (via
+    /// the Composio Google grant) and/or generic CardDAV.
+    Contacts {
+        #[command(subcommand)]
+        op: ContactsOp,
+    },
     /// Cross-platform compose-once content adapter (#53). One source draft
     /// fans out into per-platform variants. All ops stubs in
     /// foundation/swarm-v1.
@@ -221,6 +236,24 @@ enum Cmd {
     Tone {
         #[command(subcommand)]
         op: ToneOp,
+    },
+    /// #64 — mine email signature blocks for role/title/company/phone and
+    /// fill-blanks them into the wiki. Idempotent (safe to re-run); pulls
+    /// emails first seen on/after `--since`. Dry-run JSON by default.
+    BackfillSignatures {
+        /// Lower bound (`YYYY-MM-DD`). Default: 180 days ago.
+        #[arg(long)]
+        since: Option<String>,
+        /// Max emails to scan.
+        #[arg(long, default_value_t = 2000)]
+        limit: i64,
+        /// Min per-field confidence to auto-fill the wiki; lower-confidence
+        /// fields go to the daily Discord digest instead.
+        #[arg(long, default_value_t = 0.7)]
+        min_confidence: f64,
+        /// Write wiki pages (default: dry-run JSON only).
+        #[arg(long)]
+        apply: bool,
     },
     /// Draft-quality eval tooling backed by `draft_revisions` (#37).
     Drafts {
@@ -584,6 +617,24 @@ enum GdriveOp {
 }
 
 #[derive(Subcommand)]
+enum ContactsOp {
+    /// Sync contacts → wiki + phone index. Dry-run JSON by default; pass
+    /// `--apply` to write fill-blanks pages + index phones.
+    Sync {
+        /// Backend: `google` (Composio People) or `carddav` (env-configured).
+        #[arg(long, default_value = "google")]
+        backend: String,
+        /// Composio entity id for the `google` backend (the connected
+        /// Google account). Ignored for `carddav`.
+        #[arg(long, default_value = "default")]
+        entity_id: String,
+        /// Write wiki pages + phone index (default: dry-run only).
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ComposeOp {
     /// Fan a single source draft out into per-platform variants. Each
     /// variant is approval-gated independently.
@@ -894,6 +945,20 @@ enum LinkedinOp {
     /// Quick read-only check: list recent threads + print peer + snippet.
     /// Good smoke test after `login` to confirm cookies work.
     Recent,
+    /// Sync 1st-degree connections into the wiki as dormant contacts (#61).
+    ///
+    /// Default is a **dry run**: prints a JSON [`SyncReport`] and writes
+    /// nothing. Pass `--apply` to write fill-blanks-only wiki pages. Mode
+    /// (full vs delta) is decided from the persisted cursor unless
+    /// `--full` forces a full walk.
+    ConnectionsSync {
+        /// Write the merged pages (default: dry-run JSON only).
+        #[arg(long)]
+        apply: bool,
+        /// Force a full sync regardless of the persisted cursor.
+        #[arg(long)]
+        full: bool,
+    },
     /// Publish a feed post via Voyager `normShares` (#51/#77). Phase 1:
     /// text + optional single image. Manual/test path — the daemon posts
     /// through the approval pipeline, not this command.
@@ -1421,6 +1486,10 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             LinkedinOp::Recent => run_linkedin_recent().await,
+            LinkedinOp::ConnectionsSync { apply, full } => {
+                let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
+                run_linkedin_connections_sync(&cli, store, broker, *apply, *full).await
+            }
             LinkedinOp::Post {
                 text,
                 image,
@@ -1687,6 +1756,17 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::Contacts { ref op } => match op {
+            ContactsOp::Sync {
+                backend,
+                entity_id,
+                apply,
+            } => {
+                let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
+                run_contacts_sync(&cli, store, broker, backend, entity_id, *apply)
+                    .await
+            }
+        },
         Cmd::Compose { op } => match op {
             ComposeOp::FanOut { .. } => {
                 unimplemented!("see issue #53 (content-adapter feature PR)")
@@ -1723,6 +1803,24 @@ async fn main() -> Result<()> {
                 run_tone_refresh_stale(store, threshold, budget_secs).await
             }
         },
+        Cmd::BackfillSignatures {
+            ref since,
+            limit,
+            min_confidence,
+            apply,
+        } => {
+            let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
+            run_backfill_signatures(
+                &cli,
+                store,
+                broker,
+                since.clone(),
+                limit,
+                min_confidence,
+                apply,
+            )
+            .await
+        }
         Cmd::Drafts { op } => match op {
             DraftsOp::FeedbackClusters { since_days, top } => {
                 run_drafts_feedback_clusters(store, since_days, top)
@@ -4481,6 +4579,326 @@ async fn run_linkedin_recent() -> Result<()> {
             arrow,
             snippet,
         );
+    }
+    Ok(())
+}
+
+/// #61 — LinkedIn 1st-degree connection sync. Dry-run by default (prints a
+/// JSON report, writes nothing); `--apply` writes fill-blanks-only wiki
+/// pages and persists the sync cursor. Posts an "N new / M updated" summary
+/// card to Discord when a broker is wired.
+async fn run_linkedin_connections_sync(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    apply: bool,
+    force_full: bool,
+) -> Result<()> {
+    use augmentagent_store::LinkedInConnectionSync;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for connections sync")?;
+    let layout = augmentagent_wiki::WikiLayout::new(wiki_root.clone());
+    layout.bootstrap().context("wiki bootstrap")?;
+
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = LinkedInAuth::load_with_migration(&repo_root)
+        .context("load linkedin auth from keychain or legacy file")?;
+    let account_id = auth.member_urn.clone();
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let prior = store
+        .get_linkedin_connection_sync(&account_id)
+        .context("read connection-sync cursor")?;
+    let last_full = prior.as_ref().and_then(|s| s.last_full_sync_ms);
+    let mode = if force_full {
+        SyncMode::Full
+    } else {
+        SyncMode::decide(last_full, now_ms)
+    };
+    // Resume an interrupted full sync from its persisted offset; deltas
+    // always restart at 0 (recency-descending, cheap to re-walk the head).
+    let start_offset = match mode {
+        SyncMode::Full => prior.as_ref().map(|s| s.cursor_start as usize).unwrap_or(0),
+        SyncMode::Delta { .. } => 0,
+    };
+
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    let client = VoyagerConnectionsClient::new(auth);
+    let syncer = ConnectionSyncer {
+        api: &client,
+        layout: &layout,
+        today,
+        apply,
+    };
+
+    info!(
+        account = %account_id,
+        ?mode,
+        start_offset,
+        apply,
+        "starting linkedin connections sync"
+    );
+    let report = syncer
+        .run(mode, start_offset, |d| tokio::time::sleep(d))
+        .await
+        .context("connection sync run")?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+
+    if apply {
+        // On a completed run, advance the cursor. Full → record full-sync
+        // timestamp and reset cursor; delta → record delta timestamp.
+        let next = match mode {
+            SyncMode::Full => LinkedInConnectionSync {
+                account_id: account_id.clone(),
+                last_full_sync_ms: Some(now_ms),
+                last_delta_sync_ms: prior.as_ref().and_then(|s| s.last_delta_sync_ms),
+                cursor_start: 0,
+                last_synced_count: report.connections_seen as i64,
+            },
+            SyncMode::Delta { last_full_sync_ms } => LinkedInConnectionSync {
+                account_id: account_id.clone(),
+                last_full_sync_ms: Some(last_full_sync_ms),
+                last_delta_sync_ms: Some(now_ms),
+                cursor_start: 0,
+                last_synced_count: report.connections_seen as i64,
+            },
+        };
+        store
+            .upsert_linkedin_connection_sync(&next)
+            .context("persist connection-sync cursor")?;
+    }
+
+    // Surface a summary card (reuses the digest embed path; no buttons).
+    if report.created > 0 || report.updated > 0 {
+        if let Err(e) = broker
+            .post_digest(
+                "LinkedIn connections sync",
+                &report.discord_summary(),
+            )
+            .await
+        {
+            warn!("failed to post connections summary to discord: {e}");
+        }
+    }
+
+    Ok(())
+}
+
+/// #62 — contacts sync. `backend` is `google` (Composio People) or
+/// `carddav` (env-configured). Dry-run JSON by default; `--apply` writes
+/// fill-blanks wiki pages, indexes phones, persists the sync cursor, and
+/// posts a Discord summary.
+async fn run_contacts_sync(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    backend: &str,
+    entity_id: &str,
+    apply: bool,
+) -> Result<()> {
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for contacts sync")?;
+    let layout = augmentagent_wiki::WikiLayout::new(wiki_root);
+    layout.bootstrap().context("wiki bootstrap")?;
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    let (source, account_id): (Box<dyn ContactsSource>, String) = match backend {
+        "google" => {
+            let api_key = std::env::var("COMPOSIO_API_KEY")
+                .context("COMPOSIO_API_KEY env var required for the google backend")?;
+            (
+                Box::new(GooglePeopleSource::new(api_key, entity_id.to_string())),
+                entity_id.to_string(),
+            )
+        }
+        "carddav" => {
+            let src = CardDavSource::from_env().context(
+                "CardDAV not configured — set AUGMENTAGENT_CARDDAV_URL / _USER / _PASS",
+            )?;
+            (Box::new(src), "default".to_string())
+        }
+        other => anyhow::bail!("unknown contacts backend '{other}' (use google|carddav)"),
+    };
+
+    let syncer = ContactsSyncer {
+        source: source.as_ref(),
+        layout: &layout,
+        store: &store,
+        today,
+        apply,
+    };
+    info!(backend, account = %account_id, apply, "starting contacts sync");
+    let report = syncer
+        .run(&account_id)
+        .await
+        .context("contacts sync run")?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+
+    if report.created > 0 || report.updated > 0 {
+        if let Err(e) = broker
+            .post_digest("Contacts sync", &report.discord_summary())
+            .await
+        {
+            warn!("failed to post contacts summary to discord: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// #64 — email-signature backfill. Scans stored email bodies since
+/// `--since`, detects the signature block (regex + line-density), runs the
+/// LLM field extractor (strict JSON + retry + regex fallback), and merges
+/// high-confidence fields fill-blanks-only into the sender's wiki page.
+/// Low-confidence fields are collected into a single daily Discord digest
+/// for manual approval. Dry-run JSON by default.
+#[allow(clippy::too_many_arguments)]
+async fn run_backfill_signatures(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    since: Option<String>,
+    limit: i64,
+    min_confidence: f64,
+    apply: bool,
+) -> Result<()> {
+    use augmentagent_wiki::{merge_person_page, slug_from_email, WikiLayout};
+
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for signature backfill")?;
+    let layout = WikiLayout::new(wiki_root);
+    layout.bootstrap().context("wiki bootstrap")?;
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    // Resolve --since (default 180d ago) to an epoch-ms lower bound.
+    let since_ms = match &since {
+        Some(s) => {
+            let d = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+                .context("--since must be YYYY-MM-DD")?;
+            d.and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        }
+        None => (chrono::Utc::now() - chrono::Duration::days(180)).timestamp_millis(),
+    };
+
+    let rows = store
+        .email_bodies_since(since_ms, limit)
+        .context("read email bodies for signature backfill")?;
+
+    let reasoner = ClaudeCliReasoner::new();
+    let extractor = SignatureExtractor::new(&reasoner);
+
+    let mut scanned = 0usize;
+    let mut sig_found = 0usize;
+    let mut created = 0usize;
+    let mut updated = 0usize;
+    let mut noop = 0usize;
+    // De-dupe per sender within a run (latest sig wins; merge is fill-blanks
+    // so order is immaterial, but skip redundant LLM calls).
+    let mut seen_senders: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut digest_lines: Vec<String> = Vec::new();
+
+    for (_mid, from, body) in rows {
+        scanned += 1;
+        let slug = slug_from_email(&from);
+        if slug.is_empty() || !seen_senders.insert(slug.clone()) {
+            continue;
+        }
+        let stripped = strip_quoted_reply(&body);
+        let Some(block) = detect_signature_block(&stripped) else {
+            continue;
+        };
+        sig_found += 1;
+        let fields = match extractor.extract(&block.text).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::debug!(%from, "sig extract skipped: {e}");
+                continue;
+            }
+        };
+        let (patch, deferred) = signature_patch(&fields, &today, min_confidence);
+        for d in deferred {
+            digest_lines.push(format!("{from}: {d}"));
+        }
+        if patch.is_empty() {
+            noop += 1;
+            continue;
+        }
+
+        let path = layout.people_dir().join(format!("{slug}.md"));
+        let existing = std::fs::read_to_string(&path).ok();
+        let merged = merge_person_page(existing.as_deref(), &patch);
+        if !merged.changed {
+            noop += 1;
+            continue;
+        }
+        if merged.created {
+            created += 1;
+        } else {
+            updated += 1;
+        }
+        if apply {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, &merged.content)?;
+        }
+    }
+
+    let report = serde_json::json!({
+        "scanned": scanned,
+        "signatures_detected": sig_found,
+        "created": created,
+        "updated": updated,
+        "noop": noop,
+        "deferred_low_confidence": digest_lines.len(),
+        "applied": apply,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+
+    if !digest_lines.is_empty() {
+        let body = format!(
+            "Low-confidence signature fields needing review ({}):\n{}",
+            digest_lines.len(),
+            digest_lines
+                .iter()
+                .take(40)
+                .map(|l| format!("- {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        if let Err(e) = broker
+            .post_digest("Signature backfill — low-confidence", &body)
+            .await
+        {
+            warn!("failed to post signature digest: {e}");
+        }
     }
     Ok(())
 }

@@ -7,11 +7,16 @@
 
 pub mod gmail;
 pub mod inbound;
+pub mod sigextract;
 pub mod tone;
 mod channel;
 
 pub use channel::{GmailChannel, GmailChannelConfig, PollOutcome};
-pub use inbound::{GmailInbound, email_to_work_item};
+pub use inbound::{email_to_work_item, GmailInbound};
+pub use sigextract::{
+    detect_signature_block, signature_patch, ExtractedFields, SignatureBlock,
+    SignatureExtractor, SigError,
+};
 
 // Back-compat re-exports: old callers can keep using `augmentagent_channel_email::X`
 // for items that moved to `augmentagent-channel-core`. Remove once all callers migrate.
