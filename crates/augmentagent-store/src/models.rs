@@ -323,11 +323,54 @@ pub struct TelegramBot {
     pub created_at_ms: i64,
 }
 
-/// A user-defined scheduled task (#104), created via `/loop`. Channel-agnostic:
-/// `channel` is the surface it was created from (`discord` today) and
-/// `channel_ref` is the originating channel/DM id the scheduler posts results
-/// back to. `status` is `active` | `paused` | `stopped`; the scheduler pauses
-/// a loop after repeated failures (`fail_count`).
+/// #61 — LinkedIn 1st-degree connection sync cursor. One row per LinkedIn
+/// account (keyed by the user's own `urn:li:fsd_profile:...`). `cursor_start`
+/// resumes a paginated full sync that was interrupted; the two timestamps
+/// drive the full-vs-delta decision (full = monthly, delta = daily).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedInConnectionSync {
+    pub account_id: String,
+    pub last_full_sync_ms: Option<i64>,
+    pub last_delta_sync_ms: Option<i64>,
+    pub cursor_start: i64,
+    pub last_synced_count: i64,
+}
+
+/// #62 — one row in the phone→person reverse index. Lets message-triage map
+/// an inbound `+1415…` to an existing wiki page before it forks a new one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhoneIdentity {
+    /// E.164-normalized (`+14155551234`).
+    pub phone: String,
+    pub person_slug: String,
+    pub display_name: Option<String>,
+    /// Provenance: `google_people` | `carddav` | `email_signature`.
+    pub source: String,
+}
+
+/// A paired WhatsApp linked device (#74). One row per phone the user has
+/// linked via `augmentagent whatsapp login`. The whatsmeow noise session
+/// itself lives in the sidecar's own store + the keyring slot; this table is
+/// the index the channel iterates and the place `session_status` is tracked
+/// for re-pair detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhatsappDevice {
+    pub id: String,
+    pub phone: String,
+    pub device_jid: String,
+    pub user_jid: String,
+    pub paired_at_ms: i64,
+    pub last_event_at_ms: i64,
+    /// `paired` | `logged_out` — flipped to `logged_out` when the sidecar
+    /// emits a `logged-out` event so the channel stops trying to send.
+    pub session_status: String,
+    pub active: bool,
+    pub created_at_ms: i64,
+}
+
+/// A user-scheduled recurring prompt/command (`/loop`, #104). The scheduler
+/// ticks every active row on its `interval_secs` cadence. Minimal model
+/// matching the `user_loops` table the store methods read/write.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserLoop {
     pub id: String,

@@ -37,6 +37,14 @@ pub struct Identities {
     pub whatsapp: Option<String>,
     #[serde(default)]
     pub instagram: Option<String>,
+    /// E.164-normalized phone (#62). Multi-valued — a person commonly has a
+    /// mobile + a work line; CRM ingestion union-merges them.
+    #[serde(default)]
+    pub phone: Vec<String>,
+    /// Free-form mailing address (#62). Single-valued in practice; CRM
+    /// ingestion only fills it when blank.
+    #[serde(default)]
+    pub address: Option<String>,
 }
 
 impl Identities {
@@ -56,6 +64,11 @@ impl Identities {
             "slack" => self.slack.as_deref() == Some(id),
             "whatsapp" => self.whatsapp.as_deref() == Some(id),
             "instagram" => self.instagram.as_deref() == Some(id),
+            "phone" => {
+                // E.164 ids compared verbatim (already normalized upstream).
+                self.phone.iter().any(|p| p == id)
+            }
+            "address" => self.address.as_deref() == Some(id),
             _ => false,
         }
     }
@@ -67,6 +80,12 @@ impl Identities {
 struct FrontMatter {
     #[serde(default)]
     identities: Identities,
+    /// User-set engagement opt-in (#13). When `true` *and* the page carries
+    /// a `linkedin:` identity, the LinkedIn feed trigger watches this
+    /// person's posts for supportive-comment engagement. USER-SET ONLY —
+    /// ingest never writes this.
+    #[serde(default)]
+    close: bool,
 }
 
 /// One `people/<slug>.md` page + its parsed identities.
@@ -75,6 +94,9 @@ pub struct PersonPage {
     pub slug: String,
     pub path: PathBuf,
     pub identities: Identities,
+    /// `close: true` front-matter marker (#13). Drives LinkedIn feed-
+    /// engagement opt-in.
+    pub close: bool,
 }
 
 /// In-memory index of every `people/*.md` page's identity block. Rebuild on
@@ -109,7 +131,9 @@ impl IdentityIndex {
             };
 
             match parse_front_matter(&path) {
-                Ok(identities) => people.push(PersonPage { slug, path, identities }),
+                Ok((identities, close)) => {
+                    people.push(PersonPage { slug, path, identities, close })
+                }
                 Err(e) => warn!(path = %path.display(), error = %e, "skipping page with bad front-matter"),
             }
         }
@@ -132,18 +156,35 @@ impl IdentityIndex {
     pub fn pages(&self) -> &[PersonPage] {
         &self.people
     }
+
+    /// Pages flagged `close: true` that also carry a `linkedin:` identity —
+    /// the watch-list for #13 feed engagement. Returns `(slug, linkedin_urn)`
+    /// pairs.
+    pub fn close_linkedin_people(&self) -> Vec<(String, String)> {
+        self.people
+            .iter()
+            .filter(|p| p.close)
+            .filter_map(|p| {
+                p.identities
+                    .linkedin
+                    .clone()
+                    .map(|urn| (p.slug.clone(), urn))
+            })
+            .collect()
+    }
 }
 
 /// Extract the YAML front-matter from a markdown file and deserialize it.
-/// Accepts files without front-matter (returns `Identities::default()`).
-fn parse_front_matter(path: &Path) -> anyhow::Result<Identities> {
+/// Accepts files without front-matter (returns `(Identities::default(),
+/// false)`). Returns `(identities, close)`.
+fn parse_front_matter(path: &Path) -> anyhow::Result<(Identities, bool)> {
     let raw = fs::read_to_string(path)?;
     let yaml = match extract_yaml_block(&raw) {
         Some(y) => y,
-        None => return Ok(Identities::default()),
+        None => return Ok((Identities::default(), false)),
     };
     let fm: FrontMatter = serde_yaml_ng::from_str(yaml)?;
-    Ok(fm.identities)
+    Ok((fm.identities, fm.close))
 }
 
 /// Pull the YAML between the opening `---\n` and the next `\n---` line.
@@ -197,6 +238,44 @@ mod tests {
         assert_eq!(page.slug, "jane");
         assert_eq!(page.identities.linkedin.as_deref(), Some("urn:li:fsd_profile:XYZ"));
         assert_eq!(page.identities.email.len(), 2);
+    }
+
+    #[test]
+    fn close_flag_parsed_and_filters_to_linkedin_people() {
+        let (_d, layout) = layout_with_pages(&[
+            (
+                "jane",
+                "kind: person\nkey: jane\nclose: true\nidentities:\n  linkedin: urn:li:fsd_profile:JANE",
+            ),
+            (
+                "bob",
+                // close but no linkedin identity → excluded from watch-list
+                "kind: person\nkey: bob\nclose: true\nidentities:\n  email: [bob@x.com]",
+            ),
+            (
+                "carol",
+                // linkedin but not close → excluded
+                "kind: person\nkey: carol\nidentities:\n  linkedin: urn:li:fsd_profile:CAROL",
+            ),
+        ]);
+        let index = IdentityIndex::build(&layout).unwrap();
+        let jane = index.lookup("linkedin", "urn:li:fsd_profile:JANE").unwrap();
+        assert!(jane.close);
+        let watch = index.close_linkedin_people();
+        assert_eq!(watch.len(), 1);
+        assert_eq!(watch[0].0, "jane");
+        assert_eq!(watch[0].1, "urn:li:fsd_profile:JANE");
+    }
+
+    #[test]
+    fn close_defaults_false_when_absent() {
+        let (_d, layout) = layout_with_pages(&[(
+            "jane",
+            "kind: person\nkey: jane\nidentities:\n  linkedin: urn:li:fsd_profile:JANE",
+        )]);
+        let index = IdentityIndex::build(&layout).unwrap();
+        assert!(!index.pages()[0].close);
+        assert!(index.close_linkedin_people().is_empty());
     }
 
     #[test]

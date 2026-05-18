@@ -5,6 +5,8 @@ members = [
     "crates/augmentagent-channel-core",
     "crates/augmentagent-channel-email",
     "crates/augmentagent-channel-linkedin",
+    "crates/augmentagent-channel-instagram",
+    "crates/augmentagent-channel-twitter",
     "crates/augmentagent-channel-discord-dm",
     "crates/augmentagent-channel-slack",
     "crates/augmentagent-channel-telegram-bot",
@@ -18,6 +20,7 @@ members = [
     "crates/augmentagent-channel-reddit",
     "crates/augmentagent-channel-meetup",
     "crates/augmentagent-channel-gdrive",
+    "crates/augmentagent-channel-contacts",
     "crates/augmentagent-content-adapter",
     "crates/augmentagent-proactive",
     "crates/augmentagent-browser-client",
@@ -77,3 +80,6 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+
+# Test-only HTTP mock (#77 normShares body snapshot tests)
+wiremock = "0.6"

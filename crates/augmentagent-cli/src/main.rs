@@ -16,10 +16,25 @@ use augmentagent_approval_discord::{
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
 use augmentagent_channel_email::gmail::{ComposioClient, GmailApi};
+use augmentagent_channel_email::sigextract::{
+    detect_signature_block, signature_patch, strip_quoted_reply, SignatureExtractor,
+};
 use augmentagent_channel_email::{GmailChannel, GmailChannelConfig};
 use augmentagent_channel_linkedin::{
-    default_auth_path, is_linkedin_email, LinkedInApi, LinkedInAuth, LinkedInChannel,
-    LinkedInChannelConfig, VoyagerClient, ACCOUNT_PREFIX, DEFAULT_POLL_SECS,
+    build_normshares_body, default_auth_path, is_linkedin_email, LinkedInApi, LinkedInAuth,
+    LinkedInChannel, LinkedInChannelConfig, LinkedInFeedEngagement, PostDraft, VoyagerClient,
+    Visibility, ACCOUNT_PREFIX, DEFAULT_FEED_POLL_SECS, DEFAULT_MAX_ENGAGEMENTS_PER_DAY,
+    DEFAULT_POLL_SECS,
+};
+use augmentagent_channel_twitter::{
+    default_auth_path as twitter_default_auth_path, CreateTweetClient, TwitterApi, TwitterAuth,
+    TwitterClient, TwitterDmSource, TwitterFeedTrigger,
+};
+use augmentagent_channel_linkedin::connections::{
+    ConnectionSyncer, SyncMode, VoyagerConnectionsClient,
+};
+use augmentagent_channel_contacts::{
+    CardDavSource, ContactsSource, ContactsSyncer, GooglePeopleSource,
 };
 use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
@@ -120,6 +135,12 @@ enum Cmd {
         #[command(subcommand)]
         op: LinkedinOp,
     },
+    /// X / Twitter channel: harvest session, post tweets/replies, poll the
+    /// close-friend feed + DM inbox.
+    Twitter {
+        #[command(subcommand)]
+        op: TwitterOp,
+    },
     /// Discord channel: user-token REST client. Reads personal DMs + watched
     /// guild channels, routes through subscriptions (priority/digest/store_only).
     Discord {
@@ -183,6 +204,12 @@ enum Cmd {
         #[command(subcommand)]
         op: GdriveOp,
     },
+    /// Contacts → phone+address identity index (#62). Google People (via
+    /// the Composio Google grant) and/or generic CardDAV.
+    Contacts {
+        #[command(subcommand)]
+        op: ContactsOp,
+    },
     /// Cross-platform compose-once content adapter (#53). One source draft
     /// fans out into per-platform variants. All ops stubs in
     /// foundation/swarm-v1.
@@ -224,10 +251,34 @@ enum Cmd {
         #[command(subcommand)]
         op: ToneOp,
     },
+    /// #64 — mine email signature blocks for role/title/company/phone and
+    /// fill-blanks them into the wiki. Idempotent (safe to re-run); pulls
+    /// emails first seen on/after `--since`. Dry-run JSON by default.
+    BackfillSignatures {
+        /// Lower bound (`YYYY-MM-DD`). Default: 180 days ago.
+        #[arg(long)]
+        since: Option<String>,
+        /// Max emails to scan.
+        #[arg(long, default_value_t = 2000)]
+        limit: i64,
+        /// Min per-field confidence to auto-fill the wiki; lower-confidence
+        /// fields go to the daily Discord digest instead.
+        #[arg(long, default_value_t = 0.7)]
+        min_confidence: f64,
+        /// Write wiki pages (default: dry-run JSON only).
+        #[arg(long)]
+        apply: bool,
+    },
     /// Draft-quality eval tooling backed by `draft_revisions` (#37).
     Drafts {
         #[command(subcommand)]
         op: DraftsOp,
+    },
+    /// Draft approval-queue hygiene (#99): inspect + bulk-clear the pending
+    /// backlog. Destructive ops are audit-logged to stdout + tracing.
+    Approvals {
+        #[command(subcommand)]
+        op: ApprovalsOp,
     },
     /// RateGovernor (#83) audit + dump tooling. Reads `rate_events`,
     /// `rate_halts`, and `rate_warmup`. Channels write to these tables
@@ -332,6 +383,36 @@ enum DraftsOp {
         /// How many top patterns to print. Default 5.
         #[arg(long, default_value_t = 5usize)]
         top: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalsOp {
+    /// List the oldest pending drafts (action id, sender, subject, age).
+    /// Read-only; safe to run anytime.
+    List {
+        /// Cap the number of rows printed. Default 50.
+        #[arg(long, default_value_t = 50i64)]
+        limit: i64,
+    },
+    /// Bulk-resolve every pending draft to `approved` (queue-hygiene escape
+    /// hatch for "I've handled these out of band"). Does NOT send the Gmail
+    /// drafts — it only clears the backlog so new triage isn't downgraded by
+    /// backpressure. Requires `--yes` to actually mutate. Audit-logged.
+    ApproveAll {
+        /// Confirm the destructive op. Without it this is a dry-run preview.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        yes: bool,
+    },
+    /// Expire pending drafts older than N days to `timed_out`. Requires
+    /// `--yes` to mutate; otherwise prints what *would* be swept. Audit-logged.
+    DiscardOlder {
+        /// Age threshold in days. Pending rows older than this are expired.
+        #[arg(long, default_value_t = 7i64)]
+        days: i64,
+        /// Confirm the destructive op. Without it this is a dry-run preview.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        yes: bool,
     },
 }
 
@@ -569,6 +650,24 @@ enum GdriveOp {
     PollOnce {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContactsOp {
+    /// Sync contacts → wiki + phone index. Dry-run JSON by default; pass
+    /// `--apply` to write fill-blanks pages + index phones.
+    Sync {
+        /// Backend: `google` (Composio People) or `carddav` (env-configured).
+        #[arg(long, default_value = "google")]
+        backend: String,
+        /// Composio entity id for the `google` backend (the connected
+        /// Google account). Ignored for `carddav`.
+        #[arg(long, default_value = "default")]
+        entity_id: String,
+        /// Write wiki pages + phone index (default: dry-run only).
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -883,6 +982,65 @@ enum LinkedinOp {
     /// Quick read-only check: list recent threads + print peer + snippet.
     /// Good smoke test after `login` to confirm cookies work.
     Recent,
+    /// Sync 1st-degree connections into the wiki as dormant contacts (#61).
+    ///
+    /// Default is a **dry run**: prints a JSON [`SyncReport`] and writes
+    /// nothing. Pass `--apply` to write fill-blanks-only wiki pages. Mode
+    /// (full vs delta) is decided from the persisted cursor unless
+    /// `--full` forces a full walk.
+    ConnectionsSync {
+        /// Write the merged pages (default: dry-run JSON only).
+        #[arg(long)]
+        apply: bool,
+        /// Force a full sync regardless of the persisted cursor.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Publish a feed post via Voyager `normShares` (#51/#77). Phase 1:
+    /// text + optional single image. Manual/test path — the daemon posts
+    /// through the approval pipeline, not this command.
+    Post {
+        /// Post body (≤3000 chars; ~140 visible before the "see more" fold).
+        #[arg(long)]
+        text: String,
+        /// Optional single image to attach.
+        #[arg(long)]
+        image: Option<PathBuf>,
+        /// Audience: `public` (default) or `connections`.
+        #[arg(long, default_value = "public")]
+        visibility: String,
+        /// Build + print the request body, don't send.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TwitterOp {
+    /// Validate + persist a harvested X session bundle from a JSON file.
+    ///
+    /// The JSON must contain `user_id`, `screen_name`, and a `cookies`
+    /// object with at least `auth_token` and `ct0`. See
+    /// docs/twitter-protocol.md + scripts/twitter-harvest.sh.
+    Login {
+        /// Path to the session JSON file.
+        #[arg(long)]
+        session_json: PathBuf,
+    },
+    /// Post a tweet (or reply with `--reply-to <id>`). Respects `--dry-run`
+    /// and the hard 15/day quota. Media is deferred (phase 2).
+    Post {
+        #[arg(long)]
+        text: String,
+        /// When set, post as a reply to this tweet id.
+        #[arg(long)]
+        reply_to: Option<String>,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+    /// Run one close-friend feed poll cycle and print the WorkItems found.
+    /// Read-only — no replies are posted (those go via Discord approval).
+    PollOnce,
 }
 
 #[derive(Subcommand)]
@@ -1069,6 +1227,21 @@ async fn main() -> Result<()> {
                         None
                     }
                 };
+            // LinkedIn friend-post engagement (#13). Independent 6h cadence;
+            // self-disables when LinkedIn auth is absent (same gate as the
+            // DM channel) or when no wiki is configured.
+            let linkedin_feed = match build_linkedin_feed_engagement(
+                &cli,
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                dry_run,
+            ) {
+                Ok(ch) => Some(ch),
+                Err(e) => {
+                    warn!("linkedin feed engagement disabled: {e:#}");
+                    None
+                }
+            };
             // Discord is optional too — builds only if creds are in Keychain.
             let discord_ch = match build_discord_channel(
                 &cli,
@@ -1151,6 +1324,10 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { li.run(sd).await }));
             }
+            if let Some(lf) = linkedin_feed {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { lf.run(sd).await }));
+            }
             if let Some(dc) = discord_ch {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { dc.run(sd).await }));
@@ -1168,6 +1345,18 @@ async fn main() -> Result<()> {
             if let Some(sc) = slack_ch {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { sc.run(sd).await }));
+                // Slack workspace digest (#8). Rides alongside the Slack
+                // channel exactly like the Discord digest does — the shared
+                // scheduler is pinned to platform="slack" and skips cleanly
+                // when there are no Digest-mode Slack subscriptions.
+                let slack_digest = augmentagent_channel_slack::slack_digest_scheduler(
+                    Arc::clone(&store),
+                    Arc::new(ClaudeCliReasoner::new()),
+                    Arc::clone(&broker),
+                    cli.wiki_dir.clone(),
+                );
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { slack_digest.run(sd).await }));
             }
             if let Some(gh) = github_ch {
                 let sd = shutdown.clone();
@@ -1258,6 +1447,15 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+                // Stale-draft sweep (#99): periodically expire pending
+                // approvals older than AUGMENTAGENT_STALE_DRAFT_DAYS (default
+                // 7d) to `timed_out`, so an abandoned backlog can't sit
+                // forever blocking new triage via backpressure. Runs hourly.
+                let sweep_store = Arc::clone(&store);
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move {
+                    run_stale_draft_sweep(sweep_store, sd).await
+                }));
             }
 
             // Self-healing: backfill any connected-Gmail addresses Composio
@@ -1379,6 +1577,38 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             LinkedinOp::Recent => run_linkedin_recent().await,
+            LinkedinOp::ConnectionsSync { apply, full } => {
+                let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
+                run_linkedin_connections_sync(&cli, store, broker, *apply, *full).await
+            }
+            LinkedinOp::Post {
+                text,
+                image,
+                visibility,
+                dry_run,
+            } => {
+                run_linkedin_post(
+                    Arc::clone(&store),
+                    text.clone(),
+                    image.clone(),
+                    visibility.clone(),
+                    *dry_run,
+                )
+                .await
+            }
+        },
+        Cmd::Twitter { ref op } => match op {
+            TwitterOp::Login { session_json } => {
+                run_twitter_login(session_json.clone()).await
+            }
+            TwitterOp::Post {
+                text,
+                reply_to,
+                dry_run,
+            } => {
+                run_twitter_post(store, text.clone(), reply_to.clone(), *dry_run).await
+            }
+            TwitterOp::PollOnce => run_twitter_poll_once(&cli).await,
         },
         Cmd::Slack { ref op } => match op {
             SlackOp::Login { auth_json } => run_slack_login(store, auth_json.clone()).await,
@@ -1651,6 +1881,17 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::Contacts { ref op } => match op {
+            ContactsOp::Sync {
+                backend,
+                entity_id,
+                apply,
+            } => {
+                let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
+                run_contacts_sync(&cli, store, broker, backend, entity_id, *apply)
+                    .await
+            }
+        },
         Cmd::Compose { op } => match op {
             ComposeOp::FanOut { .. } => {
                 unimplemented!("see issue #53 (content-adapter feature PR)")
@@ -1687,9 +1928,34 @@ async fn main() -> Result<()> {
                 run_tone_refresh_stale(store, threshold, budget_secs).await
             }
         },
+        Cmd::BackfillSignatures {
+            ref since,
+            limit,
+            min_confidence,
+            apply,
+        } => {
+            let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
+            run_backfill_signatures(
+                &cli,
+                store,
+                broker,
+                since.clone(),
+                limit,
+                min_confidence,
+                apply,
+            )
+            .await
+        }
         Cmd::Drafts { op } => match op {
             DraftsOp::FeedbackClusters { since_days, top } => {
                 run_drafts_feedback_clusters(store, since_days, top)
+            }
+        },
+        Cmd::Approvals { op } => match op {
+            ApprovalsOp::List { limit } => run_approvals_list(store, limit),
+            ApprovalsOp::ApproveAll { yes } => run_approvals_approve_all(store, yes),
+            ApprovalsOp::DiscardOlder { days, yes } => {
+                run_approvals_discard_older(store, days, yes)
             }
         },
         Cmd::Ratelimit { op } => match op {
@@ -1704,6 +1970,111 @@ async fn main() -> Result<()> {
             RatelimitOp::Caps => run_ratelimit_caps(),
         },
     }
+}
+
+/// `approvals list` — read-only dump of the oldest pending drafts (#99).
+fn run_approvals_list(store: Arc<Store>, limit: i64) -> Result<()> {
+    let limit = limit.max(1);
+    let rows = store.oldest_pending_actions(limit)?;
+    let total = store.pending_reply_count()?;
+    if rows.is_empty() {
+        println!("No pending drafts. Backlog is clear.");
+        return Ok(());
+    }
+    println!(
+        "{} pending draft(s) (showing {} oldest first):\n",
+        total,
+        rows.len()
+    );
+    for (id, from, subject, age_ms) in &rows {
+        println!(
+            "  {id}  [{}]  {from} — {}",
+            humanize_age(*age_ms),
+            truncate(subject, 80)
+        );
+    }
+    if total > rows.len() as i64 {
+        println!("\n  (+{} more — raise --limit to see them)", total - rows.len() as i64);
+    }
+    Ok(())
+}
+
+/// `approvals approve-all` — bulk-resolve every pending draft to `approved`
+/// (#99). Queue-hygiene only: does NOT send the Gmail drafts. `--yes`-gated;
+/// audit-logged to stdout + tracing.
+fn run_approvals_approve_all(store: Arc<Store>, yes: bool) -> Result<()> {
+    let pending = store.oldest_pending_actions(i64::MAX)?;
+    if pending.is_empty() {
+        println!("No pending drafts to clear.");
+        return Ok(());
+    }
+    if !yes {
+        println!(
+            "DRY RUN — would resolve {} pending draft(s) to 'approved' \
+             (no Gmail send). Re-run with --yes true to apply:\n",
+            pending.len()
+        );
+        for (id, from, subject, age_ms) in &pending {
+            println!("  {id}  [{}]  {from} — {}", humanize_age(*age_ms), truncate(subject, 80));
+        }
+        return Ok(());
+    }
+    let mut cleared = 0usize;
+    for (id, from, subject, _age) in &pending {
+        if store.mark_pending_approved(id)? {
+            cleared += 1;
+            info!(action_id = %id, %from, "approvals approve-all: resolved pending draft");
+            println!("[audit] approve-all resolved {id}  {from} — {}", truncate(subject, 80));
+        }
+    }
+    info!(cleared, requested = pending.len(), "approvals approve-all complete");
+    println!("\nCleared {cleared} pending draft(s). Gmail drafts were NOT sent.");
+    Ok(())
+}
+
+/// `approvals discard-older <days>` — expire pending drafts older than N days
+/// to `timed_out` (#99). `--yes`-gated; audit-logged.
+fn run_approvals_discard_older(store: Arc<Store>, days: i64, yes: bool) -> Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let days = days.max(0);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let cutoff_ms = now_ms - days * 24 * 60 * 60 * 1000;
+    // Preview: enumerate the rows that would be swept. A row's creation time
+    // is `now_ms - age_ms`; it's stale when that is at/before the cutoff.
+    let stale: Vec<_> = store
+        .oldest_pending_actions(i64::MAX)?
+        .into_iter()
+        .filter(|(_, _, _, age_ms)| now_ms - age_ms <= cutoff_ms)
+        .collect();
+    if stale.is_empty() {
+        println!("No pending drafts older than {days}d.");
+        return Ok(());
+    }
+    if !yes {
+        println!(
+            "DRY RUN — would expire {} pending draft(s) older than {days}d to \
+             'timed_out'. Re-run with --yes true to apply:\n",
+            stale.len()
+        );
+        for (id, from, subject, age_ms) in &stale {
+            println!("  {id}  [{}]  {from} — {}", humanize_age(*age_ms), truncate(subject, 80));
+        }
+        return Ok(());
+    }
+    let swept = store.expire_pending_older_than(cutoff_ms)?;
+    info!(swept, days, "approvals discard-older complete");
+    for (id, from, subject, age_ms) in &stale {
+        println!(
+            "[audit] discard-older expired {id}  [{}]  {from} — {}",
+            humanize_age(*age_ms),
+            truncate(subject, 80)
+        );
+    }
+    println!("\nExpired {swept} pending draft(s) older than {days}d.");
+    Ok(())
 }
 
 /// Lightweight recurring-feedback surfacing for `draft_revisions` (#37 Phase 2
@@ -2392,6 +2763,48 @@ async fn backfill_gmail_emails(store: &Store, only_missing: bool) -> Result<Vec<
     Ok(lines)
 }
 
+/// Hourly stale-draft sweep (#99). Expires pending approvals older than
+/// `AUGMENTAGENT_STALE_DRAFT_DAYS` (default 7) to `timed_out` so an abandoned
+/// backlog can't permanently wedge new triage behind backpressure. Best-effort
+/// — a failed sweep logs and retries next tick; it never takes the daemon down.
+async fn run_stale_draft_sweep(
+    store: Arc<Store>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let days: i64 = std::env::var("AUGMENTAGENT_STALE_DRAFT_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|n| *n >= 0)
+        .unwrap_or(7);
+    let mut ticker = tokio::time::interval(Duration::from_secs(60 * 60));
+    info!(stale_draft_days = days, "stale-draft sweep started (hourly)");
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("stale-draft sweep: shutdown signal received");
+                return Ok(());
+            }
+            _ = ticker.tick() => {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let cutoff_ms = now_ms - days * 24 * 60 * 60 * 1000;
+                match store.expire_pending_older_than(cutoff_ms) {
+                    Ok(0) => {}
+                    Ok(n) => info!(
+                        swept = n,
+                        stale_draft_days = days,
+                        "stale-draft sweep: expired abandoned pending drafts"
+                    ),
+                    Err(e) => warn!("stale-draft sweep failed: {e:#}"),
+                }
+            }
+        }
+    }
+}
+
 async fn run_digest(
     cli: &Cli,
     store: Arc<Store>,
@@ -2410,6 +2823,16 @@ async fn run_digest(
     let counts = store.action_counts_since(since_ms)?;
     let recent = store.recent_emails_since(since_ms, 40)?;
     let pending = store.pending_reply_count()?;
+    // #100: explicit, *exhaustive* enumeration of the two sets that are
+    // action items — flagged (in window) and pending (all-time backlog).
+    // These are independent of the 40-row recency sample above, which
+    // silently dropped flagged/pending items once volume exceeded 40.
+    let flagged = store.flagged_actions_since(since_ms)?;
+    let pending_rows = store.pending_actions()?;
+    // Hard overflow cap so a pathological backlog can't blow the Discord
+    // message limit. Backpressure (#99) keeps `pending` well under this in
+    // practice; the digest prompt is told to enumerate every listed row.
+    const DIGEST_LIST_CAP: usize = 25;
 
     let mut ctx = String::new();
     ctx.push_str(&format!(
@@ -2423,6 +2846,45 @@ async fn run_digest(
         }
     }
     ctx.push_str(&format!("\n## Pending replies (awaiting approval)\n- {pending}\n"));
+
+    // ## Flagged items (all) — exhaustive, not a recency sample.
+    ctx.push_str(&format!(
+        "\n## Flagged items (all, last {since_hours}h) — EXHAUSTIVE\n"
+    ));
+    if flagged.is_empty() {
+        ctx.push_str("(none flagged in window)\n");
+    } else {
+        let total = flagged.len();
+        for (from, subject, reason) in flagged.iter().take(DIGEST_LIST_CAP) {
+            ctx.push_str(&format!(
+                "- {from} — {} — reason: {}\n",
+                truncate(subject, 120),
+                truncate(reason, 160)
+            ));
+        }
+        if total > DIGEST_LIST_CAP {
+            ctx.push_str(&format!("- (+{} more)\n", total - DIGEST_LIST_CAP));
+        }
+    }
+
+    // ## Pending approvals (all) — entire backlog, oldest first.
+    ctx.push_str("\n## Pending approvals (all, oldest first) — EXHAUSTIVE\n");
+    if pending_rows.is_empty() {
+        ctx.push_str("(no drafts awaiting approval)\n");
+    } else {
+        let total = pending_rows.len();
+        for (from, subject, age_ms) in pending_rows.iter().take(DIGEST_LIST_CAP) {
+            ctx.push_str(&format!(
+                "- {from} — {} — waiting {}\n",
+                truncate(subject, 120),
+                humanize_age(*age_ms)
+            ));
+        }
+        if total > DIGEST_LIST_CAP {
+            ctx.push_str(&format!("- (+{} more)\n", total - DIGEST_LIST_CAP));
+        }
+    }
+
     ctx.push_str("\n## Recent emails (from / subject / triage)\n");
     if recent.is_empty() {
         ctx.push_str("(no emails in window)\n");
@@ -2451,6 +2913,24 @@ async fn run_digest(
         info!("digest posted to Discord");
     }
     Ok(())
+}
+
+/// Coarse "how long has this been waiting" string for the digest pending
+/// list. Millisecond input; rounds down to the largest sensible unit.
+fn humanize_age(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    let mins = secs / 60;
+    let hours = mins / 60;
+    let days = hours / 24;
+    if days >= 1 {
+        format!("{days}d")
+    } else if hours >= 1 {
+        format!("{hours}h")
+    } else if mins >= 1 {
+        format!("{mins}m")
+    } else {
+        "<1m".to_string()
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2919,13 +3399,19 @@ async fn git_commit_batch(
     }
 
     let msg = format!("wiki: migrate batch {batch_no} to v2");
+    // Commit identity comes from env (no hardcoded personal data); neutral
+    // fallback so a public checkout is clean. Override via .env.
+    let git_author_name = std::env::var("AUGMENTAGENT_GIT_AUTHOR_NAME")
+        .unwrap_or_else(|_| "AugmentAgent".to_string());
+    let git_author_email = std::env::var("AUGMENTAGENT_GIT_AUTHOR_EMAIL")
+        .unwrap_or_else(|_| "augmentagent@localhost".to_string());
     let st = tokio::process::Command::new("git")
         .arg("-C")
         .arg(wiki_root)
         .arg("-c")
-        .arg("user.name=Nolan Makatche")
+        .arg(format!("user.name={git_author_name}"))
         .arg("-c")
-        .arg("user.email=REDACTED")
+        .arg(format!("user.email={git_author_email}"))
         .arg("commit")
         .arg("-m")
         .arg(&msg)
@@ -3073,39 +3559,86 @@ impl ReplyApprover {
                 message: "LinkedIn is not configured (no cookies); run `linkedin login`".into(),
             };
         };
-        let Some(conv_urn) = action.email.thread_id.as_deref() else {
-            return ApprovalActionOutcome::Failed {
-                message: "no conversationUrn on email; cannot send".into(),
-            };
-        };
         let Some(body) = action.action.draft_body.as_deref() else {
             return ApprovalActionOutcome::Failed {
                 message: "no draft body on action; cannot send".into(),
             };
         };
-        match linkedin.send_message(conv_urn, body).await {
-            Ok(_) => {
-                let _ = self.store.update_action_status(
-                    action_id,
-                    ActionStatus::Sent,
-                    Some(body),
-                    None,
-                );
-                let _ = self
-                    .store
-                    .mark_email_processed(&action.email.message_id, TriageResult::Reply);
-                tracing::info!(action_id, "linkedin reply sent via approval handler");
-                ApprovalActionOutcome::Approved
+
+        // Two LinkedIn dispatch shapes share this handler, distinguished by
+        // the email row's `kind`:
+        //  - `post_engagement` (#13): message_id IS the post urn; the
+        //    approved draft is a supportive comment → `post_comment`.
+        //  - everything else (DM reply): thread_id is the conversationUrn →
+        //    `send_message`.
+        if action.email.kind == "post_engagement" {
+            let post_urn = action.email.message_id.as_str();
+            match linkedin.post_comment(post_urn, body).await {
+                Ok(_) => {
+                    let _ = self.store.update_action_status(
+                        action_id,
+                        ActionStatus::Sent,
+                        Some(body),
+                        None,
+                    );
+                    let _ = self
+                        .store
+                        .mark_email_processed(post_urn, TriageResult::Reply);
+                    // Durable cap accounting (#13): record the successful
+                    // engagement so the feed trigger's daily cap survives
+                    // restarts and we never double-comment the same post.
+                    let _ = self.store.log_linkedin_action(
+                        &uuid::Uuid::new_v4().to_string(),
+                        "post_engagement",
+                        Some(post_urn),
+                        "ok",
+                        chrono::Utc::now().timestamp_millis(),
+                        None,
+                    );
+                    tracing::info!(action_id, "linkedin comment posted via approval handler");
+                    ApprovalActionOutcome::Approved
+                }
+                Err(e) => {
+                    let msg = format!("linkedin post_comment: {e}");
+                    let _ = self.store.update_action_status(
+                        action_id,
+                        ActionStatus::Error,
+                        None,
+                        Some(&msg),
+                    );
+                    ApprovalActionOutcome::Failed { message: msg }
+                }
             }
-            Err(e) => {
-                let msg = format!("linkedin send_message: {e}");
-                let _ = self.store.update_action_status(
-                    action_id,
-                    ActionStatus::Error,
-                    None,
-                    Some(&msg),
-                );
-                ApprovalActionOutcome::Failed { message: msg }
+        } else {
+            let Some(conv_urn) = action.email.thread_id.as_deref() else {
+                return ApprovalActionOutcome::Failed {
+                    message: "no conversationUrn on email; cannot send".into(),
+                };
+            };
+            match linkedin.send_message(conv_urn, body).await {
+                Ok(_) => {
+                    let _ = self.store.update_action_status(
+                        action_id,
+                        ActionStatus::Sent,
+                        Some(body),
+                        None,
+                    );
+                    let _ = self
+                        .store
+                        .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                    tracing::info!(action_id, "linkedin reply sent via approval handler");
+                    ApprovalActionOutcome::Approved
+                }
+                Err(e) => {
+                    let msg = format!("linkedin send_message: {e}");
+                    let _ = self.store.update_action_status(
+                        action_id,
+                        ActionStatus::Error,
+                        None,
+                        Some(&msg),
+                    );
+                    ApprovalActionOutcome::Failed { message: msg }
+                }
             }
         }
     }
@@ -4060,6 +4593,82 @@ fn build_linkedin_channel(
     ))
 }
 
+/// Build the friend-post engagement runner (#13). Shares the DM channel's
+/// auth gate (errors if LinkedIn isn't configured). Uses the
+/// `skills/linkedin-triage` rubric, a 6h-with-jitter cadence
+/// (`AUGMENTAGENT_LINKEDIN_FEED_POLL_SECS` override), and a default daily
+/// engagement cap of 5 (`AUGMENTAGENT_LINKEDIN_MAX_ENGAGEMENTS` override).
+fn build_linkedin_feed_engagement(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<LinkedInFeedEngagement<VoyagerClient, ClaudeCliReasoner>> {
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = LinkedInAuth::load_with_migration(&repo_root)
+        .context("load linkedin auth (feed engagement)")?;
+    let member_urn = auth.member_urn.clone();
+    let voyager = Arc::new(VoyagerClient::new(auth));
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+
+    let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
+        Some(root) => {
+            let schema = cli
+                .wiki_schema
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("schema/wiki-skill.md"));
+            (Some(root.clone()), Some(schema))
+        }
+        None => (None, None),
+    };
+
+    // Engagement-specific rubric sits alongside the email-triage skill dir.
+    let triage_skill_dir = cli
+        .skill_dir
+        .parent()
+        .map(|p| p.join("linkedin-triage"))
+        .unwrap_or_else(|| PathBuf::from("skills/linkedin-triage"));
+
+    let poll_secs = std::env::var("AUGMENTAGENT_LINKEDIN_FEED_POLL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FEED_POLL_SECS);
+    let max_per_day = std::env::var("AUGMENTAGENT_LINKEDIN_MAX_ENGAGEMENTS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MAX_ENGAGEMENTS_PER_DAY);
+
+    let trigger = Arc::new(augmentagent_channel_linkedin::LinkedInFeedTrigger::new(
+        Arc::clone(&voyager),
+        Arc::clone(&store),
+        wiki_root.clone(),
+        max_per_day,
+    ));
+
+    let config = LinkedInChannelConfig {
+        poll_interval: Duration::from_secs(poll_secs),
+        dry_run,
+        wiki_root,
+        wiki_schema_path,
+        skill_dir: triage_skill_dir,
+    };
+    info!(
+        member = %member_urn,
+        interval_secs = poll_secs,
+        max_per_day,
+        "linkedin feed engagement ready"
+    );
+    Ok(LinkedInFeedEngagement {
+        store,
+        reasoner,
+        approvals: broker,
+        trigger,
+        member_urn,
+        config,
+        poll_interval: Duration::from_secs(poll_secs),
+    })
+}
+
 /// Best-effort load of the voyager client. None when neither Keychain nor the
 /// legacy file has credentials — callers treat this as "LinkedIn disabled for
 /// this run".
@@ -4138,6 +4747,525 @@ async fn run_linkedin_recent() -> Result<()> {
             snippet,
         );
     }
+    Ok(())
+}
+
+/// #61 — LinkedIn 1st-degree connection sync. Dry-run by default (prints a
+/// JSON report, writes nothing); `--apply` writes fill-blanks-only wiki
+/// pages and persists the sync cursor. Posts an "N new / M updated" summary
+/// card to Discord when a broker is wired.
+async fn run_linkedin_connections_sync(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    apply: bool,
+    force_full: bool,
+) -> Result<()> {
+    use augmentagent_store::LinkedInConnectionSync;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for connections sync")?;
+    let layout = augmentagent_wiki::WikiLayout::new(wiki_root.clone());
+    layout.bootstrap().context("wiki bootstrap")?;
+
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = LinkedInAuth::load_with_migration(&repo_root)
+        .context("load linkedin auth from keychain or legacy file")?;
+    let account_id = auth.member_urn.clone();
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let prior = store
+        .get_linkedin_connection_sync(&account_id)
+        .context("read connection-sync cursor")?;
+    let last_full = prior.as_ref().and_then(|s| s.last_full_sync_ms);
+    let mode = if force_full {
+        SyncMode::Full
+    } else {
+        SyncMode::decide(last_full, now_ms)
+    };
+    // Resume an interrupted full sync from its persisted offset; deltas
+    // always restart at 0 (recency-descending, cheap to re-walk the head).
+    let start_offset = match mode {
+        SyncMode::Full => prior.as_ref().map(|s| s.cursor_start as usize).unwrap_or(0),
+        SyncMode::Delta { .. } => 0,
+    };
+
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    let client = VoyagerConnectionsClient::new(auth);
+    let syncer = ConnectionSyncer {
+        api: &client,
+        layout: &layout,
+        today,
+        apply,
+    };
+
+    info!(
+        account = %account_id,
+        ?mode,
+        start_offset,
+        apply,
+        "starting linkedin connections sync"
+    );
+    let report = syncer
+        .run(mode, start_offset, |d| tokio::time::sleep(d))
+        .await
+        .context("connection sync run")?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+
+    if apply {
+        // On a completed run, advance the cursor. Full → record full-sync
+        // timestamp and reset cursor; delta → record delta timestamp.
+        let next = match mode {
+            SyncMode::Full => LinkedInConnectionSync {
+                account_id: account_id.clone(),
+                last_full_sync_ms: Some(now_ms),
+                last_delta_sync_ms: prior.as_ref().and_then(|s| s.last_delta_sync_ms),
+                cursor_start: 0,
+                last_synced_count: report.connections_seen as i64,
+            },
+            SyncMode::Delta { last_full_sync_ms } => LinkedInConnectionSync {
+                account_id: account_id.clone(),
+                last_full_sync_ms: Some(last_full_sync_ms),
+                last_delta_sync_ms: Some(now_ms),
+                cursor_start: 0,
+                last_synced_count: report.connections_seen as i64,
+            },
+        };
+        store
+            .upsert_linkedin_connection_sync(&next)
+            .context("persist connection-sync cursor")?;
+    }
+
+    // Surface a summary card (reuses the digest embed path; no buttons).
+    if report.created > 0 || report.updated > 0 {
+        if let Err(e) = broker
+            .post_digest(
+                "LinkedIn connections sync",
+                &report.discord_summary(),
+            )
+            .await
+        {
+            warn!("failed to post connections summary to discord: {e}");
+        }
+    }
+
+    Ok(())
+}
+
+/// #62 — contacts sync. `backend` is `google` (Composio People) or
+/// `carddav` (env-configured). Dry-run JSON by default; `--apply` writes
+/// fill-blanks wiki pages, indexes phones, persists the sync cursor, and
+/// posts a Discord summary.
+async fn run_contacts_sync(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    backend: &str,
+    entity_id: &str,
+    apply: bool,
+) -> Result<()> {
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for contacts sync")?;
+    let layout = augmentagent_wiki::WikiLayout::new(wiki_root);
+    layout.bootstrap().context("wiki bootstrap")?;
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    let (source, account_id): (Box<dyn ContactsSource>, String) = match backend {
+        "google" => {
+            let api_key = std::env::var("COMPOSIO_API_KEY")
+                .context("COMPOSIO_API_KEY env var required for the google backend")?;
+            (
+                Box::new(GooglePeopleSource::new(api_key, entity_id.to_string())),
+                entity_id.to_string(),
+            )
+        }
+        "carddav" => {
+            let src = CardDavSource::from_env().context(
+                "CardDAV not configured — set AUGMENTAGENT_CARDDAV_URL / _USER / _PASS",
+            )?;
+            (Box::new(src), "default".to_string())
+        }
+        other => anyhow::bail!("unknown contacts backend '{other}' (use google|carddav)"),
+    };
+
+    let syncer = ContactsSyncer {
+        source: source.as_ref(),
+        layout: &layout,
+        store: &store,
+        today,
+        apply,
+    };
+    info!(backend, account = %account_id, apply, "starting contacts sync");
+    let report = syncer
+        .run(&account_id)
+        .await
+        .context("contacts sync run")?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+
+    if report.created > 0 || report.updated > 0 {
+        if let Err(e) = broker
+            .post_digest("Contacts sync", &report.discord_summary())
+            .await
+        {
+            warn!("failed to post contacts summary to discord: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// #64 — email-signature backfill. Scans stored email bodies since
+/// `--since`, detects the signature block (regex + line-density), runs the
+/// LLM field extractor (strict JSON + retry + regex fallback), and merges
+/// high-confidence fields fill-blanks-only into the sender's wiki page.
+/// Low-confidence fields are collected into a single daily Discord digest
+/// for manual approval. Dry-run JSON by default.
+#[allow(clippy::too_many_arguments)]
+async fn run_backfill_signatures(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    since: Option<String>,
+    limit: i64,
+    min_confidence: f64,
+    apply: bool,
+) -> Result<()> {
+    use augmentagent_wiki::{merge_person_page, slug_from_email, WikiLayout};
+
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for signature backfill")?;
+    let layout = WikiLayout::new(wiki_root);
+    layout.bootstrap().context("wiki bootstrap")?;
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    // Resolve --since (default 180d ago) to an epoch-ms lower bound.
+    let since_ms = match &since {
+        Some(s) => {
+            let d = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+                .context("--since must be YYYY-MM-DD")?;
+            d.and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        }
+        None => (chrono::Utc::now() - chrono::Duration::days(180)).timestamp_millis(),
+    };
+
+    let rows = store
+        .email_bodies_since(since_ms, limit)
+        .context("read email bodies for signature backfill")?;
+
+    let reasoner = ClaudeCliReasoner::new();
+    let extractor = SignatureExtractor::new(&reasoner);
+
+    let mut scanned = 0usize;
+    let mut sig_found = 0usize;
+    let mut created = 0usize;
+    let mut updated = 0usize;
+    let mut noop = 0usize;
+    // De-dupe per sender within a run (latest sig wins; merge is fill-blanks
+    // so order is immaterial, but skip redundant LLM calls).
+    let mut seen_senders: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut digest_lines: Vec<String> = Vec::new();
+
+    for (_mid, from, body) in rows {
+        scanned += 1;
+        let slug = slug_from_email(&from);
+        if slug.is_empty() || !seen_senders.insert(slug.clone()) {
+            continue;
+        }
+        let stripped = strip_quoted_reply(&body);
+        let Some(block) = detect_signature_block(&stripped) else {
+            continue;
+        };
+        sig_found += 1;
+        let fields = match extractor.extract(&block.text).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::debug!(%from, "sig extract skipped: {e}");
+                continue;
+            }
+        };
+        let (patch, deferred) = signature_patch(&fields, &today, min_confidence);
+        for d in deferred {
+            digest_lines.push(format!("{from}: {d}"));
+        }
+        if patch.is_empty() {
+            noop += 1;
+            continue;
+        }
+
+        let path = layout.people_dir().join(format!("{slug}.md"));
+        let existing = std::fs::read_to_string(&path).ok();
+        let merged = merge_person_page(existing.as_deref(), &patch);
+        if !merged.changed {
+            noop += 1;
+            continue;
+        }
+        if merged.created {
+            created += 1;
+        } else {
+            updated += 1;
+        }
+        if apply {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, &merged.content)?;
+        }
+    }
+
+    let report = serde_json::json!({
+        "scanned": scanned,
+        "signatures_detected": sig_found,
+        "created": created,
+        "updated": updated,
+        "noop": noop,
+        "deferred_low_confidence": digest_lines.len(),
+        "applied": apply,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+
+    if !digest_lines.is_empty() {
+        let body = format!(
+            "Low-confidence signature fields needing review ({}):\n{}",
+            digest_lines.len(),
+            digest_lines
+                .iter()
+                .take(40)
+                .map(|l| format!("- {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        if let Err(e) = broker
+            .post_digest("Signature backfill — low-confidence", &body)
+            .await
+        {
+            warn!("failed to post signature digest: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Manual / test feed-post path (#51/#77). The daemon publishes through the
+/// approval pipeline; this command is for one-shots and smoke tests. It
+/// enforces the same rolling-24h cap (3 posts/day) the daemon path does, a
+/// first-N-posts second-confirmation guard, and a `--dry-run` that prints
+/// the request body without sending.
+async fn run_linkedin_post(
+    store: Arc<Store>,
+    text: String,
+    image: Option<PathBuf>,
+    visibility: String,
+    dry_run: bool,
+) -> Result<()> {
+    let vis = Visibility::parse(&visibility)
+        .ok_or_else(|| anyhow::anyhow!("invalid --visibility (use public|connections)"))?;
+
+    // Dry-run: build + print the canonical body, no auth, no send.
+    if dry_run {
+        let body = build_normshares_body(&text, vis, image.as_ref().map(|_| "<image-urn>"));
+        println!(
+            "[linkedin post dry-run] visibility={visibility} image={}\n{}",
+            image.is_some(),
+            serde_json::to_string_pretty(&body)?
+        );
+        return Ok(());
+    }
+
+    // --- rolling-24h cap preflight (3 posts/day per #77 §7) ---
+    const POST_DAILY_CAP: u32 = 3;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let used = store
+        .linkedin_action_count_since("post", now_ms - 24 * 3600 * 1000)
+        .context("read linkedin_action_log")?;
+    if used >= POST_DAILY_CAP {
+        anyhow::bail!(
+            "linkedin post cap reached: {used}/{POST_DAILY_CAP} in the last 24h; deferring"
+        );
+    }
+
+    // --- first-N-posts second-confirmation guard ---
+    // Posting to the user's professional surface is the highest-blast-radius
+    // action in the system. For the first few posts ever made by this tool,
+    // require an explicit AUGMENTAGENT_LINKEDIN_POST_CONFIRM=yes so a stray
+    // command can't quietly publish.
+    const GUARDED_FIRST_N: u32 = 3;
+    let lifetime = store
+        .linkedin_action_count_since("post", 0)
+        .context("read lifetime linkedin posts")?;
+    if lifetime < GUARDED_FIRST_N {
+        let confirmed = std::env::var("AUGMENTAGENT_LINKEDIN_POST_CONFIRM")
+            .map(|v| v.eq_ignore_ascii_case("yes"))
+            .unwrap_or(false);
+        if !confirmed {
+            anyhow::bail!(
+                "second-confirmation required for the first {GUARDED_FIRST_N} posts \
+                 (post #{} lifetime): re-run with AUGMENTAGENT_LINKEDIN_POST_CONFIRM=yes",
+                lifetime + 1
+            );
+        }
+    }
+
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = LinkedInAuth::load_with_migration(&repo_root)
+        .context("load linkedin auth from keychain or legacy file")?;
+    let voyager = VoyagerClient::new(auth);
+
+    let image_bytes = match &image {
+        Some(p) => Some(
+            std::fs::read(p).with_context(|| format!("read image {}", p.display()))?,
+        ),
+        None => None,
+    };
+    let image_filename = image
+        .as_ref()
+        .and_then(|p| p.file_name().and_then(|n| n.to_str()));
+
+    let draft = PostDraft {
+        text: &text,
+        image: image_bytes.as_deref(),
+        image_filename,
+        visibility: vis,
+    };
+
+    let log_id = uuid::Uuid::new_v4().to_string();
+    match voyager.create_share(draft).await {
+        Ok(urn) => {
+            store
+                .log_linkedin_action(
+                    &log_id,
+                    "post",
+                    Some(&urn.0),
+                    "ok",
+                    now_ms,
+                    None,
+                )
+                .ok();
+            println!("posted: {}", urn.0);
+            Ok(())
+        }
+        Err(e) => {
+            store
+                .log_linkedin_action(
+                    &uuid::Uuid::new_v4().to_string(),
+                    "post",
+                    None,
+                    "failed",
+                    now_ms,
+                    Some(&format!("{e}")),
+                )
+                .ok();
+            Err(anyhow::anyhow!("linkedin create_share: {e}"))
+        }
+    }
+}
+
+// ================================================================
+// X / Twitter (issues #14, #15, #16, #79)
+// ================================================================
+
+async fn run_twitter_login(session_json: PathBuf) -> Result<()> {
+    let raw = std::fs::read_to_string(&session_json)
+        .with_context(|| format!("read session file at {}", session_json.display()))?;
+    let mut auth: TwitterAuth =
+        serde_json::from_str(&raw).context("parse session JSON")?;
+    auth.validate()
+        .context("session file missing required fields")?;
+    if auth.harvested_at_ms == 0 {
+        auth.harvested_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+    }
+
+    // Probe the DM inbox once to validate the session before persisting —
+    // bad cookies fail fast here instead of at the first poll.
+    let client = TwitterClient::new(auth.clone());
+    match client.fetch_dm_inbox(None).await {
+        Ok(dms) => info!(dm_count = dms.len(), "twitter session probe OK"),
+        Err(e) => anyhow::bail!("session probe failed: {e}; aborting save"),
+    }
+
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let out = twitter_default_auth_path(&repo_root);
+    auth.save(&out)
+        .with_context(|| format!("save auth to {}", out.display()))?;
+    auth.save_to_keychain(augmentagent_auth::DEFAULT_ACCOUNT)
+        .context("save auth to keychain (augmentagent/twitter/default)")?;
+    println!(
+        "twitter auth saved to {} + keychain (augmentagent/twitter/default)",
+        out.display()
+    );
+    println!("account: @{} (id {})", auth.screen_name, auth.user_id);
+    Ok(())
+}
+
+async fn run_twitter_post(
+    store: Arc<Store>,
+    text: String,
+    reply_to: Option<String>,
+    dry_run: bool,
+) -> Result<()> {
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = TwitterAuth::load_with_migration(&repo_root).context(
+        "load twitter auth from keychain or legacy file — run `augmentagent twitter login`",
+    )?;
+    let api = Arc::new(TwitterClient::new(auth));
+    let client = CreateTweetClient::new(api, store, dry_run);
+    match client.create(&text, reply_to.as_deref(), &[]).await {
+        Ok(out) => {
+            println!("{out:?}");
+            Ok(())
+        }
+        Err(e) => anyhow::bail!("twitter post failed: {e}"),
+    }
+}
+
+async fn run_twitter_poll_once(cli: &Cli) -> Result<()> {
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = TwitterAuth::load_with_migration(&repo_root)
+        .context("load twitter auth from keychain or legacy file")?;
+    let my_user_id = auth.user_id.clone();
+    let api = Arc::new(TwitterClient::new(auth));
+    let Some(wiki_root) = cli.wiki_dir.clone() else {
+        anyhow::bail!("twitter poll-once needs --wiki-dir (close-friend pages live there)");
+    };
+    let trigger = TwitterFeedTrigger::new(api.clone(), wiki_root, my_user_id.clone());
+    let cancel = CancellationToken::new();
+    let items =
+        augmentagent_channel_core::Trigger::next_work_items(&trigger, &cancel).await?;
+    println!("feed: {} new tweet(s) from close friends", items.len());
+    for it in &items {
+        println!("  - {} {}", it.kind, it.external_id);
+    }
+    // Also surface a DM-inbox count (read-only smoke).
+    let dm_src = TwitterDmSource::new(api, my_user_id);
+    let dms = augmentagent_channel_core::InboundSource::fetch_new(&dm_src).await?;
+    println!("dm inbox: {} new inbound DM(s)", dms.len());
     Ok(())
 }
 
