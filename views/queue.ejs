@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0f17" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="stylesheet" href="/styles.css" />
+  <title>AugmentAgent — Approvals</title>
+  <style>
+    body { background:#0b0f17; color:#e6edf3; font-family:system-ui,sans-serif; margin:0; padding:1rem; }
+    .card { background:#161b22; border:1px solid #30363d; border-radius:12px; padding:1rem; margin:.75rem 0; }
+    .row { display:flex; gap:.5rem; margin-top:.75rem; }
+    button { flex:1; padding:.7rem; border:0; border-radius:8px; font-weight:600; }
+    .ok { background:#238636; color:#fff; } .skip { background:#6e7681; color:#fff; }
+    .rev { background:#9e6a03; color:#fff; }
+    h1 { font-size:1.1rem; } .muted { color:#8b949e; font-size:.85rem; }
+  </style>
+</head>
+<body>
+  <h1>Pending approvals</h1>
+  <p class="muted" id="status">Loading…</p>
+  <div id="queue"></div>
+
+  <script>
+    const apiKey = localStorage.getItem("aa_api_key") || "";
+    const headers = apiKey ? { "x-api-key": apiKey } : {};
+
+    async function load() {
+      try {
+        const r = await fetch("/api/v1/actions?status=pending&limit=50", { headers });
+        if (!r.ok) { document.getElementById("status").textContent = "Auth required — set aa_api_key in localStorage."; return; }
+        const data = await r.json();
+        render(data.actions || []);
+      } catch (e) {
+        document.getElementById("status").textContent = "Offline — cached shell.";
+      }
+    }
+
+    function render(actions) {
+      const q = document.getElementById("queue");
+      document.getElementById("status").textContent = actions.length + " pending";
+      q.innerHTML = "";
+      for (const a of actions) {
+        const el = document.createElement("div");
+        el.className = "card";
+        el.innerHTML =
+          "<strong>" + (a.subject || "(no subject)") + "</strong>" +
+          "<div class='muted'>" + (a.fromEmail || "") + "</div>" +
+          "<pre style='white-space:pre-wrap'>" + (a.draftBody || "") + "</pre>" +
+          "<div class='row'>" +
+          "<button class='ok'>Approve</button>" +
+          "<button class='rev'>Revise</button>" +
+          "<button class='skip'>Skip</button></div>";
+        const [ok, rev, skip] = el.querySelectorAll("button");
+        ok.onclick = () => resolve(a.id, "sent");
+        skip.onclick = () => resolve(a.id, "rejected");
+        rev.onclick = () => {
+          const fb = prompt("Revision feedback:");
+          if (fb) resolve(a.id, "pending", fb);
+        };
+        q.appendChild(el);
+      }
+    }
+
+    async function resolve(id, status, feedback) {
+      await fetch("/api/v1/actions/" + id, {
+        method: "POST",
+        headers: Object.assign({ "Content-Type": "application/json" }, headers),
+        body: JSON.stringify({ status, source: "web_push", errorMessage: feedback }),
+      });
+      load();
+    }
+
+    // PWA + Web Push registration.
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/sw.js").then(async (reg) => {
+        try {
+          const { publicKey } = await (await fetch("/api/push/vapid")).json();
+          if (!publicKey) return;
+          const sub = await reg.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: publicKey,
+          });
+          await fetch("/api/push/subscribe", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(sub),
+          });
+        } catch (e) { /* push optional; queue still works */ }
+      });
+    }
+
+    load();
+    setInterval(load, 30000);
+  </script>
+</body>
+</html>

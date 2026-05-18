@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use augmentagent_approval_discord::{
     ApprovalActionHandler, ApprovalActionOutcome, ApprovalBroker, DiscordApprovalBroker,
-    DiscordConfig, NoopBroker, QueryHandler,
+    DiscordConfig, LoopPoster, LoopRunner, LoopScheduler, NoopBroker, QueryHandler,
 };
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
@@ -40,6 +40,7 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod invoice;
+mod self_improve;
 
 #[derive(Parser)]
 #[command(name = "augmentagent", version, about = "AugmentAgent Rust daemon")]
@@ -96,6 +97,14 @@ enum Cmd {
     /// `GMAIL_GET_PROFILE`, so the dashboard + invoice entity picker show
     /// who's who instead of opaque IDs. Safe to re-run.
     AccountsBackfillEmails,
+    /// #103 — self-improvement loop: pick an `agent-fixable` GitHub issue,
+    /// fix it on an isolated worktree/branch (never main), run the
+    /// verification gate, and open a DRAFT PR. Never auto-merges.
+    SelfImprove {
+        /// Dry-run (default true): run the gate but stop before opening a PR.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
     /// Wiki maintenance.
     Wiki {
         #[command(subcommand)]
@@ -179,6 +188,11 @@ enum Cmd {
     Github {
         #[command(subcommand)]
         op: GithubOp,
+    },
+    /// Reddit DM/inbox channel OAuth bootstrap (#48).
+    Reddit {
+        #[command(subcommand)]
+        op: RedditOp,
     },
     /// Meetup.com group events → Discord digest (multi-tenant; no email).
     Meetup {
@@ -551,6 +565,29 @@ enum VoiceOp {
         path: PathBuf,
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RedditOp {
+    /// Print the Reddit consent URL for the dashboard OAuth bootstrap.
+    AuthUrl {
+        #[arg(long)]
+        client_id: String,
+        #[arg(long)]
+        redirect_uri: String,
+        #[arg(long, default_value = "augmentagent")]
+        state: String,
+    },
+    /// Exchange an authorization code for a permanent refresh token and
+    /// persist it to the keyring.
+    Exchange {
+        #[arg(long)]
+        client_id: String,
+        #[arg(long)]
+        code: String,
+        #[arg(long)]
+        redirect_uri: String,
     },
 }
 
@@ -1132,6 +1169,12 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::SelfImprove { dry_run } => {
+            let repo_root = std::env::current_dir().context("current_dir")?;
+            let msg = self_improve::run_once(&repo_root, dry_run).await?;
+            println!("{msg}");
+            Ok(())
+        }
         Cmd::AccountsBackfillEmails => {
             let lines = backfill_gmail_emails(&store, false).await?;
             if lines.is_empty() {
@@ -1327,6 +1370,19 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { gd.run(sd).await }));
             }
+            // #48 — Reddit channel. Self-gates on having completed the
+            // dashboard OAuth bootstrap (refresh token in keyring); prod
+            // without it never spawns this, exactly like github/meetup gate.
+            match augmentagent_channel_reddit::RedditChannel::from_keychain() {
+                Ok(rc) => {
+                    let rc = Arc::new(rc);
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move { rc.run(sd).await }));
+                }
+                Err(e) => {
+                    info!("reddit channel disabled: {e:#}");
+                }
+            }
             // Nudge scheduler — surfaces pending approval cards one at a time
             // (serial queue). Cross-channel: any pending action (gmail /
             // linkedin / discord / slack) is eligible. The approver holds a
@@ -1356,6 +1412,41 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { inv.run(sd).await }));
 
+                // #104 — /loop scheduled-task scheduler. Runs each due loop's
+                // stored prompt through the wiki-ask reasoner and posts the
+                // result back to the originating Discord channel/DM. Requires
+                // a bot token (for the post-back HTTP client) and a wiki dir
+                // (the reasoner toolbelt is scoped to it); skips with a log
+                // otherwise. Gated on !dry_run alongside the other schedulers.
+                match (
+                    std::env::var("DISCORD_BOT_TOKEN").ok(),
+                    cli.wiki_dir.clone(),
+                ) {
+                    (Some(token), Some(wiki_root)) => {
+                        let repo_root = std::env::current_dir()
+                            .unwrap_or_else(|_| PathBuf::from("."));
+                        let runner = Arc::new(LoopReasonerRunner {
+                            reasoner: Arc::new(ClaudeCliReasoner::new()),
+                            wiki_root,
+                            repo_root,
+                        });
+                        let poster = Arc::new(DiscordLoopPoster {
+                            http: Arc::new(serenity::http::Http::new(&token)),
+                        });
+                        let loops = Arc::new(LoopScheduler::new(
+                            Arc::clone(&store),
+                            runner,
+                            poster,
+                        ));
+                        let sd = shutdown.clone();
+                        tasks.push(tokio::spawn(async move { loops.run(sd).await }));
+                    }
+                    _ => {
+                        info!(
+                            "/loop scheduler disabled (needs DISCORD_BOT_TOKEN                              + --wiki-dir)"
+                        );
+                    }
+                }
                 // Stale-draft sweep (#99): periodically expire pending
                 // approvals older than AUGMENTAGENT_STALE_DRAFT_DAYS (default
                 // 7d) to `timed_out`, so an abandoned backlog can't sit
@@ -1713,6 +1804,40 @@ async fn main() -> Result<()> {
         Cmd::Voice { op } => match op {
             VoiceOp::PollOnce { .. } | VoiceOp::Ingest { .. } => {
                 unimplemented!("see voice-channel feature PR")
+            }
+        },
+        Cmd::Reddit { ref op } => match op {
+            RedditOp::AuthUrl {
+                client_id,
+                redirect_uri,
+                state,
+            } => {
+                println!(
+                    "{}",
+                    augmentagent_channel_reddit::authorize_url(
+                        client_id,
+                        redirect_uri,
+                        state
+                    )
+                );
+                Ok(())
+            }
+            RedditOp::Exchange {
+                client_id,
+                code,
+                redirect_uri,
+            } => {
+                let creds = augmentagent_channel_reddit::exchange_code(
+                    client_id,
+                    code,
+                    redirect_uri,
+                )
+                .await
+                .context("reddit code exchange")?;
+                augmentagent_channel_reddit::RedditAuth::save(&creds)
+                    .context("persist reddit creds")?;
+                println!("{{\"ok\":true}}");
+                Ok(())
             }
         },
         Cmd::Github { ref op } => match op {
@@ -3316,6 +3441,48 @@ impl QueryHandler for WikiQuerier {
     async fn answer(&self, question: &str) -> anyhow::Result<String> {
         let opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
         self.reasoner.call(&opts, question).await
+    }
+}
+
+/// `/loop` runner (#104): fires a stored loop prompt through the exact same
+/// `claude` reasoner + `ask_opts` toolbelt the wiki-ask path uses, so
+/// `/loop 1h what's new in my inbox` behaves identically to asking the bot.
+struct LoopReasonerRunner {
+    reasoner: Arc<ClaudeCliReasoner>,
+    wiki_root: PathBuf,
+    repo_root: PathBuf,
+}
+
+#[async_trait]
+impl LoopRunner for LoopReasonerRunner {
+    async fn run_prompt(&self, prompt: &str) -> anyhow::Result<String> {
+        let opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
+        self.reasoner.call(&opts, prompt).await
+    }
+}
+
+/// Posts a loop's result back to the originating Discord channel/DM using a
+/// bare serenity HTTP client (no gateway) — same approach as the digest
+/// poster. `channel_ref` is the stringified channel id captured at creation.
+struct DiscordLoopPoster {
+    http: Arc<serenity::http::Http>,
+}
+
+#[async_trait]
+impl LoopPoster for DiscordLoopPoster {
+    async fn post_to(&self, channel_ref: &str, body: &str) -> anyhow::Result<()> {
+        use serenity::all::{ChannelId, CreateMessage};
+        let cid: u64 = channel_ref
+            .parse()
+            .with_context(|| format!("loop channel_ref not a u64: {channel_ref}"))?;
+        let channel = ChannelId::new(cid);
+        for chunk in augmentagent_approval_discord::chunk_for_discord(body) {
+            channel
+                .send_message(&*self.http, CreateMessage::new().content(chunk))
+                .await
+                .context("discord send_message (loop result)")?;
+        }
+        Ok(())
     }
 }
 

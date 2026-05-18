@@ -329,6 +329,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-channel-calendly"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-channel-core",
+ "augmentagent-channel-linear",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "augmentagent-channel-contacts"
 version = "0.1.0"
 dependencies = [
@@ -487,6 +504,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-channel-linear"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-channel-core",
+ "mockito",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "augmentagent-channel-linkedin"
 version = "0.1.0"
 dependencies = [
@@ -524,6 +558,40 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "augmentagent-channel-notion"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-channel-core",
+ "augmentagent-channel-linear",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "augmentagent-channel-reddit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-auth",
+ "augmentagent-channel-core",
+ "reqwest",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -670,6 +738,7 @@ dependencies = [
  "augmentagent-channel-github",
  "augmentagent-channel-linkedin",
  "augmentagent-channel-meetup",
+ "augmentagent-channel-reddit",
  "augmentagent-channel-slack",
  "augmentagent-channel-telegram-bot",
  "augmentagent-channel-twitter",
