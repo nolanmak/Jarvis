@@ -2793,13 +2793,19 @@ async fn git_commit_batch(
     }
 
     let msg = format!("wiki: migrate batch {batch_no} to v2");
+    // Commit identity comes from env (no hardcoded personal data); neutral
+    // fallback so a public checkout is clean. Override via .env.
+    let git_author_name = std::env::var("AUGMENTAGENT_GIT_AUTHOR_NAME")
+        .unwrap_or_else(|_| "AugmentAgent".to_string());
+    let git_author_email = std::env::var("AUGMENTAGENT_GIT_AUTHOR_EMAIL")
+        .unwrap_or_else(|_| "augmentagent@localhost".to_string());
     let st = tokio::process::Command::new("git")
         .arg("-C")
         .arg(wiki_root)
         .arg("-c")
-        .arg("user.name=Nolan Makatche")
+        .arg(format!("user.name={git_author_name}"))
         .arg("-c")
-        .arg("user.email=REDACTED")
+        .arg(format!("user.email={git_author_email}"))
         .arg("commit")
         .arg("-m")
         .arg(&msg)
