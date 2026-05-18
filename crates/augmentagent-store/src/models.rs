@@ -322,3 +322,42 @@ pub struct TelegramBot {
     pub active: bool,
     pub created_at_ms: i64,
 }
+
+/// A paired WhatsApp linked device (#74). One row per phone the user has
+/// linked via `augmentagent whatsapp login`. The whatsmeow noise session
+/// itself lives in the sidecar's own store + the keyring slot; this table is
+/// the index the channel iterates and the place `session_status` is tracked
+/// for re-pair detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhatsappDevice {
+    pub id: String,
+    pub phone: String,
+    pub device_jid: String,
+    pub user_jid: String,
+    pub paired_at_ms: i64,
+    pub last_event_at_ms: i64,
+    /// `paired` | `logged_out` — flipped to `logged_out` when the sidecar
+    /// emits a `logged-out` event so the channel stops trying to send.
+    pub session_status: String,
+    pub active: bool,
+    pub created_at_ms: i64,
+}
+
+/// A user-scheduled recurring prompt/command (`/loop`, #104). The scheduler
+/// ticks every active row on its `interval_secs` cadence. Minimal model
+/// matching the `user_loops` table the store methods read/write.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserLoop {
+    pub id: String,
+    pub owner: String,
+    pub channel: String,
+    pub channel_ref: String,
+    pub interval_secs: i64,
+    pub prompt: String,
+    pub status: String,
+    pub last_run_ms: Option<i64>,
+    pub last_status: Option<String>,
+    pub fail_count: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}

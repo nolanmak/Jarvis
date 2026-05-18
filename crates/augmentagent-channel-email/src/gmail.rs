@@ -58,6 +58,23 @@ pub trait GmailApi: Send + Sync {
         self.fetch_with_query(entity_id, &q, max_total).await
     }
 
+    /// Fetch the last `max` messages of a Gmail thread, oldest-first, for
+    /// thread-aware drafting (#32).
+    ///
+    /// Wraps Gmail `users.threads.get`. Implementations SHOULD return the
+    /// chronologically-ordered messages and leave token/char budgeting to the
+    /// caller. The default impl returns an empty Vec so test fakes that don't
+    /// model threads still compile; `ComposioClient` overrides it with a real
+    /// `GMAIL_FETCH_MESSAGE_BY_THREAD_ID` call.
+    async fn fetch_thread_messages(
+        &self,
+        _entity_id: &str,
+        _thread_id: &str,
+        _max: u32,
+    ) -> Result<Vec<Email>, GmailError> {
+        Ok(Vec::new())
+    }
+
     /// Create a reply draft. Returns the draft ID.
     async fn create_draft(
         &self,
@@ -440,6 +457,41 @@ impl GmailApi for ComposioClient {
             }
         }
         Ok(collected)
+    }
+
+    async fn fetch_thread_messages(
+        &self,
+        entity_id: &str,
+        thread_id: &str,
+        max: u32,
+    ) -> Result<Vec<Email>, GmailError> {
+        // Composio's GMAIL_FETCH_MESSAGE_BY_THREAD_ID returns every message in
+        // the thread in one shot (a thread is small relative to the inbox, so
+        // no pagination is needed). We trim to the last `max` here and let the
+        // prompt layer apply the hard char cap.
+        let args = serde_json::json!({
+            "thread_id": thread_id,
+            // Some Composio builds accept user_id inline; execute() also sets
+            // it at the top level. Harmless duplicate; keeps older builds happy.
+            "user_id": entity_id,
+        });
+        let v = self
+            .execute("GMAIL_FETCH_MESSAGE_BY_THREAD_ID", entity_id, args)
+            .await?;
+        let parsed: FetchResp =
+            serde_json::from_value(v).map_err(|e| GmailError::Decode(e.to_string()))?;
+        let mut msgs: Vec<Email> = parsed
+            .data
+            .messages
+            .into_iter()
+            .filter_map(|m| m.into_email(entity_id))
+            .collect();
+        // Keep only the last `max` messages, preserving chronological order.
+        if max > 0 && msgs.len() > max as usize {
+            let drop = msgs.len() - max as usize;
+            msgs.drain(0..drop);
+        }
+        Ok(msgs)
     }
 
     async fn create_draft(
