@@ -9,6 +9,10 @@ repository.workspace = true
 [dependencies]
 augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
+# #58 engagement engine surfaces preview / failure cards through the shared
+# ApprovalBroker trait. approval-discord depends only on -store, so this
+# does not create a dependency cycle.
+augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
