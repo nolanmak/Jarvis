@@ -93,6 +93,53 @@ impl Store {
         Ok(())
     }
 
+    /// #35 — record one detected ask (shadow telemetry). Cheap insert; never
+    /// dedups (we want the full shadow stream for analysis).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_detected_ask(
+        &self,
+        message_id: &str,
+        platform: &str,
+        ask_text: &str,
+        resolver_kind: &str,
+        auto_fillable: bool,
+        confidence: Option<f64>,
+        raw_json: Option<&str>,
+    ) -> StoreResult<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO detected_asks \
+                (id, message_id, platform, ask_text, resolver_kind, \
+                 auto_fillable, confidence, raw_json, detected_at_ms) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                id,
+                message_id,
+                platform,
+                ask_text,
+                resolver_kind,
+                auto_fillable as i64,
+                confidence,
+                raw_json,
+                now,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// #35 — count detected asks since `since_ms` (shadow-mode dashboards).
+    pub fn detected_asks_since(&self, since_ms: i64) -> StoreResult<i64> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM detected_asks WHERE detected_at_ms >= ?1",
+            params![since_ms],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
     /// Additive, idempotent schema migrations. Safe to run against databases
     /// that were created by the original Node daemon (they just lack some of
     /// the newer columns).
@@ -605,6 +652,38 @@ impl Store {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_proactive_user_actions_lookup \
                 ON proactive_user_actions(action, scope, expires_at_ms)",
+            [],
+        )?;
+
+        // #35 — structured ask-detection telemetry (Phase 1: shadow mode,
+        // log-only, never injected). One row per detected ask in an inbound
+        // message. `resolver_kind` is the would-be resolver
+        // (scheduling|calendly|share_doc|intro|none); `auto_fillable` records
+        // whether the shadow extractor judged it resolvable. No FK to
+        // `actions` — asks are detected on the raw message before any action
+        // row may exist.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS detected_asks (\
+                 id              TEXT PRIMARY KEY,\
+                 message_id      TEXT NOT NULL,\
+                 platform        TEXT NOT NULL,\
+                 ask_text        TEXT NOT NULL,\
+                 resolver_kind   TEXT NOT NULL,\
+                 auto_fillable   INTEGER NOT NULL DEFAULT 0,\
+                 confidence      REAL,\
+                 raw_json        TEXT,\
+                 detected_at_ms  INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_detected_asks_msg \
+                ON detected_asks(message_id)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_detected_asks_recent \
+                ON detected_asks(detected_at_ms)",
             [],
         )?;
 
