@@ -21,10 +21,14 @@ use augmentagent_channel_email::sigextract::{
 };
 use augmentagent_channel_email::{GmailChannel, GmailChannelConfig};
 use augmentagent_channel_linkedin::{
-    build_normshares_body, default_auth_path, is_linkedin_email, LinkedInApi, LinkedInAuth,
-    LinkedInChannel, LinkedInChannelConfig, LinkedInFeedEngagement, PostDraft, VoyagerClient,
-    Visibility, ACCOUNT_PREFIX, DEFAULT_FEED_POLL_SECS, DEFAULT_MAX_ENGAGEMENTS_PER_DAY,
-    DEFAULT_POLL_SECS,
+    build_normshares_body, default_auth_path, is_linkedin_email, ConnectionRequestEngagement,
+    FriendFeedEngagement, InvitationsTrigger, LinkedInApi, LinkedInAuth,
+    LinkedInChannel, LinkedInChannelConfig, LinkedInFeedEngagement, LinkedInFriendFeedSource,
+    OwnPostCommentEngagement, OwnPostsCommentTrigger, PostDraft, VoyagerClient,
+    Visibility, ACCOUNT_PREFIX, DEFAULT_FEED_POLL_SECS, DEFAULT_FRIEND_FEED_POLL_SECS,
+    DEFAULT_INVITATION_POLL_SECS, DEFAULT_MAX_ENGAGEMENTS_PER_DAY,
+    DEFAULT_MAX_FRIEND_POSTS_PER_TICK, DEFAULT_MAX_REPLIES_PER_DAY,
+    DEFAULT_OWN_POST_POLL_SECS, DEFAULT_POLL_SECS,
 };
 use augmentagent_channel_twitter::{
     default_auth_path as twitter_default_auth_path, validate_session as twitter_validate_session,
@@ -321,6 +325,48 @@ enum Cmd {
         #[command(subcommand)]
         op: SchedulePostOp,
     },
+    /// #58.2/.3 — populate the durable inputs the engagement pollers consume:
+    /// register one of your own posts to watch for comments, or add/remove a
+    /// friend on the engagement watchlist.
+    Engagement {
+        #[command(subcommand)]
+        op: EngagementOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum EngagementOp {
+    /// #58.2 — register one of your own posts. The own-post comment poller
+    /// then diffs incoming comments against `seen_comments` until
+    /// `posted_at + --days` (default 7) and surfaces approval-gated replies.
+    WatchPost {
+        /// `linkedin` (twitter/instagram once their pollers land).
+        #[arg(long, default_value = "linkedin")]
+        platform: String,
+        /// The post's stable id (LinkedIn `urn:li:activity:…`).
+        #[arg(long)]
+        external_id: String,
+        /// How many days to keep polling this post. Default 7.
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+    },
+    /// #58.3 — add (or refresh) a friend on the engagement watchlist.
+    WatchFriend {
+        #[arg(long, default_value = "linkedin")]
+        platform: String,
+        /// Platform handle (LinkedIn member urn `urn:li:fsd_profile:…`).
+        #[arg(long)]
+        handle: String,
+        /// Optional `wiki/people/<slug>.md` to ground the draft prompt.
+        #[arg(long)]
+        wiki_slug: Option<String>,
+        /// `high` (every post) | `medium` (weekly digest) | `low`
+        /// (milestones only). Default `medium`.
+        #[arg(long, default_value = "medium")]
+        engagement: String,
+    },
+    /// List pending connection requests queued for triage.
+    Invites,
 }
 
 #[derive(Subcommand)]
@@ -1486,6 +1532,49 @@ async fn main() -> Result<()> {
                     None
                 }
             };
+            // #58.2/.3/.4 — the three remaining engagement sub-features. Each
+            // shares the DM channel's LinkedIn auth gate (self-disables with a
+            // warning when auth is absent) and is inert until its durable
+            // table is populated (own_posts / friend_watchlist / pending
+            // invitations) — same proven-safe always-spawn-empty-is-free
+            // pattern as the scheduled-post engine. All outbound stays
+            // approval-gated + RateGovernor-capped.
+            let own_post_engagement = match build_own_post_comment_engagement(
+                &cli,
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                dry_run,
+            ) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    warn!("linkedin own-post comment engagement disabled: {e:#}");
+                    None
+                }
+            };
+            let friend_feed_engagement = match build_friend_feed_engagement(
+                &cli,
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                dry_run,
+            ) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    warn!("linkedin friend-feed engagement disabled: {e:#}");
+                    None
+                }
+            };
+            let connection_triage = match build_connection_request_engagement(
+                &cli,
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                dry_run,
+            ) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    warn!("linkedin connection-request triage disabled: {e:#}");
+                    None
+                }
+            };
             // Discord is optional too — builds only if creds are in Keychain.
             let discord_ch = match build_discord_channel(
                 &cli,
@@ -1652,6 +1741,18 @@ async fn main() -> Result<()> {
             if let Some(lf) = linkedin_feed {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { lf.run(sd).await }));
+            }
+            if let Some(op) = own_post_engagement {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { op.run(sd).await }));
+            }
+            if let Some(ff) = friend_feed_engagement {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { ff.run(sd).await }));
+            }
+            if let Some(ct) = connection_triage {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { ct.run(sd).await }));
             }
             if let Some(dc) = discord_ch {
                 let sd = shutdown.clone();
@@ -2336,6 +2437,7 @@ async fn main() -> Result<()> {
             RatelimitOp::Caps => run_ratelimit_caps(),
         },
         Cmd::SchedulePost { ref op } => run_schedule_post(store, op).await,
+        Cmd::Engagement { ref op } => run_engagement(store, op).await,
     }
 }
 
@@ -5036,6 +5138,176 @@ fn build_linkedin_feed_engagement(
     })
 }
 
+/// Shared auth + wiki/skill setup for the #58 LinkedIn engagement sub-feature
+/// builders. Errors (→ sub-feature disabled with a warning) when LinkedIn
+/// auth is absent — same gate as the DM channel.
+fn linkedin_engagement_ctx(
+    cli: &Cli,
+) -> Result<(Arc<VoyagerClient>, String, LinkedInChannelConfig, bool)> {
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = LinkedInAuth::load_with_migration(&repo_root)
+        .context("load linkedin auth (engagement)")?;
+    let member_urn = auth.member_urn.clone();
+    let voyager = Arc::new(VoyagerClient::new(auth));
+    let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
+        Some(root) => {
+            let schema = cli
+                .wiki_schema
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("schema/wiki-skill.md"));
+            (Some(root.clone()), Some(schema))
+        }
+        None => (None, None),
+    };
+    let triage_skill_dir = cli
+        .skill_dir
+        .parent()
+        .map(|p| p.join("linkedin-triage"))
+        .unwrap_or_else(|| PathBuf::from("skills/linkedin-triage"));
+    let config = LinkedInChannelConfig {
+        poll_interval: Duration::from_secs(DEFAULT_POLL_SECS),
+        dry_run: false, // overwritten by each caller
+        wiki_root,
+        wiki_schema_path,
+        skill_dir: triage_skill_dir,
+    };
+    Ok((voyager, member_urn, config, true))
+}
+
+/// Construct the merged SqliteGovernor (#83) the engagement sub-features wrap
+/// every outbound publish in. Same construction as the scheduled-post engine.
+fn engagement_governor(
+    store: Arc<Store>,
+) -> Arc<dyn augmentagent_channel_core::RateGovernor> {
+    Arc::new(augmentagent_channel_core::SqliteGovernor::with_system_clock(
+        store,
+    ))
+}
+
+/// #58.2 — own-post comment-reply engagement. Polls the user's registered own
+/// posts (`augmentagent linkedin watch-post …` / dashboard) for new comments,
+/// triages each, surfaces an approval-gated reply. RateGovernor `Comment`
+/// envelope. Cadence `AUGMENTAGENT_LINKEDIN_OWNPOST_POLL_SECS`; reply pre-cap
+/// `AUGMENTAGENT_LINKEDIN_MAX_OWNPOST_REPLIES`.
+fn build_own_post_comment_engagement(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<OwnPostCommentEngagement<VoyagerClient, ClaudeCliReasoner>> {
+    let (voyager, member_urn, mut config, _) = linkedin_engagement_ctx(cli)?;
+    config.dry_run = dry_run;
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let poll_secs = std::env::var("AUGMENTAGENT_LINKEDIN_OWNPOST_POLL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_OWN_POST_POLL_SECS);
+    let max_per_day = std::env::var("AUGMENTAGENT_LINKEDIN_MAX_OWNPOST_REPLIES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MAX_REPLIES_PER_DAY);
+    let trigger = Arc::new(OwnPostsCommentTrigger::new(
+        Arc::clone(&voyager),
+        Arc::clone(&store),
+        max_per_day,
+    ));
+    info!(
+        member = %member_urn,
+        interval_secs = poll_secs,
+        max_per_day,
+        "linkedin own-post comment engagement ready"
+    );
+    Ok(OwnPostCommentEngagement {
+        store: Arc::clone(&store),
+        reasoner,
+        approvals: broker,
+        governor: engagement_governor(store),
+        trigger,
+        member_urn,
+        config,
+        poll_interval: Duration::from_secs(poll_secs),
+    })
+}
+
+/// #58.3 — watchlist-driven friend-post engagement. Iterates the
+/// `friend_watchlist` table, triages each fresh post, surfaces an
+/// approval-gated wiki-grounded comment. RateGovernor `Comment` envelope.
+fn build_friend_feed_engagement(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<FriendFeedEngagement<VoyagerClient, ClaudeCliReasoner>> {
+    let (voyager, member_urn, mut config, _) = linkedin_engagement_ctx(cli)?;
+    config.dry_run = dry_run;
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let poll_secs = std::env::var("AUGMENTAGENT_LINKEDIN_FRIENDFEED_POLL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FRIEND_FEED_POLL_SECS);
+    let max_per_tick = std::env::var("AUGMENTAGENT_LINKEDIN_MAX_FRIEND_POSTS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MAX_FRIEND_POSTS_PER_TICK);
+    let source = Arc::new(LinkedInFriendFeedSource::new(
+        Arc::clone(&voyager),
+        Arc::clone(&store),
+        max_per_tick,
+    ));
+    info!(
+        member = %member_urn,
+        interval_secs = poll_secs,
+        max_per_tick,
+        "linkedin friend-feed engagement ready"
+    );
+    Ok(FriendFeedEngagement {
+        store: Arc::clone(&store),
+        reasoner,
+        approvals: broker,
+        governor: engagement_governor(store),
+        source,
+        member_urn,
+        config,
+        poll_interval: Duration::from_secs(poll_secs),
+    })
+}
+
+/// #58.4 — LinkedIn connection-request triage. Polls pending invitations,
+/// triages accept/ignore, surfaces an approval card with the recommendation
+/// + a suggested opener. The accept/ignore wire call is the approver's job.
+fn build_connection_request_engagement(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<ConnectionRequestEngagement<VoyagerClient, ClaudeCliReasoner>> {
+    let (voyager, member_urn, mut config, _) = linkedin_engagement_ctx(cli)?;
+    config.dry_run = dry_run;
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let poll_secs = std::env::var("AUGMENTAGENT_LINKEDIN_INVITE_POLL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_INVITATION_POLL_SECS);
+    let trigger = Arc::new(InvitationsTrigger::new(
+        Arc::clone(&voyager),
+        Arc::clone(&store),
+    ));
+    info!(
+        member = %member_urn,
+        interval_secs = poll_secs,
+        "linkedin connection-request triage ready"
+    );
+    Ok(ConnectionRequestEngagement {
+        store,
+        reasoner,
+        approvals: broker,
+        trigger,
+        member_urn,
+        config,
+        poll_interval: Duration::from_secs(poll_secs),
+    })
+}
+
 /// Best-effort load of the voyager client. None when neither Keychain nor the
 /// legacy file has credentials — callers treat this as "LinkedIn disabled for
 /// this run".
@@ -5566,6 +5838,62 @@ async fn run_schedule_post(store: Arc<Store>, op: &SchedulePostOp) -> Result<()>
                 println!("cancelled {id}");
             } else {
                 println!("not cancellable (already fired / unknown id): {id}");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn run_engagement(store: Arc<Store>, op: &EngagementOp) -> Result<()> {
+    match op {
+        EngagementOp::WatchPost {
+            platform,
+            external_id,
+            days,
+        } => {
+            let now = chrono::Utc::now().timestamp_millis();
+            let poll_until = now + days.max(&1) * 86_400_000;
+            let id = store.upsert_own_post(platform, external_id, now, poll_until)?;
+            println!(
+                "watching {platform} post {external_id} (row {id}) for comments \
+                 until {poll_until} (unix ms; ~{days}d)"
+            );
+            Ok(())
+        }
+        EngagementOp::WatchFriend {
+            platform,
+            handle,
+            wiki_slug,
+            engagement,
+        } => {
+            store.upsert_friend_watch(
+                platform,
+                handle,
+                wiki_slug.as_deref(),
+                engagement,
+            )?;
+            println!(
+                "watching {platform} friend {handle} (tier={engagement}{})",
+                wiki_slug
+                    .as_deref()
+                    .map(|s| format!(", wiki={s}"))
+                    .unwrap_or_default()
+            );
+            Ok(())
+        }
+        EngagementOp::Invites => {
+            let rows = store.pending_connection_requests()?;
+            if rows.is_empty() {
+                println!("no pending connection requests");
+            }
+            for r in rows {
+                println!(
+                    "{}  {:<9}  {}  {}",
+                    r.id,
+                    r.platform,
+                    r.requester_name.as_deref().unwrap_or("(unknown)"),
+                    r.external_id
+                );
             }
             Ok(())
         }

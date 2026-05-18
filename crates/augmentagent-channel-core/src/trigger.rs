@@ -271,13 +271,50 @@ fn jittered(base: Duration) -> Duration {
     Duration::from_millis(nanos % span)
 }
 
-/// Marker trait reserved for Phase 3 friend-post engagement sources.
+/// Phase 3 friend-post engagement source (#58.3).
 ///
-/// Exists now as an explicit contract so per-platform impls (LinkedIn, Twitter,
-/// Instagram) anchor to a shared name rather than inventing their own. No
-/// methods yet — per-platform fields and the actual feed-polling shape will
-/// grow here when the first Phase 3 feature issue lands.
-pub trait FriendFeedSource: Send + Sync {}
+/// Per-platform impls (LinkedIn, Twitter, Instagram) iterate the durable
+/// `friend_watchlist` table, fetch each watched friend's recent posts, dedup
+/// against `friend_posts_seen`, and yield one
+/// [`WorkItem`] (`kind = `[`kind::FRIEND_POST`]) per genuinely new post. The
+/// triage → wiki-grounded-draft → approval-card path is the caller's job
+/// (mirrors how [`InboundSource`] vs the channel split works for DMs); every
+/// engagement stays approval-gated + RateGovernor-capped.
+///
+/// Modeled as a sibling of [`InboundSource`] (one `fetch_new`-shaped method)
+/// rather than folded into [`Trigger`] directly so a platform crate can be a
+/// leaf dep of `channel-core` and still anchor to this shared contract. Wrap
+/// it in [`FriendFeedTrigger`] to drive it through [`ChannelRunner`].
+#[async_trait]
+pub trait FriendFeedSource: Send + Sync {
+    /// Return any new friend posts since the last call. Empty vec means
+    /// "nothing new this tick". Dedup (via `friend_posts_seen`) is the
+    /// source's responsibility — successive calls must not re-yield a post.
+    async fn fetch_new_friend_posts(&self) -> anyhow::Result<Vec<WorkItem>>;
+}
+
+/// Adapter: drive a [`FriendFeedSource`] through the generic
+/// [`ChannelRunner`] / [`Trigger`] machinery, exactly like
+/// [`InboundMessageTrigger`] does for [`InboundSource`].
+pub struct FriendFeedTrigger<S: FriendFeedSource> {
+    pub source: Arc<S>,
+}
+
+impl<S: FriendFeedSource> FriendFeedTrigger<S> {
+    pub fn new(source: Arc<S>) -> Self {
+        Self { source }
+    }
+}
+
+#[async_trait]
+impl<S: FriendFeedSource + 'static> Trigger for FriendFeedTrigger<S> {
+    async fn next_work_items(
+        &self,
+        _cancel: &CancellationToken,
+    ) -> anyhow::Result<Vec<WorkItem>> {
+        self.source.fetch_new_friend_posts().await
+    }
+}
 
 /// Marker trait reserved for Phase 2 digest sources (Slack workspace, Discord
 /// server). Same rationale as [`FriendFeedSource`].
@@ -524,6 +561,44 @@ mod tests {
             .expect("run did not exit on cancel")
             .unwrap();
         assert!(res.is_ok());
+    }
+
+    // --- FriendFeedSource / FriendFeedTrigger (#58.3) ---
+
+    struct StubFriendFeed {
+        posts: Mutex<Vec<WorkItem>>,
+    }
+
+    #[async_trait]
+    impl FriendFeedSource for StubFriendFeed {
+        async fn fetch_new_friend_posts(&self) -> anyhow::Result<Vec<WorkItem>> {
+            Ok(std::mem::take(&mut *self.posts.lock().unwrap()))
+        }
+    }
+
+    #[tokio::test]
+    async fn friend_feed_trigger_yields_source_posts() {
+        let src = Arc::new(StubFriendFeed {
+            posts: Mutex::new(vec![WorkItem {
+                platform: "linkedin".into(),
+                kind: kind::FRIEND_POST.into(),
+                external_id: "urn:li:activity:42".into(),
+                payload: serde_json::json!({ "friend": "alex" }),
+            }]),
+        });
+        let trig = FriendFeedTrigger::new(src);
+        let items = trig
+            .next_work_items(&CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, kind::FRIEND_POST);
+        // Drained — a second tick is empty (dedup is the source's job).
+        let again = trig
+            .next_work_items(&CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(again.is_empty());
     }
 
     #[test]
