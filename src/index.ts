@@ -14,6 +14,7 @@ import {
 import { fetchUnreadEmails } from "./gmailService";
 import { runAgent, redraftWithFeedback } from "./agent";
 import dashboardRouter from "./dashboard";
+import apiV1Router, { MODE } from "./apiV1";
 import type { Email } from "./types";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
@@ -102,11 +103,12 @@ function startDashboard(): void {
   app.set("view engine", "ejs");
   app.set("views", path.join(__dirname, "..", "views"));
 
-  // Routes
+  // Routes — versioned JSON API first (split-deployment, #1), then UI.
+  app.use(apiV1Router);
   app.use(dashboardRouter);
 
   app.listen(DASHBOARD_PORT, () => {
-    console.log(`Dashboard running at http://localhost:${DASHBOARD_PORT}`);
+    console.log(`Dashboard running at http://localhost:${DASHBOARD_PORT} (MODE=${MODE})`);
   });
 }
 
