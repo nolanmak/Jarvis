@@ -1161,6 +1161,18 @@ async fn main() -> Result<()> {
             if let Some(sc) = slack_ch {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { sc.run(sd).await }));
+                // Slack workspace digest (#8). Rides alongside the Slack
+                // channel exactly like the Discord digest does — the shared
+                // scheduler is pinned to platform="slack" and skips cleanly
+                // when there are no Digest-mode Slack subscriptions.
+                let slack_digest = augmentagent_channel_slack::slack_digest_scheduler(
+                    Arc::clone(&store),
+                    Arc::new(ClaudeCliReasoner::new()),
+                    Arc::clone(&broker),
+                    cli.wiki_dir.clone(),
+                );
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { slack_digest.run(sd).await }));
             }
             if let Some(gh) = github_ch {
                 let sd = shutdown.clone();
