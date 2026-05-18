@@ -21,7 +21,10 @@ use augmentagent_store::Store;
 
 use crate::broker::BrokerState;
 use crate::custom_id::{CustomId, Verb};
-use crate::layout::{approval_message, extract_feedback, revise_modal};
+use crate::layout::{
+    approval_message, extract_feedback, extract_fill_values, fill_ask_modal, fill_feedback,
+    revise_modal, split_needs_input,
+};
 use crate::ApprovalActionOutcome;
 
 const DISCORD_MSG_LIMIT: usize = 1900;
@@ -276,6 +279,38 @@ impl EventHandler for Handler {
                             warn!("failed to open revise modal: {e}");
                         }
                     }
+                    Verb::FillAsk => {
+                        // "Provide missing info" (#35 Phase 5). Re-read the
+                        // persisted draft, decode the needs-input marker, and
+                        // open a modal pre-labeled with each unresolved ask.
+                        // Opening a modal IS the interaction response (fast).
+                        let needs = self
+                            .state
+                            .store
+                            .as_ref()
+                            .and_then(|s| {
+                                s.get_action_with_email(&cid.action_id).ok().flatten()
+                            })
+                            .and_then(|a| a.action.draft_body)
+                            .map(|d| split_needs_input(&d).1)
+                            .unwrap_or_default();
+                        if needs.is_empty() {
+                            ack_ephemeral(
+                                &ctx,
+                                &comp,
+                                "Nothing left to fill in for this draft.",
+                            )
+                            .await;
+                            return;
+                        }
+                        let modal = fill_ask_modal(&cid.action_id, &needs);
+                        if let Err(e) = comp
+                            .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+                            .await
+                        {
+                            warn!("failed to open fill-ask modal: {e}");
+                        }
+                    }
                     Verb::QuickRefine => {
                         // Quick-refine StringSelect (#34): map the chosen
                         // preset id → canned feedback, route it through the
@@ -421,8 +456,8 @@ impl EventHandler for Handler {
                             }
                         });
                     }
-                    Verb::ReviseModal => {
-                        debug!("unexpected ReviseModal on component interaction");
+                    Verb::ReviseModal | Verb::FillAskModal => {
+                        debug!("unexpected modal verb on component interaction");
                     }
                 }
             }
@@ -430,7 +465,7 @@ impl EventHandler for Handler {
                 let Some(cid) = CustomId::parse(&modal.data.custom_id) else {
                     return;
                 };
-                if cid.verb != Verb::ReviseModal {
+                if !matches!(cid.verb, Verb::ReviseModal | Verb::FillAskModal) {
                     return;
                 }
                 if let Some(allowed) = self.state.allowed_user_id {
@@ -464,7 +499,44 @@ impl EventHandler for Handler {
                     return;
                 }
 
-                let feedback = extract_feedback(&modal.data.components).unwrap_or_default();
+                let feedback = match cid.verb {
+                    Verb::FillAskModal => {
+                        // Re-derive the unresolved asks from the persisted
+                        // draft so submitted values pair to the right ask,
+                        // then turn them into Revise feedback. Routing
+                        // through the SAME revise path below means the draft
+                        // is re-written with the concrete values and the
+                        // needs-input marker is naturally dropped (the
+                        // re-draft never re-emits it).
+                        let needs = self
+                            .state
+                            .store
+                            .as_ref()
+                            .and_then(|s| {
+                                s.get_action_with_email(&cid.action_id).ok().flatten()
+                            })
+                            .and_then(|a| a.action.draft_body)
+                            .map(|d| split_needs_input(&d).1)
+                            .unwrap_or_default();
+                        let filled =
+                            extract_fill_values(&modal.data.components, &needs);
+                        if filled.is_empty() {
+                            let _ = modal
+                                .create_followup(
+                                    &ctx.http,
+                                    CreateInteractionResponseFollowup::new()
+                                        .content(
+                                            "No values supplied — draft unchanged.",
+                                        )
+                                        .ephemeral(true),
+                                )
+                                .await;
+                            return;
+                        }
+                        fill_feedback(&filled)
+                    }
+                    _ => extract_feedback(&modal.data.components).unwrap_or_default(),
+                };
                 let handler = self.state.action_handler.clone();
                 let action_id = cid.action_id.clone();
                 let approval_channel = self.state.approval_channel_id;

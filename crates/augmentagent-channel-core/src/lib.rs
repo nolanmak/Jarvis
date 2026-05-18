@@ -22,10 +22,10 @@ pub use engagement::{
     auto_post_mode_for, AutoPostMode, PostPublisher, PublishOutcome, ScheduledPostEngine,
 };
 pub use resolve::{
-    default_resolvers, detect_asks_shadow, live_resolvers, resolve_asks_block,
+    default_resolvers, detect_asks_shadow, live_resolvers, resolve_asks, resolve_asks_block,
     resolved_asks_block, AskResolveMode, AskResolver, BusyInterval, ComposioResolveClient,
-    DetectedAsk, DriveHit, DriveSearchApi, FreeBusyApi, ResolveCtx, ResolvedFill,
-    ResolverKind,
+    DetectedAsk, DriveHit, DriveSearchApi, FreeBusyApi, ResolveCtx, ResolveOutcome,
+    ResolvedFill, ResolverKind, UnresolvedAsk,
 };
 pub use governor::{
     lookup_limit, next_action_delay, quiet_hours_until, requires_approval, scale_cap,
