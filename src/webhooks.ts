@@ -37,8 +37,14 @@ function hmacHex(secret: string, body: Buffer): string {
 function timingSafeEqualStr(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ab, bb);
+  // Hash both sides to a fixed width first so the length check itself does
+  // not leak the secret length via early return / timing.
+  const ah = crypto.createHash("sha256").update(ab).digest();
+  const bh = crypto.createHash("sha256").update(bb).digest();
+  const eq = crypto.timingSafeEqual(ah, bh);
+  // Still require true equality (sha256 collision resistance makes the hash
+  // compare sufficient, but keep the direct check as defense in depth).
+  return eq && ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
 }
 
 function spool(platform: string, payload: unknown): void {
@@ -52,7 +58,171 @@ function spool(platform: string, payload: unknown): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Deft (Deftform) webhook receiver — #116.
+//
+// Unlike Linear/Notion/Calendly, Deftform's outbound webhook is **unsigned**
+// (no HMAC/signature is documented — see `docs/deft-protocol.md` §4). The
+// only authentication available is therefore a shared secret carried in the
+// URL path: `/webhooks/deft/:secret`, constant-time-compared against
+// `AUGMENTAGENT_DEFT_WEBHOOK_SECRET`. The whole path is inert unless both
+// `AUGMENTAGENT_DEFT_ENABLED` is truthy AND the secret is set, mirroring the
+// Rust crate's `deft_enabled()` arming gate (least-privilege for a C&C
+// surface, not a ban-risk gate — the Deftform API is sanctioned).
+//
+// On a valid submission we normalize each `data[]` element to the same
+// WorkItem/command shape the Rust deft poll path produces
+// (`platform="deft"`, `kind="dm"`, `external_id="deft:<uuid>"`), dedup by
+// submission `uuid` against a persisted seen-set so a webhook+poll (or a
+// Deftform retry) double-delivery collapses to one spooled action, and hand
+// off via the same spool the daemon already tails. `Store::is_message_processed`
+// (keyed on the identical `deft:<uuid>`) is the authoritative downstream
+// backstop; this receiver-level dedup just avoids redundant spool churn.
+
+const DEFT_SEEN =
+  process.env.AUGMENTAGENT_DEFT_SEEN ||
+  path.join(os.tmpdir(), "augmentagent-deft-seen.jsonl");
+
+// Bound the in-memory mirror so a long-lived process can't grow unboundedly;
+// the persisted file + the daemon's is_message_processed remain authoritative
+// across the (rare) eviction window.
+const DEFT_SEEN_MAX = 5000;
+const deftSeenMem = new Set<string>();
+let deftSeenLoaded = false;
+
+function loadDeftSeen(): void {
+  if (deftSeenLoaded) return;
+  deftSeenLoaded = true;
+  try {
+    const raw = fs.readFileSync(DEFT_SEEN, "utf8");
+    for (const line of raw.split("\n")) {
+      const id = line.trim();
+      if (id) deftSeenMem.add(id);
+    }
+  } catch {
+    // No seen file yet — first run.
+  }
+}
+
+// Returns true if this dedup id was already seen (and records it if not).
+function deftMarkSeen(dedupId: string): boolean {
+  loadDeftSeen();
+  if (deftSeenMem.has(dedupId)) return true;
+  deftSeenMem.add(dedupId);
+  if (deftSeenMem.size > DEFT_SEEN_MAX) {
+    // Evict oldest insertion (Set preserves insertion order).
+    const oldest = deftSeenMem.values().next().value;
+    if (oldest !== undefined) deftSeenMem.delete(oldest);
+  }
+  try {
+    fs.appendFileSync(DEFT_SEEN, dedupId + "\n");
+  } catch (e) {
+    console.warn(`[webhooks] deft seen write failed: ${(e as Error).message}`);
+  }
+  return false;
+}
+
+// Mirror of the Rust `DeftSubmission` shape (defensive — docs don't pin the
+// envelope, see `docs/deft-protocol.md` §4). One Deftform webhook body may
+// carry a single submission object or a `data`/`submissions` array of them.
+interface DeftField {
+  label?: string;
+  response?: string;
+  uuid?: string;
+  custom_key?: string;
+}
+interface DeftSubmission {
+  submission_id?: string;
+  id?: string;
+  uuid?: string;
+  formId?: string;
+  form_id?: string;
+  created_at?: string;
+  submitted_at?: string;
+  data?: DeftField[];
+}
+
+// Pull submissions out of whatever frame Deftform sends. A bare submission
+// has a `data[]` of fields; a wrapper has a `data`/`submissions` array of
+// submissions. Disambiguate by whether the array elements look like fields
+// (have `label`/`response`) vs submissions (have `uuid`/`data`).
+function extractDeftSubmissions(body: unknown): DeftSubmission[] {
+  if (!body || typeof body !== "object") return [];
+  const obj = body as Record<string, unknown>;
+  const arr =
+    (Array.isArray(obj.submissions) && obj.submissions) ||
+    (Array.isArray(obj.data) &&
+      obj.data.some(
+        (e) =>
+          e &&
+          typeof e === "object" &&
+          ("uuid" in (e as object) || "data" in (e as object)) &&
+          !("response" in (e as object))
+      ) &&
+      obj.data) ||
+    null;
+  if (arr) return (arr as DeftSubmission[]).filter((s) => s && typeof s === "object");
+  // Otherwise treat the body itself as one submission.
+  return [obj as DeftSubmission];
+}
+
+function deftDedupId(sub: DeftSubmission, formId: string): string {
+  const uuid = (sub.uuid || "").trim();
+  if (uuid) return `deft:${uuid}`;
+  const sid = (sub.submission_id || sub.id || "").trim();
+  return `deft:${formId}:${sid}`;
+}
+
 const router = Router();
+
+router.post(
+  "/webhooks/deft/:secret",
+  express.raw({ type: "*/*" }),
+  (req, res) => {
+    const secret = process.env.AUGMENTAGENT_DEFT_WEBHOOK_SECRET || "";
+    const enabled = ["1", "true", "yes", "on"].includes(
+      String(process.env.AUGMENTAGENT_DEFT_ENABLED || "")
+        .trim()
+        .toLowerCase()
+    );
+    // Inert unless armed AND a secret is configured. Same 404-ish 401 for
+    // "not armed" and "bad secret" so an attacker can't probe the arming
+    // state.
+    const provided = String(req.params.secret || "");
+    if (!enabled || !secret || !timingSafeEqualStr(provided, secret)) {
+      res.status(401).json({ error: "bad secret" });
+      return;
+    }
+    const raw: Buffer = req.body instanceof Buffer ? req.body : Buffer.from("");
+    let parsed: unknown = {};
+    try {
+      parsed = JSON.parse(raw.toString("utf8"));
+    } catch {
+      res.status(400).json({ error: "bad json" });
+      return;
+    }
+    const subs = extractDeftSubmissions(parsed);
+    let accepted = 0;
+    let duplicates = 0;
+    for (const sub of subs) {
+      const formId = (sub.formId || sub.form_id || "").trim();
+      const dedupId = deftDedupId(sub, formId);
+      if (deftMarkSeen(dedupId)) {
+        duplicates++;
+        continue;
+      }
+      // Stamp the form id from nothing-but-the-body for now; the Rust
+      // handler re-derives the command from the spooled submission and
+      // applies the same `into_email` normalization the poll path uses, so
+      // the receiver only needs to forward the raw submission verbatim.
+      spool("deft", sub);
+      accepted++;
+    }
+    // Reply fast + 202 even on all-duplicate so Deftform (whose retry policy
+    // is undocumented) does not hammer us; the body reports the split.
+    res.status(202).json({ ok: true, accepted, duplicates });
+  }
+);
 
 // Linear: `linear-signature` header = hex HMAC-SHA256 of the raw body, keyed
 // by LINEAR_WEBHOOK_SECRET (falls back to LINEAR_API_KEY).
@@ -141,4 +311,4 @@ router.post(
 );
 
 export default router;
-export { hmacHex, SPOOL };
+export { hmacHex, SPOOL, DEFT_SEEN };
