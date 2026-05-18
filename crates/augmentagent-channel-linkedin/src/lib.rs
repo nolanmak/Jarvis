@@ -12,9 +12,14 @@
 pub mod api;
 pub mod auth;
 pub mod channel;
+pub mod connections;
 pub mod types;
 
 pub use api::{LinkedInApi, LinkedInError, VoyagerClient, DEFAULT_CONVERSATIONS_QUERY_ID};
 pub use auth::{default_auth_path, AuthError, LinkedInAuth, DEFAULT_USER_AGENT};
 pub use channel::{LinkedInChannel, LinkedInChannelConfig, PollOutcome, DEFAULT_POLL_SECS};
+pub use connections::{
+    connection_patch, connection_slug, parse_connections, Connection, ConnectionDiff,
+    ConnectionSyncer, ConnectionsApi, SyncMode, SyncReport, VoyagerConnectionsClient,
+};
 pub use types::{is_linkedin_email, Dm, MemberUrn, ACCOUNT_PREFIX};

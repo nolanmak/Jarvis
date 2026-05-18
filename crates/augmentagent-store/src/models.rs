@@ -322,3 +322,28 @@ pub struct TelegramBot {
     pub active: bool,
     pub created_at_ms: i64,
 }
+
+/// #61 — LinkedIn 1st-degree connection sync cursor. One row per LinkedIn
+/// account (keyed by the user's own `urn:li:fsd_profile:...`). `cursor_start`
+/// resumes a paginated full sync that was interrupted; the two timestamps
+/// drive the full-vs-delta decision (full = monthly, delta = daily).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedInConnectionSync {
+    pub account_id: String,
+    pub last_full_sync_ms: Option<i64>,
+    pub last_delta_sync_ms: Option<i64>,
+    pub cursor_start: i64,
+    pub last_synced_count: i64,
+}
+
+/// #62 — one row in the phone→person reverse index. Lets message-triage map
+/// an inbound `+1415…` to an existing wiki page before it forks a new one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhoneIdentity {
+    /// E.164-normalized (`+14155551234`).
+    pub phone: String,
+    pub person_slug: String,
+    pub display_name: Option<String>,
+    /// Provenance: `google_people` | `carddav` | `email_signature`.
+    pub source: String,
+}

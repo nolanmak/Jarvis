@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use crate::models::{
     Account, ActionRecord, ActionStatus, ChannelSubscription, DriveAccount, Email, LearnedPattern,
-    RateAuditRow, RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TelegramBot, ToneExample,
-    ToneProfile, TriageResult,
+    LinkedInConnectionSync, PhoneIdentity, RateAuditRow, RateHalt, RateWarmup, SlackWorkspace,
+    SubscriptionMode, TelegramBot, ToneExample, ToneProfile, TriageResult,
 };
 
 #[derive(Debug, Error)]
@@ -519,6 +519,61 @@ impl Store {
             [],
         )?;
 
+        // ---------------------------------------------------------------
+        // CRM ingestion (#61 LinkedIn connections / #62 contacts / #64
+        // signature backfill). All additive + dormant in prod until the
+        // respective CLI command runs; same proven-safe pattern as the
+        // wave-A tables above.
+        // ---------------------------------------------------------------
+
+        // #61 — LinkedIn 1st-degree connection sync cursor. One row keyed by
+        // the user's own member urn (`account_id`); `last_full_sync_ms`
+        // gates full-vs-delta mode, `cursor_start` resumes a paginated full
+        // sync that was interrupted mid-run.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS linkedin_connection_sync (\
+                 account_id          TEXT PRIMARY KEY,\
+                 last_full_sync_ms   INTEGER,\
+                 last_delta_sync_ms  INTEGER,\
+                 cursor_start        INTEGER NOT NULL DEFAULT 0,\
+                 last_synced_count   INTEGER NOT NULL DEFAULT 0,\
+                 updated_at_ms       INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
+        // #62 — generic contacts sync token (Google People `syncToken` or
+        // CardDAV `getctag`), keyed by `(backend, account_id)`.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS contacts_sync_state (\
+                 backend       TEXT NOT NULL,\
+                 account_id    TEXT NOT NULL,\
+                 sync_token    TEXT,\
+                 updated_at_ms INTEGER NOT NULL,\
+                 PRIMARY KEY (backend, account_id)\
+             )",
+            [],
+        )?;
+
+        // #62 — phone→person reverse index consulted by message-triage
+        // before creating a new wiki page. `phone` is E.164-normalized;
+        // unique so re-ingest is an upsert, not a duplicate.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS identity_phone (\
+                 phone         TEXT PRIMARY KEY,\
+                 person_slug   TEXT NOT NULL,\
+                 display_name  TEXT,\
+                 source        TEXT NOT NULL,\
+                 updated_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_identity_phone_slug \
+                ON identity_phone(person_slug)",
+            [],
+        )?;
+
         Ok(())
     }
 
@@ -888,6 +943,163 @@ impl Store {
              ON CONFLICT(entity_id) DO UPDATE SET \
                  page_token = excluded.page_token, updated_at_ms = excluded.updated_at_ms",
             params![entity_id, page_token, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // #61 — LinkedIn connection-sync cursor.
+    // ---------------------------------------------------------------
+
+    /// Read the connection-sync cursor for `account_id` (the user's own
+    /// member urn). `None` means this account has never synced — caller
+    /// should run a full sync.
+    pub fn get_linkedin_connection_sync(
+        &self,
+        account_id: &str,
+    ) -> StoreResult<Option<LinkedInConnectionSync>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT account_id, last_full_sync_ms, last_delta_sync_ms, \
+                        cursor_start, last_synced_count \
+                   FROM linkedin_connection_sync WHERE account_id = ?1",
+                params![account_id],
+                |r| {
+                    Ok(LinkedInConnectionSync {
+                        account_id: r.get(0)?,
+                        last_full_sync_ms: r.get(1)?,
+                        last_delta_sync_ms: r.get(2)?,
+                        cursor_start: r.get(3)?,
+                        last_synced_count: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Upsert the connection-sync cursor. Pass the full desired state — this
+    /// is a blind overwrite of the mutable columns (the caller owns the
+    /// full-vs-delta decision).
+    pub fn upsert_linkedin_connection_sync(
+        &self,
+        s: &LinkedInConnectionSync,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO linkedin_connection_sync \
+                 (account_id, last_full_sync_ms, last_delta_sync_ms, \
+                  cursor_start, last_synced_count, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(account_id) DO UPDATE SET \
+                 last_full_sync_ms = excluded.last_full_sync_ms, \
+                 last_delta_sync_ms = excluded.last_delta_sync_ms, \
+                 cursor_start = excluded.cursor_start, \
+                 last_synced_count = excluded.last_synced_count, \
+                 updated_at_ms = excluded.updated_at_ms",
+            params![
+                s.account_id,
+                s.last_full_sync_ms,
+                s.last_delta_sync_ms,
+                s.cursor_start,
+                s.last_synced_count,
+                now_millis(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // #62 — contacts sync token + phone reverse index.
+    // ---------------------------------------------------------------
+
+    /// Read the sync token (Google People `syncToken` / CardDAV `getctag`)
+    /// for `(backend, account_id)`. `None` → full sync on next run.
+    pub fn get_contacts_sync_token(
+        &self,
+        backend: &str,
+        account_id: &str,
+    ) -> StoreResult<Option<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let tok: Option<String> = guard
+            .query_row(
+                "SELECT sync_token FROM contacts_sync_state \
+                   WHERE backend = ?1 AND account_id = ?2",
+                params![backend, account_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(tok)
+    }
+
+    pub fn set_contacts_sync_token(
+        &self,
+        backend: &str,
+        account_id: &str,
+        token: &str,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO contacts_sync_state \
+                 (backend, account_id, sync_token, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(backend, account_id) DO UPDATE SET \
+                 sync_token = excluded.sync_token, \
+                 updated_at_ms = excluded.updated_at_ms",
+            params![backend, account_id, token, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// Reverse-lookup a person by E.164 phone. The message-triage path calls
+    /// this *before* creating a new wiki page so a known phone resolves to an
+    /// existing contact instead of fragmenting identity.
+    pub fn lookup_person_by_phone(
+        &self,
+        phone_e164: &str,
+    ) -> StoreResult<Option<PhoneIdentity>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT phone, person_slug, display_name, source \
+                   FROM identity_phone WHERE phone = ?1",
+                params![phone_e164],
+                |r| {
+                    Ok(PhoneIdentity {
+                        phone: r.get(0)?,
+                        person_slug: r.get(1)?,
+                        display_name: r.get(2)?,
+                        source: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Upsert a phone→person index row. Idempotent: re-ingesting the same
+    /// contact rewrites the (slug, name) for that phone rather than
+    /// duplicating.
+    pub fn upsert_phone_identity(&self, p: &PhoneIdentity) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO identity_phone \
+                 (phone, person_slug, display_name, source, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(phone) DO UPDATE SET \
+                 person_slug = excluded.person_slug, \
+                 display_name = excluded.display_name, \
+                 source = excluded.source, \
+                 updated_at_ms = excluded.updated_at_ms",
+            params![
+                p.phone,
+                p.person_slug,
+                p.display_name,
+                p.source,
+                now_millis(),
+            ],
         )?;
         Ok(())
     }
@@ -3423,5 +3635,95 @@ mod tests {
             s.record_user_edit_as_tone_example(&id2).unwrap().is_none(),
             "missing draftBody → skip"
         );
+    }
+
+    #[test]
+    fn linkedin_connection_sync_roundtrips() {
+        let (s, _f) = fresh_store();
+        assert!(s
+            .get_linkedin_connection_sync("urn:li:fsd_profile:ME")
+            .unwrap()
+            .is_none());
+        let cur = LinkedInConnectionSync {
+            account_id: "urn:li:fsd_profile:ME".into(),
+            last_full_sync_ms: Some(1_700_000_000_000),
+            last_delta_sync_ms: None,
+            cursor_start: 80,
+            last_synced_count: 562,
+        };
+        s.upsert_linkedin_connection_sync(&cur).unwrap();
+        let got = s
+            .get_linkedin_connection_sync("urn:li:fsd_profile:ME")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.cursor_start, 80);
+        assert_eq!(got.last_full_sync_ms, Some(1_700_000_000_000));
+        assert_eq!(got.last_synced_count, 562);
+        // Upsert overwrites mutable columns.
+        let cur2 = LinkedInConnectionSync {
+            cursor_start: 0,
+            last_delta_sync_ms: Some(1_700_100_000_000),
+            ..cur
+        };
+        s.upsert_linkedin_connection_sync(&cur2).unwrap();
+        let got2 = s
+            .get_linkedin_connection_sync("urn:li:fsd_profile:ME")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got2.cursor_start, 0);
+        assert_eq!(got2.last_delta_sync_ms, Some(1_700_100_000_000));
+    }
+
+    #[test]
+    fn contacts_sync_token_roundtrips() {
+        let (s, _f) = fresh_store();
+        assert!(s
+            .get_contacts_sync_token("google_people", "acc1")
+            .unwrap()
+            .is_none());
+        s.set_contacts_sync_token("google_people", "acc1", "tok-abc")
+            .unwrap();
+        assert_eq!(
+            s.get_contacts_sync_token("google_people", "acc1").unwrap(),
+            Some("tok-abc".to_string())
+        );
+        // Distinct (backend, account) key is independent.
+        assert!(s
+            .get_contacts_sync_token("carddav", "acc1")
+            .unwrap()
+            .is_none());
+        s.set_contacts_sync_token("google_people", "acc1", "tok-def")
+            .unwrap();
+        assert_eq!(
+            s.get_contacts_sync_token("google_people", "acc1").unwrap(),
+            Some("tok-def".to_string())
+        );
+    }
+
+    #[test]
+    fn phone_identity_reverse_lookup() {
+        let (s, _f) = fresh_store();
+        assert!(s.lookup_person_by_phone("+14155550100").unwrap().is_none());
+        s.upsert_phone_identity(&PhoneIdentity {
+            phone: "+14155550100".into(),
+            person_slug: "jane_doe".into(),
+            display_name: Some("Jane Doe".into()),
+            source: "google_people".into(),
+        })
+        .unwrap();
+        let p = s.lookup_person_by_phone("+14155550100").unwrap().unwrap();
+        assert_eq!(p.person_slug, "jane_doe");
+        assert_eq!(p.display_name.as_deref(), Some("Jane Doe"));
+        // Re-ingest same phone → upsert, not duplicate; slug can move.
+        s.upsert_phone_identity(&PhoneIdentity {
+            phone: "+14155550100".into(),
+            person_slug: "jane_d".into(),
+            display_name: Some("Jane D.".into()),
+            source: "carddav".into(),
+        })
+        .unwrap();
+        let p2 = s.lookup_person_by_phone("+14155550100").unwrap().unwrap();
+        assert_eq!(p2.person_slug, "jane_d");
+        assert_eq!(p2.source, "carddav");
     }
 }
