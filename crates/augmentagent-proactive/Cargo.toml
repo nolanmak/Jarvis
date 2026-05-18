@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml_ng = "0.10"
 chrono = { workspace = true }
 uuid = { workspace = true }
 

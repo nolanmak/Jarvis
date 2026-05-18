@@ -24,10 +24,12 @@ pub type StoreResult<T> = Result<T, StoreError>;
 
 pub struct Store {
     conn: Mutex<Connection>,
+    path: std::path::PathBuf,
 }
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let path_buf = path.as_ref().to_path_buf();
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
@@ -35,7 +37,27 @@ impl Store {
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            path: path_buf,
         })
+    }
+
+    /// On-disk path this store was opened from. Lets extension crates
+    /// (e.g. `augmentagent-proactive`) run their own additive queries
+    /// against the same db file without threading the path through every
+    /// constructor.
+    pub fn db_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Run a closure with the locked connection. Used by extension traits in
+    /// sibling crates that need bespoke queries the core `Store` API doesn't
+    /// expose. Keeps the single-connection WAL invariant intact.
+    pub fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> StoreResult<T> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(f(&guard)?)
     }
 
     /// Additive, idempotent schema migrations. Safe to run against databases
