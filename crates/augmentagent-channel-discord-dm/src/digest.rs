@@ -239,7 +239,7 @@ mod tests {
     use async_trait::async_trait;
     use augmentagent_approval_discord::{ApprovalError, NoopBroker};
     use augmentagent_channel_core::reasoner::{Reasoner, ReasonerOpts};
-    use augmentagent_store::{ChannelSubscription, Email, Store, SubscriptionMode};
+    use augmentagent_store::{Email, Store, SubscriptionMode};
     use std::sync::Mutex;
 
     /// Counts post_digest calls so a test can assert "exactly one per sub".
@@ -304,26 +304,65 @@ mod tests {
         }
     }
 
-    fn mk_store() -> (Arc<Store>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("t.db")).unwrap();
-        (Arc::new(store), dir)
+    /// Mirror src/db.ts base schema, then let `Store::open`'s additive
+    /// migrations layer on the platform/kind columns + channel_subscriptions.
+    /// Same pattern as `channel::tests::tmp_store`.
+    fn mk_store() -> (Arc<Store>, tempfile::NamedTempFile) {
+        use rusqlite::Connection;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(file.path()).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE actions (
+                    id TEXT PRIMARY KEY,
+                    messageId TEXT NOT NULL,
+                    threadId TEXT,
+                    fromEmail TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    originalBody TEXT,
+                    draftBody TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    errorMessage TEXT,
+                    createdAt INTEGER NOT NULL,
+                    updatedAt INTEGER NOT NULL
+                );
+                CREATE TABLE emails (
+                    messageId TEXT PRIMARY KEY,
+                    threadId TEXT,
+                    fromEmail TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body TEXT,
+                    receivedAt TEXT,
+                    accountEntityId TEXT,
+                    firstSeenAt INTEGER NOT NULL,
+                    triageResult TEXT,
+                    agentProcessedAt INTEGER
+                );
+                "#,
+            )
+            .unwrap();
+        }
+        (Arc::new(Store::open(file.path()).unwrap()), file)
     }
 
-    fn digest_sub(id: &str, platform: &str, channel_id: &str) -> ChannelSubscription {
-        ChannelSubscription {
-            id: id.to_string(),
-            platform: platform.to_string(),
-            channel_id: channel_id.to_string(),
-            display_name: format!("#{channel_id}"),
-            mode: SubscriptionMode::Digest,
-            active: true,
-            account_id: None,
-            last_seen_message_id: None,
-            last_digest_at_ms: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        }
+    /// Persist a Digest-mode subscription via the real store API and return
+    /// its generated id. `upsert_subscription` seeds the row; the mode is then
+    /// forced to Digest (default insert mode is Priority for some platforms).
+    fn add_digest_sub(store: &Store, platform: &str, channel_id: &str) -> String {
+        let sub = store
+            .upsert_subscription(
+                platform,
+                channel_id,
+                &format!("#{channel_id}"),
+                SubscriptionMode::Digest,
+                None,
+            )
+            .unwrap();
+        store
+            .update_subscription_mode(&sub.id, SubscriptionMode::Digest)
+            .unwrap();
+        sub.id
     }
 
     fn mk_email(id: &str, thread: &str, platform: &str) -> Email {
@@ -343,17 +382,16 @@ mod tests {
     #[tokio::test]
     async fn tick_once_posts_exactly_one_slack_digest_per_subscription() {
         let (store, _dir) = mk_store();
-        store
-            .upsert_subscription(&digest_sub("s1", "slack", "C1"))
-            .unwrap();
-        store
-            .upsert_subscription(&digest_sub("s2", "slack", "C2"))
-            .unwrap();
-        store
-            .upsert_subscription(&digest_sub("d1", "discord", "D1"))
-            .unwrap();
-        for (id, thread) in [("m1", "C1"), ("m2", "C2"), ("dm1", "D1")] {
-            let plat = if thread == "D1" { "discord" } else { "slack" };
+        // Two Slack digest subs, each with messages in-window.
+        add_digest_sub(&store, "slack", "C1");
+        add_digest_sub(&store, "slack", "C2");
+        // A Discord digest sub that must NOT be touched by the Slack scheduler.
+        let discord_id = add_digest_sub(&store, "discord", "D1");
+        for (id, thread, plat) in [
+            ("m1", "C1", "slack"),
+            ("m2", "C2", "slack"),
+            ("dm1", "D1", "discord"),
+        ] {
             store.upsert_email(&mk_email(id, thread, plat)).unwrap();
         }
 
@@ -372,15 +410,17 @@ mod tests {
         assert_eq!(posted, 2, "one digest per Slack digest sub");
         assert_eq!(broker.digests.lock().unwrap().len(), 2);
 
+        // Second tick within the throttle window must post nothing more.
         let posted2 = sched.tick_once().await.unwrap();
         assert_eq!(posted2, 0, "throttled within MIN_BETWEEN_DIGESTS_MS");
         assert_eq!(broker.digests.lock().unwrap().len(), 2);
 
+        // Discord sub stayed pristine — Slack scheduler never marked it.
         let d1 = store
             .list_active_subscriptions("discord")
             .unwrap()
             .into_iter()
-            .find(|s| s.id == "d1")
+            .find(|s| s.id == discord_id)
             .unwrap();
         assert!(
             d1.last_digest_at_ms.is_none(),
@@ -391,9 +431,8 @@ mod tests {
     #[tokio::test]
     async fn tick_once_skips_empty_window_but_marks_posted() {
         let (store, _dir) = mk_store();
-        store
-            .upsert_subscription(&digest_sub("s1", "slack", "C9"))
-            .unwrap();
+        let sub_id = add_digest_sub(&store, "slack", "C9");
+        // No emails for C9 → empty window.
         let broker = Arc::new(NoopBroker);
         let reasoner = Arc::new(StubReasoner::new());
         let sched = DigestScheduler::for_platform(
@@ -406,11 +445,13 @@ mod tests {
         );
         let posted = sched.tick_once().await.unwrap();
         assert_eq!(posted, 0);
+        // Empty window still stamps last_digest_at_ms so we don't re-scan it
+        // every tick.
         let s1 = store
             .list_active_subscriptions("slack")
             .unwrap()
             .into_iter()
-            .find(|s| s.id == "s1")
+            .find(|s| s.id == sub_id)
             .unwrap();
         assert!(s1.last_digest_at_ms.is_some());
     }
