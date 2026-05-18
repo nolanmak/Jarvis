@@ -9,7 +9,7 @@ mod store;
 
 pub use models::{
     Account, ActionRecord, ActionStatus, ChannelSubscription, DriveAccount, Email, LearnedPattern,
-    RateAuditRow,
+    LinkedInConnectionSync, PhoneIdentity, RateAuditRow,
     RateEvent, RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TelegramBot, ToneExample,
     ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };

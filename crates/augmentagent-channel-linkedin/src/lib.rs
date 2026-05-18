@@ -12,6 +12,7 @@
 pub mod api;
 pub mod auth;
 pub mod channel;
+pub mod connections;
 pub mod feed;
 pub mod inbound;
 pub mod posting;
@@ -25,6 +26,10 @@ pub use auth::{default_auth_path, AuthError, LinkedInAuth, DEFAULT_USER_AGENT};
 pub use channel::{
     LinkedInChannel, LinkedInChannelConfig, LinkedInFeedEngagement, PollOutcome,
     DEFAULT_POLL_SECS,
+};
+pub use connections::{
+    connection_patch, connection_slug, parse_connections, Connection, ConnectionDiff,
+    ConnectionSyncer, ConnectionsApi, SyncMode, SyncReport, VoyagerConnectionsClient,
 };
 pub use feed::{
     LinkedInFeedTrigger, DEFAULT_FEED_POLL_SECS, DEFAULT_MAX_ENGAGEMENTS_PER_DAY,
