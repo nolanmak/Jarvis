@@ -24,10 +24,16 @@ pub mod auth;
 pub mod channel;
 pub mod client;
 pub mod types;
+pub mod validate;
 
 pub use api::{
-    TwitterApi, TwitterClient, TwitterError, DEFAULT_CREATE_TWEET_QUERY_ID,
-    DEFAULT_USER_TWEETS_QUERY_ID,
+    base_url, EnvQueryIdResolver, QueryIdResolver, TwitterApi, TwitterClient,
+    TwitterError, DEFAULT_CREATE_TWEET_QUERY_ID,
+    DEFAULT_RATE_LIMIT_BACKOFF_SECS, DEFAULT_USER_TWEETS_QUERY_ID,
+};
+pub use validate::{
+    validate as validate_session, CheckResult, CheckStatus, ValidateOptions,
+    ValidationReport,
 };
 pub use auth::{
     default_auth_path, AuthError, TwitterAuth, DEFAULT_PUBLIC_BEARER, DEFAULT_USER_AGENT,
@@ -37,5 +43,8 @@ pub use channel::{
     close_friends_with_twitter, CloseFriend, TwitterDmSource, TwitterFeedTrigger,
     DM_POLL_MIN_SECS, FEED_JITTER_SECS, FEED_POLL_SECS,
 };
-pub use client::{CreateTweetClient, PostError, PostOutcome, DAILY_POST_QUOTA};
+pub use client::{
+    CreateTweetClient, PostError, PostOutcome, StoreQueryIdResolver,
+    DAILY_POST_QUOTA,
+};
 pub use types::{is_twitter_email, Tweet, TwitterDm, ACCOUNT_PREFIX};
