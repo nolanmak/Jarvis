@@ -595,7 +595,7 @@ fn handle_invoice_command(store: Option<&Store>, text: &str) -> String {
         Some("status") => {
             let recipient = {
                 let r = g("recipient_email");
-                if r.is_empty() { "REDACTED".to_string() } else { r }
+                if r.is_empty() { "(unset — set via dashboard or `!invoice recipient`)".to_string() } else { r }
             };
             let entity = g("from_entity");
             let last = g("last_billed_week_end");
