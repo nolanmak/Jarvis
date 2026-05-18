@@ -535,7 +535,23 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     .unwrap_or_default();
                 let tone_block =
                     pick_tone_block(&self.store, entity_id, &email.from);
-                let draft_prompt = draft_user_message(&email, &wiki_hint, &tone_block);
+                let thread_block = self.fetch_thread_block(entity_id, &email).await;
+                // #36: fast Haiku archetype pick → composed fragment, gated by
+                // AUGMENTAGENT_DRAFT_ARCHETYPES=1 (resolver no-ops otherwise).
+                let archetype_block =
+                    augmentagent_channel_core::archetype::resolve_archetype_block(
+                        self.reasoner.as_ref(),
+                        &email,
+                        "reply",
+                    )
+                    .await;
+                let draft_prompt = draft_user_message(
+                    &email,
+                    &wiki_hint,
+                    &tone_block,
+                    &thread_block,
+                    &archetype_block,
+                );
                 let draft = match self.reasoner.call(&draft_opts, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
                     Err(e) => {
@@ -596,6 +612,64 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 Ok(Some(DispatchOutcome::Skipped))
             }
         }
+    }
+
+    /// Build the `<thread_history>` block for thread-aware drafting (#32).
+    ///
+    /// Gated behind `AUGMENTAGENT_THREAD_AWARE=1` — unset/anything-else returns
+    /// an empty string, which `draft_user_message` treats as "no thread block"
+    /// (prompt is then byte-identical to pre-#32 behavior). Best-effort: a
+    /// fetch failure logs a warning and degrades to the empty block rather
+    /// than aborting the draft. The inbound message itself is excluded so the
+    /// model doesn't see it twice (it's already in the `<email>` block).
+    async fn fetch_thread_block(
+        &self,
+        entity_id: &str,
+        email: &augmentagent_store::Email,
+    ) -> String {
+        if std::env::var("AUGMENTAGENT_THREAD_AWARE").as_deref() != Ok("1") {
+            return String::new();
+        }
+        let Some(thread_id) = email.thread_id.as_deref() else {
+            return String::new();
+        };
+        // Last ~6 fetched so that after dropping the current inbound we still
+        // have ~5 prior turns of verbatim context (the issue's Phase 1 target).
+        const MAX_THREAD_MSGS: u32 = 6;
+        let msgs = match self
+            .gmail
+            .fetch_thread_messages(entity_id, thread_id, MAX_THREAD_MSGS)
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    message_id = %email.message_id,
+                    thread_id = %thread_id,
+                    "thread-aware: fetch_thread_messages failed, drafting without history: {e}"
+                );
+                return String::new();
+            }
+        };
+        let prior: Vec<(String, String, String)> = msgs
+            .into_iter()
+            .filter(|m| m.message_id != email.message_id)
+            .map(|m| (m.from, m.date, m.body))
+            .collect();
+        if prior.is_empty() {
+            return String::new();
+        }
+        let block =
+            augmentagent_channel_core::prompt::format_thread_history(&prior);
+        if !block.is_empty() {
+            info!(
+                message_id = %email.message_id,
+                thread_id = %thread_id,
+                prior_messages = prior.len(),
+                "thread-aware: injecting <thread_history>"
+            );
+        }
+        block
     }
 
     /// Non-blocking reply dispatch: create Gmail draft, log/update the action,
