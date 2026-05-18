@@ -489,6 +489,7 @@ dependencies = [
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",
+ "clap",
  "reqwest",
  "rusqlite",
  "serde",
@@ -500,7 +501,9 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
