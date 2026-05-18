@@ -15,6 +15,10 @@ skills/*/config.json
 linkedin-auth.json
 linkedin-cookies.json
 
+# X / Twitter session cookies — treat as secret.
+twitter-auth.json
+twitter-session.json
+
 # Discord user-token + super-properties — treat as secret. Vault location
 # (/Volumes/augmentagent/discord-creds.json) is outside the repo.
 discord-creds.json

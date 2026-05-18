@@ -21,6 +21,10 @@ use augmentagent_channel_linkedin::{
     default_auth_path, is_linkedin_email, LinkedInApi, LinkedInAuth, LinkedInChannel,
     LinkedInChannelConfig, VoyagerClient, ACCOUNT_PREFIX, DEFAULT_POLL_SECS,
 };
+use augmentagent_channel_twitter::{
+    default_auth_path as twitter_default_auth_path, CreateTweetClient, TwitterApi, TwitterAuth,
+    TwitterClient, TwitterDmSource, TwitterFeedTrigger,
+};
 use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
@@ -110,6 +114,12 @@ enum Cmd {
     Linkedin {
         #[command(subcommand)]
         op: LinkedinOp,
+    },
+    /// X / Twitter channel: harvest session, post tweets/replies, poll the
+    /// close-friend feed + DM inbox.
+    Twitter {
+        #[command(subcommand)]
+        op: TwitterOp,
     },
     /// Discord channel: user-token REST client. Reads personal DMs + watched
     /// guild channels, routes through subscriptions (priority/digest/store_only).
@@ -849,6 +859,34 @@ enum LinkedinOp {
 }
 
 #[derive(Subcommand)]
+enum TwitterOp {
+    /// Validate + persist a harvested X session bundle from a JSON file.
+    ///
+    /// The JSON must contain `user_id`, `screen_name`, and a `cookies`
+    /// object with at least `auth_token` and `ct0`. See
+    /// docs/twitter-protocol.md + scripts/twitter-harvest.sh.
+    Login {
+        /// Path to the session JSON file.
+        #[arg(long)]
+        session_json: PathBuf,
+    },
+    /// Post a tweet (or reply with `--reply-to <id>`). Respects `--dry-run`
+    /// and the hard 15/day quota. Media is deferred (phase 2).
+    Post {
+        #[arg(long)]
+        text: String,
+        /// When set, post as a reply to this tweet id.
+        #[arg(long)]
+        reply_to: Option<String>,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+    /// Run one close-friend feed poll cycle and print the WorkItems found.
+    /// Read-only — no replies are posted (those go via Discord approval).
+    PollOnce,
+}
+
+#[derive(Subcommand)]
 enum ResumeOp {
     /// Parse a resume file and seed the wiki with an `about/me.md` and
     /// stub `people/<slug>.md` pages for every named contact.
@@ -1287,6 +1325,19 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             LinkedinOp::Recent => run_linkedin_recent().await,
+        },
+        Cmd::Twitter { ref op } => match op {
+            TwitterOp::Login { session_json } => {
+                run_twitter_login(session_json.clone()).await
+            }
+            TwitterOp::Post {
+                text,
+                reply_to,
+                dry_run,
+            } => {
+                run_twitter_post(store, text.clone(), reply_to.clone(), *dry_run).await
+            }
+            TwitterOp::PollOnce => run_twitter_poll_once(&cli).await,
         },
         Cmd::Slack { ref op } => match op {
             SlackOp::Login { auth_json } => run_slack_login(store, auth_json.clone()).await,
@@ -3970,6 +4021,91 @@ async fn run_linkedin_recent() -> Result<()> {
             snippet,
         );
     }
+    Ok(())
+}
+
+// ================================================================
+// X / Twitter (issues #14, #15, #16, #79)
+// ================================================================
+
+async fn run_twitter_login(session_json: PathBuf) -> Result<()> {
+    let raw = std::fs::read_to_string(&session_json)
+        .with_context(|| format!("read session file at {}", session_json.display()))?;
+    let mut auth: TwitterAuth =
+        serde_json::from_str(&raw).context("parse session JSON")?;
+    auth.validate()
+        .context("session file missing required fields")?;
+    if auth.harvested_at_ms == 0 {
+        auth.harvested_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+    }
+
+    // Probe the DM inbox once to validate the session before persisting —
+    // bad cookies fail fast here instead of at the first poll.
+    let client = TwitterClient::new(auth.clone());
+    match client.fetch_dm_inbox(None).await {
+        Ok(dms) => info!(dm_count = dms.len(), "twitter session probe OK"),
+        Err(e) => anyhow::bail!("session probe failed: {e}; aborting save"),
+    }
+
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let out = twitter_default_auth_path(&repo_root);
+    auth.save(&out)
+        .with_context(|| format!("save auth to {}", out.display()))?;
+    auth.save_to_keychain(augmentagent_auth::DEFAULT_ACCOUNT)
+        .context("save auth to keychain (augmentagent/twitter/default)")?;
+    println!(
+        "twitter auth saved to {} + keychain (augmentagent/twitter/default)",
+        out.display()
+    );
+    println!("account: @{} (id {})", auth.screen_name, auth.user_id);
+    Ok(())
+}
+
+async fn run_twitter_post(
+    store: Arc<Store>,
+    text: String,
+    reply_to: Option<String>,
+    dry_run: bool,
+) -> Result<()> {
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = TwitterAuth::load_with_migration(&repo_root).context(
+        "load twitter auth from keychain or legacy file — run `augmentagent twitter login`",
+    )?;
+    let api = Arc::new(TwitterClient::new(auth));
+    let client = CreateTweetClient::new(api, store, dry_run);
+    match client.create(&text, reply_to.as_deref(), &[]).await {
+        Ok(out) => {
+            println!("{out:?}");
+            Ok(())
+        }
+        Err(e) => anyhow::bail!("twitter post failed: {e}"),
+    }
+}
+
+async fn run_twitter_poll_once(cli: &Cli) -> Result<()> {
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = TwitterAuth::load_with_migration(&repo_root)
+        .context("load twitter auth from keychain or legacy file")?;
+    let my_user_id = auth.user_id.clone();
+    let api = Arc::new(TwitterClient::new(auth));
+    let Some(wiki_root) = cli.wiki_dir.clone() else {
+        anyhow::bail!("twitter poll-once needs --wiki-dir (close-friend pages live there)");
+    };
+    let trigger = TwitterFeedTrigger::new(api.clone(), wiki_root, my_user_id.clone());
+    let cancel = CancellationToken::new();
+    let items =
+        augmentagent_channel_core::Trigger::next_work_items(&trigger, &cancel).await?;
+    println!("feed: {} new tweet(s) from close friends", items.len());
+    for it in &items {
+        println!("  - {} {}", it.kind, it.external_id);
+    }
+    // Also surface a DM-inbox count (read-only smoke).
+    let dm_src = TwitterDmSource::new(api, my_user_id);
+    let dms = augmentagent_channel_core::InboundSource::fetch_new(&dm_src).await?;
+    println!("dm inbox: {} new inbound DM(s)", dms.len());
     Ok(())
 }
 
