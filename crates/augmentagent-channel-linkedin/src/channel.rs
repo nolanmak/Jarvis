@@ -13,11 +13,14 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use async_trait::async_trait;
+
 use augmentagent_approval_discord::ApprovalBroker;
 use augmentagent_channel_core::decision::{parse as parse_decision, DecisionKind};
 use augmentagent_channel_core::ingest::{spawn_ingest, IngestTrigger};
 use augmentagent_channel_core::prompt::{draft_user_message, triage_user_message};
 use augmentagent_channel_core::reasoner::{draft_opts, triage_opts};
+use augmentagent_channel_core::trigger::{WorkItem, WorkItemHandler};
 use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{ActionStatus, Store, TriageResult, NUDGE_INTERVAL_MS};
 
@@ -113,30 +116,15 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
         }
     }
 
-    pub async fn run(&self, shutdown: CancellationToken) -> anyhow::Result<()> {
-        // First tick fires immediately after `interval::tick` is awaited;
-        // subsequent ticks respect `poll_interval` + random jitter.
-        let mut ticker = tokio::time::interval(self.config.poll_interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    info!("linkedin channel: shutdown signal received");
-                    return Ok(());
-                }
-                _ = ticker.tick() => {
-                    match self.poll_once().await {
-                        Ok(out) => info!(?out, "linkedin poll complete"),
-                        Err(e) => error!("linkedin poll failed: {e:#}"),
-                    }
-                    // Sleep a jitter window AFTER the poll so the next tick
-                    // doesn't cluster exactly on the hour boundary.
-                    let jitter = jitter_secs();
-                    tokio::time::sleep(Duration::from_secs(jitter)).await;
-                }
-            }
-        }
-    }
+    // The bespoke DM poll loop (`select!` + ticker + post-tick jitter sleep)
+    // was removed in the #25 cutover — its job is now done generically by
+    // `run_arc` below, which composes `augmentagent_channel_core::ChannelRunner`
+    // over a `LinkedInInbound` source. `ChannelRunner` natively reproduces the
+    // shutdown/select shape and the post-tick jitter sleep this loop used to
+    // hand-roll, so cadence (4h ± 10min) and DM dispatch behavior are
+    // unchanged. `poll_once` is retained (CLI `linkedin poll-once` + the
+    // existing channel tests drive it) and shares the exact same per-DM path
+    // via `process_email`.
 
     pub async fn poll_once(&self) -> anyhow::Result<PollOutcome> {
         let mut outcome = PollOutcome::default();
@@ -178,6 +166,21 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
 
     async fn handle_dm(&self, dm: Dm) -> anyhow::Result<Option<DispatchOutcome>> {
         let email = dm.into_email(&self.member_urn);
+        self.process_email(email).await
+    }
+
+    /// Run one already-converted DM `Email` through the full triage → draft →
+    /// approve → ingest pipeline. Single shared per-message entry point: the
+    /// bespoke `poll_once` loop reaches it via `handle_dm` (after the outbound
+    /// filter + `Dm::into_email`), and `LinkedInWorkHandler` (the
+    /// `ChannelRunner` cutover path) calls it after rehydrating the `Email`
+    /// from a `WorkItem` payload that `LinkedInInbound` already produced via
+    /// the same `Dm::into_email` + outbound filter. Both paths therefore run
+    /// byte-identical dispatch logic.
+    pub async fn process_email(
+        &self,
+        email: augmentagent_store::Email,
+    ) -> anyhow::Result<Option<DispatchOutcome>> {
         self.store.upsert_email(&email)?;
         if self.store.is_email_complete(&email.message_id)? {
             return Ok(None);
@@ -383,6 +386,83 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
     }
 }
 
+impl<L: LinkedInApi + 'static, R: Reasoner + 'static> LinkedInChannel<L, R> {
+    /// Long-running driver (the production entry point used by `serve`).
+    ///
+    /// **#25 cutover**: replaces the old bespoke `select!` + ticker +
+    /// post-tick jitter sleep. Driven by the generic
+    /// [`augmentagent_channel_core::ChannelRunner`] over a
+    /// [`LinkedInInbound`](crate::LinkedInInbound) source wrapped in an
+    /// [`InboundMessageTrigger`](augmentagent_channel_core::InboundMessageTrigger),
+    /// dispatching each `WorkItem` through [`LinkedInWorkHandler`] — which
+    /// calls the same [`LinkedInChannel::process_email`] the old loop reached
+    /// via `handle_dm`, so triage/draft/approve/ingest/dedup behavior is
+    /// unchanged.
+    ///
+    /// Cadence parity: `ChannelRunner`'s post-tick jitter sleeps a uniform
+    /// `[0, 2*jitter]` window, identical to the removed loop's
+    /// `jitter_secs()` (uniform `[0, 2*JITTER_SECS]`), so we pass
+    /// `Duration::from_secs(JITTER_SECS)` and keep the 4h ± 10min cadence.
+    ///
+    /// Takes `Arc<Self>` so the runner's handler can share the channel.
+    pub async fn run_arc(
+        self: Arc<Self>,
+        shutdown: CancellationToken,
+    ) -> anyhow::Result<()> {
+        use augmentagent_channel_core::{ChannelRunner, InboundMessageTrigger};
+
+        let source = Arc::new(crate::inbound::LinkedInInbound::new(
+            Arc::clone(&self.api),
+            self.member_urn.clone(),
+        ));
+        let trigger = Arc::new(InboundMessageTrigger::new(source));
+        let handler = Arc::new(LinkedInWorkHandler {
+            channel: Arc::clone(&self),
+        });
+        let runner = ChannelRunner::new(
+            trigger,
+            handler,
+            self.config.poll_interval,
+            Duration::from_secs(JITTER_SECS),
+            "linkedin",
+        );
+        runner.run(shutdown).await
+    }
+}
+
+/// `WorkItemHandler` for the #25 `ChannelRunner` cutover.
+///
+/// The runner pulls inbound DMs as `WorkItem`s (via `LinkedInInbound`, which
+/// already applies the same `dm.is_outbound(member_urn)` filter `poll_once`
+/// does and serializes `Dm::into_email`); this handler rehydrates each into
+/// the typed `Email` and feeds it through
+/// [`LinkedInChannel::process_email`] — the identical triage → draft →
+/// approve → ingest → dedup path the bespoke loop ran via `handle_dm`.
+pub struct LinkedInWorkHandler<L: LinkedInApi + 'static, R: Reasoner + 'static> {
+    channel: Arc<LinkedInChannel<L, R>>,
+}
+
+#[async_trait]
+impl<L: LinkedInApi + 'static, R: Reasoner + 'static> WorkItemHandler
+    for LinkedInWorkHandler<L, R>
+{
+    async fn handle(&self, item: WorkItem) -> anyhow::Result<()> {
+        let email: augmentagent_store::Email =
+            serde_json::from_value(item.payload).map_err(|e| {
+                anyhow::anyhow!("linkedin work item payload not an Email: {e}")
+            })?;
+        // Mirror poll_once's per-DM error handling: log + swallow so one bad
+        // message never aborts the tick (ChannelRunner also logs+counts).
+        match self.channel.process_email(email).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                error!("linkedin handle (channel-runner): process_email failed: {e:#}");
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Deterministic jitter: uniform int in [0, 2 * JITTER_SECS]. Pseudo-random
 /// based on the current time's nanosecond tail; no crate dep needed.
 fn jitter_secs() -> u64 {
@@ -402,8 +482,11 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// Outcome of running one DM through [`LinkedInChannel::process_email`].
+/// Public because `process_email` is the shared entry point used by both the
+/// bespoke `poll_once` loop and the `ChannelRunner` cutover handler.
 #[derive(Debug, Clone, Copy)]
-enum DispatchOutcome {
+pub enum DispatchOutcome {
     Skipped,
     Flagged,
     DryRun,
@@ -935,5 +1018,128 @@ mod tests {
         );
         let out = ch.poll_once().await.unwrap();
         assert_eq!(out.errors, 1);
+    }
+
+    // --- #25 ChannelRunner cutover equivalence ---
+    //
+    // Prove the production driver swap (poll loop → ChannelRunner +
+    // LinkedInWorkHandler) reproduces poll_once's per-DM behavior: same
+    // triage outcome, same broker posts, same per-message dedup gate.
+
+    use crate::inbound::dm_to_work_item;
+
+    const ME_URN: &str = "urn:li:fsd_profile:ME";
+
+    #[tokio::test]
+    async fn channel_runner_handler_reply_flow_matches_poll_once() {
+        let (store, _f) = tmp_store();
+        let dm = sample_dm("cr-reply");
+        let api = Arc::new(StubApi { dms: vec![dm.clone()] });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"direct question"}"#,
+            "Sure — Thursday 3pm works.",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = Arc::new(LinkedInChannel::new(
+            store.clone(),
+            api,
+            reasoner,
+            broker.clone(),
+            ME_URN.into(),
+            LinkedInChannelConfig {
+                dry_run: false,
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                ..Default::default()
+            },
+        ));
+        let handler = super::LinkedInWorkHandler {
+            channel: Arc::clone(&ch),
+        };
+        // ChannelRunner would feed exactly this: the WorkItem LinkedInInbound
+        // produces from the DM (post outbound-filter + Dm::into_email).
+        handler
+            .handle(dm_to_work_item(dm.clone(), ME_URN))
+            .await
+            .unwrap();
+
+        // Same observable state as reply_posts_approval_card.
+        assert_eq!(broker.posts.lock().unwrap().len(), 1);
+
+        // Second runner tick on the same DM must NOT stack another card —
+        // the is_message_processed gate inside process_email holds.
+        handler
+            .handle(dm_to_work_item(dm, ME_URN))
+            .await
+            .unwrap();
+        assert_eq!(broker.posts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn channel_runner_handler_flag_matches_poll_once() {
+        let (store, _f) = tmp_store();
+        let dm = sample_dm("cr-flag");
+        let api = Arc::new(StubApi { dms: vec![dm.clone()] });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"flag","reason":"personal outreach"}"#,
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = Arc::new(LinkedInChannel::new(
+            store.clone(),
+            api,
+            reasoner,
+            broker.clone(),
+            ME_URN.into(),
+            LinkedInChannelConfig {
+                dry_run: false,
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                ..Default::default()
+            },
+        ));
+        let handler = super::LinkedInWorkHandler {
+            channel: Arc::clone(&ch),
+        };
+        handler
+            .handle(dm_to_work_item(dm, ME_URN))
+            .await
+            .unwrap();
+
+        // Flag: heads-up notice, no approval card (same as poll_once).
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+        let flags = broker.flag_posts.lock().unwrap();
+        assert_eq!(flags.len(), 1);
+        assert!(flags[0].1.contains("personal outreach"));
+    }
+
+    #[tokio::test]
+    async fn channel_runner_handler_swallows_bad_payload() {
+        // A non-Email payload bubbles as Err (ChannelRunner logs+counts);
+        // process_email failures are swallowed. No panic, no post either way.
+        let (store, _f) = tmp_store();
+        let api = Arc::new(StubApi { dms: vec![] });
+        let reasoner = Arc::new(ScriptedReasoner::new([]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = Arc::new(LinkedInChannel::new(
+            store,
+            api,
+            reasoner,
+            broker.clone(),
+            ME_URN.into(),
+            LinkedInChannelConfig {
+                dry_run: false,
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                ..Default::default()
+            },
+        ));
+        let handler = super::LinkedInWorkHandler {
+            channel: Arc::clone(&ch),
+        };
+        let junk = augmentagent_channel_core::trigger::WorkItem {
+            platform: "linkedin".into(),
+            kind: "dm".into(),
+            external_id: "junk".into(),
+            payload: serde_json::json!({ "not": "an email" }),
+        };
+        let _ = handler.handle(junk).await;
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
     }
 }
