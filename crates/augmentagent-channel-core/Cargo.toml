@@ -9,6 +9,10 @@ repository.workspace = true
 [dependencies]
 augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
+# #58 engagement engine surfaces preview / failure cards through the shared
+# ApprovalBroker trait. approval-discord depends only on -store, so this
+# does not create a dependency cycle.
+augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -21,6 +25,9 @@ serde_json = { workspace = true }
 # RateGovernor (#83) — uuid for permit ids, chrono for quiet-hours TZ math.
 uuid = { workspace = true }
 chrono = { workspace = true }
+# #35 Phase 2 — Composio-backed free/busy + Drive search resolver clients.
+# Self-contained reqwest client (intentional duplication, see resolve.rs).
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

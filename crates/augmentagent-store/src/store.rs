@@ -9,8 +9,8 @@ use uuid::Uuid;
 use crate::models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription, DriveAccount,
     Email, LearnedPattern, LinkedInConnectionSync, PhoneIdentity, RateAuditRow, RateHalt,
-    RateWarmup, SlackWorkspace, SubscriptionMode, TelegramBot, ToneExample, ToneProfile,
-    TriageResult, UserLoop, WhatsappDevice,
+    RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace, SubscriptionMode, TelegramBot,
+    ToneExample, ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 
 #[derive(Debug, Error)]
@@ -673,6 +673,118 @@ impl Store {
                 ON scheduled_posts(status, fire_at_ms)",
             [],
         )?;
+
+        // ----------------------------------------------------------------
+        // #58 — engagement-automation spine. Additive + dormant in prod:
+        // empty + unwritten unless the engagement loops / CLI populate them.
+        // Same proven-safe pattern as the wave-A tables above. Schemas
+        // mirror the #58 research-issue body.
+        // ----------------------------------------------------------------
+
+        // #58.2 — the user's own watched posts + already-seen comment ids.
+        // `OwnPostsSource` polls the last N posts and diffs incoming
+        // comments against `seen_comments` so a new comment becomes one
+        // `own_post_comment` WorkItem exactly once.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS own_posts (\
+                 id            TEXT PRIMARY KEY,\
+                 platform      TEXT NOT NULL,\
+                 external_id   TEXT NOT NULL,\
+                 posted_at_ms  INTEGER NOT NULL,\
+                 poll_until_ms INTEGER NOT NULL,\
+                 last_polled_ms INTEGER,\
+                 created_at_ms INTEGER NOT NULL,\
+                 UNIQUE (platform, external_id)\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_own_posts_poll \
+                ON own_posts(platform, poll_until_ms)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS seen_comments (\
+                 id            TEXT PRIMARY KEY,\
+                 own_post_id   TEXT NOT NULL REFERENCES own_posts(id) ON DELETE CASCADE,\
+                 external_id   TEXT NOT NULL,\
+                 author_handle TEXT,\
+                 body          TEXT,\
+                 triage_id     TEXT,\
+                 created_at_ms INTEGER NOT NULL,\
+                 UNIQUE (own_post_id, external_id)\
+             )",
+            [],
+        )?;
+
+        // #58.3 — friend watchlist + seen friend posts. `engagement` is
+        // 'high' (every post) | 'medium' (weekly digest) | 'low' (only on
+        // milestone keywords). `wiki_slug` grounds the draft prompt.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS friend_watchlist (\
+                 id            TEXT PRIMARY KEY,\
+                 platform      TEXT NOT NULL,\
+                 handle        TEXT NOT NULL,\
+                 wiki_slug     TEXT,\
+                 engagement    TEXT NOT NULL DEFAULT 'medium',\
+                 added_at_ms   INTEGER NOT NULL,\
+                 paused_until_ms INTEGER,\
+                 UNIQUE (platform, handle)\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS friend_posts_seen (\
+                 id            TEXT PRIMARY KEY,\
+                 watchlist_id  TEXT NOT NULL REFERENCES friend_watchlist(id) ON DELETE CASCADE,\
+                 external_id   TEXT NOT NULL,\
+                 posted_at_ms  INTEGER NOT NULL,\
+                 triage_id     TEXT,\
+                 UNIQUE (watchlist_id, external_id)\
+             )",
+            [],
+        )?;
+
+        // #58.4 — inbound LinkedIn (and future-platform) connection-request
+        // triage queue. `decision` is one of
+        // accept|decline|accept_and_dm|pending.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS connection_requests (\
+                 id              TEXT PRIMARY KEY,\
+                 platform        TEXT NOT NULL,\
+                 external_id     TEXT NOT NULL,\
+                 requester_name  TEXT,\
+                 requester_url   TEXT,\
+                 message         TEXT,\
+                 decision        TEXT NOT NULL DEFAULT 'pending',\
+                 decided_at_ms   INTEGER,\
+                 triage_id       TEXT,\
+                 created_at_ms   INTEGER NOT NULL,\
+                 UNIQUE (platform, external_id)\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_connection_requests_decision \
+                ON connection_requests(decision, created_at_ms)",
+            [],
+        )?;
+
+        // #58.5 — warm-touch per-contact state. The actual cadence scoring
+        // is the merged #81 proactive `StaleContactScan`; this table only
+        // carries the per-slug nudge/snooze bookkeeping the #58 card needs
+        // (so we never duplicate the proactive scoring engine).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS warm_touch_state (\
+                 wiki_slug            TEXT PRIMARY KEY,\
+                 last_interaction_ms  INTEGER,\
+                 last_nudged_ms       INTEGER,\
+                 snoozed_until_ms     INTEGER,\
+                 cadence_days         INTEGER\
+             )",
+            [],
+        )?;
+
         // Multi-tenant Google Drive (Composio). Inert in prod: empty + unread
         // unless a tenant connects a Drive account. Same proven-safe pattern
         // as the dormant wave-A tables already shipping in prod.
@@ -4020,6 +4132,268 @@ impl Store {
         }
         Ok(out)
     }
+
+    // =====================================================================
+    // #58.1 — scheduled outbound posts (cross-platform queue)
+    // =====================================================================
+
+    /// Queue a new outbound post. `media_paths` is a JSON array string or
+    /// `None` for a text post. Returns the generated row id. Status starts
+    /// at `queued`; the serve-tick fire loop drives it through the
+    /// `previewed` → `posted`/`failed`/`cancelled` lifecycle.
+    pub fn enqueue_scheduled_post(
+        &self,
+        platform: &str,
+        body: &str,
+        media_paths: Option<&str>,
+        fire_at_ms: i64,
+        thread_parent: Option<&str>,
+    ) -> StoreResult<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO scheduled_posts \
+                (id, platform, body, media_paths, fire_at_ms, status, \
+                 thread_parent, created_at_ms) \
+             VALUES (?1,?2,?3,?4,?5,'queued',?6,?7)",
+            params![id, platform, body, media_paths, fire_at_ms, thread_parent, now],
+        )?;
+        Ok(id)
+    }
+
+    /// Posts that are `queued` and within `horizon_ms` of firing but have no
+    /// preview card yet — the T-30min preview batch.
+    pub fn scheduled_posts_due_for_preview(
+        &self,
+        now_ms: i64,
+        horizon_ms: i64,
+    ) -> StoreResult<Vec<ScheduledPost>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, platform, body, media_paths, fire_at_ms, status, \
+                    approval_msg, posted_at_ms, external_id, thread_parent, \
+                    created_at_ms \
+               FROM scheduled_posts \
+              WHERE status = 'queued' AND approval_msg IS NULL \
+                AND fire_at_ms <= ?1 \
+              ORDER BY fire_at_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![now_ms + horizon_ms], row_to_scheduled_post)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Posts whose `fire_at_ms` has arrived and are still `previewed`
+    /// (user did not cancel) or `queued` (post-silently mode skipped the
+    /// preview) — the T-0 publish batch.
+    pub fn scheduled_posts_due_to_fire(
+        &self,
+        now_ms: i64,
+    ) -> StoreResult<Vec<ScheduledPost>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, platform, body, media_paths, fire_at_ms, status, \
+                    approval_msg, posted_at_ms, external_id, thread_parent, \
+                    created_at_ms \
+               FROM scheduled_posts \
+              WHERE status IN ('previewed','queued') AND fire_at_ms <= ?1 \
+              ORDER BY fire_at_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![now_ms], row_to_scheduled_post)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Move a post to `previewed` and record the Discord preview message id.
+    pub fn mark_scheduled_post_previewed(
+        &self,
+        id: &str,
+        approval_msg: Option<&str>,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE scheduled_posts SET status = 'previewed', approval_msg = ?2 \
+              WHERE id = ?1",
+            params![id, approval_msg],
+        )?;
+        Ok(())
+    }
+
+    /// Terminal transition: `posted` (with the platform's external id) or a
+    /// non-ok status (`failed` / `cancelled`).
+    pub fn mark_scheduled_post_status(
+        &self,
+        id: &str,
+        status: ScheduledPostStatus,
+        external_id: Option<&str>,
+    ) -> StoreResult<()> {
+        let posted_at = if status == ScheduledPostStatus::Posted {
+            Some(now_millis())
+        } else {
+            None
+        };
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE scheduled_posts \
+                SET status = ?2, external_id = COALESCE(?3, external_id), \
+                    posted_at_ms = COALESCE(?4, posted_at_ms) \
+              WHERE id = ?1",
+            params![id, status.as_str(), external_id, posted_at],
+        )?;
+        Ok(())
+    }
+
+    /// Cancel a still-pending (`queued`/`previewed`) post. No-op (returns
+    /// `false`) if it already fired or was cancelled.
+    pub fn cancel_scheduled_post(&self, id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE scheduled_posts SET status = 'cancelled' \
+              WHERE id = ?1 AND status IN ('queued','previewed')",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// All not-yet-terminal posts, soonest first — the dashboard / CLI queue.
+    pub fn list_pending_scheduled_posts(&self) -> StoreResult<Vec<ScheduledPost>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, platform, body, media_paths, fire_at_ms, status, \
+                    approval_msg, posted_at_ms, external_id, thread_parent, \
+                    created_at_ms \
+               FROM scheduled_posts \
+              WHERE status IN ('queued','previewed') \
+              ORDER BY fire_at_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_scheduled_post)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // =====================================================================
+    // #58.2-.4 — spine accessors (own-post comments, friend feed,
+    // connection-request queue). Minimal dedup-key surface so the sources
+    // can be implemented incrementally without further migrations.
+    // =====================================================================
+
+    /// Register one of the user's own posts to watch for comments. Idempotent
+    /// on `(platform, external_id)`.
+    pub fn upsert_own_post(
+        &self,
+        platform: &str,
+        external_id: &str,
+        posted_at_ms: i64,
+        poll_until_ms: i64,
+    ) -> StoreResult<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO own_posts \
+                (id, platform, external_id, posted_at_ms, poll_until_ms, created_at_ms) \
+             VALUES (?1,?2,?3,?4,?5,?6) \
+             ON CONFLICT(platform, external_id) DO UPDATE SET \
+                poll_until_ms = MAX(poll_until_ms, excluded.poll_until_ms)",
+            params![id, platform, external_id, posted_at_ms, poll_until_ms, now],
+        )?;
+        let row_id: String = guard.query_row(
+            "SELECT id FROM own_posts WHERE platform = ?1 AND external_id = ?2",
+            params![platform, external_id],
+            |r| r.get(0),
+        )?;
+        Ok(row_id)
+    }
+
+    /// Record a freshly-seen comment. Returns `false` if it was already seen
+    /// (the `(own_post_id, external_id)` unique guard tripped) so the caller
+    /// only synthesizes a WorkItem for genuinely new comments.
+    pub fn record_seen_comment(
+        &self,
+        own_post_id: &str,
+        external_id: &str,
+        author_handle: Option<&str>,
+        body: Option<&str>,
+    ) -> StoreResult<bool> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "INSERT OR IGNORE INTO seen_comments \
+                (id, own_post_id, external_id, author_handle, body, created_at_ms) \
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![id, own_post_id, external_id, author_handle, body, now],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Add (or refresh) a friend to the engagement watchlist.
+    pub fn upsert_friend_watch(
+        &self,
+        platform: &str,
+        handle: &str,
+        wiki_slug: Option<&str>,
+        engagement: &str,
+    ) -> StoreResult<()> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO friend_watchlist \
+                (id, platform, handle, wiki_slug, engagement, added_at_ms) \
+             VALUES (?1,?2,?3,?4,?5,?6) \
+             ON CONFLICT(platform, handle) DO UPDATE SET \
+                wiki_slug = excluded.wiki_slug, \
+                engagement = excluded.engagement",
+            params![id, platform, handle, wiki_slug, engagement, now],
+        )?;
+        Ok(())
+    }
+
+    /// Queue an inbound connection request for triage. Idempotent on
+    /// `(platform, external_id)`; returns `false` if already queued.
+    pub fn record_connection_request(
+        &self,
+        platform: &str,
+        external_id: &str,
+        requester_name: Option<&str>,
+        requester_url: Option<&str>,
+        message: Option<&str>,
+    ) -> StoreResult<bool> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "INSERT OR IGNORE INTO connection_requests \
+                (id, platform, external_id, requester_name, requester_url, \
+                 message, created_at_ms) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                id, platform, external_id, requester_name, requester_url, message, now
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Resolve a queued connection request to a terminal decision.
+    pub fn decide_connection_request(
+        &self,
+        id: &str,
+        decision: &str,
+    ) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE connection_requests \
+                SET decision = ?2, decided_at_ms = ?3 WHERE id = ?1",
+            params![id, decision, now],
+        )?;
+        Ok(())
+    }
 }
 
 fn row_to_tone_profile(r: &rusqlite::Row) -> rusqlite::Result<ToneProfile> {
@@ -4152,6 +4526,22 @@ fn row_to_agent_pr_run(r: &rusqlite::Row) -> rusqlite::Result<AgentPrRun> {
         error: r.get(8)?,
         created_at_ms: r.get(9)?,
         updated_at_ms: r.get(10)?,
+    })
+}
+
+fn row_to_scheduled_post(r: &rusqlite::Row) -> rusqlite::Result<ScheduledPost> {
+    Ok(ScheduledPost {
+        id: r.get(0)?,
+        platform: r.get(1)?,
+        body: r.get(2)?,
+        media_paths: r.get::<_, Option<String>>(3)?,
+        fire_at_ms: r.get(4)?,
+        status: r.get(5)?,
+        approval_msg: r.get::<_, Option<String>>(6)?,
+        posted_at_ms: r.get::<_, Option<i64>>(7)?,
+        external_id: r.get::<_, Option<String>>(8)?,
+        thread_parent: r.get::<_, Option<String>>(9)?,
+        created_at_ms: r.get(10)?,
     })
 }
 

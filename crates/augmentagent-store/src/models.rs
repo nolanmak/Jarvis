@@ -368,6 +368,67 @@ pub struct WhatsappDevice {
     pub created_at_ms: i64,
 }
 
+/// #58.1 — one queued outbound post. Synthesized into a
+/// `scheduled_post_fire` WorkItem by the serve-tick fire loop: at T-30min a
+/// preview approval card is posted (`status` → `previewed`), at T-0 anything
+/// still `previewed` (i.e. the user did not cancel) is published via the
+/// per-platform Track-2.2 posting client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledPost {
+    pub id: String,
+    /// `twitter` | `linkedin` | `instagram` | …
+    pub platform: String,
+    pub body: String,
+    /// JSON array of local media file paths, or `None` for a text post.
+    pub media_paths: Option<String>,
+    pub fire_at_ms: i64,
+    /// `queued` | `previewed` | `posted` | `cancelled` | `failed`.
+    pub status: String,
+    /// Discord message id of the preview card once it's been surfaced.
+    pub approval_msg: Option<String>,
+    pub posted_at_ms: Option<i64>,
+    /// Platform's post id once published (tweet id / share urn / media id).
+    pub external_id: Option<String>,
+    /// For tweetstorms / multi-part LI — parent `scheduled_posts.id`.
+    pub thread_parent: Option<String>,
+    pub created_at_ms: i64,
+}
+
+/// Lifecycle states for a [`ScheduledPost`]. String-typed in the DB so a
+/// future state never needs a migration; this enum is the canonical set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduledPostStatus {
+    Queued,
+    Previewed,
+    Posted,
+    Cancelled,
+    Failed,
+}
+
+impl ScheduledPostStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Previewed => "previewed",
+            Self::Posted => "posted",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "queued" => Some(Self::Queued),
+            "previewed" => Some(Self::Previewed),
+            "posted" => Some(Self::Posted),
+            "cancelled" => Some(Self::Cancelled),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
 /// A user-scheduled recurring prompt/command (`/loop`, #104). The scheduler
 /// ticks every active row on its `interval_secs` cadence. Minimal model
 /// matching the `user_loops` table the store methods read/write.

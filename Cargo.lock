@@ -371,10 +371,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "augmentagent-approval-discord",
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",
  "futures",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -384,6 +386,25 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "augmentagent-channel-deft"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-auth",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "mockito",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -489,6 +510,7 @@ dependencies = [
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",
+ "clap",
  "reqwest",
  "rusqlite",
  "serde",
@@ -500,7 +522,9 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -732,6 +756,7 @@ dependencies = [
  "augmentagent-channel-calendar",
  "augmentagent-channel-contacts",
  "augmentagent-channel-core",
+ "augmentagent-channel-deft",
  "augmentagent-channel-discord-dm",
  "augmentagent-channel-email",
  "augmentagent-channel-gdrive",
