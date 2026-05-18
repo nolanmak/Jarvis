@@ -13,10 +13,12 @@ mod custom_id;
 mod event_handler;
 mod layout;
 mod nudge;
+mod presets;
 
 pub use broker::{DiscordApprovalBroker, DiscordConfig};
 pub use event_handler::chunk_for_discord;
 pub use nudge::NudgeScheduler;
+pub use presets::{Preset, MAX_REDRAFT_ITERATIONS, PRESETS};
 
 use async_trait::async_trait;
 use augmentagent_store::Email;

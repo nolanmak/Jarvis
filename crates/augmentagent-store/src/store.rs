@@ -54,6 +54,19 @@ impl Store {
                 [],
             )?;
         }
+        // #34: quick-refine analytics + redraft-iteration cap. `lastPresetId`
+        // records the most-recent canned preset chosen (NULL for free-form
+        // Revise / never refined); `redraftCount` is the stacked-iteration
+        // counter the approval card uses to enforce MAX_REDRAFT_ITERATIONS.
+        if !column_exists(conn, "actions", "lastPresetId")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN lastPresetId TEXT", [])?;
+        }
+        if !column_exists(conn, "actions", "redraftCount")? {
+            conn.execute(
+                "ALTER TABLE actions ADD COLUMN redraftCount INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         if !column_exists(conn, "actions", "nextNudgeAtMs")? {
             conn.execute("ALTER TABLE actions ADD COLUMN nextNudgeAtMs INTEGER", [])?;
             // One-shot backfill: rows still in 'pending' from before the
@@ -1032,6 +1045,49 @@ impl Store {
             params![action_id, draft_id, now],
         )?;
         Ok(())
+    }
+
+    /// Record a quick-refine preset choice and bump the redraft counter (#34).
+    ///
+    /// Called once per Quick-refine select. `preset_id` is `None` for a
+    /// free-form Revise (still counts toward the iteration cap). Returns the
+    /// post-increment `redraftCount` so the caller can decide whether the cap
+    /// ([`MAX_REDRAFT_ITERATIONS`-equivalent](crate)) has been hit.
+    pub fn record_redraft(
+        &self,
+        action_id: &str,
+        preset_id: Option<&str>,
+    ) -> StoreResult<i64> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE actions \
+                SET redraftCount = COALESCE(redraftCount, 0) + 1, \
+                    lastPresetId = ?2, \
+                    updatedAt = ?3 \
+              WHERE id = ?1",
+            params![action_id, preset_id, now],
+        )?;
+        let count: i64 = guard.query_row(
+            "SELECT COALESCE(redraftCount, 0) FROM actions WHERE id = ?1",
+            params![action_id],
+            |r| r.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Read the current redraft iteration count for an action (#34). Returns 0
+    /// for a never-refined action or one that predates the column.
+    pub fn redraft_count(&self, action_id: &str) -> StoreResult<i64> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let count: Option<i64> = guard
+            .query_row(
+                "SELECT COALESCE(redraftCount, 0) FROM actions WHERE id = ?1",
+                params![action_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(count.unwrap_or(0))
     }
 
     /// Find reply-intent actions that errored out and deserve another try.
@@ -2760,6 +2816,31 @@ mod tests {
         s.log_action("m1", None, "a@b.com", "s", None, None, ActionStatus::DryRun)
             .unwrap();
         assert!(s.is_message_processed("m1").unwrap());
+    }
+
+    #[test]
+    fn record_redraft_increments_and_persists_preset() {
+        // #34: quick-refine analytics + iteration cap counter.
+        let (s, _f) = fresh_store();
+        let id = s
+            .log_action("m1", None, "a@b.com", "s", None, Some("v0"), ActionStatus::Pending)
+            .unwrap();
+        assert_eq!(s.redraft_count(&id).unwrap(), 0);
+
+        let c1 = s.record_redraft(&id, Some("shorter")).unwrap();
+        assert_eq!(c1, 1);
+        let c2 = s.record_redraft(&id, Some("warmer")).unwrap();
+        assert_eq!(c2, 2);
+        // Free-form Revise records no preset but still counts.
+        let c3 = s.record_redraft(&id, None).unwrap();
+        assert_eq!(c3, 3);
+        assert_eq!(s.redraft_count(&id).unwrap(), 3);
+    }
+
+    #[test]
+    fn redraft_count_zero_for_unknown_action() {
+        let (s, _f) = fresh_store();
+        assert_eq!(s.redraft_count("does-not-exist").unwrap(), 0);
     }
 
     // --- nudge loop ---
