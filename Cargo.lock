@@ -482,6 +482,7 @@ dependencies = [
  "augmentagent-approval-discord",
  "augmentagent-auth",
  "augmentagent-channel-core",
+ "augmentagent-channel-discord-dm",
  "augmentagent-store",
  "augmentagent-wiki",
  "mockito",

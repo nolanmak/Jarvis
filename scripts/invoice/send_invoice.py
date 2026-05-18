@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a weekly Orchid invoice PDF and email it as an attachment.
+"""Generate a weekly invoice PDF and email it as an attachment.
 
 Self-contained unit used by both the backlog send and the weekly Sunday duty.
 PDF generation is offline (reportlab); sending uses the Composio Python SDK with
@@ -10,14 +10,18 @@ week) and passes it in explicitly. Standalone/backlog use passes it by hand.
 
   # dry-run (default): generate + print, send nothing
   send_invoice.py --number 35 --start 2026-05-17 --end 2026-05-24 \
-      --to REDACTED --from-entity <composio_entity>
+      --to you@example.com --from-entity <composio_entity>
 
   # actually send
   send_invoice.py ... --dry-run false
 
-Env:
-  COMPOSIO_API_KEY   required to send (not for dry-run)
-  ORCHID_GH_REPO     owner/name slug for `gh` (default REDACTED; no clone needed)
+Env (set in .env — gitignored; never hardcode personal/business data):
+  COMPOSIO_API_KEY    required to send (not for dry-run)
+  INVOICE_GH_REPO     owner/name slug for `gh` (legacy: ORCHID_GH_REPO)
+  INVOICE_GH_AUTHOR   GitHub login whose merged PRs are billed
+  INVOICE_FROM_LINES  pipe-separated "Business|Name|Street|City, ST ZIP|Phone"
+  INVOICE_BILL_TO     client / bill-to name
+  INVOICE_HOURS, INVOICE_RATE   billing quantity + rate
 """
 import argparse, datetime, os, sys, pathlib
 
@@ -142,7 +146,10 @@ def main():
     n, rng, tot, path = build(a.number, a.start, a.end, rows, out,
                               invoice_date=a.invoice_date or None)
 
-    subject = f"Invoice #{n} — {fmt(start_d)}-{fmt(end_d)} (Orchid / REDACTED)"
+    _bill_to = os.environ.get("INVOICE_BILL_TO", "").strip()
+    subject = f"Invoice #{n} — {fmt(start_d)}-{fmt(end_d)}" + (
+        f" ({_bill_to})" if _bill_to else ""
+    )
     body = email_body(start_d, end_d)
 
     print(f"Invoice #{n}: {rng}  {tot} PRs  -> {path}")

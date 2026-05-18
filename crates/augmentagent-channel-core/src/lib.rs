@@ -24,5 +24,6 @@ pub use governor::{
 };
 pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerOpts};
 pub use trigger::{
-    DigestSource, FriendFeedSource, InboundMessageTrigger, InboundSource, Trigger, WorkItem,
+    ChannelRunner, DigestSource, FriendFeedSource, InboundMessageTrigger, InboundSource,
+    Trigger, WorkItem, WorkItemHandler,
 };
