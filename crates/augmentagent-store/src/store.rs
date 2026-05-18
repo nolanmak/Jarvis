@@ -199,7 +199,7 @@ impl Store {
         // have the other keys still pick up this new row as 'false'.
         conn.execute(
             "INSERT OR IGNORE INTO invoice_config (key, value, updated_at) VALUES \
-                 ('recipient_email', 'REDACTED', ?1),\
+                 ('recipient_email', '', ?1),\
                  ('invoice_counter', '35', ?1),\
                  ('from_entity', '', ?1),\
                  ('last_billed_week_end', '2026-05-17', ?1),\
@@ -651,6 +651,39 @@ impl Store {
         Ok(id)
     }
 
+    /// Log a `flagged` action and persist the triage flag `reason` into the
+    /// `errorMessage` column (unused for non-error statuses). The morning
+    /// digest (#100) reads this back via `flagged_actions_since` so it can
+    /// enumerate *why* each item was flagged, not just that it was.
+    pub fn log_flagged_action(
+        &self,
+        message_id: &str,
+        thread_id: Option<&str>,
+        from_email: &str,
+        subject: &str,
+        original_body: Option<&str>,
+        reason: &str,
+    ) -> StoreResult<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'flagged', ?7, ?8, ?8, 0, NULL)",
+            params![
+                id,
+                message_id,
+                thread_id,
+                from_email,
+                subject,
+                original_body,
+                reason,
+                now,
+            ],
+        )?;
+        Ok(id)
+    }
+
     pub fn update_action_status(
         &self,
         action_id: &str,
@@ -970,6 +1003,131 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(n)
+    }
+
+    /// Every action that landed in `flagged` status within the window. Each
+    /// row: (from, subject, reason). The flag reason is stashed in
+    /// `errorMessage` at log time (it is otherwise unused for non-error
+    /// statuses); empty/NULL collapses to "flagged". No LIMIT — the digest
+    /// (#100) needs an exhaustive list, and flagged volume is small by
+    /// construction (triage flags are the exception, not the rule).
+    pub fn flagged_actions_since(
+        &self,
+        since_ms: i64,
+    ) -> StoreResult<Vec<(String, String, String)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT fromEmail, subject, COALESCE(NULLIF(errorMessage, ''), 'flagged') \
+             FROM actions \
+             WHERE status = 'flagged' AND createdAt >= ?1 \
+             ORDER BY createdAt DESC",
+        )?;
+        let rows = stmt.query_map(params![since_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every action currently sitting in `pending` (awaiting the user's
+    /// Discord click), oldest first. Each row: (from, subject, age_ms). No
+    /// LIMIT — the digest (#100) must enumerate the entire approval backlog,
+    /// and #99's backpressure keeps this set bounded.
+    pub fn pending_actions(&self) -> StoreResult<Vec<(String, String, i64)>> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT fromEmail, subject, createdAt \
+             FROM actions \
+             WHERE status = 'pending' \
+             ORDER BY createdAt ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                (now - r.get::<_, i64>(2)?).max(0),
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The `limit` oldest pending actions, oldest first. Each row:
+    /// (action_id, from, subject, age_ms). Backs `approvals list` and the
+    /// `discard-older` bulk-clear path (#99).
+    pub fn oldest_pending_actions(
+        &self,
+        limit: i64,
+    ) -> StoreResult<Vec<(String, String, String, i64)>> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, fromEmail, subject, createdAt \
+             FROM actions \
+             WHERE status = 'pending' \
+             ORDER BY createdAt ASC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                (now - r.get::<_, i64>(3)?).max(0),
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Expire every pending action created on or before `cutoff_ms` by
+    /// flipping it to `timed_out` (the existing terminal status for
+    /// abandoned approvals). Returns the number of rows swept. Backs both
+    /// the Serve-loop stale-draft sweep and `approvals discard-older` (#99).
+    pub fn expire_pending_older_than(&self, cutoff_ms: i64) -> StoreResult<usize> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+             SET status = 'timed_out', \
+                 errorMessage = COALESCE(NULLIF(errorMessage, ''), 'expired: stale pending draft'), \
+                 updatedAt = ?2 \
+             WHERE status = 'pending' AND createdAt <= ?1",
+            params![cutoff_ms, now],
+        )?;
+        Ok(n)
+    }
+
+    /// Resolve a single pending action to `approved` (used by
+    /// `approvals approve-all`). Returns true if a pending row was flipped.
+    /// This only flips the status row — it does NOT send the Gmail draft;
+    /// the existing Discord approve handler owns the send path. `approve-all`
+    /// is a queue-hygiene escape hatch ("I've handled these out of band"),
+    /// not a bulk-send.
+    pub fn mark_pending_approved(&self, action_id: &str) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+             SET status = 'approved', updatedAt = ?2 \
+             WHERE id = ?1 AND status = 'pending'",
+            params![action_id, now],
+        )?;
+        Ok(n > 0)
     }
 
     /// Load a single action row plus its email body. Used by the Discord
@@ -3423,5 +3581,103 @@ mod tests {
             s.record_user_edit_as_tone_example(&id2).unwrap().is_none(),
             "missing draftBody → skip"
         );
+    }
+
+    // ---- #99 / #100: queue backpressure + exhaustive digest ----
+
+    #[test]
+    fn log_flagged_action_persists_reason_and_flagged_enumerates_all() {
+        let (s, _f) = fresh_store();
+        let e1 = sample_email("f1");
+        let e2 = sample_email("f2");
+        s.upsert_email(&e1).unwrap();
+        s.upsert_email(&e2).unwrap();
+        s.log_flagged_action("f1", None, "alice@x.com", "Re: contract", None, "needs sign-off")
+            .unwrap();
+        s.log_flagged_action("f2", None, "bob@x.com", "Payout failed", None, "")
+            .unwrap();
+
+        let flagged = s.flagged_actions_since(0).unwrap();
+        assert_eq!(flagged.len(), 2, "both flagged rows must be enumerated, no LIMIT");
+        // Reason persisted; empty reason collapses to "flagged".
+        let by_from: std::collections::HashMap<_, _> = flagged
+            .iter()
+            .map(|(f, _s, r)| (f.as_str(), r.as_str()))
+            .collect();
+        assert_eq!(by_from["alice@x.com"], "needs sign-off");
+        assert_eq!(by_from["bob@x.com"], "flagged");
+    }
+
+    #[test]
+    fn flagged_actions_since_respects_window() {
+        let (s, _f) = fresh_store();
+        let e = sample_email("fw");
+        s.upsert_email(&e).unwrap();
+        s.log_flagged_action("fw", None, "a@b.com", "s", None, "r").unwrap();
+        // A far-future `since` excludes everything.
+        let future = now_millis() + 60_000;
+        assert!(s.flagged_actions_since(future).unwrap().is_empty());
+        assert_eq!(s.flagged_actions_since(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pending_actions_enumerates_entire_backlog_oldest_first() {
+        let (s, _f) = fresh_store();
+        for i in 0..3 {
+            let mid = format!("p{i}");
+            let e = sample_email(&mid);
+            s.upsert_email(&e).unwrap();
+            s.log_action(&mid, None, &format!("u{i}@x.com"), "s", None, Some("d"), ActionStatus::Pending)
+                .unwrap();
+        }
+        // A flagged row must not show up in the pending list.
+        let ef = sample_email("pf");
+        s.upsert_email(&ef).unwrap();
+        s.log_flagged_action("pf", None, "z@x.com", "s", None, "r").unwrap();
+
+        let pending = s.pending_actions().unwrap();
+        assert_eq!(pending.len(), 3, "all pending, no LIMIT; flagged excluded");
+        for (_f, _s, age) in &pending {
+            assert!(*age >= 0);
+        }
+        let oldest = s.oldest_pending_actions(2).unwrap();
+        assert_eq!(oldest.len(), 2, "limit honored");
+    }
+
+    #[test]
+    fn expire_pending_older_than_only_touches_old_pending() {
+        let (s, _f) = fresh_store();
+        let e = sample_email("ex");
+        s.upsert_email(&e).unwrap();
+        let id = s
+            .log_action("ex", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .unwrap();
+        // Cutoff in the past → nothing expired (row is fresh).
+        assert_eq!(s.expire_pending_older_than(0).unwrap(), 0);
+        assert_eq!(s.pending_reply_count().unwrap(), 1);
+        // Cutoff in the future → the fresh row is now "older than" and swept.
+        let future = now_millis() + 60_000;
+        assert_eq!(s.expire_pending_older_than(future).unwrap(), 1);
+        assert_eq!(s.pending_reply_count().unwrap(), 0);
+        // Re-sweep is a no-op (already terminal).
+        assert_eq!(s.expire_pending_older_than(future).unwrap(), 0);
+        let a = s.get_action_with_email(&id).unwrap().unwrap();
+        assert_eq!(a.action.status, "timed_out");
+    }
+
+    #[test]
+    fn mark_pending_approved_only_flips_pending_rows() {
+        let (s, _f) = fresh_store();
+        let e = sample_email("ap");
+        s.upsert_email(&e).unwrap();
+        let id = s
+            .log_action("ap", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .unwrap();
+        assert!(s.mark_pending_approved(&id).unwrap());
+        assert_eq!(s.pending_reply_count().unwrap(), 0);
+        // Second call is a no-op (no longer pending).
+        assert!(!s.mark_pending_approved(&id).unwrap());
+        let a = s.get_action_with_email(&id).unwrap().unwrap();
+        assert_eq!(a.action.status, "approved");
     }
 }
