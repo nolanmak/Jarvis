@@ -54,6 +54,19 @@ impl Store {
                 [],
             )?;
         }
+        // #34: quick-refine analytics + redraft-iteration cap. `lastPresetId`
+        // records the most-recent canned preset chosen (NULL for free-form
+        // Revise / never refined); `redraftCount` is the stacked-iteration
+        // counter the approval card uses to enforce MAX_REDRAFT_ITERATIONS.
+        if !column_exists(conn, "actions", "lastPresetId")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN lastPresetId TEXT", [])?;
+        }
+        if !column_exists(conn, "actions", "redraftCount")? {
+            conn.execute(
+                "ALTER TABLE actions ADD COLUMN redraftCount INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
         if !column_exists(conn, "actions", "nextNudgeAtMs")? {
             conn.execute("ALTER TABLE actions ADD COLUMN nextNudgeAtMs INTEGER", [])?;
             // One-shot backfill: rows still in 'pending' from before the
@@ -199,7 +212,7 @@ impl Store {
         // have the other keys still pick up this new row as 'false'.
         conn.execute(
             "INSERT OR IGNORE INTO invoice_config (key, value, updated_at) VALUES \
-                 ('recipient_email', 'REDACTED', ?1),\
+                 ('recipient_email', '', ?1),\
                  ('invoice_counter', '35', ?1),\
                  ('from_entity', '', ?1),\
                  ('last_billed_week_end', '2026-05-17', ?1),\
@@ -672,6 +685,39 @@ impl Store {
         Ok(id)
     }
 
+    /// Log a `flagged` action and persist the triage flag `reason` into the
+    /// `errorMessage` column (unused for non-error statuses). The morning
+    /// digest (#100) reads this back via `flagged_actions_since` so it can
+    /// enumerate *why* each item was flagged, not just that it was.
+    pub fn log_flagged_action(
+        &self,
+        message_id: &str,
+        thread_id: Option<&str>,
+        from_email: &str,
+        subject: &str,
+        original_body: Option<&str>,
+        reason: &str,
+    ) -> StoreResult<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'flagged', ?7, ?8, ?8, 0, NULL)",
+            params![
+                id,
+                message_id,
+                thread_id,
+                from_email,
+                subject,
+                original_body,
+                reason,
+                now,
+            ],
+        )?;
+        Ok(id)
+    }
+
     pub fn update_action_status(
         &self,
         action_id: &str,
@@ -993,6 +1039,131 @@ impl Store {
         Ok(n)
     }
 
+    /// Every action that landed in `flagged` status within the window. Each
+    /// row: (from, subject, reason). The flag reason is stashed in
+    /// `errorMessage` at log time (it is otherwise unused for non-error
+    /// statuses); empty/NULL collapses to "flagged". No LIMIT — the digest
+    /// (#100) needs an exhaustive list, and flagged volume is small by
+    /// construction (triage flags are the exception, not the rule).
+    pub fn flagged_actions_since(
+        &self,
+        since_ms: i64,
+    ) -> StoreResult<Vec<(String, String, String)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT fromEmail, subject, COALESCE(NULLIF(errorMessage, ''), 'flagged') \
+             FROM actions \
+             WHERE status = 'flagged' AND createdAt >= ?1 \
+             ORDER BY createdAt DESC",
+        )?;
+        let rows = stmt.query_map(params![since_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every action currently sitting in `pending` (awaiting the user's
+    /// Discord click), oldest first. Each row: (from, subject, age_ms). No
+    /// LIMIT — the digest (#100) must enumerate the entire approval backlog,
+    /// and #99's backpressure keeps this set bounded.
+    pub fn pending_actions(&self) -> StoreResult<Vec<(String, String, i64)>> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT fromEmail, subject, createdAt \
+             FROM actions \
+             WHERE status = 'pending' \
+             ORDER BY createdAt ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                (now - r.get::<_, i64>(2)?).max(0),
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The `limit` oldest pending actions, oldest first. Each row:
+    /// (action_id, from, subject, age_ms). Backs `approvals list` and the
+    /// `discard-older` bulk-clear path (#99).
+    pub fn oldest_pending_actions(
+        &self,
+        limit: i64,
+    ) -> StoreResult<Vec<(String, String, String, i64)>> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, fromEmail, subject, createdAt \
+             FROM actions \
+             WHERE status = 'pending' \
+             ORDER BY createdAt ASC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                (now - r.get::<_, i64>(3)?).max(0),
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Expire every pending action created on or before `cutoff_ms` by
+    /// flipping it to `timed_out` (the existing terminal status for
+    /// abandoned approvals). Returns the number of rows swept. Backs both
+    /// the Serve-loop stale-draft sweep and `approvals discard-older` (#99).
+    pub fn expire_pending_older_than(&self, cutoff_ms: i64) -> StoreResult<usize> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+             SET status = 'timed_out', \
+                 errorMessage = COALESCE(NULLIF(errorMessage, ''), 'expired: stale pending draft'), \
+                 updatedAt = ?2 \
+             WHERE status = 'pending' AND createdAt <= ?1",
+            params![cutoff_ms, now],
+        )?;
+        Ok(n)
+    }
+
+    /// Resolve a single pending action to `approved` (used by
+    /// `approvals approve-all`). Returns true if a pending row was flipped.
+    /// This only flips the status row — it does NOT send the Gmail draft;
+    /// the existing Discord approve handler owns the send path. `approve-all`
+    /// is a queue-hygiene escape hatch ("I've handled these out of band"),
+    /// not a bulk-send.
+    pub fn mark_pending_approved(&self, action_id: &str) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+             SET status = 'approved', updatedAt = ?2 \
+             WHERE id = ?1 AND status = 'pending'",
+            params![action_id, now],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Load a single action row plus its email body. Used by the Discord
     /// event handler on approve/revise/skip clicks to reconstruct context.
     pub fn get_action_with_email(&self, action_id: &str) -> StoreResult<Option<ActionWithEmail>> {
@@ -1053,6 +1224,49 @@ impl Store {
             params![action_id, draft_id, now],
         )?;
         Ok(())
+    }
+
+    /// Record a quick-refine preset choice and bump the redraft counter (#34).
+    ///
+    /// Called once per Quick-refine select. `preset_id` is `None` for a
+    /// free-form Revise (still counts toward the iteration cap). Returns the
+    /// post-increment `redraftCount` so the caller can decide whether the cap
+    /// ([`MAX_REDRAFT_ITERATIONS`-equivalent](crate)) has been hit.
+    pub fn record_redraft(
+        &self,
+        action_id: &str,
+        preset_id: Option<&str>,
+    ) -> StoreResult<i64> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE actions \
+                SET redraftCount = COALESCE(redraftCount, 0) + 1, \
+                    lastPresetId = ?2, \
+                    updatedAt = ?3 \
+              WHERE id = ?1",
+            params![action_id, preset_id, now],
+        )?;
+        let count: i64 = guard.query_row(
+            "SELECT COALESCE(redraftCount, 0) FROM actions WHERE id = ?1",
+            params![action_id],
+            |r| r.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Read the current redraft iteration count for an action (#34). Returns 0
+    /// for a never-refined action or one that predates the column.
+    pub fn redraft_count(&self, action_id: &str) -> StoreResult<i64> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let count: Option<i64> = guard
+            .query_row(
+                "SELECT COALESCE(redraftCount, 0) FROM actions WHERE id = ?1",
+                params![action_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(count.unwrap_or(0))
     }
 
     /// Find reply-intent actions that errored out and deserve another try.
@@ -2491,6 +2705,82 @@ impl Store {
         )?;
         Ok(n.max(0) as u32)
     }
+
+    // -----------------------------------------------------------------
+    // #77 / #13 — linkedin_action_log helpers.
+    //
+    // A LinkedIn-scoped, action-keyed audit log distinct from the
+    // cross-platform rate_events table. It exists so the posting + feed
+    // engagement paths can enforce their own rolling-window caps (3
+    // posts/day, 5 engagements/day) durably across daemon restarts
+    // *without* depending on the RateGovernor's full permit/record
+    // lifecycle — the governor still gates the *decision*; this table is
+    // the cheap, LinkedIn-only counter the channel reads directly.
+    // -----------------------------------------------------------------
+
+    /// Append a LinkedIn outbound-action row. `status` is free-form
+    /// (`ok` | `failed` | `pending`); only `ok` rows count toward caps via
+    /// [`Store::linkedin_action_count_since`].
+    pub fn log_linkedin_action(
+        &self,
+        id: &str,
+        action_kind: &str,
+        target_urn: Option<&str>,
+        status: &str,
+        occurred_at_ms: i64,
+        meta_json: Option<&str>,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO linkedin_action_log \
+                 (id, action_kind, target_urn, status, occurred_at_ms, meta_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, action_kind, target_urn, status, occurred_at_ms, meta_json],
+        )?;
+        Ok(())
+    }
+
+    /// Count successful (`status = 'ok'`) actions of `action_kind` since
+    /// `since_ms` (inclusive). Backs the rolling-24h post cap and the
+    /// daily engagement cap. Non-`ok` rows (failed / pending) are excluded
+    /// so a failed dispatch doesn't permanently consume a daily slot.
+    pub fn linkedin_action_count_since(
+        &self,
+        action_kind: &str,
+        since_ms: i64,
+    ) -> StoreResult<u32> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM linkedin_action_log \
+              WHERE action_kind = ?1 \
+                AND status = 'ok' \
+                AND occurred_at_ms >= ?2",
+            params![action_kind, since_ms],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
+    /// True iff any `ok` row already exists for this (`action_kind`,
+    /// `target_urn`) pair — used to suppress duplicate engagement on the
+    /// same post across feed polls.
+    pub fn linkedin_action_exists(
+        &self,
+        action_kind: &str,
+        target_urn: &str,
+    ) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let found: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM linkedin_action_log \
+                  WHERE action_kind = ?1 AND target_urn = ?2 AND status = 'ok' \
+                  LIMIT 1",
+                params![action_kind, target_urn],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
 }
 
 fn row_to_tone_profile(r: &rusqlite::Row) -> rusqlite::Result<ToneProfile> {
@@ -2862,6 +3152,31 @@ mod tests {
         s.log_action("m1", None, "a@b.com", "s", None, None, ActionStatus::DryRun)
             .unwrap();
         assert!(s.is_message_processed("m1").unwrap());
+    }
+
+    #[test]
+    fn record_redraft_increments_and_persists_preset() {
+        // #34: quick-refine analytics + iteration cap counter.
+        let (s, _f) = fresh_store();
+        let id = s
+            .log_action("m1", None, "a@b.com", "s", None, Some("v0"), ActionStatus::Pending)
+            .unwrap();
+        assert_eq!(s.redraft_count(&id).unwrap(), 0);
+
+        let c1 = s.record_redraft(&id, Some("shorter")).unwrap();
+        assert_eq!(c1, 1);
+        let c2 = s.record_redraft(&id, Some("warmer")).unwrap();
+        assert_eq!(c2, 2);
+        // Free-form Revise records no preset but still counts.
+        let c3 = s.record_redraft(&id, None).unwrap();
+        assert_eq!(c3, 3);
+        assert_eq!(s.redraft_count(&id).unwrap(), 3);
+    }
+
+    #[test]
+    fn redraft_count_zero_for_unknown_action() {
+        let (s, _f) = fresh_store();
+        assert_eq!(s.redraft_count("does-not-exist").unwrap(), 0);
     }
 
     // --- nudge loop ---
@@ -3525,5 +3840,103 @@ mod tests {
             s.record_user_edit_as_tone_example(&id2).unwrap().is_none(),
             "missing draftBody → skip"
         );
+    }
+
+    // ---- #99 / #100: queue backpressure + exhaustive digest ----
+
+    #[test]
+    fn log_flagged_action_persists_reason_and_flagged_enumerates_all() {
+        let (s, _f) = fresh_store();
+        let e1 = sample_email("f1");
+        let e2 = sample_email("f2");
+        s.upsert_email(&e1).unwrap();
+        s.upsert_email(&e2).unwrap();
+        s.log_flagged_action("f1", None, "alice@x.com", "Re: contract", None, "needs sign-off")
+            .unwrap();
+        s.log_flagged_action("f2", None, "bob@x.com", "Payout failed", None, "")
+            .unwrap();
+
+        let flagged = s.flagged_actions_since(0).unwrap();
+        assert_eq!(flagged.len(), 2, "both flagged rows must be enumerated, no LIMIT");
+        // Reason persisted; empty reason collapses to "flagged".
+        let by_from: std::collections::HashMap<_, _> = flagged
+            .iter()
+            .map(|(f, _s, r)| (f.as_str(), r.as_str()))
+            .collect();
+        assert_eq!(by_from["alice@x.com"], "needs sign-off");
+        assert_eq!(by_from["bob@x.com"], "flagged");
+    }
+
+    #[test]
+    fn flagged_actions_since_respects_window() {
+        let (s, _f) = fresh_store();
+        let e = sample_email("fw");
+        s.upsert_email(&e).unwrap();
+        s.log_flagged_action("fw", None, "a@b.com", "s", None, "r").unwrap();
+        // A far-future `since` excludes everything.
+        let future = now_millis() + 60_000;
+        assert!(s.flagged_actions_since(future).unwrap().is_empty());
+        assert_eq!(s.flagged_actions_since(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pending_actions_enumerates_entire_backlog_oldest_first() {
+        let (s, _f) = fresh_store();
+        for i in 0..3 {
+            let mid = format!("p{i}");
+            let e = sample_email(&mid);
+            s.upsert_email(&e).unwrap();
+            s.log_action(&mid, None, &format!("u{i}@x.com"), "s", None, Some("d"), ActionStatus::Pending)
+                .unwrap();
+        }
+        // A flagged row must not show up in the pending list.
+        let ef = sample_email("pf");
+        s.upsert_email(&ef).unwrap();
+        s.log_flagged_action("pf", None, "z@x.com", "s", None, "r").unwrap();
+
+        let pending = s.pending_actions().unwrap();
+        assert_eq!(pending.len(), 3, "all pending, no LIMIT; flagged excluded");
+        for (_f, _s, age) in &pending {
+            assert!(*age >= 0);
+        }
+        let oldest = s.oldest_pending_actions(2).unwrap();
+        assert_eq!(oldest.len(), 2, "limit honored");
+    }
+
+    #[test]
+    fn expire_pending_older_than_only_touches_old_pending() {
+        let (s, _f) = fresh_store();
+        let e = sample_email("ex");
+        s.upsert_email(&e).unwrap();
+        let id = s
+            .log_action("ex", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .unwrap();
+        // Cutoff in the past → nothing expired (row is fresh).
+        assert_eq!(s.expire_pending_older_than(0).unwrap(), 0);
+        assert_eq!(s.pending_reply_count().unwrap(), 1);
+        // Cutoff in the future → the fresh row is now "older than" and swept.
+        let future = now_millis() + 60_000;
+        assert_eq!(s.expire_pending_older_than(future).unwrap(), 1);
+        assert_eq!(s.pending_reply_count().unwrap(), 0);
+        // Re-sweep is a no-op (already terminal).
+        assert_eq!(s.expire_pending_older_than(future).unwrap(), 0);
+        let a = s.get_action_with_email(&id).unwrap().unwrap();
+        assert_eq!(a.action.status, "timed_out");
+    }
+
+    #[test]
+    fn mark_pending_approved_only_flips_pending_rows() {
+        let (s, _f) = fresh_store();
+        let e = sample_email("ap");
+        s.upsert_email(&e).unwrap();
+        let id = s
+            .log_action("ap", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .unwrap();
+        assert!(s.mark_pending_approved(&id).unwrap());
+        assert_eq!(s.pending_reply_count().unwrap(), 0);
+        // Second call is a no-op (no longer pending).
+        assert!(!s.mark_pending_approved(&id).unwrap());
+        let a = s.get_action_with_email(&id).unwrap().unwrap();
+        assert_eq!(a.action.status, "approved");
     }
 }

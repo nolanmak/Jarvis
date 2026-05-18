@@ -14,19 +14,24 @@
 //!   trait so platform crates can anchor their impls against a shared contract.
 //! - **Digests** (Phase 2): same story via [`DigestSource`].
 //!
-//! # Non-goals for this module
+//! # The generic driver
 //!
-//! A generic driver that pulls items from a Trigger and feeds them through the
-//! triage → draft → ingest pipeline (`ChannelRunner`) is **deferred** until at
-//! least 2-3 platforms have implemented Trigger — that's when the right driver
-//! shape will be obvious. Today Gmail and LinkedIn keep their own `run()` loops
-//! untouched.
+//! [`ChannelRunner`] is the shared driver that pulls items from a [`Trigger`]
+//! on a cadence and feeds each through a [`WorkItemHandler`], with graceful
+//! cancellation. It supersedes the per-channel `run()` boilerplate. Gmail and
+//! LinkedIn expose [`InboundSource`] adapters (#25) so they can be driven via
+//! `ChannelRunner` instead of bespoke loops; their existing rich `poll_once`
+//! triage path is preserved unchanged and remains the production code path
+//! exactly as the Telegram bot keeps its own `poll_once` alongside an
+//! `InboundSource` adapter.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
 
 /// One unit of work produced by a [`Trigger`] — a DM, a friend's post, a digest
 /// tick. Carries just enough for the triage pipeline to route the item;
@@ -102,6 +107,110 @@ impl<S: InboundSource + 'static> Trigger for InboundMessageTrigger<S> {
     ) -> anyhow::Result<Vec<WorkItem>> {
         self.source.fetch_new().await
     }
+}
+
+/// Consumes the [`WorkItem`]s a [`Trigger`] produces. Channels implement this
+/// to plug their existing triage → draft → approve → ingest dispatch into the
+/// generic [`ChannelRunner`] without re-implementing the poll loop.
+///
+/// One call per item; the runner logs and continues on error so a single bad
+/// item never stalls the channel.
+#[async_trait]
+pub trait WorkItemHandler: Send + Sync {
+    async fn handle(&self, item: WorkItem) -> anyhow::Result<()>;
+}
+
+/// Generic driver: ticks a [`Trigger`], dispatches each [`WorkItem`] through a
+/// [`WorkItemHandler`], honours a [`CancellationToken`], and optionally sleeps
+/// a post-tick jitter so cadenced channels don't cluster on the interval
+/// boundary (matches the LinkedIn channel's existing jitter behaviour).
+///
+/// This is the deferred "generic driver" the module previously punted on —
+/// now that Slack/Discord/Telegram + Gmail/LinkedIn all speak `Trigger`, the
+/// shape is settled: tick → fetch → per-item handle → optional jitter.
+pub struct ChannelRunner<T: Trigger, H: WorkItemHandler> {
+    trigger: Arc<T>,
+    handler: Arc<H>,
+    /// How often to poll the trigger.
+    interval: Duration,
+    /// Sleep a uniform `[0, 2*jitter]` window after each tick. `Duration::ZERO`
+    /// disables jitter (DM channels with tight cadence); LinkedIn passes a
+    /// non-zero value to de-cluster its hourly poll.
+    jitter: Duration,
+    /// Log label, e.g. `"gmail"` / `"linkedin"`.
+    label: &'static str,
+}
+
+impl<T: Trigger + 'static, H: WorkItemHandler + 'static> ChannelRunner<T, H> {
+    pub fn new(
+        trigger: Arc<T>,
+        handler: Arc<H>,
+        interval: Duration,
+        jitter: Duration,
+        label: &'static str,
+    ) -> Self {
+        Self {
+            trigger,
+            handler,
+            interval,
+            jitter,
+            label,
+        }
+    }
+
+    /// One pass: fetch new items, dispatch each. Returns how many items were
+    /// handled (errors counted as handled-and-logged, like the existing
+    /// `poll_once` outcome counters). Public so tests can drive it
+    /// deterministically without a timer.
+    pub async fn tick_once(&self, cancel: &CancellationToken) -> anyhow::Result<usize> {
+        let items = self.trigger.next_work_items(cancel).await?;
+        let mut handled = 0usize;
+        for item in items {
+            let id = item.external_id.clone();
+            if let Err(e) = self.handler.handle(item).await {
+                error!(channel = self.label, external_id = %id, "handle failed: {e:#}");
+            }
+            handled += 1;
+        }
+        Ok(handled)
+    }
+
+    /// Long-running loop. Exits cleanly when `shutdown` fires. Mirrors the
+    /// shutdown/select shape every channel's hand-rolled `run()` uses.
+    pub async fn run(&self, shutdown: CancellationToken) -> anyhow::Result<()> {
+        let mut ticker = tokio::time::interval(self.interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!(channel = self.label, "channel runner: shutdown signal received");
+                    return Ok(());
+                }
+                _ = ticker.tick() => {
+                    match self.tick_once(&shutdown).await {
+                        Ok(n) => info!(channel = self.label, handled = n, "poll complete"),
+                        Err(e) => error!(channel = self.label, "poll failed: {e:#}"),
+                    }
+                    if !self.jitter.is_zero() {
+                        tokio::time::sleep(jittered(self.jitter)).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Deterministic jitter in `[0, 2 * base]`, seeded off the wall-clock
+/// nanosecond tail. No crate dependency — same trick the LinkedIn channel
+/// uses for `jitter_secs()`.
+fn jittered(base: Duration) -> Duration {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0) as u64;
+    let span = base.as_millis() as u64 * 2 + 1;
+    Duration::from_millis(nanos % span)
 }
 
 /// Marker trait reserved for Phase 3 friend-post engagement sources.
@@ -231,5 +340,115 @@ mod tests {
             let json = serde_json::to_string(&item).unwrap();
             assert!(json.contains(kind));
         }
+    }
+
+    // --- ChannelRunner ---
+
+    /// Records every WorkItem it's handed; can be told to fail one item id.
+    struct RecordingHandler {
+        seen: Mutex<Vec<String>>,
+        fail_id: Option<&'static str>,
+    }
+
+    impl RecordingHandler {
+        fn new(fail_id: Option<&'static str>) -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+                fail_id,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WorkItemHandler for RecordingHandler {
+        async fn handle(&self, item: WorkItem) -> anyhow::Result<()> {
+            self.seen.lock().unwrap().push(item.external_id.clone());
+            if Some(item.external_id.as_str()) == self.fail_id {
+                anyhow::bail!("scripted handler failure for {}", item.external_id);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_runner_dispatches_every_item() {
+        let source = Arc::new(StubSource::with_items(vec![
+            sample_item("a"),
+            sample_item("b"),
+            sample_item("c"),
+        ]));
+        let trigger = Arc::new(InboundMessageTrigger::new(source));
+        let handler = Arc::new(RecordingHandler::new(None));
+        let runner = ChannelRunner::new(
+            trigger,
+            Arc::clone(&handler),
+            Duration::from_secs(60),
+            Duration::ZERO,
+            "test",
+        );
+        let cancel = CancellationToken::new();
+
+        let handled = runner.tick_once(&cancel).await.unwrap();
+        assert_eq!(handled, 3);
+        assert_eq!(*handler.seen.lock().unwrap(), vec!["a", "b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn channel_runner_continues_past_a_failing_item() {
+        let source = Arc::new(StubSource::with_items(vec![
+            sample_item("ok1"),
+            sample_item("boom"),
+            sample_item("ok2"),
+        ]));
+        let trigger = Arc::new(InboundMessageTrigger::new(source));
+        let handler = Arc::new(RecordingHandler::new(Some("boom")));
+        let runner = ChannelRunner::new(
+            trigger,
+            Arc::clone(&handler),
+            Duration::from_secs(60),
+            Duration::ZERO,
+            "test",
+        );
+        let cancel = CancellationToken::new();
+
+        // A failing item is logged + counted, never aborts the batch.
+        let handled = runner.tick_once(&cancel).await.unwrap();
+        assert_eq!(handled, 3);
+        assert_eq!(*handler.seen.lock().unwrap(), vec!["ok1", "boom", "ok2"]);
+    }
+
+    #[tokio::test]
+    async fn channel_runner_run_exits_on_cancel() {
+        let source = Arc::new(StubSource::with_items(Vec::new()));
+        let trigger = Arc::new(InboundMessageTrigger::new(source));
+        let handler = Arc::new(RecordingHandler::new(None));
+        let runner = Arc::new(ChannelRunner::new(
+            trigger,
+            handler,
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            "test",
+        ));
+        let shutdown = CancellationToken::new();
+        let r = Arc::clone(&runner);
+        let sd = shutdown.clone();
+        let h = tokio::spawn(async move { r.run(sd).await });
+        shutdown.cancel();
+        // Must return promptly (well under the 1h tick) once cancelled.
+        let res = tokio::time::timeout(Duration::from_secs(5), h)
+            .await
+            .expect("run did not exit on cancel")
+            .unwrap();
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn jittered_stays_within_window() {
+        let base = Duration::from_millis(500);
+        for _ in 0..100 {
+            let j = jittered(base);
+            assert!(j <= Duration::from_millis(1000), "jitter out of window: {j:?}");
+        }
+        assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
     }
 }

@@ -74,3 +74,6 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+
+# Test-only HTTP mock (#77 normShares body snapshot tests)
+wiremock = "0.6"

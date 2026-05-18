@@ -74,6 +74,49 @@ fn ms_to_rfc3339(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// A single feed post by a watched ("close") connection, considered for a
+/// supportive-comment engagement (#13). The pipeline reuses the same
+/// `Email`-shaped triage path as DMs — see [`FeedPost::into_email`].
+#[derive(Debug, Clone)]
+pub struct FeedPost {
+    /// `urn:li:activity:...` (or `urn:li:ugcPost:...`) — the stable id we
+    /// comment against and dedup on.
+    pub post_urn: String,
+    /// Display name of the author (the watched close connection).
+    pub author_name: String,
+    /// Author's `urn:li:fsd_profile:...`.
+    pub author_urn: MemberUrn,
+    /// The post's text commentary (may be empty for pure-media posts —
+    /// those are filtered before triage).
+    pub text: String,
+    pub created_at_ms: i64,
+}
+
+impl FeedPost {
+    /// Convert to the store's generic `Email`. Mirrors [`Dm::into_email`]
+    /// but stamps `kind = "post_engagement"` so downstream routing (and the
+    /// approver) can tell a feed engagement from a DM reply. The
+    /// `account_entity_id` keeps the `linkedin:` prefix so the approver
+    /// routes the approve-click through Voyager.
+    pub fn into_email(self, my_urn: &str) -> Email {
+        let from = format!("{} <linkedin:{}>", self.author_name, self.author_urn.0);
+        let subject = format!("[LinkedIn post by {}]", self.author_name);
+        let date = ms_to_rfc3339(self.created_at_ms);
+        let account_entity_id = format!("linkedin:{my_urn}");
+        Email {
+            message_id: self.post_urn,
+            thread_id: None,
+            from,
+            subject,
+            body: self.text,
+            date,
+            account_entity_id: Some(account_entity_id),
+            platform: "linkedin".into(),
+            kind: "post_engagement".into(),
+        }
+    }
+}
+
 /// The `linkedin:` prefix on `Email::account_entity_id` that distinguishes
 /// LinkedIn-sourced rows from Gmail rows in sqlite.
 pub const ACCOUNT_PREFIX: &str = "linkedin:";
@@ -128,6 +171,31 @@ mod tests {
             delivered_at_ms: 0,
         };
         assert!(dm.is_outbound(me));
+    }
+
+    #[test]
+    fn feed_post_roundtrips_to_email() {
+        let p = FeedPost {
+            post_urn: "urn:li:activity:123".into(),
+            author_name: "Jane Doe".into(),
+            author_urn: MemberUrn("urn:li:fsd_profile:JANE".into()),
+            text: "Shipped a release!".into(),
+            created_at_ms: 1776630000000,
+        };
+        let email = p.into_email("urn:li:fsd_profile:ME");
+        assert_eq!(email.message_id, "urn:li:activity:123");
+        assert_eq!(email.thread_id, None);
+        assert!(email.from.contains("Jane Doe"));
+        assert!(email.from.contains("linkedin:urn:li:fsd_profile:JANE"));
+        assert_eq!(email.subject, "[LinkedIn post by Jane Doe]");
+        assert_eq!(email.body, "Shipped a release!");
+        assert_eq!(email.platform, "linkedin");
+        assert_eq!(email.kind, "post_engagement");
+        assert_eq!(
+            email.account_entity_id.as_deref(),
+            Some("linkedin:urn:li:fsd_profile:ME")
+        );
+        assert!(is_linkedin_email(&email));
     }
 
     #[test]

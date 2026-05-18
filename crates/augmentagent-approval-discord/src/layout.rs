@@ -6,10 +6,12 @@
 use augmentagent_store::Email;
 use serenity::all::{
     ActionRowComponent, ButtonStyle, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedFooter,
-    CreateInputText, CreateMessage, CreateModal, InputTextStyle,
+    CreateInputText, CreateModal, CreateMessage, CreateSelectMenu, CreateSelectMenuKind,
+    CreateSelectMenuOption, InputTextStyle,
 };
 
 use crate::custom_id::{CustomId, Verb};
+use crate::presets::{MAX_REDRAFT_ITERATIONS, PRESETS};
 
 const MAX_EMBED_DESCRIPTION: usize = 3800;
 const SEPARATOR: &str = "\n\n— DRAFT —\n\n";
@@ -25,15 +27,37 @@ pub fn flag_notice_message(email: &Email, reason: &str) -> CreateMessage {
     CreateMessage::new().content(content)
 }
 
-pub fn approval_message(action_id: &str, email: &Email, draft: &str) -> CreateMessage {
+/// Build an approval card. `redraft_count` is how many times this draft has
+/// already been refined (0 on first post). When the count is under
+/// [`MAX_REDRAFT_ITERATIONS`] a second action row — the "Quick refine…"
+/// `StringSelect` (#34) — is attached so presets can stack. At/above the cap
+/// the menu is dropped (the footer says so) and only Approve/Revise/Skip
+/// remain, forcing a terminal action or free-form Revise.
+pub fn approval_message(
+    action_id: &str,
+    email: &Email,
+    draft: &str,
+    redraft_count: i64,
+) -> CreateMessage {
+    let at_cap = redraft_count >= MAX_REDRAFT_ITERATIONS;
+    let footer = if redraft_count == 0 {
+        "AugmentAgent approval".to_string()
+    } else if at_cap {
+        format!(
+            "AugmentAgent approval · draft v{} · refine cap reached — Approve/Skip or use Revise",
+            redraft_count + 1
+        )
+    } else {
+        format!("AugmentAgent approval · draft v{}", redraft_count + 1)
+    };
     let embed = CreateEmbed::new()
         .title(truncate(&email.subject, 256))
         .description(format_body(&email.body, draft))
         .field("From", truncate(&email.from, 256), true)
         .field("MessageId", truncate(&email.message_id, 256), true)
-        .footer(CreateEmbedFooter::new("AugmentAgent approval"));
+        .footer(CreateEmbedFooter::new(footer));
 
-    let row = CreateActionRow::Buttons(vec![
+    let button_row = CreateActionRow::Buttons(vec![
         CreateButton::new(CustomId::new(action_id, Verb::Approve).to_string())
             .label("Approve & Send")
             .style(ButtonStyle::Success),
@@ -45,7 +69,29 @@ pub fn approval_message(action_id: &str, email: &Email, draft: &str) -> CreateMe
             .style(ButtonStyle::Secondary),
     ]);
 
-    CreateMessage::new().embed(embed).components(vec![row])
+    let mut rows = vec![button_row];
+    if !at_cap {
+        rows.push(quick_refine_row(action_id));
+    }
+    CreateMessage::new().embed(embed).components(rows)
+}
+
+/// The "Quick refine…" `StringSelect` action row (#34). Each option's value is
+/// a preset id; the handler maps it to a canned `redraft_message` feedback
+/// string. Re-attached on every re-render so presets stack until the cap.
+fn quick_refine_row(action_id: &str) -> CreateActionRow {
+    let options: Vec<CreateSelectMenuOption> = PRESETS
+        .iter()
+        .map(|p| CreateSelectMenuOption::new(p.label, p.id))
+        .collect();
+    let menu = CreateSelectMenu::new(
+        CustomId::new(action_id, Verb::QuickRefine).to_string(),
+        CreateSelectMenuKind::String { options },
+    )
+    .placeholder("Quick refine… (no typing)")
+    .min_values(1)
+    .max_values(1);
+    CreateActionRow::SelectMenu(menu)
 }
 
 pub fn revise_modal(action_id: &str, previous_feedback: Option<&str>) -> CreateModal {
