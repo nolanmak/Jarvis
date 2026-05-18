@@ -12,6 +12,10 @@ pub enum Verb {
     Revise,
     Skip,
     ReviseModal,
+    /// Quick-refine `StringSelect` on the approval card (#34). The chosen
+    /// preset id arrives as the select's value, not in the custom_id, so this
+    /// verb carries no extra payload.
+    QuickRefine,
 }
 
 impl Verb {
@@ -21,6 +25,7 @@ impl Verb {
             Self::Revise => "revise",
             Self::Skip => "skip",
             Self::ReviseModal => "revise_modal",
+            Self::QuickRefine => "quick_refine",
         }
     }
 
@@ -30,6 +35,7 @@ impl Verb {
             "revise" => Self::Revise,
             "skip" => Self::Skip,
             "revise_modal" => Self::ReviseModal,
+            "quick_refine" => Self::QuickRefine,
             _ => return None,
         })
     }
@@ -73,7 +79,13 @@ mod tests {
 
     #[test]
     fn roundtrips_all_verbs() {
-        for v in [Verb::Approve, Verb::Revise, Verb::Skip, Verb::ReviseModal] {
+        for v in [
+            Verb::Approve,
+            Verb::Revise,
+            Verb::Skip,
+            Verb::ReviseModal,
+            Verb::QuickRefine,
+        ] {
             let cid = CustomId::new("550e8400-e29b-41d4-a716-446655440000", v);
             let s = cid.to_string();
             let back = CustomId::parse(&s).unwrap();

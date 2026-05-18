@@ -7,6 +7,7 @@
 //! additionally implement [`Trigger`] so Phase 2 digests and Phase 3 feed engagement can share
 //! one work-source contract instead of inventing their own per platform.
 
+pub mod archetype;
 pub mod decision;
 pub mod governor;
 pub mod ingest;
