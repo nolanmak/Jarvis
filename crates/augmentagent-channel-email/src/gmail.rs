@@ -160,6 +160,24 @@ impl ComposioClient {
             }
         }
     }
+
+    /// Resolve the Gmail address for a connected account via Composio's
+    /// `GMAIL_GET_PROFILE` (wraps Gmail API `users.getProfile`). Composio
+    /// doesn't surface the address on the connection itself, so this lookup
+    /// is the only way to label an entity by who it actually is. The address
+    /// lands at `data.response_data.emailAddress`; `find_string_field` walks
+    /// to it regardless of the exact nesting.
+    pub async fn get_profile_email(&self, entity_id: &str) -> Result<String, GmailError> {
+        let v = self
+            .execute("GMAIL_GET_PROFILE", entity_id, serde_json::json!({}))
+            .await?;
+        find_string_field(&v, &["emailAddress", "email"]).ok_or_else(|| {
+            GmailError::Decode(format!(
+                "no emailAddress in GMAIL_GET_PROFILE response: {}",
+                serde_json::to_string(&v).unwrap_or_default()
+            ))
+        })
+    }
 }
 
 fn is_transient_reqwest(e: &reqwest::Error) -> bool {

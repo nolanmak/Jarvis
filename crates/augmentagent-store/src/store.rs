@@ -791,6 +791,19 @@ impl Store {
         Ok(out)
     }
 
+    /// Backfill the human-readable Gmail address for a connected account.
+    /// The OAuth connect flow never captured it (Composio doesn't return it
+    /// on the connection), so the dashboard + entity picker show opaque IDs
+    /// until this is populated from a `GMAIL_GET_PROFILE` lookup.
+    pub fn update_gmail_account_email(&self, id: &str, email: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE gmail_accounts SET email = ?2 WHERE id = ?1",
+            params![id, email],
+        )?;
+        Ok(())
+    }
+
     pub fn save_learned_pattern(&self, _pattern: &LearnedPattern) -> StoreResult<()> {
         // Node writes these as JSON under skills/email-triage/learned/*.json, not sqlite.
         // Phase 3 decides final home. For Phase 1 this is a no-op; channel adapter logs instead.

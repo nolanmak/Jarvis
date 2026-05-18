@@ -73,6 +73,10 @@ enum Cmd {
     },
     /// List active gmail accounts from the shared db.
     AccountsList,
+    /// Resolve + persist each connected Gmail's real address via Composio
+    /// `GMAIL_GET_PROFILE`, so the dashboard + invoice entity picker show
+    /// who's who instead of opaque IDs. Safe to re-run.
+    AccountsBackfillEmails,
     /// Wiki maintenance.
     Wiki {
         #[command(subcommand)]
@@ -908,10 +912,27 @@ async fn main() -> Result<()> {
                 println!("(no active gmail accounts)");
             } else {
                 for a in accounts {
+                    let email = if a.email.is_empty() {
+                        "(unknown — run accounts-backfill-emails)".to_string()
+                    } else {
+                        a.email.clone()
+                    };
                     println!(
                         "{}\tentity={}\temail={}\tactive={}",
-                        a.id, a.entity_id, a.email, a.active
+                        a.id, a.entity_id, email, a.active
                     );
+                }
+            }
+            Ok(())
+        }
+        Cmd::AccountsBackfillEmails => {
+            let lines = backfill_gmail_emails(&store, false).await?;
+            if lines.is_empty() {
+                println!("(no active gmail accounts)");
+            } else {
+                println!("entity\temail\tid");
+                for l in lines {
+                    println!("{l}");
                 }
             }
             Ok(())
@@ -1050,6 +1071,24 @@ async fn main() -> Result<()> {
                 let inv = Arc::new(invoice::InvoiceScheduler::new(Arc::clone(&store)));
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { inv.run(sd).await }));
+            }
+
+            // Self-healing: backfill any connected-Gmail addresses Composio
+            // never surfaced on the connection, so the dashboard + invoice
+            // entity picker show real emails. Detached + best-effort — a
+            // flaky lookup must never take the daemon down, so this is
+            // deliberately not awaited in `tasks`.
+            {
+                let store_bf = Arc::clone(&store);
+                tokio::spawn(async move {
+                    match backfill_gmail_emails(&store_bf, true).await {
+                        Ok(lines) if !lines.is_empty() => {
+                            info!(updated = lines.len(), "gmail email backfill: {lines:?}");
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!("gmail email backfill skipped: {e:#}"),
+                    }
+                });
             }
             for handle in tasks {
                 handle.await??;
@@ -2073,6 +2112,37 @@ async fn run_gmail_send_now(
         .context("send_draft (send-now) failed")?;
     println!("sent: account={email} to={to} subject=\"{subject}\" draft_id={draft_id}");
     Ok(())
+}
+
+/// Resolve each active connected Gmail's address via Composio
+/// `GMAIL_GET_PROFILE` and persist it to `gmail_accounts.email`. The OAuth
+/// connect flow never captured it, so without this the dashboard + invoice
+/// entity picker can only show opaque IDs.
+///
+/// `only_missing` limits work to rows whose email is still blank (the
+/// self-healing startup pass). Best-effort: a flaky/expired account is logged
+/// in the returned mapping and skipped, never aborting the whole sweep.
+async fn backfill_gmail_emails(store: &Store, only_missing: bool) -> Result<Vec<String>> {
+    let api_key =
+        std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
+    let gmail = ComposioClient::new(api_key);
+    let accounts = store.get_active_gmail_accounts()?;
+    let mut lines = Vec::new();
+    for a in accounts {
+        if only_missing && !a.email.is_empty() {
+            continue;
+        }
+        match gmail.get_profile_email(&a.entity_id).await {
+            Ok(email) => {
+                store.update_gmail_account_email(&a.id, &email)?;
+                lines.push(format!("{}\t{}\t{}", a.entity_id, email, a.id));
+            }
+            Err(e) => {
+                lines.push(format!("{}\t<lookup failed: {e}>\t{}", a.entity_id, a.id));
+            }
+        }
+    }
+    Ok(lines)
 }
 
 async fn run_digest(

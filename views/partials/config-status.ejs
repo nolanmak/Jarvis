@@ -41,11 +41,12 @@
       <div class="ml-4 space-y-1">
         <% configStatus.gmailAccounts.forEach(function(account) { %>
           <div class="flex items-center justify-between py-1 group">
-            <div class="flex items-center gap-2">
+            <div class="flex items-center gap-2 min-w-0">
               <span class="w-1.5 h-1.5 rounded-full <%= account.active ? 'bg-green-400' : 'bg-gray-600' %>"></span>
               <span class="text-xs <%= account.active ? 'text-gray-300' : 'text-gray-500' %>">
                 <%= account.email || account.label || account.connectionId.slice(0, 12) + '...' %>
               </span>
+              <code class="text-[10px] text-gray-600 truncate" title="Composio entity — use with: !invoice entity &lt;id&gt;"><%= account.entityId %></code>
             </div>
             <button
               hx-delete="/api/oauth/gmail/<%= account.id %>"
