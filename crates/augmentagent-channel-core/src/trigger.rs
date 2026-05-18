@@ -18,12 +18,20 @@
 //!
 //! [`ChannelRunner`] is the shared driver that pulls items from a [`Trigger`]
 //! on a cadence and feeds each through a [`WorkItemHandler`], with graceful
-//! cancellation. It supersedes the per-channel `run()` boilerplate. Gmail and
-//! LinkedIn expose [`InboundSource`] adapters (#25) so they can be driven via
-//! `ChannelRunner` instead of bespoke loops; their existing rich `poll_once`
-//! triage path is preserved unchanged and remains the production code path
-//! exactly as the Telegram bot keeps its own `poll_once` alongside an
-//! `InboundSource` adapter.
+//! cancellation. It supersedes the per-channel `run()` boilerplate.
+//!
+//! **#25 complete**: Gmail and LinkedIn are now driven *in production* by
+//! `ChannelRunner` over their [`InboundSource`] adapters
+//! ([`GmailInbound`]/[`LinkedInInbound`]) wrapped in [`InboundMessageTrigger`].
+//! Each channel exposes a `WorkItemHandler` that rehydrates the work item back
+//! into the typed message and calls the channel's shared `process_email`
+//! entry point — the same triage → draft → approve → ingest → dedup path the
+//! removed bespoke poll loops ran. `poll_once` is retained as the CLI
+//! (`poll-once` / `linkedin poll-once`) + test entry point and shares that
+//! same `process_email`, so the driver swap is behavior-neutral. Gmail's
+//! retry queue (it scans `actions`, not the inbox) stays as a sibling ticker;
+//! LinkedIn's 4h ± 10min jitter is reproduced by `ChannelRunner`'s post-tick
+//! jitter window.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -125,9 +133,9 @@ pub trait WorkItemHandler: Send + Sync {
 /// a post-tick jitter so cadenced channels don't cluster on the interval
 /// boundary (matches the LinkedIn channel's existing jitter behaviour).
 ///
-/// This is the deferred "generic driver" the module previously punted on —
-/// now that Slack/Discord/Telegram + Gmail/LinkedIn all speak `Trigger`, the
-/// shape is settled: tick → fetch → per-item handle → optional jitter.
+/// The shape is settled and proven: tick → fetch → per-item handle →
+/// optional jitter. Slack/Discord/Telegram + Gmail/LinkedIn all run through
+/// it; #25 cut the last bespoke loops (Gmail/LinkedIn) over to this driver.
 pub struct ChannelRunner<T: Trigger, H: WorkItemHandler> {
     trigger: Arc<T>,
     handler: Arc<H>,
