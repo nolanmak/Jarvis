@@ -44,7 +44,12 @@ use tracing::{error, info};
 pub struct WorkItem {
     /// `gmail` | `linkedin` | `slack` | `discord` | `whatsapp` | `twitter` | `instagram`
     pub platform: String,
-    /// `dm` | `post_engagement` | `digest_item`
+    /// One of the [`kind`] taxonomy constants. The reactive DM pipeline emits
+    /// [`kind::DM`]; the #58 engagement spine adds
+    /// [`kind::SCHEDULED_POST_FIRE`], [`kind::OWN_POST_COMMENT`],
+    /// [`kind::FRIEND_POST`], [`kind::CONNECTION_REQUEST`] and
+    /// [`kind::WARM_TOUCH`]. Free-form (no DB CHECK) so a new kind never
+    /// needs a schema migration.
     pub kind: String,
     /// Platform-native stable identifier (messageId, post URN, thread id, …).
     /// The pipeline uses this as the dedup key when upserting into `emails`.
@@ -53,6 +58,51 @@ pub struct WorkItem {
     /// as JSON so the channel's handler can deserialize it back into a typed
     /// struct (`Email`, `Dm`, `SlackMessage`, …).
     pub payload: serde_json::Value,
+}
+
+/// Canonical [`WorkItem::kind`] taxonomy (#58 engagement spine).
+///
+/// Every engagement sub-feature emits a `WorkItem` whose `kind` is one of
+/// these strings; the triage pipeline routes on it and each has a Discord
+/// approval-card variant. Kept as `&'static str` constants (not an enum) so
+/// the value flows verbatim into the `emails.kind` TEXT column and JSON
+/// payloads without a conversion layer — exactly the contract the existing
+/// `work_item_kind_values_match_db_schema` test guards.
+pub mod kind {
+    /// Reactive inbound 1:1 message — the original pipeline.
+    pub const DM: &str = "dm";
+    /// A friend's post worth engaging with (legacy alias, kept for the
+    /// `FriendFeedSource` Phase-3 contract). Prefer [`FRIEND_POST`].
+    pub const POST_ENGAGEMENT: &str = "post_engagement";
+    /// Firehose item ingested for digest roll-up only.
+    pub const DIGEST_ITEM: &str = "digest_item";
+    /// #58.1 — a queued [`scheduled post`](crate) reaching its preview/fire
+    /// window; synthesized by the serve-tick cron, not a platform poll.
+    pub const SCHEDULED_POST_FIRE: &str = "scheduled_post_fire";
+    /// #58.2 — a new comment on one of the user's own posts.
+    pub const OWN_POST_COMMENT: &str = "own_post_comment";
+    /// #58.3 — a watched friend posted; engage proactively (wiki-grounded).
+    pub const FRIEND_POST: &str = "friend_post";
+    /// #58.4 — an inbound LinkedIn (or future-platform) connection request.
+    pub const CONNECTION_REQUEST: &str = "connection_request";
+    /// #58.5 — a proactive "you haven't talked to X in N days" nudge. The
+    /// scoring engine is the merged #81 proactive `StaleContactScan`; this
+    /// kind only labels the resulting card.
+    pub const WARM_TOUCH: &str = "warm_touch";
+
+    /// True for any of the five #58 engagement kinds (everything that is not
+    /// the reactive DM / digest path). Lets a handler cheaply branch the
+    /// engagement sub-pipeline off the shared dispatch.
+    pub fn is_engagement(k: &str) -> bool {
+        matches!(
+            k,
+            SCHEDULED_POST_FIRE
+                | OWN_POST_COMMENT
+                | FRIEND_POST
+                | CONNECTION_REQUEST
+                | WARM_TOUCH
+        )
+    }
 }
 
 /// Source of work items that's polled by a [`Trigger`] wrapper.
@@ -339,6 +389,32 @@ mod tests {
             };
             let json = serde_json::to_string(&item).unwrap();
             assert!(json.contains(kind));
+        }
+    }
+
+    #[test]
+    fn engagement_kind_taxonomy_is_stable_and_classified() {
+        use super::kind;
+        // Exact wire strings the store + JSON payloads depend on.
+        assert_eq!(kind::DM, "dm");
+        assert_eq!(kind::SCHEDULED_POST_FIRE, "scheduled_post_fire");
+        assert_eq!(kind::OWN_POST_COMMENT, "own_post_comment");
+        assert_eq!(kind::FRIEND_POST, "friend_post");
+        assert_eq!(kind::CONNECTION_REQUEST, "connection_request");
+        assert_eq!(kind::WARM_TOUCH, "warm_touch");
+        // The five engagement kinds classify as engagement; the reactive
+        // ones do not.
+        for k in [
+            kind::SCHEDULED_POST_FIRE,
+            kind::OWN_POST_COMMENT,
+            kind::FRIEND_POST,
+            kind::CONNECTION_REQUEST,
+            kind::WARM_TOUCH,
+        ] {
+            assert!(kind::is_engagement(k), "{k} should be engagement");
+        }
+        for k in [kind::DM, kind::DIGEST_ITEM, kind::POST_ENGAGEMENT] {
+            assert!(!kind::is_engagement(k), "{k} should not be engagement");
         }
     }
 
