@@ -7,8 +7,8 @@
 //! - 401 / 403            → `TwitterError::AuthExpired`
 //! - 429 (+ `retry-after`, `x-rate-limit-*`) → `RateLimited` w/ parsed window
 //! - 429 (`x-rate-limit-reset` only)         → `RateLimited` w/ derived delay
-//! - GraphQL 404/400      → `QueryIdRotated`, then fall through to the next
-//!                          queryId candidate and succeed
+//! - GraphQL 404/400      → `QueryIdRotated`, then fall through to the
+//!   next queryId candidate and succeed
 //! - every candidate stale → `QueryIdRotated` surfaced after exhaustion
 //! - 2xx but reshaped body → `SchemaDrift` (with the raw body length)
 //! - happy path           → parsed records
@@ -23,7 +23,9 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use augmentagent_channel_twitter::{
+    validate_session, validate_with_api, with_retry, CheckStatus,
     QueryIdResolver, TwitterApi, TwitterAuth, TwitterClient, TwitterError,
+    ValidateOptions,
 };
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -330,6 +332,280 @@ async fn happy_path_dm_inbox_parses() {
     let dms = client.fetch_dm_inbox(None).await.unwrap();
     assert_eq!(dms.len(), 1);
     assert_eq!(dms[0].text, "hello");
+}
+
+#[tokio::test]
+async fn create_tweet_2xx_without_rest_id_is_schema_drift() {
+    let server = MockServer::start().await;
+    // 200 OK but a GraphQL error envelope (X returns these with a 200) —
+    // no rest_id anywhere. Must surface as SchemaDrift, NOT a silent "".
+    Mock::given(method("POST"))
+        .and(path_regex(r".*/graphql/.*/CreateTweet"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "errors": [ { "message": "Tweet creation failed", "code": 187 } ]
+        })))
+        .mount(&server)
+        .await;
+    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let client = TwitterClient::with_resolver(
+        test_auth(),
+        Arc::new(FixedChain(vec!["Q".into()])),
+    );
+    let err = client.reply_to_tweet("123", "hi").await.unwrap_err();
+    match err {
+        TwitterError::SchemaDrift { op, body_len, .. } => {
+            assert_eq!(op, "CreateTweet");
+            assert!(body_len > 0);
+        }
+        other => panic!("expected SchemaDrift, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dm_send_2xx_without_event_id_is_schema_drift() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r".*/dm/new2\.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "reshaped": true, "no_id_here": [1, 2]
+        })))
+        .mount(&server)
+        .await;
+    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let client = TwitterClient::new(test_auth());
+    let err = client.send_dm("55-99", "hi").await.unwrap_err();
+    assert!(
+        matches!(err, TwitterError::SchemaDrift { ref op, .. } if op == "dm_new2"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_tweet_2xx_with_rest_id_still_succeeds() {
+    // Guard: the new drift check must NOT regress the happy path.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r".*/graphql/.*/CreateTweet"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "create_tweet": { "tweet_results": { "result": {
+                "rest_id": "1900000000000000042" }}}}
+        })))
+        .mount(&server)
+        .await;
+    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let client = TwitterClient::with_resolver(
+        test_auth(),
+        Arc::new(FixedChain(vec!["Q".into()])),
+    );
+    let id = client.reply_to_tweet("123", "hi").await.unwrap();
+    assert_eq!(id, "1900000000000000042");
+}
+
+// --- with_retry exponential-backoff helper -------------------------------
+
+#[tokio::test]
+async fn with_retry_recovers_after_transient_then_succeeds() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+    let calls = AtomicU32::new(0);
+    let slept: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+    let out: Result<&str, TwitterError> = with_retry(
+        3,
+        || async {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                Err(TwitterError::RateLimited {
+                    op: "UserTweets".into(),
+                    retry_after_secs: 7,
+                    limit: None,
+                    remaining: None,
+                })
+            } else {
+                Ok("ok")
+            }
+        },
+        |d: Duration| {
+            slept.lock().unwrap().push(d.as_secs());
+            async {}
+        },
+    )
+    .await;
+    assert_eq!(out.unwrap(), "ok");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    // RateLimited honors the server hint each time.
+    assert_eq!(*slept.lock().unwrap(), vec![7, 7]);
+}
+
+#[tokio::test]
+async fn with_retry_does_not_retry_auth_expired() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+    let calls = AtomicU32::new(0);
+    let out: Result<(), TwitterError> = with_retry(
+        5,
+        || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(TwitterError::AuthExpired)
+        },
+        |_d: Duration| async {},
+    )
+    .await;
+    assert!(matches!(out, Err(TwitterError::AuthExpired)));
+    // Terminal — exactly one attempt, no backoff loop.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn with_retry_does_not_retry_query_id_rotation() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+    let calls = AtomicU32::new(0);
+    let out: Result<(), TwitterError> = with_retry(
+        4,
+        || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(TwitterError::QueryIdRotated {
+                op: "UserTweets".into(),
+                status: 404,
+            })
+        },
+        |_d: Duration| async {},
+    )
+    .await;
+    // Rotation is recovered in-band by the chain walk, not by this loop.
+    assert!(matches!(out, Err(TwitterError::QueryIdRotated { .. })));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn with_retry_gives_up_after_max_retries() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+    let calls = AtomicU32::new(0);
+    let out: Result<(), TwitterError> = with_retry(
+        2,
+        || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(TwitterError::RateLimited {
+                op: "x".into(),
+                retry_after_secs: 1,
+                limit: None,
+                remaining: None,
+            })
+        },
+        |_d: Duration| async {},
+    )
+    .await;
+    assert!(matches!(out, Err(TwitterError::RateLimited { .. })));
+    // 1 initial + 2 retries = 3 attempts.
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+// --- the shipped validate harness, end-to-end, against wiremock ----------
+//
+// These prove the *real* `validate_with_api` / `validate` code path (the one
+// the CLI calls) is exercised against a mock and provably never reaches live
+// x.com.
+
+#[tokio::test]
+async fn validate_with_api_all_green_against_wiremock() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r".*/UserTweets"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "user": { "result": { "timeline_v2": { "timeline": {
+                "instructions": [ { "type": "TimelineAddEntries", "entries": [
+                    { "content": { "itemContent": { "tweet_results": { "result": {
+                        "rest_id": "1700000000000000001",
+                        "core": { "user_results": { "result": { "legacy": {
+                            "name": "Me", "screen_name": "tester" }}}},
+                        "legacy": {
+                            "full_text": "hi",
+                            "created_at": "Wed Oct 10 20:19:24 +0000 2018",
+                            "conversation_id_str": "1700000000000000000",
+                            "id_str": "1700000000000000001" }
+                    }}}}}
+                ]}]
+            }}}}}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r".*/inbox_initial_state\.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "inbox_initial_state": { "users": {}, "entries": [] }
+        })))
+        .mount(&server)
+        .await;
+    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let auth = test_auth();
+    let api: Arc<dyn TwitterApi> = Arc::new(TwitterClient::new(auth.clone()));
+    let report = validate_with_api(
+        api,
+        &auth.screen_name,
+        &auth.user_id,
+        &auth,
+        &ValidateOptions::default(),
+    )
+    .await;
+    assert!(report.all_passed, "{}", report.render_table());
+    assert!(!report.mock_only);
+    let auth_c = report.checks.iter().find(|c| c.check == "auth").unwrap();
+    assert_eq!(auth_c.status, CheckStatus::Pass);
+    let ut = report
+        .checks
+        .iter()
+        .find(|c| c.check == "user_tweets")
+        .unwrap();
+    assert_eq!(ut.shape_fingerprint, "tweets=1");
+}
+
+#[tokio::test]
+async fn validate_with_api_classifies_401_as_auth_fail() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r".*/UserTweets"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r".*/inbox_initial_state\.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "inbox_initial_state": { "users": {}, "entries": [] }
+        })))
+        .mount(&server)
+        .await;
+    let (_g, _lock) = EnvGuard::set(&server.uri());
+    let auth = test_auth();
+    let api: Arc<dyn TwitterApi> = Arc::new(TwitterClient::new(auth.clone()));
+    let report = validate_with_api(
+        api,
+        &auth.screen_name,
+        &auth.user_id,
+        &auth,
+        &ValidateOptions::default(),
+    )
+    .await;
+    assert!(!report.all_passed);
+    let auth_c = report.checks.iter().find(|c| c.check == "auth").unwrap();
+    assert_eq!(auth_c.status, CheckStatus::Fail);
+    assert!(auth_c.shape_fingerprint.contains("error=AuthExpired"));
+}
+
+#[tokio::test]
+async fn validate_is_mock_only_when_base_url_unset_and_no_allow_live() {
+    // The hard safety gate: with no base-url override and allow_live=false,
+    // `validate()` constructs NO client and issues NO request. (If it did
+    // hit the network here it would fail trying to reach live x.com — the
+    // test asserts it doesn't even try.)
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::remove_var("AUGMENTAGENT_TWITTER_BASE_URL");
+    let report = validate_session(test_auth(), ValidateOptions::default()).await;
+    assert!(report.mock_only);
+    assert!(!report.all_passed);
+    let auth_c = report.checks.iter().find(|c| c.check == "auth").unwrap();
+    assert_eq!(auth_c.status, CheckStatus::Skipped);
+    assert!(auth_c.detail.contains("mock-only"));
 }
 
 #[test]

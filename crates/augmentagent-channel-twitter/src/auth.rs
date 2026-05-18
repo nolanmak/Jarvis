@@ -130,6 +130,25 @@ impl TwitterAuth {
         Ok(())
     }
 
+    /// Age of the harvested session in whole days relative to `now_ms`.
+    /// `None` when `harvested_at_ms` is unset (0) or in the future. The
+    /// validate harness surfaces this as a non-fatal advisory: X
+    /// `auth_token`s don't carry a fixed TTL, but a months-old cookie is the
+    /// likeliest cause of an otherwise-inexplicable 401 mid-run.
+    pub fn session_age_days(&self, now_ms: i64) -> Option<i64> {
+        if self.harvested_at_ms <= 0 || now_ms < self.harvested_at_ms {
+            return None;
+        }
+        Some((now_ms - self.harvested_at_ms) / (24 * 60 * 60 * 1000))
+    }
+
+    /// Heuristic staleness flag for the auth probe. 60 days is well past a
+    /// typical X web-session refresh; not authoritative (only a live call
+    /// proves the cookie), just an advisory the runbook calls out.
+    pub fn is_session_stale(&self, now_ms: i64) -> bool {
+        self.session_age_days(now_ms).is_some_and(|d| d >= 60)
+    }
+
     /// The `x-csrf-token` header value X expects: a verbatim echo of the
     /// `ct0` cookie.
     pub fn csrf_token(&self) -> Result<String, AuthError> {
@@ -282,6 +301,24 @@ mod tests {
         assert_eq!(loaded.user_id, auth.user_id);
         assert_eq!(loaded.screen_name, auth.screen_name);
         assert_eq!(loaded.cookies, auth.cookies);
+    }
+
+    #[test]
+    fn session_age_and_staleness() {
+        let mut a = sample();
+        a.harvested_at_ms = 1_000_000_000_000;
+        // +10 days
+        let now = a.harvested_at_ms + 10 * 24 * 60 * 60 * 1000;
+        assert_eq!(a.session_age_days(now), Some(10));
+        assert!(!a.is_session_stale(now));
+        // +90 days → stale advisory
+        let later = a.harvested_at_ms + 90 * 24 * 60 * 60 * 1000;
+        assert_eq!(a.session_age_days(later), Some(90));
+        assert!(a.is_session_stale(later));
+        // unset harvest time → no opinion
+        a.harvested_at_ms = 0;
+        assert_eq!(a.session_age_days(now), None);
+        assert!(!a.is_session_stale(now));
     }
 
     #[test]

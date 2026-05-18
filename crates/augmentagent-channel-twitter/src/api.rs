@@ -207,6 +207,55 @@ impl TwitterError {
         let secs = 1u64.checked_shl(attempt).unwrap_or(u64::MAX).min(300);
         Duration::from_secs(secs)
     }
+
+    /// A terminal auth failure (401/403). Callers must halt and re-harvest;
+    /// no amount of backoff recovers this.
+    pub fn is_auth_fatal(&self) -> bool {
+        matches!(self, TwitterError::AuthExpired)
+    }
+}
+
+/// Drive an async X operation with bounded exponential backoff on the
+/// *transient* error classes only ([`TwitterError::is_transient`] —
+/// `RateLimited` / transport `Http`). `AuthExpired` and `QueryIdRotated` are
+/// returned immediately: the former is terminal, the latter is already
+/// recovered in-band by the queryId chain walk, so a blind retry here would
+/// just hammer a stale id. `max_retries` is the number of *re-attempts* after
+/// the first try (so `max_retries=2` => up to 3 total calls). The backoff
+/// schedule comes from [`TwitterError::backoff`]; a `sleep` hook is injected
+/// so tests assert the schedule without real time passing.
+pub async fn with_retry<T, F, Fut, S, SFut>(
+    max_retries: u32,
+    mut op: F,
+    mut sleep: S,
+) -> Result<T, TwitterError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, TwitterError>>,
+    S: FnMut(std::time::Duration) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if !e.is_transient() || attempt >= max_retries {
+                    return Err(e);
+                }
+                let wait = e.backoff(attempt);
+                tracing::warn!(
+                    attempt,
+                    max_retries,
+                    backoff_secs = wait.as_secs(),
+                    error = %e,
+                    "twitter transient error; backing off then retrying"
+                );
+                sleep(wait).await;
+                attempt += 1;
+            }
+        }
+    }
 }
 
 /// Friend-post engagement surface (#15).
@@ -552,11 +601,20 @@ impl TwitterApi for TwitterClient {
                 }
                 return Err(err);
             }
-            let v: serde_json::Value = resp
-                .json()
+            let raw = resp
+                .text()
                 .await
+                .map_err(|e| TwitterError::Decode(format!("CreateTweet body: {e}")))?;
+            let v: serde_json::Value = serde_json::from_str(&raw)
                 .map_err(|e| TwitterError::Decode(format!("CreateTweet json: {e}")))?;
-            return Ok(find_string_field(&v, "rest_id").unwrap_or_default());
+            match find_string_field(&v, "rest_id") {
+                Some(id) if !id.is_empty() => return Ok(id),
+                // 2xx but no rest_id anywhere: either X returned a GraphQL
+                // `{ "errors": [...] }` envelope with a 200, or it reshaped
+                // the success body. Surface it loudly with the raw body
+                // logged rather than silently reporting an empty id.
+                _ => return Err(schema_drift("CreateTweet", &raw)),
+            }
         }
         Err(last_rotation.unwrap_or(TwitterError::QueryIdRotated {
             op: "CreateTweet".into(),
@@ -631,11 +689,18 @@ impl TwitterApi for TwitterClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(Self::map_status("dm_new2", status, &headers, body, false));
         }
-        let v: serde_json::Value = resp
-            .json()
+        let raw = resp
+            .text()
             .await
+            .map_err(|e| TwitterError::Decode(format!("dm_new2 body: {e}")))?;
+        let v: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| TwitterError::Decode(format!("dm_new2 json: {e}")))?;
-        Ok(find_string_field(&v, "id").unwrap_or_default())
+        match find_string_field(&v, "id") {
+            Some(id) if !id.is_empty() => Ok(id),
+            // 2xx but no event id: a reshaped `new2.json` response (or an
+            // error envelope returned with 200). Log + surface as drift.
+            _ => Err(schema_drift("dm_new2", &raw)),
+        }
     }
 }
 
