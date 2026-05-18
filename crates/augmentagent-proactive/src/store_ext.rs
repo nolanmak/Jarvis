@@ -253,10 +253,8 @@ mod tests {
     use super::*;
     use crate::scan::{ProactiveSignal, SignalKind, Urgency};
 
-    fn store() -> (tempfile::TempDir, Store) {
-        let d = tempfile::tempdir().unwrap();
-        let s = Store::open(d.path().join("data.db")).unwrap();
-        (d, s)
+    fn store() -> (tempfile::TempDir, std::sync::Arc<Store>) {
+        crate::testutil::test_store()
     }
 
     fn sig(dedup: &str) -> ProactiveSignal {

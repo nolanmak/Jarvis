@@ -256,8 +256,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_once_persists_and_dispatches_then_dedups() {
-        let dbd = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dbd.path().join("data.db")).unwrap());
+        let (_dbd, store) = crate::testutil::test_store();
         let (_wd, root) = seed_wiki();
         let count = Arc::new(AtomicUsize::new(0));
         let broker: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker(Arc::clone(&count)));
@@ -275,8 +274,7 @@ mod tests {
 
     #[tokio::test]
     async fn dry_run_persists_but_never_dispatches() {
-        let dbd = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dbd.path().join("data.db")).unwrap());
+        let (_dbd, store) = crate::testutil::test_store();
         let (_wd, root) = seed_wiki();
         let runner = ProactiveRunner::new(store, Arc::new(NoopBroker), root, default_scans());
         let r = runner.run_once(false).await;
@@ -293,8 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn suppression_blocks_persist_and_dispatch() {
-        let dbd = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dbd.path().join("data.db")).unwrap());
+        let (_dbd, store) = crate::testutil::test_store();
         let (_wd, root) = seed_wiki();
         let runner = ProactiveRunner::new(store, Arc::new(NoopBroker), root, default_scans())
             .with_suppression(Arc::new(MuteAll));
