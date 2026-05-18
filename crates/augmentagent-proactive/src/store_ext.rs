@@ -240,6 +240,48 @@ impl ProactiveStore for Store {
     }
 }
 
+/// #57 opt-in + rate-limit gate helpers, on `Store`. The opt-in flag lives
+/// in the Node-owned generic `config` table (key `proactive_enabled`,
+/// value `"1"`/`"true"` to enable). Read-through only — we never write it
+/// (the dashboard does).
+pub trait ProactiveGateStore {
+    /// True iff the user has explicitly opted into proactive nudges.
+    fn proactive_opted_in(&self) -> bool;
+    /// Count signals dispatched since `since_ms` (rolling rate-limit window).
+    fn dispatched_since(&self, since_ms: i64) -> StoreResult<i64>;
+}
+
+impl ProactiveGateStore for Store {
+    fn proactive_opted_in(&self) -> bool {
+        self.with_conn(|c| {
+            let v: Option<String> = c
+                .query_row(
+                    "SELECT value FROM config WHERE key = 'proactive_enabled'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(matches!(
+                v.as_deref(),
+                Some("1") | Some("true") | Some("yes") | Some("on")
+            ))
+        })
+        .unwrap_or(false)
+    }
+
+    fn dispatched_since(&self, since_ms: i64) -> StoreResult<i64> {
+        self.with_conn(|c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM proactive_signals \
+                 WHERE dispatched_at_ms IS NOT NULL AND dispatched_at_ms >= ?1",
+                params![since_ms],
+                |r| r.get(0),
+            )?;
+            Ok(n)
+        })
+    }
+}
+
 /// Epoch-millis now.
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()

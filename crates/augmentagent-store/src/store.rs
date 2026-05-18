@@ -586,6 +586,28 @@ impl Store {
             [],
         )?;
 
+        // #57 — proactive-nudge user actions. One row per user gesture
+        // (snooze a signal, dismiss it, mute a person, mute a rule). The
+        // proactive runner read-throughs this before dispatch; the dashboard
+        // /relationships page writes it. `scope` is the target the action
+        // applies to: a signal id, a person slug, or a rule kind. NULL
+        // expires_at = permanent.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS proactive_user_actions (\
+                 id            TEXT PRIMARY KEY,\
+                 action        TEXT NOT NULL,\
+                 scope         TEXT NOT NULL,\
+                 created_at_ms INTEGER NOT NULL,\
+                 expires_at_ms INTEGER\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proactive_user_actions_lookup \
+                ON proactive_user_actions(action, scope, expires_at_ms)",
+            [],
+        )?;
+
         Ok(())
     }
 
