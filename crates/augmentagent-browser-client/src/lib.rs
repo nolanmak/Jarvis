@@ -408,6 +408,87 @@ impl BrowserClient {
             .await?;
         Ok(v["value"].clone())
     }
+
+    /// Count elements matching `selector`. Used by the Instagram composer to
+    /// verify dialog detach (Share confirmation), autocomplete-dropdown
+    /// dismissal, and carousel slide counts — a "how many match" probe that
+    /// `wait_for` (waits for *visible*) can't answer.
+    pub async fn count(&self, selector: &str) -> Result<u32, BrowserError> {
+        let v = self
+            .call(
+                "count",
+                serde_json::json!({ "selector": selector }),
+                10_000,
+            )
+            .await?;
+        Ok(v["count"].as_u64().unwrap_or(0) as u32)
+    }
+
+    /// Press a keyboard `key`. With `selector`, focuses+presses on that
+    /// element; without, presses globally. `presses` repeats the keystroke
+    /// (clamped 1..=64 by the sidecar). Used to Escape-dismiss the
+    /// hashtag/mention autocomplete (#76 §7) and nudge the Reel cover slider.
+    pub async fn press_key(
+        &self,
+        key: &str,
+        selector: Option<&str>,
+        presses: u32,
+    ) -> Result<(), BrowserError> {
+        let mut params = serde_json::json!({ "key": key, "presses": presses });
+        if let Some(sel) = selector {
+            params["selector"] = serde_json::Value::String(sel.to_string());
+        }
+        self.call("press_key", params, 12_000).await?;
+        Ok(())
+    }
+
+    /// Mouse press → stepped move → release between two absolute viewport
+    /// pixel coordinates. Drives the Reel cover-frame scrubber thumb
+    /// (IG ignores `slider.fill(value)`; a synthetic drag is required).
+    pub async fn drag(
+        &self,
+        from: (f64, f64),
+        to: (f64, f64),
+        steps: u32,
+    ) -> Result<(), BrowserError> {
+        self.call(
+            "drag",
+            serde_json::json!({
+                "from": [from.0, from.1],
+                "to": [to.0, to.1],
+                "steps": steps,
+            }),
+            15_000,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Viewport-relative bounding box `(x, y, w, h)` of the first element
+    /// matching `selector`, or `None` if absent / not rendered. Used to
+    /// compute absolute drag coordinates for the cover-frame scrubber.
+    pub async fn bounding_box(
+        &self,
+        selector: &str,
+    ) -> Result<Option<(f64, f64, f64, f64)>, BrowserError> {
+        let v = self
+            .call(
+                "bounding_box",
+                serde_json::json!({ "selector": selector }),
+                10_000,
+            )
+            .await?;
+        let b = &v["box"];
+        if b.is_null() {
+            return Ok(None);
+        }
+        Ok(Some((
+            b["x"].as_f64().unwrap_or(0.0),
+            b["y"].as_f64().unwrap_or(0.0),
+            b["w"].as_f64().unwrap_or(0.0),
+            b["h"].as_f64().unwrap_or(0.0),
+        )))
+    }
 }
 
 #[cfg(test)]

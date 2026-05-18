@@ -21,6 +21,7 @@ members = [
     "crates/augmentagent-channel-meetup",
     "crates/augmentagent-channel-gdrive",
     "crates/augmentagent-channel-contacts",
+    "crates/augmentagent-channel-deft",
     "crates/augmentagent-content-adapter",
     "crates/augmentagent-proactive",
     "crates/augmentagent-browser-client",
