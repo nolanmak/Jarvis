@@ -1,4 +1,5 @@
-//! Weekly Orchid invoice automation.
+//! Weekly invoice automation. All personal/business data is read from
+//! runtime config (gitignored DB + .env) — nothing is hardcoded.
 //!
 //! A thin Rust layer over `scripts/invoice/send_invoice.py`. Rust owns durable
 //! state (recipient, sequential counter from #35, Composio sending entity,
@@ -20,7 +21,11 @@ use tracing::{error, info, warn};
 
 use augmentagent_store::Store;
 
-const DEFAULT_RECIPIENT: &str = "REDACTED";
+// No hardcoded recipient — the real value lives in the gitignored
+// `invoice_config` DB table (set via dashboard / `!invoice recipient`).
+// Empty fallback means "unconfigured": the send path errors loudly rather
+// than mailing a baked-in personal address.
+const DEFAULT_RECIPIENT: &str = "";
 
 /// Where the vendored Python tooling lives. Override with `INVOICE_SCRIPTS_DIR`
 /// (the daemon's cwd is the repo root, where `data.db` sits).
@@ -113,6 +118,12 @@ pub async fn run_invoice(
         .get_invoice_config("recipient_email")?
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_RECIPIENT.to_string());
+    if recipient.trim().is_empty() {
+        anyhow::bail!(
+            "invoice recipient not configured — set it via the dashboard or \
+             `!invoice recipient <email>` (no address is hardcoded)"
+        );
+    }
     let from_entity = store
         .get_invoice_config("from_entity")?
         .unwrap_or_default();
