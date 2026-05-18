@@ -7,8 +7,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::models::{
-    Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription, DriveAccount,
-    Email, LearnedPattern, LinkedInConnectionSync, PhoneIdentity, RateAuditRow, RateHalt,
+    Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
+    ConnectionRequestRow, DriveAccount, Email, FriendWatch, LearnedPattern,
+    LinkedInConnectionSync, OwnPost, PhoneIdentity, RateAuditRow, RateHalt,
     RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace, SubscriptionMode, TelegramBot,
     ToneExample, ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
@@ -4394,6 +4395,126 @@ impl Store {
         )?;
         Ok(())
     }
+
+    // ---- #58.2 own-post comment poller query surface ----
+
+    /// Own posts still inside their poll window for `platform`, least-recently
+    /// polled first so a tick spreads load. The poller fetches comments for
+    /// each and diffs them against `seen_comments`.
+    pub fn own_posts_due_for_poll(
+        &self,
+        platform: &str,
+        now_ms: i64,
+    ) -> StoreResult<Vec<OwnPost>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, platform, external_id, posted_at_ms, poll_until_ms, \
+                    last_polled_ms, created_at_ms \
+               FROM own_posts \
+              WHERE platform = ?1 AND poll_until_ms >= ?2 \
+              ORDER BY COALESCE(last_polled_ms, 0) ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![platform, now_ms], row_to_own_post)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Stamp `last_polled_ms = now` after a comment-poll pass for this post.
+    pub fn mark_own_post_polled(&self, id: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE own_posts SET last_polled_ms = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        Ok(())
+    }
+
+    // ---- #58.3 friend-feed engagement query surface ----
+
+    /// Active (not paused) friend watches for `platform`. The friend-feed
+    /// source iterates these and emits a `friend_post` WorkItem per fresh
+    /// post.
+    pub fn active_friend_watch(
+        &self,
+        platform: &str,
+        now_ms: i64,
+    ) -> StoreResult<Vec<FriendWatch>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, platform, handle, wiki_slug, engagement, added_at_ms, \
+                    paused_until_ms \
+               FROM friend_watchlist \
+              WHERE platform = ?1 \
+                AND (paused_until_ms IS NULL OR paused_until_ms <= ?2) \
+              ORDER BY added_at_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![platform, now_ms], row_to_friend_watch)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Record a freshly-seen friend post. Returns `false` if it was already
+    /// seen (the `(watchlist_id, external_id)` unique guard tripped) so the
+    /// caller only synthesizes a WorkItem for genuinely new posts.
+    pub fn record_friend_post_seen(
+        &self,
+        watchlist_id: &str,
+        external_id: &str,
+        posted_at_ms: i64,
+    ) -> StoreResult<bool> {
+        let id = Uuid::new_v4().to_string();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "INSERT OR IGNORE INTO friend_posts_seen \
+                (id, watchlist_id, external_id, posted_at_ms) \
+             VALUES (?1,?2,?3,?4)",
+            params![id, watchlist_id, external_id, posted_at_ms],
+        )?;
+        Ok(n > 0)
+    }
+
+    // ---- #58.4 connection-request triage query surface ----
+
+    /// All connection requests still awaiting a decision, oldest first.
+    pub fn pending_connection_requests(
+        &self,
+    ) -> StoreResult<Vec<ConnectionRequestRow>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, platform, external_id, requester_name, requester_url, \
+                    message, decision, decided_at_ms, triage_id, created_at_ms \
+               FROM connection_requests \
+              WHERE decision = 'pending' \
+              ORDER BY created_at_ms ASC",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_connection_request)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Fetch one connection request by row id (the approver re-hydrates the
+    /// invitation urn from this on a button click).
+    pub fn connection_request_by_id(
+        &self,
+        id: &str,
+    ) -> StoreResult<Option<ConnectionRequestRow>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT id, platform, external_id, requester_name, \
+                        requester_url, message, decision, decided_at_ms, \
+                        triage_id, created_at_ms \
+                   FROM connection_requests WHERE id = ?1",
+                params![id],
+                row_to_connection_request,
+            )
+            .optional()?;
+        Ok(row)
+    }
 }
 
 fn row_to_tone_profile(r: &rusqlite::Row) -> rusqlite::Result<ToneProfile> {
@@ -4542,6 +4663,47 @@ fn row_to_scheduled_post(r: &rusqlite::Row) -> rusqlite::Result<ScheduledPost> {
         external_id: r.get::<_, Option<String>>(8)?,
         thread_parent: r.get::<_, Option<String>>(9)?,
         created_at_ms: r.get(10)?,
+    })
+}
+
+fn row_to_own_post(r: &rusqlite::Row) -> rusqlite::Result<OwnPost> {
+    Ok(OwnPost {
+        id: r.get(0)?,
+        platform: r.get(1)?,
+        external_id: r.get(2)?,
+        posted_at_ms: r.get(3)?,
+        poll_until_ms: r.get(4)?,
+        last_polled_ms: r.get::<_, Option<i64>>(5)?,
+        created_at_ms: r.get(6)?,
+    })
+}
+
+fn row_to_friend_watch(r: &rusqlite::Row) -> rusqlite::Result<FriendWatch> {
+    Ok(FriendWatch {
+        id: r.get(0)?,
+        platform: r.get(1)?,
+        handle: r.get(2)?,
+        wiki_slug: r.get::<_, Option<String>>(3)?,
+        engagement: r.get(4)?,
+        added_at_ms: r.get(5)?,
+        paused_until_ms: r.get::<_, Option<i64>>(6)?,
+    })
+}
+
+fn row_to_connection_request(
+    r: &rusqlite::Row,
+) -> rusqlite::Result<ConnectionRequestRow> {
+    Ok(ConnectionRequestRow {
+        id: r.get(0)?,
+        platform: r.get(1)?,
+        external_id: r.get(2)?,
+        requester_name: r.get::<_, Option<String>>(3)?,
+        requester_url: r.get::<_, Option<String>>(4)?,
+        message: r.get::<_, Option<String>>(5)?,
+        decision: r.get(6)?,
+        decided_at_ms: r.get::<_, Option<i64>>(7)?,
+        triage_id: r.get::<_, Option<String>>(8)?,
+        created_at_ms: r.get(9)?,
     })
 }
 
@@ -5888,5 +6050,117 @@ mod tests {
         let hist = s.list_agent_pr_runs(Some("acme/widgets"), 10).unwrap();
         assert_eq!(hist.len(), 1);
         assert_eq!(s.list_agent_pr_runs(None, 10).unwrap().len(), 1);
+    }
+
+    // ---- #58 engagement sub-feature query surface ----
+
+    #[test]
+    fn own_posts_due_for_poll_respects_horizon_and_platform() {
+        let (s, _f) = fresh_store();
+        let now = 1_700_000_000_000_i64;
+        // In-window LinkedIn post.
+        let live = s
+            .upsert_own_post("linkedin", "urn:li:activity:1", now, now + 86_400_000)
+            .unwrap();
+        // Expired (poll_until in the past) — must be excluded.
+        s.upsert_own_post("linkedin", "urn:li:activity:2", now, now - 1)
+            .unwrap();
+        // Different platform — must be excluded from a linkedin query.
+        s.upsert_own_post("twitter", "tweet-9", now, now + 86_400_000)
+            .unwrap();
+
+        let due = s.own_posts_due_for_poll("linkedin", now).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, live);
+        assert_eq!(due[0].external_id, "urn:li:activity:1");
+        assert!(due[0].last_polled_ms.is_none());
+
+        // After a poll pass the row is stamped.
+        s.mark_own_post_polled(&live).unwrap();
+        let again = s.own_posts_due_for_poll("linkedin", now).unwrap();
+        assert!(again[0].last_polled_ms.is_some());
+    }
+
+    #[test]
+    fn seen_comment_dedup_is_one_shot() {
+        let (s, _f) = fresh_store();
+        let now = 1_700_000_000_000_i64;
+        let post = s
+            .upsert_own_post("linkedin", "urn:li:activity:7", now, now + 1)
+            .unwrap();
+        // First sighting → true (synthesize a WorkItem). Repeat → false.
+        assert!(s
+            .record_seen_comment(&post, "c1", Some("jane"), Some("nice!"))
+            .unwrap());
+        assert!(!s
+            .record_seen_comment(&post, "c1", Some("jane"), Some("nice!"))
+            .unwrap());
+        // A genuinely new comment is still surfaced.
+        assert!(s
+            .record_seen_comment(&post, "c2", Some("bob"), Some("congrats"))
+            .unwrap());
+    }
+
+    #[test]
+    fn active_friend_watch_excludes_paused_and_other_platform() {
+        let (s, _f) = fresh_store();
+        let now = 1_700_000_000_000_i64;
+        s.upsert_friend_watch("linkedin", "urn:li:fsd_profile:A", Some("alex"), "high")
+            .unwrap();
+        s.upsert_friend_watch("twitter", "@b", None, "medium")
+            .unwrap();
+        let watch = s.active_friend_watch("linkedin", now).unwrap();
+        assert_eq!(watch.len(), 1);
+        assert_eq!(watch[0].handle, "urn:li:fsd_profile:A");
+        assert_eq!(watch[0].wiki_slug.as_deref(), Some("alex"));
+        assert_eq!(watch[0].engagement, "high");
+
+        // friend-post dedup: first sighting true, repeat false.
+        assert!(s
+            .record_friend_post_seen(&watch[0].id, "urn:li:activity:9", now)
+            .unwrap());
+        assert!(!s
+            .record_friend_post_seen(&watch[0].id, "urn:li:activity:9", now)
+            .unwrap());
+    }
+
+    #[test]
+    fn pending_connection_requests_round_trip() {
+        let (s, _f) = fresh_store();
+        assert!(s
+            .record_connection_request(
+                "linkedin",
+                "urn:li:invitation:1",
+                Some("Jane Doe"),
+                Some("https://linkedin.com/in/jane"),
+                Some("worked together at Acme"),
+            )
+            .unwrap());
+        // Idempotent on (platform, external_id).
+        assert!(!s
+            .record_connection_request(
+                "linkedin",
+                "urn:li:invitation:1",
+                Some("Jane Doe"),
+                None,
+                None,
+            )
+            .unwrap());
+
+        let pending = s.pending_connection_requests().unwrap();
+        assert_eq!(pending.len(), 1);
+        let id = pending[0].id.clone();
+        assert_eq!(pending[0].requester_name.as_deref(), Some("Jane Doe"));
+        assert_eq!(pending[0].decision, "pending");
+
+        let by_id = s.connection_request_by_id(&id).unwrap().unwrap();
+        assert_eq!(by_id.external_id, "urn:li:invitation:1");
+
+        // Decision moves it out of the pending queue.
+        s.decide_connection_request(&id, "accept").unwrap();
+        assert!(s.pending_connection_requests().unwrap().is_empty());
+        let decided = s.connection_request_by_id(&id).unwrap().unwrap();
+        assert_eq!(decided.decision, "accept");
+        assert!(decided.decided_at_ms.is_some());
     }
 }

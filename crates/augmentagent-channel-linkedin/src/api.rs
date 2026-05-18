@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::auth::LinkedInAuth;
 use crate::posting::{PostDraft, ShareUrn};
-use crate::types::{Dm, FeedPost, MemberUrn};
+use crate::types::{Dm, FeedPost, Invitation, MemberUrn, PostComment};
 
 /// Feed-fetch GraphQL queryId for a member's recent activity. Like the
 /// conversations id this rotates on LinkedIn deploys; override via
@@ -101,6 +101,36 @@ pub trait LinkedInApi: Send + Sync {
         &self,
         draft: PostDraft<'_>,
     ) -> Result<ShareUrn, LinkedInError>;
+
+    /// (#58.2) Fetch recent comments on one of the *user's own* posts. The
+    /// own-post comment poller diffs these against the store's
+    /// `seen_comments` so a fresh comment becomes exactly one approval-gated
+    /// reply. Default: empty (a stub channel has no own-post activity).
+    async fn fetch_post_comments(
+        &self,
+        _post_urn: &str,
+    ) -> Result<Vec<PostComment>, LinkedInError> {
+        Ok(Vec::new())
+    }
+
+    /// (#58.4) List pending inbound connection requests (the Voyager
+    /// `relationships/invitationViews` endpoint). Default: empty.
+    async fn fetch_pending_invitations(
+        &self,
+    ) -> Result<Vec<Invitation>, LinkedInError> {
+        Ok(Vec::new())
+    }
+
+    /// (#58.4) Accept (`accept = true`) or ignore (`accept = false`) a
+    /// pending invitation. Called only from the approver on a user click —
+    /// never auto-decided. Default: no-op success (stub).
+    async fn act_on_invitation(
+        &self,
+        _invitation_urn: &str,
+        _accept: bool,
+    ) -> Result<(), LinkedInError> {
+        Ok(())
+    }
 }
 
 pub struct VoyagerClient {
@@ -387,6 +417,254 @@ impl LinkedInApi for VoyagerClient {
         // media-dance + body-shape logic.
         crate::posting::create_share_impl(self, draft).await
     }
+
+    async fn fetch_post_comments(
+        &self,
+        post_urn: &str,
+    ) -> Result<Vec<PostComment>, LinkedInError> {
+        // Voyager feed-comments endpoint, threadUrn = the post's activity urn.
+        let url = format!(
+            "https://www.linkedin.com/voyager/api/feed/comments\
+             ?count=50&q=comments&sortOrder=REVERSE_CHRONOLOGICAL&threadUrn={}",
+            urlencode_restli(post_urn),
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .headers(self.base_headers()?)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(LinkedInError::AuthExpired);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LinkedInError::Voyager {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| LinkedInError::Decode(format!("comments json: {e}")))?;
+        Ok(parse_post_comments(&v, post_urn))
+    }
+
+    async fn fetch_pending_invitations(
+        &self,
+    ) -> Result<Vec<Invitation>, LinkedInError> {
+        let url = "https://www.linkedin.com/voyager/api/relationships/invitationViews\
+                   ?count=50&q=receivedInvitation&start=0";
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.base_headers()?)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(LinkedInError::AuthExpired);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LinkedInError::Voyager {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| LinkedInError::Decode(format!("invitations json: {e}")))?;
+        Ok(parse_invitations(&v))
+    }
+
+    async fn act_on_invitation(
+        &self,
+        invitation_urn: &str,
+        accept: bool,
+    ) -> Result<(), LinkedInError> {
+        // `closeInvitations` / `acceptInvitation` are normalized into one
+        // batched-action endpoint by Voyager: action=accept|ignore on the
+        // relationships invitations resource keyed by the invitation urn.
+        let action = if accept { "accept" } else { "ignore" };
+        let url = format!(
+            "https://www.linkedin.com/voyager/api/relationships/invitations?action={action}",
+        );
+        let body = serde_json::json!({
+            "invitationUrn": invitation_urn,
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.base_headers()?)
+            .header("content-type", "application/json; charset=UTF-8")
+            .body(serde_json::to_vec(&body).expect("serialize invitation action"))
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(LinkedInError::AuthExpired);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(LinkedInError::Voyager {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Parse the Voyager feed-comments payload into [`PostComment`]s. Defensive
+/// like [`parse_feed_posts`]: collect every object that carries a comment
+/// urn + non-empty text; skip the rest. Empty-text (reaction-only) and the
+/// post's own re-echo are dropped.
+fn parse_post_comments(v: &serde_json::Value, post_urn: &str) -> Vec<PostComment> {
+    let mut out = Vec::new();
+    collect_post_comments(v, post_urn, &mut out);
+    out
+}
+
+fn collect_post_comments(
+    v: &serde_json::Value,
+    post_urn: &str,
+    out: &mut Vec<PostComment>,
+) {
+    match v {
+        serde_json::Value::Object(m) => {
+            if let Some(c) = try_post_comment(m, post_urn) {
+                out.push(c);
+            }
+            for (_, vv) in m {
+                collect_post_comments(vv, post_urn, out);
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for vv in a {
+                collect_post_comments(vv, post_urn, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn try_post_comment(
+    m: &serde_json::Map<String, serde_json::Value>,
+    post_urn: &str,
+) -> Option<PostComment> {
+    let comment_urn = m
+        .get("entityUrn")
+        .or_else(|| m.get("urn"))
+        .or_else(|| m.get("commentUrn"))
+        .and_then(|x| x.as_str())
+        .filter(|s| s.contains(":comment:"))?
+        .to_string();
+    let text = m
+        .get("commentary")
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str())
+        .or_else(|| m.get("commentV2").and_then(|c| c.get("text")).and_then(|t| t.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return None;
+    }
+    let author_name = m
+        .get("commenter")
+        .and_then(|c| find_string_field(c, "name"))
+        .or_else(|| find_string_field(&serde_json::Value::Object(m.clone()), "name"))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "(commenter)".to_string());
+    let author_urn = m
+        .get("commenter")
+        .and_then(|c| find_string_field(c, "entityUrn"))
+        .or_else(|| find_string_field(&serde_json::Value::Object(m.clone()), "actorUrn"))
+        .unwrap_or_default();
+    let created_at_ms = m
+        .get("createdAt")
+        .or_else(|| m.get("createdTime"))
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    Some(PostComment {
+        post_urn: post_urn.to_string(),
+        comment_urn,
+        author_name,
+        author_urn: MemberUrn(author_urn),
+        text,
+        created_at_ms,
+    })
+}
+
+/// Parse the Voyager `invitationViews` payload into [`Invitation`]s.
+fn parse_invitations(v: &serde_json::Value) -> Vec<Invitation> {
+    let elements = v
+        .get("elements")
+        .or_else(|| v.get("data").and_then(|d| d.get("elements")))
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for el in &elements {
+        let inv = el.get("invitation").unwrap_or(el);
+        let invitation_urn = inv
+            .get("entityUrn")
+            .or_else(|| inv.get("invitationUrn"))
+            .and_then(|x| x.as_str())
+            .filter(|s| s.contains(":invitation:"))
+            .map(str::to_string);
+        let Some(invitation_urn) = invitation_urn else {
+            continue;
+        };
+        let from = inv
+            .get("fromMember")
+            .or_else(|| inv.get("fromMemberProfile"))
+            .unwrap_or(inv);
+        let first = find_string_field(from, "firstName").unwrap_or_default();
+        let last = find_string_field(from, "lastName").unwrap_or_default();
+        let requester_name = format!("{first} {last}").trim().to_string();
+        let public_id = find_string_field(from, "publicIdentifier").unwrap_or_default();
+        let requester_url = if public_id.is_empty() {
+            String::new()
+        } else {
+            format!("https://www.linkedin.com/in/{public_id}")
+        };
+        let headline = find_string_field(from, "headline")
+            .or_else(|| find_string_field(from, "occupation"))
+            .unwrap_or_default();
+        let message = inv
+            .get("message")
+            .and_then(|x| x.as_str())
+            .or_else(|| {
+                inv.get("customMessage")
+                    .and_then(|x| x.as_str())
+            })
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let created_at_ms = inv
+            .get("sentTime")
+            .or_else(|| inv.get("createdAt"))
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0);
+        out.push(Invitation {
+            invitation_urn,
+            requester_name: if requester_name.is_empty() {
+                "(connection request)".to_string()
+            } else {
+                requester_name
+            },
+            requester_url,
+            headline,
+            message,
+            created_at_ms,
+        });
+    }
+    out
 }
 
 /// Parse the profile-updates GraphQL response into [`FeedPost`]s. The
@@ -695,6 +973,71 @@ mod tests {
         assert_eq!(dm.peer_name, "Tony Siu");
         assert_eq!(dm.peer_urn.0, "urn:li:fsd_profile:PEER");
         assert_eq!(dm.text, "hello");
+    }
+
+    #[test]
+    fn parse_post_comments_collects_text_comments_only() {
+        let v = serde_json::json!({
+            "elements": [
+                {
+                    "entityUrn": "urn:li:comment:(activity:1,9001)",
+                    "commentary": { "text": "Congrats on the launch!" },
+                    "commenter": { "name": "Jane Doe", "entityUrn": "urn:li:fsd_profile:JANE" },
+                    "createdAt": 1_776_630_000_000_i64
+                },
+                {
+                    // reaction-only / empty text → dropped
+                    "entityUrn": "urn:li:comment:(activity:1,9002)",
+                    "commentary": { "text": "" }
+                },
+                {
+                    // not a comment urn → dropped
+                    "entityUrn": "urn:li:activity:1",
+                    "commentary": { "text": "the post itself" }
+                }
+            ]
+        });
+        let cs = parse_post_comments(&v, "urn:li:activity:1");
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].comment_urn, "urn:li:comment:(activity:1,9001)");
+        assert_eq!(cs[0].post_urn, "urn:li:activity:1");
+        assert_eq!(cs[0].author_name, "Jane Doe");
+        assert_eq!(cs[0].text, "Congrats on the launch!");
+    }
+
+    #[test]
+    fn parse_invitations_extracts_requester_and_note() {
+        let v = serde_json::json!({
+            "elements": [
+                {
+                    "invitation": {
+                        "entityUrn": "urn:li:invitation:7788",
+                        "fromMember": {
+                            "firstName": "Sam",
+                            "lastName": "Lee",
+                            "publicIdentifier": "sam-lee-99",
+                            "headline": "Founder at Beta"
+                        },
+                        "message": "Loved your talk at the conf",
+                        "sentTime": 1_776_630_000_000_i64
+                    }
+                },
+                {
+                    // missing invitation urn → dropped
+                    "invitation": { "fromMember": { "firstName": "No", "lastName": "Urn" } }
+                }
+            ]
+        });
+        let inv = parse_invitations(&v);
+        assert_eq!(inv.len(), 1);
+        assert_eq!(inv[0].invitation_urn, "urn:li:invitation:7788");
+        assert_eq!(inv[0].requester_name, "Sam Lee");
+        assert_eq!(
+            inv[0].requester_url,
+            "https://www.linkedin.com/in/sam-lee-99"
+        );
+        assert_eq!(inv[0].headline, "Founder at Beta");
+        assert_eq!(inv[0].message, "Loved your talk at the conf");
     }
 
     #[test]
