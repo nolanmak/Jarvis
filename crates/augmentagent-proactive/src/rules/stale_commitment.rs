@@ -149,13 +149,10 @@ fn short_hash(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use augmentagent_store::Store;
     use augmentagent_wiki::WikiLayout;
-    use std::sync::Arc;
 
     fn ctx_with(body: &str) -> (tempfile::TempDir, tempfile::TempDir, ScanCtx) {
-        let dbd = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dbd.path().join("data.db")).unwrap());
+        let (dbd, store) = crate::testutil::test_store();
         let wd = tempfile::tempdir().unwrap();
         let layout = WikiLayout::new(wd.path().to_path_buf());
         layout.bootstrap().unwrap();
