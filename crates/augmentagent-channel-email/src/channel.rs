@@ -412,27 +412,24 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 Ok(Some(DispatchOutcome::Skipped))
             }
             DecisionKind::Flag => {
-                self.store.log_action(
+                let reason = decision.reason.as_deref().unwrap_or("flagged");
+                self.store.log_flagged_action(
                     &email.message_id,
                     email.thread_id.as_deref(),
                     &email.from,
                     &email.subject,
                     Some(&email.body),
-                    None,
-                    ActionStatus::Flagged,
+                    reason,
                 )?;
                 self.store
                     .mark_email_processed(&email.message_id, TriageResult::Flag)?;
                 println!(
                     "[flag] {} from={} reason={}",
-                    email.message_id,
-                    email.from,
-                    decision.reason.as_deref().unwrap_or("")
+                    email.message_id, email.from, reason
                 );
                 // Post the heads-up to Discord. Best-effort — failure to reach
                 // the broker shouldn't abort the flag flow (wiki ingest still
                 // runs below and the email stays marked complete).
-                let reason = decision.reason.as_deref().unwrap_or("flagged");
                 if let Err(e) = self.approvals.post_flag_notice(&email, reason).await {
                     warn!(
                         message_id = %email.message_id,
@@ -455,6 +452,73 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 Ok(Some(DispatchOutcome::Flagged))
             }
             DecisionKind::Reply => {
+                // --- 1b. BACKPRESSURE (#99). Before spending an Opus draft
+                // call + a Discord card, check the approval backlog. If it's
+                // at/over the cap, downgrade Reply -> Flag: the user still
+                // gets a heads-up but we skip the expensive draft and don't
+                // pile another card onto an already-deep queue. The cap is
+                // env-tunable; default 25 mirrors the digest enumeration cap.
+                let max_pending: i64 = std::env::var("AUGMENTAGENT_MAX_PENDING_DRAFTS")
+                    .ok()
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .filter(|n| *n >= 0)
+                    .unwrap_or(25);
+                let pending_now = self.store.pending_reply_count().unwrap_or(0);
+                if pending_now >= max_pending {
+                    let base = decision.reason.as_deref().unwrap_or("reply-worthy");
+                    let reason = format!(
+                        "draft queue full ({pending_now} pending ≥ cap {max_pending}); \
+                         downgraded to flag — {base}"
+                    );
+                    warn!(
+                        message_id = %email.message_id,
+                        from = %email.from,
+                        pending = pending_now,
+                        cap = max_pending,
+                        "reply downgraded to flag: approval queue at capacity"
+                    );
+                    self.store.log_flagged_action(
+                        &email.message_id,
+                        email.thread_id.as_deref(),
+                        &email.from,
+                        &email.subject,
+                        Some(&email.body),
+                        &reason,
+                    )?;
+                    self.store
+                        .mark_email_processed(&email.message_id, TriageResult::Flag)?;
+                    println!(
+                        "[flag:backpressure] {} from={} pending={} cap={}",
+                        email.message_id, email.from, pending_now, max_pending
+                    );
+                    if let Err(e) = self
+                        .approvals
+                        .post_flag_notice(
+                            &email,
+                            &format!(
+                                "Reply-worthy, but the approval queue is full \
+                                 ({pending_now} drafts waiting). Clear some via \
+                                 `augmentagent approvals` then this can be re-drafted. \
+                                 Context: {base}"
+                            ),
+                        )
+                        .await
+                    {
+                        warn!(
+                            message_id = %email.message_id,
+                            "post_flag_notice (backpressure) failed: {e}"
+                        );
+                    }
+                    self.maybe_ingest(
+                        &email,
+                        DecisionKind::Flag,
+                        decision.reason.as_deref(),
+                        None,
+                        IngestTrigger::Triaged,
+                    );
+                    return Ok(Some(DispatchOutcome::Flagged));
+                }
+
                 // --- 2. DRAFT call (Opus, with wiki read access when enabled)
                 let draft_opts = crate::reasoner::draft_opts(
                     draft_skill.to_string(),
