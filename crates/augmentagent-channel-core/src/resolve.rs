@@ -67,6 +67,10 @@ pub enum ResolverKind {
     Calendly,
     ShareDoc,
     Intro,
+    /// A request for a video-call join link (Zoom / Meet / Teams) — distinct
+    /// from `calendly` (a *booking* page) and `scheduling` (proposing times).
+    /// "Send me the Zoom", "what's the meeting link?".
+    MeetingLink,
     None,
 }
 
@@ -77,6 +81,7 @@ impl ResolverKind {
             Self::Calendly => "calendly",
             Self::ShareDoc => "share_doc",
             Self::Intro => "intro",
+            Self::MeetingLink => "meeting_link",
             Self::None => "none",
         }
     }
@@ -86,7 +91,19 @@ impl ResolverKind {
             "calendly" => Self::Calendly,
             "share_doc" => Self::ShareDoc,
             "intro" => Self::Intro,
+            "meeting_link" | "meetinglink" => Self::MeetingLink,
             _ => Self::None,
+        }
+    }
+    /// Human-friendly label for the "Needs your input" card field.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Scheduling => "Proposed meeting time",
+            Self::Calendly => "Booking link",
+            Self::ShareDoc => "Document link",
+            Self::Intro => "Introduction",
+            Self::MeetingLink => "Video-call link",
+            Self::None => "Detail",
         }
     }
 }
@@ -332,32 +349,101 @@ const WORK_START_HOUR: u32 = 9;
 const WORK_END_HOUR: u32 = 17;
 const SLOT_MIN: i64 = 30;
 const MAX_SLOTS: usize = 3;
+/// Granularity we step the cursor at when scanning for openings. The proposed
+/// slot length itself comes from the ask (see [`requested_duration_min`]); we
+/// always *advance* on the 30-min grid so longer meetings still land on tidy
+/// :00/:30 starts.
+const STEP_MIN: i64 = 30;
+const DEFAULT_DURATION_MIN: i64 = 30;
+const MAX_DURATION_MIN: i64 = 240;
+
+/// Parse a requested meeting length out of the ask text so the scheduler
+/// proposes slots that actually fit ("a 45-minute call", "quick 15 min",
+/// "1 hour sync", "half an hour"). Falls back to [`DEFAULT_DURATION_MIN`].
+/// Deterministic and unit-tested — no model call.
+fn requested_duration_min(ask_text: &str) -> i64 {
+    let low = ask_text.to_ascii_lowercase();
+    if low.contains("half an hour") || low.contains("half-hour") {
+        return 30;
+    }
+    let tokens: Vec<&str> = low
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for (i, tok) in tokens.iter().enumerate() {
+        // "<n> hour(s)" / "<n>h" / "<n> min(ute(s))" / "<n>m".
+        let next = tokens.get(i + 1).copied().unwrap_or("");
+        if let Ok(n) = tok.parse::<i64>() {
+            if next.starts_with("hour") || next.starts_with("hr") {
+                return (n * 60).clamp(15, MAX_DURATION_MIN);
+            }
+            if next.starts_with("min") {
+                return n.clamp(5, MAX_DURATION_MIN);
+            }
+        }
+        // Glued forms: "45min", "30m", "1h", "2hr".
+        if let Some(num) = tok.strip_suffix("min") {
+            if let Ok(n) = num.parse::<i64>() {
+                return n.clamp(5, MAX_DURATION_MIN);
+            }
+        }
+        if let Some(num) = tok.strip_suffix("hr") {
+            if let Ok(n) = num.parse::<i64>() {
+                return (n * 60).clamp(15, MAX_DURATION_MIN);
+            }
+        }
+        if let Some(num) = tok.strip_suffix('h') {
+            if let Ok(n) = num.parse::<i64>() {
+                return (n * 60).clamp(15, MAX_DURATION_MIN);
+            }
+        }
+        if let Some(num) = tok.strip_suffix('m') {
+            if let Ok(n) = num.parse::<i64>() {
+                return n.clamp(5, MAX_DURATION_MIN);
+            }
+        }
+    }
+    if low.contains("hour") {
+        return 60;
+    }
+    DEFAULT_DURATION_MIN
+}
 
 /// Pure slot-finder: given busy intervals, walk the next `days` business days
-/// in 30-min steps inside working hours and return up to `MAX_SLOTS` free
-/// starts. Extracted for deterministic testing (no clock/network).
+/// on a 30-min grid inside working hours and return up to `MAX_SLOTS` free
+/// starts that fit a `duration_min`-long meeting. Extracted for deterministic
+/// testing (no clock/network).
 fn first_open_slots(
     now: chrono::DateTime<Utc>,
     busy: &[BusyInterval],
     days: i64,
+    duration_min: i64,
 ) -> Vec<chrono::DateTime<Utc>> {
     let mut out = Vec::new();
-    let step = ChronoDuration::minutes(SLOT_MIN);
+    let dur = ChronoDuration::minutes(duration_min.max(SLOT_MIN));
+    let step = ChronoDuration::minutes(STEP_MIN);
     let mut cursor = now;
     let horizon = now + ChronoDuration::days(days);
     // Round the cursor up to the next 30-min boundary.
     let minute = cursor.format("%M").to_string().parse::<i64>().unwrap_or(0);
-    let bump = (SLOT_MIN - (minute % SLOT_MIN)) % SLOT_MIN;
+    let bump = (STEP_MIN - (minute % STEP_MIN)) % STEP_MIN;
     cursor += ChronoDuration::minutes(bump);
     cursor = cursor
         - ChronoDuration::seconds(cursor.format("%S").to_string().parse().unwrap_or(0));
     while cursor < horizon && out.len() < MAX_SLOTS {
         let wd = cursor.weekday();
         let hour = cursor.hour_u32();
+        let slot_end = cursor + dur;
         let is_business = !matches!(wd, Weekday::Sat | Weekday::Sun);
-        let in_hours = (WORK_START_HOUR..WORK_END_HOUR).contains(&hour);
+        // The whole meeting must fit inside working hours — check the END
+        // lands at/under WORK_END_HOUR on the same business day.
+        let end_ok = slot_end <= cursor
+            .date_naive()
+            .and_hms_opt(WORK_END_HOUR, 0, 0)
+            .map(|nd| chrono::TimeZone::from_utc_datetime(&Utc, &nd))
+            .unwrap_or(slot_end);
+        let in_hours = hour >= WORK_START_HOUR && end_ok;
         if is_business && in_hours {
-            let slot_end = cursor + step;
             let clashes = busy
                 .iter()
                 .any(|b| cursor < b.end && slot_end > b.start);
@@ -402,7 +488,8 @@ impl AskResolver for SchedulingResolver {
         let busy = fb
             .busy(entity, &self.ctx.calendar_id, now, horizon)
             .await?;
-        let slots = first_open_slots(now, &busy, 9);
+        let duration = requested_duration_min(&ask.text);
+        let slots = first_open_slots(now, &busy, 9, duration);
         if slots.is_empty() {
             return Ok(None);
         }
@@ -414,8 +501,9 @@ impl AskResolver for SchedulingResolver {
         Ok(Some(ResolvedFill {
             kind: ResolverKind::Scheduling,
             fill: format!(
-                "Open {SLOT_MIN}-min slots on the user's calendar (UTC): {rendered}. \
-                 Offer these concrete times; do not invent others."
+                "Open {duration}-min slots on the user's calendar (UTC): {rendered}. \
+                 Offer these concrete times for a {duration}-minute meeting; \
+                 do not invent others."
             ),
         }))
     }
@@ -484,6 +572,85 @@ impl AskResolver for CalendlyResolver {
                     return Ok(Some(ResolvedFill {
                         kind: ResolverKind::Calendly,
                         fill: format!("The user's booking link is: {url}"),
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Meeting-link resolver: stored video-call join link. No network.
+// ---------------------------------------------------------------------------
+
+/// Surfaces the user's standing video-call room link (a personal Zoom PMI,
+/// Google Meet, or Teams link) when the sender asks for "the meeting link" /
+/// "the Zoom". Distinct from Calendly (a booking page) — this is the room you
+/// actually join. Lookup order:
+/// 1. `AUGMENTAGENT_MEETING_LINK` env var.
+/// 2. First Zoom/Meet/Teams URL found in the wiki `index.md`.
+///
+/// Gated by `AUGMENTAGENT_ASK_RESOLVE_MEETING_LINK=1`.
+pub struct MeetingLinkResolver {
+    ctx: ResolveCtx,
+}
+
+impl MeetingLinkResolver {
+    pub fn new(ctx: ResolveCtx) -> Self {
+        Self { ctx }
+    }
+}
+
+/// Recognize a join link for the common video platforms. Trailing markdown /
+/// sentence punctuation is stripped (same hygiene as [`find_booking_url`]).
+fn find_meeting_url(haystack: &str) -> Option<String> {
+    for token in haystack.split(|c: char| {
+        c.is_whitespace() || c == '(' || c == ')' || c == '<' || c == '>' || c == '"'
+    }) {
+        let t = token.trim_end_matches(['.', ',', ';', ']', ')']);
+        let low = t.to_ascii_lowercase();
+        let is_meet = (low.contains("zoom.us/j/")
+            || low.contains("zoom.us/my/")
+            || low.starts_with("https://meet.google.com/")
+            || low.contains("teams.microsoft.com/l/meetup-join")
+            || low.contains("teams.live.com/meet/"))
+            && (low.starts_with("http://") || low.starts_with("https://"));
+        if is_meet && t.len() > "https://".len() {
+            return Some(t.to_string());
+        }
+    }
+    None
+}
+
+#[async_trait]
+impl AskResolver for MeetingLinkResolver {
+    fn kind(&self) -> ResolverKind {
+        ResolverKind::MeetingLink
+    }
+    async fn try_resolve(&self, ask: &DetectedAsk) -> anyhow::Result<Option<ResolvedFill>> {
+        if !flag_on("AUGMENTAGENT_ASK_RESOLVE_MEETING_LINK") {
+            return Ok(None);
+        }
+        if ask.kind() != ResolverKind::MeetingLink {
+            return Ok(None);
+        }
+        if let Ok(url) = std::env::var("AUGMENTAGENT_MEETING_LINK") {
+            let url = url.trim();
+            if !url.is_empty() {
+                return Ok(Some(ResolvedFill {
+                    kind: ResolverKind::MeetingLink,
+                    fill: format!("The user's video-call link is: {url}"),
+                }));
+            }
+        }
+        if let Some(root) = &self.ctx.wiki_root {
+            let index = root.join("index.md");
+            if let Ok(body) = std::fs::read_to_string(&index) {
+                if let Some(url) = find_meeting_url(&body) {
+                    return Ok(Some(ResolvedFill {
+                        kind: ResolverKind::MeetingLink,
+                        fill: format!("The user's video-call link is: {url}"),
                     }));
                 }
             }
@@ -760,6 +927,7 @@ pub fn live_resolvers(ctx: ResolveCtx) -> Vec<Arc<dyn AskResolver>> {
     vec![
         Arc::new(SchedulingResolver::new(ctx.clone())),
         Arc::new(CalendlyResolver::new(ctx.clone())),
+        Arc::new(MeetingLinkResolver::new(ctx.clone())),
         Arc::new(ShareDocResolver::new(ctx.clone())),
         Arc::new(IntroResolver::new(ctx)),
     ]
@@ -817,26 +985,58 @@ pub fn resolved_asks_block(fills: &[ResolvedFill]) -> String {
     s
 }
 
-/// End-to-end Phase-2 entry point: extract asks, resolve the high-confidence
-/// ones in parallel under a wall-clock budget, and return a composed
-/// `<resolved_asks>` block ready for `draft_user_message`.
+/// One detected ask that cleared the confidence floor and maps to a real
+/// resolver kind, but which the matching resolver could NOT fill (returned
+/// `Ok(None)` — no calendar configured, doc not found, person not in the
+/// wiki, …). These are surfaced to the human on the Discord approval card as
+/// a "Needs your input" field so the value can be supplied inline instead of
+/// the drafter inventing a placeholder.
 ///
-/// Returns `String::new()` — meaning "inject nothing, today's behavior" —
-/// when: mode is not `Live`, no asks clear the confidence floor, or no
-/// resolver could fill any ask. The whole stage is best-effort: a timeout or
-/// error degrades to the empty block, never an error to the caller.
-pub async fn resolve_asks_block<R: Reasoner + ?Sized>(
+/// This is *only* ever produced in `AUGMENTAGENT_ASK_RESOLVE=live`; in
+/// off/shadow the resolver stage never runs, so [`ResolveOutcome::unresolved`]
+/// is always empty and the draft + card stay byte-identical to today.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnresolvedAsk {
+    /// The resolver kind that *would* have handled it (scheduling, etc.).
+    pub kind: ResolverKind,
+    /// The extractor's tight paraphrase of what was asked — shown verbatim on
+    /// the card so the user knows exactly what to supply.
+    pub text: String,
+}
+
+/// Result of the full resolve stage: the `<resolved_asks>` prompt block (fed
+/// to the drafter, exactly as before) plus the list of asks that need human
+/// input. Both are empty in any non-`live` mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolveOutcome {
+    /// `<resolved_asks>` fragment for `draft_user_message`, or empty.
+    pub block: String,
+    /// Asks that cleared the floor but no resolver could fill.
+    pub unresolved: Vec<UnresolvedAsk>,
+}
+
+/// End-to-end Phase-2/3 entry point: extract asks, resolve the
+/// high-confidence ones in parallel under a wall-clock budget, and return
+/// both the composed `<resolved_asks>` block AND the list of asks no resolver
+/// could fill (for the "Needs your input" card field, #35 Phase 5).
+///
+/// Both halves are empty — meaning "inject nothing / nothing to ask the user,
+/// today's behavior" — when: mode is not `Live`, no asks clear the confidence
+/// floor, or the budget is exceeded. The whole stage is best-effort: a
+/// timeout or error degrades to an empty outcome, never an error to the
+/// caller.
+pub async fn resolve_asks<R: Reasoner + ?Sized>(
     reasoner: &Arc<R>,
     mode: AskResolveMode,
     message_body: &str,
     ctx: ResolveCtx,
-) -> String {
+) -> ResolveOutcome {
     if mode != AskResolveMode::Live {
-        return String::new();
+        return ResolveOutcome::default();
     }
     let asks = detect_asks_shadow(reasoner, mode, message_body).await;
     if asks.is_empty() {
-        return String::new();
+        return ResolveOutcome::default();
     }
     let floor = confidence_floor();
     let eligible: Vec<DetectedAsk> = asks
@@ -845,7 +1045,7 @@ pub async fn resolve_asks_block<R: Reasoner + ?Sized>(
         .collect();
     if eligible.is_empty() {
         debug!("ask-resolve: no asks cleared the confidence floor");
-        return String::new();
+        return ResolveOutcome::default();
     }
     let resolvers = live_resolvers(ctx);
     let fills = match tokio::time::timeout(
@@ -857,14 +1057,53 @@ pub async fn resolve_asks_block<R: Reasoner + ?Sized>(
         Ok(v) => v,
         Err(_) => {
             warn!("ask-resolve: budget exceeded, drafting without resolved asks");
-            return String::new();
+            return ResolveOutcome::default();
         }
     };
-    if fills.is_empty() {
-        return String::new();
+    // An eligible ask is "unresolved" when no successful fill shares its
+    // resolver kind. De-dupe by kind so the card lists each missing thing
+    // once (mirrors the de-dupe in `resolve_all`).
+    let mut unresolved: Vec<UnresolvedAsk> = Vec::new();
+    for a in &eligible {
+        let kind = a.kind();
+        let filled = fills.iter().any(|f| f.kind == kind);
+        let already = unresolved.iter().any(|u| u.kind == kind);
+        if !filled && !already {
+            unresolved.push(UnresolvedAsk {
+                kind,
+                text: a.text.trim().to_string(),
+            });
+        }
     }
-    info!(n = fills.len(), "ask-resolve: injecting <resolved_asks>");
-    resolved_asks_block(&fills)
+    if !fills.is_empty() {
+        info!(n = fills.len(), "ask-resolve: injecting <resolved_asks>");
+    }
+    if !unresolved.is_empty() {
+        info!(
+            n = unresolved.len(),
+            "ask-resolve: asks need human input (surfacing on card)"
+        );
+    }
+    ResolveOutcome {
+        block: resolved_asks_block(&fills),
+        unresolved,
+    }
+}
+
+/// Back-compat thin wrapper: the `<resolved_asks>` block only. Callers that
+/// don't render the "Needs your input" card field (every non-email channel)
+/// keep using this and stay byte-identical. Equivalent to
+/// `resolve_asks(...).block`.
+///
+/// Returns `String::new()` — meaning "inject nothing, today's behavior" —
+/// under exactly the same conditions as [`resolve_asks`].
+pub async fn resolve_asks_block<R: Reasoner + ?Sized>(
+    reasoner: &Arc<R>,
+    mode: AskResolveMode,
+    message_body: &str,
+    ctx: ResolveCtx,
+) -> String {
+    resolve_asks(reasoner, mode, message_body, ctx).await.block
 }
 
 /// Resolve every eligible ask concurrently. Uses `tokio::join!` for the
@@ -908,8 +1147,8 @@ async fn resolve_all(
             [ra, rb, rc, rd].into_iter().flatten().collect()
         }
         many => {
-            // ≥5 distinct resolver kinds is impossible today (4 kinds), but
-            // keep a correct fallback: spawn each onto the runtime and join.
+            // ≥5 distinct resolver kinds (all 5 today): spawn each onto the
+            // runtime and join — still concurrent, still under RESOLVE_BUDGET.
             let mut handles = Vec::with_capacity(many.len());
             for a in many {
                 let rs = resolvers.to_vec();
@@ -1217,6 +1456,7 @@ mod tests {
         // no-op even with a fully-populated context.
         std::env::remove_var("AUGMENTAGENT_ASK_RESOLVE_SCHEDULING");
         std::env::remove_var("AUGMENTAGENT_ASK_RESOLVE_CALENDLY");
+        std::env::remove_var("AUGMENTAGENT_ASK_RESOLVE_MEETING_LINK");
         std::env::remove_var("AUGMENTAGENT_ASK_RESOLVE_SHARE_DOC");
         std::env::remove_var("AUGMENTAGENT_ASK_RESOLVE_INTRO");
         let ctx = ResolveCtx::default();
@@ -1238,7 +1478,7 @@ mod tests {
             start: Utc.with_ymd_and_hms(2026, 5, 15, 9, 0, 0).unwrap(),
             end: Utc.with_ymd_and_hms(2026, 5, 15, 16, 0, 0).unwrap(),
         }];
-        let slots = first_open_slots(now, &busy, 9);
+        let slots = first_open_slots(now, &busy, 9, 30);
         assert_eq!(slots.len(), 3);
         // First free slot is Fri 16:00 (after the busy block, before 17:00).
         assert_eq!(slots[0], Utc.with_ymd_and_hms(2026, 5, 15, 16, 0, 0).unwrap());
@@ -1255,7 +1495,7 @@ mod tests {
             start: Utc.with_ymd_and_hms(2026, 5, 18, 0, 0, 0).unwrap(),
             end: Utc.with_ymd_and_hms(2026, 5, 30, 0, 0, 0).unwrap(),
         }];
-        assert!(first_open_slots(now, &busy, 9).is_empty());
+        assert!(first_open_slots(now, &busy, 9, 30).is_empty());
     }
 
     struct FakeFb(Vec<BusyInterval>);
@@ -1511,10 +1751,12 @@ mod tests {
             ResolverKind::Calendly,
             ResolverKind::ShareDoc,
             ResolverKind::Intro,
+            ResolverKind::MeetingLink,
             ResolverKind::None,
         ] {
             assert_eq!(ResolverKind::parse(k.as_str()), k);
         }
+        assert_eq!(ResolverKind::parse("meetinglink"), ResolverKind::MeetingLink);
         assert_eq!(ResolverKind::parse("weird"), ResolverKind::None);
     }
 
@@ -1538,5 +1780,262 @@ mod tests {
             Some("https://calendly.com/a/b".to_string())
         );
         assert_eq!(find_booking_url("no link here"), None);
+    }
+
+    // --- #35 Phase 3/5: duration parsing, multi-slot, meeting-link
+    // resolver, and the "needs your input" (`resolve_asks`) path. ---
+
+    #[test]
+    fn requested_duration_parses_common_forms() {
+        assert_eq!(requested_duration_min("got 30 min to chat?"), 30);
+        assert_eq!(requested_duration_min("a quick 15 minute call"), 15);
+        assert_eq!(requested_duration_min("can we do a 45-minute sync"), 45);
+        assert_eq!(requested_duration_min("let's grab an hour"), 60);
+        assert_eq!(requested_duration_min("1 hour deep dive"), 60);
+        assert_eq!(requested_duration_min("2 hours workshop"), 120);
+        assert_eq!(requested_duration_min("30m standup"), 30);
+        assert_eq!(requested_duration_min("a 90min review"), 90);
+        assert_eq!(requested_duration_min("2hr planning"), 120);
+        assert_eq!(requested_duration_min("half an hour works"), 30);
+        // No duration hint ⇒ default.
+        assert_eq!(
+            requested_duration_min("can we meet next week"),
+            DEFAULT_DURATION_MIN
+        );
+        // Absurd values are clamped, never propagate.
+        assert!(requested_duration_min("a 999 hour call") <= MAX_DURATION_MIN);
+    }
+
+    #[test]
+    fn first_open_slots_respects_requested_duration() {
+        // Friday 2026-05-15 14:00. A 90-min meeting starting 16:00 would end
+        // 17:30 — past WORK_END_HOUR — so 16:00 must be rejected for 90min
+        // but accepted for 30min.
+        let now = Utc.with_ymd_and_hms(2026, 5, 15, 13, 0, 0).unwrap();
+        let busy = vec![BusyInterval {
+            start: Utc.with_ymd_and_hms(2026, 5, 15, 13, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 5, 15, 16, 0, 0).unwrap(),
+        }];
+        let short = first_open_slots(now, &busy, 9, 30);
+        assert!(short.contains(&Utc.with_ymd_and_hms(2026, 5, 15, 16, 0, 0).unwrap()));
+        let long = first_open_slots(now, &busy, 9, 90);
+        // 16:00 + 90min = 17:30 > 17:00 ⇒ not offered Friday; rolls to Monday.
+        assert!(!long
+            .iter()
+            .any(|s| *s == Utc.with_ymd_and_hms(2026, 5, 15, 16, 0, 0).unwrap()));
+        for s in &long {
+            assert!(!matches!(s.weekday(), Weekday::Sat | Weekday::Sun));
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduling_resolver_uses_ask_duration_in_fill() {
+        let _env = env_lock();
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_SCHEDULING", "1");
+        let ctx = ResolveCtx {
+            entity_id: Some("ent".into()),
+            freebusy: Some(Arc::new(FakeFb(vec![]))),
+            ..Default::default()
+        };
+        let r = SchedulingResolver::new(ctx);
+        let mut a = ask("scheduling", 0.9);
+        a.text = "can we book a 45 minute call next week".into();
+        let f = r.try_resolve(&a).await.unwrap().unwrap();
+        assert!(f.fill.contains("45-min"));
+        assert!(f.fill.contains("45-minute meeting"));
+    }
+
+    #[test]
+    fn find_meeting_url_recognizes_platforms() {
+        assert_eq!(
+            find_meeting_url("join: https://us05web.zoom.us/j/123456789?pwd=ab"),
+            Some("https://us05web.zoom.us/j/123456789?pwd=ab".to_string())
+        );
+        assert_eq!(
+            find_meeting_url("here (https://meet.google.com/abc-defg-hij)."),
+            Some("https://meet.google.com/abc-defg-hij".to_string())
+        );
+        // A Calendly link is NOT a meeting/join link.
+        assert_eq!(find_meeting_url("https://calendly.com/x/y"), None);
+        assert_eq!(find_meeting_url("nope"), None);
+    }
+
+    #[tokio::test]
+    async fn meeting_link_resolver_env_then_wiki() {
+        let _env = env_lock();
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_MEETING_LINK", "1");
+        let _u = set(
+            "AUGMENTAGENT_MEETING_LINK",
+            "https://us02web.zoom.us/my/nolan",
+        );
+        let r = MeetingLinkResolver::new(ResolveCtx::default());
+        let f = r
+            .try_resolve(&ask("meeting_link", 0.9))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.kind, ResolverKind::MeetingLink);
+        assert!(f.fill.contains("zoom.us/my/nolan"));
+
+        // Falls back to the wiki index when the env var is unset.
+        std::env::remove_var("AUGMENTAGENT_MEETING_LINK");
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("index.md"),
+            "# Wiki\n\nStanding room: https://meet.google.com/qrs-tuvw-xyz\n",
+        )
+        .unwrap();
+        let ctx = ResolveCtx {
+            wiki_root: Some(d.path().to_path_buf()),
+            ..Default::default()
+        };
+        let r = MeetingLinkResolver::new(ctx);
+        let f = r
+            .try_resolve(&ask("meeting_link", 0.9))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(f.fill.contains("meet.google.com/qrs-tuvw-xyz"));
+    }
+
+    #[tokio::test]
+    async fn meeting_link_resolver_noop_without_flag() {
+        let _env = env_lock();
+        std::env::remove_var("AUGMENTAGENT_ASK_RESOLVE_MEETING_LINK");
+        let _u = set("AUGMENTAGENT_MEETING_LINK", "https://meet.google.com/a-b-c");
+        let r = MeetingLinkResolver::new(ResolveCtx::default());
+        assert!(r
+            .try_resolve(&ask("meeting_link", 0.9))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn resolver_kind_labels_are_human_readable() {
+        assert_eq!(ResolverKind::ShareDoc.label(), "Document link");
+        assert_eq!(ResolverKind::MeetingLink.label(), "Video-call link");
+        assert_eq!(ResolverKind::Scheduling.label(), "Proposed meeting time");
+    }
+
+    #[tokio::test]
+    async fn resolve_asks_off_and_shadow_are_empty_outcome() {
+        let _env = env_lock();
+        let r = reasoner(Some(
+            r#"{"asks":[{"text":"x","resolver_kind":"calendly","confidence":0.9}]}"#,
+        ));
+        let out = resolve_asks(&r, AskResolveMode::Off, "book me", ResolveCtx::default()).await;
+        assert_eq!(out, ResolveOutcome::default());
+        let r2 = reasoner(Some(
+            r#"{"asks":[{"text":"x","resolver_kind":"calendly","confidence":0.9}]}"#,
+        ));
+        let out2 =
+            resolve_asks(&r2, AskResolveMode::Shadow, "book me", ResolveCtx::default()).await;
+        assert!(out2.block.is_empty());
+        assert!(out2.unresolved.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_asks_surfaces_unresolved_for_card() {
+        let _env = env_lock();
+        // share_doc flag ON but NO drive client + NO wiki ⇒ resolver returns
+        // Ok(None) ⇒ the ask must surface as "needs your input".
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_SHARE_DOC", "1");
+        std::env::remove_var("AUGMENTAGENT_ASK_RESOLVE_CALENDLY");
+        let r = reasoner(Some(
+            r#"{"asks":[{"text":"send me the Q4 board deck","resolver_kind":"share_doc","confidence":0.95}]}"#,
+        ));
+        let out = resolve_asks(
+            &r,
+            AskResolveMode::Live,
+            "Can you send me the Q4 board deck?",
+            ResolveCtx::default(),
+        )
+        .await;
+        assert!(out.block.is_empty(), "nothing resolved ⇒ no block");
+        assert_eq!(out.unresolved.len(), 1);
+        assert_eq!(out.unresolved[0].kind, ResolverKind::ShareDoc);
+        assert!(out.unresolved[0].text.contains("Q4 board deck"));
+    }
+
+    #[tokio::test]
+    async fn resolve_asks_resolved_ask_is_not_in_unresolved() {
+        let _env = env_lock();
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_CALENDLY", "1");
+        let _u = set("AUGMENTAGENT_CALENDLY_URL", "https://calendly.com/n/30");
+        let r = reasoner(Some(
+            r#"{"asks":[{"text":"got a calendly?","resolver_kind":"calendly","confidence":0.95}]}"#,
+        ));
+        let out = resolve_asks(
+            &r,
+            AskResolveMode::Live,
+            "Got a Calendly?",
+            ResolveCtx::default(),
+        )
+        .await;
+        assert!(out.block.contains("calendly.com/n/30"));
+        assert!(
+            out.unresolved.is_empty(),
+            "a resolved ask must NOT also be surfaced as unresolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn off_path_resolve_outcome_yields_byte_identical_draft_prompt() {
+        // The core gating guarantee for #35: with AUGMENTAGENT_ASK_RESOLVE
+        // unset/off, the resolve stage produces an empty ResolveOutcome, so
+        // `draft_user_message` sees an empty resolved-asks block AND an empty
+        // marker — the rendered draft prompt is byte-for-byte the pre-#35
+        // output. Asserted here so a future resolver change can't silently
+        // perturb the default path.
+        let _env = env_lock();
+        std::env::remove_var("AUGMENTAGENT_ASK_RESOLVE");
+        let r = reasoner(Some(
+            r#"{"asks":[{"text":"got a calendly?","resolver_kind":"calendly","confidence":0.99}]}"#,
+        ));
+        let out = resolve_asks(
+            &r,
+            AskResolveMode::from_env(),
+            "Hey, got a Calendly?",
+            ResolveCtx::default(),
+        )
+        .await;
+        assert_eq!(out, ResolveOutcome::default());
+        assert!(out.block.is_empty());
+        assert!(out.unresolved.is_empty());
+
+        let email = augmentagent_store::Email {
+            message_id: "m1".into(),
+            thread_id: Some("t1".into()),
+            from: "a@b.com".into(),
+            subject: "Re: hi".into(),
+            body: "the inbound message".into(),
+            date: "2026-05-18T00:00:00Z".into(),
+            account_entity_id: Some("acc".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        };
+        let with_outcome = crate::prompt::draft_user_message(
+            &email, "", "", "", "", &out.block,
+        );
+        let legacy = crate::prompt::draft_user_message(&email, "", "", "", "", "");
+        assert_eq!(with_outcome, legacy);
+        assert!(!with_outcome.contains("<resolved_asks>"));
+    }
+
+    #[tokio::test]
+    async fn resolve_asks_block_wrapper_matches_outcome_block() {
+        let _env = env_lock();
+        let _g = set("AUGMENTAGENT_ASK_RESOLVE_CALENDLY", "1");
+        let _u = set("AUGMENTAGENT_CALENDLY_URL", "https://calendly.com/n/x");
+        let body = "Got a Calendly link?";
+        let reply =
+            r#"{"asks":[{"text":"got a calendly?","resolver_kind":"calendly","confidence":0.9}]}"#;
+        let r1 = reasoner(Some(reply));
+        let block =
+            resolve_asks_block(&r1, AskResolveMode::Live, body, ResolveCtx::default()).await;
+        let r2 = reasoner(Some(reply));
+        let out = resolve_asks(&r2, AskResolveMode::Live, body, ResolveCtx::default()).await;
+        assert_eq!(block, out.block);
     }
 }
