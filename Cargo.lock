@@ -387,6 +387,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-channel-gdrive"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-store",
+ "mockito",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "augmentagent-channel-github"
 version = "0.1.0"
 dependencies = [
@@ -404,6 +424,33 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "augmentagent-channel-instagram"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-auth",
+ "augmentagent-browser-client",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "augmentagent-wiki",
+ "chrono",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
  "tokio",
  "tokio-util",
  "tracing",
@@ -435,6 +482,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-channel-meetup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-store",
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "augmentagent-channel-slack"
 version = "0.1.0"
 dependencies = [
@@ -443,6 +509,7 @@ dependencies = [
  "augmentagent-approval-discord",
  "augmentagent-auth",
  "augmentagent-channel-core",
+ "augmentagent-channel-discord-dm",
  "augmentagent-store",
  "augmentagent-wiki",
  "mockito",
@@ -524,6 +591,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tokio-util",
  "tracing",
@@ -543,8 +611,11 @@ dependencies = [
  "augmentagent-channel-core",
  "augmentagent-channel-discord-dm",
  "augmentagent-channel-email",
+ "augmentagent-channel-gdrive",
  "augmentagent-channel-github",
+ "augmentagent-channel-instagram",
  "augmentagent-channel-linkedin",
+ "augmentagent-channel-meetup",
  "augmentagent-channel-slack",
  "augmentagent-channel-telegram-bot",
  "augmentagent-renderer-client",
@@ -591,6 +662,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

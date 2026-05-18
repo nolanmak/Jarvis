@@ -21,6 +21,10 @@ use augmentagent_channel_linkedin::{
     default_auth_path, is_linkedin_email, LinkedInApi, LinkedInAuth, LinkedInChannel,
     LinkedInChannelConfig, VoyagerClient, ACCOUNT_PREFIX, DEFAULT_POLL_SECS,
 };
+use augmentagent_channel_instagram::{
+    is_instagram_email, InstagramApi, InstagramAuth, InstagramChannel,
+    InstagramChannelConfig, WebClient as InstagramWebClient,
+};
 use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
@@ -110,6 +114,12 @@ enum Cmd {
     Linkedin {
         #[command(subcommand)]
         op: LinkedinOp,
+    },
+    /// Instagram channel: DM triage (#18), close-contact feed engagement
+    /// (#19), and browser-driven posting (#50/#76, env-gated).
+    Instagram {
+        #[command(subcommand)]
+        op: InstagramOp,
     },
     /// Discord channel: user-token REST client. Reads personal DMs + watched
     /// guild channels, routes through subscriptions (priority/digest/store_only).
@@ -849,6 +859,29 @@ enum LinkedinOp {
 }
 
 #[derive(Subcommand)]
+enum InstagramOp {
+    /// Validate + persist harvested session cookies from a JSON file.
+    ///
+    /// The JSON must contain `ds_user_id` and a `cookies` object with at
+    /// least `sessionid` and `csrftoken`. Use `scripts/instagram-harvest.sh`
+    /// to produce it. NOTE: docs/instagram-protocol.md is a spec produced
+    /// from public knowledge — the first real login is also the live
+    /// validation run.
+    Login {
+        /// Path to the cookies JSON file.
+        #[arg(long)]
+        cookies_json: PathBuf,
+    },
+    /// Run one Instagram DM poll cycle and exit. Respects `--dry-run`.
+    PollOnce {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+    /// Quick read-only check: list recent DM threads + peer + snippet.
+    Recent,
+}
+
+#[derive(Subcommand)]
 enum ResumeOp {
     /// Parse a resume file and seed the wiki with an `about/me.md` and
     /// stub `people/<slug>.md` pages for every named contact.
@@ -1026,6 +1059,21 @@ async fn main() -> Result<()> {
                         None
                     }
                 };
+            // Instagram is optional — builds only if cookies are in
+            // keychain/legacy file; absent auth downgrades to Instagram-off
+            // with a warning, no crash.
+            let instagram_ch = match build_instagram_channel(
+                &cli,
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                dry_run,
+            ) {
+                Ok(ch) => Some(ch),
+                Err(e) => {
+                    warn!("instagram channel disabled: {e:#}");
+                    None
+                }
+            };
             // Discord is optional too — builds only if creds are in Keychain.
             let discord_ch = match build_discord_channel(
                 &cli,
@@ -1107,6 +1155,10 @@ async fn main() -> Result<()> {
             if let Some(li) = linkedin_ch {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { li.run(sd).await }));
+            }
+            if let Some(ig) = instagram_ch {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { ig.run(sd).await }));
             }
             if let Some(dc) = discord_ch {
                 let sd = shutdown.clone();
@@ -1287,6 +1339,20 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             LinkedinOp::Recent => run_linkedin_recent().await,
+        },
+        Cmd::Instagram { ref op } => match op {
+            InstagramOp::Login { cookies_json } => {
+                run_instagram_login(cookies_json.clone()).await
+            }
+            InstagramOp::PollOnce { dry_run } => {
+                let (broker, _) =
+                    build_broker(&cli, Arc::clone(&store), *dry_run).await?;
+                let ch = build_instagram_channel(&cli, store, broker, *dry_run)?;
+                let out = ch.poll_once().await?;
+                println!("{out:#?}");
+                Ok(())
+            }
+            InstagramOp::Recent => run_instagram_recent().await,
         },
         Cmd::Slack { ref op } => match op {
             SlackOp::Login { auth_json } => run_slack_login(store, auth_json.clone()).await,
@@ -2845,6 +2911,10 @@ struct ReplyApprover {
     /// (cookies not configured). Any LinkedIn-tagged action hitting this
     /// approver with a None client surfaces as `Failed`.
     linkedin: Option<Arc<VoyagerClient>>,
+    /// Optional Instagram web client. `None` = Instagram disabled for this
+    /// run (cookies not configured). Instagram-tagged actions hitting this
+    /// approver with a None client surface as `Failed`.
+    instagram: Option<Arc<InstagramWebClient>>,
     /// Optional Discord client. `None` = Discord disabled for this run
     /// (auth not loaded). Any discord-tagged action hits `Failed`.
     discord: Option<Arc<augmentagent_channel_discord_dm::DiscordClient>>,
@@ -2985,6 +3055,126 @@ impl ReplyApprover {
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
         // Nothing to delete server-side — LinkedIn has no draft concept.
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Rejected,
+            None,
+            Some("skipped by approver"),
+        );
+        let _ = self
+            .store
+            .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+        ApprovalActionOutcome::Skipped
+    }
+
+    /// Instagram has no server-side draft. A DM reply sends via
+    /// `send_dm(thread_id, body)`; a feed-engagement comment (message_id
+    /// shaped `ig:comment:<media_id>`) posts via `post_comment` — same
+    /// approval card, routed by the id prefix.
+    async fn approve_instagram(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        let Some(instagram) = self.instagram.as_ref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "Instagram is not configured (no cookies); run `instagram login`"
+                    .into(),
+            };
+        };
+        let Some(body) = action.action.draft_body.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no draft body on action; cannot send".into(),
+            };
+        };
+        let is_comment = action.email.message_id.starts_with("ig:comment:");
+        let send_result = if is_comment {
+            let Some(media_id) = action.email.thread_id.as_deref() else {
+                return ApprovalActionOutcome::Failed {
+                    message: "no media id on feed-engagement action".into(),
+                };
+            };
+            instagram.post_comment(media_id, body).await.map(|_| ())
+        } else {
+            let Some(thread_id) = action.email.thread_id.as_deref() else {
+                return ApprovalActionOutcome::Failed {
+                    message: "no thread id on email; cannot send".into(),
+                };
+            };
+            instagram.send_dm(thread_id, body).await.map(|_| ())
+        };
+        match send_result {
+            Ok(()) => {
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Sent,
+                    Some(body),
+                    None,
+                );
+                let _ = self
+                    .store
+                    .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                tracing::info!(
+                    action_id,
+                    is_comment,
+                    "instagram action sent via approval handler"
+                );
+                ApprovalActionOutcome::Approved
+            }
+            Err(e) => {
+                let msg = format!("instagram send: {e}");
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                ApprovalActionOutcome::Failed { message: msg }
+            }
+        }
+    }
+
+    async fn revise_instagram(
+        &self,
+        action_id: &str,
+        feedback: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        // No server-side draft — regenerate text, persist, re-post the card.
+        let previous_draft = action.action.draft_body.clone().unwrap_or_default();
+        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
+        let prompt = augmentagent_channel_core::prompt::redraft_message(
+            &action.email,
+            &previous_draft,
+            feedback,
+        );
+        let redraft = match self.reasoner.call(&opts, &prompt).await {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("redraft call failed: {e}"),
+                };
+            }
+        };
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Pending,
+            Some(&redraft),
+            None,
+        );
+        let _ = self.store.reset_nudge_schedule(action_id);
+        tracing::info!(action_id, "instagram revise: new draft persisted");
+        ApprovalActionOutcome::Revised {
+            email: action.email,
+            draft: redraft,
+        }
+    }
+
+    fn skip_instagram(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
         let _ = self.store.update_action_status(
             action_id,
             ActionStatus::Rejected,
@@ -3528,6 +3718,9 @@ impl ReplyApprover {
         if action.email.platform == "github" {
             return self.approve_github(action_id, action).await;
         }
+        if is_instagram_email(&action.email) {
+            return self.approve_instagram(action_id, action).await;
+        }
         if is_linkedin_email(&action.email) {
             return self.approve_linkedin(action_id, action).await;
         }
@@ -3596,6 +3789,9 @@ impl ReplyApprover {
         if action.email.platform == "github" {
             return self.skip_github(action_id, action);
         }
+        if is_instagram_email(&action.email) {
+            return self.skip_instagram(action_id, action);
+        }
         if is_linkedin_email(&action.email) {
             return self.skip_linkedin(action_id, action);
         }
@@ -3640,6 +3836,9 @@ impl ReplyApprover {
         }
         if action.email.platform == "github" {
             return self.revise_github(action_id, feedback, action).await;
+        }
+        if is_instagram_email(&action.email) {
+            return self.revise_instagram(action_id, feedback, action).await;
         }
         if is_linkedin_email(&action.email) {
             return self.revise_linkedin(action_id, feedback, action).await;
@@ -3769,6 +3968,7 @@ async fn build_broker(
     // the file is missing or malformed the daemon stays up and just can't
     // send LinkedIn replies (Gmail-only mode).
     let linkedin = load_linkedin_client(&repo_root);
+    let instagram = load_instagram_client(&repo_root);
 
     let discord = load_discord_client();
     let slack = load_slack_clients(&store);
@@ -3782,6 +3982,7 @@ async fn build_broker(
         store,
         gmail,
         linkedin,
+        instagram,
         discord,
         slack,
         telegram,
@@ -3967,6 +4168,140 @@ async fn run_linkedin_recent() -> Result<()> {
             .format("%Y-%m-%d %H:%M"),
             dm.peer_name,
             arrow,
+            snippet,
+        );
+    }
+    Ok(())
+}
+
+fn build_instagram_channel(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<InstagramChannel<InstagramWebClient, ClaudeCliReasoner>> {
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = InstagramAuth::load_with_migration(&repo_root).with_context(|| {
+        "load instagram auth from keychain or legacy file — run `augmentagent instagram login --cookies-json <file>`"
+    })?;
+    let ds_user_id = auth.ds_user_id.clone();
+    let api = Arc::new(InstagramWebClient::new(auth));
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let governor: Arc<dyn augmentagent_channel_core::RateGovernor> = Arc::new(
+        augmentagent_channel_core::SqliteGovernor::with_system_clock(Arc::clone(
+            &store,
+        )),
+    );
+
+    let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
+        Some(root) => {
+            let schema = cli
+                .wiki_schema
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("schema/wiki-skill.md"));
+            (Some(root.clone()), Some(schema))
+        }
+        None => (None, None),
+    };
+
+    let poll_interval = match std::env::var("AUGMENTAGENT_INSTAGRAM_POLL_SECS") {
+        Ok(s) => s
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(
+                augmentagent_channel_instagram::DEFAULT_POLL_SECS,
+            )),
+        Err(_) => Duration::from_secs(
+            augmentagent_channel_instagram::DEFAULT_POLL_SECS,
+        ),
+    };
+
+    let config = InstagramChannelConfig {
+        poll_interval,
+        dry_run,
+        wiki_root,
+        wiki_schema_path,
+        skill_dir: PathBuf::from("skills/instagram-triage"),
+    };
+    info!(
+        ds_user_id = %ds_user_id,
+        interval_secs = poll_interval.as_secs(),
+        "instagram channel ready"
+    );
+    Ok(InstagramChannel::new(
+        store, api, reasoner, broker, governor, ds_user_id, config,
+    ))
+}
+
+/// Best-effort load of the Instagram web client for the approval handler.
+/// `None` when neither keychain nor the legacy file has credentials.
+fn load_instagram_client(repo_root: &std::path::Path) -> Option<Arc<InstagramWebClient>> {
+    match InstagramAuth::load_with_migration(repo_root) {
+        Ok(auth) => Some(Arc::new(InstagramWebClient::new(auth))),
+        Err(e) => {
+            info!("instagram auth not loaded: {e} (instagram send disabled this run)");
+            None
+        }
+    }
+}
+
+async fn run_instagram_login(cookies_json: PathBuf) -> Result<()> {
+    let raw = std::fs::read_to_string(&cookies_json)
+        .with_context(|| format!("read cookies file at {}", cookies_json.display()))?;
+    let mut auth: InstagramAuth =
+        serde_json::from_str(&raw).with_context(|| "parse cookies JSON")?;
+    auth.validate()
+        .with_context(|| "cookie file missing required fields")?;
+    if auth.harvested_at_ms == 0 {
+        auth.harvested_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+    }
+
+    // Probe the inbox once to validate cookies before persisting. The
+    // protocol spec is unvalidated (#17) — this probe IS the validation.
+    let api = InstagramWebClient::new(auth.clone());
+    match api.fetch_inbox(None).await {
+        Ok((dms, _)) => info!(thread_count = dms.len(), "instagram cookie probe OK"),
+        Err(e) => anyhow::bail!(
+            "cookie probe failed: {e}; aborting save (note: docs/instagram-protocol.md \
+             is unvalidated — confirm endpoint shapes if this persists)"
+        ),
+    }
+
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let out = augmentagent_channel_instagram::default_auth_path(&repo_root);
+    auth.save(&out)
+        .with_context(|| format!("save auth to {}", out.display()))?;
+    auth.save_to_keychain()
+        .context("save auth to keychain (augmentagent/instagram/<ds_user_id>)")?;
+    println!(
+        "instagram auth saved to {} + keychain (augmentagent/instagram/{})",
+        out.display(),
+        auth.ds_user_id
+    );
+    Ok(())
+}
+
+async fn run_instagram_recent() -> Result<()> {
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = InstagramAuth::load_with_migration(&repo_root)
+        .context("load instagram auth from keychain or legacy file")?;
+    let me = auth.ds_user_id.clone();
+    let api = InstagramWebClient::new(auth);
+    let (dms, _cursor) = api.fetch_inbox(None).await.context("fetch inbox")?;
+    println!("{} threads\n", dms.len());
+    for (i, dm) in dms.iter().take(15).enumerate() {
+        let arrow = if dm.is_outbound(&me) { "you →" } else { "peer →" };
+        let snippet: String = dm.text.chars().take(100).collect();
+        let kind = if dm.media_only { "[media]" } else { "" };
+        println!(
+            "[{:>2}] {} {} {} {}",
+            i + 1,
+            dm.peer_name,
+            arrow,
+            kind,
             snippet,
         );
     }
