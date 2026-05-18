@@ -12,11 +12,22 @@ mod broker;
 mod custom_id;
 mod event_handler;
 mod layout;
+mod loops;
 mod nudge;
+mod status_bus;
+mod surface;
+mod presets;
 
 pub use broker::{DiscordApprovalBroker, DiscordConfig};
 pub use event_handler::chunk_for_discord;
+pub use loops::{
+    handle_loop_command, parse_interval, LoopPoster, LoopRunner, LoopScheduler,
+    MAX_ACTIVE_PER_USER, MIN_INTERVAL_SECS, PAUSE_AFTER_FAILURES,
+};
 pub use nudge::NudgeScheduler;
+pub use status_bus::{StatusBus, StatusChanged};
+pub use surface::{ApprovalSurface, ComposedSurface};
+pub use presets::{Preset, MAX_REDRAFT_ITERATIONS, PRESETS};
 
 use async_trait::async_trait;
 use augmentagent_store::Email;

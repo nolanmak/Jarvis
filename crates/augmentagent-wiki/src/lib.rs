@@ -5,6 +5,7 @@
 //! `augmentagent-channel-email` drive the Claude spawns; this crate only
 //! knows *where* files go and how to name them.
 
+pub mod crm;
 pub mod identity;
 pub mod layout;
 pub mod locks;
@@ -12,6 +13,7 @@ pub mod migrate;
 pub mod reader;
 pub mod slug;
 
+pub use crm::{merge_person_page, MergeResult, PersonPatch};
 pub use identity::{Identities, IdentityIndex, PersonPage};
 pub use layout::WikiLayout;
 pub use locks::{with_page_lock, LOCK_TIMEOUT};
