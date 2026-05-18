@@ -168,6 +168,11 @@ enum Cmd {
         #[command(subcommand)]
         op: GithubOp,
     },
+    /// Reddit DM/inbox channel OAuth bootstrap (#48).
+    Reddit {
+        #[command(subcommand)]
+        op: RedditOp,
+    },
     /// Meetup.com group events → Discord digest (multi-tenant; no email).
     Meetup {
         #[command(subcommand)]
@@ -479,6 +484,29 @@ enum VoiceOp {
         path: PathBuf,
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum RedditOp {
+    /// Print the Reddit consent URL for the dashboard OAuth bootstrap.
+    AuthUrl {
+        #[arg(long)]
+        client_id: String,
+        #[arg(long)]
+        redirect_uri: String,
+        #[arg(long, default_value = "augmentagent")]
+        state: String,
+    },
+    /// Exchange an authorization code for a permanent refresh token and
+    /// persist it to the keyring.
+    Exchange {
+        #[arg(long)]
+        client_id: String,
+        #[arg(long)]
+        code: String,
+        #[arg(long)]
+        redirect_uri: String,
     },
 }
 
@@ -1153,6 +1181,19 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { gd.run(sd).await }));
             }
+            // #48 — Reddit channel. Self-gates on having completed the
+            // dashboard OAuth bootstrap (refresh token in keyring); prod
+            // without it never spawns this, exactly like github/meetup gate.
+            match augmentagent_channel_reddit::RedditChannel::from_keychain() {
+                Ok(rc) => {
+                    let rc = Arc::new(rc);
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move { rc.run(sd).await }));
+                }
+                Err(e) => {
+                    info!("reddit channel disabled: {e:#}");
+                }
+            }
             // Nudge scheduler — surfaces pending approval cards one at a time
             // (serial queue). Cross-channel: any pending action (gmail /
             // linkedin / discord / slack) is eligible. The approver holds a
@@ -1533,6 +1574,40 @@ async fn main() -> Result<()> {
         Cmd::Voice { op } => match op {
             VoiceOp::PollOnce { .. } | VoiceOp::Ingest { .. } => {
                 unimplemented!("see voice-channel feature PR")
+            }
+        },
+        Cmd::Reddit { ref op } => match op {
+            RedditOp::AuthUrl {
+                client_id,
+                redirect_uri,
+                state,
+            } => {
+                println!(
+                    "{}",
+                    augmentagent_channel_reddit::authorize_url(
+                        client_id,
+                        redirect_uri,
+                        state
+                    )
+                );
+                Ok(())
+            }
+            RedditOp::Exchange {
+                client_id,
+                code,
+                redirect_uri,
+            } => {
+                let creds = augmentagent_channel_reddit::exchange_code(
+                    client_id,
+                    code,
+                    redirect_uri,
+                )
+                .await
+                .context("reddit code exchange")?;
+                augmentagent_channel_reddit::RedditAuth::save(&creds)
+                    .context("persist reddit creds")?;
+                println!("{{\"ok\":true}}");
+                Ok(())
             }
         },
         Cmd::Github { ref op } => match op {

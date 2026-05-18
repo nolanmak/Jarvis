@@ -25,6 +25,8 @@
 
 import { Router, Request, Response, NextFunction } from "express";
 import { EventEmitter } from "events";
+import { execFile } from "child_process";
+import path from "path";
 import {
   getActions,
   getActionById,
@@ -196,5 +198,86 @@ v1.get("/events", (req, res) => {
 
 const apiV1Router = Router();
 apiV1Router.use("/api/v1", v1);
+
+// --- #48 Reddit OAuth bootstrap (dashboard callback) ---
+//
+// Not under /api/v1 and NOT API-key gated — it's a browser redirect flow the
+// user drives from the dashboard. Shells out to the Rust CLI so the permanent
+// refresh token lands in the keyring (single source of credential truth).
+
+const REDDIT_CLIENT_ID = process.env.REDDIT_CLIENT_ID || "";
+const REDDIT_REDIRECT =
+  process.env.REDDIT_REDIRECT_URI ||
+  `http://localhost:${process.env.DASHBOARD_PORT || 3000}/api/reddit/callback`;
+
+function cliPath(): string {
+  return (
+    process.env.AUGMENTAGENT_BIN ||
+    path.join(process.cwd(), "target", "release", "augmentagent")
+  );
+}
+
+const reddit = Router();
+
+reddit.get("/api/reddit/auth", (_req, res) => {
+  if (!REDDIT_CLIENT_ID) {
+    res.status(503).send("REDDIT_CLIENT_ID not configured");
+    return;
+  }
+  execFile(
+    cliPath(),
+    [
+      "reddit",
+      "auth-url",
+      "--client-id",
+      REDDIT_CLIENT_ID,
+      "--redirect-uri",
+      REDDIT_REDIRECT,
+      "--state",
+      "augmentagent",
+    ],
+    (err, stdout) => {
+      if (err) {
+        res.status(500).send(`auth-url failed: ${err.message}`);
+        return;
+      }
+      res.redirect(stdout.trim());
+    }
+  );
+});
+
+reddit.get("/api/reddit/callback", (req, res) => {
+  const code = String(req.query.code || "");
+  if (!code) {
+    res.status(400).send("missing ?code");
+    return;
+  }
+  execFile(
+    cliPath(),
+    [
+      "reddit",
+      "exchange",
+      "--client-id",
+      REDDIT_CLIENT_ID,
+      "--code",
+      code,
+      "--redirect-uri",
+      REDDIT_REDIRECT,
+    ],
+    (err, stdout) => {
+      if (err) {
+        res.status(500).send(`token exchange failed: ${err.message}`);
+        return;
+      }
+      res.send(
+        "Reddit connected. The daemon will start polling your inbox on next restart. " +
+          stdout.trim()
+      );
+    }
+  );
+});
+
+apiV1Router.use(reddit);
+
 
 export default apiV1Router;
