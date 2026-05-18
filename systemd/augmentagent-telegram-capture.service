@@ -1,0 +1,33 @@
+# Voice-memo capture listener (#80).
+#
+# A single private Telegram bot that accepts voice memos from a hard
+# chat-id allowlist (~/.config/augmentagent/telegram-allowed-chats.json),
+# transcribes them locally via whisper.cpp, structures them with a Haiku
+# call, and feeds them into the existing wiki-ingest pipeline. The bot token
+# lives ONLY in the keyring slot augmentagent/telegram-capture.
+#
+# Decoupled from the main daemon so a flaky transcription loop can't take
+# email/Discord down. `augmentagent voice serve` self-disables (clean exit)
+# when no capture token is in the keyring, so this unit is inert until the
+# user opts in via `augmentagent voice login`.
+#
+# Install: copy to ~/.config/systemd/user/ and `systemctl --user daemon-reload`.
+[Unit]
+Description=AugmentAgent voice-memo capture (Telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/nolan-makatche/AugmentAgent
+ExecStart=/home/nolan-makatche/AugmentAgent/target/release/augmentagent --wiki-dir /home/nolan-makatche/AugmentAgent/wiki voice serve --dry-run false
+Environment=AUGMENTAGENT_DB=/home/nolan-makatche/AugmentAgent/data.db
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=120
+StandardOutput=append:/home/nolan-makatche/.local/state/augmentagent/telegram-capture.stdout.log
+StandardError=append:/home/nolan-makatche/.local/state/augmentagent/telegram-capture.stderr.log
+
+[Install]
+WantedBy=default.target
