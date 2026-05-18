@@ -555,15 +555,21 @@ enum CalendarOp {
 
 #[derive(Subcommand)]
 enum VoiceOp {
-    /// Run one drop-folder scan + transcription pass.
+    /// Persist the capture-bot token into the keyring slot
+    /// `augmentagent/telegram-capture`.
+    Login {
+        #[arg(long)]
+        token: String,
+    },
+    /// Run one long-poll batch against the capture bot and exit.
     PollOnce {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
     },
-    /// Manually ingest a single audio file.
-    Ingest {
-        path: PathBuf,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    /// Run the voice-capture listener as a daemon (used by the
+    /// augmentagent-telegram-capture systemd unit).
+    Serve {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         dry_run: bool,
     },
 }
@@ -693,6 +699,9 @@ enum ProactiveOp {
     ScanOnce {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+        /// Bypass the config `proactive_enabled` opt-in gate (manual test).
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        force: bool,
     },
     /// List recent ProactiveSignals from sqlite.
     Signals {
@@ -1316,6 +1325,35 @@ async fn main() -> Result<()> {
             });
             // Collect the enabled channels' runners + optional digest scheduler.
             let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+
+            // Voice-capture listener (#80): long-poll the capture bot. Inert
+            // unless a token is in the keyring AND the chat allowlist is
+            // non-empty — so prod (neither configured) never spawns it. The
+            // dedicated systemd unit is the primary path; this in-process
+            // spawn keeps single-host setups simple.
+            if let Some(vl) = build_voice_listener(&cli, Arc::clone(&store), dry_run) {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { vl.run(sd).await }));
+            }
+            // Proactive CRM runner (#81): 30-min loop over wiki people pages.
+            // Only when a wiki is configured (no wiki ⇒ nothing to scan).
+            // Dispatch is gated on !dry_run like the other outbound surfaces.
+            if let Some(wiki_root) = cli.wiki_dir.clone() {
+                let suppression = std::sync::Arc::new(
+                    augmentagent_proactive::TableSuppression::new(Arc::clone(&store)),
+                );
+                let runner = augmentagent_proactive::runner::ProactiveRunner::new(
+                    Arc::clone(&store),
+                    Arc::clone(&broker),
+                    wiki_root,
+                    augmentagent_proactive::rules::default_scans(),
+                )
+                .with_suppression(suppression);
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { runner.run(sd).await }));
+            } else {
+                info!("proactive runner disabled: --wiki-dir not set");
+            }
             if let Some(gmail_ch) = gmail_ch {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { gmail_ch.run(sd).await }));
@@ -1801,9 +1839,13 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
-        Cmd::Voice { op } => match op {
-            VoiceOp::PollOnce { .. } | VoiceOp::Ingest { .. } => {
-                unimplemented!("see voice-channel feature PR")
+        Cmd::Voice { ref op } => match op {
+            VoiceOp::Login { token } => run_voice_login(token.clone()),
+            VoiceOp::PollOnce { dry_run } => {
+                run_voice_poll_once(&cli, Arc::clone(&store), *dry_run).await
+            }
+            VoiceOp::Serve { dry_run } => {
+                run_voice_serve(&cli, Arc::clone(&store), *dry_run).await
             }
         },
         Cmd::Reddit { ref op } => match op {
@@ -1892,17 +1934,40 @@ async fn main() -> Result<()> {
                     .await
             }
         },
-        Cmd::Compose { op } => match op {
-            ComposeOp::FanOut { .. } => {
-                unimplemented!("see issue #53 (content-adapter feature PR)")
+        Cmd::Compose { ref op } => match op {
+            ComposeOp::FanOut {
+                source,
+                platforms,
+                dry_run,
+            } => {
+                run_compose_fan_out(
+                    &cli,
+                    Arc::clone(&store),
+                    source.clone(),
+                    platforms.clone(),
+                    *dry_run,
+                )
+                .await
             }
         },
-        Cmd::Proactive { op } => match op {
-            ProactiveOp::ScanOnce { .. }
-            | ProactiveOp::Signals { .. }
-            | ProactiveOp::Snooze { .. }
-            | ProactiveOp::Dismiss { .. } => {
-                unimplemented!("see issue #81 (proactive feature PR)")
+        Cmd::Proactive { ref op } => match op {
+            ProactiveOp::ScanOnce { dry_run, force } => {
+                run_proactive_scan_once(
+                    &cli,
+                    Arc::clone(&store),
+                    *dry_run,
+                    *force,
+                )
+                .await
+            }
+            ProactiveOp::Signals { limit, json } => {
+                run_proactive_signals(Arc::clone(&store), *limit, *json)
+            }
+            ProactiveOp::Snooze { id, days } => {
+                run_proactive_snooze(Arc::clone(&store), id.clone(), *days)
+            }
+            ProactiveOp::Dismiss { id } => {
+                run_proactive_dismiss(Arc::clone(&store), id.clone())
             }
         },
         Cmd::Browser { op } => match op {
@@ -7018,4 +7083,286 @@ mod tone_cli_tests {
         assert_eq!(parse_date_ms(""), 0);
         assert_eq!(parse_date_ms("not a date"), 0);
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// #81 — Proactive CRM scanner CLI handlers.
+// ---------------------------------------------------------------------------
+
+async fn run_proactive_scan_once(
+    cli: &Cli,
+    store: Arc<Store>,
+    dry_run: bool,
+    force: bool,
+) -> Result<()> {
+    use augmentagent_proactive::rules::default_scans;
+    use augmentagent_proactive::runner::ProactiveRunner;
+    use augmentagent_proactive::TableSuppression;
+
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("proactive scan needs --wiki-dir")?;
+    let (broker, _) = build_broker(cli, Arc::clone(&store), dry_run).await?;
+    let suppression = std::sync::Arc::new(TableSuppression::new(Arc::clone(&store)));
+    let runner = ProactiveRunner::new(store, broker, wiki_root, default_scans())
+        .with_suppression(suppression)
+        .with_opt_in_required(!force);
+    // dry_run=true ⇒ persist+dedup but never post a card.
+    let report = runner.run_once(!dry_run).await;
+    println!(
+        "proactive scan: emitted={} persisted={} dispatched={} suppressed={} (dry_run={})",
+        report.emitted,
+        report.persisted,
+        report.dispatched,
+        report.suppressed,
+        dry_run
+    );
+    Ok(())
+}
+
+fn run_proactive_signals(store: Arc<Store>, limit: u32, json: bool) -> Result<()> {
+    use augmentagent_proactive::store_ext::{now_ms, ProactiveStore};
+    let rows = store
+        .list_signals(limit, now_ms(), true)
+        .context("list proactive signals")?;
+    if json {
+        let arr: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.signal.id,
+                    "kind": r.signal.kind.as_str(),
+                    "person": r.signal.person_slug,
+                    "urgency": r.signal.urgency.as_str(),
+                    "headline": r.signal.headline,
+                    "detail": r.signal.detail,
+                    "status": r.status,
+                    "created_at_ms": r.created_at_ms,
+                    "snooze_until_ms": r.snooze_until_ms,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+    } else {
+        println!("{} proactive signal(s)\n", rows.len());
+        for r in &rows {
+            println!(
+                "  {}  [{}] {} — {} ({})",
+                r.signal.id,
+                r.signal.urgency.as_str(),
+                r.signal.kind.as_str(),
+                r.signal.headline,
+                r.status,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_proactive_snooze(store: Arc<Store>, id: String, days: u32) -> Result<()> {
+    use augmentagent_proactive::store_ext::{now_ms, ProactiveStore};
+    if store.snooze_signal(&id, now_ms(), days).context("snooze")? {
+        println!("signal {id} snoozed {days}d");
+    } else {
+        println!("no signal with id {id}");
+    }
+    Ok(())
+}
+
+fn run_proactive_dismiss(store: Arc<Store>, id: String) -> Result<()> {
+    use augmentagent_proactive::store_ext::ProactiveStore;
+    if store.dismiss_signal(&id).context("dismiss")? {
+        println!("signal {id} dismissed");
+    } else {
+        println!("no signal with id {id}");
+    }
+    Ok(())
+}
+
+
+// ---------------------------------------------------------------------------
+// #80 — Voice-capture CLI handlers.
+// ---------------------------------------------------------------------------
+
+fn run_voice_login(token: String) -> Result<()> {
+    use augmentagent_channel_voice::KEYRING_PLATFORM;
+    augmentagent_auth::Auth::put(
+        KEYRING_PLATFORM,
+        augmentagent_auth::DEFAULT_ACCOUNT,
+        token.trim().as_bytes(),
+    )
+    .context("persist capture-bot token to keyring")?;
+    println!("voice-capture token stored (keyring: augmentagent/{KEYRING_PLATFORM})");
+    Ok(())
+}
+
+/// Build the voice listener if the channel is fully configured: token in
+/// keyring + a non-empty chat allowlist + a wiki dir. Returns `None`
+/// (channel disabled) otherwise — never an error, mirroring how optional
+/// channels degrade in `serve`.
+fn build_voice_listener(
+    cli: &Cli,
+    store: Arc<Store>,
+    dry_run: bool,
+) -> Option<
+    augmentagent_channel_voice::VoiceListener<
+        ClaudeCliReasoner,
+        augmentagent_channel_voice::WhisperCppTranscriber,
+    >,
+> {
+    use augmentagent_channel_voice::{
+        default_allowlist_path, load_allowlist, load_token, VoiceListener,
+        VoiceTelegramClient, WhisperCppTranscriber,
+    };
+    let token = load_token()?;
+    let allowed = load_allowlist(&default_allowlist_path());
+    if allowed.is_empty() {
+        warn!("voice capture disabled: chat allowlist empty (deny-all)");
+        return None;
+    }
+    let wiki_root = match &cli.wiki_dir {
+        Some(w) => w.clone(),
+        None => {
+            warn!("voice capture disabled: --wiki-dir not set");
+            return None;
+        }
+    };
+    let schema = resolve_wiki_schema(cli).unwrap_or_default();
+    let client = match VoiceTelegramClient::new(token) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("voice capture disabled: client init failed: {e}");
+            return None;
+        }
+    };
+    let repo_root = std::env::current_dir().ok()?;
+    Some(VoiceListener {
+        client,
+        store,
+        reasoner: Arc::new(ClaudeCliReasoner::new()),
+        transcriber: WhisperCppTranscriber::from_repo_root(&repo_root),
+        allowed_chats: allowed,
+        wiki_root,
+        wiki_schema: schema,
+        dry_run,
+    })
+}
+
+/// Resolve the wiki maintenance schema text the same way the gcal/email
+/// channels do: explicit `--wiki-schema`, else `<repo>/schema/wiki-skill.md`.
+fn resolve_wiki_schema(cli: &Cli) -> Option<String> {
+    let path = cli
+        .wiki_schema
+        .clone()
+        .or_else(|| Some(PathBuf::from("schema/wiki-skill.md")))?;
+    std::fs::read_to_string(path).ok()
+}
+
+async fn run_voice_poll_once(
+    cli: &Cli,
+    store: Arc<Store>,
+    dry_run: bool,
+) -> Result<()> {
+    match build_voice_listener(cli, store, dry_run) {
+        Some(vl) => {
+            let n = vl.poll_once().await.context("voice poll_once")?;
+            println!("voice poll: {n} memo(s) ingested (dry_run={dry_run})");
+            Ok(())
+        }
+        None => {
+            println!("voice capture not configured (token/allowlist/wiki-dir)");
+            Ok(())
+        }
+    }
+}
+
+async fn run_voice_serve(
+    cli: &Cli,
+    store: Arc<Store>,
+    dry_run: bool,
+) -> Result<()> {
+    match build_voice_listener(cli, store, dry_run) {
+        Some(vl) => {
+            let shutdown = CancellationToken::new();
+            let s2 = shutdown.clone();
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    s2.cancel();
+                }
+            });
+            vl.run(shutdown).await
+        }
+        None => {
+            info!("voice capture not configured; exiting cleanly");
+            Ok(())
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// #53 — Cross-platform content adapter CLI handler.
+// ---------------------------------------------------------------------------
+
+async fn run_compose_fan_out(
+    cli: &Cli,
+    store: Arc<Store>,
+    source: PathBuf,
+    platforms_csv: String,
+    dry_run: bool,
+) -> Result<()> {
+    use augmentagent_content_adapter::{fan_out, preview_all, Platform, SourceDraft};
+
+    let body = std::fs::read_to_string(&source)
+        .with_context(|| format!("read source draft {}", source.display()))?;
+    if body.trim().is_empty() {
+        anyhow::bail!("source draft is empty");
+    }
+    let platforms: Vec<Platform> = platforms_csv
+        .split(',')
+        .filter_map(|p| Platform::parse(p.trim()))
+        .collect();
+    if platforms.is_empty() {
+        anyhow::bail!("no valid platforms in --platforms ({platforms_csv})");
+    }
+
+    let src = SourceDraft::new(body);
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let variants = fan_out(&reasoner, &src, &platforms).await;
+    let cards = preview_all(&variants);
+
+    if dry_run {
+        for c in &cards {
+            println!("\n----- variant -----\n{c}");
+        }
+        println!(
+            "\n{} variant(s) generated (dry-run: not posted)",
+            variants.len()
+        );
+    } else {
+        // Each variant is independently approval-gated. Post one card per
+        // variant via the broker; the channels own the actual publish step
+        // (Refs #53 — posting wiring lands with the platform channels).
+        let (broker, _) = build_broker(cli, Arc::clone(&store), dry_run).await?;
+        for (v, card) in variants.iter().zip(cards.iter()) {
+            let pseudo = augmentagent_store::Email {
+                message_id: format!("compose:{}", v.platform.as_str()),
+                thread_id: None,
+                from: "content-adapter".into(),
+                subject: format!("[{}] variant for review", v.platform.as_str()),
+                body: card.clone(),
+                date: String::new(),
+                account_entity_id: None,
+                platform: v.platform.as_str().to_string(),
+                kind: "compose_variant".into(),
+            };
+            if let Err(e) = broker.post_flag_notice(&pseudo, card).await {
+                warn!(platform = v.platform.as_str(), "compose card post failed: {e}");
+            }
+        }
+        println!("{} variant card(s) posted for approval", variants.len());
+    }
+    Ok(())
 }

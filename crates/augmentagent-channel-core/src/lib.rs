@@ -13,9 +13,14 @@ pub mod governor;
 pub mod ingest;
 pub mod prompt;
 pub mod reasoner;
+pub mod resolve;
 pub mod trigger;
 
 pub use decision::{Decision, DecisionKind};
+pub use resolve::{
+    detect_asks_shadow, default_resolvers, AskResolveMode, AskResolver, DetectedAsk,
+    ResolvedFill, ResolverKind,
+};
 pub use governor::{
     lookup_limit, next_action_delay, quiet_hours_until, requires_approval, scale_cap,
     warmup_curve, ActionKind, ActionRequest, Clock, Denial, HaltReason, HaltState, Outcome,

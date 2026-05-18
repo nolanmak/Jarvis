@@ -12,6 +12,7 @@ augmentagent-channel-core = { path = "../augmentagent-channel-core" }
 
 tokio = { workspace = true }
 async-trait = { workspace = true }
+futures = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
