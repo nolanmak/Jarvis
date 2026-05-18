@@ -287,6 +287,38 @@ enum Cmd {
         #[command(subcommand)]
         op: RatelimitOp,
     },
+    /// #58 — engagement-automation scheduled posts. Queue / list / cancel an
+    /// outbound post; the serve-tick fire loop previews it at T-30min and
+    /// publishes it at T-0 via the per-platform poster.
+    SchedulePost {
+        #[command(subcommand)]
+        op: SchedulePostOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum SchedulePostOp {
+    /// Queue an outbound post for `--platform` at `--at` (RFC3339 / unix
+    /// seconds). Status starts `queued`; serve drives it through the
+    /// preview → posted lifecycle.
+    Add {
+        /// `linkedin` | `twitter` | `instagram`.
+        #[arg(long)]
+        platform: String,
+        /// Post body.
+        #[arg(long)]
+        body: String,
+        /// Fire time: RFC3339 (`2026-05-20T15:00:00Z`) or unix seconds.
+        #[arg(long)]
+        at: String,
+    },
+    /// List not-yet-terminal scheduled posts (the queue).
+    List,
+    /// Cancel a queued / previewed post by id.
+    Cancel {
+        #[arg(long)]
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1354,6 +1386,36 @@ async fn main() -> Result<()> {
             } else {
                 info!("proactive runner disabled: --wiki-dir not set");
             }
+            // #58 — scheduled-post fire loop. 1-min serve tick: T-30min
+            // preview card → T-0 publish via the per-platform poster, every
+            // step gated by the merged RateGovernor (#83). Inert until a
+            // post is queued (`augmentagent schedule-post add …`), so this
+            // is safe to always spawn — empty queue == zero-cost tick. The
+            // engine itself honours dry_run (mutes cards + real publish).
+            {
+                let governor: Arc<dyn augmentagent_channel_core::RateGovernor> =
+                    Arc::new(
+                        augmentagent_channel_core::SqliteGovernor::with_system_clock(
+                            Arc::clone(&store),
+                        ),
+                    );
+                let publisher: Arc<dyn augmentagent_channel_core::PostPublisher> =
+                    Arc::new(MultiPlatformPublisher {
+                        store: Arc::clone(&store),
+                        repo_root: std::env::current_dir()
+                            .unwrap_or_else(|_| PathBuf::from(".")),
+                        dry_run,
+                    });
+                let engine = augmentagent_channel_core::ScheduledPostEngine::new(
+                    Arc::clone(&store),
+                    Arc::clone(&broker),
+                    governor,
+                    publisher,
+                    dry_run,
+                );
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { engine.run(sd).await }));
+            }
             if let Some(gmail_ch) = gmail_ch {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { gmail_ch.run(sd).await }));
@@ -2034,6 +2096,7 @@ async fn main() -> Result<()> {
             RatelimitOp::Halts => run_ratelimit_halts(store),
             RatelimitOp::Caps => run_ratelimit_caps(),
         },
+        Cmd::SchedulePost { ref op } => run_schedule_post(store, op).await,
     }
 }
 
@@ -5140,6 +5203,146 @@ async fn run_backfill_signatures(
 /// enforces the same rolling-24h cap (3 posts/day) the daemon path does, a
 /// first-N-posts second-confirmation guard, and a `--dry-run` that prints
 /// the request body without sending.
+// ================================================================
+// #58 — engagement-automation scheduled posts
+// ================================================================
+
+/// Routes a [`ScheduledPost`] to the right per-platform poster. Keeps
+/// `channel-core`'s `PostPublisher` trait satisfied without that crate
+/// depending on the platform crates. Auth is loaded lazily per publish so a
+/// missing LinkedIn/Twitter session degrades to a `Failed` outcome (the
+/// engine marks the row failed + alerts) rather than panicking the daemon.
+struct MultiPlatformPublisher {
+    store: Arc<Store>,
+    repo_root: PathBuf,
+    dry_run: bool,
+}
+
+#[async_trait]
+impl augmentagent_channel_core::PostPublisher for MultiPlatformPublisher {
+    async fn publish(
+        &self,
+        post: &augmentagent_store::ScheduledPost,
+    ) -> augmentagent_channel_core::PublishOutcome {
+        use augmentagent_channel_core::PublishOutcome;
+        match post.platform.as_str() {
+            "linkedin" => {
+                let auth = match LinkedInAuth::load_with_migration(&self.repo_root) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return PublishOutcome::Failed {
+                            message: format!("linkedin auth: {e}"),
+                        }
+                    }
+                };
+                if self.dry_run {
+                    return PublishOutcome::DryRun;
+                }
+                let voyager = VoyagerClient::new(auth);
+                let draft = PostDraft::text(&post.body);
+                match voyager.create_share(draft).await {
+                    Ok(urn) => PublishOutcome::Posted { external_id: urn.0 },
+                    Err(e) => PublishOutcome::Failed {
+                        message: format!("linkedin create_share: {e}"),
+                    },
+                }
+            }
+            "twitter" | "x" => {
+                let auth = match TwitterAuth::load_with_migration(&self.repo_root) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return PublishOutcome::Failed {
+                            message: format!("twitter auth: {e}"),
+                        }
+                    }
+                };
+                let api = Arc::new(TwitterClient::new(auth));
+                let client = CreateTweetClient::new(
+                    api,
+                    Arc::clone(&self.store),
+                    self.dry_run,
+                );
+                match client.create(&post.body, None, &[]).await {
+                    Ok(augmentagent_channel_twitter::PostOutcome::DryRun) => {
+                        PublishOutcome::DryRun
+                    }
+                    Ok(out) => PublishOutcome::Posted {
+                        external_id: format!("{out:?}"),
+                    },
+                    Err(e) => PublishOutcome::Failed {
+                        message: format!("twitter create: {e}"),
+                    },
+                }
+            }
+            other => PublishOutcome::Failed {
+                message: format!(
+                    "no scheduled-post publisher wired for platform '{other}' \
+                     (linkedin + twitter supported; instagram deferred)"
+                ),
+            },
+        }
+    }
+}
+
+async fn run_schedule_post(store: Arc<Store>, op: &SchedulePostOp) -> Result<()> {
+    match op {
+        SchedulePostOp::Add {
+            platform,
+            body,
+            at,
+        } => {
+            let fire_at_ms = parse_fire_at(at)?;
+            let id = store.enqueue_scheduled_post(
+                platform,
+                body,
+                None,
+                fire_at_ms,
+                None,
+            )?;
+            println!(
+                "queued scheduled post {id} for {platform} at {} (unix ms {fire_at_ms})",
+                at
+            );
+            Ok(())
+        }
+        SchedulePostOp::List => {
+            let rows = store.list_pending_scheduled_posts()?;
+            if rows.is_empty() {
+                println!("no pending scheduled posts");
+            }
+            for r in rows {
+                println!(
+                    "{}  {:<9}  {:<9}  fire@{}  {}",
+                    r.id,
+                    r.platform,
+                    r.status,
+                    r.fire_at_ms,
+                    r.body.chars().take(60).collect::<String>()
+                );
+            }
+            Ok(())
+        }
+        SchedulePostOp::Cancel { id } => {
+            if store.cancel_scheduled_post(id)? {
+                println!("cancelled {id}");
+            } else {
+                println!("not cancellable (already fired / unknown id): {id}");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Accept either an RFC3339 timestamp or raw unix seconds for `--at`.
+fn parse_fire_at(s: &str) -> Result<i64> {
+    if let Ok(secs) = s.parse::<i64>() {
+        return Ok(secs * 1000);
+    }
+    let dt = chrono::DateTime::parse_from_rfc3339(s)
+        .with_context(|| format!("--at must be RFC3339 or unix seconds, got {s:?}"))?;
+    Ok(dt.timestamp_millis())
+}
+
 async fn run_linkedin_post(
     store: Arc<Store>,
     text: String,
