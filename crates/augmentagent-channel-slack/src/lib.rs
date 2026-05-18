@@ -11,11 +11,13 @@
 pub mod api;
 pub mod auth;
 pub mod channel;
+pub mod digest;
 pub mod types;
 
 pub use api::{SlackClient, SlackError};
 pub use auth::{SlackAuth, KEYCHAIN_PLATFORM};
 pub use channel::{SlackChannel, SlackChannelConfig};
+pub use digest::{slack_digest_scheduler, SlackDigestScheduler};
 
 /// Platform discriminator used in `Email::platform` and
 /// `channel_subscriptions.platform` rows.

@@ -161,7 +161,10 @@ impl ApprovalBroker for DiscordApprovalBroker {
         email: &Email,
         draft: &str,
     ) -> Result<(), ApprovalError> {
-        let message = approval_message(action_id, email, draft);
+        // First post for this action — redraft count is always 0 here. Revise
+        // / quick-refine re-renders go through the event handler, which reads
+        // the persisted count.
+        let message = approval_message(action_id, email, draft, 0);
         self.channel_id
             .send_message(&*self.http, message)
             .await

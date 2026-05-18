@@ -359,7 +359,7 @@ impl<A: InstagramApi, R: Reasoner + 'static> InstagramChannel<A, R> {
                         .unwrap_or_default();
                 let draft_opts =
                     draft_opts(skill_system, self.config.wiki_root.clone());
-                let draft_prompt = draft_user_message(&email, "", "");
+                let draft_prompt = draft_user_message(&email, "", "", "", "");
                 let draft = match self.reasoner.call(&draft_opts, &draft_prompt).await
                 {
                     Ok(s) => s.trim().to_string(),
