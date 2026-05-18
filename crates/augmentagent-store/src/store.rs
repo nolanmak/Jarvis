@@ -1172,6 +1172,37 @@ impl Store {
         Ok(out)
     }
 
+    /// #64 — `(message_id, from_email, body)` for emails first seen on/after
+    /// `since_ms`, newest first. Backs `backfill signatures`: it mines each
+    /// body's signature block for role/title/company/phone. Idempotent at
+    /// the call site (the wiki merge is fill-blanks-only).
+    pub fn email_bodies_since(
+        &self,
+        since_ms: i64,
+        limit: i64,
+    ) -> StoreResult<Vec<(String, String, String)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT messageId, fromEmail, body \
+             FROM emails \
+             WHERE firstSeenAt >= ?1 \
+             ORDER BY firstSeenAt DESC \
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since_ms, limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// How many reply actions are currently sitting in `pending` status
     /// (awaiting the user's Discord click). Useful as a digest metric.
     pub fn pending_reply_count(&self) -> StoreResult<i64> {

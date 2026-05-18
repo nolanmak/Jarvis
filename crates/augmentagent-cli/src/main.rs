@@ -16,6 +16,9 @@ use augmentagent_approval_discord::{
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
 use augmentagent_channel_email::gmail::{ComposioClient, GmailApi};
+use augmentagent_channel_email::sigextract::{
+    detect_signature_block, signature_patch, strip_quoted_reply, SignatureExtractor,
+};
 use augmentagent_channel_email::{GmailChannel, GmailChannelConfig};
 use augmentagent_channel_linkedin::{
     default_auth_path, is_linkedin_email, LinkedInApi, LinkedInAuth, LinkedInChannel,
@@ -221,6 +224,24 @@ enum Cmd {
     Tone {
         #[command(subcommand)]
         op: ToneOp,
+    },
+    /// #64 — mine email signature blocks for role/title/company/phone and
+    /// fill-blanks them into the wiki. Idempotent (safe to re-run); pulls
+    /// emails first seen on/after `--since`. Dry-run JSON by default.
+    BackfillSignatures {
+        /// Lower bound (`YYYY-MM-DD`). Default: 180 days ago.
+        #[arg(long)]
+        since: Option<String>,
+        /// Max emails to scan.
+        #[arg(long, default_value_t = 2000)]
+        limit: i64,
+        /// Min per-field confidence to auto-fill the wiki; lower-confidence
+        /// fields go to the daily Discord digest instead.
+        #[arg(long, default_value_t = 0.7)]
+        min_confidence: f64,
+        /// Write wiki pages (default: dry-run JSON only).
+        #[arg(long)]
+        apply: bool,
     },
     /// Draft-quality eval tooling backed by `draft_revisions` (#37).
     Drafts {
@@ -1620,6 +1641,24 @@ async fn main() -> Result<()> {
                 run_tone_refresh_stale(store, threshold, budget_secs).await
             }
         },
+        Cmd::BackfillSignatures {
+            ref since,
+            limit,
+            min_confidence,
+            apply,
+        } => {
+            let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
+            run_backfill_signatures(
+                &cli,
+                store,
+                broker,
+                since.clone(),
+                limit,
+                min_confidence,
+                apply,
+            )
+            .await
+        }
         Cmd::Drafts { op } => match op {
             DraftsOp::FeedbackClusters { since_days, top } => {
                 run_drafts_feedback_clusters(store, since_days, top)
@@ -4208,6 +4247,145 @@ async fn run_contacts_sync(
             .await
         {
             warn!("failed to post contacts summary to discord: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// #64 — email-signature backfill. Scans stored email bodies since
+/// `--since`, detects the signature block (regex + line-density), runs the
+/// LLM field extractor (strict JSON + retry + regex fallback), and merges
+/// high-confidence fields fill-blanks-only into the sender's wiki page.
+/// Low-confidence fields are collected into a single daily Discord digest
+/// for manual approval. Dry-run JSON by default.
+#[allow(clippy::too_many_arguments)]
+async fn run_backfill_signatures(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    since: Option<String>,
+    limit: i64,
+    min_confidence: f64,
+    apply: bool,
+) -> Result<()> {
+    use augmentagent_wiki::{merge_person_page, slug_from_email, WikiLayout};
+
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for signature backfill")?;
+    let layout = WikiLayout::new(wiki_root);
+    layout.bootstrap().context("wiki bootstrap")?;
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    // Resolve --since (default 180d ago) to an epoch-ms lower bound.
+    let since_ms = match &since {
+        Some(s) => {
+            let d = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+                .context("--since must be YYYY-MM-DD")?;
+            d.and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        }
+        None => (chrono::Utc::now() - chrono::Duration::days(180)).timestamp_millis(),
+    };
+
+    let rows = store
+        .email_bodies_since(since_ms, limit)
+        .context("read email bodies for signature backfill")?;
+
+    let reasoner = ClaudeCliReasoner::new();
+    let extractor = SignatureExtractor::new(&reasoner);
+
+    let mut scanned = 0usize;
+    let mut sig_found = 0usize;
+    let mut created = 0usize;
+    let mut updated = 0usize;
+    let mut noop = 0usize;
+    // De-dupe per sender within a run (latest sig wins; merge is fill-blanks
+    // so order is immaterial, but skip redundant LLM calls).
+    let mut seen_senders: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    let mut digest_lines: Vec<String> = Vec::new();
+
+    for (_mid, from, body) in rows {
+        scanned += 1;
+        let slug = slug_from_email(&from);
+        if slug.is_empty() || !seen_senders.insert(slug.clone()) {
+            continue;
+        }
+        let stripped = strip_quoted_reply(&body);
+        let Some(block) = detect_signature_block(&stripped) else {
+            continue;
+        };
+        sig_found += 1;
+        let fields = match extractor.extract(&block.text).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::debug!(%from, "sig extract skipped: {e}");
+                continue;
+            }
+        };
+        let (patch, deferred) = signature_patch(&fields, &today, min_confidence);
+        for d in deferred {
+            digest_lines.push(format!("{from}: {d}"));
+        }
+        if patch.is_empty() {
+            noop += 1;
+            continue;
+        }
+
+        let path = layout.people_dir().join(format!("{slug}.md"));
+        let existing = std::fs::read_to_string(&path).ok();
+        let merged = merge_person_page(existing.as_deref(), &patch);
+        if !merged.changed {
+            noop += 1;
+            continue;
+        }
+        if merged.created {
+            created += 1;
+        } else {
+            updated += 1;
+        }
+        if apply {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, &merged.content)?;
+        }
+    }
+
+    let report = serde_json::json!({
+        "scanned": scanned,
+        "signatures_detected": sig_found,
+        "created": created,
+        "updated": updated,
+        "noop": noop,
+        "deferred_low_confidence": digest_lines.len(),
+        "applied": apply,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+
+    if !digest_lines.is_empty() {
+        let body = format!(
+            "Low-confidence signature fields needing review ({}):\n{}",
+            digest_lines.len(),
+            digest_lines
+                .iter()
+                .take(40)
+                .map(|l| format!("- {l}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        if let Err(e) = broker
+            .post_digest("Signature backfill — low-confidence", &body)
+            .await
+        {
+            warn!("failed to post signature digest: {e}");
         }
     }
     Ok(())
