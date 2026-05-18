@@ -60,6 +60,39 @@ impl Store {
         Ok(f(&guard)?)
     }
 
+    /// #80 — read the last acked Telegram update_id for the voice-capture
+    /// bot. `None` (treated as 0 by callers) before the first poll.
+    pub fn voice_capture_offset(&self, bot_key: &str) -> StoreResult<Option<i64>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let v: Option<i64> = guard
+            .query_row(
+                "SELECT last_update_id FROM voice_capture_state WHERE bot_key = ?1",
+                params![bot_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// #80 — persist the last acked Telegram update_id (monotonic upsert).
+    pub fn set_voice_capture_offset(
+        &self,
+        bot_key: &str,
+        last_update_id: i64,
+    ) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO voice_capture_state (bot_key, last_update_id, updated_at_ms) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(bot_key) DO UPDATE SET \
+                last_update_id = MAX(last_update_id, excluded.last_update_id), \
+                updated_at_ms = excluded.updated_at_ms",
+            params![bot_key, last_update_id, now],
+        )?;
+        Ok(())
+    }
+
     /// Additive, idempotent schema migrations. Safe to run against databases
     /// that were created by the original Node daemon (they just lack some of
     /// the newer columns).
@@ -537,6 +570,18 @@ impl Store {
                  entity_id     TEXT PRIMARY KEY,\
                  page_token    TEXT NOT NULL,\
                  updated_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
+        // #80 — voice-capture Telegram long-poll cursor. Single-row table
+        // keyed by a logical capture-bot id; stores the last acked update_id
+        // so a daemon restart never re-ingests an already-transcribed memo.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS voice_capture_state (\
+                 bot_key         TEXT PRIMARY KEY,\
+                 last_update_id  INTEGER NOT NULL DEFAULT 0,\
+                 updated_at_ms   INTEGER NOT NULL\
              )",
             [],
         )?;
