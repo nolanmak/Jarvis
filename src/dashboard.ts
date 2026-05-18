@@ -40,6 +40,14 @@ import {
   getSlackWorkspaces,
   getSlackWorkspaceByTeam,
   deactivateSlackWorkspace,
+  listProactiveSignals,
+  listProactiveSignalsForPerson,
+  getProactiveSignal,
+  dismissProactiveSignal,
+  snoozeProactiveSignal,
+  recordProactiveUserAction,
+  clearProactiveUserAction,
+  listActiveProactiveUserActions,
 } from "./db";
 import type { ActionStatus, SubscriptionMode } from "./types";
 import { runAgentQuery } from "./agent";
@@ -1254,6 +1262,157 @@ router.post("/api/resume", resumeUpload.single("resume"), (req, res) => {
     clearTimeout(timeout);
     res.status(500).json({ ok: false, error: e.message });
   });
+});
+
+// ---------------------------------------------------------------------------
+// #57 — Proactive nudges UX. Server-rendered relationships dashboard.
+// The Rust runner persists `proactive_signals`; this surface lets the user
+// triage them (Draft / Snooze / Stop tracking) and edit a person's cadence
+// (written straight to the wiki person-page frontmatter).
+// ---------------------------------------------------------------------------
+
+import fsSync from "fs";
+import pathMod from "path";
+
+function wikiRoot(): string {
+  return process.env.AUGMENTAGENT_WIKI_DIR || pathMod.join(process.cwd(), "wiki");
+}
+
+function personPagePath(slug: string): string {
+  // Defensive: slugs are wiki filenames; reject path escapes.
+  const safe = slug.replace(/[^a-zA-Z0-9_.-]/g, "_");
+  return pathMod.join(wikiRoot(), "people", `${safe}.md`);
+}
+
+/**
+ * Upsert a single scalar frontmatter key in a person page, preserving the
+ * rest of the file byte-for-byte. Mirrors the "never round-trip the whole
+ * frontmatter" rule from the wiki migration design.
+ */
+function setPersonFrontmatterKey(slug: string, key: string, value: string): boolean {
+  const fp = personPagePath(slug);
+  if (!fsSync.existsSync(fp)) return false;
+  const raw = fsSync.readFileSync(fp, "utf8");
+  const m = raw.match(/^---\n([\s\S]*?)\n---/);
+  if (!m) return false;
+  const fmLines = m[1].split("\n");
+  const keyRe = new RegExp(`^${key}:\\s*.*$`);
+  let replaced = false;
+  const out = fmLines.map((l) => {
+    if (keyRe.test(l)) {
+      replaced = true;
+      return `${key}: ${value}`;
+    }
+    return l;
+  });
+  if (!replaced) out.push(`${key}: ${value}`);
+  const newFm = out.join("\n");
+  const newRaw = raw.replace(m[0], `---\n${newFm}\n---`);
+  fsSync.writeFileSync(fp, newRaw);
+  return true;
+}
+
+router.get("/relationships", (_req, res) => {
+  const signals = listProactiveSignals(200);
+  const actions = listActiveProactiveUserActions();
+  const mutedPeople = new Set(
+    actions.filter((a) => a.action === "mute_person").map((a) => a.scope)
+  );
+  const mutedRules = new Set(
+    actions.filter((a) => a.action === "mute_rule").map((a) => a.scope)
+  );
+  res.render("relationships", {
+    signals,
+    mutedPeople: [...mutedPeople],
+    mutedRules: [...mutedRules],
+    page: "relationships",
+  });
+});
+
+router.get("/relationships/:slug", (req, res) => {
+  const slug = req.params.slug;
+  const signals = listProactiveSignalsForPerson(slug);
+  const actions = listActiveProactiveUserActions();
+  const muted = actions.some(
+    (a) => a.action === "mute_person" && a.scope === slug
+  );
+  let pageExists = false;
+  let cadence = "";
+  try {
+    const fp = personPagePath(slug);
+    if (fsSync.existsSync(fp)) {
+      pageExists = true;
+      const raw = fsSync.readFileSync(fp, "utf8");
+      const cm = raw.match(/^cadence:\s*(.+)$/m);
+      if (cm) cadence = cm[1].trim();
+    }
+  } catch {
+    /* best-effort */
+  }
+  res.render("relationship-detail", {
+    slug,
+    signals,
+    muted,
+    pageExists,
+    cadence,
+    page: "relationships",
+  });
+});
+
+// Inline actions. All redirect back so the page reflects new state (no SPA).
+router.post("/relationships/:id/draft", (req, res) => {
+  // Phase-1: surface the suggested draft prompt. Wiring it into the drafter
+  // queue is deferred (Refs #57) — for now we echo the prompt so the user
+  // can paste it into the wiki-ask box. Keeps the UX honest about scope.
+  const sig = getProactiveSignal(req.params.id);
+  res.render("relationship-draft", {
+    signal: sig,
+    page: "relationships",
+  });
+});
+
+router.post("/relationships/:id/snooze", (req, res) => {
+  const days = parseInt((req.body.days as string) || "7", 10) || 7;
+  const sig = getProactiveSignal(req.params.id);
+  snoozeProactiveSignal(req.params.id, days);
+  if (sig) recordProactiveUserAction("snooze", sig.dedup_key, days);
+  res.redirect("/relationships");
+});
+
+router.post("/relationships/:id/dismiss", (req, res) => {
+  const sig = getProactiveSignal(req.params.id);
+  dismissProactiveSignal(req.params.id);
+  if (sig) recordProactiveUserAction("dismiss", sig.dedup_key);
+  res.redirect("/relationships");
+});
+
+router.post("/relationships/person/:slug/mute", (req, res) => {
+  recordProactiveUserAction("mute_person", req.params.slug);
+  res.redirect(`/relationships/${encodeURIComponent(req.params.slug)}`);
+});
+
+router.post("/relationships/person/:slug/unmute", (req, res) => {
+  clearProactiveUserAction("mute_person", req.params.slug);
+  res.redirect(`/relationships/${encodeURIComponent(req.params.slug)}`);
+});
+
+router.post("/relationships/person/:slug/cadence", (req, res) => {
+  const cadence = (req.body.cadence as string || "").trim();
+  const allowed = ["weekly", "bi-weekly", "monthly", "quarterly", "ad-hoc"];
+  if (allowed.includes(cadence)) {
+    setPersonFrontmatterKey(req.params.slug, "cadence", cadence);
+  }
+  res.redirect(`/relationships/${encodeURIComponent(req.params.slug)}`);
+});
+
+router.post("/relationships/rule/:kind/mute", (req, res) => {
+  recordProactiveUserAction("mute_rule", req.params.kind);
+  res.redirect("/relationships");
+});
+
+router.post("/relationships/rule/:kind/unmute", (req, res) => {
+  clearProactiveUserAction("mute_rule", req.params.kind);
+  res.redirect("/relationships");
 });
 
 export default router;
