@@ -621,6 +621,20 @@ impl Store {
             [],
         )?;
 
+        // #45 — Web Push subscriptions for the PWA approval surface. One row
+        // per browser push endpoint; `p256dh`/`auth` are the VAPID client
+        // keys. Inert until the user installs the PWA + grants notifications.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pwa_subscriptions (\
+                 id            TEXT PRIMARY KEY,\
+                 endpoint      TEXT NOT NULL UNIQUE,\
+                 p256dh        TEXT NOT NULL,\
+                 auth          TEXT NOT NULL,\
+                 created_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
         // ---------------------------------------------------------------
         // CRM ingestion (#61 LinkedIn connections / #62 contacts / #64
         // signature backfill). All additive + dormant in prod until the
@@ -675,7 +689,6 @@ impl Store {
                 ON identity_phone(person_slug)",
             [],
         )?;
-
         Ok(())
     }
 
@@ -3290,6 +3303,59 @@ impl Store {
         Ok(v.flatten())
     }
 
+    // ---------------------------------------------------------------
+    // #45 — PWA Web Push subscriptions.
+    // ---------------------------------------------------------------
+
+    pub fn add_pwa_subscription(
+        &self,
+        endpoint: &str,
+        p256dh: &str,
+        auth: &str,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO pwa_subscriptions (id, endpoint, p256dh, auth, created_at_ms)                VALUES (?1, ?2, ?3, ?4, ?5)              ON CONFLICT(endpoint) DO UPDATE SET p256dh = ?3, auth = ?4",
+            params![
+                Uuid::new_v4().to_string(),
+                endpoint,
+                p256dh,
+                auth,
+                now_millis()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_pwa_subscriptions(
+        &self,
+    ) -> StoreResult<Vec<(String, String, String)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard
+            .prepare("SELECT endpoint, p256dh, auth FROM pwa_subscriptions")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn remove_pwa_subscription(&self, endpoint: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "DELETE FROM pwa_subscriptions WHERE endpoint = ?1",
+            params![endpoint],
+        )?;
+        Ok(())
+    }
+
     // -----------------------------------------------------------------
     // #79 — Twitter/X GraphQL queryId cache + outbound post log.
     // -----------------------------------------------------------------
@@ -4682,6 +4748,20 @@ mod tests {
     }
 
     // --- cross-surface CAS resolve (#47) ---
+
+    #[test]
+    fn pwa_subscription_upsert_list_remove() {
+        let (s, _f) = fresh_store();
+        s.add_pwa_subscription("https://push/ep1", "p1", "a1").unwrap();
+        s.add_pwa_subscription("https://push/ep1", "p2", "a2").unwrap(); // upsert
+        s.add_pwa_subscription("https://push/ep2", "p3", "a3").unwrap();
+        let subs = s.list_pwa_subscriptions().unwrap();
+        assert_eq!(subs.len(), 2);
+        let ep1 = subs.iter().find(|(e, _, _)| e == "https://push/ep1").unwrap();
+        assert_eq!(ep1.1, "p2", "upsert replaced keys");
+        s.remove_pwa_subscription("https://push/ep1").unwrap();
+        assert_eq!(s.list_pwa_subscriptions().unwrap().len(), 1);
+    }
 
     #[test]
     fn try_resolve_action_is_compare_and_swap() {
