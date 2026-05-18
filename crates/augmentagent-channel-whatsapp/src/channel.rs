@@ -409,7 +409,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                     std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
                         .unwrap_or_default();
                 let draft = draft_opts(skill_system, self.config.wiki_root.clone());
-                let draft_prompt = draft_user_message(&email, "", "");
+                let draft_prompt = draft_user_message(&email, "", "", "", "");
                 let drafted = match self.reasoner.call(&draft, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
                     Err(e) => {

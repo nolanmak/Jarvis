@@ -335,6 +335,22 @@ pub fn tone_summarize_opts() -> ReasonerOpts {
     }
 }
 
+/// Preset for the archetype picker (#36). A single fast structured-output
+/// classification: email + triage label in, one archetype id (or `none`) +
+/// confidence out. Haiku for cost/latency — the issue specifies a fast,
+/// single-call classifier; no tools, no wiki.
+pub fn archetype_pick_opts() -> ReasonerOpts {
+    ReasonerOpts {
+        system_prompt: crate::archetype::ARCHETYPE_PICKER_SYSTEM.to_string(),
+        model: Some("claude-haiku-4-5-20251001".into()),
+        allowed_tools: vec![],
+        add_dirs: vec![],
+        permission_mode: "default".into(),
+        cwd: None,
+        env: vec![],
+    }
+}
+
 pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
     ReasonerOpts {
         system_prompt,
