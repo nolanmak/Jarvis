@@ -29,3 +29,4 @@ time = { workspace = true }
 tempfile = "3"
 rusqlite = { workspace = true }
 tokio = { workspace = true }
+wiremock = { workspace = true }

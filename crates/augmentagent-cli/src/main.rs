@@ -27,8 +27,9 @@ use augmentagent_channel_linkedin::{
     DEFAULT_POLL_SECS,
 };
 use augmentagent_channel_twitter::{
-    default_auth_path as twitter_default_auth_path, CreateTweetClient, TwitterApi, TwitterAuth,
-    TwitterClient, TwitterDmSource, TwitterFeedTrigger,
+    default_auth_path as twitter_default_auth_path, validate_session as twitter_validate_session,
+    CreateTweetClient, TwitterApi, TwitterAuth, TwitterClient, TwitterDmSource, TwitterFeedTrigger,
+    ValidateOptions as TwitterValidateOptions,
 };
 use augmentagent_channel_linkedin::connections::{
     ConnectionSyncer, SyncMode, VoyagerConnectionsClient,
@@ -1151,6 +1152,30 @@ enum TwitterOp {
     /// Run one close-friend feed poll cycle and print the WorkItems found.
     /// Read-only — no replies are posted (those go via Discord approval).
     PollOnce,
+    /// #14 operator validation harness. Given an already-harvested session
+    /// (keychain / legacy file — run `twitter login` first), exercise every
+    /// documented endpoint and print a pass/fail grid mapping to the
+    /// `REQUIRES LIVE OPERATOR VALIDATION` flags in docs/twitter-protocol.md.
+    /// Read-only by default — the CreateTweet / DM-send checks are
+    /// shape-validated, never sent, unless `--allow-write` is passed.
+    Validate {
+        /// Emit the report as JSON (an attachable validation artifact)
+        /// instead of the human table.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+        /// Permit the live write probes (CreateTweet / DM send). OFF by
+        /// default — the harness never posts public content without this.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        allow_write: bool,
+        /// Throwaway tweet id to reply to for a live CreateTweet probe
+        /// (requires `--allow-write`).
+        #[arg(long)]
+        probe_reply_to: Option<String>,
+        /// Conversation id for a live DM-send probe (requires
+        /// `--allow-write`).
+        #[arg(long)]
+        probe_conversation_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1909,6 +1934,20 @@ async fn main() -> Result<()> {
                 run_twitter_post(store, text.clone(), reply_to.clone(), *dry_run).await
             }
             TwitterOp::PollOnce => run_twitter_poll_once(&cli).await,
+            TwitterOp::Validate {
+                json,
+                allow_write,
+                probe_reply_to,
+                probe_conversation_id,
+            } => {
+                run_twitter_validate(
+                    *json,
+                    *allow_write,
+                    probe_reply_to.clone(),
+                    probe_conversation_id.clone(),
+                )
+                .await
+            }
         },
         Cmd::Slack { ref op } => match op {
             SlackOp::Login { auth_json } => run_slack_login(store, auth_json.clone()).await,
@@ -5735,6 +5774,52 @@ async fn run_twitter_poll_once(cli: &Cli) -> Result<()> {
     let dms = augmentagent_channel_core::InboundSource::fetch_new(&dm_src).await?;
     println!("dm inbox: {} new inbound DM(s)", dms.len());
     Ok(())
+}
+
+/// #14 — one-command operator validation harness. Replaces the manual
+/// `/intercept` proxy session: load the harvested session, exercise every
+/// documented endpoint, print the pass/fail grid that maps to the
+/// `REQUIRES LIVE OPERATOR VALIDATION` flags in docs/twitter-protocol.md.
+async fn run_twitter_validate(
+    json: bool,
+    allow_write: bool,
+    probe_reply_to: Option<String>,
+    probe_conversation_id: Option<String>,
+) -> Result<()> {
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = TwitterAuth::load_with_migration(&repo_root).context(
+        "load twitter auth from keychain or legacy file — run `augmentagent twitter login` first",
+    )?;
+    let opts = TwitterValidateOptions {
+        allow_write,
+        probe_reply_to,
+        probe_conversation_id,
+    };
+    if allow_write {
+        warn!(
+            "twitter validate: --allow-write set — live write probes are enabled \
+             (CreateTweet / DM send will hit the wire if probe ids are given)"
+        );
+    }
+    let report = twitter_validate_session(auth, opts).await;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .context("serialize validation report")?
+        );
+    } else {
+        print!("{}", report.render_table());
+    }
+    if report.all_passed {
+        Ok(())
+    } else {
+        // Non-zero exit so a CI / scripted runbook step fails loudly.
+        anyhow::bail!(
+            "twitter validate: one or more checks failed — \
+             keep the docs/twitter-protocol.md validation flags set"
+        )
+    }
 }
 
 // ================================================================

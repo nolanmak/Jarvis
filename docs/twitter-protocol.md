@@ -233,6 +233,111 @@ Two layers of throttle protect the account:
 
 ---
 
+## Operator validation runbook — clearing the `REQUIRES LIVE OPERATOR VALIDATION` flags
+
+The spike (#14) could not run a live `/intercept` capture (no operator X
+session). Instead of a manual proxy session, validation is now **one
+command**: `augmentagent twitter validate`. It exercises every endpoint above
+against a real session and prints a pass/fail grid mapped to the section
+numbers in this doc. Run it from a host that has the X session cookies.
+
+### Step 1 — capture cookies from a logged-in browser
+
+On a machine where you're logged into `x.com` in a browser:
+
+1. Open DevTools → **Application → Cookies → `https://x.com`**.
+2. Copy the values of `auth_token` and `ct0`.
+3. Find your numeric `user_id` + `@screen_name`: DevTools → **Network**,
+   filter `graphql`, open any request — the profile API response carries
+   `rest_id` (your `user_id`); the `@handle` is your `screen_name`.
+
+`scripts/twitter-harvest.sh` automates the prompts; or write the bundle by
+hand:
+
+```json
+{
+  "user_id": "1234567890",
+  "screen_name": "you",
+  "cookies": { "auth_token": "<paste>", "ct0": "<paste>" }
+}
+```
+
+### Step 2 — persist the session
+
+```sh
+augmentagent twitter login --session-json /path/to/session.json
+```
+
+This validates the bundle, does a one-shot DM-inbox probe, and stores it in
+the OS keychain (`augmentagent/twitter/default`) with the legacy
+`twitter-auth.json` fallback.
+
+### Step 3 — run the validation harness
+
+```sh
+# read-only: exercises auth, UserTweets, DM inbox; shape-validates the
+# CreateTweet / DM-send bodies WITHOUT sending anything.
+augmentagent twitter validate
+
+# machine-readable artifact (attach to the #14 sign-off):
+augmentagent twitter validate --json true > twitter-validation.json
+```
+
+The harness prints a grid like:
+
+```
+  [PASS] auth                  §1         cookies + bearer + csrf + xctid accepted (200 on UserTweets)
+  [PASS] user_tweets           §2         parsed 18 tweet(s) from the documented timeline_v2 shape
+  [PASS] create_tweet_dry_run  §3         request body matches docs §3 contract (NOT sent ...)
+  [PASS] dm_inbox              §4         parsed 4 inbound DM(s) from inbox_initial_state.json
+  [PASS] dm_send_dry_run       §5         new2.json body matches docs §5 contract (NOT sent ...)
+```
+
+Interpreting failures (the harness exits non-zero on any FAIL):
+
+| Symptom | Meaning | Action |
+|---|---|---|
+| `auth` FAIL (401/403) | session rejected | re-harvest cookies (Step 1), `twitter login` again |
+| `user_tweets` / `create_tweet` FAIL `queryId rotated` | X redeployed; every queryId candidate stale | capture the live `queryId` (DevTools → Network → the `UserTweets`/`CreateTweet` request URL → the hash segment) and cache it: see Step 4 |
+| any check FAIL `SCHEMA DRIFT` | endpoint 200s but the JSON reshaped | the raw body is logged at WARN; diff it against the relevant §, update the parser, re-run |
+| `*` SKIP `rate limited` | 429, transient | wait the reported window, re-run |
+
+### Step 4 — refreshing a rotated queryId (no redeploy)
+
+When `validate` reports `queryId rotated`, capture the live id and cache it —
+the channel picks it up via the store→env→default chain
+(`client.rs::StoreQueryIdResolver`); the live client also auto-walks the
+chain mid-flight, so a single stale id doesn't wedge a poll:
+
+```sh
+# Option A — env override (fastest, ephemeral):
+export AUGMENTAGENT_TWITTER_USER_TWEETS_QUERY_ID=<captured-hash>
+export AUGMENTAGENT_TWITTER_CREATE_TWEET_QUERY_ID=<captured-hash>
+
+# Option B — persist in the store (survives restarts, wins over env):
+#   put_twitter_query_id("UserTweets", "<hash>", now_ms) seeds the cache.
+```
+
+Re-run `twitter validate` to confirm green, then update the
+`DEFAULT_*_QUERY_ID` constants in `api.rs` in a follow-up commit so a fresh
+clone starts from a known-good id.
+
+### Step 5 — sign-off
+
+When `twitter validate` is **all green** against a live session, the
+`REQUIRES LIVE OPERATOR VALIDATION` banners for the validated sections (§1–§5)
+may be downgraded to "validated `<date>`" and non-dry-run posting enabled.
+Attach the `--json true` artifact to issue #14. The harness only ever
+*validates* — it never enables posting on its own; that remains a deliberate
+operator action.
+
+> Live write probes (`--allow-write` + `--probe-reply-to <id>` /
+> `--probe-conversation-id <id>`) confirm §3/§5 end-to-end against throwaway
+> targets. They are OFF by default; the harness never posts public content
+> without the explicit flag **and** a target id.
+
+---
+
 ## Ban / detection risk
 
 X automation detection is aggressive. Practices baked in:
