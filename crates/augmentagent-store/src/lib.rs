@@ -11,7 +11,7 @@ pub use models::{
     Account, ActionRecord, ActionStatus, ChannelSubscription, DriveAccount, Email, LearnedPattern,
     RateAuditRow,
     RateEvent, RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TelegramBot, ToneExample,
-    ToneProfile, TriageResult,
+    ToneProfile, TriageResult, UserLoop,
 };
 pub use store::{
     ActionWithEmail, PendingNudge, RetryableReply, RevisionRecord, Store, StoreError,
