@@ -38,6 +38,7 @@ import {
   deactivateSlackWorkspace,
 } from "./db";
 import type { ActionStatus, SubscriptionMode } from "./types";
+import { runAgentQuery } from "./agent";
 import { listDms, listGuilds, listGuildChannels, discordStatus } from "./discordApi";
 import {
   listConversations as listSlackConversations,
@@ -442,6 +443,26 @@ router.post("/api/config", (req, res) => {
 router.get("/api/config/status", (_req, res) => {
   const configStatus = getConfigStatus();
   res.render("partials/config-status", { configStatus });
+});
+
+// Ad-hoc agent query. The agent answers with its tools (e.g. meetup_events)
+// instead of running email triage. Example:
+//   curl -sX POST localhost:<port>/api/ask -H 'content-type: application/json' \
+//     -d '{"question":"upcoming C&C events on meetup"}'
+router.post("/api/ask", async (req, res) => {
+  const question = (req.body?.question ?? "").toString().trim();
+  if (!question) {
+    res.status(400).json({ error: "question is required" });
+    return;
+  }
+  try {
+    const answer = await runAgentQuery(question);
+    res.json({ answer });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("/api/ask failed:", message);
+    res.status(500).json({ error: message });
+  }
 });
 
 // --- Weekly invoice automation ---
