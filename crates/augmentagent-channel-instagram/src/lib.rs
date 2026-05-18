@@ -64,7 +64,8 @@ pub use feed::{
     FeedTriggerConfig, InstagramFeedTrigger, DAILY_ENGAGE_CAP,
 };
 pub use selectors::{
-    extract_build_hash, Selector, SelectorTier, Target, ALL_TARGETS,
+    extract_build_hash, selector_registry_report, validate_selector_registry,
+    RegistryDefect, Selector, SelectorTier, Target, ALL_TARGETS,
 };
 pub use types::{
     extract_instagram_pk, is_instagram_email, Dm, FeedPost, ACCOUNT_PREFIX,
