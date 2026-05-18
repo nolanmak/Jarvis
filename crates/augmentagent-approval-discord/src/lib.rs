@@ -14,6 +14,7 @@ mod event_handler;
 mod layout;
 mod loops;
 mod nudge;
+mod status_bus;
 
 pub use broker::{DiscordApprovalBroker, DiscordConfig};
 pub use event_handler::chunk_for_discord;
@@ -22,6 +23,7 @@ pub use loops::{
     MAX_ACTIVE_PER_USER, MIN_INTERVAL_SECS, PAUSE_AFTER_FAILURES,
 };
 pub use nudge::NudgeScheduler;
+pub use status_bus::{StatusBus, StatusChanged};
 
 use async_trait::async_trait;
 use augmentagent_store::Email;
