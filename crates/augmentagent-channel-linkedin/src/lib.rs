@@ -24,8 +24,8 @@ pub use api::{
 };
 pub use auth::{default_auth_path, AuthError, LinkedInAuth, DEFAULT_USER_AGENT};
 pub use channel::{
-    LinkedInChannel, LinkedInChannelConfig, LinkedInFeedEngagement, PollOutcome,
-    DEFAULT_POLL_SECS,
+    DispatchOutcome, LinkedInChannel, LinkedInChannelConfig, LinkedInFeedEngagement,
+    LinkedInWorkHandler, PollOutcome, DEFAULT_POLL_SECS,
 };
 pub use connections::{
     connection_patch, connection_slug, parse_connections, Connection, ConnectionDiff,

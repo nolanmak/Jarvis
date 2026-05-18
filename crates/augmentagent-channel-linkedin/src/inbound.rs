@@ -5,13 +5,14 @@
 //! Mirrors the Gmail `GmailInbound` and Telegram `TelegramBotInbound`
 //! adapters.
 //!
-//! Scope note (`Refs #25 — partial`): this is the additive "raw inbox" view.
-//! The production path remains [`LinkedInChannel::poll_once`](crate::LinkedInChannel),
-//! which owns the rich triage → draft → approve → ingest dispatch plus the
-//! 4h-cadence jitter and is covered by the existing channel tests. Fully
-//! retiring that bespoke loop in favour of `ChannelRunner` is deferred to keep
-//! the regression surface contained, exactly as the Telegram bot keeps its own
-//! `poll_once` alongside an `InboundSource` adapter.
+//! Scope note (`#25 — complete`): this raw-inbox view is now the *production*
+//! source. [`LinkedInChannel::run_arc`](crate::LinkedInChannel) wraps it in an
+//! `InboundMessageTrigger` and drives it via `ChannelRunner` +
+//! `LinkedInWorkHandler`, which feeds each rehydrated DM through the channel's
+//! shared `process_email` (the same triage → draft → approve → ingest
+//! dispatch the old bespoke 4h-jitter loop ran). `poll_once` is kept for the
+//! CLI `linkedin poll-once` subcommand and the existing channel tests, and
+//! shares that same `process_email` path so the two are behavior-equivalent.
 //!
 //! Outbound (self-sent) messages are filtered here so the adapter's contract
 //! matches `poll_once`, which skips `dm.is_outbound(member_urn)` before triage.

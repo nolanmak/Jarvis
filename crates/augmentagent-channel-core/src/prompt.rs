@@ -175,12 +175,29 @@ pub fn format_thread_history(messages: &[(String, String, String)]) -> String {
 /// composed AFTER tone and thread history — closest to the new inbound
 /// message so it anchors the reply structure without disturbing the
 /// tone+system cache prefix. Empty = byte-identical to pre-#36 output.
+///
+/// `resolved_asks_block` is a pre-rendered `<resolved_asks>` fragment (see
+/// [`crate::resolve::resolved_asks_block`]) or empty for none (#35 Phase 2).
+/// It is composed LAST among the context blocks — immediately before the
+/// `<email>` body — so the concrete pre-resolved values (calendar slots,
+/// booking link, doc link, intro suggestion) sit closest to the inbound ask
+/// the drafter must answer. It is appended AFTER the archetype block, so the
+/// tone+system cache prefix (and the thread/archetype positions) are
+/// unaffected. Empty = byte-identical to pre-#35 output. Gating lives in
+/// [`crate::resolve::resolve_asks_block`]: anything other than
+/// `AUGMENTAGENT_ASK_RESOLVE=live` yields an empty block here.
+// Each `*_block` is an independent, optional, cache-stable context fragment
+// (tone/thread/archetype/resolved-asks). Bundling them into a struct would
+// obscure the deliberate positional ordering the prompt-cache contract relies
+// on, so the flat signature is intentional.
+#[allow(clippy::too_many_arguments)]
 pub fn draft_user_message(
     email: &Email,
     wiki_hint: &str,
     tone_block: &str,
     thread_block: &str,
     archetype_block: &str,
+    resolved_asks_block: &str,
 ) -> String {
     let hint_block = if wiki_hint.trim().is_empty() {
         String::new()
@@ -218,8 +235,20 @@ pub fn draft_user_message(
             "\n{archetype_block}\nUse the archetype above to anchor the STRUCTURE and intent of the reply. Write natural prose in the user's voice — do not output the slot placeholders literally; fill them from the email, or omit cleanly if unknown.\n"
         )
     };
+    // Resolved asks sit LAST among the context blocks — directly before the
+    // inbound `<email>` — so the concrete, pre-fetched values are the freshest
+    // context the drafter sees when answering the ask. Composed AFTER the
+    // archetype block so tone+system (and thread/archetype) stay cache-stable.
+    // Empty = nothing emitted, byte-identical to pre-#35 output.
+    let resolved = if resolved_asks_block.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n{resolved_asks_block}\nThe block above lists asks in this email that have ALREADY been resolved to concrete values. When the email contains a matching ask, use the EXACT value provided — real calendar times, the real booking link, the real document link. NEVER write a placeholder like \"[link]\", \"[time]\", \"my Calendly\", or \"I'll send it shortly\" when a concrete value is given here. Any line marked SUGGESTION is advisory only: acknowledge the request but do NOT promise or perform it without the user's separate explicit approval.\n"
+        )
+    };
     format!(
-        r#"Draft a reply to this email. Follow the writing-style rules in your system prompt strictly.{tone}{thread}{archetype}{hint_block}
+        r#"Draft a reply to this email. Follow the writing-style rules in your system prompt strictly.{tone}{thread}{archetype}{resolved}{hint_block}
 
 <email>
 From: {from}
@@ -291,14 +320,15 @@ mod tests {
     #[test]
     fn empty_blocks_are_byte_identical_to_legacy_output() {
         // The whole cache-safety argument rests on this: empty tone/thread/
-        // archetype must produce exactly the pre-#32/#36 prompt.
-        let got = draft_user_message(&email(), "", "", "", "");
+        // archetype/resolved must produce exactly the pre-#32/#35/#36 prompt.
+        let got = draft_user_message(&email(), "", "", "", "", "");
         assert!(got.starts_with(
             "Draft a reply to this email. Follow the writing-style rules in your system prompt strictly.\n\n<email>"
         ));
         assert!(!got.contains("<tone_profile>"));
         assert!(!got.contains("<thread_history>"));
         assert!(!got.contains("<draft_archetype"));
+        assert!(!got.contains("<resolved_asks>"));
         assert!(got.contains("the inbound message"));
     }
 
@@ -306,15 +336,16 @@ mod tests {
     fn tone_prefix_is_stable_regardless_of_thread_or_archetype() {
         // Prompt-cache keys on prefix. The bytes from the start through the
         // end of <tone_profile> must be invariant whether or not thread /
-        // archetype blocks are present.
+        // archetype / resolved-asks blocks are present.
         let tone = "voice: terse";
-        let a = draft_user_message(&email(), "", tone, "", "");
+        let a = draft_user_message(&email(), "", tone, "", "", "");
         let b = draft_user_message(
             &email(),
             "",
             tone,
             "<thread_history>\n--- message ---\nx\n</thread_history>\n",
             "<draft_archetype id=\"decline\">\nintent\n</draft_archetype>",
+            "<resolved_asks>\n- [calendly] link: z\n</resolved_asks>",
         );
         let marker = "</tone_profile>";
         let a_pre = &a[..a.find(marker).unwrap() + marker.len()];
@@ -323,19 +354,43 @@ mod tests {
     }
 
     #[test]
-    fn thread_then_archetype_order_after_tone() {
+    fn thread_then_archetype_then_resolved_order_after_tone() {
         let out = draft_user_message(
             &email(),
             "",
             "voice",
             "<thread_history>\nT\n</thread_history>\n",
             "<draft_archetype id=\"fyi\">\nF\n</draft_archetype>",
+            "<resolved_asks>\n- [scheduling] R\n</resolved_asks>",
         );
         let i_tone = out.find("<tone_profile>").unwrap();
         let i_thread = out.find("<thread_history>").unwrap();
         let i_arch = out.find("<draft_archetype").unwrap();
+        let i_resolved = out.find("<resolved_asks>").unwrap();
         let i_email = out.find("<email>").unwrap();
-        assert!(i_tone < i_thread && i_thread < i_arch && i_arch < i_email);
+        assert!(i_tone < i_thread);
+        assert!(i_thread < i_arch);
+        assert!(i_arch < i_resolved);
+        assert!(i_resolved < i_email);
+    }
+
+    #[test]
+    fn resolved_asks_block_carries_anti_placeholder_instruction() {
+        let out = draft_user_message(
+            &email(),
+            "",
+            "",
+            "",
+            "",
+            "<resolved_asks>\n- [calendly] The user's booking link is: https://calendly.com/x\n</resolved_asks>",
+        );
+        assert!(out.contains("<resolved_asks>"));
+        assert!(out.contains("calendly.com/x"));
+        assert!(out.contains("NEVER write a placeholder"));
+        assert!(out.contains("SUGGESTION"));
+        // Archetype/tone/thread absent ⇒ those blocks must not appear.
+        assert!(!out.contains("<tone_profile>"));
+        assert!(!out.contains("<draft_archetype"));
     }
 
     #[test]

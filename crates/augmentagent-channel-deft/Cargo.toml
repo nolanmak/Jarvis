@@ -1,0 +1,29 @@
+[package]
+name = "augmentagent-channel-deft"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Spike scaffold (#116). Layout mirrors augmentagent-channel-github. The crate
+# is INERT until `AUGMENTAGENT_DEFT_ENABLED` is set AND a Deftform workspace
+# token is persisted — see docs/deft-protocol.md §6.
+
+[dependencies]
+augmentagent-store = { path = "../augmentagent-store" }
+augmentagent-auth = { path = "../augmentagent-auth" }
+augmentagent-channel-core = { path = "../augmentagent-channel-core" }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+mockito = "1"
