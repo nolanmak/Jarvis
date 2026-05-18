@@ -765,3 +765,610 @@ mod tests {
         );
     }
 }
+
+// =============================================================================
+// Mocked-sidecar integration tests (#76)
+// =============================================================================
+//
+// The reel / carousel / story DOM walks are the substantive #76 deliverable
+// yet had ZERO end-to-end coverage: the only tests were pure-function unit
+// tests (preview lines, env gates, quota clamps). Live validation against a
+// real Instagram session is operator-gated and intentionally NOT automated —
+// but the *walk logic itself* (op sequence, idempotent confirm-detached, the
+// 20-item carousel cap short-circuit, the hashtag-autocomplete defuse loop,
+// the failure-detector halt mid-compose, the Story CTA targeting a different
+// button) is fully testable without Instagram by driving a real
+// `BrowserClient` against a mock sidecar on a tempfile Unix socket. This is
+// the exact pattern the WhatsApp channel uses (`crates/.../whatsapp/api.rs`).
+//
+// The mock records every `op` it serves so a test can assert the composer
+// walked the DOM in the right order, and is scriptable: a per-op handler can
+// override the default `ok:true` reply (e.g. surface a sidecar error to drive
+// the StepUnresolved path, return `body` text containing "Action Blocked" to
+// trip the failure detector, or return a `count` to exercise the
+// confirm-detached / autocomplete-open / slide-count branches).
+#[cfg(test)]
+mod mock_sidecar_tests {
+    use super::*;
+    use augmentagent_browser_client::BrowserClient;
+    use augmentagent_channel_core::{
+        ActionRequest, Denial, HaltReason, HaltState, Outcome, Permit,
+        Platform, RateGovernor,
+    };
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    /// Per-op canned behaviour the mock applies on top of its default
+    /// `ok:true` reply. The closure receives the request `params` and returns
+    /// either an override `result` JSON, or `None` to keep the default.
+    type OpHandler = Box<dyn Fn(&serde_json::Value) -> OpReply + Send + Sync>;
+
+    enum OpReply {
+        /// Use the mock's sensible default for this op.
+        Default,
+        /// Reply `ok:true` with this `result`.
+        Result(serde_json::Value),
+        /// Reply `ok:false` with a typed sidecar error envelope.
+        Error { kind: String, message: String },
+    }
+
+    /// Shared, cloneable record of every op the composer asked the sidecar to
+    /// perform, in order — the assertion surface for "did the walk happen".
+    #[derive(Clone, Default)]
+    struct OpLog(Arc<Mutex<Vec<String>>>);
+    impl OpLog {
+        fn ops(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+        fn count(&self, op: &str) -> usize {
+            self.0.lock().unwrap().iter().filter(|o| *o == op).count()
+        }
+        fn contains(&self, op: &str) -> bool {
+            self.0.lock().unwrap().iter().any(|o| o == op)
+        }
+    }
+
+    /// Spin a one-connection mock sidecar on `path`. `handlers` maps an op
+    /// name to a scripted reply; unmapped ops get a type-appropriate default.
+    /// Records every op into `log`.
+    async fn mock_sidecar(
+        path: PathBuf,
+        log: OpLog,
+        handlers: HashMap<&'static str, OpHandler>,
+    ) {
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let req: serde_json::Value =
+                    serde_json::from_str(&line).unwrap();
+                let id = req["request_id"].as_str().unwrap().to_string();
+                let op = req["op"].as_str().unwrap_or("").to_string();
+                let params = req["params"].clone();
+                log.0.lock().unwrap().push(op.clone());
+
+                let reply = match handlers.get(op.as_str()) {
+                    Some(h) => h(&params),
+                    None => OpReply::Default,
+                };
+
+                let frame = match reply {
+                    OpReply::Error { kind, message } => serde_json::json!({
+                        "request_id": id,
+                        "ok": false,
+                        "error": { "kind": kind, "message": message },
+                    }),
+                    OpReply::Result(result) => serde_json::json!({
+                        "request_id": id, "ok": true, "result": result,
+                    }),
+                    OpReply::Default => {
+                        // Type-appropriate defaults so the happy path walks
+                        // cleanly: selectors resolve, the page looks clean,
+                        // the dialog is gone after Share (idempotent confirm).
+                        let result = match op.as_str() {
+                            "evaluate" => serde_json::json!({
+                                "value": "https://www.instagram.com/"
+                            }),
+                            "get_text" => {
+                                serde_json::json!({ "text": "instagram home" })
+                            }
+                            // `count` defaults to 0 — i.e. the autocomplete
+                            // dropdown is closed and the composer dialog has
+                            // detached (post landed). Tests that need a
+                            // non-zero count script `count` explicitly.
+                            "count" => serde_json::json!({ "count": 0 }),
+                            "bounding_box" => serde_json::json!({
+                                "box": { "x": 10.0, "y": 20.0,
+                                         "w": 200.0, "h": 8.0 }
+                            }),
+                            _ => serde_json::json!({}),
+                        };
+                        serde_json::json!({
+                            "request_id": id, "ok": true, "result": result,
+                        })
+                    }
+                };
+                write
+                    .write_all(frame.to_string().as_bytes())
+                    .await
+                    .unwrap();
+                write.write_all(b"\n").await.unwrap();
+            }
+        });
+    }
+
+    /// Test governor: grants everything, never halted — unless `halted` is
+    /// flipped, which makes `is_halted` report a far-future window so the
+    /// composer's `precheck` halt-gate can be exercised.
+    struct TestGov {
+        halted: AtomicBool,
+        recorded_halts: Mutex<Vec<(String, i64)>>,
+    }
+    impl TestGov {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                halted: AtomicBool::new(false),
+                recorded_halts: Mutex::new(Vec::new()),
+            })
+        }
+    }
+    #[async_trait]
+    impl RateGovernor for TestGov {
+        async fn permit(
+            &self,
+            req: ActionRequest,
+        ) -> Result<Permit, Denial> {
+            Ok(Permit {
+                id: uuid::Uuid::new_v4(),
+                req,
+                reserved_at_ms: 0,
+            })
+        }
+        async fn record(
+            &self,
+            _: Permit,
+            _: Outcome,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn record_halt(
+            &self,
+            _: Platform,
+            reason: HaltReason,
+            until: i64,
+        ) -> anyhow::Result<()> {
+            self.recorded_halts
+                .lock()
+                .unwrap()
+                .push((reason.as_str().to_string(), until));
+            Ok(())
+        }
+        async fn halt_status(&self, _: Platform) -> Option<HaltState> {
+            None
+        }
+        async fn is_halted(&self, _: Platform) -> Option<i64> {
+            if self.halted.load(Ordering::SeqCst) {
+                Some(i64::MAX)
+            } else {
+                None
+            }
+        }
+    }
+
+    fn touch(dir: &Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::File::create(&p).unwrap().write_all(b"x").unwrap();
+        p
+    }
+
+    /// Build a `(BrowserClient, Composer, OpLog, gov)` wired to a fresh mock
+    /// sidecar with the given scripted op handlers.
+    async fn harness(
+        handlers: HashMap<&'static str, OpHandler>,
+    ) -> (Composer, OpLog, Arc<TestGov>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("browser.sock");
+        let log = OpLog::default();
+        mock_sidecar(sock.clone(), log.clone(), handlers).await;
+        // Let the listener bind before connecting.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let client = BrowserClient::connect(&sock).await.unwrap();
+        let gov = TestGov::new();
+        let composer =
+            Composer::for_test(client, gov.clone() as Arc<dyn RateGovernor>, 2);
+        (composer, log, gov, dir)
+    }
+
+    fn no_handlers() -> HashMap<&'static str, OpHandler> {
+        HashMap::new()
+    }
+
+    // --- Carousel walk + 20-item cap edge case (#76 §4) ---
+
+    #[tokio::test]
+    async fn carousel_over_cap_is_rejected_before_any_browser_op() {
+        let (composer, log, _g, dir) = harness(no_handlers()).await;
+        // 21 items — over Meta's 20 ceiling. validate_carousel must reject
+        // this BEFORE a single sidecar op (no navigate, no nothing).
+        let imgs: Vec<PathBuf> = (0..21)
+            .map(|i| touch(dir.path(), &format!("c{i}.jpg")))
+            .collect();
+        let err = composer
+            .compose_carousel_post(&imgs, "cap test")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ComposerError::Upload(UploadError::CarouselCount { n: 21 })
+        ));
+        assert!(
+            log.ops().is_empty(),
+            "over-cap carousel must not drive the UI; ops were {:?}",
+            log.ops()
+        );
+    }
+
+    #[tokio::test]
+    async fn carousel_at_cap_boundary_walks_the_dom() {
+        let (composer, log, _g, dir) = harness(no_handlers()).await;
+        // Exactly 20 — the boundary must be accepted and walked.
+        let imgs: Vec<PathBuf> = (0..20)
+            .map(|i| touch(dir.path(), &format!("b{i}.jpg")))
+            .collect();
+        let stage = composer
+            .compose_carousel_post(&imgs, "twenty up")
+            .await
+            .expect("20-item carousel should compose");
+        match stage {
+            ComposeStage::AwaitingApproval { media, preview, .. } => {
+                assert_eq!(media, PostMedia::Carousel);
+                assert_eq!(preview, "Carousel · 20 items · caption 9 chars");
+            }
+        }
+        // The walk must have navigated, staged via set_input_files, and
+        // stopped (it never auto-Shares). The terminal Share is a separate
+        // approval-gated call, so compose alone must not "confirm" a post:
+        // it must run the failure detector twice (post-navigate +
+        // post-compose) via get_text, and never re-enter confirm_detached.
+        assert!(log.contains("navigate"));
+        assert!(log.contains("set_input_files"));
+        assert!(
+            log.count("get_text") >= 2,
+            "compose runs the failure detector before and after the walk"
+        );
+    }
+
+    // --- Hashtag/mention autocomplete defuse (#76 §7) ---
+
+    #[tokio::test]
+    async fn caption_without_tags_skips_the_escape_dance() {
+        let (composer, log, _g, dir) = harness(no_handlers()).await;
+        let img = touch(dir.path(), "p.jpg");
+        composer
+            .compose_image_post(&img, "a plain caption, no tags")
+            .await
+            .unwrap();
+        // No '#'/'@' ⇒ fill_caption returns immediately; never presses Escape.
+        assert_eq!(
+            log.count("press_key"),
+            0,
+            "plain caption must not trigger the autocomplete defuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn caption_with_hashtag_dismisses_then_proceeds() {
+        // count=0 default ⇒ the dropdown reads as already gone after the
+        // first Escape, so the defuse loop exits cleanly on attempt 0.
+        let (composer, log, _g, dir) = harness(no_handlers()).await;
+        let img = touch(dir.path(), "p.jpg");
+        let stage = composer
+            .compose_image_post(&img, "ship it #rust @someone")
+            .await
+            .expect("tagged caption should compose once dropdown dismisses");
+        assert!(matches!(
+            stage,
+            ComposeStage::AwaitingApproval { .. }
+        ));
+        // The '#'/'@' path must press Escape at least once.
+        assert!(
+            log.count("press_key") >= 1,
+            "tagged caption must press Escape to defuse the dropdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn caption_autocomplete_that_never_dismisses_aborts_compose() {
+        // Script `count` to always report the listbox still open ⇒ the
+        // composer must refuse rather than ship a truncated caption.
+        let mut h = no_handlers();
+        h.insert(
+            "count",
+            Box::new(|_p| OpReply::Result(serde_json::json!({ "count": 1 }))),
+        );
+        let (composer, log, _g, dir) = harness(h).await;
+        let img = touch(dir.path(), "p.jpg");
+        let err = composer
+            .compose_image_post(&img, "stuck #tag")
+            .await
+            .unwrap_err();
+        match err {
+            ComposerError::StepUnresolved { step } => {
+                assert_eq!(step, "caption_autocomplete_dismiss");
+            }
+            other => panic!("expected autocomplete-dismiss abort, got {other:?}"),
+        }
+        // It tried the full 3-attempt defuse before giving up.
+        assert!(
+            log.count("press_key") >= 3,
+            "defuse must exhaust its 3 attempts before aborting"
+        );
+    }
+
+    // --- Failure detector halts mid-compose (#76 §6) ---
+
+    #[tokio::test]
+    async fn action_blocked_interstitial_halts_and_records() {
+        // get_text returns the "Action Blocked" toast ⇒ classify_dom trips
+        // ActionBlocked ⇒ idempotent governor halt + typed error, no Share.
+        let mut h = no_handlers();
+        h.insert(
+            "get_text",
+            Box::new(|_p| {
+                OpReply::Result(serde_json::json!({
+                    "text": "Action Blocked. We restrict certain activity \
+                             to protect our community. Try again later"
+                }))
+            }),
+        );
+        let (composer, log, gov, dir) = harness(h).await;
+        let img = touch(dir.path(), "p.jpg");
+        let err = composer
+            .compose_image_post(&img, "anything")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ComposerError::FailureDetected(FailureKind::ActionBlocked)
+        ));
+        // The halt was persisted through the governor (idempotent breaker).
+        let halts = gov.recorded_halts.lock().unwrap();
+        assert_eq!(halts.len(), 1);
+        assert_eq!(halts[0].0, "action_blocked");
+        // It bailed at the very first detect (right after navigate); it never
+        // got as far as staging a file.
+        assert!(log.contains("navigate"));
+        assert!(!log.contains("set_input_files"));
+    }
+
+    #[tokio::test]
+    async fn precheck_refuses_when_governor_already_halted() {
+        let (composer, log, gov, dir) = harness(no_handlers()).await;
+        gov.halted.store(true, Ordering::SeqCst);
+        let img = touch(dir.path(), "p.jpg");
+        let err = composer
+            .compose_image_post(&img, "x")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ComposerError::FailureDetected(FailureKind::ActionBlocked)
+        ));
+        // Halt gate is checked BEFORE any browser work — zero ops.
+        assert!(
+            log.ops().is_empty(),
+            "a halted channel must not touch the browser; ops {:?}",
+            log.ops()
+        );
+    }
+
+    // --- Reel walk incl. cover-frame scrubber drag (#76 §3) ---
+
+    #[tokio::test]
+    async fn reel_walk_drives_cover_scrubber_then_stops_for_approval() {
+        let (composer, log, _g, dir) = harness(no_handlers()).await;
+        let vid = touch(dir.path(), "reel.mp4");
+        let stage = composer
+            .compose_reel_post(&vid, "my reel #fyp")
+            .await
+            .expect("reel should compose to AwaitingApproval");
+        match stage {
+            ComposeStage::AwaitingApproval { media, preview, .. } => {
+                assert_eq!(media, PostMedia::Reel);
+                assert!(preview.contains("cover-frame picked"));
+            }
+        }
+        // bounding_box resolved (w=200 > 4) ⇒ the scrubber is driven with a
+        // synthetic drag, NOT slider.fill (#76 §3).
+        assert!(
+            log.contains("drag"),
+            "reel cover-frame pick must synthesize a drag; ops {:?}",
+            log.ops()
+        );
+        assert!(log.contains("set_input_files"));
+    }
+
+    #[tokio::test]
+    async fn reel_cover_scrubber_falls_back_to_arrow_keys_without_a_box() {
+        // No usable bounding box ⇒ keyboard ArrowRight nudge fallback.
+        let mut h = no_handlers();
+        h.insert(
+            "bounding_box",
+            Box::new(|_p| OpReply::Result(serde_json::json!({ "box": null }))),
+        );
+        let (composer, log, _g, dir) = harness(h).await;
+        let vid = touch(dir.path(), "reel.mov");
+        composer
+            .compose_reel_post(&vid, "no caption tags")
+            .await
+            .expect("reel should still compose via the arrow-key fallback");
+        assert!(
+            !log.contains("drag"),
+            "no box ⇒ must NOT drag"
+        );
+        assert!(
+            log.contains("press_key"),
+            "no box ⇒ must fall back to ArrowRight nudges"
+        );
+    }
+
+    #[tokio::test]
+    async fn reel_rejects_a_non_video_before_touching_the_browser() {
+        let (composer, log, _g, dir) = harness(no_handlers()).await;
+        let img = touch(dir.path(), "still.jpg");
+        let err =
+            composer.compose_reel_post(&img, "x").await.unwrap_err();
+        assert!(matches!(
+            err,
+            ComposerError::Upload(UploadError::UnsupportedVideo(_))
+        ));
+        assert!(log.ops().is_empty());
+    }
+
+    // --- Story walk: separate route + "Add to story" CTA (#76 §3) ---
+
+    #[tokio::test]
+    async fn story_image_composes_with_empty_caption_preview() {
+        let (composer, log, _g, dir) = harness(no_handlers()).await;
+        let img = touch(dir.path(), "story.png");
+        let stage = composer
+            .compose_story_post(&img)
+            .await
+            .expect("story image should compose");
+        match stage {
+            ComposeStage::AwaitingApproval {
+                media,
+                caption,
+                preview,
+            } => {
+                assert_eq!(media, PostMedia::Story);
+                // Story v1 ships no caption — the card must not claim one.
+                assert!(caption.is_empty());
+                assert_eq!(preview, "Story · 1 item · caption 0 chars");
+            }
+        }
+        // Story is a no-crop/no-caption route: it navigates, stages, and
+        // stops — it must NOT walk the Next gauntlet or a caption field.
+        assert!(log.contains("set_input_files"));
+    }
+
+    #[tokio::test]
+    async fn share_story_targets_the_story_cta_and_confirms_detached() {
+        // Default count=0 ⇒ confirm_detached observes the dialog gone and
+        // returns without re-clicking (idempotent, #76 §2.7).
+        let (composer, log, _g, dir) = harness(no_handlers()).await;
+        let img = touch(dir.path(), "story.jpg");
+        composer.compose_story_post(&img).await.unwrap();
+        // Approve and fire the terminal Story action.
+        composer.share_story(true).await.expect("approved story share");
+        // It clicked (the Story CTA) and then counted the dialog (detach
+        // check) — never a second click.
+        assert!(log.contains("click"));
+        assert!(log.contains("count"));
+    }
+
+    #[tokio::test]
+    async fn share_story_refuses_without_approval() {
+        let (composer, log, _g, dir) = harness(no_handlers()).await;
+        let img = touch(dir.path(), "story.jpg");
+        composer.compose_story_post(&img).await.unwrap();
+        let before = log.count("click");
+        let err = composer.share_story(false).await.unwrap_err();
+        assert!(matches!(err, ComposerError::NotApproved));
+        // Hard refusal: not a single extra click happened.
+        assert_eq!(log.count("click"), before);
+    }
+
+    #[tokio::test]
+    async fn share_refuses_without_approval_no_click() {
+        let (composer, log, _g, dir) = harness(no_handlers()).await;
+        let img = touch(dir.path(), "p.jpg");
+        composer.compose_image_post(&img, "ok").await.unwrap();
+        let before = log.count("click");
+        assert!(matches!(
+            composer.share(false).await.unwrap_err(),
+            ComposerError::NotApproved
+        ));
+        assert_eq!(
+            log.count("click"),
+            before,
+            "an unapproved share must never click"
+        );
+    }
+
+    #[tokio::test]
+    async fn share_rechecks_failure_detector_before_the_irreversible_click() {
+        // Compose cleanly, THEN the page turns into a challenge while the
+        // approval card sits pending: share() must re-detect and halt rather
+        // than click Share into a flagged account (#76 §6).
+        let challenge = Arc::new(AtomicBool::new(false));
+        let c2 = challenge.clone();
+        let mut h = no_handlers();
+        h.insert(
+            "evaluate",
+            Box::new(move |_p| {
+                if c2.load(Ordering::SeqCst) {
+                    OpReply::Result(serde_json::json!({
+                        "value": "https://www.instagram.com/challenge/?next=/"
+                    }))
+                } else {
+                    OpReply::Result(serde_json::json!({
+                        "value": "https://www.instagram.com/"
+                    }))
+                }
+            }),
+        );
+        let (composer, _log, gov, dir) = harness(h).await;
+        let img = touch(dir.path(), "p.jpg");
+        composer.compose_image_post(&img, "clean").await.unwrap();
+        // Now the challenge appears.
+        challenge.store(true, Ordering::SeqCst);
+        let err = composer.share(true).await.unwrap_err();
+        assert!(matches!(
+            err,
+            ComposerError::FailureDetected(FailureKind::Challenge)
+        ));
+        assert_eq!(gov.recorded_halts.lock().unwrap()[0].0, "login_challenge");
+    }
+
+    #[tokio::test]
+    async fn create_entry_unresolvable_yields_step_unresolved() {
+        // Every `wait_for` errors at the sidecar ⇒ no selector layer ever
+        // resolves ⇒ the composer must bail with a named StepUnresolved
+        // rather than charge ahead clicking nothing (#76 §5.6: bail on miss,
+        // never silent-retry into a misunderstood UI).
+        let mut h = no_handlers();
+        h.insert(
+            "wait_for",
+            Box::new(|_p| OpReply::Error {
+                kind: "Timeout".into(),
+                message: "selector never became visible".into(),
+            }),
+        );
+        let (composer, log, _g, dir) = harness(h).await;
+        let img = touch(dir.path(), "p.jpg");
+        let err = composer
+            .compose_image_post(&img, "x")
+            .await
+            .unwrap_err();
+        match err {
+            ComposerError::StepUnresolved { step } => {
+                // First unresolvable step in the image walk is the Create
+                // entry point (after the clean navigate + failure check).
+                assert_eq!(step, "create_entry");
+            }
+            other => panic!("expected StepUnresolved, got {other:?}"),
+        }
+        // It navigated and ran the first detector, then bailed — it never
+        // staged a file against an unresolved UI.
+        assert!(log.contains("navigate"));
+        assert!(!log.contains("set_input_files"));
+    }
+}

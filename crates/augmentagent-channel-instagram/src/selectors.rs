@@ -254,6 +254,196 @@ pub const ALL_TARGETS: &[Target] = &[
     SHARE_BUTTON,
 ];
 
+// =============================================================================
+// Registry self-validation (`instagram validate-selectors`, #76)
+// =============================================================================
+//
+// The substantive remaining #76 work — confirming each selector still
+// resolves against Instagram's live DOM — is operator-gated (needs a real
+// logged-in session) and is NOT attempted here. What *is* fully autonomous
+// and worth catching in CI is **registry-shape rot**: a future selector edit
+// that drops a target's last text fallback, breaks resilience ordering, leaves
+// a non-file selector on a file-input target, duplicates a name, or de-syncs
+// `ALL_TARGETS` from the targets the composer actually walks. Those are the
+// failure classes that silently make the live UI walk brittle long before an
+// operator notices. This module turns the existing scattered `#[cfg(test)]`
+// assertions into one reusable pure check the validate binary can run with no
+// network, no browser, no cookies — a dry-run shape audit.
+
+/// One registry-shape problem found by [`validate_selector_registry`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryDefect {
+    /// The offending target's `name` (or `"<registry>"` for global defects).
+    pub target: &'static str,
+    /// Human-readable description of what is wrong.
+    pub detail: String,
+}
+
+/// The numeric resilience rank of a tier (lower = stickier / tried first).
+fn tier_rank(t: SelectorTier) -> u8 {
+    match t {
+        SelectorTier::Aria => 0,
+        SelectorTier::Css => 1,
+        SelectorTier::Text => 2,
+        SelectorTier::Structural => 3,
+    }
+}
+
+/// Targets whose loss of a *text-tier* fallback is load-bearing: each is an
+/// approval-gated terminal action or a flow-blocking step where an aria
+/// rename with no text backstop would silently strand the composer. Kept
+/// explicit (rather than "every target") because aria-only is correct for
+/// some probes (e.g. the autocomplete-dropdown *detection* target).
+const TEXT_FALLBACK_REQUIRED: &[&str] = &[
+    "share_button",
+    "story_share_button",
+    "next_button",
+    "create_reel_choice",
+    "create_story_choice",
+];
+
+/// Pure, dependency-free audit of the layered selector registry. Returns the
+/// list of shape defects (empty == healthy). This is the engine behind the
+/// `instagram validate-selectors` dry-run: it proves the registry is
+/// *structurally* sound (the part we can verify without Instagram) and is
+/// explicit that live-DOM resolution is a separate operator-gated step.
+///
+/// Checks, per the #76 §5 resilience strategy:
+/// 1. every target has ≥1 layer;
+/// 2. layers are in non-decreasing resilience order (aria→css→text→struct);
+/// 3. file-input targets only ever select `<input type=file>` shaped queries;
+/// 4. load-bearing terminal/flow targets keep a text-tier fallback;
+/// 5. no duplicate target names;
+/// 6. no empty/whitespace selector query strings;
+/// 7. the reel/carousel/story surface targets are all registered (a guard
+///    against a future refactor silently dropping a surface from the walk).
+pub fn validate_selector_registry() -> Vec<RegistryDefect> {
+    let mut defects = Vec::new();
+
+    // 5. duplicate names.
+    let mut seen = std::collections::BTreeSet::new();
+    for t in ALL_TARGETS {
+        if !seen.insert(t.name) {
+            defects.push(RegistryDefect {
+                target: t.name,
+                detail: "duplicate target name in ALL_TARGETS".into(),
+            });
+        }
+    }
+
+    for t in ALL_TARGETS {
+        // 1. non-empty.
+        if t.layers.is_empty() {
+            defects.push(RegistryDefect {
+                target: t.name,
+                detail: "target has zero selector layers".into(),
+            });
+            continue;
+        }
+
+        // 2. resilience ordering.
+        for w in t.layers.windows(2) {
+            if tier_rank(w[0].tier) > tier_rank(w[1].tier) {
+                defects.push(RegistryDefect {
+                    target: t.name,
+                    detail: format!(
+                        "layers out of resilience order: {:?} precedes {:?}",
+                        w[0].tier, w[1].tier
+                    ),
+                });
+                break;
+            }
+        }
+
+        // 6. no blank queries.
+        for (i, l) in t.layers.iter().enumerate() {
+            if l.query.trim().is_empty() {
+                defects.push(RegistryDefect {
+                    target: t.name,
+                    detail: format!("layer {i} has an empty selector query"),
+                });
+            }
+        }
+
+        // 3. file-input targets must only ever target a file input.
+        if t.name == FILE_INPUT.name || t.name == VIDEO_FILE_INPUT.name {
+            for l in t.layers {
+                if !l.query.contains("file") {
+                    defects.push(RegistryDefect {
+                        target: t.name,
+                        detail: format!(
+                            "file-input target has a non-file selector: {:?}",
+                            l.query
+                        ),
+                    });
+                }
+            }
+        }
+
+        // 4. load-bearing targets need a text-tier backstop.
+        if TEXT_FALLBACK_REQUIRED.contains(&t.name)
+            && !t.layers.iter().any(|l| l.tier == SelectorTier::Text)
+        {
+            defects.push(RegistryDefect {
+                target: t.name,
+                detail: "load-bearing target lost its text-tier fallback \
+                         (an aria rename would strand the composer)"
+                    .into(),
+            });
+        }
+    }
+
+    // 7. every reel/carousel/story surface target still wired into the walk.
+    for required in [
+        "create_reel_choice",
+        "create_story_choice",
+        "video_file_input",
+        "carousel_add_more",
+        "carousel_slide",
+        "reel_cover_trigger",
+        "reel_cover_slider",
+        "story_share_button",
+        "caption_autocomplete",
+        "composer_dialog",
+    ] {
+        if !ALL_TARGETS.iter().any(|t| t.name == required) {
+            defects.push(RegistryDefect {
+                target: "<registry>",
+                detail: format!(
+                    "reel/carousel/story surface target `{required}` missing \
+                     from ALL_TARGETS"
+                ),
+            });
+        }
+    }
+
+    defects
+}
+
+/// A one-line, machine-greppable summary of the registry audit for the
+/// `validate-selectors` CLI / runbook checkbox. `Ok` carries the healthy
+/// target count; `Err` carries the defect list rendered for stderr.
+pub fn selector_registry_report() -> Result<String, String> {
+    let defects = validate_selector_registry();
+    if defects.is_empty() {
+        Ok(format!(
+            "selector registry OK — {} targets, all layers in resilience \
+             order, file-input + text-fallback invariants hold (NOTE: \
+             live-DOM resolution is operator-gated and NOT checked here)",
+            ALL_TARGETS.len()
+        ))
+    } else {
+        let mut s = format!(
+            "selector registry FAILED — {} shape defect(s):\n",
+            defects.len()
+        );
+        for d in &defects {
+            s.push_str(&format!("  - [{}] {}\n", d.target, d.detail));
+        }
+        Err(s)
+    }
+}
+
 /// Best-effort extraction of the Instagram asset-bundle build hash from a
 /// page's HTML / script-src list (#76 §5.5: "stamp every selector hit with
 /// the build hash so we can answer 'did our selectors break on the X.Y
@@ -420,5 +610,113 @@ mod tests {
         let srcs = "https://static.cdninstagram.com/rsrc.php/v3/aa/HASHONE.js \
                     https://static.cdninstagram.com/rsrc.php/v3/bb/HASHTWO.js";
         assert_eq!(extract_build_hash(srcs).as_deref(), Some("HASHONE"));
+    }
+
+    // --- registry self-validation (validate-selectors dry-run, #76) ---
+
+    #[test]
+    fn live_registry_is_shape_clean() {
+        // The shipped registry must pass its own audit — this is the
+        // assertion the `instagram validate-selectors` dry-run leans on.
+        let defects = validate_selector_registry();
+        assert!(
+            defects.is_empty(),
+            "registry shape defects: {defects:#?}"
+        );
+        assert!(selector_registry_report().is_ok());
+    }
+
+    #[test]
+    fn report_string_is_operator_legible_and_flags_live_gate() {
+        let msg = selector_registry_report().unwrap();
+        assert!(msg.contains("selector registry OK"));
+        // The operator must not mistake a shape pass for a live-DOM pass.
+        assert!(msg.contains("operator-gated"));
+        assert!(msg.contains(&ALL_TARGETS.len().to_string()));
+    }
+
+    // The defect detectors are exercised against hand-built bad registries so
+    // a future real regression in the live registry would be caught the same
+    // way (the predicate, not the data, is under test here).
+
+    fn audit_one(t: &'static Target) -> Vec<RegistryDefect> {
+        // Mirror the per-target portion of validate_selector_registry for a
+        // single synthetic target so each invariant has a focused test.
+        let mut d = Vec::new();
+        if t.layers.is_empty() {
+            d.push(RegistryDefect {
+                target: t.name,
+                detail: "target has zero selector layers".into(),
+            });
+            return d;
+        }
+        for w in t.layers.windows(2) {
+            if tier_rank(w[0].tier) > tier_rank(w[1].tier) {
+                d.push(RegistryDefect {
+                    target: t.name,
+                    detail: "layers out of resilience order".into(),
+                });
+                break;
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn detects_out_of_order_layers() {
+        static BAD: Target = Target {
+            name: "bad_order",
+            layers: &[
+                Selector {
+                    tier: SelectorTier::Text,
+                    query: "button:has-text('x')",
+                },
+                Selector {
+                    tier: SelectorTier::Aria,
+                    query: "[aria-label='x']",
+                },
+            ],
+        };
+        let d = audit_one(&BAD);
+        assert!(d.iter().any(|x| x.detail.contains("resilience order")));
+    }
+
+    #[test]
+    fn detects_empty_layers() {
+        static EMPTY: Target = Target {
+            name: "empty",
+            layers: &[],
+        };
+        assert!(audit_one(&EMPTY)
+            .iter()
+            .any(|x| x.detail.contains("zero selector layers")));
+    }
+
+    #[test]
+    fn every_text_fallback_required_target_actually_has_one() {
+        // Guards the TEXT_FALLBACK_REQUIRED list itself: if a name in it is
+        // typo'd or a target genuinely loses its text layer, the live audit
+        // (run above) fails — assert the cross-reference holds today so the
+        // list can't silently rot to a no-op.
+        for name in TEXT_FALLBACK_REQUIRED {
+            let t = ALL_TARGETS
+                .iter()
+                .find(|t| &t.name == name)
+                .unwrap_or_else(|| panic!("{name} not in ALL_TARGETS"));
+            assert!(
+                t.layers.iter().any(|l| l.tier == SelectorTier::Text),
+                "{name} is required to keep a text fallback but has none"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_audit_covers_every_walked_target() {
+        // ALL_TARGETS must stay in sync with what the composer walks; the
+        // surface-presence check inside validate_selector_registry encodes
+        // that, so an empty defect list here means the wiring is intact.
+        assert!(validate_selector_registry().is_empty());
+        // Sanity: the count is the same set the report advertises.
+        assert_eq!(ALL_TARGETS.len(), 16);
     }
 }
