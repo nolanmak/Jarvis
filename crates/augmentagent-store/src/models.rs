@@ -500,3 +500,54 @@ pub struct AgentPrRun {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
+
+/// #58.2 — one of the user's own posts being watched for new comments. The
+/// own-post comment poller diffs incoming comments against `seen_comments`
+/// so a fresh comment becomes exactly one `own_post_comment` WorkItem.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnPost {
+    pub id: String,
+    pub platform: String,
+    /// Post URN / tweet id / IG media id — the stable id the poller polls.
+    pub external_id: String,
+    pub posted_at_ms: i64,
+    /// Stop polling this post once `now > poll_until_ms` (the #58 spec's
+    /// per-post poll horizon — e.g. posted_at + 7d).
+    pub poll_until_ms: i64,
+    pub last_polled_ms: Option<i64>,
+    pub created_at_ms: i64,
+}
+
+/// #58.3 — a friend on the engagement watchlist. `engagement` is
+/// `high` (every post) | `medium` (weekly digest) | `low` (only milestone
+/// keywords). `wiki_slug` grounds the draft prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FriendWatch {
+    pub id: String,
+    pub platform: String,
+    /// Platform-native handle (LinkedIn member urn / X @handle / IG user).
+    pub handle: String,
+    pub wiki_slug: Option<String>,
+    pub engagement: String,
+    pub added_at_ms: i64,
+    /// While `now < paused_until_ms` the watch is skipped by the poller.
+    pub paused_until_ms: Option<i64>,
+}
+
+/// #58.4 — an inbound connection request queued for accept/ignore triage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionRequestRow {
+    pub id: String,
+    pub platform: String,
+    /// Invitation urn — the stable id used to accept/ignore it.
+    pub external_id: String,
+    pub requester_name: Option<String>,
+    pub requester_url: Option<String>,
+    /// Note the requester attached, if any.
+    pub message: Option<String>,
+    /// `pending` | `accept` | `decline` | `accept_and_dm`.
+    pub decision: String,
+    pub decided_at_ms: Option<i64>,
+    pub triage_id: Option<String>,
+    pub created_at_ms: i64,
+}

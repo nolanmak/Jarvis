@@ -35,6 +35,6 @@ pub use governor::{
 };
 pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerOpts};
 pub use trigger::{
-    kind as work_item_kind, ChannelRunner, DigestSource, FriendFeedSource, InboundMessageTrigger,
-    InboundSource, Trigger, WorkItem, WorkItemHandler,
+    kind as work_item_kind, ChannelRunner, DigestSource, FriendFeedSource, FriendFeedTrigger,
+    InboundMessageTrigger, InboundSource, Trigger, WorkItem, WorkItemHandler,
 };
