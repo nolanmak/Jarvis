@@ -4,13 +4,14 @@
 //! [`WorkItem`] shape so Gmail can be driven by
 //! [`augmentagent_channel_core::ChannelRunner`] instead of a bespoke poll loop.
 //!
-//! This intentionally mirrors `augmentagent_channel_telegram_bot`'s
-//! `TelegramBotInbound`: the production path stays on
-//! [`GmailChannel::poll_once`](crate::GmailChannel) (which owns the rich
-//! triage → draft → approve → ingest dispatch and is covered by the existing
-//! channel tests); this adapter is the "raw inbox" view downstream code can
-//! consume as `WorkItem`s without the reasoner. Behavior of the existing
-//! channel is therefore unchanged — this is purely additive.
+//! `#25 — complete`: this raw-inbox view is now the *production* source.
+//! [`GmailChannel::run_arc`](crate::GmailChannel) wraps it in an
+//! `InboundMessageTrigger` and drives it via `ChannelRunner` +
+//! `GmailWorkHandler`, which feeds each rehydrated email through the channel's
+//! shared `process_email` (the same triage → draft → approve → ingest
+//! dispatch the removed bespoke poll loop ran). `poll_once` is retained for
+//! the CLI `poll-once` subcommand and the existing channel tests, sharing
+//! that same `process_email` path so the two stay behavior-equivalent.
 //!
 //! Dedup contract: Gmail's `fetch_unread` only returns messages still carrying
 //! the `UNREAD` label, and the channel marks handled mail processed, so

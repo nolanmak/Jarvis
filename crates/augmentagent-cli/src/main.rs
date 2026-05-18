@@ -1368,13 +1368,21 @@ async fn main() -> Result<()> {
             } else {
                 info!("proactive runner disabled: --wiki-dir not set");
             }
+            // #25: Gmail + LinkedIn now run through the generic
+            // `ChannelRunner` (`run_arc`) instead of bespoke poll loops.
+            // Behavior is unchanged — `run_arc` drives the same per-message
+            // `process_email` pipeline via a `WorkItemHandler`; Gmail keeps
+            // its independent retry ticker, LinkedIn keeps its 4h±10min
+            // jittered cadence.
             if let Some(gmail_ch) = gmail_ch {
                 let sd = shutdown.clone();
-                tasks.push(tokio::spawn(async move { gmail_ch.run(sd).await }));
+                let gmail_arc = Arc::new(gmail_ch);
+                tasks.push(tokio::spawn(async move { gmail_arc.run_arc(sd).await }));
             }
             if let Some(li) = linkedin_ch {
                 let sd = shutdown.clone();
-                tasks.push(tokio::spawn(async move { li.run(sd).await }));
+                let li_arc = Arc::new(li);
+                tasks.push(tokio::spawn(async move { li_arc.run_arc(sd).await }));
             }
             if let Some(lf) = linkedin_feed {
                 let sd = shutdown.clone();
