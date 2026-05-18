@@ -563,6 +563,9 @@ enum ProactiveOp {
     ScanOnce {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+        /// Bypass the config `proactive_enabled` opt-in gate (manual test).
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        force: bool,
     },
     /// List recent ProactiveSignals from sqlite.
     Signals {
@@ -1120,12 +1123,16 @@ async fn main() -> Result<()> {
             // Only when a wiki is configured (no wiki ⇒ nothing to scan).
             // Dispatch is gated on !dry_run like the other outbound surfaces.
             if let Some(wiki_root) = cli.wiki_dir.clone() {
+                let suppression = std::sync::Arc::new(
+                    augmentagent_proactive::TableSuppression::new(Arc::clone(&store)),
+                );
                 let runner = augmentagent_proactive::runner::ProactiveRunner::new(
                     Arc::clone(&store),
                     Arc::clone(&broker),
                     wiki_root,
                     augmentagent_proactive::rules::default_scans(),
-                );
+                )
+                .with_suppression(suppression);
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { runner.run(sd).await }));
             } else {
@@ -1566,8 +1573,14 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Proactive { ref op } => match op {
-            ProactiveOp::ScanOnce { dry_run } => {
-                run_proactive_scan_once(&cli, Arc::clone(&store), *dry_run).await
+            ProactiveOp::ScanOnce { dry_run, force } => {
+                run_proactive_scan_once(
+                    &cli,
+                    Arc::clone(&store),
+                    *dry_run,
+                    *force,
+                )
+                .await
             }
             ProactiveOp::Signals { limit, json } => {
                 run_proactive_signals(Arc::clone(&store), *limit, *json)
@@ -5774,16 +5787,21 @@ async fn run_proactive_scan_once(
     cli: &Cli,
     store: Arc<Store>,
     dry_run: bool,
+    force: bool,
 ) -> Result<()> {
     use augmentagent_proactive::rules::default_scans;
     use augmentagent_proactive::runner::ProactiveRunner;
+    use augmentagent_proactive::TableSuppression;
 
     let wiki_root = cli
         .wiki_dir
         .clone()
         .context("proactive scan needs --wiki-dir")?;
     let (broker, _) = build_broker(cli, Arc::clone(&store), dry_run).await?;
-    let runner = ProactiveRunner::new(store, broker, wiki_root, default_scans());
+    let suppression = std::sync::Arc::new(TableSuppression::new(Arc::clone(&store)));
+    let runner = ProactiveRunner::new(store, broker, wiki_root, default_scans())
+        .with_suppression(suppression)
+        .with_opt_in_required(!force);
     // dry_run=true ⇒ persist+dedup but never post a card.
     let report = runner.run_once(!dry_run).await;
     println!(
