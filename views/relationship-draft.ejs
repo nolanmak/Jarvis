@@ -1,0 +1,30 @@
+<%- include('partials/header', { page: 'relationships' }) %>
+
+<div class="space-y-6 max-w-2xl">
+  <a href="/relationships" class="text-xs text-gray-500 hover:text-gray-300">&larr; Back</a>
+  <h1 class="text-xl font-semibold">Draft prompt</h1>
+
+  <% if (!signal) { %>
+    <div class="text-gray-500 text-sm">Signal not found (it may have been dismissed).</div>
+  <% } else {
+       var act = null;
+       try { act = signal.suggested_action_json ? JSON.parse(signal.suggested_action_json) : null; } catch (e) { act = null; }
+  %>
+    <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+      <h2 class="text-sm font-semibold mb-1"><%= signal.headline %></h2>
+      <p class="text-xs text-gray-500"><%= signal.detail %></p>
+    </div>
+    <% if (act && act.draft_prompt) { %>
+    <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+      <h2 class="text-sm font-semibold uppercase text-gray-400 mb-2">Suggested prompt</h2>
+      <p class="text-xs text-gray-500 mb-2">
+        Phase 1: paste this into the wiki-ask box (or a draft request).
+        Auto-routing into the drafter queue is deferred — see #57.
+      </p>
+      <textarea readonly class="w-full h-40 bg-gray-950 border border-gray-700 rounded p-3 text-sm text-gray-200"><%= act.draft_prompt %></textarea>
+    </div>
+    <% } else { %>
+    <div class="text-gray-500 text-sm">This signal has no suggested draft prompt.</div>
+    <% } %>
+  <% } %>
+</div>

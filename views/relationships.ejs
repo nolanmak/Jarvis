@@ -1,0 +1,83 @@
+<%- include('partials/header', { page: 'relationships' }) %>
+
+<div class="space-y-6">
+  <div class="flex items-center justify-between">
+    <h1 class="text-xl font-semibold">Relationships</h1>
+    <span class="text-xs text-gray-500"><%= signals.length %> active signal<%= signals.length === 1 ? '' : 's' %></span>
+  </div>
+
+  <p class="text-xs text-gray-500">
+    Proactive nudges from the CRM engine — stale contacts, overdue commitments,
+    upcoming events. Triage inline; muted people/rules are suppressed before any
+    Discord card is posted.
+  </p>
+
+  <% if (mutedRules.length > 0 || mutedPeople.length > 0) { %>
+  <section class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+    <h2 class="text-sm font-semibold uppercase text-gray-400 mb-2">Muted</h2>
+    <div class="flex flex-wrap gap-2 text-xs">
+      <% mutedRules.forEach(function(r) { %>
+        <form method="POST" action="/relationships/rule/<%= encodeURIComponent(r) %>/unmute" class="inline">
+          <button class="px-2 py-1 rounded bg-surface-soft/40 hover:bg-surface-soft text-gray-300">
+            rule:<%= r %> ✕
+          </button>
+        </form>
+      <% }); %>
+      <% mutedPeople.forEach(function(pp) { %>
+        <form method="POST" action="/relationships/person/<%= encodeURIComponent(pp) %>/unmute" class="inline">
+          <button class="px-2 py-1 rounded bg-surface-soft/40 hover:bg-surface-soft text-gray-300">
+            person:<%= pp %> ✕
+          </button>
+        </form>
+      <% }); %>
+    </div>
+  </section>
+  <% } %>
+
+  <section class="space-y-3">
+    <% if (signals.length === 0) { %>
+      <div class="bg-gray-900 border border-gray-800 rounded-lg p-6 text-center text-gray-500 text-sm">
+        Nothing needs attention. The engine scans every 30 minutes.
+      </div>
+    <% } %>
+    <% signals.forEach(function(s) {
+         var badge = s.urgency === 'high' ? 'bg-accent text-white'
+                   : s.urgency === 'normal' ? 'bg-surface-soft text-white'
+                   : 'bg-gray-800 text-gray-400';
+    %>
+    <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+      <div class="flex items-start justify-between gap-4">
+        <div class="min-w-0">
+          <div class="flex items-center gap-2 mb-1">
+            <span class="text-[10px] uppercase px-2 py-0.5 rounded <%= badge %>"><%= s.urgency %></span>
+            <span class="text-[10px] uppercase px-2 py-0.5 rounded bg-gray-800 text-gray-400"><%= s.kind %></span>
+            <% if (s.status !== 'pending') { %>
+              <span class="text-[10px] text-gray-600"><%= s.status %></span>
+            <% } %>
+          </div>
+          <h3 class="text-sm font-semibold truncate">
+            <% if (s.person_slug) { %>
+              <a class="hover:underline" href="/relationships/<%= encodeURIComponent(s.person_slug) %>"><%= s.headline %></a>
+            <% } else { %>
+              <%= s.headline %>
+            <% } %>
+          </h3>
+          <p class="text-xs text-gray-500 mt-1"><%= s.detail %></p>
+        </div>
+        <div class="flex flex-col gap-1.5 shrink-0">
+          <form method="POST" action="/relationships/<%= s.id %>/draft">
+            <button class="w-full px-3 py-1 rounded-md text-xs font-medium bg-accent text-white hover:bg-accent/90">Draft</button>
+          </form>
+          <form method="POST" action="/relationships/<%= s.id %>/snooze">
+            <input type="hidden" name="days" value="7" />
+            <button class="w-full px-3 py-1 rounded-md text-xs font-medium bg-gray-800 text-gray-300 hover:bg-gray-700">Snooze 7d</button>
+          </form>
+          <form method="POST" action="/relationships/<%= s.id %>/dismiss">
+            <button class="w-full px-3 py-1 rounded-md text-xs font-medium bg-gray-800 text-gray-400 hover:bg-gray-700">Stop tracking</button>
+          </form>
+        </div>
+      </div>
+    </div>
+    <% }); %>
+  </section>
+</div>

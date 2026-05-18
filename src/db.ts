@@ -813,3 +813,151 @@ export function deleteSubscription(id: string): void {
     .prepare("UPDATE channel_subscriptions SET active = 0, updated_at_ms = ? WHERE id = ?")
     .run(Date.now(), id);
 }
+
+// --- Proactive nudges (#57) ---
+//
+// The Rust daemon owns the `proactive_signals` + `proactive_user_actions`
+// tables (created in its migration). The dashboard only reads signals and
+// writes user actions; every accessor below first ensures the table exists
+// (additive, idempotent) so the dashboard unit can boot before the daemon
+// has ever migrated.
+
+function ensureProactiveTables(): void {
+  getDb().exec(`
+    CREATE TABLE IF NOT EXISTS proactive_signals (
+      id TEXT PRIMARY KEY, kind TEXT NOT NULL, person_slug TEXT,
+      urgency TEXT NOT NULL, headline TEXT NOT NULL, detail TEXT NOT NULL,
+      suggested_action_json TEXT, status TEXT NOT NULL, snooze_until_ms INTEGER,
+      dedup_key TEXT NOT NULL, created_at_ms INTEGER NOT NULL,
+      dispatched_at_ms INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS proactive_user_actions (
+      id TEXT PRIMARY KEY, action TEXT NOT NULL, scope TEXT NOT NULL,
+      created_at_ms INTEGER NOT NULL, expires_at_ms INTEGER
+    );
+  `);
+}
+
+export interface ProactiveSignalRow {
+  id: string;
+  kind: string;
+  person_slug: string | null;
+  urgency: string;
+  headline: string;
+  detail: string;
+  suggested_action_json: string | null;
+  status: string;
+  snooze_until_ms: number | null;
+  dedup_key: string;
+  created_at_ms: number;
+  dispatched_at_ms: number | null;
+}
+
+/** Active signals (not dismissed, not still-snoozed), newest first. */
+export function listProactiveSignals(limit = 100): ProactiveSignalRow[] {
+  ensureProactiveTables();
+  const now = Date.now();
+  return getDb()
+    .prepare(
+      `SELECT * FROM proactive_signals
+        WHERE status != 'dismissed'
+          AND (snooze_until_ms IS NULL OR snooze_until_ms <= ?)
+        ORDER BY
+          CASE urgency WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
+          created_at_ms DESC
+        LIMIT ?`
+    )
+    .all(now, limit) as ProactiveSignalRow[];
+}
+
+/** Signals for one person slug (includes dismissed for the person page). */
+export function listProactiveSignalsForPerson(slug: string): ProactiveSignalRow[] {
+  ensureProactiveTables();
+  return getDb()
+    .prepare(
+      `SELECT * FROM proactive_signals WHERE person_slug = ?
+        ORDER BY created_at_ms DESC LIMIT 100`
+    )
+    .all(slug) as ProactiveSignalRow[];
+}
+
+export function getProactiveSignal(id: string): ProactiveSignalRow | undefined {
+  ensureProactiveTables();
+  return getDb()
+    .prepare("SELECT * FROM proactive_signals WHERE id = ?")
+    .get(id) as ProactiveSignalRow | undefined;
+}
+
+/** Mark a signal dismissed (terminal). */
+export function dismissProactiveSignal(id: string): void {
+  ensureProactiveTables();
+  getDb()
+    .prepare("UPDATE proactive_signals SET status = 'dismissed' WHERE id = ?")
+    .run(id);
+}
+
+/** Snooze a signal `days` into the future. */
+export function snoozeProactiveSignal(id: string, days: number): void {
+  ensureProactiveTables();
+  const until = Date.now() + days * 24 * 60 * 60 * 1000;
+  getDb()
+    .prepare(
+      "UPDATE proactive_signals SET status = 'snoozed', snooze_until_ms = ? WHERE id = ?"
+    )
+    .run(until, id);
+}
+
+/**
+ * Record a user action into `proactive_user_actions`. The Rust runner
+ * read-throughs this before dispatch. `action` ∈ snooze|dismiss|
+ * mute_person|mute_rule. `expiresDays` undefined ⇒ permanent.
+ */
+export function recordProactiveUserAction(
+  action: "snooze" | "dismiss" | "mute_person" | "mute_rule",
+  scope: string,
+  expiresDays?: number
+): void {
+  ensureProactiveTables();
+  const id = crypto.randomUUID();
+  const now = Date.now();
+  const expires =
+    expiresDays === undefined ? null : now + expiresDays * 24 * 60 * 60 * 1000;
+  getDb()
+    .prepare(
+      `INSERT INTO proactive_user_actions
+         (id, action, scope, created_at_ms, expires_at_ms)
+       VALUES (?, ?, ?, ?, ?)`
+    )
+    .run(id, action, scope, now, expires);
+}
+
+/** Remove every row for an (action, scope) — "resume tracking" / "un-mute". */
+export function clearProactiveUserAction(action: string, scope: string): void {
+  ensureProactiveTables();
+  getDb()
+    .prepare(
+      "DELETE FROM proactive_user_actions WHERE action = ? AND scope = ?"
+    )
+    .run(action, scope);
+}
+
+export interface ProactiveActionRow {
+  id: string;
+  action: string;
+  scope: string;
+  created_at_ms: number;
+  expires_at_ms: number | null;
+}
+
+/** Active (non-expired) user actions — drives the "muted" UI state. */
+export function listActiveProactiveUserActions(): ProactiveActionRow[] {
+  ensureProactiveTables();
+  const now = Date.now();
+  return getDb()
+    .prepare(
+      `SELECT * FROM proactive_user_actions
+        WHERE expires_at_ms IS NULL OR expires_at_ms > ?
+        ORDER BY created_at_ms DESC`
+    )
+    .all(now) as ProactiveActionRow[];
+}
