@@ -612,6 +612,7 @@ dependencies = [
  "async-trait",
  "augmentagent-channel-core",
  "augmentagent-store",
+ "futures",
  "serde",
  "serde_json",
  "tempfile",
