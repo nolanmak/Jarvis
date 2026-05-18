@@ -22,3 +22,6 @@ twitter-session.json
 # Discord user-token + super-properties — treat as secret. Vault location
 # (/Volumes/augmentagent/discord-creds.json) is outside the repo.
 discord-creds.json
+
+# Claude Code harness runtime state — local to each machine, never tracked.
+.claude/
