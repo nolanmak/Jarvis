@@ -1100,6 +1100,22 @@ async fn main() -> Result<()> {
             });
             // Collect the enabled channels' runners + optional digest scheduler.
             let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+
+            // Proactive CRM runner (#81): 30-min loop over wiki people pages.
+            // Only when a wiki is configured (no wiki ⇒ nothing to scan).
+            // Dispatch is gated on !dry_run like the other outbound surfaces.
+            if let Some(wiki_root) = cli.wiki_dir.clone() {
+                let runner = augmentagent_proactive::runner::ProactiveRunner::new(
+                    Arc::clone(&store),
+                    Arc::clone(&broker),
+                    wiki_root,
+                    augmentagent_proactive::rules::default_scans(),
+                );
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { runner.run(sd).await }));
+            } else {
+                info!("proactive runner disabled: --wiki-dir not set");
+            }
             if let Some(gmail_ch) = gmail_ch {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { gmail_ch.run(sd).await }));
@@ -1530,12 +1546,18 @@ async fn main() -> Result<()> {
                 unimplemented!("see issue #53 (content-adapter feature PR)")
             }
         },
-        Cmd::Proactive { op } => match op {
-            ProactiveOp::ScanOnce { .. }
-            | ProactiveOp::Signals { .. }
-            | ProactiveOp::Snooze { .. }
-            | ProactiveOp::Dismiss { .. } => {
-                unimplemented!("see issue #81 (proactive feature PR)")
+        Cmd::Proactive { ref op } => match op {
+            ProactiveOp::ScanOnce { dry_run } => {
+                run_proactive_scan_once(&cli, Arc::clone(&store), *dry_run).await
+            }
+            ProactiveOp::Signals { limit, json } => {
+                run_proactive_signals(Arc::clone(&store), *limit, *json)
+            }
+            ProactiveOp::Snooze { id, days } => {
+                run_proactive_snooze(Arc::clone(&store), id.clone(), *days)
+            }
+            ProactiveOp::Dismiss { id } => {
+                run_proactive_dismiss(Arc::clone(&store), id.clone())
             }
         },
         Cmd::Browser { op } => match op {
@@ -5722,4 +5744,95 @@ mod tone_cli_tests {
         assert_eq!(parse_date_ms(""), 0);
         assert_eq!(parse_date_ms("not a date"), 0);
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// #81 — Proactive CRM scanner CLI handlers.
+// ---------------------------------------------------------------------------
+
+async fn run_proactive_scan_once(
+    cli: &Cli,
+    store: Arc<Store>,
+    dry_run: bool,
+) -> Result<()> {
+    use augmentagent_proactive::rules::default_scans;
+    use augmentagent_proactive::runner::ProactiveRunner;
+
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("proactive scan needs --wiki-dir")?;
+    let (broker, _) = build_broker(cli, Arc::clone(&store), dry_run).await?;
+    let runner = ProactiveRunner::new(store, broker, wiki_root, default_scans());
+    // dry_run=true ⇒ persist+dedup but never post a card.
+    let report = runner.run_once(!dry_run).await;
+    println!(
+        "proactive scan: emitted={} persisted={} dispatched={} suppressed={} (dry_run={})",
+        report.emitted,
+        report.persisted,
+        report.dispatched,
+        report.suppressed,
+        dry_run
+    );
+    Ok(())
+}
+
+fn run_proactive_signals(store: Arc<Store>, limit: u32, json: bool) -> Result<()> {
+    use augmentagent_proactive::store_ext::{now_ms, ProactiveStore};
+    let rows = store
+        .list_signals(limit, now_ms(), true)
+        .context("list proactive signals")?;
+    if json {
+        let arr: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.signal.id,
+                    "kind": r.signal.kind.as_str(),
+                    "person": r.signal.person_slug,
+                    "urgency": r.signal.urgency.as_str(),
+                    "headline": r.signal.headline,
+                    "detail": r.signal.detail,
+                    "status": r.status,
+                    "created_at_ms": r.created_at_ms,
+                    "snooze_until_ms": r.snooze_until_ms,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+    } else {
+        println!("{} proactive signal(s)\n", rows.len());
+        for r in &rows {
+            println!(
+                "  {}  [{}] {} — {} ({})",
+                r.signal.id,
+                r.signal.urgency.as_str(),
+                r.signal.kind.as_str(),
+                r.signal.headline,
+                r.status,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_proactive_snooze(store: Arc<Store>, id: String, days: u32) -> Result<()> {
+    use augmentagent_proactive::store_ext::{now_ms, ProactiveStore};
+    if store.snooze_signal(&id, now_ms(), days).context("snooze")? {
+        println!("signal {id} snoozed {days}d");
+    } else {
+        println!("no signal with id {id}");
+    }
+    Ok(())
+}
+
+fn run_proactive_dismiss(store: Arc<Store>, id: String) -> Result<()> {
+    use augmentagent_proactive::store_ext::ProactiveStore;
+    if store.dismiss_signal(&id).context("dismiss")? {
+        println!("signal {id} dismissed");
+    } else {
+        println!("no signal with id {id}");
+    }
+    Ok(())
 }
