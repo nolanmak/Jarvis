@@ -12,10 +12,15 @@ mod broker;
 mod custom_id;
 mod event_handler;
 mod layout;
+mod loops;
 mod nudge;
 
 pub use broker::{DiscordApprovalBroker, DiscordConfig};
 pub use event_handler::chunk_for_discord;
+pub use loops::{
+    handle_loop_command, parse_interval, LoopPoster, LoopRunner, LoopScheduler,
+    MAX_ACTIVE_PER_USER, MIN_INTERVAL_SECS, PAUSE_AFTER_FAILURES,
+};
 pub use nudge::NudgeScheduler;
 
 use async_trait::async_trait;
