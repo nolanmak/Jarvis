@@ -322,3 +322,24 @@ pub struct TelegramBot {
     pub active: bool,
     pub created_at_ms: i64,
 }
+
+/// A user-defined scheduled task (#104), created via `/loop`. Channel-agnostic:
+/// `channel` is the surface it was created from (`discord` today) and
+/// `channel_ref` is the originating channel/DM id the scheduler posts results
+/// back to. `status` is `active` | `paused` | `stopped`; the scheduler pauses
+/// a loop after repeated failures (`fail_count`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserLoop {
+    pub id: String,
+    pub owner: String,
+    pub channel: String,
+    pub channel_ref: String,
+    pub interval_secs: i64,
+    pub prompt: String,
+    pub status: String,
+    pub last_run_ms: Option<i64>,
+    pub last_status: Option<String>,
+    pub fail_count: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}

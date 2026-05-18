@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::models::{
     Account, ActionRecord, ActionStatus, ChannelSubscription, DriveAccount, Email, LearnedPattern,
     RateAuditRow, RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TelegramBot, ToneExample,
-    ToneProfile, TriageResult,
+    ToneProfile, TriageResult, UserLoop,
 };
 
 #[derive(Debug, Error)]
@@ -518,6 +518,51 @@ impl Store {
              )",
             [],
         )?;
+
+        // #104 — user-defined scheduled tasks (`/loop`). Channel-agnostic:
+        // `channel` is the surface the loop was created from (`discord` today)
+        // and `channel_ref` is the originating channel/DM id the scheduler
+        // posts results back to. `interval_secs` is enforced against a floor at
+        // the command layer; `fail_count` drives pause-on-repeated-failure.
+        // `status` is `active` | `paused` | `stopped`. Survives restarts — the
+        // scheduler reloads `active` rows on boot.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS user_loops (\
+                 id             TEXT PRIMARY KEY,\
+                 owner          TEXT NOT NULL,\
+                 channel        TEXT NOT NULL,\
+                 channel_ref    TEXT NOT NULL,\
+                 interval_secs  INTEGER NOT NULL,\
+                 prompt         TEXT NOT NULL,\
+                 status         TEXT NOT NULL DEFAULT 'active',\
+                 last_run_ms    INTEGER,\
+                 last_status    TEXT,\
+                 fail_count     INTEGER NOT NULL DEFAULT 0,\
+                 created_at_ms  INTEGER NOT NULL,\
+                 updated_at_ms  INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_loops_owner_status \
+                ON user_loops(owner, status)",
+            [],
+        )?;
+
+        // #47 — cross-surface state sync. `status_source` records which surface
+        // resolved an action (discord / dashboard / telegram / cli / nudge) so
+        // the originating surface can suppress its own echo;
+        // `status_updated_at` timestamps the last transition for the SSE feed.
+        // Nullable so pre-existing rows migrate cleanly.
+        if !column_exists(conn, "actions", "status_source")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN status_source TEXT", [])?;
+        }
+        if !column_exists(conn, "actions", "status_updated_at")? {
+            conn.execute(
+                "ALTER TABLE actions ADD COLUMN status_updated_at INTEGER",
+                [],
+            )?;
+        }
 
         Ok(())
     }
@@ -2389,6 +2434,171 @@ impl Store {
         )?;
         Ok(n)
     }
+
+    // ---------------------------------------------------------------
+    // #104 — user-defined scheduled tasks (`/loop`).
+    // ---------------------------------------------------------------
+
+    /// Create a loop. `id` is generated; returns it.
+    pub fn create_user_loop(
+        &self,
+        owner: &str,
+        channel: &str,
+        channel_ref: &str,
+        interval_secs: i64,
+        prompt: &str,
+    ) -> StoreResult<String> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        guard.execute(
+            "INSERT INTO user_loops \
+                 (id, owner, channel, channel_ref, interval_secs, prompt, \
+                  status, fail_count, created_at_ms, updated_at_ms) \
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0, ?7, ?7)",
+            params![id, owner, channel, channel_ref, interval_secs, prompt, now],
+        )?;
+        Ok(id)
+    }
+
+    /// All non-stopped loops for an owner, newest first.
+    pub fn list_user_loops(&self, owner: &str) -> StoreResult<Vec<UserLoop>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, owner, channel, channel_ref, interval_secs, prompt, \
+                    status, last_run_ms, last_status, fail_count, \
+                    created_at_ms, updated_at_ms \
+               FROM user_loops \
+              WHERE owner = ?1 AND status != 'stopped' \
+              ORDER BY created_at_ms DESC",
+        )?;
+        let rows = stmt.query_map(params![owner], row_to_user_loop)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every loop the scheduler should tick (status = 'active'), across owners.
+    /// Used on boot to rehydrate and on each scheduler pass.
+    pub fn list_active_user_loops(&self) -> StoreResult<Vec<UserLoop>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, owner, channel, channel_ref, interval_secs, prompt, \
+                    status, last_run_ms, last_status, fail_count, \
+                    created_at_ms, updated_at_ms \
+               FROM user_loops \
+              WHERE status = 'active' \
+              ORDER BY created_at_ms ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_user_loop)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Count active loops for an owner — backs the per-user max.
+    pub fn count_active_user_loops(&self, owner: &str) -> StoreResult<i64> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM user_loops WHERE owner = ?1 AND status = 'active'",
+            params![owner],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Transition a loop to `stopped`. Scoped by owner so a user can only
+    /// stop their own. Returns true if a row changed.
+    pub fn stop_user_loop(&self, owner: &str, id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE user_loops SET status = 'stopped', updated_at_ms = ?3 \
+              WHERE id = ?1 AND owner = ?2 AND status != 'stopped'",
+            params![id, owner, now_millis()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Record the outcome of a loop run. `ok=false` increments `fail_count`;
+    /// on reaching `pause_at` consecutive failures the loop auto-pauses.
+    /// A success resets `fail_count` to 0.
+    pub fn record_user_loop_run(
+        &self,
+        id: &str,
+        ok: bool,
+        status_text: &str,
+        pause_at: i64,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let now = now_millis();
+        if ok {
+            guard.execute(
+                "UPDATE user_loops \
+                    SET last_run_ms = ?2, last_status = ?3, fail_count = 0, \
+                        updated_at_ms = ?2 \
+                  WHERE id = ?1",
+                params![id, now, status_text],
+            )?;
+        } else {
+            guard.execute(
+                "UPDATE user_loops \
+                    SET last_run_ms = ?2, last_status = ?3, \
+                        fail_count = fail_count + 1, \
+                        status = CASE WHEN fail_count + 1 >= ?4 THEN 'paused' \
+                                      ELSE status END, \
+                        updated_at_ms = ?2 \
+                  WHERE id = ?1",
+                params![id, now, status_text, pause_at],
+            )?;
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // #47 — cross-surface state sync: compare-and-swap status mutation.
+    // ---------------------------------------------------------------
+
+    /// Atomically flip a pending action to a terminal status, recording the
+    /// resolving surface. Returns true only when this call actually performed
+    /// the transition (exactly one row changed). A second surface racing on
+    /// the same action gets `false` and must NOT re-run side effects.
+    pub fn try_resolve_action(
+        &self,
+        action_id: &str,
+        new_status: ActionStatus,
+        source: &str,
+    ) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+                SET status = ?2, status_source = ?3, status_updated_at = ?4, \
+                    updatedAt = ?4 \
+              WHERE id = ?1 AND status = 'pending'",
+            params![action_id, new_status.as_str(), source, now_millis()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// The surface that last resolved an action (NULL if still pending or
+    /// pre-migration). Drives Discord echo-suppression on the broadcast.
+    pub fn action_status_source(
+        &self,
+        action_id: &str,
+    ) -> StoreResult<Option<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let v: Option<Option<String>> = guard
+            .query_row(
+                "SELECT status_source FROM actions WHERE id = ?1",
+                params![action_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.flatten())
+    }
 }
 
 fn row_to_tone_profile(r: &rusqlite::Row) -> rusqlite::Result<ToneProfile> {
@@ -2460,6 +2670,23 @@ fn row_to_telegram_bot(r: &rusqlite::Row) -> rusqlite::Result<TelegramBot> {
         last_update_id: r.get(4)?,
         active: r.get::<_, i64>(5)? != 0,
         created_at_ms: r.get(6)?,
+    })
+}
+
+fn row_to_user_loop(r: &rusqlite::Row) -> rusqlite::Result<UserLoop> {
+    Ok(UserLoop {
+        id: r.get(0)?,
+        owner: r.get(1)?,
+        channel: r.get(2)?,
+        channel_ref: r.get(3)?,
+        interval_secs: r.get(4)?,
+        prompt: r.get(5)?,
+        status: r.get(6)?,
+        last_run_ms: r.get(7)?,
+        last_status: r.get(8)?,
+        fail_count: r.get(9)?,
+        created_at_ms: r.get(10)?,
+        updated_at_ms: r.get(11)?,
     })
 }
 
@@ -3422,6 +3649,80 @@ mod tests {
         assert!(
             s.record_user_edit_as_tone_example(&id2).unwrap().is_none(),
             "missing draftBody → skip"
+        );
+    }
+
+    // --- user loops (#104) ---
+
+    #[test]
+    fn user_loop_create_list_stop_roundtrip() {
+        let (s, _f) = fresh_store();
+        let id = s
+            .create_user_loop("u1", "discord", "chan-7", 300, "/digest")
+            .unwrap();
+        let loops = s.list_user_loops("u1").unwrap();
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].id, id);
+        assert_eq!(loops[0].interval_secs, 300);
+        assert_eq!(loops[0].status, "active");
+        assert_eq!(s.count_active_user_loops("u1").unwrap(), 1);
+        assert!(!s.stop_user_loop("u2", &id).unwrap());
+        assert!(s.stop_user_loop("u1", &id).unwrap());
+        assert!(s.list_user_loops("u1").unwrap().is_empty());
+        assert_eq!(s.count_active_user_loops("u1").unwrap(), 0);
+    }
+
+    #[test]
+    fn user_loop_pauses_after_repeated_failures() {
+        let (s, _f) = fresh_store();
+        let id = s.create_user_loop("u1", "discord", "c", 300, "/x").unwrap();
+        s.record_user_loop_run(&id, false, "boom", 3).unwrap();
+        s.record_user_loop_run(&id, false, "boom", 3).unwrap();
+        assert_eq!(s.list_active_user_loops().unwrap().len(), 1);
+        s.record_user_loop_run(&id, false, "boom", 3).unwrap();
+        assert!(s.list_active_user_loops().unwrap().is_empty());
+        let l = &s.list_user_loops("u1").unwrap()[0];
+        assert_eq!(l.status, "paused");
+        assert_eq!(l.fail_count, 3);
+    }
+
+    #[test]
+    fn user_loop_success_resets_fail_count() {
+        let (s, _f) = fresh_store();
+        let id = s.create_user_loop("u1", "discord", "c", 300, "/x").unwrap();
+        s.record_user_loop_run(&id, false, "boom", 5).unwrap();
+        s.record_user_loop_run(&id, true, "ok", 5).unwrap();
+        let l = &s.list_user_loops("u1").unwrap()[0];
+        assert_eq!(l.fail_count, 0);
+        assert_eq!(l.last_status.as_deref(), Some("ok"));
+        assert!(l.last_run_ms.is_some());
+    }
+
+    // --- cross-surface CAS resolve (#47) ---
+
+    #[test]
+    fn try_resolve_action_is_compare_and_swap() {
+        let (s, _f) = fresh_store();
+        let id = s
+            .log_action(
+                "m-cas",
+                None,
+                "a@b.com",
+                "subj",
+                None,
+                None,
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        assert!(s
+            .try_resolve_action(&id, ActionStatus::Sent, "discord")
+            .unwrap());
+        assert!(!s
+            .try_resolve_action(&id, ActionStatus::Skipped, "dashboard")
+            .unwrap());
+        assert_eq!(
+            s.action_status_source(&id).unwrap().as_deref(),
+            Some("discord")
         );
     }
 }
