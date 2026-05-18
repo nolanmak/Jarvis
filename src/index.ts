@@ -15,6 +15,7 @@ import { fetchUnreadEmails } from "./gmailService";
 import { runAgent, redraftWithFeedback } from "./agent";
 import dashboardRouter from "./dashboard";
 import apiV1Router, { MODE } from "./apiV1";
+import webhooksRouter from "./webhooks";
 import type { Email } from "./types";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
@@ -92,6 +93,9 @@ You have ${newEmails.length} new email(s) to triage. The emails are provided abo
 
 function startDashboard(): void {
   const app = express();
+
+  // Provider webhooks need the raw body for HMAC — mount before json().
+  app.use(webhooksRouter);
 
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
