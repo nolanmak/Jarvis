@@ -7,11 +7,13 @@ pub mod rules;
 pub mod runner;
 pub mod scan;
 pub mod store_ext;
+pub mod suppress;
 
 pub use scan::{
     Cadence, ProactiveSignal, ScanCtx, ScheduledScan, SignalKind, SuggestedAction, Urgency,
 };
-pub use store_ext::{ProactiveStore, SignalStatus, StoredSignal};
+pub use store_ext::{ProactiveGateStore, ProactiveStore, SignalStatus, StoredSignal};
+pub use suppress::{ProactiveActionsStore, TableSuppression, UserAction};
 
 /// Test-only helpers. The Rust `Store::migrate()` is *additive* over the
 /// Node-owned base schema (`actions`, `emails`, … live in `src/db.ts`), so a

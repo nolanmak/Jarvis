@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::scan::{ProactiveSignal, ScanCtx, ScheduledScan, Urgency};
-use crate::store_ext::{now_ms, ProactiveStore};
+use crate::store_ext::{now_ms, ProactiveGateStore, ProactiveStore};
 
 /// Default tick interval — issue #81 specifies a 30-minute loop.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(30 * 60);
@@ -49,6 +49,12 @@ pub struct ProactiveRunner {
     scans: Vec<Arc<dyn ScheduledScan>>,
     suppression: Arc<dyn SuppressionCheck>,
     tick: Duration,
+    /// #57 — require explicit opt-in (config `proactive_enabled`) before any
+    /// card is dispatched. Persistence still happens (so the dashboard /
+    /// digest can show signals), but no Discord card until opted in.
+    require_opt_in: bool,
+    /// #57 — max heads-up cards dispatched per rolling 24h. 0 = unlimited.
+    daily_dispatch_cap: i64,
 }
 
 /// Outcome of a single full scan pass — surfaced by the CLI `scan-once`.
@@ -74,7 +80,21 @@ impl ProactiveRunner {
             scans,
             suppression: Arc::new(NoSuppression),
             tick: DEFAULT_TICK,
+            require_opt_in: true,
+            daily_dispatch_cap: 5,
         }
+    }
+
+    /// Override the opt-in requirement (tests / `scan-once --force`).
+    pub fn with_opt_in_required(mut self, required: bool) -> Self {
+        self.require_opt_in = required;
+        self
+    }
+
+    /// Override the rolling 24h dispatch cap (0 = unlimited).
+    pub fn with_daily_cap(mut self, cap: i64) -> Self {
+        self.daily_dispatch_cap = cap;
+        self
     }
 
     pub fn with_suppression(mut self, s: Arc<dyn SuppressionCheck>) -> Self {
@@ -92,6 +112,19 @@ impl ProactiveRunner {
     pub async fn run_once(&self, dispatch: bool) -> ScanReport {
         let now = now_ms();
         let mut report = ScanReport::default();
+
+        // #57 opt-in + rate-limit gate. When gated, we still persist signals
+        // (dashboard + digest need them) but never post a heads-up card.
+        let opted_in = !self.require_opt_in || self.store.proactive_opted_in();
+        let day_ago = now - 24 * 60 * 60 * 1000;
+        let dispatched_today = self.store.dispatched_since(day_ago).unwrap_or(0);
+        let cap_ok = self.daily_dispatch_cap == 0
+            || dispatched_today < self.daily_dispatch_cap;
+        let mut budget = if self.daily_dispatch_cap == 0 {
+            i64::MAX
+        } else {
+            (self.daily_dispatch_cap - dispatched_today).max(0)
+        };
 
         for scan in &self.scans {
             let ctx = ScanCtx::new(Arc::clone(&self.store), self.wiki_root.clone(), now);
@@ -136,7 +169,7 @@ impl ProactiveRunner {
                 if matches!(sig.urgency, Urgency::Low) {
                     continue;
                 }
-                if !dispatch {
+                if !dispatch || !opted_in || !cap_ok || budget <= 0 {
                     continue;
                 }
 
@@ -146,6 +179,7 @@ impl ProactiveRunner {
                 }
                 let _ = self.store.mark_signal_dispatched(&id, now);
                 report.dispatched += 1;
+                budget -= 1;
             }
         }
 
@@ -260,7 +294,8 @@ mod tests {
         let (_wd, root) = seed_wiki();
         let count = Arc::new(AtomicUsize::new(0));
         let broker: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker(Arc::clone(&count)));
-        let runner = ProactiveRunner::new(Arc::clone(&store), broker, root, default_scans());
+        let runner = ProactiveRunner::new(Arc::clone(&store), broker, root, default_scans())
+            .with_opt_in_required(false);
 
         let r1 = runner.run_once(true).await;
         assert!(r1.persisted >= 1, "stale Jane should persist");
