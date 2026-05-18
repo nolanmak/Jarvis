@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use crate::models::{
     Account, ActionRecord, ActionStatus, ChannelSubscription, DriveAccount, Email, LearnedPattern,
-    RateAuditRow, RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TelegramBot, ToneExample,
-    ToneProfile, TriageResult, UserLoop,
+    LinkedInConnectionSync, PhoneIdentity, RateAuditRow, RateHalt, RateWarmup, SlackWorkspace,
+    SubscriptionMode, TelegramBot, ToneExample, ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 
 #[derive(Debug, Error)]
@@ -24,10 +24,12 @@ pub type StoreResult<T> = Result<T, StoreError>;
 
 pub struct Store {
     conn: Mutex<Connection>,
+    path: std::path::PathBuf,
 }
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let path_buf = path.as_ref().to_path_buf();
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
@@ -35,7 +37,28 @@ impl Store {
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            path: path_buf,
         })
+    }
+
+    /// On-disk path this store was opened from. Lets extension crates
+    /// (e.g. `augmentagent-proactive`) run their own additive queries
+    /// against the same db file without threading the path through every
+    /// constructor.
+    pub fn db_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Run a closure with the locked connection. Used by extension traits in
+    /// sibling crates that need bespoke queries the core `Store` API doesn't
+    /// expose. Keeps the single-connection WAL invariant intact (no second
+    /// writer connection racing the daemon's).
+    pub fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> StoreResult<T> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(f(&guard)?)
     }
 
     /// Additive, idempotent schema migrations. Safe to run against databases
@@ -51,6 +74,19 @@ impl Store {
         if !column_exists(conn, "actions", "nudgeCount")? {
             conn.execute(
                 "ALTER TABLE actions ADD COLUMN nudgeCount INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        // #34: quick-refine analytics + redraft-iteration cap. `lastPresetId`
+        // records the most-recent canned preset chosen (NULL for free-form
+        // Revise / never refined); `redraftCount` is the stacked-iteration
+        // counter the approval card uses to enforce MAX_REDRAFT_ITERATIONS.
+        if !column_exists(conn, "actions", "lastPresetId")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN lastPresetId TEXT", [])?;
+        }
+        if !column_exists(conn, "actions", "redraftCount")? {
+            conn.execute(
+                "ALTER TABLE actions ADD COLUMN redraftCount INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
         }
@@ -199,7 +235,7 @@ impl Store {
         // have the other keys still pick up this new row as 'false'.
         conn.execute(
             "INSERT OR IGNORE INTO invoice_config (key, value, updated_at) VALUES \
-                 ('recipient_email', 'REDACTED', ?1),\
+                 ('recipient_email', '', ?1),\
                  ('invoice_counter', '35', ?1),\
                  ('from_entity', '', ?1),\
                  ('last_billed_week_end', '2026-05-17', ?1),\
@@ -398,6 +434,51 @@ impl Store {
             [],
         )?;
 
+        // #104 — user-defined scheduled tasks (`/loop`). Channel-agnostic:
+        // `channel` is the surface the loop was created from (`discord` today)
+        // and `channel_ref` is the originating channel/DM id the scheduler
+        // posts results back to. `interval_secs` is enforced against a floor at
+        // the command layer; `fail_count` drives pause-on-repeated-failure.
+        // `status` is `active` | `paused` | `stopped`. Survives restarts — the
+        // scheduler reloads `active` rows on boot.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS user_loops (\
+                 id             TEXT PRIMARY KEY,\
+                 owner          TEXT NOT NULL,\
+                 channel        TEXT NOT NULL,\
+                 channel_ref    TEXT NOT NULL,\
+                 interval_secs  INTEGER NOT NULL,\
+                 prompt         TEXT NOT NULL,\
+                 status         TEXT NOT NULL DEFAULT 'active',\
+                 last_run_ms    INTEGER,\
+                 last_status    TEXT,\
+                 fail_count     INTEGER NOT NULL DEFAULT 0,\
+                 created_at_ms  INTEGER NOT NULL,\
+                 updated_at_ms  INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_loops_owner_status \
+                ON user_loops(owner, status)",
+            [],
+        )?;
+
+        // #47 — cross-surface state sync. `status_source` records which surface
+        // resolved an action (discord / dashboard / telegram / cli / nudge) so
+        // the originating surface can suppress its own echo;
+        // `status_updated_at` timestamps the last transition for the SSE feed.
+        // Nullable so pre-existing rows migrate cleanly.
+        if !column_exists(conn, "actions", "status_source")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN status_source TEXT", [])?;
+        }
+        if !column_exists(conn, "actions", "status_updated_at")? {
+            conn.execute(
+                "ALTER TABLE actions ADD COLUMN status_updated_at INTEGER",
+                [],
+            )?;
+        }
+
         // #81 — Proactive CRM signals + per-scan run cursor.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS proactive_signals (\
@@ -446,6 +527,27 @@ impl Store {
                  query_id       TEXT NOT NULL,\
                  last_seen_at   INTEGER NOT NULL\
              )",
+            [],
+        )?;
+
+        // #79 — Twitter/X outbound posting audit log. Drives the hard
+        // 15-posts/day quota preflight (separate from the #83 RateGovernor
+        // soft caps — this is the platform's own free-tier ceiling).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS twitter_post_log (\
+                 id              TEXT PRIMARY KEY,\
+                 kind            TEXT NOT NULL,\
+                 reply_to        TEXT,\
+                 status          TEXT NOT NULL,\
+                 tweet_id        TEXT,\
+                 occurred_at_ms  INTEGER NOT NULL,\
+                 meta_json       TEXT\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_twitter_post_log_window \
+                ON twitter_post_log(occurred_at_ms)",
             [],
         )?;
 
@@ -519,51 +621,6 @@ impl Store {
             [],
         )?;
 
-        // #104 — user-defined scheduled tasks (`/loop`). Channel-agnostic:
-        // `channel` is the surface the loop was created from (`discord` today)
-        // and `channel_ref` is the originating channel/DM id the scheduler
-        // posts results back to. `interval_secs` is enforced against a floor at
-        // the command layer; `fail_count` drives pause-on-repeated-failure.
-        // `status` is `active` | `paused` | `stopped`. Survives restarts — the
-        // scheduler reloads `active` rows on boot.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS user_loops (\
-                 id             TEXT PRIMARY KEY,\
-                 owner          TEXT NOT NULL,\
-                 channel        TEXT NOT NULL,\
-                 channel_ref    TEXT NOT NULL,\
-                 interval_secs  INTEGER NOT NULL,\
-                 prompt         TEXT NOT NULL,\
-                 status         TEXT NOT NULL DEFAULT 'active',\
-                 last_run_ms    INTEGER,\
-                 last_status    TEXT,\
-                 fail_count     INTEGER NOT NULL DEFAULT 0,\
-                 created_at_ms  INTEGER NOT NULL,\
-                 updated_at_ms  INTEGER NOT NULL\
-             )",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_user_loops_owner_status \
-                ON user_loops(owner, status)",
-            [],
-        )?;
-
-        // #47 — cross-surface state sync. `status_source` records which surface
-        // resolved an action (discord / dashboard / telegram / cli / nudge) so
-        // the originating surface can suppress its own echo;
-        // `status_updated_at` timestamps the last transition for the SSE feed.
-        // Nullable so pre-existing rows migrate cleanly.
-        if !column_exists(conn, "actions", "status_source")? {
-            conn.execute("ALTER TABLE actions ADD COLUMN status_source TEXT", [])?;
-        }
-        if !column_exists(conn, "actions", "status_updated_at")? {
-            conn.execute(
-                "ALTER TABLE actions ADD COLUMN status_updated_at INTEGER",
-                [],
-            )?;
-        }
-
         // #45 — Web Push subscriptions for the PWA approval surface. One row
         // per browser push endpoint; `p256dh`/`auth` are the VAPID client
         // keys. Inert until the user installs the PWA + grants notifications.
@@ -578,6 +635,60 @@ impl Store {
             [],
         )?;
 
+        // ---------------------------------------------------------------
+        // CRM ingestion (#61 LinkedIn connections / #62 contacts / #64
+        // signature backfill). All additive + dormant in prod until the
+        // respective CLI command runs; same proven-safe pattern as the
+        // wave-A tables above.
+        // ---------------------------------------------------------------
+
+        // #61 — LinkedIn 1st-degree connection sync cursor. One row keyed by
+        // the user's own member urn (`account_id`); `last_full_sync_ms`
+        // gates full-vs-delta mode, `cursor_start` resumes a paginated full
+        // sync that was interrupted mid-run.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS linkedin_connection_sync (\
+                 account_id          TEXT PRIMARY KEY,\
+                 last_full_sync_ms   INTEGER,\
+                 last_delta_sync_ms  INTEGER,\
+                 cursor_start        INTEGER NOT NULL DEFAULT 0,\
+                 last_synced_count   INTEGER NOT NULL DEFAULT 0,\
+                 updated_at_ms       INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
+        // #62 — generic contacts sync token (Google People `syncToken` or
+        // CardDAV `getctag`), keyed by `(backend, account_id)`.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS contacts_sync_state (\
+                 backend       TEXT NOT NULL,\
+                 account_id    TEXT NOT NULL,\
+                 sync_token    TEXT,\
+                 updated_at_ms INTEGER NOT NULL,\
+                 PRIMARY KEY (backend, account_id)\
+             )",
+            [],
+        )?;
+
+        // #62 — phone→person reverse index consulted by message-triage
+        // before creating a new wiki page. `phone` is E.164-normalized;
+        // unique so re-ingest is an upsert, not a duplicate.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS identity_phone (\
+                 phone         TEXT PRIMARY KEY,\
+                 person_slug   TEXT NOT NULL,\
+                 display_name  TEXT,\
+                 source        TEXT NOT NULL,\
+                 updated_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_identity_phone_slug \
+                ON identity_phone(person_slug)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -705,6 +816,39 @@ impl Store {
                 status.as_str(),
                 now,
                 next_nudge_at_ms,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// Log a `flagged` action and persist the triage flag `reason` into the
+    /// `errorMessage` column (unused for non-error statuses). The morning
+    /// digest (#100) reads this back via `flagged_actions_since` so it can
+    /// enumerate *why* each item was flagged, not just that it was.
+    pub fn log_flagged_action(
+        &self,
+        message_id: &str,
+        thread_id: Option<&str>,
+        from_email: &str,
+        subject: &str,
+        original_body: Option<&str>,
+        reason: &str,
+    ) -> StoreResult<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'flagged', ?7, ?8, ?8, 0, NULL)",
+            params![
+                id,
+                message_id,
+                thread_id,
+                from_email,
+                subject,
+                original_body,
+                reason,
+                now,
             ],
         )?;
         Ok(id)
@@ -951,6 +1095,163 @@ impl Store {
         Ok(())
     }
 
+    // ---------------------------------------------------------------
+    // #61 — LinkedIn connection-sync cursor.
+    // ---------------------------------------------------------------
+
+    /// Read the connection-sync cursor for `account_id` (the user's own
+    /// member urn). `None` means this account has never synced — caller
+    /// should run a full sync.
+    pub fn get_linkedin_connection_sync(
+        &self,
+        account_id: &str,
+    ) -> StoreResult<Option<LinkedInConnectionSync>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT account_id, last_full_sync_ms, last_delta_sync_ms, \
+                        cursor_start, last_synced_count \
+                   FROM linkedin_connection_sync WHERE account_id = ?1",
+                params![account_id],
+                |r| {
+                    Ok(LinkedInConnectionSync {
+                        account_id: r.get(0)?,
+                        last_full_sync_ms: r.get(1)?,
+                        last_delta_sync_ms: r.get(2)?,
+                        cursor_start: r.get(3)?,
+                        last_synced_count: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Upsert the connection-sync cursor. Pass the full desired state — this
+    /// is a blind overwrite of the mutable columns (the caller owns the
+    /// full-vs-delta decision).
+    pub fn upsert_linkedin_connection_sync(
+        &self,
+        s: &LinkedInConnectionSync,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO linkedin_connection_sync \
+                 (account_id, last_full_sync_ms, last_delta_sync_ms, \
+                  cursor_start, last_synced_count, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(account_id) DO UPDATE SET \
+                 last_full_sync_ms = excluded.last_full_sync_ms, \
+                 last_delta_sync_ms = excluded.last_delta_sync_ms, \
+                 cursor_start = excluded.cursor_start, \
+                 last_synced_count = excluded.last_synced_count, \
+                 updated_at_ms = excluded.updated_at_ms",
+            params![
+                s.account_id,
+                s.last_full_sync_ms,
+                s.last_delta_sync_ms,
+                s.cursor_start,
+                s.last_synced_count,
+                now_millis(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // #62 — contacts sync token + phone reverse index.
+    // ---------------------------------------------------------------
+
+    /// Read the sync token (Google People `syncToken` / CardDAV `getctag`)
+    /// for `(backend, account_id)`. `None` → full sync on next run.
+    pub fn get_contacts_sync_token(
+        &self,
+        backend: &str,
+        account_id: &str,
+    ) -> StoreResult<Option<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let tok: Option<String> = guard
+            .query_row(
+                "SELECT sync_token FROM contacts_sync_state \
+                   WHERE backend = ?1 AND account_id = ?2",
+                params![backend, account_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(tok)
+    }
+
+    pub fn set_contacts_sync_token(
+        &self,
+        backend: &str,
+        account_id: &str,
+        token: &str,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO contacts_sync_state \
+                 (backend, account_id, sync_token, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(backend, account_id) DO UPDATE SET \
+                 sync_token = excluded.sync_token, \
+                 updated_at_ms = excluded.updated_at_ms",
+            params![backend, account_id, token, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// Reverse-lookup a person by E.164 phone. The message-triage path calls
+    /// this *before* creating a new wiki page so a known phone resolves to an
+    /// existing contact instead of fragmenting identity.
+    pub fn lookup_person_by_phone(
+        &self,
+        phone_e164: &str,
+    ) -> StoreResult<Option<PhoneIdentity>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT phone, person_slug, display_name, source \
+                   FROM identity_phone WHERE phone = ?1",
+                params![phone_e164],
+                |r| {
+                    Ok(PhoneIdentity {
+                        phone: r.get(0)?,
+                        person_slug: r.get(1)?,
+                        display_name: r.get(2)?,
+                        source: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Upsert a phone→person index row. Idempotent: re-ingesting the same
+    /// contact rewrites the (slug, name) for that phone rather than
+    /// duplicating.
+    pub fn upsert_phone_identity(&self, p: &PhoneIdentity) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO identity_phone \
+                 (phone, person_slug, display_name, source, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(phone) DO UPDATE SET \
+                 person_slug = excluded.person_slug, \
+                 display_name = excluded.display_name, \
+                 source = excluded.source, \
+                 updated_at_ms = excluded.updated_at_ms",
+            params![
+                p.phone,
+                p.person_slug,
+                p.display_name,
+                p.source,
+                now_millis(),
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Backfill the human-readable Gmail address for a connected account.
     /// The OAuth connect flow never captured it (Composio doesn't return it
     /// on the connection), so the dashboard + entity picker show opaque IDs
@@ -1019,6 +1320,37 @@ impl Store {
         Ok(out)
     }
 
+    /// #64 — `(message_id, from_email, body)` for emails first seen on/after
+    /// `since_ms`, newest first. Backs `backfill signatures`: it mines each
+    /// body's signature block for role/title/company/phone. Idempotent at
+    /// the call site (the wiki merge is fill-blanks-only).
+    pub fn email_bodies_since(
+        &self,
+        since_ms: i64,
+        limit: i64,
+    ) -> StoreResult<Vec<(String, String, String)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT messageId, fromEmail, body \
+             FROM emails \
+             WHERE firstSeenAt >= ?1 \
+             ORDER BY firstSeenAt DESC \
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since_ms, limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     /// How many reply actions are currently sitting in `pending` status
     /// (awaiting the user's Discord click). Useful as a digest metric.
     pub fn pending_reply_count(&self) -> StoreResult<i64> {
@@ -1029,6 +1361,131 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(n)
+    }
+
+    /// Every action that landed in `flagged` status within the window. Each
+    /// row: (from, subject, reason). The flag reason is stashed in
+    /// `errorMessage` at log time (it is otherwise unused for non-error
+    /// statuses); empty/NULL collapses to "flagged". No LIMIT — the digest
+    /// (#100) needs an exhaustive list, and flagged volume is small by
+    /// construction (triage flags are the exception, not the rule).
+    pub fn flagged_actions_since(
+        &self,
+        since_ms: i64,
+    ) -> StoreResult<Vec<(String, String, String)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT fromEmail, subject, COALESCE(NULLIF(errorMessage, ''), 'flagged') \
+             FROM actions \
+             WHERE status = 'flagged' AND createdAt >= ?1 \
+             ORDER BY createdAt DESC",
+        )?;
+        let rows = stmt.query_map(params![since_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every action currently sitting in `pending` (awaiting the user's
+    /// Discord click), oldest first. Each row: (from, subject, age_ms). No
+    /// LIMIT — the digest (#100) must enumerate the entire approval backlog,
+    /// and #99's backpressure keeps this set bounded.
+    pub fn pending_actions(&self) -> StoreResult<Vec<(String, String, i64)>> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT fromEmail, subject, createdAt \
+             FROM actions \
+             WHERE status = 'pending' \
+             ORDER BY createdAt ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                (now - r.get::<_, i64>(2)?).max(0),
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// The `limit` oldest pending actions, oldest first. Each row:
+    /// (action_id, from, subject, age_ms). Backs `approvals list` and the
+    /// `discard-older` bulk-clear path (#99).
+    pub fn oldest_pending_actions(
+        &self,
+        limit: i64,
+    ) -> StoreResult<Vec<(String, String, String, i64)>> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, fromEmail, subject, createdAt \
+             FROM actions \
+             WHERE status = 'pending' \
+             ORDER BY createdAt ASC \
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                (now - r.get::<_, i64>(3)?).max(0),
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Expire every pending action created on or before `cutoff_ms` by
+    /// flipping it to `timed_out` (the existing terminal status for
+    /// abandoned approvals). Returns the number of rows swept. Backs both
+    /// the Serve-loop stale-draft sweep and `approvals discard-older` (#99).
+    pub fn expire_pending_older_than(&self, cutoff_ms: i64) -> StoreResult<usize> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+             SET status = 'timed_out', \
+                 errorMessage = COALESCE(NULLIF(errorMessage, ''), 'expired: stale pending draft'), \
+                 updatedAt = ?2 \
+             WHERE status = 'pending' AND createdAt <= ?1",
+            params![cutoff_ms, now],
+        )?;
+        Ok(n)
+    }
+
+    /// Resolve a single pending action to `approved` (used by
+    /// `approvals approve-all`). Returns true if a pending row was flipped.
+    /// This only flips the status row — it does NOT send the Gmail draft;
+    /// the existing Discord approve handler owns the send path. `approve-all`
+    /// is a queue-hygiene escape hatch ("I've handled these out of band"),
+    /// not a bulk-send.
+    pub fn mark_pending_approved(&self, action_id: &str) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+             SET status = 'approved', updatedAt = ?2 \
+             WHERE id = ?1 AND status = 'pending'",
+            params![action_id, now],
+        )?;
+        Ok(n > 0)
     }
 
     /// Load a single action row plus its email body. Used by the Discord
@@ -1091,6 +1548,49 @@ impl Store {
             params![action_id, draft_id, now],
         )?;
         Ok(())
+    }
+
+    /// Record a quick-refine preset choice and bump the redraft counter (#34).
+    ///
+    /// Called once per Quick-refine select. `preset_id` is `None` for a
+    /// free-form Revise (still counts toward the iteration cap). Returns the
+    /// post-increment `redraftCount` so the caller can decide whether the cap
+    /// ([`MAX_REDRAFT_ITERATIONS`-equivalent](crate)) has been hit.
+    pub fn record_redraft(
+        &self,
+        action_id: &str,
+        preset_id: Option<&str>,
+    ) -> StoreResult<i64> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE actions \
+                SET redraftCount = COALESCE(redraftCount, 0) + 1, \
+                    lastPresetId = ?2, \
+                    updatedAt = ?3 \
+              WHERE id = ?1",
+            params![action_id, preset_id, now],
+        )?;
+        let count: i64 = guard.query_row(
+            "SELECT COALESCE(redraftCount, 0) FROM actions WHERE id = ?1",
+            params![action_id],
+            |r| r.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Read the current redraft iteration count for an action (#34). Returns 0
+    /// for a never-refined action or one that predates the column.
+    pub fn redraft_count(&self, action_id: &str) -> StoreResult<i64> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let count: Option<i64> = guard
+            .query_row(
+                "SELECT COALESCE(redraftCount, 0) FROM actions WHERE id = ?1",
+                params![action_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(count.unwrap_or(0))
     }
 
     /// Find reply-intent actions that errored out and deserve another try.
@@ -1803,6 +2303,187 @@ impl Store {
         Ok(())
     }
 
+    // --- whatsapp_devices + allowlists (#74 / #102) ---
+
+    /// Insert a fresh `whatsapp_devices` row, or — if a row with this `phone`
+    /// already exists — refresh its JIDs / status and re-activate it.
+    /// `paired_at_ms` is preserved on update so the original pairing time
+    /// stays meaningful across re-pairs.
+    pub fn upsert_whatsapp_device(
+        &self,
+        phone: &str,
+        device_jid: &str,
+        user_jid: &str,
+    ) -> StoreResult<WhatsappDevice> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let existing: Option<String> = guard
+            .query_row(
+                "SELECT id FROM whatsapp_devices WHERE phone = ?1",
+                params![phone],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(id) => {
+                guard.execute(
+                    "UPDATE whatsapp_devices \
+                        SET device_jid = ?2, user_jid = ?3, \
+                            session_status = 'paired', active = 1 \
+                      WHERE id = ?1",
+                    params![id, device_jid, user_jid],
+                )?;
+            }
+            None => {
+                let id = Uuid::new_v4().to_string();
+                guard.execute(
+                    "INSERT INTO whatsapp_devices \
+                        (id, phone, device_jid, user_jid, paired_at_ms, \
+                         last_event_at_ms, session_status, active, created_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, 'paired', 1, ?5)",
+                    params![id, phone, device_jid, user_jid, now],
+                )?;
+            }
+        };
+        drop(guard);
+        self.get_whatsapp_device_by_phone(phone)?
+            .ok_or(StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn list_active_whatsapp_devices(&self) -> StoreResult<Vec<WhatsappDevice>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, phone, device_jid, user_jid, paired_at_ms, \
+                    last_event_at_ms, session_status, active, created_at_ms \
+               FROM whatsapp_devices \
+              WHERE active = 1 \
+              ORDER BY created_at_ms ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_whatsapp_device)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_whatsapp_device_by_phone(
+        &self,
+        phone: &str,
+    ) -> StoreResult<Option<WhatsappDevice>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT id, phone, device_jid, user_jid, paired_at_ms, \
+                        last_event_at_ms, session_status, active, created_at_ms \
+                   FROM whatsapp_devices WHERE phone = ?1",
+                params![phone],
+                row_to_whatsapp_device,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Mark a device logged-out (sidecar emitted `logged-out`). Keeps the row
+    /// for audit; the channel skips logged-out devices at send time.
+    pub fn mark_whatsapp_device_logged_out(&self, phone: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE whatsapp_devices \
+                SET session_status = 'logged_out', active = 0 \
+              WHERE phone = ?1",
+            params![phone],
+        )?;
+        Ok(())
+    }
+
+    pub fn touch_whatsapp_device_event(&self, phone: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE whatsapp_devices SET last_event_at_ms = ?2 WHERE phone = ?1",
+            params![phone, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// Hard delete + deactivate subscriptions for one device (unlink).
+    pub fn delete_whatsapp_device(&self, phone: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE channel_subscriptions \
+                SET active = 0, updated_at_ms = ?2 \
+              WHERE platform = 'whatsapp' AND account_id = ?1",
+            params![phone, now],
+        )?;
+        guard.execute(
+            "DELETE FROM whatsapp_devices WHERE phone = ?1",
+            params![phone],
+        )?;
+        Ok(())
+    }
+
+    /// Opt a chat into outbound sends. Idempotent.
+    pub fn allow_whatsapp_outbound(&self, chat_jid: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO whatsapp_outbound_allowlist (chat_jid, enabled_at_ms) \
+             VALUES (?1, ?2) ON CONFLICT(chat_jid) DO NOTHING",
+            params![chat_jid, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    pub fn deny_whatsapp_outbound(&self, chat_jid: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "DELETE FROM whatsapp_outbound_allowlist WHERE chat_jid = ?1",
+            params![chat_jid],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_whatsapp_outbound_allowed(&self, chat_jid: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM whatsapp_outbound_allowlist WHERE chat_jid = ?1",
+            params![chat_jid],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Opt a chat into inbound triage. Per review feedback even *reading* a
+    /// chat requires explicit opt-in for ban-risk reasons. Idempotent.
+    pub fn allow_whatsapp_inbound(&self, chat_jid: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO whatsapp_inbound_allowlist (chat_jid, enabled_at_ms) \
+             VALUES (?1, ?2) ON CONFLICT(chat_jid) DO NOTHING",
+            params![chat_jid, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    pub fn deny_whatsapp_inbound(&self, chat_jid: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "DELETE FROM whatsapp_inbound_allowlist WHERE chat_jid = ?1",
+            params![chat_jid],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_whatsapp_inbound_allowed(&self, chat_jid: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM whatsapp_inbound_allowlist WHERE chat_jid = ?1",
+            params![chat_jid],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     // --- tone profiles & examples (issue #73) ---
 
     /// Insert one tone example. Returns the new row's `id` (uuid).
@@ -2475,7 +3156,7 @@ impl Store {
         Ok(id)
     }
 
-    /// All non-stopped loops for an owner, newest first.
+    /// All loops for an owner (any status), newest first.
     pub fn list_user_loops(&self, owner: &str) -> StoreResult<Vec<UserLoop>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
@@ -2538,7 +3219,7 @@ impl Store {
     }
 
     /// Record the outcome of a loop run. `ok=false` increments `fail_count`;
-    /// on reaching `pause_at` consecutive failures the loop auto-pauses.
+    /// on reaching `pause_at` consecutive failures the loop is auto-paused.
     /// A success resets `fail_count` to 0.
     pub fn record_user_loop_run(
         &self,
@@ -2580,6 +3261,9 @@ impl Store {
     /// resolving surface. Returns true only when this call actually performed
     /// the transition (exactly one row changed). A second surface racing on
     /// the same action gets `false` and must NOT re-run side effects.
+    ///
+    /// Distinct from `update_action_status`, which is unconditional and used
+    /// for re-draft / pending bookkeeping. This is the resolve gate.
     pub fn try_resolve_action(
         &self,
         action_id: &str,
@@ -2592,13 +3276,18 @@ impl Store {
                 SET status = ?2, status_source = ?3, status_updated_at = ?4, \
                     updatedAt = ?4 \
               WHERE id = ?1 AND status = 'pending'",
-            params![action_id, new_status.as_str(), source, now_millis()],
+            params![
+                action_id,
+                new_status.as_str(),
+                source,
+                now_millis(),
+            ],
         )?;
         Ok(n == 1)
     }
 
     /// The surface that last resolved an action (NULL if still pending or
-    /// pre-migration). Drives Discord echo-suppression on the broadcast.
+    /// pre-migration). Drives the Discord echo-suppression on the broadcast.
     pub fn action_status_source(
         &self,
         action_id: &str,
@@ -2665,6 +3354,163 @@ impl Store {
             params![endpoint],
         )?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // #79 — Twitter/X GraphQL queryId cache + outbound post log.
+    // -----------------------------------------------------------------
+
+    /// Read the cached queryId for a GraphQL operation (e.g. `CreateTweet`).
+    /// `None` => never observed; caller falls back to a static default.
+    pub fn twitter_query_id(&self, operation: &str) -> StoreResult<Option<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let v: Option<String> = guard
+            .query_row(
+                "SELECT query_id FROM twitter_query_ids WHERE operation = ?1",
+                params![operation],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// Upsert an observed queryId for a GraphQL operation. Called whenever a
+    /// fresher id is harvested (env override / network capture) so the next
+    /// boot uses it without a recompile.
+    pub fn put_twitter_query_id(
+        &self,
+        operation: &str,
+        query_id: &str,
+        last_seen_at: i64,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO twitter_query_ids (operation, query_id, last_seen_at) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(operation) DO UPDATE SET \
+                 query_id = excluded.query_id, \
+                 last_seen_at = excluded.last_seen_at",
+            params![operation, query_id, last_seen_at],
+        )?;
+        Ok(())
+    }
+
+    /// Append a Twitter outbound-post audit row. `kind` is `tweet` | `reply`,
+    /// `status` is `ok` | `failed` | `dry_run`.
+    pub fn log_twitter_post(
+        &self,
+        id: &str,
+        kind: &str,
+        reply_to: Option<&str>,
+        status: &str,
+        tweet_id: Option<&str>,
+        occurred_at_ms: i64,
+        meta_json: Option<&str>,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO twitter_post_log \
+                 (id, kind, reply_to, status, tweet_id, occurred_at_ms, meta_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, kind, reply_to, status, tweet_id, occurred_at_ms, meta_json],
+        )?;
+        Ok(())
+    }
+
+    /// Count "real" outbound posts (status `ok` or `failed` — both burn the
+    /// platform quota; `dry_run` rows are excluded) in `[since_ms, now_ms]`.
+    /// Drives the hard 15/day preflight in the Twitter posting client.
+    pub fn twitter_post_count_in_window(
+        &self,
+        since_ms: i64,
+        now_ms: i64,
+    ) -> StoreResult<u32> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM twitter_post_log \
+              WHERE occurred_at_ms >= ?1 \
+                AND occurred_at_ms <= ?2 \
+                AND status != 'dry_run'",
+            params![since_ms, now_ms],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
+    // -----------------------------------------------------------------
+    // #77 / #13 — linkedin_action_log helpers.
+    //
+    // A LinkedIn-scoped, action-keyed audit log distinct from the
+    // cross-platform rate_events table. It exists so the posting + feed
+    // engagement paths can enforce their own rolling-window caps (3
+    // posts/day, 5 engagements/day) durably across daemon restarts
+    // *without* depending on the RateGovernor's full permit/record
+    // lifecycle — the governor still gates the *decision*; this table is
+    // the cheap, LinkedIn-only counter the channel reads directly.
+    // -----------------------------------------------------------------
+
+    /// Append a LinkedIn outbound-action row. `status` is free-form
+    /// (`ok` | `failed` | `pending`); only `ok` rows count toward caps via
+    /// [`Store::linkedin_action_count_since`].
+    pub fn log_linkedin_action(
+        &self,
+        id: &str,
+        action_kind: &str,
+        target_urn: Option<&str>,
+        status: &str,
+        occurred_at_ms: i64,
+        meta_json: Option<&str>,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO linkedin_action_log \
+                 (id, action_kind, target_urn, status, occurred_at_ms, meta_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, action_kind, target_urn, status, occurred_at_ms, meta_json],
+        )?;
+        Ok(())
+    }
+
+    /// Count successful (`status = 'ok'`) actions of `action_kind` since
+    /// `since_ms` (inclusive). Backs the rolling-24h post cap and the
+    /// daily engagement cap. Non-`ok` rows (failed / pending) are excluded
+    /// so a failed dispatch doesn't permanently consume a daily slot.
+    pub fn linkedin_action_count_since(
+        &self,
+        action_kind: &str,
+        since_ms: i64,
+    ) -> StoreResult<u32> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM linkedin_action_log \
+              WHERE action_kind = ?1 \
+                AND status = 'ok' \
+                AND occurred_at_ms >= ?2",
+            params![action_kind, since_ms],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
+    /// True iff any `ok` row already exists for this (`action_kind`,
+    /// `target_urn`) pair — used to suppress duplicate engagement on the
+    /// same post across feed polls.
+    pub fn linkedin_action_exists(
+        &self,
+        action_kind: &str,
+        target_urn: &str,
+    ) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let found: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM linkedin_action_log \
+                  WHERE action_kind = ?1 AND target_urn = ?2 AND status = 'ok' \
+                  LIMIT 1",
+                params![action_kind, target_urn],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
     }
 }
 
@@ -2737,6 +3583,20 @@ fn row_to_telegram_bot(r: &rusqlite::Row) -> rusqlite::Result<TelegramBot> {
         last_update_id: r.get(4)?,
         active: r.get::<_, i64>(5)? != 0,
         created_at_ms: r.get(6)?,
+    })
+}
+
+fn row_to_whatsapp_device(r: &rusqlite::Row) -> rusqlite::Result<WhatsappDevice> {
+    Ok(WhatsappDevice {
+        id: r.get(0)?,
+        phone: r.get(1)?,
+        device_jid: r.get(2)?,
+        user_jid: r.get(3)?,
+        paired_at_ms: r.get(4)?,
+        last_event_at_ms: r.get(5)?,
+        session_status: r.get(6)?,
+        active: r.get::<_, i64>(7)? != 0,
+        created_at_ms: r.get(8)?,
     })
 }
 
@@ -3054,6 +3914,31 @@ mod tests {
         s.log_action("m1", None, "a@b.com", "s", None, None, ActionStatus::DryRun)
             .unwrap();
         assert!(s.is_message_processed("m1").unwrap());
+    }
+
+    #[test]
+    fn record_redraft_increments_and_persists_preset() {
+        // #34: quick-refine analytics + iteration cap counter.
+        let (s, _f) = fresh_store();
+        let id = s
+            .log_action("m1", None, "a@b.com", "s", None, Some("v0"), ActionStatus::Pending)
+            .unwrap();
+        assert_eq!(s.redraft_count(&id).unwrap(), 0);
+
+        let c1 = s.record_redraft(&id, Some("shorter")).unwrap();
+        assert_eq!(c1, 1);
+        let c2 = s.record_redraft(&id, Some("warmer")).unwrap();
+        assert_eq!(c2, 2);
+        // Free-form Revise records no preset but still counts.
+        let c3 = s.record_redraft(&id, None).unwrap();
+        assert_eq!(c3, 3);
+        assert_eq!(s.redraft_count(&id).unwrap(), 3);
+    }
+
+    #[test]
+    fn redraft_count_zero_for_unknown_action() {
+        let (s, _f) = fresh_store();
+        assert_eq!(s.redraft_count("does-not-exist").unwrap(), 0);
     }
 
     // --- nudge loop ---
@@ -3719,6 +4604,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn linkedin_connection_sync_roundtrips() {
+        let (s, _f) = fresh_store();
+        assert!(s
+            .get_linkedin_connection_sync("urn:li:fsd_profile:ME")
+            .unwrap()
+            .is_none());
+        let cur = LinkedInConnectionSync {
+            account_id: "urn:li:fsd_profile:ME".into(),
+            last_full_sync_ms: Some(1_700_000_000_000),
+            last_delta_sync_ms: None,
+            cursor_start: 80,
+            last_synced_count: 562,
+        };
+        s.upsert_linkedin_connection_sync(&cur).unwrap();
+        let got = s
+            .get_linkedin_connection_sync("urn:li:fsd_profile:ME")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.cursor_start, 80);
+        assert_eq!(got.last_full_sync_ms, Some(1_700_000_000_000));
+        assert_eq!(got.last_synced_count, 562);
+        // Upsert overwrites mutable columns.
+        let cur2 = LinkedInConnectionSync {
+            cursor_start: 0,
+            last_delta_sync_ms: Some(1_700_100_000_000),
+            ..cur
+        };
+        s.upsert_linkedin_connection_sync(&cur2).unwrap();
+        let got2 = s
+            .get_linkedin_connection_sync("urn:li:fsd_profile:ME")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got2.cursor_start, 0);
+        assert_eq!(got2.last_delta_sync_ms, Some(1_700_100_000_000));
+    }
+
+    #[test]
+    fn contacts_sync_token_roundtrips() {
+        let (s, _f) = fresh_store();
+        assert!(s
+            .get_contacts_sync_token("google_people", "acc1")
+            .unwrap()
+            .is_none());
+        s.set_contacts_sync_token("google_people", "acc1", "tok-abc")
+            .unwrap();
+        assert_eq!(
+            s.get_contacts_sync_token("google_people", "acc1").unwrap(),
+            Some("tok-abc".to_string())
+        );
+        // Distinct (backend, account) key is independent.
+        assert!(s
+            .get_contacts_sync_token("carddav", "acc1")
+            .unwrap()
+            .is_none());
+        s.set_contacts_sync_token("google_people", "acc1", "tok-def")
+            .unwrap();
+        assert_eq!(
+            s.get_contacts_sync_token("google_people", "acc1").unwrap(),
+            Some("tok-def".to_string())
+        );
+    }
+
+    #[test]
+    fn phone_identity_reverse_lookup() {
+        let (s, _f) = fresh_store();
+        assert!(s.lookup_person_by_phone("+14155550100").unwrap().is_none());
+        s.upsert_phone_identity(&PhoneIdentity {
+            phone: "+14155550100".into(),
+            person_slug: "jane_doe".into(),
+            display_name: Some("Jane Doe".into()),
+            source: "google_people".into(),
+        })
+        .unwrap();
+        let p = s.lookup_person_by_phone("+14155550100").unwrap().unwrap();
+        assert_eq!(p.person_slug, "jane_doe");
+        assert_eq!(p.display_name.as_deref(), Some("Jane Doe"));
+        // Re-ingest same phone → upsert, not duplicate; slug can move.
+        s.upsert_phone_identity(&PhoneIdentity {
+            phone: "+14155550100".into(),
+            person_slug: "jane_d".into(),
+            display_name: Some("Jane D.".into()),
+            source: "carddav".into(),
+        })
+        .unwrap();
+        let p2 = s.lookup_person_by_phone("+14155550100").unwrap().unwrap();
+        assert_eq!(p2.person_slug, "jane_d");
+        assert_eq!(p2.source, "carddav");
+    }
+
     // --- user loops (#104) ---
 
     #[test]
@@ -3733,8 +4708,11 @@ mod tests {
         assert_eq!(loops[0].interval_secs, 300);
         assert_eq!(loops[0].status, "active");
         assert_eq!(s.count_active_user_loops("u1").unwrap(), 1);
+
+        // scoped: another user can't stop it
         assert!(!s.stop_user_loop("u2", &id).unwrap());
         assert!(s.stop_user_loop("u1", &id).unwrap());
+        // stopped rows drop out of the owner listing
         assert!(s.list_user_loops("u1").unwrap().is_empty());
         assert_eq!(s.count_active_user_loops("u1").unwrap(), 0);
     }
@@ -3742,11 +4720,15 @@ mod tests {
     #[test]
     fn user_loop_pauses_after_repeated_failures() {
         let (s, _f) = fresh_store();
-        let id = s.create_user_loop("u1", "discord", "c", 300, "/x").unwrap();
+        let id = s
+            .create_user_loop("u1", "discord", "c", 300, "/x")
+            .unwrap();
         s.record_user_loop_run(&id, false, "boom", 3).unwrap();
         s.record_user_loop_run(&id, false, "boom", 3).unwrap();
+        // still active after 2 failures
         assert_eq!(s.list_active_user_loops().unwrap().len(), 1);
         s.record_user_loop_run(&id, false, "boom", 3).unwrap();
+        // 3rd failure auto-pauses
         assert!(s.list_active_user_loops().unwrap().is_empty());
         let l = &s.list_user_loops("u1").unwrap()[0];
         assert_eq!(l.status, "paused");
@@ -3795,9 +4777,11 @@ mod tests {
                 ActionStatus::Pending,
             )
             .unwrap();
+        // First resolver wins.
         assert!(s
             .try_resolve_action(&id, ActionStatus::Sent, "discord")
             .unwrap());
+        // Second resolver (racing surface) loses — no double side effect.
         assert!(!s
             .try_resolve_action(&id, ActionStatus::Skipped, "dashboard")
             .unwrap());
@@ -3805,5 +4789,103 @@ mod tests {
             s.action_status_source(&id).unwrap().as_deref(),
             Some("discord")
         );
+    }
+
+    // ---- #99 / #100: queue backpressure + exhaustive digest ----
+
+    #[test]
+    fn log_flagged_action_persists_reason_and_flagged_enumerates_all() {
+        let (s, _f) = fresh_store();
+        let e1 = sample_email("f1");
+        let e2 = sample_email("f2");
+        s.upsert_email(&e1).unwrap();
+        s.upsert_email(&e2).unwrap();
+        s.log_flagged_action("f1", None, "alice@x.com", "Re: contract", None, "needs sign-off")
+            .unwrap();
+        s.log_flagged_action("f2", None, "bob@x.com", "Payout failed", None, "")
+            .unwrap();
+
+        let flagged = s.flagged_actions_since(0).unwrap();
+        assert_eq!(flagged.len(), 2, "both flagged rows must be enumerated, no LIMIT");
+        // Reason persisted; empty reason collapses to "flagged".
+        let by_from: std::collections::HashMap<_, _> = flagged
+            .iter()
+            .map(|(f, _s, r)| (f.as_str(), r.as_str()))
+            .collect();
+        assert_eq!(by_from["alice@x.com"], "needs sign-off");
+        assert_eq!(by_from["bob@x.com"], "flagged");
+    }
+
+    #[test]
+    fn flagged_actions_since_respects_window() {
+        let (s, _f) = fresh_store();
+        let e = sample_email("fw");
+        s.upsert_email(&e).unwrap();
+        s.log_flagged_action("fw", None, "a@b.com", "s", None, "r").unwrap();
+        // A far-future `since` excludes everything.
+        let future = now_millis() + 60_000;
+        assert!(s.flagged_actions_since(future).unwrap().is_empty());
+        assert_eq!(s.flagged_actions_since(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn pending_actions_enumerates_entire_backlog_oldest_first() {
+        let (s, _f) = fresh_store();
+        for i in 0..3 {
+            let mid = format!("p{i}");
+            let e = sample_email(&mid);
+            s.upsert_email(&e).unwrap();
+            s.log_action(&mid, None, &format!("u{i}@x.com"), "s", None, Some("d"), ActionStatus::Pending)
+                .unwrap();
+        }
+        // A flagged row must not show up in the pending list.
+        let ef = sample_email("pf");
+        s.upsert_email(&ef).unwrap();
+        s.log_flagged_action("pf", None, "z@x.com", "s", None, "r").unwrap();
+
+        let pending = s.pending_actions().unwrap();
+        assert_eq!(pending.len(), 3, "all pending, no LIMIT; flagged excluded");
+        for (_f, _s, age) in &pending {
+            assert!(*age >= 0);
+        }
+        let oldest = s.oldest_pending_actions(2).unwrap();
+        assert_eq!(oldest.len(), 2, "limit honored");
+    }
+
+    #[test]
+    fn expire_pending_older_than_only_touches_old_pending() {
+        let (s, _f) = fresh_store();
+        let e = sample_email("ex");
+        s.upsert_email(&e).unwrap();
+        let id = s
+            .log_action("ex", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .unwrap();
+        // Cutoff in the past → nothing expired (row is fresh).
+        assert_eq!(s.expire_pending_older_than(0).unwrap(), 0);
+        assert_eq!(s.pending_reply_count().unwrap(), 1);
+        // Cutoff in the future → the fresh row is now "older than" and swept.
+        let future = now_millis() + 60_000;
+        assert_eq!(s.expire_pending_older_than(future).unwrap(), 1);
+        assert_eq!(s.pending_reply_count().unwrap(), 0);
+        // Re-sweep is a no-op (already terminal).
+        assert_eq!(s.expire_pending_older_than(future).unwrap(), 0);
+        let a = s.get_action_with_email(&id).unwrap().unwrap();
+        assert_eq!(a.action.status, "timed_out");
+    }
+
+    #[test]
+    fn mark_pending_approved_only_flips_pending_rows() {
+        let (s, _f) = fresh_store();
+        let e = sample_email("ap");
+        s.upsert_email(&e).unwrap();
+        let id = s
+            .log_action("ap", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .unwrap();
+        assert!(s.mark_pending_approved(&id).unwrap());
+        assert_eq!(s.pending_reply_count().unwrap(), 0);
+        // Second call is a no-op (no longer pending).
+        assert!(!s.mark_pending_approved(&id).unwrap());
+        let a = s.get_action_with_email(&id).unwrap().unwrap();
+        assert_eq!(a.action.status, "approved");
     }
 }

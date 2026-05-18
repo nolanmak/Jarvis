@@ -108,10 +108,48 @@ On the Linux daemon host, the usual case is #3 — lives in `~/AugmentAgent/link
 
 If step 3 fails, nothing is persisted and the existing auth file (if any) is untouched.
 
+## Friend-post engagement (#13)
+
+Alongside DMs, the daemon watches the feeds of people you mark "close" and
+drafts a supportive comment for each fresh post — sent to Discord for
+approval, never auto-posted.
+
+- Mark a contact: add `close: true` to the front-matter of their
+  `people/<slug>.md` wiki page. The page must also carry a `linkedin:`
+  identity (`identities.linkedin: urn:li:fsd_profile:...`).
+- Cadence: every 6h + jitter (independent of the 4h DM poll).
+- Daily cap: 5 engagements/day by default, enforced durably via the
+  `linkedin_action_log` table (survives restarts; never double-comments the
+  same post).
+- Approve a card → the comment is posted via Voyager and the engagement is
+  logged against the cap. Rubric lives in `skills/linkedin-triage/SKILL.md`.
+
+## Posting to your feed (#51 / #77)
+
+`augmentagent linkedin post --text "..." [--image path] [--visibility public|connections] [--dry-run true]`
+
+Phase 1 is Voyager-only **text** + **single-image** posts via
+`contentcreation/normShares`. `--dry-run true` prints the exact request body
+without sending. Guards:
+
+- Rolling-24h cap of **3 posts/day** (preflight; defers with a clear error).
+- First 3 lifetime posts require `AUGMENTAGENT_LINKEDIN_POST_CONFIRM=yes` —
+  a second-confirmation guard for the highest-blast-radius action.
+- The CLI is a manual/test path. The daemon posts through the standard
+  Discord approval pipeline.
+
+Deferred to Phase 2 (`Refs #51`): video, polls, articles, scheduling,
+multi-image, browser fallback.
+
 ## Tuning
 
-- `AUGMENTAGENT_LINKEDIN_POLL_SECS=14400` — override the default 4h poll interval (min 60)
-- `AUGMENTAGENT_LINKEDIN_CONVERSATIONS_QUERY_ID=messengerConversations.xxx` — override if LinkedIn rotates the queryId (error text includes the current one)
+- `AUGMENTAGENT_LINKEDIN_POLL_SECS=14400` — override the default 4h DM poll interval (min 60)
+- `AUGMENTAGENT_LINKEDIN_FEED_POLL_SECS=21600` — override the default 6h feed-engagement poll
+- `AUGMENTAGENT_LINKEDIN_MAX_ENGAGEMENTS=5` — override the daily friend-post engagement cap
+- `AUGMENTAGENT_LINKEDIN_CONVERSATIONS_QUERY_ID=messengerConversations.xxx` — override if LinkedIn rotates the DM queryId (error text includes the current one)
+- `AUGMENTAGENT_LINKEDIN_FEED_QUERY_ID=...` — override if LinkedIn rotates the profile-updates feed queryId
+- `AUGMENTAGENT_LINKEDIN_MEDIA_UPLOAD_PATH=/voyager/api/...` — override if LinkedIn renames the media-upload register endpoint
+- `AUGMENTAGENT_LINKEDIN_CLIENT_VERSION=1.13.x` — override the `x-li-track` clientVersion sent on content-creation calls
 - `AUGMENTAGENT_LINKEDIN_AUTH=/path/to/file.json` — use a non-default cookie path
 
 ## Risks

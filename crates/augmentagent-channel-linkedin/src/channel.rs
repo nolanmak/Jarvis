@@ -263,7 +263,7 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                 let skill_system = std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
                     .unwrap_or_default();
                 let draft_opts = draft_opts(skill_system, self.config.wiki_root.clone());
-                let draft_prompt = draft_user_message(&email, "", "");
+                let draft_prompt = draft_user_message(&email, "", "", "", "");
                 let draft = match self.reasoner.call(&draft_opts, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
                     Err(e) => {
@@ -411,6 +411,193 @@ enum DispatchOutcome {
     AwaitingApproval,
 }
 
+// =============================================================================
+// Friend-post engagement (#13)
+// =============================================================================
+
+/// Drives the [`LinkedInFeedTrigger`] on a ~6h-with-jitter cadence and runs
+/// each surfaced friend post through the same triage → draft → approval-card
+/// pipeline DMs use. Approve → the approver calls `post_comment` (no
+/// auto-posting; cap accounting lives in `linkedin_action_log`).
+///
+/// Kept as a sibling of [`LinkedInChannel`] (not folded into its poll loop)
+/// so the DM cadence and the feed cadence stay independent — the issue calls
+/// for a distinct 6h feed poll vs the 4h DM poll.
+pub struct LinkedInFeedEngagement<L: crate::api::LinkedInApi, R: Reasoner> {
+    pub store: Arc<Store>,
+    pub reasoner: Arc<R>,
+    pub approvals: Arc<dyn ApprovalBroker>,
+    pub trigger: Arc<crate::feed::LinkedInFeedTrigger<L>>,
+    pub member_urn: String,
+    pub config: LinkedInChannelConfig,
+    pub poll_interval: Duration,
+}
+
+impl<L: crate::api::LinkedInApi + 'static, R: Reasoner + 'static> LinkedInFeedEngagement<L, R> {
+    pub async fn run(&self, shutdown: CancellationToken) -> anyhow::Result<()> {
+        let mut ticker = tokio::time::interval(self.poll_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("linkedin feed engagement: shutdown signal received");
+                    return Ok(());
+                }
+                _ = ticker.tick() => {
+                    match self.poll_once(&shutdown).await {
+                        Ok(n) => info!(engaged = n, "linkedin feed poll complete"),
+                        Err(e) => error!("linkedin feed poll failed: {e:#}"),
+                    }
+                    let jitter = jitter_secs();
+                    tokio::time::sleep(Duration::from_secs(jitter)).await;
+                }
+            }
+        }
+    }
+
+    /// One feed poll: ask the trigger for fresh posts (cap-gated), triage +
+    /// draft a supportive comment for each, post an approval card. Returns
+    /// the count of approval cards posted.
+    pub async fn poll_once(&self, cancel: &CancellationToken) -> anyhow::Result<usize> {
+        use augmentagent_channel_core::trigger::Trigger;
+        let items = self.trigger.next_work_items(cancel).await?;
+        let mut posted = 0usize;
+        for item in items {
+            let payload: crate::feed::FeedEngagementPayload =
+                match serde_json::from_value(item.payload.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("feed work-item payload decode failed: {e}");
+                        continue;
+                    }
+                };
+            let post = crate::types::FeedPost {
+                post_urn: payload.post_urn,
+                author_name: payload.author_name,
+                author_urn: crate::types::MemberUrn(payload.author_urn),
+                text: payload.text,
+                created_at_ms: payload.created_at_ms,
+            };
+            match self.handle_post(post).await {
+                Ok(true) => posted += 1,
+                Ok(false) => {}
+                Err(e) => error!("handle_post failed: {e:#}"),
+            }
+        }
+        Ok(posted)
+    }
+
+    /// Triage (engage vs skip) then, on engage, draft a short supportive
+    /// comment and post an approval card. Returns `true` iff a card was
+    /// posted. Mirrors `LinkedInChannel::handle_dm` but the only terminal
+    /// non-skip kind is Reply (a comment) — Flag/Capture/Meeting are coerced
+    /// to skip since they're meaningless for feed engagement.
+    async fn handle_post(&self, post: crate::types::FeedPost) -> anyhow::Result<bool> {
+        let email = post.into_email(&self.member_urn);
+        self.store.upsert_email(&email)?;
+        if self.store.is_message_processed(&email.message_id)? {
+            return Ok(false);
+        }
+
+        let triage_opts = triage_opts(self.config.wiki_root.clone());
+        let triage_prompt = triage_user_message(&email, "", "");
+        let raw = self.reasoner.call(&triage_opts, &triage_prompt).await?;
+        let decision = match parse_decision(&raw) {
+            Ok(d) => d,
+            Err(e) => {
+                error!(message_id = %email.message_id, "feed triage parse failed: {e}; raw={raw}");
+                self.store.log_action(
+                    &email.message_id,
+                    None,
+                    &email.from,
+                    &email.subject,
+                    Some(&email.body),
+                    None,
+                    ActionStatus::Error,
+                )?;
+                return Err(e.into());
+            }
+        };
+
+        if !matches!(decision.decision, DecisionKind::Reply) {
+            // engage == Reply; anything else => skip this post.
+            self.store.log_action(
+                &email.message_id,
+                None,
+                &email.from,
+                &email.subject,
+                Some(&email.body),
+                None,
+                ActionStatus::Skipped,
+            )?;
+            self.store
+                .mark_email_processed(&email.message_id, TriageResult::Skip)?;
+            return Ok(false);
+        }
+
+        let skill_system = std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
+            .unwrap_or_default();
+        let draft_opts = draft_opts(skill_system, self.config.wiki_root.clone());
+        let draft_prompt = draft_user_message(&email, "", "", "", "");
+        let draft = self
+            .reasoner
+            .call(&draft_opts, &draft_prompt)
+            .await?
+            .trim()
+            .to_string();
+
+        if self.config.dry_run {
+            self.store.log_action(
+                &email.message_id,
+                None,
+                &email.from,
+                &email.subject,
+                Some(&email.body),
+                Some(&draft),
+                ActionStatus::DryRun,
+            )?;
+            self.store
+                .mark_email_processed(&email.message_id, TriageResult::Reply)?;
+            println!(
+                "[linkedin engage dry-run] {}\n--- comment ---\n{}\n--- /comment ---",
+                email.subject, draft
+            );
+            return Ok(false);
+        }
+
+        let action_id = self.store.log_action(
+            &email.message_id,
+            None,
+            &email.from,
+            &email.subject,
+            Some(&email.body),
+            Some(&draft),
+            ActionStatus::Pending,
+        )?;
+        if let Err(e) = self
+            .approvals
+            .post_approval(&action_id, &email, &draft)
+            .await
+        {
+            self.store.update_action_status(
+                &action_id,
+                ActionStatus::Error,
+                None,
+                Some(&format!("post_approval: {e}")),
+            )?;
+            return Err(anyhow::anyhow!("post_approval: {e}"));
+        }
+        if let Err(e) = self
+            .store
+            .record_nudge(&action_id, now_millis() + NUDGE_INTERVAL_MS)
+        {
+            warn!(action_id, "record_nudge after feed post_approval failed: {e}");
+        }
+        info!(action_id, post = %email.message_id, "linkedin engagement card posted");
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,7 +607,8 @@ mod tests {
     use augmentagent_store::Email;
 
     use crate::api::LinkedInError;
-    use crate::types::MemberUrn;
+    use crate::posting::{PostDraft, ShareUrn};
+    use crate::types::{FeedPost, MemberUrn};
 
     struct StubApi {
         dms: Vec<Dm>,
@@ -436,6 +624,24 @@ mod tests {
             _text: &str,
         ) -> Result<String, LinkedInError> {
             Ok("urn:li:messagingMessage:STUB".into())
+        }
+        async fn fetch_feed_posts_by_author(
+            &self,
+            _author_urn: &str,
+        ) -> Result<Vec<FeedPost>, LinkedInError> {
+            Ok(vec![])
+        }
+        async fn post_comment(&self, _: &str, _: &str) -> Result<String, LinkedInError> {
+            Ok("urn:li:comment:STUB".into())
+        }
+        async fn react(&self, _: &str, _: &str) -> Result<(), LinkedInError> {
+            Ok(())
+        }
+        async fn create_share(
+            &self,
+            _draft: PostDraft<'_>,
+        ) -> Result<ShareUrn, LinkedInError> {
+            Ok(ShareUrn("urn:li:share:STUB".into()))
         }
     }
 
@@ -690,6 +896,28 @@ mod tests {
                 _: &str,
                 _: &str,
             ) -> Result<String, LinkedInError> {
+                Err(LinkedInError::AuthExpired)
+            }
+            async fn fetch_feed_posts_by_author(
+                &self,
+                _: &str,
+            ) -> Result<Vec<FeedPost>, LinkedInError> {
+                Err(LinkedInError::AuthExpired)
+            }
+            async fn post_comment(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<String, LinkedInError> {
+                Err(LinkedInError::AuthExpired)
+            }
+            async fn react(&self, _: &str, _: &str) -> Result<(), LinkedInError> {
+                Err(LinkedInError::AuthExpired)
+            }
+            async fn create_share(
+                &self,
+                _draft: crate::posting::PostDraft<'_>,
+            ) -> Result<crate::posting::ShareUrn, LinkedInError> {
                 Err(LinkedInError::AuthExpired)
             }
         }

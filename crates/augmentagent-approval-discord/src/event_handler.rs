@@ -276,6 +276,151 @@ impl EventHandler for Handler {
                             warn!("failed to open revise modal: {e}");
                         }
                     }
+                    Verb::QuickRefine => {
+                        // Quick-refine StringSelect (#34): map the chosen
+                        // preset id → canned feedback, route it through the
+                        // SAME revise path as the free-form modal, re-render
+                        // the card with the menu still attached so presets
+                        // stack. Enforce MAX_REDRAFT_ITERATIONS.
+                        let selected = match &comp.data.kind {
+                            serenity::all::ComponentInteractionDataKind::StringSelect {
+                                values,
+                            } => values.first().cloned(),
+                            _ => None,
+                        };
+                        let Some(preset_id) = selected else {
+                            debug!("quick_refine: no preset selected");
+                            return;
+                        };
+                        let Some(preset) = crate::presets::lookup(&preset_id) else {
+                            ack_ephemeral(&ctx, &comp, "Unknown refine preset.").await;
+                            return;
+                        };
+                        if let Err(e) = defer_ephemeral(&ctx, &comp).await {
+                            warn!("failed to defer QuickRefine: {e}");
+                            return;
+                        }
+                        let handler = self.state.action_handler.clone();
+                        let action_id = cid.action_id.clone();
+                        let approval_channel = self.state.approval_channel_id;
+                        let store_for_capture = self.state.store.clone();
+                        let feedback = preset.feedback.to_string();
+                        let preset_id_owned = preset.id.to_string();
+                        let ctx_clone = ctx.clone();
+                        let comp_clone = comp.clone();
+
+                        tokio::spawn(async move {
+                            // Enforce the iteration cap before doing the work.
+                            let already = store_for_capture
+                                .as_ref()
+                                .and_then(|s| s.redraft_count(&action_id).ok())
+                                .unwrap_or(0);
+                            if already >= crate::presets::MAX_REDRAFT_ITERATIONS {
+                                followup(
+                                    &ctx_clone,
+                                    &comp_clone,
+                                    "Refine limit reached for this draft — Approve, Skip, or use Revise for a free-form edit.",
+                                )
+                                .await;
+                                return;
+                            }
+
+                            // Snapshot the pre-redraft draft BEFORE revising
+                            // (revise mutates draftBody in place) — needed for
+                            // the (orig, feedback, revised) eval triple (#37).
+                            let original_draft = store_for_capture
+                                .as_ref()
+                                .and_then(|s| {
+                                    s.get_action_with_email(&action_id).ok().flatten()
+                                })
+                                .map(|a| a.action.draft_body.unwrap_or_default());
+
+                            let outcome = match handler {
+                                Some(h) => h.revise(&action_id, &feedback).await,
+                                None => ApprovalActionOutcome::Failed {
+                                    message: "no action handler configured".into(),
+                                },
+                            };
+
+                            let repost = if let ApprovalActionOutcome::Revised {
+                                email,
+                                draft,
+                            } = &outcome
+                            {
+                                if let (Some(store), Some(orig)) = (
+                                    store_for_capture.as_ref(),
+                                    original_draft.as_ref(),
+                                ) {
+                                    if let Err(e) = store.record_revision_triple(
+                                        &action_id, orig, &feedback, draft,
+                                    ) {
+                                        warn!(
+                                            action_id = %action_id,
+                                            "quick_refine: record triple failed: {e}"
+                                        );
+                                    }
+                                }
+                                Some((email.clone(), draft.clone()))
+                            } else {
+                                None
+                            };
+
+                            followup(&ctx_clone, &comp_clone, &describe(&outcome)).await;
+
+                            let mut new_card_posted = false;
+                            if let Some((email, draft)) = repost {
+                                // Persist preset choice + bump the counter, then
+                                // re-render with the post-increment count so the
+                                // card shows the right version and drops the
+                                // menu once the cap is hit.
+                                let count = match store_for_capture.as_ref() {
+                                    Some(s) => s
+                                        .record_redraft(&action_id, Some(&preset_id_owned))
+                                        .unwrap_or_else(|e| {
+                                            warn!(
+                                                action_id = %action_id,
+                                                "quick_refine: record_redraft failed: {e}"
+                                            );
+                                            0
+                                        }),
+                                    None => 0,
+                                };
+                                info!(
+                                    action_id = %action_id,
+                                    preset = %preset_id_owned,
+                                    redraft_count = count,
+                                    "quick_refine applied"
+                                );
+                                let msg =
+                                    approval_message(&action_id, &email, &draft, count);
+                                match approval_channel
+                                    .send_message(&ctx_clone.http, msg)
+                                    .await
+                                {
+                                    Ok(_) => new_card_posted = true,
+                                    Err(e) => warn!(
+                                        action_id = %action_id,
+                                        "quick_refine: re-post card failed: {e}"
+                                    ),
+                                }
+                            }
+
+                            let delete_old = match &outcome {
+                                ApprovalActionOutcome::Revised { .. } => new_card_posted,
+                                ApprovalActionOutcome::AlreadyResolved { .. } => true,
+                                _ => false,
+                            };
+                            if delete_old {
+                                delete_source_message(
+                                    &ctx_clone,
+                                    comp_clone.channel_id,
+                                    comp_clone.message.id,
+                                    &action_id,
+                                )
+                                .await;
+                            }
+                        });
+                    }
                     Verb::ReviseModal => {
                         debug!("unexpected ReviseModal on component interaction");
                     }
@@ -394,7 +539,17 @@ impl EventHandler for Handler {
                     // user isn't left without a card to act on.
                     let mut new_card_posted = false;
                     if let Some((email, draft)) = repost {
-                        let msg = approval_message(&action_id, &email, &draft);
+                        // Free-form Revise counts toward the visible draft
+                        // version (#34) but records no preset. It's the
+                        // explicit escape hatch, so we never block it.
+                        let count = match store_for_capture.as_ref() {
+                            Some(s) => s.record_redraft(&action_id, None).unwrap_or_else(|e| {
+                                warn!(action_id = %action_id, "revise: record_redraft failed: {e}");
+                                0
+                            }),
+                            None => 0,
+                        };
+                        let msg = approval_message(&action_id, &email, &draft, count);
                         match approval_channel.send_message(&ctx_clone.http, msg).await {
                             Ok(_) => new_card_posted = true,
                             Err(e) => warn!(
@@ -620,7 +775,7 @@ fn handle_invoice_command(store: Option<&Store>, text: &str) -> String {
         Some("status") => {
             let recipient = {
                 let r = g("recipient_email");
-                if r.is_empty() { "REDACTED".to_string() } else { r }
+                if r.is_empty() { "(unset — set via dashboard or `!invoice recipient`)".to_string() } else { r }
             };
             let entity = g("from_entity");
             let last = g("last_billed_week_end");

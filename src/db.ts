@@ -680,7 +680,7 @@ export interface InvoiceSettings {
 export function getInvoiceSettings(): InvoiceSettings {
   return {
     autoSendEnabled: getInvoiceConfig("auto_send_enabled") === "true",
-    recipientEmail: getInvoiceConfig("recipient_email") || "REDACTED",
+    recipientEmail: getInvoiceConfig("recipient_email") || "",
     nextNumber: parseInt(getInvoiceConfig("invoice_counter") || "35", 10) || 35,
     fromEntity: getInvoiceConfig("from_entity") || "",
     lastBilledWeekEnd: getInvoiceConfig("last_billed_week_end") || "",
