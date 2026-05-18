@@ -440,7 +440,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         ));
     }
 
-    // Commit (as Nolan, per repo convention — no Claude attribution) + push.
+    // Commit via the configured git identity (env; no hardcoded personal
+    // data so the repo stays open-source-safe) + push. Neutral fallback.
     let _ = run("git", &["add", "-A"], &worktree).await?;
     let commit_msg = format!(
         "fix: {} (#{})\n\n{}",
@@ -448,13 +449,19 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         issue.number,
         truncate(&summary, 500)
     );
+    let git_name = std::env::var("AUGMENTAGENT_GIT_AUTHOR_NAME")
+        .unwrap_or_else(|_| "AugmentAgent".to_string());
+    let git_email = std::env::var("AUGMENTAGENT_GIT_AUTHOR_EMAIL")
+        .unwrap_or_else(|_| "augmentagent@localhost".to_string());
+    let name_arg = format!("user.name={git_name}");
+    let email_arg = format!("user.email={git_email}");
     let (ok, _o, e) = run(
         "git",
         &[
             "-c",
-            "user.name=Nolan Makatche",
+            &name_arg,
             "-c",
-            "user.email=REDACTED",
+            &email_arg,
             "commit",
             "-m",
             &commit_msg,
