@@ -447,3 +447,56 @@ pub struct UserLoop {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
+
+/// #117 — an allowlisted repo the multi-repo agent-coding loop is permitted
+/// to touch. Default-deny: the loop refuses any repo not represented by an
+/// `enabled` row here. `blast_radius_extra` is a comma-separated list of
+/// extra path fragments (on top of the hard built-in deny list) that mark a
+/// diff "too dangerous to auto-touch" for THIS repo (e.g. a third-party
+/// repo's own deploy dir). `build_cmd` is the per-repo verification-gate
+/// command run inside the throwaway clone before a PR is proposed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRepo {
+    pub id: String,
+    /// `owner/name` GitHub full-name. Unique (case-insensitive) per row.
+    pub full_name: String,
+    /// Branch PRs target (default-branch of the repo, e.g. `main`).
+    pub base_branch: String,
+    /// Verification-gate shell command, run with `bash -lc` in the clone.
+    /// Empty ⇒ gate is skipped (clone-only repos / docs repos).
+    pub build_cmd: String,
+    /// Extra comma-separated blast-radius path fragments for this repo.
+    pub blast_radius_extra: String,
+    /// Max changed lines this repo will accept in one agent diff.
+    pub max_diff_lines: i64,
+    /// `false` ⇒ revoked. A revoked repo is hard-skipped by the loop and its
+    /// in-flight gate rows are auto-rejected.
+    pub enabled: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// #117 — one audit/gate row per multi-repo agent-coding attempt. The loop
+/// inserts it `pending_approval` after the verification gate passes, posts a
+/// Discord prompt + dashboard card, and only opens the draft PR once a human
+/// flips it to `approved`. Terminal states: `pr_opened`, `rejected`,
+/// `failed`, `expired`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentPrRun {
+    pub id: String,
+    pub repo_full_name: String,
+    pub issue_number: i64,
+    pub branch: String,
+    /// Short Claude-authored summary of the change.
+    pub summary: String,
+    pub diff_lines: i64,
+    /// `pending_approval` | `approved` | `rejected` | `pr_opened` | `failed`
+    /// | `expired`.
+    pub status: String,
+    /// Populated once the draft PR is opened.
+    pub pr_url: Option<String>,
+    /// Last error if `status = failed`.
+    pub error: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}

@@ -7,10 +7,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::models::{
-    Account, ActionRecord, ActionStatus, ChannelSubscription, DriveAccount, Email, LearnedPattern,
-    LinkedInConnectionSync, PhoneIdentity, RateAuditRow, RateHalt, RateWarmup, ScheduledPost,
-    ScheduledPostStatus, SlackWorkspace,
-    SubscriptionMode, TelegramBot, ToneExample, ToneProfile, TriageResult, UserLoop, WhatsappDevice,
+    Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription, DriveAccount,
+    Email, LearnedPattern, LinkedInConnectionSync, PhoneIdentity, RateAuditRow, RateHalt,
+    RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace, SubscriptionMode, TelegramBot,
+    ToneExample, ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 
 #[derive(Debug, Error)]
@@ -949,6 +949,62 @@ impl Store {
                 ON identity_phone(person_slug)",
             [],
         )?;
+
+        // #117 — multi-repo agent-coding allowlist + audit. Both additive +
+        // dormant in prod until a repo is granted via the dashboard; same
+        // proven-safe pattern as the wave-A tables above. `full_name` is
+        // UNIQUE NOCASE so `Owner/Repo` and `owner/repo` can't both be
+        // allowlisted. Default-deny: an empty table means the loop touches
+        // nothing.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_repos (\
+                 id                 TEXT PRIMARY KEY,\
+                 full_name          TEXT NOT NULL UNIQUE COLLATE NOCASE,\
+                 base_branch        TEXT NOT NULL DEFAULT 'main',\
+                 build_cmd          TEXT NOT NULL DEFAULT '',\
+                 blast_radius_extra TEXT NOT NULL DEFAULT '',\
+                 max_diff_lines     INTEGER NOT NULL DEFAULT 600,\
+                 enabled            INTEGER NOT NULL DEFAULT 1,\
+                 created_at_ms      INTEGER NOT NULL,\
+                 updated_at_ms      INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_repos_enabled \
+                ON agent_repos(enabled)",
+            [],
+        )?;
+        // One row per attempt. The gate (`pending_approval`) lives here so a
+        // daemon restart never loses an awaiting-approval PR and the
+        // dashboard can render full per-repo history.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_pr_runs (\
+                 id             TEXT PRIMARY KEY,\
+                 repo_full_name TEXT NOT NULL,\
+                 issue_number   INTEGER NOT NULL,\
+                 branch         TEXT NOT NULL,\
+                 summary        TEXT NOT NULL DEFAULT '',\
+                 diff_lines     INTEGER NOT NULL DEFAULT 0,\
+                 status         TEXT NOT NULL,\
+                 pr_url         TEXT,\
+                 error          TEXT,\
+                 created_at_ms  INTEGER NOT NULL,\
+                 updated_at_ms  INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_pr_runs_repo \
+                ON agent_pr_runs(repo_full_name, created_at_ms)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_pr_runs_status \
+                ON agent_pr_runs(status)",
+            [],
+        )?;
+
         Ok(())
     }
 
@@ -3773,6 +3829,310 @@ impl Store {
         Ok(found.is_some())
     }
 
+    // --- #117 multi-repo agent-coding allowlist + audit ----------------
+
+    /// Allowlist (or update) a repo. Idempotent on `full_name` (case-insens):
+    /// re-granting an existing repo updates its config + re-enables it
+    /// without resetting its PR-run history.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_agent_repo(
+        &self,
+        full_name: &str,
+        base_branch: &str,
+        build_cmd: &str,
+        blast_radius_extra: &str,
+        max_diff_lines: i64,
+    ) -> StoreResult<AgentRepo> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let existing: Option<String> = guard
+            .query_row(
+                "SELECT id FROM agent_repos WHERE full_name = ?1 COLLATE NOCASE",
+                params![full_name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(id) => {
+                guard.execute(
+                    "UPDATE agent_repos SET base_branch = ?2, build_cmd = ?3, \
+                            blast_radius_extra = ?4, max_diff_lines = ?5, \
+                            enabled = 1, updated_at_ms = ?6 \
+                      WHERE id = ?1",
+                    params![
+                        id,
+                        base_branch,
+                        build_cmd,
+                        blast_radius_extra,
+                        max_diff_lines,
+                        now
+                    ],
+                )?;
+            }
+            None => {
+                let id = Uuid::new_v4().to_string();
+                guard.execute(
+                    "INSERT INTO agent_repos \
+                        (id, full_name, base_branch, build_cmd, \
+                         blast_radius_extra, max_diff_lines, enabled, \
+                         created_at_ms, updated_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)",
+                    params![
+                        id,
+                        full_name,
+                        base_branch,
+                        build_cmd,
+                        blast_radius_extra,
+                        max_diff_lines,
+                        now
+                    ],
+                )?;
+            }
+        }
+        drop(guard);
+        self.get_agent_repo(full_name)?
+            .ok_or(StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn get_agent_repo(&self, full_name: &str) -> StoreResult<Option<AgentRepo>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT id, full_name, base_branch, build_cmd, \
+                        blast_radius_extra, max_diff_lines, enabled, \
+                        created_at_ms, updated_at_ms \
+                   FROM agent_repos WHERE full_name = ?1 COLLATE NOCASE",
+                params![full_name],
+                row_to_agent_repo,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// List allowlisted repos. `enabled_only` filters to active grants — the
+    /// loop always passes `true` (default-deny); the dashboard passes `false`
+    /// to also show revoked rows.
+    pub fn list_agent_repos(&self, enabled_only: bool) -> StoreResult<Vec<AgentRepo>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let sql = if enabled_only {
+            "SELECT id, full_name, base_branch, build_cmd, blast_radius_extra, \
+                    max_diff_lines, enabled, created_at_ms, updated_at_ms \
+               FROM agent_repos WHERE enabled = 1 ORDER BY full_name ASC"
+        } else {
+            "SELECT id, full_name, base_branch, build_cmd, blast_radius_extra, \
+                    max_diff_lines, enabled, created_at_ms, updated_at_ms \
+               FROM agent_repos ORDER BY full_name ASC"
+        };
+        let mut stmt = guard.prepare(sql)?;
+        let rows = stmt.query_map([], row_to_agent_repo)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Revoke a repo (soft: `enabled = 0`) AND auto-reject any of its
+    /// in-flight `pending_approval` gate rows so a revoked repo can never get
+    /// a PR opened from a stale awaiting-approval card. Returns the number of
+    /// gate rows that were cancelled.
+    pub fn revoke_agent_repo(&self, full_name: &str) -> StoreResult<usize> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE agent_repos SET enabled = 0, updated_at_ms = ?2 \
+              WHERE full_name = ?1 COLLATE NOCASE",
+            params![full_name, now],
+        )?;
+        let cancelled = guard.execute(
+            "UPDATE agent_pr_runs \
+                SET status = 'rejected', \
+                    error = 'repo access revoked', \
+                    updated_at_ms = ?2 \
+              WHERE repo_full_name = ?1 COLLATE NOCASE \
+                AND status = 'pending_approval'",
+            params![full_name, now],
+        )?;
+        Ok(cancelled)
+    }
+
+    /// Insert a fresh PR-run audit row (called once the verification gate
+    /// passes, in `pending_approval`).
+    pub fn insert_agent_pr_run(
+        &self,
+        repo_full_name: &str,
+        issue_number: i64,
+        branch: &str,
+        summary: &str,
+        diff_lines: i64,
+        status: &str,
+    ) -> StoreResult<AgentPrRun> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO agent_pr_runs \
+                (id, repo_full_name, issue_number, branch, summary, \
+                 diff_lines, status, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![
+                id,
+                repo_full_name,
+                issue_number,
+                branch,
+                summary,
+                diff_lines,
+                status,
+                now
+            ],
+        )?;
+        drop(guard);
+        self.get_agent_pr_run(&id)?
+            .ok_or(StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn get_agent_pr_run(&self, id: &str) -> StoreResult<Option<AgentPrRun>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT id, repo_full_name, issue_number, branch, summary, \
+                        diff_lines, status, pr_url, error, created_at_ms, \
+                        updated_at_ms \
+                   FROM agent_pr_runs WHERE id = ?1",
+                params![id],
+                row_to_agent_pr_run,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Approve a `pending_approval` gate row. Returns the freshly-approved
+    /// row, or `None` if it wasn't pending (already resolved / not found) so
+    /// callers can render a 409-style "already resolved" without racing two
+    /// surfaces (mirrors the reply-approval CAS guard).
+    pub fn approve_agent_pr_run(&self, id: &str) -> StoreResult<Option<AgentPrRun>> {
+        self.transition_gate(id, "approved", None, None)
+    }
+
+    /// Reject a `pending_approval` gate row. Same CAS semantics as approve.
+    pub fn reject_agent_pr_run(&self, id: &str) -> StoreResult<Option<AgentPrRun>> {
+        self.transition_gate(id, "rejected", None, Some("rejected by reviewer"))
+    }
+
+    /// Mark a gate row `pr_opened` with its URL (terminal). Unconditional —
+    /// only the loop calls this, right after it opens the draft PR.
+    pub fn mark_agent_pr_opened(&self, id: &str, pr_url: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE agent_pr_runs SET status = 'pr_opened', pr_url = ?2, \
+                    updated_at_ms = ?3 WHERE id = ?1",
+            params![id, pr_url, now],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a gate row `failed` with an error (terminal).
+    pub fn mark_agent_pr_failed(&self, id: &str, error: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE agent_pr_runs SET status = 'failed', error = ?2, \
+                    updated_at_ms = ?3 WHERE id = ?1",
+            params![id, error, now],
+        )?;
+        Ok(())
+    }
+
+    /// CAS-style transition: only mutate when still `pending_approval`.
+    fn transition_gate(
+        &self,
+        id: &str,
+        new_status: &str,
+        pr_url: Option<&str>,
+        error: Option<&str>,
+    ) -> StoreResult<Option<AgentPrRun>> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE agent_pr_runs \
+                SET status = ?2, pr_url = COALESCE(?3, pr_url), \
+                    error = COALESCE(?4, error), updated_at_ms = ?5 \
+              WHERE id = ?1 AND status = 'pending_approval'",
+            params![id, new_status, pr_url, error, now],
+        )?;
+        drop(guard);
+        if n == 0 {
+            return Ok(None);
+        }
+        self.get_agent_pr_run(id)
+    }
+
+    /// True if an open (non-terminal) gate row already exists for this
+    /// (repo, issue). Dedup guard so the loop doesn't queue two approval
+    /// cards for the same issue. `pending_approval` + `approved` (queued for
+    /// the open-PR step) both count as open.
+    pub fn has_open_agent_pr_run(
+        &self,
+        repo_full_name: &str,
+        issue_number: i64,
+    ) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let found: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM agent_pr_runs \
+                  WHERE repo_full_name = ?1 COLLATE NOCASE \
+                    AND issue_number = ?2 \
+                    AND status IN ('pending_approval','approved') \
+                  LIMIT 1",
+                params![repo_full_name, issue_number],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Per-repo PR-run history, newest first (dashboard audit view).
+    pub fn list_agent_pr_runs(
+        &self,
+        repo_full_name: Option<&str>,
+        limit: i64,
+    ) -> StoreResult<Vec<AgentPrRun>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut out = Vec::new();
+        match repo_full_name {
+            Some(repo) => {
+                let mut stmt = guard.prepare(
+                    "SELECT id, repo_full_name, issue_number, branch, summary, \
+                            diff_lines, status, pr_url, error, created_at_ms, \
+                            updated_at_ms \
+                       FROM agent_pr_runs \
+                      WHERE repo_full_name = ?1 COLLATE NOCASE \
+                      ORDER BY created_at_ms DESC LIMIT ?2",
+                )?;
+                let rows =
+                    stmt.query_map(params![repo, limit], row_to_agent_pr_run)?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+            None => {
+                let mut stmt = guard.prepare(
+                    "SELECT id, repo_full_name, issue_number, branch, summary, \
+                            diff_lines, status, pr_url, error, created_at_ms, \
+                            updated_at_ms \
+                       FROM agent_pr_runs \
+                      ORDER BY created_at_ms DESC LIMIT ?1",
+                )?;
+                let rows = stmt.query_map(params![limit], row_to_agent_pr_run)?;
+                for r in rows {
+                    out.push(r?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     // =====================================================================
     // #58.1 — scheduled outbound posts (cross-platform queue)
     // =====================================================================
@@ -4136,6 +4496,36 @@ fn row_to_user_loop(r: &rusqlite::Row) -> rusqlite::Result<UserLoop> {
         fail_count: r.get(9)?,
         created_at_ms: r.get(10)?,
         updated_at_ms: r.get(11)?,
+    })
+}
+
+fn row_to_agent_repo(r: &rusqlite::Row) -> rusqlite::Result<AgentRepo> {
+    Ok(AgentRepo {
+        id: r.get(0)?,
+        full_name: r.get(1)?,
+        base_branch: r.get(2)?,
+        build_cmd: r.get(3)?,
+        blast_radius_extra: r.get(4)?,
+        max_diff_lines: r.get(5)?,
+        enabled: r.get::<_, i64>(6)? != 0,
+        created_at_ms: r.get(7)?,
+        updated_at_ms: r.get(8)?,
+    })
+}
+
+fn row_to_agent_pr_run(r: &rusqlite::Row) -> rusqlite::Result<AgentPrRun> {
+    Ok(AgentPrRun {
+        id: r.get(0)?,
+        repo_full_name: r.get(1)?,
+        issue_number: r.get(2)?,
+        branch: r.get(3)?,
+        summary: r.get(4)?,
+        diff_lines: r.get(5)?,
+        status: r.get(6)?,
+        pr_url: r.get(7)?,
+        error: r.get(8)?,
+        created_at_ms: r.get(9)?,
+        updated_at_ms: r.get(10)?,
     })
 }
 
@@ -5425,5 +5815,78 @@ mod tests {
         assert!(!s.mark_pending_approved(&id).unwrap());
         let a = s.get_action_with_email(&id).unwrap().unwrap();
         assert_eq!(a.action.status, "approved");
+    }
+
+    // --- #117 multi-repo allowlist + gate -----------------------------
+
+    #[test]
+    fn agent_repo_allowlist_is_default_deny_and_idempotent() {
+        let (s, _f) = fresh_store();
+        // Default-deny: nothing allowlisted out of the box.
+        assert!(s.list_agent_repos(true).unwrap().is_empty());
+        assert!(s.get_agent_repo("acme/widgets").unwrap().is_none());
+
+        let r = s
+            .upsert_agent_repo("acme/widgets", "main", "cargo test", "infra/", 400)
+            .unwrap();
+        assert_eq!(r.full_name, "acme/widgets");
+        assert!(r.enabled);
+        assert_eq!(r.max_diff_lines, 400);
+
+        // Case-insensitive uniqueness: re-granting updates in place, no dup.
+        let r2 = s
+            .upsert_agent_repo("ACME/Widgets", "develop", "make test", "", 999)
+            .unwrap();
+        assert_eq!(r2.id, r.id);
+        assert_eq!(r2.base_branch, "develop");
+        assert_eq!(s.list_agent_repos(false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn revoking_repo_cancels_inflight_gate_rows() {
+        let (s, _f) = fresh_store();
+        s.upsert_agent_repo("acme/widgets", "main", "", "", 600)
+            .unwrap();
+        let run = s
+            .insert_agent_pr_run("acme/widgets", 42, "agent-fix/issue-42", "fix", 12, "pending_approval")
+            .unwrap();
+        assert!(s.has_open_agent_pr_run("acme/widgets", 42).unwrap());
+
+        let cancelled = s.revoke_agent_repo("acme/widgets").unwrap();
+        assert_eq!(cancelled, 1);
+        assert!(!s.get_agent_repo("acme/widgets").unwrap().unwrap().enabled);
+        let after = s.get_agent_pr_run(&run.id).unwrap().unwrap();
+        assert_eq!(after.status, "rejected");
+        // Loop default-deny no longer sees it.
+        assert!(s.list_agent_repos(true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gate_approve_is_cas_guarded() {
+        let (s, _f) = fresh_store();
+        s.upsert_agent_repo("acme/widgets", "main", "", "", 600)
+            .unwrap();
+        let run = s
+            .insert_agent_pr_run("acme/widgets", 7, "agent-fix/issue-7", "sum", 3, "pending_approval")
+            .unwrap();
+
+        let approved = s.approve_agent_pr_run(&run.id).unwrap();
+        assert_eq!(approved.unwrap().status, "approved");
+        // Second transition is rejected (no longer pending) — no double-fire.
+        assert!(s.approve_agent_pr_run(&run.id).unwrap().is_none());
+        assert!(s.reject_agent_pr_run(&run.id).unwrap().is_none());
+
+        s.mark_agent_pr_opened(&run.id, "https://github.com/acme/widgets/pull/9")
+            .unwrap();
+        let done = s.get_agent_pr_run(&run.id).unwrap().unwrap();
+        assert_eq!(done.status, "pr_opened");
+        assert_eq!(
+            done.pr_url.as_deref(),
+            Some("https://github.com/acme/widgets/pull/9")
+        );
+
+        let hist = s.list_agent_pr_runs(Some("acme/widgets"), 10).unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(s.list_agent_pr_runs(None, 10).unwrap().len(), 1);
     }
 }

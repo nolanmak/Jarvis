@@ -1021,3 +1021,199 @@ export function listActiveProactiveUserActions(): ProactiveActionRow[] {
     )
     .all(now) as ProactiveActionRow[];
 }
+
+// --- #117 multi-repo agent-coding allowlist + audit ---
+//
+// The Rust daemon's `migrate()` owns the canonical `agent_repos` /
+// `agent_pr_runs` schema. Schema here MUST stay byte-identical (snake_case,
+// same column types/defaults) since both processes share the tenant's
+// data.db. Like the proactive tables, every accessor first ensures the
+// tables exist (additive, idempotent) so the dashboard unit can boot before
+// the daemon has ever migrated. Default-deny: an empty `agent_repos` means
+// the agent can touch nothing.
+
+function ensureAgentRepoTables(): void {
+  getDb().exec(`
+    CREATE TABLE IF NOT EXISTS agent_repos (
+      id                 TEXT PRIMARY KEY,
+      full_name          TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      base_branch        TEXT NOT NULL DEFAULT 'main',
+      build_cmd          TEXT NOT NULL DEFAULT '',
+      blast_radius_extra TEXT NOT NULL DEFAULT '',
+      max_diff_lines     INTEGER NOT NULL DEFAULT 600,
+      enabled            INTEGER NOT NULL DEFAULT 1,
+      created_at_ms      INTEGER NOT NULL,
+      updated_at_ms      INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_repos_enabled ON agent_repos(enabled);
+    CREATE TABLE IF NOT EXISTS agent_pr_runs (
+      id             TEXT PRIMARY KEY,
+      repo_full_name TEXT NOT NULL,
+      issue_number   INTEGER NOT NULL,
+      branch         TEXT NOT NULL,
+      summary        TEXT NOT NULL DEFAULT '',
+      diff_lines     INTEGER NOT NULL DEFAULT 0,
+      status         TEXT NOT NULL,
+      pr_url         TEXT,
+      error          TEXT,
+      created_at_ms  INTEGER NOT NULL,
+      updated_at_ms  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_pr_runs_repo
+      ON agent_pr_runs(repo_full_name, created_at_ms);
+    CREATE INDEX IF NOT EXISTS idx_agent_pr_runs_status
+      ON agent_pr_runs(status);
+  `);
+}
+
+export interface AgentRepoRow {
+  id: string;
+  full_name: string;
+  base_branch: string;
+  build_cmd: string;
+  blast_radius_extra: string;
+  max_diff_lines: number;
+  enabled: number;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface AgentPrRunRow {
+  id: string;
+  repo_full_name: string;
+  issue_number: number;
+  branch: string;
+  summary: string;
+  diff_lines: number;
+  status: string;
+  pr_url: string | null;
+  error: string | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+/** Allowlisted repos. `enabledOnly` filters to active grants. */
+export function listAgentRepos(enabledOnly = false): AgentRepoRow[] {
+  ensureAgentRepoTables();
+  const sql = enabledOnly
+    ? "SELECT * FROM agent_repos WHERE enabled = 1 ORDER BY full_name ASC"
+    : "SELECT * FROM agent_repos ORDER BY full_name ASC";
+  return getDb().prepare(sql).all() as AgentRepoRow[];
+}
+
+/** Allowlist (or re-grant / update) a repo. Idempotent on full_name. */
+export function upsertAgentRepo(
+  fullName: string,
+  baseBranch: string,
+  buildCmd: string,
+  blastRadiusExtra: string,
+  maxDiffLines: number
+): AgentRepoRow {
+  ensureAgentRepoTables();
+  const now = Date.now();
+  const existing = getDb()
+    .prepare("SELECT id FROM agent_repos WHERE full_name = ? COLLATE NOCASE")
+    .get(fullName) as { id: string } | undefined;
+  if (existing) {
+    getDb()
+      .prepare(
+        `UPDATE agent_repos SET base_branch = ?, build_cmd = ?,
+                blast_radius_extra = ?, max_diff_lines = ?, enabled = 1,
+                updated_at_ms = ? WHERE id = ?`
+      )
+      .run(baseBranch, buildCmd, blastRadiusExtra, maxDiffLines, now, existing.id);
+  } else {
+    getDb()
+      .prepare(
+        `INSERT INTO agent_repos
+           (id, full_name, base_branch, build_cmd, blast_radius_extra,
+            max_diff_lines, enabled, created_at_ms, updated_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`
+      )
+      .run(
+        crypto.randomUUID(),
+        fullName,
+        baseBranch,
+        buildCmd,
+        blastRadiusExtra,
+        maxDiffLines,
+        now,
+        now
+      );
+  }
+  return getDb()
+    .prepare("SELECT * FROM agent_repos WHERE full_name = ? COLLATE NOCASE")
+    .get(fullName) as AgentRepoRow;
+}
+
+/**
+ * Revoke a repo: soft-disable + auto-reject its in-flight `pending_approval`
+ * gate rows so a revoked repo can never get a PR opened from a stale card.
+ * Returns the number of gate rows cancelled. Mirrors the Rust
+ * `revoke_agent_repo` exactly.
+ */
+export function revokeAgentRepo(fullName: string): number {
+  ensureAgentRepoTables();
+  const now = Date.now();
+  getDb()
+    .prepare(
+      "UPDATE agent_repos SET enabled = 0, updated_at_ms = ? WHERE full_name = ? COLLATE NOCASE"
+    )
+    .run(now, fullName);
+  const res = getDb()
+    .prepare(
+      `UPDATE agent_pr_runs
+          SET status = 'rejected', error = 'repo access revoked', updated_at_ms = ?
+        WHERE repo_full_name = ? COLLATE NOCASE AND status = 'pending_approval'`
+    )
+    .run(now, fullName);
+  return res.changes;
+}
+
+/** Per-repo (or global) agent-PR run history, newest first. */
+export function listAgentPrRuns(
+  fullName?: string,
+  limit = 50
+): AgentPrRunRow[] {
+  ensureAgentRepoTables();
+  if (fullName) {
+    return getDb()
+      .prepare(
+        `SELECT * FROM agent_pr_runs WHERE repo_full_name = ? COLLATE NOCASE
+          ORDER BY created_at_ms DESC LIMIT ?`
+      )
+      .all(fullName, limit) as AgentPrRunRow[];
+  }
+  return getDb()
+    .prepare(
+      "SELECT * FROM agent_pr_runs ORDER BY created_at_ms DESC LIMIT ?"
+    )
+    .all(limit) as AgentPrRunRow[];
+}
+
+/**
+ * Resolve a queued gate row. CAS-guarded: only mutates when still
+ * `pending_approval`, returning the updated row, or null if it wasn't
+ * pending (already resolved / unknown) — mirrors the Rust transition_gate
+ * so two surfaces can't double-fire.
+ */
+export function resolveAgentPrRun(
+  id: string,
+  decision: "approved" | "rejected"
+): AgentPrRunRow | null {
+  ensureAgentRepoTables();
+  const now = Date.now();
+  const res = getDb()
+    .prepare(
+      `UPDATE agent_pr_runs
+          SET status = ?,
+              error = CASE WHEN ? = 'rejected' THEN 'rejected by reviewer' ELSE error END,
+              updated_at_ms = ?
+        WHERE id = ? AND status = 'pending_approval'`
+    )
+    .run(decision, decision, now, id);
+  if (res.changes === 0) return null;
+  return getDb()
+    .prepare("SELECT * FROM agent_pr_runs WHERE id = ?")
+    .get(id) as AgentPrRunRow;
+}
