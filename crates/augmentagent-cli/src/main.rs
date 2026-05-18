@@ -1567,9 +1567,20 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
-        Cmd::Compose { op } => match op {
-            ComposeOp::FanOut { .. } => {
-                unimplemented!("see issue #53 (content-adapter feature PR)")
+        Cmd::Compose { ref op } => match op {
+            ComposeOp::FanOut {
+                source,
+                platforms,
+                dry_run,
+            } => {
+                run_compose_fan_out(
+                    &cli,
+                    Arc::clone(&store),
+                    source.clone(),
+                    platforms.clone(),
+                    *dry_run,
+                )
+                .await
             }
         },
         Cmd::Proactive { ref op } => match op {
@@ -5992,4 +6003,70 @@ async fn run_voice_serve(
             Ok(())
         }
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// #53 — Cross-platform content adapter CLI handler.
+// ---------------------------------------------------------------------------
+
+async fn run_compose_fan_out(
+    cli: &Cli,
+    store: Arc<Store>,
+    source: PathBuf,
+    platforms_csv: String,
+    dry_run: bool,
+) -> Result<()> {
+    use augmentagent_content_adapter::{fan_out, preview_all, Platform, SourceDraft};
+
+    let body = std::fs::read_to_string(&source)
+        .with_context(|| format!("read source draft {}", source.display()))?;
+    if body.trim().is_empty() {
+        anyhow::bail!("source draft is empty");
+    }
+    let platforms: Vec<Platform> = platforms_csv
+        .split(',')
+        .filter_map(|p| Platform::parse(p.trim()))
+        .collect();
+    if platforms.is_empty() {
+        anyhow::bail!("no valid platforms in --platforms ({platforms_csv})");
+    }
+
+    let src = SourceDraft::new(body);
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let variants = fan_out(&reasoner, &src, &platforms).await;
+    let cards = preview_all(&variants);
+
+    if dry_run {
+        for c in &cards {
+            println!("\n----- variant -----\n{c}");
+        }
+        println!(
+            "\n{} variant(s) generated (dry-run: not posted)",
+            variants.len()
+        );
+    } else {
+        // Each variant is independently approval-gated. Post one card per
+        // variant via the broker; the channels own the actual publish step
+        // (Refs #53 — posting wiring lands with the platform channels).
+        let (broker, _) = build_broker(cli, Arc::clone(&store), dry_run).await?;
+        for (v, card) in variants.iter().zip(cards.iter()) {
+            let pseudo = augmentagent_store::Email {
+                message_id: format!("compose:{}", v.platform.as_str()),
+                thread_id: None,
+                from: "content-adapter".into(),
+                subject: format!("[{}] variant for review", v.platform.as_str()),
+                body: card.clone(),
+                date: String::new(),
+                account_entity_id: None,
+                platform: v.platform.as_str().to_string(),
+                kind: "compose_variant".into(),
+            };
+            if let Err(e) = broker.post_flag_notice(&pseudo, card).await {
+                warn!(platform = v.platform.as_str(), "compose card post failed: {e}");
+            }
+        }
+        println!("{} variant card(s) posted for approval", variants.len());
+    }
+    Ok(())
 }

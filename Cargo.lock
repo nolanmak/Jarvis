@@ -589,6 +589,7 @@ dependencies = [
  "augmentagent-channel-slack",
  "augmentagent-channel-telegram-bot",
  "augmentagent-channel-voice",
+ "augmentagent-content-adapter",
  "augmentagent-proactive",
  "augmentagent-renderer-client",
  "augmentagent-store",
