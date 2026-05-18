@@ -13,6 +13,7 @@ import path from "path";
 import dotenv from "dotenv";
 
 import { createDraft, sendDraft } from "./gmailService";
+import { getGroupEvents } from "./meetupService";
 import { sendForApproval } from "./discordService";
 import { logAction, updateActionStatus, markEmailProcessed } from "./db";
 import type { Email } from "./types";
@@ -225,6 +226,36 @@ const notifyTool = (tool as any)({
   },
 }) as Tool;
 
+const meetupTool = (tool as any)({
+  name: "meetup_events",
+  description: `List a Meetup group's events via Meetup's API (no auth needed for public groups). Available actions:
+- list_events: Fetch a group's events. params: { urlname: string (group slug from meetup.com/<urlname>/, e.g. "code-coffee-philly"), kind?: "upcoming" | "past" (default "upcoming"), limit?: number (default all) }
+Returns JSON: { totalCount, count, events: [{ id, title, url, status, dateTime, endTime, isOnline, eventType, going, venue, recurrence }] }`,
+  parameters: z.object({
+    action: z.enum(["list_events"]),
+    params: z.record(z.string(), z.unknown()),
+  }),
+  execute: async (input: { action: string; params: Record<string, unknown> }) => {
+    switch (input.action) {
+      case "list_events": {
+        const urlname = input.params.urlname as string;
+        if (!urlname) return JSON.stringify({ error: "urlname is required" });
+        const kind = input.params.kind === "past" ? "past" : "upcoming";
+        const rawLimit = Number(input.params.limit);
+        const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : undefined;
+        try {
+          const { totalCount, events } = await getGroupEvents(urlname, { kind, limit });
+          return JSON.stringify({ totalCount, count: events.length, events });
+        } catch (err: any) {
+          return JSON.stringify({ error: err?.message ?? String(err) });
+        }
+      }
+      default:
+        return JSON.stringify({ error: `Unknown action: ${input.action}` });
+    }
+  },
+}) as Tool;
+
 // --- Agent Instructions (static prefix + skill file, cacheable per session) ---
 
 function buildInstructions(): string {
@@ -261,15 +292,34 @@ For each email provided:
 6. Report a brief summary: X emails checked, Y skipped, Z drafted, W sent`;
 }
 
-const agentTools: Tool[] = [gmailTool, notifyTool];
+const agentTools: Tool[] = [gmailTool, notifyTool, meetupTool];
 
-function createAgent(model: any): Agent {
+function createAgent(model: any, instructions: string = buildInstructions()): Agent {
   return new Agent({
     name: "AugmentAgent",
-    instructions: buildInstructions(),
+    instructions,
     tools: agentTools,
     model,
   });
+}
+
+// Ad-hoc query mode: same tools, but the agent answers a one-off request
+// instead of running the email-triage workflow. Used by POST /api/ask.
+function buildQueryInstructions(): string {
+  return `You are AugmentAgent answering a one-off request from the operator. Use the available tools to answer, then reply with the answer only — no triage, no email processing, no Discord approval.
+
+## Meetup events
+Use the meetup_events tool for any request about Meetup events. Group name → urlname mapping:
+- "C&C", "Code & Coffee", "Coffee & Code", "code coffee", "the meetup" → urlname "code-coffee-philly"
+If the user names another group, use their slug from meetup.com/<urlname>/.
+
+When asked for events (e.g. "C&C events on meetup", "upcoming Code & Coffee meetups"):
+1. call meetup_events({ action: "list_events", params: { urlname: "code-coffee-philly", kind: "upcoming", limit: 10 } }) — default limit 10. Use the user's number if they ask for a specific count; omit limit only if they explicitly ask for "all" events. Use kind "past" only if the user explicitly asks for past events.
+2. Format the result as a clean Markdown list, one event per item, sorted by time (earliest first):
+   - **<title>** — <day, date, start time in a human-readable form>
+   - <location: venue name + city, or "Online" if isOnline> · <url>
+3. Start with a one-line header like "Upcoming Code & Coffee events (<count> of <totalCount>):". If there are no events, say so plainly. If the tool returns an { error }, report it briefly (a stale-hash error means the Meetup API hash needs refreshing via /intercept).
+Keep it concise — title, time, location, link. No descriptions unless asked.`;
 }
 
 // --- Run with retry + provider fallback ---
@@ -309,7 +359,13 @@ async function runWithRetry(
   throw new Error("Unreachable");
 }
 
-export async function runAgent(dynamicContext: string): Promise<string> {
+// Run `input` through each configured provider in turn (Cerebras → Groq),
+// retrying within a provider before falling back. `instructions` selects the
+// agent's mode: email-triage (default) or ad-hoc query.
+async function runWithProviders(
+  input: string,
+  instructions: string
+): Promise<string> {
   const providers: { name: string; model: any; modelId: string }[] = [];
 
   if (process.env.CEREBRAS_API_KEY) {
@@ -332,12 +388,8 @@ export async function runAgent(dynamicContext: string): Promise<string> {
   for (const provider of providers) {
     try {
       console.log(`Trying ${provider.name} (${provider.modelId})...`);
-      const agent = createAgent(provider.model);
-      const result = await runWithRetry(
-        agent,
-        dynamicContext,
-        provider.name
-      );
+      const agent = createAgent(provider.model, instructions);
+      const result = await runWithRetry(agent, input, provider.name);
       console.log(`${provider.name} succeeded.`);
       return result;
     } catch (err) {
@@ -350,6 +402,18 @@ export async function runAgent(dynamicContext: string): Promise<string> {
   throw new Error(
     `All LLM providers failed:\n${errors.map((e) => `  - ${e}`).join("\n")}`
   );
+}
+
+export async function runAgent(dynamicContext: string): Promise<string> {
+  return runWithProviders(dynamicContext, buildInstructions());
+}
+
+/**
+ * Answer a one-off operator request (e.g. "C&C events on meetup") using the
+ * agent's tools, bypassing the email-triage workflow. Backs POST /api/ask.
+ */
+export async function runAgentQuery(question: string): Promise<string> {
+  return runWithProviders(question, buildQueryInstructions());
 }
 
 /**
