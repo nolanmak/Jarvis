@@ -99,6 +99,31 @@ impl EventHandler for Handler {
             return;
         }
 
+        // `/loop` — user-defined scheduled tasks (#104). Handled inline like
+        // `!invoice`; never routed to the wiki query handler. The user id and
+        // channel id keep the registry channel-agnostic (the scheduler posts
+        // results back to this channel_ref).
+        if user_text.starts_with("/loop") {
+            let owner = msg.author.id.get().to_string();
+            let channel_ref = msg.channel_id.get().to_string();
+            let reply = crate::handle_loop_command(
+                self.state.store.as_deref(),
+                &owner,
+                &channel_ref,
+                &user_text,
+            );
+            for chunk in chunk_for_discord(&reply) {
+                let builder = CreateMessage::new()
+                    .content(chunk)
+                    .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+                if let Err(e) = msg.channel_id.send_message(&ctx.http, builder).await {
+                    warn!("failed to post loop command reply: {e}");
+                    break;
+                }
+            }
+            return;
+        }
+
         let handler = Arc::clone(handler);
         let ctx_for_history = ctx.clone();
         let http = ctx.http.clone();

@@ -11,7 +11,7 @@ use tracing::{info, warn};
 
 use augmentagent_approval_discord::{
     ApprovalActionHandler, ApprovalActionOutcome, ApprovalBroker, DiscordApprovalBroker,
-    DiscordConfig, NoopBroker, QueryHandler,
+    DiscordConfig, LoopPoster, LoopRunner, LoopScheduler, NoopBroker, QueryHandler,
 };
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
@@ -1166,6 +1166,42 @@ async fn main() -> Result<()> {
                 let inv = Arc::new(invoice::InvoiceScheduler::new(Arc::clone(&store)));
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { inv.run(sd).await }));
+
+                // #104 — /loop scheduled-task scheduler. Runs each due loop's
+                // stored prompt through the wiki-ask reasoner and posts the
+                // result back to the originating Discord channel/DM. Requires
+                // a bot token (for the post-back HTTP client) and a wiki dir
+                // (the reasoner toolbelt is scoped to it); skips with a log
+                // otherwise. Gated on !dry_run alongside the other schedulers.
+                match (
+                    std::env::var("DISCORD_BOT_TOKEN").ok(),
+                    cli.wiki_dir.clone(),
+                ) {
+                    (Some(token), Some(wiki_root)) => {
+                        let repo_root = std::env::current_dir()
+                            .unwrap_or_else(|_| PathBuf::from("."));
+                        let runner = Arc::new(LoopReasonerRunner {
+                            reasoner: Arc::new(ClaudeCliReasoner::new()),
+                            wiki_root,
+                            repo_root,
+                        });
+                        let poster = Arc::new(DiscordLoopPoster {
+                            http: Arc::new(serenity::http::Http::new(&token)),
+                        });
+                        let loops = Arc::new(LoopScheduler::new(
+                            Arc::clone(&store),
+                            runner,
+                            poster,
+                        ));
+                        let sd = shutdown.clone();
+                        tasks.push(tokio::spawn(async move { loops.run(sd).await }));
+                    }
+                    _ => {
+                        info!(
+                            "/loop scheduler disabled (needs DISCORD_BOT_TOKEN                              + --wiki-dir)"
+                        );
+                    }
+                }
             }
 
             // Self-healing: backfill any connected-Gmail addresses Composio
@@ -2829,6 +2865,48 @@ impl QueryHandler for WikiQuerier {
     async fn answer(&self, question: &str) -> anyhow::Result<String> {
         let opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
         self.reasoner.call(&opts, question).await
+    }
+}
+
+/// `/loop` runner (#104): fires a stored loop prompt through the exact same
+/// `claude` reasoner + `ask_opts` toolbelt the wiki-ask path uses, so
+/// `/loop 1h what's new in my inbox` behaves identically to asking the bot.
+struct LoopReasonerRunner {
+    reasoner: Arc<ClaudeCliReasoner>,
+    wiki_root: PathBuf,
+    repo_root: PathBuf,
+}
+
+#[async_trait]
+impl LoopRunner for LoopReasonerRunner {
+    async fn run_prompt(&self, prompt: &str) -> anyhow::Result<String> {
+        let opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
+        self.reasoner.call(&opts, prompt).await
+    }
+}
+
+/// Posts a loop's result back to the originating Discord channel/DM using a
+/// bare serenity HTTP client (no gateway) — same approach as the digest
+/// poster. `channel_ref` is the stringified channel id captured at creation.
+struct DiscordLoopPoster {
+    http: Arc<serenity::http::Http>,
+}
+
+#[async_trait]
+impl LoopPoster for DiscordLoopPoster {
+    async fn post_to(&self, channel_ref: &str, body: &str) -> anyhow::Result<()> {
+        use serenity::all::{ChannelId, CreateMessage};
+        let cid: u64 = channel_ref
+            .parse()
+            .with_context(|| format!("loop channel_ref not a u64: {channel_ref}"))?;
+        let channel = ChannelId::new(cid);
+        for chunk in augmentagent_approval_discord::chunk_for_discord(body) {
+            channel
+                .send_message(&*self.http, CreateMessage::new().content(chunk))
+                .await
+                .context("discord send_message (loop result)")?;
+        }
+        Ok(())
     }
 }
 
