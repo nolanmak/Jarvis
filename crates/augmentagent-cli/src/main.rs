@@ -21,6 +21,9 @@ use augmentagent_channel_linkedin::{
     default_auth_path, is_linkedin_email, LinkedInApi, LinkedInAuth, LinkedInChannel,
     LinkedInChannelConfig, VoyagerClient, ACCOUNT_PREFIX, DEFAULT_POLL_SECS,
 };
+use augmentagent_channel_linkedin::connections::{
+    ConnectionSyncer, SyncMode, VoyagerConnectionsClient,
+};
 use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
@@ -846,6 +849,20 @@ enum LinkedinOp {
     /// Quick read-only check: list recent threads + print peer + snippet.
     /// Good smoke test after `login` to confirm cookies work.
     Recent,
+    /// Sync 1st-degree connections into the wiki as dormant contacts (#61).
+    ///
+    /// Default is a **dry run**: prints a JSON [`SyncReport`] and writes
+    /// nothing. Pass `--apply` to write fill-blanks-only wiki pages. Mode
+    /// (full vs delta) is decided from the persisted cursor unless
+    /// `--full` forces a full walk.
+    ConnectionsSync {
+        /// Write the merged pages (default: dry-run JSON only).
+        #[arg(long)]
+        apply: bool,
+        /// Force a full sync regardless of the persisted cursor.
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1287,6 +1304,10 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             LinkedinOp::Recent => run_linkedin_recent().await,
+            LinkedinOp::ConnectionsSync { apply, full } => {
+                let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
+                run_linkedin_connections_sync(&cli, store, broker, *apply, *full).await
+            }
         },
         Cmd::Slack { ref op } => match op {
             SlackOp::Login { auth_json } => run_slack_login(store, auth_json.clone()).await,
@@ -3970,6 +3991,120 @@ async fn run_linkedin_recent() -> Result<()> {
             snippet,
         );
     }
+    Ok(())
+}
+
+/// #61 — LinkedIn 1st-degree connection sync. Dry-run by default (prints a
+/// JSON report, writes nothing); `--apply` writes fill-blanks-only wiki
+/// pages and persists the sync cursor. Posts an "N new / M updated" summary
+/// card to Discord when a broker is wired.
+async fn run_linkedin_connections_sync(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    apply: bool,
+    force_full: bool,
+) -> Result<()> {
+    use augmentagent_store::LinkedInConnectionSync;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for connections sync")?;
+    let layout = augmentagent_wiki::WikiLayout::new(wiki_root.clone());
+    layout.bootstrap().context("wiki bootstrap")?;
+
+    let repo_root = std::env::current_dir().context("current_dir")?;
+    let auth = LinkedInAuth::load_with_migration(&repo_root)
+        .context("load linkedin auth from keychain or legacy file")?;
+    let account_id = auth.member_urn.clone();
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let prior = store
+        .get_linkedin_connection_sync(&account_id)
+        .context("read connection-sync cursor")?;
+    let last_full = prior.as_ref().and_then(|s| s.last_full_sync_ms);
+    let mode = if force_full {
+        SyncMode::Full
+    } else {
+        SyncMode::decide(last_full, now_ms)
+    };
+    // Resume an interrupted full sync from its persisted offset; deltas
+    // always restart at 0 (recency-descending, cheap to re-walk the head).
+    let start_offset = match mode {
+        SyncMode::Full => prior.as_ref().map(|s| s.cursor_start as usize).unwrap_or(0),
+        SyncMode::Delta { .. } => 0,
+    };
+
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    let client = VoyagerConnectionsClient::new(auth);
+    let syncer = ConnectionSyncer {
+        api: &client,
+        layout: &layout,
+        today,
+        apply,
+    };
+
+    info!(
+        account = %account_id,
+        ?mode,
+        start_offset,
+        apply,
+        "starting linkedin connections sync"
+    );
+    let report = syncer
+        .run(mode, start_offset, |d| tokio::time::sleep(d))
+        .await
+        .context("connection sync run")?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+
+    if apply {
+        // On a completed run, advance the cursor. Full → record full-sync
+        // timestamp and reset cursor; delta → record delta timestamp.
+        let next = match mode {
+            SyncMode::Full => LinkedInConnectionSync {
+                account_id: account_id.clone(),
+                last_full_sync_ms: Some(now_ms),
+                last_delta_sync_ms: prior.as_ref().and_then(|s| s.last_delta_sync_ms),
+                cursor_start: 0,
+                last_synced_count: report.connections_seen as i64,
+            },
+            SyncMode::Delta { last_full_sync_ms } => LinkedInConnectionSync {
+                account_id: account_id.clone(),
+                last_full_sync_ms: Some(last_full_sync_ms),
+                last_delta_sync_ms: Some(now_ms),
+                cursor_start: 0,
+                last_synced_count: report.connections_seen as i64,
+            },
+        };
+        store
+            .upsert_linkedin_connection_sync(&next)
+            .context("persist connection-sync cursor")?;
+    }
+
+    // Surface a summary card (reuses the digest embed path; no buttons).
+    if report.created > 0 || report.updated > 0 {
+        if let Err(e) = broker
+            .post_digest(
+                "LinkedIn connections sync",
+                &report.discord_summary(),
+            )
+            .await
+        {
+            warn!("failed to post connections summary to discord: {e}");
+        }
+    }
+
     Ok(())
 }
 

@@ -37,6 +37,14 @@ pub struct Identities {
     pub whatsapp: Option<String>,
     #[serde(default)]
     pub instagram: Option<String>,
+    /// E.164-normalized phone (#62). Multi-valued — a person commonly has a
+    /// mobile + a work line; CRM ingestion union-merges them.
+    #[serde(default)]
+    pub phone: Vec<String>,
+    /// Free-form mailing address (#62). Single-valued in practice; CRM
+    /// ingestion only fills it when blank.
+    #[serde(default)]
+    pub address: Option<String>,
 }
 
 impl Identities {
@@ -56,6 +64,11 @@ impl Identities {
             "slack" => self.slack.as_deref() == Some(id),
             "whatsapp" => self.whatsapp.as_deref() == Some(id),
             "instagram" => self.instagram.as_deref() == Some(id),
+            "phone" => {
+                // E.164 ids compared verbatim (already normalized upstream).
+                self.phone.iter().any(|p| p == id)
+            }
+            "address" => self.address.as_deref() == Some(id),
             _ => false,
         }
     }
