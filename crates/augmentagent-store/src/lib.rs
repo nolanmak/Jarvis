@@ -8,7 +8,8 @@ pub mod models;
 mod store;
 
 pub use models::{
-    Account, ActionRecord, ActionStatus, ChannelSubscription, Email, LearnedPattern, RateAuditRow,
+    Account, ActionRecord, ActionStatus, ChannelSubscription, DriveAccount, Email, LearnedPattern,
+    RateAuditRow,
     RateEvent, RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TelegramBot, ToneExample,
     ToneProfile, TriageResult,
 };

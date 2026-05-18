@@ -144,6 +144,19 @@ case "$(uname -s)" in
         log "dashboard not registered under systemd ($DASHBOARD_SYSTEMD_UNIT) — run install-dashboard.sh manually"
       fi
     fi
+    # Multi-tenant: tenant units run the same target/release/augmentagent
+    # binary, so a Rust rebuild means they need a bounce too. Additive +
+    # best-effort: prod restart above already completed; a tenant failure
+    # here is logged, never fatal. Zero tenant units ⇒ loop no-ops (the
+    # prod agent's behavior is unchanged).
+    if [ "$NEEDS_REBUILD" -eq 1 ]; then
+      while read -r tunit; do
+        [ -n "$tunit" ] || continue
+        log "restarting tenant unit $tunit"
+        systemctl --user restart "$tunit" >> "$LOG" 2>&1 \
+          || log "tenant restart $tunit failed (continuing)"
+      done < <(systemctl --user list-unit-files 'augmentagent-tenant-*.service' --no-legend 2>/dev/null | awk '{print $1}')
+    fi
     ;;
   *)
     log "no restart strategy for $(uname -s) — restart the daemon + dashboard manually"

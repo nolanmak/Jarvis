@@ -105,6 +105,18 @@ pub struct Account {
     pub active: bool,
 }
 
+/// A Composio-connected Google Drive account for a multi-tenant agent.
+/// Lives only in a tenant's db; prod has none.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DriveAccount {
+    pub id: String,
+    pub connection_id: String,
+    pub entity_id: String,
+    pub email: String,
+    pub label: Option<String>,
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearnedPattern {
     pub pattern_type: String,

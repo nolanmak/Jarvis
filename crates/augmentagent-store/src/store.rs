@@ -7,9 +7,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::models::{
-    Account, ActionRecord, ActionStatus, ChannelSubscription, Email, LearnedPattern, RateAuditRow,
-    RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TelegramBot, ToneExample, ToneProfile,
-    TriageResult,
+    Account, ActionRecord, ActionStatus, ChannelSubscription, DriveAccount, Email, LearnedPattern,
+    RateAuditRow, RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TelegramBot, ToneExample,
+    ToneProfile, TriageResult,
 };
 
 #[derive(Debug, Error)]
@@ -490,6 +490,34 @@ impl Store {
                 ON scheduled_posts(status, fire_at_ms)",
             [],
         )?;
+        // Multi-tenant Google Drive (Composio). Inert in prod: empty + unread
+        // unless a tenant connects a Drive account. Same proven-safe pattern
+        // as the dormant wave-A tables already shipping in prod.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS drive_accounts (\
+                 id            TEXT PRIMARY KEY,\
+                 connection_id TEXT NOT NULL,\
+                 entity_id     TEXT NOT NULL,\
+                 email         TEXT,\
+                 label         TEXT,\
+                 active        INTEGER NOT NULL DEFAULT 1,\
+                 created_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_drive_accounts_active \
+                ON drive_accounts(active)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS drive_sync_state (\
+                 entity_id     TEXT PRIMARY KEY,\
+                 page_token    TEXT NOT NULL,\
+                 updated_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
 
         Ok(())
     }
@@ -789,6 +817,79 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    // --- Multi-tenant Google Drive (Composio) ---------------------------
+    // Inert in prod (no rows) — only a tenant that connects Drive uses these.
+
+    /// Insert/replace a connected Drive account (dedup by `connection_id`).
+    pub fn add_drive_account(
+        &self,
+        connection_id: &str,
+        entity_id: &str,
+        email: Option<&str>,
+        label: Option<&str>,
+    ) -> StoreResult<String> {
+        let id = format!("drive-{connection_id}");
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO drive_accounts \
+                 (id, connection_id, entity_id, email, label, active, created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6) \
+             ON CONFLICT(id) DO UPDATE SET \
+                 entity_id = excluded.entity_id, email = excluded.email, \
+                 label = excluded.label, active = 1",
+            params![id, connection_id, entity_id, email, label, now_millis()],
+        )?;
+        Ok(id)
+    }
+
+    pub fn get_active_drive_accounts(&self) -> StoreResult<Vec<DriveAccount>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, connection_id, entity_id, email, label, active \
+               FROM drive_accounts WHERE active = 1 ORDER BY created_at_ms ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(DriveAccount {
+                id: r.get(0)?,
+                connection_id: r.get(1)?,
+                entity_id: r.get(2)?,
+                email: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                label: r.get::<_, Option<String>>(4)?,
+                active: r.get::<_, i64>(5)? != 0,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Persisted Drive `changes.list` cursor for an entity (None on first poll).
+    pub fn get_drive_sync_token(&self, entity_id: &str) -> StoreResult<Option<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let tok: Option<String> = guard
+            .query_row(
+                "SELECT page_token FROM drive_sync_state WHERE entity_id = ?1",
+                params![entity_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(tok)
+    }
+
+    pub fn set_drive_sync_token(&self, entity_id: &str, page_token: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO drive_sync_state (entity_id, page_token, updated_at_ms) \
+                 VALUES (?1, ?2, ?3) \
+             ON CONFLICT(entity_id) DO UPDATE SET \
+                 page_token = excluded.page_token, updated_at_ms = excluded.updated_at_ms",
+            params![entity_id, page_token, now_millis()],
+        )?;
+        Ok(())
     }
 
     /// Backfill the human-readable Gmail address for a connected account.
