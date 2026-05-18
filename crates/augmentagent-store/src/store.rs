@@ -462,6 +462,27 @@ impl Store {
             [],
         )?;
 
+        // #79 — Twitter/X outbound posting audit log. Drives the hard
+        // 15-posts/day quota preflight (separate from the #83 RateGovernor
+        // soft caps — this is the platform's own free-tier ceiling).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS twitter_post_log (\
+                 id              TEXT PRIMARY KEY,\
+                 kind            TEXT NOT NULL,\
+                 reply_to        TEXT,\
+                 status          TEXT NOT NULL,\
+                 tweet_id        TEXT,\
+                 occurred_at_ms  INTEGER NOT NULL,\
+                 meta_json       TEXT\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_twitter_post_log_window \
+                ON twitter_post_log(occurred_at_ms)",
+            [],
+        )?;
+
         // #77 — LinkedIn outbound action audit log (post / comment / like /
         // connection_invite / dm / profile_view), drives daily/hourly caps.
         conn.execute(
@@ -2602,6 +2623,87 @@ impl Store {
             params![older_than_ms],
         )?;
         Ok(n)
+    }
+
+    // -----------------------------------------------------------------
+    // #79 — Twitter/X GraphQL queryId cache + outbound post log.
+    // -----------------------------------------------------------------
+
+    /// Read the cached queryId for a GraphQL operation (e.g. `CreateTweet`).
+    /// `None` => never observed; caller falls back to a static default.
+    pub fn twitter_query_id(&self, operation: &str) -> StoreResult<Option<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let v: Option<String> = guard
+            .query_row(
+                "SELECT query_id FROM twitter_query_ids WHERE operation = ?1",
+                params![operation],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// Upsert an observed queryId for a GraphQL operation. Called whenever a
+    /// fresher id is harvested (env override / network capture) so the next
+    /// boot uses it without a recompile.
+    pub fn put_twitter_query_id(
+        &self,
+        operation: &str,
+        query_id: &str,
+        last_seen_at: i64,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO twitter_query_ids (operation, query_id, last_seen_at) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(operation) DO UPDATE SET \
+                 query_id = excluded.query_id, \
+                 last_seen_at = excluded.last_seen_at",
+            params![operation, query_id, last_seen_at],
+        )?;
+        Ok(())
+    }
+
+    /// Append a Twitter outbound-post audit row. `kind` is `tweet` | `reply`,
+    /// `status` is `ok` | `failed` | `dry_run`.
+    pub fn log_twitter_post(
+        &self,
+        id: &str,
+        kind: &str,
+        reply_to: Option<&str>,
+        status: &str,
+        tweet_id: Option<&str>,
+        occurred_at_ms: i64,
+        meta_json: Option<&str>,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO twitter_post_log \
+                 (id, kind, reply_to, status, tweet_id, occurred_at_ms, meta_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, kind, reply_to, status, tweet_id, occurred_at_ms, meta_json],
+        )?;
+        Ok(())
+    }
+
+    /// Count "real" outbound posts (status `ok` or `failed` — both burn the
+    /// platform quota; `dry_run` rows are excluded) in `[since_ms, now_ms]`.
+    /// Drives the hard 15/day preflight in the Twitter posting client.
+    pub fn twitter_post_count_in_window(
+        &self,
+        since_ms: i64,
+        now_ms: i64,
+    ) -> StoreResult<u32> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM twitter_post_log \
+              WHERE occurred_at_ms >= ?1 \
+                AND occurred_at_ms <= ?2 \
+                AND status != 'dry_run'",
+            params![since_ms, now_ms],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
     }
 
     // -----------------------------------------------------------------

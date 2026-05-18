@@ -524,6 +524,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-channel-twitter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-approval-discord",
+ "augmentagent-auth",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "augmentagent-wiki",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "augmentagent-channel-voice"
 version = "0.1.0"
 dependencies = [
@@ -590,6 +614,7 @@ dependencies = [
  "augmentagent-channel-meetup",
  "augmentagent-channel-slack",
  "augmentagent-channel-telegram-bot",
+ "augmentagent-channel-twitter",
  "augmentagent-renderer-client",
  "augmentagent-store",
  "augmentagent-wiki",
