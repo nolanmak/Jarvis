@@ -15,6 +15,7 @@ members = [
     "crates/augmentagent-channel-linear",
     "crates/augmentagent-channel-notion",
     "crates/augmentagent-channel-calendly",
+    "crates/augmentagent-channel-reddit",
     "crates/augmentagent-channel-meetup",
     "crates/augmentagent-channel-gdrive",
     "crates/augmentagent-content-adapter",
