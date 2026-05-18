@@ -166,20 +166,60 @@ endpoint may be reused across forms.
   The `label`/`response`/`uuid`/`custom_key` quartet is vendor-confirmed; the
   exact placement of `submission_id`/`uuid` *meta* keys and any wrapper
   envelope is **REQUIRES LIVE VALIDATION** (docs say "additional metadata
-  including submission ID and UUID" without the literal frame).
+  including submission ID and UUID" without the literal frame). The receiver
+  + serde decode all three plausible frames (bare submission object, a
+  `data[]`-of-submissions wrapper, an explicit `submissions[]` wrapper) so
+  the unpinned frame degrades gracefully; the §4 quartet is the canonical
+  shape `DeftSubmission`/`DeftField` is now tightened to (#116).
 - **Signing / verification:** **not documented → REQUIRES LIVE VALIDATION.**
   Unlike Calendly (`Calendly-Webhook-Signature: t=…,v1=hmac`) the Deftform
-  docs describe **no HMAC/signature**. Mitigation baked into the scaffold:
-  the webhook receiver requires a **shared-secret path token**
-  (`/deft/webhook/<AUGMENTAGENT_DEFT_WEBHOOK_SECRET>`) and an exact-match
-  `formId` allowlist, since the body itself is unauthenticated. Treat any
-  request not carrying the secret path as hostile.
-- **Retries:** not documented → REQUIRES LIVE VALIDATION. Assume *no* retry
-  (so the receiver must be reply-fast and persist before ack); the poll path
-  (§3) is the safety net for missed pushes.
+  docs describe **no HMAC/signature**. Mitigation **shipped** (#116): the
+  Express receiver is **`POST /webhooks/deft/:secret`** — the secret in the
+  path is constant-time-compared against `AUGMENTAGENT_DEFT_WEBHOOK_SECRET`
+  (the body itself is unauthenticated, so the path token *is* the auth).
+  Any request not carrying the exact secret path gets `401` with an
+  indistinguishable response whether the cause is bad-secret or
+  not-armed (no arming-state probe). The receiver is **inert unless
+  `AUGMENTAGENT_DEFT_ENABLED` is truthy AND the secret is set** (mirrors the
+  Rust crate's `deft_enabled()` arming gate).
+- **Dedup:** the receiver dedups by submission `uuid` against a persisted
+  seen-set (`AUGMENTAGENT_DEFT_SEEN`, default `$TMPDIR/augmentagent-deft-seen.jsonl`)
+  so a Deftform retry or a webhook+poll double-delivery collapses to one
+  spooled action. `Store::is_message_processed` (keyed on the identical
+  `deft:<uuid>` written as `Email.message_id`) is the authoritative
+  downstream backstop; the receiver-level dedup just avoids redundant spool
+  churn. Valid submissions are normalized to the same WorkItem/command shape
+  the poll path produces and handed off via the shared webhook spool
+  (`AUGMENTAGENT_WEBHOOK_SPOOL`, `platform="deft"`) the daemon already tails.
+- **Retries:** not documented → REQUIRES LIVE VALIDATION. The receiver
+  persists (seen-set append + spool append) **before** the `202`, and replies
+  fast (no downstream work inline), so a no-retry Deftform and an
+  aggressively-retrying one both behave correctly; the poll path (§3) is the
+  safety net for missed pushes.
 - **Test affordance:** workspace UI "Send test" + webhook.site — usable to
   capture the real envelope and clear the `REQUIRES LIVE VALIDATION` flags
   here without a real respondent.
+
+### Operator step — live Deftform token + envelope validation (REQUIRED before un-gating)
+
+The receiver, serde, and dedup are **landed and unit-tested offline** (#116).
+What remains is operator-side, not code:
+
+1. Confirm "Deft" == Deftform with the user and obtain a workspace access
+   token (`https://deftform.com/settings/api`); persist it via
+   `augmentagent deft login` (keyring slot `augmentagent/deft/<workspace_id>`).
+2. In the Deftform workspace, create a webhook **endpoint** pointing at
+   `https://<dashboard-host>/webhooks/deft/<AUGMENTAGENT_DEFT_WEBHOOK_SECRET>`
+   and attach it to the chosen C&C form(s). Set `AUGMENTAGENT_DEFT_WEBHOOK_SECRET`
+   to a high-entropy value (it is the *only* auth — treat it like a bearer
+   token; rotate by changing both the env var and the Deftform endpoint URL).
+3. Use the workspace "Send test" affordance and capture the real body. Confirm
+   it matches one of the three frames §4 lists; if Deftform's live frame
+   differs, the defensive decode should still extract the submission — file the
+   captured body and tighten further if needed.
+4. Only then set `AUGMENTAGENT_DEFT_ENABLED=1`. Until both the secret and the
+   enable flag are set, `POST /webhooks/deft/:secret` returns `401` for every
+   request and the Rust path performs zero network I/O.
 
 ---
 
@@ -239,9 +279,13 @@ Crate: `crates/augmentagent-channel-deft/` — layout mirrors
 `augmentagent-channel-github`: `lib.rs` / `auth.rs` / `api.rs` /
 `channel.rs` / `types.rs`.
 
-- `types.rs` — `DeftSubmission` (wire shape, defensively decoded),
-  `command_from_submission` (the §5 mapping, fully unit-tested offline),
-  `into_email` conversion.
+- `types.rs` — `DeftSubmission`/`DeftField` (wire shape, **tightened to the
+  §4 webhook payload as the canonical shape** (#116), still defensively
+  decoded for envelope drift), `command_from_submission` (the §5 mapping,
+  fully unit-tested offline), `into_email` conversion, and
+  `webhook_submissions` (extracts submissions from any of the three §4
+  frames — mirrors the Express receiver's `extractDeftSubmissions` so push
+  and poll converge on identical `DeftSubmission`s).
 - `auth.rs` — `DeftAuth { workspace_id, token, base_url }`, keyring slot
   `augmentagent/deft/<workspace_id>`. Mirrors `GithubAuth`.
 - `api.rs` — `DeftApi` trait + `DeftClient` (reqwest). Endpoints from §3.
@@ -249,8 +293,15 @@ Crate: `crates/augmentagent-channel-deft/` — layout mirrors
   `deft_enabled()` and returns `DeftError::Disabled` if the env gate is
   unset, so the crate is provably inert in prod until armed.
 - `channel.rs` — `DeftChannel` implementing the `Trigger` contract
-  (`next_work_items`) over the poll path; webhook receiver is a documented
-  TODO (needs the live envelope from §4).
+  (`next_work_items`) over the poll path.
+- **Webhook receiver — DELIVERED (#116):** `POST /webhooks/deft/:secret` in
+  the Express dashboard (`src/webhooks.ts`), mirroring the Linear/Notion/
+  Calendly receivers but secret-in-path (Deftform webhooks are unsigned).
+  Constant-time secret compare, `uuid` dedup against a persisted seen-set,
+  normalize → shared spool the daemon tails. Inert unless
+  `AUGMENTAGENT_DEFT_ENABLED` + `AUGMENTAGENT_DEFT_WEBHOOK_SECRET` are set.
+  Live Deftform token + envelope validation remains the documented operator
+  step in §4 (un-gating precondition, not a code TODO).
 - Workspace `Cargo.toml`: member added. CLI: dependency added; **no `serve`
   spawn** until the live-validation TODOs clear — exactly like the GitHub
   channel "gates on a PAT ⇒ never spawned in prod" pattern, here it gates on
@@ -262,7 +313,7 @@ Crate: `crates/augmentagent-channel-deft/` — layout mirrors
 |---|---|---|
 | Confirm "Deft" == Deftform with the user | everything | §1 |
 | Capture real `GET /responses/{formId}` JSON (via live token or webhook.site) and pin `DeftSubmission` | un-gating poll path | §3 |
-| Capture real webhook envelope + confirm POST + meta frame | webhook receiver impl | §4 |
+| ~~Webhook receiver impl~~ — **DONE (#116)**: `POST /webhooks/deft/:secret` + uuid dedup + tightened serde, all unit-tested offline. Capturing the real webhook envelope is now an *operator validation step* (§4), not a code TODO. | — | §4 |
 | Confirm token rotation/expiry + read-only scoping | secret-handling hardening | §2 |
 | Confirm operator's actual `custom_key`s on the form | command mapping defaults | §5 |
 | Decide pagination strategy once list shape known | large-form correctness | §3 |

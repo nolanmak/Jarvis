@@ -23,7 +23,9 @@ pub mod types;
 pub use api::{DeftApi, DeftClient, DeftError};
 pub use auth::{DeftAuth, KEYCHAIN_PLATFORM};
 pub use channel::{DeftChannel, DeftChannelConfig, DEFAULT_POLL_SECS};
-pub use types::{command_from_submission, is_deft_email, DeftCommand, DeftSubmission};
+pub use types::{
+    command_from_submission, is_deft_email, webhook_submissions, DeftCommand, DeftSubmission,
+};
 
 /// Platform discriminator written to `Email::platform` and
 /// `channel_subscriptions.platform`.
