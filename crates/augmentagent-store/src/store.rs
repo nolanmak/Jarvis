@@ -2389,6 +2389,82 @@ impl Store {
         )?;
         Ok(n)
     }
+
+    // -----------------------------------------------------------------
+    // #77 / #13 — linkedin_action_log helpers.
+    //
+    // A LinkedIn-scoped, action-keyed audit log distinct from the
+    // cross-platform rate_events table. It exists so the posting + feed
+    // engagement paths can enforce their own rolling-window caps (3
+    // posts/day, 5 engagements/day) durably across daemon restarts
+    // *without* depending on the RateGovernor's full permit/record
+    // lifecycle — the governor still gates the *decision*; this table is
+    // the cheap, LinkedIn-only counter the channel reads directly.
+    // -----------------------------------------------------------------
+
+    /// Append a LinkedIn outbound-action row. `status` is free-form
+    /// (`ok` | `failed` | `pending`); only `ok` rows count toward caps via
+    /// [`Store::linkedin_action_count_since`].
+    pub fn log_linkedin_action(
+        &self,
+        id: &str,
+        action_kind: &str,
+        target_urn: Option<&str>,
+        status: &str,
+        occurred_at_ms: i64,
+        meta_json: Option<&str>,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO linkedin_action_log \
+                 (id, action_kind, target_urn, status, occurred_at_ms, meta_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, action_kind, target_urn, status, occurred_at_ms, meta_json],
+        )?;
+        Ok(())
+    }
+
+    /// Count successful (`status = 'ok'`) actions of `action_kind` since
+    /// `since_ms` (inclusive). Backs the rolling-24h post cap and the
+    /// daily engagement cap. Non-`ok` rows (failed / pending) are excluded
+    /// so a failed dispatch doesn't permanently consume a daily slot.
+    pub fn linkedin_action_count_since(
+        &self,
+        action_kind: &str,
+        since_ms: i64,
+    ) -> StoreResult<u32> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM linkedin_action_log \
+              WHERE action_kind = ?1 \
+                AND status = 'ok' \
+                AND occurred_at_ms >= ?2",
+            params![action_kind, since_ms],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u32)
+    }
+
+    /// True iff any `ok` row already exists for this (`action_kind`,
+    /// `target_urn`) pair — used to suppress duplicate engagement on the
+    /// same post across feed polls.
+    pub fn linkedin_action_exists(
+        &self,
+        action_kind: &str,
+        target_urn: &str,
+    ) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let found: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM linkedin_action_log \
+                  WHERE action_kind = ?1 AND target_urn = ?2 AND status = 'ok' \
+                  LIMIT 1",
+                params![action_kind, target_urn],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
 }
 
 fn row_to_tone_profile(r: &rusqlite::Row) -> rusqlite::Result<ToneProfile> {

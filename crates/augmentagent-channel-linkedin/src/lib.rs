@@ -12,9 +12,24 @@
 pub mod api;
 pub mod auth;
 pub mod channel;
+pub mod feed;
+pub mod posting;
 pub mod types;
 
-pub use api::{LinkedInApi, LinkedInError, VoyagerClient, DEFAULT_CONVERSATIONS_QUERY_ID};
+pub use api::{
+    LinkedInApi, LinkedInError, VoyagerClient, DEFAULT_CONVERSATIONS_QUERY_ID,
+    DEFAULT_FEED_QUERY_ID,
+};
 pub use auth::{default_auth_path, AuthError, LinkedInAuth, DEFAULT_USER_AGENT};
-pub use channel::{LinkedInChannel, LinkedInChannelConfig, PollOutcome, DEFAULT_POLL_SECS};
-pub use types::{is_linkedin_email, Dm, MemberUrn, ACCOUNT_PREFIX};
+pub use channel::{
+    LinkedInChannel, LinkedInChannelConfig, LinkedInFeedEngagement, PollOutcome,
+    DEFAULT_POLL_SECS,
+};
+pub use feed::{
+    LinkedInFeedTrigger, DEFAULT_FEED_POLL_SECS, DEFAULT_MAX_ENGAGEMENTS_PER_DAY,
+};
+pub use posting::{
+    build_normshares_body, PostDraft, ShareUrn, Visibility,
+    DEFAULT_MEDIA_UPLOAD_PATH,
+};
+pub use types::{is_linkedin_email, Dm, FeedPost, MemberUrn, ACCOUNT_PREFIX};
