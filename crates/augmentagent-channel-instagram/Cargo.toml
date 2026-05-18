@@ -1,0 +1,33 @@
+[package]
+name = "augmentagent-channel-instagram"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+augmentagent-store = { path = "../augmentagent-store" }
+augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
+augmentagent-auth = { path = "../augmentagent-auth" }
+augmentagent-channel-core = { path = "../augmentagent-channel-core" }
+augmentagent-browser-client = { path = "../augmentagent-browser-client" }
+augmentagent-wiki = { path = "../augmentagent-wiki" }
+
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+chrono = { workspace = true }
+serde_yaml_ng = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+rusqlite = { workspace = true }
