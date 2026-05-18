@@ -28,6 +28,7 @@ augmentagent-wiki = { path = "../augmentagent-wiki" }
 augmentagent-browser-client = { path = "../augmentagent-browser-client" }
 augmentagent-renderer-client = { path = "../augmentagent-renderer-client" }
 augmentagent-proactive = { path = "../augmentagent-proactive" }
+augmentagent-channel-voice = { path = "../augmentagent-channel-voice" }
 
 async-trait = { workspace = true }
 serenity = { workspace = true }

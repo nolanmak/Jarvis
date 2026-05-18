@@ -460,15 +460,21 @@ enum CalendarOp {
 
 #[derive(Subcommand)]
 enum VoiceOp {
-    /// Run one drop-folder scan + transcription pass.
+    /// Persist the capture-bot token into the keyring slot
+    /// `augmentagent/telegram-capture`.
+    Login {
+        #[arg(long)]
+        token: String,
+    },
+    /// Run one long-poll batch against the capture bot and exit.
     PollOnce {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
     },
-    /// Manually ingest a single audio file.
-    Ingest {
-        path: PathBuf,
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    /// Run the voice-capture listener as a daemon (used by the
+    /// augmentagent-telegram-capture systemd unit).
+    Serve {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         dry_run: bool,
     },
 }
@@ -1101,6 +1107,15 @@ async fn main() -> Result<()> {
             // Collect the enabled channels' runners + optional digest scheduler.
             let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
 
+            // Voice-capture listener (#80): long-poll the capture bot. Inert
+            // unless a token is in the keyring AND the chat allowlist is
+            // non-empty — so prod (neither configured) never spawns it. The
+            // dedicated systemd unit is the primary path; this in-process
+            // spawn keeps single-host setups simple.
+            if let Some(vl) = build_voice_listener(&cli, Arc::clone(&store), dry_run) {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { vl.run(sd).await }));
+            }
             // Proactive CRM runner (#81): 30-min loop over wiki people pages.
             // Only when a wiki is configured (no wiki ⇒ nothing to scan).
             // Dispatch is gated on !dry_run like the other outbound surfaces.
@@ -1495,9 +1510,13 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
-        Cmd::Voice { op } => match op {
-            VoiceOp::PollOnce { .. } | VoiceOp::Ingest { .. } => {
-                unimplemented!("see voice-channel feature PR")
+        Cmd::Voice { ref op } => match op {
+            VoiceOp::Login { token } => run_voice_login(token.clone()),
+            VoiceOp::PollOnce { dry_run } => {
+                run_voice_poll_once(&cli, Arc::clone(&store), *dry_run).await
+            }
+            VoiceOp::Serve { dry_run } => {
+                run_voice_serve(&cli, Arc::clone(&store), *dry_run).await
             }
         },
         Cmd::Github { ref op } => match op {
@@ -5835,4 +5854,124 @@ fn run_proactive_dismiss(store: Arc<Store>, id: String) -> Result<()> {
         println!("no signal with id {id}");
     }
     Ok(())
+}
+
+
+// ---------------------------------------------------------------------------
+// #80 — Voice-capture CLI handlers.
+// ---------------------------------------------------------------------------
+
+fn run_voice_login(token: String) -> Result<()> {
+    use augmentagent_channel_voice::KEYRING_PLATFORM;
+    augmentagent_auth::Auth::put(
+        KEYRING_PLATFORM,
+        augmentagent_auth::DEFAULT_ACCOUNT,
+        token.trim().as_bytes(),
+    )
+    .context("persist capture-bot token to keyring")?;
+    println!("voice-capture token stored (keyring: augmentagent/{KEYRING_PLATFORM})");
+    Ok(())
+}
+
+/// Build the voice listener if the channel is fully configured: token in
+/// keyring + a non-empty chat allowlist + a wiki dir. Returns `None`
+/// (channel disabled) otherwise — never an error, mirroring how optional
+/// channels degrade in `serve`.
+fn build_voice_listener(
+    cli: &Cli,
+    store: Arc<Store>,
+    dry_run: bool,
+) -> Option<
+    augmentagent_channel_voice::VoiceListener<
+        ClaudeCliReasoner,
+        augmentagent_channel_voice::WhisperCppTranscriber,
+    >,
+> {
+    use augmentagent_channel_voice::{
+        default_allowlist_path, load_allowlist, load_token, VoiceListener,
+        VoiceTelegramClient, WhisperCppTranscriber,
+    };
+    let token = load_token()?;
+    let allowed = load_allowlist(&default_allowlist_path());
+    if allowed.is_empty() {
+        warn!("voice capture disabled: chat allowlist empty (deny-all)");
+        return None;
+    }
+    let wiki_root = match &cli.wiki_dir {
+        Some(w) => w.clone(),
+        None => {
+            warn!("voice capture disabled: --wiki-dir not set");
+            return None;
+        }
+    };
+    let schema = resolve_wiki_schema(cli).unwrap_or_default();
+    let client = match VoiceTelegramClient::new(token) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("voice capture disabled: client init failed: {e}");
+            return None;
+        }
+    };
+    let repo_root = std::env::current_dir().ok()?;
+    Some(VoiceListener {
+        client,
+        store,
+        reasoner: Arc::new(ClaudeCliReasoner::new()),
+        transcriber: WhisperCppTranscriber::from_repo_root(&repo_root),
+        allowed_chats: allowed,
+        wiki_root,
+        wiki_schema: schema,
+        dry_run,
+    })
+}
+
+/// Resolve the wiki maintenance schema text the same way the gcal/email
+/// channels do: explicit `--wiki-schema`, else `<repo>/schema/wiki-skill.md`.
+fn resolve_wiki_schema(cli: &Cli) -> Option<String> {
+    let path = cli
+        .wiki_schema
+        .clone()
+        .or_else(|| Some(PathBuf::from("schema/wiki-skill.md")))?;
+    std::fs::read_to_string(path).ok()
+}
+
+async fn run_voice_poll_once(
+    cli: &Cli,
+    store: Arc<Store>,
+    dry_run: bool,
+) -> Result<()> {
+    match build_voice_listener(cli, store, dry_run) {
+        Some(vl) => {
+            let n = vl.poll_once().await.context("voice poll_once")?;
+            println!("voice poll: {n} memo(s) ingested (dry_run={dry_run})");
+            Ok(())
+        }
+        None => {
+            println!("voice capture not configured (token/allowlist/wiki-dir)");
+            Ok(())
+        }
+    }
+}
+
+async fn run_voice_serve(
+    cli: &Cli,
+    store: Arc<Store>,
+    dry_run: bool,
+) -> Result<()> {
+    match build_voice_listener(cli, store, dry_run) {
+        Some(vl) => {
+            let shutdown = CancellationToken::new();
+            let s2 = shutdown.clone();
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    s2.cancel();
+                }
+            });
+            vl.run(shutdown).await
+        }
+        None => {
+            info!("voice capture not configured; exiting cleanly");
+            Ok(())
+        }
+    }
 }
