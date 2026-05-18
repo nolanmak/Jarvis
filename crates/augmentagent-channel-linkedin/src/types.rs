@@ -117,6 +117,93 @@ impl FeedPost {
     }
 }
 
+/// A single comment on one of the *user's own* posts (#58.2). The own-post
+/// comment poller diffs these against the store's `seen_comments` so a fresh
+/// comment becomes exactly one approval-gated reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostComment {
+    /// The post this comment is on (`urn:li:activity:...`).
+    pub post_urn: String,
+    /// Stable comment urn — the dedup key + the reply parent.
+    pub comment_urn: String,
+    pub author_name: String,
+    pub author_urn: MemberUrn,
+    pub text: String,
+    pub created_at_ms: i64,
+}
+
+impl PostComment {
+    /// Convert to the store's generic `Email` so the comment rides the same
+    /// triage → draft → approval-card path as DMs. `kind` is stamped
+    /// `own_post_comment` (#58 taxonomy) so the approver routes a Reply click
+    /// through `post_comment` against `thread_id` (the comment urn).
+    pub fn into_email(self, my_urn: &str) -> Email {
+        let from = format!("{} <linkedin:{}>", self.author_name, self.author_urn.0);
+        let subject = format!("[Comment on your post by {}]", self.author_name);
+        let date = ms_to_rfc3339(self.created_at_ms);
+        let account_entity_id = format!("linkedin:{my_urn}");
+        Email {
+            message_id: self.comment_urn,
+            // thread_id carries the parent post urn so a Reply is posted as a
+            // sub-comment on the right activity.
+            thread_id: Some(self.post_urn),
+            from,
+            subject,
+            body: self.text,
+            date,
+            account_entity_id: Some(account_entity_id),
+            platform: "linkedin".into(),
+            kind: "own_post_comment".into(),
+        }
+    }
+}
+
+/// A pending inbound connection request (#58.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invitation {
+    /// `urn:li:invitation:...` — stable id; used to accept/ignore.
+    pub invitation_urn: String,
+    pub requester_name: String,
+    /// Public profile URL of the requester (best-effort, may be empty).
+    pub requester_url: String,
+    pub headline: String,
+    /// Note the requester attached, if any.
+    pub message: String,
+    pub created_at_ms: i64,
+}
+
+impl Invitation {
+    /// Convert to `Email` for the triage pipeline. `kind = connection_request`
+    /// (#58 taxonomy). `body` carries the headline + note so the reasoner can
+    /// judge accept/ignore; `thread_id` carries the invitation urn so the
+    /// approver re-hydrates the accept/ignore target.
+    pub fn into_email(self, my_urn: &str) -> Email {
+        let from = format!("{} <linkedin:invitation>", self.requester_name);
+        let subject = format!("[Connection request from {}]", self.requester_name);
+        let date = ms_to_rfc3339(self.created_at_ms);
+        let account_entity_id = format!("linkedin:{my_urn}");
+        let body = if self.message.trim().is_empty() {
+            format!("{}\n{}", self.headline, self.requester_url)
+        } else {
+            format!(
+                "{}\n{}\n\nNote: {}",
+                self.headline, self.requester_url, self.message
+            )
+        };
+        Email {
+            message_id: self.invitation_urn.clone(),
+            thread_id: Some(self.invitation_urn),
+            from,
+            subject,
+            body,
+            date,
+            account_entity_id: Some(account_entity_id),
+            platform: "linkedin".into(),
+            kind: "connection_request".into(),
+        }
+    }
+}
+
 /// The `linkedin:` prefix on `Email::account_entity_id` that distinguishes
 /// LinkedIn-sourced rows from Gmail rows in sqlite.
 pub const ACCOUNT_PREFIX: &str = "linkedin:";
