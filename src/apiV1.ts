@@ -36,6 +36,8 @@ import {
   addSender,
   removeSender,
   updateActionStatus,
+  addPushSubscription,
+  removePushSubscription,
 } from "./db";
 import type { ActionStatus } from "./types";
 
@@ -198,6 +200,46 @@ v1.get("/events", (req, res) => {
 
 const apiV1Router = Router();
 apiV1Router.use("/api/v1", v1);
+
+// --- #45 PWA approval surface: queue route + Web Push subscription ---
+
+const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || "";
+
+const pwa = Router();
+
+// Installable PWA queue view. Deep-linkable via ?action=<id> (the service
+// worker focuses here on notification click).
+pwa.get("/queue", (_req, res) => {
+  res.render("queue", { vapidPublic: VAPID_PUBLIC });
+});
+
+// The browser fetches the VAPID public key to subscribe.
+pwa.get("/api/push/vapid", (_req, res) => {
+  res.json({ publicKey: VAPID_PUBLIC });
+});
+
+pwa.post("/api/push/subscribe", (req, res) => {
+  const sub = req.body;
+  if (!sub || !sub.endpoint || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) {
+    res.status(400).json({ error: "invalid subscription" });
+    return;
+  }
+  addPushSubscription(sub);
+  res.status(201).json({ ok: true });
+});
+
+pwa.post("/api/push/unsubscribe", (req, res) => {
+  const endpoint = req.body && req.body.endpoint;
+  if (!endpoint) {
+    res.status(400).json({ error: "endpoint required" });
+    return;
+  }
+  removePushSubscription(endpoint);
+  res.json({ ok: true });
+});
+
+apiV1Router.use(pwa);
+
 
 // --- #48 Reddit OAuth bootstrap (dashboard callback) ---
 //

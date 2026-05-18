@@ -369,6 +369,66 @@ export function toggleSender(id: string): void {
     .run(id);
 }
 
+// --- #45 Web Push subscriptions (PWA approval surface) ---
+//
+// Shares the pwa_subscriptions table the Rust store's migrate() creates
+// (CREATE TABLE IF NOT EXISTS; idempotent across both daemons). The Rust side
+// sends the actual VAPID-signed pushes; the Node dashboard just records the
+// browser's subscription when the user installs the PWA + grants permission.
+
+export interface PushSubscription {
+  endpoint: string;
+  keys: { p256dh: string; auth: string };
+}
+
+export function addPushSubscription(sub: PushSubscription): void {
+  getDb()
+    .prepare(
+      "CREATE TABLE IF NOT EXISTS pwa_subscriptions (" +
+        "id TEXT PRIMARY KEY, endpoint TEXT NOT NULL UNIQUE, " +
+        "p256dh TEXT NOT NULL, auth TEXT NOT NULL, created_at_ms INTEGER NOT NULL)"
+    )
+    .run();
+  getDb()
+    .prepare(
+      "INSERT INTO pwa_subscriptions (id, endpoint, p256dh, auth, created_at_ms) " +
+        "VALUES (?, ?, ?, ?, ?) " +
+        "ON CONFLICT(endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth"
+    )
+    .run(
+      crypto.randomUUID(),
+      sub.endpoint,
+      sub.keys.p256dh,
+      sub.keys.auth,
+      Date.now()
+    );
+}
+
+export function listPushSubscriptions(): PushSubscription[] {
+  try {
+    return (
+      getDb()
+        .prepare("SELECT endpoint, p256dh, auth FROM pwa_subscriptions")
+        .all() as { endpoint: string; p256dh: string; auth: string }[]
+    ).map((r) => ({
+      endpoint: r.endpoint,
+      keys: { p256dh: r.p256dh, auth: r.auth },
+    }));
+  } catch {
+    return [];
+  }
+}
+
+export function removePushSubscription(endpoint: string): void {
+  try {
+    getDb()
+      .prepare("DELETE FROM pwa_subscriptions WHERE endpoint = ?")
+      .run(endpoint);
+  } catch {
+    /* table may not exist yet — nothing to remove */
+  }
+}
+
 // --- Gmail Accounts ---
 
 export interface GmailAccount {

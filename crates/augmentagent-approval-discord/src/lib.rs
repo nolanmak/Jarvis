@@ -15,6 +15,7 @@ mod layout;
 mod loops;
 mod nudge;
 mod status_bus;
+mod surface;
 
 pub use broker::{DiscordApprovalBroker, DiscordConfig};
 pub use event_handler::chunk_for_discord;
@@ -24,6 +25,7 @@ pub use loops::{
 };
 pub use nudge::NudgeScheduler;
 pub use status_bus::{StatusBus, StatusChanged};
+pub use surface::{ApprovalSurface, ComposedSurface};
 
 use async_trait::async_trait;
 use augmentagent_store::Email;
