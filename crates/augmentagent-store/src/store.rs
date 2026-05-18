@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::models::{
     Account, ActionRecord, ActionStatus, ChannelSubscription, DriveAccount, Email, LearnedPattern,
     RateAuditRow, RateHalt, RateWarmup, SlackWorkspace, SubscriptionMode, TelegramBot, ToneExample,
-    ToneProfile, TriageResult,
+    ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 
 #[derive(Debug, Error)]
@@ -24,10 +24,12 @@ pub type StoreResult<T> = Result<T, StoreError>;
 
 pub struct Store {
     conn: Mutex<Connection>,
+    path: std::path::PathBuf,
 }
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> StoreResult<Self> {
+        let path_buf = path.as_ref().to_path_buf();
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
@@ -35,7 +37,28 @@ impl Store {
         Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            path: path_buf,
         })
+    }
+
+    /// On-disk path this store was opened from. Lets extension crates
+    /// (e.g. `augmentagent-proactive`) run their own additive queries
+    /// against the same db file without threading the path through every
+    /// constructor.
+    pub fn db_path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Run a closure with the locked connection. Used by extension traits in
+    /// sibling crates that need bespoke queries the core `Store` API doesn't
+    /// expose. Keeps the single-connection WAL invariant intact (no second
+    /// writer connection racing the daemon's).
+    pub fn with_conn<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> StoreResult<T> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        Ok(f(&guard)?)
     }
 
     /// Additive, idempotent schema migrations. Safe to run against databases
@@ -411,6 +434,51 @@ impl Store {
             [],
         )?;
 
+        // #104 — user-defined scheduled tasks (`/loop`). Channel-agnostic:
+        // `channel` is the surface the loop was created from (`discord` today)
+        // and `channel_ref` is the originating channel/DM id the scheduler
+        // posts results back to. `interval_secs` is enforced against a floor at
+        // the command layer; `fail_count` drives pause-on-repeated-failure.
+        // `status` is `active` | `paused` | `stopped`. Survives restarts — the
+        // scheduler reloads `active` rows on boot.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS user_loops (\
+                 id             TEXT PRIMARY KEY,\
+                 owner          TEXT NOT NULL,\
+                 channel        TEXT NOT NULL,\
+                 channel_ref    TEXT NOT NULL,\
+                 interval_secs  INTEGER NOT NULL,\
+                 prompt         TEXT NOT NULL,\
+                 status         TEXT NOT NULL DEFAULT 'active',\
+                 last_run_ms    INTEGER,\
+                 last_status    TEXT,\
+                 fail_count     INTEGER NOT NULL DEFAULT 0,\
+                 created_at_ms  INTEGER NOT NULL,\
+                 updated_at_ms  INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_loops_owner_status \
+                ON user_loops(owner, status)",
+            [],
+        )?;
+
+        // #47 — cross-surface state sync. `status_source` records which surface
+        // resolved an action (discord / dashboard / telegram / cli / nudge) so
+        // the originating surface can suppress its own echo;
+        // `status_updated_at` timestamps the last transition for the SSE feed.
+        // Nullable so pre-existing rows migrate cleanly.
+        if !column_exists(conn, "actions", "status_source")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN status_source TEXT", [])?;
+        }
+        if !column_exists(conn, "actions", "status_updated_at")? {
+            conn.execute(
+                "ALTER TABLE actions ADD COLUMN status_updated_at INTEGER",
+                [],
+            )?;
+        }
+
         // #81 — Proactive CRM signals + per-scan run cursor.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS proactive_signals (\
@@ -550,6 +618,61 @@ impl Store {
                  page_token    TEXT NOT NULL,\
                  updated_at_ms INTEGER NOT NULL\
              )",
+            [],
+        )?;
+
+        // ---------------------------------------------------------------
+        // CRM ingestion (#61 LinkedIn connections / #62 contacts / #64
+        // signature backfill). All additive + dormant in prod until the
+        // respective CLI command runs; same proven-safe pattern as the
+        // wave-A tables above.
+        // ---------------------------------------------------------------
+
+        // #61 — LinkedIn 1st-degree connection sync cursor. One row keyed by
+        // the user's own member urn (`account_id`); `last_full_sync_ms`
+        // gates full-vs-delta mode, `cursor_start` resumes a paginated full
+        // sync that was interrupted mid-run.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS linkedin_connection_sync (\
+                 account_id          TEXT PRIMARY KEY,\
+                 last_full_sync_ms   INTEGER,\
+                 last_delta_sync_ms  INTEGER,\
+                 cursor_start        INTEGER NOT NULL DEFAULT 0,\
+                 last_synced_count   INTEGER NOT NULL DEFAULT 0,\
+                 updated_at_ms       INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
+        // #62 — generic contacts sync token (Google People syncToken or
+        // CardDAV getctag), keyed by `(backend, account_id)`.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS contacts_sync_state (\
+                 backend       TEXT NOT NULL,\
+                 account_id    TEXT NOT NULL,\
+                 sync_token    TEXT,\
+                 updated_at_ms INTEGER NOT NULL,\
+                 PRIMARY KEY (backend, account_id)\
+             )",
+            [],
+        )?;
+
+        // #62 — phone→person reverse index consulted by message-triage
+        // before creating a new wiki page. `phone` is E.164-normalized;
+        // unique so re-ingest is an upsert, not a duplicate.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS identity_phone (\
+                 phone         TEXT PRIMARY KEY,\
+                 person_slug   TEXT NOT NULL,\
+                 display_name  TEXT,\
+                 source        TEXT NOT NULL,\
+                 updated_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_identity_phone_slug \
+                ON identity_phone(person_slug)",
             [],
         )?;
 
@@ -1979,6 +2102,187 @@ impl Store {
         Ok(())
     }
 
+    // --- whatsapp_devices + allowlists (#74 / #102) ---
+
+    /// Insert a fresh `whatsapp_devices` row, or — if a row with this `phone`
+    /// already exists — refresh its JIDs / status and re-activate it.
+    /// `paired_at_ms` is preserved on update so the original pairing time
+    /// stays meaningful across re-pairs.
+    pub fn upsert_whatsapp_device(
+        &self,
+        phone: &str,
+        device_jid: &str,
+        user_jid: &str,
+    ) -> StoreResult<WhatsappDevice> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let existing: Option<String> = guard
+            .query_row(
+                "SELECT id FROM whatsapp_devices WHERE phone = ?1",
+                params![phone],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(id) => {
+                guard.execute(
+                    "UPDATE whatsapp_devices \
+                        SET device_jid = ?2, user_jid = ?3, \
+                            session_status = 'paired', active = 1 \
+                      WHERE id = ?1",
+                    params![id, device_jid, user_jid],
+                )?;
+            }
+            None => {
+                let id = Uuid::new_v4().to_string();
+                guard.execute(
+                    "INSERT INTO whatsapp_devices \
+                        (id, phone, device_jid, user_jid, paired_at_ms, \
+                         last_event_at_ms, session_status, active, created_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, 'paired', 1, ?5)",
+                    params![id, phone, device_jid, user_jid, now],
+                )?;
+            }
+        };
+        drop(guard);
+        self.get_whatsapp_device_by_phone(phone)?
+            .ok_or(StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
+    }
+
+    pub fn list_active_whatsapp_devices(&self) -> StoreResult<Vec<WhatsappDevice>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, phone, device_jid, user_jid, paired_at_ms, \
+                    last_event_at_ms, session_status, active, created_at_ms \
+               FROM whatsapp_devices \
+              WHERE active = 1 \
+              ORDER BY created_at_ms ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_whatsapp_device)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_whatsapp_device_by_phone(
+        &self,
+        phone: &str,
+    ) -> StoreResult<Option<WhatsappDevice>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT id, phone, device_jid, user_jid, paired_at_ms, \
+                        last_event_at_ms, session_status, active, created_at_ms \
+                   FROM whatsapp_devices WHERE phone = ?1",
+                params![phone],
+                row_to_whatsapp_device,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Mark a device logged-out (sidecar emitted `logged-out`). Keeps the row
+    /// for audit; the channel skips logged-out devices at send time.
+    pub fn mark_whatsapp_device_logged_out(&self, phone: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE whatsapp_devices \
+                SET session_status = 'logged_out', active = 0 \
+              WHERE phone = ?1",
+            params![phone],
+        )?;
+        Ok(())
+    }
+
+    pub fn touch_whatsapp_device_event(&self, phone: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE whatsapp_devices SET last_event_at_ms = ?2 WHERE phone = ?1",
+            params![phone, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// Hard delete + deactivate subscriptions for one device (unlink).
+    pub fn delete_whatsapp_device(&self, phone: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE channel_subscriptions \
+                SET active = 0, updated_at_ms = ?2 \
+              WHERE platform = 'whatsapp' AND account_id = ?1",
+            params![phone, now],
+        )?;
+        guard.execute(
+            "DELETE FROM whatsapp_devices WHERE phone = ?1",
+            params![phone],
+        )?;
+        Ok(())
+    }
+
+    /// Opt a chat into outbound sends. Idempotent.
+    pub fn allow_whatsapp_outbound(&self, chat_jid: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO whatsapp_outbound_allowlist (chat_jid, enabled_at_ms) \
+             VALUES (?1, ?2) ON CONFLICT(chat_jid) DO NOTHING",
+            params![chat_jid, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    pub fn deny_whatsapp_outbound(&self, chat_jid: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "DELETE FROM whatsapp_outbound_allowlist WHERE chat_jid = ?1",
+            params![chat_jid],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_whatsapp_outbound_allowed(&self, chat_jid: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM whatsapp_outbound_allowlist WHERE chat_jid = ?1",
+            params![chat_jid],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Opt a chat into inbound triage. Per review feedback even *reading* a
+    /// chat requires explicit opt-in for ban-risk reasons. Idempotent.
+    pub fn allow_whatsapp_inbound(&self, chat_jid: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO whatsapp_inbound_allowlist (chat_jid, enabled_at_ms) \
+             VALUES (?1, ?2) ON CONFLICT(chat_jid) DO NOTHING",
+            params![chat_jid, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    pub fn deny_whatsapp_inbound(&self, chat_jid: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "DELETE FROM whatsapp_inbound_allowlist WHERE chat_jid = ?1",
+            params![chat_jid],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_whatsapp_inbound_allowed(&self, chat_jid: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM whatsapp_inbound_allowlist WHERE chat_jid = ?1",
+            params![chat_jid],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     // --- tone profiles & examples (issue #73) ---
 
     /// Insert one tone example. Returns the new row's `id` (uuid).
@@ -2625,6 +2929,179 @@ impl Store {
         Ok(n)
     }
 
+    // ---------------------------------------------------------------
+    // #104 — user-defined scheduled tasks (`/loop`).
+    // ---------------------------------------------------------------
+
+    /// Create a loop. `id` is generated; returns it.
+    pub fn create_user_loop(
+        &self,
+        owner: &str,
+        channel: &str,
+        channel_ref: &str,
+        interval_secs: i64,
+        prompt: &str,
+    ) -> StoreResult<String> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        guard.execute(
+            "INSERT INTO user_loops \
+                 (id, owner, channel, channel_ref, interval_secs, prompt, \
+                  status, fail_count, created_at_ms, updated_at_ms) \
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0, ?7, ?7)",
+            params![id, owner, channel, channel_ref, interval_secs, prompt, now],
+        )?;
+        Ok(id)
+    }
+
+    /// All loops for an owner (any status), newest first.
+    pub fn list_user_loops(&self, owner: &str) -> StoreResult<Vec<UserLoop>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, owner, channel, channel_ref, interval_secs, prompt, \
+                    status, last_run_ms, last_status, fail_count, \
+                    created_at_ms, updated_at_ms \
+               FROM user_loops \
+              WHERE owner = ?1 AND status != 'stopped' \
+              ORDER BY created_at_ms DESC",
+        )?;
+        let rows = stmt.query_map(params![owner], row_to_user_loop)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Every loop the scheduler should tick (status = 'active'), across owners.
+    /// Used on boot to rehydrate and on each scheduler pass.
+    pub fn list_active_user_loops(&self) -> StoreResult<Vec<UserLoop>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, owner, channel, channel_ref, interval_secs, prompt, \
+                    status, last_run_ms, last_status, fail_count, \
+                    created_at_ms, updated_at_ms \
+               FROM user_loops \
+              WHERE status = 'active' \
+              ORDER BY created_at_ms ASC",
+        )?;
+        let rows = stmt.query_map([], row_to_user_loop)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Count active loops for an owner — backs the per-user max.
+    pub fn count_active_user_loops(&self, owner: &str) -> StoreResult<i64> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: i64 = guard.query_row(
+            "SELECT COUNT(*) FROM user_loops WHERE owner = ?1 AND status = 'active'",
+            params![owner],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// Transition a loop to `stopped`. Scoped by owner so a user can only
+    /// stop their own. Returns true if a row changed.
+    pub fn stop_user_loop(&self, owner: &str, id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE user_loops SET status = 'stopped', updated_at_ms = ?3 \
+              WHERE id = ?1 AND owner = ?2 AND status != 'stopped'",
+            params![id, owner, now_millis()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Record the outcome of a loop run. `ok=false` increments `fail_count`;
+    /// on reaching `pause_at` consecutive failures the loop is auto-paused.
+    /// A success resets `fail_count` to 0.
+    pub fn record_user_loop_run(
+        &self,
+        id: &str,
+        ok: bool,
+        status_text: &str,
+        pause_at: i64,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let now = now_millis();
+        if ok {
+            guard.execute(
+                "UPDATE user_loops \
+                    SET last_run_ms = ?2, last_status = ?3, fail_count = 0, \
+                        updated_at_ms = ?2 \
+                  WHERE id = ?1",
+                params![id, now, status_text],
+            )?;
+        } else {
+            guard.execute(
+                "UPDATE user_loops \
+                    SET last_run_ms = ?2, last_status = ?3, \
+                        fail_count = fail_count + 1, \
+                        status = CASE WHEN fail_count + 1 >= ?4 THEN 'paused' \
+                                      ELSE status END, \
+                        updated_at_ms = ?2 \
+                  WHERE id = ?1",
+                params![id, now, status_text, pause_at],
+            )?;
+        }
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // #47 — cross-surface state sync: compare-and-swap status mutation.
+    // ---------------------------------------------------------------
+
+    /// Atomically flip a pending action to a terminal status, recording the
+    /// resolving surface. Returns true only when this call actually performed
+    /// the transition (exactly one row changed). A second surface racing on
+    /// the same action gets `false` and must NOT re-run side effects.
+    ///
+    /// Distinct from `update_action_status`, which is unconditional and used
+    /// for re-draft / pending bookkeeping. This is the resolve gate.
+    pub fn try_resolve_action(
+        &self,
+        action_id: &str,
+        new_status: ActionStatus,
+        source: &str,
+    ) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+                SET status = ?2, status_source = ?3, status_updated_at = ?4, \
+                    updatedAt = ?4 \
+              WHERE id = ?1 AND status = 'pending'",
+            params![
+                action_id,
+                new_status.as_str(),
+                source,
+                now_millis(),
+            ],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// The surface that last resolved an action (NULL if still pending or
+    /// pre-migration). Drives the Discord echo-suppression on the broadcast.
+    pub fn action_status_source(
+        &self,
+        action_id: &str,
+    ) -> StoreResult<Option<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let v: Option<Option<String>> = guard
+            .query_row(
+                "SELECT status_source FROM actions WHERE id = ?1",
+                params![action_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.flatten())
+    }
+
     // -----------------------------------------------------------------
     // #79 — Twitter/X GraphQL queryId cache + outbound post log.
     // -----------------------------------------------------------------
@@ -2852,6 +3329,37 @@ fn row_to_telegram_bot(r: &rusqlite::Row) -> rusqlite::Result<TelegramBot> {
         last_update_id: r.get(4)?,
         active: r.get::<_, i64>(5)? != 0,
         created_at_ms: r.get(6)?,
+    })
+}
+
+fn row_to_whatsapp_device(r: &rusqlite::Row) -> rusqlite::Result<WhatsappDevice> {
+    Ok(WhatsappDevice {
+        id: r.get(0)?,
+        phone: r.get(1)?,
+        device_jid: r.get(2)?,
+        user_jid: r.get(3)?,
+        paired_at_ms: r.get(4)?,
+        last_event_at_ms: r.get(5)?,
+        session_status: r.get(6)?,
+        active: r.get::<_, i64>(7)? != 0,
+        created_at_ms: r.get(8)?,
+    })
+}
+
+fn row_to_user_loop(r: &rusqlite::Row) -> rusqlite::Result<UserLoop> {
+    Ok(UserLoop {
+        id: r.get(0)?,
+        owner: r.get(1)?,
+        channel: r.get(2)?,
+        channel_ref: r.get(3)?,
+        interval_secs: r.get(4)?,
+        prompt: r.get(5)?,
+        status: r.get(6)?,
+        last_run_ms: r.get(7)?,
+        last_status: r.get(8)?,
+        fail_count: r.get(9)?,
+        created_at_ms: r.get(10)?,
+        updated_at_ms: r.get(11)?,
     })
 }
 
@@ -3839,6 +4347,89 @@ mod tests {
         assert!(
             s.record_user_edit_as_tone_example(&id2).unwrap().is_none(),
             "missing draftBody → skip"
+        );
+    }
+
+    // --- user loops (#104) ---
+
+    #[test]
+    fn user_loop_create_list_stop_roundtrip() {
+        let (s, _f) = fresh_store();
+        let id = s
+            .create_user_loop("u1", "discord", "chan-7", 300, "/digest")
+            .unwrap();
+        let loops = s.list_user_loops("u1").unwrap();
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].id, id);
+        assert_eq!(loops[0].interval_secs, 300);
+        assert_eq!(loops[0].status, "active");
+        assert_eq!(s.count_active_user_loops("u1").unwrap(), 1);
+
+        // scoped: another user can't stop it
+        assert!(!s.stop_user_loop("u2", &id).unwrap());
+        assert!(s.stop_user_loop("u1", &id).unwrap());
+        // stopped rows drop out of the owner listing
+        assert!(s.list_user_loops("u1").unwrap().is_empty());
+        assert_eq!(s.count_active_user_loops("u1").unwrap(), 0);
+    }
+
+    #[test]
+    fn user_loop_pauses_after_repeated_failures() {
+        let (s, _f) = fresh_store();
+        let id = s
+            .create_user_loop("u1", "discord", "c", 300, "/x")
+            .unwrap();
+        s.record_user_loop_run(&id, false, "boom", 3).unwrap();
+        s.record_user_loop_run(&id, false, "boom", 3).unwrap();
+        // still active after 2 failures
+        assert_eq!(s.list_active_user_loops().unwrap().len(), 1);
+        s.record_user_loop_run(&id, false, "boom", 3).unwrap();
+        // 3rd failure auto-pauses
+        assert!(s.list_active_user_loops().unwrap().is_empty());
+        let l = &s.list_user_loops("u1").unwrap()[0];
+        assert_eq!(l.status, "paused");
+        assert_eq!(l.fail_count, 3);
+    }
+
+    #[test]
+    fn user_loop_success_resets_fail_count() {
+        let (s, _f) = fresh_store();
+        let id = s.create_user_loop("u1", "discord", "c", 300, "/x").unwrap();
+        s.record_user_loop_run(&id, false, "boom", 5).unwrap();
+        s.record_user_loop_run(&id, true, "ok", 5).unwrap();
+        let l = &s.list_user_loops("u1").unwrap()[0];
+        assert_eq!(l.fail_count, 0);
+        assert_eq!(l.last_status.as_deref(), Some("ok"));
+        assert!(l.last_run_ms.is_some());
+    }
+
+    // --- cross-surface CAS resolve (#47) ---
+
+    #[test]
+    fn try_resolve_action_is_compare_and_swap() {
+        let (s, _f) = fresh_store();
+        let id = s
+            .log_action(
+                "m-cas",
+                None,
+                "a@b.com",
+                "subj",
+                None,
+                None,
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        // First resolver wins.
+        assert!(s
+            .try_resolve_action(&id, ActionStatus::Sent, "discord")
+            .unwrap());
+        // Second resolver (racing surface) loses — no double side effect.
+        assert!(!s
+            .try_resolve_action(&id, ActionStatus::Skipped, "dashboard")
+            .unwrap());
+        assert_eq!(
+            s.action_status_source(&id).unwrap().as_deref(),
+            Some("discord")
         );
     }
 
