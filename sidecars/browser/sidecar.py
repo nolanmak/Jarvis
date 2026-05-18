@@ -21,6 +21,9 @@ Ops implemented (per #75 §6 + the wave-A spec):
     navigate, click, type, screenshot, get_text, set_input_files,
     wait_for, evaluate, ping.
 
+Ops added for the IG Reel/Carousel/Story composer (#76):
+    count, press_key, drag, bounding_box.
+
 Concurrent requests on a single connection are supported: each frame is
 dispatched to its own asyncio task so a long `wait_for` doesn't block
 a `ping`. Ordering is per-page (Playwright's API is not thread-safe but
@@ -347,6 +350,96 @@ async def op_evaluate(page: Page, params: dict) -> dict:
     return {"value": result}
 
 
+async def op_count(page: Page, params: dict) -> dict:
+    """Count elements matching a selector. Used by the IG composer to verify
+    dialog detach (Share confirmation), autocomplete-dropdown dismissal, and
+    carousel slide counts — all of which need a "how many match" probe rather
+    than a wait-for-visible."""
+    sel = params.get("selector")
+    if not sel:
+        raise SidecarError("count: 'selector' required")
+    try:
+        n = await page.locator(sel).count()
+    except PWError as e:
+        raise SidecarError(f"count failed for {sel}: {e}") from e
+    return {"selector": sel, "count": int(n)}
+
+
+async def op_press_key(page: Page, params: dict) -> dict:
+    """Press a keyboard key globally (no selector focus change). Used to
+    dismiss the hashtag/mention autocomplete dropdown with Escape (#76 §7)
+    and to nudge the Reel cover-frame slider with Arrow keys."""
+    key = params.get("key")
+    if not key:
+        raise SidecarError("press_key: 'key' required")
+    presses = int(params.get("presses", 1))
+    if presses < 1 or presses > 64:
+        raise SidecarError("press_key: 'presses' must be 1..=64")
+    sel = params.get("selector")
+    try:
+        for _ in range(presses):
+            if sel:
+                await page.press(sel, key, timeout=params.get("timeout_ms", 10_000))
+            else:
+                await page.keyboard.press(key)
+    except PWTimeoutError as e:
+        raise SelectorNotFound(f"press_key timeout for {sel}: {e}") from e
+    except PWError as e:
+        raise SidecarError(f"press_key failed: {e}") from e
+    return {"key": key, "presses": presses}
+
+
+async def op_drag(page: Page, params: dict) -> dict:
+    """Mouse press → stepped move → release. Drives the Reel cover-frame
+    scrubber thumb: IG ignores `slider.fill(value)`, so we synthesize a real
+    drag. Coordinates are absolute viewport pixels; pass `from`/`to` as
+    [x, y]. `steps` smooths the move so IG's pointermove listeners fire."""
+    src = params.get("from")
+    dst = params.get("to")
+    if not (isinstance(src, list) and len(src) == 2):
+        raise SidecarError("drag: 'from' must be [x, y]")
+    if not (isinstance(dst, list) and len(dst) == 2):
+        raise SidecarError("drag: 'to' must be [x, y]")
+    steps = int(params.get("steps", 12))
+    steps = max(1, min(steps, 100))
+    try:
+        await page.mouse.move(float(src[0]), float(src[1]))
+        await page.mouse.down()
+        await page.mouse.move(float(dst[0]), float(dst[1]), steps=steps)
+        await page.mouse.up()
+    except PWError as e:
+        raise SidecarError(f"drag failed: {e}") from e
+    return {"from": src, "to": dst, "steps": steps}
+
+
+async def op_bounding_box(page: Page, params: dict) -> dict:
+    """Return the viewport-relative bounding box {x, y, w, h} of the first
+    element matching `selector`, or null if not found / not rendered. The IG
+    composer uses this to compute absolute drag coordinates for the
+    cover-frame scrubber thumb."""
+    sel = params.get("selector")
+    if not sel:
+        raise SidecarError("bounding_box: 'selector' required")
+    try:
+        handle = await page.query_selector(sel)
+    except PWError as e:
+        raise SidecarError(f"bounding_box: query failed: {e}") from e
+    if handle is None:
+        return {"selector": sel, "box": None}
+    box = await handle.bounding_box()
+    if box is None:
+        return {"selector": sel, "box": None}
+    return {
+        "selector": sel,
+        "box": {
+            "x": box["x"],
+            "y": box["y"],
+            "w": box["width"],
+            "h": box["height"],
+        },
+    }
+
+
 _OPS: dict[str, Callable[[Page, dict], Awaitable[dict]]] = {
     "ping": op_ping,
     "navigate": op_navigate,
@@ -357,6 +450,10 @@ _OPS: dict[str, Callable[[Page, dict], Awaitable[dict]]] = {
     "set_input_files": op_set_input_files,
     "wait_for": op_wait_for,
     "evaluate": op_evaluate,
+    "count": op_count,
+    "press_key": op_press_key,
+    "drag": op_drag,
+    "bounding_box": op_bounding_box,
 }
 
 

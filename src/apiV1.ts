@@ -60,7 +60,10 @@ export function publishStatusChange(
 
 // API-key middleware. In split mode a key is mandatory; in local mode it's
 // only enforced if one is set (so existing single-host setups keep working).
-function requireApiKey(req: Request, res: Response, next: NextFunction): void {
+// Exported so the dashboard router can gate the #117 /repos admin surface
+// behind the SAME key check (the dashboard process doesn't mount the v1
+// router, so it can't inherit `v1.use(requireApiKey)` — it reuses this).
+export function requireApiKey(req: Request, res: Response, next: NextFunction): void {
   if (MODE === "split" && !API_KEY) {
     res
       .status(503)

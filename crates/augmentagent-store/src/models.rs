@@ -368,6 +368,67 @@ pub struct WhatsappDevice {
     pub created_at_ms: i64,
 }
 
+/// #58.1 — one queued outbound post. Synthesized into a
+/// `scheduled_post_fire` WorkItem by the serve-tick fire loop: at T-30min a
+/// preview approval card is posted (`status` → `previewed`), at T-0 anything
+/// still `previewed` (i.e. the user did not cancel) is published via the
+/// per-platform Track-2.2 posting client.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledPost {
+    pub id: String,
+    /// `twitter` | `linkedin` | `instagram` | …
+    pub platform: String,
+    pub body: String,
+    /// JSON array of local media file paths, or `None` for a text post.
+    pub media_paths: Option<String>,
+    pub fire_at_ms: i64,
+    /// `queued` | `previewed` | `posted` | `cancelled` | `failed`.
+    pub status: String,
+    /// Discord message id of the preview card once it's been surfaced.
+    pub approval_msg: Option<String>,
+    pub posted_at_ms: Option<i64>,
+    /// Platform's post id once published (tweet id / share urn / media id).
+    pub external_id: Option<String>,
+    /// For tweetstorms / multi-part LI — parent `scheduled_posts.id`.
+    pub thread_parent: Option<String>,
+    pub created_at_ms: i64,
+}
+
+/// Lifecycle states for a [`ScheduledPost`]. String-typed in the DB so a
+/// future state never needs a migration; this enum is the canonical set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduledPostStatus {
+    Queued,
+    Previewed,
+    Posted,
+    Cancelled,
+    Failed,
+}
+
+impl ScheduledPostStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Previewed => "previewed",
+            Self::Posted => "posted",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "queued" => Some(Self::Queued),
+            "previewed" => Some(Self::Previewed),
+            "posted" => Some(Self::Posted),
+            "cancelled" => Some(Self::Cancelled),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
 /// A user-scheduled recurring prompt/command (`/loop`, #104). The scheduler
 /// ticks every active row on its `interval_secs` cadence. Minimal model
 /// matching the `user_loops` table the store methods read/write.
@@ -383,6 +444,59 @@ pub struct UserLoop {
     pub last_run_ms: Option<i64>,
     pub last_status: Option<String>,
     pub fail_count: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// #117 — an allowlisted repo the multi-repo agent-coding loop is permitted
+/// to touch. Default-deny: the loop refuses any repo not represented by an
+/// `enabled` row here. `blast_radius_extra` is a comma-separated list of
+/// extra path fragments (on top of the hard built-in deny list) that mark a
+/// diff "too dangerous to auto-touch" for THIS repo (e.g. a third-party
+/// repo's own deploy dir). `build_cmd` is the per-repo verification-gate
+/// command run inside the throwaway clone before a PR is proposed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRepo {
+    pub id: String,
+    /// `owner/name` GitHub full-name. Unique (case-insensitive) per row.
+    pub full_name: String,
+    /// Branch PRs target (default-branch of the repo, e.g. `main`).
+    pub base_branch: String,
+    /// Verification-gate shell command, run with `bash -lc` in the clone.
+    /// Empty ⇒ gate is skipped (clone-only repos / docs repos).
+    pub build_cmd: String,
+    /// Extra comma-separated blast-radius path fragments for this repo.
+    pub blast_radius_extra: String,
+    /// Max changed lines this repo will accept in one agent diff.
+    pub max_diff_lines: i64,
+    /// `false` ⇒ revoked. A revoked repo is hard-skipped by the loop and its
+    /// in-flight gate rows are auto-rejected.
+    pub enabled: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// #117 — one audit/gate row per multi-repo agent-coding attempt. The loop
+/// inserts it `pending_approval` after the verification gate passes, posts a
+/// Discord prompt + dashboard card, and only opens the draft PR once a human
+/// flips it to `approved`. Terminal states: `pr_opened`, `rejected`,
+/// `failed`, `expired`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentPrRun {
+    pub id: String,
+    pub repo_full_name: String,
+    pub issue_number: i64,
+    pub branch: String,
+    /// Short Claude-authored summary of the change.
+    pub summary: String,
+    pub diff_lines: i64,
+    /// `pending_approval` | `approved` | `rejected` | `pr_opened` | `failed`
+    /// | `expired`.
+    pub status: String,
+    /// Populated once the draft PR is opened.
+    pub pr_url: Option<String>,
+    /// Last error if `status = failed`.
+    pub error: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }

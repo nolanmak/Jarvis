@@ -11,7 +11,9 @@ pub mod sigextract;
 pub mod tone;
 mod channel;
 
-pub use channel::{GmailChannel, GmailChannelConfig, PollOutcome};
+pub use channel::{
+    DispatchOutcome, GmailChannel, GmailChannelConfig, GmailWorkHandler, PollOutcome,
+};
 pub use inbound::{email_to_work_item, GmailInbound};
 pub use sigextract::{
     detect_signature_block, signature_patch, ExtractedFields, SignatureBlock,

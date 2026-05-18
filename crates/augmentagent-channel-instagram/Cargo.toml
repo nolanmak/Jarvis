@@ -6,6 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# Operator validation harness (#17). Standalone binary so it ships with the
+# crate without threading through the contended top-level CLI:
+#   augmentagent-instagram-validate --cookies ig.json [--feed-user <id>] ...
+[[bin]]
+name = "augmentagent-instagram-validate"
+path = "src/bin/validate_main.rs"
+
 [dependencies]
 augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
@@ -27,7 +34,10 @@ uuid = { workspace = true }
 time = { workspace = true }
 chrono = { workspace = true }
 serde_yaml_ng = "0.10"
+clap = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
 rusqlite = { workspace = true }
+wiremock = { workspace = true }

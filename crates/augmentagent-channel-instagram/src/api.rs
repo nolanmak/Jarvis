@@ -49,9 +49,40 @@ impl InstagramError {
     pub fn is_soft_block(&self) -> bool {
         matches!(self, InstagramError::RateLimited(_))
     }
-    /// True for the terminal account-flagged class (needs a human in-app).
+    /// True for the terminal account-flagged class (needs a human in-app)
+    /// *or* a dead session (needs a re-harvest). The channel halts the
+    /// poll loop on both; the operator action differs (re-login vs clear
+    /// the in-app checkpoint) and is spelled out in the log line.
     pub fn is_challenge(&self) -> bool {
         matches!(self, InstagramError::Challenged(_) | InstagramError::AuthExpired)
+    }
+
+    /// Stable machine-readable tag for the validation harness + structured
+    /// logs. Keeps drift reporting greppable across runs.
+    pub fn kind_tag(&self) -> &'static str {
+        match self {
+            InstagramError::Http(_) => "http_transport",
+            InstagramError::AuthExpired => "auth_expired",
+            InstagramError::RateLimited(_) => "rate_limited",
+            InstagramError::Challenged(_) => "challenged",
+            InstagramError::Api { .. } => "api_error",
+            InstagramError::Decode(_) => "schema_drift",
+            InstagramError::Config(_) => "config",
+        }
+    }
+}
+
+/// Truncate a response body for a log line — enough to fingerprint a schema
+/// change without dumping a session-bearing payload into the journal.
+fn body_sample(body: &str) -> String {
+    const MAX: usize = 280;
+    let trimmed = body.trim();
+    if trimmed.len() <= MAX {
+        trimmed.to_string()
+    } else {
+        let mut s: String = trimmed.chars().take(MAX).collect();
+        s.push_str(" …[truncated]");
+        s
     }
 }
 
@@ -88,6 +119,10 @@ pub trait InstagramApi: Send + Sync {
 pub struct WebClient {
     http: reqwest::Client,
     auth: InstagramAuth,
+    /// API base. Production is always [`BASE`]; only the mocked-HTTP tests
+    /// point this at a local wiremock server (so every error branch is
+    /// exercised over a real reqwest round-trip, not just unit fakes).
+    base: String,
 }
 
 impl WebClient {
@@ -96,7 +131,27 @@ impl WebClient {
             .user_agent(auth.user_agent.clone())
             .build()
             .expect("reqwest client build");
-        Self { http, auth }
+        Self {
+            http,
+            auth,
+            base: BASE.to_string(),
+        }
+    }
+
+    /// Point the client at an arbitrary base URL. Test-only: lets the
+    /// mocked-HTTP suite drive the full reqwest path against wiremock without
+    /// changing the production constructor.
+    #[cfg(test)]
+    pub(crate) fn with_base(auth: InstagramAuth, base: impl Into<String>) -> Self {
+        let http = reqwest::Client::builder()
+            .user_agent(auth.user_agent.clone())
+            .build()
+            .expect("reqwest client build");
+        Self {
+            http,
+            auth,
+            base: base.into(),
+        }
     }
 
     fn base_headers(&self) -> Result<reqwest::header::HeaderMap, InstagramError> {
@@ -132,31 +187,121 @@ impl WebClient {
     }
 
     /// Map a non-2xx response into the right typed error. 401 → AuthExpired;
-    /// a `checkpoint_required`/`challenge` body → Challenged; a
-    /// feedback/spam/lock body or 429 → RateLimited; everything else → Api.
+    /// 429 → RateLimited even if the body is opaque; a `login_required` body
+    /// (often served as 403) → AuthExpired; a `checkpoint`/`challenge` body →
+    /// Challenged; a feedback/spam/lock body → RateLimited; everything else →
+    /// Api. A non-2xx that classifies as nothing ban-ish is logged as a
+    /// schema-drift candidate so the operator notices the protocol moved.
     async fn classify_response(
         &self,
+        endpoint: &str,
         resp: reqwest::Response,
     ) -> Result<reqwest::Response, InstagramError> {
         let status = resp.status();
-        if status.as_u16() == 401 {
+        let code = status.as_u16();
+        if code == 401 {
             return Err(InstagramError::AuthExpired);
         }
         if status.is_success() {
             return Ok(resp);
         }
         let body = resp.text().await.unwrap_or_default();
-        match classify_body(status.as_u16(), &body) {
+        // 429 is unambiguous regardless of body shape — back off hard.
+        if code == 429 {
+            tracing::warn!(endpoint, status = code, "instagram HTTP 429 — rate limited");
+            return Err(InstagramError::RateLimited(FailureKind::RateLimit));
+        }
+        match classify_body(code, &body) {
+            Some(FailureKind::LoginRequired) => {
+                tracing::warn!(
+                    endpoint,
+                    status = code,
+                    "instagram session dead (login_required) — re-harvest cookies"
+                );
+                Err(InstagramError::AuthExpired)
+            }
             Some(FailureKind::Challenge) | Some(FailureKind::Captcha) => {
                 Err(InstagramError::Challenged(FailureKind::Challenge))
             }
             Some(k @ FailureKind::RateLimit)
-            | Some(k @ FailureKind::ActionBlocked) => Err(InstagramError::RateLimited(k)),
-            _ => Err(InstagramError::Api {
-                status: status.as_u16(),
-                body,
-            }),
+            | Some(k @ FailureKind::ActionBlocked)
+            | Some(k @ FailureKind::CookieBanner) => {
+                Err(InstagramError::RateLimited(k))
+            }
+            None => {
+                // Nothing ban-ish, nothing decodable as a known shape — most
+                // likely the protocol drifted (HTML shell, new error
+                // envelope). Log a fingerprint so it's caught at validate
+                // time / in the journal rather than silently swallowed.
+                tracing::error!(
+                    endpoint,
+                    status = code,
+                    body_sample = %body_sample(&body),
+                    "instagram unrecognized non-2xx — possible SCHEMA DRIFT; \
+                     re-run `instagram validate` + re-capture the protocol"
+                );
+                Err(InstagramError::Api { status: code, body })
+            }
         }
+    }
+
+    /// Guard a 2xx body before serde decode: IG sometimes returns HTTP 200
+    /// with a `login_required` / `feedback_required` / `{"status":"fail"}`
+    /// JSON envelope (the read endpoints never status-checked this before).
+    /// Returns the parsed value on a clean body; a typed error otherwise.
+    fn guard_ok_body(
+        endpoint: &str,
+        body: &str,
+    ) -> Result<serde_json::Value, InstagramError> {
+        let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+            tracing::error!(
+                endpoint,
+                error = %e,
+                body_sample = %body_sample(body),
+                "instagram 200 body is not JSON — SCHEMA DRIFT (logged-out HTML \
+                 shell?); re-run `instagram validate`"
+            );
+            InstagramError::Decode(format!("{endpoint}: not json: {e}"))
+        })?;
+        if let Some(k) = classify_body(200, body) {
+            return match k {
+                FailureKind::LoginRequired => {
+                    tracing::warn!(
+                        endpoint,
+                        "instagram 200 carried login_required — session dead"
+                    );
+                    Err(InstagramError::AuthExpired)
+                }
+                FailureKind::Challenge | FailureKind::Captcha => {
+                    Err(InstagramError::Challenged(FailureKind::Challenge))
+                }
+                other => Err(InstagramError::RateLimited(other)),
+            };
+        }
+        if v.get("status").and_then(|s| s.as_str()) == Some("fail") {
+            return Err(InstagramError::RateLimited(FailureKind::ActionBlocked));
+        }
+        Ok(v)
+    }
+
+    /// Decode a typed payload from a guarded 2xx body, emitting a
+    /// schema-drift error (with a fingerprint) on a parse miss instead of a
+    /// bare serde message.
+    fn decode_payload<T: serde::de::DeserializeOwned>(
+        endpoint: &str,
+        body: &str,
+    ) -> Result<T, InstagramError> {
+        let _ = Self::guard_ok_body(endpoint, body)?;
+        serde_json::from_str::<T>(body).map_err(|e| {
+            tracing::error!(
+                endpoint,
+                error = %e,
+                body_sample = %body_sample(body),
+                "instagram payload shape mismatch — SCHEMA DRIFT; \
+                 expected fields moved/renamed. Re-run `instagram validate`"
+            );
+            InstagramError::Decode(format!("{endpoint}: shape mismatch: {e}"))
+        })
     }
 }
 
@@ -167,7 +312,8 @@ impl InstagramApi for WebClient {
         cursor: Option<&str>,
     ) -> Result<(Vec<Dm>, Option<String>), InstagramError> {
         let mut url = format!(
-            "{BASE}/direct_v2/inbox/?persistentBadging=true&limit=20&thread_message_limit=1"
+            "{}/direct_v2/inbox/?persistentBadging=true&limit=20&thread_message_limit=1",
+            self.base
         );
         if let Some(c) = cursor {
             url.push_str("&cursor=");
@@ -179,11 +325,12 @@ impl InstagramApi for WebClient {
             .headers(self.base_headers()?)
             .send()
             .await?;
-        let resp = self.classify_response(resp).await?;
-        let payload: InboxResponse = resp
-            .json()
+        let resp = self.classify_response("inbox", resp).await?;
+        let body = resp
+            .text()
             .await
-            .map_err(|e| InstagramError::Decode(format!("inbox json: {e}")))?;
+            .map_err(|e| InstagramError::Decode(format!("inbox read: {e}")))?;
+        let payload: InboxResponse = Self::decode_payload("inbox", &body)?;
 
         let my_pk = payload
             .viewer
@@ -204,7 +351,8 @@ impl InstagramApi for WebClient {
         thread_id: &str,
         text: &str,
     ) -> Result<String, InstagramError> {
-        let url = format!("{BASE}/direct_v2/threads/{thread_id}/items/text/");
+        let url =
+            format!("{}/direct_v2/threads/{thread_id}/items/text/", self.base);
         let client_context = Uuid::new_v4().to_string();
         let form = [
             ("text", text),
@@ -219,15 +367,14 @@ impl InstagramApi for WebClient {
             .form(&form)
             .send()
             .await?;
-        let resp = self.classify_response(resp).await?;
-        let v: serde_json::Value = resp
-            .json()
+        let resp = self.classify_response("send_dm", resp).await?;
+        let body = resp
+            .text()
             .await
-            .map_err(|e| InstagramError::Decode(format!("send json: {e}")))?;
-        // A 200 with status:"fail" is still a throttle.
-        if v.get("status").and_then(|s| s.as_str()) == Some("fail") {
-            return Err(InstagramError::RateLimited(FailureKind::ActionBlocked));
-        }
+            .map_err(|e| InstagramError::Decode(format!("send read: {e}")))?;
+        // guard_ok_body covers the 200-with-`status:"fail"` /
+        // login_required / feedback_required envelopes in one place.
+        let v = Self::guard_ok_body("send_dm", &body)?;
         Ok(find_string_field(&v, "item_id").unwrap_or_default())
     }
 
@@ -236,7 +383,8 @@ impl InstagramApi for WebClient {
         user_id: &str,
         cursor: Option<&str>,
     ) -> Result<(Vec<FeedPost>, Option<String>), InstagramError> {
-        let mut url = format!("{BASE}/feed/user/{user_id}/?count=12");
+        let mut url =
+            format!("{}/feed/user/{user_id}/?count=12", self.base);
         if let Some(c) = cursor {
             url.push_str("&max_id=");
             url.push_str(c);
@@ -247,11 +395,12 @@ impl InstagramApi for WebClient {
             .headers(self.base_headers()?)
             .send()
             .await?;
-        let resp = self.classify_response(resp).await?;
-        let payload: FeedResponse = resp
-            .json()
+        let resp = self.classify_response("feed", resp).await?;
+        let body = resp
+            .text()
             .await
-            .map_err(|e| InstagramError::Decode(format!("feed json: {e}")))?;
+            .map_err(|e| InstagramError::Decode(format!("feed read: {e}")))?;
+        let payload: FeedResponse = Self::decode_payload("feed", &body)?;
         let posts = payload.items.into_iter().filter_map(build_post).collect();
         Ok((posts, payload.next_max_id))
     }
@@ -261,7 +410,7 @@ impl InstagramApi for WebClient {
         media_id: &str,
         text: &str,
     ) -> Result<String, InstagramError> {
-        let url = format!("{BASE}/web/comments/{media_id}/add/");
+        let url = format!("{}/web/comments/{media_id}/add/", self.base);
         let form = [
             ("comment_text", text),
             ("_uuid", &self.auth.device_uuid()),
@@ -273,14 +422,12 @@ impl InstagramApi for WebClient {
             .form(&form)
             .send()
             .await?;
-        let resp = self.classify_response(resp).await?;
-        let v: serde_json::Value = resp
-            .json()
+        let resp = self.classify_response("comment", resp).await?;
+        let body = resp
+            .text()
             .await
-            .map_err(|e| InstagramError::Decode(format!("comment json: {e}")))?;
-        if v.get("status").and_then(|s| s.as_str()) == Some("fail") {
-            return Err(InstagramError::RateLimited(FailureKind::ActionBlocked));
-        }
+            .map_err(|e| InstagramError::Decode(format!("comment read: {e}")))?;
+        let v = Self::guard_ok_body("comment", &body)?;
         Ok(find_string_field(&v, "id").unwrap_or_default())
     }
 }
@@ -570,5 +717,430 @@ mod tests {
         assert!(InstagramError::Challenged(FailureKind::Challenge).is_challenge());
         assert!(InstagramError::AuthExpired.is_challenge());
         assert!(!InstagramError::AuthExpired.is_soft_block());
+    }
+
+    #[test]
+    fn body_sample_truncates_long_bodies() {
+        let short = body_sample("  {\"ok\":1}  ");
+        assert_eq!(short, "{\"ok\":1}");
+        let long = "x".repeat(1000);
+        let s = body_sample(&long);
+        assert!(s.ends_with("…[truncated]"));
+        assert!(s.len() < 400);
+    }
+
+    #[test]
+    fn kind_tag_is_stable() {
+        assert_eq!(InstagramError::AuthExpired.kind_tag(), "auth_expired");
+        assert_eq!(
+            InstagramError::Decode("x".into()).kind_tag(),
+            "schema_drift"
+        );
+        assert_eq!(
+            InstagramError::RateLimited(FailureKind::RateLimit).kind_tag(),
+            "rate_limited"
+        );
+    }
+
+    #[test]
+    fn guard_ok_body_rejects_non_json_as_schema_drift() {
+        // The classic drift: IG serves the logged-out HTML shell with a 200.
+        let err = WebClient::guard_ok_body("inbox", "<!DOCTYPE html><html>...")
+            .unwrap_err();
+        assert!(matches!(err, InstagramError::Decode(_)));
+        assert_eq!(err.kind_tag(), "schema_drift");
+    }
+
+    #[test]
+    fn guard_ok_body_maps_200_login_required_to_auth_expired() {
+        let err = WebClient::guard_ok_body(
+            "inbox",
+            r#"{"message":"login_required","status":"fail"}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, InstagramError::AuthExpired));
+    }
+
+    #[test]
+    fn guard_ok_body_maps_200_status_fail_to_rate_limited() {
+        let err =
+            WebClient::guard_ok_body("send_dm", r#"{"status":"fail"}"#).unwrap_err();
+        assert!(matches!(
+            err,
+            InstagramError::RateLimited(FailureKind::ActionBlocked)
+        ));
+    }
+
+    #[test]
+    fn guard_ok_body_passes_clean_payload() {
+        let v = WebClient::guard_ok_body("inbox", r#"{"status":"ok","x":1}"#)
+            .unwrap();
+        assert_eq!(v.get("x").and_then(|n| n.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn decode_payload_shape_mismatch_is_schema_drift() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Need {
+            #[allow(dead_code)]
+            required_field: String,
+        }
+        let err = WebClient::decode_payload::<Need>(
+            "feed",
+            r#"{"status":"ok","other":1}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind_tag(), "schema_drift");
+        assert!(format!("{err}").contains("shape mismatch"));
+    }
+}
+
+/// Mocked-HTTP integration coverage for every classify_response /
+/// guard_ok_body branch, driven over a real reqwest round-trip against a
+/// local wiremock server (the production path, base URL swapped only).
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn auth() -> InstagramAuth {
+        let mut cookies = BTreeMap::new();
+        cookies.insert("sessionid".into(), "456%3Aa%3A1".into());
+        cookies.insert("csrftoken".into(), "tok".into());
+        cookies.insert("ds_user_id".into(), "456".into());
+        cookies.insert("mid".into(), "M".into());
+        cookies.insert("ig_did".into(), "11111111-1111-1111-1111-111111111111".into());
+        InstagramAuth {
+            ds_user_id: "456".into(),
+            username: "me".into(),
+            cookies,
+            user_agent: "UA/1.0".into(),
+            harvested_at_ms: 1,
+        }
+    }
+
+    async fn server() -> MockServer {
+        MockServer::start().await
+    }
+
+    fn client(srv: &MockServer) -> WebClient {
+        WebClient::with_base(auth(), format!("{}/api/v1", srv.uri()))
+    }
+
+    // ---- inbox (read) branches ----
+
+    #[tokio::test]
+    async fn inbox_happy_path_parses_threads_and_cursor() {
+        let srv = server().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/direct_v2/inbox/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"inbox":{"threads":[
+                    {"thread_id":"t1","users":[{"pk":123,"username":"tony","full_name":"Tony"}],
+                     "items":[{"item_id":"i1","user_id":123,"timestamp":1715900000000000,
+                               "item_type":"text","text":"hi"}]}],
+                  "oldest_cursor":"cur1"},"viewer":{"pk":"456"}}"#,
+                "application/json",
+            ))
+            .mount(&srv)
+            .await;
+        let (dms, cursor) = client(&srv).fetch_inbox(None).await.unwrap();
+        assert_eq!(dms.len(), 1);
+        assert_eq!(dms[0].peer_name, "Tony");
+        assert_eq!(cursor.as_deref(), Some("cur1"));
+    }
+
+    #[tokio::test]
+    async fn inbox_401_is_auth_expired() {
+        let srv = server().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/direct_v2/inbox/"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("nope"))
+            .mount(&srv)
+            .await;
+        let e = client(&srv).fetch_inbox(None).await.unwrap_err();
+        assert!(matches!(e, InstagramError::AuthExpired));
+    }
+
+    #[tokio::test]
+    async fn inbox_429_is_rate_limited_even_with_opaque_body() {
+        let srv = server().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/direct_v2/inbox/"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("<html>"))
+            .mount(&srv)
+            .await;
+        let e = client(&srv).fetch_inbox(None).await.unwrap_err();
+        assert!(matches!(
+            e,
+            InstagramError::RateLimited(FailureKind::RateLimit)
+        ));
+    }
+
+    #[tokio::test]
+    async fn inbox_403_login_required_is_auth_expired() {
+        let srv = server().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/direct_v2/inbox/"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                r#"{"message":"login_required","status":"fail"}"#,
+            ))
+            .mount(&srv)
+            .await;
+        let e = client(&srv).fetch_inbox(None).await.unwrap_err();
+        assert!(matches!(e, InstagramError::AuthExpired));
+    }
+
+    #[tokio::test]
+    async fn inbox_checkpoint_is_challenged() {
+        let srv = server().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/direct_v2/inbox/"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"message":"checkpoint_required","checkpoint_url":"/cp"}"#,
+            ))
+            .mount(&srv)
+            .await;
+        let e = client(&srv).fetch_inbox(None).await.unwrap_err();
+        assert!(matches!(e, InstagramError::Challenged(_)));
+    }
+
+    #[tokio::test]
+    async fn inbox_feedback_required_is_rate_limited() {
+        let srv = server().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/direct_v2/inbox/"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"message":"feedback_required","spam":true}"#,
+            ))
+            .mount(&srv)
+            .await;
+        let e = client(&srv).fetch_inbox(None).await.unwrap_err();
+        assert!(matches!(
+            e,
+            InstagramError::RateLimited(FailureKind::ActionBlocked)
+        ));
+    }
+
+    #[tokio::test]
+    async fn inbox_unrecognized_500_is_api_error_schema_drift_candidate() {
+        let srv = server().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/direct_v2/inbox/"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(r#"{"message":"server boom"}"#),
+            )
+            .mount(&srv)
+            .await;
+        let e = client(&srv).fetch_inbox(None).await.unwrap_err();
+        match e {
+            InstagramError::Api { status, .. } => assert_eq!(status, 500),
+            other => panic!("expected Api, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inbox_200_html_shell_is_schema_drift_decode_error() {
+        let srv = server().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/direct_v2/inbox/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<!DOCTYPE html><html><body>logged out</body></html>",
+            ))
+            .mount(&srv)
+            .await;
+        let e = client(&srv).fetch_inbox(None).await.unwrap_err();
+        assert_eq!(e.kind_tag(), "schema_drift");
+    }
+
+    #[tokio::test]
+    async fn inbox_200_with_login_required_envelope_is_auth_expired() {
+        let srv = server().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/direct_v2/inbox/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"logged_in_user": null, "status":"fail", "message":"login_required"}"#,
+            ))
+            .mount(&srv)
+            .await;
+        let e = client(&srv).fetch_inbox(None).await.unwrap_err();
+        assert!(matches!(e, InstagramError::AuthExpired));
+    }
+
+    // ---- feed (read) ----
+
+    #[tokio::test]
+    async fn feed_happy_path_parses_posts() {
+        let srv = server().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/feed/user/789/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"items":[{"id":"9_1","code":"C1","taken_at":1715900000,
+                    "caption":{"text":"hi"},"user":{"pk":1,"full_name":"Jane"}}],
+                  "next_max_id":"nm1"}"#,
+            ))
+            .mount(&srv)
+            .await;
+        let (posts, cursor) =
+            client(&srv).fetch_user_feed("789", None).await.unwrap();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].author_name, "Jane");
+        assert_eq!(cursor.as_deref(), Some("nm1"));
+    }
+
+    #[tokio::test]
+    async fn feed_shape_drift_is_decode_error() {
+        let srv = server().await;
+        // Valid JSON, but `items` became an object — a real drift shape.
+        Mock::given(method("GET"))
+            .and(path_regex(r"/feed/user/789/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"items":{"unexpected":"object"},"next_max_id":"x"}"#,
+            ))
+            .mount(&srv)
+            .await;
+        let e = client(&srv).fetch_user_feed("789", None).await.unwrap_err();
+        assert_eq!(e.kind_tag(), "schema_drift");
+    }
+
+    // ---- send_dm (write) ----
+
+    #[tokio::test]
+    async fn send_dm_success_returns_item_id() {
+        let srv = server().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/direct_v2/threads/t1/items/text/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"status":"ok","payload":{"item_id":"new-item-42"}}"#,
+            ))
+            .mount(&srv)
+            .await;
+        let id = client(&srv).send_dm("t1", "hello").await.unwrap();
+        assert_eq!(id, "new-item-42");
+    }
+
+    #[tokio::test]
+    async fn send_dm_200_status_fail_is_rate_limited() {
+        let srv = server().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/direct_v2/threads/t1/items/text/"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"status":"fail"}"#),
+            )
+            .mount(&srv)
+            .await;
+        let e = client(&srv).send_dm("t1", "hello").await.unwrap_err();
+        assert!(matches!(
+            e,
+            InstagramError::RateLimited(FailureKind::ActionBlocked)
+        ));
+    }
+
+    #[tokio::test]
+    async fn send_dm_400_feedback_required_is_rate_limited() {
+        let srv = server().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/direct_v2/threads/t1/items/text/"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"message":"feedback_required","spam":true}"#,
+            ))
+            .mount(&srv)
+            .await;
+        let e = client(&srv).send_dm("t1", "hello").await.unwrap_err();
+        assert!(matches!(e, InstagramError::RateLimited(_)));
+    }
+
+    #[tokio::test]
+    async fn send_dm_403_login_required_is_auth_expired() {
+        let srv = server().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/direct_v2/threads/t1/items/text/"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string(r#"{"message":"login_required"}"#),
+            )
+            .mount(&srv)
+            .await;
+        let e = client(&srv).send_dm("t1", "hello").await.unwrap_err();
+        assert!(matches!(e, InstagramError::AuthExpired));
+    }
+
+    // ---- comment (write) ----
+
+    #[tokio::test]
+    async fn comment_success_returns_id() {
+        let srv = server().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/web/comments/9_1/add/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"status":"ok","id":"cmt-7"}"#,
+            ))
+            .mount(&srv)
+            .await;
+        let id = client(&srv).post_comment("9_1", "nice").await.unwrap();
+        assert_eq!(id, "cmt-7");
+    }
+
+    #[tokio::test]
+    async fn comment_challenge_body_is_challenged() {
+        let srv = server().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/web/comments/9_1/add/"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"message":"challenge_required"}"#,
+            ))
+            .mount(&srv)
+            .await;
+        let e = client(&srv).post_comment("9_1", "nice").await.unwrap_err();
+        assert!(matches!(e, InstagramError::Challenged(_)));
+    }
+
+    #[tokio::test]
+    async fn comment_lock_body_is_rate_limited() {
+        let srv = server().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/web/comments/9_1/add/"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string(r#"{"status":"fail","lock":true}"#),
+            )
+            .mount(&srv)
+            .await;
+        let e = client(&srv).post_comment("9_1", "nice").await.unwrap_err();
+        assert!(matches!(
+            e,
+            InstagramError::RateLimited(FailureKind::ActionBlocked)
+        ));
+    }
+
+    #[tokio::test]
+    async fn full_validation_harness_over_mocked_http_passes() {
+        let srv = server().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/direct_v2/inbox/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"inbox":{"threads":[],"oldest_cursor":null},"viewer":{"pk":"456"}}"#,
+            ))
+            .mount(&srv)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/feed/user/789/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"items":[],"next_max_id":null}"#,
+            ))
+            .mount(&srv)
+            .await;
+        let cli = client(&srv);
+        let opts = crate::validate::ValidateOpts {
+            feed_user: Some("789".into()),
+            ..Default::default()
+        };
+        let report =
+            crate::validate::run_validation(&auth(), &cli, &opts, 100).await;
+        assert!(report.passed(), "{}", report.render_table());
+        assert_eq!(report.drift_count(), 0);
     }
 }
