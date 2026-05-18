@@ -1,0 +1,69 @@
+<%- include('partials/header', { page: 'relationships' }) %>
+
+<div class="space-y-6">
+  <div class="flex items-center justify-between">
+    <div>
+      <a href="/relationships" class="text-xs text-gray-500 hover:text-gray-300">&larr; All relationships</a>
+      <h1 class="text-xl font-semibold mt-1"><%= slug %></h1>
+    </div>
+    <% if (muted) { %>
+      <form method="POST" action="/relationships/person/<%= encodeURIComponent(slug) %>/unmute">
+        <button class="px-3 py-1 rounded-md text-xs font-medium bg-surface-soft text-white">Un-mute person</button>
+      </form>
+    <% } else { %>
+      <form method="POST" action="/relationships/person/<%= encodeURIComponent(slug) %>/mute">
+        <button class="px-3 py-1 rounded-md text-xs font-medium bg-gray-800 text-gray-400 hover:bg-gray-700">Mute person</button>
+      </form>
+    <% } %>
+  </div>
+
+  <% if (pageExists) { %>
+  <section class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+    <h2 class="text-sm font-semibold uppercase text-gray-400 mb-2">Cadence</h2>
+    <form method="POST" action="/relationships/person/<%= encodeURIComponent(slug) %>/cadence" class="flex items-center gap-2">
+      <select name="cadence" class="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm">
+        <% ['weekly','bi-weekly','monthly','quarterly','ad-hoc'].forEach(function(c) { %>
+          <option value="<%= c %>" <%= cadence === c ? 'selected' : '' %>><%= c %></option>
+        <% }); %>
+      </select>
+      <button class="px-3 py-1 rounded-md text-xs font-medium bg-accent text-white hover:bg-accent/90">Save</button>
+      <span class="text-xs text-gray-600">writes <code>cadence:</code> to <code>people/<%= slug %>.md</code></span>
+    </form>
+  </section>
+  <% } else { %>
+  <section class="bg-gray-900 border border-gray-800 rounded-lg p-4 text-xs text-gray-500">
+    No wiki page <code>people/<%= slug %>.md</code> yet — cadence editing unavailable.
+  </section>
+  <% } %>
+
+  <section class="space-y-3">
+    <h2 class="text-sm font-semibold uppercase text-gray-400">Signal history</h2>
+    <% if (signals.length === 0) { %>
+      <div class="text-gray-500 text-sm">No signals recorded for this person.</div>
+    <% } %>
+    <% signals.forEach(function(s) { %>
+    <div class="bg-gray-900 border border-gray-800 rounded-lg p-4">
+      <div class="flex items-center gap-2 mb-1">
+        <span class="text-[10px] uppercase px-2 py-0.5 rounded bg-gray-800 text-gray-400"><%= s.kind %></span>
+        <span class="text-[10px] text-gray-600"><%= s.status %></span>
+      </div>
+      <h3 class="text-sm font-semibold"><%= s.headline %></h3>
+      <p class="text-xs text-gray-500 mt-1"><%= s.detail %></p>
+      <% if (s.status === 'pending' || s.status === 'dispatched') { %>
+      <div class="flex gap-1.5 mt-2">
+        <form method="POST" action="/relationships/<%= s.id %>/draft">
+          <button class="px-3 py-1 rounded-md text-xs font-medium bg-accent text-white hover:bg-accent/90">Draft</button>
+        </form>
+        <form method="POST" action="/relationships/<%= s.id %>/snooze">
+          <input type="hidden" name="days" value="7" />
+          <button class="px-3 py-1 rounded-md text-xs font-medium bg-gray-800 text-gray-300 hover:bg-gray-700">Snooze 7d</button>
+        </form>
+        <form method="POST" action="/relationships/<%= s.id %>/dismiss">
+          <button class="px-3 py-1 rounded-md text-xs font-medium bg-gray-800 text-gray-400 hover:bg-gray-700">Stop tracking</button>
+        </form>
+      </div>
+      <% } %>
+    </div>
+    <% }); %>
+  </section>
+</div>

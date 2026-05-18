@@ -335,6 +335,26 @@ pub fn tone_summarize_opts() -> ReasonerOpts {
     }
 }
 
+/// Preset for the cross-platform content adapter (#53). One call per target
+/// platform, fanned out in parallel. Pure text transform: no tools, no wiki
+/// access, no Bash. The full system prompt (shared rules + the one platform's
+/// section + optional voice sample) is assembled by the content-adapter crate
+/// and passed in; we just pin the model + lock the toolbelt shut.
+///
+/// Opus, not Haiku: voice-matching + format nuance across platforms is
+/// quality-sensitive and volume is tiny (a handful of variants per compose).
+pub fn social_adapter_opts(system_prompt: String) -> ReasonerOpts {
+    ReasonerOpts {
+        system_prompt,
+        model: None, // Opus — voice + format fidelity matter, volume is low
+        allowed_tools: vec![],
+        add_dirs: vec![],
+        permission_mode: "default".into(),
+        cwd: None,
+        env: vec![],
+    }
+}
+
 /// Preset for the archetype picker (#36). A single fast structured-output
 /// classification: email + triage label in, one archetype id (or `none`) +
 /// confidence out. Haiku for cost/latency — the issue specifies a fast,

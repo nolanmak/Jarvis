@@ -30,6 +30,9 @@ augmentagent-auth = { path = "../augmentagent-auth" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
 augmentagent-browser-client = { path = "../augmentagent-browser-client" }
 augmentagent-renderer-client = { path = "../augmentagent-renderer-client" }
+augmentagent-proactive = { path = "../augmentagent-proactive" }
+augmentagent-channel-voice = { path = "../augmentagent-channel-voice" }
+augmentagent-content-adapter = { path = "../augmentagent-content-adapter" }
 
 async-trait = { workspace = true }
 serenity = { workspace = true }
