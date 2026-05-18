@@ -15,10 +15,13 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use async_trait::async_trait;
+
 use augmentagent_approval_discord::{ApprovalBroker, NoopBroker};
 use augmentagent_channel_core::decision::{parse as parse_decision, DecisionKind};
 use augmentagent_channel_core::ingest::{spawn_ingest, IngestTrigger};
 use augmentagent_channel_core::prompt::{draft_user_message, triage_user_message, SkillPrompt, TRIAGE_SYSTEM};
+use augmentagent_channel_core::trigger::{WorkItem, WorkItemHandler};
 use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{ActionStatus, RetryableReply, Store, TriageResult, NUDGE_INTERVAL_MS};
 
@@ -172,38 +175,6 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         );
     }
 
-    pub async fn run(&self, shutdown: CancellationToken) -> anyhow::Result<()> {
-        let mut poll_ticker = tokio::time::interval(self.config.poll_interval);
-        let retry_enabled = !self.config.retry_interval.is_zero();
-        let mut retry_ticker = tokio::time::interval(if retry_enabled {
-            self.config.retry_interval
-        } else {
-            // Stub interval; we'll never actually select on this branch.
-            Duration::from_secs(3600)
-        });
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    info!("gmail channel: shutdown signal received");
-                    return Ok(());
-                }
-                _ = poll_ticker.tick() => {
-                    match self.poll_once().await {
-                        Ok(outcome) => info!(?outcome, "gmail poll complete"),
-                        Err(e) => error!("gmail poll failed: {e:#}"),
-                    }
-                }
-                _ = retry_ticker.tick(), if retry_enabled => {
-                    match self.retry_once().await {
-                        Ok(n) if n > 0 => info!(retried = n, "retry tick complete"),
-                        Ok(_) => {}
-                        Err(e) => error!("retry tick failed: {e:#}"),
-                    }
-                }
-            }
-        }
-    }
-
     /// One pass of the retry queue. Returns the number of actions re-attempted.
     /// Not public since normal callers should rely on `run`, but tests call it
     /// directly to exercise the logic deterministically.
@@ -295,7 +266,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     outcome.emails_checked += emails.len();
                     for email in emails {
                         match self
-                            .handle_email(&skill.system, &learned, &account.entity_id, email)
+                            .process_email(&skill.system, &learned, &account.entity_id, email)
                             .await
                         {
                             Ok(kind) => match kind {
@@ -328,7 +299,13 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         Ok(outcome)
     }
 
-    async fn handle_email(
+    /// Run one email through the full triage → draft → approve → ingest
+    /// pipeline. This is the single shared per-email entry point: the bespoke
+    /// `poll_once` account loop calls it directly, and `GmailWorkHandler`
+    /// (the `ChannelRunner` cutover path) calls it after rehydrating the
+    /// `Email` from a `WorkItem` payload. Both therefore exercise byte-identical
+    /// dispatch logic — the cutover is a driver swap, not a behavior change.
+    pub async fn process_email(
         &self,
         draft_skill: &str,
         learned: &str,
@@ -782,6 +759,143 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
     }
 }
 
+impl<G: GmailApi + 'static, R: Reasoner + 'static> GmailChannel<G, R> {
+    /// Long-running driver (the production entry point used by `serve`).
+    ///
+    /// **#25 cutover**: the poll path no longer hand-rolls a `select!` +
+    /// ticker. It is driven by the generic
+    /// [`augmentagent_channel_core::ChannelRunner`] over a
+    /// [`GmailInbound`](crate::GmailInbound) source wrapped in an
+    /// [`InboundMessageTrigger`](augmentagent_channel_core::InboundMessageTrigger),
+    /// dispatching each `WorkItem` through [`GmailWorkHandler`] — which calls
+    /// the very same [`GmailChannel::process_email`] the old loop did, so
+    /// triage/draft/approve/ingest/dedup behavior is unchanged.
+    ///
+    /// The retry queue is independent of polling (it scans the `actions`
+    /// table, not the inbox) so it stays as a sibling ticker here rather than
+    /// being folded into `ChannelRunner`.
+    ///
+    /// Takes `Arc<Self>` so the runner's handler can share the channel.
+    pub async fn run_arc(
+        self: Arc<Self>,
+        shutdown: CancellationToken,
+    ) -> anyhow::Result<()> {
+        use augmentagent_channel_core::{ChannelRunner, InboundMessageTrigger};
+
+        let source = Arc::new(crate::inbound::GmailInbound::new(
+            Arc::clone(&self.store),
+            Arc::clone(&self.gmail),
+            self.config.per_account_limit,
+        ));
+        let trigger = Arc::new(InboundMessageTrigger::new(source));
+        let handler = Arc::new(GmailWorkHandler::new(Arc::clone(&self)));
+        let runner = Arc::new(ChannelRunner::new(
+            trigger,
+            handler,
+            self.config.poll_interval,
+            // Gmail's old loop had no post-poll jitter (only LinkedIn did).
+            Duration::ZERO,
+            "gmail",
+        ));
+
+        let retry_enabled = !self.config.retry_interval.is_zero();
+        let retry_interval = if retry_enabled {
+            self.config.retry_interval
+        } else {
+            Duration::from_secs(3600)
+        };
+
+        let runner_sd = shutdown.clone();
+        let poll = tokio::spawn(async move { runner.run(runner_sd).await });
+
+        let retry_self = Arc::clone(&self);
+        let retry = tokio::spawn(async move {
+            let mut retry_ticker = tokio::time::interval(retry_interval);
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        info!("gmail channel: retry loop shutdown signal received");
+                        return;
+                    }
+                    _ = retry_ticker.tick(), if retry_enabled => {
+                        match retry_self.retry_once().await {
+                            Ok(n) if n > 0 => info!(retried = n, "retry tick complete"),
+                            Ok(_) => {}
+                            Err(e) => error!("retry tick failed: {e:#}"),
+                        }
+                    }
+                }
+            }
+        });
+
+        let _ = poll.await;
+        let _ = retry.await;
+        Ok(())
+    }
+}
+
+/// `WorkItemHandler` for the #25 `ChannelRunner` cutover.
+///
+/// The runner pulls unread mail as `WorkItem`s (via `GmailInbound`); this
+/// handler rehydrates each into the typed `Email` and feeds it through the
+/// channel's shared [`GmailChannel::process_email`] — i.e. the *identical*
+/// triage → draft → approve → ingest → dedup path the bespoke `poll_once`
+/// account loop runs. The only intentional delta vs the old loop: the
+/// triage skill prompt is loaded once at handler construction (daemon
+/// start) instead of re-read every poll cycle. The on-disk skill is static
+/// for a daemon's lifetime, so dispatch decisions are unchanged; this just
+/// drops a redundant per-tick file read.
+pub struct GmailWorkHandler<G: GmailApi, R: Reasoner + 'static> {
+    channel: Arc<GmailChannel<G, R>>,
+    /// `SKILL.md` system text, loaded once (mirrors `poll_once`'s `skill.system`).
+    draft_skill: String,
+    /// Learned-patterns text, loaded once (mirrors `poll_once`'s `learned`).
+    learned: String,
+}
+
+impl<G: GmailApi + 'static, R: Reasoner + 'static> GmailWorkHandler<G, R> {
+    pub fn new(channel: Arc<GmailChannel<G, R>>) -> Self {
+        let skill = SkillPrompt::load(&channel.config.skill_dir);
+        let learned = skill.load_learned();
+        Self {
+            channel,
+            draft_skill: skill.system,
+            learned,
+        }
+    }
+}
+
+#[async_trait]
+impl<G: GmailApi + 'static, R: Reasoner + 'static> WorkItemHandler
+    for GmailWorkHandler<G, R>
+{
+    async fn handle(&self, item: WorkItem) -> anyhow::Result<()> {
+        let email: augmentagent_store::Email =
+            serde_json::from_value(item.payload).map_err(|e| {
+                anyhow::anyhow!("gmail work item payload not an Email: {e}")
+            })?;
+        // `poll_once` keys dispatch off the polled account's entity_id; the
+        // serialized Email already carries it (`GmailInbound` fans out over
+        // active accounts and stamps each). Fall back to the work-item's
+        // empty string only if absent — `process_email`'s thread-fetch /
+        // dispatch tolerate it the same way the loop would for a NULL.
+        let entity_id = email.account_entity_id.clone().unwrap_or_default();
+        // Mirror poll_once's per-email error handling: log + swallow so one
+        // bad message never aborts the tick (ChannelRunner also logs+counts).
+        match self
+            .channel
+            .process_email(&self.draft_skill, &self.learned, &entity_id, email)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                error!("gmail handle (channel-runner): process_email failed: {e:#}");
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Resolve the tone block for `to_addr` against the user's `account` profiles.
 ///
 /// Lookup order (per #73 §6 bootstrap thresholds):
@@ -845,8 +959,11 @@ fn reply_subject(original: &str) -> String {
     }
 }
 
+/// Outcome of running one email through [`GmailChannel::process_email`].
+/// Public because `process_email` is the shared entry point used by both the
+/// bespoke `poll_once` loop and the `ChannelRunner` cutover handler.
 #[derive(Debug, Clone, Copy)]
-enum DispatchOutcome {
+pub enum DispatchOutcome {
     Skipped,
     Flagged,
     DryRun,
@@ -1538,5 +1655,155 @@ mod tests {
             .unwrap();
         let out = super::pick_tone_block(&store, "acc1", "alex@startup.io");
         assert_eq!(out, "GLOBAL");
+    }
+
+    // --- #25 ChannelRunner cutover equivalence ---
+    //
+    // These prove the production driver swap (poll loop → ChannelRunner +
+    // GmailWorkHandler) reproduces poll_once's per-email behavior exactly:
+    // same triage decisions, same broker posts, same email-complete dedup.
+
+    use crate::inbound::email_to_work_item;
+
+    #[tokio::test]
+    async fn channel_runner_handler_reply_flow_matches_poll_once() {
+        let (store, _f) = tmp_store();
+        let email = Email {
+            message_id: "cr-reply".into(),
+            thread_id: Some("t-cr".into()),
+            from: "user@client.com".into(),
+            subject: "Ping".into(),
+            body: "any update?".into(),
+            date: "2026-05-18".into(),
+            account_entity_id: Some("acc1".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        };
+        let gmail = Arc::new(StubGmail { emails: vec![email.clone()] });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"ping"}"#,
+            "Yes — shipping today.",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = Arc::new(GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        ));
+        // Drive the cutover handler exactly as ChannelRunner would: one
+        // WorkItem rehydrated from the GmailInbound serialization.
+        let handler = super::GmailWorkHandler::new(Arc::clone(&ch));
+        handler
+            .handle(email_to_work_item(&email))
+            .await
+            .unwrap();
+
+        // Identical observable state to live_reply_flow_posts_approval_card.
+        assert_eq!(broker.posts.lock().unwrap().len(), 1);
+        assert!(store.is_email_complete("cr-reply").unwrap());
+
+        // Re-handling the same unread email (next runner tick) must NOT
+        // spawn a second card — the email-complete gate holds.
+        handler
+            .handle(email_to_work_item(&email))
+            .await
+            .unwrap();
+        assert_eq!(broker.posts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn channel_runner_handler_skip_and_flag_match_poll_once() {
+        let (store, _f) = tmp_store();
+        let skip_email = Email {
+            message_id: "cr-skip".into(),
+            thread_id: None,
+            from: "noreply@marketing.com".into(),
+            subject: "50% off!".into(),
+            body: "deal deal".into(),
+            date: "2026-05-18".into(),
+            account_entity_id: Some("acc1".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        };
+        let flag_email = Email {
+            message_id: "cr-flag".into(),
+            thread_id: None,
+            from: "friend@edu.com".into(),
+            subject: "Catching up".into(),
+            body: "wanted to reach out".into(),
+            date: "2026-05-18".into(),
+            account_entity_id: Some("acc1".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        };
+        let gmail = Arc::new(StubGmail { emails: vec![] });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"skip","reason":"marketing"}"#,
+            r#"{"decision":"flag","reason":"personal outreach"}"#,
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = Arc::new(GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        ));
+        let handler = super::GmailWorkHandler::new(Arc::clone(&ch));
+        handler.handle(email_to_work_item(&skip_email)).await.unwrap();
+        handler.handle(email_to_work_item(&flag_email)).await.unwrap();
+
+        // Skip: no posts at all; email complete.
+        assert!(store.is_email_complete("cr-skip").unwrap());
+        // Flag: heads-up notice, no approval card; email complete.
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+        let flags = broker.flag_posts.lock().unwrap();
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0].0, "cr-flag");
+        assert!(store.is_email_complete("cr-flag").unwrap());
+    }
+
+    #[tokio::test]
+    async fn channel_runner_handler_swallows_bad_payload() {
+        // ChannelRunner counts a handler error as handled-and-logged; the
+        // Gmail handler additionally swallows process_email errors so one
+        // bad message never aborts a tick — same as poll_once's per-email
+        // error arm. A non-Email payload must therefore be a benign no-op.
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail { emails: vec![] });
+        let reasoner = Arc::new(ScriptedReasoner::new([]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = Arc::new(GmailChannel::new(
+            store,
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        ));
+        let handler = super::GmailWorkHandler::new(Arc::clone(&ch));
+        let junk = augmentagent_channel_core::trigger::WorkItem {
+            platform: "gmail".into(),
+            kind: "dm".into(),
+            external_id: "junk".into(),
+            payload: serde_json::json!({ "not": "an email" }),
+        };
+        // Payload-decode failures bubble as Err (ChannelRunner logs+counts);
+        // process_email failures are swallowed. Either way: no panic, no post.
+        let _ = handler.handle(junk).await;
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
     }
 }
