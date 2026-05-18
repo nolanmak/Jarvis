@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Weekly Orchid invoice generator — matches sample Orchid_Invoice_28 layout.
+"""Weekly invoice generator.
 
 Reads merged PRs (gh) for a Sunday->Sunday week, categorizes them, and renders a
-single PDF styled like the sample: Letter, Arial(=Helvetica), INVOICE title,
-FROM / BILL TO / meta blocks, SERVICES & GOODS body at 8.5pt, divider + pinned
-Total / Billed / Total Due line at the bottom of the last page.
+single PDF: Letter, Arial(=Helvetica), INVOICE title, FROM / BILL TO / meta
+blocks, SERVICES & GOODS body at 8.5pt, divider + pinned Total / Billed /
+Total Due line at the bottom of the last page.
+
+All personal/business data (FROM/BILL-TO/rate/repo/author) comes from env —
+see .env.example. Nothing personal is hardcoded.
 
 Usage:
   invoice_gen.py --number 29 --start 2026-04-05 --end 2026-04-12 \
-                 --prs /tmp/orchid_prs.tsv --out /path/Orchid_Invoice_29.pdf
+                 --prs /tmp/prs.tsv --out /path/Invoice_29.pdf
 """
 import argparse, datetime, subprocess, json, sys, os
 from reportlab.pdfgen import canvas
@@ -19,13 +22,14 @@ W, H = letter                       # 612 x 792
 LEFT = 72.0                         # 1" left margin (matches sample)
 REG, BOLD = "Helvetica", "Helvetica-Bold"
 
-# ---- billing constants (from sample #28: 50h @ $55 = $2,750) ----
-HOURS = 50
-RATE = 55
+# ---- billing config — read from env (.env, which is gitignored). NEVER ----
+# hardcode personal/business data here. See .env.example for the template.
+# INVOICE_FROM_LINES is pipe-separated: "Business|Name|Street|City, ST ZIP|Phone".
+HOURS = int(os.environ.get("INVOICE_HOURS", "0") or "0")
+RATE = int(os.environ.get("INVOICE_RATE", "0") or "0")
 TOTAL_DUE = f"${HOURS * RATE:,}"
-FROM_LINES = ["REDACTED", "Nolan Makatche", "REDACTED",
-              "REDACTED", "REDACTED"]
-BILL_TO = "REDACTED"
+FROM_LINES = [s for s in os.environ.get("INVOICE_FROM_LINES", "Your Name").split("|") if s]
+BILL_TO = os.environ.get("INVOICE_BILL_TO", "Client Name")
 
 # ---- closing-block coordinates (pinned to bottom, from sample) ----
 DIV_TOP, TOTAL_TOP, BILLED_TOP, DUE_TOP = 658.7, 670.0, 681.2, 704.8
@@ -69,10 +73,13 @@ def wrap(text, font, size, max_w, indent=0.0):
     return lines
 
 
-# GitHub repo to read merged PRs from. A slug (owner/name) so `gh` works with
-# NO local clone — portable across machines (the Linux daemon never checks out
-# Orchid). Override with ORCHID_GH_REPO if the slug ever changes.
-DEFAULT_GH_REPO = os.environ.get("ORCHID_GH_REPO", "REDACTED")
+# GitHub repo to read merged PRs from (owner/name slug) — `gh --repo` so NO
+# local clone is needed. Set INVOICE_GH_REPO in .env (gitignored); the legacy
+# ORCHID_GH_REPO name is still honored. No hardcoded default — a public repo
+# must not name a private client project.
+DEFAULT_GH_REPO = os.environ.get("INVOICE_GH_REPO") or os.environ.get("ORCHID_GH_REPO", "")
+# GitHub login whose merged PRs are billed. Set INVOICE_GH_AUTHOR in .env.
+GH_AUTHOR = os.environ.get("INVOICE_GH_AUTHOR", "")
 
 
 def fetch_prs(gh_repo, tsv):
@@ -88,11 +95,21 @@ def fetch_prs(gh_repo, tsv):
             if len(p) >= 3:
                 rows.append((p[0], p[1], p[2]))
         return rows
+    repo = gh_repo or DEFAULT_GH_REPO
+    if not repo or not GH_AUTHOR:
+        sys.exit(
+            "invoice_gen: set INVOICE_GH_REPO and INVOICE_GH_AUTHOR in .env "
+            "(or pass a --prs tsv cache). Refusing to guess."
+        )
+    jq = (
+        '.[]|select(.author.login=="%s")|'
+        r'"\(.mergedAt[:10])\t#\(.number)\t\(.title)"' % GH_AUTHOR
+    )
     raw = subprocess.check_output(
-        ["gh", "pr", "list", "--repo", gh_repo or DEFAULT_GH_REPO,
+        ["gh", "pr", "list", "--repo", repo,
          "--state", "merged", "--limit", "800",
          "--json", "number,title,mergedAt,author",
-         "--jq", r'.[]|select(.author.login=="nolanmak")|"\(.mergedAt[:10])\t#\(.number)\t\(.title)"'],
+         "--jq", jq],
         text=True)
     for ln in raw.splitlines():
         p = ln.split("\t")

@@ -199,7 +199,7 @@ impl Store {
         // have the other keys still pick up this new row as 'false'.
         conn.execute(
             "INSERT OR IGNORE INTO invoice_config (key, value, updated_at) VALUES \
-                 ('recipient_email', 'REDACTED', ?1),\
+                 ('recipient_email', '', ?1),\
                  ('invoice_counter', '35', ?1),\
                  ('from_entity', '', ?1),\
                  ('last_billed_week_end', '2026-05-17', ?1),\
