@@ -5,12 +5,24 @@
 # install-autoupdate.sh — but also runnable manually.
 #
 # Design notes:
-# - We compare HEAD to origin/main. If they match, zero cost (just a fetch).
-# - We only rebuild when something in crates/ changed, so wiki-only sessions
-#   on the daemon side don't trigger expensive rebuilds.
+# - We compare HEAD to origin/main. If they match, normally zero cost (just a
+#   fetch) — UNLESS the deployed artifacts were not actually built from HEAD
+#   (see "build stamp" below), in which case we force a rebuild.
+# - We only rebuild Rust when something in crates/ changed, so wiki-only
+#   sessions on the daemon side don't trigger expensive rebuilds.
 # - On build failure we DO NOT restart, so a broken push doesn't take the
 #   daemon down — it keeps running on the old binary until next pull fixes.
 # - All output goes to a per-platform log dir for post-mortem.
+#
+# Build stamp (idempotency fix):
+#   Idempotency used to be keyed purely on `HEAD == origin/main`. If the
+#   checkout was reconciled to origin OUT OF BAND (e.g. a force-push / history
+#   rewrite on main left the local copy "diverged", and a human or another
+#   process later reset it to origin) the script would then see HEAD == origin
+#   forever and NEVER rebuild — silently serving a stale binary indefinitely.
+#   We now also record the commit the artifacts were last built from in
+#   $STAMP. The invariant the script enforces is "the running artifacts were
+#   built from the current HEAD", not merely "HEAD matches origin".
 
 set -euo pipefail
 
@@ -24,6 +36,7 @@ case "$(uname -s)" in
 esac
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/update.log"
+STAMP="$LOG_DIR/built-commit"   # SHA the deployed artifacts were last built from
 LABEL="com.nolanmak.augmentagent"
 SYSTEMD_UNIT="augmentagent.service"
 DASHBOARD_LABEL="com.nolanmak.augmentagent-dashboard"
@@ -31,6 +44,100 @@ DASHBOARD_SYSTEMD_UNIT="augmentagent-dashboard.service"
 
 stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s [update] %s\n' "$(stamp)" "$*" >> "$LOG"; }
+
+# Rebuild the side(s) flagged by NEEDS_REBUILD / NEEDS_DASHBOARD_REBUILD, then
+# restart the corresponding services. On Rust build failure we exit non-zero
+# WITHOUT restarting and WITHOUT advancing the stamp, so the daemon keeps
+# running the previous good binary and the next tick retries. On success the
+# stamp is advanced to $TARGET so a subsequent tick is a true no-op.
+apply_update() {
+  local TARGET="$1"
+
+  if [ "$NEEDS_REBUILD" -eq 1 ]; then
+    log "rebuilding rust (changed files touched crates/ or Cargo)"
+    if ! cargo build --release -p augmentagent-cli >> "$LOG" 2>&1; then
+      log "RUST BUILD FAILED — not restarting; daemon stays on previous binary"
+      exit 1
+    fi
+    log "rust build ok"
+  else
+    log "no rust code changed; skipping rust rebuild"
+  fi
+
+  if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
+    log "rebuilding dashboard (changed files touched src/, views/, or package.json)"
+    if ! command -v npm >/dev/null 2>&1; then
+      log "npm not found on PATH; skipping dashboard rebuild — UI will be stale until manual rebuild"
+    elif ! (npm install --production=false >> "$LOG" 2>&1 && npm run build >> "$LOG" 2>&1); then
+      log "DASHBOARD BUILD FAILED — leaving previous build in place"
+    else
+      log "dashboard build ok"
+    fi
+  else
+    log "no dashboard code changed; skipping dashboard rebuild"
+  fi
+
+  # Restart services so the new binary / config takes effect.
+  case "$(uname -s)" in
+    Darwin)
+      if [ "$NEEDS_REBUILD" -eq 1 ]; then
+        if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+          log "restarting daemon via launchctl kickstart"
+          launchctl kickstart -k "gui/$(id -u)/$LABEL" >> "$LOG" 2>&1 || log "kickstart failed"
+        else
+          log "daemon not registered under launchd ($LABEL) — run install-autostart.sh manually"
+        fi
+      fi
+      if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
+        if launchctl print "gui/$(id -u)/$DASHBOARD_LABEL" >/dev/null 2>&1; then
+          log "restarting dashboard via launchctl kickstart"
+          launchctl kickstart -k "gui/$(id -u)/$DASHBOARD_LABEL" >> "$LOG" 2>&1 || log "dashboard kickstart failed"
+        else
+          log "dashboard not registered under launchd ($DASHBOARD_LABEL) — run install-dashboard.sh manually"
+        fi
+      fi
+      ;;
+    Linux)
+      if [ "$NEEDS_REBUILD" -eq 1 ]; then
+        if systemctl --user list-unit-files "$SYSTEMD_UNIT" 2>/dev/null | grep -q "$SYSTEMD_UNIT"; then
+          log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
+          systemctl --user restart "$SYSTEMD_UNIT" >> "$LOG" 2>&1 || log "systemctl restart failed"
+        else
+          log "daemon not registered under systemd ($SYSTEMD_UNIT) — run install-autostart.sh manually"
+        fi
+      fi
+      if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
+        if systemctl --user list-unit-files "$DASHBOARD_SYSTEMD_UNIT" 2>/dev/null | grep -q "$DASHBOARD_SYSTEMD_UNIT"; then
+          log "restarting dashboard via systemctl --user restart $DASHBOARD_SYSTEMD_UNIT"
+          systemctl --user restart "$DASHBOARD_SYSTEMD_UNIT" >> "$LOG" 2>&1 || log "systemctl dashboard restart failed"
+        else
+          log "dashboard not registered under systemd ($DASHBOARD_SYSTEMD_UNIT) — run install-dashboard.sh manually"
+        fi
+      fi
+      # Multi-tenant: tenant units run the same target/release/augmentagent
+      # binary, so a Rust rebuild means they need a bounce too. Additive +
+      # best-effort: prod restart above already completed; a tenant failure
+      # here is logged, never fatal. Zero tenant units ⇒ loop no-ops (the
+      # prod agent's behavior is unchanged).
+      if [ "$NEEDS_REBUILD" -eq 1 ]; then
+        while read -r tunit; do
+          [ -n "$tunit" ] || continue
+          log "restarting tenant unit $tunit"
+          systemctl --user restart "$tunit" >> "$LOG" 2>&1 \
+            || log "tenant restart $tunit failed (continuing)"
+        done < <(systemctl --user list-unit-files 'augmentagent-tenant-*.service' --no-legend 2>/dev/null | awk '{print $1}')
+      fi
+      ;;
+    *)
+      log "no restart strategy for $(uname -s) — restart the daemon + dashboard manually"
+      ;;
+  esac
+
+  # Record what we successfully built from so the next tick is a true no-op
+  # (and so an out-of-band checkout move is detected, not silently ignored).
+  printf '%s\n' "$TARGET" > "$STAMP"
+  log "update complete: now at $TARGET (build stamp written)"
+}
 
 log "checking for updates"
 
@@ -41,9 +148,23 @@ git fetch origin main --quiet || {
 
 LOCAL=$(git rev-parse HEAD)
 REMOTE=$(git rev-parse origin/main)
+BUILT=$(cat "$STAMP" 2>/dev/null || true)
 
 if [ "$LOCAL" = "$REMOTE" ]; then
-  log "up to date ($LOCAL)"
+  # Checkout is at origin/main. Normally nothing to do — UNLESS the deployed
+  # artifacts were never actually built from this commit (out-of-band
+  # reconcile after a divergence). In that case force a full rebuild: we have
+  # no pulled range to diff, so rebuild both sides unconditionally
+  # (correctness over cost — this path only fires when something already went
+  # wrong, not on the steady-state hot path).
+  if [ "$BUILT" = "$LOCAL" ]; then
+    log "up to date ($LOCAL)"
+    exit 0
+  fi
+  log "checkout up to date ($LOCAL) but artifacts last built from '${BUILT:-none}' — forcing rebuild/restart"
+  NEEDS_REBUILD=1
+  NEEDS_DASHBOARD_REBUILD=1
+  apply_update "$LOCAL"
   exit 0
 fi
 
@@ -57,6 +178,8 @@ fi
 
 # If HEAD is not an ancestor of origin/main, the branches have diverged. A
 # non-ff pull would fail anyway; bail cleanly so a developer can reconcile.
+# (Once reconciled, the build-stamp check above guarantees the binary is
+# rebuilt even if the reconcile lands HEAD == origin out of band.)
 if ! git merge-base --is-ancestor "$LOCAL" "$REMOTE"; then
   log "LOCAL ($LOCAL) and origin/main ($REMOTE) have diverged — manual reconcile required"
   exit 0
@@ -83,87 +206,7 @@ if ! git pull --ff-only origin main >> "$LOG" 2>&1; then
   exit 0
 fi
 
-if [ "$NEEDS_REBUILD" -eq 1 ]; then
-  log "rebuilding rust (changed files touched crates/ or Cargo)"
-  if ! cargo build --release -p augmentagent-cli >> "$LOG" 2>&1; then
-    log "RUST BUILD FAILED — not restarting; daemon stays on previous binary"
-    exit 1
-  fi
-  log "rust build ok"
-else
-  log "no rust code changed; skipping rust rebuild"
-fi
-
-if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
-  log "rebuilding dashboard (changed files touched src/, views/, or package.json)"
-  if ! command -v npm >/dev/null 2>&1; then
-    log "npm not found on PATH; skipping dashboard rebuild — UI will be stale until manual rebuild"
-  elif ! (npm install --production=false >> "$LOG" 2>&1 && npm run build >> "$LOG" 2>&1); then
-    log "DASHBOARD BUILD FAILED — leaving previous build in place"
-  else
-    log "dashboard build ok"
-  fi
-else
-  log "no dashboard code changed; skipping dashboard rebuild"
-fi
-
-# Restart the Rust daemon so the new binary / config takes effect.
-case "$(uname -s)" in
-  Darwin)
-    if [ "$NEEDS_REBUILD" -eq 1 ]; then
-      if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
-        log "restarting daemon via launchctl kickstart"
-        launchctl kickstart -k "gui/$(id -u)/$LABEL" >> "$LOG" 2>&1 || log "kickstart failed"
-      else
-        log "daemon not registered under launchd ($LABEL) — run install-autostart.sh manually"
-      fi
-    fi
-    if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
-      if launchctl print "gui/$(id -u)/$DASHBOARD_LABEL" >/dev/null 2>&1; then
-        log "restarting dashboard via launchctl kickstart"
-        launchctl kickstart -k "gui/$(id -u)/$DASHBOARD_LABEL" >> "$LOG" 2>&1 || log "dashboard kickstart failed"
-      else
-        log "dashboard not registered under launchd ($DASHBOARD_LABEL) — run install-dashboard.sh manually"
-      fi
-    fi
-    ;;
-  Linux)
-    if [ "$NEEDS_REBUILD" -eq 1 ]; then
-      if systemctl --user list-unit-files "$SYSTEMD_UNIT" 2>/dev/null | grep -q "$SYSTEMD_UNIT"; then
-        log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
-        systemctl --user restart "$SYSTEMD_UNIT" >> "$LOG" 2>&1 || log "systemctl restart failed"
-      else
-        log "daemon not registered under systemd ($SYSTEMD_UNIT) — run install-autostart.sh manually"
-      fi
-    fi
-    if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
-      if systemctl --user list-unit-files "$DASHBOARD_SYSTEMD_UNIT" 2>/dev/null | grep -q "$DASHBOARD_SYSTEMD_UNIT"; then
-        log "restarting dashboard via systemctl --user restart $DASHBOARD_SYSTEMD_UNIT"
-        systemctl --user restart "$DASHBOARD_SYSTEMD_UNIT" >> "$LOG" 2>&1 || log "systemctl dashboard restart failed"
-      else
-        log "dashboard not registered under systemd ($DASHBOARD_SYSTEMD_UNIT) — run install-dashboard.sh manually"
-      fi
-    fi
-    # Multi-tenant: tenant units run the same target/release/augmentagent
-    # binary, so a Rust rebuild means they need a bounce too. Additive +
-    # best-effort: prod restart above already completed; a tenant failure
-    # here is logged, never fatal. Zero tenant units ⇒ loop no-ops (the
-    # prod agent's behavior is unchanged).
-    if [ "$NEEDS_REBUILD" -eq 1 ]; then
-      while read -r tunit; do
-        [ -n "$tunit" ] || continue
-        log "restarting tenant unit $tunit"
-        systemctl --user restart "$tunit" >> "$LOG" 2>&1 \
-          || log "tenant restart $tunit failed (continuing)"
-      done < <(systemctl --user list-unit-files 'augmentagent-tenant-*.service' --no-legend 2>/dev/null | awk '{print $1}')
-    fi
-    ;;
-  *)
-    log "no restart strategy for $(uname -s) — restart the daemon + dashboard manually"
-    ;;
-esac
-
-log "update complete: now at $REMOTE"
+apply_update "$REMOTE"
 
 # --- Auto-register optional scheduled jobs once ----------------------------
 # When a new install-*.sh ships with the pull, check whether its
