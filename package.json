@@ -15,15 +15,15 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nolanmak/AugmentAgent.git"
+    "url": "git+https://github.com/nolanmak/MyAgentAssistant.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "bugs": {
-    "url": "https://github.com/nolanmak/AugmentAgent/issues"
+    "url": "https://github.com/nolanmak/MyAgentAssistant/issues"
   },
-  "homepage": "https://github.com/nolanmak/AugmentAgent#readme",
+  "homepage": "https://github.com/nolanmak/MyAgentAssistant#readme",
   "dependencies": {
     "@ai-sdk/groq": "^3.0.31",
     "@ai-sdk/provider": "^3.0.8",
