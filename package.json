@@ -5,7 +5,8 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "nodemon --exec ts-node src/index.ts",
-    "build": "tsc",
+    "build": "npm run tailwind:build && tsc",
+    "tailwind:build": "tailwindcss -i ./tailwind.input.css -o ./public/tailwind.css --minify",
     "start": "node dist/index.js",
     "test": "tsc && node --test test/*.test.js",
     "pm2:start": "pm2 start ecosystem.config.js",
@@ -45,6 +46,7 @@
     "@types/multer": "^1.4.12",
     "@types/node": "^25.5.0",
     "nodemon": "^3.1.14",
+    "tailwindcss": "^3.4.19",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   }
