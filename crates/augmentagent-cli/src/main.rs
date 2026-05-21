@@ -45,6 +45,7 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod channel_router;
+mod installers;
 mod invoice;
 mod logs;
 mod self_improve;
@@ -339,7 +340,7 @@ enum Cmd {
     },
 
     // === setup+maintenance subcommands (alphabetical) ===
-    // Future variants: Doctor, Env, Install, Uninstall
+    // Future variants: Doctor, Env
     /// Issue #2 — cross-channel router. `augmentagent channel <name> <op>` is
     /// a thin alias for the per-channel `augmentagent <name> <op>` form so
     /// the /setup skill (and the dashboard) can speak one shape for every
@@ -356,6 +357,18 @@ enum Cmd {
         /// per-channel command (e.g. `--json`, `--dry-run false`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// #6 — install a component by shelling out to the matching
+    /// `scripts/install-*.sh` (or the systemd unit-template copy for
+    /// `browser-sidecar`). Idempotent — re-running is safe.
+    ///
+    /// Each component subcommand accepts `--rebuild` (cargo + npm build
+    /// before the install script) and `--json` (suppress live stream, emit
+    /// a single JSON summary).
+    Install {
+        /// Which component to install.
+        #[command(subcommand)]
+        component: installers::InstallComponent,
     },
     /// Tail or dump the daemon's systemd-journal logs (wraps
     /// `journalctl --user -u <unit>`). Linux-only.
@@ -425,6 +438,17 @@ enum Cmd {
         /// `/setup` skill can adopt the flag from day one.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         refresh: bool,
+    },
+    /// #6 — uninstall a component by shelling out to the matching
+    /// `scripts/uninstall-*.sh` (or undoing the systemd unit-file copy for
+    /// `browser-sidecar`). Idempotent — safe on a never-installed system.
+    ///
+    /// Each component subcommand accepts `--json` (suppress live stream,
+    /// emit a single JSON summary).
+    Uninstall {
+        /// Which component to uninstall.
+        #[command(subcommand)]
+        component: installers::UninstallComponent,
     },
     // === end setup+maintenance subcommands ===
 }
@@ -2548,7 +2572,8 @@ async fn main() -> Result<()> {
         Cmd::Engagement { ref op } => run_engagement(store, op).await,
 
         // === setup+maintenance subcommands (alphabetical) ===
-        // Future arms: Doctor, Env, Install, Uninstall
+        // Future arms: Doctor, Env
+        Cmd::Install { component } => installers::run_install(component).await,
         Cmd::Logs {
             unit,
             follow,
@@ -2570,6 +2595,7 @@ async fn main() -> Result<()> {
             // `std::process::exit`.
             std::process::exit(code);
         }
+        Cmd::Uninstall { component } => installers::run_uninstall(component).await,
         // === end setup+maintenance subcommands ===
     }
 }
