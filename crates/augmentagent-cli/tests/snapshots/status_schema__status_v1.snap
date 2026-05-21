@@ -1,0 +1,172 @@
+---
+source: crates/augmentagent-cli/tests/status_schema.rs
+assertion_line: 188
+expression: json
+---
+{
+  "channels": {
+    "calendar": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
+    "contacts": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
+    "discord": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
+    "gdrive": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
+    "github": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
+    "gmail": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
+    "instagram": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
+    "linkedin": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
+    "meetup": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
+    "reddit": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
+    "slack": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
+    "telegram": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
+    "twitter": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
+    "voice": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
+    "whatsapp": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    }
+  },
+  "core_keys": {
+    "cerebras": false,
+    "composio": false,
+    "discord_bot": false,
+    "groq": false
+  },
+  "daemon": {
+    "active": "[volatile]",
+    "since_unix": "[volatile]",
+    "unit": "augmentagent.service"
+  },
+  "dashboard": {
+    "active": "[volatile]",
+    "port": 3000,
+    "reachable": "[volatile]",
+    "unit": "augmentagent-dashboard.service"
+  },
+  "host": "linux",
+  "queue": {
+    "pending": 0
+  },
+  "schema_version": "1",
+  "summary": "[volatile]",
+  "updater": {
+    "last_run_unix": "[volatile]",
+    "timer_active": "[volatile]",
+    "unit": "augmentagent-update.timer"
+  }
+}
