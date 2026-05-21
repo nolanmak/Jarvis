@@ -12,8 +12,11 @@
 //!  * **channels**  — best-effort `configured` flag per known channel
 //!                   (gmail probes the Composio accounts table; others
 //!                   probe the sqlite `config` table for canonical keys).
-//!                   `armed` defaults to `false` until #7 lands the
-//!                   arm/disarm verbs.
+//!                   `armed` reads the per-channel arming gate from the
+//!                   sqlite `config` table (set by
+//!                   `augmentagent channel <x> arm`, #7), falling back to
+//!                   the matching env var. Sqlite wins on conflict —
+//!                   mirrors `getConfigStatus()` in `src/dashboard.ts:78`.
 //!  * **queue**     — `pending_reply_count()` from the store
 //!
 //! Output is JSON by default when stdout is piped (CI, dashboard shell-out)
@@ -43,6 +46,8 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 
 use augmentagent_store::{rusqlite, Store};
+
+use crate::channel_router;
 
 /// JSON schema version. Bump on any breaking change to the document shape.
 /// The CI snapshot test in #14 keys off this constant.
@@ -462,6 +467,20 @@ fn cfg_or_env(cfg: &BTreeMap<String, String>, sqlite_key: &str, env_key: &str) -
     std::env::var(env_key).map(|v| !v.is_empty()).unwrap_or(false)
 }
 
+/// Like `cfg_or_env`, but for arming flags (truthy parse, not "non-empty").
+/// `arm`/`disarm` write the literal strings `"true"` / `"false"` — treating
+/// "non-empty" as armed would invert the disarm path. Sqlite still wins on
+/// conflict, matching `getConfigStatus()` precedence (`src/dashboard.ts:78`).
+fn armed_from(cfg: &BTreeMap<String, String>, sqlite_key: &str, env_key: &str) -> bool {
+    if let Some(v) = cfg.get(sqlite_key) {
+        return channel_router::is_truthy(v);
+    }
+    std::env::var(env_key)
+        .ok()
+        .map(|v| channel_router::is_truthy(&v))
+        .unwrap_or(false)
+}
+
 fn collect_core_keys(cfg: &BTreeMap<String, String>) -> CoreKeys {
     CoreKeys {
         composio: cfg_or_env(cfg, "composio_api_key", "COMPOSIO_API_KEY"),
@@ -565,13 +584,23 @@ fn collect_channels(
         } else {
             vec!["login".to_string()]
         };
+        // #7 — armed reads from the sqlite `config` table the dashboard
+        // writes (`augmentagent channel <name> arm`), falling back to the
+        // matching env var. Sqlite wins on conflict so the CLI agrees with
+        // the dashboard's `getConfigStatus()` precedence (src/dashboard.ts:78).
+        // Channels without an arming gate (gmail, slack, etc.) read as
+        // `false` — they're on-by-default once their credential is in place.
+        let armed = match channel_router::arming_keys_for(name) {
+            Some((sqlite_key, env_key)) => armed_from(cfg, sqlite_key, env_key),
+            None => false,
+        };
         out.insert(
             name.to_string(),
             ChannelStatus {
                 configured,
-                armed: false, // #7 will flip this once arm/disarm lands.
+                armed,
                 accounts,
-                last_poll_unix: None, // #7 / per-channel last-poll table.
+                last_poll_unix: None, // future: per-channel last-poll table.
                 needs,
             },
         );
