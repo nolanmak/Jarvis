@@ -46,6 +46,7 @@ use async_trait::async_trait;
 
 mod invoice;
 mod self_improve;
+mod status;
 
 #[derive(Parser)]
 #[command(name = "augmentagent", version, about = "AugmentAgent Rust daemon")]
@@ -332,6 +333,29 @@ enum Cmd {
         #[command(subcommand)]
         op: EngagementOp,
     },
+
+    // === setup+maintenance subcommands (alphabetical) ===
+    // Future variants: Channel, Doctor, Env, Install, Logs, Service, Setup, Status, Uninstall
+    /// #1 — one-document health aggregator: daemon, dashboard, updater,
+    /// core keys, per-channel configured/armed, queue depth. Source of truth
+    /// for the `/setup` skill and ongoing maintenance.
+    ///
+    /// Exit codes: 0 ok, 10 degraded/needs-setup, 20 daemon-down,
+    /// 30 dashboard-down, 40 config-invalid.
+    Status {
+        /// Force JSON (`--json true`) or human table (`--json false`).
+        /// Default: auto — JSON when stdout is piped, table on a tty.
+        #[arg(long)]
+        json: Option<bool>,
+        /// Narrow `channels` to just one entry (e.g. `--channel gmail`).
+        #[arg(long)]
+        channel: Option<String>,
+        /// Placeholder for a future probe-cache; currently a no-op so the
+        /// `/setup` skill can adopt the flag from day one.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        refresh: bool,
+    },
+    // === end setup+maintenance subcommands ===
 }
 
 #[derive(Subcommand)]
@@ -2450,6 +2474,22 @@ async fn main() -> Result<()> {
         },
         Cmd::SchedulePost { ref op } => run_schedule_post(store, op).await,
         Cmd::Engagement { ref op } => run_engagement(store, op).await,
+
+        // === setup+maintenance subcommands (alphabetical) ===
+        // Future arms: Channel, Doctor, Env, Install, Logs, Service, Setup, Status, Uninstall
+        Cmd::Status {
+            json,
+            channel,
+            refresh,
+        } => {
+            let code = status::run(store, json, channel, refresh).await?;
+            // Drop straight to the process exit code so degraded/down states
+            // are scriptable from the `/setup` skill. The store is dropped
+            // here cleanly via RAII on the `Arc` going out of scope at
+            // `std::process::exit`.
+            std::process::exit(code);
+        }
+        // === end setup+maintenance subcommands ===
     }
 }
 
