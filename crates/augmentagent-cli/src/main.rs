@@ -49,6 +49,7 @@ mod invoice;
 mod logs;
 mod self_improve;
 mod service;
+mod setup;
 mod status;
 
 #[derive(Parser)]
@@ -338,7 +339,7 @@ enum Cmd {
     },
 
     // === setup+maintenance subcommands (alphabetical) ===
-    // Future variants: Doctor, Env, Install, Setup, Uninstall
+    // Future variants: Doctor, Env, Install, Uninstall
     /// Issue #2 — cross-channel router. `augmentagent channel <name> <op>` is
     /// a thin alias for the per-channel `augmentagent <name> <op>` form so
     /// the /setup skill (and the dashboard) can speak one shape for every
@@ -396,6 +397,15 @@ enum Cmd {
         /// Emit machine-readable JSON (status op only).
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+    /// Operator-onboarding helpers. Issue #8 lands `setup harvest <channel>`,
+    /// a cookie-harvest field-schema emitter that the `/setup` skill uses to
+    /// drive Discord/Twitter/LinkedIn/Instagram credential capture via
+    /// `AskUserQuestion` instead of an interactive `read` loop. Future ops
+    /// (Oauth from #10) slot in alphabetically under `setup`.
+    Setup {
+        #[command(subcommand)]
+        op: setup::SetupOp,
     },
     /// #1 — one-document health aggregator: daemon, dashboard, updater,
     /// core keys, per-channel configured/armed, queue depth. Source of truth
@@ -2538,7 +2548,7 @@ async fn main() -> Result<()> {
         Cmd::Engagement { ref op } => run_engagement(store, op).await,
 
         // === setup+maintenance subcommands (alphabetical) ===
-        // Future arms: Channel, Doctor, Env, Install, Setup, Uninstall
+        // Future arms: Doctor, Env, Install, Uninstall
         Cmd::Logs {
             unit,
             follow,
@@ -2547,6 +2557,7 @@ async fn main() -> Result<()> {
             json,
         } => logs::run_logs(unit, follow, lines, since, json).await,
         Cmd::Service { op, ref unit, json } => service::run_service(op, unit, json).await,
+        Cmd::Setup { ref op } => setup::run_setup(op).await,
         Cmd::Status {
             json,
             channel,
