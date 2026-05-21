@@ -777,6 +777,7 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
+ "reqwest",
  "serde_json",
  "serenity",
  "tokio",
