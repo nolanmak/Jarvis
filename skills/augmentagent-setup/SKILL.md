@@ -32,73 +32,215 @@ augmentagent status --json
 
 If the binary is missing, tell the user to run `cargo build --release -p
 augmentagent-cli` and stop. If it returns non-zero with a parseable JSON body,
-read `state` and route. If it returns non-zero with no JSON, surface stderr
-and consult troubleshooting.
+read `summary` and route. If it returns non-zero with no JSON and stderr
+contains an sqlite error, jump to the First-run bootstrap caveat below; the
+db may not exist yet. Otherwise surface stderr and consult troubleshooting.
+
+The skill keys on `summary` (the canonical classification, see
+`reference/status-schema.md`). Mapping:
+
+| `summary`         | branch              |
+| ----------------- | ------------------- |
+| `ok`              | MAINTENANCE         |
+| `needs_setup`     | FRESH or PARTIAL    |
+| `degraded`        | PARTIAL or REPAIR   |
+| `daemon_down`     | REPAIR              |
+| `dashboard_down`  | REPAIR              |
+| `config_invalid`  | REPAIR              |
+
+Distinguish FRESH from PARTIAL by counting channels with `configured ==
+true`: zero is fresh, one or more is partial. Distinguish PARTIAL from
+REPAIR by looking at `daemon.active` and `dashboard.active` (both true is
+partial; either false is repair).
 
 The four branches:
 
 ### FRESH INSTALL, not configured
 
-Enter this branch when `status.state == "fresh"` or when the JSON shows no
-configured channels and no running services. Phase 2 (issue #9) will replace
-this stub with a guided installer that runs the three install scripts in the
-right order and harvests credentials with permission. Phase 3 (issue #13)
-adds OAuth orchestration on top of that.
+Enter this branch when `summary == "needs_setup"` and every channel reports
+`configured = false`, or when `augmentagent status --json` fails outright
+because the sqlite db does not exist yet. See the First-run bootstrap caveat
+below; on a truly fresh box you must run `augmentagent install dashboard`
+BEFORE the first `status --json` call.
 
-For now, print the manual fallback verbatim and stop:
+Confirm with AskUserQuestion before each side effect; this branch installs
+systemd units and touches the keyring.
 
-```
-./scripts/install-autostart.sh && ./scripts/install-dashboard.sh && ./scripts/install-autoupdate.sh
-```
+Step-by-step:
 
-Then tell the user: after those three scripts finish, copy `.env.example` to
-`.env`, fill the core API keys and the Discord block, and re-run `/setup`.
-Do not attempt to edit `.env` yourself; that is a Phase 3 capability behind
-issue #12.
+1. Bootstrap the db and dashboard (always first, even if status worked).
+
+   ```
+   augmentagent install dashboard
+   ```
+
+   This idempotent script creates `~/.config/systemd/user/augmentagent-dashboard.service`,
+   initialises the sqlite db on first start, and binds the OAuth callback
+   port. Re-run is safe.
+
+2. Re-run `augmentagent status --json`. If it still fails, surface stderr
+   verbatim and jump to `reference/troubleshooting.md` under `sqlite_open`.
+   Otherwise read the channel set and continue.
+
+3. Confirm the core API keys with the user. Read `core_keys` from the status
+   JSON. For every key that reports `false` (`composio`, `groq`, `cerebras`,
+   `discord_bot`), tell the user which env var to add to `.env`, point at
+   `.env.example` for the canonical block header, and offer to write it via:
+
+   ```
+   augmentagent env set <KEY> <VALUE>
+   ```
+
+   The env subcommand writes to the sqlite `config` table (which wins over
+   `.env` at startup), so this works even before the user edits `.env`.
+   AskUserQuestion masks the value when the key matches one of `KEY`,
+   `TOKEN`, `SECRET`, `PASSWORD`, `PASS`, `AUTH` (the same rule
+   `augmentagent env list` uses).
+
+4. Present channel selection grouped by tier via AskUserQuestion. Three
+   groups, multi-select within each, the user picks which channels to wire
+   up now and which to defer.
+
+   - Required (the daemon barely functions without these):
+     `gmail`, `discord`.
+   - Recommended (most installs want these):
+     `slack`, `drive`, `github`, `reddit`.
+   - Optional (channel-specific, often ban-risk or niche):
+     `twitter`, `linkedin`, `instagram`, `meetup`, `telegram-bot`,
+     `deftform`.
+
+   Channels the user defers stay `configured = false` in status; they can
+   be wired later via `/setup --fix <channel>`.
+
+5. Loop the selected channels. For each `<name>`, READ
+   `channels/<name>.md` and execute its Steps section. The sub-file is the
+   runbook; the loop is just iteration. Order the loop by category so
+   browser-driven cookie-harvest channels run last (they need a graphical
+   session, the rest do not).
+
+   Callback-OAuth channels (gmail, drive, slack, reddit) use the OAuth
+   orchestration block below rather than the legacy browser-paste flow.
+
+6. Install the remaining systemd units. Confirm each with AskUserQuestion;
+   any of these can be re-run safely.
+
+   ```
+   augmentagent install autostart
+   augmentagent install autoupdate
+   augmentagent install digest
+   ```
+
+   `autostart` enables `augmentagent.service` (the main daemon).
+   `autoupdate` enables the 5-minute `augmentagent-update.timer` which
+   runs `scripts/check-for-updates.sh`. `digest` enables the daily
+   `augmentagent-digest.timer` (reads `AUGMENTAGENT_DIGEST_HOUR` /
+   `AUGMENTAGENT_DIGEST_MINUTE` from the environment).
+
+7. Run the final health check:
+
+   ```
+   augmentagent doctor --json
+   ```
+
+   Parse the `checks[]` array. For every finding with `severity == "error"`,
+   surface its `message` and offer to run `suggested_cmd` (AskUserQuestion,
+   one at a time). Warns are informational; print them but do not block.
+   Exit when `summary.error == 0`.
+
+8. Final read-only confirmation: `augmentagent status --json` and report
+   each `configured = true` channel to the user as a sanity check.
 
 ### PARTIAL INSTALL, some channels configured
 
-Enter this branch when `status.state == "partial"`, meaning some services are
-up but at least one channel reports `armed=false` or `validated=false` where
-the user appears to want it on. The Phase 2 setup orchestrator (issue #9)
-will own this branch; for now it is a stub.
+Enter this branch when `summary` is `needs_setup` or `degraded`, both
+`daemon.active` and `dashboard.active` are true, and at least one channel
+reports `configured = true`. Some services are up, at least one channel is
+on, but at least one more channel either needs creds (`needs` non-empty),
+needs arming (in the arming-gates list with `armed = false`), or simply
+has not been wired yet.
 
-Print the same manual fallback as Fresh Install, then add:
+The flow:
 
-- List the channels reported `armed=false` from the status JSON.
-- For each, refer the user to `.env.example` (the channel arming gates block)
-  and to the per-channel docs under `docs/`.
-- Recommend running `/setup` again once they have flipped the gate envs.
+- List the channels with `configured = true` (the working set) and the
+  channels with `configured = false` (the gap). Report both back to the
+  user.
+- AskUserQuestion: "Which of these would you like to wire up now?"
+  Multi-select; defer the rest to a later `/setup --fix <name>` call.
+- For each selected channel, READ `channels/<name>.md` and run its Steps
+  section. Callback-OAuth channels go through the OAuth orchestration
+  block; cookie-harvest channels go through the cookie-harvest sub-flow;
+  token-paste channels read the token via AskUserQuestion and call
+  `augmentagent env set <KEY> <VALUE>`.
+- After each channel completes, re-run `augmentagent status --channel
+  <name> --json` and confirm `configured = true`.
+- When the loop finishes, run `augmentagent doctor --json` for the same
+  end-of-flow health check the Fresh-install branch uses.
 
-Do not run install scripts in this branch yourself; partial installs can be
-in a half-applied state, and an unguarded re-run can clobber working units.
+Do not run install scripts in this branch unless `status` reports a
+component as missing (no `autostart` unit, no `dashboard` unit, etc.).
+Partial installs are usually missing creds, not units; an unguarded
+`install` re-run can clobber working systemd files.
 
 ### REPAIR, channel validation failing
 
-Enter this branch when `status.state == "repair"` or when the JSON shows a
-service in a failed state, a validation that has flipped from green to red,
-or a unit that has been restarting in a loop. Phase 3 (issue #11) adds the
-`augmentagent doctor` command that will own this branch end to end.
+Enter this branch when `summary` is `degraded`, `daemon_down`,
+`dashboard_down`, or `config_invalid`, OR when at least one channel reports
+`configured = true && armed = false`, OR when `needs` is non-empty for any
+configured channel. These are the actual repair signals in the schema; the
+issue spec's `last_error` shorthand maps to `needs[]` plus stderr from the
+matching `augmentagent channel <name> validate` call.
 
-For now, stub:
+Step-by-step:
 
-1. Print the failing units and channels from the status JSON.
-2. Pull recent logs for each via `augmentagent logs --unit <name>` (capped
-   at the last 200 lines so the chat stays readable).
-3. Consult `reference/troubleshooting.md` for the symptom table.
-4. Surface CLI stderr verbatim; do not paraphrase.
-5. Recommend a single `augmentagent service restart --unit <name>` only if
-   the troubleshooting table maps the symptom to a clean restart fix.
+1. Run `augmentagent doctor --json` first. It composes status with the
+   liveness probes (sqlite integrity, keyring reachability, dashboard,
+   binary freshness) and tags each result with a severity. The doctor is
+   the source of truth for "what's wrong"; the channel-level repair is
+   downstream of fixing the host first.
+
+2. Address `severity == "error"` findings in the order the doctor emits
+   them. For each error, surface `name`, `message`, and `suggested_cmd`.
+   AskUserQuestion before running any `suggested_cmd`; never run the
+   suggestion silently. See `reference/troubleshooting.md` for the per-
+   finding "What it means" / "Fix" entries.
+
+3. Once doctor reports `summary.error == 0`, pin the failing channel set.
+   Re-run `augmentagent status --json` and build the failing-channel list:
+
+   - Any channel with `configured == true && armed == false` AND the
+     channel is in the arming-gates list (see `components/env-file.md`).
+     The fix is the arming flow in the sub-file.
+   - Any channel with non-empty `needs` (typically `["login"]`). The fix
+     is to re-enter the cookie-harvest or OAuth flow.
+
+   Optionally pull recent logs for context: `augmentagent logs --unit
+   augmentagent.service` capped at the last 200 lines. Surface CLI stderr
+   verbatim.
+
+4. For each pinned channel, READ `channels/<name>.md` and re-enter its
+   Steps section from the top. The sub-file is idempotent; re-running it
+   on a partially-configured channel either no-ops or refreshes the bad
+   credential.
+
+5. Re-validate. Run `augmentagent channel <name> validate` for each
+   repaired channel (AskUserQuestion first; this is the only verb in the
+   Repair branch that can hit a live third-party service). Confirm the
+   `needs` array empties out.
+
+6. Re-run `augmentagent status --json` and confirm `summary == "ok"`.
+   If doctor still flags errors, do not loop; report what's left and ask
+   the user how to proceed.
 
 Never run `--purge`, `--force`, or `--reset` flags in this branch. Repair is
-read-mostly until the user explicitly asks for a destructive action and the
-skill confirms via AskUserQuestion.
+read-mostly except for the per-channel sub-flow and the doctor's
+`suggested_cmd` runs, both of which require explicit AskUserQuestion
+confirmation.
 
 ### MAINTENANCE, fully configured
 
-Enter this branch when `status.state == "ok"` and the JSON shows every
-channel the user expects is armed and validated. This is the wired branch;
-the others are stubs until Phases 2 and 3 land.
+Enter this branch when `summary == "ok"` and the JSON shows every channel
+the user expects is configured and (where applicable) armed. This is the
+green-light branch; the user has a healthy install.
 
 Open the Maintenance Menu (next section) and ask which action the user wants.
 Default behavior when the user just says "run setup" with no further detail
@@ -218,6 +360,173 @@ Every cookie-harvest channel uses the in-skill loop below.
 | meetup        | `channels/meetup.md`              | Group urlname (no auth today)                    |
 | deftform      | `channels/deftform.md`            | Workspace API token + webhook secret             |
 | telegram-bot  | `channels/telegram-bot.md`        | BotFather token                                  |
+
+## First-run bootstrap caveat
+
+On a truly fresh box (no daemon has ever started, no sqlite db exists),
+`augmentagent status --json` may fail before the dashboard installer has
+run. The sqlite database lives at `$AUGMENTAGENT_DB` (default `./data.db`
+relative to the daemon's cwd) and is created on first dashboard start. The
+status aggregator opens that db; with no file there yet, the call exits
+non-zero with a `could not open data.db` style error.
+
+The Fresh-install branch handles this by running `augmentagent install
+dashboard` BEFORE any status call. If the user runs `/setup` from a clean
+checkout and the very first `augmentagent status --json` fails with an
+sqlite error:
+
+1. Surface the stderr verbatim.
+2. AskUserQuestion to confirm running `augmentagent install dashboard`.
+3. Run it.
+4. Re-run `augmentagent status --json`. It should now succeed and report
+   `summary == "needs_setup"`.
+5. Fall through to the Fresh-install branch.
+
+Do not work around this by guessing at the channel set or by editing
+`.env`; the db is the source of truth and the dashboard installer is the
+only sanctioned way to initialise it.
+
+## OAuth orchestration
+
+The callback-OAuth channels (gmail, drive, slack, reddit) delegate the
+browser dance to a single Rust orchestrator. The skill drives it via:
+
+```
+augmentagent setup oauth <provider> --json
+```
+
+Providers (the value enum is locked):
+
+- `gmail`     → `/oauth/gmail/start`
+- `drive`     → `/oauth/googledrive/start` (the provider slug in JSON
+                output is `googledrive`, not `drive`)
+- `slack`     → `/oauth/slack/start`
+- `reddit`    → `/api/reddit/auth`
+
+The orchestrator preflights the dashboard, snapshots the current connection
+set, opens `xdg-open` (or prints the URL when `$DISPLAY` is empty / when
+`--open-browser false` is set), then polls
+`/api/v1/oauth/status` every 2s until either the connection set grows or
+the timeout expires (`--timeout-secs`, default 300). Stderr carries a
+one-line JSON heartbeat per poll; stdout carries the terminal result.
+
+Pseudocode the skill runs per OAuth channel:
+
+```
+result_json = run("augmentagent setup oauth " + provider + " --json",
+                  stream_stderr_to_log=True)
+# result_json is the LAST stdout line (the rest were intermediate URL prints).
+status = result_json["status"]
+```
+
+Branch on `status`:
+
+- `"connected"`: success. The JSON also carries `provider` and a list of
+  accounts (for gmail / drive: `accounts[]` keyed by `id`; for slack:
+  `workspaces[]` keyed by `team_id`; for reddit: `connected: true`).
+  Continue to the channel's Validate step in its sub-file.
+- `"timeout"`: the user did not finish the consent flow in
+  `--timeout-secs`. JSON carries `elapsed_secs` and a `hint`. Tell the
+  user, then AskUserQuestion whether to retry immediately or defer. Exit
+  code is 124.
+- `"dashboard_down"`: the dashboard answered the preflight with anything
+  other than 200 on `/api/v1/health`. JSON carries
+  `suggested_cmd: "augmentagent service start --unit dashboard"`. Run it
+  via AskUserQuestion, wait for the unit to come back active, then retry
+  the orchestrator. Exit code is 30.
+- `"interrupted"`: the user hit Ctrl+C. JSON arrives on STDERR (not
+  stdout) and carries `elapsed_secs`. Treat it as a user decision; do not
+  retry without asking. Exit code is 130.
+
+Heartbeats on stderr have shape `{"event":"poll","tick":N,
+"provider":"<slug>","elapsed_secs":N,"status":"waiting"}` and one-off
+poll errors land as `{"event":"poll_error","error":"..."}`. The skill
+should surface poll errors but keep waiting; the orchestrator retries
+automatically until the timeout.
+
+The orchestrator never edits `.env` or sqlite directly; the dashboard's
+existing callback handler writes the account row, and the orchestrator
+just detects the diff. After a `"connected"` result, re-run
+`augmentagent status --json` and confirm the matching channel flipped to
+`configured = true`.
+
+## /setup --doctor
+
+When the user invokes `/setup --doctor` (or asks for "a health check"),
+skip triage and run:
+
+```
+augmentagent doctor --json
+```
+
+`--deep` adds slower probes (one Composio API ping plus a per-channel
+validate finding). Only add `--deep` when the user explicitly asks for
+the full picture, or when triage already failed and the basic checks were
+all green.
+
+Pretty-print the findings as a table. The JSON has the shape:
+
+```
+{
+  "checks": [
+    {"name": "...", "severity": "ok|warn|error", "message": "...",
+     "suggested_cmd": "..." | null},
+    ...
+  ],
+  "summary": {"ok": N, "warn": N, "error": N},
+  "exit_code": 0 | 1
+}
+```
+
+Table columns: severity, name, message. Print `suggested_cmd` as a
+second indented line under each finding that has one.
+
+For every finding with `severity == "error"`:
+
+1. Surface its `message` verbatim.
+2. If `suggested_cmd` is present, AskUserQuestion to offer running it
+   (quote the exact command back). Run on confirmation, surface stderr
+   verbatim if it fails.
+3. Re-run `augmentagent doctor --json` after each fix and confirm the
+   finding flipped to `ok` (or moved to a different error).
+
+Warns are informational. Surface them, but do not chain
+AskUserQuestion prompts for warns; the user has not signed up for a
+remediation walkthrough for non-blocking issues.
+
+See `reference/troubleshooting.md` for the per-finding "What it means" /
+"Fix" entries. Known finding names emitted by doctor today:
+`status_collect`, `sqlite_open`, `sqlite_migrated`, `keyring_reachable`,
+`dashboard_reachable`, `claude_cli_in_path`, `python3_in_path`,
+`node_in_path`, `rust_binary_freshness`, `dashboard_build_present`,
+`env_file_present`. With `--deep`: `composio_api` plus one
+`channel.<name>.validate` per configured channel.
+
+## /setup --fix CHANNEL
+
+When the user invokes `/setup --fix <name>` (or asks to "fix" or "redo"
+one channel), skip triage and the per-channel decision flow. Go straight
+to:
+
+1. Run `augmentagent status --channel <name> --json` and confirm the
+   channel exists. If the CLI exits non-zero for "channel not configured",
+   that is the cue the channel needs a from-scratch enrolment; otherwise
+   treat the existing config as broken and prepare to overwrite.
+2. READ `channels/<name>.md`. Run its Steps section from the top. The
+   sub-file is idempotent.
+3. For callback-OAuth channels, run the OAuth orchestration block above
+   instead of the sub-file's legacy dashboard-URL paste step.
+4. Re-validate with `augmentagent channel <name> validate`
+   (AskUserQuestion first; live calls have rate limits and ban-risk on
+   `twitter`, `instagram`, `whatsapp`).
+5. Re-run `augmentagent status --channel <name> --json` and confirm
+   `configured = true` and `needs` is empty. If the channel has an arming
+   gate (see `components/env-file.md`), also confirm `armed = true`.
+
+If the user did not pass a `<name>` after `--fix`, AskUserQuestion with a
+single-select list of every channel reporting `configured = false` or
+non-empty `needs`. Do not loop over channels in `--fix` mode; one channel
+per invocation.
 
 ## Cookie-harvest sub-flow
 
@@ -353,31 +662,48 @@ the exact command back to the user:
   count against quota.
 - `systemctl --user disable` on any augmentagent unit. Always prefer
   `augmentagent service restart` and `augmentagent service stop`.
-- Anything that writes to `.env` directly. The Phase 3 env subcommand
-  (issue #12) is the only sanctioned writer; until it ships, point the user
-  at the file and let them edit by hand.
+- Anything that writes to `.env` directly. Writes go through `augmentagent
+  env set <KEY> <VALUE>`, which persists to the sqlite `config` table; the
+  daemon merges that over the `.env` values at startup. The skill does not
+  edit `.env` itself.
+- `augmentagent install <component>` and `augmentagent uninstall
+  <component>`. These shell out to `scripts/install-*.sh` and rewrite
+  systemd user units. Idempotent in theory, but always confirm with
+  AskUserQuestion that quotes the component name.
+- `augmentagent doctor`'s `suggested_cmd` runs. Doctor never runs these
+  itself (it stays read-only); the skill is the one that can invoke them
+  after confirmation.
 
-The skill is also forbidden from running `cargo` builds or installer scripts
-without explicit user confirmation. Those scripts are idempotent in theory
-but interact with systemd unit files; a silent re-run during a confused
-session can mask state.
+The skill is also forbidden from running `cargo` builds without explicit
+user confirmation. The `--rebuild` flag on `augmentagent install` invokes
+`cargo build --release` followed by `npm run build`; quote that back to
+the user before passing it.
 
 ## Allowed Tools
 
-This skill is read-mostly. It may use:
+The skill is mutation-aware but every mutating call is gated by
+AskUserQuestion. It may use:
 
-- `Bash` for running `augmentagent` CLI invocations, `cat .env.example`,
-  `systemctl --user status` (read-only), and `journalctl --user-unit` reads
-  when the wrapped logs command is unavailable.
-- `AskUserQuestion` for every action that mutates state (service restart,
-  channel validate, anything in the Safety list).
-- `Read` for opening `reference/status-schema.md` and
-  `reference/troubleshooting.md` when triaging.
+- `Bash` for running `augmentagent` CLI invocations (`status`, `doctor`,
+  `service`, `logs`, `channel`, `setup oauth`, `setup harvest`, `env`,
+  `install`, `uninstall`), `cat .env.example`, `systemctl --user status`
+  (read-only), and `journalctl --user-unit` reads when the wrapped logs
+  command is unavailable.
+- `AskUserQuestion` for every action that mutates state: `service restart`,
+  `channel validate`, `channel arm` / `disarm`, `env set` / `env unset`,
+  `install` / `uninstall` of any component, `setup oauth` (the browser
+  open), and every doctor `suggested_cmd` run.
+- `Read` for opening `reference/status-schema.md`,
+  `reference/troubleshooting.md`, `components/*.md`, and `channels/*.md`
+  during triage and per-channel routing.
+- Temporary file writes under `/tmp` for the cookie-harvest creds files
+  only; see the cookie-harvest sub-flow for the lifecycle. The skill
+  never writes anywhere else in the repo.
 
-The skill must not use Edit or Write tools on any file in the repo, must not
-fetch remote URLs, and must not invoke other skills. If the user needs a
-different skill (for example, the email-triage skill), tell them to invoke
-it directly.
+The skill must not use Edit or Write tools on any file in the repo outside
+of `/tmp` creds files, must not fetch remote URLs, and must not invoke
+other skills. If the user needs a different skill (for example, the
+email-triage skill), tell them to invoke it directly.
 
 ## Gotchas
 
