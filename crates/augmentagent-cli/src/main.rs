@@ -47,6 +47,7 @@ use async_trait::async_trait;
 mod invoice;
 mod logs;
 mod self_improve;
+mod service;
 mod status;
 
 #[derive(Parser)]
@@ -336,7 +337,7 @@ enum Cmd {
     },
 
     // === setup+maintenance subcommands (alphabetical) ===
-    // Future variants: Channel, Doctor, Env, Install, Service, Setup, Uninstall
+    // Future variants: Channel, Doctor, Env, Install, Setup, Uninstall
     /// Tail or dump the daemon's systemd-journal logs (wraps
     /// `journalctl --user -u <unit>`). Linux-only.
     ///
@@ -360,6 +361,21 @@ enum Cmd {
         #[arg(long)]
         since: Option<String>,
         /// Emit one JSON object per line (`journalctl -o json`).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Thin wrapper over `systemctl --user` for the augmentagent unit family.
+    /// Lets the `/setup` skill (and humans) say `service restart --unit
+    /// dashboard` instead of memorising unit names. Linux-only by design.
+    Service {
+        #[command(subcommand)]
+        op: service::ServiceOp,
+        /// Unit alias: `daemon` (default) | `dashboard` | `updater` | `digest`
+        /// | `tone-refresh` | `browser-sidecar` | `tenant:<name>` | `all`, or
+        /// a full systemd unit name (e.g. `augmentagent-digest.timer`).
+        #[arg(long, default_value = "daemon")]
+        unit: String,
+        /// Emit machine-readable JSON (status op only).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -2503,7 +2519,7 @@ async fn main() -> Result<()> {
         Cmd::Engagement { ref op } => run_engagement(store, op).await,
 
         // === setup+maintenance subcommands (alphabetical) ===
-        // Future arms: Channel, Doctor, Env, Install, Service, Setup, Uninstall
+        // Future arms: Channel, Doctor, Env, Install, Setup, Uninstall
         Cmd::Logs {
             unit,
             follow,
@@ -2511,6 +2527,7 @@ async fn main() -> Result<()> {
             since,
             json,
         } => logs::run_logs(unit, follow, lines, since, json).await,
+        Cmd::Service { op, ref unit, json } => service::run_service(op, unit, json).await,
         Cmd::Status {
             json,
             channel,
