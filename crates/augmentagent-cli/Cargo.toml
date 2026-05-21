@@ -51,3 +51,9 @@ dotenvy = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+# #1 — `status` subcommand probes the dashboard's `/api/v1/stats` for proof
+# of life. Workspace `reqwest` is `default-features = false` + `rustls-tls`,
+# so this pulls in no openssl. The dep is re-asserted here (rather than
+# inherited transitively) so the binary keeps building even if a sibling
+# crate drops its reqwest dep in the future.
+reqwest = { workspace = true }
