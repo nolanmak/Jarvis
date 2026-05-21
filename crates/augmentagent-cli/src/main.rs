@@ -45,6 +45,7 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod channel_router;
+mod doctor;
 mod env_cfg;
 mod installers;
 mod invoice;
@@ -341,7 +342,6 @@ enum Cmd {
     },
 
     // === setup+maintenance subcommands (alphabetical) ===
-    // Future variants: Doctor
     /// Issue #2 — cross-channel router. `augmentagent channel <name> <op>` is
     /// a thin alias for the per-channel `augmentagent <name> <op>` form so
     /// the /setup skill (and the dashboard) can speak one shape for every
@@ -358,6 +358,21 @@ enum Cmd {
         /// per-channel command (e.g. `--json`, `--dry-run false`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// #11 — read-only diagnostic checks. Composes the `status` aggregator
+    /// (#1) with additional probes (sqlite integrity, keyring reachability,
+    /// tool binaries on `$PATH`, build freshness, `.env` presence). Emits
+    /// severity-tagged findings; exit 0 unless any check is `error`. `--fix`
+    /// lands as a follow-up issue — doctor stays strictly read-only.
+    Doctor {
+        /// Force JSON (`--json`) or human table. Default: auto — JSON when
+        /// stdout is piped, table on a tty.
+        #[arg(long)]
+        json: Option<bool>,
+        /// Add slower probes (Composio whoami ping; per-channel validate
+        /// summaries sourced from `status`).
+        #[arg(long, default_value_t = false)]
+        deep: bool,
     },
     /// Issue #12 — read/write the sqlite `config` table so the `/setup`
     /// skill never has to parse or rewrite `.env`. Reads merge config over
@@ -2586,7 +2601,10 @@ async fn main() -> Result<()> {
         Cmd::Engagement { ref op } => run_engagement(store, op).await,
 
         // === setup+maintenance subcommands (alphabetical) ===
-        // Future arms: Doctor
+        Cmd::Doctor { json, deep } => {
+            let code = doctor::run(store, json, deep).await?;
+            std::process::exit(code);
+        }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
         Cmd::Install { component } => installers::run_install(component).await,
         Cmd::Logs {
