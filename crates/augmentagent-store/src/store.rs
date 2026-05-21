@@ -536,7 +536,8 @@ impl Store {
                  last_status    TEXT,\
                  fail_count     INTEGER NOT NULL DEFAULT 0,\
                  created_at_ms  INTEGER NOT NULL,\
-                 updated_at_ms  INTEGER NOT NULL\
+                 updated_at_ms  INTEGER NOT NULL,\
+                 expires_at_ms  INTEGER\
              )",
             [],
         )?;
@@ -545,6 +546,14 @@ impl Store {
                 ON user_loops(owner, status)",
             [],
         )?;
+        // Auto-stop deadline (#104 follow-up). Nullable; pre-existing rows
+        // migrate cleanly with `None` (run forever until manually stopped).
+        if !column_exists(conn, "user_loops", "expires_at_ms")? {
+            conn.execute(
+                "ALTER TABLE user_loops ADD COLUMN expires_at_ms INTEGER",
+                [],
+            )?;
+        }
 
         // #47 — cross-surface state sync. `status_source` records which surface
         // resolved an action (discord / dashboard / telegram / cli / nudge) so
@@ -3451,7 +3460,8 @@ impl Store {
     // #104 — user-defined scheduled tasks (`/loop`).
     // ---------------------------------------------------------------
 
-    /// Create a loop. `id` is generated; returns it.
+    /// Create a loop. `id` is generated; returns it. `expires_at_ms` is an
+    /// optional auto-stop deadline (wall-clock ms); `None` means run forever.
     pub fn create_user_loop(
         &self,
         owner: &str,
@@ -3459,6 +3469,7 @@ impl Store {
         channel_ref: &str,
         interval_secs: i64,
         prompt: &str,
+        expires_at_ms: Option<i64>,
     ) -> StoreResult<String> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let id = Uuid::new_v4().to_string();
@@ -3466,9 +3477,18 @@ impl Store {
         guard.execute(
             "INSERT INTO user_loops \
                  (id, owner, channel, channel_ref, interval_secs, prompt, \
-                  status, fail_count, created_at_ms, updated_at_ms) \
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0, ?7, ?7)",
-            params![id, owner, channel, channel_ref, interval_secs, prompt, now],
+                  status, fail_count, created_at_ms, updated_at_ms, expires_at_ms) \
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0, ?7, ?7, ?8)",
+            params![
+                id,
+                owner,
+                channel,
+                channel_ref,
+                interval_secs,
+                prompt,
+                now,
+                expires_at_ms
+            ],
         )?;
         Ok(id)
     }
@@ -3479,7 +3499,7 @@ impl Store {
         let mut stmt = guard.prepare(
             "SELECT id, owner, channel, channel_ref, interval_secs, prompt, \
                     status, last_run_ms, last_status, fail_count, \
-                    created_at_ms, updated_at_ms \
+                    created_at_ms, updated_at_ms, expires_at_ms \
                FROM user_loops \
               WHERE owner = ?1 AND status != 'stopped' \
               ORDER BY created_at_ms DESC",
@@ -3499,7 +3519,7 @@ impl Store {
         let mut stmt = guard.prepare(
             "SELECT id, owner, channel, channel_ref, interval_secs, prompt, \
                     status, last_run_ms, last_status, fail_count, \
-                    created_at_ms, updated_at_ms \
+                    created_at_ms, updated_at_ms, expires_at_ms \
                FROM user_loops \
               WHERE status = 'active' \
               ORDER BY created_at_ms ASC",
@@ -3568,6 +3588,50 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+
+    /// Transition every active loop whose `expires_at_ms <= now` to
+    /// `stopped`, in a single statement. Returns the `(id, channel, channel_ref)`
+    /// tuples of the rows we just stopped so the caller can post an
+    /// "expired" notice back to the originating surface. Idempotent — a
+    /// second call is a no-op once everything's already stopped.
+    pub fn stop_expired_user_loops(
+        &self,
+        now_ms: i64,
+    ) -> StoreResult<Vec<(String, String, String)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        // Select first so we can return the surface info; then stop in the
+        // same lock acquisition so a racing scheduler tick can't double-post.
+        let mut stmt = guard.prepare(
+            "SELECT id, channel, channel_ref FROM user_loops \
+              WHERE status = 'active' \
+                AND expires_at_ms IS NOT NULL \
+                AND expires_at_ms <= ?1",
+        )?;
+        let rows = stmt.query_map(params![now_ms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out: Vec<(String, String, String)> = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        drop(stmt);
+        if !out.is_empty() {
+            guard.execute(
+                "UPDATE user_loops \
+                    SET status = 'stopped', last_status = 'expired', \
+                        updated_at_ms = ?1 \
+                  WHERE status = 'active' \
+                    AND expires_at_ms IS NOT NULL \
+                    AND expires_at_ms <= ?1",
+                params![now_ms],
+            )?;
+        }
+        Ok(out)
     }
 
     // ---------------------------------------------------------------
@@ -4617,6 +4681,7 @@ fn row_to_user_loop(r: &rusqlite::Row) -> rusqlite::Result<UserLoop> {
         fail_count: r.get(9)?,
         created_at_ms: r.get(10)?,
         updated_at_ms: r.get(11)?,
+        expires_at_ms: r.get(12)?,
     })
 }
 
@@ -5790,13 +5855,14 @@ mod tests {
     fn user_loop_create_list_stop_roundtrip() {
         let (s, _f) = fresh_store();
         let id = s
-            .create_user_loop("u1", "discord", "chan-7", 300, "/digest")
+            .create_user_loop("u1", "discord", "chan-7", 300, "/digest", None)
             .unwrap();
         let loops = s.list_user_loops("u1").unwrap();
         assert_eq!(loops.len(), 1);
         assert_eq!(loops[0].id, id);
         assert_eq!(loops[0].interval_secs, 300);
         assert_eq!(loops[0].status, "active");
+        assert!(loops[0].expires_at_ms.is_none());
         assert_eq!(s.count_active_user_loops("u1").unwrap(), 1);
 
         // scoped: another user can't stop it
@@ -5811,7 +5877,7 @@ mod tests {
     fn user_loop_pauses_after_repeated_failures() {
         let (s, _f) = fresh_store();
         let id = s
-            .create_user_loop("u1", "discord", "c", 300, "/x")
+            .create_user_loop("u1", "discord", "c", 300, "/x", None)
             .unwrap();
         s.record_user_loop_run(&id, false, "boom", 3).unwrap();
         s.record_user_loop_run(&id, false, "boom", 3).unwrap();
@@ -5828,13 +5894,50 @@ mod tests {
     #[test]
     fn user_loop_success_resets_fail_count() {
         let (s, _f) = fresh_store();
-        let id = s.create_user_loop("u1", "discord", "c", 300, "/x").unwrap();
+        let id = s
+            .create_user_loop("u1", "discord", "c", 300, "/x", None)
+            .unwrap();
         s.record_user_loop_run(&id, false, "boom", 5).unwrap();
         s.record_user_loop_run(&id, true, "ok", 5).unwrap();
         let l = &s.list_user_loops("u1").unwrap()[0];
         assert_eq!(l.fail_count, 0);
         assert_eq!(l.last_status.as_deref(), Some("ok"));
         assert!(l.last_run_ms.is_some());
+    }
+
+    #[test]
+    fn user_loop_expires_at_stops_at_deadline() {
+        let (s, _f) = fresh_store();
+        // Past deadline → should be swept on the next stop_expired_user_loops().
+        let past = 1_000_i64;
+        let id_expired = s
+            .create_user_loop("u1", "discord", "chan-a", 300, "ping", Some(past))
+            .unwrap();
+        // Future deadline → should be left alone.
+        let id_live = s
+            .create_user_loop("u1", "discord", "chan-b", 300, "pong", Some(i64::MAX))
+            .unwrap();
+        // No deadline → also left alone.
+        let id_forever = s
+            .create_user_loop("u1", "discord", "chan-c", 300, "forever", None)
+            .unwrap();
+
+        let stopped = s.stop_expired_user_loops(2_000).unwrap();
+        let ids: Vec<&str> = stopped.iter().map(|(i, _, _)| i.as_str()).collect();
+        assert_eq!(ids, vec![id_expired.as_str()]);
+        // Returned tuple carries the surface info needed to post the notice.
+        assert_eq!(stopped[0].1, "discord");
+        assert_eq!(stopped[0].2, "chan-a");
+
+        // Row is now `stopped` with last_status='expired'.
+        let all = s.list_user_loops("u1").unwrap();
+        // listing drops stopped rows, so only two remain
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|l| l.id == id_live));
+        assert!(all.iter().any(|l| l.id == id_forever));
+
+        // Second sweep is a no-op (idempotent).
+        assert!(s.stop_expired_user_loops(2_000).unwrap().is_empty());
     }
 
     // --- cross-surface CAS resolve (#47) ---
