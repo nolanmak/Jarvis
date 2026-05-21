@@ -171,6 +171,127 @@ messages skipped, approvals issued); use this to sanity-check that a quiet
 channel is quiet because the inbox is empty, not because the channel is
 silently broken.
 
+## Per-Channel Routing
+
+When the user asks for a channel-specific action (`/setup discord`,
+`/setup gmail`, "wire up my LinkedIn"), or when a triage branch lands on
+a single channel that needs configuration, READ the matching sub-file
+under `channels/` FIRST. The sub-file is the runbook; this top-level
+SKILL.md is the decision tree.
+
+Sub-file path is `skills/augmentagent-setup/channels/<name>.md`. Names
+match the channel slug the CLI accepts (lowercase, kebab-case for
+`telegram-bot`). Each sub-file has the same seven sections: Category,
+When to use, Prereqs, Steps, Validate, Common errors and fixes, Disarm /
+undo. The Steps section is enough for the skill to execute mechanically.
+
+The 12 channels split into three setup categories:
+
+### callback OAuth (dashboard hosts the callback)
+
+| Channel | Sub-file                  | Dashboard start URL                                     |
+| ------- | ------------------------- | ------------------------------------------------------- |
+| gmail   | `channels/gmail.md`       | `http://localhost:<port>/oauth/gmail/start`             |
+| drive   | `channels/drive.md`       | `http://localhost:<port>/oauth/googledrive/start`       |
+| slack   | `channels/slack.md`       | `http://localhost:<port>/oauth/slack/start`             |
+| reddit  | `channels/reddit.md`      | `http://localhost:<port>/api/reddit/auth`               |
+
+Dashboard must be installed and reachable. Read
+`components/systemd-units.md` first if `dashboard.reachable = false`.
+
+### cookie harvest (devtools paste, validated via harvest schema)
+
+| Channel   | Sub-file                  | Schema source                                  |
+| --------- | ------------------------- | ---------------------------------------------- |
+| discord   | `channels/discord.md`     | `augmentagent setup harvest discord …`         |
+| twitter   | `channels/twitter.md`     | `augmentagent setup harvest twitter …`         |
+| linkedin  | `channels/linkedin.md`    | `augmentagent setup harvest linkedin …`        |
+| instagram | `channels/instagram.md`   | `augmentagent setup harvest instagram …`       |
+
+Every cookie-harvest channel uses the in-skill loop below.
+
+### token paste (user copies a token from a vendor portal)
+
+| Channel       | Sub-file                          | Token source                                     |
+| ------------- | --------------------------------- | ------------------------------------------------ |
+| github        | `channels/github.md`              | PAT at `https://github.com/settings/tokens`      |
+| meetup        | `channels/meetup.md`              | Group urlname (no auth today)                    |
+| deftform      | `channels/deftform.md`            | Workspace API token + webhook secret             |
+| telegram-bot  | `channels/telegram-bot.md`        | BotFather token                                  |
+
+## Cookie-harvest sub-flow
+
+For the four cookie-harvest channels (discord, twitter, linkedin,
+instagram), the skill runs this loop. The CLI schema emitter from issue
+#8 (`augmentagent setup harvest <ch> --non-interactive --json`) is the
+authoritative source for fields, hints, and the next command; the skill
+parses it instead of hard-coding field lists per channel.
+
+Pseudocode:
+
+```
+ch = "<channel>"             # one of discord | twitter | linkedin | instagram
+out = "/tmp/" + ch + "-creds-" + pid + ".json"
+
+# 1. Parse the schema.
+schema = run("augmentagent setup harvest " + ch +
+             " --non-interactive --json --creds-out " + out)
+# schema is JSON with: channel, instructions_url, methods[], next_cmd,
+# expected_creds_path. Methods carry name, label, script_path,
+# doc_steps[], fields[]. Pick methods[0] for the devtools-paste flow.
+
+method = schema.methods[0]
+print(method.doc_steps)      # echo verbatim so the user knows where to look
+
+# 2. Ask the user per field. AskUserQuestion masks secrets.
+creds = {}
+for field in method.fields:
+    value = AskUserQuestion(field.label,
+                            hint=field.hint,
+                            secret=field.secret,
+                            optional=field.optional)
+    if value or not field.optional:
+        creds[field.name] = value
+
+# 3. Write the temp creds file (mode 0600).
+write_json(schema.expected_creds_path, creds, mode=0o600)
+
+# 4. Run the login command with the temp file. The schema's next_cmd
+#    contains the right flag (--creds-json for discord, --session-json
+#    for twitter, --cookies-json for linkedin/instagram). Substitute
+#    <path> with expected_creds_path.
+login_cmd = schema.next_cmd.replace("<path>", schema.expected_creds_path)
+run(login_cmd)
+
+# 5. Validate (read-only first; live only with explicit confirmation).
+run("augmentagent channel " + ch + " validate")
+
+# 6. Always delete the temp file, even on failure.
+delete(schema.expected_creds_path)
+```
+
+The skill must:
+
+- Mask any field flagged `secret = true` in the schema. Never echo it
+  back to the transcript.
+- Honour `optional = true`. The Instagram `username` and `rur` fields
+  are optional; leave them out of the JSON when the user skips.
+- Use the schema's `next_cmd` rather than hard-coding the login
+  invocation. Channels do not all share the same flag name; the schema
+  carries the right one.
+- Always delete the temp file in a `finally`-equivalent block. The
+  credentials are session-bearer; leaking them onto disk is the worst
+  failure mode.
+- For LinkedIn, the schema returns two methods. Default to
+  `devtools_cookies` unless the user explicitly confirms they have a
+  recent `/intercept` capture, in which case skip the AskUserQuestion
+  loop entirely and run the `browser_intercept` script directly (it
+  has zero fields).
+
+After login succeeds, follow the channel's sub-file Steps section for
+arming (if the channel has an arming gate) and the live validation
+sign-off. See `components/env-file.md` for the arm/disarm semantics.
+
 ## Reading .env.example as Runtime Checklist
 
 The `.env.example` file at the repo root is the canonical list of channel
