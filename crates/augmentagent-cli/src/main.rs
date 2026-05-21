@@ -45,6 +45,7 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod channel_router;
+mod env_cfg;
 mod installers;
 mod invoice;
 mod logs;
@@ -340,7 +341,7 @@ enum Cmd {
     },
 
     // === setup+maintenance subcommands (alphabetical) ===
-    // Future variants: Doctor, Env
+    // Future variants: Doctor
     /// Issue #2 — cross-channel router. `augmentagent channel <name> <op>` is
     /// a thin alias for the per-channel `augmentagent <name> <op>` form so
     /// the /setup skill (and the dashboard) can speak one shape for every
@@ -357,6 +358,19 @@ enum Cmd {
         /// per-channel command (e.g. `--json`, `--dry-run false`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Issue #12 — read/write the sqlite `config` table so the `/setup`
+    /// skill never has to parse or rewrite `.env`. Reads merge config over
+    /// `process.env` (config wins) — same precedence as the dashboard.
+    /// Secrets are masked in `list`; `get` prints raw values.
+    Env {
+        /// Op to run.
+        #[command(subcommand)]
+        op: env_cfg::EnvOp,
+        /// Emit JSON. Applies to `list` and `get`; `set`/`unset` always
+        /// emit JSON receipts.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// #6 — install a component by shelling out to the matching
     /// `scripts/install-*.sh` (or the systemd unit-template copy for
@@ -2572,7 +2586,8 @@ async fn main() -> Result<()> {
         Cmd::Engagement { ref op } => run_engagement(store, op).await,
 
         // === setup+maintenance subcommands (alphabetical) ===
-        // Future arms: Doctor, Env
+        // Future arms: Doctor
+        Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
         Cmd::Install { component } => installers::run_install(component).await,
         Cmd::Logs {
             unit,
