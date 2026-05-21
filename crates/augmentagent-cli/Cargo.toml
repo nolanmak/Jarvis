@@ -57,3 +57,14 @@ uuid = { workspace = true }
 # inherited transitively) so the binary keeps building even if a sibling
 # crate drops its reqwest dep in the future.
 reqwest = { workspace = true }
+
+# #14 — snapshot test for the `augmentagent status --json` schema. `insta`
+# is the idiomatic Rust snapshot crate; `tempfile` gives the test an isolated
+# sqlite db path so probe output is deterministic on a fresh box.
+[dev-dependencies]
+insta = { version = "1", features = ["json", "redactions"] }
+tempfile = "3"
+# Used by the snapshot test to pre-seed the legacy schema tables (`actions`,
+# `emails`, `gmail_accounts`) that `Store::migrate` assumes already exist —
+# `augmentagent-store::Store::open` panics on a fresh empty db otherwise.
+rusqlite = { workspace = true }
