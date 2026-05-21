@@ -45,6 +45,7 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod invoice;
+mod logs;
 mod self_improve;
 mod status;
 
@@ -335,7 +336,33 @@ enum Cmd {
     },
 
     // === setup+maintenance subcommands (alphabetical) ===
-    // Future variants: Channel, Doctor, Env, Install, Logs, Service, Setup, Status, Uninstall
+    // Future variants: Channel, Doctor, Env, Install, Service, Setup, Uninstall
+    /// Tail or dump the daemon's systemd-journal logs (wraps
+    /// `journalctl --user -u <unit>`). Linux-only.
+    ///
+    /// `--unit` accepts short aliases: `daemon` → `augmentagent.service`,
+    /// `dashboard` → `augmentagent-dashboard.service`, and any bare name
+    /// `X` expands to `augmentagent-X.service`. Names already containing
+    /// a `.` (e.g. `custom.service`) pass through unchanged.
+    Logs {
+        /// Unit to tail. Short aliases (`daemon`, `dashboard`, `web`, …)
+        /// are expanded — see the command help for the full mapping.
+        #[arg(long, default_value = "augmentagent.service")]
+        unit: String,
+        /// Stream new entries as they arrive (`journalctl -f`).
+        #[arg(long, short = 'f', default_value_t = false)]
+        follow: bool,
+        /// How many recent entries to show (`journalctl -n <lines>`).
+        #[arg(long, default_value_t = 200)]
+        lines: u32,
+        /// Only show entries on/after this time. Passed straight to
+        /// `journalctl --since` (e.g. `"2026-05-20"`, `"1 hour ago"`).
+        #[arg(long)]
+        since: Option<String>,
+        /// Emit one JSON object per line (`journalctl -o json`).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// #1 — one-document health aggregator: daemon, dashboard, updater,
     /// core keys, per-channel configured/armed, queue depth. Source of truth
     /// for the `/setup` skill and ongoing maintenance.
@@ -2476,7 +2503,14 @@ async fn main() -> Result<()> {
         Cmd::Engagement { ref op } => run_engagement(store, op).await,
 
         // === setup+maintenance subcommands (alphabetical) ===
-        // Future arms: Channel, Doctor, Env, Install, Logs, Service, Setup, Status, Uninstall
+        // Future arms: Channel, Doctor, Env, Install, Service, Setup, Uninstall
+        Cmd::Logs {
+            unit,
+            follow,
+            lines,
+            since,
+            json,
+        } => logs::run_logs(unit, follow, lines, since, json).await,
         Cmd::Status {
             json,
             channel,
