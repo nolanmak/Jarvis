@@ -1,57 +1,63 @@
-# status --json Schema, Version 1
+# `augmentagent status --json` Schema, Version 1
 
 The `augmentagent status --json` command emits a single JSON object on
-stdout. This file locks the shape of that object at `schema_version: 1`.
-The setup skill consumes this contract; any breaking change must bump the
-version number, and the skill is allowed to refuse to parse a version it
-does not recognize.
+stdout. This file locks the shape of that object at `schema_version: "1"`.
+The `/setup` skill consumes this contract; any breaking change must bump
+the version string, and the skill is allowed to refuse to parse a version
+it does not recognize.
+
+The pinned snapshot lives at
+`crates/augmentagent-cli/tests/snapshots/status_schema__status_v1.snap`.
+Treat this document as the human-readable counterpart of that snapshot —
+they must agree.
 
 ## Full shape
 
-```
+```json
 {
-  "schema_version": 1,
-  "generated_at": "2026-05-21T14:52:00Z",
-  "host": {
-    "os": "linux",
-    "hostname": "augmentagent-box",
-    "user": "nolanmak",
-    "binary_path": "/home/nolanmak/.cargo/bin/augmentagent",
-    "binary_version": "0.x.y",
-    "build_stamp": "2026-05-21T13:00:00Z"
+  "schema_version": "1",
+  "host": "linux",
+  "daemon": {
+    "unit": "augmentagent.service",
+    "active": true,
+    "since_unix": 1747856073
   },
-  "state": "fresh" | "partial" | "ok" | "repair",
-  "services": [
-    {
-      "unit": "augmentagent.service",
-      "active": true,
-      "sub_state": "running",
-      "since": "2026-05-21T13:05:00Z",
-      "restart_count_24h": 0
-    }
-  ],
-  "channels": [
-    {
-      "name": "discord",
-      "configured": true,
-      "armed": true,
-      "validated": true,
-      "last_validated_at": "2026-05-21T14:00:00Z",
-      "last_event_at": "2026-05-21T14:51:30Z",
-      "gates": {
-        "DISCORD_BOT_TOKEN": "set",
-        "DISCORD_CHANNEL_ID": "set"
-      },
-      "notes": []
-    }
-  ],
   "dashboard": {
-    "installed": true,
-    "running": true,
-    "port": 3000
+    "unit": "augmentagent-dashboard.service",
+    "active": true,
+    "port": 3000,
+    "reachable": true
   },
-  "warnings": [],
-  "errors": []
+  "updater": {
+    "unit": "augmentagent-update.timer",
+    "timer_active": true,
+    "last_run_unix": 1747850000
+  },
+  "core_keys": {
+    "composio": true,
+    "groq": true,
+    "cerebras": false,
+    "discord_bot": true
+  },
+  "channels": {
+    "calendar":  { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
+    "contacts":  { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
+    "discord":   { "configured": true,  "armed": false, "accounts": 0, "last_poll_unix": null, "needs": [] },
+    "gdrive":    { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
+    "github":    { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
+    "gmail":     { "configured": true,  "armed": false, "accounts": 2, "last_poll_unix": null, "needs": [] },
+    "instagram": { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
+    "linkedin":  { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
+    "meetup":    { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
+    "reddit":    { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
+    "slack":     { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
+    "telegram":  { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
+    "twitter":   { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
+    "voice":     { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
+    "whatsapp":  { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] }
+  },
+  "queue": { "pending": 0 },
+  "summary": "ok"
 }
 ```
 
@@ -59,120 +65,147 @@ does not recognize.
 
 ### Top level
 
-- `schema_version` (integer, required). Locked at `1`. The skill must read
-  this before any other field and bail with a friendly "skill needs an
-  update" message if it does not equal `1`.
-- `generated_at` (ISO 8601 UTC string, required). Used only for display;
-  the skill must not gate logic on this timestamp.
-- `state` (enum, required). One of `fresh`, `partial`, `ok`, `repair`. This
-  is the field the skill's Triage Decision branches on. The CLI computes
-  this from the other fields; the skill must not re-derive it.
+- `schema_version` (string, required). Locked at `"1"`. The skill must
+  read this before any other field and bail with a friendly "skill needs
+  an update" message if it does not equal `"1"`.
+- `host` (string, required). Always `"linux"` — AugmentAgent ships on
+  Linux only and the CLI does not pretend otherwise. If the skill sees
+  anything else, refuse to proceed.
+- `summary` (string, required). One of `ok`, `degraded`, `needs_setup`,
+  `daemon_down`, `dashboard_down`, `config_invalid`. The CLI also maps
+  this to a process exit code:
 
-### host
+  | summary          | exit code |
+  | ---------------- | --------- |
+  | `ok`             | 0         |
+  | `degraded`       | 10        |
+  | `needs_setup`    | 10        |
+  | `daemon_down`    | 20        |
+  | `dashboard_down` | 30        |
+  | `config_invalid` | 40        |
 
-- `os` is always `"linux"` on this deployment. If the skill sees anything
-  else, it should refuse to proceed.
-- `hostname`, `user`: cosmetic, used in confirmations only.
-- `binary_path`: where the CLI was invoked from. Useful when the user has
-  multiple builds on PATH.
-- `binary_version`: the cargo package version of the CLI.
-- `build_stamp`: when the binary was built. Older than 24 hours plus the
-  auto-updater stamp older than that is a hint that updates are not flowing.
+  The skill branches on `summary` and trusts it; it never re-derives the
+  classification from the underlying fields.
 
-### services
+### daemon
 
-An array of systemd user units the daemon owns. The setup skill cares about:
+`systemctl --user show augmentagent.service`.
 
-- `unit`: full unit name, including `.service`. Pass this to `augmentagent
-  service restart --unit <name>` and `augmentagent logs --unit <name>`.
-- `active`: boolean from `systemctl is-active`. `false` on a configured
-  install is what tips `state` toward `repair`.
-- `sub_state`: the systemd sub-state string (`running`, `dead`,
-  `auto-restart`, and so on). The skill surfaces this verbatim.
-- `since`: when the current run started. A `since` value newer than
-  `generated_at` minus a few minutes means the unit just restarted.
-- `restart_count_24h`: integer. Greater than zero on a unit that should be
-  stable indicates flapping; the skill should route to Repair.
-
-### channels
-
-The list the user actually cares about. One entry per known channel; the
-list is generated from the channel registry inside the daemon, not from
-`.env.example`. If a channel is not listed, the daemon does not know about
-it.
-
-- `name`: short channel name, lowercase, matches what the CLI accepts as
-  `--channel <name>` and `channel <name>`.
-- `configured`: the daemon found enough env or stored credentials to
-  consider this channel set up.
-- `armed`: the user's arming gate is on. A channel can be `configured=true`
-  and `armed=false`, which is the normal "off but ready" state.
-- `validated`: the last live-credential check passed. `last_validated_at`
-  is `null` until the channel has ever been validated.
-- `last_validated_at`, `last_event_at`: ISO 8601 timestamps or `null`. The
-  skill displays them in human form when reporting status.
-- `gates`: object mapping env var name to `"set"`, `"unset"`, or
-  `"invalid"`. The skill reads this to build the per-channel checklist
-  without re-parsing `.env` itself.
-- `notes`: array of free-form strings the daemon attaches. Surface them
-  verbatim; do not try to interpret.
+- `unit` (string): full unit name including `.service`. Pass straight to
+  `augmentagent service restart` and `augmentagent logs`.
+- `active` (boolean): true iff `ActiveState=active`.
+- `since_unix` (integer): `ActiveEnterTimestamp` parsed to a unix epoch
+  in seconds. `0` means systemd reported `n/a` or the property was unset
+  (treat as "unknown", not "epoch").
 
 ### dashboard
 
-The optional dashboard sidecar. Present even when not installed so the
-skill can branch on `installed`.
+`systemctl --user show augmentagent-dashboard.service` plus a 2-second
+HTTP probe against `/api/v1/stats`.
 
-- `installed`: whether `install-dashboard.sh` has run.
-- `running`: whether the dashboard unit is active.
-- `port`: from `DASHBOARD_PORT`, default 3000.
+- `unit` (string): unit name including `.service`.
+- `active` (boolean): true iff the unit is active.
+- `port` (integer): `DASHBOARD_PORT` env var or `3000`.
+- `reachable` (boolean): true iff the dashboard answered the probe with
+  2xx or 401 (an `x-api-key`-gated 401 is real proof-of-life). Net
+  errors and timeouts collapse to false.
 
-### warnings, errors
+### updater
 
-Two arrays of objects. Each object has `code` (string), `message` (string),
-and an optional `hint` (string). `warnings` should not affect `state`;
-`errors` typically drives `state` to `repair`. The skill surfaces both
-verbatim; it never re-wraps the message.
+`systemctl --user show augmentagent-update.timer`.
 
-## How the skill consumes each field
+- `unit` (string): `augmentagent-update.timer`.
+- `timer_active` (boolean): true iff the timer is `active`.
+- `last_run_unix` (integer): `ActiveEnterTimestamp` of the timer (when
+  it most recently armed), as unix seconds. `0` when never run.
 
-The skill reads the JSON exactly once per invocation and threads the parsed
-object into its decision tree:
+### core_keys
 
-- `schema_version` gates everything. Wrong version, bail.
-- `state` picks the Triage branch (Fresh, Partial, Repair, Maintenance).
-- `services` populates the "restart which unit" prompt when the user asks
-  to restart, and feeds the Repair branch when any unit is inactive.
-- `channels` drives the Maintenance Menu's per-channel actions and the
-  Partial branch's gap analysis. The skill never re-derives `armed` or
-  `validated` from env; it trusts these fields.
-- `gates` is the bridge between `.env.example` (the docs) and the running
-  daemon (the truth). When the skill needs to tell the user "set X in
-  .env", it cross-references `gates` against the channel's documented
-  requirements.
-- `dashboard` is informational unless the user explicitly asks about it.
-- `warnings` and `errors` are surfaced verbatim under a "Notes from the
-  daemon" header.
+One boolean per top-level credential the daemon needs. A `true` value
+means the canonical sqlite `config` row OR the corresponding env var is
+set and non-empty. Sqlite wins on conflict, mirroring
+`getConfigStatus()` in `src/dashboard.ts`.
+
+- `composio` — `COMPOSIO_API_KEY` / `config.composio_api_key`.
+- `groq` — `GROQ_API_KEY` / `config.groq_api_key`.
+- `cerebras` — `CEREBRAS_API_KEY` / `config.cerebras_api_key`.
+- `discord_bot` — `DISCORD_BOT_TOKEN` / `config.discord_bot_token`.
+
+### channels
+
+An object keyed by channel name (lowercase, matches what
+`augmentagent channel <name>` accepts). Locked-in keys, in the order
+emitted by `BTreeMap` (alphabetical):
+
+`calendar`, `contacts`, `discord`, `gdrive`, `github`, `gmail`,
+`instagram`, `linkedin`, `meetup`, `reddit`, `slack`, `telegram`,
+`twitter`, `voice`, `whatsapp`.
+
+Each value is an object:
+
+- `configured` (boolean): the daemon found enough creds to consider this
+  channel set up. The probe is best-effort per channel — gmail wants a
+  Composio key plus at least one row in the gmail-accounts table;
+  gdrive counts active drive accounts; the rest probe their canonical
+  sqlite config key (with env-var fallback).
+- `armed` (boolean): the user's arming gate. Hard-wired to `false`
+  today; flips to a real value once issue #7 ships the arm/disarm verbs.
+  The skill must not write through this field — bumping it on the
+  client side will be ignored by the daemon.
+- `accounts` (integer): connected-account count. Only populated for
+  `gmail` and `gdrive`; `0` everywhere else until per-channel last-poll
+  tables land in #7.
+- `last_poll_unix` (integer or null): unix-seconds timestamp of the most
+  recent successful poll. Always `null` today; reserved for #7.
+- `needs` (array of strings): what's missing. `["login"]` when
+  `configured=false`, `[]` otherwise. The schema reserves room for
+  richer entries (`"refresh_token"`, `"webhook_url"`, etc.) that future
+  PRs may add — the skill must treat unknown strings as opaque and
+  surface them verbatim.
+
+### queue
+
+- `pending` (integer): number of rows in `actions` with status
+  `pending`. Comes from `Store::pending_reply_count()`.
 
 ## Stability promise
 
-`schema_version: 1` means:
+`schema_version: "1"` means:
 
-- The top-level keys listed above are present (or `null` for optional
-  scalar fields like `last_validated_at`).
-- The enums on `state`, `sub_state`, and `gates` values are append-only;
-  new variants may appear, existing ones do not change meaning.
-- Field types do not change. Strings stay strings, integers stay integers.
-- Adding new keys to existing objects is allowed and is NOT a breaking
-  change; the skill must ignore unknown keys.
-- Renaming a key, removing a key, or changing a type IS a breaking change
-  and the CLI must bump `schema_version` to `2`.
+- Every top-level key listed above is present.
+- Every field type stays put. Booleans stay booleans, integers stay
+  integers (note: `schema_version` is a STRING, not an integer).
+- Every channel name listed above is present in `channels`. The
+  `--channel <name>` flag may narrow the map at runtime; the snapshot
+  test covers the unfiltered case.
+- Adding a new key to an existing object is NOT a breaking change —
+  the skill must ignore unknown keys.
+- Renaming a key, removing a key, changing a type, or removing a
+  channel from `channels` IS a breaking change and the CLI must bump
+  `schema_version` to `"2"`.
 
-The skill is allowed to assume version 1 fields exist when version 1 is
-reported. It must not assume any field outside this document exists.
+## How the skill consumes each field
+
+- `schema_version` gates everything. Wrong version, bail.
+- `summary` picks the Triage branch. `ok` → Maintenance; `daemon_down`
+  / `dashboard_down` → Repair; `needs_setup` / `degraded` → Partial.
+- `daemon`, `dashboard`, `updater` populate the systemd panel. The skill
+  surfaces `unit` names verbatim when telling the user which unit to
+  restart.
+- `core_keys` drives the "credentials" checklist on the Partial branch.
+- `channels` drives the Maintenance Menu's per-channel actions and the
+  Partial branch's gap analysis. The skill trusts `configured` /
+  `armed` rather than re-deriving them.
+- `queue.pending` is informational unless the user explicitly asks
+  about it.
 
 ## Related issues
 
-- Issue #1: status aggregator implementation, owns the schema producer.
+- Issue #1: `status` aggregator implementation, owns the schema
+  producer (`crates/augmentagent-cli/src/status.rs`).
 - Issue #5: this skill, owns the schema consumer.
-- Issue #14: cross-cutting snapshot test that pins the schema against this
-  document so the producer and consumer stay in sync.
+- Issue #14: cross-cutting snapshot test
+  (`crates/augmentagent-cli/tests/status_schema.rs`) that pins the
+  producer against this document so the two stay in sync. The
+  snapshot's `.snap` file is checked into the repo and reviewers
+  must accept the diff whenever the producer changes.
