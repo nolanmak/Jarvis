@@ -44,6 +44,7 @@ use augmentagent_channel_contacts::{
 use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
+mod channel_router;
 mod invoice;
 mod logs;
 mod self_improve;
@@ -337,7 +338,24 @@ enum Cmd {
     },
 
     // === setup+maintenance subcommands (alphabetical) ===
-    // Future variants: Channel, Doctor, Env, Install, Setup, Uninstall
+    // Future variants: Doctor, Env, Install, Setup, Uninstall
+    /// Issue #2 — cross-channel router. `augmentagent channel <name> <op>` is
+    /// a thin alias for the per-channel `augmentagent <name> <op>` form so
+    /// the /setup skill (and the dashboard) can speak one shape for every
+    /// channel. Pass-through trailing args (e.g. `--json`, `--dry-run`,
+    /// `--account work@example.com`) are forwarded verbatim.
+    Channel {
+        /// Channel to dispatch to (e.g. `gmail`, `slack`, `telegram-bot`).
+        #[arg(value_enum)]
+        name: channel_router::ChannelName,
+        /// Op to run. `arm` / `disarm` land in issue #7.
+        #[arg(value_enum)]
+        op: channel_router::ChannelOp,
+        /// Pass-through flags forwarded verbatim to the underlying
+        /// per-channel command (e.g. `--json`, `--dry-run false`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Tail or dump the daemon's systemd-journal logs (wraps
     /// `journalctl --user -u <unit>`). Linux-only.
     ///
@@ -2012,6 +2030,7 @@ async fn main() -> Result<()> {
             since,
             post_discord,
         } => run_digest(&cli, store, since, post_discord).await,
+        Cmd::Channel { name, op, args } => channel_router::dispatch(name, op, args).await,
         Cmd::Gmail { ref op } => match op {
             GmailOp::Search { query, limit, full } => {
                 run_gmail_search(store, query.clone(), *limit, *full).await
