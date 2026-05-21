@@ -27,6 +27,7 @@ import { Router, Request, Response, NextFunction } from "express";
 import { EventEmitter } from "events";
 import { execFile } from "child_process";
 import path from "path";
+import fs from "fs";
 import {
   getActions,
   getActionById,
@@ -38,6 +39,10 @@ import {
   updateActionStatus,
   addPushSubscription,
   removePushSubscription,
+  getActiveGmailAccounts,
+  getActiveDriveAccounts,
+  getActiveSlackWorkspaces,
+  getConfig,
 } from "./db";
 import type { ActionStatus } from "./types";
 
@@ -80,12 +85,87 @@ export function requireApiKey(req: Request, res: Response, next: NextFunction): 
   next();
 }
 
+// Process start timestamp — used by `/api/v1/health` so we report uptime
+// against THIS process, not the system clock. Captured at module-load
+// rather than via `process.uptime()` so the CLI integration test in #10
+// can reason about a stable monotonic source.
+const PROCESS_STARTED_MS = Date.now();
+
+// Cached `package.json#version` for the health probe. The dashboard runs
+// from `dist/`, so resolve relative to the source root via `__dirname`.
+// Falls back to "unknown" if the file can't be read (defensive — the
+// preflight check just needs *something* non-empty in the version field).
+function readPackageVersion(): string {
+  const candidates = [
+    path.join(__dirname, "..", "package.json"),
+    path.join(process.cwd(), "package.json"),
+  ];
+  for (const p of candidates) {
+    try {
+      const raw = fs.readFileSync(p, "utf8");
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.version === "string") {
+        return parsed.version;
+      }
+    } catch {
+      // try the next candidate
+    }
+  }
+  return "unknown";
+}
+const PACKAGE_VERSION = readPackageVersion();
+
+// Public preflight surface for the `augmentagent setup oauth` orchestrator
+// (#10). NOT gated by `requireApiKey` — the CLI uses this to decide whether
+// the dashboard is up *before* it has any creds in hand, and there's no
+// sensitive data in the response.
+const publicV1 = Router();
+publicV1.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    version: PACKAGE_VERSION,
+    uptime_secs: Math.floor((Date.now() - PROCESS_STARTED_MS) / 1000),
+  });
+});
+
 const v1 = Router();
 v1.use(requireApiKey);
 
 // GET /api/v1/stats — same numbers the dashboard stats partial renders.
 v1.get("/stats", (_req, res) => {
   res.json(getStats());
+});
+
+// GET /api/v1/oauth/status — rollup of per-provider connection state used
+// by the `augmentagent setup oauth` orchestrator (#10). Composes the same
+// helpers backing the individual `/api/oauth/<provider>/status` routes in
+// `dashboard.ts` so a "new connection appeared" diff between two snapshots
+// is the canonical success signal. Reddit has no accounts table — its
+// keychain refresh token is the proof-of-life, so `getConfig` is enough.
+v1.get("/oauth/status", (_req, res) => {
+  const gmailAccounts = getActiveGmailAccounts().map((a) => ({
+    id: a.id,
+    email: a.email,
+    entityId: a.entityId,
+  }));
+  const driveAccounts = getActiveDriveAccounts().map((a) => ({
+    id: a.id,
+    email: a.email,
+    entityId: a.entity_id,
+  }));
+  const slackWorkspaces = getActiveSlackWorkspaces().map((w) => ({
+    id: w.id,
+    team_id: w.teamId,
+    team_name: w.teamName,
+    user_id: w.userId,
+  }));
+  const redditConnected = !!getConfig("reddit_refresh_token");
+  res.json({
+    gmail: { accounts: gmailAccounts, lastError: null },
+    googledrive: { accounts: driveAccounts, lastError: null },
+    slack: { workspaces: slackWorkspaces, lastError: null },
+    reddit: { connected: redditConnected },
+  });
 });
 
 // GET /api/v1/actions — paginated list, parity with the HTMX /api/actions.
@@ -202,6 +282,9 @@ v1.get("/events", (req, res) => {
 });
 
 const apiV1Router = Router();
+// Mount the public preflight surface first so `/api/v1/health` short-circuits
+// before Express ever consults the API-key middleware on the gated `v1` chain.
+apiV1Router.use("/api/v1", publicV1);
 apiV1Router.use("/api/v1", v1);
 
 // --- #45 PWA approval surface: queue route + Web Push subscription ---
