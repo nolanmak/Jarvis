@@ -14,9 +14,11 @@ import dotenv from "dotenv";
 
 import { createDraft, sendDraft } from "./gmailService";
 import { getGroupEvents } from "./meetupService";
-import { sendForApproval } from "./discordService";
+import { sendForApproval, sendCartForApproval } from "./discordService";
 import { logAction, updateActionStatus, markEmailProcessed } from "./db";
 import type { Email } from "./types";
+import { grocery as grocerySidecar } from "./grocerySidecar";
+import { kgList, kgRead, kgWrite, kgAppend, recordOrder, type OrderRecord } from "./groceryKg";
 
 dotenv.config();
 
@@ -29,28 +31,32 @@ const BASE_DELAY_MS = 1000;
 
 // --- Skill Loading ---
 
-const SKILL_DIR = path.join(process.cwd(), "skills", "email-triage");
-const LEARNED_DIR = path.join(SKILL_DIR, "learned");
+const SKILLS_ROOT = path.join(process.cwd(), "skills");
 
-function loadSkillFile(): string {
+function skillDir(name: string): string {
+  return path.join(SKILLS_ROOT, name);
+}
+
+function loadSkillFile(name: string = "email-triage"): string {
   try {
-    return fs.readFileSync(path.join(SKILL_DIR, "SKILL.md"), "utf-8");
+    return fs.readFileSync(path.join(skillDir(name), "SKILL.md"), "utf-8");
   } catch {
     return "";
   }
 }
 
-function loadLearnedPatterns(): string {
+function loadLearnedPatterns(name: string = "email-triage"): string {
   try {
-    if (!fs.existsSync(LEARNED_DIR)) return "";
+    const learnedDir = path.join(skillDir(name), "learned");
+    if (!fs.existsSync(learnedDir)) return "";
 
-    const files = fs.readdirSync(LEARNED_DIR).filter((f) => f.endsWith(".json"));
+    const files = fs.readdirSync(learnedDir).filter((f) => f.endsWith(".json"));
     if (files.length === 0) return "";
 
     const patterns: string[] = [];
     for (const file of files) {
       try {
-        const content = fs.readFileSync(path.join(LEARNED_DIR, file), "utf-8");
+        const content = fs.readFileSync(path.join(learnedDir, file), "utf-8");
         const data = JSON.parse(content);
         if (Array.isArray(data) && data.length > 0) {
           patterns.push(`### ${file.replace(".json", "")}:\n${JSON.stringify(data, null, 2)}`);
@@ -68,19 +74,18 @@ function loadLearnedPatterns(): string {
   }
 }
 
-function saveLearnedPattern(pattern: {
-  type: string;
-  pattern: string;
-  action: string;
-  reason: string;
-}): void {
+function saveLearnedPattern(
+  pattern: { type: string; pattern: string; action: string; reason: string },
+  skillName: string = "email-triage",
+): void {
   try {
-    if (!fs.existsSync(LEARNED_DIR)) {
-      fs.mkdirSync(LEARNED_DIR, { recursive: true });
+    const learnedDir = path.join(skillDir(skillName), "learned");
+    if (!fs.existsSync(learnedDir)) {
+      fs.mkdirSync(learnedDir, { recursive: true });
     }
 
     const filename = `${pattern.type}-patterns.json`;
-    const filepath = path.join(LEARNED_DIR, filename);
+    const filepath = path.join(learnedDir, filename);
 
     let existing: any[] = [];
     try {
@@ -256,6 +261,135 @@ Returns JSON: { totalCount, count, events: [{ id, title, url, status, dateTime, 
   },
 }) as Tool;
 
+const groceryTool = (tool as any)({
+  name: "grocery",
+  description: `Order groceries from the configured provider (default: Giant Food Stores) and read/write the wiki/groceries/ knowledge graph.
+
+The tool is the hands, you are the brain. Search returns options; you decide which products to add. The flow ends at a Discord approval card — checkout itself is finished by the user in the browser.
+
+Available actions:
+- session_check: Verify the grocery store session. No params. Returns { authenticated, userId?, storeId?, firstName? }.
+- login: Log in to the grocery store. params: { email?, password? } (both default to env vars). If OTP required, returns { status: "otp_sent", channel, maskedValue }. If success, returns { status: "success", userId }.
+- verify_otp: Complete OTP login. params: { code: string, channel?: string }. Returns { userId }.
+- search: Search products. params: { query: string, limit?: number }. Returns { query, products: [{ prodId, name, brand, price, regularPrice, size, inStock, onSale }] }.
+- search_batch: Search multiple queries at once. params: { queries: string[], limit_per_query?: number }. Returns { results: [...] }.
+- products_by_id: Look up known products by id (fallback when search misses a known staple). params: { prodIds: number[] }.
+- cart_view: Show current cart. No params. Returns { cartId, items, subtotal, tax, total, storeId }.
+- cart_add: Add items by product id. params: { items: [{ productId, quantity }] }. Returns { added, errors }.
+- cart_remove: Remove an item by product id. params: { productId }.
+- submit_for_approval: Post the cart summary to Discord and wait for human approve/skip. params: { title: string, body_md: string }. Returns { approved: boolean, feedback: string }. ALWAYS use this before treating the order as final.
+- kg_list: List all pages under wiki/groceries/. No params. Returns { pages: string[] }.
+- kg_read: Read a page from wiki/groceries/. params: { page: string } (relative path under wiki/groceries/, e.g. "staples.md", "orders/2026-05-21.md"). Returns { page, content }.
+- kg_write: Overwrite a page in wiki/groceries/. params: { page: string, content: string }.
+- kg_append: Append to a page in wiki/groceries/. params: { page: string, content: string }.
+- record_order: Append a structured order record to wiki/groceries/orders/<date>.md. params: { date?: string (YYYY-MM-DD, defaults to today), order: { items_ordered: [{ name, qty, brand?, prodId?, price? }], items_oos?, substitutions?, total?, feedback?, approved? } }. Returns { page }.`,
+  parameters: z.object({
+    action: z.enum([
+      "session_check",
+      "login",
+      "verify_otp",
+      "search",
+      "search_batch",
+      "products_by_id",
+      "cart_view",
+      "cart_add",
+      "cart_remove",
+      "submit_for_approval",
+      "kg_list",
+      "kg_read",
+      "kg_write",
+      "kg_append",
+      "record_order",
+    ]),
+    params: z.record(z.string(), z.unknown()).optional(),
+  }),
+  execute: async (input: { action: string; params?: Record<string, unknown> }) => {
+    const params = input.params ?? {};
+    try {
+      switch (input.action) {
+        case "session_check":
+          return JSON.stringify(await grocerySidecar.sessionCheck());
+        case "login":
+          return JSON.stringify(await grocerySidecar.login(params.email as string | undefined, params.password as string | undefined));
+        case "verify_otp": {
+          const code = params.code as string | undefined;
+          if (!code) return JSON.stringify({ error: "verify_otp requires { code }" });
+          return JSON.stringify(await grocerySidecar.verifyOtp(code, params.channel as string | undefined));
+        }
+        case "search": {
+          const query = params.query as string | undefined;
+          if (!query) return JSON.stringify({ error: "search requires { query }" });
+          const limit = Number(params.limit);
+          return JSON.stringify(await grocerySidecar.search(query, Number.isFinite(limit) ? limit : undefined));
+        }
+        case "search_batch": {
+          const queries = params.queries;
+          if (!Array.isArray(queries)) return JSON.stringify({ error: "search_batch requires { queries: string[] }" });
+          const lpq = Number(params.limit_per_query);
+          return JSON.stringify(await grocerySidecar.searchBatch(queries.map(String), Number.isFinite(lpq) ? lpq : undefined));
+        }
+        case "products_by_id": {
+          const prodIds = params.prodIds;
+          if (!Array.isArray(prodIds)) return JSON.stringify({ error: "products_by_id requires { prodIds: number[] }" });
+          return JSON.stringify(await grocerySidecar.productsById(prodIds as Array<string | number>));
+        }
+        case "cart_view":
+          return JSON.stringify(await grocerySidecar.cartView());
+        case "cart_add": {
+          const items = params.items;
+          if (!Array.isArray(items)) return JSON.stringify({ error: "cart_add requires { items: [{ productId, quantity }] }" });
+          return JSON.stringify(await grocerySidecar.cartAdd(items as any));
+        }
+        case "cart_remove": {
+          const productId = params.productId;
+          if (productId == null) return JSON.stringify({ error: "cart_remove requires { productId }" });
+          return JSON.stringify(await grocerySidecar.cartRemove(productId as any));
+        }
+        case "submit_for_approval": {
+          const title = (params.title as string) ?? "Grocery cart for review";
+          const body = (params.body_md as string) ?? "(empty cart)";
+          const result = await sendCartForApproval(title, body);
+          return JSON.stringify(result);
+        }
+        case "kg_list":
+          return JSON.stringify({ pages: kgList() });
+        case "kg_read": {
+          const page = params.page as string | undefined;
+          if (!page) return JSON.stringify({ error: "kg_read requires { page }" });
+          return JSON.stringify({ page, content: kgRead(page) });
+        }
+        case "kg_write": {
+          const page = params.page as string | undefined;
+          const content = params.content as string | undefined;
+          if (!page || content == null) return JSON.stringify({ error: "kg_write requires { page, content }" });
+          kgWrite(page, content);
+          return JSON.stringify({ success: true, page });
+        }
+        case "kg_append": {
+          const page = params.page as string | undefined;
+          const content = params.content as string | undefined;
+          if (!page || content == null) return JSON.stringify({ error: "kg_append requires { page, content }" });
+          kgAppend(page, content);
+          return JSON.stringify({ success: true, page });
+        }
+        case "record_order": {
+          const date = (params.date as string) || new Date().toISOString().slice(0, 10);
+          const order = params.order as OrderRecord | undefined;
+          if (!order || !Array.isArray(order.items_ordered)) {
+            return JSON.stringify({ error: "record_order requires { order: { items_ordered: [...] } }" });
+          }
+          const page = recordOrder(date, order);
+          return JSON.stringify({ success: true, page });
+        }
+        default:
+          return JSON.stringify({ error: `Unknown action: ${input.action}` });
+      }
+    } catch (err: any) {
+      return JSON.stringify({ error: err?.message ?? String(err), kind: err?.kind });
+    }
+  },
+}) as Tool;
+
 // --- Agent Instructions (static prefix + skill file, cacheable per session) ---
 
 function buildInstructions(): string {
@@ -292,7 +426,7 @@ For each email provided:
 6. Report a brief summary: X emails checked, Y skipped, Z drafted, W sent`;
 }
 
-const agentTools: Tool[] = [gmailTool, notifyTool, meetupTool];
+const agentTools: Tool[] = [gmailTool, notifyTool, meetupTool, groceryTool];
 
 function createAgent(model: any, instructions: string = buildInstructions()): Agent {
   return new Agent({
@@ -306,7 +440,10 @@ function createAgent(model: any, instructions: string = buildInstructions()): Ag
 // Ad-hoc query mode: same tools, but the agent answers a one-off request
 // instead of running the email-triage workflow. Used by POST /api/ask.
 function buildQueryInstructions(): string {
-  return `You are AugmentAgent answering a one-off request from the operator. Use the available tools to answer, then reply with the answer only — no triage, no email processing, no Discord approval.
+  const grocerySkill = loadSkillFile("grocery");
+  const groceryLearned = loadLearnedPatterns("grocery");
+
+  return `You are AugmentAgent answering a one-off request from the operator. Use the available tools to answer, then reply with the answer only — no triage, no email processing, no Discord approval (unless the grocery workflow specifically requires it).
 
 ## Meetup events
 Use the meetup_events tool for any request about Meetup events. Group name → urlname mapping:
@@ -319,7 +456,13 @@ When asked for events (e.g. "C&C events on meetup", "upcoming Code & Coffee meet
    - **<title>** — <day, date, start time in a human-readable form>
    - <location: venue name + city, or "Online" if isOnline> · <url>
 3. Start with a one-line header like "Upcoming Code & Coffee events (<count> of <totalCount>):". If there are no events, say so plainly. If the tool returns an { error }, report it briefly (a stale-hash error means the Meetup API hash needs refreshing via /intercept).
-Keep it concise — title, time, location, link. No descriptions unless asked.`;
+Keep it concise — title, time, location, link. No descriptions unless asked.
+
+## Groceries
+Use the grocery tool for any request about ordering groceries, the staples list, pantry state, preferences, dislikes, or past orders. Knowledge lives in wiki/groceries/ — always read it before acting and write back what you learn.
+
+${grocerySkill}
+${groceryLearned}`;
 }
 
 // --- Run with retry + provider fallback ---
