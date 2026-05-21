@@ -432,6 +432,11 @@ impl ScheduledPostStatus {
 /// A user-scheduled recurring prompt/command (`/loop`, #104). The scheduler
 /// ticks every active row on its `interval_secs` cadence. Minimal model
 /// matching the `user_loops` table the store methods read/write.
+///
+/// `expires_at_ms` is an optional auto-stop deadline (wall-clock ms). When
+/// set, the scheduler transitions the row to `stopped` once `now >=
+/// expires_at_ms`. `None` means run forever (until manually stopped or
+/// auto-paused by repeated failures).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserLoop {
     pub id: String,
@@ -446,6 +451,7 @@ pub struct UserLoop {
     pub fail_count: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    pub expires_at_ms: Option<i64>,
 }
 
 /// #117 — an allowlisted repo the multi-repo agent-coding loop is permitted
