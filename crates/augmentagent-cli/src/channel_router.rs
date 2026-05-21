@@ -11,13 +11,23 @@
 //! argv. That keeps this file inside its allowlist (NEW file + main.rs only)
 //! and guarantees parity by construction — there's only one code path.
 //!
-//! Op coverage today: `Status | Login | Validate | Recent | PollOnce`. Channels
-//! that don't expose a given op return a clear "<channel> does not support
-//! op <op>" error rather than silently doing the wrong thing.
-//! `Arm | Disarm` land in issue #7.
+//! Op coverage today: `Arm | Disarm | Login | PollOnce | Recent | Status |
+//! Validate`. `arm/disarm` (#7) flip per-channel arming flags in the sqlite
+//! `config` table — the same row the dashboard's `getConfig()` reads (see
+//! `src/dashboard.ts:78` `getConfigStatus()`) so the CLI and dashboard agree
+//! on which channels are live. The daemon picks the flip up on next restart;
+//! the `arm` op emits JSON the `/setup` skill keys off (`restart_required`,
+//! `restart_cmd`) so it can offer the restart inline.
+//!
+//! Channels without an arming gate (e.g. `gmail`, which is on-by-default once
+//! Composio is connected) return a clean `"channel 'X' has no arming gate"`
+//! error rather than no-op silently. Other ops a channel doesn't expose
+//! return the existing "does not support op" error.
 
 use anyhow::{bail, Context, Result};
+use augmentagent_store::rusqlite;
 use clap::ValueEnum;
+use serde_json::json;
 use std::process::Stdio;
 use tokio::process::Command;
 
@@ -77,24 +87,35 @@ impl ChannelName {
 
 /// Cross-channel verbs the /setup skill and dashboard rely on. Each variant
 /// maps to the matching op on the per-channel `*Op` enum when one exists.
+///
+/// Order is alphabetical to match the `--help` rendering.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum ChannelOp {
+    /// Flip the channel's arming flag ON in the sqlite `config` table. The
+    /// flip is picked up by the daemon on next restart — `arm` prints JSON
+    /// the `/setup` skill keys off (`restart_required`, `restart_cmd`) so it
+    /// can offer the restart inline. Channels without an arming gate return
+    /// a clean error.
+    Arm,
+    /// Inverse of `arm` — flip the channel's arming flag OFF in the sqlite
+    /// `config` table.
+    Disarm,
+    /// Persist credentials (cookies / token / OAuth bundle).
+    Login,
+    /// Run one poll cycle and exit. Respects `--dry-run` (the per-channel
+    /// default is true).
+    PollOnce,
+    /// "Show me a few recent items" smoke test (read-only).
+    Recent,
     /// Print whether the channel is logged in / configured. Today only
     /// Discord, Whatsapp, and Browser expose a native `status` op; for the
     /// others we return a "does not support op status" error so the skill
     /// can fall back to `augmentagent status --json` (issue #1).
     Status,
-    /// Persist credentials (cookies / token / OAuth bundle).
-    Login,
     /// Read-only credential probe — does NOT log in. Twitter is the canonical
     /// implementation today.
     Validate,
-    /// "Show me a few recent items" smoke test (read-only).
-    Recent,
-    /// Run one poll cycle and exit. Respects `--dry-run` (the per-channel
-    /// default is true).
-    PollOnce,
 }
 
 impl ChannelOp {
@@ -102,13 +123,109 @@ impl ChannelOp {
     /// `PollOnce` to `poll-once`.
     pub fn as_subcommand(self) -> &'static str {
         match self {
-            ChannelOp::Status => "status",
+            ChannelOp::Arm => "arm",
+            ChannelOp::Disarm => "disarm",
             ChannelOp::Login => "login",
-            ChannelOp::Validate => "validate",
-            ChannelOp::Recent => "recent",
             ChannelOp::PollOnce => "poll-once",
+            ChannelOp::Recent => "recent",
+            ChannelOp::Status => "status",
+            ChannelOp::Validate => "validate",
         }
     }
+}
+
+/// Arming-key map. Returns `(sqlite_config_key, env_var)` for channels with a
+/// known arming gate, `None` for channels that are on-by-default (e.g.
+/// `gmail`, which arms itself once Composio is connected). The map mirrors
+/// the env-gate names already in `.env.example`; for `twitter` we coin
+/// `AUGMENTAGENT_TWITTER_REAL_ENABLED` to follow the same `_REAL_ENABLED` /
+/// `_ENABLED` pattern instagram + whatsapp use.
+///
+/// Exposed as a free function so `status.rs` can re-use it to surface
+/// `armed: true/false` per channel without duplicating the table.
+pub fn arming_keys_for(channel: &str) -> Option<(&'static str, &'static str)> {
+    match channel {
+        "instagram" => Some(("instagram_real_account_enabled", "INSTAGRAM_REAL_ACCOUNT_ENABLED")),
+        "twitter" => Some(("twitter_real_enabled", "AUGMENTAGENT_TWITTER_REAL_ENABLED")),
+        "linkedin" => Some(("linkedin_post_confirm", "AUGMENTAGENT_LINKEDIN_POST_CONFIRM")),
+        "whatsapp" => Some(("whatsapp_control_enabled", "AUGMENTAGENT_WHATSAPP_CONTROL_ENABLED")),
+        _ => None,
+    }
+}
+
+/// Boolean parse matching the existing channel-crate gate semantics (see
+/// `is_control_enabled` in `crates/augmentagent-channel-whatsapp/src/channel.rs`).
+/// Public so `status.rs` agrees on what "armed" means when surfacing the flag
+/// in `--json` output.
+pub fn is_truthy(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    !matches!(
+        s.to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
+/// Resolve the sqlite path the way `main.rs` does (matches `AUGMENTAGENT_DB`
+/// env-or-`./data.db`). Kept private — the only caller is the arming-flag
+/// reader/writer below.
+fn db_path() -> String {
+    std::env::var("AUGMENTAGENT_DB").unwrap_or_else(|_| "data.db".to_string())
+}
+
+/// Write one row to the dashboard's `config` table. Schema mirrors
+/// `src/db.ts:45`: `(key TEXT PK, value TEXT NOT NULL, updatedAt INTEGER
+/// NOT NULL)`. We `CREATE TABLE IF NOT EXISTS` defensively so this works on
+/// a box where the dashboard has never started (the daemon shares the same
+/// sqlite file but `Store::migrate` doesn't create `config` — that's the
+/// dashboard's responsibility today).
+fn write_config_value(key: &str, value: &str) -> Result<()> {
+    let conn = rusqlite::Connection::open(db_path())
+        .with_context(|| format!("open sqlite at {}", db_path()))?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS config (\
+             key TEXT PRIMARY KEY,\
+             value TEXT NOT NULL,\
+             updatedAt INTEGER NOT NULL\
+         )",
+        [],
+    )
+    .context("create config table")?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    conn.execute(
+        "INSERT INTO config (key, value, updatedAt) VALUES (?, ?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updatedAt = excluded.updatedAt",
+        rusqlite::params![key, value, now_ms],
+    )
+    .with_context(|| format!("upsert config row {key}"))?;
+    Ok(())
+}
+
+/// Flip the arming flag for a channel and print the JSON receipt the
+/// `/setup` skill keys off. `armed=true` ⇒ `arm`; `armed=false` ⇒ `disarm`.
+fn flip_armed(name: ChannelName, armed: bool) -> Result<()> {
+    let ch = name.as_subcommand();
+    let Some((sqlite_key, _env_key)) = arming_keys_for(ch) else {
+        bail!("channel '{ch}' has no arming gate");
+    };
+    let value = if armed { "true" } else { "false" };
+    write_config_value(sqlite_key, value)?;
+    println!(
+        "{}",
+        json!({
+            "channel": ch,
+            "armed": armed,
+            "config_key": sqlite_key,
+            "restart_required": true,
+            "restart_cmd": "augmentagent service restart",
+        })
+    );
+    Ok(())
 }
 
 /// `true` ⇒ this `(channel, op)` pair has a real handler in `main.rs`. Used
@@ -122,6 +239,12 @@ pub fn supports(name: ChannelName, op: ChannelOp) -> bool {
     use ChannelName::*;
     use ChannelOp::*;
     match (name, op) {
+        // ----- Arm / Disarm -------------------------------------------------
+        // Handled inline (no subprocess) — see `dispatch`. The router itself
+        // is the implementation, so `supports` is `true` exactly for the
+        // channels with a known arming gate. Channels without a gate still
+        // get a clean error from `dispatch`, just via a different code path.
+        (_, Arm) | (_, Disarm) => arming_keys_for(name.as_subcommand()).is_some(),
         // ----- Login --------------------------------------------------------
         (Discord, Login)
         | (Github, Login)
@@ -180,9 +303,24 @@ pub fn build_argv<S: AsRef<str>>(
 /// stderr so JSON-mode consumers (`--json`) see byte-identical bytes to a
 /// direct call. Exit code is mirrored.
 pub async fn dispatch(name: ChannelName, op: ChannelOp, args: Vec<String>) -> Result<()> {
+    // Arm/Disarm are inline — they write to the sqlite `config` table and
+    // print the restart-required JSON. No subprocess. `args` is ignored
+    // (these ops take no pass-through flags today).
+    match op {
+        ChannelOp::Arm => {
+            let _ = args; // explicit: no pass-through args for arm
+            return flip_armed(name, true);
+        }
+        ChannelOp::Disarm => {
+            let _ = args;
+            return flip_armed(name, false);
+        }
+        _ => {}
+    }
+
     if !supports(name, op) {
         bail!(
-            "{} does not support op {} (router knows: status | login | validate | recent | poll-once; arm/disarm land in issue #7)",
+            "{} does not support op {} (router knows: arm | disarm | status | login | validate | recent | poll-once)",
             name.as_subcommand(),
             op.as_subcommand()
         );
@@ -343,5 +481,58 @@ mod tests {
 
         let parsed = ChannelOp::from_str("poll-once", true).unwrap();
         assert_eq!(parsed, ChannelOp::PollOnce);
+
+        // #7 — arm / disarm parse as kebab-case singles.
+        assert_eq!(ChannelOp::from_str("arm", true).unwrap(), ChannelOp::Arm);
+        assert_eq!(
+            ChannelOp::from_str("disarm", true).unwrap(),
+            ChannelOp::Disarm
+        );
+    }
+
+    #[test]
+    fn arming_keys_cover_known_gates() {
+        // The four channels with an existing env-gate in `.env.example`.
+        // Twitter inherits the `_REAL_ENABLED` pattern; the daemon doesn't
+        // consume it yet — the flag's role today is to drive `status.armed`
+        // so the /setup skill can offer the restart.
+        assert!(arming_keys_for("instagram").is_some());
+        assert!(arming_keys_for("twitter").is_some());
+        assert!(arming_keys_for("linkedin").is_some());
+        assert!(arming_keys_for("whatsapp").is_some());
+        // Channels on-by-default once their credential is in place.
+        assert!(arming_keys_for("gmail").is_none());
+        assert!(arming_keys_for("slack").is_none());
+        assert!(arming_keys_for("discord").is_none());
+    }
+
+    #[test]
+    fn supports_arm_disarm_for_gated_channels() {
+        for ch in [
+            ChannelName::Twitter,
+            ChannelName::Linkedin,
+            ChannelName::Whatsapp,
+        ] {
+            assert!(supports(ch, ChannelOp::Arm), "Arm support for {ch:?}");
+            assert!(supports(ch, ChannelOp::Disarm), "Disarm support for {ch:?}");
+        }
+        // Gmail is on-by-default — `supports` is false, `dispatch` returns
+        // a clean "no arming gate" error.
+        assert!(!supports(ChannelName::Gmail, ChannelOp::Arm));
+        assert!(!supports(ChannelName::Gmail, ChannelOp::Disarm));
+    }
+
+    #[test]
+    fn truthy_parsing_matches_existing_gate_semantics() {
+        assert!(is_truthy("1"));
+        assert!(is_truthy("true"));
+        assert!(is_truthy("yes"));
+        assert!(is_truthy("on"));
+        assert!(!is_truthy(""));
+        assert!(!is_truthy("0"));
+        assert!(!is_truthy("false"));
+        assert!(!is_truthy("FALSE"));
+        assert!(!is_truthy("off"));
+        assert!(!is_truthy("no"));
     }
 }
