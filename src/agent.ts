@@ -16,6 +16,7 @@ import { createDraft, sendDraft } from "./gmailService";
 import { getGroupEvents } from "./meetupService";
 import { sendForApproval } from "./discordService";
 import { logAction, updateActionStatus, markEmailProcessed } from "./db";
+import { extractEmailAddress } from "./types";
 import type { Email } from "./types";
 
 dotenv.config();
@@ -164,9 +165,9 @@ const gmailTool = (tool as any)({
 const notifyTool = (tool as any)({
   name: "notify",
   description: `Send notifications, log actions, and learn patterns. Available actions:
-- send_for_approval: Send email + draft to Discord for human approval (opens a thread). User can approve, revise (with feedback), or skip. params: { email: { messageId, threadId, from, subject, body, date }, draft: string }. Returns { approved: boolean, finalDraft: string }. IMPORTANT: use finalDraft (not your original draft) for creating the Gmail draft, as the user may have revised it.
-- log_action: Record an action to the database. params: { messageId: string, fromEmail: string, subject: string, originalBody?: string, draftBody?: string, status: "pending"|"approved"|"rejected"|"sent"|"error"|"skipped"|"flagged" }. Returns { actionId: string }
-- update_action: Update an existing action's status. params: { actionId: string, status: string, draftBody?: string, errorMessage?: string }
+- send_for_approval: Send email + draft to Discord for human approval (opens a thread). User can approve, revise (with feedback), skip, or change the recipient. params: { actionId: string, email: { messageId, threadId, from, subject, body, date }, draft: string, recipientEmail: string }. Returns { approved: boolean, finalDraft: string, finalRecipient: string }. IMPORTANT: use finalDraft AND finalRecipient (not the originals) for creating the Gmail draft — the user may have revised either.
+- log_action: Record an action to the database. params: { messageId: string, fromEmail: string, recipientEmail?: string, subject: string, originalBody?: string, draftBody?: string, status: "pending"|"approved"|"rejected"|"sent"|"error"|"skipped"|"flagged" }. Returns { actionId: string }
+- update_action: Update an existing action's status. params: { actionId: string, status: string, draftBody?: string, recipientEmail?: string, errorMessage?: string }
 - learn_pattern: Save a pattern for future triage. params: { type: "sender"|"domain"|"subject"|"style", pattern: string, action: "skip"|"flag"|"reply", reason: string }
 - mark_processed: Mark an email as processed with triage result. params: { messageId: string, triageResult: "reply"|"skip"|"flag" }`,
   parameters: z.object({
@@ -178,14 +179,29 @@ const notifyTool = (tool as any)({
       case "send_for_approval": {
         const email = input.params.email as Email;
         const draft = input.params.draft as string;
-        const result = await sendForApproval(email, draft);
+        // #36: recipientEmail flows through so the Discord card can display a
+        // "To:" line AND offer a Change-To override. Falls back to the parsed
+        // sender if the agent forgot to pass it (older prompts).
+        const initialRecipient =
+          (input.params.recipientEmail as string | undefined) ||
+          extractEmailAddress(email.from);
+        const actionId = input.params.actionId as string | undefined;
+        const result = await sendForApproval(email, draft, actionId, initialRecipient);
         return JSON.stringify(result);
       }
       case "log_action": {
+        // #36: default recipientEmail to the parsed sender so the action row
+        // always carries the address that WILL be used at send time. The UI
+        // and the agent can both edit it later via update_action.
+        const fromEmail = input.params.fromEmail as string;
+        const recipientEmail =
+          (input.params.recipientEmail as string | undefined) ||
+          extractEmailAddress(fromEmail);
         const actionId = logAction({
           messageId: input.params.messageId as string,
           threadId: input.params.threadId as string | undefined,
-          fromEmail: input.params.fromEmail as string,
+          fromEmail,
+          recipientEmail,
           subject: input.params.subject as string,
           originalBody: input.params.originalBody as string | undefined,
           draftBody: input.params.draftBody as string | undefined,
@@ -200,6 +216,7 @@ const notifyTool = (tool as any)({
           {
             draftBody: input.params.draftBody as string | undefined,
             errorMessage: input.params.errorMessage as string | undefined,
+            recipientEmail: input.params.recipientEmail as string | undefined,
           }
         );
         return JSON.stringify({ success: true });
@@ -280,13 +297,14 @@ For each email provided:
    - call notify({ action: "log_action", params: { messageId, fromEmail, subject, status: "flagged" } })
    - call notify({ action: "mark_processed", params: { messageId, triageResult: "flag" } })
 4. If REPLY:
-   - call notify({ action: "log_action", params: { messageId, fromEmail, subject, originalBody, status: "pending" } })
+   - Determine recipientEmail: the bare email address parsed out of the email's "from" header (strip any display name and angle brackets). The operator can override this on the approval card.
+   - call notify({ action: "log_action", params: { messageId, fromEmail, recipientEmail, subject, originalBody, status: "pending" } })
    - Draft a reply following the Writing Style rules strictly
    - call notify({ action: "update_action", params: { actionId, status: "pending", draftBody: <draft> } })
-   - call notify({ action: "send_for_approval", params: { email, draft } })
-   - The result includes { approved, finalDraft }. The user may have revised the draft in Discord.
-   - If approved: use finalDraft (not your original draft) for create_draft, then send_draft, update status to "sent"
-   - If not approved: update status to "rejected"
+   - call notify({ action: "send_for_approval", params: { actionId, email, draft, recipientEmail } })
+   - The result includes { approved, finalDraft, finalRecipient }. The user may have revised the draft AND/OR changed the recipient in Discord.
+   - If approved: call gmail({ action: "create_draft", params: { to: finalRecipient, subject, body: finalDraft, threadId, entityId } }), then send_draft, then update_action to "sent"
+   - If not approved: update_action to "rejected"
    - call notify({ action: "mark_processed", params: { messageId, triageResult: "reply" } })
 5. After processing all emails, call learn_pattern for any new skip/flag patterns you discovered
 6. Report a brief summary: X emails checked, Y skipped, Z drafted, W sent`;
