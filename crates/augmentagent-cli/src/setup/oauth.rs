@@ -61,8 +61,7 @@ const EXIT_INTERRUPTED: i32 = 130;
 #[derive(Args, Debug, Clone)]
 pub struct OauthArgs {
     /// Which OAuth provider to drive. Maps 1:1 to a dashboard
-    /// `/oauth/<slug>/start` (or `/api/reddit/auth`) route — see
-    /// [`OauthProvider::start_path`].
+    /// `/oauth/<slug>/start` route — see [`OauthProvider::start_path`].
     #[arg(value_enum)]
     pub provider: OauthProvider,
 
@@ -116,16 +115,17 @@ impl OauthProvider {
         }
     }
 
-    /// Path on the dashboard that bootstraps the OAuth redirect. Reddit
-    /// lives under `/api/reddit/auth` (it's not a `/oauth/<x>/start` route —
-    /// it shells out to `augmentagent reddit auth-url` internally), the
-    /// rest follow the conventional shape.
+    /// Path on the dashboard that bootstraps the OAuth redirect. All
+    /// providers now follow the `/oauth/<slug>/start` convention (issue
+    /// #34) — Reddit used to be a special case under `/api/reddit/auth`,
+    /// which is still served as an alias for backward compat but no longer
+    /// has to leak into the orchestrator.
     fn start_path(self) -> &'static str {
         match self {
             OauthProvider::Gmail => "/oauth/gmail/start",
             OauthProvider::Drive => "/oauth/googledrive/start",
             OauthProvider::Slack => "/oauth/slack/start",
-            OauthProvider::Reddit => "/api/reddit/auth",
+            OauthProvider::Reddit => "/oauth/reddit/start",
         }
     }
 }
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(OauthProvider::Gmail.start_path(), "/oauth/gmail/start");
         assert_eq!(OauthProvider::Drive.start_path(), "/oauth/googledrive/start");
         assert_eq!(OauthProvider::Slack.start_path(), "/oauth/slack/start");
-        assert_eq!(OauthProvider::Reddit.start_path(), "/api/reddit/auth");
+        assert_eq!(OauthProvider::Reddit.start_path(), "/oauth/reddit/start");
     }
 
     #[test]

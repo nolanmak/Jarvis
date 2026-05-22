@@ -35,13 +35,15 @@ wants Reddit on.
    `http://localhost:<DASHBOARD_PORT>/api/reddit/callback`.
 3. Build the start URL from the reported port:
    ```
-   http://localhost:<dashboard.port>/api/reddit/auth
+   http://localhost:<dashboard.port>/oauth/reddit/start
    ```
-   Note Reddit lives under `/api/reddit/*` on the dashboard, not under
-   `/oauth/<provider>/*` like Gmail/Drive/Slack.
+   The legacy `/api/reddit/auth` path is still served as an alias for
+   apps registered against the original URI; new flows should use the
+   canonical `/oauth/reddit/start` form so they match Gmail/Drive/Slack.
 4. Tell the user to open that URL, sign in to Reddit, and click Allow.
-   The callback at `/api/reddit/callback` finishes the exchange and the
-   dashboard prints "Reddit connected".
+   The callback at `/oauth/reddit/callback` (or the legacy
+   `/api/reddit/callback`, both routed to the same handler) finishes the
+   exchange and the dashboard prints "Reddit connected".
 5. Alternative headless flow (if the user cannot use a browser on the
    daemon host): generate the URL with the CLI and exchange the code
    manually:
