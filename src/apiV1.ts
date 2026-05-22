@@ -347,7 +347,14 @@ function cliPath(): string {
 
 const reddit = Router();
 
-reddit.get("/api/reddit/auth", (_req, res) => {
+// Handlers are pulled out as named consts so we can mount them at BOTH the
+// historical `/api/reddit/*` paths AND the canonical `/oauth/reddit/*` aliases
+// (issue #34). The `/oauth/<slug>/start` + `/oauth/<slug>/callback` shape is
+// what every other provider uses, so the CLI orchestrator and the `/setup`
+// skill can stop special-casing Reddit. The originals stay live for backward
+// compat — anything pinned to the old paths (registered Reddit app redirect
+// URIs, bookmarks, docs in the wild) keeps working untouched.
+const redditAuthHandler = (_req: Request, res: Response): void => {
   if (!REDDIT_CLIENT_ID) {
     res.status(503).send("REDDIT_CLIENT_ID not configured");
     return;
@@ -372,9 +379,9 @@ reddit.get("/api/reddit/auth", (_req, res) => {
       res.redirect(stdout.trim());
     }
   );
-});
+};
 
-reddit.get("/api/reddit/callback", (req, res) => {
+const redditCallbackHandler = (req: Request, res: Response): void => {
   const code = String(req.query.code || "");
   if (!code) {
     res.status(400).send("missing ?code");
@@ -403,7 +410,17 @@ reddit.get("/api/reddit/callback", (req, res) => {
       );
     }
   );
-});
+};
+
+reddit.get("/api/reddit/auth", redditAuthHandler);
+reddit.get("/api/reddit/callback", redditCallbackHandler);
+
+// Canonical `/oauth/<slug>/start` + `/oauth/<slug>/callback` aliases (issue
+// #34). Same handlers, same redirect-URI env (`REDDIT_REDIRECT` still defaults
+// to the legacy `/api/reddit/callback` path, so a Reddit app registered
+// against the old URI keeps round-tripping correctly through either entry).
+reddit.get("/oauth/reddit/start", redditAuthHandler);
+reddit.get("/oauth/reddit/callback", redditCallbackHandler);
 
 apiV1Router.use(reddit);
 
