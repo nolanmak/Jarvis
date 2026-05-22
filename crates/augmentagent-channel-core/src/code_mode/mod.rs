@@ -20,4 +20,4 @@
 
 pub mod manifest;
 
-pub use manifest::{manifest_v1, ToolDef, ToolManifest};
+pub use manifest::{manifest_v1, ToolCallRecord, ToolDef, ToolManifest};
