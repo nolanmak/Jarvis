@@ -570,6 +570,32 @@ impl Store {
             )?;
         }
 
+        // #48 — Code Mode for AugmentAgent. Three additive columns on `actions`
+        // so a code-mode draft can persist the generated TypeScript program and
+        // its tool-call trace next to the existing draft body. `mode` is the
+        // discriminator — `'classic'` (the existing one-shot draft prompt) or
+        // `'code'` (the Cloudflare-style TS program executed in the Deno
+        // sidecar); defaults to `'classic'` so pre-existing rows + every classic
+        // path call site stay byte-identical. `generatedSource` is the full TS
+        // program (only populated when `mode = 'code'`, or when a failed
+        // code-mode program is recorded after fallback for audit); nullable for
+        // classic rows. `toolCallTrace` is a JSON array of
+        // `{call, args_summary, result_summary, error?}` records — see
+        // `ToolCallRecord` in `augmentagent-store::models`. Nullable for
+        // classic rows.
+        if !column_exists(conn, "actions", "mode")? {
+            conn.execute(
+                "ALTER TABLE actions ADD COLUMN mode TEXT NOT NULL DEFAULT 'classic'",
+                [],
+            )?;
+        }
+        if !column_exists(conn, "actions", "generatedSource")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN generatedSource TEXT", [])?;
+        }
+        if !column_exists(conn, "actions", "toolCallTrace")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN toolCallTrace TEXT", [])?;
+        }
+
         // #81 — Proactive CRM signals + per-scan run cursor.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS proactive_signals (\
@@ -1128,6 +1154,11 @@ impl Store {
             _ => None,
         };
         let guard = self.conn.lock().expect("store mutex poisoned");
+        // #48: `mode`/`generatedSource`/`toolCallTrace` are intentionally
+        // omitted from the column list — the migration's column defaults
+        // populate them as 'classic' / NULL / NULL so the classic path stays
+        // byte-identical post-migration. Code-mode callers use the dedicated
+        // `log_action_code_mode` helper.
         guard.execute(
             "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9, 0, ?10)",
@@ -1145,6 +1176,104 @@ impl Store {
             ],
         )?;
         Ok(id)
+    }
+
+    /// #48 — code-mode draft variant of [`Self::log_action`]. Persists the
+    /// generated TypeScript program (`generated_source`) and the tool-call
+    /// trace alongside the standard action row, with `mode = 'code'`.
+    ///
+    /// Call this from the code-mode dispatcher's terminal `tools.draft` path
+    /// (and from the fallback bookkeeping when a failed code-mode program is
+    /// recorded for audit before falling back to the classic prompt). The
+    /// classic-path code keeps calling [`Self::log_action`] — no behavior
+    /// change there.
+    ///
+    /// `trace` is serialized to a compact JSON array and stored in the
+    /// `toolCallTrace` column. Round-tripping through `serde_json` is the
+    /// only failure mode that's not a SQLite error, hence the explicit
+    /// `expect`: the [`crate::models::ToolCallRecord`] struct is pure data
+    /// with no custom `Serialize` impls, so a panic here would indicate a
+    /// programmer bug (e.g. someone added a non-serializable field), not a
+    /// runtime condition worth threading a new error variant for.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_action_code_mode(
+        &self,
+        message_id: &str,
+        thread_id: Option<&str>,
+        from_email: &str,
+        subject: &str,
+        original_body: Option<&str>,
+        draft_body: Option<&str>,
+        status: ActionStatus,
+        generated_source: &str,
+        trace: &[crate::models::ToolCallRecord],
+    ) -> StoreResult<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_millis();
+        let next_nudge_at_ms = match status {
+            ActionStatus::Pending => Some(now + NUDGE_INTERVAL_MS),
+            _ => None,
+        };
+        let trace_json = serde_json::to_string(trace)
+            .expect("ToolCallRecord serialization is infallible for pure-data fields");
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs, mode, generatedSource, toolCallTrace) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9, 0, ?10, 'code', ?11, ?12)",
+            params![
+                id,
+                message_id,
+                thread_id,
+                from_email,
+                subject,
+                original_body,
+                draft_body,
+                status.as_str(),
+                now,
+                next_nudge_at_ms,
+                generated_source,
+                trace_json,
+            ],
+        )?;
+        Ok(id)
+    }
+
+    /// #48 — read the code-mode fields for a single action. `mode` is always
+    /// non-NULL (defaulted to `'classic'` by the migration); `generated_source`
+    /// and `tool_call_trace` are `None` for classic rows. Used by tests +
+    /// downstream postmortem / audit code.
+    pub fn action_code_mode_fields(
+        &self,
+        action_id: &str,
+    ) -> StoreResult<Option<ActionCodeModeFields>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row: Option<(String, Option<String>, Option<String>)> = guard
+            .query_row(
+                "SELECT mode, generatedSource, toolCallTrace FROM actions WHERE id = ?1",
+                params![action_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((mode, generated_source, trace_json)) = row else {
+            return Ok(None);
+        };
+        let tool_call_trace = match trace_json {
+            Some(s) => Some(
+                serde_json::from_str::<Vec<crate::models::ToolCallRecord>>(&s).map_err(|e| {
+                    StoreError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    ))
+                })?,
+            ),
+            None => None,
+        };
+        Ok(Some(ActionCodeModeFields {
+            mode,
+            generated_source,
+            tool_call_trace,
+        }))
     }
 
     /// Log a `flagged` action and persist the triage flag `reason` into the
@@ -4803,6 +4932,17 @@ pub struct RetryableReply {
     pub email: Email,
 }
 
+/// #48 — the three code-mode columns on `actions`, returned by
+/// [`Store::action_code_mode_fields`]. `mode` is `'classic'` or `'code'` (never
+/// NULL post-migration). For classic rows `generated_source` and
+/// `tool_call_trace` are `None`; for code-mode rows both are populated.
+#[derive(Debug, Clone)]
+pub struct ActionCodeModeFields {
+    pub mode: String,
+    pub generated_source: Option<String>,
+    pub tool_call_trace: Option<Vec<crate::models::ToolCallRecord>>,
+}
+
 /// One row from `draft_revisions` (#37). The full chain for a given action is
 /// `iteration = 0, 1, 2, ...` with `outcome ∈ { superseded, pending, approved,
 /// skipped }`. `feedbackText` is the user's Revise feedback for this draft;
@@ -6265,5 +6405,195 @@ mod tests {
         let decided = s.connection_request_by_id(&id).unwrap().unwrap();
         assert_eq!(decided.decision, "accept");
         assert!(decided.decided_at_ms.is_some());
+    }
+
+    // ---- #48 code-mode actions schema --------------------------------
+
+    #[test]
+    fn migration_adds_code_mode_columns_on_fresh_store() {
+        // `fresh_store` creates the pre-#48 `actions` schema by hand, then
+        // opens Store which runs `migrate()`. The new columns must be present
+        // and `mode` must default to 'classic' for any inserted row that
+        // doesn't set it.
+        let (s, f) = fresh_store();
+        let id = s
+            .log_action(
+                "m1",
+                None,
+                "alice@example.com",
+                "s",
+                None,
+                Some("d"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        let conn = Connection::open(f.path()).unwrap();
+        let (mode, source, trace): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT mode, generatedSource, toolCallTrace FROM actions WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(mode, "classic", "classic log_action defaults mode to 'classic'");
+        assert!(source.is_none(), "classic rows leave generatedSource NULL");
+        assert!(trace.is_none(), "classic rows leave toolCallTrace NULL");
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        // Opening Store twice must not error on the second run — every
+        // ALTER TABLE is guarded by `column_exists`.
+        let file = NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(file.path()).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE actions (
+                    id TEXT PRIMARY KEY,
+                    messageId TEXT NOT NULL,
+                    threadId TEXT,
+                    fromEmail TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    originalBody TEXT,
+                    draftBody TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    errorMessage TEXT,
+                    createdAt INTEGER NOT NULL,
+                    updatedAt INTEGER NOT NULL
+                );
+                CREATE TABLE emails (
+                    messageId TEXT PRIMARY KEY,
+                    threadId TEXT,
+                    fromEmail TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    body TEXT,
+                    receivedAt TEXT,
+                    accountEntityId TEXT,
+                    firstSeenAt INTEGER NOT NULL,
+                    triageResult TEXT,
+                    agentProcessedAt INTEGER,
+                    platform TEXT NOT NULL DEFAULT 'gmail',
+                    kind TEXT NOT NULL DEFAULT 'dm'
+                );
+                CREATE TABLE gmail_accounts (
+                    id TEXT PRIMARY KEY,
+                    connectionId TEXT NOT NULL,
+                    email TEXT,
+                    label TEXT,
+                    entityId TEXT NOT NULL,
+                    active INTEGER DEFAULT 1,
+                    createdAt INTEGER NOT NULL
+                );
+                "#,
+            )
+            .unwrap();
+        }
+        let _s1 = Store::open(file.path()).unwrap();
+        let _s2 = Store::open(file.path()).unwrap();
+    }
+
+    #[test]
+    fn log_action_code_mode_persists_source_and_trace_round_trip() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("c1")).unwrap();
+        let trace = vec![
+            crate::models::ToolCallRecord {
+                call: "db.recentEmailsFrom".into(),
+                args_summary: "sender=alice@example.com, days=30".into(),
+                result_summary: "3 results".into(),
+                error: None,
+            },
+            crate::models::ToolCallRecord {
+                call: "tools.draft".into(),
+                args_summary: "channel=gmail, body_len=142".into(),
+                result_summary: "ok".into(),
+                error: None,
+            },
+        ];
+        let source = "async function main() { /* ... */ }\nmain();";
+        let id = s
+            .log_action_code_mode(
+                "c1",
+                Some("thr1"),
+                "alice@example.com",
+                "Re: thing",
+                Some("orig body"),
+                Some("drafted body"),
+                ActionStatus::Pending,
+                source,
+                &trace,
+            )
+            .unwrap();
+        let got = s
+            .action_code_mode_fields(&id)
+            .unwrap()
+            .expect("row must exist");
+        assert_eq!(got.mode, "code");
+        assert_eq!(got.generated_source.as_deref(), Some(source));
+        assert_eq!(got.tool_call_trace.as_deref(), Some(trace.as_slice()));
+    }
+
+    #[test]
+    fn log_action_code_mode_serializes_optional_error_field() {
+        // The trace's `error` field is `#[serde(skip_serializing_if = "Option::is_none")]`
+        // so calls without errors round-trip with `error: None`, and calls
+        // with a structured error round-trip with the message intact.
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("c2")).unwrap();
+        let trace = vec![crate::models::ToolCallRecord {
+            call: "tools.notAThing".into(),
+            args_summary: "".into(),
+            result_summary: "".into(),
+            error: Some("unknown tool: tools.notAThing".into()),
+        }];
+        let id = s
+            .log_action_code_mode(
+                "c2",
+                None,
+                "x@example.com",
+                "s",
+                None,
+                None,
+                ActionStatus::Error,
+                "// failed program",
+                &trace,
+            )
+            .unwrap();
+        let got = s
+            .action_code_mode_fields(&id)
+            .unwrap()
+            .expect("row must exist");
+        let decoded_trace = got.tool_call_trace.expect("trace populated");
+        assert_eq!(decoded_trace.len(), 1);
+        assert_eq!(
+            decoded_trace[0].error.as_deref(),
+            Some("unknown tool: tools.notAThing")
+        );
+    }
+
+    #[test]
+    fn classic_log_action_leaves_code_mode_fields_null() {
+        // Belt-and-suspenders: a classic-path action read back via the new
+        // helper returns mode='classic' with no source / no trace.
+        let (s, _f) = fresh_store();
+        let id = s
+            .log_action(
+                "cl",
+                None,
+                "a@example.com",
+                "s",
+                None,
+                Some("d"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        let got = s
+            .action_code_mode_fields(&id)
+            .unwrap()
+            .expect("row must exist");
+        assert_eq!(got.mode, "classic");
+        assert!(got.generated_source.is_none());
+        assert!(got.tool_call_trace.is_none());
     }
 }

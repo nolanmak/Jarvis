@@ -13,11 +13,11 @@ pub use models::{
     LinkedInConnectionSync, OwnPost, PhoneIdentity, RateAuditRow,
     RateEvent, RateHalt, RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace,
     SubscriptionMode, TelegramBot, ToneExample,
-    ToneProfile, TriageResult, UserLoop, WhatsappDevice,
+    ToneProfile, ToolCallRecord, TriageResult, UserLoop, WhatsappDevice,
 };
 pub use store::{
-    ActionWithEmail, PendingNudge, RetryableReply, RevisionRecord, Store, StoreError,
-    StoreResult, NUDGE_INTERVAL_MS,
+    ActionCodeModeFields, ActionWithEmail, PendingNudge, RetryableReply, RevisionRecord, Store,
+    StoreError, StoreResult, NUDGE_INTERVAL_MS,
 };
 
 /// Re-exported so extension crates (`augmentagent-proactive`, …) can write
