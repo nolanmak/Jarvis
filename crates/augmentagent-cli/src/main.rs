@@ -367,7 +367,7 @@ enum Cmd {
     Doctor {
         /// Force JSON (`--json`) or human table. Default: auto — JSON when
         /// stdout is piped, table on a tty.
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         json: Option<bool>,
         /// Add slower probes (Composio whoami ping; per-channel validate
         /// summaries sourced from `status`).
@@ -458,7 +458,7 @@ enum Cmd {
     Status {
         /// Force JSON (`--json true`) or human table (`--json false`).
         /// Default: auto — JSON when stdout is piped, table on a tty.
-        #[arg(long)]
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         json: Option<bool>,
         /// Narrow `channels` to just one entry (e.g. `--channel gmail`).
         #[arg(long)]
