@@ -15,10 +15,15 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
 mode="${1:-staged}"
 if [ "$mode" = "--tracked" ]; then
   mapfile -t files < <(git ls-files)
+  scan_added_only=0
 elif [ "$mode" = "staged" ]; then
   mapfile -t files < <(git diff --cached --name-only --diff-filter=ACM)
+  # pre-commit mode: scan added lines only (not whole files); avoids tripping on
+  # pre-existing strings the current commit doesn't touch.
+  scan_added_only=1
 else
   files=("$@")
+  scan_added_only=0
 fi
 [ "${#files[@]}" -eq 0 ] && exit 0
 
@@ -39,7 +44,6 @@ PAT
 
 fail=0
 for f in "${files[@]}"; do
-  [ -f "$f" ] || continue
   if printf '%s\n' "$f" | grep -qE "$BANNED_NAMES"; then
     echo "BLOCKED (must be gitignored, never tracked): $f" >&2
     fail=1
@@ -48,14 +52,31 @@ for f in "${files[@]}"; do
   case "$f" in
     *.example|*.example.*|.env.example|*/SECURITY.md|*/check-no-personal-data.sh) continue ;;
   esac
-  while IFS= read -r pat; do
-    [ -z "$pat" ] && continue
-    if hits=$(grep -nPI "$pat" "$f" 2>/dev/null); then
-      echo "POSSIBLE secret/PII in $f:" >&2
-      echo "$hits" | sed 's/^/  /' >&2
-      fail=1
-    fi
-  done <<< "$PATTERNS"
+  if [ "$scan_added_only" -eq 1 ]; then
+    # Only the lines this commit is adding — strip the leading '+' and the
+    # '+++ b/path' header so patterns see real content.
+    added=$(git diff --cached -U0 --diff-filter=AM -- "$f" \
+      | grep -E '^\+' | grep -v '^+++ ' | sed 's/^+//')
+    [ -z "$added" ] && continue
+    while IFS= read -r pat; do
+      [ -z "$pat" ] && continue
+      if hits=$(printf '%s\n' "$added" | grep -nP "$pat" 2>/dev/null); then
+        echo "POSSIBLE secret/PII in $f (added lines):" >&2
+        echo "$hits" | sed 's/^/  /' >&2
+        fail=1
+      fi
+    done <<< "$PATTERNS"
+  else
+    [ -f "$f" ] || continue
+    while IFS= read -r pat; do
+      [ -z "$pat" ] && continue
+      if hits=$(grep -nPI "$pat" "$f" 2>/dev/null); then
+        echo "POSSIBLE secret/PII in $f:" >&2
+        echo "$hits" | sed 's/^/  /' >&2
+        fail=1
+      fi
+    done <<< "$PATTERNS"
+  fi
 done
 
 if [ "$fail" -ne 0 ]; then
