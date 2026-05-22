@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use augmentagent_store::Email;
 
+use crate::code_mode::ToolManifest;
+
 /// System prompt for the triage-only call. Decides whether the user should
 /// hear about this email today, and if so, whether a reply is expected.
 pub const TRIAGE_SYSTEM: &str = r#"You are an email triage classifier for a busy person's inbox. For each email, pick exactly one:
@@ -271,6 +273,175 @@ Return ONLY the reply text — no JSON, no quotes, no commentary, no subject lin
     )
 }
 
+/// Static prefix of the Code-Mode system prompt.
+///
+/// Defines the role and the hard rules every generated program must obey.
+/// The full system prompt is this prefix concatenated with the rendered
+/// `.d.ts` from a [`ToolManifest`] (see [`code_mode_system`]). The two are
+/// emitted as a single string passed to `--system-prompt` on the `claude`
+/// CLI so the model sees role + rules + real type signatures in one block.
+///
+/// Cache-prefix discipline: this `&'static str` is byte-stable across calls,
+/// so when paired with the same manifest the rendered system prompt is
+/// byte-stable too — Claude's prompt cache can key on the prefix.
+pub const CODE_MODE_SYSTEM_PREFIX: &str = r#"You are writing a TypeScript program that drafts a reply on behalf of Nolan.
+
+Output one TypeScript program in a single fenced ```ts code block. No prose outside the fence. Put any reasoning in code comments above the function body.
+
+Hard rules — the runner WILL reject programs that violate any of these:
+
+1. Define exactly one top-level `async function main(): Promise<void>`. Call it once at the very bottom of the file with `await main();` (the only top-level await allowed).
+2. End the program with **exactly one** `tools.draft(...)` call. That call is the terminal action for the turn; no work should happen after it returns.
+3. No `import` statements. No `require`. No dynamic `import()`.
+4. No `fetch`, no `XMLHttpRequest`, no `WebSocket`, no `Deno.*`, no `process.*`, no `globalThis.*` writes. The sandbox runs with `--allow-none`; network and filesystem access will deny.
+5. Only call `tools.*` (the API declared below) and standard JavaScript built-ins (`Date`, `Math`, `JSON`, `Array`, `String`, `Number`, `Promise`, `console.log`, etc.).
+6. Keep reasoning in comments above `main`. Keep the body of `main` tight — fetch what you need via `tools.*`, decide, then call `tools.draft` once.
+7. Every `tools.*` call MUST be `await`-ed. They return Promises; missing `await` is a bug.
+
+The available tool surface is declared below as a TypeScript `.d.ts`. Treat every property's type signature as the source of truth.
+
+"#;
+
+/// Build the full Code-Mode system prompt from a [`ToolManifest`].
+///
+/// Concatenates [`CODE_MODE_SYSTEM_PREFIX`] with the manifest's rendered
+/// `.d.ts` block (see [`ToolManifest::to_dts`]). The result is intended to
+/// be passed to `Reasoner::call_code_mode` via `ReasonerOpts::system_prompt`.
+pub fn code_mode_system(manifest: &ToolManifest) -> String {
+    let mut out = String::with_capacity(CODE_MODE_SYSTEM_PREFIX.len() + 1024);
+    out.push_str(CODE_MODE_SYSTEM_PREFIX);
+    out.push_str(&manifest.to_dts());
+    out
+}
+
+/// Build the Code-Mode user message for the first attempt.
+///
+/// This mirrors the block ordering of [`draft_user_message`] EXACTLY so the
+/// model sees the same context budget (tone → thread → archetype → resolved
+/// asks → wiki hint → email body). The only differences from
+/// `draft_user_message` are:
+///
+/// 1. The lead instruction asks for a TypeScript program (not prose).
+/// 2. The tail instruction reminds the model to return one ```ts fenced
+///    block (not a verbatim reply).
+///
+/// The four `*_block` arguments are independent, optional, pre-rendered
+/// fragments — same semantics as in [`draft_user_message`]. Pass `""` to
+/// omit any of them; empty blocks produce no output (no surrounding
+/// whitespace either) so the cache-prefix bytes are stable.
+#[allow(clippy::too_many_arguments)]
+pub fn code_mode_user_message(
+    email: &Email,
+    wiki_hint: &str,
+    tone_block: &str,
+    thread_block: &str,
+    archetype_block: &str,
+    resolved_asks_block: &str,
+) -> String {
+    // Block rendering rules below are intentionally byte-for-byte identical
+    // to `draft_user_message`. If you change one, change both — the whole
+    // point of mirroring is shared context shape across classic + code-mode.
+    let hint_block = if wiki_hint.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{wiki_hint}\n")
+    };
+    let tone = if tone_block.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n<tone_profile>\n{tone_block}\n</tone_profile>\n\nMatch the voice in <tone_profile>. When verbatim opener/closer examples appear, weight them heavily — sign off the way the user actually signs off to this recipient.\n"
+        )
+    };
+    let thread = if thread_block.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n{thread_block}\nThe block above is the prior conversation in this thread, oldest first. Do not repeat questions already answered, honor commitments the user already made, and acknowledge anything already sent.\n"
+        )
+    };
+    let archetype = if archetype_block.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n{archetype_block}\nUse the archetype above to anchor the STRUCTURE and intent of the reply. Write natural prose in the user's voice — do not output the slot placeholders literally; fill them from the email, or omit cleanly if unknown.\n"
+        )
+    };
+    let resolved = if resolved_asks_block.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n{resolved_asks_block}\nThe block above lists asks in this email that have ALREADY been resolved to concrete values. When the email contains a matching ask, use the EXACT value provided — real calendar times, the real booking link, the real document link. NEVER write a placeholder like \"[link]\", \"[time]\", \"my Calendly\", or \"I'll send it shortly\" when a concrete value is given here. Any line marked SUGGESTION is advisory only: acknowledge the request but do NOT promise or perform it without the user's separate explicit approval.\n"
+        )
+    };
+    format!(
+        r#"Write a TypeScript program that drafts a reply to this email. Follow every hard rule in your system prompt; the runner will reject programs that violate them.{tone}{thread}{archetype}{resolved}{hint_block}
+
+<email>
+From: {from}
+Subject: {subject}
+Date: {date}
+ThreadId: {thread_id}
+MessageId: {message_id}
+
+{body}
+</email>
+
+Return ONLY a single fenced ```ts code block containing the program — no prose before or after the fence, no JSON, no extra commentary.
+"#,
+        from = email.from,
+        subject = email.subject,
+        date = email.date,
+        thread_id = email.thread_id.as_deref().unwrap_or("(none)"),
+        message_id = email.message_id,
+        body = email.body,
+    )
+}
+
+/// Build the Code-Mode user message for a self-repair retry.
+///
+/// Re-uses [`code_mode_user_message`] for the inbound context (so the
+/// archetype / thread / resolved-asks blocks are byte-identical to the
+/// failed attempt), then appends the prior failed program and the error
+/// message and asks for a corrected version. The appended blocks sit AFTER
+/// the original user message body so the cache prefix (system + the same
+/// initial blocks) is unchanged across the attempt.
+#[allow(clippy::too_many_arguments)]
+pub fn code_mode_repair_user_message(
+    email: &Email,
+    wiki_hint: &str,
+    tone_block: &str,
+    thread_block: &str,
+    archetype_block: &str,
+    resolved_asks_block: &str,
+    prior_source: &str,
+    prior_error: &str,
+) -> String {
+    let base = code_mode_user_message(
+        email,
+        wiki_hint,
+        tone_block,
+        thread_block,
+        archetype_block,
+        resolved_asks_block,
+    );
+    format!(
+        r#"{base}
+The previous attempt failed. Read the program and the error, then output a corrected program. Same hard rules apply.
+
+<prior_program>
+{prior_source}
+</prior_program>
+
+<prior_error>
+{prior_error}
+</prior_error>
+
+Return ONLY a single fenced ```ts code block containing the corrected program.
+"#
+    )
+}
+
 /// Build the redraft prompt when the user clicks "Revise" in Discord.
 pub fn redraft_message(email: &Email, previous_draft: &str, feedback: &str) -> String {
     format!(
@@ -422,5 +593,133 @@ mod tests {
         ];
         let out = format_thread_history(&msgs);
         assert!(out.find("first@x.com").unwrap() < out.find("second@x.com").unwrap());
+    }
+
+    // --- Code-Mode prompt builders (I5) ---
+
+    #[test]
+    fn code_mode_system_contains_role_rules_and_dts_header() {
+        let sys = code_mode_system(&crate::code_mode::manifest_v1());
+
+        // Role line (the "Role" requirement from the issue).
+        assert!(
+            sys.contains(
+                "You are writing a TypeScript program that drafts a reply on behalf of Nolan."
+            ),
+            "missing role line in:\n{sys}"
+        );
+        // The "exactly one tools.draft" hard rule.
+        assert!(
+            sys.contains("exactly one** `tools.draft("),
+            "missing 'exactly one tools.draft' rule in:\n{sys}"
+        );
+        // The literal `declare const tools` substring from the manifest dts.
+        assert!(
+            sys.contains("declare const tools"),
+            "missing dts header in:\n{sys}"
+        );
+        // Bans on import / fetch / Deno.* should all be stated.
+        assert!(sys.contains("No `import`"), "missing import ban");
+        assert!(sys.contains("No `fetch`"), "missing fetch ban");
+        assert!(sys.contains("Deno.*"), "missing Deno.* ban");
+        // Main signature spelled out.
+        assert!(
+            sys.contains("async function main(): Promise<void>"),
+            "missing main signature"
+        );
+    }
+
+    #[test]
+    fn code_mode_system_prefix_then_dts_in_that_order() {
+        let sys = code_mode_system(&crate::code_mode::manifest_v1());
+        let prefix_marker = "Hard rules";
+        let dts_marker = "declare const tools";
+        let i_prefix = sys.find(prefix_marker).expect("prefix present");
+        let i_dts = sys.find(dts_marker).expect("dts present");
+        assert!(i_prefix < i_dts, "prefix must appear before dts in:\n{sys}");
+    }
+
+    #[test]
+    fn code_mode_user_message_empty_blocks_lead_then_email() {
+        let got = code_mode_user_message(&email(), "", "", "", "", "");
+        assert!(
+            got.starts_with(
+                "Write a TypeScript program that drafts a reply to this email. Follow every hard rule in your system prompt; the runner will reject programs that violate them.\n\n<email>"
+            ),
+            "lead → email shape changed:\n{got}"
+        );
+        assert!(!got.contains("<tone_profile>"));
+        assert!(!got.contains("<thread_history>"));
+        assert!(!got.contains("<draft_archetype"));
+        assert!(!got.contains("<resolved_asks>"));
+        assert!(got.contains("the inbound message"));
+        assert!(got.contains("Return ONLY a single fenced ```ts code block"));
+    }
+
+    #[test]
+    fn code_mode_user_message_block_order_mirrors_classic_draft() {
+        // tone → thread → archetype → resolved → email, same as draft_user_message.
+        let out = code_mode_user_message(
+            &email(),
+            "",
+            "voice",
+            "<thread_history>\nT\n</thread_history>\n",
+            "<draft_archetype id=\"fyi\">\nF\n</draft_archetype>",
+            "<resolved_asks>\n- [scheduling] R\n</resolved_asks>",
+        );
+        let i_tone = out.find("<tone_profile>").unwrap();
+        let i_thread = out.find("<thread_history>").unwrap();
+        let i_arch = out.find("<draft_archetype").unwrap();
+        let i_resolved = out.find("<resolved_asks>").unwrap();
+        let i_email = out.find("<email>").unwrap();
+        assert!(i_tone < i_thread);
+        assert!(i_thread < i_arch);
+        assert!(i_arch < i_resolved);
+        assert!(i_resolved < i_email);
+    }
+
+    #[test]
+    fn code_mode_user_message_tone_prefix_cache_stable() {
+        // Same cache-stability guarantee draft_user_message offers: bytes
+        // from the start through </tone_profile> must be invariant whether
+        // or not thread/archetype/resolved-asks blocks are present.
+        let tone = "voice: terse";
+        let a = code_mode_user_message(&email(), "", tone, "", "", "");
+        let b = code_mode_user_message(
+            &email(),
+            "",
+            tone,
+            "<thread_history>\nx\n</thread_history>\n",
+            "<draft_archetype id=\"decline\">\nintent\n</draft_archetype>",
+            "<resolved_asks>\n- [calendly] link: z\n</resolved_asks>",
+        );
+        let marker = "</tone_profile>";
+        let a_pre = &a[..a.find(marker).unwrap() + marker.len()];
+        let b_pre = &b[..b.find(marker).unwrap() + marker.len()];
+        assert_eq!(a_pre, b_pre, "tone+system prefix must be cache-stable");
+    }
+
+    #[test]
+    fn code_mode_repair_user_message_appends_prior_program_and_error() {
+        let out = code_mode_repair_user_message(
+            &email(),
+            "",
+            "",
+            "",
+            "",
+            "",
+            "async function main(){ throw new Error('boom') } main();",
+            "Error: boom\n  at main (program.ts:1:23)",
+        );
+        // The original base message must be a prefix.
+        let base = code_mode_user_message(&email(), "", "", "", "", "");
+        assert!(out.starts_with(&base), "repair msg must extend base msg");
+        // The failed program and error must be present, in tagged blocks.
+        assert!(out.contains("<prior_program>"));
+        assert!(out.contains("async function main(){ throw new Error('boom') }"));
+        assert!(out.contains("<prior_error>"));
+        assert!(out.contains("Error: boom"));
+        // Closing instruction asks for ts again.
+        assert!(out.contains("Return ONLY a single fenced ```ts code block"));
     }
 }

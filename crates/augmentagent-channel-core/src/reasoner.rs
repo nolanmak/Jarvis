@@ -34,9 +34,62 @@ pub struct ReasonerOpts {
 }
 
 /// Trait the channel uses to reach Claude. Test doubles stub this.
+///
+/// `call_code_mode` and `call_code_mode_with_repair` are sibling entrypoints
+/// that reuse the same `claude` CLI machinery as `call`. They are provided
+/// as default trait methods so test doubles only need to stub `call` — the
+/// fenced-block extraction layer lives here, once.
 #[async_trait]
 pub trait Reasoner: Send + Sync {
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String>;
+
+    /// Code-Mode entrypoint. Spawns `claude` exactly like [`Reasoner::call`]
+    /// using the caller-provided system prompt (which should be built via
+    /// [`crate::prompt::code_mode_system`] from a manifest), parses the
+    /// stream-json output identically, then extracts the first fenced
+    /// ```ts``` or ```typescript``` block from the assistant text.
+    ///
+    /// Returns the source string (trimmed) on success. Returns
+    /// [`crate::code_mode::CodeModeError::NoCodeBlock`] (wrapped in
+    /// `anyhow::Error`) if the response has no fenced ts block.
+    async fn call_code_mode(
+        &self,
+        opts: &ReasonerOpts,
+        user_message: &str,
+    ) -> anyhow::Result<String> {
+        // Wrap the inner `call` error in `CodeModeError::ReasonerFailed` so
+        // callers can distinguish "claude itself failed" from "claude returned
+        // text but it had no fenced block".
+        let raw = match self.call(opts, user_message).await {
+            Ok(t) => t,
+            Err(e) => return Err(crate::code_mode::CodeModeError::ReasonerFailed(e).into()),
+        };
+        let source = crate::code_mode::extract_ts_block(&raw)?;
+        Ok(source)
+    }
+
+    /// Self-repair retry. Same wiring as [`Reasoner::call_code_mode`] but
+    /// the caller supplies the prior failed source and the error message,
+    /// which are appended to `user_message` before sending. The base
+    /// `user_message` should be the same string passed to the first
+    /// `call_code_mode` attempt so the cache prefix is preserved.
+    async fn call_code_mode_with_repair(
+        &self,
+        opts: &ReasonerOpts,
+        user_message: &str,
+        prior_source: &str,
+        prior_error: &str,
+    ) -> anyhow::Result<String> {
+        // Repair tail is byte-identical to the one in
+        // `crate::prompt::code_mode_repair_user_message` so the two ways of
+        // assembling a repair message (here in the reasoner, or pre-built
+        // by the caller via `code_mode_repair_user_message`) produce the
+        // same wire bytes given the same base message.
+        let repair_msg = format!(
+            "{user_message}\nThe previous attempt failed. Read the program and the error, then output a corrected program. Same hard rules apply.\n\n<prior_program>\n{prior_source}\n</prior_program>\n\n<prior_error>\n{prior_error}\n</prior_error>\n\nReturn ONLY a single fenced ```ts code block containing the corrected program.\n"
+        );
+        self.call_code_mode(opts, &repair_msg).await
+    }
 }
 
 pub struct ClaudeCliReasoner {
@@ -411,6 +464,140 @@ pub fn wiki_migrate_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerO
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Test double that records the args of the last `call` and returns a
+    /// canned string. Used to verify `call_code_mode` extracts the fenced
+    /// block from whatever the underlying `call` returns, without spawning
+    /// the real `claude` CLI.
+    struct CannedReasoner {
+        canned: String,
+        last_user: Mutex<Option<String>>,
+        last_system: Mutex<Option<String>>,
+        fail: bool,
+    }
+
+    impl CannedReasoner {
+        fn ok(canned: impl Into<String>) -> Self {
+            Self {
+                canned: canned.into(),
+                last_user: Mutex::new(None),
+                last_system: Mutex::new(None),
+                fail: false,
+            }
+        }
+        fn err() -> Self {
+            Self {
+                canned: String::new(),
+                last_user: Mutex::new(None),
+                last_system: Mutex::new(None),
+                fail: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Reasoner for CannedReasoner {
+        async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
+            *self.last_user.lock().unwrap() = Some(user_message.to_string());
+            *self.last_system.lock().unwrap() = Some(opts.system_prompt.clone());
+            if self.fail {
+                Err(anyhow::anyhow!("simulated claude failure"))
+            } else {
+                Ok(self.canned.clone())
+            }
+        }
+    }
+
+    fn dummy_opts() -> ReasonerOpts {
+        ReasonerOpts {
+            system_prompt: "stub".into(),
+            model: None,
+            allowed_tools: vec![],
+            add_dirs: vec![],
+            permission_mode: "default".into(),
+            cwd: None,
+            env: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn call_code_mode_returns_fenced_ts_body_verbatim() {
+        let canned = "Sure, here's the program:\n\n```ts\nasync function main(): Promise<void> {\n  await tools.draft(\"gmail\", \"hello\", \"reason\");\n}\nawait main();\n```\n";
+        let reasoner = CannedReasoner::ok(canned);
+        let got = reasoner
+            .call_code_mode(&dummy_opts(), "user")
+            .await
+            .expect("must extract ts block");
+        assert_eq!(
+            got,
+            "async function main(): Promise<void> {\n  await tools.draft(\"gmail\", \"hello\", \"reason\");\n}\nawait main();"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_code_mode_errors_when_no_fenced_block() {
+        let reasoner = CannedReasoner::ok("Sorry, I can't help with that.");
+        let err = reasoner
+            .call_code_mode(&dummy_opts(), "user")
+            .await
+            .expect_err("no code block must error");
+        // Downcast through the anyhow chain to verify the typed error.
+        let typed = err
+            .downcast_ref::<crate::code_mode::CodeModeError>()
+            .expect("error must be a CodeModeError");
+        assert!(matches!(
+            typed,
+            crate::code_mode::CodeModeError::NoCodeBlock
+        ));
+    }
+
+    #[tokio::test]
+    async fn call_code_mode_wraps_underlying_call_failure() {
+        let reasoner = CannedReasoner::err();
+        let err = reasoner
+            .call_code_mode(&dummy_opts(), "user")
+            .await
+            .expect_err("must surface call failure");
+        let typed = err
+            .downcast_ref::<crate::code_mode::CodeModeError>()
+            .expect("error must be a CodeModeError");
+        assert!(matches!(
+            typed,
+            crate::code_mode::CodeModeError::ReasonerFailed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn call_code_mode_with_repair_appends_prior_program_and_error() {
+        let canned = "```ts\nawait tools.draft(\"gmail\", \"fixed\", \"r\");\n```";
+        let reasoner = CannedReasoner::ok(canned);
+        let base_user = "Write a TypeScript program that drafts a reply.";
+        let got = reasoner
+            .call_code_mode_with_repair(
+                &dummy_opts(),
+                base_user,
+                "async function main(){ throw new Error('boom') } main();",
+                "Error: boom",
+            )
+            .await
+            .expect("repair succeeds");
+        assert_eq!(got, "await tools.draft(\"gmail\", \"fixed\", \"r\");");
+
+        // The user message sent to `call` must include both the base text
+        // and the failed program + error blocks.
+        let sent = reasoner
+            .last_user
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("call must have been invoked");
+        assert!(sent.contains(base_user), "missing base user msg: {sent}");
+        assert!(sent.contains("<prior_program>"));
+        assert!(sent.contains("throw new Error('boom')"));
+        assert!(sent.contains("<prior_error>"));
+        assert!(sent.contains("Error: boom"));
+    }
 
     #[test]
     fn ask_opts_ships_absolute_db_env() {
