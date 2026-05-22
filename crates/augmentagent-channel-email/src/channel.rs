@@ -18,7 +18,10 @@ use tracing::{error, info, warn};
 use async_trait::async_trait;
 
 use augmentagent_approval_discord::{ApprovalBroker, NoopBroker};
-use augmentagent_channel_core::code_mode::{self, manifest_v1, DefaultDispatcher, MessageContext};
+use augmentagent_channel_core::code_mode::{
+    self, handle_code_mode_failure, manifest_v1, report_classic_fallback, DefaultDispatcher,
+    DraftOutcome, FailureCtx, FailureStage, GhCliIssueRunner, GhIssueRunner, MessageContext,
+};
 use augmentagent_channel_core::decision::{parse as parse_decision, DecisionKind};
 use augmentagent_channel_core::ingest::{spawn_ingest, IngestTrigger};
 use augmentagent_channel_core::prompt::{
@@ -98,6 +101,10 @@ pub struct GmailChannel<G: GmailApi, R: Reasoner> {
     pub config: GmailChannelConfig,
     /// Schema contents (`wiki-skill.md`), lazily cached. `None` means wiki disabled.
     wiki_schema: Option<String>,
+    /// gh CLI runner for I7 postmortems. Behind a trait so tests can mock
+    /// the `gh issue create` invocation; production defaults to
+    /// [`GhCliIssueRunner`] which shells out to the `gh` binary on PATH.
+    gh_issue_runner: Arc<dyn GhIssueRunner>,
 }
 
 impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
@@ -142,7 +149,16 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             approvals,
             config,
             wiki_schema,
+            gh_issue_runner: Arc::new(GhCliIssueRunner::new()),
         }
+    }
+
+    /// Swap the gh-CLI runner used for I7 postmortem issues. Production
+    /// callers don't need this; tests pass a recording stub so the suite
+    /// never actually files issues on the real repo.
+    pub fn with_gh_issue_runner(mut self, runner: Arc<dyn GhIssueRunner>) -> Self {
+        self.gh_issue_runner = runner;
+        self
     }
 
     /// Build a channel with the no-op approval broker. Used when `dry_run = true`.
@@ -546,74 +562,138 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 //      the action id for us to pick up below.
                 //
                 // On ANY failure (reasoner spawn, missing fenced block, sandbox
-                // timeout, runtime exception, dispatcher error) we log + fall
-                // through to the classic prompt path so the user still gets a
-                // draft. I7 will replace this stub with the full self-repair +
-                // gh-issue + Discord-notice flow.
-                let code_mode_result: Result<Option<String>, anyhow::Error> = async {
-                    let manifest = manifest_v1();
-                    let system_prompt = code_mode_system(&manifest);
-                    let user_msg = code_mode_user_message(
-                        &email,
-                        &wiki_hint,
-                        &tone_block,
-                        &thread_block,
-                        &archetype_block,
-                        &resolve_outcome.block,
-                    );
-                    // Opts mirror `draft_opts`' shape: same permission mode,
-                    // no allowed_tools / add_dirs — the Deno sandbox is the
-                    // tool surface, not the host claude CLI's Read/Grep/Glob.
-                    let opts = augmentagent_channel_core::ReasonerOpts {
-                        system_prompt,
-                        model: None,
-                        allowed_tools: Vec::new(),
-                        add_dirs: Vec::new(),
-                        permission_mode: "default".into(),
-                        cwd: None,
-                        env: Vec::new(),
+                // timeout, runtime exception, dispatcher error) we hand off to
+                // `handle_code_mode_failure` (I7 / #53) which runs one
+                // self-repair pass. If the repair lands a working code-mode
+                // draft, we use it. Otherwise we fall through to the classic
+                // prompt path AND, after it lands its row, call
+                // `report_classic_fallback` to file the postmortem gh issue +
+                // post the Discord notice.
+                let manifest = manifest_v1();
+                let system_prompt = code_mode_system(&manifest);
+                let user_msg = code_mode_user_message(
+                    &email,
+                    &wiki_hint,
+                    &tone_block,
+                    &thread_block,
+                    &archetype_block,
+                    &resolve_outcome.block,
+                );
+                // Opts mirror `draft_opts`' shape: same permission mode, no
+                // allowed_tools / add_dirs — the Deno sandbox is the tool
+                // surface, not the host claude CLI's Read/Grep/Glob.
+                let code_mode_opts = augmentagent_channel_core::ReasonerOpts {
+                    system_prompt,
+                    model: None,
+                    allowed_tools: Vec::new(),
+                    add_dirs: Vec::new(),
+                    permission_mode: "default".into(),
+                    cwd: None,
+                    env: Vec::new(),
+                };
+                let message_ctx = MessageContext {
+                    channel: "gmail".to_string(),
+                    email: email.clone(),
+                    account_id: Some(entity_id.to_string()),
+                };
+
+                // Attempt 1: original program. Capture the source on a
+                // `NoCodeBlock`-vs-`RunnerError` distinction so the failure
+                // handler can pass the program text to the repair prompt.
+                let mut cm_source: String = String::new();
+                let cm_attempt: Result<String, (augmentagent_channel_core::code_mode::CodeModeError, FailureStage)> = async {
+                    let ts_source = match self.reasoner.call_code_mode(&code_mode_opts, &user_msg).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            // Downcast to CodeModeError when possible; otherwise
+                            // wrap. The repair prompt only sees the error text,
+                            // so the wrap fidelity is purely diagnostic.
+                            let cme = match e.downcast::<augmentagent_channel_core::code_mode::CodeModeError>() {
+                                Ok(cme) => cme,
+                                Err(other) => augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(other),
+                            };
+                            return Err((cme, FailureStage::CallCodeMode));
+                        }
                     };
-                    let ts_source = self
-                        .reasoner
-                        .call_code_mode(&opts, &user_msg)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("call_code_mode: {e}"))?;
+                    cm_source = ts_source.clone();
                     let dispatcher = DefaultDispatcher::new(
                         self.store.as_ref(),
-                        MessageContext {
-                            channel: "gmail".to_string(),
-                            email: email.clone(),
-                            account_id: Some(entity_id.to_string()),
-                        },
+                        message_ctx.clone(),
                         ts_source.clone(),
                     )
                     .with_wiki_hint(wiki_hint.clone());
-                    code_mode::run_program(&ts_source, &manifest, &dispatcher)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("run_program: {e}"))?;
-                    Ok(dispatcher.last_action_id())
+                    if let Err(e) = code_mode::run_program(&ts_source, &manifest, &dispatcher).await {
+                        // Wrap a RunnerError in CodeModeError::ReasonerFailed
+                        // so the failure handler has a uniform type. The
+                        // stage tag distinguishes the two layers; the
+                        // wrapped error text preserves the kind+message+stack.
+                        let wrapped = augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(
+                            anyhow::anyhow!("run_program: {e}"),
+                        );
+                        return Err((wrapped, FailureStage::RunProgram));
+                    }
+                    match dispatcher.last_action_id() {
+                        Some(id) => Ok(id),
+                        None => Err((
+                            augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(
+                                anyhow::anyhow!("code-mode program produced no draft call"),
+                            ),
+                            FailureStage::RunProgram,
+                        )),
+                    }
                 }
                 .await;
 
-                let code_mode_action_id = match code_mode_result {
-                    Ok(Some(action_id)) => Some(action_id),
-                    Ok(None) => {
-                        // Program completed without ever calling tools.draft.
-                        // No row was written, so there is nothing to clean up.
-                        // TODO(I7): replace stub fallback with handle_code_mode_failure
+                // Either Some(action_id) → keep going on the code-mode rail,
+                // or None + carried FailureRecord → run classic, then report.
+                let (code_mode_action_id, pending_classic_record): (
+                    Option<String>,
+                    Option<augmentagent_channel_core::code_mode::FailureRecord>,
+                ) = match cm_attempt {
+                    Ok(action_id) => (Some(action_id), None),
+                    Err((cme, stage)) => {
                         warn!(
                             message_id = %email.message_id,
-                            "code-mode program produced no draft call; falling back to classic"
+                            stage = ?stage,
+                            "code-mode attempt failed: {cme}; invoking self-repair"
                         );
-                        None
-                    }
-                    Err(e) => {
-                        // TODO(I7): replace stub fallback with handle_code_mode_failure
-                        error!(
-                            message_id = %email.message_id,
-                            "code-mode draft failed; falling back to classic: {e:#}"
-                        );
-                        None
+                        let failure_ctx = FailureCtx {
+                            reasoner: self.reasoner.as_ref(),
+                            opts: code_mode_opts.clone(),
+                            user_msg: user_msg.clone(),
+                            manifest: manifest.clone(),
+                            message_ctx: message_ctx.clone(),
+                            wiki_hint: wiki_hint.clone(),
+                            store: Arc::clone(&self.store),
+                            broker: Arc::clone(&self.approvals),
+                            gh: Arc::clone(&self.gh_issue_runner),
+                            email: email.clone(),
+                            channel: "gmail".to_string(),
+                            model: code_mode_opts.model.clone(),
+                            manifest_version: "v1",
+                        };
+                        match handle_code_mode_failure(&failure_ctx, &cm_source, &cme, stage).await
+                        {
+                            DraftOutcome::CodeMode {
+                                action_id,
+                                repair_used,
+                            } => {
+                                info!(
+                                    message_id = %email.message_id,
+                                    action_id = %action_id,
+                                    repair_used,
+                                    "code-mode self-repair succeeded"
+                                );
+                                (Some(action_id), None)
+                            }
+                            DraftOutcome::ClassicNeeded(record) => {
+                                error!(
+                                    message_id = %email.message_id,
+                                    "code-mode self-repair failed; falling back to classic"
+                                );
+                                (None, Some(record))
+                            }
+                        }
                     }
                 };
 
@@ -661,13 +741,15 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                         .await;
                 }
 
-                // --- 2c. Classic fallback (stub for I7).
+                // --- 2c. Classic fallback (I7).
                 //
-                // Reached only when code-mode failed above. Behavior here is
-                // intentionally the pre-#52 classic prompt path — same draft
-                // call, same needs-input marker append, same dispatch. I7 will
-                // wrap this in a `handle_code_mode_failure` helper that also
-                // emits the postmortem gh issue and Discord notice.
+                // Reached when code-mode failed AND self-repair didn't produce
+                // a working code-mode draft. Behaviour matches the pre-#52
+                // classic prompt path — same draft call, same needs-input
+                // marker append, same dispatch — except we then call
+                // `report_classic_fallback` to file the postmortem gh issue
+                // and post the Discord notice tagged with the classic
+                // action_id.
                 let draft_opts = crate::reasoner::draft_opts(
                     draft_skill.to_string(),
                     self.config.wiki_root.clone(),
@@ -709,7 +791,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 };
 
                 if self.config.dry_run {
-                    self.store.log_action(
+                    let action_id = self.store.log_action(
                         &email.message_id,
                         email.thread_id.as_deref(),
                         &email.from,
@@ -724,6 +806,28 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                         "[reply dry-run] {} from={} subject={}\n--- draft ---\n{}\n--- /draft ---",
                         email.message_id, email.from, email.subject, draft,
                     );
+                    // I7: file postmortem when classic fallback was triggered
+                    // by a code-mode failure. Successful repair never reaches
+                    // here (it returns Some(action_id) above), so this branch
+                    // is exclusively for "repair couldn't save it".
+                    if let Some(record) = pending_classic_record {
+                        let failure_ctx = FailureCtx {
+                            reasoner: self.reasoner.as_ref(),
+                            opts: code_mode_opts.clone(),
+                            user_msg: user_msg.clone(),
+                            manifest: manifest.clone(),
+                            message_ctx: message_ctx.clone(),
+                            wiki_hint: wiki_hint.clone(),
+                            store: Arc::clone(&self.store),
+                            broker: Arc::clone(&self.approvals),
+                            gh: Arc::clone(&self.gh_issue_runner),
+                            email: email.clone(),
+                            channel: "gmail".to_string(),
+                            model: code_mode_opts.model.clone(),
+                            manifest_version: "v1",
+                        };
+                        report_classic_fallback(&failure_ctx, &record, &action_id).await;
+                    }
                     self.maybe_ingest(
                         &email,
                         DecisionKind::Reply,
@@ -733,7 +837,47 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     );
                     return Ok(Some(DispatchOutcome::DryRun));
                 }
-                self.dispatch_reply(entity_id, email, draft, None).await
+
+                // Non-dry-run classic dispatch. To make the action_id known
+                // before `dispatch_reply` runs (so we can pass it to
+                // `report_classic_fallback`), we pre-create the row in
+                // `Pending` and let `dispatch_reply` reuse it via the
+                // `existing_action_id` arm.
+                let classic_action_id = if pending_classic_record.is_some() {
+                    Some(self.store.log_action(
+                        &email.message_id,
+                        email.thread_id.as_deref(),
+                        &email.from,
+                        &email.subject,
+                        Some(&email.body),
+                        Some(&draft),
+                        ActionStatus::Pending,
+                    )?)
+                } else {
+                    None
+                };
+                if let (Some(record), Some(action_id)) =
+                    (pending_classic_record.as_ref(), classic_action_id.as_ref())
+                {
+                    let failure_ctx = FailureCtx {
+                        reasoner: self.reasoner.as_ref(),
+                        opts: code_mode_opts.clone(),
+                        user_msg: user_msg.clone(),
+                        manifest: manifest.clone(),
+                        message_ctx: message_ctx.clone(),
+                        wiki_hint: wiki_hint.clone(),
+                        store: Arc::clone(&self.store),
+                        broker: Arc::clone(&self.approvals),
+                        gh: Arc::clone(&self.gh_issue_runner),
+                        email: email.clone(),
+                        channel: "gmail".to_string(),
+                        model: code_mode_opts.model.clone(),
+                        manifest_version: "v1",
+                    };
+                    report_classic_fallback(&failure_ctx, record, action_id).await;
+                }
+                self.dispatch_reply(entity_id, email, draft, classic_action_id)
+                    .await
             }
             // Capture / Meeting are wave-A wiki-ingest-only kinds emitted by
             // the voice and gcal channels respectively. The email triage
@@ -1169,6 +1313,25 @@ mod tests {
     use augmentagent_channel_core::ReasonerOpts;
     use augmentagent_store::Email;
 
+    /// Disable `gh issue create` for the entire test binary. Without this,
+    /// any test that traverses the I7 code-mode-failure → classic fallback
+    /// path would spawn the production gh CLI and (because dev boxes are
+    /// commonly authenticated) create a real issue on
+    /// `nolanmak/MyAgentAssistant`. The env-var check lives in
+    /// `GhCliIssueRunner::create_issue`; setting it once at module load is
+    /// cheaper than threading a mock runner through every existing
+    /// reply-flow test. Tests that DO want to assert gh invocations inject
+    /// a `RecordingGh` via `.with_gh_issue_runner(...)` — which bypasses
+    /// the env-var check entirely.
+    static GH_DISABLE_INIT: std::sync::Once = std::sync::Once::new();
+    fn disable_gh_for_tests() {
+        GH_DISABLE_INIT.call_once(|| {
+            // SAFETY: set once at module init before any test runs; no
+            // concurrent reads of this var.
+            std::env::set_var("AUGMENTAGENT_GH_DISABLE", "1");
+        });
+    }
+
     struct StubGmail {
         emails: Vec<Email>,
     }
@@ -1239,6 +1402,9 @@ mod tests {
     }
 
     fn tmp_store() -> (Arc<Store>, tempfile::NamedTempFile) {
+        // Belt-and-suspenders: any test that opens a store also disables
+        // the real `gh` CLI for the rest of the process.
+        disable_gh_for_tests();
         let file = tempfile::NamedTempFile::new().unwrap();
         {
             let conn = rusqlite::Connection::open(file.path()).unwrap();
@@ -1337,6 +1503,56 @@ mod tests {
         );
         let out = ch.poll_once().await.unwrap();
         assert_eq!(out.replied_dry_run, 1);
+    }
+
+    /// Mock gh-CLI runner that records every `gh issue create` call without
+    /// spawning the real binary. Returns canned issue numbers starting at
+    /// `next_number`. Wire into a `GmailChannel` via `.with_gh_issue_runner(...)`
+    /// so I7 postmortem tests never touch the production repo.
+    #[derive(Default)]
+    struct RecordingGh {
+        calls: std::sync::Mutex<Vec<(String, String, Vec<String>)>>,
+        next_number: std::sync::Mutex<u64>,
+    }
+    impl RecordingGh {
+        fn new(start: u64) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                next_number: std::sync::Mutex::new(start),
+            }
+        }
+    }
+    #[async_trait]
+    impl GhIssueRunner for RecordingGh {
+        async fn create_issue(
+            &self,
+            title: &str,
+            body: &str,
+            labels: &[&str],
+        ) -> anyhow::Result<u64> {
+            self.calls.lock().unwrap().push((
+                title.to_string(),
+                body.to_string(),
+                labels.iter().map(|s| s.to_string()).collect(),
+            ));
+            let mut n = self.next_number.lock().unwrap();
+            let out = *n;
+            *n += 1;
+            Ok(out)
+        }
+    }
+
+    /// No-op gh runner. Kept available as a swap-in for any future tests
+    /// that want to skip postmortem-issue assertions without falling back to
+    /// the env-var disable hook. Today every test either uses the env hook
+    /// (default path) or wires `RecordingGh` explicitly.
+    #[allow(dead_code)]
+    struct NoopGh;
+    #[async_trait]
+    impl GhIssueRunner for NoopGh {
+        async fn create_issue(&self, _: &str, _: &str, _: &[&str]) -> anyhow::Result<u64> {
+            Ok(0)
+        }
     }
 
     /// Broker that records every post without blocking. Used by tests to
@@ -2133,10 +2349,12 @@ mod tests {
 
     #[tokio::test]
     async fn code_mode_failure_falls_through_to_classic_path() {
-        // No Deno needed: the model returns a response WITHOUT a fenced TS
-        // block, so `call_code_mode` fails with NoCodeBlock and we land in
-        // the stub-fallback classic path. Verifies the TODO(I7) error arm
-        // doesn't break the existing reply pipeline.
+        // No Deno needed: code-mode response has no fenced block, repair
+        // retry also fails, classic kicks in. Verifies the I7 wiring lands a
+        // `mode='classic'` row, files a `code-mode-failure` gh issue (via
+        // the mock runner), and posts a Discord notice with the issue
+        // number. Also confirms the I7 helper does NOT break the
+        // pre-existing reply pipeline (approval card still gets posted).
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
@@ -2151,17 +2369,17 @@ mod tests {
                 kind: "dm".into(),
             }],
         });
-        // Triage → reply. Code-mode response is plain text (no fence) →
-        // call_code_mode errors → fallback consumes the SAME response as
-        // a classic draft body. ScriptedReasoner's default-on-empty returns
-        // the skip JSON if the queue drains; we put a third response so the
-        // classic call gets a clean string.
+        // Triage → reply. Two no-fence code-mode responses (initial + repair
+        // retry both fail). Fourth response feeds the classic prose-draft
+        // call.
         let reasoner = Arc::new(ScriptedReasoner::new([
             r#"{"decision":"reply","reason":"ping"}"#,
             "no fenced block here, just prose",
+            "still no fenced block — repair gave up",
             "Yes — shipping today.",
         ]));
         let broker = Arc::new(RecordingBroker::default());
+        let gh = Arc::new(RecordingGh::new(101));
         let ch = GmailChannel::new(
             store.clone(),
             gmail,
@@ -2172,14 +2390,16 @@ mod tests {
                 dry_run: false,
                 ..Default::default()
             },
-        );
+        )
+        .with_gh_issue_runner(gh.clone());
         let out = ch.poll_once().await.unwrap();
-        // Stub fallback path successfully ran classic draft → approval card.
+        // Classic path produced a draft → approval card posted.
         assert_eq!(out.awaiting_approval, 1);
         assert_eq!(out.errors, 0);
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
-        // Action row exists with mode='classic' (the fallback path uses
-        // log_action, not log_action_code_mode).
+        // Action row landed with mode='classic'. `generatedSource` carries
+        // the empty original source (the first failure was a NoCodeBlock
+        // before any source materialised) — we just check the column exists.
         let mode: Option<String> = store
             .with_conn(|c| {
                 c.query_row(
@@ -2195,5 +2415,192 @@ mod tests {
             Some("classic"),
             "fallback path must land mode='classic'"
         );
+        // I7: exactly one gh issue filed with the right label + title prefix.
+        let calls = gh.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one gh issue should be filed");
+        let (title, body, labels) = &calls[0];
+        assert!(title.starts_with("[code-mode]"));
+        assert!(body.contains("## Postmortem"));
+        assert!(body.contains("**Final draft mode:** classic"));
+        assert!(body.contains("**Channel:** gmail"));
+        assert_eq!(labels, &vec!["code-mode-failure".to_string()]);
+        // I7: Discord notice posted with the issue number (#101).
+        let notices = broker.flag_posts.lock().unwrap();
+        assert_eq!(notices.len(), 1, "exactly one Discord notice should fire");
+        assert!(notices[0].1.contains("#101"));
+        assert!(notices[0].1.contains("classic"));
+    }
+
+    /// Successful self-repair: original program has no fence → repair
+    /// returns a valid fenced TS block → the Deno sandbox runs it cleanly →
+    /// the row carries `mode='code'` AND a `repair_used: true` audit
+    /// marker. NO gh issue is filed.
+    #[tokio::test]
+    async fn code_mode_self_repair_success_no_issue_filed() {
+        if !deno_available_for_tests() {
+            eprintln!(
+                "skipping code_mode_self_repair_success_no_issue_filed: \
+                 `deno` not on PATH (set AUGMENTAGENT_DENO_BIN to override)"
+            );
+            return;
+        }
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                message_id: "m-cm-repair-ok".into(),
+                thread_id: Some("t-cm-r".into()),
+                from: "user@client.com".into(),
+                subject: "Re: postmortem".into(),
+                body: "still good?".into(),
+                date: "2026-05-22".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        // Triage → reply. Code-mode initial: no fence → fails. Repair: a
+        // valid fenced TS program → executes cleanly. Classic call never
+        // reached.
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"actionable"}"#,
+            "no fence — bug forced",
+            "```ts\n\
+             async function main() {\n\
+               await tools.draft(\"gmail\", \"fixed by repair\", \"answer\");\n\
+             }\n\
+             main();\n\
+             ```\n",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let gh = Arc::new(RecordingGh::new(900));
+        let ch = GmailChannel::dry_run(
+            store.clone(),
+            gmail,
+            reasoner,
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                ..Default::default()
+            },
+        )
+        .with_gh_issue_runner(gh.clone());
+        let _ = ch.approvals; // dry_run uses NoopBroker; broker var unused here
+        let _ = broker;
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.replied_dry_run, 1, "repair must produce a dry-run reply");
+        assert_eq!(out.errors, 0);
+        // Action row: mode='code' (repair lands code-mode), trace carries
+        // the repair_used marker, body is what the repaired program drafted.
+        let (mode, trace, body): (Option<String>, Option<String>, Option<String>) = store
+            .with_conn(|c| {
+                let row = c.query_row(
+                    "SELECT mode, toolCallTrace, draftBody FROM actions WHERE messageId = 'm-cm-repair-ok'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+                Ok(row)
+            })
+            .unwrap();
+        assert_eq!(mode.as_deref(), Some("code"));
+        let trace_str = trace.unwrap_or_default();
+        assert!(
+            trace_str.contains("\"repair_used\":true"),
+            "trace must carry repair_used marker; got {trace_str}"
+        );
+        assert_eq!(body.as_deref(), Some("fixed by repair"));
+        // CRUCIAL: no gh issue was filed for the successful repair.
+        assert_eq!(
+            gh.calls.lock().unwrap().len(),
+            0,
+            "successful repair must not file a gh issue"
+        );
+    }
+
+    /// Failure with Deno available: forced repair-also-fails program causes
+    /// classic fallback. Verifies `generatedSource` on the classic row
+    /// carries the ORIGINAL (failed) program text for audit.
+    #[tokio::test]
+    async fn code_mode_repair_runtime_error_falls_through_to_classic() {
+        if !deno_available_for_tests() {
+            eprintln!(
+                "skipping code_mode_repair_runtime_error_falls_through_to_classic: \
+                 `deno` not on PATH"
+            );
+            return;
+        }
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                message_id: "m-cm-repair-fail".into(),
+                thread_id: Some("t-cm-rf".into()),
+                from: "user@client.com".into(),
+                subject: "Quick q".into(),
+                body: "thoughts?".into(),
+                date: "2026-05-22".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        // Original: a fenced program that throws. Repair: a fenced program
+        // that ALSO throws. Classic call: a plain prose draft.
+        let throws_original =
+            "```ts\nasync function main() { throw new Error('original boom'); }\nmain();\n```";
+        let throws_repair =
+            "```ts\nasync function main() { throw new Error('repair boom'); }\nmain();\n```";
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"actionable"}"#,
+            throws_original,
+            throws_repair,
+            "Got it — classic kicked in.",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let gh = Arc::new(RecordingGh::new(500));
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        )
+        .with_gh_issue_runner(gh.clone());
+        let out = ch.poll_once().await.unwrap();
+        // Approval card posted via classic path.
+        assert_eq!(out.awaiting_approval, 1, "classic path posts approval");
+        assert_eq!(out.errors, 0);
+        // Row: mode='classic', generatedSource = original failed program.
+        let (mode, gen_src): (Option<String>, Option<String>) = store
+            .with_conn(|c| {
+                let row = c.query_row(
+                    "SELECT mode, generatedSource FROM actions \
+                     WHERE messageId = 'm-cm-repair-fail'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                Ok(row)
+            })
+            .unwrap();
+        assert_eq!(mode.as_deref(), Some("classic"));
+        let src = gen_src.unwrap_or_default();
+        assert!(
+            src.contains("original boom"),
+            "generatedSource must carry the ORIGINAL failed program; got {src}"
+        );
+        assert!(
+            !src.contains("repair boom"),
+            "generatedSource must NOT contain the repaired program; got {src}"
+        );
+        // gh issue + Discord notice both fired.
+        assert_eq!(gh.calls.lock().unwrap().len(), 1);
+        let calls = gh.calls.lock().unwrap();
+        let (_, body, _) = &calls[0];
+        assert!(body.contains("**Repair attempted:** yes"));
+        assert!(body.contains("**Final draft mode:** classic"));
+        let flag_notices = broker.flag_posts.lock().unwrap();
+        assert_eq!(flag_notices.len(), 1);
+        assert!(flag_notices[0].1.contains("#500"));
     }
 }
