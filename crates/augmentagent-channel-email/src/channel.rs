@@ -18,9 +18,13 @@ use tracing::{error, info, warn};
 use async_trait::async_trait;
 
 use augmentagent_approval_discord::{ApprovalBroker, NoopBroker};
+use augmentagent_channel_core::code_mode::{self, manifest_v1, DefaultDispatcher, MessageContext};
 use augmentagent_channel_core::decision::{parse as parse_decision, DecisionKind};
 use augmentagent_channel_core::ingest::{spawn_ingest, IngestTrigger};
-use augmentagent_channel_core::prompt::{draft_user_message, triage_user_message, SkillPrompt, TRIAGE_SYSTEM};
+use augmentagent_channel_core::prompt::{
+    code_mode_system, code_mode_user_message, draft_user_message, triage_user_message, SkillPrompt,
+    TRIAGE_SYSTEM,
+};
 use augmentagent_channel_core::trigger::{WorkItem, WorkItemHandler};
 use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{ActionStatus, RetryableReply, Store, TriageResult, NUDGE_INTERVAL_MS};
@@ -208,10 +212,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
 
             // Bump the retry counter FIRST. If we crash mid-retry, the counter
             // is still incremented — we don't want to risk an infinite loop.
-            let new_count = self.store.increment_retry_count(
-                &item.action.id,
-                self.config.retry_max_attempts,
-            )?;
+            let new_count = self
+                .store
+                .increment_retry_count(&item.action.id, self.config.retry_max_attempts)?;
             info!(
                 action_id = %item.action.id,
                 attempt = new_count,
@@ -220,11 +223,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 "retrying reply"
             );
 
-            let draft = item
-                .action
-                .draft_body
-                .clone()
-                .unwrap_or_default();
+            let draft = item.action.draft_body.clone().unwrap_or_default();
             // Reuse the existing action_id so the Discord card already showing
             // for this action stays valid (the event handler looks up this id
             // in sqlite on click).
@@ -292,10 +291,8 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             }
         }
 
-        outcome.new_emails = outcome.skipped
-            + outcome.flagged
-            + outcome.replied_dry_run
-            + outcome.awaiting_approval;
+        outcome.new_emails =
+            outcome.skipped + outcome.flagged + outcome.replied_dry_run + outcome.awaiting_approval;
         Ok(outcome)
     }
 
@@ -496,11 +493,12 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     return Ok(Some(DispatchOutcome::Flagged));
                 }
 
-                // --- 2. DRAFT call (Opus, with wiki read access when enabled)
-                let draft_opts = crate::reasoner::draft_opts(
-                    draft_skill.to_string(),
-                    self.config.wiki_root.clone(),
-                );
+                // --- 2. DRAFT phase. Code-mode (#52 / I6) is the production
+                // default; on any code-mode failure we log + fall through to
+                // the classic prompt path so a model hiccup or sandbox glitch
+                // never blocks a reply. I7 (#53) will replace the stub
+                // fallback below with the full self-repair + gh-issue +
+                // Discord-notice flow.
                 let wiki_hint = self
                     .config
                     .wiki_root
@@ -510,8 +508,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                         augmentagent_wiki::WikiReader::new(&layout).draft_hint(&email)
                     })
                     .unwrap_or_default();
-                let tone_block =
-                    pick_tone_block(&self.store, entity_id, &email.from);
+                let tone_block = pick_tone_block(&self.store, entity_id, &email.from);
                 let thread_block = self.fetch_thread_block(entity_id, &email).await;
                 // #36: fast Haiku archetype pick → composed fragment, gated by
                 // AUGMENTAGENT_DRAFT_ARCHETYPES=1 (resolver no-ops otherwise).
@@ -532,14 +529,149 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 // so the Discord card can surface a "Needs your input" field
                 // (#35 Phase 5). Empty `unresolved` ⇒ marker is never
                 // appended ⇒ draft + card stay byte-identical to pre-#35.
-                let resolve_outcome =
-                    augmentagent_channel_core::resolve_asks(
-                        &self.reasoner,
-                        augmentagent_channel_core::AskResolveMode::from_env(),
-                        &email.body,
-                        self.build_resolve_ctx(entity_id),
+                let resolve_outcome = augmentagent_channel_core::resolve_asks(
+                    &self.reasoner,
+                    augmentagent_channel_core::AskResolveMode::from_env(),
+                    &email.body,
+                    self.build_resolve_ctx(entity_id),
+                )
+                .await;
+
+                // --- 2a. CODE-MODE attempt. Two-step flow:
+                //   1. Reasoner emits a TypeScript program that orchestrates
+                //      tool calls and ends with `tools.draft(channel, body, reason)`.
+                //   2. The Deno sandbox executes the program. The dispatcher's
+                //      terminal `tools.draft` handler writes the actions row
+                //      (mode='code', generatedSource, toolCallTrace) and stashes
+                //      the action id for us to pick up below.
+                //
+                // On ANY failure (reasoner spawn, missing fenced block, sandbox
+                // timeout, runtime exception, dispatcher error) we log + fall
+                // through to the classic prompt path so the user still gets a
+                // draft. I7 will replace this stub with the full self-repair +
+                // gh-issue + Discord-notice flow.
+                let code_mode_result: Result<Option<String>, anyhow::Error> = async {
+                    let manifest = manifest_v1();
+                    let system_prompt = code_mode_system(&manifest);
+                    let user_msg = code_mode_user_message(
+                        &email,
+                        &wiki_hint,
+                        &tone_block,
+                        &thread_block,
+                        &archetype_block,
+                        &resolve_outcome.block,
+                    );
+                    // Opts mirror `draft_opts`' shape: same permission mode,
+                    // no allowed_tools / add_dirs — the Deno sandbox is the
+                    // tool surface, not the host claude CLI's Read/Grep/Glob.
+                    let opts = augmentagent_channel_core::ReasonerOpts {
+                        system_prompt,
+                        model: None,
+                        allowed_tools: Vec::new(),
+                        add_dirs: Vec::new(),
+                        permission_mode: "default".into(),
+                        cwd: None,
+                        env: Vec::new(),
+                    };
+                    let ts_source = self
+                        .reasoner
+                        .call_code_mode(&opts, &user_msg)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("call_code_mode: {e}"))?;
+                    let dispatcher = DefaultDispatcher::new(
+                        self.store.as_ref(),
+                        MessageContext {
+                            channel: "gmail".to_string(),
+                            email: email.clone(),
+                            account_id: Some(entity_id.to_string()),
+                        },
+                        ts_source.clone(),
                     )
-                    .await;
+                    .with_wiki_hint(wiki_hint.clone());
+                    code_mode::run_program(&ts_source, &manifest, &dispatcher)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("run_program: {e}"))?;
+                    Ok(dispatcher.last_action_id())
+                }
+                .await;
+
+                let code_mode_action_id = match code_mode_result {
+                    Ok(Some(action_id)) => Some(action_id),
+                    Ok(None) => {
+                        // Program completed without ever calling tools.draft.
+                        // No row was written, so there is nothing to clean up.
+                        // TODO(I7): replace stub fallback with handle_code_mode_failure
+                        warn!(
+                            message_id = %email.message_id,
+                            "code-mode program produced no draft call; falling back to classic"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        // TODO(I7): replace stub fallback with handle_code_mode_failure
+                        error!(
+                            message_id = %email.message_id,
+                            "code-mode draft failed; falling back to classic: {e:#}"
+                        );
+                        None
+                    }
+                };
+
+                // --- 2b. Code-mode success path: read the persisted draft
+                // body out of the actions row the dispatcher just wrote, then
+                // hand off to the existing approval / Gmail-draft flow. The
+                // downstream code (create_draft, post_approval, record_nudge,
+                // mark_email_processed) is unchanged — see `dispatch_reply`'s
+                // `Some(existing_action_id)` arm.
+                if let Some(action_id) = code_mode_action_id {
+                    let draft_body = self
+                        .store
+                        .get_action_with_email(&action_id)?
+                        .and_then(|a| a.action.draft_body)
+                        .unwrap_or_default();
+
+                    if self.config.dry_run {
+                        // Promote the dispatcher's `Pending` row to `DryRun`
+                        // so daemon dry-run accounting matches classic. The
+                        // persisted code-mode columns (mode='code',
+                        // generatedSource, toolCallTrace) are untouched.
+                        self.store.update_action_status(
+                            &action_id,
+                            ActionStatus::DryRun,
+                            Some(&draft_body),
+                            None,
+                        )?;
+                        self.store
+                            .mark_email_processed(&email.message_id, TriageResult::Reply)?;
+                        println!(
+                            "[reply dry-run:code] {} from={} subject={}\n--- draft ---\n{}\n--- /draft ---",
+                            email.message_id, email.from, email.subject, draft_body,
+                        );
+                        self.maybe_ingest(
+                            &email,
+                            DecisionKind::Reply,
+                            decision.reason.as_deref(),
+                            Some(&draft_body),
+                            IngestTrigger::DryRunDrafted,
+                        );
+                        return Ok(Some(DispatchOutcome::DryRun));
+                    }
+                    return self
+                        .dispatch_reply(entity_id, email, draft_body, Some(action_id))
+                        .await;
+                }
+
+                // --- 2c. Classic fallback (stub for I7).
+                //
+                // Reached only when code-mode failed above. Behavior here is
+                // intentionally the pre-#52 classic prompt path — same draft
+                // call, same needs-input marker append, same dispatch. I7 will
+                // wrap this in a `handle_code_mode_failure` helper that also
+                // emits the postmortem gh issue and Discord notice.
+                let draft_opts = crate::reasoner::draft_opts(
+                    draft_skill.to_string(),
+                    self.config.wiki_root.clone(),
+                );
                 let draft_prompt = draft_user_message(
                     &email,
                     &wiki_hint,
@@ -558,9 +690,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                             .iter()
                             .map(|u| (u.kind.as_str().to_string(), u.text.clone()))
                             .collect();
-                        augmentagent_approval_discord::append_needs_input_marker(
-                            &body, &pairs,
-                        )
+                        augmentagent_approval_discord::append_needs_input_marker(&body, &pairs)
                     }
                     Err(e) => {
                         error!(message_id = %email.message_id, "draft call failed: {e}");
@@ -630,10 +760,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
     /// `None` and the scheduling/share_doc resolvers self-gate to no-ops
     /// (calendly/intro need no network). `resolve_asks_block` itself is gated
     /// on `AUGMENTAGENT_ASK_RESOLVE=live`, so this is never reached otherwise.
-    fn build_resolve_ctx(
-        &self,
-        entity_id: &str,
-    ) -> augmentagent_channel_core::ResolveCtx {
+    fn build_resolve_ctx(&self, entity_id: &str) -> augmentagent_channel_core::ResolveCtx {
         let mut ctx = augmentagent_channel_core::ResolveCtx {
             entity_id: Some(entity_id.to_string()),
             calendar_id: "primary".into(),
@@ -643,9 +770,8 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         };
         if let Ok(key) = std::env::var("COMPOSIO_API_KEY") {
             if !key.trim().is_empty() {
-                let client = std::sync::Arc::new(
-                    augmentagent_channel_core::ComposioResolveClient::new(key),
-                );
+                let client =
+                    std::sync::Arc::new(augmentagent_channel_core::ComposioResolveClient::new(key));
                 ctx.freebusy = Some(client.clone());
                 ctx.drive = Some(client);
             }
@@ -698,8 +824,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         if prior.is_empty() {
             return String::new();
         }
-        let block =
-            augmentagent_channel_core::prompt::format_thread_history(&prior);
+        let block = augmentagent_channel_core::prompt::format_thread_history(&prior);
         if !block.is_empty() {
             info!(
                 message_id = %email.message_id,
@@ -760,8 +885,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         // needs-input marker (the marker is a Discord-card-only carrier; it
         // lives in `actions.draftBody` so the card can render the field, but
         // it must never reach Gmail). No marker ⇒ unchanged (pre-#35 bytes).
-        let gmail_body =
-            augmentagent_approval_discord::split_needs_input(&initial_draft).0;
+        let gmail_body = augmentagent_approval_discord::split_needs_input(&initial_draft).0;
         let draft_id = match existing_draft_id {
             Some(d) => d,
             None => match self
@@ -844,10 +968,7 @@ impl<G: GmailApi + 'static, R: Reasoner + 'static> GmailChannel<G, R> {
     /// being folded into `ChannelRunner`.
     ///
     /// Takes `Arc<Self>` so the runner's handler can share the channel.
-    pub async fn run_arc(
-        self: Arc<Self>,
-        shutdown: CancellationToken,
-    ) -> anyhow::Result<()> {
+    pub async fn run_arc(self: Arc<Self>, shutdown: CancellationToken) -> anyhow::Result<()> {
         use augmentagent_channel_core::{ChannelRunner, InboundMessageTrigger};
 
         let source = Arc::new(crate::inbound::GmailInbound::new(
@@ -934,14 +1055,10 @@ impl<G: GmailApi + 'static, R: Reasoner + 'static> GmailWorkHandler<G, R> {
 }
 
 #[async_trait]
-impl<G: GmailApi + 'static, R: Reasoner + 'static> WorkItemHandler
-    for GmailWorkHandler<G, R>
-{
+impl<G: GmailApi + 'static, R: Reasoner + 'static> WorkItemHandler for GmailWorkHandler<G, R> {
     async fn handle(&self, item: WorkItem) -> anyhow::Result<()> {
-        let email: augmentagent_store::Email =
-            serde_json::from_value(item.payload).map_err(|e| {
-                anyhow::anyhow!("gmail work item payload not an Email: {e}")
-            })?;
+        let email: augmentagent_store::Email = serde_json::from_value(item.payload)
+            .map_err(|e| anyhow::anyhow!("gmail work item payload not an Email: {e}"))?;
         // `poll_once` keys dispatch off the polled account's entity_id; the
         // serialized Email already carries it (`GmailInbound` fans out over
         // active accounts and stamps each). Fall back to the work-item's
@@ -1502,17 +1619,41 @@ mod tests {
     }
     #[async_trait]
     impl GmailApi for CountingGmail {
-        async fn fetch_unread(&self, _e: &str, _l: u32) -> Result<Vec<Email>, crate::gmail::GmailError> {
+        async fn fetch_unread(
+            &self,
+            _e: &str,
+            _l: u32,
+        ) -> Result<Vec<Email>, crate::gmail::GmailError> {
             Ok(self.emails.clone())
         }
-        async fn fetch_with_query(&self, _e: &str, _q: &str, _l: u32) -> Result<Vec<Email>, crate::gmail::GmailError> {
+        async fn fetch_with_query(
+            &self,
+            _e: &str,
+            _q: &str,
+            _l: u32,
+        ) -> Result<Vec<Email>, crate::gmail::GmailError> {
             Ok(self.emails.clone())
         }
-        async fn update_draft(&self, _e: &str, _d: &str, _t: &str, _s: &str, _b: &str) -> Result<(), crate::gmail::GmailError> {
+        async fn update_draft(
+            &self,
+            _e: &str,
+            _d: &str,
+            _t: &str,
+            _s: &str,
+            _b: &str,
+        ) -> Result<(), crate::gmail::GmailError> {
             Ok(())
         }
-        async fn create_draft(&self, _e: &str, _t: &str, _s: &str, _b: &str, _th: Option<&str>) -> Result<String, crate::gmail::GmailError> {
-            self.create_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async fn create_draft(
+            &self,
+            _e: &str,
+            _t: &str,
+            _s: &str,
+            _b: &str,
+            _th: Option<&str>,
+        ) -> Result<String, crate::gmail::GmailError> {
+            self.create_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok("draft-once".into())
         }
         async fn send_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
@@ -1600,14 +1741,20 @@ mod tests {
         // First pass: triage + draft + create_draft OK, post_approval FAILS.
         let out1 = ch.poll_once().await.unwrap();
         assert_eq!(out1.errors, 1);
-        assert_eq!(gmail.create_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            gmail.create_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
 
         // Retry tick: post_approval succeeds. create_draft must NOT be called
         // a second time — the action already has a draftId from the first pass.
         let retried = ch.retry_once().await.unwrap();
         assert_eq!(retried, 1);
-        assert_eq!(gmail.create_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            gmail.create_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
         assert!(store.is_email_complete("m-broker-fail").unwrap());
     }
@@ -1628,14 +1775,7 @@ mod tests {
             .upsert_tone_profile("global", "*", Some("acc1"), "GLOBAL", "[]", 50)
             .unwrap();
         store
-            .upsert_tone_profile(
-                "domain",
-                "startup.io",
-                Some("acc1"),
-                "DOMAIN",
-                "[]",
-                10,
-            )
+            .upsert_tone_profile("domain", "startup.io", Some("acc1"), "DOMAIN", "[]", 10)
             .unwrap();
         store
             .upsert_tone_profile(
@@ -1658,14 +1798,7 @@ mod tests {
             .upsert_tone_profile("global", "*", Some("acc1"), "GLOBAL", "[]", 50)
             .unwrap();
         store
-            .upsert_tone_profile(
-                "domain",
-                "startup.io",
-                Some("acc1"),
-                "DOMAIN",
-                "[]",
-                10,
-            )
+            .upsert_tone_profile("domain", "startup.io", Some("acc1"), "DOMAIN", "[]", 10)
             .unwrap();
         // sample_count=2 → below the 3-message recipient threshold.
         store
@@ -1690,14 +1823,7 @@ mod tests {
             .unwrap();
         // sample_count=3 → below the 5-message domain threshold.
         store
-            .upsert_tone_profile(
-                "domain",
-                "startup.io",
-                Some("acc1"),
-                "DOMAIN",
-                "[]",
-                3,
-            )
+            .upsert_tone_profile("domain", "startup.io", Some("acc1"), "DOMAIN", "[]", 3)
             .unwrap();
         let out = super::pick_tone_block(&store, "acc1", "alex@startup.io");
         assert_eq!(out, "GLOBAL");
@@ -1747,7 +1873,9 @@ mod tests {
             platform: "gmail".into(),
             kind: "dm".into(),
         };
-        let gmail = Arc::new(StubGmail { emails: vec![email.clone()] });
+        let gmail = Arc::new(StubGmail {
+            emails: vec![email.clone()],
+        });
         let reasoner = Arc::new(ScriptedReasoner::new([
             r#"{"decision":"reply","reason":"ping"}"#,
             "Yes — shipping today.",
@@ -1767,10 +1895,7 @@ mod tests {
         // Drive the cutover handler exactly as ChannelRunner would: one
         // WorkItem rehydrated from the GmailInbound serialization.
         let handler = super::GmailWorkHandler::new(Arc::clone(&ch));
-        handler
-            .handle(email_to_work_item(&email))
-            .await
-            .unwrap();
+        handler.handle(email_to_work_item(&email)).await.unwrap();
 
         // Identical observable state to live_reply_flow_posts_approval_card.
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
@@ -1778,10 +1903,7 @@ mod tests {
 
         // Re-handling the same unread email (next runner tick) must NOT
         // spawn a second card — the email-complete gate holds.
-        handler
-            .handle(email_to_work_item(&email))
-            .await
-            .unwrap();
+        handler.handle(email_to_work_item(&email)).await.unwrap();
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
     }
 
@@ -1828,8 +1950,14 @@ mod tests {
             },
         ));
         let handler = super::GmailWorkHandler::new(Arc::clone(&ch));
-        handler.handle(email_to_work_item(&skip_email)).await.unwrap();
-        handler.handle(email_to_work_item(&flag_email)).await.unwrap();
+        handler
+            .handle(email_to_work_item(&skip_email))
+            .await
+            .unwrap();
+        handler
+            .handle(email_to_work_item(&flag_email))
+            .await
+            .unwrap();
 
         // Skip: no posts at all; email complete.
         assert!(store.is_email_complete("cr-skip").unwrap());
@@ -1873,5 +2001,199 @@ mod tests {
         // process_email failures are swallowed. Either way: no panic, no post.
         let _ = handler.handle(junk).await;
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
+    }
+
+    // ---- I6 (#52): code-mode draft path ----------------------------------
+    //
+    // The pre-existing tests above all rely on the classic prose-draft
+    // fallback (their `ScriptedReasoner` returns plain text, not a fenced
+    // TS block) — when code-mode's `extract_ts_block` fails on those
+    // responses, the channel falls through to the classic path and behavior
+    // is unchanged. Those tests therefore double as the "code-mode-error →
+    // classic fallback" coverage for the stub-fallback path (the TODO(I7)
+    // arm). The new tests below cover the OTHER half: a code-mode response
+    // that does carry a fenced TS block runs through the Deno sandbox and
+    // lands an `actions` row with `mode='code'`, `generatedSource`, and
+    // `toolCallTrace` populated.
+
+    /// `true` iff `deno --version` succeeds (resolved via the same env-var
+    /// convention as the runner itself). Returning `false` here makes the
+    /// code-mode tests print a notice and exit clean instead of failing on
+    /// a dev box without Deno installed.
+    fn deno_available_for_tests() -> bool {
+        let bin = std::env::var("AUGMENTAGENT_DENO_BIN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "deno".to_string());
+        std::process::Command::new(&bin)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn code_mode_dry_run_lands_action_row_with_mode_code() {
+        if !deno_available_for_tests() {
+            eprintln!(
+                "skipping code_mode_dry_run_lands_action_row_with_mode_code: \
+                 `deno` not on PATH (set AUGMENTAGENT_DENO_BIN to override)"
+            );
+            return;
+        }
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                message_id: "m-cm-dryrun".into(),
+                thread_id: Some("t-cm".into()),
+                from: "user@client.com".into(),
+                subject: "Quick q".into(),
+                body: "any update?".into(),
+                date: "2026-05-22".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        // First response: triage → reply. Second response: a *fenced* TS
+        // program → code-mode extracts it, run_program executes it, the
+        // dispatcher writes the actions row.
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"actionable"}"#,
+            // Plain JS body inside a ```ts fence — `extract_ts_block`
+            // matches the language tag, while the Deno runner uses indirect
+            // eval (no TS-stripping), so the program itself must not carry
+            // TypeScript type annotations.
+            "```ts\n\
+             async function main() {\n\
+               await tools.draft(\"gmail\", \"thanks — shipping today\", \"answer the question\");\n\
+             }\n\
+             main();\n\
+             ```\n",
+        ]));
+        let ch = GmailChannel::dry_run(
+            store.clone(),
+            gmail,
+            reasoner,
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        // Code-mode succeeded → DryRun outcome.
+        assert_eq!(out.replied_dry_run, 1, "expected 1 dry-run reply");
+        assert_eq!(out.errors, 0);
+
+        // Find the action that was just landed for this message. The dry-run
+        // promotion path updates the dispatcher's Pending row to DryRun, so
+        // we read it back by messageId.
+        let actions = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, mode, generatedSource, toolCallTrace, draftBody, status \
+                     FROM actions WHERE messageId = 'm-cm-dryrun'",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, String>(5)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(actions.len(), 1, "expected exactly one actions row");
+        let (_, mode, src, trace, body, status) = &actions[0];
+        assert_eq!(mode.as_deref(), Some("code"), "mode must be 'code'");
+        assert!(
+            src.as_deref()
+                .map(|s| s.contains("tools.draft"))
+                .unwrap_or(false),
+            "generatedSource must contain the program; got {src:?}"
+        );
+        let trace_str = trace.as_deref().unwrap_or("");
+        assert!(
+            trace_str.contains("\"call\":\"draft\""),
+            "toolCallTrace must include the draft call; got {trace_str:?}"
+        );
+        assert_eq!(
+            body.as_deref(),
+            Some("thanks — shipping today"),
+            "draftBody must match what tools.draft passed"
+        );
+        assert_eq!(status, "dry_run", "dry-run mode must update status");
+    }
+
+    #[tokio::test]
+    async fn code_mode_failure_falls_through_to_classic_path() {
+        // No Deno needed: the model returns a response WITHOUT a fenced TS
+        // block, so `call_code_mode` fails with NoCodeBlock and we land in
+        // the stub-fallback classic path. Verifies the TODO(I7) error arm
+        // doesn't break the existing reply pipeline.
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                message_id: "m-cm-fallback".into(),
+                thread_id: Some("t-cm-fb".into()),
+                from: "user@client.com".into(),
+                subject: "Ping".into(),
+                body: "u there?".into(),
+                date: "2026-05-22".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        // Triage → reply. Code-mode response is plain text (no fence) →
+        // call_code_mode errors → fallback consumes the SAME response as
+        // a classic draft body. ScriptedReasoner's default-on-empty returns
+        // the skip JSON if the queue drains; we put a third response so the
+        // classic call gets a clean string.
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"ping"}"#,
+            "no fenced block here, just prose",
+            "Yes — shipping today.",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        // Stub fallback path successfully ran classic draft → approval card.
+        assert_eq!(out.awaiting_approval, 1);
+        assert_eq!(out.errors, 0);
+        assert_eq!(broker.posts.lock().unwrap().len(), 1);
+        // Action row exists with mode='classic' (the fallback path uses
+        // log_action, not log_action_code_mode).
+        let mode: Option<String> = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT mode FROM actions WHERE messageId = 'm-cm-fallback'",
+                    [],
+                    |r| r.get(0),
+                )
+                .or(Ok(None))
+            })
+            .unwrap();
+        assert_eq!(
+            mode.as_deref(),
+            Some("classic"),
+            "fallback path must land mode='classic'"
+        );
     }
 }
