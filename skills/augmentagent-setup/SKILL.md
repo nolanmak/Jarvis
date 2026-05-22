@@ -363,17 +363,18 @@ Every cookie-harvest channel uses the in-skill loop below.
 
 ## First-run bootstrap caveat
 
-On a truly fresh box (no daemon has ever started, no sqlite db exists),
-`augmentagent status --json` may fail before the dashboard installer has
-run. The sqlite database lives at `$AUGMENTAGENT_DB` (default `./data.db`
-relative to the daemon's cwd) and is created on first dashboard start. The
-status aggregator opens that db; with no file there yet, the call exits
-non-zero with a `could not open data.db` style error.
+As of #33, `augmentagent install dashboard` opens the store after the
+install script returns, which creates `$AUGMENTAGENT_DB` (default
+`./data.db` relative to the daemon's cwd) and runs migrations. The next
+`augmentagent status --json` succeeds on a fresh box without any extra
+step.
 
-The Fresh-install branch handles this by running `augmentagent install
-dashboard` BEFORE any status call. If the user runs `/setup` from a clean
-checkout and the very first `augmentagent status --json` fails with an
-sqlite error:
+The Fresh-install branch still runs `augmentagent install dashboard`
+BEFORE the first status call — both because that's the sanctioned bootstrap
+and because it's idempotent (re-runs are safe). If the very first
+`augmentagent status --json` somehow still fails with an sqlite error
+(e.g. the install was skipped, or `$AUGMENTAGENT_DB` points at a path the
+CLI couldn't open):
 
 1. Surface the stderr verbatim.
 2. AskUserQuestion to confirm running `augmentagent install dashboard`.
