@@ -35,9 +35,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use augmentagent_approval_discord::ApprovalBroker;
+use augmentagent_channel_core::code_mode::{
+    self, handle_code_mode_failure, manifest_v1, report_classic_fallback, DefaultDispatcher,
+    DraftOutcome, FailureCtx, FailureStage, GhCliIssueRunner, GhIssueRunner, MessageContext,
+};
 use augmentagent_channel_core::decision::{parse as parse_decision, DecisionKind};
 use augmentagent_channel_core::ingest::{spawn_ingest, IngestTrigger};
-use augmentagent_channel_core::prompt::{draft_user_message, triage_user_message};
+use augmentagent_channel_core::prompt::{
+    code_mode_system, code_mode_user_message, draft_user_message, triage_user_message,
+};
 use augmentagent_channel_core::reasoner::{draft_opts, triage_opts};
 use augmentagent_channel_core::trigger::{InboundSource, Trigger, WorkItem};
 use augmentagent_channel_core::Reasoner;
@@ -125,6 +131,11 @@ pub struct WhatsappChannel<R: Reasoner> {
     pub control: Option<Arc<crate::control::WhatsappControlSurface>>,
     inbox: Inbox,
     wiki_schema: Option<String>,
+    /// gh CLI runner for I7 postmortems on code-mode failures. Behind a
+    /// trait so tests can swap in a recorder. Production uses
+    /// [`GhCliIssueRunner`], which honours `AUGMENTAGENT_GH_DISABLE=1` as a
+    /// test-time no-op.
+    gh_issue_runner: Arc<dyn GhIssueRunner>,
 }
 
 impl<R: Reasoner + 'static> WhatsappChannel<R> {
@@ -159,7 +170,16 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
             control: None,
             inbox: Arc::new(Mutex::new(Vec::new())),
             wiki_schema,
+            gh_issue_runner: Arc::new(GhCliIssueRunner::new()),
         }
+    }
+
+    /// Swap the gh-CLI runner used for I7 postmortem issues. Production
+    /// callers don't need this; tests pass a recording stub so the suite
+    /// never actually files issues on the real repo.
+    pub fn with_gh_issue_runner(mut self, runner: Arc<dyn GhIssueRunner>) -> Self {
+        self.gh_issue_runner = runner;
+        self
     }
 
     /// Attach the agent control/approval surface (#102). Builder-style so the
@@ -405,6 +425,205 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                 Ok(())
             }
             DecisionKind::Reply => {
+                // --- CODE-MODE attempt (I12 / #58). Mirrors the email
+                // channel's I6+I7 wiring; see
+                // `crates/augmentagent-channel-email/src/channel.rs` for the
+                // canonical block. The reasoner emits a TS program that ends
+                // in `tools.draft("whatsapp", body, reason)`; the Deno
+                // sandbox executes it, and the dispatcher's terminal handler
+                // writes the actions row (mode='code', generatedSource,
+                // toolCallTrace) and stashes the action id we pick up below.
+                //
+                // On any failure (reasoner spawn, missing fenced block,
+                // sandbox timeout, runtime exception, dispatcher error) we
+                // hand off to `handle_code_mode_failure` for one self-repair
+                // pass. If repair lands a working draft we use it; otherwise
+                // we fall through to the classic prompt path and call
+                // `report_classic_fallback` to file the postmortem gh issue
+                // + post the Discord notice. The whatsmeow sidecar dispatch
+                // path is untouched — it only fires on user Approve from the
+                // Discord card, and both rails post to the same approval
+                // broker with the same action id, so the sidecar sees no
+                // difference between code-mode and classic actions.
+                //
+                // WhatsApp has no wiki / tone / thread / archetype / ask
+                // resolver wiring (unlike email), so all of those block
+                // strings are passed empty and short-circuit in the prompt
+                // builders.
+                let manifest = manifest_v1();
+                let system_prompt = code_mode_system(&manifest);
+                let user_msg = code_mode_user_message(&email, "", "", "", "", "");
+                let code_mode_opts = augmentagent_channel_core::ReasonerOpts {
+                    system_prompt,
+                    model: None,
+                    allowed_tools: Vec::new(),
+                    add_dirs: Vec::new(),
+                    permission_mode: "default".into(),
+                    cwd: None,
+                    env: Vec::new(),
+                };
+                let message_ctx = MessageContext {
+                    channel: "whatsapp".to_string(),
+                    email: email.clone(),
+                    account_id: Some(self.config.phone.clone()),
+                };
+
+                let mut cm_source: String = String::new();
+                let cm_attempt: Result<String, (augmentagent_channel_core::code_mode::CodeModeError, FailureStage)> = async {
+                    let ts_source = match self.reasoner.call_code_mode(&code_mode_opts, &user_msg).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let cme = match e.downcast::<augmentagent_channel_core::code_mode::CodeModeError>() {
+                                Ok(cme) => cme,
+                                Err(other) => augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(other),
+                            };
+                            return Err((cme, FailureStage::CallCodeMode));
+                        }
+                    };
+                    cm_source = ts_source.clone();
+                    let dispatcher = DefaultDispatcher::new(
+                        self.store.as_ref(),
+                        message_ctx.clone(),
+                        ts_source.clone(),
+                    )
+                    .with_wiki_hint(String::new());
+                    if let Err(e) = code_mode::run_program(&ts_source, &manifest, &dispatcher).await {
+                        let wrapped = augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(
+                            anyhow::anyhow!("run_program: {e}"),
+                        );
+                        return Err((wrapped, FailureStage::RunProgram));
+                    }
+                    match dispatcher.last_action_id() {
+                        Some(id) => Ok(id),
+                        None => Err((
+                            augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(
+                                anyhow::anyhow!("code-mode program produced no draft call"),
+                            ),
+                            FailureStage::RunProgram,
+                        )),
+                    }
+                }
+                .await;
+
+                let (code_mode_action_id, pending_classic_record): (
+                    Option<String>,
+                    Option<augmentagent_channel_core::code_mode::FailureRecord>,
+                ) = match cm_attempt {
+                    Ok(action_id) => (Some(action_id), None),
+                    Err((cme, stage)) => {
+                        warn!(
+                            message_id = %email.message_id,
+                            stage = ?stage,
+                            "whatsapp code-mode attempt failed: {cme}; invoking self-repair"
+                        );
+                        let failure_ctx = FailureCtx {
+                            reasoner: self.reasoner.as_ref(),
+                            opts: code_mode_opts.clone(),
+                            user_msg: user_msg.clone(),
+                            manifest: manifest.clone(),
+                            message_ctx: message_ctx.clone(),
+                            wiki_hint: String::new(),
+                            store: Arc::clone(&self.store),
+                            broker: Arc::clone(&self.approvals),
+                            gh: Arc::clone(&self.gh_issue_runner),
+                            email: email.clone(),
+                            channel: "whatsapp".to_string(),
+                            model: code_mode_opts.model.clone(),
+                            manifest_version: "v1",
+                        };
+                        match handle_code_mode_failure(&failure_ctx, &cm_source, &cme, stage).await
+                        {
+                            DraftOutcome::CodeMode {
+                                action_id,
+                                repair_used,
+                            } => {
+                                info!(
+                                    message_id = %email.message_id,
+                                    action_id = %action_id,
+                                    repair_used,
+                                    "whatsapp code-mode self-repair succeeded"
+                                );
+                                (Some(action_id), None)
+                            }
+                            DraftOutcome::ClassicNeeded(record) => {
+                                error!(
+                                    message_id = %email.message_id,
+                                    "whatsapp code-mode self-repair failed; falling back to classic"
+                                );
+                                (None, Some(record))
+                            }
+                        }
+                    }
+                };
+
+                // --- Code-mode success: read the persisted draft body the
+                // dispatcher just wrote, then hand off to the existing
+                // approval flow (post_approval → record_nudge → wait for
+                // user Approve → whatsmeow sidecar send via the approver).
+                if let Some(action_id) = code_mode_action_id {
+                    let drafted = self
+                        .store
+                        .get_action_with_email(&action_id)?
+                        .and_then(|a| a.action.draft_body)
+                        .unwrap_or_default();
+
+                    if self.config.dry_run {
+                        // Promote the dispatcher's `Pending` row to `DryRun`
+                        // so dry-run accounting matches classic. The
+                        // persisted code-mode columns (mode='code',
+                        // generatedSource, toolCallTrace) are untouched.
+                        self.store.update_action_status(
+                            &action_id,
+                            ActionStatus::DryRun,
+                            Some(&drafted),
+                            None,
+                        )?;
+                        self.store
+                            .mark_email_processed(&email.message_id, TriageResult::Reply)?;
+                        println!(
+                            "[whatsapp reply dry-run:code] from={} ({} chars)\n--- draft ---\n{}\n--- /draft ---",
+                            email.from,
+                            drafted.len(),
+                            drafted
+                        );
+                        self.maybe_ingest(
+                            &email,
+                            DecisionKind::Reply,
+                            decision.reason.as_deref(),
+                            Some(&drafted),
+                            IngestTrigger::DryRunDrafted,
+                        );
+                        outcome.replied_dry_run += 1;
+                        return Ok(());
+                    }
+
+                    if let Err(e) = self
+                        .approvals
+                        .post_approval(&action_id, &email, &drafted)
+                        .await
+                    {
+                        self.store.update_action_status(
+                            &action_id,
+                            ActionStatus::Error,
+                            None,
+                            Some(&format!("post_approval: {e}")),
+                        )?;
+                        return Err(anyhow::anyhow!("post_approval: {e}"));
+                    }
+                    if let Err(e) = self
+                        .store
+                        .record_nudge(&action_id, now_millis() + NUDGE_INTERVAL_MS)
+                    {
+                        warn!(action_id, "record_nudge after post_approval failed: {e}");
+                    }
+                    info!(action_id, message_id = %email.message_id, "whatsapp approval card posted (code-mode)");
+                    outcome.awaiting_approval += 1;
+                    return Ok(());
+                }
+
+                // --- Classic fallback (I7). Reached when code-mode failed
+                // AND self-repair couldn't recover. Pre-#52 draft path,
+                // plus `report_classic_fallback` after the row lands.
                 let skill_system =
                     std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
                         .unwrap_or_default();
@@ -428,7 +647,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                 };
 
                 if self.config.dry_run {
-                    self.store.log_action(
+                    let action_id = self.store.log_action(
                         &email.message_id,
                         email.thread_id.as_deref(),
                         &email.from,
@@ -445,6 +664,24 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                         drafted.len(),
                         drafted
                     );
+                    if let Some(record) = pending_classic_record {
+                        let failure_ctx = FailureCtx {
+                            reasoner: self.reasoner.as_ref(),
+                            opts: code_mode_opts.clone(),
+                            user_msg: user_msg.clone(),
+                            manifest: manifest.clone(),
+                            message_ctx: message_ctx.clone(),
+                            wiki_hint: String::new(),
+                            store: Arc::clone(&self.store),
+                            broker: Arc::clone(&self.approvals),
+                            gh: Arc::clone(&self.gh_issue_runner),
+                            email: email.clone(),
+                            channel: "whatsapp".to_string(),
+                            model: code_mode_opts.model.clone(),
+                            manifest_version: "v1",
+                        };
+                        report_classic_fallback(&failure_ctx, &record, &action_id).await;
+                    }
                     self.maybe_ingest(
                         &email,
                         DecisionKind::Reply,
@@ -465,6 +702,24 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                     Some(&drafted),
                     ActionStatus::Pending,
                 )?;
+                if let Some(record) = pending_classic_record.as_ref() {
+                    let failure_ctx = FailureCtx {
+                        reasoner: self.reasoner.as_ref(),
+                        opts: code_mode_opts.clone(),
+                        user_msg: user_msg.clone(),
+                        manifest: manifest.clone(),
+                        message_ctx: message_ctx.clone(),
+                        wiki_hint: String::new(),
+                        store: Arc::clone(&self.store),
+                        broker: Arc::clone(&self.approvals),
+                        gh: Arc::clone(&self.gh_issue_runner),
+                        email: email.clone(),
+                        channel: "whatsapp".to_string(),
+                        model: code_mode_opts.model.clone(),
+                        manifest_version: "v1",
+                    };
+                    report_classic_fallback(&failure_ctx, record, &action_id).await;
+                }
                 if let Err(e) = self
                     .approvals
                     .post_approval(&action_id, &email, &drafted)
@@ -601,6 +856,22 @@ mod tests {
     use augmentagent_channel_core::ReasonerOpts;
     use crate::types::Jid;
 
+    /// Disable `gh issue create` for the whole test binary. The I7
+    /// code-mode-failure → classic fallback path lives downstream of the
+    /// Reply branch, and tests that traverse it would otherwise shell out
+    /// to a possibly-authenticated `gh` and file real issues. The env-var
+    /// hook is read by `GhCliIssueRunner::create_issue`. Tests that DO
+    /// want to assert gh invocations can swap a recording stub via
+    /// `with_gh_issue_runner` — which bypasses this hook.
+    static GH_DISABLE_INIT: std::sync::Once = std::sync::Once::new();
+    fn disable_gh_for_tests() {
+        GH_DISABLE_INIT.call_once(|| {
+            // SAFETY: set once at module init before any test runs; no
+            // concurrent reads of this var.
+            std::env::set_var("AUGMENTAGENT_GH_DISABLE", "1");
+        });
+    }
+
     struct ScriptedReasoner {
         responses: std::sync::Mutex<std::collections::VecDeque<String>>,
     }
@@ -686,6 +957,8 @@ mod tests {
         reasoner: Arc<R>,
         broker: Arc<dyn ApprovalBroker>,
     ) -> WhatsappChannel<R> {
+        // Block any gh CLI calls the I7 classic-fallback path might trigger.
+        disable_gh_for_tests();
         WhatsappChannel::new(
             store,
             reasoner,
