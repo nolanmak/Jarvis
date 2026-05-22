@@ -21,6 +21,7 @@
 //! action row."
 
 pub mod dispatch;
+pub mod failure;
 pub mod manifest;
 pub mod runner;
 pub mod trace;
@@ -28,6 +29,10 @@ pub mod trace;
 pub use dispatch::{
     CalendarBusyLookup, DefaultDispatcher, DispatchError, Dispatcher, MessageContext,
     StubDispatcher,
+};
+pub use failure::{
+    handle_code_mode_failure, report_classic_fallback, DraftOutcome, FailureCtx, FailureRecord,
+    FailureStage, GhCliIssueRunner, GhIssueRunner,
 };
 pub use manifest::{manifest_v1, ToolDef, ToolManifest};
 // The runtime layer renames its error type to `RunnerError` to avoid
