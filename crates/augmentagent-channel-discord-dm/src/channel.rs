@@ -17,9 +17,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use augmentagent_approval_discord::ApprovalBroker;
+use augmentagent_channel_core::code_mode::{
+    self, handle_code_mode_failure, manifest_v1, report_classic_fallback, DefaultDispatcher,
+    DraftOutcome, FailureCtx, FailureStage, GhCliIssueRunner, GhIssueRunner, MessageContext,
+};
 use augmentagent_channel_core::decision::{parse as parse_decision, DecisionKind};
 use augmentagent_channel_core::ingest::{spawn_ingest, IngestTrigger};
-use augmentagent_channel_core::prompt::{draft_user_message, triage_user_message};
+use augmentagent_channel_core::prompt::{
+    code_mode_system, code_mode_user_message, draft_user_message, triage_user_message,
+};
 use augmentagent_channel_core::reasoner::{draft_opts, triage_opts};
 use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{
@@ -89,6 +95,10 @@ pub struct DiscordChannel<R: Reasoner> {
     /// outbound messages on ingest (same idea as LinkedIn's `member_urn`).
     pub my_user_id: String,
     wiki_schema: Option<String>,
+    /// gh CLI runner for I7 postmortems on code-mode failures. Behind a trait
+    /// so tests can mock the `gh issue create` invocation; production defaults
+    /// to [`GhCliIssueRunner`] which shells out to the `gh` binary on PATH.
+    gh_issue_runner: Arc<dyn GhIssueRunner>,
 }
 
 impl<R: Reasoner + 'static> DiscordChannel<R> {
@@ -125,7 +135,16 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
             identity_index,
             my_user_id,
             wiki_schema,
+            gh_issue_runner: Arc::new(GhCliIssueRunner::new()),
         }
+    }
+
+    /// Swap the gh-CLI runner used for I7 postmortem issues. Production
+    /// callers don't need this; tests pass a recording stub so the suite
+    /// never actually files issues on the real repo.
+    pub fn with_gh_issue_runner(mut self, runner: Arc<dyn GhIssueRunner>) -> Self {
+        self.gh_issue_runner = runner;
+        self
     }
 
     pub async fn run(&self, shutdown: CancellationToken) -> anyhow::Result<()> {
@@ -330,6 +349,213 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
                 Ok(())
             }
             DecisionKind::Reply => {
+                // --- CODE-MODE attempt (I9). Two-step flow:
+                //   1. Reasoner emits a TypeScript program that orchestrates
+                //      tool calls and ends with `tools.draft("discord", body, reason)`.
+                //   2. The Deno sandbox executes the program. The dispatcher's
+                //      terminal `tools.draft` handler writes the actions row
+                //      (mode='code', generatedSource, toolCallTrace) and stashes
+                //      the action id for us to pick up below.
+                //
+                // On ANY failure (reasoner spawn, missing fenced block, sandbox
+                // timeout, runtime exception, dispatcher error) we hand off to
+                // `handle_code_mode_failure` (I7 / #53) which runs one
+                // self-repair pass. If the repair lands a working code-mode
+                // draft, we use it. Otherwise we fall through to the classic
+                // prompt path AND, after it lands its row, call
+                // `report_classic_fallback` to file the postmortem gh issue +
+                // post the Discord notice.
+                //
+                // The Discord DM channel doesn't synthesise tone/thread/
+                // archetype/resolved-asks blocks (those are email-only today),
+                // so we pass empty strings — `code_mode_user_message` skips
+                // empty blocks byte-for-byte.
+                let manifest = manifest_v1();
+                let system_prompt = code_mode_system(&manifest);
+                let user_msg = code_mode_user_message(&email, &wiki_hint, "", "", "", "");
+                // Opts mirror the classic `draft_opts` shape: same permission
+                // mode, no allowed_tools / add_dirs — the Deno sandbox is the
+                // tool surface, not the host claude CLI's Read/Grep/Glob.
+                let code_mode_opts = augmentagent_channel_core::ReasonerOpts {
+                    system_prompt,
+                    model: None,
+                    allowed_tools: Vec::new(),
+                    add_dirs: Vec::new(),
+                    permission_mode: "default".into(),
+                    cwd: None,
+                    env: Vec::new(),
+                };
+                let message_ctx = MessageContext {
+                    channel: "discord".to_string(),
+                    email: email.clone(),
+                    account_id: email.account_entity_id.clone(),
+                };
+
+                // Attempt 1: original program. Capture the source on a
+                // `NoCodeBlock`-vs-`RunnerError` distinction so the failure
+                // handler can pass the program text to the repair prompt.
+                let mut cm_source: String = String::new();
+                let cm_attempt: Result<String, (augmentagent_channel_core::code_mode::CodeModeError, FailureStage)> = async {
+                    let ts_source = match self.reasoner.call_code_mode(&code_mode_opts, &user_msg).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let cme = match e.downcast::<augmentagent_channel_core::code_mode::CodeModeError>() {
+                                Ok(cme) => cme,
+                                Err(other) => augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(other),
+                            };
+                            return Err((cme, FailureStage::CallCodeMode));
+                        }
+                    };
+                    cm_source = ts_source.clone();
+                    let dispatcher = DefaultDispatcher::new(
+                        self.store.as_ref(),
+                        message_ctx.clone(),
+                        ts_source.clone(),
+                    )
+                    .with_wiki_hint(wiki_hint.clone());
+                    if let Err(e) = code_mode::run_program(&ts_source, &manifest, &dispatcher).await {
+                        let wrapped = augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(
+                            anyhow::anyhow!("run_program: {e}"),
+                        );
+                        return Err((wrapped, FailureStage::RunProgram));
+                    }
+                    match dispatcher.last_action_id() {
+                        Some(id) => Ok(id),
+                        None => Err((
+                            augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(
+                                anyhow::anyhow!("code-mode program produced no draft call"),
+                            ),
+                            FailureStage::RunProgram,
+                        )),
+                    }
+                }
+                .await;
+
+                // Either Some(action_id) → keep going on the code-mode rail,
+                // or None + carried FailureRecord → run classic, then report.
+                let (code_mode_action_id, pending_classic_record): (
+                    Option<String>,
+                    Option<augmentagent_channel_core::code_mode::FailureRecord>,
+                ) = match cm_attempt {
+                    Ok(action_id) => (Some(action_id), None),
+                    Err((cme, stage)) => {
+                        warn!(
+                            message_id = %email.message_id,
+                            stage = ?stage,
+                            "code-mode attempt failed: {cme}; invoking self-repair"
+                        );
+                        let failure_ctx = FailureCtx {
+                            reasoner: self.reasoner.as_ref(),
+                            opts: code_mode_opts.clone(),
+                            user_msg: user_msg.clone(),
+                            manifest: manifest.clone(),
+                            message_ctx: message_ctx.clone(),
+                            wiki_hint: wiki_hint.clone(),
+                            store: Arc::clone(&self.store),
+                            broker: Arc::clone(&self.approvals),
+                            gh: Arc::clone(&self.gh_issue_runner),
+                            email: email.clone(),
+                            channel: "discord".to_string(),
+                            model: code_mode_opts.model.clone(),
+                            manifest_version: "v1",
+                        };
+                        match handle_code_mode_failure(&failure_ctx, &cm_source, &cme, stage).await
+                        {
+                            DraftOutcome::CodeMode {
+                                action_id,
+                                repair_used,
+                            } => {
+                                info!(
+                                    message_id = %email.message_id,
+                                    action_id = %action_id,
+                                    repair_used,
+                                    "code-mode self-repair succeeded"
+                                );
+                                (Some(action_id), None)
+                            }
+                            DraftOutcome::ClassicNeeded(record) => {
+                                error!(
+                                    message_id = %email.message_id,
+                                    "code-mode self-repair failed; falling back to classic"
+                                );
+                                (None, Some(record))
+                            }
+                        }
+                    }
+                };
+
+                // --- Code-mode success path: read the persisted draft body
+                // out of the actions row the dispatcher just wrote, then run
+                // the existing discord-dm approval-card flow against that
+                // action id.
+                if let Some(action_id) = code_mode_action_id {
+                    let drafted = self
+                        .store
+                        .get_action_with_email(&action_id)?
+                        .and_then(|a| a.action.draft_body)
+                        .unwrap_or_default();
+
+                    if self.config.dry_run {
+                        // Promote the dispatcher's `Pending` row to `DryRun`
+                        // so the dry-run accounting matches classic. The
+                        // persisted code-mode columns (mode='code',
+                        // generatedSource, toolCallTrace) are untouched.
+                        self.store.update_action_status(
+                            &action_id,
+                            ActionStatus::DryRun,
+                            Some(&drafted),
+                            None,
+                        )?;
+                        self.store
+                            .mark_email_processed(&email.message_id, TriageResult::Reply)?;
+                        println!(
+                            "[discord reply dry-run:code] from={} ({} chars)\n--- draft ---\n{}\n--- /draft ---",
+                            email.from,
+                            drafted.len(),
+                            drafted
+                        );
+                        self.maybe_ingest(
+                            &email,
+                            DecisionKind::Reply,
+                            decision.reason.as_deref(),
+                            Some(&drafted),
+                            IngestTrigger::DryRunDrafted,
+                        );
+                        outcome.priority_replied_dry_run += 1;
+                        return Ok(());
+                    }
+
+                    if let Err(e) = self
+                        .approvals
+                        .post_approval(&action_id, &email, &drafted)
+                        .await
+                    {
+                        self.store.update_action_status(
+                            &action_id,
+                            ActionStatus::Error,
+                            None,
+                            Some(&format!("post_approval: {e}")),
+                        )?;
+                        return Err(anyhow::anyhow!("post_approval: {e}"));
+                    }
+                    if let Err(e) = self
+                        .store
+                        .record_nudge(&action_id, now_millis() + NUDGE_INTERVAL_MS)
+                    {
+                        warn!(action_id, "record_nudge after post_approval failed: {e}");
+                    }
+                    info!(action_id, message_id = %email.message_id, "discord approval card posted (code-mode)");
+                    outcome.priority_awaiting_approval += 1;
+                    return Ok(());
+                }
+
+                // --- Classic fallback (I7). Reached when code-mode failed AND
+                // self-repair didn't produce a working code-mode draft.
+                // Behaviour matches the pre-code-mode classic path — same
+                // draft call, same dispatch — except we then call
+                // `report_classic_fallback` to file the postmortem gh issue
+                // and post the Discord notice tagged with the classic
+                // action_id.
                 let skill_system =
                     std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
                         .unwrap_or_default();
@@ -353,7 +579,7 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
                 };
 
                 if self.config.dry_run {
-                    self.store.log_action(
+                    let action_id = self.store.log_action(
                         &email.message_id,
                         email.thread_id.as_deref(),
                         &email.from,
@@ -370,6 +596,24 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
                         drafted.len(),
                         drafted
                     );
+                    if let Some(record) = pending_classic_record {
+                        let failure_ctx = FailureCtx {
+                            reasoner: self.reasoner.as_ref(),
+                            opts: code_mode_opts.clone(),
+                            user_msg: user_msg.clone(),
+                            manifest: manifest.clone(),
+                            message_ctx: message_ctx.clone(),
+                            wiki_hint: wiki_hint.clone(),
+                            store: Arc::clone(&self.store),
+                            broker: Arc::clone(&self.approvals),
+                            gh: Arc::clone(&self.gh_issue_runner),
+                            email: email.clone(),
+                            channel: "discord".to_string(),
+                            model: code_mode_opts.model.clone(),
+                            manifest_version: "v1",
+                        };
+                        report_classic_fallback(&failure_ctx, &record, &action_id).await;
+                    }
                     self.maybe_ingest(
                         &email,
                         DecisionKind::Reply,
@@ -390,6 +634,24 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
                     Some(&drafted),
                     ActionStatus::Pending,
                 )?;
+                if let Some(record) = pending_classic_record.as_ref() {
+                    let failure_ctx = FailureCtx {
+                        reasoner: self.reasoner.as_ref(),
+                        opts: code_mode_opts.clone(),
+                        user_msg: user_msg.clone(),
+                        manifest: manifest.clone(),
+                        message_ctx: message_ctx.clone(),
+                        wiki_hint: wiki_hint.clone(),
+                        store: Arc::clone(&self.store),
+                        broker: Arc::clone(&self.approvals),
+                        gh: Arc::clone(&self.gh_issue_runner),
+                        email: email.clone(),
+                        channel: "discord".to_string(),
+                        model: code_mode_opts.model.clone(),
+                        manifest_version: "v1",
+                    };
+                    report_classic_fallback(&failure_ctx, record, &action_id).await;
+                }
                 if let Err(e) = self
                     .approvals
                     .post_approval(&action_id, &email, &drafted)
