@@ -20,19 +20,32 @@
 //! ultimately calls. v1 backings (sketched here; wired up in I4):
 //!
 //! - `wiki.draftHint`        ← `augmentagent_wiki::WikiReader::draft_hint`
-//! - `db.recentEmailsFrom`   ← `augmentagent_store::Store::recent_emails_since`
-//! - `db.threadHistory`      ← `augmentagent_store::Store::email_bodies_since`
-//!   (filtered by thread id in the dispatcher)
+//! - `db.recentEmailsFrom`   ← **no direct backing yet**; see NOTE below.
+//! - `db.threadHistory`      ← `augmentagent_store::Store::recent_emails_for_thread(thread_id, since_ms)`
 //! - `db.isProcessed`        ← `augmentagent_store::Store::is_message_processed`
 //! - `calendar.busy`         ← `augmentagent_channel_calendar::gcal::CalendarApi::list_events`
 //! - `draft` (terminal)      ← `augmentagent_store::Store::log_action_code_mode`
 //!
 //! The TS-side shapes (`EmailContext`, `EmailSummary`, `CalEvent`, `Channel`)
 //! are JSON-marshalled equivalents of the Rust types; the dispatcher is
-//! responsible for the marshal. Anything missing from the Rust signature
-//! (e.g. `db.recentEmailsFrom(sender, days)` filters by sender + window
-//! whereas `recent_emails_since` is window-only) is fulfilled by adapter
-//! logic in I4's `DefaultDispatcher`, not here.
+//! responsible for the marshal.
+//!
+//! # NOTE — `db.recentEmailsFrom` is a follow-up dependency for I4
+//!
+//! `Store::recent_emails_since(since_ms, limit)` takes **no sender argument**
+//! and returns `(from_email, subject, triage_result)` — it does **not**
+//! include a `messageId` column. The TS surface `recentEmailsFrom(sender,
+//! days): Promise<EmailSummary[]>` requires both sender filtering and
+//! `messageId` in the result. Adapter logic in I4 cannot invent a column
+//! that the query does not return.
+//!
+//! I4 will need a new query overload, e.g.:
+//! ```text
+//! Store::recent_emails_from_sender(sender: &str, since_ms: i64)
+//!     -> StoreResult<Vec<(messageId, subject, timestampMs)>>
+//! ```
+//! This is a **known I4 blocker** — the adapter for `db.recentEmailsFrom`
+//! cannot be completed until that query exists.
 
 use std::collections::BTreeMap;
 
@@ -118,6 +131,31 @@ impl ToolManifest {
     pub fn to_runner_manifest(&self) -> Vec<String> {
         self.tools.iter().map(|t| t.name.clone()).collect()
     }
+}
+
+/// A single tool invocation captured during a code-mode program run.
+///
+/// Used by:
+/// - I2 (#48) — `Store::log_action_code_mode` receives a `Vec<ToolCallRecord>`
+///   as the trace of calls the program made before emitting a draft.
+/// - I4 (#50) — the `DefaultDispatcher` accumulates one `ToolCallRecord` per
+///   dispatched call and passes the full vec to the action logger at program
+///   completion.
+///
+/// Truncation of `args_summary` and `result_summary` is the caller's
+/// responsibility; this type imposes no length constraints.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallRecord {
+    /// Dotted tool name, e.g. `"wiki.draftHint"`.
+    pub call: String,
+    /// Truncated/summarized args (caller decides truncation policy).
+    pub args_summary: serde_json::Value,
+    /// Truncated result; `None` if the call errored.
+    pub result_summary: Option<serde_json::Value>,
+    /// Error message if the call failed; `None` on success.
+    pub error: Option<String>,
+    /// Unix timestamp (ms) when the call completed.
+    pub timestamp_ms: i64,
 }
 
 /// Hard-coded v1 tool surface (see epic + issue #49).
@@ -545,5 +583,144 @@ void main;
             String::from_utf8_lossy(&out.stderr),
             dts
         );
+    }
+
+    /// Pin the exact rendered `.d.ts` string so that any change to indentation,
+    /// namespace ordering, JSDoc formatting, or tool declarations trips a test
+    /// failure in CI rather than silently passing the idempotence check.
+    #[test]
+    fn dts_output_matches_snapshot() {
+        const EXPECTED: &str = r#"// Code Mode tool surface — auto-generated from ToolManifest.
+// All tools are async. The model writes:
+//
+//   async function main(): Promise<void> {
+//     // ... call tools.* here ...
+//     await tools.draft("gmail", "...", "...");
+//   }
+//
+// Imports, fetch, and Deno.* are forbidden by the sandbox.
+
+type Channel =
+  | "gmail"
+  | "linkedin"
+  | "discord"
+  | "twitter"
+  | "instagram"
+  | "whatsapp"
+  | "slack";
+
+interface EmailContext {
+  from: string;
+  subject: string;
+  body: string;
+  threadId?: string;
+  messageId: string;
+}
+
+interface EmailSummary {
+  messageId: string;
+  from: string;
+  subject: string;
+  triageResult?: string;
+}
+
+interface CalEvent {
+  startIso: string;
+  endIso: string;
+  summary?: string;
+}
+
+declare const tools: {
+  calendar: {
+    /**
+     * Busy intervals on the user's primary calendar between two ISO
+     * 8601 timestamps. Use this before proposing a meeting time.
+     * Both bounds are inclusive; recurring events are expanded to
+     * individual instances.
+     */
+    busy(startIso: string, endIso: string): Promise<CalEvent[]>;
+  };
+  db: {
+    /**
+     * True iff an action row already exists for this messageId.
+     * Use this to avoid double-replying when a sibling channel may have
+     * already handled the same message.
+     */
+    isProcessed(messageId: string): Promise<boolean>;
+    /**
+     * Most recent emails from `sender` within the last `days` days,
+     * newest first. Returns at most 50 rows. Use this to check whether
+     * the sender has recent context you should reference.
+     */
+    recentEmailsFrom(sender: string, days: number): Promise<EmailSummary[]>;
+    /**
+     * Every prior message in the given Gmail thread (oldest → newest).
+     * Use this when drafting a reply to make sure you don't repeat
+     * yourself or contradict an earlier message in the same thread.
+     */
+    threadHistory(threadId: string): Promise<EmailSummary[]>;
+  };
+  wiki: {
+    /**
+     * Hint string pointing at likely-relevant wiki pages for this email.
+     * Empty string means "no prior context — rely on the raw email only".
+     * Backed by WikiReader::draft_hint.
+     */
+    draftHint(email: EmailContext): Promise<string>;
+  };
+  /**
+   * TERMINAL. Submits a draft reply for human approval on Discord.
+   * Must be the last tool call in your program. `body` is the literal
+   * reply text; `reason` is a one-sentence justification logged with
+   * the action. Calling this more than once in a single program is an
+   * error.
+   */
+  draft(channel: Channel, body: string, reason: string): Promise<void>;
+};
+"#;
+        let actual = manifest_v1().to_dts();
+        assert_eq!(
+            actual, EXPECTED,
+            "manifest_v1().to_dts() output changed — update the snapshot in \
+             `dts_output_matches_snapshot` if this was intentional"
+        );
+    }
+
+    /// Verify ToolCallRecord round-trips through JSON without data loss.
+    #[test]
+    fn tool_call_record_json_round_trip_success() {
+        let record = ToolCallRecord {
+            call: "wiki.draftHint".to_string(),
+            args_summary: serde_json::json!({"email": "alice@example.com"}),
+            result_summary: Some(serde_json::json!("hint text here")),
+            error: None,
+            timestamp_ms: 1_700_000_000_000,
+        };
+        let json = serde_json::to_string(&record).expect("serialize");
+        let back: ToolCallRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.call, record.call);
+        assert_eq!(back.args_summary, record.args_summary);
+        assert_eq!(back.result_summary, record.result_summary);
+        assert_eq!(back.error, record.error);
+        assert_eq!(back.timestamp_ms, record.timestamp_ms);
+    }
+
+    /// Verify ToolCallRecord round-trips correctly when the call errored
+    /// (result_summary is None, error is set).
+    #[test]
+    fn tool_call_record_json_round_trip_error() {
+        let record = ToolCallRecord {
+            call: "db.recentEmailsFrom".to_string(),
+            args_summary: serde_json::json!({"sender": "bob@example.com", "days": 7}),
+            result_summary: None,
+            error: Some("db connection timeout".to_string()),
+            timestamp_ms: 1_700_000_001_234,
+        };
+        let json = serde_json::to_string(&record).expect("serialize");
+        let back: ToolCallRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.call, record.call);
+        assert!(back.result_summary.is_none());
+        assert_eq!(back.error.as_deref(), Some("db connection timeout"));
+        assert_eq!(back.timestamp_ms, record.timestamp_ms);
     }
 }
