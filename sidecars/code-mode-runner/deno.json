@@ -1,0 +1,23 @@
+{
+  "lock": false,
+  "nodeModulesDir": "none",
+  "imports": {},
+  "compilerOptions": {
+    "strict": true,
+    "lib": ["deno.ns", "deno.window", "esnext"],
+    "noImplicitAny": true
+  },
+  "fmt": {
+    "lineWidth": 100,
+    "indentWidth": 2,
+    "useTabs": false,
+    "semiColons": true,
+    "singleQuote": false
+  },
+  "tasks": {
+    "run": "deno run runner.ts",
+    "test": "deno test --allow-run --allow-read=. --no-prompt runner_test.ts"
+  },
+  "_minDenoVersion": "2.7.0",
+  "_note": "Imports are locked empty. The runner forbids any `import`/`fetch`/`Deno.*` access by being run without any `--allow-*` flags (Deno's default: all permissions denied)."
+}
