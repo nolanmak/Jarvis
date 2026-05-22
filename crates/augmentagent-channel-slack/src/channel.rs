@@ -16,9 +16,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use augmentagent_approval_discord::ApprovalBroker;
+use augmentagent_channel_core::code_mode::{
+    self, handle_code_mode_failure, manifest_v1, report_classic_fallback, DefaultDispatcher,
+    DraftOutcome, FailureCtx, FailureStage, GhCliIssueRunner, GhIssueRunner, MessageContext,
+};
 use augmentagent_channel_core::decision::{parse as parse_decision, DecisionKind};
 use augmentagent_channel_core::ingest::{spawn_ingest, IngestTrigger};
-use augmentagent_channel_core::prompt::{draft_user_message, triage_user_message};
+use augmentagent_channel_core::prompt::{
+    code_mode_system, code_mode_user_message, draft_user_message, triage_user_message,
+};
 use augmentagent_channel_core::reasoner::{draft_opts, triage_opts};
 use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{
@@ -88,6 +94,10 @@ pub struct SlackChannel<R: Reasoner> {
     pub config: SlackChannelConfig,
     pub identity_index: Option<Arc<IdentityIndex>>,
     wiki_schema: Option<String>,
+    /// gh CLI runner for I7 postmortems on code-mode failures. Behind a trait
+    /// so tests can swap in a recorder; production defaults to
+    /// [`GhCliIssueRunner`] which shells out to the `gh` binary on PATH.
+    gh_issue_runner: Arc<dyn GhIssueRunner>,
 }
 
 impl<R: Reasoner + 'static> SlackChannel<R> {
@@ -120,7 +130,16 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
             config,
             identity_index,
             wiki_schema,
+            gh_issue_runner: Arc::new(GhCliIssueRunner::new()),
         }
+    }
+
+    /// Swap the gh-CLI runner used for I7 code-mode postmortem issues.
+    /// Production callers don't need this; tests pass a recording stub so the
+    /// suite never actually files issues on the real repo.
+    pub fn with_gh_issue_runner(mut self, runner: Arc<dyn GhIssueRunner>) -> Self {
+        self.gh_issue_runner = runner;
+        self
     }
 
     /// Build a per-workspace client map from the active rows in
@@ -376,6 +395,227 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
                 Ok(())
             }
             DecisionKind::Reply => {
+                // --- CODE-MODE attempt (I13, mirroring I6/I7).
+                //
+                // Two-step flow:
+                //   1. Reasoner emits a TypeScript program that orchestrates
+                //      tool calls and ends with `tools.draft("slack", body, reason)`.
+                //   2. The Deno sandbox executes the program. The dispatcher's
+                //      terminal `tools.draft` handler writes the actions row
+                //      (mode='code', generatedSource, toolCallTrace) and stashes
+                //      the action id for us to pick up below.
+                //
+                // On ANY failure (reasoner spawn, missing fenced block, sandbox
+                // timeout, runtime exception, dispatcher error) we hand off to
+                // `handle_code_mode_failure` (I7) which runs one self-repair
+                // pass. If the repair lands a working code-mode draft we use
+                // it. Otherwise we fall through to the classic prompt path AND
+                // call `report_classic_fallback` to file the postmortem gh
+                // issue + post the Discord notice.
+                //
+                // Slack passes empty tone/thread/archetype/resolve blocks
+                // today — same shape as the classic `draft_user_message`
+                // call below — so the code-mode prompt stays apples-to-apples
+                // with the existing slack draft.
+                let manifest = manifest_v1();
+                let system_prompt = code_mode_system(&manifest);
+                let user_msg =
+                    code_mode_user_message(&email, &wiki_hint, "", "", "", "");
+                let code_mode_opts = augmentagent_channel_core::ReasonerOpts {
+                    system_prompt,
+                    model: None,
+                    allowed_tools: Vec::new(),
+                    add_dirs: Vec::new(),
+                    permission_mode: "default".into(),
+                    cwd: None,
+                    env: Vec::new(),
+                };
+                let message_ctx = MessageContext {
+                    channel: "slack".to_string(),
+                    email: email.clone(),
+                    account_id: email.account_entity_id.clone(),
+                };
+
+                // Attempt 1: original program. Capture the source on a
+                // `NoCodeBlock`-vs-`RunnerError` distinction so the failure
+                // handler can pass the program text to the repair prompt.
+                let mut cm_source: String = String::new();
+                let cm_attempt: Result<
+                    String,
+                    (augmentagent_channel_core::code_mode::CodeModeError, FailureStage),
+                > = async {
+                    let ts_source = match self
+                        .reasoner
+                        .call_code_mode(&code_mode_opts, &user_msg)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let cme = match e
+                                .downcast::<augmentagent_channel_core::code_mode::CodeModeError>()
+                            {
+                                Ok(cme) => cme,
+                                Err(other) => {
+                                    augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(other)
+                                }
+                            };
+                            return Err((cme, FailureStage::CallCodeMode));
+                        }
+                    };
+                    cm_source = ts_source.clone();
+                    let dispatcher = DefaultDispatcher::new(
+                        self.store.as_ref(),
+                        message_ctx.clone(),
+                        ts_source.clone(),
+                    )
+                    .with_wiki_hint(wiki_hint.clone());
+                    if let Err(e) =
+                        code_mode::run_program(&ts_source, &manifest, &dispatcher).await
+                    {
+                        let wrapped =
+                            augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(
+                                anyhow::anyhow!("run_program: {e}"),
+                            );
+                        return Err((wrapped, FailureStage::RunProgram));
+                    }
+                    match dispatcher.last_action_id() {
+                        Some(id) => Ok(id),
+                        None => Err((
+                            augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(
+                                anyhow::anyhow!("code-mode program produced no draft call"),
+                            ),
+                            FailureStage::RunProgram,
+                        )),
+                    }
+                }
+                .await;
+
+                // Either Some(action_id) → keep going on the code-mode rail,
+                // or None + carried FailureRecord → run classic, then report.
+                let (code_mode_action_id, pending_classic_record): (
+                    Option<String>,
+                    Option<augmentagent_channel_core::code_mode::FailureRecord>,
+                ) = match cm_attempt {
+                    Ok(action_id) => (Some(action_id), None),
+                    Err((cme, stage)) => {
+                        warn!(
+                            message_id = %email.message_id,
+                            stage = ?stage,
+                            "code-mode attempt failed: {cme}; invoking self-repair"
+                        );
+                        let failure_ctx = FailureCtx {
+                            reasoner: self.reasoner.as_ref(),
+                            opts: code_mode_opts.clone(),
+                            user_msg: user_msg.clone(),
+                            manifest: manifest.clone(),
+                            message_ctx: message_ctx.clone(),
+                            wiki_hint: wiki_hint.clone(),
+                            store: Arc::clone(&self.store),
+                            broker: Arc::clone(&self.approvals),
+                            gh: Arc::clone(&self.gh_issue_runner),
+                            email: email.clone(),
+                            channel: "slack".to_string(),
+                            model: code_mode_opts.model.clone(),
+                            manifest_version: "v1",
+                        };
+                        match handle_code_mode_failure(&failure_ctx, &cm_source, &cme, stage)
+                            .await
+                        {
+                            DraftOutcome::CodeMode {
+                                action_id,
+                                repair_used,
+                            } => {
+                                info!(
+                                    message_id = %email.message_id,
+                                    action_id = %action_id,
+                                    repair_used,
+                                    "slack code-mode self-repair succeeded"
+                                );
+                                (Some(action_id), None)
+                            }
+                            DraftOutcome::ClassicNeeded(record) => {
+                                error!(
+                                    message_id = %email.message_id,
+                                    "slack code-mode self-repair failed; falling back to classic"
+                                );
+                                (None, Some(record))
+                            }
+                        }
+                    }
+                };
+
+                // --- Code-mode success path. The dispatcher already wrote
+                // the actions row with mode='code', so we just read the body
+                // back and hand off to the existing approval flow.
+                if let Some(action_id) = code_mode_action_id {
+                    let draft_body = self
+                        .store
+                        .get_action_with_email(&action_id)?
+                        .and_then(|a| a.action.draft_body)
+                        .unwrap_or_default();
+
+                    if self.config.dry_run {
+                        // Promote the dispatcher's `Pending` row to `DryRun`
+                        // so accounting matches classic. The persisted
+                        // code-mode columns (mode='code', generatedSource,
+                        // toolCallTrace) are untouched.
+                        self.store.update_action_status(
+                            &action_id,
+                            ActionStatus::DryRun,
+                            Some(&draft_body),
+                            None,
+                        )?;
+                        self.store
+                            .mark_email_processed(&email.message_id, TriageResult::Reply)?;
+                        println!(
+                            "[slack reply dry-run:code] from={} ({} chars)\n--- draft ---\n{}\n--- /draft ---",
+                            email.from,
+                            draft_body.len(),
+                            draft_body
+                        );
+                        self.maybe_ingest(
+                            &email,
+                            DecisionKind::Reply,
+                            decision.reason.as_deref(),
+                            Some(&draft_body),
+                            IngestTrigger::DryRunDrafted,
+                        );
+                        outcome.priority_replied_dry_run += 1;
+                        return Ok(());
+                    }
+
+                    if let Err(e) = self
+                        .approvals
+                        .post_approval(&action_id, &email, &draft_body)
+                        .await
+                    {
+                        self.store.update_action_status(
+                            &action_id,
+                            ActionStatus::Error,
+                            None,
+                            Some(&format!("post_approval: {e}")),
+                        )?;
+                        return Err(anyhow::anyhow!("post_approval: {e}"));
+                    }
+                    if let Err(e) = self
+                        .store
+                        .record_nudge(&action_id, now_millis() + NUDGE_INTERVAL_MS)
+                    {
+                        warn!(action_id, "record_nudge after post_approval failed: {e}");
+                    }
+                    info!(action_id, message_id = %email.message_id, "slack approval card posted (code-mode)");
+                    outcome.priority_awaiting_approval += 1;
+                    return Ok(());
+                }
+
+                // --- Classic fallback (I7).
+                //
+                // Reached when code-mode failed AND self-repair didn't
+                // produce a working code-mode draft. Behaviour matches the
+                // pre-I13 classic prompt path — same draft call, same
+                // dispatch — except we then call `report_classic_fallback`
+                // to file the postmortem gh issue and post the Discord
+                // notice tagged with the classic action_id.
                 let skill_system =
                     std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
                         .unwrap_or_default();
@@ -399,7 +639,7 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
                 };
 
                 if self.config.dry_run {
-                    self.store.log_action(
+                    let action_id = self.store.log_action(
                         &email.message_id,
                         email.thread_id.as_deref(),
                         &email.from,
@@ -416,6 +656,27 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
                         drafted.len(),
                         drafted
                     );
+                    // I7: file postmortem when classic fallback was triggered
+                    // by a code-mode failure. Successful repair returns above,
+                    // so this branch is exclusively for "repair couldn't save it".
+                    if let Some(record) = pending_classic_record {
+                        let failure_ctx = FailureCtx {
+                            reasoner: self.reasoner.as_ref(),
+                            opts: code_mode_opts.clone(),
+                            user_msg: user_msg.clone(),
+                            manifest: manifest.clone(),
+                            message_ctx: message_ctx.clone(),
+                            wiki_hint: wiki_hint.clone(),
+                            store: Arc::clone(&self.store),
+                            broker: Arc::clone(&self.approvals),
+                            gh: Arc::clone(&self.gh_issue_runner),
+                            email: email.clone(),
+                            channel: "slack".to_string(),
+                            model: code_mode_opts.model.clone(),
+                            manifest_version: "v1",
+                        };
+                        report_classic_fallback(&failure_ctx, &record, &action_id).await;
+                    }
                     self.maybe_ingest(
                         &email,
                         DecisionKind::Reply,
@@ -436,6 +697,26 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
                     Some(&drafted),
                     ActionStatus::Pending,
                 )?;
+                // I7 postmortem (non-dry-run): file before post_approval so
+                // the Discord notice + the approval card land together.
+                if let Some(record) = pending_classic_record.as_ref() {
+                    let failure_ctx = FailureCtx {
+                        reasoner: self.reasoner.as_ref(),
+                        opts: code_mode_opts.clone(),
+                        user_msg: user_msg.clone(),
+                        manifest: manifest.clone(),
+                        message_ctx: message_ctx.clone(),
+                        wiki_hint: wiki_hint.clone(),
+                        store: Arc::clone(&self.store),
+                        broker: Arc::clone(&self.approvals),
+                        gh: Arc::clone(&self.gh_issue_runner),
+                        email: email.clone(),
+                        channel: "slack".to_string(),
+                        model: code_mode_opts.model.clone(),
+                        manifest_version: "v1",
+                    };
+                    report_classic_fallback(&failure_ctx, record, &action_id).await;
+                }
                 if let Err(e) = self
                     .approvals
                     .post_approval(&action_id, &email, &drafted)
@@ -748,7 +1029,92 @@ mod tests {
         }
     }
 
+    /// Disable the real `gh` CLI for the duration of the test binary.
+    /// `GhCliIssueRunner::create_issue` honors `AUGMENTAGENT_GH_DISABLE=1` and
+    /// returns a benign error instead of shelling out, so the I7 reporter
+    /// logs + continues without touching the production repo.
+    static GH_DISABLE_INIT: std::sync::Once = std::sync::Once::new();
+    fn disable_gh_for_tests() {
+        GH_DISABLE_INIT.call_once(|| {
+            // SAFETY: set once at module init before any test runs; no
+            // concurrent reads of this var.
+            std::env::set_var("AUGMENTAGENT_GH_DISABLE", "1");
+        });
+    }
+
+    /// Mock gh-CLI runner that records every `gh issue create` call without
+    /// spawning the real binary. Returns canned issue numbers starting at
+    /// `next_number`. Wire into a `SlackChannel` via
+    /// `.with_gh_issue_runner(...)` so I7 postmortem tests never touch the
+    /// production repo.
+    #[derive(Default)]
+    struct RecordingGh {
+        calls: std::sync::Mutex<Vec<(String, String, Vec<String>)>>,
+        next_number: std::sync::Mutex<u64>,
+    }
+    impl RecordingGh {
+        fn new(start: u64) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                next_number: std::sync::Mutex::new(start),
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl GhIssueRunner for RecordingGh {
+        async fn create_issue(
+            &self,
+            title: &str,
+            body: &str,
+            labels: &[&str],
+        ) -> anyhow::Result<u64> {
+            self.calls.lock().unwrap().push((
+                title.to_string(),
+                body.to_string(),
+                labels.iter().map(|s| s.to_string()).collect(),
+            ));
+            let mut n = self.next_number.lock().unwrap();
+            let out = *n;
+            *n += 1;
+            Ok(out)
+        }
+    }
+
+    /// Broker that records every post/flag without blocking — used by I7
+    /// fallback tests to assert the Discord notice carries the issue number.
+    #[derive(Default)]
+    struct RecordingBroker {
+        posts: std::sync::Mutex<Vec<String>>,
+        flag_posts: std::sync::Mutex<Vec<(String, String)>>,
+    }
+    #[async_trait::async_trait]
+    impl ApprovalBroker for RecordingBroker {
+        async fn post_approval(
+            &self,
+            action_id: &str,
+            _email: &Email,
+            _draft: &str,
+        ) -> Result<(), augmentagent_approval_discord::ApprovalError> {
+            self.posts.lock().unwrap().push(action_id.to_string());
+            Ok(())
+        }
+        async fn post_flag_notice(
+            &self,
+            email: &Email,
+            reason: &str,
+        ) -> Result<(), augmentagent_approval_discord::ApprovalError> {
+            self.flag_posts
+                .lock()
+                .unwrap()
+                .push((email.message_id.clone(), reason.to_string()));
+            Ok(())
+        }
+    }
+
     fn tmp_store() -> (Arc<Store>, tempfile::NamedTempFile) {
+        // Belt-and-suspenders: any test that opens a store also disables the
+        // real `gh` CLI for the rest of the process.
+        disable_gh_for_tests();
         use rusqlite::Connection;
         let file = tempfile::NamedTempFile::new().unwrap();
         {
@@ -853,5 +1219,209 @@ mod tests {
         ch.handle_priority(e, &mut out).await.unwrap();
         assert_eq!(out.priority_flagged, 1);
         assert_eq!(*counting.flags.lock().unwrap(), 1);
+    }
+
+    /// `true` iff `deno --version` succeeds (resolved via the same env-var
+    /// convention as the runner itself). Returning `false` here makes the
+    /// code-mode tests print a notice and exit clean instead of failing on
+    /// a dev box without Deno installed.
+    fn deno_available_for_tests() -> bool {
+        let bin = std::env::var("AUGMENTAGENT_DENO_BIN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "deno".to_string());
+        std::process::Command::new(&bin)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Code-mode happy path (dry-run): triage returns reply, the second
+    /// reasoner response is a fenced TS program whose body calls
+    /// `tools.draft("slack", ...)`. The Deno sandbox executes it and the
+    /// dispatcher lands an `actions` row with `mode='code'`,
+    /// `generatedSource`, and `toolCallTrace`. Verifies the channel string
+    /// is `slack` (I13's headline contract).
+    #[tokio::test]
+    async fn code_mode_dry_run_lands_action_row_with_mode_code() {
+        if !deno_available_for_tests() {
+            eprintln!(
+                "skipping code_mode_dry_run_lands_action_row_with_mode_code: \
+                 `deno` not on PATH (set AUGMENTAGENT_DENO_BIN to override)"
+            );
+            return;
+        }
+        let (store, _f) = tmp_store();
+        let r = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"actionable"}"#,
+            // Plain JS body inside a ```ts fence — `extract_ts_block`
+            // matches the language tag, while the Deno runner uses indirect
+            // eval (no TS-stripping), so the program itself must not carry
+            // TypeScript type annotations.
+            "```ts\n\
+             async function main() {\n\
+               await tools.draft(\"slack\", \"thanks — shipping today\", \"answer the question\");\n\
+             }\n\
+             main();\n\
+             ```\n",
+        ]));
+        let broker: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker::default());
+        let ch = SlackChannel::new(
+            store.clone(),
+            r,
+            broker,
+            SlackChannelConfig {
+                dry_run: true,
+                poll_interval: Duration::from_secs(1),
+                wiki_root: None,
+                wiki_schema_path: None,
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+            },
+            None,
+        );
+        let sub = sub_with_mode(SubscriptionMode::Priority);
+        let m = sample_msg("100.000001", "any update?");
+        let e = message_to_email(&m, &sub, "me");
+        store.upsert_email(&e).unwrap();
+
+        let mut out = PollOutcome::default();
+        ch.handle_priority(e, &mut out).await.unwrap();
+        assert_eq!(out.priority_replied_dry_run, 1, "expected 1 dry-run reply");
+        assert_eq!(out.errors, 0);
+
+        // Read the actions row back and verify the code-mode columns.
+        let rows = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT mode, generatedSource, toolCallTrace, draftBody, status \
+                     FROM actions",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, Option<String>>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1, "expected exactly one actions row");
+        let (mode, src, trace, body, status) = &rows[0];
+        assert_eq!(mode.as_deref(), Some("code"), "mode must be 'code'");
+        assert!(
+            src.as_deref()
+                .map(|s| s.contains("tools.draft"))
+                .unwrap_or(false),
+            "generatedSource must contain the program; got {src:?}"
+        );
+        let trace_str = trace.as_deref().unwrap_or("");
+        assert!(
+            trace_str.contains("\"call\":\"draft\""),
+            "toolCallTrace must include the draft call; got {trace_str:?}"
+        );
+        // The dispatcher's terminal `tools.draft` records the channel arg as
+        // part of the trace. Sanity-check it reads "slack" — the headline
+        // contract for I13.
+        assert!(
+            trace_str.contains("\"slack\""),
+            "toolCallTrace must record channel=\"slack\"; got {trace_str:?}"
+        );
+        assert_eq!(
+            body.as_deref(),
+            Some("thanks — shipping today"),
+            "draftBody must match what tools.draft passed"
+        );
+        assert_eq!(status, "dry_run", "dry-run mode must update status");
+    }
+
+    /// Code-mode failure path: neither the initial program nor the repair
+    /// program carry a fenced TS block, so code-mode + self-repair both
+    /// fall through to the classic prose draft. Verifies that:
+    ///   - the classic action row is landed with `mode='classic'`,
+    ///   - exactly one `gh issue create` invocation is filed with the
+    ///     `code-mode-failure` label,
+    ///   - the Discord notice fires through `post_flag_notice` carrying the
+    ///     issue number,
+    ///   - the existing slack approval card still posts (existing pipeline
+    ///     unbroken).
+    #[tokio::test]
+    async fn code_mode_failure_falls_through_to_classic_path() {
+        let (store, _f) = tmp_store();
+        // Triage → reply. Two no-fence code-mode responses (initial + repair
+        // retry both fail). Fourth response feeds the classic prose-draft
+        // call.
+        let r = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"ping"}"#,
+            "no fenced block here, just prose",
+            "still no fenced block — repair gave up",
+            "Yes — shipping today.",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let gh = Arc::new(RecordingGh::new(202));
+        let ch = SlackChannel::new(
+            store.clone(),
+            r,
+            broker.clone(),
+            SlackChannelConfig {
+                dry_run: false,
+                poll_interval: Duration::from_secs(1),
+                wiki_root: None,
+                wiki_schema_path: None,
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+            },
+            None,
+        )
+        .with_gh_issue_runner(gh.clone());
+
+        let sub = sub_with_mode(SubscriptionMode::Priority);
+        let m = sample_msg("100.000001", "u there?");
+        let e = message_to_email(&m, &sub, "me");
+        store.upsert_email(&e).unwrap();
+
+        let mut out = PollOutcome::default();
+        ch.handle_priority(e, &mut out).await.unwrap();
+
+        assert_eq!(out.priority_awaiting_approval, 1);
+        assert_eq!(out.errors, 0);
+        assert_eq!(broker.posts.lock().unwrap().len(), 1);
+
+        // Action row landed with mode='classic'.
+        let mode: Option<String> = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT mode FROM actions WHERE status = 'pending'",
+                    [],
+                    |r| r.get(0),
+                )
+                .or(Ok(None))
+            })
+            .unwrap();
+        assert_eq!(
+            mode.as_deref(),
+            Some("classic"),
+            "fallback path must land mode='classic'"
+        );
+
+        // Exactly one gh issue filed with the right label + title prefix.
+        let calls = gh.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one gh issue should be filed");
+        let (title, body, labels) = &calls[0];
+        assert!(title.starts_with("[code-mode]"));
+        assert!(body.contains("## Postmortem"));
+        assert!(body.contains("**Final draft mode:** classic"));
+        assert!(body.contains("**Channel:** slack"));
+        assert_eq!(labels, &vec!["code-mode-failure".to_string()]);
+
+        // Discord notice posted with the issue number (#202).
+        let notices = broker.flag_posts.lock().unwrap();
+        assert_eq!(notices.len(), 1, "exactly one Discord notice should fire");
+        assert!(notices[0].1.contains("#202"));
+        assert!(notices[0].1.contains("classic"));
     }
 }
