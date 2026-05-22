@@ -2093,7 +2093,6 @@ async fn main() -> Result<()> {
             since,
             post_discord,
         } => run_digest(&cli, store, since, post_discord).await,
-        Cmd::Channel { name, op, args } => channel_router::dispatch(name, op, args).await,
         Cmd::Gmail { ref op } => match op {
             GmailOp::Search { query, limit, full } => {
                 run_gmail_search(store, query.clone(), *limit, *full).await
@@ -2601,6 +2600,7 @@ async fn main() -> Result<()> {
         Cmd::Engagement { ref op } => run_engagement(store, op).await,
 
         // === setup+maintenance subcommands (alphabetical) ===
+        Cmd::Channel { name, op, args } => channel_router::dispatch(name, op, args).await,
         Cmd::Doctor { json, deep } => {
             let code = doctor::run(store, json, deep).await?;
             std::process::exit(code);
