@@ -45,6 +45,7 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod channel_router;
+mod code_mode;
 mod doctor;
 mod env_cfg;
 mod installers;
@@ -358,6 +359,14 @@ enum Cmd {
         /// per-channel command (e.g. `--json`, `--dry-run false`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// #50 — Code-Mode debug surface. Wraps the Rust dispatcher + Deno
+    /// sidecar so I6's acceptance test (and humans poking the pipeline) can
+    /// drive a fixture program end-to-end without the polling daemon or the
+    /// LLM. The runtime + manifest live in `augmentagent-channel-core`.
+    CodeMode {
+        #[command(subcommand)]
+        op: code_mode::CodeModeOp,
     },
     /// #11 — read-only diagnostic checks. Composes the `status` aggregator
     /// (#1) with additional probes (sqlite integrity, keyring reachability,
@@ -2601,6 +2610,7 @@ async fn main() -> Result<()> {
 
         // === setup+maintenance subcommands (alphabetical) ===
         Cmd::Channel { name, op, args } => channel_router::dispatch(name, op, args).await,
+        Cmd::CodeMode { op } => code_mode::run(store, op).await,
         Cmd::Doctor { json, deep } => {
             let code = doctor::run(store, json, deep).await?;
             std::process::exit(code);
