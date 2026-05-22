@@ -287,6 +287,133 @@ Deno.test("manifest enforcement: missing tool raises in-program error", async ()
 });
 
 // ---------------------------------------------------------------------------
+// Ordering: boot-line is fully parsed before eval(program) runs.
+//
+// The program calls tools.draft() as its very first statement (synchronously
+// inside main()). For the runner to emit that RPC frame the boot-line must
+// already have been consumed and the manifest installed — if eval happened
+// before readFirstLine() returned, globalThis.tools would be undefined and
+// the runner would crash before emitting any call frame.
+// ---------------------------------------------------------------------------
+Deno.test("ordering: boot-line fully parsed before eval(program) runs", async () => {
+  // The program calls tools.draft() synchronously on first microtask tick.
+  // If the boot line weren't fully drained first, `tools` would be undefined
+  // and we'd get an error frame (or no call frame) instead.
+  const result = await driveRunner({
+    header: {
+      program:
+        'async function main(){ const r = await tools.draft("x","y","z"); return r; } main();',
+      manifest: ["draft"],
+    },
+    onFrame: (f) => {
+      if ("call" in f) return { id: f.id, result: "boot-order-ok" };
+      return undefined;
+    },
+    testTimeoutMs: 10_000,
+  });
+
+  assertEquals(result.status.code, 0, `stderr: ${result.stderr}`);
+  const calls = result.stdoutFrames.filter((f) => "call" in f);
+  const finals = result.stdoutFrames.filter((f) => "final" in f);
+  // A call frame must have arrived — proving tools was installed (boot line
+  // parsed) before eval fired.
+  assertEquals(calls.length, 1, "expected exactly one call frame");
+  assertEquals(calls[0].call, "draft");
+  // The first frame in the sequence must be the call, not an error.
+  assertEquals(
+    "call" in result.stdoutFrames[0],
+    true,
+    "first emitted frame must be a call (not an error), confirming boot-line was parsed first",
+  );
+  assertEquals(finals.length, 1);
+  assertEquals(finals[0].final, "boot-order-ok");
+});
+
+// ---------------------------------------------------------------------------
+// Race regression: rpc() registers the pending Promise BEFORE writing the
+// call frame to stdout, so a pre-buffered response arriving in the same stdin
+// chunk as the boot line is still matched correctly.
+//
+// We write boot-line + RPC response {"id":1,"result":"ok"} in a single
+// write() call (one chunk). If the pending-Promise registration ever moved to
+// after writeLine(), the reader loop could consume the response before the
+// Promise was registered and the runner would hang forever on `await rpc()`.
+// ---------------------------------------------------------------------------
+Deno.test({
+  name: "rpc race: pre-buffered response in same stdin chunk resolves correctly",
+  sanitizeResources: false,
+  fn: async () => {
+    const header = {
+      program: 'async function main(){ return await tools.ping(); } main();',
+      manifest: ["ping"],
+    };
+    // We spawn manually so we can write both lines in a single chunk.
+    const cmd = new Deno.Command(Deno.execPath(), {
+      args: ["run", RUNNER],
+      stdin: "piped",
+      stdout: "piped",
+      stderr: "piped",
+    });
+    const child = cmd.spawn();
+    const writer = child.stdin.getWriter();
+
+    // Single write: boot line + pre-arranged response for id=1.
+    // The runner must match this response even though it arrives in the same
+    // read() call as the boot line (i.e. before rpc() has written the call
+    // frame to stdout).
+    const combined =
+      JSON.stringify(header) + "\n" + JSON.stringify({ id: 1, result: "ok" }) + "\n";
+    await writer.write(new TextEncoder().encode(combined));
+    // Close stdin immediately — no further writes needed.
+    try {
+      await writer.close();
+    } catch { /* ignore */ }
+
+    // Collect all stdout frames.
+    const stdoutFrames: Frame[] = [];
+    const reader = child.stdout.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    const deadline = Date.now() + 10_000;
+    while (true) {
+      if (Date.now() > deadline) {
+        try {
+          child.kill("SIGKILL");
+        } catch { /* already dead */ }
+        throw new Error("test wall clock exceeded");
+      }
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value);
+      let idx;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        if (line.length === 0) continue;
+        stdoutFrames.push(JSON.parse(line) as Frame);
+      }
+    }
+    reader.releaseLock();
+
+    const stderrBytes = await new Response(child.stderr).bytes();
+    const status = await child.status;
+
+    assertEquals(
+      status.code,
+      0,
+      `runner exited non-zero — pre-buffered response was likely dropped.\nstderr: ${new TextDecoder().decode(stderrBytes)}`,
+    );
+    const calls = stdoutFrames.filter((f) => "call" in f);
+    const finals = stdoutFrames.filter((f) => "final" in f);
+    assertEquals(calls.length, 1, "expected one call frame");
+    assertEquals(calls[0].call, "ping");
+    assertEquals(finals.length, 1, "expected one final frame");
+    // The resolved value from the pre-buffered response must propagate.
+    assertEquals(finals[0].final, "ok");
+  },
+});
+
+// ---------------------------------------------------------------------------
 // Extra: RPC error frames from the parent surface as in-program throws.
 // ---------------------------------------------------------------------------
 Deno.test("rpc error: parent {id,error} frame rejects the in-program await", async () => {
