@@ -40,7 +40,8 @@ pub use auth::{
     KEYCHAIN_PLATFORM,
 };
 pub use channel::{
-    close_friends_with_twitter, CloseFriend, TwitterDmSource, TwitterFeedTrigger,
+    close_friends_with_twitter, CloseFriend, DispatchOutcome, TwitterChannel,
+    TwitterChannelConfig, TwitterDmSource, TwitterFeedTrigger, TwitterWorkHandler,
     DM_POLL_MIN_SECS, FEED_JITTER_SECS, FEED_POLL_SECS,
 };
 pub use client::{
