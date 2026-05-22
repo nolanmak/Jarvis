@@ -8,6 +8,7 @@
 //! one work-source contract instead of inventing their own per platform.
 
 pub mod archetype;
+pub mod code_mode;
 pub mod decision;
 pub mod engagement;
 pub mod governor;
