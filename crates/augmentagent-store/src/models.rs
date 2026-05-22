@@ -96,30 +96,6 @@ pub struct ActionRecord {
     pub updated_at: String,
 }
 
-/// One entry in a code-mode program's tool-call trace (#48 — actions schema for
-/// the Code Mode epic). Persisted as a JSON array in `actions.toolCallTrace`
-/// alongside `actions.generatedSource` whenever `actions.mode = 'code'`.
-///
-/// `call` is the dotted tool name the program invoked (`db.recentEmailsFrom`,
-/// `tools.draft`, …). `args_summary` and `result_summary` are intentionally
-/// short, redacted blurbs — we don't persist raw bodies or PII into the trace;
-/// the dispatcher fills these in with one-line summaries suitable for the
-/// approval-card postmortem. `error` is set only when the dispatched call
-/// failed (timeout, bad args, allowlist miss) — it carries the structured
-/// error message returned to the program.
-///
-/// Lives in `augmentagent-store` rather than `augmentagent-channel-core` so the
-/// store's `log_action_code_mode` helper can take a typed slice without
-/// inverting the existing dependency direction (channel-core → store).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolCallRecord {
-    pub call: String,
-    pub args_summary: String,
-    pub result_summary: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,

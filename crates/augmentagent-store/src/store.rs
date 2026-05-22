@@ -580,8 +580,8 @@ impl Store {
         // program (only populated when `mode = 'code'`, or when a failed
         // code-mode program is recorded after fallback for audit); nullable for
         // classic rows. `toolCallTrace` is a JSON array of
-        // `{call, args_summary, result_summary, error?}` records — see
-        // `ToolCallRecord` in `augmentagent-store::models`. Nullable for
+        // `{call, args_summary, result_summary, error?}` records (see
+        // `ToolCallRecord` in `augmentagent-channel-core`). Nullable for
         // classic rows.
         if !column_exists(conn, "actions", "mode")? {
             conn.execute(
@@ -1188,13 +1188,11 @@ impl Store {
     /// classic-path code keeps calling [`Self::log_action`] — no behavior
     /// change there.
     ///
-    /// `trace` is serialized to a compact JSON array and stored in the
-    /// `toolCallTrace` column. Round-tripping through `serde_json` is the
-    /// only failure mode that's not a SQLite error, hence the explicit
-    /// `expect`: the [`crate::models::ToolCallRecord`] struct is pure data
-    /// with no custom `Serialize` impls, so a panic here would indicate a
-    /// programmer bug (e.g. someone added a non-serializable field), not a
-    /// runtime condition worth threading a new error variant for.
+    /// `trace_json` is a pre-serialized JSON string (compact array) stored
+    /// verbatim in the `toolCallTrace` column. The caller is responsible for
+    /// serializing the `Vec<ToolCallRecord>` to JSON before calling — matching
+    /// how `meta_json`, `exemplar_ids`, and `raw_json` work throughout this
+    /// file. The store is a dumb byte-bucket for this field.
     #[allow(clippy::too_many_arguments)]
     pub fn log_action_code_mode(
         &self,
@@ -1206,7 +1204,7 @@ impl Store {
         draft_body: Option<&str>,
         status: ActionStatus,
         generated_source: &str,
-        trace: &[crate::models::ToolCallRecord],
+        trace_json: &str,
     ) -> StoreResult<String> {
         let id = Uuid::new_v4().to_string();
         let now = now_millis();
@@ -1214,8 +1212,6 @@ impl Store {
             ActionStatus::Pending => Some(now + NUDGE_INTERVAL_MS),
             _ => None,
         };
-        let trace_json = serde_json::to_string(trace)
-            .expect("ToolCallRecord serialization is infallible for pure-data fields");
         let guard = self.conn.lock().expect("store mutex poisoned");
         guard.execute(
             "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs, mode, generatedSource, toolCallTrace) \
@@ -1254,20 +1250,8 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((mode, generated_source, trace_json)) = row else {
+        let Some((mode, generated_source, tool_call_trace)) = row else {
             return Ok(None);
-        };
-        let tool_call_trace = match trace_json {
-            Some(s) => Some(
-                serde_json::from_str::<Vec<crate::models::ToolCallRecord>>(&s).map_err(|e| {
-                    StoreError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    ))
-                })?,
-            ),
-            None => None,
         };
         Ok(Some(ActionCodeModeFields {
             mode,
@@ -4936,11 +4920,13 @@ pub struct RetryableReply {
 /// [`Store::action_code_mode_fields`]. `mode` is `'classic'` or `'code'` (never
 /// NULL post-migration). For classic rows `generated_source` and
 /// `tool_call_trace` are `None`; for code-mode rows both are populated.
+/// `tool_call_trace` is the raw JSON string as stored — callers (channel-core)
+/// are responsible for deserializing it into `Vec<ToolCallRecord>`.
 #[derive(Debug, Clone)]
 pub struct ActionCodeModeFields {
     pub mode: String,
     pub generated_source: Option<String>,
-    pub tool_call_trace: Option<Vec<crate::models::ToolCallRecord>>,
+    pub tool_call_trace: Option<String>,
 }
 
 /// One row from `draft_revisions` (#37). The full chain for a given action is
@@ -5105,6 +5091,7 @@ fn now_millis() -> i64 {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+    use serde_json;
 
     fn fresh_store() -> (Store, NamedTempFile) {
         let file = NamedTempFile::new().unwrap();
@@ -6497,20 +6484,7 @@ mod tests {
     fn log_action_code_mode_persists_source_and_trace_round_trip() {
         let (s, _f) = fresh_store();
         s.upsert_email(&sample_email("c1")).unwrap();
-        let trace = vec![
-            crate::models::ToolCallRecord {
-                call: "db.recentEmailsFrom".into(),
-                args_summary: "sender=alice@example.com, days=30".into(),
-                result_summary: "3 results".into(),
-                error: None,
-            },
-            crate::models::ToolCallRecord {
-                call: "tools.draft".into(),
-                args_summary: "channel=gmail, body_len=142".into(),
-                result_summary: "ok".into(),
-                error: None,
-            },
-        ];
+        let trace_json = r#"[{"call":"db.recentEmailsFrom","args_summary":"sender=alice@example.com, days=30","result_summary":"3 results"},{"call":"tools.draft","args_summary":"channel=gmail, body_len=142","result_summary":"ok"}]"#;
         let source = "async function main() { /* ... */ }\nmain();";
         let id = s
             .log_action_code_mode(
@@ -6522,7 +6496,7 @@ mod tests {
                 Some("drafted body"),
                 ActionStatus::Pending,
                 source,
-                &trace,
+                trace_json,
             )
             .unwrap();
         let got = s
@@ -6531,22 +6505,18 @@ mod tests {
             .expect("row must exist");
         assert_eq!(got.mode, "code");
         assert_eq!(got.generated_source.as_deref(), Some(source));
-        assert_eq!(got.tool_call_trace.as_deref(), Some(trace.as_slice()));
+        // Assert raw JSON string equality — the store must return exactly what was passed in.
+        assert_eq!(got.tool_call_trace.as_deref(), Some(trace_json));
     }
 
     #[test]
-    fn log_action_code_mode_serializes_optional_error_field() {
-        // The trace's `error` field is `#[serde(skip_serializing_if = "Option::is_none")]`
-        // so calls without errors round-trip with `error: None`, and calls
-        // with a structured error round-trip with the message intact.
+    fn log_action_code_mode_stores_error_field_in_trace_json() {
+        // The trace JSON (pre-serialized by the caller) is stored verbatim and
+        // returned as-is. Parse both sides to serde_json::Value to confirm the
+        // stored bytes represent the same structure that was passed in.
         let (s, _f) = fresh_store();
         s.upsert_email(&sample_email("c2")).unwrap();
-        let trace = vec![crate::models::ToolCallRecord {
-            call: "tools.notAThing".into(),
-            args_summary: "".into(),
-            result_summary: "".into(),
-            error: Some("unknown tool: tools.notAThing".into()),
-        }];
+        let trace_json = r#"[{"call":"tools.notAThing","args_summary":"","result_summary":"","error":"unknown tool: tools.notAThing"}]"#;
         let id = s
             .log_action_code_mode(
                 "c2",
@@ -6557,19 +6527,18 @@ mod tests {
                 None,
                 ActionStatus::Error,
                 "// failed program",
-                &trace,
+                trace_json,
             )
             .unwrap();
         let got = s
             .action_code_mode_fields(&id)
             .unwrap()
             .expect("row must exist");
-        let decoded_trace = got.tool_call_trace.expect("trace populated");
-        assert_eq!(decoded_trace.len(), 1);
-        assert_eq!(
-            decoded_trace[0].error.as_deref(),
-            Some("unknown tool: tools.notAThing")
-        );
+        let stored = got.tool_call_trace.expect("trace populated");
+        // Parse both sides to confirm structural equality (allows whitespace differences).
+        let expected: serde_json::Value = serde_json::from_str(trace_json).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]

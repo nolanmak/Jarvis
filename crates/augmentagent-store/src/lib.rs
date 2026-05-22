@@ -13,7 +13,7 @@ pub use models::{
     LinkedInConnectionSync, OwnPost, PhoneIdentity, RateAuditRow,
     RateEvent, RateHalt, RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace,
     SubscriptionMode, TelegramBot, ToneExample,
-    ToneProfile, ToolCallRecord, TriageResult, UserLoop, WhatsappDevice,
+    ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 pub use store::{
     ActionCodeModeFields, ActionWithEmail, PendingNudge, RetryableReply, RevisionRecord, Store,
