@@ -183,10 +183,7 @@ impl<R: Reasoner + 'static> DigestScheduler<R> {
             source = self.source_label,
             count = rows.len(),
         );
-        let wiki_root = self
-            .wiki_root
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("."));
+        let wiki_root = self.wiki_root.clone().unwrap_or_else(|| PathBuf::from("."));
         let mut opts = ingest_opts(system.clone(), wiki_root);
         // Override the system prompt directly rather than through skill loader.
         opts.system_prompt = system;
@@ -205,11 +202,7 @@ impl<R: Reasoner + 'static> DigestScheduler<R> {
             }
         };
 
-        if let Err(e) = self
-            .approvals
-            .post_digest(display_name, &summary)
-            .await
-        {
+        if let Err(e) = self.approvals.post_digest(display_name, &summary).await {
             warn!(sub_id, "post_digest failed: {e}");
             return Err(anyhow::anyhow!("post_digest: {e}"));
         }
@@ -257,26 +250,13 @@ mod tests {
 
     #[async_trait]
     impl ApprovalBroker for CountingBroker {
-        async fn post_approval(
-            &self,
-            _: &str,
-            _: &Email,
-            _: &str,
-        ) -> Result<(), ApprovalError> {
+        async fn post_approval(&self, _: &str, _: &Email, _: &str) -> Result<(), ApprovalError> {
             Ok(())
         }
-        async fn post_flag_notice(
-            &self,
-            _: &Email,
-            _: &str,
-        ) -> Result<(), ApprovalError> {
+        async fn post_flag_notice(&self, _: &Email, _: &str) -> Result<(), ApprovalError> {
             Ok(())
         }
-        async fn post_digest(
-            &self,
-            title: &str,
-            body: &str,
-        ) -> Result<(), ApprovalError> {
+        async fn post_digest(&self, title: &str, body: &str) -> Result<(), ApprovalError> {
             self.digests
                 .lock()
                 .unwrap()

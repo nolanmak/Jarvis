@@ -50,9 +50,7 @@ pub struct DiscordClient {
 
 impl DiscordClient {
     pub fn new(auth: DiscordAuth) -> Result<Self, DiscordError> {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let http = Client::builder().timeout(Duration::from_secs(30)).build()?;
         Ok(Self {
             auth,
             http,
@@ -131,10 +129,7 @@ impl DiscordClient {
 
     // ---------- internals ----------
 
-    async fn get_json<T: for<'de> Deserialize<'de>>(
-        &self,
-        path: &str,
-    ) -> Result<T, DiscordError> {
+    async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, DiscordError> {
         self.request_with_retry(|| {
             let url = format!("{}{path}", self.base_url);
             self.http.get(url).headers(self.auth_headers())
@@ -225,9 +220,8 @@ impl DiscordClient {
         let mut h = header::HeaderMap::new();
         h.insert(
             header::AUTHORIZATION,
-            header::HeaderValue::from_str(&self.auth.token).unwrap_or_else(|_| {
-                header::HeaderValue::from_static("")
-            }),
+            header::HeaderValue::from_str(&self.auth.token)
+                .unwrap_or_else(|_| header::HeaderValue::from_static("")),
         );
         h.insert(
             "x-super-properties",
