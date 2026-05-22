@@ -16,8 +16,8 @@ pub use models::{
     ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 pub use store::{
-    ActionWithEmail, PendingNudge, RetryableReply, RevisionRecord, Store, StoreError,
-    StoreResult, NUDGE_INTERVAL_MS,
+    ActionCodeModeFields, ActionWithEmail, PendingNudge, RetryableReply, RevisionRecord, Store,
+    StoreError, StoreResult, NUDGE_INTERVAL_MS,
 };
 
 /// Re-exported so extension crates (`augmentagent-proactive`, …) can write
