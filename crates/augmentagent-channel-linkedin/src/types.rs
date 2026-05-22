@@ -233,7 +233,10 @@ mod tests {
         };
         let email = dm.into_email("urn:li:fsd_profile:ME");
         assert_eq!(email.message_id, "urn:li:messagingMessage:xyz");
-        assert_eq!(email.thread_id.as_deref(), Some("urn:li:msg_conversation:abc"));
+        assert_eq!(
+            email.thread_id.as_deref(),
+            Some("urn:li:msg_conversation:abc")
+        );
         assert!(email.from.contains("Tony Siu"));
         assert!(email.from.contains("linkedin:urn:li:fsd_profile:PEER"));
         assert_eq!(email.subject, "[LinkedIn DM from Tony Siu]");

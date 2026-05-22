@@ -143,12 +143,7 @@ impl ConnectionsApi for VoyagerConnectionsClient {
              ?decorationId=com.linkedin.voyager.dash.deco.web.mynetwork.ConnectionListWithProfile-16\
              &count={PAGE_SIZE}&q=search&sortType=RECENTLY_ADDED&start={start}"
         );
-        let resp = self
-            .http
-            .get(&url)
-            .headers(self.headers()?)
-            .send()
-            .await?;
+        let resp = self.http.get(&url).headers(self.headers()?).send().await?;
         let status = resp.status();
         if status.as_u16() == 401 || status.as_u16() == 403 {
             return Err(LinkedInError::AuthExpired);
@@ -188,10 +183,7 @@ pub fn parse_connections(v: &serde_json::Value) -> Vec<Connection> {
 
     let mut out = Vec::new();
     for el in &elements {
-        let connected_at_ms = el
-            .get("createdAt")
-            .and_then(|c| c.as_i64())
-            .unwrap_or(0);
+        let connected_at_ms = el.get("createdAt").and_then(|c| c.as_i64()).unwrap_or(0);
         let prof = el
             .get("connectedMemberResolutionResult")
             .or_else(|| el.get("miniProfile"))
@@ -202,8 +194,7 @@ pub fn parse_connections(v: &serde_json::Value) -> Vec<Connection> {
         if public_identifier.is_empty() {
             continue;
         }
-        let headline = str_field(prof, "headline")
-            .or_else_str(|| str_field(prof, "occupation"));
+        let headline = str_field(prof, "headline").or_else_str(|| str_field(prof, "occupation"));
         let company = company_from_headline(&headline);
         out.push(Connection {
             first_name,
@@ -440,9 +431,7 @@ impl<'a> ConnectionSyncer<'a> {
                 // older than the last full sync means everything past here
                 // was already ingested.
                 if let SyncMode::Delta { last_full_sync_ms } = mode {
-                    if conn.connected_at_ms != 0
-                        && conn.connected_at_ms < last_full_sync_ms
-                    {
+                    if conn.connected_at_ms != 0 && conn.connected_at_ms < last_full_sync_ms {
                         stop_after = true;
                         break;
                     }
@@ -472,15 +461,8 @@ impl<'a> ConnectionSyncer<'a> {
     }
 
     /// Read existing page (if any), merge fill-blanks-only, optionally write.
-    fn apply_one(
-        &self,
-        conn: &Connection,
-        slug: &str,
-    ) -> Result<ConnectionDiff, LinkedInError> {
-        let path: PathBuf = self
-            .layout
-            .people_dir()
-            .join(format!("{slug}.md"));
+    fn apply_one(&self, conn: &Connection, slug: &str) -> Result<ConnectionDiff, LinkedInError> {
+        let path: PathBuf = self.layout.people_dir().join(format!("{slug}.md"));
         let existing = std::fs::read_to_string(&path).ok();
         let patch = connection_patch(conn, &self.today);
         let merged = merge_person_page(existing.as_deref(), &patch);
@@ -630,10 +612,9 @@ mod tests {
         };
         let r1 = s.run(SyncMode::Full, 0, noop_sleep).await.unwrap();
         assert_eq!(r1.created, 1);
-        let page = l.people_dir().join(format!(
-            "{}.md",
-            connection_slug(&conn("jane-2", 0))
-        ));
+        let page = l
+            .people_dir()
+            .join(format!("{}.md", connection_slug(&conn("jane-2", 0))));
         assert!(page.is_file());
         let body = std::fs::read_to_string(&page).unwrap();
         assert!(body.contains("linkedin: jane-2"));

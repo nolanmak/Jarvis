@@ -63,10 +63,7 @@ impl<L: LinkedInApi> InvitationsTrigger<L> {
 
 #[async_trait]
 impl<L: LinkedInApi + 'static> Trigger for InvitationsTrigger<L> {
-    async fn next_work_items(
-        &self,
-        _cancel: &CancellationToken,
-    ) -> anyhow::Result<Vec<WorkItem>> {
+    async fn next_work_items(&self, _cancel: &CancellationToken) -> anyhow::Result<Vec<WorkItem>> {
         let invites = match self.api.fetch_pending_invitations().await {
             Ok(v) => v,
             Err(e) => {
@@ -180,10 +177,7 @@ impl<L: LinkedInApi + 'static, R: Reasoner + 'static> ConnectionRequestEngagemen
         Ok(posted)
     }
 
-    async fn handle_invite(
-        &self,
-        payload: ConnectionRequestPayload,
-    ) -> anyhow::Result<bool> {
+    async fn handle_invite(&self, payload: ConnectionRequestPayload) -> anyhow::Result<bool> {
         let inv = Invitation {
             invitation_urn: payload.invitation_urn,
             requester_name: payload.requester_name,
@@ -345,28 +339,16 @@ mod tests {
         async fn react(&self, _: &str, _: &str) -> Result<(), LinkedInError> {
             Ok(())
         }
-        async fn create_share(
-            &self,
-            _: PostDraft<'_>,
-        ) -> Result<ShareUrn, LinkedInError> {
+        async fn create_share(&self, _: PostDraft<'_>) -> Result<ShareUrn, LinkedInError> {
             Ok(ShareUrn("urn:li:share:STUB".into()))
         }
-        async fn fetch_post_comments(
-            &self,
-            _: &str,
-        ) -> Result<Vec<PostComment>, LinkedInError> {
+        async fn fetch_post_comments(&self, _: &str) -> Result<Vec<PostComment>, LinkedInError> {
             Ok(vec![])
         }
-        async fn fetch_pending_invitations(
-            &self,
-        ) -> Result<Vec<Invitation>, LinkedInError> {
+        async fn fetch_pending_invitations(&self) -> Result<Vec<Invitation>, LinkedInError> {
             Ok(self.invites.clone())
         }
-        async fn act_on_invitation(
-            &self,
-            _: &str,
-            _: bool,
-        ) -> Result<(), LinkedInError> {
+        async fn act_on_invitation(&self, _: &str, _: bool) -> Result<(), LinkedInError> {
             Ok(())
         }
     }
@@ -377,9 +359,7 @@ mod tests {
     impl ScriptedReasoner {
         fn new<I: IntoIterator<Item = &'static str>>(r: I) -> Self {
             Self {
-                responses: std::sync::Mutex::new(
-                    r.into_iter().map(String::from).collect(),
-                ),
+                responses: std::sync::Mutex::new(r.into_iter().map(String::from).collect()),
             }
         }
     }
@@ -408,11 +388,7 @@ mod tests {
             self.posts.lock().unwrap().push(action_id.to_string());
             Ok(())
         }
-        async fn post_flag_notice(
-            &self,
-            email: &Email,
-            _: &str,
-        ) -> Result<(), ApprovalError> {
+        async fn post_flag_notice(&self, email: &Email, _: &str) -> Result<(), ApprovalError> {
             self.flags.lock().unwrap().push(email.message_id.clone());
             Ok(())
         }
@@ -513,12 +489,7 @@ mod tests {
             "Great to connect, Sam — enjoyed your work at Beta!",
         ]));
         let broker = Arc::new(RecordingBroker::default());
-        let e = eng(
-            Arc::clone(&store),
-            api,
-            reasoner,
-            Arc::clone(&broker),
-        );
+        let e = eng(Arc::clone(&store), api, reasoner, Arc::clone(&broker));
         let n = e.poll_once(&CancellationToken::new()).await.unwrap();
         assert_eq!(n, 1);
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
@@ -535,12 +506,7 @@ mod tests {
             r#"{"decision":"skip","reason":"spammy recruiter blast"}"#,
         ]));
         let broker = Arc::new(RecordingBroker::default());
-        let e = eng(
-            Arc::clone(&store),
-            api,
-            reasoner,
-            Arc::clone(&broker),
-        );
+        let e = eng(Arc::clone(&store), api, reasoner, Arc::clone(&broker));
         let n = e.poll_once(&CancellationToken::new()).await.unwrap();
         assert_eq!(n, 0);
         assert!(broker.posts.lock().unwrap().is_empty());

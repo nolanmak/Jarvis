@@ -82,10 +82,7 @@ impl<L: LinkedInApi> OwnPostsCommentTrigger<L> {
 
 #[async_trait]
 impl<L: LinkedInApi + 'static> Trigger for OwnPostsCommentTrigger<L> {
-    async fn next_work_items(
-        &self,
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<Vec<WorkItem>> {
+    async fn next_work_items(&self, cancel: &CancellationToken) -> anyhow::Result<Vec<WorkItem>> {
         let now_ms = now_millis();
         let posts = self.store.own_posts_due_for_poll("linkedin", now_ms)?;
         if posts.is_empty() {
@@ -197,14 +194,14 @@ impl<L: LinkedInApi + 'static, R: Reasoner + 'static> OwnPostCommentEngagement<L
         let items = self.trigger.next_work_items(cancel).await?;
         let mut posted = 0usize;
         for item in items {
-            let payload: OwnPostCommentPayload =
-                match serde_json::from_value(item.payload.clone()) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!("own-post comment payload decode failed: {e}");
-                        continue;
-                    }
-                };
+            let payload: OwnPostCommentPayload = match serde_json::from_value(item.payload.clone())
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("own-post comment payload decode failed: {e}");
+                    continue;
+                }
+            };
             match self.handle_comment(payload).await {
                 Ok(true) => posted += 1,
                 Ok(false) => {}
@@ -214,10 +211,7 @@ impl<L: LinkedInApi + 'static, R: Reasoner + 'static> OwnPostCommentEngagement<L
         Ok(posted)
     }
 
-    async fn handle_comment(
-        &self,
-        payload: OwnPostCommentPayload,
-    ) -> anyhow::Result<bool> {
+    async fn handle_comment(&self, payload: OwnPostCommentPayload) -> anyhow::Result<bool> {
         let comment = PostComment {
             post_urn: payload.post_urn,
             comment_urn: payload.comment_urn,
@@ -300,8 +294,7 @@ impl<L: LinkedInApi + 'static, R: Reasoner + 'static> OwnPostCommentEngagement<L
         };
 
         let skill_system =
-            std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
-                .unwrap_or_default();
+            std::fs::read_to_string(self.config.skill_dir.join("SKILL.md")).unwrap_or_default();
         let draft_opts = draft_opts(skill_system, self.config.wiki_root.clone());
         let draft_prompt = draft_user_message(&email, "", "", "", "", "");
         let draft = self
@@ -315,10 +308,7 @@ impl<L: LinkedInApi + 'static, R: Reasoner + 'static> OwnPostCommentEngagement<L
             if let Some(p) = permit {
                 let _ = self
                     .governor
-                    .record(
-                        p,
-                        augmentagent_channel_core::governor::Outcome::RolledBack,
-                    )
+                    .record(p, augmentagent_channel_core::governor::Outcome::RolledBack)
                     .await;
             }
             self.store.log_action(
@@ -356,10 +346,7 @@ impl<L: LinkedInApi + 'static, R: Reasoner + 'static> OwnPostCommentEngagement<L
             if let Some(p) = permit {
                 let _ = self
                     .governor
-                    .record(
-                        p,
-                        augmentagent_channel_core::governor::Outcome::RolledBack,
-                    )
+                    .record(p, augmentagent_channel_core::governor::Outcome::RolledBack)
                     .await;
             }
             self.store.update_action_status(
@@ -428,10 +415,7 @@ mod tests {
         async fn react(&self, _: &str, _: &str) -> Result<(), LinkedInError> {
             Ok(())
         }
-        async fn create_share(
-            &self,
-            _: PostDraft<'_>,
-        ) -> Result<ShareUrn, LinkedInError> {
+        async fn create_share(&self, _: PostDraft<'_>) -> Result<ShareUrn, LinkedInError> {
             Ok(ShareUrn("urn:li:share:STUB".into()))
         }
         async fn fetch_post_comments(
@@ -440,16 +424,10 @@ mod tests {
         ) -> Result<Vec<PostComment>, LinkedInError> {
             Ok(self.comments.clone())
         }
-        async fn fetch_pending_invitations(
-            &self,
-        ) -> Result<Vec<Invitation>, LinkedInError> {
+        async fn fetch_pending_invitations(&self) -> Result<Vec<Invitation>, LinkedInError> {
             Ok(vec![])
         }
-        async fn act_on_invitation(
-            &self,
-            _: &str,
-            _: bool,
-        ) -> Result<(), LinkedInError> {
+        async fn act_on_invitation(&self, _: &str, _: bool) -> Result<(), LinkedInError> {
             Ok(())
         }
     }
@@ -460,9 +438,7 @@ mod tests {
     impl ScriptedReasoner {
         fn new<I: IntoIterator<Item = &'static str>>(r: I) -> Self {
             Self {
-                responses: std::sync::Mutex::new(
-                    r.into_iter().map(String::from).collect(),
-                ),
+                responses: std::sync::Mutex::new(r.into_iter().map(String::from).collect()),
             }
         }
     }
@@ -490,11 +466,7 @@ mod tests {
             self.posts.lock().unwrap().push(action_id.to_string());
             Ok(())
         }
-        async fn post_flag_notice(
-            &self,
-            _: &Email,
-            _: &str,
-        ) -> Result<(), ApprovalError> {
+        async fn post_flag_notice(&self, _: &Email, _: &str) -> Result<(), ApprovalError> {
             Ok(())
         }
     }

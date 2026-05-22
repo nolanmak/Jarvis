@@ -88,11 +88,7 @@ impl<L: LinkedInApi> LinkedInFeedTrigger<L> {
     fn already_seen(&self, post_urn: &str) -> bool {
         // Two-layer dedup: an existing email row (surfaced before) OR a
         // logged successful engagement on this exact post.
-        if self
-            .store
-            .is_message_processed(post_urn)
-            .unwrap_or(false)
-        {
+        if self.store.is_message_processed(post_urn).unwrap_or(false) {
             return true;
         }
         self.store
@@ -103,10 +99,7 @@ impl<L: LinkedInApi> LinkedInFeedTrigger<L> {
 
 #[async_trait]
 impl<L: LinkedInApi + 'static> Trigger for LinkedInFeedTrigger<L> {
-    async fn next_work_items(
-        &self,
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<Vec<WorkItem>> {
+    async fn next_work_items(&self, cancel: &CancellationToken) -> anyhow::Result<Vec<WorkItem>> {
         let Some(root) = self.wiki_root.clone() else {
             debug!("linkedin feed trigger: no wiki root configured; skipping");
             return Ok(Vec::new());
@@ -214,10 +207,7 @@ mod tests {
         async fn react(&self, _: &str, _: &str) -> Result<(), LinkedInError> {
             Ok(())
         }
-        async fn create_share(
-            &self,
-            _draft: PostDraft<'_>,
-        ) -> Result<ShareUrn, LinkedInError> {
+        async fn create_share(&self, _draft: PostDraft<'_>) -> Result<ShareUrn, LinkedInError> {
             Ok(ShareUrn("urn:li:share:STUB".into()))
         }
     }
@@ -288,13 +278,15 @@ mod tests {
             Some(dir.path().to_path_buf()),
             DEFAULT_MAX_ENGAGEMENTS_PER_DAY,
         );
-        let items = trig.next_work_items(&CancellationToken::new()).await.unwrap();
+        let items = trig
+            .next_work_items(&CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].platform, "linkedin");
         assert_eq!(items[0].kind, "post_engagement");
         assert_eq!(items[0].external_id, "urn:li:activity:1");
-        let p: FeedEngagementPayload =
-            serde_json::from_value(items[0].payload.clone()).unwrap();
+        let p: FeedEngagementPayload = serde_json::from_value(items[0].payload.clone()).unwrap();
         assert_eq!(p.person_slug, "jane");
         assert_eq!(p.author_urn, "urn:li:fsd_profile:JANE");
     }
@@ -311,9 +303,11 @@ mod tests {
             ],
         });
         // Cap of 2 → only 2 of the 3 posts surface.
-        let trig =
-            LinkedInFeedTrigger::new(api, store, Some(dir.path().to_path_buf()), 2);
-        let items = trig.next_work_items(&CancellationToken::new()).await.unwrap();
+        let trig = LinkedInFeedTrigger::new(api, store, Some(dir.path().to_path_buf()), 2);
+        let items = trig
+            .next_work_items(&CancellationToken::new())
+            .await
+            .unwrap();
         assert_eq!(items.len(), 2);
     }
 
@@ -340,9 +334,11 @@ mod tests {
                 post("urn:li:activity:3"),
             ],
         });
-        let trig =
-            LinkedInFeedTrigger::new(api, store, Some(dir.path().to_path_buf()), 2);
-        let items = trig.next_work_items(&CancellationToken::new()).await.unwrap();
+        let trig = LinkedInFeedTrigger::new(api, store, Some(dir.path().to_path_buf()), 2);
+        let items = trig
+            .next_work_items(&CancellationToken::new())
+            .await
+            .unwrap();
         // budget = 2 - 1 = 1; activity:1 deduped; so exactly activity:2.
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].external_id, "urn:li:activity:2");
@@ -353,7 +349,10 @@ mod tests {
         let (store, _f) = tmp_store();
         let api = Arc::new(StubApi { posts: vec![] });
         let trig = LinkedInFeedTrigger::new(api, store, None, 5);
-        let items = trig.next_work_items(&CancellationToken::new()).await.unwrap();
+        let items = trig
+            .next_work_items(&CancellationToken::new())
+            .await
+            .unwrap();
         assert!(items.is_empty());
     }
 
@@ -365,9 +364,11 @@ mod tests {
         let api = Arc::new(StubApi {
             posts: vec![post("urn:li:activity:1")],
         });
-        let trig =
-            LinkedInFeedTrigger::new(api, store, Some(dir.path().to_path_buf()), 5);
-        let items = trig.next_work_items(&CancellationToken::new()).await.unwrap();
+        let trig = LinkedInFeedTrigger::new(api, store, Some(dir.path().to_path_buf()), 5);
+        let items = trig
+            .next_work_items(&CancellationToken::new())
+            .await
+            .unwrap();
         assert!(items.is_empty());
     }
 }

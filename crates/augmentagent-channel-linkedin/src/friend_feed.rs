@@ -49,8 +49,17 @@ pub const DEFAULT_MAX_FRIEND_POSTS_PER_TICK: u32 = 8;
 /// Milestone keywords used to gate `engagement = 'low'` watches — only
 /// surface a low-tier friend's post if it reads like a real life/work event.
 const MILESTONE_KEYWORDS: &[&str] = &[
-    "raising", "raised", "launching", "launched", "joined", "hiring",
-    "excited to announce", "new role", "new job", "acquired", "shipped",
+    "raising",
+    "raised",
+    "launching",
+    "launched",
+    "joined",
+    "hiring",
+    "excited to announce",
+    "new role",
+    "new job",
+    "acquired",
+    "shipped",
 ];
 
 /// Serialized payload carried in `WorkItem.payload`.
@@ -137,11 +146,7 @@ impl<L: LinkedInApi + 'static> FriendFeedSource for LinkedInFriendFeedSource<L> 
     }
 }
 
-fn to_work_item(
-    post: &FeedPost,
-    wiki_slug: &Option<String>,
-    engagement: &str,
-) -> WorkItem {
+fn to_work_item(post: &FeedPost, wiki_slug: &Option<String>, engagement: &str) -> WorkItem {
     let payload = FriendPostPayload {
         post_urn: post.post_urn.clone(),
         author_name: post.author_name.clone(),
@@ -205,14 +210,13 @@ impl<L: LinkedInApi + 'static, R: Reasoner + 'static> FriendFeedEngagement<L, R>
         let items = self.source.fetch_new_friend_posts().await?;
         let mut posted = 0usize;
         for item in items {
-            let payload: FriendPostPayload =
-                match serde_json::from_value(item.payload.clone()) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!("friend-post payload decode failed: {e}");
-                        continue;
-                    }
-                };
+            let payload: FriendPostPayload = match serde_json::from_value(item.payload.clone()) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("friend-post payload decode failed: {e}");
+                    continue;
+                }
+            };
             match self.handle_post(payload).await {
                 Ok(true) => posted += 1,
                 Ok(false) => {}
@@ -233,8 +237,7 @@ impl<L: LinkedInApi + 'static, R: Reasoner + 'static> FriendFeedEngagement<L, R>
         let mut email = post.into_email(&self.member_urn);
         // #58.3 taxonomy: stamp the friend_post kind (FeedPost::into_email
         // defaults to the #13 `post_engagement` kind).
-        email.kind =
-            augmentagent_channel_core::work_item_kind::FRIEND_POST.to_string();
+        email.kind = augmentagent_channel_core::work_item_kind::FRIEND_POST.to_string();
         self.store.upsert_email(&email)?;
         if self.store.is_message_processed(&email.message_id)? {
             return Ok(false);
@@ -302,8 +305,7 @@ impl<L: LinkedInApi + 'static, R: Reasoner + 'static> FriendFeedEngagement<L, R>
         // context — the #58 "killer feature" (generic engagement reads as
         // spam; wiki-grounded reads as personal).
         let skill_system =
-            std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
-                .unwrap_or_default();
+            std::fs::read_to_string(self.config.skill_dir.join("SKILL.md")).unwrap_or_default();
         let draft_opts = draft_opts(skill_system, self.config.wiki_root.clone());
         let draft_prompt = draft_user_message(&email, "", "", "", "", "");
         let draft = self
@@ -412,28 +414,16 @@ mod tests {
         async fn react(&self, _: &str, _: &str) -> Result<(), LinkedInError> {
             Ok(())
         }
-        async fn create_share(
-            &self,
-            _: PostDraft<'_>,
-        ) -> Result<ShareUrn, LinkedInError> {
+        async fn create_share(&self, _: PostDraft<'_>) -> Result<ShareUrn, LinkedInError> {
             Ok(ShareUrn("urn:li:share:STUB".into()))
         }
-        async fn fetch_post_comments(
-            &self,
-            _: &str,
-        ) -> Result<Vec<PostComment>, LinkedInError> {
+        async fn fetch_post_comments(&self, _: &str) -> Result<Vec<PostComment>, LinkedInError> {
             Ok(vec![])
         }
-        async fn fetch_pending_invitations(
-            &self,
-        ) -> Result<Vec<Invitation>, LinkedInError> {
+        async fn fetch_pending_invitations(&self) -> Result<Vec<Invitation>, LinkedInError> {
             Ok(vec![])
         }
-        async fn act_on_invitation(
-            &self,
-            _: &str,
-            _: bool,
-        ) -> Result<(), LinkedInError> {
+        async fn act_on_invitation(&self, _: &str, _: bool) -> Result<(), LinkedInError> {
             Ok(())
         }
     }
@@ -444,9 +434,7 @@ mod tests {
     impl ScriptedReasoner {
         fn new<I: IntoIterator<Item = &'static str>>(r: I) -> Self {
             Self {
-                responses: std::sync::Mutex::new(
-                    r.into_iter().map(String::from).collect(),
-                ),
+                responses: std::sync::Mutex::new(r.into_iter().map(String::from).collect()),
             }
         }
     }
@@ -474,11 +462,7 @@ mod tests {
             self.posts.lock().unwrap().push(action_id.to_string());
             Ok(())
         }
-        async fn post_flag_notice(
-            &self,
-            _: &Email,
-            _: &str,
-        ) -> Result<(), ApprovalError> {
+        async fn post_flag_notice(&self, _: &Email, _: &str) -> Result<(), ApprovalError> {
             Ok(())
         }
     }
@@ -561,18 +545,15 @@ mod tests {
     async fn source_yields_new_posts_and_dedups() {
         let (store, _f) = tmp_store();
         store
-            .upsert_friend_watch(
-                "linkedin",
-                "urn:li:fsd_profile:ALEX",
-                Some("alex"),
-                "high",
-            )
+            .upsert_friend_watch("linkedin", "urn:li:fsd_profile:ALEX", Some("alex"), "high")
             .unwrap();
         let api = Arc::new(StubApi {
-            posts: vec![post("urn:li:activity:1", "hi"), post("urn:li:activity:2", "yo")],
+            posts: vec![
+                post("urn:li:activity:1", "hi"),
+                post("urn:li:activity:2", "yo"),
+            ],
         });
-        let src =
-            LinkedInFriendFeedSource::new(api, Arc::clone(&store), 10);
+        let src = LinkedInFriendFeedSource::new(api, Arc::clone(&store), 10);
         let first = src.fetch_new_friend_posts().await.unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(
@@ -592,7 +573,10 @@ mod tests {
         let api = Arc::new(StubApi {
             posts: vec![
                 post("urn:li:activity:1", "had a nice coffee today"),
-                post("urn:li:activity:2", "Excited to announce we raised our seed!"),
+                post(
+                    "urn:li:activity:2",
+                    "Excited to announce we raised our seed!",
+                ),
             ],
         });
         let src = LinkedInFriendFeedSource::new(api, Arc::clone(&store), 10);
@@ -605,12 +589,7 @@ mod tests {
     async fn engagement_reply_posts_card() {
         let (store, _f) = tmp_store();
         store
-            .upsert_friend_watch(
-                "linkedin",
-                "urn:li:fsd_profile:ALEX",
-                Some("alex"),
-                "high",
-            )
+            .upsert_friend_watch("linkedin", "urn:li:fsd_profile:ALEX", Some("alex"), "high")
             .unwrap();
         let api = Arc::new(StubApi {
             posts: vec![post("urn:li:activity:1", "We shipped v2!")],
@@ -620,11 +599,7 @@ mod tests {
             "Huge — congrats on v2, Alex!",
         ]));
         let broker = Arc::new(RecordingBroker::default());
-        let src = Arc::new(LinkedInFriendFeedSource::new(
-            api,
-            Arc::clone(&store),
-            10,
-        ));
+        let src = Arc::new(LinkedInFriendFeedSource::new(api, Arc::clone(&store), 10));
         let eng = FriendFeedEngagement {
             store: Arc::clone(&store),
             reasoner,

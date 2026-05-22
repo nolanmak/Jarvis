@@ -126,10 +126,8 @@ impl LinkedInAuth {
     /// Read LinkedIn credentials from macOS Keychain at
     /// `augmentagent/linkedin/default`.
     pub fn load_from_keychain() -> Result<Self, AuthError> {
-        let bytes = augmentagent_auth::Auth::get(
-            KEYCHAIN_PLATFORM,
-            augmentagent_auth::DEFAULT_ACCOUNT,
-        )?;
+        let bytes =
+            augmentagent_auth::Auth::get(KEYCHAIN_PLATFORM, augmentagent_auth::DEFAULT_ACCOUNT)?;
         let parsed: LinkedInAuth = serde_json::from_slice(&bytes)?;
         parsed.validate()?;
         Ok(parsed)
@@ -203,10 +201,7 @@ mod tests {
     fn sample() -> LinkedInAuth {
         let mut cookies = BTreeMap::new();
         cookies.insert("li_at".into(), "AQEFAHkBAAAA".into());
-        cookies.insert(
-            "JSESSIONID".into(),
-            "\"ajax:0103540587890015905\"".into(),
-        );
+        cookies.insert("JSESSIONID".into(), "\"ajax:0103540587890015905\"".into());
         cookies.insert("bcookie".into(), "v=2&d9d8a9a3".into());
         LinkedInAuth {
             member_urn: "urn:li:fsd_profile:ACoAAB-7H5gB".into(),

@@ -16,9 +16,15 @@ use tracing::{error, info, warn};
 use async_trait::async_trait;
 
 use augmentagent_approval_discord::ApprovalBroker;
+use augmentagent_channel_core::code_mode::{
+    self, handle_code_mode_failure, manifest_v1, report_classic_fallback, DefaultDispatcher,
+    DraftOutcome, FailureCtx, FailureStage, GhCliIssueRunner, GhIssueRunner, MessageContext,
+};
 use augmentagent_channel_core::decision::{parse as parse_decision, DecisionKind};
 use augmentagent_channel_core::ingest::{spawn_ingest, IngestTrigger};
-use augmentagent_channel_core::prompt::{draft_user_message, triage_user_message};
+use augmentagent_channel_core::prompt::{
+    code_mode_system, code_mode_user_message, draft_user_message, triage_user_message,
+};
 use augmentagent_channel_core::reasoner::{draft_opts, triage_opts};
 use augmentagent_channel_core::trigger::{WorkItem, WorkItemHandler};
 use augmentagent_channel_core::Reasoner;
@@ -78,6 +84,10 @@ pub struct LinkedInChannel<L: LinkedInApi, R: Reasoner> {
     /// carry into the `account_entity_id` prefix.
     pub member_urn: String,
     wiki_schema: Option<String>,
+    /// gh CLI runner for I7 postmortems on code-mode failure. Behind a trait
+    /// so tests can mock the `gh issue create` invocation; production defaults
+    /// to [`GhCliIssueRunner`] which shells out to the `gh` binary on PATH.
+    gh_issue_runner: Arc<dyn GhIssueRunner>,
 }
 
 impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
@@ -113,7 +123,16 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
             config,
             member_urn,
             wiki_schema,
+            gh_issue_runner: Arc::new(GhCliIssueRunner::new()),
         }
+    }
+
+    /// Swap the gh-CLI runner used for I7 postmortem issues. Production
+    /// callers don't need this; tests pass a recording stub so the suite
+    /// never actually files issues on the real repo.
+    pub fn with_gh_issue_runner(mut self, runner: Arc<dyn GhIssueRunner>) -> Self {
+        self.gh_issue_runner = runner;
+        self
     }
 
     // The bespoke DM poll loop (`select!` + ticker + post-tick jitter sleep)
@@ -262,12 +281,250 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                 Ok(Some(DispatchOutcome::Flagged))
             }
             DecisionKind::Reply => {
-                // --- DRAFT (Opus with optional wiki read) ---
+                // --- 2. DRAFT phase. Code-mode (I8 / #54) is the production
+                // default; on any code-mode failure we log + fall through to
+                // the classic prompt path so a model hiccup or sandbox glitch
+                // never blocks a reply. Self-repair (I7 / #53) + gh-issue +
+                // Discord-notice flow mirrors the email channel pattern.
+                //
+                // LinkedIn has no resolve-asks / tone / archetype pipeline
+                // (those are gmail-only today), so the context blocks fed to
+                // `code_mode_user_message` are empty — exactly the same
+                // strings the classic `draft_user_message` call below gets.
+                let manifest = manifest_v1();
+                let system_prompt = code_mode_system(&manifest);
+                let wiki_hint = String::new();
+                let user_msg = code_mode_user_message(&email, &wiki_hint, "", "", "", "");
+                // Opts mirror the classic `draft_opts` shape: same permission
+                // mode, no allowed_tools / add_dirs — the Deno sandbox is
+                // the tool surface, not the host claude CLI's Read/Grep/Glob.
+                let code_mode_opts = augmentagent_channel_core::ReasonerOpts {
+                    system_prompt,
+                    model: None,
+                    allowed_tools: Vec::new(),
+                    add_dirs: Vec::new(),
+                    permission_mode: "default".into(),
+                    cwd: None,
+                    env: Vec::new(),
+                };
+                let message_ctx = MessageContext {
+                    channel: "linkedin".to_string(),
+                    email: email.clone(),
+                    account_id: email.account_entity_id.clone(),
+                };
+
+                // --- 2a. CODE-MODE attempt. Two-step flow:
+                //   1. Reasoner emits a TypeScript program that orchestrates
+                //      tool calls and ends with
+                //      `tools.draft(channel="linkedin", body, reason)`.
+                //   2. The Deno sandbox executes the program. The dispatcher's
+                //      terminal `tools.draft` handler writes the actions row
+                //      (mode='code', generatedSource, toolCallTrace) and
+                //      stashes the action id for us to pick up below.
+                //
+                // On ANY failure (reasoner spawn, missing fenced block,
+                // sandbox timeout, runtime exception, dispatcher error) we
+                // hand off to `handle_code_mode_failure` (I7 / #53) which
+                // runs one self-repair pass. If the repair lands a working
+                // code-mode draft, we use it. Otherwise we fall through to
+                // the classic prompt path AND, after it lands its row, call
+                // `report_classic_fallback` to file the postmortem gh issue
+                // + post the Discord notice tagged with the classic action id.
+                let mut cm_source: String = String::new();
+                let cm_attempt: Result<
+                    String,
+                    (augmentagent_channel_core::code_mode::CodeModeError, FailureStage),
+                > = async {
+                    let ts_source = match self
+                        .reasoner
+                        .call_code_mode(&code_mode_opts, &user_msg)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let cme = match e
+                                .downcast::<augmentagent_channel_core::code_mode::CodeModeError>()
+                            {
+                                Ok(cme) => cme,
+                                Err(other) => {
+                                    augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(
+                                        other,
+                                    )
+                                }
+                            };
+                            return Err((cme, FailureStage::CallCodeMode));
+                        }
+                    };
+                    cm_source = ts_source.clone();
+                    let dispatcher = DefaultDispatcher::new(
+                        self.store.as_ref(),
+                        message_ctx.clone(),
+                        ts_source.clone(),
+                    )
+                    .with_wiki_hint(wiki_hint.clone());
+                    if let Err(e) =
+                        code_mode::run_program(&ts_source, &manifest, &dispatcher).await
+                    {
+                        let wrapped =
+                            augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(
+                                anyhow::anyhow!("run_program: {e}"),
+                            );
+                        return Err((wrapped, FailureStage::RunProgram));
+                    }
+                    match dispatcher.last_action_id() {
+                        Some(id) => Ok(id),
+                        None => Err((
+                            augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(
+                                anyhow::anyhow!("code-mode program produced no draft call"),
+                            ),
+                            FailureStage::RunProgram,
+                        )),
+                    }
+                }
+                .await;
+
+                // Either Some(action_id) → keep going on the code-mode rail,
+                // or None + carried FailureRecord → run classic, then report.
+                let (code_mode_action_id, pending_classic_record): (
+                    Option<String>,
+                    Option<augmentagent_channel_core::code_mode::FailureRecord>,
+                ) = match cm_attempt {
+                    Ok(action_id) => (Some(action_id), None),
+                    Err((cme, stage)) => {
+                        warn!(
+                            message_id = %email.message_id,
+                            stage = ?stage,
+                            "linkedin code-mode attempt failed: {cme}; invoking self-repair"
+                        );
+                        let failure_ctx = FailureCtx {
+                            reasoner: self.reasoner.as_ref(),
+                            opts: code_mode_opts.clone(),
+                            user_msg: user_msg.clone(),
+                            manifest: manifest.clone(),
+                            message_ctx: message_ctx.clone(),
+                            wiki_hint: wiki_hint.clone(),
+                            store: Arc::clone(&self.store),
+                            broker: Arc::clone(&self.approvals),
+                            gh: Arc::clone(&self.gh_issue_runner),
+                            email: email.clone(),
+                            channel: "linkedin".to_string(),
+                            model: code_mode_opts.model.clone(),
+                            manifest_version: "v1",
+                        };
+                        match handle_code_mode_failure(&failure_ctx, &cm_source, &cme, stage).await
+                        {
+                            DraftOutcome::CodeMode {
+                                action_id,
+                                repair_used,
+                            } => {
+                                info!(
+                                    message_id = %email.message_id,
+                                    action_id = %action_id,
+                                    repair_used,
+                                    "linkedin code-mode self-repair succeeded"
+                                );
+                                (Some(action_id), None)
+                            }
+                            DraftOutcome::ClassicNeeded(record) => {
+                                error!(
+                                    message_id = %email.message_id,
+                                    "linkedin code-mode self-repair failed; falling back to classic"
+                                );
+                                (None, Some(record))
+                            }
+                        }
+                    }
+                };
+
+                // --- 2b. Code-mode success path ---
+                //
+                // The dispatcher's `tools.draft` already wrote the action row
+                // (mode='code', generatedSource, toolCallTrace). Read the
+                // persisted draft body back out so we can post the approval
+                // card / mark the dry-run row / record the nudge against the
+                // SAME action_id (no new log_action).
+                if let Some(action_id) = code_mode_action_id {
+                    let draft_body = self
+                        .store
+                        .get_action_with_email(&action_id)?
+                        .and_then(|a| a.action.draft_body)
+                        .unwrap_or_default();
+
+                    if self.config.dry_run {
+                        // Promote the dispatcher's `Pending` row to `DryRun`
+                        // so dry-run accounting matches classic. The
+                        // persisted code-mode columns (mode='code',
+                        // generatedSource, toolCallTrace) are untouched.
+                        self.store.update_action_status(
+                            &action_id,
+                            ActionStatus::DryRun,
+                            Some(&draft_body),
+                            None,
+                        )?;
+                        self.store
+                            .mark_email_processed(&email.message_id, TriageResult::Reply)?;
+                        println!(
+                            "[linkedin reply dry-run:code] {}\n--- draft ---\n{}\n--- /draft ---",
+                            email.subject, draft_body
+                        );
+                        self.maybe_ingest(
+                            &email,
+                            DecisionKind::Reply,
+                            decision.reason.as_deref(),
+                            Some(&draft_body),
+                            IngestTrigger::DryRunDrafted,
+                        );
+                        return Ok(Some(DispatchOutcome::DryRun));
+                    }
+
+                    // Non-dry-run: post the approval card against the
+                    // code-mode-written action row. LinkedIn has no
+                    // server-side draft — approval-on-click triggers
+                    // voyager send.
+                    if let Err(e) = self
+                        .approvals
+                        .post_approval(&action_id, &email, &draft_body)
+                        .await
+                    {
+                        self.store.update_action_status(
+                            &action_id,
+                            ActionStatus::Error,
+                            None,
+                            Some(&format!("post_approval: {e}")),
+                        )?;
+                        return Err(anyhow::anyhow!("post_approval: {e}"));
+                    }
+                    if let Err(e) = self
+                        .store
+                        .record_nudge(&action_id, now_millis() + NUDGE_INTERVAL_MS)
+                    {
+                        warn!(action_id, "record_nudge after post_approval failed: {e}");
+                    }
+                    // LinkedIn does NOT mark the email complete here — the email
+                    // is only complete once the user clicks Approve and the
+                    // voyager send completes. mark_email_processed is omitted
+                    // intentionally (matches pre-I8 behavior).
+                    info!(
+                        action_id,
+                        message_id = %email.message_id,
+                        "linkedin code-mode approval card posted"
+                    );
+                    return Ok(Some(DispatchOutcome::AwaitingApproval));
+                }
+
+                // --- 2c. Classic fallback (I7) ---
+                //
+                // Reached when code-mode failed AND self-repair didn't
+                // produce a working code-mode draft. Behaviour matches the
+                // pre-I8 classic prompt path — same draft call, same
+                // dispatch — except we then call `report_classic_fallback`
+                // to file the postmortem gh issue and post the Discord
+                // notice tagged with the classic action_id.
                 let skill_system = std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
                     .unwrap_or_default();
-                let draft_opts = draft_opts(skill_system, self.config.wiki_root.clone());
+                let classic_draft_opts = draft_opts(skill_system, self.config.wiki_root.clone());
                 let draft_prompt = draft_user_message(&email, "", "", "", "", "");
-                let draft = match self.reasoner.call(&draft_opts, &draft_prompt).await {
+                let draft = match self.reasoner.call(&classic_draft_opts, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
                     Err(e) => {
                         error!(message_id = %email.message_id, "draft call failed: {e}");
@@ -285,7 +542,7 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                 };
 
                 if self.config.dry_run {
-                    self.store.log_action(
+                    let action_id = self.store.log_action(
                         &email.message_id,
                         email.thread_id.as_deref(),
                         &email.from,
@@ -300,6 +557,28 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                         "[linkedin reply dry-run] {}\n--- draft ---\n{}\n--- /draft ---",
                         email.subject, draft
                     );
+                    // I7: file postmortem when classic fallback was triggered
+                    // by a code-mode failure. Successful repair never reaches
+                    // here (it returns Some(action_id) above), so this branch
+                    // is exclusively for "repair couldn't save it".
+                    if let Some(record) = pending_classic_record {
+                        let failure_ctx = FailureCtx {
+                            reasoner: self.reasoner.as_ref(),
+                            opts: code_mode_opts.clone(),
+                            user_msg: user_msg.clone(),
+                            manifest: manifest.clone(),
+                            message_ctx: message_ctx.clone(),
+                            wiki_hint: wiki_hint.clone(),
+                            store: Arc::clone(&self.store),
+                            broker: Arc::clone(&self.approvals),
+                            gh: Arc::clone(&self.gh_issue_runner),
+                            email: email.clone(),
+                            channel: "linkedin".to_string(),
+                            model: code_mode_opts.model.clone(),
+                            manifest_version: "v1",
+                        };
+                        report_classic_fallback(&failure_ctx, &record, &action_id).await;
+                    }
                     self.maybe_ingest(
                         &email,
                         DecisionKind::Reply,
@@ -310,18 +589,58 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                     return Ok(Some(DispatchOutcome::DryRun));
                 }
 
-                // --- DISPATCH ---
-                // LinkedIn has no server-side draft — we post the approval card
-                // directly, the approver calls voyager send on Approve.
-                let action_id = self.store.log_action(
-                    &email.message_id,
-                    email.thread_id.as_deref(),
-                    &email.from,
-                    &email.subject,
-                    Some(&email.body),
-                    Some(&draft),
-                    ActionStatus::Pending,
-                )?;
+                // --- DISPATCH (classic, non-dry-run) ---
+                // LinkedIn has no server-side draft — we post the approval
+                // card directly, the approver calls voyager send on Approve.
+                //
+                // Non-dry-run classic dispatch. Pre-create the row so we can
+                // pass the action_id to `report_classic_fallback` before the
+                // approval card goes up, consistent with the email channel.
+                let classic_action_id = if pending_classic_record.is_some() {
+                    Some(self.store.log_action(
+                        &email.message_id,
+                        email.thread_id.as_deref(),
+                        &email.from,
+                        &email.subject,
+                        Some(&email.body),
+                        Some(&draft),
+                        ActionStatus::Pending,
+                    )?)
+                } else {
+                    None
+                };
+                if let (Some(record), Some(action_id)) =
+                    (pending_classic_record.as_ref(), classic_action_id.as_ref())
+                {
+                    let failure_ctx = FailureCtx {
+                        reasoner: self.reasoner.as_ref(),
+                        opts: code_mode_opts.clone(),
+                        user_msg: user_msg.clone(),
+                        manifest: manifest.clone(),
+                        message_ctx: message_ctx.clone(),
+                        wiki_hint: wiki_hint.clone(),
+                        store: Arc::clone(&self.store),
+                        broker: Arc::clone(&self.approvals),
+                        gh: Arc::clone(&self.gh_issue_runner),
+                        email: email.clone(),
+                        channel: "linkedin".to_string(),
+                        model: code_mode_opts.model.clone(),
+                        manifest_version: "v1",
+                    };
+                    report_classic_fallback(&failure_ctx, record, action_id).await;
+                }
+                let action_id = match classic_action_id {
+                    Some(id) => id,
+                    None => self.store.log_action(
+                        &email.message_id,
+                        email.thread_id.as_deref(),
+                        &email.from,
+                        &email.subject,
+                        Some(&email.body),
+                        Some(&draft),
+                        ActionStatus::Pending,
+                    )?,
+                };
                 if let Err(e) = self
                     .approvals
                     .post_approval(&action_id, &email, &draft)
@@ -343,6 +662,9 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                 {
                     warn!(action_id, "record_nudge after post_approval failed: {e}");
                 }
+                // LinkedIn does NOT mark the email complete here — only after
+                // the user clicks Approve (voyager send). Omitted intentionally
+                // to match pre-I8 behavior.
                 info!(action_id, message_id = %email.message_id, "linkedin approval card posted");
                 Ok(Some(DispatchOutcome::AwaitingApproval))
             }
@@ -405,10 +727,7 @@ impl<L: LinkedInApi + 'static, R: Reasoner + 'static> LinkedInChannel<L, R> {
     /// `Duration::from_secs(JITTER_SECS)` and keep the 4h ± 10min cadence.
     ///
     /// Takes `Arc<Self>` so the runner's handler can share the channel.
-    pub async fn run_arc(
-        self: Arc<Self>,
-        shutdown: CancellationToken,
-    ) -> anyhow::Result<()> {
+    pub async fn run_arc(self: Arc<Self>, shutdown: CancellationToken) -> anyhow::Result<()> {
         use augmentagent_channel_core::{ChannelRunner, InboundMessageTrigger};
 
         let source = Arc::new(crate::inbound::LinkedInInbound::new(
@@ -447,10 +766,8 @@ impl<L: LinkedInApi + 'static, R: Reasoner + 'static> WorkItemHandler
     for LinkedInWorkHandler<L, R>
 {
     async fn handle(&self, item: WorkItem) -> anyhow::Result<()> {
-        let email: augmentagent_store::Email =
-            serde_json::from_value(item.payload).map_err(|e| {
-                anyhow::anyhow!("linkedin work item payload not an Email: {e}")
-            })?;
+        let email: augmentagent_store::Email = serde_json::from_value(item.payload)
+            .map_err(|e| anyhow::anyhow!("linkedin work item payload not an Email: {e}"))?;
         // Mirror poll_once's per-DM error handling: log + swallow so one bad
         // message never aborts the tick (ChannelRunner also logs+counts).
         match self.channel.process_email(email).await {
@@ -618,8 +935,8 @@ impl<L: crate::api::LinkedInApi + 'static, R: Reasoner + 'static> LinkedInFeedEn
             return Ok(false);
         }
 
-        let skill_system = std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
-            .unwrap_or_default();
+        let skill_system =
+            std::fs::read_to_string(self.config.skill_dir.join("SKILL.md")).unwrap_or_default();
         let draft_opts = draft_opts(skill_system, self.config.wiki_root.clone());
         let draft_prompt = draft_user_message(&email, "", "", "", "", "");
         let draft = self
@@ -674,7 +991,10 @@ impl<L: crate::api::LinkedInApi + 'static, R: Reasoner + 'static> LinkedInFeedEn
             .store
             .record_nudge(&action_id, now_millis() + NUDGE_INTERVAL_MS)
         {
-            warn!(action_id, "record_nudge after feed post_approval failed: {e}");
+            warn!(
+                action_id,
+                "record_nudge after feed post_approval failed: {e}"
+            );
         }
         info!(action_id, post = %email.message_id, "linkedin engagement card posted");
         Ok(true)
@@ -692,6 +1012,21 @@ mod tests {
     use crate::api::LinkedInError;
     use crate::posting::{PostDraft, ShareUrn};
     use crate::types::{FeedPost, MemberUrn};
+
+    /// Disable `gh issue create` for the entire test binary. Without this,
+    /// any test that traverses the I7 code-mode-failure → classic fallback
+    /// path would spawn the production gh CLI and potentially create a real
+    /// issue on `nolanmak/MyAgentAssistant`. Tests that DO want to assert gh
+    /// invocations inject a `RecordingGh` via `.with_gh_issue_runner(...)` —
+    /// which bypasses the env-var check entirely.
+    static GH_DISABLE_INIT: std::sync::Once = std::sync::Once::new();
+    fn disable_gh_for_tests() {
+        GH_DISABLE_INIT.call_once(|| {
+            // SAFETY: set once at module init before any test runs; no
+            // concurrent reads of this var.
+            std::env::set_var("AUGMENTAGENT_GH_DISABLE", "1");
+        });
+    }
 
     struct StubApi {
         dms: Vec<Dm>,
@@ -720,10 +1055,7 @@ mod tests {
         async fn react(&self, _: &str, _: &str) -> Result<(), LinkedInError> {
             Ok(())
         }
-        async fn create_share(
-            &self,
-            _draft: PostDraft<'_>,
-        ) -> Result<ShareUrn, LinkedInError> {
+        async fn create_share(&self, _draft: PostDraft<'_>) -> Result<ShareUrn, LinkedInError> {
             Ok(ShareUrn("urn:li:share:STUB".into()))
         }
     }
@@ -763,11 +1095,7 @@ mod tests {
             self.posts.lock().unwrap().push(action_id.to_string());
             Ok(())
         }
-        async fn post_flag_notice(
-            &self,
-            email: &Email,
-            reason: &str,
-        ) -> Result<(), ApprovalError> {
+        async fn post_flag_notice(&self, email: &Email, reason: &str) -> Result<(), ApprovalError> {
             self.flag_posts
                 .lock()
                 .unwrap()
@@ -776,7 +1104,44 @@ mod tests {
         }
     }
 
+    /// Mock gh-CLI runner that records every `gh issue create` call without
+    /// spawning the real binary. Returns canned issue numbers starting at
+    /// `next_number`.
+    #[derive(Default)]
+    struct RecordingGh {
+        calls: std::sync::Mutex<Vec<(String, String, Vec<String>)>>,
+        next_number: std::sync::Mutex<u64>,
+    }
+    impl RecordingGh {
+        fn new(start: u64) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                next_number: std::sync::Mutex::new(start),
+            }
+        }
+    }
+    #[async_trait]
+    impl GhIssueRunner for RecordingGh {
+        async fn create_issue(
+            &self,
+            title: &str,
+            body: &str,
+            labels: &[&str],
+        ) -> anyhow::Result<u64> {
+            self.calls.lock().unwrap().push((
+                title.to_string(),
+                body.to_string(),
+                labels.iter().map(|s| s.to_string()).collect(),
+            ));
+            let mut n = self.next_number.lock().unwrap();
+            let out = *n;
+            *n += 1;
+            Ok(out)
+        }
+    }
+
     fn tmp_store() -> (Arc<Store>, tempfile::NamedTempFile) {
+        disable_gh_for_tests();
         let file = tempfile::NamedTempFile::new().unwrap();
         {
             let conn = rusqlite::Connection::open(file.path()).unwrap();
@@ -856,9 +1221,13 @@ mod tests {
         let api = Arc::new(StubApi {
             dms: vec![sample_dm("m-reply")],
         });
+        // Triage → reply. Code-mode attempt: no fenced block → fails. Repair:
+        // also no fenced block → fails. Classic draft fires.
         let reasoner = Arc::new(ScriptedReasoner::new([
             r#"{"decision":"reply","reason":"direct question"}"#,
-            "Sure — Thursday 3pm works.",
+            "no fenced block",            // code-mode initial
+            "no fenced block repair",     // repair attempt
+            "Sure — Thursday 3pm works.", // classic draft
         ]));
         let broker = Arc::new(RecordingBroker::default());
         let ch = LinkedInChannel::new(
@@ -974,11 +1343,7 @@ mod tests {
             async fn fetch_recent_dms(&self) -> Result<Vec<Dm>, LinkedInError> {
                 Err(LinkedInError::AuthExpired)
             }
-            async fn send_message(
-                &self,
-                _: &str,
-                _: &str,
-            ) -> Result<String, LinkedInError> {
+            async fn send_message(&self, _: &str, _: &str) -> Result<String, LinkedInError> {
                 Err(LinkedInError::AuthExpired)
             }
             async fn fetch_feed_posts_by_author(
@@ -987,11 +1352,7 @@ mod tests {
             ) -> Result<Vec<FeedPost>, LinkedInError> {
                 Err(LinkedInError::AuthExpired)
             }
-            async fn post_comment(
-                &self,
-                _: &str,
-                _: &str,
-            ) -> Result<String, LinkedInError> {
+            async fn post_comment(&self, _: &str, _: &str) -> Result<String, LinkedInError> {
                 Err(LinkedInError::AuthExpired)
             }
             async fn react(&self, _: &str, _: &str) -> Result<(), LinkedInError> {
@@ -1034,9 +1395,14 @@ mod tests {
     async fn channel_runner_handler_reply_flow_matches_poll_once() {
         let (store, _f) = tmp_store();
         let dm = sample_dm("cr-reply");
-        let api = Arc::new(StubApi { dms: vec![dm.clone()] });
+        let api = Arc::new(StubApi {
+            dms: vec![dm.clone()],
+        });
+        // Code-mode: no fenced block → repair: also no fenced block → classic.
         let reasoner = Arc::new(ScriptedReasoner::new([
             r#"{"decision":"reply","reason":"direct question"}"#,
+            "no fenced block",
+            "no fenced block repair",
             "Sure — Thursday 3pm works.",
         ]));
         let broker = Arc::new(RecordingBroker::default());
@@ -1067,10 +1433,7 @@ mod tests {
 
         // Second runner tick on the same DM must NOT stack another card —
         // the is_message_processed gate inside process_email holds.
-        handler
-            .handle(dm_to_work_item(dm, ME_URN))
-            .await
-            .unwrap();
+        handler.handle(dm_to_work_item(dm, ME_URN)).await.unwrap();
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
     }
 
@@ -1078,7 +1441,9 @@ mod tests {
     async fn channel_runner_handler_flag_matches_poll_once() {
         let (store, _f) = tmp_store();
         let dm = sample_dm("cr-flag");
-        let api = Arc::new(StubApi { dms: vec![dm.clone()] });
+        let api = Arc::new(StubApi {
+            dms: vec![dm.clone()],
+        });
         let reasoner = Arc::new(ScriptedReasoner::new([
             r#"{"decision":"flag","reason":"personal outreach"}"#,
         ]));
@@ -1098,10 +1463,7 @@ mod tests {
         let handler = super::LinkedInWorkHandler {
             channel: Arc::clone(&ch),
         };
-        handler
-            .handle(dm_to_work_item(dm, ME_URN))
-            .await
-            .unwrap();
+        handler.handle(dm_to_work_item(dm, ME_URN)).await.unwrap();
 
         // Flag: heads-up notice, no approval card (same as poll_once).
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
@@ -1141,5 +1503,189 @@ mod tests {
         };
         let _ = handler.handle(junk).await;
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
+    }
+
+    // ---- I8 (#54): code-mode draft path for LinkedIn ---------------------
+    //
+    // The existing tests above all send plain-text responses (no fenced TS
+    // block), so code-mode fails → repair fails → classic fallback runs. Those
+    // tests therefore double as "code-mode-error → classic fallback" coverage.
+    // The new tests below cover the success path (fenced TS program executes
+    // and lands an `actions` row with `mode='code'`) and the failure-with-
+    // postmortem path (forced failure → gh issue filed, Discord notice posted,
+    // mode='classic').
+
+    /// `true` iff `deno --version` succeeds (resolved via the same env-var
+    /// convention as the runner itself). Returning `false` here makes the
+    /// code-mode tests print a notice and exit clean instead of failing on
+    /// a dev box without Deno installed.
+    fn deno_available_for_tests() -> bool {
+        let bin = std::env::var("AUGMENTAGENT_DENO_BIN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "deno".to_string());
+        std::process::Command::new(&bin)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn code_mode_dry_run_lands_action_row_with_mode_code_linkedin() {
+        if !deno_available_for_tests() {
+            eprintln!(
+                "skipping code_mode_dry_run_lands_action_row_with_mode_code_linkedin: \
+                 `deno` not on PATH (set AUGMENTAGENT_DENO_BIN to override)"
+            );
+            return;
+        }
+        let (store, _f) = tmp_store();
+        let api = Arc::new(StubApi {
+            dms: vec![sample_dm("m-li-cm-dryrun")],
+        });
+        // First response: triage → reply. Second: a fenced TS program → code-mode
+        // extracts it, run_program executes it, the dispatcher writes the
+        // actions row with mode='code'.
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"actionable question"}"#,
+            "```ts\n\
+             async function main() {\n\
+               await tools.draft(\"linkedin\", \"happy to connect — let me know your schedule\", \"answer the question\");\n\
+             }\n\
+             main();\n\
+             ```\n",
+        ]));
+        let ch = LinkedInChannel::new(
+            store.clone(),
+            api,
+            reasoner,
+            Arc::new(augmentagent_approval_discord::NoopBroker),
+            "urn:li:fsd_profile:ME".into(),
+            LinkedInChannelConfig {
+                dry_run: true,
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        // Code-mode succeeded → DryRun outcome.
+        assert_eq!(out.replied_dry_run, 1, "expected 1 dry-run reply");
+        assert_eq!(out.errors, 0);
+
+        // Read back the action row to verify code-mode columns.
+        let actions = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, mode, generatedSource, toolCallTrace, draftBody, status \
+                     FROM actions WHERE messageId = 'm-li-cm-dryrun'",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, String>(5)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(actions.len(), 1, "expected exactly one actions row");
+        let (_, mode, src, trace, body, status) = &actions[0];
+        assert_eq!(mode.as_deref(), Some("code"), "mode must be 'code'");
+        assert!(
+            src.as_deref()
+                .map(|s| s.contains("tools.draft"))
+                .unwrap_or(false),
+            "generatedSource must contain the program; got {src:?}"
+        );
+        let trace_str = trace.as_deref().unwrap_or("");
+        assert!(
+            trace_str.contains("\"call\":\"draft\""),
+            "toolCallTrace must include the draft call; got {trace_str:?}"
+        );
+        assert_eq!(
+            body.as_deref(),
+            Some("happy to connect — let me know your schedule"),
+            "draftBody must match what tools.draft passed"
+        );
+        assert_eq!(status, "dry_run", "dry-run mode must update status");
+    }
+
+    #[tokio::test]
+    async fn code_mode_failure_falls_through_to_classic_path_linkedin() {
+        // No Deno needed: code-mode response has no fenced block, repair
+        // retry also fails, classic kicks in. Verifies the I7 wiring lands a
+        // `mode='classic'` row, files a `code-mode-failure` gh issue (via
+        // the mock runner), and posts a Discord notice with the issue number.
+        // Also confirms the I7 helper does NOT break the pre-existing reply
+        // pipeline (approval card still gets posted).
+        let (store, _f) = tmp_store();
+        let api = Arc::new(StubApi {
+            dms: vec![sample_dm("m-li-cm-fallback")],
+        });
+        // Triage → reply. Two no-fence code-mode responses (initial + repair
+        // retry both fail). Fourth response feeds the classic prose-draft call.
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"ping"}"#,
+            "no fenced block here, just prose",
+            "still no fenced block — repair gave up",
+            "Yes — happy to chat.",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let gh = Arc::new(RecordingGh::new(201));
+        let ch = LinkedInChannel::new(
+            store.clone(),
+            api,
+            reasoner,
+            broker.clone(),
+            "urn:li:fsd_profile:ME".into(),
+            LinkedInChannelConfig {
+                dry_run: false,
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                ..Default::default()
+            },
+        )
+        .with_gh_issue_runner(gh.clone());
+        let out = ch.poll_once().await.unwrap();
+        // Classic path produced a draft → approval card posted.
+        assert_eq!(out.awaiting_approval, 1);
+        assert_eq!(out.errors, 0);
+        assert_eq!(broker.posts.lock().unwrap().len(), 1);
+        // Action row landed with mode='classic'.
+        let mode: Option<String> = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT mode FROM actions WHERE messageId = 'm-li-cm-fallback'",
+                    [],
+                    |r| r.get(0),
+                )
+                .or(Ok(None))
+            })
+            .unwrap();
+        assert_eq!(
+            mode.as_deref(),
+            Some("classic"),
+            "fallback path must land mode='classic'"
+        );
+        // I7: exactly one gh issue filed with the right label + title prefix.
+        let calls = gh.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "exactly one gh issue should be filed");
+        let (title, body, labels) = &calls[0];
+        assert!(title.starts_with("[code-mode]"));
+        assert!(body.contains("## Postmortem"));
+        assert!(body.contains("**Final draft mode:** classic"));
+        assert!(body.contains("**Channel:** linkedin"));
+        assert_eq!(labels, &vec!["code-mode-failure".to_string()]);
+        // I7: Discord notice posted with the issue number (#201).
+        let notices = broker.flag_posts.lock().unwrap();
+        assert_eq!(notices.len(), 1, "exactly one Discord notice should fire");
+        assert!(notices[0].1.contains("#201"));
+        assert!(notices[0].1.contains("classic"));
     }
 }

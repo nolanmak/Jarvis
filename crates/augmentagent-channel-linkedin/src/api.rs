@@ -77,30 +77,19 @@ pub trait LinkedInApi: Send + Sync {
 
     /// (#13) Post a top-level comment on `post_urn`. Returns the new
     /// comment's urn on success.
-    async fn post_comment(
-        &self,
-        post_urn: &str,
-        text: &str,
-    ) -> Result<String, LinkedInError>;
+    async fn post_comment(&self, post_urn: &str, text: &str) -> Result<String, LinkedInError>;
 
     /// (#13) React to `post_urn`. `reaction` is one of LinkedIn's reaction
     /// verbs (`LIKE` | `PRAISE` | `EMPATHY` | `INTEREST` | `APPRECIATION` |
     /// `ENTERTAINMENT`). Comment-only is the v1 engagement path; this is
     /// wired for completeness + Phase-2 use but is not called by the feed
     /// trigger.
-    async fn react(
-        &self,
-        post_urn: &str,
-        reaction: &str,
-    ) -> Result<(), LinkedInError>;
+    async fn react(&self, post_urn: &str, reaction: &str) -> Result<(), LinkedInError>;
 
     /// (#51 / #77) Create a feed share (text or text+single-image post).
     /// Goes through the approval pipeline at the channel layer; this is the
     /// raw wire call.
-    async fn create_share(
-        &self,
-        draft: PostDraft<'_>,
-    ) -> Result<ShareUrn, LinkedInError>;
+    async fn create_share(&self, draft: PostDraft<'_>) -> Result<ShareUrn, LinkedInError>;
 
     /// (#58.2) Fetch recent comments on one of the *user's own* posts. The
     /// own-post comment poller diffs these against the store's
@@ -115,9 +104,7 @@ pub trait LinkedInApi: Send + Sync {
 
     /// (#58.4) List pending inbound connection requests (the Voyager
     /// `relationships/invitationViews` endpoint). Default: empty.
-    async fn fetch_pending_invitations(
-        &self,
-    ) -> Result<Vec<Invitation>, LinkedInError> {
+    async fn fetch_pending_invitations(&self) -> Result<Vec<Invitation>, LinkedInError> {
         Ok(Vec::new())
     }
 
@@ -330,11 +317,7 @@ impl LinkedInApi for VoyagerClient {
         Ok(parse_feed_posts(&v, author_urn))
     }
 
-    async fn post_comment(
-        &self,
-        post_urn: &str,
-        text: &str,
-    ) -> Result<String, LinkedInError> {
+    async fn post_comment(&self, post_urn: &str, text: &str) -> Result<String, LinkedInError> {
         // Voyager comments endpoint: the threadUrn / parent is the post's
         // activity urn. `commentary` carries the text + (empty) attributes.
         let url = format!(
@@ -373,11 +356,7 @@ impl LinkedInApi for VoyagerClient {
             .unwrap_or_default())
     }
 
-    async fn react(
-        &self,
-        post_urn: &str,
-        reaction: &str,
-    ) -> Result<(), LinkedInError> {
+    async fn react(&self, post_urn: &str, reaction: &str) -> Result<(), LinkedInError> {
         let url = format!(
             "https://www.linkedin.com/voyager/api/voyagerSocialDashReactions?action=react&threadUrn={}",
             urlencode_restli(post_urn),
@@ -408,20 +387,14 @@ impl LinkedInApi for VoyagerClient {
         Ok(())
     }
 
-    async fn create_share(
-        &self,
-        draft: PostDraft<'_>,
-    ) -> Result<ShareUrn, LinkedInError> {
+    async fn create_share(&self, draft: PostDraft<'_>) -> Result<ShareUrn, LinkedInError> {
         // Delegated to the posting module; kept off the trait surface here
         // so api.rs stays the wire layer and posting.rs owns the
         // media-dance + body-shape logic.
         crate::posting::create_share_impl(self, draft).await
     }
 
-    async fn fetch_post_comments(
-        &self,
-        post_urn: &str,
-    ) -> Result<Vec<PostComment>, LinkedInError> {
+    async fn fetch_post_comments(&self, post_urn: &str) -> Result<Vec<PostComment>, LinkedInError> {
         // Voyager feed-comments endpoint, threadUrn = the post's activity urn.
         let url = format!(
             "https://www.linkedin.com/voyager/api/feed/comments\
@@ -452,9 +425,7 @@ impl LinkedInApi for VoyagerClient {
         Ok(parse_post_comments(&v, post_urn))
     }
 
-    async fn fetch_pending_invitations(
-        &self,
-    ) -> Result<Vec<Invitation>, LinkedInError> {
+    async fn fetch_pending_invitations(&self) -> Result<Vec<Invitation>, LinkedInError> {
         let url = "https://www.linkedin.com/voyager/api/relationships/invitationViews\
                    ?count=50&q=receivedInvitation&start=0";
         let resp = self
@@ -529,11 +500,7 @@ fn parse_post_comments(v: &serde_json::Value, post_urn: &str) -> Vec<PostComment
     out
 }
 
-fn collect_post_comments(
-    v: &serde_json::Value,
-    post_urn: &str,
-    out: &mut Vec<PostComment>,
-) {
+fn collect_post_comments(v: &serde_json::Value, post_urn: &str, out: &mut Vec<PostComment>) {
     match v {
         serde_json::Value::Object(m) => {
             if let Some(c) = try_post_comment(m, post_urn) {
@@ -567,7 +534,11 @@ fn try_post_comment(
         .get("commentary")
         .and_then(|c| c.get("text"))
         .and_then(|t| t.as_str())
-        .or_else(|| m.get("commentV2").and_then(|c| c.get("text")).and_then(|t| t.as_str()))
+        .or_else(|| {
+            m.get("commentV2")
+                .and_then(|c| c.get("text"))
+                .and_then(|t| t.as_str())
+        })
         .unwrap_or("")
         .trim()
         .to_string();
@@ -639,10 +610,7 @@ fn parse_invitations(v: &serde_json::Value) -> Vec<Invitation> {
         let message = inv
             .get("message")
             .and_then(|x| x.as_str())
-            .or_else(|| {
-                inv.get("customMessage")
-                    .and_then(|x| x.as_str())
-            })
+            .or_else(|| inv.get("customMessage").and_then(|x| x.as_str()))
             .unwrap_or("")
             .trim()
             .to_string();
@@ -942,7 +910,9 @@ mod tests {
                     participant_type: ParticipantType {
                         member: Some(Member {
                             first_name: Some(AttributedText { text: "Me".into() }),
-                            last_name: Some(AttributedText { text: "Self".into() }),
+                            last_name: Some(AttributedText {
+                                text: "Self".into(),
+                            }),
                         }),
                     },
                 },
@@ -950,7 +920,9 @@ mod tests {
                     host_identity_urn: "urn:li:fsd_profile:PEER".into(),
                     participant_type: ParticipantType {
                         member: Some(Member {
-                            first_name: Some(AttributedText { text: "Tony".into() }),
+                            first_name: Some(AttributedText {
+                                text: "Tony".into(),
+                            }),
                             last_name: Some(AttributedText { text: "Siu".into() }),
                         }),
                     },
@@ -960,7 +932,9 @@ mod tests {
                 elements: vec![Message {
                     backend_urn: "urn:li:messagingMessage:m1".into(),
                     delivered_at: 200,
-                    body: Some(AttributedText { text: "hello".into() }),
+                    body: Some(AttributedText {
+                        text: "hello".into(),
+                    }),
                     actor: Some(Participant {
                         host_identity_urn: "urn:li:fsd_profile:PEER".into(),
                         participant_type: ParticipantType::default(),

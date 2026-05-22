@@ -34,9 +34,7 @@ pub use connections::{
     connection_patch, connection_slug, parse_connections, Connection, ConnectionDiff,
     ConnectionSyncer, ConnectionsApi, SyncMode, SyncReport, VoyagerConnectionsClient,
 };
-pub use feed::{
-    LinkedInFeedTrigger, DEFAULT_FEED_POLL_SECS, DEFAULT_MAX_ENGAGEMENTS_PER_DAY,
-};
+pub use feed::{LinkedInFeedTrigger, DEFAULT_FEED_POLL_SECS, DEFAULT_MAX_ENGAGEMENTS_PER_DAY};
 pub use friend_feed::{
     FriendFeedEngagement, FriendPostPayload, LinkedInFriendFeedSource,
     DEFAULT_FRIEND_FEED_POLL_SECS, DEFAULT_MAX_FRIEND_POSTS_PER_TICK,
@@ -51,10 +49,8 @@ pub use own_posts::{
     DEFAULT_MAX_REPLIES_PER_DAY, DEFAULT_OWN_POST_POLL_SECS,
 };
 pub use posting::{
-    build_normshares_body, PostDraft, ShareUrn, Visibility,
-    DEFAULT_MEDIA_UPLOAD_PATH,
+    build_normshares_body, PostDraft, ShareUrn, Visibility, DEFAULT_MEDIA_UPLOAD_PATH,
 };
 pub use types::{
-    is_linkedin_email, Dm, FeedPost, Invitation, MemberUrn, PostComment,
-    ACCOUNT_PREFIX,
+    is_linkedin_email, Dm, FeedPost, Invitation, MemberUrn, PostComment, ACCOUNT_PREFIX,
 };

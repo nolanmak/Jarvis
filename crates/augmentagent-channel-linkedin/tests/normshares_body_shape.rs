@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use augmentagent_channel_linkedin::{
-    LinkedInApi, LinkedInAuth, PostDraft, VoyagerClient, Visibility,
+    LinkedInApi, LinkedInAuth, PostDraft, Visibility, VoyagerClient,
 };
 use serde_json::Value;
 use wiremock::matchers::{method, path};
@@ -41,10 +41,7 @@ fn test_auth() -> LinkedInAuth {
 }
 
 /// Capture the JSON body posted to `/voyager/api/contentcreation/normShares`.
-async fn capture_normshares_body(
-    server: &MockServer,
-    draft: PostDraft<'_>,
-) -> Value {
+async fn capture_normshares_body(server: &MockServer, draft: PostDraft<'_>) -> Value {
     let captured: std::sync::Arc<std::sync::Mutex<Option<Value>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let sink = captured.clone();
@@ -54,10 +51,9 @@ async fn capture_normshares_body(
         .respond_with(move |req: &Request| {
             let body: Value = serde_json::from_slice(&req.body).unwrap();
             *sink.lock().unwrap() = Some(body);
-            ResponseTemplate::new(201)
-                .set_body_json(serde_json::json!({
-                    "data": { "entityUrn": "urn:li:share:7000000000000000000" }
-                }))
+            ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "data": { "entityUrn": "urn:li:share:7000000000000000000" }
+            }))
         })
         .mount(server)
         .await;
@@ -76,11 +72,8 @@ async fn text_only_body_shape() {
     let server = MockServer::start().await;
     std::env::set_var("AUGMENTAGENT_LINKEDIN_BASE_URL", server.uri());
 
-    let body = capture_normshares_body(
-        &server,
-        PostDraft::text("Hello world from AugmentAgent."),
-    )
-    .await;
+    let body =
+        capture_normshares_body(&server, PostDraft::text("Hello world from AugmentAgent.")).await;
 
     assert_eq!(body["visibleToConnectionsOnly"], false);
     assert_eq!(

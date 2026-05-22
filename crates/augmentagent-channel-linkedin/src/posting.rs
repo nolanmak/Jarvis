@@ -46,9 +46,7 @@ impl Visibility {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "public" => Some(Self::Public),
-            "connections" | "connections_only" | "connectionsonly" => {
-                Some(Self::ConnectionsOnly)
-            }
+            "connections" | "connections_only" | "connectionsonly" => Some(Self::ConnectionsOnly),
             _ => None,
         }
     }
@@ -86,8 +84,7 @@ const DEFAULT_CLIENT_VERSION: &str = "1.13.32099";
 /// Voyager media-upload register endpoint. Renamed historically by LinkedIn
 /// (`voyagerMediaUploadMetadata` → `voyagerVideoDashMediaUploadMetadata`);
 /// env override per #77 §3 caveat.
-pub const DEFAULT_MEDIA_UPLOAD_PATH: &str =
-    "/voyager/api/voyagerVideoDashMediaUploadMetadata";
+pub const DEFAULT_MEDIA_UPLOAD_PATH: &str = "/voyager/api/voyagerVideoDashMediaUploadMetadata";
 
 const NORMSHARES_PATH: &str = "/voyager/api/contentcreation/normShares";
 

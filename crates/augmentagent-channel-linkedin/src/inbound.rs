@@ -135,11 +135,7 @@ mod tests {
         ) -> Result<String, LinkedInError> {
             Ok("urn:li:comment:fake".into())
         }
-        async fn react(
-            &self,
-            _post_urn: &str,
-            _reaction: &str,
-        ) -> Result<(), LinkedInError> {
+        async fn react(&self, _post_urn: &str, _reaction: &str) -> Result<(), LinkedInError> {
             Ok(())
         }
         async fn create_share(
@@ -175,7 +171,9 @@ mod tests {
         let items = inbound.fetch_new().await.unwrap();
         let ids: Vec<_> = items.iter().map(|w| w.external_id.clone()).collect();
         assert_eq!(ids, vec!["m1", "m2"]);
-        assert!(items.iter().all(|w| w.platform == "linkedin" && w.kind == "dm"));
+        assert!(items
+            .iter()
+            .all(|w| w.platform == "linkedin" && w.kind == "dm"));
         // Payload round-trips into a typed Email with the linkedin prefix.
         let email: augmentagent_store::Email =
             serde_json::from_value(items[0].payload.clone()).unwrap();
