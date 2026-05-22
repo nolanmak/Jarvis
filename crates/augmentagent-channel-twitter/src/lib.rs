@@ -44,7 +44,7 @@ pub use channel::{
     DM_POLL_MIN_SECS, FEED_JITTER_SECS, FEED_POLL_SECS,
 };
 pub use client::{
-    CreateTweetClient, PostError, PostOutcome, StoreQueryIdResolver,
-    DAILY_POST_QUOTA,
+    twitter_armed, CreateTweetClient, PostError, PostOutcome, StoreQueryIdResolver,
+    ARMED_CONFIG_KEY, ARMED_ENV_KEY, DAILY_POST_QUOTA,
 };
 pub use types::{is_twitter_email, Tweet, TwitterDm, ACCOUNT_PREFIX};
