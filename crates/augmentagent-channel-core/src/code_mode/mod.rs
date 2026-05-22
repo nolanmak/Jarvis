@@ -1,26 +1,49 @@
-//! Code-Mode tool manifest and TypeScript declaration emitter.
+//! Code-Mode tool manifest, sandbox glue, and audit-trace plumbing.
 //!
-//! This module owns the v1 tool surface that the LLM is allowed to call from
-//! generated TypeScript. It produces two artifacts:
+//! This module owns three layers of the Code-Mode pipeline:
 //!
-//! * a `.d.ts` block injected into the system prompt so the model has type
-//!   signatures and JSDoc for every tool, and
-//! * a flat allowlist of dotted tool names that the Deno runner uses to
-//!   gate host-bridge calls.
+//! * The **v1 manifest** (`manifest`) — the LLM-allowed tool surface, with
+//!   both a `.d.ts` declaration block (for the system prompt) and a flat
+//!   allowlist of dotted names (for the Deno runner).
+//! * The **runtime / Deno wiring** (`runner` + `dispatch`) — subprocess +
+//!   NDJSON RPC loop plus the allowlist trait and per-tool handlers.
+//! * The **audit trace** (`trace`) — [`ToolCallRecord`] shape and the
+//!   `summarize_value` clip helpers that keep one runaway call from
+//!   blowing up the `actions.toolCallTrace` row.
 //!
-//! No runtime / Deno wiring lives here — this is pure string emission so it
-//! can be unit-tested without spawning subprocesses.
+//! The pieces are split so the manifest can be unit-tested without
+//! spawning subprocesses, and the runner can be integration-tested with a
+//! `StubDispatcher` instead of a live SQLite + Composio backing store.
+//!
+//! The reasoner-side `extract_ts_block` helper (and `CodeModeError`) lives
+//! here too — produced by I5 (#51) so this module is also the entry point
+//! between "model text → fenced TS program" and "program → sandbox →
+//! action row."
 
+pub mod dispatch;
 pub mod manifest;
+pub mod runner;
+pub mod trace;
 
+pub use dispatch::{
+    CalendarBusyLookup, DefaultDispatcher, DispatchError, Dispatcher, MessageContext,
+    StubDispatcher,
+};
 pub use manifest::{manifest_v1, ToolDef, ToolManifest};
+// The runtime layer renames its error type to `RunnerError` to avoid
+// colliding with the reasoner-side [`CodeModeError`] this module already
+// owns. Downstream callers compose the two (reasoner produces source →
+// runner consumes source) but they're distinct failure modes.
+pub use runner::{run_program, CodeModeOutcome, RunnerError, RUST_WALL_CLOCK_MS};
+pub use trace::{summarize_value, ToolCallRecord, SUMMARY_MAX_BYTES};
 
 /// Failure modes specific to the Code-Mode call pipeline.
 ///
 /// I5 only owns the reasoner-side variants (`NoCodeBlock`, `ReasonerFailed`).
-/// I4's dispatcher / sandbox layer will extend this enum with runner /
-/// timeout / budget variants when it lands; downstream callers should match
-/// by name and treat the enum as forward-compatible.
+/// I4's dispatcher / sandbox layer surfaces its own
+/// [`RunnerError`](crate::code_mode::RunnerError) for runner / timeout /
+/// budget faults; downstream callers match by name and treat the two
+/// enums as composable.
 #[derive(Debug, thiserror::Error)]
 pub enum CodeModeError {
     /// The reasoner returned an assistant message that did not contain a
