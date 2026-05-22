@@ -37,6 +37,12 @@
       }
     }
 
+    function escHtml(s) {
+      return String(s == null ? "" : s)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    }
+
     function render(actions) {
       const q = document.getElementById("queue");
       document.getElementById("status").textContent = actions.length + " pending";
@@ -44,30 +50,45 @@
       for (const a of actions) {
         const el = document.createElement("div");
         el.className = "card";
+        // #36: surface the recipient (To:) on the card with an editable input
+        // so the operator can redirect the reply before clicking Approve.
+        const to = a.recipientEmail || a.fromEmail || "";
         el.innerHTML =
-          "<strong>" + (a.subject || "(no subject)") + "</strong>" +
-          "<div class='muted'>" + (a.fromEmail || "") + "</div>" +
-          "<pre style='white-space:pre-wrap'>" + (a.draftBody || "") + "</pre>" +
+          "<strong>" + escHtml(a.subject || "(no subject)") + "</strong>" +
+          "<div class='muted'>From: " + escHtml(a.fromEmail || "") + "</div>" +
+          "<div style='margin-top:.5rem;display:flex;gap:.5rem;align-items:center'>" +
+            "<label class='muted' style='flex:0 0 auto'>To:</label>" +
+            "<input type='email' value='" + escHtml(to) + "' " +
+              "style='flex:1;padding:.4rem;border-radius:6px;border:1px solid #30363d;background:#0b0f17;color:#e6edf3' />" +
+          "</div>" +
+          "<pre style='white-space:pre-wrap'>" + escHtml(a.draftBody || "") + "</pre>" +
           "<div class='row'>" +
-          "<button class='ok'>Approve</button>" +
-          "<button class='rev'>Revise</button>" +
-          "<button class='skip'>Skip</button></div>";
+            "<button class='ok'>Approve</button>" +
+            "<button class='rev'>Revise</button>" +
+            "<button class='skip'>Skip</button>" +
+          "</div>";
+        const toInput = el.querySelector("input[type=email]");
         const [ok, rev, skip] = el.querySelectorAll("button");
-        ok.onclick = () => resolve(a.id, "sent");
+        const currentTo = () => (toInput.value || "").trim();
+        ok.onclick = () => resolve(a.id, "sent", undefined, currentTo());
         skip.onclick = () => resolve(a.id, "rejected");
         rev.onclick = () => {
           const fb = prompt("Revision feedback:");
-          if (fb) resolve(a.id, "pending", fb);
+          if (fb) resolve(a.id, "pending", fb, currentTo());
         };
         q.appendChild(el);
       }
     }
 
-    async function resolve(id, status, feedback) {
+    async function resolve(id, status, feedback, recipientEmail) {
+      const body = { status, source: "web_push", errorMessage: feedback };
+      if (recipientEmail && recipientEmail.indexOf("@") > 0) {
+        body.recipientEmail = recipientEmail;
+      }
       await fetch("/api/v1/actions/" + id, {
         method: "POST",
         headers: Object.assign({ "Content-Type": "application/json" }, headers),
-        body: JSON.stringify({ status, source: "web_push", errorMessage: feedback }),
+        body: JSON.stringify(body),
       });
       load();
     }

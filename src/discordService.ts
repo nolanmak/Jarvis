@@ -12,6 +12,8 @@ import {
 } from "discord.js";
 import type { ThreadChannel, ButtonInteraction } from "discord.js";
 import type { Email } from "./types";
+import { isPlausibleEmail } from "./types";
+import { updateActionRecipient } from "./db";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -60,11 +62,13 @@ function formatEmailSummary(original: Email): string {
   ].join("\n");
 }
 
-function formatDraftMessage(draft: string, revision?: number): string {
+// #36: header now shows the recipient so the operator sees who the reply
+// would go to BEFORE clicking Approve. The Change-To button lets them swap it.
+function formatDraftMessage(draft: string, recipient: string, revision?: number): string {
   const header = revision
     ? `**Draft (revision ${revision}):**`
     : "**Draft reply:**";
-  return `${header}\n\n${draft}`;
+  return `${header}\n**To:** ${recipient}\n\n${draft}`;
 }
 
 function buildButtons(): ActionRowBuilder<ButtonBuilder> {
@@ -78,6 +82,10 @@ function buildButtons(): ActionRowBuilder<ButtonBuilder> {
       .setLabel("Revise")
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
+      .setCustomId("change_to")
+      .setLabel("Change To")
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
       .setCustomId("reject")
       .setLabel("Skip")
       .setStyle(ButtonStyle.Danger),
@@ -87,11 +95,18 @@ function buildButtons(): ActionRowBuilder<ButtonBuilder> {
 export interface ApprovalResult {
   approved: boolean;
   finalDraft: string;
+  finalRecipient: string;
 }
 
+// #36: `actionId` and `initialRecipient` are new. `actionId` lets us persist
+// recipient overrides to the DB so the dashboard reflects the change too;
+// `initialRecipient` is the default "To:" the agent picked (usually the
+// parsed sender). `actionId` is optional only for safety against older callers.
 export async function sendForApproval(
   original: Email,
-  draft: string
+  draft: string,
+  actionId?: string,
+  initialRecipient?: string
 ): Promise<ApprovalResult> {
   if (!isReady) {
     throw new Error("Discord bot is not initialized. Call initBot() first.");
@@ -119,10 +134,14 @@ export async function sendForApproval(
 
   // Post initial draft with buttons
   let currentDraft = draft;
+  // #36: track the recipient locally so Change-To can mutate it without losing
+  // state across revise rounds. Default falls back to `from` if a caller from
+  // before this change didn't pass initialRecipient.
+  let currentRecipient = (initialRecipient || original.from).trim();
   let revision = 0;
 
   const draftMessage = await thread.send({
-    content: formatDraftMessage(currentDraft),
+    content: formatDraftMessage(currentDraft, currentRecipient),
     components: [buildButtons()],
   });
 
@@ -141,7 +160,7 @@ export async function sendForApproval(
     const timeout = setTimeout(async () => {
       if (settled) return;
       await thread.send({ content: "**Timed out** -- no action taken. Thread will be archived." });
-      settle({ approved: false, finalDraft: currentDraft });
+      settle({ approved: false, finalDraft: currentDraft, finalRecipient: currentRecipient });
     }, TIMEOUT_MS);
 
     // Listen for button interactions in this thread
@@ -156,23 +175,84 @@ export async function sendForApproval(
       switch (interaction.customId) {
         case "approve": {
           await interaction.update({
-            content: formatDraftMessage(currentDraft, revision || undefined) + "\n\n**APPROVED** -- sending email.",
+            content: formatDraftMessage(currentDraft, currentRecipient, revision || undefined) + "\n\n**APPROVED** -- sending email.",
             components: [],
           });
           clearTimeout(timeout);
           collector.stop();
-          settle({ approved: true, finalDraft: currentDraft });
+          settle({ approved: true, finalDraft: currentDraft, finalRecipient: currentRecipient });
           break;
         }
 
         case "reject": {
           await interaction.update({
-            content: formatDraftMessage(currentDraft, revision || undefined) + "\n\n**SKIPPED** -- no email sent.",
+            content: formatDraftMessage(currentDraft, currentRecipient, revision || undefined) + "\n\n**SKIPPED** -- no email sent.",
             components: [],
           });
           clearTimeout(timeout);
           collector.stop();
-          settle({ approved: false, finalDraft: currentDraft });
+          settle({ approved: false, finalDraft: currentDraft, finalRecipient: currentRecipient });
+          break;
+        }
+
+        case "change_to": {
+          // #36: Show modal for editing the recipient address. Keep buttons
+          // active throughout — this is a non-terminal action, the operator
+          // can still Approve/Revise/Skip after changing the address.
+          const modalId = `change_to_modal_${Date.now()}`;
+          const modal = new ModalBuilder()
+            .setCustomId(modalId)
+            .setTitle("Change recipient");
+
+          const toInput = new TextInputBuilder()
+            .setCustomId("recipient")
+            .setLabel("To: address")
+            .setStyle(TextInputStyle.Short)
+            .setValue(currentRecipient)
+            .setPlaceholder("name@example.com")
+            .setRequired(true)
+            .setMaxLength(254);
+
+          modal.addComponents(
+            new ActionRowBuilder<TextInputBuilder>().addComponents(toInput)
+          );
+
+          await interaction.showModal(modal);
+
+          try {
+            const modalSubmit = await interaction.awaitModalSubmit({
+              filter: (i) => i.customId === modalId,
+              time: 5 * 60 * 1000,
+            });
+
+            const newTo = modalSubmit.fields.getTextInputValue("recipient").trim();
+            await modalSubmit.deferUpdate();
+
+            if (!isPlausibleEmail(newTo)) {
+              await thread.send({
+                content: `**Change To failed:** \`${newTo}\` doesn't look like an email address.`,
+              });
+              break;
+            }
+
+            currentRecipient = newTo;
+            if (actionId) {
+              try {
+                updateActionRecipient(actionId, newTo);
+              } catch (err) {
+                // DB write failed but the local state is still authoritative
+                // for this approval round — log and continue.
+                console.warn("updateActionRecipient failed:", err);
+              }
+            }
+
+            await thread.send({
+              content: formatDraftMessage(currentDraft, currentRecipient, revision || undefined),
+              components: [buildButtons()],
+            });
+          } catch {
+            await thread.send({ content: "*Change To cancelled (modal timed out).*" });
+          }
           break;
         }
 
@@ -216,7 +296,7 @@ export async function sendForApproval(
 
                 // Post revised draft with new buttons
                 await thread.send({
-                  content: formatDraftMessage(currentDraft, revision),
+                  content: formatDraftMessage(currentDraft, currentRecipient, revision),
                   components: [buildButtons()],
                 });
               } catch (err) {
@@ -244,7 +324,7 @@ export async function sendForApproval(
     collector.on("end", () => {
       clearTimeout(timeout);
       if (!settled) {
-        settle({ approved: false, finalDraft: currentDraft });
+        settle({ approved: false, finalDraft: currentDraft, finalRecipient: currentRecipient });
       }
     });
   });

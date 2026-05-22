@@ -14,6 +14,27 @@
       <span class="text-gray-500">Date:</span>
       <span class="ml-2"><%= new Date(action.createdAt).toLocaleString() %></span>
     </div>
+    <%# #36: editable recipient. Pending → input + Save; otherwise read-only. %>
+    <div class="col-span-2 flex items-center">
+      <span class="text-gray-500">To:</span>
+      <% if (action.status === 'pending') { %>
+        <input
+          type="email"
+          id="recipient-input-<%= action.id %>"
+          value="<%= action.recipientEmail || action.fromEmail %>"
+          class="ml-2 flex-1 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-blue-500"
+        />
+        <button
+          type="button"
+          onclick="saveRecipient('<%= action.id %>')"
+          class="ml-2 px-3 py-1 text-xs bg-blue-700 hover:bg-blue-600 rounded text-white">
+          Save
+        </button>
+        <span id="recipient-status-<%= action.id %>" class="ml-2 text-xs text-gray-500"></span>
+      <% } else { %>
+        <span class="ml-2"><%= action.recipientEmail || action.fromEmail %></span>
+      <% } %>
+    </div>
     <div class="col-span-2">
       <span class="text-gray-500">Subject:</span>
       <span class="ml-2 font-medium"><%= action.subject %></span>
@@ -28,6 +49,52 @@
       </span>
     </div>
   </div>
+
+  <% if (action.status === 'pending') { %>
+    <script>
+      // #36: dashboard recipient override. POSTs to the same v1 endpoint the
+      // PWA + Discord-side updates use; the API keeps status=pending.
+      window.saveRecipient = window.saveRecipient || async function (id) {
+        var input = document.getElementById("recipient-input-" + id);
+        var status = document.getElementById("recipient-status-" + id);
+        if (!input || !status) return;
+        var val = (input.value || "").trim();
+        if (!val || val.indexOf("@") < 0) {
+          status.textContent = "invalid";
+          status.className = "ml-2 text-xs text-red-400";
+          return;
+        }
+        status.textContent = "saving…";
+        status.className = "ml-2 text-xs text-gray-400";
+        var apiKey = localStorage.getItem("aa_api_key") || "";
+        var headers = { "Content-Type": "application/json" };
+        if (apiKey) headers["x-api-key"] = apiKey;
+        try {
+          var r = await fetch("/api/v1/actions/" + id, {
+            method: "POST",
+            headers: headers,
+            body: JSON.stringify({
+              status: "pending",
+              recipientEmail: val,
+              source: "dashboard_preview",
+            }),
+          });
+          if (!r.ok) {
+            var msg = "save failed (" + r.status + ")";
+            try { var j = await r.json(); if (j && j.error) msg = j.error; } catch (e) {}
+            status.textContent = msg;
+            status.className = "ml-2 text-xs text-red-400";
+            return;
+          }
+          status.textContent = "saved";
+          status.className = "ml-2 text-xs text-green-400";
+        } catch (e) {
+          status.textContent = "network error";
+          status.className = "ml-2 text-xs text-red-400";
+        }
+      };
+    </script>
+  <% } %>
 
   <% if (action.originalBody) { %>
     <div>

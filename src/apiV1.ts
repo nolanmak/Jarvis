@@ -45,6 +45,7 @@ import {
   getConfig,
 } from "./db";
 import type { ActionStatus } from "./types";
+import { isPlausibleEmail } from "./types";
 
 export const MODE = (process.env.MODE || "local").toLowerCase();
 const API_KEY = process.env.AUGMENTAGENT_API_KEY || "";
@@ -206,15 +207,23 @@ v1.get("/actions/:id", (req, res) => {
 
 // POST /api/v1/actions/:id — mutate status (approve/skip/etc) from a remote
 // surface. Publishes a cross-surface event (#47).
+//
+// #36: also accepts `recipientEmail` so the dashboard / PWA / Discord webhook
+// can swap the "To:" address before approval. Validated against a minimal
+// shape check (`isPlausibleEmail`) — we don't pretend to do MX lookups.
 v1.post("/actions/:id", (req, res) => {
   const action = getActionById(req.params.id);
   if (!action) {
     res.status(404).json({ error: "action not found" });
     return;
   }
-  const { status, draftBody, errorMessage, source } = req.body || {};
+  const { status, draftBody, errorMessage, recipientEmail, source } = req.body || {};
   if (!status) {
     res.status(400).json({ error: "body.status is required" });
+    return;
+  }
+  if (recipientEmail !== undefined && !isPlausibleEmail(recipientEmail)) {
+    res.status(400).json({ error: "recipientEmail is not a valid email address" });
     return;
   }
   // CAS-ish guard: only mutate if still pending, mirroring the Rust
@@ -228,6 +237,7 @@ v1.post("/actions/:id", (req, res) => {
   updateActionStatus(req.params.id, status as ActionStatus, {
     draftBody,
     errorMessage,
+    recipientEmail,
   });
   publishStatusChange(req.params.id, status, source || "api_v1");
   res.json(getActionById(req.params.id));

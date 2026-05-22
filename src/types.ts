@@ -25,6 +25,8 @@ export interface ActionRecord {
   messageId: string;
   threadId?: string;
   fromEmail: string;
+  /// #36: Operator-editable "To:" override. NULL → fall back to fromEmail on send.
+  recipientEmail?: string | null;
   subject: string;
   originalBody?: string;
   draftBody?: string;
@@ -35,6 +37,23 @@ export interface ActionRecord {
   /// Populated via LEFT JOIN on emails.messageId. Absent for orphan actions (should be rare).
   platform?: string;
   kind?: string;
+}
+
+// #36: parse the bare email address out of a From header like
+// `"Name" <addr@x>` / `Name <addr@x>` / `addr@x`. Returns the input trimmed
+// if no angle-bracket form is present.
+export function extractEmailAddress(from: string): string {
+  if (!from) return "";
+  const m = from.match(/<([^>]+)>/);
+  return (m ? m[1] : from).trim();
+}
+
+// #36: minimal RFC-5322-ish sanity check — the API and UIs reject inputs that
+// fail this. We don't go further (no DNS lookups, no MX checks).
+export function isPlausibleEmail(s: unknown): s is string {
+  if (typeof s !== "string") return false;
+  const t = s.trim();
+  return t.length > 2 && t.includes("@") && !t.includes(" ") && t.indexOf("@") < t.length - 1;
 }
 
 export interface Sender {

@@ -25,6 +25,7 @@ export function initDb(dbPath?: string): Database.Database {
       messageId TEXT NOT NULL,
       threadId TEXT,
       fromEmail TEXT NOT NULL,
+      recipientEmail TEXT,
       subject TEXT NOT NULL,
       originalBody TEXT,
       draftBody TEXT,
@@ -142,6 +143,13 @@ export function initDb(dbPath?: string): Database.Database {
     db.exec("ALTER TABLE emails ADD COLUMN kind TEXT NOT NULL DEFAULT 'dm'");
   }
 
+  // #36: recipientEmail lets the operator override the "To:" address on a
+  // pending action card before approval — older DBs won't have the column.
+  const actionCols = db.prepare("PRAGMA table_info(actions)").all() as { name: string }[];
+  if (!actionCols.some((c) => c.name === "recipientEmail")) {
+    db.exec("ALTER TABLE actions ADD COLUMN recipientEmail TEXT");
+  }
+
   // Multi-workspace Slack: drop the old (platform, channel_id) UNIQUE when we
   // add account_id. SQLite can't ALTER constraints, so on old DBs that still
   // carry it we rebuild the table.
@@ -195,14 +203,15 @@ export function logAction(action: Omit<ActionRecord, "id" | "createdAt" | "updat
 
   getDb()
     .prepare(
-      `INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO actions (id, messageId, threadId, fromEmail, recipientEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       id,
       action.messageId,
       action.threadId || null,
       action.fromEmail,
+      action.recipientEmail || null,
       action.subject,
       action.originalBody || null,
       action.draftBody || null,
@@ -215,26 +224,45 @@ export function logAction(action: Omit<ActionRecord, "id" | "createdAt" | "updat
   return id;
 }
 
+// #36: extra accepts an optional recipientEmail so the operator can edit the
+// "To:" address from the approval UIs before send. Build the UPDATE dynamically
+// so callers can mix-and-match fields (the old draftBody/errorMessage paths
+// kept their previous semantics).
 export function updateActionStatus(
   id: string,
   status: ActionStatus,
-  extra?: { draftBody?: string; errorMessage?: string }
+  extra?: { draftBody?: string; errorMessage?: string; recipientEmail?: string }
 ): void {
   const now = Date.now();
+  const sets: string[] = ["status = ?", "updatedAt = ?"];
+  const vals: unknown[] = [status, now];
 
-  if (extra?.draftBody) {
-    getDb()
-      .prepare("UPDATE actions SET status = ?, draftBody = ?, updatedAt = ? WHERE id = ?")
-      .run(status, extra.draftBody, now, id);
-  } else if (extra?.errorMessage) {
-    getDb()
-      .prepare("UPDATE actions SET status = ?, errorMessage = ?, updatedAt = ? WHERE id = ?")
-      .run(status, extra.errorMessage, now, id);
-  } else {
-    getDb()
-      .prepare("UPDATE actions SET status = ?, updatedAt = ? WHERE id = ?")
-      .run(status, now, id);
+  if (extra?.draftBody !== undefined) {
+    sets.push("draftBody = ?");
+    vals.push(extra.draftBody);
   }
+  if (extra?.errorMessage !== undefined) {
+    sets.push("errorMessage = ?");
+    vals.push(extra.errorMessage);
+  }
+  if (extra?.recipientEmail !== undefined) {
+    sets.push("recipientEmail = ?");
+    vals.push(extra.recipientEmail);
+  }
+
+  getDb()
+    .prepare(`UPDATE actions SET ${sets.join(", ")} WHERE id = ?`)
+    .run(...vals, id);
+}
+
+// #36: standalone update for the "Change To" button on the approval card —
+// keeps the action's status untouched (still pending) and only swaps the
+// recipient. Returns true if a row was updated.
+export function updateActionRecipient(id: string, recipientEmail: string): boolean {
+  const res = getDb()
+    .prepare("UPDATE actions SET recipientEmail = ?, updatedAt = ? WHERE id = ?")
+    .run(recipientEmail, Date.now(), id);
+  return res.changes > 0;
 }
 
 export function getActions(opts: {
