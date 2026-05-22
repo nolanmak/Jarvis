@@ -403,7 +403,37 @@ pub async fn run_install(component: InstallComponent) -> Result<()> {
             run_script("install-autoupdate.sh", &[], flags.json, &mut cap).await?
         }
         InstallComponent::Dashboard { .. } => {
-            run_script("install-dashboard.sh", &[], flags.json, &mut cap).await?
+            let script_ok =
+                run_script("install-dashboard.sh", &[], flags.json, &mut cap).await?;
+            // #33 — idempotently initialise the sqlite db so the very next
+            // `augmentagent status --json` doesn't fail on a fresh box. Opening
+            // the store creates the file (if missing) and runs migrations; on
+            // a re-run it's a near no-op. Failure here MUST NOT fail the
+            // install — the dashboard itself opens the db on first start, so
+            // we log + continue.
+            let db_path = std::env::var("AUGMENTAGENT_DB")
+                .unwrap_or_else(|_| "./data.db".to_string());
+            match augmentagent_store::Store::open(&db_path) {
+                Ok(_) => {
+                    tracing::info!(target: "augmentagent_cli::installers", "sqlite db ready at {db_path}");
+                    if flags.json {
+                        cap.stdout
+                            .push_str(&format!("sqlite db ready at {db_path}\n"));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "augmentagent_cli::installers",
+                        "could not init sqlite db at {db_path}: {e}. Dashboard will init on first run."
+                    );
+                    if flags.json {
+                        cap.stderr.push_str(&format!(
+                            "could not init sqlite db at {db_path}: {e}. Dashboard will init on first run.\n"
+                        ));
+                    }
+                }
+            }
+            script_ok
         }
         InstallComponent::Digest { .. } => {
             run_script("install-digest.sh", &[], flags.json, &mut cap).await?
@@ -519,6 +549,62 @@ mod tests {
             .label(),
             "tenant:code-coffee"
         );
+    }
+
+    /// #33 — the dashboard branch of `run_install` opens the store after the
+    /// shell script returns to guarantee `$AUGMENTAGENT_DB` exists + migrated
+    /// before the very next `augmentagent status --json`. Locks in two
+    /// behaviours the dashboard branch relies on:
+    ///
+    /// 1. On a truly empty file (the Node dashboard hasn't booted yet and
+    ///    therefore hasn't created the base `actions`/`emails`/etc tables that
+    ///    `Store::migrate` ALTERs), `Store::open` returns `Err`, NOT a panic.
+    ///    The install branch swallows that error and logs a warn — must not
+    ///    fail the install.
+    /// 2. On an already-bootstrapped db (the steady-state re-run case),
+    ///    `Store::open` succeeds and can be called repeatedly without
+    ///    corruption.
+    #[test]
+    fn store_open_dashboard_bootstrap_is_safe_to_retry() {
+        let tmp = std::env::temp_dir().join(format!(
+            "augmentagent-issue-33-{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        // (1) Empty file: error must be returned cleanly, not panic. This is
+        // the race-window failure mode on a real fresh box.
+        match augmentagent_store::Store::open(&tmp) {
+            Ok(_) => panic!("Store::open on a truly empty db unexpectedly succeeded"),
+            Err(e) => {
+                // Sanity: the error mentions a missing table (the actions
+                // schema the Node tree owns).
+                let msg = format!("{e}");
+                assert!(
+                    msg.contains("no such table"),
+                    "unexpected error from empty-db open: {msg}"
+                );
+            }
+        }
+
+        // (2) Pre-seed the minimal legacy schema the Node tree creates on
+        // first dashboard start; now Store::open must succeed and be safe to
+        // call again.
+        {
+            let c = rusqlite::Connection::open(&tmp).expect("open seed conn");
+            c.execute_batch(
+                "CREATE TABLE IF NOT EXISTS actions (id TEXT PRIMARY KEY, status TEXT, createdAt INTEGER); \
+                 CREATE TABLE IF NOT EXISTS emails (id TEXT PRIMARY KEY, accountEntityId TEXT); \
+                 CREATE TABLE IF NOT EXISTS gmail_accounts (id TEXT PRIMARY KEY);",
+            )
+            .expect("seed legacy schema");
+        }
+        augmentagent_store::Store::open(&tmp)
+            .expect("first open on seeded db should succeed");
+        augmentagent_store::Store::open(&tmp)
+            .expect("re-open on migrated db should be a no-op");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
