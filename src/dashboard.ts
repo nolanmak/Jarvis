@@ -574,16 +574,18 @@ router.post("/api/ask", async (req, res) => {
 
 // --- Weekly invoice automation ---
 // Writes the same `invoice_config` rows the Rust scheduler reads. The master
-// kill switch (`auto_send_enabled`) is seeded OFF by the daemon migration;
-// nothing auto-sends until it's flipped on here (or via `!invoice autosend`).
+// kill switch (`auto_draft_enabled`) is seeded OFF by the daemon migration;
+// nothing auto-drafts until it's flipped on here (or via `!invoice autodraft`).
+// When ON, the Sunday scheduler posts a draft card with the PDF + Approve/
+// Reject buttons; a human still has to click Approve for anything to send.
 router.post("/api/invoice-config", (req, res) => {
   const { key, value } = req.body as { key?: string; value?: string };
 
-  if (key === "auto_send_enabled") {
+  if (key === "auto_draft_enabled") {
     // Normalize a checkbox/string to exactly the "true"/"false" the Rust
     // scheduler compares against.
     const on = value === "true" || value === "on" || value === "1";
-    setInvoiceConfig("auto_send_enabled", on ? "true" : "false");
+    setInvoiceConfig("auto_draft_enabled", on ? "true" : "false");
   } else if (key === "recipient_email") {
     const email = (value || "").trim();
     if (!email.includes("@") || !email.includes(".")) {

@@ -48,7 +48,7 @@
       Generates and emails the weekly Orchid invoice PDF every Sunday at 9am.
       <span class="text-amber-500 font-medium">Off by default</span> — turn it on
       only after the recipient and the sending Gmail account are set. The first
-      automated send is invoice #35 for the week ending 2026-05-24.
+      automated draft is invoice #35 for the week ending 2026-05-24.
     </p>
 
     <div id="invoice-config" class="mb-4">
@@ -57,13 +57,13 @@
 
     <form hx-post="/api/invoice-config" hx-target="#invoice-config" hx-swap="innerHTML"
           class="flex gap-3 items-end mb-3">
-      <input type="hidden" name="key" value="auto_send_enabled" />
+      <input type="hidden" name="key" value="auto_draft_enabled" />
       <div class="flex-1">
-        <label class="block text-sm text-gray-400 mb-1">Automatic sending</label>
+        <label class="block text-sm text-gray-400 mb-1">Automatic Sunday draft</label>
         <select name="value"
                 class="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
-          <option value="false" <%= invoice.autoSendEnabled ? '' : 'selected' %>>Off — do not send (default)</option>
-          <option value="true" <%= invoice.autoSendEnabled ? 'selected' : '' %>>On — send every Sunday</option>
+          <option value="false" <%= invoice.autoDraftEnabled ? '' : 'selected' %>>Off — do not post drafts (default)</option>
+          <option value="true" <%= invoice.autoDraftEnabled ? 'selected' : '' %>>On — post draft for approval every Sunday</option>
         </select>
       </div>
       <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-md text-sm font-medium transition-colors">
@@ -86,8 +86,10 @@
     </form>
     <p class="text-xs text-gray-600 mt-2">
       The sending Gmail account (Composio entity) is set over Discord with
-      <code class="text-gray-400">!invoice entity &lt;id&gt;</code>. Until automatic
-      sending is On, the Sunday scheduler ticks but performs no send.
+      <code class="text-gray-400">!invoice entity &lt;id&gt;</code>. Until the
+      Sunday draft is On, the scheduler ticks but posts nothing. When On, the
+      scheduler posts a draft PDF to Discord and waits for a human Approve
+      click before any email is sent.
     </p>
   </div>
 

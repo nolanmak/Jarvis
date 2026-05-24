@@ -540,6 +540,28 @@ pub struct FriendWatch {
     pub paused_until_ms: Option<i64>,
 }
 
+/// One row of the human-in-the-loop invoice draft surface. The Discord
+/// scheduler and the `!invoice draft` command both insert one of these
+/// when posting the PDF; the Approve/Reject buttons resolve it. `status`
+/// is the lifecycle marker: `pending` → `approved` | `rejected` | `failed`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvoiceDraft {
+    pub id: String,
+    /// Sunday that closes the billed week (YYYY-MM-DD).
+    pub week_end: String,
+    pub invoice_number: i64,
+    pub pdf_path: String,
+    /// Set after the PDF was posted; lets the buttons edit the source card.
+    pub discord_channel_id: Option<String>,
+    pub discord_message_id: Option<String>,
+    /// `pending` | `approved` | `rejected` | `failed`.
+    pub status: String,
+    pub created_at: i64,
+    pub resolved_at: Option<i64>,
+    /// Discord user id (string for forward-compat) of whoever resolved it.
+    pub resolved_by: Option<String>,
+}
+
 /// #58.4 — an inbound connection request queued for accept/ignore triage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionRequestRow {
