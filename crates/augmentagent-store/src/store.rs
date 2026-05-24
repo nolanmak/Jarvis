@@ -146,7 +146,118 @@ impl Store {
     /// Additive, idempotent schema migrations. Safe to run against databases
     /// that were created by the original Node daemon (they just lack some of
     /// the newer columns).
+    ///
+    /// SCHEMA OWNERSHIP (#45): This crate is the authoritative source for the
+    /// 9 base tables + 10 indexes that used to live in `src/db.ts`. The block
+    /// of `CREATE TABLE IF NOT EXISTS` statements below mirrors `initDb()`
+    /// column-for-column and runs BEFORE the additive `ALTER TABLE` blocks so
+    /// the daemon can come up cleanly on an empty file without waiting for the
+    /// Node dashboard to bootstrap the schema first (the race that PR #39
+    /// papered over). Every CREATE is `IF NOT EXISTS` and every CREATE INDEX
+    /// is `IF NOT EXISTS`, which makes this safe to run against the live
+    /// production DB (~1.16GB, WAL-active) where every table+index already
+    /// exists — the statements become no-ops. Node still defensively re-runs
+    /// its own CREATE TABLE IF NOT EXISTS in `initDb()` so the dashboard can
+    /// boot even if the Rust daemon hasn't run yet (concurrent systemd start).
     fn migrate(conn: &Connection) -> StoreResult<()> {
+        // -------------------------------------------------------------------
+        // #45 — Rust-owned schema. Mirrors `src/db.ts::initDb()` exactly
+        // (column names, types, NOT NULL, DEFAULT, PRIMARY KEY). Do NOT
+        // diverge from Node here; the `storeSchemaParity.test.js` test pins
+        // the column lists, and Rust's `store_open_creates_all_node_owned_tables`
+        // pins table presence. Indexes for these tables are created at the
+        // END of migrate() (after the ALTERs) so legacy DBs that pre-date a
+        // referenced column (e.g. `emails.platform`) still upgrade cleanly.
+        // -------------------------------------------------------------------
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS actions (\
+                 id TEXT PRIMARY KEY,\
+                 messageId TEXT NOT NULL,\
+                 threadId TEXT,\
+                 fromEmail TEXT NOT NULL,\
+                 recipientEmail TEXT,\
+                 subject TEXT NOT NULL,\
+                 originalBody TEXT,\
+                 draftBody TEXT,\
+                 status TEXT NOT NULL DEFAULT 'pending',\
+                 errorMessage TEXT,\
+                 createdAt INTEGER NOT NULL,\
+                 updatedAt INTEGER NOT NULL\
+             );\
+             CREATE TABLE IF NOT EXISTS senders (\
+                 id TEXT PRIMARY KEY,\
+                 email TEXT UNIQUE NOT NULL,\
+                 label TEXT,\
+                 active INTEGER DEFAULT 1,\
+                 createdAt INTEGER NOT NULL\
+             );\
+             CREATE TABLE IF NOT EXISTS config (\
+                 key TEXT PRIMARY KEY,\
+                 value TEXT NOT NULL,\
+                 updatedAt INTEGER NOT NULL\
+             );\
+             CREATE TABLE IF NOT EXISTS gmail_accounts (\
+                 id TEXT PRIMARY KEY,\
+                 connectionId TEXT NOT NULL,\
+                 email TEXT,\
+                 label TEXT,\
+                 entityId TEXT NOT NULL,\
+                 active INTEGER DEFAULT 1,\
+                 createdAt INTEGER NOT NULL\
+             );\
+             CREATE TABLE IF NOT EXISTS emails (\
+                 messageId TEXT PRIMARY KEY,\
+                 threadId TEXT,\
+                 fromEmail TEXT NOT NULL,\
+                 subject TEXT NOT NULL,\
+                 body TEXT,\
+                 receivedAt TEXT,\
+                 accountEntityId TEXT,\
+                 firstSeenAt INTEGER NOT NULL,\
+                 triageResult TEXT,\
+                 agentProcessedAt INTEGER,\
+                 platform TEXT NOT NULL DEFAULT 'gmail',\
+                 kind TEXT NOT NULL DEFAULT 'dm'\
+             );\
+             CREATE TABLE IF NOT EXISTS channel_subscriptions (\
+                 id                   TEXT PRIMARY KEY,\
+                 platform             TEXT NOT NULL,\
+                 channel_id           TEXT NOT NULL,\
+                 display_name         TEXT NOT NULL,\
+                 mode                 TEXT NOT NULL,\
+                 active               INTEGER NOT NULL DEFAULT 1,\
+                 account_id           TEXT,\
+                 last_seen_message_id TEXT,\
+                 last_digest_at_ms    INTEGER,\
+                 created_at_ms        INTEGER NOT NULL,\
+                 updated_at_ms        INTEGER NOT NULL\
+             );\
+             CREATE TABLE IF NOT EXISTS slack_workspaces (\
+                 id              TEXT PRIMARY KEY,\
+                 team_id         TEXT NOT NULL UNIQUE,\
+                 team_name       TEXT NOT NULL,\
+                 entity_id       TEXT NOT NULL,\
+                 connection_id   TEXT NOT NULL,\
+                 user_id         TEXT NOT NULL,\
+                 active          INTEGER NOT NULL DEFAULT 1,\
+                 created_at_ms   INTEGER NOT NULL\
+             );\
+             CREATE TABLE IF NOT EXISTS drive_accounts (\
+                 id            TEXT PRIMARY KEY,\
+                 connection_id TEXT NOT NULL,\
+                 entity_id     TEXT NOT NULL,\
+                 email         TEXT,\
+                 label         TEXT,\
+                 active        INTEGER NOT NULL DEFAULT 1,\
+                 created_at_ms INTEGER NOT NULL\
+             );\
+             CREATE TABLE IF NOT EXISTS drive_sync_state (\
+                 entity_id     TEXT PRIMARY KEY,\
+                 page_token    TEXT NOT NULL,\
+                 updated_at_ms INTEGER NOT NULL\
+             );",
+        )?;
+
         if !column_exists(conn, "actions", "retryCount")? {
             conn.execute("ALTER TABLE actions ADD COLUMN retryCount INTEGER DEFAULT 0", [])?;
         }
@@ -1039,6 +1150,26 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS idx_agent_pr_runs_status \
                 ON agent_pr_runs(status)",
             [],
+        )?;
+
+        // -------------------------------------------------------------------
+        // #45 — indexes for Node-owned tables. Created at the END of migrate
+        // so they run AFTER the additive ALTERs above have added any columns
+        // they reference (most notably `emails.platform` on legacy DBs).
+        // Every CREATE INDEX uses IF NOT EXISTS so this is a no-op on the
+        // production DB where the indexes already exist.
+        // -------------------------------------------------------------------
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status);\
+             CREATE INDEX IF NOT EXISTS idx_actions_created ON actions(createdAt);\
+             CREATE INDEX IF NOT EXISTS idx_actions_messageId ON actions(messageId);\
+             CREATE INDEX IF NOT EXISTS idx_gmail_accounts_active ON gmail_accounts(active);\
+             CREATE INDEX IF NOT EXISTS idx_emails_triage ON emails(triageResult);\
+             CREATE INDEX IF NOT EXISTS idx_emails_seen ON emails(firstSeenAt);\
+             CREATE INDEX IF NOT EXISTS idx_emails_platform ON emails(platform);\
+             CREATE INDEX IF NOT EXISTS idx_channel_subs_active_mode ON channel_subscriptions(active, mode);\
+             CREATE INDEX IF NOT EXISTS idx_slack_workspaces_active ON slack_workspaces(active);\
+             CREATE INDEX IF NOT EXISTS idx_drive_accounts_active ON drive_accounts(active);",
         )?;
 
         Ok(())
@@ -6564,5 +6695,134 @@ mod tests {
         assert_eq!(got.mode, "classic");
         assert!(got.generated_source.is_none());
         assert!(got.tool_call_trace.is_none());
+    }
+
+    // ----- #45: Rust-owned schema tests -----
+
+    /// The 9 Node-owned base tables that, as of #45, the Rust crate MUST
+    /// create itself on an empty file. Keep this list in sync with the
+    /// corresponding parity reference in `test/storeSchemaParity.test.js`.
+    const NODE_OWNED_TABLES: &[&str] = &[
+        "actions",
+        "senders",
+        "config",
+        "gmail_accounts",
+        "emails",
+        "channel_subscriptions",
+        "slack_workspaces",
+        "drive_accounts",
+        "drive_sync_state",
+    ];
+
+    /// The 10 Node-owned indexes mirrored into Rust as of #45.
+    const NODE_OWNED_INDEXES: &[&str] = &[
+        "idx_actions_status",
+        "idx_actions_created",
+        "idx_actions_messageId",
+        "idx_gmail_accounts_active",
+        "idx_emails_triage",
+        "idx_emails_seen",
+        "idx_emails_platform",
+        "idx_channel_subs_active_mode",
+        "idx_slack_workspaces_active",
+        "idx_drive_accounts_active",
+    ];
+
+    fn table_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows
+    }
+
+    fn index_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index'")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows
+    }
+
+    /// #45 — opening Store on a fresh tempfile (no Node ever touched it)
+    /// must create every Node-owned base table itself.
+    #[test]
+    fn store_open_creates_all_node_owned_tables() {
+        let file = NamedTempFile::new().unwrap();
+        let _store = Store::open(file.path()).expect("open on empty file should succeed");
+        let conn = Connection::open(file.path()).unwrap();
+        let tables = table_names(&conn);
+        for t in NODE_OWNED_TABLES {
+            assert!(
+                tables.iter().any(|n| n == *t),
+                "missing Node-owned base table '{t}'. Present: {tables:?}",
+            );
+        }
+    }
+
+    /// #45 — every Node-owned index must be present after Store::open on an
+    /// otherwise-empty tempfile.
+    #[test]
+    fn store_open_creates_all_required_indexes() {
+        let file = NamedTempFile::new().unwrap();
+        let _store = Store::open(file.path()).expect("open on empty file should succeed");
+        let conn = Connection::open(file.path()).unwrap();
+        let indexes = index_names(&conn);
+        for i in NODE_OWNED_INDEXES {
+            assert!(
+                indexes.iter().any(|n| n == *i),
+                "missing Node-owned index '{i}'. Present: {indexes:?}",
+            );
+        }
+    }
+
+    /// #45 — if Node has already partially initialized the DB (the
+    /// concurrent-startup case the comment in `initDb()` calls out), the
+    /// Rust migration must not error. Simulate by pre-creating one of the
+    /// base tables with the minimal Node shape, then open Store.
+    #[test]
+    fn store_open_is_idempotent_against_node_initialized_db() {
+        let file = NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(file.path()).unwrap();
+            // Pre-seed actions exactly as Node's initDb would (older shape:
+            // no recipientEmail yet — that's what the ALTER guards exist for).
+            conn.execute_batch(
+                "CREATE TABLE actions (
+                     id TEXT PRIMARY KEY,
+                     messageId TEXT NOT NULL,
+                     threadId TEXT,
+                     fromEmail TEXT NOT NULL,
+                     subject TEXT NOT NULL,
+                     originalBody TEXT,
+                     draftBody TEXT,
+                     status TEXT NOT NULL DEFAULT 'pending',
+                     errorMessage TEXT,
+                     createdAt INTEGER NOT NULL,
+                     updatedAt INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+        }
+        let _store = Store::open(file.path())
+            .expect("open against Node-style pre-seeded db should succeed");
+        // And re-opening must be safe (steady-state autostart case).
+        let _store2 = Store::open(file.path()).expect("re-open should be a no-op");
+        let conn = Connection::open(file.path()).unwrap();
+        let tables = table_names(&conn);
+        for t in NODE_OWNED_TABLES {
+            assert!(
+                tables.iter().any(|n| n == *t),
+                "missing Node-owned base table '{t}' after re-open. Present: {tables:?}",
+            );
+        }
     }
 }

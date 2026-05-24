@@ -411,6 +411,12 @@ pub async fn run_install(component: InstallComponent) -> Result<()> {
             // a re-run it's a near no-op. Failure here MUST NOT fail the
             // install — the dashboard itself opens the db on first start, so
             // we log + continue.
+            //
+            // #45: Rust now owns the base schema (no longer waits for Node to
+            // CREATE the tables Rust ALTERs), so the "no such table" race PR
+            // #39 worked around is gone. The guard is retained because other
+            // errors are still possible (disk full, permission denied, lock
+            // contention).
             let db_path = std::env::var("AUGMENTAGENT_DB")
                 .unwrap_or_else(|_| "./data.db".to_string());
             match augmentagent_store::Store::open(&db_path) {
@@ -551,19 +557,22 @@ mod tests {
         );
     }
 
-    /// #33 — the dashboard branch of `run_install` opens the store after the
-    /// shell script returns to guarantee `$AUGMENTAGENT_DB` exists + migrated
-    /// before the very next `augmentagent status --json`. Locks in two
-    /// behaviours the dashboard branch relies on:
+    /// #33 + #45 — the dashboard branch of `run_install` opens the store
+    /// after the shell script returns to guarantee `$AUGMENTAGENT_DB` exists
+    /// + migrated before the very next `augmentagent status --json`. Locks
+    /// in three behaviours the dashboard branch relies on:
     ///
-    /// 1. On a truly empty file (the Node dashboard hasn't booted yet and
-    ///    therefore hasn't created the base `actions`/`emails`/etc tables that
-    ///    `Store::migrate` ALTERs), `Store::open` returns `Err`, NOT a panic.
-    ///    The install branch swallows that error and logs a warn — must not
-    ///    fail the install.
-    /// 2. On an already-bootstrapped db (the steady-state re-run case),
-    ///    `Store::open` succeeds and can be called repeatedly without
-    ///    corruption.
+    /// 1. On a truly empty file, `Store::open` now SUCCEEDS — as of #45 the
+    ///    Rust crate owns the schema and creates the 9 base tables itself
+    ///    before ALTERing them, so it no longer needs the Node dashboard to
+    ///    have run first. The install branch's warn-on-error guard still
+    ///    wraps the call (other errors are still possible — disk full,
+    ///    permission denied, etc.) but the "no such table" race window from
+    ///    PR #39 is gone.
+    /// 2. On a pre-seeded (legacy / Node-bootstrapped) db, `Store::open`
+    ///    succeeds (its CREATE TABLE IF NOT EXISTS statements are no-ops
+    ///    against the existing tables).
+    /// 3. Re-opens of a migrated db remain safe (steady-state autostart).
     #[test]
     fn store_open_dashboard_bootstrap_is_safe_to_retry() {
         let tmp = std::env::temp_dir().join(format!(
@@ -572,35 +581,49 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&tmp);
 
-        // (1) Empty file: error must be returned cleanly, not panic. This is
-        // the race-window failure mode on a real fresh box.
-        match augmentagent_store::Store::open(&tmp) {
-            Ok(_) => panic!("Store::open on a truly empty db unexpectedly succeeded"),
-            Err(e) => {
-                // Sanity: the error mentions a missing table (the actions
-                // schema the Node tree owns).
-                let msg = format!("{e}");
-                assert!(
-                    msg.contains("no such table"),
-                    "unexpected error from empty-db open: {msg}"
-                );
-            }
-        }
+        // (1) Empty file: must now succeed (Rust owns the schema as of #45).
+        augmentagent_store::Store::open(&tmp)
+            .expect("Store::open on an empty db should succeed after #45");
 
-        // (2) Pre-seed the minimal legacy schema the Node tree creates on
-        // first dashboard start; now Store::open must succeed and be safe to
-        // call again.
+        // (2) Pre-seed a Node-style bootstrap (actions with the real columns
+        // Node creates, including `messageId` so the matching index can be
+        // built), then call Store::open. Mirrors the concurrent-startup
+        // scenario where the dashboard initialised the DB before the Rust
+        // daemon did.
+        let _ = std::fs::remove_file(&tmp);
         {
             let c = rusqlite::Connection::open(&tmp).expect("open seed conn");
             c.execute_batch(
-                "CREATE TABLE IF NOT EXISTS actions (id TEXT PRIMARY KEY, status TEXT, createdAt INTEGER); \
-                 CREATE TABLE IF NOT EXISTS emails (id TEXT PRIMARY KEY, accountEntityId TEXT); \
-                 CREATE TABLE IF NOT EXISTS gmail_accounts (id TEXT PRIMARY KEY);",
+                "CREATE TABLE IF NOT EXISTS actions (\
+                     id TEXT PRIMARY KEY,\
+                     messageId TEXT NOT NULL,\
+                     threadId TEXT,\
+                     fromEmail TEXT NOT NULL,\
+                     subject TEXT NOT NULL,\
+                     originalBody TEXT,\
+                     draftBody TEXT,\
+                     status TEXT NOT NULL DEFAULT 'pending',\
+                     errorMessage TEXT,\
+                     createdAt INTEGER NOT NULL,\
+                     updatedAt INTEGER NOT NULL\
+                 ); \
+                 CREATE TABLE IF NOT EXISTS emails (\
+                     messageId TEXT PRIMARY KEY,\
+                     accountEntityId TEXT,\
+                     firstSeenAt INTEGER NOT NULL DEFAULT 0,\
+                     triageResult TEXT,\
+                     platform TEXT NOT NULL DEFAULT 'gmail'\
+                 ); \
+                 CREATE TABLE IF NOT EXISTS gmail_accounts (\
+                     id TEXT PRIMARY KEY,\
+                     active INTEGER DEFAULT 1\
+                 );",
             )
             .expect("seed legacy schema");
         }
         augmentagent_store::Store::open(&tmp)
             .expect("first open on seeded db should succeed");
+        // (3) Re-open must remain safe.
         augmentagent_store::Store::open(&tmp)
             .expect("re-open on migrated db should be a no-op");
 

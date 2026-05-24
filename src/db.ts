@@ -13,6 +13,13 @@ import type {
 let db: Database.Database;
 
 export function initDb(dbPath?: string): Database.Database {
+  // SCHEMA OWNERSHIP: As of #45, the Rust crate `augmentagent-store` is the
+  // authoritative source for all SQLite schema. The CREATE TABLE IF NOT EXISTS
+  // statements below are retained as defense-in-depth so the dashboard can
+  // initialize a database even if the Rust daemon hasn't run yet (e.g., during
+  // concurrent systemd startup). They are idempotent no-ops once Rust has
+  // migrated. The additive ALTER TABLE blocks below are kept for legacy DBs
+  // that pre-date the Rust ALTERs.
   const resolvedPath = dbPath || path.join(process.cwd(), "data.db");
   db = new Database(resolvedPath);
 
