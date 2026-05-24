@@ -150,6 +150,40 @@ fn label_for(kind: &str) -> &'static str {
     }
 }
 
+/// Build the Approve / Reject button row that rides under a weekly invoice
+/// draft card. Keyed by `draft_id` (an `invoice_drafts.id`), not an
+/// `actions.id` — the event-handler arms route on the verb to keep them
+/// off the content-draft path.
+pub fn invoice_draft_components(draft_id: &str) -> Vec<CreateActionRow> {
+    vec![CreateActionRow::Buttons(vec![
+        CreateButton::new(CustomId::new(draft_id, Verb::InvoiceApprove).to_string())
+            .label("Approve & Send")
+            .style(ButtonStyle::Success),
+        CreateButton::new(CustomId::new(draft_id, Verb::InvoiceReject).to_string())
+            .label("Reject")
+            .style(ButtonStyle::Danger),
+    ])]
+}
+
+/// Human-readable body for an invoice draft card. Kept separate from the
+/// button row so the post helper can mix it with `CreateAttachment` of the
+/// PDF in either a fresh `CreateMessage` or as an edit-source preamble.
+pub fn invoice_draft_content(
+    number: u32,
+    week_start: &str,
+    week_end: &str,
+    recipient: &str,
+    pdf_filename: &str,
+) -> String {
+    format!(
+        "**Invoice #{number} draft**\n\
+         Week: {week_start} → {week_end}\n\
+         Recipient: `{recipient}`\n\
+         File: `{pdf_filename}`\n\
+         _Approve to email it, Reject to discard._"
+    )
+}
+
 /// Plain-text "heads up" card for triage-flagged emails. No buttons, no draft.
 pub fn flag_notice_message(email: &Email, reason: &str) -> CreateMessage {
     let subject = truncate(&email.subject, 256);
