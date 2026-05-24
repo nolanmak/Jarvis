@@ -39,7 +39,10 @@ pub use manifest::{manifest_v1, ToolDef, ToolManifest};
 // colliding with the reasoner-side [`CodeModeError`] this module already
 // owns. Downstream callers compose the two (reasoner produces source →
 // runner consumes source) but they're distinct failure modes.
-pub use runner::{run_program, CodeModeOutcome, RunnerError, RUST_WALL_CLOCK_MS};
+pub use runner::{
+    check_deno_available, resolve_deno_bin, run_program, CodeModeOutcome, DenoResolution,
+    DenoSource, RunnerError, RUST_WALL_CLOCK_MS,
+};
 pub use trace::{summarize_value, ToolCallRecord, SUMMARY_MAX_BYTES};
 
 /// Failure modes specific to the Code-Mode call pipeline.
