@@ -510,24 +510,21 @@ returns: { url, final_url, status, title, markdown, layer_used, attempts: [...],
 
 const interceptTool = (tool as any)({
   name: "intercept",
-  description: `Query the local Claude Intercept MITM proxy (port 7777) to inspect captured HTTP/S traffic. Useful for:
-- API discovery on sites with no public docs (capture a real browser session, then read the requests)
-- Auth extraction (pull Bearer tokens / cookies / API keys from a live session)
+  description: `Read-only query of the local Claude Intercept MITM proxy (port 7777). Inspects HTTP/S traffic the operator has ALREADY captured via the global /intercept skill. Useful for:
+- API discovery on sites with no public docs (analyze a real browser session the operator already captured)
+- Auth extraction (pull Bearer tokens / cookies / API keys from a capture the operator collected)
 - Debugging failed scrapes (compare what curl sees vs what a real browser sent)
 
-This is a local-only tool. Returns proxy state or captured traffic; never sends data to remote services.
+This is a local-only, read-only tool. It cannot start or stop the proxy and cannot install / trust the CA cert — those are dangerous machine-wide operations and stay with the human operator's /intercept skill. Returns proxy state or captured traffic; never sends data to remote services.
 
 Actions:
 - status: is the proxy running, how many requests captured
-- start: start the proxy (port 7777) without opening the dashboard
-- stop: stop the proxy
-- clear: delete all captured traffic
-- cert: print the path to the CA certificate (needed for cert install on devices)
 - export: dump captured traffic. params: { mode: "api-docs" | "auth" | "summary" | "full", host?: string, limit?: number }
+- clear: delete the local capture buffer (does NOT touch the proxy itself)
 
-If the proxy is not installed, the tool reports it cleanly — do not retry.`,
+If the proxy is not installed, the tool reports it cleanly — do not retry. If status reports the proxy is OFF, ask the operator to enable it via the /intercept skill rather than trying to start it yourself.`,
   parameters: z.object({
-    action: z.enum(["status", "start", "stop", "clear", "cert", "export"]),
+    action: z.enum(["status", "export", "clear"]),
     mode: z.enum(["api-docs", "auth", "summary", "full"]).optional(),
     host: z.string().optional(),
     limit: z.number().int().positive().optional(),
@@ -587,7 +584,7 @@ ${groceryLearned}
 For ANY URL the operator asks you to read, summarize, or pull data from, use the web_fetch tool — never assume a URL's contents or make raw HTTP calls. It tries plain HTTPS first (free), escalates to a headless-Chromium render for JS-rendered SPAs, then to Firecrawl / Bright Data if API keys are configured. If the first response looks like an empty SPA shell or is unexpectedly short, retry with force_render: true. The returned markdown is what you should reason over; cite final_url when surfacing links.
 
 ## Intercept (optional, debugging only)
-If a fetch fails repeatedly or you need to discover an undocumented API / extract auth from a captured browser session, use the intercept tool to query the local MITM proxy (status, export with mode "api-docs" | "auth" | "summary" | "full"). Read-only inspection — don't start/stop/clear the proxy unless the operator explicitly asks. If the proxy isn't installed the tool reports it cleanly; don't retry.`;
+If a fetch fails repeatedly or you need to discover an undocumented API / extract auth from a captured browser session, use the intercept tool to query the local MITM proxy (status, export with mode "api-docs" | "auth" | "summary" | "full"). Read-only inspection: you can read captures the operator has already collected but cannot start/stop the proxy or install the CA cert — if the proxy is off, ask the operator to enable it via the /intercept skill. If the proxy isn't installed the tool reports it cleanly; don't retry.`;
 }
 
 // --- Run with retry + provider fallback ---
