@@ -25,8 +25,9 @@ pub use event_handler::chunk_for_discord;
 // re-exported for the channel/test surface.
 pub use layout::{append_needs_input_marker, split_needs_input, NeedsInput};
 pub use loops::{
-    handle_loop_command, parse_interval, LoopPoster, LoopRunner, LoopScheduler,
-    MAX_ACTIVE_PER_USER, MIN_INTERVAL_SECS, PAUSE_AFTER_FAILURES,
+    handle_loop_command, match_loop_prefix, max_active_per_user, min_interval_secs,
+    parse_interval, pause_after_failures, LoopCommandParser, LoopPoster, LoopRunner,
+    LoopScheduler, ParsedLoop,
 };
 pub use nudge::NudgeScheduler;
 pub use status_bus::{StatusBus, StatusChanged};
