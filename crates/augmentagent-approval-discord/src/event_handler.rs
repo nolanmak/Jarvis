@@ -139,19 +139,21 @@ impl EventHandler for Handler {
             return;
         }
 
-        // `/loop` — user-defined scheduled tasks (#104). Handled inline like
-        // `!invoice`; never routed to the wiki query handler. The user id and
-        // channel id keep the registry channel-agnostic (the scheduler posts
-        // results back to this channel_ref).
-        if user_text.starts_with("/loop") {
+        // `loop` / `/loop` — user-defined scheduled tasks (#104). Handled
+        // inline like `!invoice`; never routed to the wiki query handler.
+        // Leading `/` is optional — `match_loop_prefix` accepts either form
+        // as long as it's word-bounded (so `loops are nice` isn't matched).
+        if crate::loops::match_loop_prefix(&user_text).is_some() {
             let owner = msg.author.id.get().to_string();
             let channel_ref = msg.channel_id.get().to_string();
             let reply = crate::handle_loop_command(
                 self.state.store.as_deref(),
+                self.state.loop_parser.as_deref(),
                 &owner,
                 &channel_ref,
                 &user_text,
-            );
+            )
+            .await;
             for chunk in chunk_for_discord(&reply) {
                 let builder = CreateMessage::new()
                     .content(chunk)
