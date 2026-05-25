@@ -85,8 +85,27 @@ impl EventHandler for Handler {
         }
 
         let user_text = msg.content.trim().to_string();
-        let images = filter_image_attachments(&msg.attachments);
-        if user_text.is_empty() && images.is_empty() {
+        let AttachmentPartition {
+            images,
+            text_files,
+            docs,
+            rejected,
+        } = partition_attachments(&msg.attachments);
+        if user_text.is_empty()
+            && images.is_empty()
+            && text_files.is_empty()
+            && docs.is_empty()
+        {
+            // Rejected-only path: tell the user what was dropped, don't ping
+            // the reasoner. Otherwise the message is truly empty — return.
+            if let Some(footer) = format_rejection_footer(&rejected) {
+                let builder = CreateMessage::new()
+                    .content(footer)
+                    .reference_message(MessageReference::from((msg.channel_id, msg.id)));
+                if let Err(e) = msg.channel_id.send_message(&ctx.http, builder).await {
+                    warn!("failed to post rejection footer: {e}");
+                }
+            }
             return;
         }
 
@@ -186,25 +205,46 @@ impl EventHandler for Handler {
             )
             .await;
 
-            // Download images to /tmp so the reasoner's Read tool can open them.
-            // A partial download (some succeed, some fail) is fine — we proceed
-            // with whatever landed and warn about the rest.
-            let downloaded = download_images(&images, msg_id.get()).await;
+            // Download attachments to /tmp so the reasoner's Read tool can open
+            // them. Partial success is fine — we proceed with whatever landed
+            // and warn about the rest. PDF/DOCX attachments are converted to
+            // text via pdftotext/pandoc and join downloaded_txts so the prompt
+            // path treats them uniformly.
+            let downloaded_imgs = download_images(&images, msg_id.get()).await;
+            let mut downloaded_txts = download_text_files(&text_files, msg_id.get()).await;
+            let extracted_docs = extract_doc_attachments(&docs, msg_id.get()).await;
+            downloaded_txts.extend(extracted_docs);
 
-            let prompt = build_prompt_with_context(&history, &user_text, &downloaded);
+            let prompt = build_prompt_with_context(
+                &history,
+                &user_text,
+                &downloaded_imgs,
+                &downloaded_txts,
+            );
 
             let result = handler.answer(&prompt).await;
 
-            // Best-effort cleanup. Image tmpfiles aren't load-bearing for the
-            // reply we're about to post, so we tolerate failures.
-            for path in &downloaded {
+            // Best-effort cleanup. Tempfiles aren't load-bearing for the reply
+            // we're about to post, so we tolerate failures.
+            for path in downloaded_imgs
+                .iter()
+                .chain(downloaded_txts.iter().map(|f| &f.path))
+            {
                 if let Err(e) = tokio::fs::remove_file(path).await {
                     warn!("failed to remove tempfile {}: {e}", path.display());
                 }
             }
 
+            let footer = format_rejection_footer(&rejected);
+
             match result {
-                Ok(answer) => {
+                Ok(mut answer) => {
+                    if let Some(f) = &footer {
+                        // Append before chunking so a long answer's footer
+                        // still ends up in the final Discord message.
+                        answer.push_str("\n\n");
+                        answer.push_str(f);
+                    }
                     for chunk in chunk_for_discord(&answer) {
                         let builder = CreateMessage::new()
                             .content(chunk)
@@ -216,7 +256,11 @@ impl EventHandler for Handler {
                     }
                 }
                 Err(e) => {
-                    let err_msg = format!("wiki query failed: {e}");
+                    let mut err_msg = format!("wiki query failed: {e}");
+                    if let Some(f) = &footer {
+                        err_msg.push_str("\n\n");
+                        err_msg.push_str(f);
+                    }
                     let builder = CreateMessage::new()
                         .content(err_msg)
                         .reference_message(MessageReference::from((channel_id, msg_id)));
@@ -1269,16 +1313,297 @@ fn handle_invoice_command(store: Option<&Store>, text: &str) -> String {
     }
 }
 
-fn filter_image_attachments(attachments: &[Attachment]) -> Vec<Attachment> {
+/// Soft cap on how much of a text file we feed into the prompt. Files larger
+/// than this are downloaded up to `MAX_DOWNLOAD_BYTES` and truncated to the
+/// first `MAX_TEXT_BYTES` bytes — the prompt annotation marks the file as
+/// `TRUNCATED — first X of Y` so the reasoner knows it has the head only.
+const MAX_TEXT_BYTES: u32 = 1_048_576; // 1 MB (matches serenity's Attachment.size u32)
+
+/// Hard cap on text-file attachment size. Files larger than this are dropped
+/// at filter time so we never spend bandwidth downloading them. Sized to leave
+/// headroom above `MAX_TEXT_BYTES` — files in `MAX_TEXT_BYTES..MAX_DOWNLOAD_BYTES`
+/// are accepted and truncated at write time.
+const MAX_DOWNLOAD_BYTES: u32 = 8 * 1_048_576; // 8 MB
+
+/// Extensions we accept as text even when Discord omits `content_type`.
+/// Discord populates `content_type` from the upload, which is unreliable for
+/// code/config files, so we fall back to extension here.
+const TEXT_EXT_ALLOWLIST: &[&str] = &[
+    // plain text & docs
+    "txt", "md", "markdown", "rst", "log",
+    // structured data
+    "json", "yaml", "yml", "toml", "csv", "tsv", "xml",
+    // source code
+    "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs",
+    "py", "go", "java", "c", "cc", "cpp", "h", "hpp",
+    "cs", "rb", "php", "swift", "kt", "scala",
+    "sh", "bash", "zsh", "sql",
+    "html", "css", "scss", "less",
+    // config
+    "ini", "conf", "cfg", "properties",
+];
+
+/// Extensions we refuse to ingest as text even if the MIME type matches.
+/// These are formats that commonly contain credentials.
+const TEXT_EXT_DENYLIST: &[&str] = &["env", "pem", "key", "p12", "pfx"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocKind {
+    Pdf,
+    Docx,
+    Doc,
+}
+
+/// Identify the doc kind from an attachment's content_type and/or filename
+/// extension. Returns `None` for everything else — non-docs flow through the
+/// regular text-file / image / rejected branches.
+fn doc_kind_for(att: &Attachment) -> Option<DocKind> {
+    let ext = std::path::Path::new(&att.filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase());
+    let ct = att.content_type.as_deref();
+    match (ct, ext.as_deref()) {
+        (Some("application/pdf"), _) | (_, Some("pdf")) => Some(DocKind::Pdf),
+        (
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            _,
+        )
+        | (_, Some("docx")) => Some(DocKind::Docx),
+        (Some("application/msword"), _) | (_, Some("doc")) => Some(DocKind::Doc),
+        _ => None,
+    }
+}
+
+/// Pure helper that picks the converter binary + args for a doc kind.
+/// Extracted so the dispatch is unit-testable without the binaries installed.
+fn doc_command_for(kind: DocKind, in_path: &std::path::Path) -> (&'static str, Vec<String>) {
+    let in_arg = in_path.to_string_lossy().into_owned();
+    match kind {
+        // `-` writes to stdout; `-layout` preserves columns/whitespace better
+        // for log-like dumps.
+        DocKind::Pdf => ("pdftotext", vec!["-layout".into(), in_arg, "-".into()]),
+        // pandoc handles both .docx and legacy .doc.
+        DocKind::Docx | DocKind::Doc => ("pandoc", vec!["--to=plain".into(), in_arg]),
+    }
+}
+
+/// Shell out to the appropriate converter and return the extracted text.
+/// Errors include: binary missing, non-zero exit, invalid UTF-8 in stdout.
+async fn convert_doc_to_text(kind: DocKind, in_path: &std::path::Path) -> anyhow::Result<String> {
+    let (program, args) = doc_command_for(kind, in_path);
+    let output = tokio::process::Command::new(program)
+        .args(&args)
+        .output()
+        .await?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "{program} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Mirror of the image filter for text files. Accepts attachments whose
+/// `content_type` starts with `text/`, or whose extension is in
+/// `TEXT_EXT_ALLOWLIST`. Drops anything in `TEXT_EXT_DENYLIST` or larger than
+/// `MAX_DOWNLOAD_BYTES`, regardless of MIME. Files between `MAX_TEXT_BYTES`
+/// and `MAX_DOWNLOAD_BYTES` are accepted here and truncated at download time.
+fn filter_text_attachments(attachments: &[Attachment]) -> Vec<Attachment> {
     attachments
         .iter()
         .filter(|a| {
-            a.content_type
+            if a.size > MAX_DOWNLOAD_BYTES {
+                return false;
+            }
+            let ext = std::path::Path::new(&a.filename)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_lowercase());
+            if let Some(e) = ext.as_deref() {
+                if TEXT_EXT_DENYLIST.contains(&e) {
+                    return false;
+                }
+            }
+            if a.content_type
                 .as_deref()
-                .is_some_and(|ct| ct.starts_with("image/"))
+                .is_some_and(|ct| ct.starts_with("text/"))
+            {
+                return true;
+            }
+            if let Some(e) = ext.as_deref() {
+                if TEXT_EXT_ALLOWLIST.contains(&e) {
+                    return true;
+                }
+            }
+            false
         })
         .cloned()
         .collect()
+}
+
+/// Why an attachment was dropped. Rendered into a footer on the bot's reply
+/// so the user knows we saw it but couldn't ingest it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RejectReason {
+    /// Above `MAX_DOWNLOAD_BYTES`. Carries the actual size in bytes for the
+    /// footer (e.g. "9.0 MB > 8.0 MB"). Files between `MAX_TEXT_BYTES` and
+    /// `MAX_DOWNLOAD_BYTES` are truncated rather than rejected.
+    Oversize { size: u32 },
+    /// Extension is in `TEXT_EXT_DENYLIST` — formats that commonly hold
+    /// credentials (.env, .pem, etc.). Refused even with matching MIME.
+    SecurityDenylist,
+    /// Not an image, not text by MIME, not in the text extension allowlist.
+    UnsupportedType {
+        content_type: Option<String>,
+        ext: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct RejectedAttachment {
+    filename: String,
+    reason: RejectReason,
+}
+
+#[derive(Debug, Default)]
+struct AttachmentPartition {
+    images: Vec<Attachment>,
+    text_files: Vec<Attachment>,
+    /// PDFs / DOCXs / DOCs routed through `extract_doc_attachments` instead
+    /// of the regular text-file download path. Their extracted text is fed
+    /// to the prompt as if it were a regular text attachment.
+    docs: Vec<Attachment>,
+    rejected: Vec<RejectedAttachment>,
+}
+
+/// Classify each attachment into images / text-files / docs / rejected in one
+/// pass. Replaces the per-category filter calls so a `.zip` (which no filter
+/// accepts) shows up exactly once in `rejected` rather than being silently
+/// dropped by each filter.
+///
+/// Images are unconditionally accepted (no size/extension gate; matches the
+/// pre-existing image-attachment behavior). The text-file gating logic
+/// mirrors `filter_text_attachments` — kept in sync deliberately rather than
+/// delegated, because the rejection reasons need to be produced inline.
+fn partition_attachments(attachments: &[Attachment]) -> AttachmentPartition {
+    let mut out = AttachmentPartition::default();
+    for a in attachments {
+        if a
+            .content_type
+            .as_deref()
+            .is_some_and(|ct| ct.starts_with("image/"))
+        {
+            out.images.push(a.clone());
+            continue;
+        }
+        let ext = std::path::Path::new(&a.filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase());
+        if let Some(e) = ext.as_deref() {
+            if TEXT_EXT_DENYLIST.contains(&e) {
+                out.rejected.push(RejectedAttachment {
+                    filename: a.filename.clone(),
+                    reason: RejectReason::SecurityDenylist,
+                });
+                continue;
+            }
+        }
+        if a.size > MAX_DOWNLOAD_BYTES {
+            out.rejected.push(RejectedAttachment {
+                filename: a.filename.clone(),
+                reason: RejectReason::Oversize { size: a.size },
+            });
+            continue;
+        }
+        // Doc formats (PDF / DOCX / DOC) get routed through the converter
+        // pipeline before joining text_files for the prompt.
+        if doc_kind_for(a).is_some() {
+            out.docs.push(a.clone());
+            continue;
+        }
+        let is_text_mime = a
+            .content_type
+            .as_deref()
+            .is_some_and(|ct| ct.starts_with("text/"));
+        let is_allowlisted_ext = ext
+            .as_deref()
+            .is_some_and(|e| TEXT_EXT_ALLOWLIST.contains(&e));
+        if is_text_mime || is_allowlisted_ext {
+            out.text_files.push(a.clone());
+        } else {
+            out.rejected.push(RejectedAttachment {
+                filename: a.filename.clone(),
+                reason: RejectReason::UnsupportedType {
+                    content_type: a.content_type.as_deref().map(|s| s.to_string()),
+                    ext,
+                },
+            });
+        }
+    }
+    out
+}
+
+fn format_size(bytes: u32) -> String {
+    const MB: f64 = 1_048_576.0;
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Render the rejection footer. Returns `None` if there's nothing to surface,
+/// so callers can use `if let Some(footer) = format_rejection_footer(...)`.
+fn format_rejection_footer(rejected: &[RejectedAttachment]) -> Option<String> {
+    if rejected.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = rejected
+        .iter()
+        .map(|r| match &r.reason {
+            RejectReason::Oversize { size } => format!(
+                "{} ({} > {})",
+                r.filename,
+                format_size(*size),
+                format_size(MAX_DOWNLOAD_BYTES),
+            ),
+            RejectReason::SecurityDenylist => format!("{} (security)", r.filename),
+            RejectReason::UnsupportedType { content_type, ext } => {
+                let detail = content_type
+                    .clone()
+                    .or_else(|| ext.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                format!("{} (unsupported: {})", r.filename, detail)
+            }
+        })
+        .collect();
+    Some(format!("\u{26A0}\u{FE0F} skipped: {}", parts.join(", ")))
+}
+
+/// Label used to annotate prior turns in conversation history when the user
+/// previously sent attachments. Chosen from the present attachment kinds so the
+/// model has a coarse hint about what was in the earlier turn.
+fn attachment_kind_label(attachments: &[Attachment]) -> &'static str {
+    let has_img = attachments.iter().any(|a| {
+        a.content_type
+            .as_deref()
+            .is_some_and(|ct| ct.starts_with("image/"))
+    });
+    let has_txt = !filter_text_attachments(attachments).is_empty();
+    match (has_img, has_txt) {
+        (true, true) => "[image + text attachment]",
+        (true, false) => "[image attachment]",
+        (false, true) => "[text attachment]",
+        _ => "[attachment]",
+    }
 }
 
 /// Pick a sensible file extension for the tempfile. Prefer the URL filename's
@@ -1301,6 +1626,14 @@ fn extension_for(att: &Attachment) -> String {
                 other => other,
             };
             return ext.to_string();
+        }
+        // text/* fallback for the common cases. Only kicks in when the
+        // filename has no extension — otherwise the early-return above wins.
+        match ct {
+            "text/plain" => return "txt".into(),
+            "text/markdown" => return "md".into(),
+            "text/csv" => return "csv".into(),
+            _ => {}
         }
     }
     "bin".into()
@@ -1327,10 +1660,155 @@ async fn download_images(attachments: &[Attachment], msg_id: u64) -> Vec<PathBuf
     out
 }
 
-/// Combine the user's text (possibly empty) with a list of locally-downloaded
-/// image paths, instructing Claude to use the Read tool to inspect them.
-fn build_prompt(user_text: &str, images: &[PathBuf]) -> String {
-    if images.is_empty() {
+/// A text-file attachment that was downloaded to disk for the reasoner.
+/// `truncated` is true when the file was larger than `MAX_TEXT_BYTES` and we
+/// wrote only the first MB; `original_size` is what Discord reported on the
+/// uploaded attachment.
+#[derive(Debug, Clone)]
+struct DownloadedTextFile {
+    path: PathBuf,
+    truncated: bool,
+    original_size: u32,
+}
+
+/// Pure slicing helper for the truncation logic. Extracted so the cap behavior
+/// is unit-testable without standing up a fake HTTP server.
+fn truncate_text_bytes(bytes: &[u8]) -> (&[u8], bool) {
+    let cap = MAX_TEXT_BYTES as usize;
+    if bytes.len() > cap {
+        (&bytes[..cap], true)
+    } else {
+        (bytes, false)
+    }
+}
+
+/// Mirror of `download_images` for text-file attachments. Writes to
+/// `/tmp/aa-txt-<msg_id>-<idx>.<ext>`. Partial success is fine — failures are
+/// logged and skipped, same as the image path.
+///
+/// Files larger than `MAX_TEXT_BYTES` are *truncated* (we still write the
+/// first MB) so the reasoner can read the head of a large log/config rather
+/// than the user getting nothing back. The hard cap is `MAX_DOWNLOAD_BYTES`,
+/// enforced at filter time.
+async fn download_text_files(
+    attachments: &[Attachment],
+    msg_id: u64,
+) -> Vec<DownloadedTextFile> {
+    let mut out = Vec::with_capacity(attachments.len());
+    for (idx, att) in attachments.iter().enumerate() {
+        let ext = extension_for(att);
+        let path = PathBuf::from(format!("/tmp/aa-txt-{msg_id}-{idx}.{ext}"));
+        match reqwest::get(&att.url).await {
+            Ok(resp) => match resp.bytes().await {
+                Ok(bytes) => {
+                    let (to_write, truncated) = truncate_text_bytes(&bytes);
+                    match tokio::fs::write(&path, to_write).await {
+                        Ok(()) => out.push(DownloadedTextFile {
+                            path,
+                            truncated,
+                            original_size: att.size,
+                        }),
+                        Err(e) => warn!("write text tempfile {} failed: {e}", path.display()),
+                    }
+                }
+                Err(e) => warn!("read text bytes from {} failed: {e}", att.url),
+            },
+            Err(e) => warn!("download text file {} failed: {e}", att.url),
+        }
+    }
+    out
+}
+
+/// Download PDF / DOCX / DOC attachments, shell out to the appropriate
+/// converter (pdftotext / pandoc), truncate the extracted text to
+/// `MAX_TEXT_BYTES`, and write the result to `/tmp/aa-doc-<msg_id>-<idx>.txt`.
+///
+/// Returns `DownloadedTextFile`s so the converted output flows through the
+/// same prompt-builder annotation as a regular text attachment. The original
+/// binary tempfile is removed after conversion regardless of outcome.
+///
+/// Partial success is fine — failures (binary missing, conversion error,
+/// non-UTF-8 stdout) are logged and the attachment is skipped, matching the
+/// `download_*` pattern elsewhere in this file.
+async fn extract_doc_attachments(
+    attachments: &[Attachment],
+    msg_id: u64,
+) -> Vec<DownloadedTextFile> {
+    let mut out = Vec::with_capacity(attachments.len());
+    for (idx, att) in attachments.iter().enumerate() {
+        let Some(kind) = doc_kind_for(att) else {
+            continue;
+        };
+        let in_ext = extension_for(att);
+        let in_path = PathBuf::from(format!("/tmp/aa-doc-{msg_id}-{idx}.{in_ext}"));
+        let out_path = PathBuf::from(format!("/tmp/aa-doc-{msg_id}-{idx}.txt"));
+
+        // Download binary.
+        let download_ok = match reqwest::get(&att.url).await {
+            Ok(resp) => match resp.bytes().await {
+                Ok(bytes) => match tokio::fs::write(&in_path, &bytes).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!("write doc tempfile {} failed: {e}", in_path.display());
+                        false
+                    }
+                },
+                Err(e) => {
+                    warn!("read doc bytes from {} failed: {e}", att.url);
+                    false
+                }
+            },
+            Err(e) => {
+                warn!("download doc {} failed: {e}", att.url);
+                false
+            }
+        };
+
+        if download_ok {
+            match convert_doc_to_text(kind, &in_path).await {
+                Ok(text) => {
+                    let (to_write, truncated) = truncate_text_bytes(text.as_bytes());
+                    let extracted_len = text.len().min(u32::MAX as usize) as u32;
+                    match tokio::fs::write(&out_path, to_write).await {
+                        Ok(()) => out.push(DownloadedTextFile {
+                            path: out_path,
+                            truncated,
+                            original_size: extracted_len,
+                        }),
+                        Err(e) => {
+                            warn!("write doc text tempfile {} failed: {e}", out_path.display())
+                        }
+                    }
+                }
+                Err(e) => warn!(
+                    "convert {} ({:?}) failed: {e:#}",
+                    att.filename, kind
+                ),
+            }
+        }
+
+        // Best-effort: clean up the binary tempfile regardless of conversion
+        // outcome. The .txt tempfile is cleaned up by the handler.
+        if let Err(e) = tokio::fs::remove_file(&in_path).await {
+            // Missing-file is benign (download may have failed before write).
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("remove doc tempfile {} failed: {e}", in_path.display());
+            }
+        }
+    }
+    out
+}
+
+/// Combine the user's text (possibly empty) with lists of locally-downloaded
+/// image and text-file paths, instructing Claude to use the Read tool to
+/// inspect them. Truncated text files get a marker so the reasoner knows it
+/// is reading the head of the file only.
+fn build_prompt(
+    user_text: &str,
+    images: &[PathBuf],
+    text_files: &[DownloadedTextFile],
+) -> String {
+    if images.is_empty() && text_files.is_empty() {
         return user_text.to_string();
     }
     let mut s = String::new();
@@ -1338,21 +1816,43 @@ fn build_prompt(user_text: &str, images: &[PathBuf]) -> String {
         s.push_str(user_text);
         s.push_str("\n\n");
     }
-    s.push_str("[attached images to analyze]\n");
-    for path in images {
-        s.push_str("- ");
-        s.push_str(&path.display().to_string());
-        s.push('\n');
+    if !images.is_empty() {
+        s.push_str("[attached images to analyze]\n");
+        for path in images {
+            s.push_str("- ");
+            s.push_str(&path.display().to_string());
+            s.push('\n');
+        }
     }
-    s.push_str("\nUse the Read tool to view each image and answer based on them.");
+    if !text_files.is_empty() {
+        s.push_str("[attached text files to read]\n");
+        for f in text_files {
+            s.push_str("- ");
+            s.push_str(&f.path.display().to_string());
+            if f.truncated {
+                s.push_str(&format!(
+                    "  (TRUNCATED — first {} of {})",
+                    format_size(MAX_TEXT_BYTES),
+                    format_size(f.original_size),
+                ));
+            }
+            s.push('\n');
+        }
+    }
+    s.push_str("\nUse the Read tool to view each attachment and answer based on them.");
     s
 }
 
 /// Layer a pre-formatted `<conversation_history>` block in front of the
 /// current-turn prompt. If `history` is empty, falls through to the bare
 /// `build_prompt` so first-turn messages match prior behavior exactly.
-fn build_prompt_with_context(history: &str, user_text: &str, images: &[PathBuf]) -> String {
-    let current = build_prompt(user_text, images);
+fn build_prompt_with_context(
+    history: &str,
+    user_text: &str,
+    images: &[PathBuf],
+    text_files: &[DownloadedTextFile],
+) -> String {
+    let current = build_prompt(user_text, images, text_files);
     if history.is_empty() {
         return current;
     }
@@ -1409,7 +1909,7 @@ async fn fetch_conversation_context(
             if !body.is_empty() {
                 body.push('\n');
             }
-            body.push_str("[image attachment]");
+            body.push_str(attachment_kind_label(&m.attachments));
         }
         if body.is_empty() {
             continue;
@@ -1574,14 +2074,14 @@ mod tests {
 
     #[test]
     fn build_prompt_without_history_matches_bare_prompt() {
-        let got = build_prompt_with_context("", "hello", &[]);
+        let got = build_prompt_with_context("", "hello", &[], &[]);
         assert_eq!(got, "hello");
     }
 
     #[test]
     fn build_prompt_layers_history_before_current_message() {
         let history = "<conversation_history>\nuser: hi\nassistant: hello\n</conversation_history>";
-        let got = build_prompt_with_context(history, "what's next?", &[]);
+        let got = build_prompt_with_context(history, "what's next?", &[], &[]);
         assert!(got.starts_with("<conversation_history>"));
         assert!(got.contains("user's current message:\nwhat's next?"));
     }
@@ -1602,19 +2102,6 @@ mod tests {
     }
 
     #[test]
-    fn filter_keeps_only_image_content_types() {
-        let atts = vec![
-            att("a.png", Some("image/png")),
-            att("b.pdf", Some("application/pdf")),
-            att("c.jpg", Some("image/jpeg")),
-            att("d.txt", None),
-        ];
-        let images = filter_image_attachments(&atts);
-        let names: Vec<&str> = images.iter().map(|a| a.filename.as_str()).collect();
-        assert_eq!(names, vec!["a.png", "c.jpg"]);
-    }
-
-    #[test]
     fn extension_prefers_filename_then_mime() {
         assert_eq!(extension_for(&att("photo.JPG", Some("image/jpeg"))), "jpg");
         assert_eq!(extension_for(&att("noext", Some("image/png"))), "png");
@@ -1623,9 +2110,27 @@ mod tests {
     }
 
     #[test]
+    fn extension_for_text_mime_falls_back_to_subtype_mapping() {
+        // No filename extension → derive from text/* MIME.
+        assert_eq!(extension_for(&att("noext", Some("text/plain"))), "txt");
+        assert_eq!(extension_for(&att("noext", Some("text/markdown"))), "md");
+        assert_eq!(extension_for(&att("noext", Some("text/csv"))), "csv");
+        // Unmapped text MIME falls through to bin (the reasoner reads the
+        // file regardless of extension, so this only affects tempfile naming).
+        assert_eq!(extension_for(&att("noext", Some("text/x-rust"))), "bin");
+    }
+
+    #[test]
+    fn extension_for_prefers_filename_extension_over_text_mime() {
+        // Filename extension always wins, even when content_type says text/*.
+        assert_eq!(extension_for(&att("foo.rs", Some("text/plain"))), "rs");
+        assert_eq!(extension_for(&att("README.md", Some("text/plain"))), "md");
+    }
+
+    #[test]
     fn build_prompt_with_only_images_does_not_panic_on_empty_text() {
         let images = vec![PathBuf::from("/tmp/aa-img-42-0.png")];
-        let prompt = build_prompt("", &images);
+        let prompt = build_prompt("", &images, &[]);
         assert!(prompt.contains("[attached images to analyze]"));
         assert!(prompt.contains("/tmp/aa-img-42-0.png"));
         assert!(prompt.contains("Use the Read tool"));
@@ -1637,7 +2142,7 @@ mod tests {
             PathBuf::from("/tmp/aa-img-7-0.png"),
             PathBuf::from("/tmp/aa-img-7-1.jpg"),
         ];
-        let prompt = build_prompt("what's in this?", &images);
+        let prompt = build_prompt("what's in this?", &images, &[]);
         assert!(prompt.starts_with("what's in this?"));
         assert!(prompt.contains("/tmp/aa-img-7-0.png"));
         assert!(prompt.contains("/tmp/aa-img-7-1.jpg"));
@@ -1645,7 +2150,372 @@ mod tests {
 
     #[test]
     fn build_prompt_without_images_returns_plain_text() {
-        let prompt = build_prompt("hello", &[]);
+        let prompt = build_prompt("hello", &[], &[]);
         assert_eq!(prompt, "hello");
+    }
+
+    fn fresh_txt(path: &str) -> DownloadedTextFile {
+        DownloadedTextFile {
+            path: PathBuf::from(path),
+            truncated: false,
+            original_size: 1,
+        }
+    }
+
+    #[test]
+    fn build_prompt_includes_text_files() {
+        let txts = vec![fresh_txt("/tmp/aa-txt-9-0.md"), fresh_txt("/tmp/aa-txt-9-1.json")];
+        let prompt = build_prompt("summarize", &[], &txts);
+        assert!(prompt.starts_with("summarize"));
+        assert!(prompt.contains("[attached text files to read]"));
+        assert!(prompt.contains("/tmp/aa-txt-9-0.md"));
+        assert!(prompt.contains("/tmp/aa-txt-9-1.json"));
+        assert!(prompt.contains("Use the Read tool"));
+        // Non-truncated files do NOT get the marker.
+        assert!(!prompt.contains("TRUNCATED"));
+    }
+
+    #[test]
+    fn build_prompt_combines_images_and_text_files() {
+        let images = vec![PathBuf::from("/tmp/aa-img-1-0.png")];
+        let txts = vec![fresh_txt("/tmp/aa-txt-1-0.md")];
+        let prompt = build_prompt("what do these say?", &images, &txts);
+        let img_idx = prompt.find("[attached images to analyze]").expect("image block");
+        let txt_idx = prompt.find("[attached text files to read]").expect("text block");
+        assert!(img_idx < txt_idx);
+        assert!(prompt.contains("/tmp/aa-img-1-0.png"));
+        assert!(prompt.contains("/tmp/aa-txt-1-0.md"));
+    }
+
+    #[test]
+    fn build_prompt_annotates_truncated_files() {
+        let txts = vec![
+            DownloadedTextFile {
+                path: PathBuf::from("/tmp/aa-txt-3-0.log"),
+                truncated: true,
+                original_size: 4 * 1_048_576 + 700_000, // ~4.7 MB
+            },
+            fresh_txt("/tmp/aa-txt-3-1.md"),
+        ];
+        let prompt = build_prompt("anything weird in the log?", &[], &txts);
+        // Truncated file gets the marker.
+        assert!(prompt.contains("/tmp/aa-txt-3-0.log"));
+        assert!(prompt.contains("TRUNCATED — first 1.0 MB of 4.7 MB"));
+        // Non-truncated sibling does not.
+        let md_line = prompt
+            .lines()
+            .find(|l| l.contains("aa-txt-3-1.md"))
+            .expect("md line");
+        assert!(!md_line.contains("TRUNCATED"));
+    }
+
+    #[test]
+    fn truncate_returns_full_buffer_when_under_cap() {
+        let bytes = vec![0u8; 500_000];
+        let (slice, truncated) = truncate_text_bytes(&bytes);
+        assert_eq!(slice.len(), 500_000);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn truncate_clips_to_cap_when_over() {
+        let bytes = vec![0u8; (MAX_TEXT_BYTES + 1) as usize];
+        let (slice, truncated) = truncate_text_bytes(&bytes);
+        assert_eq!(slice.len(), MAX_TEXT_BYTES as usize);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn partition_accepts_up_to_download_cap_and_rejects_beyond() {
+        let just_under = att_sized("a.log", Some("text/plain"), MAX_DOWNLOAD_BYTES);
+        let just_over = att_sized("b.log", Some("text/plain"), MAX_DOWNLOAD_BYTES + 1);
+        let between = att_sized("c.log", Some("text/plain"), MAX_TEXT_BYTES + 1);
+        let p = partition_attachments(&[just_under, just_over, between]);
+        // Files in MAX_TEXT_BYTES..=MAX_DOWNLOAD_BYTES are accepted (will be truncated at download).
+        let accepted_names: Vec<&str> =
+            p.text_files.iter().map(|a| a.filename.as_str()).collect();
+        assert_eq!(accepted_names, vec!["a.log", "c.log"]);
+        // Only files > MAX_DOWNLOAD_BYTES are rejected.
+        assert_eq!(p.rejected.len(), 1);
+        assert_eq!(p.rejected[0].filename, "b.log");
+        assert!(matches!(p.rejected[0].reason, RejectReason::Oversize { .. }));
+    }
+
+    #[test]
+    fn attachment_kind_label_picks_label_per_kind() {
+        assert_eq!(
+            attachment_kind_label(&[att("a.png", Some("image/png"))]),
+            "[image attachment]"
+        );
+        assert_eq!(
+            attachment_kind_label(&[att("b.md", Some("text/markdown"))]),
+            "[text attachment]"
+        );
+        assert_eq!(
+            attachment_kind_label(&[
+                att("a.png", Some("image/png")),
+                att("b.md", Some("text/markdown")),
+            ]),
+            "[image + text attachment]"
+        );
+        assert_eq!(
+            attachment_kind_label(&[att("c.zip", Some("application/zip"))]),
+            "[attachment]"
+        );
+    }
+
+    fn att_sized(filename: &str, content_type: Option<&str>, size: u32) -> Attachment {
+        let json = serde_json::json!({
+            "id": "1",
+            "filename": filename,
+            "content_type": content_type,
+            "size": size,
+            "url": "https://cdn.discordapp.com/example.png",
+            "proxy_url": "https://cdn.discordapp.com/example.png",
+            "ephemeral": false,
+        });
+        serde_json::from_value(json).expect("attachment fixture should deserialize")
+    }
+
+    #[test]
+    fn filter_text_by_content_type() {
+        let atts = vec![
+            att("a.txt", Some("text/plain")),
+            att("b.md", Some("text/markdown")),
+            att("c.png", Some("image/png")),
+            att("d.pdf", Some("application/pdf")),
+        ];
+        let texts = filter_text_attachments(&atts);
+        let names: Vec<&str> = texts.iter().map(|a| a.filename.as_str()).collect();
+        assert_eq!(names, vec!["a.txt", "b.md"]);
+    }
+
+    #[test]
+    fn filter_text_by_extension_when_content_type_missing() {
+        let atts = vec![
+            att("a.rs", None),
+            att("b.md", None),
+            att("c.json", None),
+            att("d.bin", None),
+            att("e.exe", None),
+        ];
+        let texts = filter_text_attachments(&atts);
+        let names: Vec<&str> = texts.iter().map(|a| a.filename.as_str()).collect();
+        assert_eq!(names, vec!["a.rs", "b.md", "c.json"]);
+    }
+
+    #[test]
+    fn filter_text_rejects_oversized() {
+        // Files in MAX_TEXT_BYTES..=MAX_DOWNLOAD_BYTES are accepted (and
+        // truncated at download time); only files > MAX_DOWNLOAD_BYTES drop.
+        let atts = vec![
+            att_sized("small.txt", Some("text/plain"), 500_000),
+            att_sized("big.txt", Some("text/plain"), MAX_DOWNLOAD_BYTES + 1),
+        ];
+        let texts = filter_text_attachments(&atts);
+        let names: Vec<&str> = texts.iter().map(|a| a.filename.as_str()).collect();
+        assert_eq!(names, vec!["small.txt"]);
+    }
+
+    #[test]
+    fn filter_text_rejects_denylisted_extensions() {
+        let atts = vec![
+            att("ok.json", Some("text/plain")),
+            att("creds.env", Some("text/plain")),
+            att("secret.pem", Some("text/plain")),
+            att("cert.p12", None),
+            att("normal.txt", Some("text/plain")),
+        ];
+        let texts = filter_text_attachments(&atts);
+        let names: Vec<&str> = texts.iter().map(|a| a.filename.as_str()).collect();
+        assert_eq!(names, vec!["ok.json", "normal.txt"]);
+    }
+
+    #[test]
+    fn partition_classifies_image_text_and_rejected() {
+        let atts = vec![
+            att("photo.png", Some("image/png")),
+            att("notes.md", Some("text/markdown")),
+            att("archive.zip", Some("application/zip")),
+        ];
+        let p = partition_attachments(&atts);
+        assert_eq!(
+            p.images.iter().map(|a| a.filename.as_str()).collect::<Vec<_>>(),
+            vec!["photo.png"]
+        );
+        assert_eq!(
+            p.text_files
+                .iter()
+                .map(|a| a.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notes.md"]
+        );
+        assert_eq!(p.rejected.len(), 1);
+        assert_eq!(p.rejected[0].filename, "archive.zip");
+        assert!(matches!(
+            p.rejected[0].reason,
+            RejectReason::UnsupportedType { .. }
+        ));
+    }
+
+    #[test]
+    fn partition_rejects_oversize_with_size_in_reason() {
+        let big = MAX_DOWNLOAD_BYTES + 1;
+        let atts = vec![att_sized("huge.log", Some("text/plain"), big)];
+        let p = partition_attachments(&atts);
+        assert!(p.text_files.is_empty());
+        assert_eq!(p.rejected.len(), 1);
+        match &p.rejected[0].reason {
+            RejectReason::Oversize { size } => assert_eq!(*size, big),
+            other => panic!("expected Oversize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partition_rejects_denylist_even_with_text_mime() {
+        let atts = vec![
+            att("ok.json", Some("text/plain")),
+            att("creds.env", Some("text/plain")),
+            att("secret.pem", Some("text/plain")),
+        ];
+        let p = partition_attachments(&atts);
+        assert_eq!(
+            p.text_files
+                .iter()
+                .map(|a| a.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ok.json"]
+        );
+        let rejected_names: Vec<&str> =
+            p.rejected.iter().map(|r| r.filename.as_str()).collect();
+        assert_eq!(rejected_names, vec!["creds.env", "secret.pem"]);
+        assert!(p
+            .rejected
+            .iter()
+            .all(|r| matches!(r.reason, RejectReason::SecurityDenylist)));
+    }
+
+    #[test]
+    fn format_rejection_footer_returns_none_when_empty() {
+        assert_eq!(format_rejection_footer(&[]), None);
+    }
+
+    #[test]
+    fn format_rejection_footer_renders_each_reason_kind() {
+        let rejected = vec![
+            RejectedAttachment {
+                filename: "creds.env".into(),
+                reason: RejectReason::SecurityDenylist,
+            },
+            RejectedAttachment {
+                filename: "huge.log".into(),
+                reason: RejectReason::Oversize {
+                    size: MAX_DOWNLOAD_BYTES + MAX_TEXT_BYTES / 2,
+                },
+            },
+            RejectedAttachment {
+                filename: "weird.iso".into(),
+                reason: RejectReason::UnsupportedType {
+                    content_type: Some("application/octet-stream".into()),
+                    ext: Some("iso".into()),
+                },
+            },
+        ];
+        let footer = format_rejection_footer(&rejected).expect("footer");
+        assert!(footer.starts_with("\u{26A0}\u{FE0F} skipped: "));
+        assert!(footer.contains("creds.env (security)"));
+        assert!(footer.contains("huge.log (8.5 MB > 8.0 MB)"));
+        assert!(footer.contains("weird.iso (unsupported: application/octet-stream)"));
+    }
+
+    #[test]
+    fn format_rejection_footer_falls_back_to_ext_when_no_content_type() {
+        let rejected = vec![RejectedAttachment {
+            filename: "thing.dat".into(),
+            reason: RejectReason::UnsupportedType {
+                content_type: None,
+                ext: Some("dat".into()),
+            },
+        }];
+        let footer = format_rejection_footer(&rejected).expect("footer");
+        assert!(footer.contains("thing.dat (unsupported: dat)"));
+    }
+
+    #[test]
+    fn doc_kind_for_detects_each_format() {
+        assert_eq!(
+            doc_kind_for(&att("report.pdf", Some("application/pdf"))),
+            Some(DocKind::Pdf)
+        );
+        // Discord sometimes omits content_type — extension still detects.
+        assert_eq!(doc_kind_for(&att("report.pdf", None)), Some(DocKind::Pdf));
+        assert_eq!(
+            doc_kind_for(&att(
+                "notes.docx",
+                Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            )),
+            Some(DocKind::Docx)
+        );
+        assert_eq!(doc_kind_for(&att("notes.docx", None)), Some(DocKind::Docx));
+        assert_eq!(
+            doc_kind_for(&att("legacy.doc", Some("application/msword"))),
+            Some(DocKind::Doc)
+        );
+        assert_eq!(doc_kind_for(&att("legacy.doc", None)), Some(DocKind::Doc));
+    }
+
+    #[test]
+    fn doc_kind_for_returns_none_for_non_docs() {
+        assert_eq!(doc_kind_for(&att("a.png", Some("image/png"))), None);
+        assert_eq!(doc_kind_for(&att("b.txt", Some("text/plain"))), None);
+        assert_eq!(doc_kind_for(&att("c.zip", Some("application/zip"))), None);
+        assert_eq!(doc_kind_for(&att("noext", None)), None);
+    }
+
+    #[test]
+    fn doc_command_for_pdf_invokes_pdftotext() {
+        let (program, args) = doc_command_for(DocKind::Pdf, std::path::Path::new("/tmp/x.pdf"));
+        assert_eq!(program, "pdftotext");
+        assert!(args.iter().any(|a| a == "-layout"));
+        assert!(args.iter().any(|a| a == "/tmp/x.pdf"));
+        // Trailing "-" tells pdftotext to write to stdout.
+        assert_eq!(args.last().map(String::as_str), Some("-"));
+    }
+
+    #[test]
+    fn doc_command_for_docx_and_doc_invoke_pandoc() {
+        for kind in [DocKind::Docx, DocKind::Doc] {
+            let (program, args) = doc_command_for(kind, std::path::Path::new("/tmp/x.docx"));
+            assert_eq!(program, "pandoc", "kind={kind:?}");
+            assert!(args.iter().any(|a| a == "--to=plain"), "kind={kind:?}");
+            assert!(args.iter().any(|a| a == "/tmp/x.docx"), "kind={kind:?}");
+        }
+    }
+
+    #[test]
+    fn partition_routes_docs_into_docs_bucket() {
+        let atts = vec![
+            att("report.pdf", Some("application/pdf")),
+            att("notes.docx", None),
+            att("readme.md", Some("text/markdown")),
+            att("photo.png", Some("image/png")),
+            att("archive.zip", Some("application/zip")),
+        ];
+        let p = partition_attachments(&atts);
+        let doc_names: Vec<&str> = p.docs.iter().map(|a| a.filename.as_str()).collect();
+        assert_eq!(doc_names, vec!["report.pdf", "notes.docx"]);
+        assert_eq!(
+            p.text_files
+                .iter()
+                .map(|a| a.filename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["readme.md"]
+        );
+        assert_eq!(
+            p.images.iter().map(|a| a.filename.as_str()).collect::<Vec<_>>(),
+            vec!["photo.png"]
+        );
+        assert_eq!(p.rejected.len(), 1);
+        assert_eq!(p.rejected[0].filename, "archive.zip");
     }
 }
