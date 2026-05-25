@@ -31,6 +31,12 @@ pub struct ReasonerOpts {
     /// search`). Used to pass `AUGMENTAGENT_DB` so sub-CLIs find the db even
     /// when `cwd` is pinned to a sibling directory like the wiki root.
     pub env: Vec<(String, String)>,
+    /// Inline JSON forwarded to `claude --settings <json>`. Used by
+    /// [`ask_opts`] to install a PreToolUse hook that path-scopes
+    /// Read/Write/Edit/Glob/Grep to the wiki root (#127). When `None`,
+    /// no `--settings` flag is passed and Claude falls back to its
+    /// usual settings-source resolution.
+    pub settings_json: Option<String>,
 }
 
 /// Trait the channel uses to reach Claude. Test doubles stub this.
@@ -153,6 +159,14 @@ impl Reasoner for ClaudeCliReasoner {
             args.push(dir.to_string_lossy().into_owned());
         }
 
+        // `--settings <json>` wires in per-call settings — notably the
+        // PreToolUse hook that path-scopes Read/Write/Edit/Glob/Grep to
+        // `WIKI_ROOT` for the wiki-query agent (#127).
+        if let Some(settings) = &opts.settings_json {
+            args.push("--settings".into());
+            args.push(settings.clone());
+        }
+
         let mut cmd = Command::new(&self.bin);
         cmd.args(&args)
             .stdin(Stdio::piped())
@@ -271,6 +285,7 @@ pub fn triage_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         permission_mode: "default".into(),
         cwd: None,
         env: Vec::new(),
+        settings_json: None,
     }
 }
 
@@ -289,6 +304,7 @@ pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> Reasoner
         permission_mode: "default".into(),
         cwd: None,
         env: Vec::new(),
+        settings_json: None,
     }
 }
 
@@ -301,6 +317,7 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         permission_mode: "default".into(),
         cwd: None,
         env: Vec::new(),
+        settings_json: None,
     }
 }
 
@@ -333,6 +350,16 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
     // resolves the db regardless of cwd.
     let db_path = resolve_db_path(&repo_root);
+    // #127 — Path-scoping enforcement at the harness layer. The Claude CLI
+    // does not natively path-scope Read/Write/Edit/Glob/Grep to `--add-dir`;
+    // a 2026-05-24 sandbox-escape probe confirmed Read/Write/Glob succeeded
+    // against /tmp and the source tree even though `wiki-ask.md` claimed
+    // they were wiki-scoped. We install a PreToolUse hook that rejects any
+    // file-tool call whose path resolves outside `wiki_root`. WIKI_ROOT
+    // is forwarded as an env var so the hook script can resolve it without
+    // baking the absolute path into the JSON.
+    let guard_path = repo_root.join("scripts/aa-wiki-scope-guard.sh");
+    let settings_json = build_wiki_scope_settings(&guard_path);
     ReasonerOpts {
         system_prompt: include_str!("../../../schema/wiki-ask.md").to_string(),
         model: None, // Opus — quality matters for answer coherence
@@ -359,12 +386,45 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         add_dirs: vec![wiki_root.clone()],
         permission_mode: "acceptEdits".into(),
         // Pin cwd to the wiki so Write/Edit cannot touch the source tree.
-        cwd: Some(wiki_root),
-        env: vec![(
-            "AUGMENTAGENT_DB".into(),
-            db_path.to_string_lossy().into_owned(),
-        )],
+        cwd: Some(wiki_root.clone()),
+        env: vec![
+            (
+                "AUGMENTAGENT_DB".into(),
+                db_path.to_string_lossy().into_owned(),
+            ),
+            // WIKI_ROOT is consumed by `scripts/aa-wiki-scope-guard.sh` to
+            // know which prefix is permitted for file tools.
+            ("WIKI_ROOT".into(), wiki_root.to_string_lossy().into_owned()),
+        ],
+        settings_json: Some(settings_json),
     }
+}
+
+/// Build the inline JSON passed to `claude --settings` for wiki-query mode.
+///
+/// Registers a single PreToolUse hook covering the five file tools Claude
+/// Code does not natively path-scope (Read/Write/Edit/Glob/Grep). The hook
+/// is a shell script that reads the tool-call JSON from stdin and emits a
+/// `decision: "block"` reply when the path resolves outside `WIKI_ROOT`.
+///
+/// Returns a one-line JSON string so it survives `--settings` arg passing
+/// without shell-quoting heartburn.
+fn build_wiki_scope_settings(guard_path: &std::path::Path) -> String {
+    // Use serde_json to ensure the guard path is JSON-escaped correctly
+    // (spaces, quotes, backslashes). The settings shape is the Claude Code
+    // hook spec: `hooks.PreToolUse[].matcher` (regex) + `hooks[].command`.
+    serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "Read|Write|Edit|Glob|Grep",
+                "hooks": [{
+                    "type": "command",
+                    "command": guard_path.to_string_lossy()
+                }]
+            }]
+        }
+    })
+    .to_string()
 }
 
 /// Preset for the morning digest synthesis call.
@@ -386,6 +446,7 @@ pub fn digest_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         permission_mode: "default".into(),
         cwd: None,
         env: Vec::new(),
+        settings_json: None,
     }
 }
 
@@ -401,6 +462,7 @@ pub fn tone_summarize_opts() -> ReasonerOpts {
         permission_mode: "default".into(),
         cwd: None,
         env: vec![],
+        settings_json: None,
     }
 }
 
@@ -421,6 +483,7 @@ pub fn social_adapter_opts(system_prompt: String) -> ReasonerOpts {
         permission_mode: "default".into(),
         cwd: None,
         env: vec![],
+        settings_json: None,
     }
 }
 
@@ -461,6 +524,7 @@ Examples:
         permission_mode: "default".into(),
         cwd: None,
         env: vec![],
+        settings_json: None,
     }
 }
 
@@ -477,6 +541,7 @@ pub fn archetype_pick_opts() -> ReasonerOpts {
         permission_mode: "default".into(),
         cwd: None,
         env: vec![],
+        settings_json: None,
     }
 }
 
@@ -495,6 +560,7 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         permission_mode: "acceptEdits".into(),
         cwd: None,
         env: Vec::new(),
+        settings_json: None,
     }
 }
 
@@ -514,6 +580,7 @@ pub fn wiki_migrate_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerO
         permission_mode: "acceptEdits".into(),
         cwd: Some(wiki_root),
         env: Vec::new(),
+        settings_json: None,
     }
 }
 
@@ -574,6 +641,7 @@ mod tests {
             permission_mode: "default".into(),
             cwd: None,
             env: vec![],
+            settings_json: None,
         }
     }
 
@@ -724,6 +792,59 @@ mod tests {
         }
     }
 
+    /// #127 — `ask_opts` must wire up a PreToolUse hook so the harness
+    /// path-scopes Read/Write/Edit/Glob/Grep to the wiki root. Without
+    /// this, the `wiki-ask.md` "scoped to the wiki root" claim is
+    /// prompt-as-policy, not policy.
+    #[test]
+    fn ask_opts_installs_pretool_use_hook_for_file_tools() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        let _guard = EnvGuard::unset("AUGMENTAGENT_DB");
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+
+        let settings = opts
+            .settings_json
+            .as_deref()
+            .expect("ask_opts must ship a settings_json with the scope hook");
+        let value: serde_json::Value =
+            serde_json::from_str(settings).expect("settings_json must be valid JSON");
+
+        let matcher = value
+            .pointer("/hooks/PreToolUse/0/matcher")
+            .and_then(|v| v.as_str())
+            .expect("hook matcher must be a string");
+        // Each of the file-touching tools that Claude Code does not
+        // natively path-scope must appear in the matcher regex.
+        for tool in ["Read", "Write", "Edit", "Glob", "Grep"] {
+            assert!(
+                matcher.contains(tool),
+                "hook matcher must cover {tool}; got: {matcher}"
+            );
+        }
+
+        let cmd = value
+            .pointer("/hooks/PreToolUse/0/hooks/0/command")
+            .and_then(|v| v.as_str())
+            .expect("hook command must be a string");
+        assert!(
+            cmd.ends_with("scripts/aa-wiki-scope-guard.sh"),
+            "hook command must point at the wiki-scope guard script; got: {cmd}"
+        );
+
+        // WIKI_ROOT must be forwarded so the guard script knows the
+        // permitted prefix. Without it the script bails out exit-2 and
+        // every file-tool call is denied.
+        let wiki_env = opts
+            .env
+            .iter()
+            .find(|(k, _)| k == "WIKI_ROOT")
+            .map(|(_, v)| v.clone())
+            .expect("WIKI_ROOT env var must be forwarded to the guard");
+        assert_eq!(wiki_env, wiki.path().to_string_lossy());
+    }
+
     /// Load-bearing safety invariant: the LLM must never be able to invoke
     /// the real-send path. Only the Discord Approve button can call `run`.
     #[test]
@@ -805,6 +926,7 @@ pub fn resume_opts(wiki_root: PathBuf) -> ReasonerOpts {
         permission_mode: "acceptEdits".into(),
         cwd: Some(wiki_root),
         env: Vec::new(),
+        settings_json: None,
     }
 }
 
