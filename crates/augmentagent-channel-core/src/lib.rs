@@ -16,6 +16,7 @@ pub mod ingest;
 pub mod prompt;
 pub mod reasoner;
 pub mod resolve;
+pub mod skills;
 pub mod trigger;
 
 pub use decision::{Decision, DecisionKind};
@@ -35,6 +36,7 @@ pub use governor::{
     TargetAttrs, WindowedCounter, RATE_TABLE,
 };
 pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerOpts};
+pub use skills::{SkillEntry, SkillRegistry};
 pub use trigger::{
     kind as work_item_kind, ChannelRunner, DigestSource, FriendFeedSource, FriendFeedTrigger,
     InboundMessageTrigger, InboundSource, Trigger, WorkItem, WorkItemHandler,
