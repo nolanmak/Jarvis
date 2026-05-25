@@ -1,8 +1,21 @@
 /**
- * Thin wrapper around the local Claude Intercept MITM proxy CLI at
+ * Read-only wrapper around the local Claude Intercept MITM proxy CLI at
  * ~/claude_intercept/src/cli.js. Lets the agent query captured HTTP/S
- * traffic, extract auth tokens, and check proxy status — purely local,
- * never sent to remote sinks.
+ * traffic and check proxy status — purely local, never sent to remote
+ * sinks.
+ *
+ * Intentionally read-only: the agent CANNOT start/stop the proxy, manage
+ * the CA cert, or otherwise toggle MITM of the host's TLS connections.
+ * `proxy on` would intercept every TLS connection on this machine (other
+ * Claude sessions, browsers, pip, etc.) and capture plaintext auth — an
+ * autonomous agent flipping that based on a Discord message is a real
+ * footgun. Discovery is user-initiated via the global `/intercept` skill;
+ * this tool only exposes analysis of captures the user has already
+ * collected.
+ *
+ * Allowed subcommands: status, export, clear.
+ * Forbidden (never wrapped here): start, stop, proxy on/off, trust,
+ * untrust, cert.
  */
 
 import { spawn } from "child_process";
@@ -13,7 +26,7 @@ import path from "path";
 const DEFAULT_CLI = path.join(os.homedir(), "claude_intercept", "src", "cli.js");
 
 function cliPath(): string {
-  return process.env.CLAUDE_INTERCEPT_CLI ?? DEFAULT_CLI;
+  return process.env.CLAUDE_INTERCEPT_CLI ?? process.env.INTERCEPT_CLI ?? DEFAULT_CLI;
 }
 
 export function interceptAvailable(): boolean {
@@ -75,7 +88,10 @@ function tryParseJson(s: string): any {
   }
 }
 
-export type InterceptAction = "status" | "start" | "stop" | "clear" | "export" | "cert";
+// Read-only surface: status (inspect proxy + capture count), export
+// (dump captures the user has already collected), clear (drop the local
+// capture buffer; does not touch the proxy itself).
+export type InterceptAction = "status" | "export" | "clear";
 export type ExportMode = "api-docs" | "auth" | "summary" | "full";
 
 export interface InterceptParams {
@@ -90,7 +106,7 @@ export async function intercept(p: InterceptParams): Promise<any> {
     return {
       ok: false,
       error: `Claude Intercept not installed (looked at ${cliPath()})`,
-      hint: "Install from https://github.com/anthropics/claude_intercept or set CLAUDE_INTERCEPT_CLI",
+      hint: "Install from https://github.com/anthropics/claude_intercept or set CLAUDE_INTERCEPT_CLI / INTERCEPT_CLI",
     };
   }
 
@@ -99,21 +115,9 @@ export async function intercept(p: InterceptParams): Promise<any> {
       const r = await runCli(["status"]);
       return { ok: r.ok, status: r.stdout.trim(), stderr: r.stderr.trim() };
     }
-    case "start": {
-      const r = await runCli(["start", "--no-open"]);
-      return { ok: r.ok, output: r.stdout.trim(), stderr: r.stderr.trim() };
-    }
-    case "stop": {
-      const r = await runCli(["stop"]);
-      return { ok: r.ok, output: r.stdout.trim(), stderr: r.stderr.trim() };
-    }
     case "clear": {
       const r = await runCli(["clear"]);
       return { ok: r.ok, output: r.stdout.trim(), stderr: r.stderr.trim() };
-    }
-    case "cert": {
-      const r = await runCli(["cert"]);
-      return { ok: r.ok, cert_path: r.stdout.trim(), stderr: r.stderr.trim() };
     }
     case "export": {
       const args = ["export", "--mode", p.mode ?? "summary"];
