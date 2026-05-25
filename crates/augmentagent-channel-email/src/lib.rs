@@ -16,8 +16,8 @@ pub use channel::{
 };
 pub use inbound::{email_to_work_item, GmailInbound};
 pub use sigextract::{
-    detect_signature_block, signature_patch, ExtractedFields, SignatureBlock,
-    SignatureExtractor, SigError,
+    detect_signature_block, is_human_sender, signature_patch, ExtractedFields,
+    SignatureBlock, SignatureExtractor, SigError,
 };
 
 // Back-compat re-exports: old callers can keep using `augmentagent_channel_email::X`
