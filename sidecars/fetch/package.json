@@ -1,0 +1,26 @@
+{
+  "name": "@augmentagent/fetch-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Layered URL fetch sidecar — tries plain HTTPS, headless render, Firecrawl, Bright Data in order. NDJSON over Unix socket.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "ts-node --esm src/index.ts",
+    "smoke": "node dist/smoke.js",
+    "test": "echo 'no tests yet' && exit 0"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "playwright": "^1.52.0",
+    "turndown": "^7.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/turndown": "^5.0.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.0"
+  }
+}

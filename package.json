@@ -17,7 +17,11 @@
     "grocery:build": "cd sidecars/grocery && npm run build",
     "grocery:sidecar": "cd sidecars/grocery && npm start",
     "grocery:bootstrap": "node --env-file=.env scripts/grocery-bootstrap.mjs",
-    "grocery:order": "curl -s -X POST http://localhost:${DASHBOARD_PORT:-3000}/api/ask -H 'content-type: application/json' -d '{\"question\":\"order groceries for this week\"}'"
+    "grocery:order": "curl -s -X POST http://localhost:${DASHBOARD_PORT:-3000}/api/ask -H 'content-type: application/json' -d '{\"question\":\"order groceries for this week\"}'",
+    "fetch:install": "cd sidecars/fetch && npm install && npx playwright install chromium",
+    "fetch:build": "cd sidecars/fetch && npm run build",
+    "fetch:sidecar": "cd sidecars/fetch && npm start",
+    "fetch:smoke": "cd sidecars/fetch && npm run smoke --"
   },
   "repository": {
     "type": "git",
