@@ -28,13 +28,34 @@ use tracing::{error, info, warn};
 
 use augmentagent_store::{Store, UserLoop};
 
-/// Floor on loop cadence. Tighter than this and a misbehaving loop could
-/// hammer the reasoner / spam the channel.
-pub const MIN_INTERVAL_SECS: i64 = 5 * 60;
-/// Per-user cap on simultaneously-active loops.
-pub const MAX_ACTIVE_PER_USER: i64 = 10;
-/// Consecutive-failure count at which a loop auto-pauses.
-pub const PAUSE_AFTER_FAILURES: i64 = 3;
+/// Floor on loop cadence (seconds). Defaults to `0` — no floor. Set
+/// `AUGMENTAGENT_LOOP_MIN_INTERVAL_SECS` to re-enable a minimum if a
+/// misbehaving loop ever becomes a real problem.
+pub fn min_interval_secs() -> i64 {
+    std::env::var("AUGMENTAGENT_LOOP_MIN_INTERVAL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Per-user cap on simultaneously-active loops. Defaults to `i64::MAX` —
+/// effectively no cap. Set `AUGMENTAGENT_LOOP_MAX_ACTIVE_PER_USER` to limit.
+pub fn max_active_per_user() -> i64 {
+    std::env::var("AUGMENTAGENT_LOOP_MAX_ACTIVE_PER_USER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(i64::MAX)
+}
+
+/// Consecutive-failure count at which a loop auto-pauses. Defaults to
+/// `i64::MAX` — never auto-pause. Set `AUGMENTAGENT_LOOP_PAUSE_AFTER_FAILURES`
+/// to re-enable.
+pub fn pause_after_failures() -> i64 {
+    std::env::var("AUGMENTAGENT_LOOP_PAUSE_AFTER_FAILURES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(i64::MAX)
+}
 
 /// Runs a loop's stored prompt and returns the agent's text answer. The CLI
 /// implements this against the same `ClaudeCliReasoner` + `ask_opts` used for
@@ -50,6 +71,37 @@ pub trait LoopRunner: Send + Sync {
 #[async_trait]
 pub trait LoopPoster: Send + Sync {
     async fn post_to(&self, channel_ref: &str, body: &str) -> anyhow::Result<()>;
+}
+
+/// Parses free-form `/loop <…>` create-text into a [`ParsedLoop`]. The CLI's
+/// concrete impl asks Claude (Haiku, no tools) to extract `{interval, prompt,
+/// duration?}` from arbitrary phrasing so we're not at the mercy of a
+/// hand-written regex. Unit tests inject a deterministic stub that delegates
+/// to the legacy [`parse_create_args`] regex parser — no `claude` spawn.
+#[async_trait]
+pub trait LoopCommandParser: Send + Sync {
+    /// `raw` is the create-args after the `loop`/`/loop` prefix and
+    /// subcommand keyword have been stripped — e.g. `every 5m hello world 🙂`.
+    /// Returns a user-facing error string on failure (surfaced verbatim in the
+    /// channel reply).
+    async fn parse(&self, raw: &str) -> Result<ParsedLoop, String>;
+}
+
+/// If `text` starts with `/loop` or bare `loop` as a word, return everything
+/// after the keyword (still untrimmed). Otherwise `None`.
+///
+/// "As a word" = followed by whitespace or end-of-input, so `loops are nice`
+/// and `looper` do not match.
+pub fn match_loop_prefix(text: &str) -> Option<&str> {
+    let trimmed = text.trim_start();
+    for prefix in ["/loop", "loop"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                return Some(rest);
+            }
+        }
+    }
+    None
 }
 
 /// Parse a human interval into seconds. Accepts `45s`, `30m`, `2h`, `1d`, or a
@@ -95,6 +147,7 @@ pub struct ParsedLoop {
 ///
 /// Case-insensitive on the unit word. The numeric portion must be a positive
 /// integer.
+#[allow(dead_code)] // used by tests + kept as a deterministic fallback reference
 fn parse_time_at(s: &str) -> Option<(i64, usize)> {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -130,6 +183,7 @@ fn parse_time_at(s: &str) -> Option<(i64, usize)> {
 }
 
 /// Whitespace-bordered, case-insensitive keyword match at `pos` in `bytes`.
+#[allow(dead_code)]
 fn match_kw(bytes: &[u8], pos: usize, kw: &[u8]) -> bool {
     if pos + kw.len() > bytes.len() {
         return false;
@@ -143,6 +197,7 @@ fn match_kw(bytes: &[u8], pos: usize, kw: &[u8]) -> bool {
     before_ok && after_ok
 }
 
+#[allow(dead_code)]
 fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
@@ -150,7 +205,9 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
     i
 }
 
-/// Parse the create-loop arguments. Accepts two shapes:
+/// Parse the create-loop arguments via a hand-written regex. Now used only by
+/// tests (the production path uses an injected [`LoopCommandParser`] backed
+/// by Claude); kept here as a deterministic test fixture covering two shapes:
 ///
 /// 1. **Terse:** `<interval> <prompt…>` — e.g. `5m /digest`.
 /// 2. **Natural:** `<prompt…> every <N> <unit> [for [the next] <N> <unit>]`
@@ -159,6 +216,7 @@ fn skip_ws(bytes: &[u8], mut i: usize) -> usize {
 /// The trailing-`for` clause sets an auto-stop deadline (returned as
 /// `duration_secs`). Interval-floor / max-active enforcement happens in
 /// [`handle_loop_command`], not here.
+#[allow(dead_code)]
 pub fn parse_create_args(rest: &str) -> Result<ParsedLoop, String> {
     let rest = rest.trim();
     if rest.is_empty() {
@@ -247,15 +305,20 @@ pub fn parse_create_args(rest: &str) -> Result<ParsedLoop, String> {
     )
 }
 
-/// Parse + validate create-loop arguments against the minimum-interval floor
-/// and the duration-vs-interval invariant. Pure (no store access), so the
-/// command layer can compose it and tests can call it directly.
-pub fn validate_create_args(
-    rest: &str,
+/// Validate an already-parsed loop spec against the minimum-interval floor
+/// and the duration-vs-interval invariant. Used by [`handle_loop_command`]
+/// after the LLM parser returns, and by [`validate_create_args`] for tests.
+///
+/// `min_interval_secs <= 0` disables the floor (default behavior — see
+/// [`min_interval_secs`]).
+pub fn validate_parsed(
+    parsed: &ParsedLoop,
     min_interval_secs: i64,
-) -> Result<ParsedLoop, String> {
-    let parsed = parse_create_args(rest)?;
-    if parsed.interval_secs < min_interval_secs {
+) -> Result<(), String> {
+    if parsed.interval_secs <= 0 {
+        return Err("interval must be positive".to_string());
+    }
+    if min_interval_secs > 0 && parsed.interval_secs < min_interval_secs {
         return Err(format!(
             "interval too short — minimum is {}.",
             fmt_interval(min_interval_secs)
@@ -270,6 +333,19 @@ pub fn validate_create_args(
             ));
         }
     }
+    Ok(())
+}
+
+/// Parse + validate create-loop arguments via the legacy regex parser. Kept
+/// for unit tests so the test corpus doesn't need a `claude` spawn. Prod code
+/// uses an injected [`LoopCommandParser`] + [`validate_parsed`] instead.
+#[allow(dead_code)]
+pub fn validate_create_args(
+    rest: &str,
+    min_interval_secs: i64,
+) -> Result<ParsedLoop, String> {
+    let parsed = parse_create_args(rest)?;
+    validate_parsed(&parsed, min_interval_secs)?;
     Ok(parsed)
 }
 
@@ -287,9 +363,15 @@ fn fmt_interval(secs: i64) -> String {
 
 /// Pure command handler. `owner` and `channel_ref` are the Discord user id and
 /// channel/DM id (as strings) so the registry stays channel-agnostic. Returns
-/// the reply text to post. No Discord types here — fully unit-testable.
-pub fn handle_loop_command(
+/// the reply text to post. No Discord types here — fully unit-testable with a
+/// stub [`LoopCommandParser`].
+///
+/// `text` may include the leading `loop` or `/loop` keyword — both are
+/// accepted via [`match_loop_prefix`]. If neither matches, the input is used
+/// as-is (the dispatcher already gated on the keyword).
+pub async fn handle_loop_command(
     store: Option<&Store>,
+    parser: Option<&dyn LoopCommandParser>,
     owner: &str,
     channel_ref: &str,
     text: &str,
@@ -297,7 +379,7 @@ pub fn handle_loop_command(
     let Some(store) = store else {
         return "loop registry unavailable (store not wired)".to_string();
     };
-    let rest = text.trim().strip_prefix("/loop").unwrap_or("").trim();
+    let rest = match_loop_prefix(text).unwrap_or(text).trim();
     let mut parts = rest.splitn(2, char::is_whitespace);
     let sub = parts.next().unwrap_or("").trim();
 
@@ -305,7 +387,7 @@ pub fn handle_loop_command(
         "" | "help" => USAGE.to_string(),
         "list" => match store.list_user_loops(owner) {
             Ok(loops) if loops.is_empty() => {
-                "you have no loops. create one: `/loop 1h /digest`".to_string()
+                "you have no loops. create one: `loop 1h /digest`".to_string()
             }
             Ok(loops) => render_list(&loops),
             Err(e) => format!("⚠️ failed to list loops: {e}"),
@@ -313,7 +395,7 @@ pub fn handle_loop_command(
         "stop" => {
             let id = parts.next().unwrap_or("").trim();
             if id.is_empty() {
-                return "usage: `/loop stop <id>` (get ids from `/loop list`)".to_string();
+                return "usage: `loop stop <id>` (get ids from `loop list`)".to_string();
             }
             match store.stop_user_loop(owner, id) {
                 Ok(true) => format!("🛑 stopped loop `{id}`"),
@@ -322,15 +404,22 @@ pub fn handle_loop_command(
             }
         }
         _ => {
-            let parsed = match validate_create_args(rest, MIN_INTERVAL_SECS) {
+            let Some(parser) = parser else {
+                return "loop parser unavailable (reasoner not wired)".to_string();
+            };
+            let parsed = match parser.parse(rest).await {
                 Ok(p) => p,
                 Err(e) => return e,
             };
+            if let Err(e) = validate_parsed(&parsed, min_interval_secs()) {
+                return e;
+            }
+            let cap = max_active_per_user();
             match store.count_active_user_loops(owner) {
-                Ok(n) if n >= MAX_ACTIVE_PER_USER => {
+                Ok(n) if n >= cap => {
                     return format!(
-                        "you already have {MAX_ACTIVE_PER_USER} active loops (the max). \
-                         stop one with `/loop stop <id>` first."
+                        "you already have {cap} active loops (the max). \
+                         stop one with `loop stop <id>` first."
                     );
                 }
                 Ok(_) => {}
@@ -368,12 +457,13 @@ pub fn handle_loop_command(
     }
 }
 
-const USAGE: &str = "**/loop** — scheduled tasks\n\
-    • `/loop <interval> <prompt or /slash>` — e.g. `/loop 30m /digest` (min 5m)\n\
-    • `/loop <prompt> every <N> <unit>` — e.g. `/loop say hi every 5m`\n\
+const USAGE: &str = "**loop** — scheduled tasks (leading `/` optional)\n\
+    • `loop <interval> <prompt or /slash>` — e.g. `loop 30m /digest`\n\
+    • `loop <prompt> every <N> <unit>` — e.g. `loop say hi every 5m`\n\
+    • clauses may appear in any order; phrasing is parsed by Claude\n\
     • append `for <N> <unit>` to auto-stop — e.g. `… every 5m for the next 15m`\n\
-    • `/loop list` — your loops + last status\n\
-    • `/loop stop <id>` — stop a loop";
+    • `loop list` — your loops + last status\n\
+    • `loop stop <id>` — stop a loop";
 
 fn render_list(loops: &[UserLoop]) -> String {
     let mut out = String::from("**Your loops**\n");
@@ -497,6 +587,7 @@ impl LoopScheduler {
 
     async fn run_one(&self, l: &UserLoop) {
         info!(loop_id = %l.id, "running loop");
+        let pause_after = pause_after_failures();
         match self.runner.run_prompt(&l.prompt).await {
             Ok(answer) => {
                 let header = format!("🔁 loop `{}` · _{}_", l.id, truncate(&l.prompt, 80));
@@ -507,13 +598,13 @@ impl LoopScheduler {
                         &l.id,
                         false,
                         &format!("post failed: {e}"),
-                        PAUSE_AFTER_FAILURES,
+                        pause_after,
                     );
                     return;
                 }
                 let _ = self
                     .store
-                    .record_user_loop_run(&l.id, true, "ok", PAUSE_AFTER_FAILURES);
+                    .record_user_loop_run(&l.id, true, "ok", pause_after);
             }
             Err(e) => {
                 warn!(loop_id = %l.id, "loop prompt failed: {e:#}");
@@ -521,7 +612,7 @@ impl LoopScheduler {
                     &l.id,
                     false,
                     &truncate(&format!("error: {e}"), 200),
-                    PAUSE_AFTER_FAILURES,
+                    pause_after,
                 );
             }
         }
@@ -560,9 +651,128 @@ mod tests {
         assert_eq!(fmt_interval(45), "45s");
     }
 
+    #[tokio::test]
+    async fn command_help_and_unwired() {
+        // Store missing → unavailable message; parser doesn't matter for this path.
+        let reply = handle_loop_command(None, None, "u", "c", "/loop list").await;
+        assert!(reply.contains("unavailable"), "got: {reply}");
+    }
+
+    /// Test parser that delegates to the legacy regex parser — keeps the
+    /// async surface of [`handle_loop_command`] testable without spawning
+    /// `claude`.
+    struct RegexParser;
+
+    #[async_trait]
+    impl LoopCommandParser for RegexParser {
+        async fn parse(&self, raw: &str) -> Result<ParsedLoop, String> {
+            parse_create_args(raw)
+        }
+    }
+
+    fn tmp_store() -> (Store, tempfile::NamedTempFile) {
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        let store = Store::open(file.path()).expect("open store");
+        (store, file)
+    }
+
+    #[tokio::test]
+    async fn create_path_accepts_bare_loop_prefix() {
+        let (store, _file) = tmp_store();
+        let parser = RegexParser;
+        let reply = handle_loop_command(
+            Some(&store),
+            Some(&parser as &dyn LoopCommandParser),
+            "user-1",
+            "chan-1",
+            "loop ping every 5m for 15m",
+        )
+        .await;
+        assert!(reply.contains("loop `"), "expected loop-created reply: {reply}");
+        assert!(reply.contains("every 5m"), "should report cadence: {reply}");
+    }
+
+    #[tokio::test]
+    async fn create_path_accepts_slash_loop_prefix() {
+        let (store, _file) = tmp_store();
+        let parser = RegexParser;
+        let reply = handle_loop_command(
+            Some(&store),
+            Some(&parser as &dyn LoopCommandParser),
+            "user-1",
+            "chan-1",
+            "/loop ping every 10m",
+        )
+        .await;
+        assert!(reply.contains("loop `"), "expected loop-created reply: {reply}");
+    }
+
+    #[tokio::test]
+    async fn create_path_surfaces_parser_error_verbatim() {
+        struct AlwaysErr;
+        #[async_trait]
+        impl LoopCommandParser for AlwaysErr {
+            async fn parse(&self, _raw: &str) -> Result<ParsedLoop, String> {
+                Err("nope, couldn't tell what you meant".to_string())
+            }
+        }
+        let (store, _file) = tmp_store();
+        let parser = AlwaysErr;
+        let reply = handle_loop_command(
+            Some(&store),
+            Some(&parser as &dyn LoopCommandParser),
+            "user-1",
+            "chan-1",
+            "loop frobnicate",
+        )
+        .await;
+        assert_eq!(reply, "nope, couldn't tell what you meant");
+    }
+
+    #[tokio::test]
+    async fn create_path_missing_parser_reports_unavailable() {
+        let (store, _file) = tmp_store();
+        let reply = handle_loop_command(
+            Some(&store),
+            None,
+            "user-1",
+            "chan-1",
+            "loop frobnicate every 5m",
+        )
+        .await;
+        assert!(reply.contains("parser unavailable"), "got: {reply}");
+    }
+
+    #[tokio::test]
+    async fn validate_parsed_rejects_zero_interval() {
+        let p = ParsedLoop {
+            interval_secs: 0,
+            prompt: "x".into(),
+            duration_secs: None,
+        };
+        let err = validate_parsed(&p, 0).unwrap_err();
+        assert!(err.contains("positive"), "got: {err}");
+    }
+
+    // --- match_loop_prefix --------------------------------------------------
+
     #[test]
-    fn command_help_and_unwired() {
-        assert!(handle_loop_command(None, "u", "c", "/loop list").contains("unavailable"));
+    fn match_loop_prefix_accepts_both_forms() {
+        assert_eq!(match_loop_prefix("/loop list"), Some(" list"));
+        assert_eq!(match_loop_prefix("loop list"), Some(" list"));
+        assert_eq!(match_loop_prefix("  /loop  hello"), Some("  hello"));
+        assert_eq!(match_loop_prefix("/loop"), Some(""));
+        assert_eq!(match_loop_prefix("loop"), Some(""));
+    }
+
+    #[test]
+    fn match_loop_prefix_rejects_word_continuations() {
+        // `loops are nice` and `looper` are NOT loop commands.
+        assert_eq!(match_loop_prefix("loops are great"), None);
+        assert_eq!(match_loop_prefix("looper"), None);
+        assert_eq!(match_loop_prefix("/loops"), None);
+        assert_eq!(match_loop_prefix("hello loop"), None);
+        assert_eq!(match_loop_prefix(""), None);
     }
 
     #[test]
@@ -679,12 +889,16 @@ mod tests {
 
     // --- validate_create_args (parser + floor + duration-vs-interval guard) ---
 
+    /// Tests pin the floor at 5m explicitly so they don't depend on the
+    /// (env-driven) prod default, which is `0` (no floor).
+    const TEST_MIN_INTERVAL: i64 = 5 * 60;
+
     #[test]
     fn validate_accepts_users_actual_failing_input() {
         // The exact input that surfaced the bug in the original report.
         let p = validate_create_args(
             "and say hello world every 5 mins for the next 15 mins",
-            MIN_INTERVAL_SECS,
+            TEST_MIN_INTERVAL,
         )
         .unwrap();
         assert_eq!(p.interval_secs, 300);
@@ -694,20 +908,28 @@ mod tests {
 
     #[test]
     fn validate_rejects_duration_shorter_than_interval() {
-        let err = validate_create_args("ping every 10m for 1m", MIN_INTERVAL_SECS).unwrap_err();
+        let err = validate_create_args("ping every 10m for 1m", TEST_MIN_INTERVAL).unwrap_err();
         assert!(err.contains("shorter than interval"), "err: {err}");
     }
 
     #[test]
     fn validate_rejects_below_min_interval() {
-        let err = validate_create_args("ping every 30s", MIN_INTERVAL_SECS).unwrap_err();
+        let err = validate_create_args("ping every 30s", TEST_MIN_INTERVAL).unwrap_err();
         assert!(err.contains("too short"), "err: {err}");
+    }
+
+    #[test]
+    fn validate_floor_disabled_when_zero() {
+        // Floor of 0 = no floor (the prod default). Sub-minute intervals
+        // parse + validate cleanly.
+        let p = validate_create_args("ping every 30s", 0).unwrap();
+        assert_eq!(p.interval_secs, 30);
     }
 
     #[test]
     fn validate_accepts_duration_equal_to_interval() {
         // Edge case: dur == interval fires exactly once before expiry sweep.
-        let p = validate_create_args("ping every 5m for 5m", MIN_INTERVAL_SECS).unwrap();
+        let p = validate_create_args("ping every 5m for 5m", TEST_MIN_INTERVAL).unwrap();
         assert_eq!(p.interval_secs, 300);
         assert_eq!(p.duration_secs, Some(300));
     }

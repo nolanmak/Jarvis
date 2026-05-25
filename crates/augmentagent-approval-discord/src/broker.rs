@@ -13,6 +13,7 @@ use augmentagent_store::{Email, Store};
 
 use crate::event_handler::Handler;
 use crate::layout::{approval_message, flag_notice_message};
+use crate::loops::LoopCommandParser;
 use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, QueryHandler};
 
 #[derive(Clone)]
@@ -37,6 +38,10 @@ pub struct DiscordConfig {
     /// triples to `draft_revisions` after a Revise (#37). `None` disables
     /// persistence — the broker still works, the data just isn't captured.
     pub store: Option<Arc<Store>>,
+    /// LLM-backed parser for `/loop` create-text. `None` disables the create
+    /// path (list / stop / help still work). The CLI wires this with a Claude
+    /// reasoner; tests can omit it.
+    pub loop_parser: Option<Arc<dyn LoopCommandParser>>,
 }
 
 pub(crate) struct BrokerState {
@@ -50,12 +55,15 @@ pub(crate) struct BrokerState {
     pub(crate) invoice_store: Option<Arc<Store>>,
     /// Store handle for persisting Revise triples to `draft_revisions` (#37).
     pub(crate) store: Option<Arc<Store>>,
+    /// LLM parser for `/loop` create text. `None` disables the create path.
+    pub(crate) loop_parser: Option<Arc<dyn LoopCommandParser>>,
     /// Populated once, from the first `Ready` event. Used to distinguish the
     /// bot's own messages from the user's when building conversation context.
     pub(crate) bot_user_id: std::sync::OnceLock<UserId>,
 }
 
 impl BrokerState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         approval_channel_id: ChannelId,
         query_channel_id: Option<ChannelId>,
@@ -64,6 +72,7 @@ impl BrokerState {
         action_handler: Option<Arc<dyn ApprovalActionHandler>>,
         invoice_store: Option<Arc<Store>>,
         store: Option<Arc<Store>>,
+        loop_parser: Option<Arc<dyn LoopCommandParser>>,
     ) -> Self {
         Self {
             ready: Arc::new(Notify::new()),
@@ -75,6 +84,7 @@ impl BrokerState {
             approval_channel_id,
             invoice_store,
             store,
+            loop_parser,
             bot_user_id: std::sync::OnceLock::new(),
         }
     }
@@ -112,6 +122,7 @@ impl DiscordApprovalBroker {
             config.action_handler.clone(),
             config.invoice_store.clone(),
             config.store.clone(),
+            config.loop_parser.clone(),
         ));
 
         let mut intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES;
