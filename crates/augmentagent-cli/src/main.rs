@@ -4194,6 +4194,132 @@ impl LoopRunner for LoopReasonerRunner {
     }
 }
 
+/// `loop` command parser: asks Haiku to extract {interval, prompt, duration?}
+/// from arbitrary phrasing. See `loop_parse_opts` for the system prompt.
+struct LoopReasonerParser {
+    reasoner: Arc<ClaudeCliReasoner>,
+}
+
+#[async_trait]
+impl augmentagent_approval_discord::LoopCommandParser for LoopReasonerParser {
+    async fn parse(
+        &self,
+        raw: &str,
+    ) -> std::result::Result<augmentagent_approval_discord::ParsedLoop, String> {
+        use augmentagent_channel_core::Reasoner;
+        let opts = augmentagent_channel_core::reasoner::loop_parse_opts();
+        let answer = match self.reasoner.call(&opts, raw).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("loop parser claude call failed: {e:#}");
+                return Err(format!("couldn't reach claude to parse loop: {e}"));
+            }
+        };
+        parse_loop_json(&answer)
+    }
+}
+
+/// Strip code fences if Claude added them, then extract the first JSON object
+/// and shape it into a `ParsedLoop` or a user-facing error.
+fn parse_loop_json(raw: &str) -> std::result::Result<augmentagent_approval_discord::ParsedLoop, String> {
+    let text = raw.trim();
+    // Tolerate ```json … ``` or ``` … ``` fences.
+    let stripped = text
+        .strip_prefix("```json")
+        .or_else(|| text.strip_prefix("```"))
+        .and_then(|s| s.rsplit_once("```").map(|(body, _)| body))
+        .unwrap_or(text)
+        .trim();
+    // Extract the first {...} object so prose around the JSON is tolerated.
+    let json_blob = match (stripped.find('{'), stripped.rfind('}')) {
+        (Some(a), Some(b)) if b > a => &stripped[a..=b],
+        _ => return Err(format!("loop parser returned no JSON: {raw}")),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(json_blob) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("loop parser json decode failed: {e}; raw={raw}");
+            return Err("couldn't parse loop spec — try `loop 5m do thing`".to_string());
+        }
+    };
+    if let Some(err) = parsed.get("error").and_then(|v| v.as_str()) {
+        return Err(err.to_string());
+    }
+    let interval = parsed
+        .get("interval_secs")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| "loop parser omitted interval".to_string())?;
+    let prompt = parsed
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "loop parser omitted prompt".to_string())?;
+    let duration_secs = parsed
+        .get("duration_secs")
+        .and_then(|v| if v.is_null() { None } else { v.as_i64() });
+    Ok(augmentagent_approval_discord::ParsedLoop {
+        interval_secs: interval,
+        prompt,
+        duration_secs,
+    })
+}
+
+#[cfg(test)]
+mod loop_parser_tests {
+    use super::parse_loop_json;
+
+    #[test]
+    fn parses_strict_json() {
+        let raw = r#"{"interval_secs": 300, "prompt": "say hi", "duration_secs": 900}"#;
+        let p = parse_loop_json(raw).unwrap();
+        assert_eq!(p.interval_secs, 300);
+        assert_eq!(p.prompt, "say hi");
+        assert_eq!(p.duration_secs, Some(900));
+    }
+
+    #[test]
+    fn parses_with_null_duration() {
+        let raw = r#"{"interval_secs": 60, "prompt": "ping", "duration_secs": null}"#;
+        let p = parse_loop_json(raw).unwrap();
+        assert_eq!(p.duration_secs, None);
+    }
+
+    #[test]
+    fn strips_code_fences() {
+        let raw = "```json\n{\"interval_secs\": 30, \"prompt\": \"x\", \"duration_secs\": null}\n```";
+        let p = parse_loop_json(raw).unwrap();
+        assert_eq!(p.interval_secs, 30);
+        assert_eq!(p.prompt, "x");
+    }
+
+    #[test]
+    fn surfaces_error_field_verbatim() {
+        let raw = r#"{"error": "couldn't find an interval"}"#;
+        let err = parse_loop_json(raw).unwrap_err();
+        assert_eq!(err, "couldn't find an interval");
+    }
+
+    #[test]
+    fn tolerates_prose_around_json() {
+        let raw = "Sure! {\"interval_secs\": 300, \"prompt\": \"do thing\", \"duration_secs\": null} hope this helps.";
+        let p = parse_loop_json(raw).unwrap();
+        assert_eq!(p.interval_secs, 300);
+    }
+
+    #[test]
+    fn rejects_empty_prompt() {
+        let raw = r#"{"interval_secs": 300, "prompt": "   ", "duration_secs": null}"#;
+        assert!(parse_loop_json(raw).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_interval() {
+        let raw = r#"{"prompt": "x", "duration_secs": null}"#;
+        assert!(parse_loop_json(raw).is_err());
+    }
+}
+
 /// Posts a loop's result back to the originating Discord channel/DM using a
 /// bare serenity HTTP client (no gateway) — same approach as the digest
 /// poster. `channel_ref` is the stringified channel id captured at creation.
@@ -5292,6 +5418,11 @@ async fn build_broker(
     });
 
     let approver_for_broker = Arc::clone(&approver);
+    let loop_parser: Option<Arc<dyn augmentagent_approval_discord::LoopCommandParser>> = Some(
+        Arc::new(LoopReasonerParser {
+            reasoner: Arc::clone(&reasoner),
+        }),
+    );
     let broker = DiscordApprovalBroker::start(DiscordConfig {
         bot_token: token,
         channel_id,
@@ -5302,6 +5433,7 @@ async fn build_broker(
         invoice_store: Some(invoice_store),
         invoice_ops: Some(invoice_ops),
         store: Some(store_for_broker),
+        loop_parser,
     })
     .await
     .context("start discord broker")?;

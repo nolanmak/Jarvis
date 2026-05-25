@@ -408,6 +408,46 @@ pub fn social_adapter_opts(system_prompt: String) -> ReasonerOpts {
     }
 }
 
+/// Preset for parsing Discord `/loop` create-text into a structured spec.
+/// One JSON object out, no tools, Haiku for snappy command-feedback latency
+/// (loop creates are interactive — sub-second matters). The system prompt
+/// is inlined here since it's tiny and only used at one site.
+pub fn loop_parse_opts() -> ReasonerOpts {
+    ReasonerOpts {
+        system_prompt: r#"You parse a single user request to create a recurring task ("loop").
+
+The input describes:
+- An interval (how often the loop fires) — REQUIRED
+- A prompt (what the loop should do each tick) — REQUIRED
+- Optionally, a total duration (auto-stop time)
+
+Clauses may appear in any order. Recognised units: s/sec/seconds, m/min/minutes, h/hr/hours, d/day/days.
+
+Output a SINGLE JSON object on one line, no prose, no code fences:
+  {"interval_secs": <int>, "prompt": <string>, "duration_secs": <int or null>}
+
+On failure (no parseable interval, ambiguous, or empty prompt), output:
+  {"error": "<short user-facing message>"}
+
+Examples:
+  "5m do the digest" → {"interval_secs": 300, "prompt": "do the digest", "duration_secs": null}
+  "say hi every 5 mins" → {"interval_secs": 300, "prompt": "say hi", "duration_secs": null}
+  "every 5mins for 20 mins and say hello world 🙂" → {"interval_secs": 300, "prompt": "say hello world 🙂", "duration_secs": 1200}
+  "ping me every 10 minutes for the next 2 hours" → {"interval_secs": 600, "prompt": "ping me", "duration_secs": 7200}
+  "and say hello world every 5 mins for the next 15 mins" → {"interval_secs": 300, "prompt": "and say hello world", "duration_secs": 900}
+  "triage every email every 1h" → {"interval_secs": 3600, "prompt": "triage every email", "duration_secs": null}
+  "thirty seconds /digest" → {"interval_secs": 30, "prompt": "/digest", "duration_secs": null}
+  "asdf" → {"error": "couldn't find an interval — try `loop 5m do thing` or `loop do thing every 5m`"}
+"#.to_string(),
+        model: Some("claude-haiku-4-5-20251001".into()),
+        allowed_tools: vec![],
+        add_dirs: vec![],
+        permission_mode: "default".into(),
+        cwd: None,
+        env: vec![],
+    }
+}
+
 /// Preset for the archetype picker (#36). A single fast structured-output
 /// classification: email + triage label in, one archetype id (or `none`) +
 /// confidence out. Haiku for cost/latency — the issue specifies a fast,
