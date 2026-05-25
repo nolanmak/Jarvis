@@ -85,3 +85,30 @@ counterpart.
 Branch + PR only — never push to `main` (the auto-updater watches it).
 Feature work should build cleanly (`cargo check --workspace`, `npm run build`)
 and keep its tests green before the PR is opened.
+
+## Grocery channel
+
+Order groceries from Discord. v1 ships the Giant Food Stores provider
+(ported from DSado88/Grocery's PRISM API client) behind a pluggable
+provider interface. The sidecar lives at `sidecars/grocery/` next to the
+browser and renderer sidecars, the skill prompt at
+`skills/grocery/SKILL.md`, and the knowledge graph layout at
+`schema/wiki-groceries.md`.
+
+1. Fill in `.env` — `GIANT_EMAIL`, `GIANT_PASSWORD`, `GIANT_STORE_ID`,
+   and optionally `GROCERY_PROXY` (Cloudflare WARP SOCKS5 to dodge
+   DataDome).
+2. One-time setup:
+       npm run grocery:install      # sidecar deps + Playwright chromium
+       npm run grocery:build
+       npm run grocery:bootstrap    # interactive OTP login
+3. Run the sidecar (PM2 handles it in prod, see `ecosystem.config.js`):
+       npm run grocery:sidecar
+4. Trigger an order via Discord ("order groceries for this week") or:
+       npm run grocery:order
+
+The agent reads `wiki/groceries/{staples,preferences,pantry,dislikes}.md`,
+searches the store catalog, and posts a cart-for-review card to Discord
+with Approve / Feedback / Skip buttons. It stops at the cart — the user
+finishes checkout in the Giant web app — and folds feedback back into
+the KG (e.g. "skip salmon next time" → `dislikes.md`).
