@@ -16,6 +16,7 @@ pub mod ingest;
 pub mod prompt;
 pub mod reasoner;
 pub mod resolve;
+pub mod secret_loader;
 pub mod trigger;
 
 pub use decision::{Decision, DecisionKind};
