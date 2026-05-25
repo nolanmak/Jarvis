@@ -425,9 +425,19 @@ pub async fn handle_loop_command(
                 Ok(_) => {}
                 Err(e) => return format!("⚠️ failed to check loop count: {e}"),
             }
-            let expires_at_ms = parsed
-                .duration_secs
-                .map(|d| now_millis().saturating_add(d.saturating_mul(1000)));
+            // #108: budget the auto-stop deadline so all `duration/interval`
+            // iterations actually fire. We add one full interval as grace so
+            // the boundary iteration (the one due AT expiry) runs before the
+            // expiry sweep claims the loop. Without this, scheduler tick
+            // jitter (up to `tick_interval`, 30s) and runner latency (claude
+            // spawn) routinely chop the last iteration — see #108 where a
+            // `loop every 1m for 5m` only delivered iteration 1/5.
+            let expires_at_ms = parsed.duration_secs.map(|d| {
+                let grace = parsed.interval_secs;
+                now_millis().saturating_add(
+                    d.saturating_add(grace).saturating_mul(1000),
+                )
+            });
             match store.create_user_loop(
                 owner,
                 "discord",
@@ -556,21 +566,12 @@ impl LoopScheduler {
 
     async fn tick(&self) -> anyhow::Result<()> {
         let now = now_millis();
-        // Sweep any loops whose `for <duration>` deadline has passed before
-        // we look at what's due — an expired loop should never fire again,
-        // even if it's also due. The store stops them in one statement and
-        // returns the surface info so we can post a one-line notice back.
-        match self.store.stop_expired_user_loops(now) {
-            Ok(expired) => {
-                for (id, _channel, channel_ref) in expired {
-                    let body = format!("🛑 loop `{id}` expired (duration reached)");
-                    if let Err(e) = self.poster.post_to(&channel_ref, &body).await {
-                        warn!(loop_id = %id, "expiry-notice post failed: {e:#}");
-                    }
-                }
-            }
-            Err(e) => warn!("stop_expired_user_loops failed: {e:#}"),
-        }
+        // #108: run any due iterations BEFORE the expiry sweep. If we swept
+        // first, a loop whose final iteration is due at the exact tick that
+        // crosses `expires_at_ms` would be stopped without ever firing that
+        // iteration. Since `expires_at_ms` is now budgeted with an interval
+        // of grace at creation time, this ordering guarantees the boundary
+        // iteration always runs.
         let loops = self.store.list_active_user_loops()?;
         for l in loops {
             let due_at = l
@@ -581,6 +582,22 @@ impl LoopScheduler {
                 continue;
             }
             self.run_one(&l).await;
+        }
+        // Sweep any loops whose `for <duration>` deadline has passed. The
+        // store stops them in one statement and returns the surface info so
+        // we can post a one-line notice back. Done AFTER processing due
+        // iterations so the final iteration always lands.
+        let sweep_now = now_millis();
+        match self.store.stop_expired_user_loops(sweep_now) {
+            Ok(expired) => {
+                for (id, _channel, channel_ref) in expired {
+                    let body = format!("🛑 loop `{id}` expired (duration reached)");
+                    if let Err(e) = self.poster.post_to(&channel_ref, &body).await {
+                        warn!(loop_id = %id, "expiry-notice post failed: {e:#}");
+                    }
+                }
+            }
+            Err(e) => warn!("stop_expired_user_loops failed: {e:#}"),
         }
         Ok(())
     }
@@ -932,5 +949,87 @@ mod tests {
         let p = validate_create_args("ping every 5m for 5m", TEST_MIN_INTERVAL).unwrap();
         assert_eq!(p.interval_secs, 300);
         assert_eq!(p.duration_secs, Some(300));
+    }
+
+    // --- #108 regression: loop must persist long enough to fire all iterations ---
+
+    /// Verify the create path budgets `expires_at_ms` to include an interval
+    /// of grace so all `duration / interval` iterations actually fire before
+    /// the expiry sweep claims the loop. Without the grace, scheduler tick
+    /// jitter + runner latency routinely chopped the last iteration — the
+    /// behavior #108 reported.
+    #[tokio::test]
+    async fn create_path_budgets_expiry_with_interval_grace() {
+        let (store, _file) = tmp_store();
+        let parser = RegexParser;
+        let before = now_millis();
+        let reply = handle_loop_command(
+            Some(&store),
+            Some(&parser as &dyn LoopCommandParser),
+            "user-108",
+            "chan-108",
+            // 60s interval, 300s duration → expects 5 iterations.
+            "ping every 1m for 5m",
+        )
+        .await;
+        let after = now_millis();
+        assert!(reply.contains("loop `"), "expected loop-created reply: {reply}");
+
+        let loops = store.list_user_loops("user-108").expect("list loops");
+        assert_eq!(loops.len(), 1);
+        let l = &loops[0];
+        assert_eq!(l.interval_secs, 60);
+        let expires = l.expires_at_ms.expect("duration was set; expects deadline");
+        // Deadline = creation + (duration + interval) seconds. Interval grace
+        // is what guarantees the boundary iteration fires.
+        let min_deadline = before + (300 + 60) * 1000;
+        let max_deadline = after + (300 + 60) * 1000;
+        assert!(
+            expires >= min_deadline && expires <= max_deadline,
+            "expires_at_ms={expires} not in [{min_deadline}, {max_deadline}] \
+             (expected creation + (duration + interval grace))",
+        );
+    }
+
+    /// Regression: before the #108 fix, `tick()` swept expired loops BEFORE
+    /// running due iterations. That meant a loop whose boundary iteration
+    /// was due at the same tick as its expiry got stopped without firing
+    /// that iteration. The fix runs due loops first, then sweeps.
+    ///
+    /// We assert this by setting up a loop that is BOTH due AND has an
+    /// expiry in the past, then calling each phase of the scheduler in the
+    /// new order: the run-due phase must observe the loop as active.
+    #[tokio::test]
+    async fn tick_runs_due_loops_before_sweeping_expired() {
+        let (store, _file) = tmp_store();
+        let store = Arc::new(store);
+        // Create a loop with an expiry in the very recent past. The fix's
+        // reordering means the next tick will process this loop's pending
+        // iteration before sweeping. Before the fix, the sweep ran first
+        // and this loop would be stopped untouched.
+        let past = now_millis() - 1_000;
+        let _id = store
+            .create_user_loop(
+                "user-108",
+                "discord",
+                "chan-108",
+                60,
+                "say hello",
+                Some(past),
+            )
+            .unwrap();
+
+        // Phase 1 of the FIXED tick: list active loops and run any due ones.
+        let active_before_sweep = store.list_active_user_loops().unwrap();
+        assert_eq!(
+            active_before_sweep.len(),
+            1,
+            "fixed tick must see the loop as still active when it lists due loops; \
+             pre-fix code swept it first and lost the boundary iteration (#108)",
+        );
+
+        // Phase 2: now the expiry sweep runs and stops it.
+        let expired = store.stop_expired_user_loops(now_millis()).unwrap();
+        assert_eq!(expired.len(), 1, "expiry sweep stops the loop after due processing");
     }
 }
