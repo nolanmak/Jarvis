@@ -74,7 +74,7 @@ Contents:
 $(cd "$STAGING" && find . -type f | sed 's|^\./|  |' | sort)
 
 Restore on the target machine:
-  1. Clone this repo: git clone https://github.com/nolanmak/AugmentAgent.git
+  1. Clone this repo: git clone https://github.com/nolanmak/MyAgentAssistant.git AugmentAgent
   2. cd AugmentAgent
   3. ./scripts/migrate-import.sh <path-to-this-tarball>
   4. Copy .env over separately (secure channel — Tailscale file cp, AirDrop, 1Password, etc.)
