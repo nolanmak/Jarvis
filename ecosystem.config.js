@@ -20,6 +20,16 @@ module.exports = {
       max_restarts: 5,
     },
     {
+      name: "fetch-sidecar",
+      script: "dist/index.js",
+      cwd: "sidecars/fetch",
+      watch: false,
+      env: { NODE_ENV: "production" },
+      max_memory_restart: "1G",
+      min_uptime: "30s",
+      max_restarts: 5,
+    },
+    {
       name: "grocery-weekly",
       script: "scripts/grocery-weekly.mjs",
       // PM2 cron: every Sunday at 10:00 local. Posts "order groceries for
