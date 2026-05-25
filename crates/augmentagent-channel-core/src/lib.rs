@@ -13,6 +13,7 @@ pub mod decision;
 pub mod engagement;
 pub mod governor;
 pub mod ingest;
+pub mod mcp;
 pub mod prompt;
 pub mod reasoner;
 pub mod resolve;
@@ -34,6 +35,7 @@ pub use governor::{
     Permit, Platform, RateCaps, RateGovernor, RateLimit, Risk, SqliteGovernor, SystemClock,
     TargetAttrs, WindowedCounter, RATE_TABLE,
 };
+pub use mcp::{default_mcp_config_path, McpConfig, McpServerConfig};
 pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerOpts};
 pub use trigger::{
     kind as work_item_kind, ChannelRunner, DigestSource, FriendFeedSource, FriendFeedTrigger,
