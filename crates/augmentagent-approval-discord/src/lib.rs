@@ -19,7 +19,7 @@ mod surface;
 mod presets;
 
 pub use broker::{DiscordApprovalBroker, DiscordConfig};
-pub use event_handler::chunk_for_discord;
+pub use event_handler::{chunk_for_discord, post_invoice_draft_card};
 // #35 Phase 5: the email channel appends the needs-input marker to the
 // persisted draft via this; the card decodes it on render. `NeedsInput` is
 // re-exported for the channel/test surface.
@@ -144,6 +144,44 @@ impl ApprovalBroker for NoopBroker {
     ) -> Result<(), ApprovalError> {
         Ok(())
     }
+}
+
+/// Bridge into the weekly Orchid invoice flow (lives in `augmentagent-cli`).
+/// The discord crate depends on this trait, the cli depends on the discord
+/// crate and implements the trait — keeps the python-shell + config-read
+/// logic in a single place (`cli::invoice`) while letting the discord
+/// event handler drive Approve / Reject without a circular dep.
+///
+/// Both methods refer to a Sun→Sun billing window keyed by its closing
+/// Sunday; the implementation reads recipient / counter / sending-entity
+/// from the shared store.
+#[async_trait]
+pub trait InvoiceOps: Send + Sync {
+    /// Generate the PDF for the given closing Sunday (defaults to the most
+    /// recent Sunday when None). Returns `(number, pdf_path, week_start)`.
+    async fn draft_pdf(
+        &self,
+        week_end: Option<chrono::NaiveDate>,
+    ) -> anyhow::Result<InvoiceDraftPdf>;
+
+    /// Real-send path. Calls the same code path as `augmentagent invoice run
+    /// --dry-run false`: emails the PDF, advances the counter, records the
+    /// billed week.
+    async fn send(
+        &self,
+        week_end: chrono::NaiveDate,
+    ) -> anyhow::Result<String>;
+}
+
+/// What [`InvoiceOps::draft_pdf`] returns: enough to post a Discord card
+/// (PDF path + invoice number + the rendered week window).
+#[derive(Debug, Clone)]
+pub struct InvoiceDraftPdf {
+    pub number: u32,
+    pub week_start: chrono::NaiveDate,
+    pub week_end: chrono::NaiveDate,
+    pub pdf_path: std::path::PathBuf,
+    pub recipient: String,
 }
 
 /// Executes the user's button click against the product side (gmail send /

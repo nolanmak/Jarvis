@@ -703,7 +703,7 @@ export function setInvoiceConfig(key: string, value: string): void {
 }
 
 export interface InvoiceSettings {
-  autoSendEnabled: boolean;
+  autoDraftEnabled: boolean;
   recipientEmail: string;
   nextNumber: number;
   fromEntity: string;
@@ -714,7 +714,7 @@ export interface InvoiceSettings {
  *  would, so the UI is coherent even before the daemon has migrated. */
 export function getInvoiceSettings(): InvoiceSettings {
   return {
-    autoSendEnabled: getInvoiceConfig("auto_send_enabled") === "true",
+    autoDraftEnabled: getInvoiceConfig("auto_draft_enabled") === "true",
     recipientEmail: getInvoiceConfig("recipient_email") || "",
     nextNumber: parseInt(getInvoiceConfig("invoice_counter") || "35", 10) || 35,
     fromEntity: getInvoiceConfig("from_entity") || "",
