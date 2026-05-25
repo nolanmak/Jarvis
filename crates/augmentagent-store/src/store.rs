@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
-    ConnectionRequestRow, DriveAccount, Email, FriendWatch, LearnedPattern,
+    ConnectionRequestRow, DriveAccount, Email, FriendWatch, InvoiceDraft, LearnedPattern,
     LinkedInConnectionSync, OwnPost, PhoneIdentity, RateAuditRow, RateHalt,
     RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace, SubscriptionMode, TelegramBot,
     ToneExample, ToneProfile, TriageResult, UserLoop, WhatsappDevice,
@@ -419,11 +419,14 @@ impl Store {
         )?;
         // `last_billed_week_end` is seeded to 2026-05-17 — the manual backlog
         // (#29-#34) covered through that Sunday, so on a fresh db the first
-        // automated send is the NEXT Sunday (05/24 → #35). Prevents an
+        // automated draft is the NEXT Sunday (05/24 → #35). Prevents an
         // immediate duplicate of the already-billed 05/10–05/17 week.
-        // `auto_send_enabled` is the master kill switch — seeded 'false' so a
-        // fresh deploy NEVER auto-sends until it's explicitly turned on
-        // (dashboard / `!invoice autosend on` / `invoice set-auto-send`).
+        // `auto_draft_enabled` is the master kill switch for the Sunday
+        // scheduler — seeded 'false' so a fresh deploy NEVER auto-drafts
+        // (and therefore never queues a human Approve) until it's explicitly
+        // turned on (dashboard / `!invoice autodraft on` / `invoice
+        // set-auto-draft`). The earlier `auto_send_enabled` row is left
+        // untouched on existing dbs and simply ignored by the new flow.
         // INSERT OR IGNORE is per-row, so existing deployed dbs that already
         // have the other keys still pick up this new row as 'false'.
         conn.execute(
@@ -432,8 +435,35 @@ impl Store {
                  ('invoice_counter', '35', ?1),\
                  ('from_entity', '', ?1),\
                  ('last_billed_week_end', '2026-05-17', ?1),\
-                 ('auto_send_enabled', 'false', ?1)",
+                 ('auto_draft_enabled', 'false', ?1)",
             params![now_millis()],
+        )?;
+        // Human-in-the-loop invoice approval surface. One row per posted
+        // draft (manual `!invoice draft` or Sunday auto-draft). `week_end`
+        // is UNIQUE — used as the idempotency key so the scheduler can't
+        // double-post a draft for the same Sunday. The Discord
+        // channel/message ids are populated after the post succeeds so the
+        // Approve/Reject buttons can edit the source card. `status` walks
+        // `pending → approved | rejected | failed`.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS invoice_drafts (\
+                 id                  TEXT PRIMARY KEY,\
+                 week_end            TEXT NOT NULL UNIQUE,\
+                 invoice_number      INTEGER NOT NULL,\
+                 pdf_path            TEXT NOT NULL,\
+                 discord_channel_id  TEXT,\
+                 discord_message_id  TEXT,\
+                 status              TEXT NOT NULL DEFAULT 'pending',\
+                 created_at          INTEGER NOT NULL,\
+                 resolved_at         INTEGER,\
+                 resolved_by         TEXT\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_invoice_drafts_status \
+                ON invoice_drafts(status)",
+            [],
         )?;
 
         // ----------------------------------------------------------------
@@ -2714,6 +2744,119 @@ impl Store {
             .get_invoice_config("invoice_counter")?
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(35))
+    }
+
+    /// Insert a fresh invoice draft row. Returns the generated id (UUID).
+    /// `week_end` is UNIQUE so a duplicate insert for the same Sunday is a
+    /// sqlite constraint violation — callers that care about idempotency
+    /// should check [`get_pending_invoice_draft_for_week`] first.
+    pub fn insert_invoice_draft(
+        &self,
+        week_end: &str,
+        invoice_number: u32,
+        pdf_path: &str,
+    ) -> StoreResult<String> {
+        let id = Uuid::new_v4().to_string();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO invoice_drafts \
+                 (id, week_end, invoice_number, pdf_path, status, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+            params![id, week_end, invoice_number as i64, pdf_path, now_millis()],
+        )?;
+        Ok(id)
+    }
+
+    pub fn get_invoice_draft(&self, id: &str) -> StoreResult<Option<InvoiceDraft>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT id, week_end, invoice_number, pdf_path, \
+                        discord_channel_id, discord_message_id, status, \
+                        created_at, resolved_at, resolved_by \
+                 FROM invoice_drafts WHERE id = ?1",
+                params![id],
+                |r| Ok(InvoiceDraft {
+                    id: r.get(0)?,
+                    week_end: r.get(1)?,
+                    invoice_number: r.get(2)?,
+                    pdf_path: r.get(3)?,
+                    discord_channel_id: r.get(4)?,
+                    discord_message_id: r.get(5)?,
+                    status: r.get(6)?,
+                    created_at: r.get(7)?,
+                    resolved_at: r.get(8)?,
+                    resolved_by: r.get(9)?,
+                }),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Sunday-scheduler idempotency guard: is there already a pending draft
+    /// for this week? If yes, the scheduler short-circuits the post.
+    pub fn get_pending_invoice_draft_for_week(
+        &self,
+        week_end: &str,
+    ) -> StoreResult<Option<InvoiceDraft>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT id, week_end, invoice_number, pdf_path, \
+                        discord_channel_id, discord_message_id, status, \
+                        created_at, resolved_at, resolved_by \
+                 FROM invoice_drafts \
+                 WHERE week_end = ?1 AND status = 'pending'",
+                params![week_end],
+                |r| Ok(InvoiceDraft {
+                    id: r.get(0)?,
+                    week_end: r.get(1)?,
+                    invoice_number: r.get(2)?,
+                    pdf_path: r.get(3)?,
+                    discord_channel_id: r.get(4)?,
+                    discord_message_id: r.get(5)?,
+                    status: r.get(6)?,
+                    created_at: r.get(7)?,
+                    resolved_at: r.get(8)?,
+                    resolved_by: r.get(9)?,
+                }),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Stamp the Discord channel + message ids after the draft card posts.
+    pub fn update_invoice_draft_message(
+        &self,
+        id: &str,
+        channel_id: &str,
+        message_id: &str,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE invoice_drafts \
+                 SET discord_channel_id = ?2, discord_message_id = ?3 \
+             WHERE id = ?1",
+            params![id, channel_id, message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Walk a draft to a terminal state and record who clicked the button.
+    pub fn mark_invoice_draft_resolved(
+        &self,
+        id: &str,
+        status: &str,
+        resolved_by: &str,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE invoice_drafts \
+                 SET status = ?2, resolved_at = ?3, resolved_by = ?4 \
+             WHERE id = ?1",
+            params![id, status, now_millis(), resolved_by],
+        )?;
+        Ok(())
     }
 
     /// Atomically take the current invoice number and advance the counter.
@@ -6824,5 +6967,89 @@ mod tests {
                 "missing Node-owned base table '{t}' after re-open. Present: {tables:?}",
             );
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // invoice_drafts CRUD (human-in-the-loop weekly invoice flow).
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn invoice_draft_insert_and_fetch_by_id() {
+        let (s, _f) = fresh_store();
+        let id = s
+            .insert_invoice_draft("2026-05-24", 35, "/tmp/invoices/Orchid_Invoice_35.pdf")
+            .unwrap();
+        let row = s.get_invoice_draft(&id).unwrap().expect("draft present");
+        assert_eq!(row.week_end, "2026-05-24");
+        assert_eq!(row.invoice_number, 35);
+        assert_eq!(row.status, "pending");
+        assert!(row.resolved_at.is_none());
+        assert!(row.resolved_by.is_none());
+        assert!(row.discord_message_id.is_none());
+    }
+
+    #[test]
+    fn invoice_draft_week_end_is_unique() {
+        let (s, _f) = fresh_store();
+        s.insert_invoice_draft("2026-05-24", 35, "/p1.pdf").unwrap();
+        let err = s
+            .insert_invoice_draft("2026-05-24", 36, "/p2.pdf")
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").to_lowercase().contains("unique"),
+            "expected UNIQUE violation, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn pending_lookup_only_matches_pending_status() {
+        let (s, _f) = fresh_store();
+        let id = s
+            .insert_invoice_draft("2026-05-24", 35, "/p.pdf")
+            .unwrap();
+        assert!(s
+            .get_pending_invoice_draft_for_week("2026-05-24")
+            .unwrap()
+            .is_some());
+        s.mark_invoice_draft_resolved(&id, "rejected", "u1").unwrap();
+        assert!(s
+            .get_pending_invoice_draft_for_week("2026-05-24")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn update_invoice_draft_message_persists_channel_and_message() {
+        let (s, _f) = fresh_store();
+        let id = s
+            .insert_invoice_draft("2026-05-24", 35, "/p.pdf")
+            .unwrap();
+        s.update_invoice_draft_message(&id, "111", "222").unwrap();
+        let row = s.get_invoice_draft(&id).unwrap().unwrap();
+        assert_eq!(row.discord_channel_id.as_deref(), Some("111"));
+        assert_eq!(row.discord_message_id.as_deref(), Some("222"));
+    }
+
+    #[test]
+    fn mark_invoice_draft_resolved_walks_status_and_stamps_resolver() {
+        let (s, _f) = fresh_store();
+        let id = s
+            .insert_invoice_draft("2026-05-24", 35, "/p.pdf")
+            .unwrap();
+        s.mark_invoice_draft_resolved(&id, "approved", "user-9999")
+            .unwrap();
+        let row = s.get_invoice_draft(&id).unwrap().unwrap();
+        assert_eq!(row.status, "approved");
+        assert!(row.resolved_at.is_some());
+        assert_eq!(row.resolved_by.as_deref(), Some("user-9999"));
+    }
+
+    #[test]
+    fn auto_draft_enabled_seeded_off() {
+        let (s, _f) = fresh_store();
+        assert_eq!(
+            s.get_invoice_config("auto_draft_enabled").unwrap().as_deref(),
+            Some("false")
+        );
     }
 }

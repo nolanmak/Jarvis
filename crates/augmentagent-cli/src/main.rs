@@ -11,7 +11,8 @@ use tracing::{info, warn};
 
 use augmentagent_approval_discord::{
     ApprovalActionHandler, ApprovalActionOutcome, ApprovalBroker, DiscordApprovalBroker,
-    DiscordConfig, LoopPoster, LoopRunner, LoopScheduler, NoopBroker, QueryHandler,
+    DiscordConfig, InvoiceDraftPdf, InvoiceOps, LoopPoster, LoopRunner, LoopScheduler, NoopBroker,
+    QueryHandler,
 };
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
@@ -565,16 +566,25 @@ enum InvoiceOp {
         #[arg(long)]
         entity: String,
     },
-    /// Master kill switch for the weekly scheduler. Seeded OFF — the
-    /// scheduler never auto-sends until this is explicitly turned on.
-    SetAutoSend {
-        /// true = let the Sunday scheduler send; false = generate-only/no-op.
+    /// Master kill switch for the Sunday auto-draft scheduler. Seeded OFF
+    /// — the scheduler never posts a draft for approval until this is
+    /// explicitly turned on (the human-Approve gate makes auto-send moot).
+    SetAutoDraft {
+        /// true = let the Sunday scheduler post a draft card; false = no-op.
         #[arg(long, action = clap::ArgAction::Set)]
         on: bool,
     },
+    /// Generate the weekly PDF and print where it landed. Doesn't post to
+    /// Discord and doesn't send — for one-off local previews. The Discord
+    /// `!invoice draft` command is the real way to queue an approval.
+    Draft {
+        /// Week-ending Sunday, YYYY-MM-DD. Omit for the most recent Sunday.
+        #[arg(long)]
+        week_end: Option<String>,
+    },
     /// Mark a week (ending Sunday, YYYY-MM-DD) as already billed so the
-    /// scheduler won't (re)send it. Use at cutover: the backlog covered
-    /// through 2026-05-17, so seed that to make the first auto-send 05/24.
+    /// scheduler won't (re)draft it. Use at cutover: the backlog covered
+    /// through 2026-05-17, so seed that to make the first auto-draft 05/24.
     MarkBilled {
         #[arg(long)]
         week_end: String,
@@ -1999,9 +2009,36 @@ async fn main() -> Result<()> {
                 tasks.push(tokio::spawn(async move { nudge_for_task.run(sd).await }));
 
                 // Weekly Orchid invoice scheduler — Sundays only, idempotent.
-                // Gated on !dry_run for the same reason as nudge: it performs
-                // a real outbound send.
-                let inv = Arc::new(invoice::InvoiceScheduler::new(Arc::clone(&store)));
+                // Gated on !dry_run for the same reason as nudge. Now posts a
+                // human-approval draft (PDF + Approve/Reject buttons) instead
+                // of sending directly; the click handler does the send. The
+                // poster is None when the bot token / channel id aren't
+                // configured — auto_draft_enabled then has nowhere to dispatch
+                // to, so the scheduler logs and skips.
+                let poster: Option<Arc<dyn invoice::InvoiceDraftPoster>> = match (
+                    std::env::var("DISCORD_BOT_TOKEN").ok(),
+                    std::env::var("DISCORD_CHANNEL_ID")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok()),
+                ) {
+                    (Some(token), Some(cid)) => {
+                        let http = Arc::new(serenity::http::Http::new(&token));
+                        let ops: Arc<dyn InvoiceOps> = Arc::new(CliInvoiceOps {
+                            store: Arc::clone(&store),
+                        });
+                        Some(Arc::new(DiscordInvoicePoster {
+                            store: Arc::clone(&store),
+                            ops,
+                            http,
+                            approval_channel: serenity::all::ChannelId::new(cid),
+                        }))
+                    }
+                    _ => None,
+                };
+                let inv = Arc::new(invoice::InvoiceScheduler::new(
+                    Arc::clone(&store),
+                    poster,
+                ));
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { inv.run(sd).await }));
 
@@ -2287,11 +2324,11 @@ async fn main() -> Result<()> {
                     let w = g("last_billed_week_end");
                     if w.is_empty() { "(never)".into() } else { w }
                 });
-                println!("auto_send_enabled   : {}", {
-                    if g("auto_send_enabled") == "true" {
+                println!("auto_draft_enabled  : {}", {
+                    if g("auto_draft_enabled") == "true" {
                         "ON"
                     } else {
-                        "OFF (scheduler will not send)"
+                        "OFF (scheduler will not post drafts)"
                     }
                 });
                 Ok(())
@@ -2306,11 +2343,36 @@ async fn main() -> Result<()> {
                 println!("invoice sending entity set to {entity}");
                 Ok(())
             }
-            InvoiceOp::SetAutoSend { on } => {
-                store.set_invoice_config("auto_send_enabled", if *on { "true" } else { "false" })?;
+            InvoiceOp::SetAutoDraft { on } => {
+                store.set_invoice_config(
+                    "auto_draft_enabled",
+                    if *on { "true" } else { "false" },
+                )?;
                 println!(
-                    "invoice auto-send {}",
-                    if *on { "ENABLED — scheduler will send on Sundays" } else { "DISABLED" }
+                    "invoice auto-draft {}",
+                    if *on {
+                        "ENABLED — Sunday scheduler will post a draft for approval"
+                    } else {
+                        "DISABLED"
+                    }
+                );
+                Ok(())
+            }
+            InvoiceOp::Draft { week_end } => {
+                let we = match week_end {
+                    Some(s) => Some(
+                        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                            .context("--week-end must be YYYY-MM-DD")?,
+                    ),
+                    None => None,
+                };
+                let pdf = invoice::generate_pdf(&store, we).await?;
+                println!(
+                    "invoice #{} {}→{} drafted (PDF: {}) — post via Discord `!invoice draft` to queue for approval",
+                    pdf.number,
+                    pdf.week_start,
+                    pdf.week_end,
+                    pdf.pdf_path.display()
                 );
                 Ok(())
             }
@@ -4283,6 +4345,62 @@ impl LoopPoster for DiscordLoopPoster {
     }
 }
 
+/// Bridge into invoice.rs: thin shim implementing the discord crate's
+/// [`InvoiceOps`] trait so the !invoice draft command + Approve button can
+/// reach into PDF generation and the real-send path without the discord
+/// crate taking a cli dep.
+struct CliInvoiceOps {
+    store: Arc<Store>,
+}
+
+#[async_trait]
+impl InvoiceOps for CliInvoiceOps {
+    async fn draft_pdf(
+        &self,
+        week_end: Option<chrono::NaiveDate>,
+    ) -> anyhow::Result<InvoiceDraftPdf> {
+        let g = invoice::generate_pdf(&self.store, week_end).await?;
+        Ok(InvoiceDraftPdf {
+            number: g.number,
+            week_start: g.week_start,
+            week_end: g.week_end,
+            pdf_path: g.pdf_path,
+            recipient: g.recipient,
+        })
+    }
+
+    async fn send(&self, week_end: chrono::NaiveDate) -> anyhow::Result<String> {
+        invoice::run_invoice(&self.store, Some(week_end), false).await
+    }
+}
+
+/// Bridge for the Sunday scheduler: calls the same `post_invoice_draft_card`
+/// path the manual `!invoice draft` command uses, so behaviour is identical.
+struct DiscordInvoicePoster {
+    store: Arc<Store>,
+    ops: Arc<dyn InvoiceOps>,
+    http: Arc<serenity::http::Http>,
+    approval_channel: serenity::all::ChannelId,
+}
+
+#[async_trait]
+impl invoice::InvoiceDraftPoster for DiscordInvoicePoster {
+    async fn dispatch_draft(
+        &self,
+        week_end: chrono::NaiveDate,
+    ) -> anyhow::Result<String> {
+        let reply = augmentagent_approval_discord::post_invoice_draft_card(
+            &self.store,
+            self.ops.as_ref(),
+            &self.http,
+            self.approval_channel,
+            Some(&week_end.to_string()),
+        )
+        .await;
+        Ok(reply)
+    }
+}
+
 /// Executes Approve / Revise / Skip clicks against sqlite + Composio +
 /// reasoner. Backed entirely by the persistent action row — no in-memory
 /// state — so cards remain valid across daemon restarts and indefinitely.
@@ -5282,6 +5400,9 @@ async fn build_broker(
     // the `!invoice` config command and #37 Revise-triple capture.
     let invoice_store = Arc::clone(&store);
     let store_for_broker = Arc::clone(&store);
+    let invoice_ops: Arc<dyn InvoiceOps> = Arc::new(CliInvoiceOps {
+        store: Arc::clone(&store),
+    });
     let approver = Arc::new(ReplyApprover {
         store,
         gmail,
@@ -5310,6 +5431,7 @@ async fn build_broker(
         query_handler,
         action_handler: Some(approver_for_broker),
         invoice_store: Some(invoice_store),
+        invoice_ops: Some(invoice_ops),
         store: Some(store_for_broker),
         loop_parser,
     })
