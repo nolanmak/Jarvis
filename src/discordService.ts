@@ -329,3 +329,114 @@ export async function sendForApproval(
     });
   });
 }
+
+
+// ── Generic cart-style approval ──────────────────────────────────────────
+//
+// Used by the grocery tool. A simpler shape than the email flow: post a
+// title + markdown body in a thread, render Approve / Skip / Feedback
+// buttons. Feedback opens a modal whose text is captured into the result
+// so the agent can fold it back into the knowledge graph.
+
+export interface CartApprovalResult {
+  approved: boolean;
+  feedback: string;
+}
+
+function buildCartButtons(): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId("cart_approve").setLabel("Approve & Checkout").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId("cart_feedback").setLabel("Feedback").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("cart_skip").setLabel("Skip").setStyle(ButtonStyle.Danger),
+  );
+}
+
+export async function sendCartForApproval(title: string, bodyMd: string): Promise<CartApprovalResult> {
+  if (!isReady) throw new Error("Discord bot is not initialized. Call initBot() first.");
+  const channelId = process.env.DISCORD_CHANNEL_ID;
+  if (!channelId) throw new Error("DISCORD_CHANNEL_ID is not set");
+
+  const channel = await client.channels.fetch(channelId);
+  if (!channel || !(channel instanceof TextChannel)) {
+    throw new Error(`Channel ${channelId} not found or is not a text channel`);
+  }
+
+  const thread = await channel.threads.create({
+    name: title.slice(0, 100),
+    autoArchiveDuration: 60,
+  });
+
+  await thread.send({ content: `**${title}**` });
+  await thread.send({ content: bodyMd, components: [buildCartButtons()] });
+
+  return new Promise<CartApprovalResult>((resolve) => {
+    const TIMEOUT_MS = 6 * 60 * 60 * 1000;
+    let settled = false;
+    let feedback = "";
+
+    function settle(r: CartApprovalResult) {
+      if (settled) return;
+      settled = true;
+      resolve(r);
+    }
+
+    const timeout = setTimeout(async () => {
+      if (settled) return;
+      await thread.send({ content: "**Timed out** — cart left as-is, no checkout." });
+      settle({ approved: false, feedback });
+    }, TIMEOUT_MS);
+
+    const collector = thread.createMessageComponentCollector({
+      componentType: ComponentType.Button,
+      time: TIMEOUT_MS,
+    });
+
+    collector.on("collect", async (interaction: ButtonInteraction) => {
+      if (settled) return;
+      switch (interaction.customId) {
+        case "cart_approve": {
+          await interaction.update({ content: bodyMd + "\n\n**APPROVED** — proceed to checkout.", components: [] });
+          clearTimeout(timeout);
+          collector.stop();
+          settle({ approved: true, feedback });
+          break;
+        }
+        case "cart_skip": {
+          await interaction.update({ content: bodyMd + "\n\n**SKIPPED** — no checkout.", components: [] });
+          clearTimeout(timeout);
+          collector.stop();
+          settle({ approved: false, feedback });
+          break;
+        }
+        case "cart_feedback": {
+          const modalId = `cart_feedback_modal_${Date.now()}`;
+          const modal = new ModalBuilder().setCustomId(modalId).setTitle("Feedback for next time");
+          const input = new TextInputBuilder()
+            .setCustomId("feedback")
+            .setLabel("e.g. 'skip salmon', 'try a different brand'")
+            .setStyle(TextInputStyle.Paragraph)
+            .setRequired(true);
+          modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+          await interaction.showModal(modal);
+          try {
+            const submit = await interaction.awaitModalSubmit({
+              filter: (i) => i.customId === modalId,
+              time: 5 * 60 * 1000,
+            });
+            feedback = submit.fields.getTextInputValue("feedback");
+            await submit.deferUpdate();
+            await thread.send({ content: `*Captured feedback:* ${feedback}` });
+          } catch {
+            await thread.send({ content: "*Feedback modal timed out.*" });
+          }
+          break;
+        }
+      }
+    });
+
+    collector.on("end", () => {
+      clearTimeout(timeout);
+      if (!settled) settle({ approved: false, feedback });
+    });
+  });
+}
