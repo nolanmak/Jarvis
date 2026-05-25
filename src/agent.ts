@@ -20,6 +20,8 @@ import { extractEmailAddress } from "./types";
 import type { Email } from "./types";
 import { grocery as grocerySidecar } from "./grocerySidecar";
 import { kgList, kgRead, kgWrite, kgAppend, recordOrder, type OrderRecord } from "./groceryKg";
+import { webFetch as fetchSidecar, type LayerId } from "./fetchSidecar";
+import { intercept as runIntercept, interceptAvailable, type InterceptParams } from "./interceptTool";
 
 dotenv.config();
 
@@ -444,7 +446,106 @@ For each email provided:
 6. Report a brief summary: X emails checked, Y skipped, Z drafted, W sent`;
 }
 
-const agentTools: Tool[] = [gmailTool, notifyTool, meetupTool, groceryTool];
+const webFetchTool = (tool as any)({
+  name: "web_fetch",
+  description: `Fetch a URL and return rendered markdown. Tries strategies in order:
+1. plain HTTPS (fastest, free)
+2. headless Chromium render (handles JS-rendered SPAs)
+3. Firecrawl API (if FIRECRAWL_API_KEY set) — fallback for sites where local render fails
+4. Bright Data Unlocker (if BRIGHTDATA_API_KEY + BRIGHTDATA_ZONE set) — final fallback for anti-bot / captcha sites
+
+Layers without configured API keys are skipped automatically. Use this for any URL fetch — do NOT make raw HTTP calls.
+
+params:
+- url (required): the URL to fetch
+- layers (optional): subset of ["http","render","firecrawl","brightdata"] to restrict to specific layers
+- force_render (optional): true to skip plain HTTP and start at the render layer
+- min_quality_chars (optional, default 400): if returned markdown is shorter, the next layer is tried
+- timeout_ms (optional, default 90000): per-layer timeout
+- include_html (optional): include raw HTML in response (default: no)
+
+returns: { url, final_url, status, title, markdown, layer_used, attempts: [...], elapsed_ms }`,
+  parameters: z.object({
+    url: z.string(),
+    layers: z.array(z.enum(["http", "render", "firecrawl", "brightdata"])).optional(),
+    force_render: z.boolean().optional(),
+    min_quality_chars: z.number().int().positive().optional(),
+    timeout_ms: z.number().int().positive().optional(),
+    include_html: z.boolean().optional(),
+  }),
+  execute: async (input: {
+    url: string;
+    layers?: LayerId[];
+    force_render?: boolean;
+    min_quality_chars?: number;
+    timeout_ms?: number;
+    include_html?: boolean;
+  }) => {
+    try {
+      const layers: LayerId[] | undefined = input.force_render
+        ? (input.layers ?? ["render", "firecrawl", "brightdata"])
+        : input.layers;
+      const r = await fetchSidecar.fetch({
+        url: input.url,
+        layers,
+        min_quality_chars: input.min_quality_chars,
+        timeout_ms: input.timeout_ms,
+      });
+      return JSON.stringify({
+        url: r.url,
+        final_url: r.final_url,
+        status: r.status,
+        title: r.title,
+        markdown: r.markdown,
+        ...(input.include_html ? { html: r.html } : {}),
+        layer_used: r.layer_used,
+        attempts: r.attempts,
+        elapsed_ms: r.elapsed_ms,
+      });
+    } catch (err: any) {
+      return JSON.stringify({ error: err?.message ?? String(err), kind: err?.kind });
+    }
+  },
+}) as Tool;
+
+const interceptTool = (tool as any)({
+  name: "intercept",
+  description: `Query the local Claude Intercept MITM proxy (port 7777) to inspect captured HTTP/S traffic. Useful for:
+- API discovery on sites with no public docs (capture a real browser session, then read the requests)
+- Auth extraction (pull Bearer tokens / cookies / API keys from a live session)
+- Debugging failed scrapes (compare what curl sees vs what a real browser sent)
+
+This is a local-only tool. Returns proxy state or captured traffic; never sends data to remote services.
+
+Actions:
+- status: is the proxy running, how many requests captured
+- start: start the proxy (port 7777) without opening the dashboard
+- stop: stop the proxy
+- clear: delete all captured traffic
+- cert: print the path to the CA certificate (needed for cert install on devices)
+- export: dump captured traffic. params: { mode: "api-docs" | "auth" | "summary" | "full", host?: string, limit?: number }
+
+If the proxy is not installed, the tool reports it cleanly — do not retry.`,
+  parameters: z.object({
+    action: z.enum(["status", "start", "stop", "clear", "cert", "export"]),
+    mode: z.enum(["api-docs", "auth", "summary", "full"]).optional(),
+    host: z.string().optional(),
+    limit: z.number().int().positive().optional(),
+  }),
+  execute: async (input: InterceptParams) => {
+    try {
+      if (!interceptAvailable() && input.action !== "status") {
+        return JSON.stringify({ ok: false, error: "Claude Intercept not installed on this machine" });
+      }
+      const r = await runIntercept(input);
+      return JSON.stringify(r);
+    } catch (err: any) {
+      return JSON.stringify({ ok: false, error: err?.message ?? String(err) });
+    }
+  },
+}) as Tool;
+
+const agentTools: Tool[] = [gmailTool, notifyTool, meetupTool, groceryTool, webFetchTool, interceptTool];
 
 function createAgent(model: any, instructions: string = buildInstructions()): Agent {
   return new Agent({
@@ -480,7 +581,13 @@ Keep it concise — title, time, location, link. No descriptions unless asked.
 Use the grocery tool for any request about ordering groceries, the staples list, pantry state, preferences, dislikes, or past orders. Knowledge lives in wiki/groceries/ — always read it before acting and write back what you learn.
 
 ${grocerySkill}
-${groceryLearned}`;
+${groceryLearned}
+
+## Web fetching
+For ANY URL the operator asks you to read, summarize, or pull data from, use the web_fetch tool — never assume a URL's contents or make raw HTTP calls. It tries plain HTTPS first (free), escalates to a headless-Chromium render for JS-rendered SPAs, then to Firecrawl / Bright Data if API keys are configured. If the first response looks like an empty SPA shell or is unexpectedly short, retry with force_render: true. The returned markdown is what you should reason over; cite final_url when surfacing links.
+
+## Intercept (optional, debugging only)
+If a fetch fails repeatedly or you need to discover an undocumented API / extract auth from a captured browser session, use the intercept tool to query the local MITM proxy (status, export with mode "api-docs" | "auth" | "summary" | "full"). Read-only inspection — don't start/stop/clear the proxy unless the operator explicitly asks. If the proxy isn't installed the tool reports it cleanly; don't retry.`;
 }
 
 // --- Run with retry + provider fallback ---
