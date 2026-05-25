@@ -49,6 +49,7 @@ fn opts() -> ReasonerOpts {
         permission_mode: "default".into(),
         cwd: None,
         env: vec![],
+        settings_json: None,
     }
 }
 

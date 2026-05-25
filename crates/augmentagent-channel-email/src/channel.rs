@@ -590,6 +590,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     permission_mode: "default".into(),
                     cwd: None,
                     env: Vec::new(),
+                    settings_json: None,
                 };
                 let message_ctx = MessageContext {
                     channel: "gmail".to_string(),

@@ -234,6 +234,7 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
         permission_mode: "acceptEdits".into(),
         cwd: Some(worktree),
         env: Vec::new(),
+        settings_json: None,
     }
 }
 

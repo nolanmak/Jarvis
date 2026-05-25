@@ -309,6 +309,7 @@ impl<'a> SignatureExtractor<'a> {
             permission_mode: "default".to_string(),
             cwd: None,
             env: vec![],
+            settings_json: None,
         };
 
         for attempt in 0..2 {

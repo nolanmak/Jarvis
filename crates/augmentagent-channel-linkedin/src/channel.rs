@@ -322,6 +322,7 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                     permission_mode: "default".into(),
                     cwd: None,
                     env: Vec::new(),
+                    settings_json: None,
                 };
                 let message_ctx = MessageContext {
                     channel: "linkedin".to_string(),
