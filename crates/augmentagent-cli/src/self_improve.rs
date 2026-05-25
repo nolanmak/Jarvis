@@ -235,6 +235,7 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
         cwd: Some(worktree),
         env: Vec::new(),
         settings_json: None,
+        restrict_env: false,
     }
 }
 

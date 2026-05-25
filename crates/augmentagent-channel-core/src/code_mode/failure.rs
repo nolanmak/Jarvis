@@ -787,6 +787,7 @@ mod tests {
                 cwd: None,
                 env: Vec::new(),
                 settings_json: None,
+                restrict_env: false,
             },
             user_msg: "draft a reply".to_string(),
             manifest: manifest_v1(),

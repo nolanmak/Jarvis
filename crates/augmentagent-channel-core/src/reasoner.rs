@@ -13,6 +13,36 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, warn};
 
+/// Env-var safelist for `restrict_env=true` spawns (see #128).
+///
+/// The spawned `claude` CLI needs these to function:
+///   - `HOME` — locates `~/.claude/credentials.json` (OAuth) and the
+///     Claude Max subscription session cache.
+///   - `PATH` — finds `node`, `gh`, `secret-tool`, and any binaries
+///     the user has installed for tool subcommands.
+///   - `USER` / `LOGNAME` — some libraries identify the running user.
+///   - `TERM` / `LANG` — terminal capability + locale for output.
+///   - `SHELL` — Bash-allowlisted tool invocations honor the user's
+///     shell when claude shells out for command execution.
+///   - `DBUS_SESSION_BUS_ADDRESS` — required for `secret-tool` /
+///     libsecret access on Linux. Without it, keyring fallback in
+///     any sub-CLI breaks.
+///
+/// LC_* and XDG_* are forwarded dynamically (too many names to list).
+const SAFELIST_ENV_VARS: &[&str] = &[
+    "HOME",
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "TERM",
+    "LANG",
+    "SHELL",
+    "DBUS_SESSION_BUS_ADDRESS",
+    // Claude Max + Anthropic-side overrides users set explicitly.
+    "CLAUDE_CLI",
+    "ANTHROPIC_API_KEY",
+];
+
 /// Per-call options for a `Reasoner`. Each call type (triage, draft, ingest)
 /// gets a different preset — see `triage_opts`, `draft_opts`, `ingest_opts`.
 #[derive(Debug, Clone)]
@@ -37,6 +67,16 @@ pub struct ReasonerOpts {
     /// no `--settings` flag is passed and Claude falls back to its
     /// usual settings-source resolution.
     pub settings_json: Option<String>,
+    /// When true, the spawned Claude CLI process's env is **cleared**
+    /// before [`env`](Self::env) is applied, retaining only a small
+    /// safelist of OS essentials (HOME, PATH, USER, TERM, LANG,
+    /// LC_*, XDG_*) so the child can still find its OAuth credentials,
+    /// resolve binaries on PATH, and render TTY output. Used by
+    /// [`ask_opts`] for #128 so the wiki-query agent does NOT
+    /// inherit the daemon's `GROQ_API_KEY`, `CEREBRAS_API_KEY`, etc.
+    /// loaded from `.env` at startup. Default `false` keeps existing
+    /// call sites (triage, draft, ingest) unchanged.
+    pub restrict_env: bool,
 }
 
 /// Trait the channel uses to reach Claude. Test doubles stub this.
@@ -176,6 +216,26 @@ impl Reasoner for ClaudeCliReasoner {
         if let Some(cwd) = &opts.cwd {
             cmd.current_dir(cwd);
         }
+        // #128 — When `restrict_env` is set (wiki-query path), clear the
+        // inherited env and re-add only OS essentials. This prevents the
+        // spawned `claude` CLI (and any sub-CLIs it spawns via the
+        // scoped Bash allowlist) from seeing provider keys the daemon
+        // loaded from `.env` at startup. `opts.env` is then layered on
+        // top with explicit, just-in-time-loaded secrets.
+        if opts.restrict_env {
+            cmd.env_clear();
+            for var in SAFELIST_ENV_VARS {
+                if let Ok(v) = std::env::var(var) {
+                    cmd.env(var, v);
+                }
+            }
+            // Forward LC_*/XDG_* dynamically — there are too many to list.
+            for (k, v) in std::env::vars() {
+                if k.starts_with("LC_") || k.starts_with("XDG_") {
+                    cmd.env(k, v);
+                }
+            }
+        }
         // Forward any extra env vars. These are inherited by any subprocesses
         // Claude spawns (notably `augmentagent gmail search` via the scoped
         // Bash allowlist in `ask_opts`), which is how we carry `AUGMENTAGENT_DB`
@@ -286,6 +346,7 @@ pub fn triage_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         cwd: None,
         env: Vec::new(),
         settings_json: None,
+        restrict_env: false,
     }
 }
 
@@ -305,6 +366,7 @@ pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> Reasoner
         cwd: None,
         env: Vec::new(),
         settings_json: None,
+        restrict_env: false,
     }
 }
 
@@ -318,6 +380,7 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         cwd: None,
         env: Vec::new(),
         settings_json: None,
+        restrict_env: false,
     }
 }
 
@@ -360,6 +423,32 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // baking the absolute path into the JSON.
     let guard_path = repo_root.join("scripts/aa-wiki-scope-guard.sh");
     let settings_json = build_wiki_scope_settings(&guard_path);
+
+    // #128 — Provider secrets are loaded from the Linux Secret Service
+    // just-in-time so the `Read` tool can never exfiltrate them from
+    // `.env` (companion fix to #127's path scoping). We forward only
+    // the keys the wiki-query agent's sub-CLIs actually need:
+    //
+    //   - COMPOSIO_API_KEY — `augmentagent gmail` subcommands.
+    //
+    // GROQ/Cerebras are not consumed by anything the wiki-query agent
+    // can spawn (those are used by the daemon's email-triage path
+    // running in a separate process), so we deliberately do NOT
+    // forward them. Defense in depth: even if scoping breaks, those
+    // keys are not in the agent's env.
+    let mut env: Vec<(String, String)> = vec![
+        (
+            "AUGMENTAGENT_DB".into(),
+            db_path.to_string_lossy().into_owned(),
+        ),
+        // WIKI_ROOT is consumed by `scripts/aa-wiki-scope-guard.sh` to
+        // know which prefix is permitted for file tools.
+        ("WIKI_ROOT".into(), wiki_root.to_string_lossy().into_owned()),
+    ];
+    if let Some(key) = crate::secret_loader::load_provider_key("COMPOSIO_API_KEY") {
+        env.push(("COMPOSIO_API_KEY".into(), key));
+    }
+
     ReasonerOpts {
         system_prompt: include_str!("../../../schema/wiki-ask.md").to_string(),
         model: None, // Opus — quality matters for answer coherence
@@ -387,16 +476,11 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         permission_mode: "acceptEdits".into(),
         // Pin cwd to the wiki so Write/Edit cannot touch the source tree.
         cwd: Some(wiki_root.clone()),
-        env: vec![
-            (
-                "AUGMENTAGENT_DB".into(),
-                db_path.to_string_lossy().into_owned(),
-            ),
-            // WIKI_ROOT is consumed by `scripts/aa-wiki-scope-guard.sh` to
-            // know which prefix is permitted for file tools.
-            ("WIKI_ROOT".into(), wiki_root.to_string_lossy().into_owned()),
-        ],
+        env,
         settings_json: Some(settings_json),
+        // #128 — Clear the spawned process's env so the wiki-query
+        // agent does not inherit secrets from the daemon's `.env`.
+        restrict_env: true,
     }
 }
 
@@ -447,6 +531,7 @@ pub fn digest_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         cwd: None,
         env: Vec::new(),
         settings_json: None,
+        restrict_env: false,
     }
 }
 
@@ -463,6 +548,7 @@ pub fn tone_summarize_opts() -> ReasonerOpts {
         cwd: None,
         env: vec![],
         settings_json: None,
+        restrict_env: false,
     }
 }
 
@@ -484,6 +570,7 @@ pub fn social_adapter_opts(system_prompt: String) -> ReasonerOpts {
         cwd: None,
         env: vec![],
         settings_json: None,
+        restrict_env: false,
     }
 }
 
@@ -525,6 +612,7 @@ Examples:
         cwd: None,
         env: vec![],
         settings_json: None,
+        restrict_env: false,
     }
 }
 
@@ -542,6 +630,7 @@ pub fn archetype_pick_opts() -> ReasonerOpts {
         cwd: None,
         env: vec![],
         settings_json: None,
+        restrict_env: false,
     }
 }
 
@@ -561,6 +650,7 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         cwd: None,
         env: Vec::new(),
         settings_json: None,
+        restrict_env: false,
     }
 }
 
@@ -581,6 +671,7 @@ pub fn wiki_migrate_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerO
         cwd: Some(wiki_root),
         env: Vec::new(),
         settings_json: None,
+        restrict_env: false,
     }
 }
 
@@ -642,6 +733,7 @@ mod tests {
             cwd: None,
             env: vec![],
             settings_json: None,
+            restrict_env: false,
         }
     }
 
@@ -927,6 +1019,7 @@ pub fn resume_opts(wiki_root: PathBuf) -> ReasonerOpts {
         cwd: Some(wiki_root),
         env: Vec::new(),
         settings_json: None,
+        restrict_env: false,
     }
 }
 
