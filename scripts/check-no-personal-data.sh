@@ -8,6 +8,11 @@
 # Exit 1 (with the offending file:line) if anything matches. Install as a
 # pre-commit hook via ./scripts/install-git-hooks.sh. Not exhaustive — a
 # backstop, not a substitute for not hardcoding personal data.
+#
+# Allow-marker: a line containing `pii-ok` (e.g. `// pii-ok` in Rust/TS,
+# `# pii-ok` in shell/Python) is exempt. Intended ONLY for test-fixture
+# data where the pattern is real but the value is synthetic, e.g.
+# `"newsletter@brand.co"` in a unit test that verifies a matcher.
 
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
@@ -54,9 +59,13 @@ for f in "${files[@]}"; do
   esac
   if [ "$scan_added_only" -eq 1 ]; then
     # Only the lines this commit is adding — strip the leading '+' and the
-    # '+++ b/path' header so patterns see real content.
+    # '+++ b/path' header so patterns see real content. Lines that contain
+    # the inline allow-marker `pii-ok` (typically `// pii-ok` or `# pii-ok`)
+    # are skipped: they're explicitly marked test-fixture data. Use the
+    # marker sparingly and only in test/fixture code; reviewer must agree.
     added=$(git diff --cached -U0 --diff-filter=AM -- "$f" \
-      | grep -E '^\+' | grep -v '^+++ ' | sed 's/^+//')
+      | grep -E '^\+' | grep -v '^+++ ' | sed 's/^+//' \
+      | grep -v 'pii-ok')
     [ -z "$added" ] && continue
     while IFS= read -r pat; do
       [ -z "$pat" ] && continue
@@ -70,7 +79,7 @@ for f in "${files[@]}"; do
     [ -f "$f" ] || continue
     while IFS= read -r pat; do
       [ -z "$pat" ] && continue
-      if hits=$(grep -nPI "$pat" "$f" 2>/dev/null); then
+      if hits=$(grep -nPI "$pat" "$f" 2>/dev/null | grep -v 'pii-ok'); then
         echo "POSSIBLE secret/PII in $f:" >&2
         echo "$hits" | sed 's/^/  /' >&2
         fail=1
