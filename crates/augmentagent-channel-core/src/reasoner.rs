@@ -319,6 +319,16 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // absolute path because the systemd unit's PATH does not include /snap/bin.
     // Anything else is denied by claude CLI.
     let bash_gmail = format!("Bash({} gmail *)", bin.display());
+    // Invoice subcommands the LLM can autonomously invoke. `invoice run` is
+    // intentionally absent — the only real-send path is the user clicking
+    // Approve on a draft card. `status` and `list-accounts` omit the trailing
+    // `*` because they take no args (clap would reject extras anyway).
+    let bash_invoice_status = format!("Bash({} invoice status)", bin.display());
+    let bash_invoice_draft = format!("Bash({} invoice draft *)", bin.display());
+    let bash_invoice_list_accounts = format!("Bash({} invoice list-accounts)", bin.display());
+    let bash_invoice_set_recipient = format!("Bash({} invoice set-recipient *)", bin.display());
+    let bash_invoice_set_entity = format!("Bash({} invoice set-entity *)", bin.display());
+    let bash_invoice_set_auto_draft = format!("Bash({} invoice set-auto-draft *)", bin.display());
     // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
     // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
     // resolves the db regardless of cwd.
@@ -335,6 +345,12 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             "WebSearch".into(),
             "WebFetch".into(),
             bash_gmail,
+            bash_invoice_status,
+            bash_invoice_draft,
+            bash_invoice_list_accounts,
+            bash_invoice_set_recipient,
+            bash_invoice_set_entity,
+            bash_invoice_set_auto_draft,
             "Bash(/snap/bin/gh issue create *)".into(),
             "Bash(/snap/bin/gh issue list *)".into(),
             "Bash(/snap/bin/gh issue view *)".into(),
@@ -682,6 +698,48 @@ mod tests {
             std::path::Path::new(&value).file_name().unwrap(),
             "custom.db"
         );
+    }
+
+    #[test]
+    fn ask_opts_includes_invoice_read_and_config_tools() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        let _guard = EnvGuard::unset("AUGMENTAGENT_DB");
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+
+        let joined = opts.allowed_tools.join("\n");
+        for needle in [
+            "invoice status)",
+            "invoice draft *)",
+            "invoice list-accounts)",
+            "invoice set-recipient *)",
+            "invoice set-entity *)",
+            "invoice set-auto-draft *)",
+        ] {
+            assert!(
+                joined.contains(needle),
+                "expected allowed_tools to contain {needle}; got:\n{joined}"
+            );
+        }
+    }
+
+    /// Load-bearing safety invariant: the LLM must never be able to invoke
+    /// the real-send path. Only the Discord Approve button can call `run`.
+    #[test]
+    fn ask_opts_excludes_invoice_run() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        let _guard = EnvGuard::unset("AUGMENTAGENT_DB");
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+
+        for entry in &opts.allowed_tools {
+            assert!(
+                !entry.contains("invoice run"),
+                "allowed_tools must NEVER expose `invoice run` to the LLM: {entry}"
+            );
+        }
     }
 
     /// Serialize env-var mutations across the two tests so they don't race.
