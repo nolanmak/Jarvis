@@ -26,6 +26,169 @@ use serde::{Deserialize, Serialize};
 use augmentagent_channel_core::reasoner::{Reasoner, ReasonerOpts};
 use augmentagent_wiki::PersonPatch;
 
+/// Local-part patterns that mark a sender as non-human (newsletter, vendor,
+/// automated). Compared case-insensitively against the part before `@` —
+/// substring match, so `support+sub@…` and `team-marketing@…` both hit.
+/// Kept in sync with `tone.rs::NOREPLY_LOCAL_PATTERNS` plus additional
+/// CRM-only buckets (newsletter / marketing / billing local parts that
+/// pollute `people/` per issue #120).
+const NON_HUMAN_LOCAL_PATTERNS: &[&str] = &[
+    "no-reply",
+    "noreply",
+    "donotreply",
+    "do-not-reply",
+    "notifications",
+    "notification",
+    "alerts",
+    "alert",
+    "mailer-daemon",
+    "postmaster",
+    "bounce",
+    "support+",
+    "news",
+    "newsletter",
+    "marketing",
+    "deals",
+    "updates",
+    "digest",
+    "billing",
+    "receipts",
+    "invoice",
+    "team@",
+    "team-",
+    "hello@",
+    "hi@",
+    "info@",
+    "contact@",
+    "auto-confirm",
+    "automated",
+];
+
+/// Domain suffixes / substrings owned by ESPs and bulk senders. Mail
+/// originating from these domains is almost never a human counterpart.
+/// Substring match against the lowercased domain.
+const NON_HUMAN_DOMAIN_PATTERNS: &[&str] = &[
+    "mailgun",
+    "sendgrid",
+    "postmarkapp",
+    "resend.dev",
+    "mailchimp",
+    "mailerlite",
+    "constantcontact",
+    "amazonses",
+    "sparkpost",
+    "convertkit",
+    "substack.com",
+    "beehiiv.com",
+    "buttondown.email",
+    "mc.notifylink.com",
+    "linkedin.com",
+    "github.com",
+    "gitlab.com",
+    "atlassian.com",
+    "uber.com",
+    "venmo.com",
+    "chase.com",
+    "wellsfargo.com",
+    "amazon.com",
+    "stripe.com",
+    "coderabbit",
+    "dependabot",
+];
+
+/// Body markers (case-insensitive) that strongly indicate a bulk / automated
+/// mail rather than a human conversation: List-Unsubscribe headers leaking
+/// into the body, "click here to unsubscribe" boilerplate, "do not reply"
+/// disclaimers.
+const NON_HUMAN_BODY_MARKERS: &[&str] = &[
+    "list-unsubscribe:",
+    "precedence: bulk",
+    "auto-submitted: auto-",
+    "this is an automated",
+    "do not reply to this email",
+    "this email was sent automatically",
+    "click here to unsubscribe",
+    "manage your subscription",
+    "manage your preferences",
+    "view this email in your browser",
+];
+
+/// Heuristic classifier: should this `(from, body)` pair create a new
+/// `people/` CRM page? Returns `true` only when the sender looks like a
+/// human counterpart (not a newsletter, vendor, or no-reply bot).
+///
+/// Used to gate **new-page creation** in the email-signature backfill so
+/// `people/` doesn't accumulate hundreds of subscription / SaaS / billing
+/// entries (issue #120). Existing pages are left untouched — they may
+/// already be valuable to the user; cleanup of the polluted backlog is a
+/// follow-up, not gated by this helper.
+///
+/// Decision order:
+/// 1. Body markers (List-Unsubscribe, "do not reply", etc.) → not human.
+/// 2. Local-part patterns (`noreply`, `newsletter`, `support+`, …) → not human.
+/// 3. ESP / bulk-sender domain patterns (Mailgun, Substack, …) → not human.
+/// 4. Otherwise: assume human (default-allow, so we never *block* a real
+///    person who happens to have an unusual mailbox).
+pub fn is_human_sender(from: &str, body: &str) -> bool {
+    let bare = extract_bare(from);
+    if bare.is_empty() {
+        return false;
+    }
+    let lower = bare.to_ascii_lowercase();
+    let (local, domain) = match lower.split_once('@') {
+        Some((l, d)) => (l, d),
+        // No `@` at all is not a real address.
+        None => return false,
+    };
+
+    // 1. Body-content markers (bulk-mail signature).
+    if !body.is_empty() {
+        let body_lower = body.to_ascii_lowercase();
+        for marker in NON_HUMAN_BODY_MARKERS {
+            if body_lower.contains(marker) {
+                return false;
+            }
+        }
+    }
+
+    // 2. Local-part patterns. Use `contains` so `support+foo` and
+    //    `team-news` both hit; pattern strings that include `@` or `-`
+    //    are matched as anchors against `local@` synthesized below so
+    //    `team@` doesn't false-positive on `team-lead@`.
+    let local_at = format!("{local}@");
+    for pat in NON_HUMAN_LOCAL_PATTERNS {
+        if pat.ends_with('@') || pat.ends_with('-') {
+            if local_at.contains(pat) || local.contains(pat) {
+                return false;
+            }
+        } else if local.contains(pat) {
+            return false;
+        }
+    }
+
+    // 3. Known ESP / bulk-sender domains.
+    for pat in NON_HUMAN_DOMAIN_PATTERNS {
+        if domain.contains(pat) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Pull the bare `local@domain` from a raw `From:` header value that may
+/// include a display name (`"Foo" <foo@bar.com>` or `Foo <foo@bar.com>`). // pii-ok
+/// Falls back to the trimmed input if no angle-bracket pattern is found.
+fn extract_bare(from: &str) -> String {
+    let trimmed = from.trim();
+    if let Some(start) = trimmed.find('<') {
+        if let Some(end) = trimmed[start + 1..].find('>') {
+            return trimmed[start + 1..start + 1 + end].trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 /// Strip a Gmail/Outlook quoted-reply chain. **Local copy** of the rule in
 /// `tone.rs` (lines flagged "Strip Gmail's quoted-reply preamble"): keeping
 /// it separate is deliberate — #64 must not edit the prod tone cleaner.
@@ -661,6 +824,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(f.phones, vec!["+14155550100"]);
+    }
+
+    #[test]
+    fn is_human_accepts_plain_person() {
+        // pii-ok — synthetic test fixtures, not real personal data.
+        // Plain personal mailbox at a generic domain, no automation signals.
+        assert!(is_human_sender("alice@example.com", "Hey, want to grab coffee?")); // pii-ok
+        assert!(is_human_sender(
+            "\"Bob Smith\" <bob.smith@startup.io>", // pii-ok
+            "thanks for the intro",
+        ));
+        assert!(is_human_sender("Carol <carol@acme.co>", "")); // pii-ok
+    }
+
+    #[test]
+    fn is_human_rejects_noreply_local_parts() {
+        // pii-ok — synthetic test fixtures verifying local-part matcher.
+        for from in [
+            "no-reply@stripe.com",    // pii-ok
+            "noreply@github.com",     // pii-ok
+            "donotreply@calendly.com",// pii-ok
+            "notifications@linkedin.com", // pii-ok
+            "alerts@aws.com",         // pii-ok
+            "newsletter@tldr.tech",   // pii-ok
+            "marketing@brand.co",     // pii-ok
+            "deals@vendor.io",        // pii-ok
+            "updates@app.dev",        // pii-ok
+            "billing@saas.com",       // pii-ok
+            "receipts@uber.com",      // pii-ok
+            "team@somecompany.co",    // pii-ok
+            "hello@fuggit.dev",       // pii-ok
+            "support+sub@github.com", // pii-ok
+        ] {
+            assert!(!is_human_sender(from, ""), "{from} should not be human");
+        }
+    }
+
+    #[test]
+    fn is_human_rejects_esp_domains() {
+        // pii-ok — synthetic ESP-domain fixtures verifying domain matcher.
+        // Even with an innocuous local part, the domain alone classifies them as non-human.
+        for from in [
+            "lenny@substack.com",      // pii-ok
+            "writer@beehiiv.com",      // pii-ok
+            "alice@buttondown.email",  // pii-ok
+            "bounce@mailgun.example.net", // pii-ok
+            "x@something.amazonses.com",  // pii-ok
+            "person@linkedin.com",     // pii-ok
+            "user@coderabbitai.com",   // pii-ok
+        ] {
+            assert!(!is_human_sender(from, ""), "{from} should not be human");
+        }
+    }
+
+    #[test]
+    fn is_human_rejects_body_markers() {
+        // pii-ok — synthetic test fixture for body-marker heuristic.
+        // Body carrying bulk-mail boilerplate forces a non-human verdict
+        // even if the local part looks innocent.
+        let from = "alex@some-random-domain.com"; // pii-ok
+        assert!(!is_human_sender(
+            from,
+            "Hi! List-Unsubscribe: <mailto:u@x.com>\nDeal of the day...", // pii-ok
+        ));
+        assert!(!is_human_sender(
+            from,
+            "This is an automated message. Please do not reply to this email.",
+        ));
+        assert!(!is_human_sender(
+            from,
+            "View this email in your browser. Manage your subscription here.",
+        ));
+    }
+
+    #[test]
+    fn is_human_rejects_garbage_input() {
+        assert!(!is_human_sender("", ""));
+        assert!(!is_human_sender("not-an-email", "hi"));
+    }
+
+    #[test]
+    fn is_human_default_allows_unknown_normal_address() {
+        // pii-ok — synthetic test fixture (jane.doe@employer.com is RFC-2606-ish).
+        // A perfectly ordinary first.last@employer.com with normal body — // pii-ok
+        // we default-allow rather than block.
+        assert!(is_human_sender(
+            "jane.doe@employer.com", // pii-ok
+            "Following up on yesterday's chat — Friday at 2 still works.",
+        ));
     }
 
     #[tokio::test]
