@@ -89,7 +89,7 @@ sqlite3 --version
 ### 3b. Clone + import
 
 ```bash
-git clone https://github.com/nolanmak/AugmentAgent.git ~/AugmentAgent
+git clone https://github.com/nolanmak/MyAgentAssistant.git ~/AugmentAgent
 cd ~/AugmentAgent
 ./scripts/migrate-import.sh ~/Downloads/migrate-*.tar.gz   # or wherever you put it
 cp /path/to/secure/.env .env                                # from Tailscale/AirDrop

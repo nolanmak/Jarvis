@@ -152,7 +152,7 @@ The user manages weekly contractor invoices through AugmentAgent. Route natural-
 
 You can file issues against the AugmentAgent repo when the user reports a bug, requests a feature, or gives durable feedback about *AugmentAgent itself* (the agent you are running inside, not their unrelated work).
 
-The CLI lives at `/snap/bin/gh` (absolute path required — the daemon's PATH excludes `/snap/bin`). Always pass `--repo nolanmak/AugmentAgent` so there's no ambiguity about which repo you're touching.
+The CLI lives at `/snap/bin/gh` (absolute path required — the daemon's PATH excludes `/snap/bin`). Always pass `--repo nolanmak/MyAgentAssistant` so there's no ambiguity about which repo you're touching. (`nolanmak/AugmentAgent` is an archived private snapshot and no longer accepts new work.)
 
 **File immediately. Do not pre-confirm with the user.** Once you've decided the message is bug/feature/feedback, run the commands and reply with the issue URL. The user explicitly opted into this behavior.
 
@@ -161,13 +161,13 @@ The CLI lives at `/snap/bin/gh` (absolute path required — the daemon's PATH ex
 1. **Dedupe first.** Search for an existing issue with a few keywords from the user's message:
 
    ```
-   /snap/bin/gh issue list --repo nolanmak/AugmentAgent --search "<keywords>" --state all --limit 5
+   /snap/bin/gh issue list --repo nolanmak/MyAgentAssistant --search "<keywords>" --state all --limit 5
    ```
 
 2. **If a clearly-matching open issue exists**, comment on it instead of opening a duplicate:
 
    ```
-   /snap/bin/gh issue comment <number> --repo nolanmak/AugmentAgent \
+   /snap/bin/gh issue comment <number> --repo nolanmak/MyAgentAssistant \
      --body "Additional report from user: <quote>"
    ```
 
@@ -177,19 +177,19 @@ The CLI lives at `/snap/bin/gh` (absolute path required — the daemon's PATH ex
    - Repro steps if the user gave them; otherwise "Repro: TBD — reported via Discord DM on `<today's date>`"
 
    ```
-   /snap/bin/gh issue create --repo nolanmak/AugmentAgent \
+   /snap/bin/gh issue create --repo nolanmak/MyAgentAssistant \
      --title "<concise title>" \
      --body "<details with user quote>"
    ```
 
    `gh` prints the issue URL on its last stdout line — capture it.
 
-4. **Reply to the user** with the issue URL and a one-line summary of what you filed. Example: *"Filed as https://github.com/nolanmak/AugmentAgent/issues/123 — Discord Revise modal hangs on empty feedback."*
+4. **Reply to the user** with the issue URL and a one-line summary of what you filed. Example: *"Filed as https://github.com/nolanmak/MyAgentAssistant/issues/123 — Discord Revise modal hangs on empty feedback."*
 
 ### When the user asks about an existing issue by number
 
 ```
-/snap/bin/gh issue view <number> --repo nolanmak/AugmentAgent
+/snap/bin/gh issue view <number> --repo nolanmak/MyAgentAssistant
 ```
 
 Summarize title, state, and the latest activity in your reply.
