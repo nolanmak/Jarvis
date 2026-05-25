@@ -222,7 +222,12 @@ impl EventHandler for Handler {
                 &downloaded_txts,
             );
 
-            let result = handler.answer(&prompt).await;
+            // #125: Liveness signal. Discord's typing indicator auto-expires
+            // after ~10s, so we kick one off immediately and re-broadcast on a
+            // ~9s tick until the reasoner returns. Failures here are cosmetic
+            // (network blip, missing perm) — log and keep going so a typing
+            // glitch never blocks the actual reply.
+            let result = run_with_typing(&http, channel_id, handler.answer(&prompt)).await;
 
             // Best-effort cleanup. Tempfiles aren't load-bearing for the reply
             // we're about to post, so we tolerate failures.
@@ -799,6 +804,43 @@ impl EventHandler for Handler {
         }
     }
 }
+
+/// Run the reasoner future while keeping a Discord typing indicator alive in
+/// `channel_id`. The indicator auto-expires after ~10s, so we kick one off
+/// immediately and re-broadcast every `TYPING_REFRESH_SECS` until the future
+/// resolves. Indicator-broadcast failures are logged and otherwise ignored —
+/// the reply path must not depend on the typing UX succeeding. (#125)
+async fn run_with_typing<F, T>(http: &Http, channel_id: ChannelId, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    // Send the first ping unconditionally so the indicator appears within a
+    // round-trip of the user's message, even if the reasoner finishes quickly.
+    if let Err(e) = channel_id.broadcast_typing(http).await {
+        debug!("initial broadcast_typing failed: {e}");
+    }
+    tokio::pin!(fut);
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(TYPING_REFRESH_SECS));
+    // Discord's indicator times out at ~10s; an early extra tick is fine but
+    // we don't want to re-fire immediately on the first poll.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Consume the immediate first tick so the first refresh happens after the
+    // configured interval rather than at t=0.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut fut => return out,
+            _ = ticker.tick() => {
+                if let Err(e) = channel_id.broadcast_typing(http).await {
+                    debug!("broadcast_typing refresh failed: {e}");
+                }
+            }
+        }
+    }
+}
+
+const TYPING_REFRESH_SECS: u64 = 9;
 
 /// Immediate, within-budget ack for a component interaction (Approve / Skip)
 /// before we start slow work. Follow up with `followup` once the work is done.
