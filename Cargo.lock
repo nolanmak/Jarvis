@@ -781,6 +781,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "insta",
+ "mockito",
  "reqwest",
  "rusqlite",
  "serde_json",
