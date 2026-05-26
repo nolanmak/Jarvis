@@ -42,6 +42,29 @@ use augmentagent_store::Email;
 
 use crate::{ACCOUNT_ENTITY_ID_PREFIX, PLATFORM};
 
+/// One form discovered via `GET /forms` (`docs/deft-protocol.md` §3). The
+/// minimal field set the channel needs for workspace auto-discovery (#157):
+/// the `id` for polling `GET /responses/{formId}`, the human `name` for log
+/// + UI surfaces, and best-effort `created_at` for ordering.
+///
+/// Decoded **defensively** — only documented fields are pinned, everything
+/// else upstream returns is ignored. If the live `/forms` payload turns out
+/// to use a different spelling for the id, we will see decode failures in
+/// the wire and tighten then (same pattern as `DeftSubmission`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DeftForm {
+    /// Form id (`OUm6T9`-shaped). Used as `{formId}` in
+    /// `GET /responses/{formId}`.
+    #[serde(default)]
+    pub id: String,
+    /// Operator-chosen display name for the form.
+    #[serde(default)]
+    pub name: String,
+    /// Creation timestamp (best-effort; not pinned in public docs).
+    #[serde(default, alias = "createdAt")]
+    pub created_at: String,
+}
+
 /// One field of a submission. `custom_key` is the operator-chosen, form-unique
 /// anchor we map commands on (labels can be reworded; `uuid` is opaque).
 ///
