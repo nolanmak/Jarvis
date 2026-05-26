@@ -1183,6 +1183,81 @@ impl Store {
         )?;
 
         // -------------------------------------------------------------------
+        // #111 — FTS5-backed cross-session memory. Owned by Rust (Cluster G).
+        // `memory` is the durable storage; `memory_fts` is the FTS5 virtual
+        // table the MCP memory server (crates/augmentagent-mcp-memory) reads
+        // for `memory_search`. Triggers keep the two in lockstep so callers
+        // can write to `memory` and search through `memory_fts` without a
+        // separate index step.
+        //
+        // Schema mirrors issue #111: id (TEXT, opaque uuid), created_at_ms,
+        // surface (email/slack/discord/ask/digest/other), subject, body,
+        // tags (comma-separated, optional). `tags` is a single TEXT column
+        // rather than a join table because we expect single-digit tags per
+        // entry and the MCP layer just wants prefix-search behavior; an
+        // FTS5 index over the joined tag string subsumes both needs.
+        //
+        // FTS5 is compiled into the bundled libsqlite3-sys (see the
+        // -DSQLITE_ENABLE_FTS5 flag in the bundled build), so no extension
+        // load is required at runtime — `CREATE VIRTUAL TABLE` Just Works.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS memory (\
+                 id            TEXT PRIMARY KEY,\
+                 created_at_ms INTEGER NOT NULL,\
+                 surface       TEXT NOT NULL,\
+                 subject       TEXT NOT NULL,\
+                 body          TEXT NOT NULL,\
+                 tags          TEXT NOT NULL DEFAULT ''\
+             )",
+            [],
+        )?;
+        // External-content FTS5: the `memory` table is the source of truth;
+        // the FTS table is rebuildable. `content_rowid` ties FTS rows to
+        // `memory.rowid` so the `delete-by-rowid` trigger can clean up FTS
+        // when memory rows are pruned. Tokenizer = `porter unicode61` for
+        // sensible stemming on English text without locale baggage.
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(\
+                 subject, body, tags, surface UNINDEXED, \
+                 content='memory', content_rowid='rowid', \
+                 tokenize='porter unicode61'\
+             )",
+            [],
+        )?;
+        // Keep FTS in sync. INSERT/DELETE/UPDATE triggers mirror SQLite's
+        // documented external-content recipe. `UPDATE` is implemented as
+        // DELETE-then-INSERT so the FTS internal docid tracking stays
+        // correct across edits.
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory BEGIN \
+                 INSERT INTO memory_fts(rowid, subject, body, tags, surface) \
+                 VALUES (new.rowid, new.subject, new.body, new.tags, new.surface); \
+             END;\
+             CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory BEGIN \
+                 INSERT INTO memory_fts(memory_fts, rowid, subject, body, tags, surface) \
+                 VALUES('delete', old.rowid, old.subject, old.body, old.tags, old.surface); \
+             END;\
+             CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory BEGIN \
+                 INSERT INTO memory_fts(memory_fts, rowid, subject, body, tags, surface) \
+                 VALUES('delete', old.rowid, old.subject, old.body, old.tags, old.surface); \
+                 INSERT INTO memory_fts(rowid, subject, body, tags, surface) \
+                 VALUES (new.rowid, new.subject, new.body, new.tags, new.surface); \
+             END;",
+        )?;
+        // Chronological index for `memory_recent` (the MCP server's
+        // search-isn't-the-right-shape path). Surface-filtered index too
+        // because most reads scope to one channel.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_created ON memory(created_at_ms DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_surface_created \
+                ON memory(surface, created_at_ms DESC)",
+            [],
+        )?;
+
+        // -------------------------------------------------------------------
         // #45 — indexes for Node-owned tables. Created at the END of migrate
         // so they run AFTER the additive ALTERs above have added any columns
         // they reference (most notably `emails.platform` on legacy DBs).
