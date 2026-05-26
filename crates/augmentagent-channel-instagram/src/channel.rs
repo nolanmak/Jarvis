@@ -418,6 +418,7 @@ impl<A: InstagramApi, R: Reasoner + 'static> InstagramChannel<A, R> {
                     cwd: None,
                     env: Vec::new(),
                     settings_json: None,
+                    restrict_env: false,
                 };
                 let message_ctx = MessageContext {
                     channel: "instagram".to_string(),

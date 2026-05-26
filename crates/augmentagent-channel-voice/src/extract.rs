@@ -50,6 +50,7 @@ fn opts() -> ReasonerOpts {
         cwd: None,
         env: vec![],
         settings_json: None,
+        restrict_env: false,
     }
 }
 
