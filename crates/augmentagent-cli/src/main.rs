@@ -18,7 +18,8 @@ use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
 use augmentagent_channel_email::gmail::{ComposioClient, GmailApi};
 use augmentagent_channel_email::sigextract::{
-    detect_signature_block, signature_patch, strip_quoted_reply, SignatureExtractor,
+    detect_signature_block, is_human_sender, signature_patch, strip_quoted_reply,
+    SignatureExtractor,
 };
 use augmentagent_channel_email::{GmailChannel, GmailChannelConfig};
 use augmentagent_channel_linkedin::{
@@ -6083,6 +6084,11 @@ async fn run_backfill_signatures(
     let mut created = 0usize;
     let mut updated = 0usize;
     let mut noop = 0usize;
+    // #120 — skipped because the sender looks non-human (newsletter, ESP,
+    // no-reply, bulk-mail body markers). We never create a NEW `people/`
+    // page for such senders; existing pages are still updated so we don't
+    // silently lose data the human may have curated.
+    let mut skipped_non_human = 0usize;
     // De-dupe per sender within a run (latest sig wins; merge is fill-blanks
     // so order is immaterial, but skip redundant LLM calls).
     let mut seen_senders: std::collections::BTreeSet<String> =
@@ -6118,6 +6124,17 @@ async fn run_backfill_signatures(
 
         let path = layout.people_dir().join(format!("{slug}.md"));
         let existing = std::fs::read_to_string(&path).ok();
+
+        // #120 — gate new-page creation: if there's no existing page AND
+        // this sender doesn't look human (newsletter / vendor / no-reply),
+        // skip rather than pollute `people/`. Existing pages still merge —
+        // those are presumed already-curated.
+        if existing.is_none() && !is_human_sender(&from, &body) {
+            skipped_non_human += 1;
+            tracing::debug!(%from, "skipped non-human sender for people/ creation");
+            continue;
+        }
+
         let merged = merge_person_page(existing.as_deref(), &patch);
         if !merged.changed {
             noop += 1;
@@ -6142,6 +6159,7 @@ async fn run_backfill_signatures(
         "created": created,
         "updated": updated,
         "noop": noop,
+        "skipped_non_human": skipped_non_human,
         "deferred_low_confidence": digest_lines.len(),
         "applied": apply,
     });
