@@ -49,10 +49,8 @@ API.
    ```
    The form-level webhook fires on every submission.
 6. (Optional) For the poll path, persist the API token into the keychain
-   manually. There is no `augmentagent deft login` subcommand today;
-   `docs/deft-protocol.md` §6 lists the storage path. Until that CLI
-   verb lands, the user must follow the doc's "manual: store token at
-   `~/.config/augmentagent/deft-token`" pattern.
+   via the `augmentagent deft login` subcommand documented in the
+   **Login** section below.
 
 ## Validate
 
@@ -96,3 +94,35 @@ augmentagent service restart
 Also delete the webhook registration in the Deftform portal so Deftform
 stops posting to the dead URL. No CLI verb for either side today; both
 are manual.
+
+## Login (CLI)
+
+The systemd unit installed by `scripts/install-autostart.sh` pins
+`Environment=AUGMENTAGENT_DEFT_ENABLED=1` so the channel is **armed** at
+the OS level. The crate stays inert (no network I/O) until a workspace
+token is also persisted to the Linux keyring. Three operator verbs:
+
+- `augmentagent deft login [--token <bearer>] [--base-url <url>]`
+  Validates the workspace token via `GET /workspace` **before** writing
+  anything. On success, persists `DeftAuth` to
+  `augmentagent/deft/<workspace_id>` under the Linux Secret Service. If
+  `--token` is omitted the CLI prompts on stdin so the secret never
+  lands in shell history. Issue a token at
+  <https://deftform.com/settings/api>.
+
+- `augmentagent deft status [--workspace-id <id>] [--offline] [--json]`
+  Reports whether a token is in the keyring for the named workspace,
+  and (unless `--offline`) re-runs `whoami()` to confirm reachability.
+  `--workspace-id` falls back to the `AUGMENTAGENT_DEFT_WORKSPACE_ID`
+  env var. The `--json` form is what the dashboard's status panel
+  consumes.
+
+- `augmentagent deft logout [--workspace-id <id>]`
+  Deletes the keychain slot. Idempotent — running it twice is fine.
+
+Linux Secret Service can't enumerate slots, so every `status`/`logout`
+invocation must name the workspace (either via `--workspace-id` or
+`AUGMENTAGENT_DEFT_WORKSPACE_ID`). `login` learns the workspace id from
+the server during the `whoami()` probe and prints it on success — copy
+that into `.env` if you want subsequent `status`/`logout` calls to find
+the slot without a flag.

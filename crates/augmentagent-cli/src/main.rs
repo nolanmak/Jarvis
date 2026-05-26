@@ -231,6 +231,13 @@ enum Cmd {
         #[command(subcommand)]
         op: GithubOp,
     },
+    /// Deftform channel: operator-facing onboarding (#160). The channel
+    /// itself is still inert (spike scaffold #116) until both
+    /// `AUGMENTAGENT_DEFT_ENABLED=1` and a workspace token are persisted.
+    Deft {
+        #[command(subcommand)]
+        op: DeftOp,
+    },
     /// Reddit DM/inbox channel OAuth bootstrap (#48).
     Reddit {
         #[command(subcommand)]
@@ -937,6 +944,52 @@ enum GithubOp {
     PollOnce {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeftOp {
+    /// Persist a Deftform workspace API token to the Linux keyring.
+    ///
+    /// Verifies the token via `GET /workspace` (whoami) **before** writing
+    /// anything. The server-confirmed `workspace_id` becomes the keychain
+    /// account slot (`augmentagent/deft/<workspace_id>`). Mirrors
+    /// `github login` / `voice login`.
+    ///
+    /// Issue your workspace token at <https://deftform.com/settings/api>.
+    /// If `--token` is omitted the CLI reads one token from stdin so the
+    /// secret never lands in shell history.
+    Login {
+        /// Workspace access token (Bearer). Optional — omit to read from
+        /// stdin (one line, no echo of the value back).
+        #[arg(long)]
+        token: Option<String>,
+        /// Override the API base. Defaults to the documented prod URL
+        /// (`https://deftform.com/api/v1`). Used by tests against a mock
+        /// server; no operator should need this in normal use.
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    /// Report whether a Deftform token is in the keyring + optionally
+    /// reach out to `GET /workspace` to confirm it's still valid.
+    Status {
+        /// Workspace id the token was stored under. Linux Secret Service
+        /// can't enumerate slots, so the caller must name the workspace.
+        /// Falls back to the `AUGMENTAGENT_DEFT_WORKSPACE_ID` env var.
+        #[arg(long)]
+        workspace_id: Option<String>,
+        /// Skip the live `whoami()` reachability probe — keychain-only check.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        offline: bool,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Delete the stored token. Idempotent — no error if nothing is stored.
+    Logout {
+        /// Workspace id slot to remove. Falls back to
+        /// `AUGMENTAGENT_DEFT_WORKSPACE_ID`.
+        #[arg(long)]
+        workspace_id: Option<String>,
     },
 }
 
@@ -2532,6 +2585,22 @@ async fn main() -> Result<()> {
                 println!("{out:#?}");
                 Ok(())
             }
+        },
+        Cmd::Deft { ref op } => match op {
+            DeftOp::Login { token, base_url } => {
+                run_deft_login(
+                    token.clone(),
+                    base_url.clone(),
+                    &mut StdinTokenReader,
+                )
+                .await
+            }
+            DeftOp::Status {
+                workspace_id,
+                offline,
+                json,
+            } => run_deft_status(workspace_id.clone(), *offline, *json).await,
+            DeftOp::Logout { workspace_id } => run_deft_logout(workspace_id.clone()),
         },
         Cmd::Meetup { ref op } => match op {
             MeetupOp::Subscribe { urlname, mode } => {
@@ -7778,6 +7847,331 @@ fn run_github_unsubscribe(store: Arc<Store>, id: String) -> Result<()> {
     store.delete_subscription(&id).context("delete subscription")?;
     println!("subscription {id} deactivated");
     Ok(())
+}
+
+// ================================================================
+// Deftform / Deft (#160) — operator-facing `login | status | logout`
+// onboarding verbs. Mirrors `github login`: validate via whoami() before
+// persisting; never write a token that doesn't auth. The crate itself
+// stays inert in production until both AUGMENTAGENT_DEFT_ENABLED=1 (set
+// by the systemd unit) AND a token is stored.
+// ================================================================
+
+/// Read a token from stdin. Stubbable in tests so the prompt path is
+/// exercised without touching the real stdin.
+trait DeftTokenReader {
+    fn read_token(&mut self) -> Result<String>;
+}
+
+/// Production reader: one line from stdin, trimmed. Used when `--token`
+/// is not provided.
+struct StdinTokenReader;
+impl DeftTokenReader for StdinTokenReader {
+    fn read_token(&mut self) -> Result<String> {
+        use std::io::{BufRead, Write};
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        writeln!(
+            out,
+            "Paste your Deftform workspace access token (https://deftform.com/settings/api):"
+        )?;
+        out.flush()?;
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        stdin.lock().read_line(&mut line).context("read token from stdin")?;
+        Ok(line.trim().to_string())
+    }
+}
+
+/// Validate a freshly-pasted token via `DeftClient::whoami()` and, on
+/// success, persist via `DeftAuth` into `augmentagent/deft/<workspace_id>`.
+/// Mirrors `run_github_login`.
+///
+/// Implementation note: every method on `DeftClient` is gated on
+/// [`augmentagent_channel_deft::deft_enabled`]. Login itself is an explicit
+/// arming action, so we set the gate env var for the duration of this
+/// process to perform the probe. The systemd unit pins
+/// `AUGMENTAGENT_DEFT_ENABLED=1` separately for the daemon (see
+/// `scripts/install-autostart.sh`); the two are independent.
+async fn run_deft_login(
+    token: Option<String>,
+    base_url_override: Option<String>,
+    reader: &mut dyn DeftTokenReader,
+) -> Result<()> {
+    use augmentagent_channel_deft::api::{DeftApi, DeftClient};
+    use augmentagent_channel_deft::auth::{DeftAuth, DEFAULT_BASE_URL};
+
+    let token = match token {
+        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => {
+            let pasted = reader.read_token()?;
+            if pasted.trim().is_empty() {
+                anyhow::bail!("token is empty");
+            }
+            pasted
+        }
+    };
+    let base_url = base_url_override.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+
+    // Arm the gate just for this probe — login is an explicit operator
+    // action and the gate is per-process env. Restored on the way out so
+    // we don't pollute the running shell's environment more than needed
+    // (the systemd unit pins this independently anyway).
+    let prior_gate = std::env::var("AUGMENTAGENT_DEFT_ENABLED").ok();
+    std::env::set_var("AUGMENTAGENT_DEFT_ENABLED", "1");
+
+    // Probe DeftAuth — workspace_id is a placeholder until whoami() tells
+    // us the server-confirmed id. We never persist this probe.
+    let probe = DeftAuth {
+        workspace_id: "probe".to_string(),
+        token: token.clone(),
+        base_url: base_url.clone(),
+        fetched_at_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    let client = DeftClient::new(probe).context("build deft http client")?;
+    let whoami_result = client.whoami().await;
+
+    // Restore the gate env var to its prior state so the prompt-driven
+    // login does not silently arm the next process the user launches
+    // from this shell. (Daemon arming is handled by the systemd unit.)
+    match prior_gate {
+        Some(v) => std::env::set_var("AUGMENTAGENT_DEFT_ENABLED", v),
+        None => std::env::remove_var("AUGMENTAGENT_DEFT_ENABLED"),
+    }
+
+    let workspace_id = match whoami_result {
+        Ok(id) if !id.is_empty() => id,
+        Ok(_) => {
+            anyhow::bail!(
+                "deft whoami succeeded but returned an empty workspace id; \
+                 not persisting (token may be valid but the workspace endpoint \
+                 envelope is unrecognized — see docs/deft-protocol.md §2)"
+            );
+        }
+        Err(e) => {
+            anyhow::bail!("deft token rejected by whoami(): {e}");
+        }
+    };
+
+    let auth = DeftAuth {
+        workspace_id: workspace_id.clone(),
+        token,
+        base_url,
+        fetched_at_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    auth.save_to_keychain()
+        .context("save deft auth to keychain")?;
+    println!(
+        "deft auth saved to keychain (augmentagent/deft/{workspace_id})"
+    );
+    Ok(())
+}
+
+/// Pick the workspace id to operate on. Priority: explicit `--workspace-id`,
+/// then `AUGMENTAGENT_DEFT_WORKSPACE_ID` env. Errors when neither is set —
+/// Linux Secret Service can't enumerate slots, so the operator must name
+/// the workspace (same constraint as `github login`).
+fn resolve_deft_workspace_id(workspace_id: Option<String>) -> Result<String> {
+    if let Some(w) = workspace_id {
+        if !w.trim().is_empty() {
+            return Ok(w.trim().to_string());
+        }
+    }
+    if let Ok(env) = std::env::var("AUGMENTAGENT_DEFT_WORKSPACE_ID") {
+        if !env.trim().is_empty() {
+            return Ok(env.trim().to_string());
+        }
+    }
+    anyhow::bail!(
+        "workspace id required (pass --workspace-id <id> or set \
+         AUGMENTAGENT_DEFT_WORKSPACE_ID); Linux Secret Service cannot \
+         enumerate slots"
+    );
+}
+
+async fn run_deft_status(
+    workspace_id: Option<String>,
+    offline: bool,
+    json: bool,
+) -> Result<()> {
+    use augmentagent_channel_deft::api::{DeftApi, DeftClient};
+    use augmentagent_channel_deft::auth::DeftAuth;
+
+    let workspace_id = resolve_deft_workspace_id(workspace_id)?;
+    let auth = match DeftAuth::load_for_workspace(&workspace_id) {
+        Ok(a) => a,
+        Err(e) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "connected": false,
+                        "workspace_id": workspace_id,
+                        "error": e.to_string(),
+                    })
+                );
+            } else {
+                println!("deft not connected (workspace_id={workspace_id}): {e}");
+            }
+            return Ok(());
+        }
+    };
+
+    if offline {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "connected": true,
+                    "workspace_id": auth.workspace_id,
+                    "base_url": auth.base_url,
+                    "fetched_at_ms": auth.fetched_at_ms,
+                    "reachable": null,
+                })
+            );
+        } else {
+            println!(
+                "deft token present (workspace_id={}, base_url={}, fetched_at_ms={})",
+                auth.workspace_id, auth.base_url, auth.fetched_at_ms
+            );
+        }
+        return Ok(());
+    }
+
+    // Live probe. Same arm-during-probe dance as `login`.
+    let prior_gate = std::env::var("AUGMENTAGENT_DEFT_ENABLED").ok();
+    std::env::set_var("AUGMENTAGENT_DEFT_ENABLED", "1");
+    let probe = DeftClient::new(auth.clone()).context("build deft http client")?;
+    let whoami_result = probe.whoami().await;
+    match prior_gate {
+        Some(v) => std::env::set_var("AUGMENTAGENT_DEFT_ENABLED", v),
+        None => std::env::remove_var("AUGMENTAGENT_DEFT_ENABLED"),
+    }
+
+    match whoami_result {
+        Ok(server_ws) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "connected": true,
+                        "workspace_id": auth.workspace_id,
+                        "server_workspace_id": server_ws,
+                        "base_url": auth.base_url,
+                        "fetched_at_ms": auth.fetched_at_ms,
+                        "reachable": true,
+                    })
+                );
+            } else {
+                println!(
+                    "deft connected: workspace_id={} (server reports {}), base_url={}",
+                    auth.workspace_id, server_ws, auth.base_url
+                );
+            }
+        }
+        Err(e) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "connected": true,
+                        "workspace_id": auth.workspace_id,
+                        "base_url": auth.base_url,
+                        "reachable": false,
+                        "error": e.to_string(),
+                    })
+                );
+            } else {
+                println!(
+                    "deft token present (workspace_id={}) but whoami() failed: {e}",
+                    auth.workspace_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove the keychain slot. Idempotent — a missing slot is success
+/// (matches `Auth::delete`'s contract; see `augmentagent-auth`).
+fn run_deft_logout(workspace_id: Option<String>) -> Result<()> {
+    use augmentagent_channel_deft::auth::DeftAuth;
+    let workspace_id = resolve_deft_workspace_id(workspace_id)?;
+    DeftAuth::delete_from_keychain(&workspace_id)
+        .context("delete deft auth from keychain")?;
+    println!("deft auth removed (augmentagent/deft/{workspace_id})");
+    Ok(())
+}
+
+#[cfg(test)]
+mod deft_cli_tests {
+    use super::*;
+
+    /// Stub reader that yields a canned token without touching stdin.
+    struct CannedReader(String);
+    impl DeftTokenReader for CannedReader {
+        fn read_token(&mut self) -> Result<String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// resolve_deft_workspace_id prefers the explicit arg.
+    #[test]
+    fn resolve_workspace_id_prefers_arg() {
+        let got = resolve_deft_workspace_id(Some("ws_explicit".into())).unwrap();
+        assert_eq!(got, "ws_explicit");
+    }
+
+    /// resolve_deft_workspace_id falls back to the env var when arg is None.
+    #[test]
+    fn resolve_workspace_id_env_fallback() {
+        // Serialize with the gate lock if needed in the future; this env
+        // var is local to this test only.
+        std::env::set_var("AUGMENTAGENT_DEFT_WORKSPACE_ID", "ws_env");
+        let got = resolve_deft_workspace_id(None).unwrap();
+        std::env::remove_var("AUGMENTAGENT_DEFT_WORKSPACE_ID");
+        assert_eq!(got, "ws_env");
+    }
+
+    /// resolve_deft_workspace_id errors when neither arg nor env is set.
+    #[test]
+    fn resolve_workspace_id_errors_when_unset() {
+        std::env::remove_var("AUGMENTAGENT_DEFT_WORKSPACE_ID");
+        assert!(resolve_deft_workspace_id(None).is_err());
+        assert!(resolve_deft_workspace_id(Some("   ".into())).is_err());
+    }
+
+    /// Login refuses to persist if whoami() fails (4xx from mock server).
+    /// Crucially: the stubbed reader is exercised, so the prompt path is
+    /// covered without an interactive stdin.
+    #[tokio::test]
+    async fn login_rejects_bad_token_via_mock_whoami() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/workspace")
+            .with_status(401)
+            .with_body(r#"{"success":false,"message":"bad token"}"#)
+            .create_async()
+            .await;
+        let mut reader = CannedReader("dft_bogus".into());
+        let res = run_deft_login(None, Some(server.url()), &mut reader).await;
+        assert!(res.is_err(), "expected login to fail on 401, got Ok");
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(
+            msg.contains("whoami") || msg.contains("rejected"),
+            "error should mention whoami rejection, got: {msg}"
+        );
+    }
+
+    /// Empty token (after trimming) is rejected before any HTTP call.
+    #[tokio::test]
+    async fn login_rejects_empty_token() {
+        let mut reader = CannedReader("   ".into());
+        let res = run_deft_login(None, None, &mut reader).await;
+        assert!(res.is_err());
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(msg.contains("empty"), "got: {msg}");
+    }
 }
 
 fn run_meetup_subscribe(store: Arc<Store>, urlname: String, mode: String) -> Result<()> {
