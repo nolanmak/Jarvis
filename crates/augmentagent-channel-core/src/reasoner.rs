@@ -616,6 +616,7 @@ Examples:
     }
 }
 
+
 /// Preset for the archetype picker (#36). A single fast structured-output
 /// classification: email + triage label in, one archetype id (or `none`) +
 /// confidence out. Haiku for cost/latency — the issue specifies a fast,
