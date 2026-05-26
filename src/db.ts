@@ -474,6 +474,14 @@ export interface GmailAccount {
   entityId: string;
   active: boolean;
   createdAt: number;
+  // #179 — liveness signal written by the Rust daemon's gmail poll path.
+  // `lastPolledAt` is ms since epoch of the most recent fetch attempt;
+  // `lastPollOk` is 1 if that fetch succeeded, 0 if it failed (4xx/5xx),
+  // null if the account has never been polled yet. The dashboard's
+  // "connected" indicator (see `dashboard.ts`) uses both to compute a
+  // *live* connected state rather than trusting the static `active` flag.
+  lastPolledAt: number | null;
+  lastPollOk: number | null;
 }
 
 export function getGmailAccounts(): GmailAccount[] {
