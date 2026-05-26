@@ -320,9 +320,9 @@ Available actions:
       "kg_append",
       "record_order",
     ]),
-    params: z.record(z.string(), z.unknown()).optional(),
+    params: z.record(z.string(), z.unknown()).nullable().optional(),
   }),
-  execute: async (input: { action: string; params?: Record<string, unknown> }) => {
+  execute: async (input: { action: string; params?: Record<string, unknown> | null }) => {
     const params = input.params ?? {};
     try {
       switch (input.action) {
@@ -467,11 +467,11 @@ params:
 returns: { url, final_url, status, title, markdown, layer_used, attempts: [...], elapsed_ms }`,
   parameters: z.object({
     url: z.string(),
-    layers: z.array(z.enum(["http", "render", "firecrawl", "brightdata"])).optional(),
-    force_render: z.boolean().optional(),
-    min_quality_chars: z.number().int().positive().optional(),
-    timeout_ms: z.number().int().positive().optional(),
-    include_html: z.boolean().optional(),
+    layers: z.array(z.enum(["http", "render", "firecrawl", "brightdata"])).nullable().optional(),
+    force_render: z.boolean().nullable().optional(),
+    min_quality_chars: z.number().int().positive().nullable().optional(),
+    timeout_ms: z.number().int().positive().nullable().optional(),
+    include_html: z.boolean().nullable().optional(),
   }),
   execute: async (input: {
     url: string;
@@ -525,9 +525,9 @@ Actions:
 If the proxy is not installed, the tool reports it cleanly — do not retry. If status reports the proxy is OFF, ask the operator to enable it via the /intercept skill rather than trying to start it yourself.`,
   parameters: z.object({
     action: z.enum(["status", "export", "clear"]),
-    mode: z.enum(["api-docs", "auth", "summary", "full"]).optional(),
-    host: z.string().optional(),
-    limit: z.number().int().positive().optional(),
+    mode: z.enum(["api-docs", "auth", "summary", "full"]).nullable().optional(),
+    host: z.string().nullable().optional(),
+    limit: z.number().int().positive().nullable().optional(),
   }),
   execute: async (input: InterceptParams) => {
     try {
