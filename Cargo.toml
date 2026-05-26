@@ -31,6 +31,7 @@ members = [
     "crates/augmentagent-wiki",
     "crates/augmentagent-cli",
     "crates/augmentagent-tools",
+    "crates/augmentagent-mcp-memory",
 ]
 
 [workspace.package]
