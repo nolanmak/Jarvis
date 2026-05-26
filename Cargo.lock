@@ -374,6 +374,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "augmentagent-approval-discord",
+ "augmentagent-auth",
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",
@@ -807,6 +808,21 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "augmentagent-mcp-memory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "augmentagent-store",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

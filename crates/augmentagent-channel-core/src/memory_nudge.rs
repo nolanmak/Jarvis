@@ -36,7 +36,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// What kind of work the cycle did. Used as a section header so the writer
 /// can mix multiple surfaces (email triage + Discord ask + digest) into one
@@ -272,6 +272,7 @@ pub fn default_cycles_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn read(path: &Path) -> String {
