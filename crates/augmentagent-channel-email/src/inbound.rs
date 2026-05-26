@@ -77,11 +77,27 @@ impl<G: GmailApi + 'static> InboundSource for GmailInbound<G> {
         }
         let mut items = Vec::new();
         for account in accounts {
-            match self
+            let fetch_result = self
                 .gmail
                 .fetch_unread(&account.entity_id, self.per_account_limit)
-                .await
-            {
+                .await;
+            // #179 — record liveness so the dashboard can show *actually
+            // connected* instead of trusting the static `active` flag.
+            // Failure to record is downgraded to a warn: a missed write
+            // here just leaves the indicator briefly stale; the next
+            // tick fixes it.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if let Err(e) = self.store.set_gmail_account_poll_outcome(
+                &account.entity_id,
+                fetch_result.is_ok(),
+                now_ms,
+            ) {
+                warn!(account = %account.entity_id, "set_gmail_account_poll_outcome failed: {e}");
+            }
+            match fetch_result {
                 Ok(emails) => {
                     for email in &emails {
                         items.push(email_to_work_item(email));

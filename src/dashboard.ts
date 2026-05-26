@@ -74,15 +74,38 @@ function getComposioClient(): Composio | null {
   return new Composio({ apiKey });
 }
 
+// #179 — How long since the last successful gmail poll counts as "still
+// connected." The daemon polls every ~2 min in steady state, so 5 min
+// covers a missed cycle (transient network blip) but flips the indicator
+// off after two consecutive failures — long enough that one bad poll
+// doesn't toggle the UI, short enough that a revoked OAuth grant or a
+// switched Composio project shows up within minutes rather than the
+// indefinite-stale state #179 describes.
+const GMAIL_LIVENESS_STALE_MS = 5 * 60 * 1000;
+
 // Check both DB config and env vars for integration status
 function getConfigStatus() {
   const gmailAccounts = getGmailAccounts();
+  // #179 — "connected" means the most recent poll *succeeded* recently.
+  // `active=1` alone doesn't prove the connection still works at Composio
+  // (key rotations / project switches / revoked grants leave `active=1`
+  // forever). `lastPolledAt=null` means the daemon hasn't polled yet —
+  // treat as not-yet-verified to surface real state once the first poll
+  // lands (within ~2 min of a fresh connect).
+  const nowMs = Date.now();
+  const gmailConnected = gmailAccounts.some(
+    (a) =>
+      a.active &&
+      a.lastPollOk === 1 &&
+      a.lastPolledAt != null &&
+      nowMs - a.lastPolledAt < GMAIL_LIVENESS_STALE_MS,
+  );
   return {
     groqKey: !!(getConfig("groq_api_key") || process.env.GROQ_API_KEY),
     cerebrasKey: !!(getConfig("cerebras_api_key") || process.env.CEREBRAS_API_KEY),
     composioKey: !!(getConfig("composio_api_key") || process.env.COMPOSIO_API_KEY),
     gmailAccounts,
-    gmailConnected: gmailAccounts.some((a) => a.active),
+    gmailConnected,
     discordWebhook: !!(getConfig("discord_webhook_url") || process.env.DISCORD_WEBHOOK_URL),
     discordBotToken: !!(getConfig("discord_bot_token") || process.env.DISCORD_BOT_TOKEN),
     emailRetentionDays: getConfig("email_retention_days") || "0",

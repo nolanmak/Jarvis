@@ -737,6 +737,28 @@ impl Store {
             conn.execute("ALTER TABLE actions ADD COLUMN toolCallTrace TEXT", [])?;
         }
 
+        // #179 — Liveness signal for `gmail_accounts`. `active=1` only tells
+        // us the operator connected this account at some point, NOT that
+        // the connection still works at Composio (project switches, key
+        // rotations, revoked OAuth grants all leave `active=1` forever).
+        // The Rust gmail poller writes these on every cycle so the
+        // dashboard can compute "actually connected" = `active=1` AND
+        // `lastPollOk=1` AND `now - lastPolledAt < STALE_MS`. Column names
+        // are camelCase to match the rest of the `gmail_accounts` table
+        // (`connectionId`, `entityId`, `createdAt`).
+        if !column_exists(conn, "gmail_accounts", "lastPolledAt")? {
+            conn.execute(
+                "ALTER TABLE gmail_accounts ADD COLUMN lastPolledAt INTEGER",
+                [],
+            )?;
+        }
+        if !column_exists(conn, "gmail_accounts", "lastPollOk")? {
+            conn.execute(
+                "ALTER TABLE gmail_accounts ADD COLUMN lastPollOk INTEGER",
+                [],
+            )?;
+        }
+
         // #81 — Proactive CRM signals + per-scan run cursor.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS proactive_signals (\
@@ -1672,6 +1694,27 @@ impl Store {
         guard.execute(
             "UPDATE emails SET triageResult = ?2, agentProcessedAt = ?3 WHERE messageId = ?1",
             params![message_id, triage.as_str(), now],
+        )?;
+        Ok(())
+    }
+
+    /// #179 — record the outcome of the most recent gmail poll for an entity
+    /// so the dashboard can show a *live* connected indicator instead of
+    /// trusting the static `active` flag. `ok=true` after a successful
+    /// `GMAIL_FETCH_EMAILS`, `false` after any 4xx/5xx. UPDATE-by-entity
+    /// (no-op if the entity isn't in `gmail_accounts`, which only happens
+    /// in tests with mock stores).
+    pub fn set_gmail_account_poll_outcome(
+        &self,
+        entity_id: &str,
+        ok: bool,
+        at_ms: i64,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE gmail_accounts SET lastPolledAt = ?1, lastPollOk = ?2 \
+             WHERE entityId = ?3",
+            rusqlite::params![at_ms, if ok { 1 } else { 0 }, entity_id],
         )?;
         Ok(())
     }
