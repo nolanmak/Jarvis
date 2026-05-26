@@ -385,6 +385,7 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
                     cwd: None,
                     env: Vec::new(),
                     settings_json: None,
+                    restrict_env: false,
                 };
                 let message_ctx = MessageContext {
                     channel: "discord".to_string(),

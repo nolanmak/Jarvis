@@ -462,6 +462,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                     cwd: None,
                     env: Vec::new(),
                     settings_json: None,
+                    restrict_env: false,
                 };
                 let message_ctx = MessageContext {
                     channel: "whatsapp".to_string(),

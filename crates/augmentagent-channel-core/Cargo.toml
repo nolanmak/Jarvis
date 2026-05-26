@@ -13,6 +13,9 @@ augmentagent-wiki = { path = "../augmentagent-wiki" }
 # ApprovalBroker trait. approval-discord depends only on -store, so this
 # does not create a dependency cycle.
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
+# #128 — load provider API keys from the OS keyring just-in-time at the
+# wiki-query call boundary so secrets don't sit on disk in `.env`.
+augmentagent-auth = { path = "../augmentagent-auth" }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
