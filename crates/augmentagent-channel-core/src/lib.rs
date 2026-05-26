@@ -19,6 +19,7 @@ pub mod prompt;
 pub mod reasoner;
 pub mod resolve;
 pub mod secret_loader;
+pub mod skills;
 pub mod trigger;
 
 pub use decision::{Decision, DecisionKind};
@@ -40,6 +41,7 @@ pub use governor::{
 pub use mcp::{default_mcp_config_path, McpConfig, McpServerConfig};
 pub use memory_nudge::{default_cycles_root, CycleLogger, CycleSummary, CycleSurface};
 pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerOpts};
+pub use skills::{SkillEntry, SkillRegistry};
 pub use trigger::{
     kind as work_item_kind, ChannelRunner, DigestSource, FriendFeedSource, FriendFeedTrigger,
     InboundMessageTrigger, InboundSource, Trigger, WorkItem, WorkItemHandler,
