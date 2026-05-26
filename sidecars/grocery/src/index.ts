@@ -6,6 +6,7 @@
 
 import "dotenv/config";
 import { GiantProvider } from "./providers/giant/index.js";
+import { WegmansProvider } from "./providers/wegmans/index.js";
 import { GrocerySocketServer } from "./server.js";
 import type { GroceryProvider } from "./provider.js";
 
@@ -14,6 +15,8 @@ function pickProvider(): GroceryProvider {
   switch (id) {
     case "giant":
       return new GiantProvider();
+    case "wegmans":
+      return new WegmansProvider();
     default:
       throw new Error(`unknown GROCERY_PROVIDER: ${id}`);
   }
