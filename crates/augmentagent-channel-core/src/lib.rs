@@ -13,6 +13,7 @@ pub mod decision;
 pub mod engagement;
 pub mod governor;
 pub mod ingest;
+pub mod mcp;
 pub mod memory_nudge;
 pub mod prompt;
 pub mod reasoner;
@@ -36,6 +37,7 @@ pub use governor::{
     Permit, Platform, RateCaps, RateGovernor, RateLimit, Risk, SqliteGovernor, SystemClock,
     TargetAttrs, WindowedCounter, RATE_TABLE,
 };
+pub use mcp::{default_mcp_config_path, McpConfig, McpServerConfig};
 pub use memory_nudge::{default_cycles_root, CycleLogger, CycleSummary, CycleSurface};
 pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerOpts};
 pub use trigger::{
