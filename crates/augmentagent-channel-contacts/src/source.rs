@@ -309,20 +309,13 @@ mod tests {
         let d = tempfile::TempDir::new().unwrap();
         let l = WikiLayout::new(d.path().join("wiki"));
         l.bootstrap().unwrap();
-        // Minimal schema the store's migrate() needs (mirrors store tests).
+        // `Store::open()` is the authoritative schema owner since #97; it
+        // creates every table this test touches (`emails`, `actions`,
+        // `gmail_accounts`) with the full current column set (including
+        // `triageResult`/`agentProcessedAt`, which a hand-rolled fixture
+        // would have to keep manually in sync — see #138).
         let dbp = d.path().join("data.db");
-        let store = {
-            let conn = rusqlite::Connection::open(&dbp).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS emails (messageId TEXT PRIMARY KEY, threadId TEXT, fromEmail TEXT, subject TEXT, body TEXT, receivedAt TEXT, accountEntityId TEXT, firstSeenAt INTEGER);\
-                 CREATE TABLE IF NOT EXISTS actions (id TEXT PRIMARY KEY, messageId TEXT, threadId TEXT, fromEmail TEXT, subject TEXT, originalBody TEXT, draftBody TEXT, status TEXT, errorMessage TEXT, createdAt INTEGER, updatedAt INTEGER);\
-                 CREATE TABLE IF NOT EXISTS learned_patterns (patternType TEXT, pattern TEXT, action TEXT, reason TEXT);\
-                 CREATE TABLE IF NOT EXISTS gmail_accounts (id TEXT PRIMARY KEY, connectionId TEXT, email TEXT, label TEXT, entityId TEXT NOT NULL, active INTEGER DEFAULT 1, createdAt INTEGER NOT NULL);",
-            )
-            .unwrap();
-            drop(conn);
-            Store::open(&dbp).unwrap()
-        };
+        let store = Store::open(&dbp).unwrap();
         (d, l, store)
     }
 
