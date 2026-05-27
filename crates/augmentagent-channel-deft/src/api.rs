@@ -22,7 +22,7 @@ use thiserror::Error;
 
 use crate::auth::DeftAuth;
 use crate::deft_enabled;
-use crate::types::DeftSubmission;
+use crate::types::{DeftForm, DeftSubmission};
 
 #[derive(Debug, Error)]
 pub enum DeftError {
@@ -51,6 +51,15 @@ pub trait DeftApi: Send + Sync {
     /// `GET /responses/{form_id}` — all submissions for a form. Dedup is the
     /// caller's job (by `DeftSubmission::dedup_id`).
     async fn list_responses(&self, form_id: &str) -> Result<Vec<DeftSubmission>, DeftError>;
+
+    /// `GET /forms` — every form in the workspace. Used by the channel for
+    /// auto-discovery (#157) so the operator does not have to maintain an
+    /// explicit `form_ids` allowlist. Default impl returns `Ok(vec![])` so
+    /// existing test stubs (e.g. the one in `channel.rs`) don't need updating
+    /// — only real clients need to implement this.
+    async fn list_forms(&self) -> Result<Vec<DeftForm>, DeftError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Real REST client. Inert unless [`deft_enabled`] is true.
@@ -164,6 +173,34 @@ struct WorkspaceData {
     id: String,
 }
 
+/// Defensive decode for `GET /forms`. Public docs do not pin the outer frame
+/// (`REQUIRES LIVE VALIDATION`); accept the same three shapes as
+/// `/responses/{formId}`: a bare array, a `{ "data": [ ... ] }` wrapper, or a
+/// `{ "data": { "forms": [ ... ] } }` wrapper. Mirrors `ResponsesEnvelope`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FormsEnvelope {
+    Bare(Vec<DeftForm>),
+    Wrapped { data: Vec<DeftForm> },
+    DoubleWrapped { data: FormsInner },
+}
+
+#[derive(Deserialize)]
+struct FormsInner {
+    #[serde(default, alias = "forms", alias = "items")]
+    items: Vec<DeftForm>,
+}
+
+impl FormsEnvelope {
+    fn into_vec(self) -> Vec<DeftForm> {
+        match self {
+            FormsEnvelope::Bare(v) => v,
+            FormsEnvelope::Wrapped { data } => data,
+            FormsEnvelope::DoubleWrapped { data } => data.items,
+        }
+    }
+}
+
 #[async_trait]
 impl DeftApi for DeftClient {
     async fn whoami(&self) -> Result<String, DeftError> {
@@ -193,6 +230,16 @@ impl DeftApi for DeftClient {
         }
         Ok(subs)
     }
+
+    async fn list_forms(&self) -> Result<Vec<DeftForm>, DeftError> {
+        if !deft_enabled() {
+            return Err(DeftError::Disabled);
+        }
+        let url = format!("{}/forms", self.base());
+        let resp = self.http.get(&url).headers(self.headers()?).send().await?;
+        let env: FormsEnvelope = self.check(resp).await?;
+        Ok(env.into_vec())
+    }
 }
 
 #[cfg(test)]
@@ -219,6 +266,7 @@ mod tests {
             c.list_responses("F1").await,
             Err(DeftError::Disabled)
         ));
+        assert!(matches!(c.list_forms().await, Err(DeftError::Disabled)));
     }
 
     #[tokio::test]
@@ -297,6 +345,76 @@ mod tests {
             .await;
         let c = DeftClient::new(sample_auth(&server.url())).unwrap();
         match c.list_responses("F1").await.unwrap_err() {
+            DeftError::RateLimited { remaining } => assert_eq!(remaining, Some(0)),
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+        crate::set_gate(false);
+    }
+
+    #[tokio::test]
+    async fn list_forms_happy_path_returns_forms() {
+        let _g = crate::gate_test_lock().await;
+        crate::set_gate(true);
+        let mut server = mockito::Server::new_async().await;
+        // Vendor envelope shape (matches `GET /workspace`):
+        // `{ "success": true, "data": [ ... ] }`. The defensive decode also
+        // accepts a bare array or a `data.forms[]` wrapper.
+        let body = r#"{
+            "success": true,
+            "data": [
+                {"id":"OUm6T9","name":"Contact form","created_at":"2026-05-01T10:00:00Z"},
+                {"id":"AbCdEf","name":"Newsletter","created_at":"2026-05-10T12:00:00Z"}
+            ]
+        }"#;
+        let _m = server
+            .mock("GET", "/forms")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        let c = DeftClient::new(sample_auth(&server.url())).unwrap();
+        let forms = c.list_forms().await.unwrap();
+        assert_eq!(forms.len(), 2);
+        assert_eq!(forms[0].id, "OUm6T9");
+        assert_eq!(forms[0].name, "Contact form");
+        assert_eq!(forms[0].created_at, "2026-05-01T10:00:00Z");
+        assert_eq!(forms[1].id, "AbCdEf");
+        assert_eq!(forms[1].name, "Newsletter");
+        crate::set_gate(false);
+    }
+
+    #[tokio::test]
+    async fn list_forms_auth_invalid_surfaces_clean() {
+        let _g = crate::gate_test_lock().await;
+        crate::set_gate(true);
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/forms")
+            .with_status(401)
+            .with_body(r#"{"success":false,"message":"bad token"}"#)
+            .create_async()
+            .await;
+        let c = DeftClient::new(sample_auth(&server.url())).unwrap();
+        let err = c.list_forms().await.unwrap_err();
+        assert!(matches!(err, DeftError::AuthInvalid));
+        crate::set_gate(false);
+    }
+
+    #[tokio::test]
+    async fn list_forms_rate_limit_surfaces_remaining() {
+        let _g = crate::gate_test_lock().await;
+        crate::set_gate(true);
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/forms")
+            .with_status(429)
+            .with_header("x-ratelimit-remaining", "0")
+            .with_body("{}")
+            .create_async()
+            .await;
+        let c = DeftClient::new(sample_auth(&server.url())).unwrap();
+        match c.list_forms().await.unwrap_err() {
             DeftError::RateLimited { remaining } => assert_eq!(remaining, Some(0)),
             other => panic!("expected RateLimited, got {other:?}"),
         }
