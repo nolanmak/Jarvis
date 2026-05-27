@@ -8,6 +8,9 @@ repository.workspace = true
 
 [dependencies]
 augmentagent-store = { path = "../augmentagent-store" }
+# #176 — `!loops` Discord command reuses the shared /proc walker + signal
+# primitive that backs `augmentagent loops` (#175).
+augmentagent-loops = { path = "../augmentagent-loops" }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -24,3 +27,6 @@ reqwest = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 tempfile = "3"
+# #176 — the `process_loops` test fakes use `libc::ESRCH` to model
+# "no such process" responses from the signaler.
+libc = "0.2"
