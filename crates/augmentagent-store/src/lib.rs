@@ -5,6 +5,7 @@
 //! concurrently.
 
 pub mod models;
+pub mod redact;
 mod store;
 
 pub use models::{
