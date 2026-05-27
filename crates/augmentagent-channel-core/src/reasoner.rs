@@ -583,10 +583,14 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     let bin = repo_root.join("target/release/augmentagent");
     // Scoped Bash patterns: Claude can invoke our gmail subcommand via the
     // release binary's absolute path, plus `gh issue {create,list,view,comment}`
-    // for filing AugmentAgent self-feedback issues. `/snap/bin/gh` is an
-    // absolute path because the systemd unit's PATH does not include /snap/bin.
-    // Anything else is denied by claude CLI.
+    // for filing AugmentAgent self-feedback issues — routed via the
+    // `scripts/aa-gh` shim (#131) so the agent cannot reach destructive
+    // `gh repo delete`, `gh pr merge --admin`, `gh secret set`, etc. even
+    // if it tried to glob past the issue subcommand. The shim is referenced
+    // by absolute path because the systemd unit's PATH does not include
+    // the repo's scripts dir. Anything else is denied by claude CLI.
     let bash_gmail = format!("Bash({} gmail *)", bin.display());
+    let aa_gh = repo_root.join("scripts/aa-gh");
     // Invoice subcommands the LLM can autonomously invoke. `invoice run` is
     // intentionally absent — the only real-send path is the user clicking
     // Approve on a draft card. `status` and `list-accounts` omit the trailing
@@ -655,10 +659,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_invoice_set_recipient,
             bash_invoice_set_entity,
             bash_invoice_set_auto_draft,
-            "Bash(/snap/bin/gh issue create *)".into(),
-            "Bash(/snap/bin/gh issue list *)".into(),
-            "Bash(/snap/bin/gh issue view *)".into(),
-            "Bash(/snap/bin/gh issue comment *)".into(),
+            format!("Bash({} issue create *)", aa_gh.display()),
+            format!("Bash({} issue list *)", aa_gh.display()),
+            format!("Bash({} issue view *)", aa_gh.display()),
+            format!("Bash({} issue comment *)", aa_gh.display()),
         ],
         add_dirs: vec![wiki_root.clone()],
         permission_mode: "acceptEdits".into(),
