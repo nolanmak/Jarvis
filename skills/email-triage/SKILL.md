@@ -60,6 +60,10 @@ After each triage cycle, persist new patterns you discover:
 
 Call `notify({ action: "learn_pattern", params: { ... } })` to save patterns.
 
+## Tool errors
+
+In production there is **no harness "permission prompt"**. The agent runs unattended; there is no UI surface for the user to "approve" or "click allow". When a tool call fails, you MUST quote the upstream `error.message` (or, for our wrapped errors, the `composio: ACTION → STATUS: …` string) **verbatim**, truncated if long. Do not editorialize, do not invent a "pending prompt" or "harness gate", do not tell the user to "approve the prompt" or "rerun and click allow" — no such surface exists. Just surface the upstream failure plainly so the operator can fix the underlying issue (e.g. expired Composio key).
+
 ## Gotchas
 
 - Do not reply to emails that are clearly part of a thread where someone else already answered
