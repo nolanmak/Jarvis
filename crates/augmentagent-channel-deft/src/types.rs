@@ -73,6 +73,10 @@ pub struct DeftForm {
 /// drift. `response` may arrive as a non-string (number/bool for
 /// numeric/checkbox fields); it is coerced to its display string so the
 /// command parser always sees text.
+///
+/// `field_type` is the Deftform widget type (`email`, `text`, `number`,
+/// `checkbox`, ...) — used by [`DeftSubmission::into_email`] to locate the
+/// submitter's address without label heuristics when the form declares it.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DeftField {
     #[serde(default)]
@@ -85,6 +89,11 @@ pub struct DeftField {
     /// custom keys — the mapping falls back to a label match then.
     #[serde(default, alias = "customKey")]
     pub custom_key: Option<String>,
+    /// Deftform widget type, lowercase (e.g. `email`, `text`, `number`,
+    /// `checkbox`). Renamed from JSON's `type` because `type` is a Rust
+    /// keyword; `fieldType` camelCase alternate accepted defensively.
+    #[serde(default, rename = "type", alias = "fieldType", alias = "field_type")]
+    pub field_type: Option<String>,
 }
 
 /// Coerce a JSON scalar to its display string. Deftform number/checkbox
@@ -119,6 +128,11 @@ pub struct DeftSubmission {
     /// stamp it from the receiver's route).
     #[serde(default, alias = "formId", alias = "form_id")]
     pub form_id: String,
+    /// Human-readable form name (vendor field), when present. Used in
+    /// `Email.subject` so the user sees "[Deftform: Contact Us] ..." rather
+    /// than the opaque form id. Falls back to `form_id` if absent.
+    #[serde(default, alias = "formName", alias = "form_name")]
+    pub form_name: Option<String>,
     /// Submission timestamp if present (RFC3339-ish). Best-effort.
     #[serde(default, alias = "created_at", alias = "submitted_at")]
     pub created_at: String,
@@ -207,6 +221,12 @@ pub fn webhook_submissions(body: &Value, route_form_id: &str) -> Vec<DeftSubmiss
 /// Which form fields encode the command / argument / free-text query.
 /// Defaults match `docs/deft-protocol.md` §5; overridable because it is the
 /// user's form (the actual keys are `REQUIRES LIVE VALIDATION`).
+///
+/// **Legacy (#116 spike).** The command-and-control framing is being replaced
+/// by inbound-message semantics (#158). New code should use
+/// [`FormFieldHints`] + [`DeftSubmission::into_email`]; this struct remains
+/// only because the channel still calls [`DeftSubmission::into_command_email`]
+/// pending the channel-side rewire in #159.
 #[derive(Debug, Clone)]
 pub struct CommandFieldMap {
     pub command_key: String,
@@ -223,6 +243,30 @@ impl Default for CommandFieldMap {
         }
     }
 }
+
+/// Optional hints used by [`DeftSubmission::into_email`] when the form's own
+/// field metadata is ambiguous.
+///
+/// The detection order is always:
+/// 1. operator hint — `email_field_hint` matched against `custom_key` then
+///    case-insensitive `label`;
+/// 2. Deftform field whose `type == "email"`;
+/// 3. label heuristic (case-insensitive substring: `email`, `e-mail`,
+///    `your email`);
+/// 4. no match ⇒ `Email.from` left empty.
+///
+/// All fields are optional; `FormFieldHints::default()` is the common case
+/// where the form is left to self-describe.
+#[derive(Debug, Clone, Default)]
+pub struct FormFieldHints {
+    /// `custom_key` (or label) of the field that carries the submitter's
+    /// email address. Overrides type/label auto-detection when set.
+    pub email_field_hint: Option<String>,
+}
+
+/// Case-insensitive substrings that mark a field as "probably the submitter's
+/// email address". Order doesn't matter — the first matching field wins.
+const EMAIL_LABEL_NEEDLES: &[&str] = &["e-mail", "email"];
 
 /// Parsed command-and-control intent. Mirrors the WhatsApp control surface's
 /// `ControlCommand` so the downstream dispatch is identical across channels.
@@ -282,10 +326,15 @@ pub fn command_from_submission(sub: &DeftSubmission, map: &CommandFieldMap) -> D
 }
 
 impl DeftSubmission {
-    /// Convert into the store's generic `Email`. `workspace_id` is stamped
-    /// into `account_entity_id` so the dispatcher routes acks back to the
-    /// right Deftform workspace token.
-    pub fn into_email(&self, workspace_id: &str, map: &CommandFieldMap) -> Email {
+    /// **Legacy C&C conversion.** Decodes the submission as an agent
+    /// command-and-control instruction (`approve` / `decline` / `revise` /
+    /// `query`) and writes it into `Email.body`. Used by the channel until the
+    /// switchover to inbound-message semantics lands in #159.
+    ///
+    /// New code should call [`Self::into_email`] instead, which preserves the
+    /// submitter's answers verbatim so the existing email triage → draft →
+    /// approval pipeline can produce a reply.
+    pub fn into_command_email(&self, workspace_id: &str, map: &CommandFieldMap) -> Email {
         let cmd = command_from_submission(self, map);
         let (verb, body) = match &cmd {
             DeftCommand::Approve => ("approve".to_string(), "approve".to_string()),
@@ -298,6 +347,126 @@ impl DeftSubmission {
             thread_id: Some(self.form_id.clone()),
             from: format!("Deft form <deft:{}>", self.form_id),
             subject: format!("[deft:{verb}] {}", self.form_id),
+            body,
+            date: self.created_at.clone(),
+            account_entity_id: Some(format!("{ACCOUNT_ENTITY_ID_PREFIX}:{workspace_id}")),
+            platform: PLATFORM.to_string(),
+            kind: "dm".to_string(),
+        }
+    }
+
+    /// Locate the field that carries the submitter's email address.
+    ///
+    /// Returns the first match by precedence: operator hint
+    /// (`hints.email_field_hint` against `custom_key`, then label), then
+    /// Deftform `type == "email"`, then label heuristic
+    /// ([`EMAIL_LABEL_NEEDLES`]). `None` if the form does not collect one.
+    fn find_email_field(&self, hints: &FormFieldHints) -> Option<&DeftField> {
+        if let Some(hint) = hints.email_field_hint.as_deref().filter(|h| !h.is_empty()) {
+            if let Some(f) = self.field(hint) {
+                return Some(f);
+            }
+        }
+        if let Some(f) = self.data.iter().find(|f| {
+            f.field_type
+                .as_deref()
+                .is_some_and(|t| t.eq_ignore_ascii_case("email"))
+        }) {
+            return Some(f);
+        }
+        self.data.iter().find(|f| {
+            let label = f.label.to_ascii_lowercase();
+            EMAIL_LABEL_NEEDLES.iter().any(|n| label.contains(n))
+        })
+    }
+
+    /// First short, text-only answer in the submission — the seed for the
+    /// `Email.subject` summary. "Short" = ≤ 80 chars after trimming, "text" =
+    /// `field_type` is `text`/`textarea`/`shorttext` or unset. Skips the
+    /// email field itself so the subject is not literally the address.
+    fn first_short_text_answer(&self, email_field_uuid: Option<&str>) -> Option<String> {
+        for f in &self.data {
+            if Some(f.uuid.as_str()) == email_field_uuid {
+                continue;
+            }
+            let kind_ok = match f.field_type.as_deref() {
+                Some(t) => matches!(
+                    t.to_ascii_lowercase().as_str(),
+                    "text" | "textarea" | "shorttext" | "short_text" | "longtext" | "long_text"
+                ),
+                None => true,
+            };
+            if !kind_ok {
+                continue;
+            }
+            let trimmed = f.response.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.chars().count() <= 80 {
+                return Some(trimmed.to_string());
+            }
+        }
+        None
+    }
+
+    /// Map this submission to the canonical inbound [`Email`] the rest of the
+    /// pipeline understands.
+    ///
+    /// - `from`: best-effort submitter address (see [`Self::find_email_field`]);
+    ///   empty string when the form does not collect one. The canonical
+    ///   `Email.from` is a non-optional `String`, so "no address" is encoded
+    ///   as `""` — downstream triage already treats an empty `from` as a
+    ///   no-reply / system message.
+    /// - `subject`: `"[Deftform: {form_name or form_id}] {first short text
+    ///   answer | 'New submission'}"`.
+    /// - `body`: every answer rendered as a `Q: <label>\nA: <response>\n\n`
+    ///   block, in original form order.
+    /// - `message_id`: `"deft:{uuid}"` (via [`Self::dedup_id`]) — matches the
+    ///   key the store uses for cross-restart dedup.
+    /// - `thread_id`: the `form_id` (so an outbound ack/reply can be routed
+    ///   back to the originating form when a sender channel arrives).
+    /// - `account_entity_id`: `"deft:{workspace_id}"` so the dispatcher picks
+    ///   the right Deftform workspace token at action time.
+    pub fn into_email(&self, workspace_id: &str, hints: &FormFieldHints) -> Email {
+        let email_field = self.find_email_field(hints);
+        let from = email_field
+            .map(|f| f.response.trim().to_string())
+            .unwrap_or_default();
+
+        let form_label = self
+            .form_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(self.form_id.as_str());
+
+        let seed = self
+            .first_short_text_answer(email_field.map(|f| f.uuid.as_str()))
+            .unwrap_or_else(|| "New submission".to_string());
+
+        let subject = format!("[Deftform: {form_label}] {seed}");
+
+        let mut body = String::new();
+        for f in &self.data {
+            let label = if f.label.trim().is_empty() {
+                "(unlabeled)"
+            } else {
+                f.label.trim()
+            };
+            body.push_str("Q: ");
+            body.push_str(label);
+            body.push('\n');
+            body.push_str("A: ");
+            body.push_str(f.response.trim());
+            body.push_str("\n\n");
+        }
+
+        Email {
+            message_id: self.dedup_id(),
+            thread_id: Some(self.form_id.clone()),
+            from,
+            subject,
             body,
             date: self.created_at.clone(),
             account_entity_id: Some(format!("{ACCOUNT_ENTITY_ID_PREFIX}:{workspace_id}")),
@@ -327,6 +496,7 @@ mod tests {
             submission_id: "s1".into(),
             uuid: "u-123".into(),
             form_id: "OUm6T9".into(),
+            form_name: None,
             created_at: "2026-05-18T10:00:00Z".into(),
             data: fields
                 .iter()
@@ -338,6 +508,38 @@ mod tests {
                         None
                     } else {
                         Some(key.to_string())
+                    },
+                    field_type: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Like [`sub_with`] but each field tuple is `(label, response,
+    /// custom_key, field_type)` so tests can exercise `into_email`'s
+    /// type-aware email detection.
+    fn sub_with_types(fields: &[(&str, &str, &str, &str)]) -> DeftSubmission {
+        DeftSubmission {
+            submission_id: "s1".into(),
+            uuid: "u-123".into(),
+            form_id: "OUm6T9".into(),
+            form_name: None,
+            created_at: "2026-05-18T10:00:00Z".into(),
+            data: fields
+                .iter()
+                .map(|(label, resp, key, ty)| DeftField {
+                    label: label.to_string(),
+                    response: resp.to_string(),
+                    uuid: format!("fuuid-{label}"),
+                    custom_key: if key.is_empty() {
+                        None
+                    } else {
+                        Some(key.to_string())
+                    },
+                    field_type: if ty.is_empty() {
+                        None
+                    } else {
+                        Some(ty.to_string())
                     },
                 })
                 .collect(),
@@ -411,13 +613,13 @@ mod tests {
     }
 
     #[test]
-    fn into_email_stamps_workspace_and_platform() {
+    fn into_command_email_stamps_workspace_and_platform() {
         let m = CommandFieldMap::default();
         let s = sub_with(&[
             ("Command", "revise", "agent_command"),
             ("Argument", "less formal", "agent_arg"),
         ]);
-        let e = s.into_email("ws_abc", &m);
+        let e = s.into_command_email("ws_abc", &m);
         assert_eq!(e.platform, "deft");
         assert_eq!(e.kind, "dm");
         assert_eq!(e.message_id, "deft:u-123");
@@ -426,6 +628,112 @@ mod tests {
         assert_eq!(e.body, "revise less formal");
         assert!(e.subject.starts_with("[deft:revise]"));
         assert!(is_deft_email(&e));
+    }
+
+    // ---- #158 into_email (inbound-message semantics) -------------------
+
+    #[test]
+    fn into_email_picks_explicit_email_type_field() {
+        // A form declaring `type: "email"` on one field — that wins over a
+        // label heuristic, even if another field's label also says "email".
+        let s = sub_with_types(&[
+            ("Contact", "alice@example.com", "", "email"),
+            ("Backup email label only", "ignored@example.com", "", "text"),
+            ("Subject", "Looking for a demo", "", "text"),
+        ]);
+        let e = s.into_email("ws_abc", &FormFieldHints::default());
+        assert_eq!(e.from, "alice@example.com");
+        assert_eq!(e.platform, "deft");
+        assert_eq!(e.message_id, "deft:u-123");
+    }
+
+    #[test]
+    fn into_email_label_heuristic_when_no_type_metadata() {
+        // No `type` info — fall through to the label heuristic. "Your Email"
+        // matches the `email` needle case-insensitively.
+        let s = sub_with(&[
+            ("Your Email", "bob@example.com", ""),
+            ("Question", "Can you reply by Friday?", ""),
+        ]);
+        let e = s.into_email("ws_abc", &FormFieldHints::default());
+        assert_eq!(e.from, "bob@example.com");
+    }
+
+    #[test]
+    fn into_email_no_email_field_yields_empty_from() {
+        // A form that doesn't collect an address — `from` stays empty so
+        // downstream triage knows there's no reply-target. The rest of the
+        // Email is still well-formed.
+        let s = sub_with(&[
+            ("Name", "Carol", ""),
+            ("Message", "Just saying hi", ""),
+        ]);
+        let e = s.into_email("ws_abc", &FormFieldHints::default());
+        assert_eq!(e.from, "");
+        assert_eq!(e.message_id, "deft:u-123");
+        assert!(e.body.contains("Q: Name\nA: Carol"));
+    }
+
+    #[test]
+    fn into_email_body_formats_each_answer_as_qa_block() {
+        // Multi-answer body: every field becomes a Q:/A: pair separated by a
+        // blank line, in original form order.
+        let s = sub_with_types(&[
+            ("Email", "dana@example.com", "", "email"),
+            ("Name", "Dana", "", "text"),
+            ("Message", "Please send pricing", "", "textarea"),
+        ]);
+        let e = s.into_email("ws_abc", &FormFieldHints::default());
+        let expected = "Q: Email\nA: dana@example.com\n\n\
+                        Q: Name\nA: Dana\n\n\
+                        Q: Message\nA: Please send pricing\n\n";
+        assert_eq!(e.body, expected);
+    }
+
+    #[test]
+    fn into_email_message_id_matches_dedup_id() {
+        // Store dedup is keyed on `message_id`; the contract is that it
+        // equals `dedup_id()` so webhook+poll double-delivery collapses.
+        let s = sub_with(&[("Email", "e@example.com", "")]);
+        let e = s.into_email("ws_abc", &FormFieldHints::default());
+        assert_eq!(e.message_id, "deft:u-123");
+        assert_eq!(e.message_id, s.dedup_id());
+    }
+
+    #[test]
+    fn into_email_subject_uses_form_name_when_present() {
+        // form_name supplied ⇒ subject prefix uses it; first short text
+        // answer (skipping the email field) seeds the summary.
+        let mut s = sub_with_types(&[
+            ("Email", "e@example.com", "", "email"),
+            ("Topic", "Pricing question", "", "text"),
+        ]);
+        s.form_name = Some("Contact Us".into());
+        let e = s.into_email("ws_abc", &FormFieldHints::default());
+        assert_eq!(e.subject, "[Deftform: Contact Us] Pricing question");
+    }
+
+    #[test]
+    fn into_email_subject_falls_back_to_form_id_and_default_seed() {
+        // No form_name, no short text answer ⇒ subject = `[Deftform: <form_id>] New submission`.
+        let s = sub_with_types(&[("Email", "e@example.com", "", "email")]);
+        let e = s.into_email("ws_abc", &FormFieldHints::default());
+        assert_eq!(e.subject, "[Deftform: OUm6T9] New submission");
+    }
+
+    #[test]
+    fn into_email_operator_hint_overrides_auto_detection() {
+        // Hint targets a field by `custom_key` even when its type/label
+        // wouldn't normally trip the email detector.
+        let s = sub_with_types(&[
+            ("Reply To", "ops@example.com", "reply_addr", "text"),
+            ("Notes", "internal note", "", "textarea"),
+        ]);
+        let hints = FormFieldHints {
+            email_field_hint: Some("reply_addr".into()),
+        };
+        let e = s.into_email("ws_abc", &hints);
+        assert_eq!(e.from, "ops@example.com");
     }
 
     #[test]

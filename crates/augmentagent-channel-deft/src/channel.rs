@@ -117,7 +117,11 @@ impl<A: DeftApi> DeftChannel<A> {
                 if !seen.insert(id.clone()) {
                     continue; // already emitted this process lifetime
                 }
-                let email = sub.into_email(&self.workspace_id, &self.config.field_map);
+                // #158: still using the legacy C&C conversion here — the
+                // switchover to `into_email` + `FormFieldHints` is staged in
+                // #159 so the inbound-message rewire ships as a single
+                // reviewable change.
+                let email = sub.into_command_email(&self.workspace_id, &self.config.field_map);
                 let payload = serde_json::to_value(&email)
                     .unwrap_or(serde_json::Value::Null);
                 out.push(WorkItem {
