@@ -1409,6 +1409,171 @@ function setPersonFrontmatterKey(slug: string, key: string, value: string): bool
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// #177 — Sessions tab: enumerate running `claude` processes, with a Kill
+// action per row. Frontend lives in views/sessions.ejs and polls /api/sessions
+// every 5s while the tab is open. POST /api/sessions/:pid/stop hard-rejects
+// any PID whose cmdline doesn't include "claude" as a defense-in-depth check
+// before signaling.
+// ---------------------------------------------------------------------------
+
+type SessionRow = {
+  pid: number;
+  ppid: number;
+  etime: string;
+  tty: string;
+  cwd: string;
+  cmd: string;
+};
+
+function readProcCmdline(pid: number): string[] | null {
+  try {
+    const raw = fs.readFileSync(`/proc/${pid}/cmdline`);
+    // /proc/<pid>/cmdline is NUL-separated and trailing-NUL terminated.
+    const parts = raw
+      .toString("utf8")
+      .split("\0")
+      .filter((s) => s.length > 0);
+    return parts.length ? parts : null;
+  } catch {
+    return null;
+  }
+}
+
+function readProcComm(pid: number): string | null {
+  try {
+    return fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+  } catch {
+    return null;
+  }
+}
+
+function readProcCwd(pid: number): string {
+  try {
+    return fs.readlinkSync(`/proc/${pid}/cwd`);
+  } catch {
+    return "";
+  }
+}
+
+function readProcStatPpid(pid: number): number {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    // The comm field is wrapped in parens and may contain spaces/parens —
+    // split on the LAST ')' so the field offsets line up regardless.
+    const close = stat.lastIndexOf(")");
+    if (close < 0) return 0;
+    const rest = stat.slice(close + 2).split(/\s+/);
+    // After comm: state ppid pgrp ... (ppid is index 1 in `rest`)
+    return parseInt(rest[1] || "0", 10) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function isClaudeCmdline(cmdline: string[] | null, comm: string | null): boolean {
+  if (comm === "claude") return true;
+  if (!cmdline || cmdline.length === 0) return false;
+  const base = path.basename(cmdline[0]);
+  return base === "claude";
+}
+
+function enumerateClaudeSessions(): SessionRow[] {
+  const rows: SessionRow[] = [];
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync("/proc");
+  } catch {
+    return rows;
+  }
+  const pids: number[] = [];
+  for (const e of entries) {
+    if (/^\d+$/.test(e)) pids.push(parseInt(e, 10));
+  }
+
+  // Pull etime + tty from a single `ps` invocation keyed by PID. /proc gives
+  // us start time in clock ticks since boot — easier and more accurate to let
+  // `ps` format the elapsed time string ("etime") and resolve the tty.
+  let psMap = new Map<number, { etime: string; tty: string }>();
+  if (pids.length) {
+    try {
+      const { execSync } = require("child_process") as typeof import("child_process");
+      const out = execSync("ps -e -o pid=,etime=,tty=", {
+        encoding: "utf8",
+        timeout: 2000,
+      });
+      for (const line of out.split("\n")) {
+        const m = line.trim().match(/^(\d+)\s+(\S+)\s+(\S+)$/);
+        if (!m) continue;
+        psMap.set(parseInt(m[1], 10), { etime: m[2], tty: m[3] });
+      }
+    } catch {
+      // ps may be unavailable in some sandboxes; fall through with empty map.
+      psMap = new Map();
+    }
+  }
+
+  for (const pid of pids) {
+    const cmdline = readProcCmdline(pid);
+    const comm = readProcComm(pid);
+    if (!isClaudeCmdline(cmdline, comm)) continue;
+    const ppid = readProcStatPpid(pid);
+    const cwd = readProcCwd(pid);
+    const meta = psMap.get(pid);
+    rows.push({
+      pid,
+      ppid,
+      etime: meta?.etime ?? "",
+      tty: meta?.tty ?? "?",
+      cwd,
+      cmd: (cmdline || [comm || "claude"]).join(" "),
+    });
+  }
+  // Stable order: youngest first by PID (proxy for newest), like a process list.
+  rows.sort((a, b) => b.pid - a.pid);
+  return rows;
+}
+
+router.get("/sessions", (_req, res) => {
+  res.render("sessions", { page: "sessions" });
+});
+
+router.get("/api/sessions", (_req, res) => {
+  try {
+    res.json(enumerateClaudeSessions());
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+router.post("/api/sessions/:pid/stop", (req, res) => {
+  const pid = parseInt(req.params.pid, 10);
+  if (!Number.isFinite(pid) || pid <= 1) {
+    res.status(400).json({ error: "invalid pid" });
+    return;
+  }
+  // Defense-in-depth: re-read /proc/<pid>/cmdline at signal time and
+  // hard-reject anything that doesn't look like a claude process. Prevents
+  // a stale client (or a malicious one) from convincing us to SIGKILL init
+  // or some unrelated daemon that happened to recycle the PID.
+  const cmdline = readProcCmdline(pid);
+  const comm = readProcComm(pid);
+  if (!isClaudeCmdline(cmdline, comm)) {
+    res.status(403).json({
+      error: "pid is not a claude process (refusing to signal)",
+    });
+    return;
+  }
+  const force = !!(req.body && req.body.force);
+  const signal: NodeJS.Signals = force ? "SIGKILL" : "SIGTERM";
+  try {
+    process.kill(pid, signal);
+    res.json({ ok: true, pid, signal });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 router.get("/relationships", (_req, res) => {
   const signals = listProactiveSignals(200);
   const actions = listActiveProactiveUserActions();

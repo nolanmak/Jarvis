@@ -1,0 +1,135 @@
+<%- include('partials/header', { page: 'sessions' }) %>
+
+<div class="space-y-6">
+  <div class="flex items-center justify-between">
+    <div>
+      <h1 class="text-xl font-semibold">Sessions</h1>
+      <p class="text-xs text-gray-500 mt-1">
+        #177 — running <code class="text-gray-400">claude</code> processes on this host.
+        Auto-refreshes every 5s while this tab is open. Kill sends
+        <span class="text-gray-300">SIGTERM</span>; hold <span class="text-gray-300">Shift</span>
+        for <span class="text-gray-300">SIGKILL</span>.
+      </p>
+    </div>
+    <div class="text-xs text-gray-500">
+      <span id="sessions-status">loading…</span>
+    </div>
+  </div>
+
+  <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="border-b border-gray-800 text-left">
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">PID</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">PPID</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Age</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">TTY</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">CWD</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Cmd</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium text-right"></th>
+        </tr>
+      </thead>
+      <tbody id="session-rows">
+        <tr><td colspan="7" class="px-4 py-6 text-center text-gray-500">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  (function () {
+    const REFRESH_MS = 5000;
+    let timer = null;
+    let inFlight = false;
+
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+    function truncate(s, n) {
+      const str = String(s == null ? '' : s);
+      if (str.length <= n) return str;
+      return '…' + str.slice(str.length - (n - 1));
+    }
+
+    async function load() {
+      if (inFlight) return;
+      inFlight = true;
+      const statusEl = document.getElementById('sessions-status');
+      try {
+        const res = await fetch('/api/sessions', { headers: { 'accept': 'application/json' } });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const rows = await res.json();
+        const tb = document.getElementById('session-rows');
+        if (!Array.isArray(rows) || rows.length === 0) {
+          tb.innerHTML = '<tr><td colspan="7" class="px-4 py-6 text-center text-gray-500">No claude processes running.</td></tr>';
+        } else {
+          tb.innerHTML = rows.map(function (r) {
+            const cwdShort = truncate(r.cwd, 50);
+            const cmdShort = truncate(r.cmd, 80);
+            return '<tr class="border-b border-gray-800/50">' +
+              '<td class="px-4 py-2 font-mono">' + esc(r.pid) + '</td>' +
+              '<td class="px-4 py-2 font-mono text-gray-400">' + esc(r.ppid) + '</td>' +
+              '<td class="px-4 py-2 font-mono text-gray-400">' + esc(r.etime) + '</td>' +
+              '<td class="px-4 py-2 font-mono text-gray-400">' + esc(r.tty) + '</td>' +
+              '<td class="px-4 py-2 text-gray-400 font-mono text-xs" title="' + esc(r.cwd) + '">' + esc(cwdShort) + '</td>' +
+              '<td class="px-4 py-2 text-gray-400 font-mono text-xs" title="' + esc(r.cmd) + '">' + esc(cmdShort) + '</td>' +
+              '<td class="px-4 py-2 text-right">' +
+                '<button onclick="killSession(' + esc(r.pid) + ', event)" ' +
+                '   class="text-xs px-2 py-1 rounded bg-red-900/40 text-red-300 border border-red-700/50 hover:bg-red-900/70">' +
+                '  Kill' +
+                '</button>' +
+              '</td>' +
+            '</tr>';
+          }).join('');
+        }
+        const ts = new Date().toLocaleTimeString();
+        statusEl.textContent = rows.length + ' process' + (rows.length === 1 ? '' : 'es') + ' · updated ' + ts;
+      } catch (e) {
+        statusEl.textContent = 'load failed: ' + e.message;
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    window.killSession = async function (pid, ev) {
+      const force = !!(ev && ev.shiftKey);
+      const label = force ? 'SIGKILL' : 'SIGTERM';
+      if (!confirm('Send ' + label + ' to PID ' + pid + '?')) return;
+      try {
+        const res = await fetch('/api/sessions/' + encodeURIComponent(pid) + '/stop', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ force: force }),
+        });
+        if (!res.ok) {
+          let msg = 'HTTP ' + res.status;
+          try { msg = (await res.json()).error || msg; } catch (_) { /* ignore */ }
+          alert('Kill failed: ' + msg);
+        }
+      } catch (e) {
+        alert('Kill failed: ' + e.message);
+      }
+      await load();
+    };
+
+    function start() {
+      stop();
+      load();
+      timer = setInterval(load, REFRESH_MS);
+    }
+    function stop() {
+      if (timer) { clearInterval(timer); timer = null; }
+    }
+
+    // Pause polling when the tab is in the background to avoid useless work.
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible') start();
+      else stop();
+    });
+
+    start();
+  })();
+</script>
+
+<%- include('partials/footer') %>
