@@ -437,3 +437,129 @@ Deno.test("rpc error: parent {id,error} frame rejects the in-program await", asy
   const finals = result.stdoutFrames.filter((f) => "final" in f);
   assertStringIncludes(String(finals[0].final), "rate_limited");
 });
+
+// ---------------------------------------------------------------------------
+// #183 regression: a program containing TypeScript-only syntax (type
+// annotations on parameters / return, `as unknown as Foo` cast, generics,
+// interface declarations) must parse + run without `SyntaxError: Unexpected
+// token ':'`. Before the fix the runner used `eval`, which is plain JS and
+// chokes on the very first `: Promise<void>`. The program below is the
+// exact failing snippet from the issue (with the same EmailContext cast).
+// ---------------------------------------------------------------------------
+Deno.test("#183: typescript type-cast program parses and runs", async () => {
+  const program = `
+    interface EmailContext {
+      from: string;
+      subject: string;
+      threadId: string;
+      messageId: string;
+      channel: string;
+      body: string;
+    }
+
+    async function main(): Promise<void> {
+      const messageId = "urn:li:messagingMessage:abc";
+      const threadId = "urn:li:msg_conversation:xyz";
+      const sender = "linkedin:urn:li:fsd_profile:nope";
+
+      const already = await tools.db.isProcessed(messageId);
+      if (already) {
+        await tools.draft("linkedin", "", "already processed");
+        return;
+      }
+
+      const [history, recent, hint] = await Promise.all([
+        tools.db.threadHistory(threadId),
+        tools.db.recentEmailsFrom(sender, 30),
+        tools.wiki.draftHint({
+          from: sender,
+          subject: "[LinkedIn DM]",
+          threadId,
+          messageId,
+          channel: "linkedin",
+          body: "Hey, follow-up.",
+        } as unknown as EmailContext),
+      ]);
+
+      const priorTurns =
+        ((history as Array<unknown> | null)?.length ?? 0) +
+        ((recent as Array<unknown> | null)?.length ?? 0);
+      const opener = priorTurns > 1 ? "thanks for circling back" : "appreciate the nudge";
+      const body = opener + (hint ? " // " + String(hint).slice(0, 40) : "");
+      await tools.draft("linkedin", body, "polite ack");
+    }
+
+    await main();
+  `;
+
+  const result = await driveRunner({
+    header: {
+      program,
+      manifest: ["draft", "db.isProcessed", "db.threadHistory", "db.recentEmailsFrom", "wiki.draftHint"],
+    },
+    onFrame: (f) => {
+      if (!("call" in f)) return undefined;
+      // Stub each tool with a deterministic response so the program
+      // exercises the type-annotated paths.
+      switch (f.call) {
+        case "db.isProcessed":
+          return { id: f.id, result: false };
+        case "db.threadHistory":
+          return { id: f.id, result: [{ id: "h1" }, { id: "h2" }] };
+        case "db.recentEmailsFrom":
+          return { id: f.id, result: [{ id: "r1" }] };
+        case "wiki.draftHint":
+          return { id: f.id, result: "podcast-invite archetype" };
+        case "draft":
+          return { id: f.id, result: null };
+        default:
+          return { id: f.id, error: "unexpected call: " + String(f.call) };
+      }
+    },
+    testTimeoutMs: 15_000,
+  });
+
+  assertEquals(
+    result.status.code,
+    0,
+    `runner exited non-zero — TS parser missing or program shape rejected.\n` +
+      `stdout frames: ${JSON.stringify(result.stdoutFrames)}\nstderr: ${result.stderr}`,
+  );
+  // No `Unexpected token` SyntaxError anywhere in the output.
+  const errFrames = result.stdoutFrames.filter((f) => "error" in f);
+  assertEquals(
+    errFrames.length,
+    0,
+    `expected no error frames, got: ${JSON.stringify(errFrames)}`,
+  );
+  assert(
+    !result.stderr.toLowerCase().includes("unexpected token"),
+    `runner stderr should not contain 'Unexpected token': ${result.stderr}`,
+  );
+  // The program reaches its single tools.draft(...) at the end.
+  const draftCalls = result.stdoutFrames.filter(
+    (f) => "call" in f && f.call === "draft",
+  );
+  assertEquals(draftCalls.length, 1, "expected exactly one draft call");
+  const finals = result.stdoutFrames.filter((f) => "final" in f);
+  assertEquals(finals.length, 1, "expected exactly one final frame");
+});
+
+// ---------------------------------------------------------------------------
+// #183 unit test: `wrapProgramForModule` strips a trailing `main();` /
+// `await main();` so the injected `export const __result__ = await main();`
+// doesn't double-invoke. Also leaves programs with no trailing main() alone.
+// ---------------------------------------------------------------------------
+import { __internal } from "./runner.ts";
+Deno.test("wrapProgramForModule strips trailing main() invocation", () => {
+  const wrap = __internal.wrapProgramForModule;
+  const a = wrap("async function main(){ return 1; } main();");
+  assert(!/main\(\)\s*;\s*$/.test(a), "should have stripped trailing main();");
+  assertStringIncludes(a, "export const __result__");
+  // `await main();` also gets stripped.
+  const b = wrap("async function main(){ return 2; }\nawait main();\n");
+  assert(!/await\s+main\(\)/.test(b.split("// ---- runner shim")[0]), "await main() should be stripped from user code");
+  // Programs that don't end with main() are left intact in the user body.
+  const c = wrap("const x = 1;");
+  assertStringIncludes(c, "const x = 1;");
+});
