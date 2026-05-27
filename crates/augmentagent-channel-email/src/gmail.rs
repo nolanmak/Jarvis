@@ -235,6 +235,91 @@ mod tests {
             "user+tag@example.com"
         );
     }
+
+    // ---- #164: tool-error propagation ----
+    //
+    // Regression test for the bug where the reasoner narrated a fabricated
+    // "harness permission prompt" instead of surfacing the actual upstream
+    // 401 from Composio. The propagation path under test is:
+    //   ComposioClient::execute (formats `{action} → {status}: {text}`)
+    //     → GmailError::Composio { message }
+    //     → Display impl ("composio: {message}")
+    // Anything above this layer (the CLI, anyhow chain, the reasoner's
+    // tool-output capture) forwards the Display string verbatim. As long
+    // as the response body lands in that string, the model has the real
+    // error in context and is given clear-prompt instructions not to
+    // editorialize it (see schema/wiki-ask.md, skills/email-triage/SKILL.md).
+    //
+    // We mock Composio with a one-shot tokio TCP listener that replies 401
+    // with the same JSON shape the real revoked-key incident produced, then
+    // assert the resulting GmailError::Composio Display string contains
+    // both "401" and "Invalid API key". No actual model call is needed —
+    // this tests the tool-error formatting layer the model relies on.
+
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Spawn a single-response HTTP/1.1 mock that returns `body` with `status`
+    /// to the first POST it sees, then closes. Returns the bound address.
+    async fn spawn_one_shot_http(status: u16, body: &'static str) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Drain the request enough to know the client finished sending
+            // headers. We only need the status line and headers; reqwest will
+            // happily move on once the response is received.
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 {status} Unauthorized\r\nContent-Length: {len}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                len = body.len(),
+                body = body
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn composio_401_propagates_status_and_message_to_error_display() {
+        let body =
+            r#"{"error":{"message":"Invalid API key: ak_637S7*","code":10401,"type":"auth"}}"#;
+        let addr = spawn_one_shot_http(401, body).await;
+        let base = format!("http://{addr}");
+        let client = ComposioClient::new("ak_637S7_fake".into()).with_base_url(base);
+
+        let err = client
+            .create_draft("entity-x", "to@example.com", "subj", "body", None)
+            .await
+            .expect_err("401 must surface as an error");
+        let display = format!("{err}");
+
+        // The reasoner-visible string must carry the real 401 signal so the
+        // model cannot justifiably invent a "permission prompt" narrative.
+        assert!(
+            display.contains("401"),
+            "missing 401 in error display: {display}"
+        );
+        assert!(
+            display.contains("Invalid API key"),
+            "missing upstream message in error display: {display}"
+        );
+        // And it should be tagged as a composio error so the model can route
+        // it correctly (vs. e.g. a local file-read error).
+        assert!(
+            display.starts_with("composio:"),
+            "missing composio tag in error display: {display}"
+        );
+        // The action name must be present so the operator can locate the
+        // failing call.
+        assert!(
+            display.contains("GMAIL_CREATE_EMAIL_DRAFT"),
+            "missing action in error display: {display}"
+        );
+    }
 }
 
 /// Recursively search a JSON value for the first string-valued field whose

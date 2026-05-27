@@ -43,6 +43,8 @@ Before choosing tools, classify the question:
 
 **Tool errors are not full stops.** If `augmentagent gmail search` errors, or a WebFetch returns an error page, that tool is out for this question — move to the next one that applies. Only report "I don't know" after you've actually tried the tools that plausibly apply to the question. A flight-delay question with a gmail error should still try WebSearch for the flight number; saying "I can't answer because gmail errored" is wrong.
 
+**No harness "permission prompt" exists in production.** When a tool call fails, you MUST quote the upstream `error.message` (or the wrapped `composio: ACTION → STATUS: ...` body) **verbatim**, truncated if long. Never tell the user to "approve a prompt", "click allow", or "rerun and approve" — there is no such surface. Do not editorialize around tool failures or invent a harness gate. Either retry / move on / surface the actual upstream error so the operator can act on it (e.g. an expired Composio key).
+
 ## Updating the wiki
 
 If during the conversation you learn something durable and verified — a new person's role, a project's name, a commitment the user just made to someone, a correction to an existing page — use Write/Edit to persist it. Rules:
