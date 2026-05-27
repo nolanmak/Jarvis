@@ -167,6 +167,28 @@ export interface CartDetail {
   storeId: string | number;
 }
 
+export type ScheduleKind = "recurring" | "oneshot";
+
+export interface ScheduleSetResult {
+  ok: true;
+  unit: string;
+  next: string | null;
+  kind: ScheduleKind;
+  oncalendar: string;
+}
+
+export interface ScheduleListEntry {
+  name: string;
+  next: string | null;
+  last: string | null;
+  kind: ScheduleKind;
+}
+
+export interface ScheduleClearResult {
+  ok: true;
+  cleared: string[];
+}
+
 export const grocery = {
   ping: () => client().call<{ pong: boolean; provider: string }>("ping"),
   sessionCheck: () => client().call<SessionInfo>("session_check"),
@@ -185,4 +207,9 @@ export const grocery = {
   cartAdd: (items: Array<{ productId: string | number; quantity: number }>) =>
     client().call<{ added: any[]; errors: any[] }>("cart_add", { items }),
   cartRemove: (productId: string | number) => client().call<{ removed: any }>("cart_remove", { productId }),
+  scheduleSet: (kind: ScheduleKind, oncalendar: string, label?: string) =>
+    client().call<ScheduleSetResult>("schedule_set", { kind, oncalendar, label }),
+  scheduleList: () => client().call<ScheduleListEntry[]>("schedule_list"),
+  scheduleClear: (name?: string) =>
+    client().call<ScheduleClearResult>("schedule_clear", name ? { name } : {}),
 };

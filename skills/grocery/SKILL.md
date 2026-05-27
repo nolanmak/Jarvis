@@ -327,6 +327,72 @@ Answer from the KG only. Don't touch the sidecar. Examples:
 - "what did I think of the salmon?" → `kg_read("dislikes.md")` then the
   most recent order
 
+## Scheduling mode
+
+The user can ask you to schedule grocery orders to fire automatically.
+Recurring orders use a single systemd user timer slot
+(`augmentagent-grocery.timer`). One-off orders are transient units named
+`augmentagent-grocery-oneshot-<slug>.timer`. Both ultimately invoke
+`scripts/grocery-weekly.mjs`, which POSTs the standard "order groceries
+for this week" prompt to the dashboard — i.e. the same flow as if the
+user had typed it.
+
+### Intent recognition
+
+Treat any of these as a scheduling intent and route to the appropriate
+tool call (NOT to the order workflow above):
+
+- "schedule", "schedule a grocery order", "order groceries every …"
+- "every Sunday at 10am", "weekdays at 8", "on the first of the month"
+- "this Saturday at 9am", "tomorrow at 5pm", "next Friday morning"
+- "stop the weekly orders", "cancel the weekly grocery order"
+- "cancel that one", "cancel the Saturday order"
+- "what's scheduled?", "when's my next grocery order?", "list my grocery schedules"
+
+### Natural language → systemd OnCalendar
+
+You translate the user's phrasing **directly** into systemd `OnCalendar=`
+syntax. No cron. systemd's calendar format is `DOW YYYY-MM-DD HH:MM:SS`
+with `*` for wildcards and `..` for ranges. Examples:
+
+- "every Sunday at 10am" → recurring, `Sun *-*-* 10:00:00`
+- "every weekday at 8am" → recurring, `Mon..Fri *-*-* 08:00:00`
+- "daily at 6pm" → recurring, `*-*-* 18:00:00`
+- "the first of every month at 9am" → recurring, `*-*-01 09:00:00`
+- "this Saturday at 9am" → oneshot, resolved date e.g. `2026-05-30 09:00:00`
+- "tomorrow at 5pm" → oneshot, resolved date e.g. `2026-05-28 17:00:00`
+
+When the user gives a relative day ("Saturday", "next Friday", "tomorrow"),
+**resolve it to a concrete date first** using the current date, **then
+read the resolved date back to the user before calling `schedule_set`**.
+"Saturday" alone means the **upcoming** Saturday (today + 1..7 days). If
+the resolved date is today and the time has already passed, advance by one
+week (or one day for "tomorrow"-style intents).
+
+### Tool calls
+
+- Set recurring:
+  `grocery({ action: "schedule_set", params: { kind: "recurring", oncalendar: "Sun *-*-* 10:00:00" } })`
+  → returns `{ ok: true, unit: "augmentagent-grocery.timer", next: "<...>", ... }`. Echo the `next` field back to the user as confirmation.
+
+- Set one-off:
+  `grocery({ action: "schedule_set", params: { kind: "oneshot", oncalendar: "2026-05-30 09:00:00", label: "sat-9am" } })`
+  → returns `{ ok: true, unit: "augmentagent-grocery-oneshot-sat-9am.timer", next: "<...>", ... }`. Pick a short slug `^[a-z0-9-]{1,32}$` (e.g. day-of-week plus time, like `sat-9am` or `tue-eve`).
+
+- List: `grocery({ action: "schedule_list" })` → array of `{ name, next, last, kind }`. Render as a friendly list, e.g. "Weekly: Sun at 10am (next: …). One-offs: Sat 9am (next: …)."
+
+- Clear all: `grocery({ action: "schedule_clear" })`. Use this for "stop all grocery schedules". Confirm with the user before wiping multiple units.
+
+- Clear one: `grocery({ action: "schedule_clear", params: { name: "augmentagent-grocery.timer" } })` for "stop the weekly orders". For "cancel that one"-style requests where the target is ambiguous, call `schedule_list` first and ask which to cancel.
+
+### Always echo the next-run
+
+After any successful `schedule_set`, reply with one line that includes the
+resolved next-run time, e.g. "Got it — next grocery order: Sunday May 31 at
+10:00 AM." If the helper returns `ok: false`, surface the error to the
+user verbatim and **do not** retry blindly. A bad OnCalendar spec means
+your translation was wrong; ask the user to clarify or re-derive.
+
 ## Hard rules
 
 - Never call `checkout` — there is no checkout op. Stop at

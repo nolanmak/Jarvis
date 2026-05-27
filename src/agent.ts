@@ -301,7 +301,10 @@ Available actions:
 - kg_read: Read a page from wiki/groceries/. params: { page: string } (relative path under wiki/groceries/, e.g. "staples.md", "orders/2026-05-21.md"). Returns { page, content }.
 - kg_write: Overwrite a page in wiki/groceries/. params: { page: string, content: string }.
 - kg_append: Append to a page in wiki/groceries/. params: { page: string, content: string }.
-- record_order: Append a structured order record to wiki/groceries/orders/<date>.md. params: { date?: string (YYYY-MM-DD, defaults to today), order: { items_ordered: [{ name, qty, brand?, prodId?, price? }], items_oos?, substitutions?, total?, feedback?, approved? } }. Returns { page }.`,
+- record_order: Append a structured order record to wiki/groceries/orders/<date>.md. params: { date?: string (YYYY-MM-DD, defaults to today), order: { items_ordered: [{ name, qty, brand?, prodId?, price? }], items_oos?, substitutions?, total?, feedback?, approved? } }. Returns { page }.
+- schedule_set: Create or replace a grocery-order schedule via systemd user timers. params: { kind: "recurring" | "oneshot", oncalendar: string (systemd OnCalendar=, e.g. "Sun *-*-* 10:00:00" or "2026-05-30 09:00:00"), label?: string (required for oneshot, matches ^[a-z0-9-]{1,32}$) }. Recurring is a single slot — calling again replaces the previous recurring timer. Returns { ok: true, unit, next, kind, oncalendar }.
+- schedule_list: List scheduled grocery-order timers. No params. Returns [{ name, next, last, kind }].
+- schedule_clear: Cancel a grocery schedule. params: { name?: string } (omit name to clear all). Returns { ok: true, cleared: [unit, ...] }.`,
   parameters: z.object({
     action: z.enum([
       "session_check",
@@ -319,6 +322,9 @@ Available actions:
       "kg_write",
       "kg_append",
       "record_order",
+      "schedule_set",
+      "schedule_list",
+      "schedule_clear",
     ]),
     params: z.record(z.string(), z.unknown()).nullable().optional(),
   }),
@@ -399,6 +405,27 @@ Available actions:
           }
           const page = recordOrder(date, order);
           return JSON.stringify({ success: true, page });
+        }
+        case "schedule_set": {
+          const kind = params.kind as string | undefined;
+          const oncalendar = params.oncalendar as string | undefined;
+          const label = params.label as string | undefined;
+          if (kind !== "recurring" && kind !== "oneshot") {
+            return JSON.stringify({ error: "schedule_set requires { kind: 'recurring' | 'oneshot' }" });
+          }
+          if (!oncalendar || typeof oncalendar !== "string") {
+            return JSON.stringify({ error: "schedule_set requires { oncalendar: string }" });
+          }
+          if (kind === "oneshot" && (!label || !/^[a-z0-9-]{1,32}$/.test(label))) {
+            return JSON.stringify({ error: "schedule_set kind=oneshot requires { label: ^[a-z0-9-]{1,32}$ }" });
+          }
+          return JSON.stringify(await grocerySidecar.scheduleSet(kind as "recurring" | "oneshot", oncalendar, label));
+        }
+        case "schedule_list":
+          return JSON.stringify(await grocerySidecar.scheduleList());
+        case "schedule_clear": {
+          const name = params.name as string | undefined;
+          return JSON.stringify(await grocerySidecar.scheduleClear(name));
         }
         default:
           return JSON.stringify({ error: `Unknown action: ${input.action}` });

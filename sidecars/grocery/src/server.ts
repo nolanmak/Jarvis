@@ -7,11 +7,48 @@
 import net from "net";
 import path from "path";
 import fs from "fs";
+import { spawn } from "child_process";
 import { groceryRuntimeDir, grocerySocketPath } from "./socketPath.js";
 import { GroceryError, classify } from "./errors.js";
 import type { GroceryProvider } from "./provider.js";
 
 type Handler = (params: any) => Promise<any>;
+
+const SCHEDULE_HELPER = "/home/nolan-makatche/AugmentAgent/scripts/grocery-schedule.mjs";
+const NODE_BIN = "/usr/bin/node";
+const SLUG_RE = /^[a-z0-9-]{1,32}$/;
+
+function runHelper(argv: string[]): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(NODE_BIN, [SCHEDULE_HELPER, ...argv], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (c) => (stdout += c.toString()));
+    child.stderr.on("data", (c) => (stderr += c.toString()));
+    child.on("error", (e) => reject(new GroceryError("Internal", `helper spawn error: ${e.message}`)));
+    child.on("close", (code) => {
+      // The helper always prints JSON to stdout (either {ok:true,...} or {ok:false,error:...}).
+      // For --list it prints a JSON array. Try to parse and surface errors uniformly.
+      const text = stdout.trim();
+      if (!text) {
+        return reject(new GroceryError("Internal", `helper exited code=${code} with empty output: ${stderr.trim()}`));
+      }
+      let parsed: any;
+      try {
+        parsed = JSON.parse(text.split("\n").pop() || text);
+      } catch (e: any) {
+        return reject(new GroceryError("Internal", `helper non-JSON output: ${text}`));
+      }
+      if (Array.isArray(parsed)) return resolve(parsed);
+      if (parsed && parsed.ok === false) {
+        return reject(new GroceryError("Internal", parsed.error || `helper failed (code=${code})`));
+      }
+      return resolve(parsed);
+    });
+  });
+}
 
 export class GrocerySocketServer {
   private server: net.Server | null = null;
@@ -52,6 +89,41 @@ export class GrocerySocketServer {
       if (p?.productId == null) throw new GroceryError("Internal", "cart_remove requires { productId }");
       await this.provider.cartRemove(p.productId);
       return { removed: p.productId };
+    });
+
+    // Scheduling ops — shell out to scripts/grocery-schedule.mjs which
+    // owns the systemd user units. The helper validates OnCalendar before
+    // writing anything; we still pre-validate the shapes here so we don't
+    // spawn for obviously-bad input.
+    this.ops.set("schedule_set", async (p) => {
+      const kind = p?.kind;
+      const oncalendar = p?.oncalendar;
+      const label = p?.label;
+      if (kind !== "recurring" && kind !== "oneshot") {
+        throw new GroceryError("Internal", "schedule_set requires { kind: 'recurring' | 'oneshot' }");
+      }
+      if (typeof oncalendar !== "string" || !oncalendar.trim()) {
+        throw new GroceryError("Internal", "schedule_set requires { oncalendar: non-empty string }");
+      }
+      const argv = ["--set", "--kind", String(kind), "--oncalendar", String(oncalendar)];
+      if (kind === "oneshot") {
+        if (typeof label !== "string" || !SLUG_RE.test(label)) {
+          throw new GroceryError("Internal", "schedule_set kind=oneshot requires { label: matching ^[a-z0-9-]{1,32}$ }");
+        }
+        argv.push("--label", label);
+      }
+      return runHelper(argv);
+    });
+    this.ops.set("schedule_list", async () => runHelper(["--list"]));
+    this.ops.set("schedule_clear", async (p) => {
+      const argv = ["--clear"];
+      if (p && p.name != null) {
+        if (typeof p.name !== "string" || !/^[a-zA-Z0-9@:_.-]+$/.test(p.name)) {
+          throw new GroceryError("Internal", "schedule_clear name must be a valid unit name");
+        }
+        argv.push("--name", p.name);
+      }
+      return runHelper(argv);
     });
   }
 
