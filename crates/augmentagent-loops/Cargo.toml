@@ -1,0 +1,21 @@
+[package]
+name = "augmentagent-loops"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Tiny shared crate so both the CLI's `augmentagent loops` subcommand (#175)
+# and the Discord `!loops` command (#176) can call the same /proc walker
+# + signal helpers without circular deps (cli → approval-discord, so
+# approval-discord can't depend on cli).
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

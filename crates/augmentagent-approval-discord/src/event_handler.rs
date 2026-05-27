@@ -158,6 +158,35 @@ impl EventHandler for Handler {
             return;
         }
 
+        // `!loops` — list / stop running `claude` CLI processes (#176).
+        // Distinct from `/loop` below (which is the in-process scheduler).
+        // Matched first because the visual similarity to `/loop` makes
+        // ordering load-bearing. Owner gating: the allowlist check at the
+        // top of this handler already returned for non-allowed users; the
+        // refusal in `process_loops::handle` covers the no-allowlist case
+        // (without an allowlist, *anyone* DMing the bot could kill host
+        // processes — refuse the command entirely in that mode).
+        if user_text == "!loops" || user_text.starts_with("!loops ") {
+            let allowlist_active = self.state.allowed_user_id.is_some();
+            let text = user_text.clone();
+            let http = ctx.http.clone();
+            let channel_id = msg.channel_id;
+            let msg_id = msg.id;
+            tokio::spawn(async move {
+                let reply = crate::process_loops::handle(&text, allowlist_active).await;
+                for chunk in chunk_for_discord(&reply) {
+                    let builder = CreateMessage::new()
+                        .content(chunk)
+                        .reference_message(MessageReference::from((channel_id, msg_id)));
+                    if let Err(e) = channel_id.send_message(&*http, builder).await {
+                        warn!("failed to post !loops reply: {e}");
+                        break;
+                    }
+                }
+            });
+            return;
+        }
+
         // `loop` / `/loop` — user-defined scheduled tasks (#104). Handled
         // inline like `!invoice`; never routed to the wiki query handler.
         // Leading `/` is optional — `match_loop_prefix` accepts either form
