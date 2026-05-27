@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# aa-gh: restricted `gh` shim for the wiki-query Claude CLI sandbox.
+#
+# The wiki-query system prompt instructs the agent to file/search/view/
+# comment on AugmentAgent issues. Nothing previously restricted the
+# subcommand surface — `gh repo delete`, `gh pr merge --admin`, `gh
+# release create`, `gh secret set`, etc. were all reachable from the
+# Bash allowlist.
+#
+# This shim accepts ONLY: `gh issue {list,view,create,comment} …` and
+# forwards to the real /snap/bin/gh. Anything else: refuse with a clear
+# stderr message and exit 2.
+#
+# Issue: #131
+
+set -euo pipefail
+
+GH_BIN="${AA_GH_REAL:-/snap/bin/gh}"
+
+if [[ $# -lt 2 ]]; then
+  echo "aa-gh: refusing ${*:-<no args>} — query agent may only run 'gh issue {list,view,create,comment}'" >&2
+  exit 2
+fi
+
+case "$1" in
+  issue) ;;
+  *)
+    echo "aa-gh: refusing $* — query agent may only run 'gh issue {list,view,create,comment}'" >&2
+    exit 2
+    ;;
+esac
+
+case "$2" in
+  list|view|create|comment) ;;
+  *)
+    echo "aa-gh: refusing $* — query agent may only run 'gh issue {list,view,create,comment}'" >&2
+    exit 2
+    ;;
+esac
+
+exec "$GH_BIN" "$@"
