@@ -75,16 +75,24 @@ Exactly one line. Required before any other I/O.
 {"program": "<TypeScript source>", "manifest": ["wiki.draftHint", "draft", ...]}
 ```
 
-- `program` is a string of TypeScript / JavaScript that the runner evaluates.
-  The convention (and what the system prompt in issue #51 enforces) is:
+- `program` is a string of TypeScript / JavaScript. The convention (and what
+  the system prompt in issue #51 enforces) is:
 
   ```ts
   async function main(): Promise<void | unknown> { ... }
   main();
   ```
 
-  The trailing `main();` is required: the runner uses indirect eval and awaits
-  the value of the last expression statement, which is the call to `main`.
+  The trailing `main();` or `await main();` is required: the runner strips it
+  and re-emits `export const __result__ = await main();` so the resolved
+  value of `main()` becomes the `{"final": ...}` frame.
+
+  TypeScript-only syntax (type annotations, generics, interface declarations,
+  `as`/`as unknown as` casts, `import type`, etc.) is fully supported — the
+  runner imports the program as a `data:application/typescript` module so
+  Deno's bundled TypeScript loader strips types before execution. Prior
+  versions used `eval(program)`, which is a plain-JS parser and rejected
+  any `:` in a type annotation as a SyntaxError (#183).
 - `manifest` is a flat allowlist of tool names. Dotted names produce nested
   namespaces in `tools` — e.g. `"wiki.draftHint"` is exposed as
   `tools.wiki.draftHint`.
