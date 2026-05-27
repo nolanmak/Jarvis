@@ -1,0 +1,133 @@
+<%- include('partials/header', { page: 'audit' }) %>
+
+<div class="space-y-6">
+  <div class="flex items-center justify-between">
+    <div>
+      <h1 class="text-xl font-semibold">Query agent activity</h1>
+      <p class="text-xs text-gray-500 mt-1">
+        #132 — every tool call the wiki-query agent makes, newest first.
+        Tails <code class="text-gray-400">~/.local/state/augmentagent/tool-audit.log</code>.
+        Auto-refreshes every 5s while this tab is open.
+      </p>
+    </div>
+    <div class="flex items-center gap-3">
+      <input id="audit-filter" type="text" placeholder="filter by tool name…"
+             class="px-2 py-1 text-xs bg-gray-900 border border-gray-800 rounded text-white placeholder-gray-600 w-48" />
+      <span class="text-xs text-gray-500" id="audit-status">loading…</span>
+    </div>
+  </div>
+
+  <div class="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="border-b border-gray-800 text-left">
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">When</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Session</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Tool</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Args</th>
+          <th class="px-4 py-2 text-xs text-gray-500 font-medium">Exit</th>
+        </tr>
+      </thead>
+      <tbody id="audit-rows">
+        <tr><td colspan="5" class="px-4 py-6 text-center text-gray-500">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  (function () {
+    const REFRESH_MS = 5000;
+    let timer = null;
+    let inFlight = false;
+    let lastRows = [];
+
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+    function truncate(s, n) {
+      const str = String(s == null ? '' : s);
+      if (str.length <= n) return str;
+      return str.slice(0, n - 1) + '…';
+    }
+    function ago(tsStr) {
+      const t = Date.parse(tsStr);
+      if (!Number.isFinite(t)) return tsStr || '';
+      const diffSec = Math.max(0, Math.floor((Date.now() - t) / 1000));
+      if (diffSec < 60) return diffSec + 's ago';
+      if (diffSec < 3600) return Math.floor(diffSec / 60) + 'm ago';
+      if (diffSec < 86400) return Math.floor(diffSec / 3600) + 'h ago';
+      return Math.floor(diffSec / 86400) + 'd ago';
+    }
+    function summarizeArgs(args) {
+      if (args == null) return '';
+      if (typeof args === 'string') return args;
+      // Prefer common keys for a short summary.
+      const preferred = ['file_path', 'path', 'command', 'query', 'pattern'];
+      for (const k of preferred) {
+        if (args[k] != null) return String(args[k]);
+      }
+      try { return JSON.stringify(args); } catch (_) { return ''; }
+    }
+
+    function render() {
+      const filter = (document.getElementById('audit-filter').value || '').toLowerCase().trim();
+      const rows = filter
+        ? lastRows.filter(r => String(r.tool || '').toLowerCase().includes(filter))
+        : lastRows;
+      const tb = document.getElementById('audit-rows');
+      if (rows.length === 0) {
+        tb.innerHTML = '<tr><td colspan="5" class="px-4 py-6 text-center text-gray-500">' +
+          (filter ? 'No matches.' : 'No tool calls audited yet.') +
+          '</td></tr>';
+        return;
+      }
+      tb.innerHTML = rows.map(function (r) {
+        const argsShort = truncate(summarizeArgs(r.args), 80);
+        const exit = r.exit_code == null ? '' : String(r.exit_code);
+        const session = truncate(r.session_id || '', 24);
+        return '<tr class="border-b border-gray-800/50">' +
+          '<td class="px-4 py-2 font-mono text-xs text-gray-400" title="' + esc(r.ts) + '">' + esc(ago(r.ts)) + '</td>' +
+          '<td class="px-4 py-2 font-mono text-xs text-gray-400" title="' + esc(r.session_id) + '">' + esc(session) + '</td>' +
+          '<td class="px-4 py-2 font-mono text-white">' + esc(r.tool) + '</td>' +
+          '<td class="px-4 py-2 text-xs text-gray-300 font-mono" title="' + esc(JSON.stringify(r.args || {})) + '">' + esc(argsShort) + '</td>' +
+          '<td class="px-4 py-2 font-mono text-xs ' + (exit && exit !== '0' ? 'text-red-400' : 'text-gray-400') + '">' + esc(exit) + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    async function load() {
+      if (inFlight) return;
+      inFlight = true;
+      const statusEl = document.getElementById('audit-status');
+      try {
+        const res = await fetch('/api/audit?limit=200', { headers: { 'accept': 'application/json' } });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        lastRows = Array.isArray(data.rows) ? data.rows : [];
+        const ts = new Date().toLocaleTimeString();
+        statusEl.textContent = lastRows.length + ' record' + (lastRows.length === 1 ? '' : 's') + ' · ' + ts;
+        render();
+      } catch (e) {
+        statusEl.textContent = 'load failed: ' + e.message;
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    document.getElementById('audit-filter').addEventListener('input', render);
+
+    function start() { stop(); load(); timer = setInterval(load, REFRESH_MS); }
+    function stop() { if (timer) { clearInterval(timer); timer = null; } }
+
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'visible') start();
+      else stop();
+    });
+
+    start();
+  })();
+</script>
+
+<%- include('partials/footer') %>
