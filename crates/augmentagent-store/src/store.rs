@@ -6,6 +6,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::redact;
+
 use crate::models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
     ConnectionRequestRow, DriveAccount, Email, FriendWatch, InvoiceDraft, LearnedPattern,
@@ -1313,6 +1315,11 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?;
+        // #165: redact secrets/PII at the persistence boundary. The
+        // channel layer still operates on plaintext for API calls; only
+        // the persisted copy is masked.
+        let body_masked = redact::mask(&email.body);
+        let body_param: &str = &body_masked;
         if existed.is_some() {
             guard.execute(
                 "UPDATE emails SET threadId = ?2, fromEmail = ?3, subject = ?4, body = ?5, receivedAt = ?6 WHERE messageId = ?1",
@@ -1321,7 +1328,7 @@ impl Store {
                     email.thread_id,
                     email.from,
                     email.subject,
-                    email.body,
+                    body_param,
                     email.date,
                 ],
             )?;
@@ -1336,7 +1343,7 @@ impl Store {
                     email.thread_id,
                     email.from,
                     email.subject,
-                    email.body,
+                    body_param,
                     email.date,
                     email.account_entity_id,
                     now,
@@ -1412,6 +1419,12 @@ impl Store {
             _ => None,
         };
         let guard = self.conn.lock().expect("store mutex poisoned");
+        // #165: mask free-form bodies before persisting. Borrowed when no
+        // secrets matched (zero-alloc fast path), owned otherwise.
+        let original_body_masked = original_body.map(redact::mask);
+        let draft_body_masked = draft_body.map(redact::mask);
+        let original_body_param: Option<&str> = original_body_masked.as_deref();
+        let draft_body_param: Option<&str> = draft_body_masked.as_deref();
         // #48: `mode`/`generatedSource`/`toolCallTrace` are intentionally
         // omitted from the column list — the migration's column defaults
         // populate them as 'classic' / NULL / NULL so the classic path stays
@@ -1426,8 +1439,8 @@ impl Store {
                 thread_id,
                 from_email,
                 subject,
-                original_body,
-                draft_body,
+                original_body_param,
+                draft_body_param,
                 status.as_str(),
                 now,
                 next_nudge_at_ms,
@@ -1471,6 +1484,19 @@ impl Store {
             _ => None,
         };
         let guard = self.conn.lock().expect("store mutex poisoned");
+        // #165: mask free-form bodies + the code-mode tool-call trace
+        // before persisting. `generated_source` is the LLM-emitted TS
+        // program and is also caller-supplied free-form text, so it goes
+        // through the same redactor in case the model echoed back any
+        // tokens it saw in scope.
+        let original_body_masked = original_body.map(redact::mask);
+        let draft_body_masked = draft_body.map(redact::mask);
+        let original_body_param: Option<&str> = original_body_masked.as_deref();
+        let draft_body_param: Option<&str> = draft_body_masked.as_deref();
+        let generated_source_masked = redact::mask(generated_source);
+        let trace_json_masked = redact::mask(trace_json);
+        let generated_source_param: &str = &generated_source_masked;
+        let trace_json_param: &str = &trace_json_masked;
         guard.execute(
             "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs, mode, generatedSource, toolCallTrace) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9, 0, ?10, 'code', ?11, ?12)",
@@ -1480,13 +1506,13 @@ impl Store {
                 thread_id,
                 from_email,
                 subject,
-                original_body,
-                draft_body,
+                original_body_param,
+                draft_body_param,
                 status.as_str(),
                 now,
                 next_nudge_at_ms,
-                generated_source,
-                trace_json,
+                generated_source_param,
+                trace_json_param,
             ],
         )?;
         Ok(id)
