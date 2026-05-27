@@ -24,8 +24,8 @@ pub use api::{DeftApi, DeftClient, DeftError};
 pub use auth::{DeftAuth, KEYCHAIN_PLATFORM};
 pub use channel::{DeftChannel, DeftChannelConfig, DEFAULT_POLL_SECS};
 pub use types::{
-    command_from_submission, is_deft_email, webhook_submissions, DeftCommand, DeftForm,
-    DeftSubmission,
+    command_from_submission, is_deft_email, webhook_submissions, CommandFieldMap, DeftCommand,
+    DeftField, DeftForm, DeftSubmission, FormFieldHints,
 };
 
 /// Platform discriminator written to `Email::platform` and
