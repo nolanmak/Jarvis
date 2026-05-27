@@ -136,6 +136,8 @@ WorkingDirectory=$REPO_ROOT
 ExecStart=$REPO_ROOT/scripts/run-rs.sh --wiki-dir ./wiki serve --dry-run false
 Environment=PATH=$SERVICE_PATH
 Environment=RUST_LOG=info
+# Deft channel still inert until a token is stored via 'augmentagent deft login'
+Environment=AUGMENTAGENT_DEFT_ENABLED=1
 Restart=on-failure
 RestartSec=10
 StandardOutput=append:$LOG_DIR/stdout.log

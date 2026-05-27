@@ -68,3 +68,6 @@ tempfile = "3"
 # `emails`, `gmail_accounts`) that `Store::migrate` assumes already exist —
 # `augmentagent-store::Store::open` panics on a fresh empty db otherwise.
 rusqlite = { workspace = true }
+# #160 — `deft login` tests stub the Deftform `whoami()` HTTP probe so the
+# CLI's reject-on-bad-token path is exercised without a real workspace.
+mockito = "1"
