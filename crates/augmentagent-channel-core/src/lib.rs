@@ -20,6 +20,7 @@ pub mod reasoner;
 pub mod resolve;
 pub mod secret_loader;
 pub mod skills;
+pub mod tool_audit;
 pub mod trigger;
 
 pub use decision::{Decision, DecisionKind};
@@ -42,6 +43,10 @@ pub use mcp::{default_mcp_config_path, McpConfig, McpServerConfig};
 pub use memory_nudge::{default_cycles_root, CycleLogger, CycleSummary, CycleSurface};
 pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerOpts};
 pub use skills::{SkillEntry, SkillRegistry};
+pub use tool_audit::{
+    default_audit_log_path, format_notice, is_high_risk, parse_stream_event, truncate_stream,
+    AuditLogger, AuditNotifier, AuditRecord, ToolEvent,
+};
 pub use trigger::{
     kind as work_item_kind, ChannelRunner, DigestSource, FriendFeedSource, FriendFeedTrigger,
     InboundMessageTrigger, InboundSource, Trigger, WorkItem, WorkItemHandler,
