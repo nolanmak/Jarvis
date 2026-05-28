@@ -614,6 +614,87 @@ export function hasAnyGmailAccount(): boolean {
   return !!row;
 }
 
+// --- SocialAPI.ai Accounts (#246) ---
+//
+// Registry of connected SocialAPI.ai handles. The table is created in the
+// schema above (#238). The hosted-first setup flow (paste API key → sync)
+// upserts rows here; each row can be enabled/disabled to control which
+// accounts the daemon manages. The API key itself lives in the `config`
+// table under `socialapi_api_key` (masked when surfaced).
+
+export interface SocialApiAccount {
+  id: string;
+  brand_id: string | null;
+  platform: string;
+  display_name: string | null;
+  account_handle: string | null;
+  active: boolean;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+function rowToSocialApiAccount(row: any): SocialApiAccount {
+  return { ...row, active: !!row.active } as SocialApiAccount;
+}
+
+export function getSocialApiAccounts(): SocialApiAccount[] {
+  return getDb()
+    .prepare("SELECT * FROM socialapi_accounts ORDER BY created_at_ms DESC")
+    .all()
+    .map(rowToSocialApiAccount);
+}
+
+export function getActiveSocialApiAccounts(): SocialApiAccount[] {
+  return getDb()
+    .prepare("SELECT * FROM socialapi_accounts WHERE active = 1 ORDER BY created_at_ms DESC")
+    .all()
+    .map(rowToSocialApiAccount);
+}
+
+export function upsertSocialApiAccount(
+  id: string,
+  platform: string,
+  opts: {
+    brandId?: string | null;
+    displayName?: string | null;
+    accountHandle?: string | null;
+  } = {}
+): string {
+  const now = Date.now();
+  getDb()
+    .prepare(
+      `INSERT INTO socialapi_accounts
+         (id, brand_id, platform, display_name, account_handle, active, created_at_ms, updated_at_ms)
+       VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         brand_id = excluded.brand_id,
+         platform = excluded.platform,
+         display_name = excluded.display_name,
+         account_handle = excluded.account_handle,
+         updated_at_ms = excluded.updated_at_ms`
+    )
+    .run(
+      id,
+      opts.brandId ?? null,
+      platform,
+      opts.displayName ?? null,
+      opts.accountHandle ?? null,
+      now,
+      now
+    );
+  return id;
+}
+
+export function setSocialApiAccountActive(id: string, active: boolean): void {
+  getDb()
+    .prepare("UPDATE socialapi_accounts SET active = ?, updated_at_ms = ? WHERE id = ?")
+    .run(active ? 1 : 0, Date.now(), id);
+}
+
+export function removeSocialApiAccount(id: string): void {
+  getDb().prepare("DELETE FROM socialapi_accounts WHERE id = ?").run(id);
+}
+
 // --- Slack Workspaces ---
 
 export interface SlackWorkspace {
