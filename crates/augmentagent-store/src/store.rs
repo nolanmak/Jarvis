@@ -1027,6 +1027,20 @@ impl Store {
             [],
         )?;
 
+        // #219 — outbound-mail observer cursor. One row per Gmail account
+        // entity; `last_seen_sent_at_ms` is the high-water timestamp of the
+        // newest SENT message we've already classified, so a daemon restart
+        // never re-emits an OutboundEvent for the same reply. Mirrors the
+        // `voice_capture_state` single-row-per-source shape.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS outbound_state (\
+                 entity_id              TEXT PRIMARY KEY,\
+                 last_seen_sent_at_ms   INTEGER NOT NULL DEFAULT 0,\
+                 updated_at_ms          INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
         // #57 — proactive-nudge user actions. One row per user gesture
         // (snooze a signal, dismiss it, mute a person, mute a rule). The
         // proactive runner read-throughs this before dispatch; the dashboard
@@ -2230,6 +2244,89 @@ impl Store {
             params![action_id, now],
         )?;
         Ok(n > 0)
+    }
+
+    /// #219 — flip every `pending`/`dry_run` action on `thread_id` to
+    /// `superseded` because the user replied out-of-band (Gmail web / mobile).
+    /// Returns the list of affected action ids so the caller can edit the
+    /// matching Discord approval cards in a follow-on (the card-edit step is
+    /// intentionally NOT done here; this method only owns the queue-state
+    /// transition so #220's auto-expire and the outbound observer can both
+    /// call it without dragging the Discord http client through the store).
+    /// `reason` is stashed in `errorMessage` (same convention as
+    /// `expire_pending_older_than`) so the dashboard can surface why the row
+    /// went terminal.
+    pub fn mark_pending_drafts_superseded_by_thread(
+        &self,
+        thread_id: &str,
+        reason: &str,
+    ) -> StoreResult<Vec<String>> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        // Collect the ids first so we can return them. A single transaction
+        // (implicit on a single UPDATE with RETURNING-like read) isn't worth
+        // the ceremony: at worst a concurrent writer races us and the second
+        // UPDATE no-ops on already-superseded rows. The SELECT scope matches
+        // the UPDATE WHERE exactly, so the ids we hand back are precisely
+        // the ones the UPDATE will (or just did) flip.
+        let mut stmt = guard.prepare(
+            "SELECT id FROM actions \
+             WHERE threadId = ?1 AND status IN ('pending', 'dry_run')",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map(params![thread_id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        guard.execute(
+            "UPDATE actions \
+             SET status = 'superseded', \
+                 errorMessage = COALESCE(NULLIF(?2, ''), 'superseded by manual reply'), \
+                 updatedAt = ?3 \
+             WHERE threadId = ?1 AND status IN ('pending', 'dry_run')",
+            params![thread_id, reason, now],
+        )?;
+        Ok(ids)
+    }
+
+    /// #219 — read the high-water `sent` timestamp the outbound observer has
+    /// already classified for `entity_id`. `None` (treated as 0 by the
+    /// observer) before the first poll on that account, so the first tick
+    /// after enabling the observer doesn't backfill the entire SENT folder.
+    pub fn outbound_last_seen(&self, entity_id: &str) -> StoreResult<Option<i64>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let v: Option<i64> = guard
+            .query_row(
+                "SELECT last_seen_sent_at_ms FROM outbound_state WHERE entity_id = ?1",
+                params![entity_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// #219 — persist the high-water `sent` timestamp for `entity_id`.
+    /// Monotonic upsert (same pattern as `set_voice_capture_offset`): a
+    /// stale write never rewinds the cursor, so an out-of-order page from
+    /// Composio can't cause us to re-emit OutboundEvents we already handled.
+    pub fn set_outbound_last_seen(
+        &self,
+        entity_id: &str,
+        last_seen_sent_at_ms: i64,
+    ) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO outbound_state (entity_id, last_seen_sent_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(entity_id) DO UPDATE SET \
+                last_seen_sent_at_ms = MAX(last_seen_sent_at_ms, excluded.last_seen_sent_at_ms), \
+                updated_at_ms = excluded.updated_at_ms",
+            params![entity_id, last_seen_sent_at_ms, now],
+        )?;
+        Ok(())
     }
 
     /// Load a single action row plus its email body. Used by the Discord
@@ -7195,5 +7292,132 @@ mod tests {
             s.get_invoice_config("auto_draft_enabled").unwrap().as_deref(),
             Some("false")
         );
+    }
+
+    // ---- #219 — outbound observer: supersede pending drafts by thread ----
+
+    /// Two pending drafts on T1 + one pending on T2 ⇒ only T1's flip;
+    /// T2 untouched; returns the two ids. Also asserts errorMessage carries
+    /// the reason so the dashboard can render context.
+    // pii-ok — synthetic test fixtures (a@b.com is the local fresh_store convention).
+    #[test]
+    fn mark_pending_drafts_superseded_by_thread_only_flips_matching_thread() {
+        let (s, _f) = fresh_store();
+        let id1 = s
+            .log_action("m1", Some("T1"), "a@b.com", "s1", None, Some("d1"), ActionStatus::Pending) // pii-ok
+            .unwrap();
+        let id2 = s
+            .log_action("m2", Some("T1"), "a@b.com", "s2", None, Some("d2"), ActionStatus::Pending) // pii-ok
+            .unwrap();
+        let id3 = s
+            .log_action("m3", Some("T2"), "a@b.com", "s3", None, Some("d3"), ActionStatus::Pending) // pii-ok
+            .unwrap();
+
+        let affected = s
+            .mark_pending_drafts_superseded_by_thread("T1", "superseded by manual reply")
+            .unwrap();
+        let mut got: Vec<String> = affected;
+        got.sort();
+        let mut want = vec![id1.clone(), id2.clone()];
+        want.sort();
+        assert_eq!(got, want, "only T1's pending rows return");
+
+        // Status side-effect check.
+        let conn = Connection::open(_f.path()).unwrap();
+        let status_of = |id: &str| -> (String, Option<String>) {
+            conn.query_row(
+                "SELECT status, errorMessage FROM actions WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap()
+        };
+        let (s1, e1) = status_of(&id1);
+        let (s2, _e2) = status_of(&id2);
+        let (s3, _e3) = status_of(&id3);
+        assert_eq!(s1, "superseded");
+        assert_eq!(s2, "superseded");
+        assert_eq!(s3, "pending", "T2 must be untouched");
+        assert_eq!(e1.as_deref(), Some("superseded by manual reply"));
+    }
+
+    /// `dry_run` rows on the same thread also get swept — they're equivalent
+    /// to pending from the user's perspective (a card the daemon would
+    /// surface if dry_run flipped off).
+    // pii-ok — synthetic test fixture (a@b.com is the local fresh_store convention).
+    #[test]
+    fn mark_pending_drafts_superseded_by_thread_includes_dry_run() {
+        let (s, _f) = fresh_store();
+        let id_dry = s
+            .log_action("m1", Some("T1"), "a@b.com", "s1", None, Some("d1"), ActionStatus::DryRun) // pii-ok
+            .unwrap();
+        let affected = s
+            .mark_pending_drafts_superseded_by_thread("T1", "")
+            .unwrap();
+        assert_eq!(affected, vec![id_dry]);
+    }
+
+    /// Non-pending rows (already sent / rejected / superseded) on the same
+    /// thread stay put — the observer must not "un-send" history.
+    // pii-ok — synthetic test fixtures (a@b.com is the local fresh_store convention).
+    #[test]
+    fn mark_pending_drafts_superseded_by_thread_leaves_terminal_rows_alone() {
+        let (s, _f) = fresh_store();
+        let id_pending = s
+            .log_action("m1", Some("T1"), "a@b.com", "s1", None, Some("d1"), ActionStatus::Pending) // pii-ok
+            .unwrap();
+        let id_sent = s
+            .log_action("m2", Some("T1"), "a@b.com", "s2", None, Some("d2"), ActionStatus::Sent) // pii-ok
+            .unwrap();
+        let id_rej = s
+            .log_action("m3", Some("T1"), "a@b.com", "s3", None, Some("d3"), ActionStatus::Rejected) // pii-ok
+            .unwrap();
+
+        let affected = s
+            .mark_pending_drafts_superseded_by_thread("T1", "rsn")
+            .unwrap();
+        assert_eq!(affected, vec![id_pending.clone()]);
+
+        let conn = Connection::open(_f.path()).unwrap();
+        let st = |id: &str| -> String {
+            conn.query_row(
+                "SELECT status FROM actions WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(st(&id_sent), "sent");
+        assert_eq!(st(&id_rej), "rejected");
+    }
+
+    /// No matching rows ⇒ empty Vec, no error. Also covers the
+    /// short-circuit path that skips the UPDATE entirely.
+    #[test]
+    fn mark_pending_drafts_superseded_by_thread_empty_when_no_match() {
+        let (s, _f) = fresh_store();
+        let affected = s
+            .mark_pending_drafts_superseded_by_thread("nope", "rsn")
+            .unwrap();
+        assert!(affected.is_empty());
+    }
+
+    /// Cursor starts unset and survives a monotonic upsert; an older write
+    /// cannot rewind the high-water timestamp.
+    #[test]
+    fn outbound_last_seen_is_monotonic() {
+        let (s, _f) = fresh_store();
+        assert_eq!(s.outbound_last_seen("ent-1").unwrap(), None);
+        s.set_outbound_last_seen("ent-1", 1_000).unwrap();
+        assert_eq!(s.outbound_last_seen("ent-1").unwrap(), Some(1_000));
+        s.set_outbound_last_seen("ent-1", 5_000).unwrap();
+        assert_eq!(s.outbound_last_seen("ent-1").unwrap(), Some(5_000));
+        // Stale write must NOT rewind.
+        s.set_outbound_last_seen("ent-1", 2_000).unwrap();
+        assert_eq!(s.outbound_last_seen("ent-1").unwrap(), Some(5_000));
+        // Independent per entity.
+        assert_eq!(s.outbound_last_seen("ent-2").unwrap(), None);
+        s.set_outbound_last_seen("ent-2", 42).unwrap();
+        assert_eq!(s.outbound_last_seen("ent-2").unwrap(), Some(42));
     }
 }

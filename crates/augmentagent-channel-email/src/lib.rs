@@ -7,6 +7,7 @@
 
 pub mod gmail;
 pub mod inbound;
+pub mod outbound;
 pub mod sigextract;
 pub mod tone;
 mod channel;
@@ -15,6 +16,9 @@ pub use channel::{
     DispatchOutcome, GmailChannel, GmailChannelConfig, GmailWorkHandler, PollOutcome,
 };
 pub use inbound::{email_to_work_item, GmailInbound};
+pub use outbound::{
+    classify_outbound, Classification, OutboundEvent, OutboundObserver, ACTION_ID_HEADER,
+};
 pub use sigextract::{
     detect_signature_block, is_human_sender, signature_patch, ExtractedFields,
     SignatureBlock, SignatureExtractor, SigError,
