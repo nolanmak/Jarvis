@@ -1,0 +1,180 @@
+name: Autonomous Code Scanner
+
+on:
+  schedule:
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+    inputs:
+      open_issue:
+        description: 'Open/update sticky issue with findings'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: code-scanner
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  STICKY_ISSUE_TITLE: "[scanner] Nightly Rust health report"
+
+jobs:
+  p0-blocking:
+    name: P0 — fmt + clippy (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      fmt: ${{ steps.fmt.outcome }}
+      clippy: ${{ steps.clippy.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - id: fmt
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+      - id: clippy
+        run: cargo clippy --workspace --all-targets --quiet 2>&1 | tee clippy.log
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p0-logs
+          path: clippy.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  p1-tests:
+    name: P1 — test suite (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      test: ${{ steps.test.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - id: test
+        run: cargo test --workspace --quiet 2>&1 | tee test.log
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p1-logs
+          path: test.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  p2-supply-chain:
+    name: P2 — audit + deny (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      audit: ${{ steps.audit.outcome }}
+      deny: ${{ steps.deny.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - id: audit
+        uses: rustsec/audit-check@v2.0.0
+        continue-on-error: true
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        id: deny
+        continue-on-error: true
+        with:
+          command: check advisories bans licenses
+
+  p3-hygiene:
+    name: P3 — unused deps + dead code (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      machete: ${{ steps.machete.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-machete --locked
+      - id: machete
+        run: cargo machete 2>&1 | tee machete.log
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p3-logs
+          path: machete.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  report:
+    name: Sticky issue report
+    needs: [p0-blocking, p1-tests, p2-supply-chain, p3-hygiene]
+    if: |
+      always() && (github.event_name == 'schedule' ||
+      inputs.open_issue == true)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render + post sticky issue
+        uses: actions/github-script@v7
+        env:
+          P0_FMT: ${{ needs.p0-blocking.outputs.fmt }}
+          P0_CLIPPY: ${{ needs.p0-blocking.outputs.clippy }}
+          P1_TEST: ${{ needs.p1-tests.outputs.test }}
+          P2_AUDIT: ${{ needs.p2-supply-chain.outputs.audit }}
+          P2_DENY: ${{ needs.p2-supply-chain.outputs.deny }}
+          P3_MACHETE: ${{ needs.p3-hygiene.outputs.machete }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const title = process.env.STICKY_ISSUE_TITLE || '[scanner] Nightly Rust health report';
+            const lines = [
+              `Scan run: ${process.env.RUN_URL}`,
+              `Generated: ${new Date().toISOString()}`,
+              '',
+              '| Tier | Check | Outcome |',
+              '|------|-------|---------|',
+              `| P0 | cargo fmt --check | ${process.env.P0_FMT || 'skipped'} |`,
+              `| P0 | cargo clippy -Dwarnings | ${process.env.P0_CLIPPY || 'skipped'} |`,
+              `| P1 | cargo test --workspace | ${process.env.P1_TEST || 'skipped'} |`,
+              `| P2 | cargo audit | ${process.env.P2_AUDIT || 'skipped'} |`,
+              `| P2 | cargo deny | ${process.env.P2_DENY || 'skipped'} |`,
+              `| P3 | cargo machete | ${process.env.P3_MACHETE || 'skipped'} |`,
+              '',
+              'Logs: see workflow run artifacts (`p0-logs`, `p1-logs`, `p3-logs`).',
+              '',
+              '_Posted by `.github/workflows/autonomous-code-scanner.yml`. Close to dismiss; the next scan will reopen if anything is failing._',
+            ];
+            const body = lines.join('\n');
+
+            const { owner, repo } = context.repo;
+            const existing = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${owner}/${repo} is:issue is:open in:title "${title}"`,
+            });
+            const failed = [
+              process.env.P0_FMT, process.env.P0_CLIPPY, process.env.P1_TEST,
+              process.env.P2_AUDIT, process.env.P2_DENY, process.env.P3_MACHETE,
+            ].some(o => o === 'failure');
+
+            if (existing.data.total_count > 0) {
+              const num = existing.data.items[0].number;
+              await github.rest.issues.update({ owner, repo, issue_number: num, body, state: failed ? 'open' : 'closed' });
+              core.info(`Updated issue #${num} (state=${failed ? 'open' : 'closed'})`);
+            } else if (failed) {
+              const created = await github.rest.issues.create({
+                owner, repo, title, body, labels: ['scanner'],
+              });
+              core.info(`Opened issue #${created.data.number}`);
+            } else {
+              core.info('All gates green and no sticky issue exists — nothing to do.');
+            }
