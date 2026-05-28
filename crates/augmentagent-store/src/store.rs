@@ -1385,6 +1385,40 @@ impl Store {
             [],
         )?;
 
+        // #173 — channel-draft lifecycle for high-stakes channels (email,
+        // linkedin, slack DMs). State machine: pending → approved → published,
+        // with pending|approved → discarded as the bail path. The `payload_json`
+        // column is opaque to the store — channel crates serialize their own
+        // shape. Status is enforced in Rust (`crates/augmentagent-proactive::
+        // drafts`), not via CHECK, so we can add new states without ALTER.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS channel_drafts (\
+                 id                  TEXT PRIMARY KEY,\
+                 target_channel      TEXT NOT NULL,\
+                 payload_json        TEXT NOT NULL,\
+                 status              TEXT NOT NULL DEFAULT 'pending',\
+                 note                TEXT,\
+                 created_at_ms       INTEGER NOT NULL,\
+                 updated_at_ms       INTEGER NOT NULL,\
+                 approved_at_ms      INTEGER,\
+                 published_at_ms     INTEGER,\
+                 discarded_at_ms     INTEGER,\
+                 publish_result_json TEXT,\
+                 error_message       TEXT\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_channel_drafts_status \
+                ON channel_drafts(status, created_at_ms DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_channel_drafts_target \
+                ON channel_drafts(target_channel, status)",
+            [],
+        )?;
+
         // -------------------------------------------------------------------
         // #45 — indexes for Node-owned tables. Created at the END of migrate
         // so they run AFTER the additive ALTERs above have added any columns
