@@ -65,6 +65,34 @@ pub struct SocialApiOwnPostCommentPayload {
     pub created_at: String,
 }
 
+/// Normalized comment webhook event body (#249) as persisted by the Express
+/// receiver into `socialapi_webhook_events.payload_json`. Mirrors the
+/// receiver's `normalizeSocialApiEvent` comment shape.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct CommentWebhookPayload {
+    /// Platform-native comment id (dedup key against `socialapi_seen_comments`).
+    id: String,
+    post_id: String,
+    #[serde(default)]
+    author: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    created_at: String,
+}
+
+impl From<CommentWebhookPayload> for SocialApiOwnPostCommentPayload {
+    fn from(w: CommentWebhookPayload) -> Self {
+        SocialApiOwnPostCommentPayload {
+            post_id: w.post_id,
+            comment_id: w.id,
+            author: w.author,
+            text: w.text,
+            created_at: w.created_at,
+        }
+    }
+}
+
 impl SocialApiOwnPostCommentPayload {
     fn from_comment(c: &Comment) -> Self {
         Self {
@@ -113,6 +141,67 @@ impl SocialApiOwnPostCommentTrigger {
             max_per_day: max_per_day.max(1),
         }
     }
+
+    /// Fast-path drain of webhook-delivered comment events (#249). Reads up to
+    /// `budget` unprocessed `socialapi_webhook_events` of kind `comment`, marks
+    /// each processed, and — for comments landing on a `watched` own post and
+    /// not already in `socialapi_seen_comments` — emits an `own_post_comment`
+    /// WorkItem. Reusing the same dedup ledger as the poll path means a
+    /// webhook-delivered comment and a later poll of the same comment collapse
+    /// to a single draft. Comments on un-watched posts are still marked
+    /// processed (so they don't wedge the queue) but produce no work — the poll
+    /// path applies the identical watched-post filter. Best-effort: a malformed
+    /// row is marked processed and skipped.
+    fn drain_webhook_events(
+        &self,
+        watched: &HashSet<&str>,
+        budget: u32,
+    ) -> anyhow::Result<Vec<WorkItem>> {
+        if budget == 0 {
+            return Ok(Vec::new());
+        }
+        let events = self
+            .store
+            .take_unprocessed_socialapi_webhook_events("comment", budget)?;
+        let mut out = Vec::new();
+        for ev in events {
+            if let Err(e) = self.store.mark_socialapi_webhook_event_processed(&ev.id) {
+                warn!(event = %ev.id, "socialapi comment webhook: mark processed failed: {e}");
+            }
+            let wp: CommentWebhookPayload = match serde_json::from_str(&ev.payload_json) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(event = %ev.id, "socialapi comment webhook: payload decode failed: {e}");
+                    continue;
+                }
+            };
+            if !watched.contains(wp.post_id.as_str()) {
+                continue;
+            }
+            let payload: SocialApiOwnPostCommentPayload = wp.into();
+            // Durable one-shot dedup on (post_id, comment_id) — the SAME ledger
+            // the poll path writes, so no double-draft.
+            let is_new = self.store.record_seen_socialapi_comment(
+                &payload.post_id,
+                &payload.comment_id,
+                Some(payload.author.as_str()),
+                Some(payload.text.as_str()),
+            )?;
+            if !is_new {
+                continue;
+            }
+            out.push(WorkItem {
+                platform: PLATFORM.into(),
+                kind: work_item_kind::OWN_POST_COMMENT.into(),
+                external_id: payload.comment_id.clone(),
+                payload: serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
+            });
+        }
+        if !out.is_empty() {
+            info!(n = out.len(), "socialapi own-post comment: drained webhook events (fast-path)");
+        }
+        Ok(out)
+    }
 }
 
 #[async_trait]
@@ -141,7 +230,13 @@ impl Trigger for SocialApiOwnPostCommentTrigger {
         };
 
         let mut budget = self.max_per_day;
-        let mut out = Vec::new();
+        // #249 fast-path: drain webhook-delivered comment events AHEAD of the
+        // API poll so near-real-time pushes don't wait for the next 30-min
+        // tick. Shares the `socialapi_seen_comments` dedup ledger and the
+        // watched-post filter with the poll below, so a webhook item drained
+        // here is skipped when the poll later sees it.
+        let mut out = self.drain_webhook_events(&watched, budget)?;
+        budget = budget.saturating_sub(out.len() as u32);
         for scope in scopes {
             if cancel.is_cancelled() || budget == 0 {
                 break;
@@ -605,6 +700,63 @@ mod tests {
         // Second poll → all already in socialapi_seen_comments → empty.
         let second = trig.next_work_items(&cancel).await.unwrap();
         assert!(second.is_empty());
+    }
+
+    /// #249 fast-path: a webhook-delivered comment on a WATCHED post drains
+    /// into one `own_post_comment` WorkItem; a comment on an UN-watched post is
+    /// marked processed but produces no work; a later poll of the same comment
+    /// (shared `socialapi_seen_comments` ledger) does not duplicate.
+    #[tokio::test]
+    async fn drains_webhook_comment_event_for_watched_post_only() {
+        let (store, _f) = tmp_store();
+        let now = now_millis();
+        store
+            .upsert_own_post(PLATFORM, "post_1", now, now + 86_400_000)
+            .unwrap();
+        // Watched-post comment → should surface.
+        store
+            .insert_socialapi_webhook_event(
+                "socialapi:comment:post_1:c1",
+                "comment",
+                None,
+                &serde_json::json!({
+                    "type":"comment","id":"c1","post_id":"post_1",
+                    "author":"jane","text":"nice!","created_at":"2026-05-28T00:00:00Z"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        // Un-watched-post comment → drained-but-dropped (no work item).
+        store
+            .insert_socialapi_webhook_event(
+                "socialapi:comment:other:c2",
+                "comment",
+                None,
+                &serde_json::json!({
+                    "type":"comment","id":"c2","post_id":"other_post",
+                    "author":"bob","text":"ignored","created_at":"2026-05-28T00:01:00Z"
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        // Poll re-returns c1 → deduped via the seen-ledger written by the drain.
+        let server = MockServer::start().await;
+        mount_comments(
+            &server,
+            serde_json::json!([
+                {"id":"c1","post_id":"post_1","author":"jane","text":"nice!","created_at":"2026-05-28T00:00:00Z"}
+            ]),
+        )
+        .await;
+        let trig = SocialApiOwnPostCommentTrigger::new(client(&server), Arc::clone(&store), 10);
+        let cancel = CancellationToken::new();
+        let first = trig.next_work_items(&cancel).await.unwrap();
+        assert_eq!(first.len(), 1, "only the watched-post webhook comment surfaces");
+        assert_eq!(first[0].external_id, "c1");
+        // Both webhook events are now processed; poll re-sees c1 deduped → empty.
+        let second = trig.next_work_items(&cancel).await.unwrap();
+        assert!(second.is_empty(), "no duplicate from webhook+poll convergence");
     }
 
     #[tokio::test]

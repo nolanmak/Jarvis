@@ -157,6 +157,24 @@ export function initDb(dbPath?: string): Database.Database {
       seen_at_ms    INTEGER NOT NULL,
       PRIMARY KEY (post_id, comment_id)
     );
+    -- #249: SocialAPI.ai inbound webhook events (near-real-time inbox). The
+    -- Express dashboard receives + verifies + persists each event here; the
+    -- Rust daemon DRAINS unprocessed rows as a fast-path alongside its API
+    -- poll, reusing socialapi_seen_{dms,comments} for dedup so a
+    -- webhook-delivered item and a later poll of the same item don't both
+    -- produce a draft. id is the provider event id (idempotent dedup);
+    -- kind is 'dm' | 'comment'; processed flips to 1 once the daemon has
+    -- emitted the corresponding WorkItem. Mirrors the Rust store migration.
+    CREATE TABLE IF NOT EXISTS socialapi_webhook_events (
+      id             TEXT PRIMARY KEY,
+      kind           TEXT NOT NULL,
+      account_id     TEXT,
+      payload_json   TEXT NOT NULL,
+      received_at_ms INTEGER NOT NULL,
+      processed      INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_socialapi_webhook_events_unprocessed
+      ON socialapi_webhook_events(processed, received_at_ms);
   `);
 
   // Additive migrations for existing DBs created before the platform/kind columns landed.
@@ -693,6 +711,30 @@ export function setSocialApiAccountActive(id: string, active: boolean): void {
 
 export function removeSocialApiAccount(id: string): void {
   getDb().prepare("DELETE FROM socialapi_accounts WHERE id = ?").run(id);
+}
+
+// --- SocialAPI.ai inbound webhook events (#249) ---
+//
+// The webhook receiver (`POST /webhooks/socialapi`) persists each verified
+// event here idempotently (de-duped by provider event id). The Rust daemon
+// drains unprocessed rows as a near-real-time fast-path alongside its API
+// poll, reusing socialapi_seen_{dms,comments} for downstream dedup. Returns
+// true when the row was newly inserted (false on a duplicate event id), so
+// the receiver can report accepted vs duplicate without re-enqueueing.
+export function insertSocialApiWebhookEvent(
+  id: string,
+  kind: "dm" | "comment",
+  accountId: string | null,
+  payloadJson: string
+): boolean {
+  const res = getDb()
+    .prepare(
+      `INSERT OR IGNORE INTO socialapi_webhook_events
+         (id, kind, account_id, payload_json, received_at_ms, processed)
+       VALUES (?, ?, ?, ?, ?, 0)`
+    )
+    .run(id, kind, accountId, payloadJson, Date.now());
+  return res.changes > 0;
 }
 
 // --- Slack Workspaces ---

@@ -567,6 +567,11 @@ router.post("/api/config", (req, res) => {
     "discord_bot_token",
     "email_retention_days",
     "github_webhook_secret",
+    // #249 — HMAC secret for the SocialAPI.ai inbound webhook receiver
+    // (POST /webhooks/socialapi). The receiver reads config-then-env and
+    // FAILS CLOSED when neither is set, so configuring this here arms the
+    // near-real-time inbox without an env/service restart.
+    "socialapi_webhook_secret",
   ];
 
   if (!allowedKeys.includes(key)) {
