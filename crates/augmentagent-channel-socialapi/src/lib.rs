@@ -20,10 +20,16 @@
 
 pub mod auth;
 pub mod client;
+pub mod own_posts;
 pub mod types;
 
 pub use auth::{SocialApiAuth, AuthError, KEYCHAIN_PLATFORM};
 pub use client::{SocialApiClient, ClientError, DEFAULT_BASE_URL};
+pub use own_posts::{
+    SocialApiOwnPostCommentEngagement, SocialApiOwnPostCommentPayload,
+    SocialApiOwnPostCommentTrigger, SocialApiOwnPostConfig, DEFAULT_MAX_REPLIES_PER_DAY,
+    DEFAULT_OWN_POST_POLL_SECS,
+};
 pub use types::{
     Account, Comment, Conversation, CreatePostRequest, CreatePostResponse, ConnectResponse,
     DmMessage, MediaUploadRequest, MediaUploadResponse, PostTarget, ReplyRequest,

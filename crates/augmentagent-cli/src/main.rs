@@ -1829,6 +1829,22 @@ async fn main() -> Result<()> {
                     None
                 }
             };
+            // #243 — SocialAPI.ai own-post comment engagement. Gates on a
+            // SocialAPI.ai key (env/keyring); self-disables with a warning when
+            // absent. Inert until `own_posts` has platform="socialapi" rows —
+            // same always-spawn-empty-is-free pattern as the LinkedIn engages.
+            let socialapi_own_post = match build_socialapi_own_post_engagement(
+                &cli,
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                dry_run,
+            ) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    warn!("socialapi own-post comment engagement disabled: {e:#}");
+                    None
+                }
+            };
             // Discord is optional too — builds only if creds are in Keychain.
             let discord_ch = match build_discord_channel(
                 &cli,
@@ -2007,6 +2023,10 @@ async fn main() -> Result<()> {
             if let Some(ct) = connection_triage {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { ct.run(sd).await }));
+            }
+            if let Some(sa) = socialapi_own_post {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { sa.run(sd).await }));
             }
             if let Some(dc) = discord_ch {
                 let sd = shutdown.clone();
@@ -6009,6 +6029,62 @@ fn build_own_post_comment_engagement(
         governor: engagement_governor(store),
         trigger,
         member_urn,
+        config,
+        poll_interval: Duration::from_secs(poll_secs),
+    })
+}
+
+/// #243 — SocialAPI.ai own-post comment engagement. Polls the user's
+/// registered own posts (`own_posts` rows with platform `"socialapi"`) for new
+/// comments via the SocialAPI.ai inbox, triages each, surfaces an
+/// approval-gated reply (the actual send lands in #244). Gated on
+/// `SOCIALAPI_API_KEY` / keyring; self-disables with a warning when absent.
+/// Cadence `AUGMENTAGENT_SOCIALAPI_OWNPOST_POLL_SECS`; reply pre-cap
+/// `AUGMENTAGENT_SOCIALAPI_MAX_OWNPOST_REPLIES`.
+fn build_socialapi_own_post_engagement(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<augmentagent_channel_socialapi::SocialApiOwnPostCommentEngagement<ClaudeCliReasoner>>
+{
+    use augmentagent_channel_socialapi::{
+        SocialApiAuth, SocialApiClient, SocialApiOwnPostCommentEngagement,
+        SocialApiOwnPostCommentTrigger, SocialApiOwnPostConfig, DEFAULT_MAX_REPLIES_PER_DAY,
+        DEFAULT_OWN_POST_POLL_SECS,
+    };
+
+    let auth = SocialApiAuth::load().context("load socialapi auth")?;
+    let client = Arc::new(SocialApiClient::new(auth));
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let poll_secs = std::env::var("AUGMENTAGENT_SOCIALAPI_OWNPOST_POLL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_OWN_POST_POLL_SECS);
+    let max_per_day = std::env::var("AUGMENTAGENT_SOCIALAPI_MAX_OWNPOST_REPLIES")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MAX_REPLIES_PER_DAY);
+    let trigger = Arc::new(SocialApiOwnPostCommentTrigger::new(
+        Arc::clone(&client),
+        Arc::clone(&store),
+        max_per_day,
+    ));
+    let config = SocialApiOwnPostConfig {
+        dry_run,
+        wiki_root: cli.wiki_dir.clone(),
+        skill_dir: cli.skill_dir.clone(),
+    };
+    info!(
+        interval_secs = poll_secs,
+        max_per_day, "socialapi own-post comment engagement ready"
+    );
+    Ok(SocialApiOwnPostCommentEngagement {
+        store: Arc::clone(&store),
+        reasoner,
+        approvals: broker,
+        governor: engagement_governor(store),
+        trigger,
         config,
         poll_interval: Duration::from_secs(poll_secs),
     })

@@ -10,8 +10,10 @@ repository.workspace = true
 augmentagent-channel-core = { path = "../augmentagent-channel-core" }
 augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-auth = { path = "../augmentagent-auth" }
+augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -22,3 +24,5 @@ reqwest = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
+uuid = { workspace = true }
+tempfile = "3"
