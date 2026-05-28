@@ -398,6 +398,10 @@ pub struct ScheduledPost {
     /// For tweetstorms / multi-part LI — parent `scheduled_posts.id`.
     pub thread_parent: Option<String>,
     pub created_at_ms: i64,
+    /// #240 — when set, publish via SocialAPI.ai to this connected account;
+    /// `platform` then holds the real sub-platform (instagram / x / …).
+    /// `None` ⇒ use the native LinkedIn / Twitter publisher arms.
+    pub socialapi_account_id: Option<String>,
 }
 
 /// Lifecycle states for a [`ScheduledPost`]. String-typed in the DB so a

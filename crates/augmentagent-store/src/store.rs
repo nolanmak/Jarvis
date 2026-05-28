@@ -891,6 +891,19 @@ impl Store {
                 ON scheduled_posts(status, fire_at_ms)",
             [],
         )?;
+        // #240 — SocialAPI.ai outbound. When set, the publisher routes the row
+        // through SocialAPI.ai (platform = "socialapi") to this connected
+        // account; `platform` then carries the real sub-platform
+        // (instagram / x / linkedin / …) so the publisher knows the target.
+        // Nullable + additive: pre-existing rows migrate cleanly with `None`
+        // and keep using the native LinkedIn / Twitter arms. Multi-account
+        // fan-out (N rows) is #241.
+        if !column_exists(conn, "scheduled_posts", "socialapi_account_id")? {
+            conn.execute(
+                "ALTER TABLE scheduled_posts ADD COLUMN socialapi_account_id TEXT",
+                [],
+            )?;
+        }
 
         // ----------------------------------------------------------------
         // #58 — engagement-automation spine. Additive + dormant in prod:
@@ -5039,6 +5052,23 @@ impl Store {
         Ok(id)
     }
 
+    /// #240 — route a queued post through SocialAPI.ai to a specific connected
+    /// account. `platform` on the row should already hold the real
+    /// sub-platform (instagram / x / linkedin / …). No-op-safe to call before
+    /// firing. Returns whether a row was updated.
+    pub fn set_scheduled_post_socialapi_account(
+        &self,
+        id: &str,
+        socialapi_account_id: &str,
+    ) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE scheduled_posts SET socialapi_account_id = ?2 WHERE id = ?1",
+            params![id, socialapi_account_id],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Posts that are `queued` and within `horizon_ms` of firing but have no
     /// preview card yet — the T-30min preview batch.
     pub fn scheduled_posts_due_for_preview(
@@ -5050,7 +5080,7 @@ impl Store {
         let mut stmt = guard.prepare(
             "SELECT id, platform, body, media_paths, fire_at_ms, status, \
                     approval_msg, posted_at_ms, external_id, thread_parent, \
-                    created_at_ms \
+                    created_at_ms, socialapi_account_id \
                FROM scheduled_posts \
               WHERE status = 'queued' AND approval_msg IS NULL \
                 AND fire_at_ms <= ?1 \
@@ -5073,7 +5103,7 @@ impl Store {
         let mut stmt = guard.prepare(
             "SELECT id, platform, body, media_paths, fire_at_ms, status, \
                     approval_msg, posted_at_ms, external_id, thread_parent, \
-                    created_at_ms \
+                    created_at_ms, socialapi_account_id \
                FROM scheduled_posts \
               WHERE status IN ('previewed','queued') AND fire_at_ms <= ?1 \
               ORDER BY fire_at_ms ASC",
@@ -5141,7 +5171,7 @@ impl Store {
         let mut stmt = guard.prepare(
             "SELECT id, platform, body, media_paths, fire_at_ms, status, \
                     approval_msg, posted_at_ms, external_id, thread_parent, \
-                    created_at_ms \
+                    created_at_ms, socialapi_account_id \
                FROM scheduled_posts \
               WHERE status IN ('queued','previewed') \
               ORDER BY fire_at_ms ASC",
@@ -5542,6 +5572,7 @@ fn row_to_scheduled_post(r: &rusqlite::Row) -> rusqlite::Result<ScheduledPost> {
         external_id: r.get::<_, Option<String>>(8)?,
         thread_parent: r.get::<_, Option<String>>(9)?,
         created_at_ms: r.get(10)?,
+        socialapi_account_id: r.get::<_, Option<String>>(11)?,
     })
 }
 

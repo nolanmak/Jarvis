@@ -6587,10 +6587,73 @@ impl augmentagent_channel_core::PostPublisher for MultiPlatformPublisher {
                     },
                 }
             }
+            // #240 — SocialAPI.ai outbound. The row's `platform` of "socialapi"
+            // routes it here; the connected account lives in
+            // `socialapi_account_id`. The real sub-platform (instagram / x /
+            // linkedin / …) is encoded in the platform string as a
+            // "socialapi:<sub>" suffix when known — e.g. "socialapi:instagram";
+            // a bare "socialapi" leaves `PostTarget.platform` empty so the
+            // unified API resolves the destination from the account id itself.
+            // Single-target only — multi-account fan-out (N rows) is #241.
+            p if p == "socialapi" || p.starts_with("socialapi:") => {
+                use augmentagent_channel_socialapi::{
+                    CreatePostRequest, PostTarget, SocialApiAuth, SocialApiClient,
+                };
+                let account_id = match post.socialapi_account_id.clone() {
+                    Some(a) if !a.is_empty() => a,
+                    _ => {
+                        return PublishOutcome::Failed {
+                            message: "socialapi: scheduled post has no \
+                                      socialapi_account_id set"
+                                .to_string(),
+                        }
+                    }
+                };
+                let auth = match SocialApiAuth::load() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        return PublishOutcome::Failed {
+                            message: format!("socialapi auth: {e}"),
+                        }
+                    }
+                };
+                if self.dry_run {
+                    return PublishOutcome::DryRun;
+                }
+                // Sub-platform is the part after "socialapi:" if present;
+                // empty otherwise (the API resolves it from the account id).
+                let target_platform = post
+                    .platform
+                    .strip_prefix("socialapi:")
+                    .unwrap_or("")
+                    .to_string();
+                let media = post
+                    .media_paths
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                    .filter(|v| !v.is_empty());
+                let client = SocialApiClient::new(auth);
+                let req = CreatePostRequest {
+                    targets: vec![PostTarget {
+                        account_id,
+                        platform: target_platform,
+                    }],
+                    body: post.body.clone(),
+                    media,
+                };
+                match client.create_post(&req).await {
+                    Ok(resp) => PublishOutcome::Posted {
+                        external_id: resp.id,
+                    },
+                    Err(e) => PublishOutcome::Failed {
+                        message: format!("socialapi create_post: {e}"),
+                    },
+                }
+            }
             other => PublishOutcome::Failed {
                 message: format!(
                     "no scheduled-post publisher wired for platform '{other}' \
-                     (linkedin + twitter supported; instagram deferred)"
+                     (linkedin + twitter + socialapi supported; instagram deferred)"
                 ),
             },
         }

@@ -215,6 +215,22 @@ export function initDb(dbPath?: string): Database.Database {
     `);
   }
 
+  // #240: SocialAPI.ai outbound publisher target. Mirrors the Rust store
+  // migration that adds scheduled_posts.socialapi_account_id (when set, the
+  // post is routed through SocialAPI.ai to that connected account; platform
+  // then carries the real sub-platform). scheduled_posts is a Rust-daemon
+  // table, so this is a guarded no-op on Node-only DBs — kept for schema
+  // parity if a shared DB ever surfaces the table to the Node side.
+  const schedTable = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='scheduled_posts'")
+    .get() as { name: string } | undefined;
+  if (schedTable) {
+    const schedCols = db.prepare("PRAGMA table_info(scheduled_posts)").all() as { name: string }[];
+    if (!schedCols.some((c) => c.name === "socialapi_account_id")) {
+      db.exec("ALTER TABLE scheduled_posts ADD COLUMN socialapi_account_id TEXT");
+    }
+  }
+
   return db;
 }
 
