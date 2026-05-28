@@ -883,6 +883,8 @@ dependencies = [
 name = "augmentagent-store"
 version = "0.1.0"
 dependencies = [
+ "once_cell",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
@@ -902,6 +904,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
 ]

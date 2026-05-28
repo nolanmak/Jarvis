@@ -1597,6 +1597,71 @@ router.post("/api/sessions/:pid/stop", (req, res) => {
   }
 });
 
+// #132 — "Query agent activity" view. Tails the tool-audit NDJSON log the
+// Rust reasoner writes for each tool call its wiki-query agent makes. The
+// view itself is in views/audit.ejs and polls /api/audit every 5s.
+//
+// We read the tail of the file (last ~256 KB) and parse line-by-line newest
+// first, so a runaway log doesn't blow the dashboard's memory.
+const TOOL_AUDIT_LOG_PATH =
+  process.env.AUGMENTAGENT_TOOL_AUDIT_LOG ||
+  path.join(
+    process.env.HOME || "/tmp",
+    ".local/state/augmentagent/tool-audit.log"
+  );
+const AUDIT_TAIL_BYTES = 256 * 1024;
+
+function readAuditTail(limit: number): Array<Record<string, unknown>> {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(TOOL_AUDIT_LOG_PATH);
+  } catch (_e) {
+    return []; // log not created yet — fine.
+  }
+  const start = Math.max(0, stat.size - AUDIT_TAIL_BYTES);
+  const buf = Buffer.alloc(stat.size - start);
+  const fd = fs.openSync(TOOL_AUDIT_LOG_PATH, "r");
+  try {
+    fs.readSync(fd, buf, 0, buf.length, start);
+  } finally {
+    fs.closeSync(fd);
+  }
+  // If we sliced mid-line, drop the leading partial line.
+  let text = buf.toString("utf8");
+  if (start > 0) {
+    const nl = text.indexOf("\n");
+    if (nl >= 0) text = text.slice(nl + 1);
+  }
+  const lines = text.split("\n").filter((l) => l.trim().length > 0);
+  // Newest first.
+  lines.reverse();
+  const out: Array<Record<string, unknown>> = [];
+  for (const line of lines) {
+    if (out.length >= limit) break;
+    try {
+      out.push(JSON.parse(line) as Record<string, unknown>);
+    } catch (_e) {
+      // Skip malformed lines (truncated write, partial flush) silently.
+    }
+  }
+  return out;
+}
+
+router.get("/audit", (_req, res) => {
+  res.render("audit", { page: "audit" });
+});
+
+router.get("/api/audit", (req, res) => {
+  const rawLimit = parseInt(String(req.query.limit ?? "200"), 10);
+  const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(rawLimit, 1000)) : 200;
+  try {
+    const rows = readAuditTail(limit);
+    res.json({ path: TOOL_AUDIT_LOG_PATH, rows });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
 router.get("/relationships", (_req, res) => {
   const signals = listProactiveSignals(200);
   const actions = listActiveProactiveUserActions();

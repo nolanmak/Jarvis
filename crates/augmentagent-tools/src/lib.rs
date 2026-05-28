@@ -5,3 +5,4 @@
 //! scoring primitives so future eval harnesses can reuse them.
 
 pub mod scoring;
+pub mod text;
