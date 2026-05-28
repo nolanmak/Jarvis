@@ -838,6 +838,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "augmentagent-store",
+ "chrono",
  "rusqlite",
  "serde",
  "serde_json",
