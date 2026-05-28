@@ -601,6 +601,15 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     let bash_invoice_set_recipient = format!("Bash({} invoice set-recipient *)", bin.display());
     let bash_invoice_set_entity = format!("Bash({} invoice set-entity *)", bin.display());
     let bash_invoice_set_auto_draft = format!("Bash({} invoice set-auto-draft *)", bin.display());
+    // #174/#176 follow-on — let the wiki agent list + stop runaway `claude`
+    // CLI loops when the user asks in natural language ("kill the hello
+    // world loop", "what loops are running"). The bot's `!loops` typed
+    // command still exists; this gives the agent the same capability
+    // without forcing the user to know the prefix. Destructive but
+    // explicitly authorised — the system prompt requires the agent to
+    // resolve the target via `loops list` before calling `loops stop`.
+    let bash_loops_list = format!("Bash({} loops list*)", bin.display());
+    let bash_loops_stop = format!("Bash({} loops stop *)", bin.display());
     // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
     // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
     // resolves the db regardless of cwd.
@@ -659,6 +668,8 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_invoice_set_recipient,
             bash_invoice_set_entity,
             bash_invoice_set_auto_draft,
+            bash_loops_list,
+            bash_loops_stop,
             format!("Bash({} issue create *)", aa_gh.display()),
             format!("Bash({} issue list *)", aa_gh.display()),
             format!("Bash({} issue view *)", aa_gh.display()),
