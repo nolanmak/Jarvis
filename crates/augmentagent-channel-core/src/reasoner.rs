@@ -601,20 +601,17 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     let bash_invoice_set_recipient = format!("Bash({} invoice set-recipient *)", bin.display());
     let bash_invoice_set_entity = format!("Bash({} invoice set-entity *)", bin.display());
     let bash_invoice_set_auto_draft = format!("Bash({} invoice set-auto-draft *)", bin.display());
-    // #174/#176 follow-on — let the wiki agent list + stop runaway `claude`
-    // CLI loops when the user asks in natural language ("kill the hello
-    // world loop", "what loops are running"). The bot's `!loops` typed
-    // command still exists; this gives the agent the same capability
-    // without forcing the user to know the prefix. Destructive but
-    // explicitly authorised — the system prompt requires the agent to
-    // resolve the target via `loops list` before calling `loops stop`.
-    //
-    // #210: original pair `loops list*` + `loops stop *` was wrong. The
-    // claude permission glob only expands `*` after a separator (space) —
-    // `list*` without a separating space falls through to "requires
-    // approval". Collapsed to a single `loops *` rule that mirrors the
-    // `gmail *` pattern and covers list / list --json / stop <pid> /
-    // stop <pid> --force / stop --all-but-current in one entry.
+    // #212 — `loop` (singular) reads/updates the sqlite `user_loops` table
+    // that backs the Discord `/loop` scheduler (#104). This is the COMMON
+    // CASE when the user asks "kill the hello world loop" — the loop runs
+    // inside the daemon, no claude PID involved. The prior `loops` (plural)
+    // PID-control was a misdiagnosis: it solves a different (real but rare)
+    // problem.
+    let bash_loop = format!("Bash({} loop *)", bin.display());
+    // #174/#176 — `loops` (plural) is OS-level claude PID control for the
+    // orphan-Claude-Code-session case. Kept on the allowlist for the rare
+    // case it's actually needed; the system prompt now points at `loop`
+    // first for any natural-language "kill the loop" request.
     let bash_loops = format!("Bash({} loops *)", bin.display());
     // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
     // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
@@ -674,6 +671,7 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_invoice_set_recipient,
             bash_invoice_set_entity,
             bash_invoice_set_auto_draft,
+            bash_loop,
             bash_loops,
             format!("Bash({} issue create *)", aa_gh.display()),
             format!("Bash({} issue list *)", aa_gh.display()),
