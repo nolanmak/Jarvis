@@ -17,6 +17,7 @@ augmentagent-store = { path = "../augmentagent-store" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

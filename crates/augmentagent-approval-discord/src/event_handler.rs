@@ -202,15 +202,14 @@ impl EventHandler for Handler {
                 &user_text,
             )
             .await;
-            for chunk in chunk_for_discord(&reply) {
-                let builder = CreateMessage::new()
-                    .content(chunk)
-                    .reference_message(MessageReference::from((msg.channel_id, msg.id)));
-                if let Err(e) = msg.channel_id.send_message(&ctx.http, builder).await {
-                    warn!("failed to post loop command reply: {e}");
-                    break;
-                }
-            }
+            send_chunks_reply_chain(
+                &ctx.http,
+                msg.channel_id,
+                msg.id,
+                chunk_for_discord(&reply),
+                "loop command reply",
+            )
+            .await;
             return;
         }
 
@@ -279,15 +278,14 @@ impl EventHandler for Handler {
                         answer.push_str("\n\n");
                         answer.push_str(f);
                     }
-                    for chunk in chunk_for_discord(&answer) {
-                        let builder = CreateMessage::new()
-                            .content(chunk)
-                            .reference_message(MessageReference::from((channel_id, msg_id)));
-                        if let Err(e) = channel_id.send_message(&*http, builder).await {
-                            warn!("failed to post wiki answer chunk: {e}");
-                            break;
-                        }
-                    }
+                    send_chunks_reply_chain(
+                        &http,
+                        channel_id,
+                        msg_id,
+                        chunk_for_discord(&answer),
+                        "wiki answer chunk",
+                    )
+                    .await;
                 }
                 Err(e) => {
                     let mut err_msg = format!("wiki query failed: {e}");
@@ -2023,6 +2021,111 @@ fn format_transcript(turns: &[(&str, String)], char_cap: usize) -> String {
 }
 
 /// Split a wiki answer into Discord-friendly chunks.
+/// Post a multi-chunk reply to `channel_id` with reply-chaining and retry
+/// (issue #126).
+///
+/// - Chunk 1 references the original user message (`root_msg`).
+/// - Chunks 2..N reference the *previous chunk's* message id, not the root.
+///   Discord sometimes rejects rapid-fire reply-to-same-parent sends, and
+///   chaining sidesteps that failure mode while still keeping the visual
+///   thread together.
+/// - Each chunk send retries once on failure with 250ms then 750ms backoff
+///   before giving up. The second retry drops the reply reference entirely,
+///   in case the reference itself (deleted parent / Discord validation) is
+///   what failed.
+/// - If a chunk still can't be delivered after both retries, we post a
+///   fallback `couldn't deliver remaining N message(s)` notice so the user
+///   isn't left thinking the answer ended early. We keep trying subsequent
+///   chunks anyway — a single bad chunk shouldn't truncate the whole reply.
+/// - 200ms `tokio::time::sleep` between chunks to stay under Discord's
+///   per-channel send rate.
+async fn send_chunks_reply_chain(
+    http: &Http,
+    channel_id: ChannelId,
+    root_msg: MessageId,
+    chunks: Vec<String>,
+    label: &str,
+) {
+    let total = chunks.len();
+    let mut prev_msg_id: Option<MessageId> = None;
+    let mut failed_count: usize = 0;
+
+    for (idx, chunk) in chunks.into_iter().enumerate() {
+        // 200ms inter-chunk delay (skip before the very first chunk).
+        if idx > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        let reply_target = if idx == 0 {
+            Some(root_msg)
+        } else {
+            prev_msg_id
+        };
+
+        match send_one_with_retry(http, channel_id, reply_target, &chunk, label).await {
+            Some(sent_id) => {
+                prev_msg_id = Some(sent_id);
+            }
+            None => {
+                failed_count += 1;
+                // Don't stop the loop — keep trying remaining chunks so a
+                // single transient failure doesn't truncate everything.
+            }
+        }
+    }
+
+    if failed_count > 0 {
+        let notice = format!(
+            "\u{26a0}\u{fe0f} couldn't deliver {failed_count} of {total} message(s) — check logs"
+        );
+        let builder = CreateMessage::new()
+            .content(notice)
+            .reference_message(MessageReference::from((channel_id, root_msg)));
+        if let Err(e) = channel_id.send_message(http, builder).await {
+            warn!("failed to post {label} truncation notice: {e}");
+        }
+    }
+}
+
+/// Send a single chunk with one retry. Returns the sent message id on
+/// success, or `None` if both attempts failed.
+///
+/// Backoff schedule: initial send → 250ms → retry → 750ms → final retry
+/// without the reply reference (defensive: in case the parent message
+/// reference itself is what Discord rejected).
+async fn send_one_with_retry(
+    http: &Http,
+    channel_id: ChannelId,
+    reply_target: Option<MessageId>,
+    chunk: &str,
+    label: &str,
+) -> Option<MessageId> {
+    let attempts: [(u64, bool); 3] = [(0, true), (250, true), (750, false)];
+    let mut last_err: Option<String> = None;
+    for (delay_ms, use_reference) in attempts {
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        let mut builder = CreateMessage::new().content(chunk);
+        if use_reference {
+            if let Some(target) = reply_target {
+                builder = builder.reference_message(MessageReference::from((channel_id, target)));
+            }
+        }
+        match channel_id.send_message(http, builder).await {
+            Ok(sent) => return Some(sent.id),
+            Err(e) => {
+                last_err = Some(e.to_string());
+                warn!("failed to post {label} (delay={delay_ms}ms, ref={use_reference}): {e}");
+            }
+        }
+    }
+    if let Some(err) = last_err {
+        warn!("giving up on {label} after retries: {err}");
+    }
+    None
+}
+
 pub fn chunk_for_discord(full: &str) -> Vec<String> {
     if full.len() <= DISCORD_MSG_LIMIT {
         return vec![full.to_string()];

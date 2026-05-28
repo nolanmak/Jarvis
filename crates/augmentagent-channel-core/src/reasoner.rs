@@ -166,6 +166,72 @@ impl ClaudeCliReasoner {
 #[async_trait]
 impl Reasoner for ClaudeCliReasoner {
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
+        // #141 — Try the subprocess once. If it fails because the user's
+        // `~/.claude.json` is corrupted (the CLI itself writes the corruption
+        // diagnostics into stderr and exits non-zero), attempt a one-shot
+        // auto-recovery from the most recent on-disk backup and retry. If the
+        // retry also fails or no backup exists, surface a short sanitized
+        // user-facing error instead of the raw multi-line stderr blob.
+        match self.call_once(opts, user_message).await {
+            Ok(text) => Ok(text),
+            Err(CallError::ConfigCorrupted { stderr }) => {
+                let recovered = match restore_latest_claude_backup() {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(e) => {
+                        warn!("claude backup restore failed: {e:#}");
+                        false
+                    }
+                };
+                if recovered {
+                    match self.call_once(opts, user_message).await {
+                        Ok(text) => return Ok(text),
+                        Err(CallError::ConfigCorrupted { stderr }) => {
+                            return Err(anyhow::anyhow!(sanitize_claude_error(&stderr)));
+                        }
+                        Err(CallError::Other(e)) => return Err(e),
+                    }
+                }
+                Err(anyhow::anyhow!(sanitize_claude_error(&stderr)))
+            }
+            Err(CallError::Other(e)) => Err(e),
+        }
+    }
+}
+
+/// Inner-call result. Distinguishes the "corrupted `~/.claude.json`" failure
+/// (which the outer `call` tries to auto-recover from) from any other error
+/// (which is propagated as-is).
+enum CallError {
+    /// `claude` exited non-zero with stderr that matches the
+    /// "Configuration error … JSON Parse error" / "is corrupted" pattern the
+    /// subprocess emits when `~/.claude.json` is unreadable.
+    ConfigCorrupted { stderr: String },
+    /// Any other failure: spawn errors, IO errors, non-config exit failures.
+    Other(anyhow::Error),
+}
+
+impl From<anyhow::Error> for CallError {
+    fn from(e: anyhow::Error) -> Self {
+        CallError::Other(e)
+    }
+}
+
+impl From<std::io::Error> for CallError {
+    fn from(e: std::io::Error) -> Self {
+        CallError::Other(e.into())
+    }
+}
+
+impl ClaudeCliReasoner {
+    /// Single-shot spawn-and-read. Pulled out of [`Reasoner::call`] so the
+    /// outer wrapper can retry on a recoverable failure (corrupted
+    /// `~/.claude.json`, see #141).
+    async fn call_once(
+        &self,
+        opts: &ReasonerOpts,
+        user_message: &str,
+    ) -> Result<String, CallError> {
         let mut args: Vec<String> = vec![
             "-p".into(),
             "--output-format".into(),
@@ -290,16 +356,138 @@ impl Reasoner for ClaudeCliReasoner {
             }
             warn!("claude exited {status:?}: {stderr_buf}");
             if final_text.is_empty() {
-                return Err(anyhow::anyhow!(
+                // #141 — Detect the "~/.claude.json corrupted" pattern and
+                // surface a typed error so the outer wrapper can attempt
+                // one-shot auto-recovery from the backup the CLI itself
+                // wrote.
+                if is_claude_config_corrupted(&stderr_buf) {
+                    return Err(CallError::ConfigCorrupted { stderr: stderr_buf });
+                }
+                return Err(CallError::Other(anyhow::anyhow!(
                     "claude exited non-zero: {status:?}: {stderr_buf}"
-                ));
+                )));
             }
         }
         if final_text.is_empty() {
-            return Err(anyhow::anyhow!("claude produced no assistant text"));
+            return Err(CallError::Other(anyhow::anyhow!(
+                "claude produced no assistant text"
+            )));
         }
         Ok(final_text)
     }
+}
+
+/// Recognises the stderr pattern emitted by the `claude` CLI when it cannot
+/// parse `~/.claude.json`. We match on the two phrases the CLI prints
+/// together: a "Configuration error" / "JSON Parse error" header and the
+/// "is corrupted" follow-up. Either phrase alone is enough — the CLI varies
+/// the exact wording between versions.
+fn is_claude_config_corrupted(stderr: &str) -> bool {
+    let needle = stderr.to_ascii_lowercase();
+    (needle.contains("configuration error") && needle.contains("json parse error"))
+        || needle.contains("is corrupted")
+        || needle.contains(".claude.json is corrupted")
+}
+
+/// Locate the most recent `.claude.json.backup.*` file under
+/// `~/.claude/backups/` and copy it over `~/.claude.json`. Returns the path
+/// that was restored, `Ok(None)` if no backups exist (or `HOME` is unset),
+/// or `Err` if a filesystem op failed. Caller decides whether to retry the
+/// spawn.
+fn restore_latest_claude_backup() -> anyhow::Result<Option<PathBuf>> {
+    let home = match std::env::var_os("HOME") {
+        Some(h) => PathBuf::from(h),
+        None => return Ok(None),
+    };
+    let backups_dir = home.join(".claude/backups");
+    let target = home.join(".claude.json");
+    let read = match std::fs::read_dir(&backups_dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut latest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in read.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if !name.starts_with(".claude.json.backup.") {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if latest.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            latest = Some((mtime, path));
+        }
+    }
+    let Some((_, src)) = latest else {
+        return Ok(None);
+    };
+    std::fs::copy(&src, &target)?;
+    Ok(Some(src))
+}
+
+/// Pure helper: turn the multi-line, often-duplicated stderr blob the
+/// `claude` CLI emits on a corrupted-config failure into a single short
+/// user-facing line. No `ExitStatus(...)` prefix, no absolute home paths, no
+/// repeated blocks.
+///
+/// Caller (`event_handler.rs`) already prefixes the returned string with
+/// `"wiki query failed: "` so we deliberately omit that here.
+pub fn sanitize_claude_error(stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        return "wiki temporarily unavailable: claude subprocess failed".into();
+    }
+    // De-duplicate the stderr buffer: the same diagnostic block is sometimes
+    // repeated 2-4x by the subprocess. We split on blank-line separators,
+    // keep insertion order, and drop exact-duplicate blocks.
+    let mut seen: Vec<&str> = Vec::new();
+    for block in trimmed.split("\n\n") {
+        let b = block.trim();
+        if b.is_empty() {
+            continue;
+        }
+        if !seen.iter().any(|s| *s == b) {
+            seen.push(b);
+        }
+    }
+    let deduped = seen.join("\n\n");
+    let lower = deduped.to_ascii_lowercase();
+    if (lower.contains("configuration error") && lower.contains("json parse error"))
+        || lower.contains("is corrupted")
+        || lower.contains(".claude.json is corrupted")
+    {
+        return "wiki temporarily unavailable: claude config corrupted (auto-recovery failed)"
+            .into();
+    }
+    // Generic fallback: a single short line scrubbed of `ExitStatus(...)`
+    // noise and absolute `$HOME` paths. Cap length so a wall of text from an
+    // unrelated tool failure cannot leak to Discord.
+    let mut line = deduped.lines().next().unwrap_or("").trim().to_string();
+    if line.is_empty() {
+        line = "claude subprocess failed".into();
+    }
+    if let Some(rest) = line.strip_prefix("ExitStatus(") {
+        if let Some(idx) = rest.find("): ") {
+            line = rest[idx + 3..].to_string();
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_str = home.to_string_lossy().into_owned();
+        if !home_str.is_empty() {
+            line = line.replace(&home_str, "~");
+        }
+    }
+    if line.len() > 200 {
+        line.truncate(200);
+        line.push('…');
+    }
+    format!("wiki temporarily unavailable: {line}")
 }
 
 /// Resolve the absolute on-disk path of the app database so it can be passed
@@ -395,10 +583,14 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     let bin = repo_root.join("target/release/augmentagent");
     // Scoped Bash patterns: Claude can invoke our gmail subcommand via the
     // release binary's absolute path, plus `gh issue {create,list,view,comment}`
-    // for filing AugmentAgent self-feedback issues. `/snap/bin/gh` is an
-    // absolute path because the systemd unit's PATH does not include /snap/bin.
-    // Anything else is denied by claude CLI.
+    // for filing AugmentAgent self-feedback issues — routed via the
+    // `scripts/aa-gh` shim (#131) so the agent cannot reach destructive
+    // `gh repo delete`, `gh pr merge --admin`, `gh secret set`, etc. even
+    // if it tried to glob past the issue subcommand. The shim is referenced
+    // by absolute path because the systemd unit's PATH does not include
+    // the repo's scripts dir. Anything else is denied by claude CLI.
     let bash_gmail = format!("Bash({} gmail *)", bin.display());
+    let aa_gh = repo_root.join("scripts/aa-gh");
     // Invoice subcommands the LLM can autonomously invoke. `invoice run` is
     // intentionally absent — the only real-send path is the user clicking
     // Approve on a draft card. `status` and `list-accounts` omit the trailing
@@ -467,10 +659,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_invoice_set_recipient,
             bash_invoice_set_entity,
             bash_invoice_set_auto_draft,
-            "Bash(/snap/bin/gh issue create *)".into(),
-            "Bash(/snap/bin/gh issue list *)".into(),
-            "Bash(/snap/bin/gh issue view *)".into(),
-            "Bash(/snap/bin/gh issue comment *)".into(),
+            format!("Bash({} issue create *)", aa_gh.display()),
+            format!("Bash({} issue list *)", aa_gh.display()),
+            format!("Bash({} issue view *)", aa_gh.display()),
+            format!("Bash({} issue comment *)", aa_gh.display()),
         ],
         add_dirs: vec![wiki_root.clone()],
         permission_mode: "acceptEdits".into(),
@@ -999,6 +1191,69 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    // ---- #141: subprocess error sanitization ----
+
+    /// Verbatim sample of the multi-line stderr blob that surfaced in the
+    /// Discord bug report — block repeated 4x, leading `ExitStatus(...)`,
+    /// absolute home paths.
+    const CORRUPT_4X_STDERR: &str = "Configuration error in /home/nolan-makatche/.claude.json: JSON Parse error: Unexpected EOF\n\nClaude configuration file at /home/nolan-makatche/.claude.json is corrupted: JSON Parse error: Unexpected EOF\nThe corrupted file has already been backed up.\nA backup file exists at: /home/nolan-makatche/.claude/backups/.claude.json.backup.1779736244424\nYou can manually restore it by running: cp \"/home/nolan-makatche/.claude/backups/.claude.json.backup.1779736244424\" \"/home/nolan-makatche/.claude.json\"\n\nConfiguration error in /home/nolan-makatche/.claude.json: JSON Parse error: Unexpected EOF\n\nClaude configuration file at /home/nolan-makatche/.claude.json is corrupted: JSON Parse error: Unexpected EOF\nThe corrupted file has already been backed up.\nA backup file exists at: /home/nolan-makatche/.claude/backups/.claude.json.backup.1779736244424\nYou can manually restore it by running: cp \"/home/nolan-makatche/.claude/backups/.claude.json.backup.1779736244424\" \"/home/nolan-makatche/.claude.json\"\n\nConfiguration error in /home/nolan-makatche/.claude.json: JSON Parse error: Unexpected EOF\n\nClaude configuration file at /home/nolan-makatche/.claude.json is corrupted: JSON Parse error: Unexpected EOF\nThe corrupted file has already been backed up.";
+
+    #[test]
+    fn sanitize_corrupted_config_returns_single_short_line() {
+        let out = sanitize_claude_error(CORRUPT_4X_STDERR);
+        assert_eq!(
+            out,
+            "wiki temporarily unavailable: claude config corrupted (auto-recovery failed)"
+        );
+        // The single line must not leak ExitStatus noise, absolute home
+        // paths, or repeated diagnostic blocks.
+        assert!(!out.contains("ExitStatus"), "leaked ExitStatus: {out}");
+        assert!(!out.contains("/home/"), "leaked absolute path: {out}");
+        assert_eq!(out.lines().count(), 1, "must be single-line: {out:?}");
+    }
+
+    #[test]
+    fn sanitize_dedupes_repeated_blocks() {
+        let block = "Configuration error in /tmp/x.json: JSON Parse error: foo";
+        let repeated = format!("{block}\n\n{block}\n\n{block}\n\n{block}");
+        let out = sanitize_claude_error(&repeated);
+        // Even on the matched-pattern fast-path we collapse to one line; the
+        // important property is that the output never repeats the diagnostic.
+        let matches = out.matches("auto-recovery failed").count();
+        assert_eq!(matches, 1, "diagnostic must not repeat: {out}");
+    }
+
+    #[test]
+    fn sanitize_generic_failure_strips_exitstatus_and_home() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/test".into());
+        let stderr = format!(
+            "ExitStatus(unix_wait_status(256)): some tool failed reading {home}/.config/foo"
+        );
+        let out = sanitize_claude_error(&stderr);
+        assert!(out.starts_with("wiki temporarily unavailable: "), "{out}");
+        assert!(!out.contains("ExitStatus"), "{out}");
+        assert!(!out.contains(&home), "{out}");
+    }
+
+    #[test]
+    fn sanitize_empty_returns_friendly_fallback() {
+        let out = sanitize_claude_error("");
+        assert_eq!(
+            out,
+            "wiki temporarily unavailable: claude subprocess failed"
+        );
+    }
+
+    #[test]
+    fn is_claude_config_corrupted_matches_real_stderr() {
+        assert!(is_claude_config_corrupted(CORRUPT_4X_STDERR));
+        assert!(is_claude_config_corrupted(
+            "Claude configuration file at /home/u/.claude.json is corrupted: foo"
+        ));
+        assert!(!is_claude_config_corrupted("network connection failed"));
+        assert!(!is_claude_config_corrupted(""));
     }
 }
 
