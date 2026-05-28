@@ -13,7 +13,7 @@ pub use models::{
     ConnectionRequestRow, DriveAccount, Email, FriendWatch, InvoiceDraft, LearnedPattern,
     LinkedInConnectionSync, OwnPost, PhoneIdentity, RateAuditRow,
     RateEvent, RateHalt, RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace,
-    SocialapiAccount, SubscriptionMode, TelegramBot, ToneExample,
+    SocialapiAccount, SocialapiWebhookEvent, SubscriptionMode, TelegramBot, ToneExample,
     ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 pub use store::{

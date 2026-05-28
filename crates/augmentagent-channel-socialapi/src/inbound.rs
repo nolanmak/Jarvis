@@ -51,6 +51,48 @@ pub const DEFAULT_DM_POLL_SECS: u64 = 5 * 60;
 /// of inbound DMs can't enqueue hundreds of LLM calls in a single tick.
 pub const DEFAULT_DM_MAX_PER_TICK: u32 = 25;
 
+/// Normalized inbound-DM webhook event body (#249) as persisted by the Express
+/// receiver into `socialapi_webhook_events.payload_json`. Mirrors the receiver's
+/// `normalizeSocialApiEvent` DM shape; everything the drain needs to rebuild a
+/// [`SocialApiDmPayload`] without another API call.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DmWebhookPayload {
+    /// Platform-native message id (dedup key against `socialapi_seen_dms`).
+    id: String,
+    conversation_id: String,
+    #[serde(default)]
+    account_id: String,
+    #[serde(default)]
+    with: String,
+    #[serde(default)]
+    author: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    created_at: String,
+}
+
+impl From<DmWebhookPayload> for SocialApiDmPayload {
+    fn from(w: DmWebhookPayload) -> Self {
+        // `with` is the other party; fall back to `author` if the receiver
+        // couldn't populate it.
+        let with = if w.with.is_empty() {
+            w.author.clone()
+        } else {
+            w.with
+        };
+        SocialApiDmPayload {
+            conversation_id: w.conversation_id,
+            account_id: w.account_id,
+            with,
+            message_id: w.id,
+            author: w.author,
+            text: w.text,
+            created_at: w.created_at,
+        }
+    }
+}
+
 /// Serialized payload carried in `WorkItem.payload` for an inbound DM. Captures
 /// the conversation it arrived in plus the single message that's new.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -133,11 +175,74 @@ impl SocialApiDmSource {
             max_per_tick: max_per_tick.max(1),
         }
     }
+
+    /// Fast-path drain of webhook-delivered DM events (#249). Reads up to
+    /// `budget` unprocessed `socialapi_webhook_events` of kind `dm`, marks each
+    /// processed, and — for the ones not already in `socialapi_seen_dms` —
+    /// emits a `dm` WorkItem. Reusing the same dedup ledger as the poll path
+    /// means a webhook-delivered DM and a later poll of the same DM collapse to
+    /// a single draft. Returns the emitted work items; the API poll runs after
+    /// this with whatever budget remains. Best-effort: a malformed row is
+    /// marked processed (so it doesn't wedge the queue) and skipped.
+    fn drain_webhook_events(&self, budget: u32) -> anyhow::Result<Vec<WorkItem>> {
+        if budget == 0 {
+            return Ok(Vec::new());
+        }
+        let events = self
+            .store
+            .take_unprocessed_socialapi_webhook_events("dm", budget)?;
+        let mut out = Vec::new();
+        for ev in events {
+            // Always mark processed first so a poison row can't be re-drained
+            // forever; the seen-ledger is the authoritative dedup if the same
+            // id later arrives via poll.
+            if let Err(e) = self.store.mark_socialapi_webhook_event_processed(&ev.id) {
+                warn!(event = %ev.id, "socialapi dm webhook: mark processed failed: {e}");
+            }
+            let wp: DmWebhookPayload = match serde_json::from_str(&ev.payload_json) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(event = %ev.id, "socialapi dm webhook: payload decode failed: {e}");
+                    continue;
+                }
+            };
+            let payload: SocialApiDmPayload = wp.into();
+            // Durable one-shot dedup keyed on (conversation_id, message_id) —
+            // the SAME ledger the poll path writes, so no double-draft.
+            let is_new = self.store.record_seen_socialapi_dm(
+                &payload.conversation_id,
+                &payload.message_id,
+                Some(payload.author.as_str()),
+                Some(payload.text.as_str()),
+            )?;
+            if !is_new {
+                continue;
+            }
+            out.push(WorkItem {
+                platform: PLATFORM.into(),
+                kind: work_item_kind::DM.into(),
+                external_id: payload.message_id.clone(),
+                payload: serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
+            });
+        }
+        if !out.is_empty() {
+            info!(n = out.len(), "socialapi dm source: drained webhook events (fast-path)");
+        }
+        Ok(out)
+    }
 }
 
 #[async_trait]
 impl InboundSource for SocialApiDmSource {
     async fn fetch_new(&self) -> anyhow::Result<Vec<WorkItem>> {
+        let mut budget = self.max_per_tick;
+        // #249 fast-path: drain webhook-delivered DM events AHEAD of the API
+        // poll so near-real-time pushes don't wait for the next tick. Shares
+        // the `socialapi_seen_dms` dedup ledger with the poll below, so a
+        // webhook item drained here is skipped when the poll later sees it.
+        let mut out = self.drain_webhook_events(budget)?;
+        budget = budget.saturating_sub(out.len() as u32);
+
         let accounts = self.store.active_socialapi_account_ids()?;
         // No registered accounts → poll the whole inbox once (account_id=None),
         // same fallback the own-post comment poller uses.
@@ -147,8 +252,6 @@ impl InboundSource for SocialApiDmSource {
             accounts.into_iter().map(Some).collect()
         };
 
-        let mut budget = self.max_per_tick;
-        let mut out = Vec::new();
         for scope in scopes {
             if budget == 0 {
                 break;
@@ -636,6 +739,63 @@ mod tests {
 
         let row = store.get_action_with_email(&action_id).unwrap().unwrap();
         assert_eq!(row.action.status, "superseded");
+    }
+
+    /// #249 fast-path: a webhook-delivered DM event drained from
+    /// `socialapi_webhook_events` surfaces as a `dm` WorkItem exactly once, is
+    /// marked processed, and a later API poll of the SAME message id (shared
+    /// `socialapi_seen_dms` ledger) produces no duplicate.
+    #[tokio::test]
+    async fn drains_webhook_dm_event_once_and_dedups_against_poll() {
+        let (store, _f) = tmp_store();
+        // Seed a webhook event for an inbound DM from jane.
+        let payload = serde_json::json!({
+            "type": "dm",
+            "id": "m1",
+            "conversation_id": "conv_1",
+            "account_id": "acc_1",
+            "with": "jane",
+            "author": "jane",
+            "text": "hey there",
+            "created_at": "2026-05-28T00:00:00Z"
+        });
+        let new = store
+            .insert_socialapi_webhook_event(
+                "socialapi:dm:conv_1:m1",
+                "dm",
+                Some("acc_1"),
+                &payload.to_string(),
+            )
+            .unwrap();
+        assert!(new);
+
+        // The API poll returns the SAME message (m1) plus our own outbound.
+        let server = MockServer::start().await;
+        mount_conversations(
+            &server,
+            serde_json::json!([
+                {
+                    "id": "conv_1", "account_id": "acc_1", "with": "jane",
+                    "messages": [
+                        {"id":"m1","author":"jane","text":"hey there","created_at":"2026-05-28T00:00:00Z"}
+                    ]
+                }
+            ]),
+        )
+        .await;
+        let source = SocialApiDmSource::new(client(&server), Arc::clone(&store), 10);
+
+        // First fetch: drains the webhook event → 1 work item (the poll sees m1
+        // but it's already in seen_dms from the drain, so no double).
+        let first = source.fetch_new().await.unwrap();
+        assert_eq!(first.len(), 1, "webhook drain should surface m1 exactly once");
+        assert_eq!(first[0].external_id, "m1");
+        assert_eq!(first[0].kind, work_item_kind::DM);
+
+        // Webhook event is now processed → second fetch drains nothing and the
+        // poll re-sees m1 but it's deduped → empty.
+        let second = source.fetch_new().await.unwrap();
+        assert!(second.is_empty(), "no duplicate from webhook+poll convergence");
     }
 
     #[tokio::test]
