@@ -12,7 +12,8 @@ use crate::models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
     ConnectionRequestRow, DriveAccount, Email, FriendWatch, InvoiceDraft, LearnedPattern,
     LinkedInConnectionSync, OwnPost, PhoneIdentity, RateAuditRow, RateHalt,
-    RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace, SubscriptionMode, TelegramBot,
+    RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace, SocialapiAccount,
+    SubscriptionMode, TelegramBot,
     ToneExample, ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 
@@ -5450,6 +5451,52 @@ impl Store {
         Ok(rows)
     }
 
+    /// List every registered SocialAPI.ai account (active + inactive), in a
+    /// stable order (active first, then by id). Powers the CLI `socialapi
+    /// list` verb (#245), which has to surface disabled accounts too — unlike
+    /// [`Store::active_socialapi_account_ids`], which only feeds the live
+    /// engagement loop.
+    pub fn list_socialapi_accounts(&self) -> StoreResult<Vec<SocialapiAccount>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, brand_id, platform, display_name, account_handle, active \
+               FROM socialapi_accounts ORDER BY active DESC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(SocialapiAccount {
+                    id: r.get(0)?,
+                    brand_id: r.get::<_, Option<String>>(1)?,
+                    platform: r.get(2)?,
+                    display_name: r.get::<_, Option<String>>(3)?,
+                    account_handle: r.get::<_, Option<String>>(4)?,
+                    active: r.get::<_, i64>(5)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Toggle a SocialAPI.ai account's `active` gate. Returns the number of
+    /// rows touched (0 when `id` is unknown) so the CLI `socialapi disable`
+    /// verb can tell the operator whether the id matched. Also bumps
+    /// `updated_at_ms` (caller supplies `now_ms`, matching the store's
+    /// timestamp-injection convention) so the change is observable in audit
+    /// listings.
+    pub fn set_socialapi_account_active(
+        &self,
+        id: &str,
+        active: bool,
+        now_ms: i64,
+    ) -> StoreResult<usize> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE socialapi_accounts SET active = ?2, updated_at_ms = ?3 WHERE id = ?1",
+            params![id, active as i64, now_ms],
+        )?;
+        Ok(n)
+    }
+
     // ---- #58.3 friend-feed engagement query surface ----
 
     /// Active (not paused) friend watches for `platform`. The friend-feed
@@ -7325,6 +7372,38 @@ mod tests {
         drop(guard);
         let ids = s.active_socialapi_account_ids().unwrap();
         assert_eq!(ids, vec!["acc_a".to_string(), "acc_c".to_string()]);
+    }
+
+    #[test]
+    fn list_and_disable_socialapi_accounts() {
+        let (s, _f) = fresh_store();
+        assert!(s.list_socialapi_accounts().unwrap().is_empty());
+        {
+            let guard = s.conn.lock().unwrap();
+            guard
+                .execute(
+                    "INSERT INTO socialapi_accounts \
+                        (id, platform, display_name, account_handle, active, created_at_ms, updated_at_ms) \
+                     VALUES ('acc_a','twitter','Acme','@acme',1,0,0), \
+                            ('acc_b','instagram',NULL,NULL,0,0,0)",
+                    [],
+                )
+                .unwrap();
+        }
+        // list returns active-first, then by id; surfaces inactive too.
+        let all = s.list_socialapi_accounts().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id, "acc_a");
+        assert!(all[0].active);
+        assert_eq!(all[0].display_name.as_deref(), Some("Acme"));
+        assert_eq!(all[1].id, "acc_b");
+        assert!(!all[1].active);
+
+        // disabling a known id flips active and reports 1 row touched.
+        assert_eq!(s.set_socialapi_account_active("acc_a", false, 123).unwrap(), 1);
+        assert!(s.active_socialapi_account_ids().unwrap().is_empty());
+        // unknown id touches nothing.
+        assert_eq!(s.set_socialapi_account_active("nope", false, 123).unwrap(), 0);
     }
 
     #[test]

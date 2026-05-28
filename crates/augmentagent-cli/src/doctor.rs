@@ -167,6 +167,8 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
     findings.push(check_dashboard_build_present().await);
     // 10. env_file_present
     findings.push(check_env_file_present());
+    // 11. socialapi — key present? accounts active? (#245)
+    findings.push(check_socialapi(&store));
 
     // --- Deep checks (off by default).
     if deep {
@@ -549,6 +551,65 @@ fn check_env_file_present() -> Finding {
         "no .env found in cwd or ~/.config/augmentagent/".to_string(),
         Some("cp .env.example .env && $EDITOR .env"),
     )
+}
+
+/// SocialAPI.ai readiness probe (#245). Two signals:
+///   * is the API key in place? (sqlite `socialapi_api_key` OR env
+///     `SOCIALAPI_API_KEY` — same precedence as the dashboard's
+///     `getConfigStatus()`), and
+///   * is there ≥1 active account in the local `socialapi_accounts` registry?
+///
+/// Maps to:
+///   * ok    — key set AND ≥1 active account (channel is live),
+///   * warn  — key set but no active accounts (connect one), or
+///   * warn  — no key at all (optional integration, so never error).
+/// The suggested_cmd points operators at the connect flow.
+fn check_socialapi(store: &Store) -> Finding {
+    let key_present = socialapi_key_present();
+    let accounts = store
+        .active_socialapi_account_ids()
+        .map(|v| v.len())
+        .unwrap_or(0);
+
+    let connect_hint = "augmentagent socialapi connect (or connect via the dashboard)";
+
+    match (key_present, accounts) {
+        (true, n) if n > 0 => Finding::ok(
+            "socialapi",
+            format!("SOCIALAPI_API_KEY set, {n} active account(s)"),
+        ),
+        (true, _) => Finding::warn(
+            "socialapi",
+            "SOCIALAPI_API_KEY set but no active accounts".to_string(),
+            Some(connect_hint),
+        ),
+        (false, _) => Finding::warn(
+            "socialapi",
+            "SOCIALAPI_API_KEY not set (SocialAPI.ai integration inactive)".to_string(),
+            Some(connect_hint),
+        ),
+    }
+}
+
+/// True iff the SocialAPI.ai key is configured. Checks the sqlite `config`
+/// table first (the dashboard writes `socialapi_api_key` there) then the
+/// `SOCIALAPI_API_KEY` env var — same precedence as `status::cfg_or_env`.
+fn socialapi_key_present() -> bool {
+    if let Ok(v) = std::env::var("SOCIALAPI_API_KEY") {
+        if !v.is_empty() {
+            return true;
+        }
+    }
+    let db_path = std::env::var("AUGMENTAGENT_DB").unwrap_or_else(|_| "data.db".to_string());
+    let Ok(conn) = rusqlite::Connection::open(&db_path) else {
+        return false;
+    };
+    let val: rusqlite::Result<String> = conn.query_row(
+        "SELECT value FROM config WHERE key = 'socialapi_api_key'",
+        [],
+        |r| r.get(0),
+    );
+    matches!(val, Ok(v) if !v.is_empty())
 }
 
 // ---------------------------------------------------------------------------

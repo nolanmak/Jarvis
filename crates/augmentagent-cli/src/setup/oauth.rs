@@ -99,6 +99,7 @@ pub enum OauthProvider {
     Drive,
     Slack,
     Reddit,
+    Socialapi,
 }
 
 impl OauthProvider {
@@ -112,6 +113,7 @@ impl OauthProvider {
             OauthProvider::Drive => "googledrive",
             OauthProvider::Slack => "slack",
             OauthProvider::Reddit => "reddit",
+            OauthProvider::Socialapi => "socialapi",
         }
     }
 
@@ -126,6 +128,7 @@ impl OauthProvider {
             OauthProvider::Drive => "/oauth/googledrive/start",
             OauthProvider::Slack => "/oauth/slack/start",
             OauthProvider::Reddit => "/oauth/reddit/start",
+            OauthProvider::Socialapi => "/oauth/socialapi/start",
         }
     }
 }
@@ -344,6 +347,12 @@ fn new_connection_appeared(provider: OauthProvider, before: &Value, now: &Value)
         OauthProvider::Gmail => connection_diff(before, now, "gmail", "accounts", "id", "gmail"),
         OauthProvider::Drive => connection_diff(before, now, "googledrive", "accounts", "id", "googledrive"),
         OauthProvider::Slack => connection_diff(before, now, "slack", "workspaces", "team_id", "slack"),
+        // #246 added `socialapi.accounts` to the rollup; each entry carries an
+        // `id` (the SocialAPI.ai-managed account id). Mirror the gmail/drive
+        // list-diff exactly.
+        OauthProvider::Socialapi => {
+            connection_diff(before, now, "socialapi", "accounts", "id", "socialapi")
+        }
         OauthProvider::Reddit => {
             let before_conn = before
                 .pointer("/reddit/connected")
@@ -430,6 +439,7 @@ mod tests {
         assert_eq!(OauthProvider::Drive.slug(), "googledrive");
         assert_eq!(OauthProvider::Slack.slug(), "slack");
         assert_eq!(OauthProvider::Reddit.slug(), "reddit");
+        assert_eq!(OauthProvider::Socialapi.slug(), "socialapi");
     }
 
     #[test]
@@ -442,6 +452,7 @@ mod tests {
         assert_eq!(OauthProvider::Drive.start_path(), "/oauth/googledrive/start");
         assert_eq!(OauthProvider::Slack.start_path(), "/oauth/slack/start");
         assert_eq!(OauthProvider::Reddit.start_path(), "/oauth/reddit/start");
+        assert_eq!(OauthProvider::Socialapi.start_path(), "/oauth/socialapi/start");
     }
 
     #[test]
@@ -520,6 +531,28 @@ mod tests {
 
         let same_false = json!({"reddit": {"connected": false}});
         assert!(new_connection_appeared(OauthProvider::Reddit, &same_false, &same_false).is_none());
+    }
+
+    #[test]
+    fn socialapi_diff_detects_new_account() {
+        let before = json!({"socialapi": {"accounts": [{"id": "s1"}]}});
+        let now = json!({
+            "socialapi": {"accounts": [{"id": "s1"}, {"id": "s2"}]}
+        });
+        let hit = new_connection_appeared(OauthProvider::Socialapi, &before, &now);
+        let doc = hit.expect("should detect new socialapi account");
+        assert_eq!(doc.get("status").and_then(|v| v.as_str()), Some("connected"));
+        assert_eq!(doc.get("provider").and_then(|v| v.as_str()), Some("socialapi"));
+        assert_eq!(
+            doc.get("accounts").and_then(|v| v.as_array()).unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn socialapi_diff_ignores_unchanged_set() {
+        let same = json!({"socialapi": {"accounts": [{"id": "s1"}]}});
+        assert!(new_connection_appeared(OauthProvider::Socialapi, &same, &same).is_none());
     }
 
     #[test]

@@ -123,6 +123,19 @@ pub struct DriveAccount {
     pub active: bool,
 }
 
+/// A SocialAPI.ai-managed social account (#238). One row per platform handle
+/// in the `socialapi_accounts` registry; `active` gates polling/posting. The
+/// CLI `socialapi list`/`disable` verbs (#245) read and toggle these.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialapiAccount {
+    pub id: String,
+    pub brand_id: Option<String>,
+    pub platform: String,
+    pub display_name: Option<String>,
+    pub account_handle: Option<String>,
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearnedPattern {
     pub pattern_type: String,

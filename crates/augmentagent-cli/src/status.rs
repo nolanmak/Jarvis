@@ -73,6 +73,7 @@ const KNOWN_CHANNELS: &[&str] = &[
     "voice",
     "gdrive",
     "contacts",
+    "socialapi",
 ];
 
 // ---------------------------------------------------------------------------
@@ -506,6 +507,10 @@ fn collect_channels(
         .get_active_gmail_accounts()
         .map(|v| v.len() as u32)
         .unwrap_or(0);
+    let socialapi_accounts: u32 = store
+        .active_socialapi_account_ids()
+        .map(|v| v.len() as u32)
+        .unwrap_or(0);
 
     for &name in KNOWN_CHANNELS {
         let (configured, accounts) = match name {
@@ -576,6 +581,14 @@ fn collect_channels(
                     || cfg_or_env(cfg, "composio_api_key", "COMPOSIO_API_KEY"),
                 0,
             ),
+            // #245 — SocialAPI.ai. "Configured" iff the API key is in place
+            // (sqlite `socialapi_api_key` or env `SOCIALAPI_API_KEY`) AND at
+            // least one socialapi account is active in the local registry.
+            // Mirrors gmail's "credential present AND ≥1 account" gate.
+            "socialapi" => {
+                let key_present = cfg_or_env(cfg, "socialapi_api_key", "SOCIALAPI_API_KEY");
+                (key_present && socialapi_accounts > 0, socialapi_accounts)
+            }
             _ => (false, 0),
         };
 
@@ -901,7 +914,7 @@ mod tests {
         for required in [
             "gmail", "slack", "discord", "twitter", "linkedin", "instagram", "reddit",
             "github", "meetup", "telegram", "whatsapp", "calendar", "voice", "gdrive",
-            "contacts",
+            "contacts", "socialapi",
         ] {
             assert!(
                 KNOWN_CHANNELS.contains(&required),
