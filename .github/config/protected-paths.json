@@ -1,0 +1,23 @@
+{
+  "comment": "Files/dirs the issue-to-PR automation must never modify. Edits are reverted post-implementation; if all edits land in protected paths the PR is rejected.",
+  "protected_patterns": [
+    "Cargo.lock",
+    "systemd/**",
+    ".github/workflows/**",
+    ".github/config/protected-paths.json",
+    "scripts/check-for-updates.sh",
+    "*-auth.json",
+    "data.db",
+    "data.db-shm",
+    "data.db-wal",
+    ".env",
+    ".env.*",
+    "CLAUDE.md",
+    ".claude/**"
+  ],
+  "high_stakes_paths": [
+    "crates/augmentagent-store/src/schema.rs",
+    "crates/augmentagent-channel-core/src/lib.rs",
+    "crates/augmentagent-auth/**"
+  ]
+}
