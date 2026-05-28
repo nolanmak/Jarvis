@@ -1336,6 +1336,42 @@ impl Store {
             [],
         )?;
 
+        // #238 — SocialAPI.ai integration. `socialapi_accounts` is the local
+        // registry of managed social accounts (one row per platform handle);
+        // `active` gates polling/posting. `socialapi_seen_comments` dedupes
+        // inbound comments per post so the engagement loop only triages each
+        // comment once. Both nullable-where-noted so onboarding can backfill
+        // metadata later.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS socialapi_accounts (\
+                 id             TEXT PRIMARY KEY,\
+                 brand_id       TEXT,\
+                 platform       TEXT NOT NULL,\
+                 display_name   TEXT,\
+                 account_handle TEXT,\
+                 active         INTEGER NOT NULL DEFAULT 1,\
+                 created_at_ms  INTEGER NOT NULL,\
+                 updated_at_ms  INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_socialapi_accounts_active \
+                ON socialapi_accounts(active)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS socialapi_seen_comments (\
+                 post_id       TEXT NOT NULL,\
+                 comment_id    TEXT NOT NULL,\
+                 author        TEXT,\
+                 text          TEXT,\
+                 seen_at_ms    INTEGER NOT NULL,\
+                 PRIMARY KEY (post_id, comment_id)\
+             )",
+            [],
+        )?;
+
         // -------------------------------------------------------------------
         // #45 — indexes for Node-owned tables. Created at the END of migrate
         // so they run AFTER the additive ALTERs above have added any columns
@@ -5827,6 +5863,22 @@ mod tests {
         let e = sample_email("m1");
         assert!(s.upsert_email(&e).unwrap());
         assert!(!s.upsert_email(&e).unwrap());
+    }
+
+    #[test]
+    fn socialapi_tables_exist_after_migrate() {
+        let (s, _f) = fresh_store();
+        let guard = s.conn.lock().unwrap();
+        for tbl in ["socialapi_accounts", "socialapi_seen_comments"] {
+            let n: i64 = guard
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![tbl],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "expected table {tbl} to exist");
+        }
     }
 
     #[test]
