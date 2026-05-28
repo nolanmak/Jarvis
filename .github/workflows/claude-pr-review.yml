@@ -1,0 +1,98 @@
+name: Claude PR Review (Phase 1)
+
+# Comment-only auto-review on PRs. No-ops if ANTHROPIC_API_KEY is missing.
+# Skip cases:
+#   - PR author is a bot
+#   - >1000 changed lines (cost cap; override with 'force-review' label)
+#   - Labels: skip-review, wip
+#   - Doc-only diffs (handled in the prompt, not the gate)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Eligibility gate
+    runs-on: ubuntu-latest
+    if: |
+      github.actor != 'dependabot[bot]' &&
+      github.actor != 'github-actions[bot]' &&
+      github.event.pull_request.draft != true &&
+      !contains(github.event.pull_request.labels.*.name, 'skip-review') &&
+      !contains(github.event.pull_request.labels.*.name, 'wip')
+    outputs:
+      has_secret: ${{ steps.secret.outputs.present }}
+      too_big: ${{ steps.size.outputs.too_big }}
+      changed_lines: ${{ steps.size.outputs.changed_lines }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: secret
+        run: |
+          if [ -n "${{ secrets.ANTHROPIC_API_KEY }}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::ANTHROPIC_API_KEY not set — auto-review will no-op. Add the secret to enable."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - id: size
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_REF" >/dev/null 2>&1 || true
+          LINES=$(git diff --stat "origin/$BASE_REF...HEAD" | tail -1 | awk '{print $4+$6}')
+          LINES=${LINES:-0}
+          echo "changed_lines=$LINES" >> "$GITHUB_OUTPUT"
+          FORCE='${{ contains(github.event.pull_request.labels.*.name, ''force-review'') }}'
+          if [ "$LINES" -gt 1000 ] && [ "$FORCE" != "true" ]; then
+            echo "too_big=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::PR >1000 lines ($LINES) — skipping. Add 'force-review' label to override."
+          else
+            echo "too_big=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  review:
+    name: Claude review (comment-only)
+    runs-on: ubuntu-latest
+    needs: gate
+    if: needs.gate.outputs.has_secret == 'true' && needs.gate.outputs.too_big == 'false'
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Claude review
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt_file: .github/prompts/pr-review.md
+          prompt: |
+            PR_NUMBER: ${{ github.event.pull_request.number }}
+            BASE_REF: ${{ github.event.pull_request.base.ref }}
+            HEAD_REF: ${{ github.event.pull_request.head.ref }}
+            CHANGED_LINES: ${{ needs.gate.outputs.changed_lines }}
+          claude_args: >-
+            --allowed-tools
+            "Bash(git diff *),Bash(git log *),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh api:*),Read,Glob,Grep"
+            --max-turns 20
+
+  no_op_notice:
+    name: No-op (no secret configured)
+    runs-on: ubuntu-latest
+    needs: gate
+    if: needs.gate.outputs.has_secret != 'true'
+    steps:
+      - run: |
+          echo "::notice::Auto-review skipped — ANTHROPIC_API_KEY secret not configured."
