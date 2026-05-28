@@ -1112,8 +1112,17 @@ enum ComposeOp {
         #[arg(long)]
         source: PathBuf,
         /// CSV of target platforms. Defaults to "twitter,linkedin,instagram".
+        /// Include the token `socialapi` to also fan the draft out across every
+        /// connected SocialAPI.ai account (one adapted variant per account):
+        /// a single cross-post approval card, then on approve one queued
+        /// `scheduled_posts` row per account that #240's publisher sends.
         #[arg(long, default_value = "twitter,linkedin,instagram")]
         platforms: String,
+        /// When the queued SocialAPI.ai cross-post rows should fire — RFC3339
+        /// or unix seconds. Defaults to now (immediate). Only affects the
+        /// `socialapi` cross-post rows.
+        #[arg(long)]
+        at: Option<String>,
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
     },
@@ -2840,6 +2849,7 @@ async fn main() -> Result<()> {
             ComposeOp::FanOut {
                 source,
                 platforms,
+                at,
                 dry_run,
             } => {
                 run_compose_fan_out(
@@ -2847,6 +2857,7 @@ async fn main() -> Result<()> {
                     Arc::clone(&store),
                     source.clone(),
                     platforms.clone(),
+                    at.clone(),
                     *dry_run,
                 )
                 .await
@@ -9597,6 +9608,7 @@ async fn run_compose_fan_out(
     store: Arc<Store>,
     source: PathBuf,
     platforms_csv: String,
+    at: Option<String>,
     dry_run: bool,
 ) -> Result<()> {
     use augmentagent_content_adapter::{fan_out, preview_all, Platform, SourceDraft};
@@ -9606,50 +9618,177 @@ async fn run_compose_fan_out(
     if body.trim().is_empty() {
         anyhow::bail!("source draft is empty");
     }
+
+    // `socialapi` is a meta-token: it doesn't name a text-shape platform, it
+    // asks for a cross-post fan-out across every connected SocialAPI.ai
+    // account (#241). It's stripped before the regular Platform parse.
+    let want_socialapi = platforms_csv
+        .split(',')
+        .any(|p| p.trim().eq_ignore_ascii_case("socialapi"));
     let platforms: Vec<Platform> = platforms_csv
         .split(',')
+        .filter(|p| !p.trim().eq_ignore_ascii_case("socialapi"))
         .filter_map(|p| Platform::parse(p.trim()))
         .collect();
-    if platforms.is_empty() {
+    if platforms.is_empty() && !want_socialapi {
         anyhow::bail!("no valid platforms in --platforms ({platforms_csv})");
     }
 
     let src = SourceDraft::new(body);
     let reasoner = Arc::new(ClaudeCliReasoner::new());
-    let variants = fan_out(&reasoner, &src, &platforms).await;
-    let cards = preview_all(&variants);
+
+    // ---- direct per-platform variants (#53): one independently-gated card each
+    if !platforms.is_empty() {
+        let variants = fan_out(&reasoner, &src, &platforms).await;
+        let cards = preview_all(&variants);
+        if dry_run {
+            for c in &cards {
+                println!("\n----- variant -----\n{c}");
+            }
+            println!(
+                "\n{} variant(s) generated (dry-run: not posted)",
+                variants.len()
+            );
+        } else {
+            // Each variant is independently approval-gated. Post one card per
+            // variant via the broker; the channels own the actual publish step
+            // (Refs #53 — posting wiring lands with the platform channels).
+            let (broker, _) = build_broker(cli, Arc::clone(&store), dry_run).await?;
+            for (v, card) in variants.iter().zip(cards.iter()) {
+                let pseudo = augmentagent_store::Email {
+                    message_id: format!("compose:{}", v.platform.as_str()),
+                    thread_id: None,
+                    from: "content-adapter".into(),
+                    subject: format!("[{}] variant for review", v.platform.as_str()),
+                    body: card.clone(),
+                    date: String::new(),
+                    account_entity_id: None,
+                    platform: v.platform.as_str().to_string(),
+                    kind: "compose_variant".into(),
+                };
+                if let Err(e) = broker.post_flag_notice(&pseudo, card).await {
+                    warn!(platform = v.platform.as_str(), "compose card post failed: {e}");
+                }
+            }
+            println!("{} variant card(s) posted for approval", variants.len());
+        }
+    }
+
+    // ---- SocialAPI.ai cross-post fan-out (#241)
+    if want_socialapi {
+        run_socialapi_cross_post(cli, Arc::clone(&store), &reasoner, &src, at, dry_run).await?;
+    }
+
+    Ok(())
+}
+
+/// #241 — SocialAPI.ai cross-post fan-out (OUTBOUND).
+///
+/// One source draft → one adapted variant per connected SocialAPI.ai account →
+/// ONE cross-post approval card (the family) → on approve, one queued
+/// `scheduled_posts` row per account (`platform="socialapi:<sub>"` +
+/// `socialapi_account_id` set), which #240's `MultiPlatformPublisher` then
+/// sends.
+///
+/// Dry-run prints the family card and the rows that *would* be enqueued without
+/// touching the queue. Otherwise the family card is posted via the broker (the
+/// human-facing approval surface) and the rows are queued; the scheduled-post
+/// engine's own per-row T-horizon preview provides the cancel window before
+/// each fires.
+async fn run_socialapi_cross_post<R>(
+    cli: &Cli,
+    store: Arc<Store>,
+    reasoner: &Arc<R>,
+    src: &augmentagent_content_adapter::SourceDraft,
+    at: Option<String>,
+    dry_run: bool,
+) -> Result<()>
+where
+    R: augmentagent_channel_core::reasoner::Reasoner + ?Sized,
+{
+    use augmentagent_content_adapter::{family_card, fan_out_socialapi, SocialTarget};
+
+    let accounts: Vec<SocialTarget> = store
+        .list_socialapi_accounts()
+        .context("list socialapi accounts")?
+        .into_iter()
+        .filter(|a| a.active)
+        .map(|a| {
+            let label = a
+                .display_name
+                .clone()
+                .or_else(|| a.account_handle.clone())
+                .unwrap_or_else(|| a.id.clone());
+            SocialTarget::new(a.id, a.platform).with_label(label)
+        })
+        .collect();
+
+    if accounts.is_empty() {
+        println!(
+            "socialapi cross-post: no active SocialAPI.ai accounts connected \
+             — nothing to fan out (run `socialapi list`)"
+        );
+        return Ok(());
+    }
+
+    let items = fan_out_socialapi(reasoner, src, &accounts).await;
+    let card = family_card(&items);
+    // Fire time for every row in the family. Default: now (immediate).
+    let fire_at_ms = match &at {
+        Some(s) => parse_fire_at(s)?,
+        None => chrono::Utc::now().timestamp_millis(),
+    };
 
     if dry_run {
-        for c in &cards {
-            println!("\n----- variant -----\n{c}");
+        println!("\n----- cross-post family (dry-run: not queued) -----\n{card}");
+        println!("\nwould enqueue {} scheduled_posts row(s):", items.len());
+        for it in &items {
+            println!(
+                "  socialapi:{}  account={}  body={:?}",
+                it.target.sub_platform,
+                it.target.account_id,
+                it.variant.posts.join(" / ").chars().take(60).collect::<String>(),
+            );
         }
-        println!(
-            "\n{} variant(s) generated (dry-run: not posted)",
-            variants.len()
-        );
-    } else {
-        // Each variant is independently approval-gated. Post one card per
-        // variant via the broker; the channels own the actual publish step
-        // (Refs #53 — posting wiring lands with the platform channels).
-        let (broker, _) = build_broker(cli, Arc::clone(&store), dry_run).await?;
-        for (v, card) in variants.iter().zip(cards.iter()) {
-            let pseudo = augmentagent_store::Email {
-                message_id: format!("compose:{}", v.platform.as_str()),
-                thread_id: None,
-                from: "content-adapter".into(),
-                subject: format!("[{}] variant for review", v.platform.as_str()),
-                body: card.clone(),
-                date: String::new(),
-                account_entity_id: None,
-                platform: v.platform.as_str().to_string(),
-                kind: "compose_variant".into(),
-            };
-            if let Err(e) = broker.post_flag_notice(&pseudo, card).await {
-                warn!(platform = v.platform.as_str(), "compose card post failed: {e}");
-            }
-        }
-        println!("{} variant card(s) posted for approval", variants.len());
+        return Ok(());
     }
+
+    // One approval surface for the whole family.
+    let (broker, _) = build_broker(cli, Arc::clone(&store), dry_run).await?;
+    let pseudo = augmentagent_store::Email {
+        message_id: "compose:socialapi-crosspost".into(),
+        thread_id: None,
+        from: "content-adapter".into(),
+        subject: format!("[socialapi] cross-post — {} account(s)", items.len()),
+        body: card.clone(),
+        date: String::new(),
+        account_entity_id: None,
+        platform: "socialapi".into(),
+        kind: "compose_crosspost".into(),
+    };
+    if let Err(e) = broker.post_flag_notice(&pseudo, &card).await {
+        warn!("socialapi cross-post card post failed: {e}");
+    }
+
+    // Enqueue one row per (variant, account). The row's platform encodes the
+    // sub-platform as `socialapi:<sub>`; a thread (X) joins its posts with the
+    // platform-standard double newline so the unified API sees one body.
+    let mut queued = 0usize;
+    for it in &items {
+        let platform = format!("socialapi:{}", it.target.sub_platform);
+        let body = it.variant.posts.join("\n\n");
+        let id = store
+            .enqueue_scheduled_post(&platform, &body, None, fire_at_ms, None)
+            .context("enqueue socialapi cross-post row")?;
+        store
+            .set_scheduled_post_socialapi_account(&id, &it.target.account_id)
+            .context("set socialapi_account_id on cross-post row")?;
+        queued += 1;
+    }
+    println!(
+        "socialapi cross-post: family card posted for approval; \
+         {queued} scheduled_posts row(s) queued (fire@{fire_at_ms})"
+    );
     Ok(())
 }
 

@@ -29,6 +29,18 @@ impl Platform {
         }
     }
 
+    /// Map a SocialAPI.ai sub-platform string (the `platform` field on a
+    /// connected account — e.g. `"instagram"`, `"twitter"`, `"x"`,
+    /// `"linkedin"`) to the adapter's text-shape `Platform`, so a SocialAPI
+    /// fan-out reuses the existing per-platform adaptation prompts and char
+    /// limits. Returns `None` for sub-platforms the text adapter has no
+    /// rendering profile for (the caller then falls back to the source body
+    /// verbatim). Shares [`Platform::parse`]'s alias table so an account whose
+    /// `platform` is `"x"` still lands on the X prompt / 280-char limit.
+    pub fn from_socialapi_sub(sub: &str) -> Option<Self> {
+        Self::parse(sub)
+    }
+
     /// Hard character ceiling for a single post on this platform. Used by the
     /// preview to flag an over-long variant before it reaches approval.
     pub fn char_limit(self) -> usize {

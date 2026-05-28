@@ -579,6 +579,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-channel-luma"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "augmentagent-channel-core",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "augmentagent-channel-meetup"
 version = "0.1.0"
 dependencies = [
@@ -611,6 +624,19 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "augmentagent-channel-partiful"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "augmentagent-channel-core",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
