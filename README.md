@@ -17,6 +17,9 @@ layer, a personal wiki, and a growing set of social/posting integrations.
 - **Many channels.** Email (Gmail), Discord, Slack, Telegram, LinkedIn,
   WhatsApp, Twitter/X, Instagram, Reddit, GitHub, Linear, Notion, Calendly,
   Google Calendar, Google Drive, Meetup, and a voice-capture channel.
+- **SocialAPI.ai backend.** An official unified REST integration for
+  cross-posting and reading/replying to comments + DMs across connected
+  social accounts. See [SocialAPI.ai integration](#socialapiai-integration).
 - **Approval surfaces.** Discord is the primary control surface; a WhatsApp
   control surface and a PWA + Web Push surface are also available.
 - **Proactive CRM.** A scheduled engine surfaces stale contacts, unmet
@@ -85,6 +88,57 @@ counterpart.
 Branch + PR only — never push to `main` (the auto-updater watches it).
 Feature work should build cleanly (`cargo check --workspace`, `npm run build`)
 and keep its tests green before the PR is opened.
+
+## SocialAPI.ai integration
+
+[SocialAPI.ai](https://social-api.ai) is an **official, additive** backend for
+the social channels. A single API key (a bearer token) fronts many connected
+social accounts — one "brand" account per platform (e.g. one Instagram, one X).
+SocialAPI.ai handles the per-platform OAuth and normalises two things behind one
+REST surface (`https://api.social-api.ai/v1/`):
+
+- **Cross-posting** — publish a post to a connected account through the official
+  API instead of a browser/automation path.
+- **Comment + DM read+reply** — list inbox comments on your own posts and DM
+  conversations, and (with approval) reply to them.
+
+It is additive: it augments rather than replaces the existing browser /
+Voyager / GraphQL paths. Notably, LinkedIn personal comment replies still go
+through the existing Voyager path; SocialAPI.ai does not displace it.
+
+Reading comments and DMs is free under SocialAPI.ai; only some send actions
+are metered (X applies metered pricing underneath). The plan in use is flat
+(Side Hustle, $29/mo).
+
+Everything still flows through the daemon's triage → draft → **Discord
+approval** path. Inbound comments and DMs are surfaced, triaged, and a reply is
+drafted, then an approval card is posted to Discord. The merged code stops at
+the approval card; the actual reply *send* and cross-post fan-out are tracked
+in forthcoming issues (#244, #241).
+
+The engagement skill fragment lives at `skills/socialapi-triage/SKILL.md`.
+
+### Setup
+
+- **Dashboard (hosted-key flow, primary).** On the dashboard, open the
+  SocialAPI.ai settings card, paste your SocialAPI.ai API key and save it, then
+  click **Sync accounts** to pull your connected handles. Each handle is upserted
+  into the registry; toggle accounts active/inactive or remove them inline.
+  (Routes: `/api/socialapi/key`, `/api/socialapi/sync`,
+  `/api/socialapi/accounts/*`.)
+- **Env / keyring.** The key resolves from the `SOCIALAPI_API_KEY` environment
+  variable first, falling back to the keyring vault slot
+  `augmentagent/socialapi/default`.
+- **CLI (forthcoming).** A dedicated `augmentagent socialapi` command and a
+  `setup oauth --provider socialapi` flow are planned (#245), along with a
+  proxied OAuth path (#247). These are not yet merged; use the dashboard
+  hosted-key flow or `SOCIALAPI_API_KEY` today.
+
+#### Instagram requirements
+
+Instagram accounts connected through SocialAPI.ai must be a **Business or
+Creator** account **linked to a Facebook Page** — personal Instagram accounts
+are not supported by the underlying API.
 
 ## Grocery channel
 
