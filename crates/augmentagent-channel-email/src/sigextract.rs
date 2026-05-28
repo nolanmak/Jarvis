@@ -176,6 +176,154 @@ pub fn is_human_sender(from: &str, body: &str) -> bool {
     true
 }
 
+/// Domains owned by event platforms / signup-confirmation senders. Matched
+/// against the lowercased `domain` portion of the bare address. Plain
+/// substring match unless the pattern is anchored:
+///   - leading `.` (e.g. `.luma-mail.com`) → suffix match (true subdomains
+///     of `luma-mail.com` but NOT `luma-mail.com.evil.example`).
+/// Curated for the senders the user signed up to via a script — Partiful,
+/// Luma, Meetup, Eventbrite, Covent, Hopin, Zoom, plus generic
+/// `noreply@calendar.<corp>` (handled separately on local-part below).
+const EVENT_BLAST_DOMAIN_PATTERNS: &[&str] = &[
+    "partiful-mail.com",
+    "email.meetup.com",
+    "eventbrite.com",
+    "joincovent.com",
+    "hopin.com",
+    "zoom.us",
+    ".luma-mail.com",
+];
+
+/// Subject markers (case-insensitive) for event invites / RSVPs /
+/// registration confirmations. Plain `contains` substring match against the
+/// lowercased subject. The weekday list is enumerated explicitly so we can
+/// match "see you wed" / "see you next thursday" without pulling in a regex
+/// crate.
+const EVENT_BLAST_SUBJECT_MARKERS: &[&str] = &[
+    "registration confirmed",
+    "you're invited",
+    "youre invited",
+    "you're in!",
+    "youre in!",
+    "rsvp",
+    "invitation from an unknown sender",
+    "action required: complete your registration",
+    "\u{1f48c}", // 💌 (love letter emoji used by invite platforms)
+    "your tickets",
+];
+
+/// Weekday names — combined with the literal prefix "see you" to match
+/// "See you Wed", "See you next Thursday", "See you this Friday", etc.
+/// Lowercase; matched against the lowercased subject as a substring search
+/// for `"see you " + (?optional "next "|"this ") + weekday`.
+const WEEKDAYS: &[&str] = &[
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "mon",
+    "tue",
+    "tues",
+    "wed",
+    "thu",
+    "thur",
+    "thurs",
+    "fri",
+    "sat",
+    "sun",
+];
+
+/// Body markers (case-insensitive) that strongly indicate an event invite /
+/// calendar-attached blast — a calendar artifact in the body or an `.ics`
+/// attachment reference.
+const EVENT_BLAST_BODY_MARKERS: &[&str] = &[
+    "add to calendar",
+    ".ics attached",
+    "ical://",
+    "google.com/calendar",
+];
+
+/// Heuristic: should this `(from, subject, body)` be treated as an
+/// event-platform / signup-confirmation blast?
+///
+/// Issue #222: the user signed up for many tech events via a script and
+/// doesn't want a draft reply for each Partiful/Luma/Meetup/Eventbrite
+/// invite, RSVP confirmation, or "Action Required: Complete Registration"
+/// nudge. These mails carry valuable CRM context (organizers, event
+/// titles, locations), so we still ingest into the wiki — but we never
+/// generate a draft, never queue an approval card, and never post a
+/// Discord flag notice (per the user's explicit preference: no noise from
+/// event blasts).
+///
+/// Returns true if **any** of:
+///   1. The sender domain matches a curated event-platform list.
+///   2. The local part is `noreply@calendar.<anything>` (corporate calendar
+///      invites — most Calendly / Google Calendar bounce-back domains
+///      follow this shape).
+///   3. The subject contains a registration/invite/RSVP marker — including
+///      "see you (next|this)? <weekday>" via the explicit weekday list.
+///   4. The body references calendar boilerplate (`Add to calendar`,
+///      `.ics attached`, `ical://`, `google.com/calendar`).
+///
+/// All comparisons are case-insensitive plain `contains` checks; no regex
+/// crate dependency.
+pub fn is_event_blast(from: &str, subject: &str, body: &str) -> bool {
+    // 1 + 2. Sender — domain list + `noreply@calendar.` local-part rule.
+    let bare = extract_bare(from).to_ascii_lowercase();
+    if let Some((local, domain)) = bare.split_once('@') {
+        for pat in EVENT_BLAST_DOMAIN_PATTERNS {
+            if let Some(suffix) = pat.strip_prefix('.') {
+                // Anchored suffix match: only true subdomains of `<suffix>`.
+                if domain.ends_with(suffix) && domain != suffix {
+                    return true;
+                }
+            } else if domain.contains(pat) {
+                return true;
+            }
+        }
+        // `noreply@calendar.<anything>` — corporate calendar invites.
+        if local.starts_with("noreply") && domain.starts_with("calendar.") {
+            return true;
+        }
+    }
+
+    // 3. Subject markers (case-insensitive substring).
+    let subject_lower = subject.to_ascii_lowercase();
+    for marker in EVENT_BLAST_SUBJECT_MARKERS {
+        if subject_lower.contains(marker) {
+            return true;
+        }
+    }
+    // 3b. "see you (next|this)? <weekday>" — enumerated weekday match.
+    if subject_lower.contains("see you ") {
+        for wd in WEEKDAYS {
+            // Direct: "see you wed"
+            // Modified: "see you next wed" / "see you this wed"
+            for prefix in ["see you ", "see you next ", "see you this "] {
+                let needle = format!("{prefix}{wd}");
+                if subject_lower.contains(&needle) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 4. Body markers.
+    if !body.is_empty() {
+        let body_lower = body.to_ascii_lowercase();
+        for marker in EVENT_BLAST_BODY_MARKERS {
+            if body_lower.contains(marker) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Pull the bare `local@domain` from a raw `From:` header value that may
 /// include a display name (`"Foo" <foo@bar.com>` or `Foo <foo@bar.com>`). // pii-ok
 /// Falls back to the trimmed input if no angle-bracket pattern is found.
@@ -914,6 +1062,114 @@ mod tests {
         assert!(is_human_sender(
             "jane.doe@employer.com", // pii-ok
             "Following up on yesterday's chat — Friday at 2 still works.",
+        ));
+    }
+
+    #[test]
+    fn event_blast_matches_known_domains() {
+        // pii-ok — synthetic test fixtures (event-platform senders).
+        // (1) Domain category: Partiful, Luma subdomain, Meetup.
+        assert!(is_event_blast(
+            "\"Partiful\" <invites@partiful-mail.com>", // pii-ok
+            "You're Invited: NYC Tech Drinks",
+            "Body text here",
+        ));
+        assert!(is_event_blast(
+            "noreply@send.luma-mail.com", // pii-ok
+            "Confirming your registration",
+            "",
+        ));
+        assert!(is_event_blast(
+            "Meetup <info@email.meetup.com>", // pii-ok
+            "Reminder: meetup tomorrow",
+            "",
+        ));
+    }
+
+    #[test]
+    fn event_blast_matches_subject_markers() {
+        // pii-ok — synthetic subject-marker fixtures.
+        // (2) Subject category: Registration Confirmed, RSVP, "see you Wed".
+        assert!(is_event_blast(
+            "Eventbrite <noreply@somewhere.example>", // pii-ok
+            "Registration Confirmed for AI Demo Night",
+            "irrelevant body",
+        ));
+        assert!(is_event_blast(
+            "host@randomdomain.example", // pii-ok
+            "RSVP requested: brunch",
+            "",
+        ));
+        assert!(is_event_blast(
+            "organizer@randomdomain.example", // pii-ok
+            "See you Wed at the loft!",
+            "",
+        ));
+        // Variant: "see you next Thursday" via the modifier branch.
+        assert!(is_event_blast(
+            "organizer@randomdomain.example", // pii-ok
+            "See you next Thursday",
+            "",
+        ));
+    }
+
+    #[test]
+    fn event_blast_matches_body_markers() {
+        // pii-ok — synthetic body-marker fixtures.
+        // (3) Body category: calendar artifacts.
+        assert!(is_event_blast(
+            "host@unknown.example", // pii-ok
+            "quick note",
+            "Looking forward to seeing you. Add to Calendar: link",
+        ));
+        assert!(is_event_blast(
+            "host@unknown.example", // pii-ok
+            "details",
+            "ical://example.com/event.ics",
+        ));
+        assert!(is_event_blast(
+            "host@unknown.example", // pii-ok
+            "fyi",
+            "RSVP via https://www.google.com/calendar/event?eid=abc",
+        ));
+    }
+
+    #[test]
+    fn event_blast_matches_calendar_noreply_local_part() {
+        // pii-ok — synthetic calendar-noreply fixture.
+        // The `noreply@calendar.<corp>` rule catches Calendly /
+        // Google-Calendar-style bounce-back senders.
+        assert!(is_event_blast(
+            "noreply@calendar.google.com", // pii-ok
+            "Invitation: Coffee chat",
+            "",
+        ));
+    }
+
+    #[test]
+    fn event_blast_matches_invitation_unknown_sender_subject() {
+        // pii-ok — synthetic Google-Calendar "unknown sender" subject.
+        assert!(is_event_blast(
+            "no-reply@somecorp.example", // pii-ok
+            "Invitation from an unknown sender: project sync",
+            "",
+        ));
+    }
+
+    #[test]
+    fn event_blast_passes_through_real_personal_mail() {
+        // pii-ok — synthetic personal-mail negatives (no event signals).
+        // (4) Negative controls: ordinary personal correspondence MUST NOT
+        // match — these would otherwise lose a draft.
+        assert!(!is_event_blast(
+            "alice@example.com",                                 // pii-ok
+            "Re: Coffee tomorrow?",                              // pii-ok
+            "Sounds good — see you at the usual spot at 9am.",   // pii-ok
+        ));
+        assert!(!is_event_blast(
+            "bob.smith@startup.io",                              // pii-ok
+            "Quick question on the deploy",                      // pii-ok
+            "Hey — did the migration land yet? Need to plan around it.", // pii-ok
         ));
     }
 
