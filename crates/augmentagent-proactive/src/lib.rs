@@ -2,6 +2,7 @@
 //! sqlite, emit `ProactiveSignal`s, and the runner persists + dispatches them
 //! through the existing `ApprovalBroker`. See issue #81.
 
+pub mod drafts;
 pub mod person;
 pub mod rules;
 pub mod runner;
@@ -9,6 +10,7 @@ pub mod scan;
 pub mod store_ext;
 pub mod suppress;
 
+pub use drafts::{DraftStatus, DraftStore, StoredDraft};
 pub use scan::{
     Cadence, ProactiveSignal, ScanCtx, ScheduledScan, SignalKind, SuggestedAction, Urgency,
 };
