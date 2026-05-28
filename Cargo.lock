@@ -662,15 +662,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "augmentagent-approval-discord",
  "augmentagent-auth",
  "augmentagent-channel-core",
  "augmentagent-store",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
+ "uuid",
  "wiremock",
 ]
 

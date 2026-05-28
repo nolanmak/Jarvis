@@ -1384,6 +1384,21 @@ impl Store {
              )",
             [],
         )?;
+        // #242 — inbound DM dedup. `socialapi_seen_dms` records each inbound
+        // DM message once, keyed on (conversation_id, message_id), so the DM
+        // poller only surfaces a genuinely new inbound message a single time,
+        // even across daemon restarts. Mirrors `socialapi_seen_comments`.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS socialapi_seen_dms (\
+                 conversation_id TEXT NOT NULL,\
+                 message_id      TEXT NOT NULL,\
+                 author          TEXT,\
+                 text            TEXT,\
+                 seen_at_ms      INTEGER NOT NULL,\
+                 PRIMARY KEY (conversation_id, message_id)\
+             )",
+            [],
+        )?;
 
         // #173 — channel-draft lifecycle for high-stakes channels (email,
         // linkedin, slack DMs). State machine: pending → approved → published,
@@ -5396,6 +5411,30 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// One-shot dedup for inbound SocialAPI.ai DM messages (#242). Returns
+    /// `true` the first time a `(conversation_id, message_id)` pair is seen and
+    /// `false` on every subsequent call. Mirrors
+    /// [`Store::record_seen_socialapi_comment`] but against the
+    /// `socialapi_seen_dms` ledger; the DM inbound poller calls this so each
+    /// inbound message surfaces a single WorkItem, ever, across restarts.
+    pub fn record_seen_socialapi_dm(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        author: Option<&str>,
+        text: Option<&str>,
+    ) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "INSERT OR IGNORE INTO socialapi_seen_dms \
+                (conversation_id, message_id, author, text, seen_at_ms) \
+             VALUES (?1,?2,?3,?4,?5)",
+            params![conversation_id, message_id, author, text, now],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Account ids of the active (polling-enabled) SocialAPI.ai accounts. The
     /// own-post comment poller iterates these to scope `list_comments` per
     /// account. Empty when no accounts are registered yet, which makes the
@@ -5974,7 +6013,7 @@ mod tests {
     fn socialapi_tables_exist_after_migrate() {
         let (s, _f) = fresh_store();
         let guard = s.conn.lock().unwrap();
-        for tbl in ["socialapi_accounts", "socialapi_seen_comments"] {
+        for tbl in ["socialapi_accounts", "socialapi_seen_comments", "socialapi_seen_dms"] {
             let n: i64 = guard
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -7245,6 +7284,26 @@ mod tests {
         // Same comment id on a *different* post is a distinct ledger key.
         assert!(s
             .record_seen_socialapi_comment("post_2", "cmt_1", None, None)
+            .unwrap());
+    }
+
+    #[test]
+    fn socialapi_seen_dm_dedup_is_one_shot() {
+        let (s, _f) = fresh_store();
+        // First sighting of (conversation, message) → true; repeat → false.
+        assert!(s
+            .record_seen_socialapi_dm("conv_1", "msg_1", Some("jane"), Some("hi!"))
+            .unwrap());
+        assert!(!s
+            .record_seen_socialapi_dm("conv_1", "msg_1", Some("jane"), Some("hi!"))
+            .unwrap());
+        // A new message in the same conversation is still surfaced.
+        assert!(s
+            .record_seen_socialapi_dm("conv_1", "msg_2", Some("jane"), Some("again"))
+            .unwrap());
+        // Same message id in a *different* conversation is a distinct key.
+        assert!(s
+            .record_seen_socialapi_dm("conv_2", "msg_1", None, None)
             .unwrap());
     }
 
