@@ -33,6 +33,7 @@ use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{ActionStatus, RetryableReply, Store, TriageResult, NUDGE_INTERVAL_MS};
 
 use crate::gmail::{extract_bare_email, GmailApi};
+use crate::sigextract::is_human_sender;
 
 #[derive(Clone, Debug)]
 pub struct GmailChannelConfig {
@@ -442,6 +443,48 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 Ok(Some(DispatchOutcome::Flagged))
             }
             DecisionKind::Reply => {
+                // --- 1a. AUTOMATED-SENDER GUARD (#217). The triage model
+                // occasionally returns `reply` for mail from `noreply@…`,
+                // `notifications@…`, ESP/bulk-sender domains, or messages
+                // carrying List-Unsubscribe / "do not reply" markers. The
+                // `is_human_sender` helper (see `sigextract.rs`) is the
+                // canonical filter already used for wiki backfill (#120);
+                // it was previously dead code on the live triage path, so
+                // the bot was drafting replies to GitHub, Partiful,
+                // marketing blasts, etc. Gate the Reply arm on it: when
+                // the sender is non-human we route to Skip directly —
+                // mirroring the existing `DecisionKind::Skip` branch
+                // above — log `[skip:automated]`, and intentionally NOT
+                // post a Discord flag notice (these are high-volume; we
+                // don't want to noisy-page the user). Wiki ingest still
+                // runs so the sender's signature/page state stays
+                // consistent with the rest of the Skip path.
+                if !is_human_sender(&email.from, &email.body) {
+                    self.store.log_action(
+                        &email.message_id,
+                        email.thread_id.as_deref(),
+                        &email.from,
+                        &email.subject,
+                        Some(&email.body),
+                        None,
+                        ActionStatus::Skipped,
+                    )?;
+                    self.store
+                        .mark_email_processed(&email.message_id, TriageResult::Skip)?;
+                    println!(
+                        "[skip:automated] {} from={} reason=non_human_sender",
+                        email.message_id, email.from,
+                    );
+                    self.maybe_ingest(
+                        &email,
+                        DecisionKind::Skip,
+                        Some("non_human_sender"),
+                        None,
+                        IngestTrigger::Triaged,
+                    );
+                    return Ok(Some(DispatchOutcome::Skipped));
+                }
+
                 // --- 1b. BACKPRESSURE (#99). Before spending an Opus draft
                 // call + a Discord card, check the approval backlog. If it's
                 // at/over the cap, downgrade Reply -> Flag: the user still
@@ -1669,6 +1712,64 @@ mod tests {
         assert_eq!(out.skipped, 1);
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
         assert_eq!(broker.flag_posts.lock().unwrap().len(), 0);
+    }
+
+    /// #217: even if the triage model returns `reply` for a non-human
+    /// sender (a GitHub notification, a no-reply marketing blast, …),
+    /// the live dispatch must intercept and route to Skip — no Opus
+    /// draft, no Discord card, no flag notice. Without the
+    /// `is_human_sender` guard this test would post an approval card.
+    #[tokio::test]
+    async fn reply_decision_for_automated_sender_routes_to_skip() {
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                message_id: "m-bot".into(),
+                thread_id: Some("t-bot".into()),
+                // Classic automated sender — `noreply@` local part on a
+                // domain (`github.com`) that routinely sends actionable-
+                // looking notifications that occasionally fool the
+                // triage model into returning `reply`.
+                from: "noreply@github.com".into(), // pii-ok: synthetic test fixture
+                subject: "[org/repo] PR #42 review requested".into(),
+                body: "@you was requested to review PR #42. Please respond.".into(),
+                date: "2026-05-27".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        // Force the failure mode: triage says `reply` (model bug we're
+        // guarding against). If the draft phase ever ran it would pull
+        // the second scripted response — assertions below prove it
+        // doesn't.
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"requested action"}"#,
+            "Sure, I'll take a look.",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        // Routed to Skip, NOT replied or awaiting approval.
+        assert_eq!(out.skipped, 1, "automated sender must be skipped");
+        assert_eq!(out.awaiting_approval, 0, "no approval card for noreply@");
+        assert_eq!(out.replied_dry_run, 0);
+        assert_eq!(out.flagged, 0, "no flag — automated mail is silent skip");
+        // Discord broker untouched on both rails (card + flag notice).
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+        assert_eq!(broker.flag_posts.lock().unwrap().len(), 0);
+        // Email is terminally processed so the next tick won't re-spawn.
+        assert!(store.is_email_complete("m-bot").unwrap());
     }
 
     #[tokio::test]
