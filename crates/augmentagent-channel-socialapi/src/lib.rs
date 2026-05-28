@@ -20,11 +20,16 @@
 
 pub mod auth;
 pub mod client;
+pub mod inbound;
 pub mod own_posts;
 pub mod types;
 
 pub use auth::{SocialApiAuth, AuthError, KEYCHAIN_PLATFORM};
 pub use client::{SocialApiClient, ClientError, DEFAULT_BASE_URL};
+pub use inbound::{
+    SocialApiDmChannel, SocialApiDmConfig, SocialApiDmPayload, SocialApiDmSource,
+    DEFAULT_DM_MAX_PER_TICK, DEFAULT_DM_POLL_SECS,
+};
 pub use own_posts::{
     SocialApiOwnPostCommentEngagement, SocialApiOwnPostCommentPayload,
     SocialApiOwnPostCommentTrigger, SocialApiOwnPostConfig, DEFAULT_MAX_REPLIES_PER_DAY,

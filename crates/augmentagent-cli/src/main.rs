@@ -1845,6 +1845,22 @@ async fn main() -> Result<()> {
                     None
                 }
             };
+            // #242 — SocialAPI.ai inbound DM channel. Same key gate as the
+            // own-post engagement; inert (polls an empty inbox) until accounts
+            // are registered. Stops at the approval card — the reply send is
+            // #244.
+            let socialapi_dm = match build_socialapi_dm_channel(
+                &cli,
+                Arc::clone(&store),
+                Arc::clone(&broker),
+                dry_run,
+            ) {
+                Ok(c) => Some(Arc::new(c)),
+                Err(e) => {
+                    warn!("socialapi dm channel disabled: {e:#}");
+                    None
+                }
+            };
             // Discord is optional too — builds only if creds are in Keychain.
             let discord_ch = match build_discord_channel(
                 &cli,
@@ -2027,6 +2043,10 @@ async fn main() -> Result<()> {
             if let Some(sa) = socialapi_own_post {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { sa.run(sd).await }));
+            }
+            if let Some(sdm) = socialapi_dm {
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move { sdm.run(sd).await }));
             }
             if let Some(dc) = discord_ch {
                 let sd = shutdown.clone();
@@ -6088,6 +6108,74 @@ fn build_socialapi_own_post_engagement(
         config,
         poll_interval: Duration::from_secs(poll_secs),
     })
+}
+
+/// #242 — SocialAPI.ai inbound DM channel. Polls DM conversations across the
+/// active SocialAPI.ai accounts, triages each genuinely new inbound message,
+/// and surfaces an approval-gated reply (the actual send lands in #244). Gated
+/// on `SOCIALAPI_API_KEY` / keyring; self-disables with a warning when absent.
+/// Cadence `AUGMENTAGENT_SOCIALAPI_DM_POLL_SECS`; per-tick pre-cap
+/// `AUGMENTAGENT_SOCIALAPI_DM_MAX_PER_TICK`.
+#[allow(clippy::type_complexity)]
+fn build_socialapi_dm_channel(
+    cli: &Cli,
+    store: Arc<Store>,
+    broker: Arc<dyn ApprovalBroker>,
+    dry_run: bool,
+) -> Result<
+    augmentagent_channel_core::trigger::ChannelRunner<
+        augmentagent_channel_core::trigger::InboundMessageTrigger<
+            augmentagent_channel_socialapi::SocialApiDmSource,
+        >,
+        augmentagent_channel_socialapi::SocialApiDmChannel<ClaudeCliReasoner>,
+    >,
+> {
+    use augmentagent_channel_core::trigger::{ChannelRunner, InboundMessageTrigger};
+    use augmentagent_channel_socialapi::{
+        SocialApiAuth, SocialApiClient, SocialApiDmChannel, SocialApiDmConfig, SocialApiDmSource,
+        DEFAULT_DM_MAX_PER_TICK, DEFAULT_DM_POLL_SECS,
+    };
+
+    let auth = SocialApiAuth::load().context("load socialapi auth")?;
+    let client = Arc::new(SocialApiClient::new(auth));
+    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let poll_secs = std::env::var("AUGMENTAGENT_SOCIALAPI_DM_POLL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DM_POLL_SECS);
+    let max_per_tick = std::env::var("AUGMENTAGENT_SOCIALAPI_DM_MAX_PER_TICK")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_DM_MAX_PER_TICK);
+
+    let source = Arc::new(SocialApiDmSource::new(
+        client,
+        Arc::clone(&store),
+        max_per_tick,
+    ));
+    let trigger = Arc::new(InboundMessageTrigger::new(source));
+    let handler = Arc::new(SocialApiDmChannel {
+        store: Arc::clone(&store),
+        reasoner,
+        approvals: broker,
+        governor: engagement_governor(store),
+        config: SocialApiDmConfig {
+            dry_run,
+            wiki_root: cli.wiki_dir.clone(),
+            skill_dir: cli.skill_dir.clone(),
+        },
+    });
+    info!(
+        interval_secs = poll_secs,
+        max_per_tick, "socialapi dm channel ready"
+    );
+    Ok(ChannelRunner::new(
+        trigger,
+        handler,
+        Duration::from_secs(poll_secs),
+        Duration::ZERO,
+        "socialapi-dm",
+    ))
 }
 
 /// #58.3 — watchlist-driven friend-post engagement. Iterates the
