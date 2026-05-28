@@ -57,6 +57,13 @@ uuid = { workspace = true }
 # inherited transitively) so the binary keeps building even if a sibling
 # crate drops its reqwest dep in the future.
 reqwest = { workspace = true }
+serde = { workspace = true }
+
+# #175 — `augmentagent loops` walks /proc directly and signals PIDs via
+# `libc::kill`. `libc` is the lightest std-extension that covers the SIGTERM
+# / SIGKILL / ESRCH constants and `sysconf(_SC_CLK_TCK)` for elapsed-time
+# math; pulling `nix` for ~3 calls would be heavier than needed.
+libc = "0.2"
 
 # #14 — snapshot test for the `augmentagent status --json` schema. `insta`
 # is the idiomatic Rust snapshot crate; `tempfile` gives the test an isolated

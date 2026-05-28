@@ -53,6 +53,7 @@ mod env_cfg;
 mod installers;
 mod invoice;
 mod logs;
+mod loops;
 mod self_improve;
 mod service;
 mod setup;
@@ -442,6 +443,16 @@ enum Cmd {
         /// Emit one JSON object per line (`journalctl -o json`).
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+    /// #175 — list + signal `claude` CLI processes on this host. Addresses
+    /// the orphaned-`/loop` bug (#174): a wakeup scheduled in one Claude
+    /// session keeps firing into Discord but no other session can see or
+    /// cancel it. `loops list` shows every claude PID; `loops stop <PID>`
+    /// sends SIGTERM (or SIGKILL with `--force`). `--all-but-current` nukes
+    /// every claude process except the caller's ancestor chain.
+    Loops {
+        #[command(subcommand)]
+        op: loops::LoopsOp,
     },
     /// Thin wrapper over `systemctl --user` for the augmentagent unit family.
     /// Lets the `/setup` skill (and humans) say `service restart --unit
@@ -2756,6 +2767,7 @@ async fn main() -> Result<()> {
             since,
             json,
         } => logs::run_logs(unit, follow, lines, since, json).await,
+        Cmd::Loops { op } => loops::run(op).await,
         Cmd::Service { op, ref unit, json } => service::run_service(op, unit, json).await,
         Cmd::Setup { ref op } => setup::run_setup(op).await,
         Cmd::Status {
