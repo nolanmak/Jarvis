@@ -84,5 +84,11 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
 
+# #231 — cron-style /loop scheduling. `cron` parses 5-field cron exprs
+# and computes next firings; `chrono-tz` carries the IANA tz database
+# so cron expressions can be anchored to a user-specific zone (DST-aware).
+cron = "0.12"
+chrono-tz = "0.10"
+
 # Test-only HTTP mock (#77 normShares body snapshot tests)
 wiremock = "0.6"

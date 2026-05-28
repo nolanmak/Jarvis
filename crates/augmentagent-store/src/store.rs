@@ -697,6 +697,23 @@ impl Store {
                 [],
             )?;
         }
+        // #231 — cron-style scheduling. When `cron_expr` is set,
+        // `interval_secs` is ignored and `tz` is required for next-firing
+        // computation. Both nullable so existing interval-only rows
+        // migrate cleanly. The scheduler tick picks the cron branch
+        // whenever `cron_expr.is_some()`.
+        if !column_exists(conn, "user_loops", "cron_expr")? {
+            conn.execute(
+                "ALTER TABLE user_loops ADD COLUMN cron_expr TEXT",
+                [],
+            )?;
+        }
+        if !column_exists(conn, "user_loops", "tz")? {
+            conn.execute(
+                "ALTER TABLE user_loops ADD COLUMN tz TEXT",
+                [],
+            )?;
+        }
 
         // #47 — cross-surface state sync. `status_source` records which surface
         // resolved an action (discord / dashboard / telegram / cli / nudge) so
@@ -4205,8 +4222,15 @@ impl Store {
     // #104 — user-defined scheduled tasks (`/loop`).
     // ---------------------------------------------------------------
 
-    /// Create a loop. `id` is generated; returns it. `expires_at_ms` is an
-    /// optional auto-stop deadline (wall-clock ms); `None` means run forever.
+    /// Create a loop. `id` is generated; returns it.
+    ///
+    /// - `interval_secs` — fixed-interval cadence; pass `0` when using
+    ///   `cron_expr` (the scheduler ignores it in that case).
+    /// - `expires_at_ms` — optional auto-stop deadline; `None` means run
+    ///   forever (until manually stopped or auto-paused on failures).
+    /// - `cron_expr` + `tz` (#231) — cron-style cadence anchored to a
+    ///   timezone. Must be both `Some` or both `None`; callers validate
+    ///   the cron expression and tz string before reaching this method.
     pub fn create_user_loop(
         &self,
         owner: &str,
@@ -4215,6 +4239,8 @@ impl Store {
         interval_secs: i64,
         prompt: &str,
         expires_at_ms: Option<i64>,
+        cron_expr: Option<&str>,
+        tz: Option<&str>,
     ) -> StoreResult<String> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let id = Uuid::new_v4().to_string();
@@ -4222,8 +4248,9 @@ impl Store {
         guard.execute(
             "INSERT INTO user_loops \
                  (id, owner, channel, channel_ref, interval_secs, prompt, \
-                  status, fail_count, created_at_ms, updated_at_ms, expires_at_ms) \
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0, ?7, ?7, ?8)",
+                  status, fail_count, created_at_ms, updated_at_ms, \
+                  expires_at_ms, cron_expr, tz) \
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 0, ?7, ?7, ?8, ?9, ?10)",
             params![
                 id,
                 owner,
@@ -4232,7 +4259,9 @@ impl Store {
                 interval_secs,
                 prompt,
                 now,
-                expires_at_ms
+                expires_at_ms,
+                cron_expr,
+                tz,
             ],
         )?;
         Ok(id)
@@ -4244,7 +4273,8 @@ impl Store {
         let mut stmt = guard.prepare(
             "SELECT id, owner, channel, channel_ref, interval_secs, prompt, \
                     status, last_run_ms, last_status, fail_count, \
-                    created_at_ms, updated_at_ms, expires_at_ms \
+                    created_at_ms, updated_at_ms, expires_at_ms, \
+                    cron_expr, tz \
                FROM user_loops \
               WHERE owner = ?1 AND status != 'stopped' \
               ORDER BY created_at_ms DESC",
@@ -4264,7 +4294,8 @@ impl Store {
         let mut stmt = guard.prepare(
             "SELECT id, owner, channel, channel_ref, interval_secs, prompt, \
                     status, last_run_ms, last_status, fail_count, \
-                    created_at_ms, updated_at_ms, expires_at_ms \
+                    created_at_ms, updated_at_ms, expires_at_ms, \
+                    cron_expr, tz \
                FROM user_loops \
               WHERE status = 'active' \
               ORDER BY created_at_ms ASC",
@@ -5427,6 +5458,8 @@ fn row_to_user_loop(r: &rusqlite::Row) -> rusqlite::Result<UserLoop> {
         created_at_ms: r.get(10)?,
         updated_at_ms: r.get(11)?,
         expires_at_ms: r.get(12)?,
+        cron_expr: r.get(13)?,
+        tz: r.get(14)?,
     })
 }
 
@@ -6614,7 +6647,7 @@ mod tests {
     fn user_loop_create_list_stop_roundtrip() {
         let (s, _f) = fresh_store();
         let id = s
-            .create_user_loop("u1", "discord", "chan-7", 300, "/digest", None)
+            .create_user_loop("u1", "discord", "chan-7", 300, "/digest", None, None, None)
             .unwrap();
         let loops = s.list_user_loops("u1").unwrap();
         assert_eq!(loops.len(), 1);
@@ -6636,7 +6669,7 @@ mod tests {
     fn user_loop_pauses_after_repeated_failures() {
         let (s, _f) = fresh_store();
         let id = s
-            .create_user_loop("u1", "discord", "c", 300, "/x", None)
+            .create_user_loop("u1", "discord", "c", 300, "/x", None, None, None)
             .unwrap();
         s.record_user_loop_run(&id, false, "boom", 3).unwrap();
         s.record_user_loop_run(&id, false, "boom", 3).unwrap();
@@ -6654,7 +6687,7 @@ mod tests {
     fn user_loop_success_resets_fail_count() {
         let (s, _f) = fresh_store();
         let id = s
-            .create_user_loop("u1", "discord", "c", 300, "/x", None)
+            .create_user_loop("u1", "discord", "c", 300, "/x", None, None, None)
             .unwrap();
         s.record_user_loop_run(&id, false, "boom", 5).unwrap();
         s.record_user_loop_run(&id, true, "ok", 5).unwrap();
@@ -6670,15 +6703,15 @@ mod tests {
         // Past deadline → should be swept on the next stop_expired_user_loops().
         let past = 1_000_i64;
         let id_expired = s
-            .create_user_loop("u1", "discord", "chan-a", 300, "ping", Some(past))
+            .create_user_loop("u1", "discord", "chan-a", 300, "ping", Some(past), None, None)
             .unwrap();
         // Future deadline → should be left alone.
         let id_live = s
-            .create_user_loop("u1", "discord", "chan-b", 300, "pong", Some(i64::MAX))
+            .create_user_loop("u1", "discord", "chan-b", 300, "pong", Some(i64::MAX), None, None)
             .unwrap();
         // No deadline → also left alone.
         let id_forever = s
-            .create_user_loop("u1", "discord", "chan-c", 300, "forever", None)
+            .create_user_loop("u1", "discord", "chan-c", 300, "forever", None, None, None)
             .unwrap();
 
         let stopped = s.stop_expired_user_loops(2_000).unwrap();

@@ -449,6 +449,9 @@ pub struct UserLoop {
     pub owner: String,
     pub channel: String,
     pub channel_ref: String,
+    /// Fixed-interval cadence (seconds). When `cron_expr` is `Some`, the
+    /// scheduler ignores this field — cron-based loops persist `0` here
+    /// (clap validation rejects `--interval` + `--cron` together).
     pub interval_secs: i64,
     pub prompt: String,
     pub status: String,
@@ -458,6 +461,14 @@ pub struct UserLoop {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub expires_at_ms: Option<i64>,
+    /// #231 — 5-field cron expression (`min hour dom month dow`). When
+    /// set, scheduler computes next-firing relative to `last_run_ms` (or
+    /// `created_at_ms`) anchored in the row's `tz`. Validated at the
+    /// create-time entry points (CLI flag, Discord parser).
+    pub cron_expr: Option<String>,
+    /// IANA timezone (`America/New_York`, `UTC`, …) used as the anchor
+    /// for `cron_expr` math. Required iff `cron_expr` is `Some`.
+    pub tz: Option<String>,
 }
 
 /// #117 — an allowlisted repo the multi-repo agent-coding loop is permitted

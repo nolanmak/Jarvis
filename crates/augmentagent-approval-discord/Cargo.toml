@@ -17,6 +17,9 @@ tokio-util = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+# #231 — cron-style /loop scheduling (timezone-aware via IANA db).
+cron = { workspace = true }
+chrono-tz = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 dashmap = { workspace = true }

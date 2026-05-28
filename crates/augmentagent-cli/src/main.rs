@@ -4524,10 +4524,26 @@ fn parse_loop_json(raw: &str) -> std::result::Result<augmentagent_approval_disco
     let duration_secs = parsed
         .get("duration_secs")
         .and_then(|v| if v.is_null() { None } else { v.as_i64() });
+    // #231 — cron-style scheduling. The LLM parser emits `cron_expr` +
+    // `tz` (both strings) when the user asked for day-of-week / specific
+    // time. Either-both-or-neither; we don't enforce that here — the
+    // scheduler/store boundary validates before persisting.
+    let cron_expr = parsed
+        .get("cron_expr")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let tz = parsed
+        .get("tz")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     Ok(augmentagent_approval_discord::ParsedLoop {
         interval_secs: interval,
         prompt,
         duration_secs,
+        cron_expr,
+        tz,
     })
 }
 

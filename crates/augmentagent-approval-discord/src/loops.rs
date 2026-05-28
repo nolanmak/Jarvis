@@ -23,6 +23,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use chrono::{DateTime, TimeZone, Utc};
+use chrono_tz::Tz;
+use cron::Schedule;
+use std::str::FromStr;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -128,6 +132,11 @@ pub fn parse_interval(raw: &str) -> Option<i64> {
 
 /// Result of [`parse_create_args`]: the interval the loop ticks on, the
 /// prompt to run each tick, and an optional total runtime before auto-stop.
+///
+/// `cron_expr` + `tz` (#231) are the alternate cron-style cadence form.
+/// When `cron_expr` is `Some`, `interval_secs` is `0` and `tz` is
+/// required. The natural-language parser may set both when the user
+/// asked for "every Monday 9am Eastern" or similar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedLoop {
     pub interval_secs: i64,
@@ -135,6 +144,12 @@ pub struct ParsedLoop {
     /// Total runtime in seconds before the scheduler stops the loop. `None`
     /// means run forever (until manually stopped).
     pub duration_secs: Option<i64>,
+    /// #231 — 5-field cron expression for day-of-week / hour-of-day style
+    /// asks. Set by the LLM parser or explicit `cron:"…" tz:…` syntax.
+    pub cron_expr: Option<String>,
+    /// #231 — IANA timezone anchor for `cron_expr`. Required iff
+    /// `cron_expr` is `Some`.
+    pub tz: Option<String>,
 }
 
 /// Read `<N><unit>` (or `<N> <unit-word>`) at the start of `s`, returning the
@@ -235,6 +250,8 @@ pub fn parse_create_args(rest: &str) -> Result<ParsedLoop, String> {
             interval_secs: secs,
             prompt: prompt.to_string(),
             duration_secs: None,
+            cron_expr: None,
+            tz: None,
         });
     }
 
@@ -295,6 +312,8 @@ pub fn parse_create_args(rest: &str) -> Result<ParsedLoop, String> {
             interval_secs,
             prompt: prompt.to_string(),
             duration_secs,
+            cron_expr: None,
+            tz: None,
         });
     }
 
@@ -445,6 +464,8 @@ pub async fn handle_loop_command(
                 parsed.interval_secs,
                 &parsed.prompt,
                 expires_at_ms,
+                parsed.cron_expr.as_deref(),
+                parsed.tz.as_deref(),
             ) {
                 Ok(id) => match parsed.duration_secs {
                     Some(dur) => format!(
@@ -574,10 +595,30 @@ impl LoopScheduler {
         // iteration always runs.
         let loops = self.store.list_active_user_loops()?;
         for l in loops {
-            let due_at = l
-                .last_run_ms
-                .map(|t| t + l.interval_secs * 1000)
-                .unwrap_or(0);
+            // #231 — cron-style loops (`cron_expr` + `tz`) compute next
+            // firing via the cron crate anchored in the row's tz. Plain
+            // interval loops keep the legacy arithmetic (back-compat for
+            // every existing row, which has cron_expr = NULL).
+            let due_at = if let (Some(cron_expr), Some(tz)) =
+                (l.cron_expr.as_deref(), l.tz.as_deref())
+            {
+                match next_cron_firing_ms(cron_expr, tz, l.last_run_ms, l.created_at_ms) {
+                    Some(next) => next,
+                    None => {
+                        warn!(
+                            loop_id = %l.id,
+                            cron_expr = cron_expr,
+                            tz = tz,
+                            "cron loop has no next firing or invalid expr/tz — skipping"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                l.last_run_ms
+                    .map(|t| t + l.interval_secs * 1000)
+                    .unwrap_or(0)
+            };
             if due_at > now {
                 continue;
             }
@@ -641,6 +682,220 @@ fn now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ----------------------------------------------------------------------
+// #231 — cron-style scheduling helpers (shared by scheduler + CLI).
+// ----------------------------------------------------------------------
+
+/// Validate a 5-field cron expression by parsing it. Returns a
+/// normalised form (always 6-field with seconds-prefix) that the cron
+/// crate can consume directly.
+///
+/// **dow convention**: the user-facing form is **Unix cron** (0=Sun ..
+/// 6=Sat, with 7 also accepted as Sun). The cron crate (and Quartz)
+/// uses 1=Sun..7=Sat, which trips up everyone who has ever written a
+/// crontab. We translate by mapping numeric dow fields to three-letter
+/// names (SUN/MON/...) which both conventions agree on. Ranges, lists,
+/// and steps in the dow field are passed through unchanged — users
+/// using those should rely on names (`MON-FRI`, `MON,WED,FRI`) to avoid
+/// the off-by-one entirely.
+///
+/// Returns the normalised (always 6-field) expression, or an error
+/// string suitable for surfacing to the user.
+pub fn normalize_and_validate_cron(expr: &str) -> Result<String, String> {
+    let trimmed = expr.trim();
+    let fields: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut six_field: Vec<String> = match fields.len() {
+        5 => std::iter::once("0".to_string())
+            .chain(fields.iter().map(|s| s.to_string()))
+            .collect(),
+        6 | 7 => fields.iter().map(|s| s.to_string()).collect(),
+        n => {
+            return Err(format!(
+                "cron expression must have 5 fields (min hour dom month dow); got {n}"
+            ))
+        }
+    };
+    // Translate the dow field (index 5 in the 6-field form) from Unix
+    // convention to a name, so `1` always means Monday regardless of
+    // which crate is parsing.
+    if let Some(dow) = six_field.get_mut(5) {
+        *dow = translate_unix_dow(dow);
+    }
+    let normalized = six_field.join(" ");
+    Schedule::from_str(&normalized).map_err(|e| format!("invalid cron expression: {e}"))?;
+    Ok(normalized)
+}
+
+/// Map a single Unix dow numeric (0..7) to a name. Anything that
+/// doesn't look like a bare numeric (e.g. `*`, `MON-FRI`, `1,3,5`) is
+/// returned unchanged — let the cron crate handle (or reject) it.
+fn translate_unix_dow(field: &str) -> String {
+    let trimmed = field.trim();
+    match trimmed.parse::<u8>() {
+        Ok(n @ 0..=7) => match n {
+            0 | 7 => "SUN".to_string(),
+            1 => "MON".to_string(),
+            2 => "TUE".to_string(),
+            3 => "WED".to_string(),
+            4 => "THU".to_string(),
+            5 => "FRI".to_string(),
+            6 => "SAT".to_string(),
+            _ => unreachable!(),
+        },
+        _ => trimmed.to_string(),
+    }
+}
+
+/// Validate an IANA timezone string. Returns the canonical form on
+/// success (e.g. `America/New_York`), or an error suitable for the
+/// user.
+pub fn validate_tz(tz: &str) -> Result<String, String> {
+    let parsed: Tz = tz
+        .trim()
+        .parse()
+        .map_err(|_| format!("unknown IANA timezone: `{tz}`"))?;
+    Ok(parsed.name().to_string())
+}
+
+/// Compute the next firing time for a cron loop, in epoch millis.
+///
+/// `cron_expr` is already-normalised (6-field) — same shape
+/// [`normalize_and_validate_cron`] returns. `tz` is an IANA string.
+///
+/// Anchor: `last_run_ms` if set, else `created_at_ms` (a freshly
+/// created loop should fire on its next cron tick, not retroactively).
+/// Returns `None` if the cron expression or tz is malformed or if the
+/// cron has no further occurrences in our window (unlikely for
+/// recurring expressions).
+pub fn next_cron_firing_ms(
+    cron_expr: &str,
+    tz: &str,
+    last_run_ms: Option<i64>,
+    created_at_ms: i64,
+) -> Option<i64> {
+    let normalized = normalize_and_validate_cron(cron_expr).ok()?;
+    let schedule = Schedule::from_str(&normalized).ok()?;
+    let zone: Tz = tz.parse().ok()?;
+    let anchor_ms = last_run_ms.unwrap_or(created_at_ms);
+    let anchor_utc: DateTime<Utc> = Utc.timestamp_millis_opt(anchor_ms).single()?;
+    let anchor_in_tz = anchor_utc.with_timezone(&zone);
+    let next = schedule.after(&anchor_in_tz).next()?;
+    Some(next.with_timezone(&Utc).timestamp_millis())
+}
+
+#[cfg(test)]
+mod cron_helpers_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_accepts_5_field_and_translates_unix_dow() {
+        // Unix dow `1` = Monday → translated to `MON` for cron crate.
+        let n = normalize_and_validate_cron("0 9 * * 1").unwrap();
+        assert_eq!(n, "0 0 9 * * MON");
+    }
+
+    #[test]
+    fn normalize_accepts_6_field_seconds() {
+        // 6-field still gets dow translated.
+        let n = normalize_and_validate_cron("0 0 9 * * 1").unwrap();
+        assert_eq!(n, "0 0 9 * * MON");
+    }
+
+    #[test]
+    fn normalize_translates_all_unix_dow_singletons() {
+        for (unix, name) in [
+            (0, "SUN"), (1, "MON"), (2, "TUE"), (3, "WED"),
+            (4, "THU"), (5, "FRI"), (6, "SAT"), (7, "SUN"),
+        ] {
+            let n = normalize_and_validate_cron(&format!("0 9 * * {unix}")).unwrap();
+            assert!(n.ends_with(name), "dow {unix} → {n}, expected ending {name}");
+        }
+    }
+
+    #[test]
+    fn normalize_passes_through_star_and_names() {
+        assert_eq!(normalize_and_validate_cron("0 9 * * *").unwrap(), "0 0 9 * * *");
+        assert_eq!(normalize_and_validate_cron("0 9 * * MON").unwrap(), "0 0 9 * * MON");
+        // Lists / ranges pass through untranslated — users using these
+        // should use names per the docs.
+        assert_eq!(
+            normalize_and_validate_cron("0 9 * * MON-FRI").unwrap(),
+            "0 0 9 * * MON-FRI"
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_garbage() {
+        assert!(normalize_and_validate_cron("not a cron").is_err());
+        assert!(normalize_and_validate_cron("9 * * 1").is_err()); // 4 fields
+    }
+
+    #[test]
+    fn validate_tz_accepts_iana() {
+        assert_eq!(validate_tz("America/New_York").unwrap(), "America/New_York");
+        assert_eq!(validate_tz("UTC").unwrap(), "UTC");
+        assert_eq!(validate_tz(" UTC ").unwrap(), "UTC");
+    }
+
+    #[test]
+    fn validate_tz_rejects_garbage() {
+        assert!(validate_tz("Mars/Olympus_Mons").is_err());
+        assert!(validate_tz("EST5EDT_zzzz").is_err());
+    }
+
+    #[test]
+    fn next_firing_is_in_future_relative_to_anchor() {
+        // Anchor: 2026-01-05 (Monday) 15:30 UTC = 10:30 EST. Cron: every
+        // Monday 9:00 EST (= 14:00 UTC). Already past 9:00 EST today, so
+        // next firing must be 2026-01-12 14:00 UTC (next Monday).
+        let anchor =
+            Utc.with_ymd_and_hms(2026, 1, 5, 15, 30, 0).unwrap().timestamp_millis();
+        let next = next_cron_firing_ms("0 9 * * 1", "America/New_York", None, anchor).unwrap();
+        let next_utc = Utc.timestamp_millis_opt(next).single().unwrap();
+        assert_eq!(next_utc.format("%Y-%m-%d %H:%M").to_string(), "2026-01-12 14:00");
+    }
+
+    #[test]
+    fn next_firing_fires_same_day_when_anchor_is_before_cron_hour() {
+        // Anchor: 2026-01-05 (Monday) 04:30 EST = 09:30 UTC. Cron: every
+        // Monday 9:00 EST. Anchor is BEFORE today's firing, so next
+        // firing is today at 14:00 UTC.
+        let anchor =
+            Utc.with_ymd_and_hms(2026, 1, 5, 9, 30, 0).unwrap().timestamp_millis();
+        let next = next_cron_firing_ms("0 9 * * 1", "America/New_York", None, anchor).unwrap();
+        let next_utc = Utc.timestamp_millis_opt(next).single().unwrap();
+        assert_eq!(next_utc.format("%Y-%m-%d %H:%M").to_string(), "2026-01-05 14:00");
+    }
+
+    #[test]
+    fn next_firing_handles_dst_spring_forward() {
+        // 2026-03-08 02:00 EST → 03:00 EDT (DST starts). A cron "every day
+        // 02:30 America/New_York" should skip the missing 02:30 on the
+        // 8th and land on the 9th instead.
+        let anchor =
+            Utc.with_ymd_and_hms(2026, 3, 8, 6, 0, 0).unwrap().timestamp_millis(); // 01:00 EST
+        let next = next_cron_firing_ms("30 2 * * *", "America/New_York", None, anchor).unwrap();
+        let next_utc = Utc.timestamp_millis_opt(next).single().unwrap();
+        // 02:30 EST on the 8th doesn't exist (we sprang forward at 02:00);
+        // cron crate's after() should return the next valid 02:30 = the 9th.
+        // 02:30 EDT on the 9th = 06:30 UTC.
+        assert_eq!(next_utc.format("%Y-%m-%d %H:%M").to_string(), "2026-03-09 06:30");
+    }
+
+    #[test]
+    fn next_firing_uses_last_run_when_present() {
+        // last_run_ms supplied → anchor should be last_run, not created_at.
+        let created = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap().timestamp_millis();
+        let last_run = Utc.with_ymd_and_hms(2026, 1, 5, 14, 0, 0).unwrap().timestamp_millis();
+        let next = next_cron_firing_ms("0 9 * * 1", "America/New_York", Some(last_run), created).unwrap();
+        let next_utc = Utc.timestamp_millis_opt(next).single().unwrap();
+        // Anchor is Monday 14:00 UTC = 09:00 EST. Cron "0 9 * * 1" fires
+        // at 09:00 in tz = 14:00 UTC. .after() is strict (>), so next
+        // firing is the FOLLOWING Monday, 2026-01-12 14:00 UTC.
+        assert_eq!(next_utc.format("%Y-%m-%d %H:%M").to_string(), "2026-01-12 14:00");
+    }
 }
 
 #[cfg(test)]
@@ -766,6 +1021,8 @@ mod tests {
             interval_secs: 0,
             prompt: "x".into(),
             duration_secs: None,
+            cron_expr: None,
+            tz: None,
         };
         let err = validate_parsed(&p, 0).unwrap_err();
         assert!(err.contains("positive"), "got: {err}");
@@ -1016,6 +1273,8 @@ mod tests {
                 60,
                 "say hello",
                 Some(past),
+                None,
+                None,
             )
             .unwrap();
 
