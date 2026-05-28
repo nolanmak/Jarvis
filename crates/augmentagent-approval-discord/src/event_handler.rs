@@ -255,7 +255,18 @@ impl EventHandler for Handler {
             // ~9s tick until the reasoner returns. Failures here are cosmetic
             // (network blip, missing perm) — log and keep going so a typing
             // glitch never blocks the actual reply.
-            let result = run_with_typing(&http, channel_id, handler.answer(&prompt)).await;
+            //
+            // #132 / #201 — Build the per-request audit context so the
+            // reasoner can record tool calls into the NDJSON audit log and
+            // post side-channel notifications back to THIS channel on
+            // high-risk tool calls (Write/Edit/Bash/...).
+            let audit_ctx = crate::AuditCtx {
+                session_id: format!("{}:{}", channel_id, msg_id),
+                http: Some(http.clone()),
+                channel_id: Some(channel_id),
+            };
+            let result =
+                run_with_typing(&http, channel_id, handler.answer(&audit_ctx, &prompt)).await;
 
             // Best-effort cleanup. Tempfiles aren't load-bearing for the reply
             // we're about to post, so we tolerate failures.

@@ -246,7 +246,7 @@ pub fn default_audit_log_path() -> PathBuf {
 
 /// Append-only NDJSON writer. Cheap to clone (`Arc<Mutex<…>>` inside) so
 /// the caller can hand it to spawned tasks.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AuditLogger {
     path: PathBuf,
     // Serializes appends across concurrent callers. The mutex is held only
@@ -312,12 +312,53 @@ impl AuditLogger {
 /// Discord notification sink for high-risk tool calls. Implemented by the
 /// approval-discord crate (or a test stub) so this module can stay free of
 /// any direct serenity dependency.
+///
+/// `Debug` is required so [`crate::reasoner::ReasonerOpts`] (which holds an
+/// `Option<Arc<dyn AuditNotifier>>`) can keep its `#[derive(Debug)]`. Real
+/// impls just `#[derive(Debug)]`; the trait object dispatches through that.
 #[async_trait]
-pub trait AuditNotifier: Send + Sync {
+pub trait AuditNotifier: Send + Sync + std::fmt::Debug {
     /// Post a short notice to the channel the wiki query originated in.
     /// Implementations are expected to swallow transport errors and log
     /// them — auditing must never crash the reasoner.
     async fn notify(&self, session_id: &str, record: &AuditRecord);
+}
+
+/// Pair a captured `tool_use` block with its later `tool_result` and produce
+/// the [`AuditRecord`] both the log and the notifier consume.
+///
+/// Extracted from the reasoner's stream loop so unit tests can verify the
+/// pairing + truncation logic without spawning the `claude` CLI. `ts` is
+/// taken as an argument so tests can pin it; production callers pass
+/// `chrono::Utc::now().to_rfc3339()`.
+pub fn build_audit_record(
+    ts: String,
+    session_id: String,
+    tool: String,
+    args: serde_json::Value,
+    result_content: &str,
+    is_error: bool,
+) -> AuditRecord {
+    let (captured, _truncated) = truncate_stream(result_content);
+    // Bash failures from the CLI surface as `is_error=true` with the command
+    // output in the result content. We have no real exit code from the
+    // stream-json event shape, but recording the captured text on the
+    // appropriate side (stdout for ok, stderr for error) lets reviewers tell
+    // success from failure at a glance.
+    let (stdout_truncated, stderr_truncated) = if is_error {
+        (None, Some(captured))
+    } else {
+        (Some(captured), None)
+    };
+    AuditRecord {
+        ts,
+        session_id,
+        tool,
+        args,
+        exit_code: None,
+        stdout_truncated,
+        stderr_truncated,
+    }
 }
 
 /// Format a one-line Discord notice for a high-risk tool call. Kept
@@ -515,6 +556,45 @@ mod tests {
         assert!(notice.contains("Bash"));
         assert!(notice.contains("ls /tmp"));
         assert!(notice.contains("exit 0"));
+    }
+
+    #[test]
+    fn build_audit_record_routes_content_by_is_error() {
+        let ok = build_audit_record(
+            "2026-05-28T00:00:00Z".into(),
+            "ch:1".into(),
+            "Bash".into(),
+            serde_json::json!({"command": "ls"}),
+            "a\nb",
+            false,
+        );
+        assert_eq!(ok.stdout_truncated.as_deref(), Some("a\nb"));
+        assert!(ok.stderr_truncated.is_none());
+        let err = build_audit_record(
+            "2026-05-28T00:00:01Z".into(),
+            "ch:1".into(),
+            "Bash".into(),
+            serde_json::json!({"command": "false"}),
+            "command not found",
+            true,
+        );
+        assert!(err.stdout_truncated.is_none());
+        assert_eq!(err.stderr_truncated.as_deref(), Some("command not found"));
+    }
+
+    #[test]
+    fn build_audit_record_truncates_huge_output() {
+        let big = "x".repeat(10_000);
+        let rec = build_audit_record(
+            "ts".into(),
+            "s".into(),
+            "Bash".into(),
+            serde_json::json!({}),
+            &big,
+            false,
+        );
+        let body = rec.stdout_truncated.unwrap();
+        assert_eq!(body.len(), MAX_STREAM_BYTES);
     }
 
     #[tokio::test]

@@ -236,6 +236,9 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
         env: Vec::new(),
         settings_json: None,
         restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
     }
 }
 

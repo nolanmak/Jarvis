@@ -622,6 +622,9 @@ impl<'a> SignatureExtractor<'a> {
             env: vec![],
             settings_json: None,
             restrict_env: false,
+            audit_logger: None,
+            audit_notifier: None,
+            session_id: None,
         };
 
         for attempt in 0..2 {
