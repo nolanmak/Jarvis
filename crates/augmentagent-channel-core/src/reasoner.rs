@@ -581,38 +581,48 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
 /// Write/Edit cannot escape into the source tree.
 pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     let bin = repo_root.join("target/release/augmentagent");
-    // Scoped Bash patterns: Claude can invoke our gmail subcommand via the
-    // release binary's absolute path, plus `gh issue {create,list,view,comment}`
-    // for filing AugmentAgent self-feedback issues — routed via the
-    // `scripts/aa-gh` shim (#131) so the agent cannot reach destructive
-    // `gh repo delete`, `gh pr merge --admin`, `gh secret set`, etc. even
-    // if it tried to glob past the issue subcommand. The shim is referenced
-    // by absolute path because the systemd unit's PATH does not include
-    // the repo's scripts dir. Anything else is denied by claude CLI.
-    let bash_gmail = format!("Bash({} gmail *)", bin.display());
+    // Scoped Bash patterns. The claude permission matcher does literal
+    // string comparison — `augmentagent foo` (bare) and `/abs/path/augmentagent
+    // foo` are different patterns even though the shell resolves them to the
+    // same binary. We register BOTH forms for every `augmentagent` subcommand
+    // because the agent (correctly, per the schema's "binary is on $PATH"
+    // claim) tends to invoke the bare command. To make that work end-to-end
+    // we also push `bin.parent()` onto the spawned process's PATH below, so
+    // bare `augmentagent` actually resolves to *our* release binary. The
+    // absolute-path patterns stay as a defense-in-depth fallback. (#214)
     let aa_gh = repo_root.join("scripts/aa-gh");
+    let bash_gmail_abs = format!("Bash({} gmail *)", bin.display());
+    let bash_gmail_bare = "Bash(augmentagent gmail *)".to_string();
     // Invoice subcommands the LLM can autonomously invoke. `invoice run` is
     // intentionally absent — the only real-send path is the user clicking
     // Approve on a draft card. `status` and `list-accounts` omit the trailing
     // `*` because they take no args (clap would reject extras anyway).
-    let bash_invoice_status = format!("Bash({} invoice status)", bin.display());
-    let bash_invoice_draft = format!("Bash({} invoice draft *)", bin.display());
-    let bash_invoice_list_accounts = format!("Bash({} invoice list-accounts)", bin.display());
-    let bash_invoice_set_recipient = format!("Bash({} invoice set-recipient *)", bin.display());
-    let bash_invoice_set_entity = format!("Bash({} invoice set-entity *)", bin.display());
-    let bash_invoice_set_auto_draft = format!("Bash({} invoice set-auto-draft *)", bin.display());
+    let bash_invoice_status_abs = format!("Bash({} invoice status)", bin.display());
+    let bash_invoice_draft_abs = format!("Bash({} invoice draft *)", bin.display());
+    let bash_invoice_list_accounts_abs = format!("Bash({} invoice list-accounts)", bin.display());
+    let bash_invoice_set_recipient_abs = format!("Bash({} invoice set-recipient *)", bin.display());
+    let bash_invoice_set_entity_abs = format!("Bash({} invoice set-entity *)", bin.display());
+    let bash_invoice_set_auto_draft_abs =
+        format!("Bash({} invoice set-auto-draft *)", bin.display());
+    let bash_invoice_status_bare = "Bash(augmentagent invoice status)".to_string();
+    let bash_invoice_draft_bare = "Bash(augmentagent invoice draft *)".to_string();
+    let bash_invoice_list_accounts_bare =
+        "Bash(augmentagent invoice list-accounts)".to_string();
+    let bash_invoice_set_recipient_bare =
+        "Bash(augmentagent invoice set-recipient *)".to_string();
+    let bash_invoice_set_entity_bare = "Bash(augmentagent invoice set-entity *)".to_string();
+    let bash_invoice_set_auto_draft_bare =
+        "Bash(augmentagent invoice set-auto-draft *)".to_string();
     // #212 — `loop` (singular) reads/updates the sqlite `user_loops` table
-    // that backs the Discord `/loop` scheduler (#104). This is the COMMON
-    // CASE when the user asks "kill the hello world loop" — the loop runs
-    // inside the daemon, no claude PID involved. The prior `loops` (plural)
-    // PID-control was a misdiagnosis: it solves a different (real but rare)
-    // problem.
-    let bash_loop = format!("Bash({} loop *)", bin.display());
+    // that backs the Discord `/loop` scheduler (#104). The COMMON case for
+    // "kill the hello world loop" — runs inside the daemon, no claude PID.
+    let bash_loop_abs = format!("Bash({} loop *)", bin.display());
+    let bash_loop_bare = "Bash(augmentagent loop *)".to_string();
     // #174/#176 — `loops` (plural) is OS-level claude PID control for the
-    // orphan-Claude-Code-session case. Kept on the allowlist for the rare
-    // case it's actually needed; the system prompt now points at `loop`
-    // first for any natural-language "kill the loop" request.
-    let bash_loops = format!("Bash({} loops *)", bin.display());
+    // rare orphan-Claude-Code-session case. Kept on the allowlist; the
+    // system prompt points at `loop` first.
+    let bash_loops_abs = format!("Bash({} loops *)", bin.display());
+    let bash_loops_bare = "Bash(augmentagent loops *)".to_string();
     // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
     // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
     // resolves the db regardless of cwd.
@@ -649,6 +659,21 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         // know which prefix is permitted for file tools.
         ("WIKI_ROOT".into(), wiki_root.to_string_lossy().into_owned()),
     ];
+    // #214 — Prepend the release bin's dir to PATH so the agent's bare
+    // `augmentagent <subcommand>` invocations actually resolve to OUR
+    // binary. Without this, the bare-command allowlist patterns above
+    // are dead letters (shell would fail with "command not found" even
+    // if the harness allowed the string). The systemd unit's PATH does
+    // not include `target/release` by default.
+    if let Some(parent) = bin.parent() {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        let prepended = if existing.is_empty() {
+            parent.to_string_lossy().into_owned()
+        } else {
+            format!("{}:{}", parent.display(), existing)
+        };
+        env.push(("PATH".into(), prepended));
+    }
     if let Some(key) = crate::secret_loader::load_provider_key("COMPOSIO_API_KEY") {
         env.push(("COMPOSIO_API_KEY".into(), key));
     }
@@ -664,15 +689,24 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             "Edit".into(),
             "WebSearch".into(),
             "WebFetch".into(),
-            bash_gmail,
-            bash_invoice_status,
-            bash_invoice_draft,
-            bash_invoice_list_accounts,
-            bash_invoice_set_recipient,
-            bash_invoice_set_entity,
-            bash_invoice_set_auto_draft,
-            bash_loop,
-            bash_loops,
+            bash_gmail_abs,
+            bash_gmail_bare,
+            bash_invoice_status_abs,
+            bash_invoice_status_bare,
+            bash_invoice_draft_abs,
+            bash_invoice_draft_bare,
+            bash_invoice_list_accounts_abs,
+            bash_invoice_list_accounts_bare,
+            bash_invoice_set_recipient_abs,
+            bash_invoice_set_recipient_bare,
+            bash_invoice_set_entity_abs,
+            bash_invoice_set_entity_bare,
+            bash_invoice_set_auto_draft_abs,
+            bash_invoice_set_auto_draft_bare,
+            bash_loop_abs,
+            bash_loop_bare,
+            bash_loops_abs,
+            bash_loops_bare,
             format!("Bash({} issue create *)", aa_gh.display()),
             format!("Bash({} issue list *)", aa_gh.display()),
             format!("Bash({} issue view *)", aa_gh.display()),
