@@ -447,6 +447,7 @@ dependencies = [
  "augmentagent-channel-core",
  "augmentagent-store",
  "augmentagent-wiki",
+ "chrono",
  "reqwest",
  "rusqlite",
  "serde",

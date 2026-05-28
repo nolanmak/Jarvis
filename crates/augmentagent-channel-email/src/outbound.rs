@@ -133,7 +133,7 @@ pub fn classify_outbound(
 /// "unknown" and uses wallclock-now as the cursor advance). Wrong-by-a-few-
 /// seconds is harmless: the cursor is `MAX(stored, new)` so a stale value
 /// just doesn't advance.
-fn parse_rfc2822_or_ms(s: &str) -> i64 {
+pub(crate) fn parse_rfc2822_or_ms(s: &str) -> i64 {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return 0;
@@ -147,6 +147,15 @@ fn parse_rfc2822_or_ms(s: &str) -> i64 {
         if n > 1_000_000_000 {
             return n * 1000;
         }
+    }
+    // RFC 2822 (`Mon, 27 May 2026 14:23:00 +0000`) is the canonical Gmail
+    // Date-header shape. RFC 3339 (`2026-05-27T14:23:00Z`) is what some
+    // Composio payloads return. Try both; failure ⇒ 0 (unknown).
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(trimmed) {
+        return dt.timestamp_millis();
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return dt.timestamp_millis();
     }
     0
 }
@@ -305,6 +314,23 @@ impl<G: GmailApi> OutboundObserver<G> {
                                     );
                                 }
                             }
+                        }
+                        // #218 — also persist this event in the per-thread
+                        // log so the inbound triage gate can cheaply detect
+                        // "user already replied" without a live Gmail call.
+                        // Idempotent on `(entity_id, message_id)` — re-polls
+                        // of overlapping `after:` windows are safe.
+                        if let Err(e) = self.store.record_outbound_thread_event(
+                            &account.entity_id,
+                            &ev.message_id,
+                            ev.thread_id.as_deref(),
+                            ev.sent_at_ms,
+                        ) {
+                            warn!(
+                                account = %account.entity_id,
+                                message_id = %ev.message_id,
+                                "outbound observer: failed to log thread event: {e:#}"
+                            );
                         }
                         emitted.push(ev);
                     }

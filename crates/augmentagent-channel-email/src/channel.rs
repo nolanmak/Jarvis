@@ -33,6 +33,7 @@ use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{ActionStatus, RetryableReply, Store, TriageResult, NUDGE_INTERVAL_MS};
 
 use crate::gmail::{extract_bare_email, GmailApi};
+use crate::outbound::parse_rfc2822_or_ms;
 use crate::sigextract::{is_event_blast, is_human_sender};
 
 #[derive(Clone, Debug)]
@@ -490,6 +491,75 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                         IngestTrigger::Triaged,
                     );
                     return Ok(Some(DispatchOutcome::Skipped));
+                }
+
+                // --- 1a-bis. ALREADY-REPLIED GUARD (#218). The OutboundObserver
+                // (#219/#225) logs every classified SENT message into
+                // `outbound_thread_log` keyed by thread. If the user has
+                // already sent a reply on this thread AFTER this inbound
+                // arrived — typically via the Gmail web UI or any other
+                // client — there's nothing for us to draft: surfacing a
+                // card now would either duplicate what the user already
+                // wrote, or worse, propose a stale take. Bail with a
+                // silent skip (NO `post_flag_notice` — these are
+                // not noise, just no-ops). Wiki ingest still runs so the
+                // sender's page stays consistent with the rest of the Skip
+                // path. NOTE: when `parse_rfc2822_or_ms` returns 0
+                // (unparseable date), we conservatively use `i64::MAX` as
+                // the cutoff — meaning ZERO outbound rows will "look
+                // newer" — so a date parse failure never causes us to
+                // over-skip. The store call is a single covered-index
+                // point-lookup (idx_outbound_thread_log_thread_sent), so
+                // adding this check is effectively free per-email. Only
+                // ships the in-process layer this PR; a live Gmail
+                // thread-fetch fallback (for users whose outbound observer
+                // hasn't run yet) is deferred to a follow-on. Sequenced
+                // before #222's event-blast guard so an already-handled
+                // event thread doesn't get re-routed through ingest-only.
+                if let Some(thread_id) = email.thread_id.as_deref() {
+                    let parsed = parse_rfc2822_or_ms(&email.date);
+                    let after_ms = if parsed > 0 { parsed } else { i64::MAX };
+                    match self.store.thread_has_user_reply_after(thread_id, after_ms) {
+                        Ok(true) => {
+                            self.store.log_action(
+                                &email.message_id,
+                                Some(thread_id),
+                                &email.from,
+                                &email.subject,
+                                Some(&email.body),
+                                None,
+                                ActionStatus::Skipped,
+                            )?;
+                            self.store.mark_email_processed(
+                                &email.message_id,
+                                TriageResult::Skip,
+                            )?;
+                            println!(
+                                "[skip:already-replied] {} thread={} from={}",
+                                email.message_id, thread_id, email.from,
+                            );
+                            self.maybe_ingest(
+                                &email,
+                                DecisionKind::Skip,
+                                Some("user_already_replied"),
+                                None,
+                                IngestTrigger::Triaged,
+                            );
+                            return Ok(Some(DispatchOutcome::Skipped));
+                        }
+                        Ok(false) => {} // fall through to event-blast / backpressure
+                        Err(e) => {
+                            // Defensive: a query failure here must NOT
+                            // block drafting — fall through so the user
+                            // still gets the card. Log loudly so the
+                            // failure is visible.
+                            warn!(
+                                message_id = %email.message_id,
+                                thread = %thread_id,
+                                "thread_has_user_reply_after failed: {e:#}"
+                            );
+                        }
+                    }
                 }
 
                 // --- 1a'. EVENT-BLAST INGEST-ONLY GUARD (#222). After the
@@ -1911,6 +1981,123 @@ mod tests {
         assert_eq!(out2.ingest_only, 0);
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
         assert_eq!(broker.flag_posts.lock().unwrap().len(), 0);
+    }
+
+    /// #218 — when the outbound observer has already recorded a user reply
+    /// on the same thread newer than the inbound's arrival, the inbound
+    /// must be skipped before any draft / approval card / flag fires.
+    /// Mirrors the `is_human_sender` skip shape (no Discord noise, wiki
+    /// ingest still runs, email marked complete).
+    #[tokio::test]
+    async fn reply_decision_skipped_when_user_already_replied_on_thread() {
+        let (store, _f) = tmp_store();
+        // Seed: user replied on T-already at a timestamp NEWER than the
+        // inbound below. acc1 matches the entity_id in tmp_store().
+        let inbound_ms = chrono::DateTime::parse_from_rfc2822(
+            "Wed, 27 May 2026 12:00:00 +0000",
+        )
+        .unwrap()
+        .timestamp_millis();
+        store
+            .record_outbound_thread_event(
+                "acc1",
+                "msg-user-reply", // pii-ok: synthetic test fixture
+                Some("T-already"),
+                inbound_ms + 60_000, // user replied 1 minute later
+            )
+            .unwrap();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                message_id: "m-already".into(),
+                thread_id: Some("T-already".into()),
+                // Human sender — clears the is_human_sender guard so we
+                // know it's specifically the #218 guard that fires.
+                from: "client@example.com".into(), // pii-ok: synthetic test fixture
+                subject: "Re: project update".into(),
+                body: "any thoughts on the proposal?".into(),
+                date: "Wed, 27 May 2026 12:00:00 +0000".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        // Triage says reply — without the #218 guard a draft + card would
+        // fire. The second scripted response (the draft body) must NEVER
+        // be consumed.
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"asks for thoughts"}"#,
+            "Here are my thoughts...",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.skipped, 1, "user-already-replied inbound must skip");
+        assert_eq!(out.awaiting_approval, 0, "no approval card");
+        assert_eq!(out.replied_dry_run, 0);
+        assert_eq!(out.flagged, 0, "silent skip — no flag notice");
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+        assert_eq!(broker.flag_posts.lock().unwrap().len(), 0);
+        assert!(store.is_email_complete("m-already").unwrap());
+    }
+
+    /// #218 — when no outbound row exists on this thread (or none newer
+    /// than the inbound), drafting proceeds normally. Negative-case pin
+    /// against an over-eager skip.
+    #[tokio::test]
+    async fn reply_decision_drafts_when_no_user_reply_on_thread() {
+        let (store, _f) = tmp_store();
+        // Seed an OUTBOUND on a DIFFERENT thread; lookup must not match.
+        store
+            .record_outbound_thread_event(
+                "acc1",
+                "msg-other-thread", // pii-ok: synthetic test fixture
+                Some("T-other"),
+                9_999_999_999_999,
+            )
+            .unwrap();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                message_id: "m-fresh".into(),
+                thread_id: Some("T-fresh".into()),
+                from: "client@example.com".into(), // pii-ok: synthetic test fixture
+                subject: "Quick question".into(),
+                body: "do you have a minute?".into(),
+                date: "Wed, 27 May 2026 12:00:00 +0000".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"actionable question"}"#,
+            "Sure — happy to help.",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.awaiting_approval, 1, "must draft when no thread match");
+        assert_eq!(out.skipped, 0);
+        assert_eq!(broker.posts.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
