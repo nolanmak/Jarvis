@@ -12,7 +12,7 @@ use tracing::debug;
 use crate::auth::SocialApiAuth;
 use crate::types::{
     Account, Comment, ConnectResponse, Conversation, CreatePostRequest, CreatePostResponse,
-    MediaUploadRequest, MediaUploadResponse, ReplyRequest,
+    DmMessage, MediaUploadRequest, MediaUploadResponse, ReplyRequest,
 };
 
 /// Production base URL. Always carries the trailing slash so relative joins
@@ -172,6 +172,21 @@ impl SocialApiClient {
             .await?)
     }
 
+    /// `POST /inbox/conversations/{conversation_id}` — send a reply into an
+    /// existing DM thread. Mirrors [`reply_comment`](Self::reply_comment) but
+    /// targets a conversation and returns the created [`DmMessage`]. Used by
+    /// the approve→send path for `kind = "dm"` (#244).
+    pub async fn send_dm(
+        &self,
+        conversation_id: &str,
+        req: &ReplyRequest,
+    ) -> anyhow::Result<DmMessage> {
+        debug!(conversation_id, "socialapi send_dm");
+        Ok(self
+            .post_json(&format!("inbox/conversations/{conversation_id}"), req)
+            .await?)
+    }
+
     // --- media -----------------------------------------------------------
 
     /// `POST /media/upload-url` — request a presigned upload slot.
@@ -263,6 +278,40 @@ mod tests {
 
         let body = captured.lock().unwrap().clone().expect("body captured");
         assert_eq!(body, serde_json::json!({ "text": "thanks!" }));
+    }
+
+    /// send_dm: assert the bearer header, the `{conversation_id}` in the path,
+    /// the JSON reply body, and that the response parses into a `DmMessage`.
+    #[tokio::test]
+    async fn send_dm_sends_bearer_path_and_body() {
+        let server = MockServer::start().await;
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let sink = captured.clone();
+
+        Mock::given(method("POST"))
+            .and(path("/inbox/conversations/conv_3"))
+            .and(header("authorization", "Bearer sk_test_key"))
+            .respond_with(move |req: &Request| {
+                *sink.lock().unwrap() = Some(serde_json::from_slice(&req.body).unwrap());
+                ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "id": "dm_9",
+                    "author": "me",
+                    "text": "on it!",
+                    "created_at": "2026-05-28T00:00:00Z"
+                }))
+            })
+            .mount(&server)
+            .await;
+
+        let req = ReplyRequest {
+            text: "on it!".into(),
+        };
+        let resp = client(&server).send_dm("conv_3", &req).await.unwrap();
+        assert_eq!(resp.id, "dm_9");
+        assert_eq!(resp.text, "on it!");
+
+        let body = captured.lock().unwrap().clone().expect("body captured");
+        assert_eq!(body, serde_json::json!({ "text": "on it!" }));
     }
 
     #[tokio::test]
