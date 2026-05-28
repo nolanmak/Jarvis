@@ -52,6 +52,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
 chrono = { workspace = true }
+# #231 — `loop create --cron --tz` validates cron exprs + IANA tz at
+# create-time before persisting; fails fast with clear error.
+cron = { workspace = true }
+chrono-tz = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 # #1 — `status` subcommand probes the dashboard's `/api/v1/stats` for proof

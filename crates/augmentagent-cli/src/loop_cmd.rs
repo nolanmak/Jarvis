@@ -21,7 +21,8 @@ use clap::Subcommand;
 use serde::Serialize;
 
 use augmentagent_approval_discord::{
-    max_active_per_user, min_interval_secs, parse_interval,
+    max_active_per_user, min_interval_secs, normalize_and_validate_cron, parse_interval,
+    validate_tz,
 };
 use augmentagent_store::{rusqlite, Store};
 
@@ -55,10 +56,21 @@ pub enum LoopOp {
     /// env-configured Discord identity so the agent doesn't have to thread
     /// them through.
     Create {
-        /// Tick cadence — accepts `45s`, `30m`, `2h`, `1d`, or a bare
-        /// integer interpreted as minutes (same grammar as `/loop`).
-        #[arg(long)]
-        interval: String,
+        /// Fixed-interval cadence — accepts `45s`, `30m`, `2h`, `1d`, or
+        /// a bare integer interpreted as minutes (same grammar as
+        /// `/loop`). Mutually exclusive with `--cron`.
+        #[arg(long, conflicts_with = "cron")]
+        interval: Option<String>,
+        /// #231 — cron-style cadence, 5 fields (`min hour dom month dow`).
+        /// dow is Unix convention (0=Sun..6=Sat). Requires `--tz`. For
+        /// non-numeric dow prefer names (`MON`, `MON-FRI`) which both
+        /// Unix and cron agree on. Mutually exclusive with `--interval`.
+        #[arg(long, requires = "tz", conflicts_with = "interval")]
+        cron: Option<String>,
+        /// #231 — IANA timezone anchor for `--cron` (e.g.
+        /// `America/New_York`). Required iff `--cron` is set.
+        #[arg(long, requires = "cron")]
+        tz: Option<String>,
         /// Prompt the scheduler runs each tick. Quote multi-word prompts.
         #[arg(long)]
         prompt: String,
@@ -72,7 +84,9 @@ pub enum LoopOp {
         owner: Option<String>,
         /// Optional auto-stop deadline — accepts the same grammar as
         /// `--interval`. The scheduler grants one interval of grace so the
-        /// boundary iteration fires (mirrors `/loop`'s #108 fix).
+        /// boundary iteration fires (mirrors `/loop`'s #108 fix). For
+        /// cron loops, the grace is one hour (rough lower bound on
+        /// expected fire cadence).
         #[arg(long)]
         expires_in: Option<String>,
         /// Emit JSON `{"id":"<uuid>","interval_secs":N,...}` instead of
@@ -156,6 +170,8 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
         }
         LoopOp::Create {
             interval,
+            cron,
+            tz,
             prompt,
             channel_ref,
             owner,
@@ -164,6 +180,8 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
         } => {
             let args = CreateArgs {
                 interval,
+                cron,
+                tz,
                 prompt,
                 channel_ref,
                 owner,
@@ -177,6 +195,8 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
                 resolved.interval_secs,
                 &resolved.prompt,
                 resolved.expires_at_ms,
+                resolved.cron_expr.as_deref(),
+                resolved.tz.as_deref(),
             )?;
             if json {
                 let payload = serde_json::json!({
@@ -185,6 +205,8 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
                     "owner": resolved.owner,
                     "channel_ref": resolved.channel_ref,
                     "expires_at_ms": resolved.expires_at_ms,
+                    "cron_expr": resolved.cron_expr,
+                    "tz": resolved.tz,
                 });
                 println!("{}", serde_json::to_string(&payload)?);
             } else {
@@ -211,7 +233,13 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
 
 #[derive(Debug, Clone)]
 struct CreateArgs {
-    interval: String,
+    /// `Some` for interval-style; `None` when `cron` is set (clap
+    /// enforces exclusivity).
+    interval: Option<String>,
+    /// `Some` for cron-style; `None` for interval-style.
+    cron: Option<String>,
+    /// IANA tz; required iff `cron` is `Some` (clap requires this).
+    tz: Option<String>,
     prompt: String,
     channel_ref: Option<String>,
     owner: Option<String>,
@@ -220,11 +248,18 @@ struct CreateArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedCreate {
+    /// 0 for cron-based loops; positive integer for interval-based.
+    /// Reflects what we persist into `user_loops.interval_secs`.
     interval_secs: i64,
     prompt: String,
     channel_ref: String,
     owner: String,
     expires_at_ms: Option<i64>,
+    /// Normalised cron expression (always 6-field with Quartz-converted
+    /// dow), or `None` for interval-based loops.
+    cron_expr: Option<String>,
+    /// Canonical IANA tz, or `None` for interval-based loops.
+    tz: Option<String>,
 }
 
 /// Live env lookup. Split out as a function pointer so tests can inject a
@@ -251,20 +286,41 @@ fn resolve_create_args_with<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    let interval_secs = parse_interval(&args.interval).ok_or_else(|| {
-        anyhow!(
-            "--interval: couldn't parse `{}`; use e.g. `30m`, `2h`, `1d`",
-            args.interval
-        )
-    })?;
-    if floor > 0 && interval_secs < floor {
-        return Err(anyhow!(
-            "--interval: {}s is below the configured floor of {}s \
-             (AUGMENTAGENT_LOOP_MIN_INTERVAL_SECS)",
-            interval_secs,
-            floor
-        ));
-    }
+    // Cron-style branch (#231). Must supply both --cron and --tz; clap
+    // already enforces that (`requires_with`), but we re-check here in
+    // case the resolver is called from a path that bypasses clap.
+    let (interval_secs, cron_expr, tz_canonical) = match (args.cron.as_deref(), args.tz.as_deref()) {
+        (Some(cron), Some(tz)) => {
+            let normalized =
+                normalize_and_validate_cron(cron).map_err(|e| anyhow!("--cron: {e}"))?;
+            let canon = validate_tz(tz).map_err(|e| anyhow!("--tz: {e}"))?;
+            (0i64, Some(normalized), Some(canon))
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(anyhow!("--cron and --tz must be passed together"));
+        }
+        (None, None) => {
+            // Interval-style branch — existing logic.
+            let raw = args.interval.as_deref().ok_or_else(|| {
+                anyhow!("either --interval or (--cron + --tz) is required")
+            })?;
+            let secs = parse_interval(raw).ok_or_else(|| {
+                anyhow!(
+                    "--interval: couldn't parse `{}`; use e.g. `30m`, `2h`, `1d`",
+                    raw
+                )
+            })?;
+            if floor > 0 && secs < floor {
+                return Err(anyhow!(
+                    "--interval: {}s is below the configured floor of {}s \
+                     (AUGMENTAGENT_LOOP_MIN_INTERVAL_SECS)",
+                    secs,
+                    floor
+                ));
+            }
+            (secs, None, None)
+        }
+    };
     let prompt = args.prompt.trim().to_string();
     if prompt.is_empty() {
         return Err(anyhow!("--prompt cannot be empty"));
@@ -294,7 +350,17 @@ where
                     raw
                 )
             })?;
-            if dur < interval_secs {
+            // Cron-based loops use 1 hour as the grace lower-bound (a
+            // cron expression's tick cadence isn't a single number we
+            // can echo). Interval-based loops use their own interval as
+            // grace per `/loop`'s #108 fix so the boundary tick lands
+            // before the expiry sweep.
+            let grace = if cron_expr.is_some() {
+                3600
+            } else {
+                interval_secs
+            };
+            if cron_expr.is_none() && dur < interval_secs {
                 return Err(anyhow!(
                     "--expires-in: {}s is shorter than --interval {}s — \
                      loop would never fire",
@@ -302,9 +368,6 @@ where
                     interval_secs
                 ));
             }
-            // Mirror `/loop`'s #108 grace: add one full interval so the
-            // boundary tick lands before the expiry sweep claims the row.
-            let grace = interval_secs;
             let total_ms = dur.saturating_add(grace).saturating_mul(1000);
             Some(now_millis().saturating_add(total_ms))
         }
@@ -315,6 +378,8 @@ where
         channel_ref,
         owner,
         expires_at_ms,
+        cron_expr,
+        tz: tz_canonical,
     })
 }
 
@@ -623,7 +688,9 @@ mod tests {
     #[test]
     fn resolve_create_args_uses_env_defaults() {
         let args = CreateArgs {
-            interval: "30m".into(),
+            interval: Some("30m".into()),
+            cron: None,
+            tz: None,
             prompt: "  ping me  ".into(),
             channel_ref: None,
             owner: None,
@@ -644,7 +711,9 @@ mod tests {
     #[test]
     fn resolve_create_args_explicit_flags_win() {
         let args = CreateArgs {
-            interval: "2h".into(),
+            interval: Some("2h".into()),
+            cron: None,
+            tz: None,
             prompt: "hi".into(),
             channel_ref: Some("override-chan".into()),
             owner: Some("override-owner".into()),
@@ -664,7 +733,9 @@ mod tests {
     #[test]
     fn resolve_create_args_rejects_bad_interval() {
         let args = CreateArgs {
-            interval: "garbage".into(),
+            interval: Some("garbage".into()),
+            cron: None,
+            tz: None,
             prompt: "hi".into(),
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
@@ -677,7 +748,9 @@ mod tests {
     #[test]
     fn resolve_create_args_rejects_empty_prompt() {
         let args = CreateArgs {
-            interval: "1h".into(),
+            interval: Some("1h".into()),
+            cron: None,
+            tz: None,
             prompt: "   ".into(),
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
@@ -690,7 +763,9 @@ mod tests {
     #[test]
     fn resolve_create_args_missing_owner_errors() {
         let args = CreateArgs {
-            interval: "1h".into(),
+            interval: Some("1h".into()),
+            cron: None,
+            tz: None,
             prompt: "hi".into(),
             channel_ref: Some("c".into()),
             owner: None,
@@ -703,7 +778,9 @@ mod tests {
     #[test]
     fn resolve_create_args_missing_channel_errors() {
         let args = CreateArgs {
-            interval: "1h".into(),
+            interval: Some("1h".into()),
+            cron: None,
+            tz: None,
             prompt: "hi".into(),
             channel_ref: None,
             owner: Some("o".into()),
@@ -716,7 +793,9 @@ mod tests {
     #[test]
     fn resolve_create_args_expires_in_shorter_than_interval_errors() {
         let args = CreateArgs {
-            interval: "1h".into(),
+            interval: Some("1h".into()),
+            cron: None,
+            tz: None,
             prompt: "hi".into(),
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
@@ -730,7 +809,9 @@ mod tests {
     fn resolve_create_args_floor_rejects_too_short_interval() {
         // 30m, floor 1h → reject.
         let args = CreateArgs {
-            interval: "30m".into(),
+            interval: Some("30m".into()),
+            cron: None,
+            tz: None,
             prompt: "hi".into(),
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
@@ -744,7 +825,9 @@ mod tests {
     fn resolve_create_args_floor_zero_allows_anything_positive() {
         // Floor 0 (default) disables the check — short intervals OK.
         let args = CreateArgs {
-            interval: "45s".into(),
+            interval: Some("45s".into()),
+            cron: None,
+            tz: None,
             prompt: "hi".into(),
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
@@ -757,7 +840,9 @@ mod tests {
     #[test]
     fn resolve_create_args_expires_in_grants_grace_interval() {
         let args = CreateArgs {
-            interval: "1h".into(),
+            interval: Some("1h".into()),
+            cron: None,
+            tz: None,
             prompt: "hi".into(),
             channel_ref: Some("c".into()),
             owner: Some("o".into()),
@@ -781,7 +866,9 @@ mod tests {
         let code = run_with(
             &s,
             LoopOp::Create {
-                interval: "30m".into(),
+                interval: Some("30m".into()),
+            cron: None,
+            tz: None,
                 prompt: "say hi".into(),
                 channel_ref: Some("test-channel".into()),
                 owner: Some("test-owner".into()),
@@ -818,5 +905,86 @@ mod tests {
         assert_eq!(row.2, "test-channel");
         assert_eq!(row.3, 1800);
         assert_eq!(row.4, "active");
+    }
+
+    // ----- #231 cron-style scheduling -----
+
+    #[test]
+    fn resolve_create_args_cron_path_populates_cron_and_tz() {
+        let args = CreateArgs {
+            interval: None,
+            cron: Some("0 9 * * 1".into()),
+            tz: Some("America/New_York".into()),
+            prompt: "morning".into(),
+            channel_ref: Some("c".into()),
+            owner: Some("o".into()),
+            expires_in: None,
+        };
+        let r = resolve_create_args(args, |_| None).unwrap();
+        assert_eq!(r.interval_secs, 0, "cron loops persist 0 for interval_secs");
+        assert_eq!(r.cron_expr.as_deref(), Some("0 0 9 * * MON"));
+        assert_eq!(r.tz.as_deref(), Some("America/New_York"));
+    }
+
+    #[test]
+    fn resolve_create_args_cron_without_tz_errors() {
+        // clap normally blocks this via `requires = "tz"`, but the
+        // resolver guards too in case it's called from a non-clap path.
+        let args = CreateArgs {
+            interval: None,
+            cron: Some("0 9 * * 1".into()),
+            tz: None,
+            prompt: "x".into(),
+            channel_ref: Some("c".into()),
+            owner: Some("o".into()),
+            expires_in: None,
+        };
+        let err = resolve_create_args(args, |_| None).unwrap_err();
+        assert!(err.to_string().contains("--cron and --tz"));
+    }
+
+    #[test]
+    fn resolve_create_args_neither_interval_nor_cron_errors() {
+        let args = CreateArgs {
+            interval: None,
+            cron: None,
+            tz: None,
+            prompt: "x".into(),
+            channel_ref: Some("c".into()),
+            owner: Some("o".into()),
+            expires_in: None,
+        };
+        let err = resolve_create_args(args, |_| None).unwrap_err();
+        assert!(err.to_string().contains("either --interval or"));
+    }
+
+    #[test]
+    fn resolve_create_args_cron_invalid_expr_errors() {
+        let args = CreateArgs {
+            interval: None,
+            cron: Some("not a cron".into()),
+            tz: Some("UTC".into()),
+            prompt: "x".into(),
+            channel_ref: Some("c".into()),
+            owner: Some("o".into()),
+            expires_in: None,
+        };
+        let err = resolve_create_args(args, |_| None).unwrap_err();
+        assert!(err.to_string().contains("--cron"));
+    }
+
+    #[test]
+    fn resolve_create_args_cron_invalid_tz_errors() {
+        let args = CreateArgs {
+            interval: None,
+            cron: Some("0 9 * * 1".into()),
+            tz: Some("Mars/Olympus_Mons".into()),
+            prompt: "x".into(),
+            channel_ref: Some("c".into()),
+            owner: Some("o".into()),
+            expires_in: None,
+        };
+        let err = resolve_create_args(args, |_| None).unwrap_err();
+        assert!(err.to_string().contains("--tz"));
     }
 }
