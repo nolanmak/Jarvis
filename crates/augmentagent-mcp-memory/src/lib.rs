@@ -41,6 +41,34 @@ pub struct MemoryRow {
     pub score: Option<f64>,
 }
 
+/// One hit from `search_conversation_history`. Snippet is the first
+/// `SNIPPET_MAX_CHARS` chars of the message body so the agent gets enough
+/// signal to decide whether to re-fetch the full message via `rowid`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConversationHit {
+    /// SQLite rowid of the underlying row. Stable for the lifetime of the
+    /// row; lets a follow-up tool fetch the full content if the snippet
+    /// isn't enough.
+    pub rowid: i64,
+    /// Epoch ms. For inbound rows this is `emails.firstSeenAt`; for agent
+    /// drafts it's `actions.createdAt`.
+    pub timestamp_ms: i64,
+    /// `discord`, `email`, `slack`, `linkedin`, etc. — i.e. the channel
+    /// the message came in / went out on.
+    pub channel: String,
+    /// `user` for inbound messages, `agent` for drafts the agent produced.
+    pub role: String,
+    /// First [`SNIPPET_MAX_CHARS`] chars of the body, with subject prefixed
+    /// when present so a single line read tells the agent what it's looking
+    /// at.
+    pub snippet: String,
+}
+
+/// Maximum snippet length returned per conversation hit. Picked to keep
+/// 100 hits well under a 64KB tool result while still showing enough
+/// context for the agent to pick a candidate.
+pub const SNIPPET_MAX_CHARS: usize = 300;
+
 /// Pagination cap for any single call. Matches Claude Code's typical
 /// per-tool reply budget so a runaway `memory_search` doesn't blow out
 /// the context window.
@@ -48,6 +76,11 @@ pub const MAX_LIMIT: usize = 100;
 
 /// Default limit when the caller doesn't supply one.
 pub const DEFAULT_LIMIT: usize = 10;
+
+/// Default limit for `search_conversation_history`. Higher than
+/// [`DEFAULT_LIMIT`] because conversation snippets are shorter than
+/// memory rows so 20 fits comfortably in a single tool result.
+pub const DEFAULT_CONVO_LIMIT: usize = 20;
 
 /// In-process server. Owns the SQLite connection. Cloning is intentionally
 /// not implemented — the MCP stdio loop is single-threaded and we want a
@@ -179,6 +212,116 @@ impl Server {
         Ok(rows)
     }
 
+    /// Search prior conversation history across all channels (#252).
+    ///
+    /// Reads two underlying tables the daemon already populates:
+    /// - `emails` — every inbound DM/post the channel layer ingests,
+    ///   regardless of `platform` (gmail, discord, slack, …). These
+    ///   become `role = "user"` hits.
+    /// - `actions.draftBody` — the agent's outbound drafts, joined back
+    ///   to `emails` so the hit carries the same channel as the message
+    ///   it replied to. These become `role = "agent"` hits.
+    ///
+    /// Filtering is intentionally simple: case-insensitive `LIKE %kw%`
+    /// over subject+body, optional `since`/`until` bounds (epoch ms), and
+    /// optional channel (matched against `emails.platform`). All
+    /// parameters are bound — no string concat.
+    ///
+    /// `limit` clamps to [`MAX_LIMIT`]. At least one of `keyword`,
+    /// `since_ms`, `until_ms` must be set; otherwise we refuse so the
+    /// agent can't accidentally pull the entire log into context.
+    pub fn search_conversation_history(
+        &self,
+        keyword: Option<&str>,
+        since_ms: Option<i64>,
+        until_ms: Option<i64>,
+        channel: Option<&str>,
+        limit: Option<usize>,
+    ) -> anyhow::Result<Vec<ConversationHit>> {
+        let keyword = keyword.map(str::trim).filter(|s| !s.is_empty());
+        let channel = channel.map(str::trim).filter(|s| !s.is_empty());
+        if keyword.is_none() && since_ms.is_none() && until_ms.is_none() {
+            anyhow::bail!(
+                "search_conversation_history: at least one of keyword, since, until is required"
+            );
+        }
+        let limit = clamp_limit_with_default(limit, DEFAULT_CONVO_LIMIT);
+
+        // LIKE pattern: case-insensitivity handled by lowercasing both sides.
+        // We bind the pattern as `%kw%` once and reuse it for subject + body.
+        let like_pattern = keyword.map(|k| format!("%{}%", k.to_lowercase()));
+
+        // Two SELECTs UNION ALL'd then sorted by timestamp DESC + LIMIT.
+        // Each leg uses the same five bind slots so the prepared statement
+        // is uniform; channel/keyword filters short-circuit via `?N IS NULL`.
+        // Order of binds (per leg): keyword_like, keyword_like, since_ms,
+        // until_ms, channel.
+        let sql = "\
+            SELECT rowid, timestamp_ms, channel, role, snippet FROM ( \
+                SELECT \
+                    e.rowid AS rowid, \
+                    e.firstSeenAt AS timestamp_ms, \
+                    e.platform AS channel, \
+                    'user' AS role, \
+                    COALESCE(NULLIF(e.subject, '') || ': ', '') || COALESCE(e.body, '') AS snippet \
+                FROM emails e \
+                WHERE (?1 IS NULL \
+                       OR LOWER(COALESCE(e.body, '')) LIKE ?1 \
+                       OR LOWER(COALESCE(e.subject, '')) LIKE ?2) \
+                  AND (?3 IS NULL OR e.firstSeenAt >= ?3) \
+                  AND (?4 IS NULL OR e.firstSeenAt <= ?4) \
+                  AND (?5 IS NULL OR e.platform = ?5) \
+                UNION ALL \
+                SELECT \
+                    a.rowid AS rowid, \
+                    a.createdAt AS timestamp_ms, \
+                    COALESCE(e2.platform, 'unknown') AS channel, \
+                    'agent' AS role, \
+                    COALESCE(NULLIF(a.subject, '') || ': ', '') || COALESCE(a.draftBody, '') AS snippet \
+                FROM actions a \
+                LEFT JOIN emails e2 ON e2.messageId = a.messageId \
+                WHERE a.draftBody IS NOT NULL AND a.draftBody <> '' \
+                  AND (?1 IS NULL \
+                       OR LOWER(a.draftBody) LIKE ?1 \
+                       OR LOWER(COALESCE(a.subject, '')) LIKE ?2) \
+                  AND (?3 IS NULL OR a.createdAt >= ?3) \
+                  AND (?4 IS NULL OR a.createdAt <= ?4) \
+                  AND (?5 IS NULL OR COALESCE(e2.platform, 'unknown') = ?5) \
+            ) \
+            ORDER BY timestamp_ms DESC \
+            LIMIT ?6";
+
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .context("prepare search_conversation_history query")?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![
+                    like_pattern,
+                    like_pattern,
+                    since_ms,
+                    until_ms,
+                    channel,
+                    limit as i64,
+                ],
+                |row| {
+                    let raw_snippet: String = row.get(4)?;
+                    Ok(ConversationHit {
+                        rowid: row.get(0)?,
+                        timestamp_ms: row.get(1)?,
+                        channel: row.get(2)?,
+                        role: row.get(3)?,
+                        snippet: truncate_snippet(&raw_snippet),
+                    })
+                },
+            )
+            .context("execute search_conversation_history query")?
+            .collect::<Result<Vec<_>, _>>()
+            .context("collect search_conversation_history results")?;
+        Ok(rows)
+    }
+
     /// Single-row lookup by id. Useful for tests + future "follow-up on
     /// memory <id>" tool surfaces.
     pub fn get(&self, id: &str) -> anyhow::Result<Option<MemoryRow>> {
@@ -246,6 +389,9 @@ impl Server {
             "memory_write" => self.tool_memory_write(req.id.clone(), &args),
             "memory_search" => self.tool_memory_search(req.id.clone(), &args),
             "memory_recent" => self.tool_memory_recent(req.id.clone(), &args),
+            "search_conversation_history" => {
+                self.tool_search_conversation_history(req.id.clone(), &args)
+            }
             other => json!({
                 "jsonrpc": "2.0",
                 "id": req.id,
@@ -287,6 +433,33 @@ impl Server {
             .and_then(Value::as_u64)
             .map(|n| n as usize);
         match self.recent(surface, limit) {
+            Ok(rows) => tool_json_result(id, &json!({ "hits": rows })),
+            Err(e) => tool_error(id, format!("{e}")),
+        }
+    }
+
+    fn tool_search_conversation_history(&self, id: Value, args: &Value) -> Value {
+        let keyword = args.get("keyword").and_then(Value::as_str);
+        let channel = args.get("channel").and_then(Value::as_str);
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        let since_ms = match args.get("since").and_then(Value::as_str) {
+            Some(s) => match parse_date_to_ms(s, /* end_of_day = */ false) {
+                Ok(ms) => Some(ms),
+                Err(e) => return tool_error(id, format!("invalid `since`: {e}")),
+            },
+            None => None,
+        };
+        let until_ms = match args.get("until").and_then(Value::as_str) {
+            Some(s) => match parse_date_to_ms(s, /* end_of_day = */ true) {
+                Ok(ms) => Some(ms),
+                Err(e) => return tool_error(id, format!("invalid `until`: {e}")),
+            },
+            None => None,
+        };
+        match self.search_conversation_history(keyword, since_ms, until_ms, channel, limit) {
             Ok(rows) => tool_json_result(id, &json!({ "hits": rows })),
             Err(e) => tool_error(id, format!("{e}")),
         }
@@ -343,6 +516,20 @@ fn tool_descriptors() -> Value {
                 "properties": {
                     "surface": { "type": "string", "description": "filter to a single surface; omit for all" },
                     "limit":   { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 }
+                }
+            }
+        },
+        {
+            "name": "search_conversation_history",
+            "description": "Search prior conversation history (inbound messages + agent drafts) across all channels. At least one of `keyword`, `since`, `until` is required.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "keyword": { "type": "string", "description": "case-insensitive substring matched against message subject/body" },
+                    "since":   { "type": "string", "description": "lower bound on timestamp; ISO 8601 or YYYY-MM-DD" },
+                    "until":   { "type": "string", "description": "upper bound on timestamp; ISO 8601 or YYYY-MM-DD" },
+                    "channel": { "type": "string", "description": "restrict to one platform (e.g. discord, gmail, slack, linkedin)" },
+                    "limit":   { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
                 }
             }
         }
@@ -410,12 +597,51 @@ fn row_to_memory_scored(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryRow> 
 }
 
 fn clamp_limit(limit: Option<usize>) -> usize {
+    clamp_limit_with_default(limit, DEFAULT_LIMIT)
+}
+
+fn clamp_limit_with_default(limit: Option<usize>, default: usize) -> usize {
     match limit {
-        None => DEFAULT_LIMIT,
-        Some(0) => DEFAULT_LIMIT,
+        None => default,
+        Some(0) => default,
         Some(n) if n > MAX_LIMIT => MAX_LIMIT,
         Some(n) => n,
     }
+}
+
+/// Truncate a snippet to [`SNIPPET_MAX_CHARS`] on a char boundary, adding
+/// a `…` marker when truncation occurred so the agent can tell the
+/// snippet was cut off and decide whether to fetch the full row.
+fn truncate_snippet(s: &str) -> String {
+    if s.chars().count() <= SNIPPET_MAX_CHARS {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(SNIPPET_MAX_CHARS).collect();
+    out.push('…');
+    out
+}
+
+/// Parse a user-supplied date into epoch ms. Accepts:
+/// - `YYYY-MM-DD` — interpreted as 00:00:00 UTC (or 23:59:59.999 UTC if
+///   `end_of_day`).
+/// - ISO 8601 / RFC 3339 timestamps (e.g. `2025-05-12T14:00:00Z`).
+fn parse_date_to_ms(s: &str, end_of_day: bool) -> anyhow::Result<i64> {
+    use chrono::{NaiveDate, TimeZone, Utc};
+    let trimmed = s.trim();
+    // Date-only path: anchor to start- or end-of-day in UTC.
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        let dt = if end_of_day {
+            date.and_hms_milli_opt(23, 59, 59, 999)
+        } else {
+            date.and_hms_opt(0, 0, 0)
+        }
+        .ok_or_else(|| anyhow::anyhow!("invalid date components: {trimmed}"))?;
+        return Ok(Utc.from_utc_datetime(&dt).timestamp_millis());
+    }
+    // Full ISO 8601 / RFC 3339 path.
+    let dt = chrono::DateTime::parse_from_rfc3339(trimmed)
+        .map_err(|e| anyhow::anyhow!("expected YYYY-MM-DD or ISO 8601, got `{trimmed}`: {e}"))?;
+    Ok(dt.timestamp_millis())
 }
 
 fn current_ms() -> i64 {
@@ -587,7 +813,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_tools_list_enumerates_three_tools() {
+    fn dispatch_tools_list_enumerates_all_tools() {
         let s = new_server();
         let req = McpRequest {
             jsonrpc: "2.0".into(),
@@ -604,6 +830,7 @@ mod tests {
         assert!(names.contains(&"memory_write"));
         assert!(names.contains(&"memory_search"));
         assert!(names.contains(&"memory_recent"));
+        assert!(names.contains(&"search_conversation_history"));
     }
 
     #[test]
@@ -659,6 +886,254 @@ mod tests {
         };
         let resp = s.dispatch(&req);
         assert_eq!(resp["error"]["code"], -32601);
+    }
+
+    /// Direct insert helpers — the conversation tables are owned by
+    /// `augmentagent-store` and there isn't a write-path API exposed for
+    /// `actions` we can reuse, so tests seed them by raw SQL via the
+    /// server's connection.
+    fn insert_email(
+        s: &Server,
+        message_id: &str,
+        platform: &str,
+        subject: &str,
+        body: &str,
+        first_seen_at: i64,
+    ) {
+        s.conn
+            .execute(
+                "INSERT INTO emails (messageId, threadId, fromEmail, subject, body, receivedAt, accountEntityId, firstSeenAt, platform, kind) \
+                 VALUES (?1, NULL, ?2, ?3, ?4, NULL, NULL, ?5, ?6, 'dm')",
+                rusqlite::params![message_id, "sender@example.com", subject, body, first_seen_at, platform],
+            )
+            .expect("seed email");
+    }
+
+    fn insert_action(
+        s: &Server,
+        id: &str,
+        message_id: &str,
+        subject: &str,
+        draft_body: &str,
+        created_at: i64,
+    ) {
+        s.conn
+            .execute(
+                "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt) \
+                 VALUES (?1, ?2, NULL, ?3, ?4, NULL, ?5, 'sent', NULL, ?6, ?6)",
+                rusqlite::params![id, message_id, "sender@example.com", subject, draft_body, created_at],
+            )
+            .expect("seed action");
+    }
+
+    #[test]
+    fn search_conversation_history_requires_a_filter() {
+        let s = new_server();
+        let err = s
+            .search_conversation_history(None, None, None, None, None)
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("keyword") && msg.contains("since") && msg.contains("until"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn search_conversation_history_finds_inbound_by_keyword() {
+        let s = new_server();
+        insert_email(&s, "m1", "discord", "rust talk", "we discussed rust 2 plans", 1_700_000_000_000);
+        insert_email(&s, "m2", "gmail", "lunch", "want to grab lunch tomorrow", 1_700_000_100_000);
+        let hits = s
+            .search_conversation_history(Some("rust"), None, None, None, None)
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].channel, "discord");
+        assert_eq!(hits[0].role, "user");
+        assert!(hits[0].snippet.contains("rust"), "snippet: {}", hits[0].snippet);
+    }
+
+    #[test]
+    fn search_conversation_history_keyword_is_case_insensitive() {
+        let s = new_server();
+        insert_email(&s, "m1", "discord", "Rust Talk", "Body mentioning Rust", 1_700_000_000_000);
+        let hits = s
+            .search_conversation_history(Some("RUST"), None, None, None, None)
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn search_conversation_history_filters_by_channel() {
+        let s = new_server();
+        insert_email(&s, "m1", "discord", "hi", "hello there from discord", 1_700_000_000_000);
+        insert_email(&s, "m2", "gmail", "hi", "hello there from email", 1_700_000_100_000);
+        let hits = s
+            .search_conversation_history(Some("hello"), None, None, Some("discord"), None)
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].channel, "discord");
+    }
+
+    #[test]
+    fn search_conversation_history_filters_by_date_range() {
+        let s = new_server();
+        // Three messages straddling 2025-05-15.
+        insert_email(&s, "m1", "gmail", "before", "old chat", 1_715_000_000_000); // May 6 2024 ish — well before
+        insert_email(&s, "m2", "gmail", "middle", "mid chat", 1_747_440_000_000); // May 17 2025
+        insert_email(&s, "m3", "gmail", "after", "new chat", 1_900_000_000_000);
+        let since = 1_747_000_000_000;
+        let until = 1_748_000_000_000;
+        let hits = s
+            .search_conversation_history(None, Some(since), Some(until), None, None)
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].snippet, "middle: mid chat");
+    }
+
+    #[test]
+    fn search_conversation_history_returns_agent_drafts() {
+        let s = new_server();
+        insert_email(&s, "m1", "discord", "ping", "user pinged us", 1_700_000_000_000);
+        insert_action(
+            &s,
+            "a1",
+            "m1",
+            "re: ping",
+            "agent drafted reply mentioning meeting time",
+            1_700_000_050_000,
+        );
+        let hits = s
+            .search_conversation_history(Some("meeting"), None, None, None, None)
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].role, "agent");
+        assert_eq!(
+            hits[0].channel, "discord",
+            "agent draft inherits channel from joined emails row"
+        );
+    }
+
+    #[test]
+    fn search_conversation_history_orders_newest_first() {
+        let s = new_server();
+        insert_email(&s, "m1", "gmail", "first", "match foo body", 1_700_000_000_000);
+        insert_email(&s, "m2", "gmail", "second", "match foo body", 1_800_000_000_000);
+        let hits = s
+            .search_conversation_history(Some("foo"), None, None, None, None)
+            .expect("search");
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].timestamp_ms > hits[1].timestamp_ms);
+    }
+
+    #[test]
+    fn search_conversation_history_respects_limit_clamp() {
+        let s = new_server();
+        for i in 0..30 {
+            insert_email(
+                &s,
+                &format!("m{i}"),
+                "gmail",
+                "foo",
+                "match foo body",
+                1_700_000_000_000 + i,
+            );
+        }
+        let hits = s
+            .search_conversation_history(Some("foo"), None, None, None, Some(5))
+            .expect("search");
+        assert_eq!(hits.len(), 5);
+        // Over-cap clamps to MAX_LIMIT, not the supplied value.
+        let hits = s
+            .search_conversation_history(Some("foo"), None, None, None, Some(9999))
+            .expect("search");
+        assert!(hits.len() <= MAX_LIMIT);
+        assert_eq!(hits.len(), 30, "all rows fit under MAX_LIMIT here");
+    }
+
+    #[test]
+    fn search_conversation_history_snippet_truncates_with_ellipsis() {
+        let s = new_server();
+        let long = "x".repeat(SNIPPET_MAX_CHARS + 100);
+        insert_email(&s, "m1", "gmail", "", &long, 1_700_000_000_000);
+        let hits = s
+            .search_conversation_history(Some("x"), None, None, None, None)
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        // Ellipsis is one extra char beyond SNIPPET_MAX_CHARS.
+        let count = hits[0].snippet.chars().count();
+        assert_eq!(count, SNIPPET_MAX_CHARS + 1);
+        assert!(hits[0].snippet.ends_with('…'));
+    }
+
+    #[test]
+    fn parse_date_to_ms_accepts_yyyymmdd() {
+        // 2025-01-15T00:00:00Z = 1736899200000 ms
+        let start = parse_date_to_ms("2025-01-15", false).unwrap();
+        assert_eq!(start, 1_736_899_200_000);
+        // end-of-day pushes to 23:59:59.999.
+        let end = parse_date_to_ms("2025-01-15", true).unwrap();
+        assert_eq!(end - start, 86_399_999);
+    }
+
+    #[test]
+    fn parse_date_to_ms_accepts_rfc3339() {
+        let ms = parse_date_to_ms("2025-01-15T12:00:00Z", false).unwrap();
+        assert_eq!(ms, 1_736_942_400_000);
+    }
+
+    #[test]
+    fn parse_date_to_ms_rejects_junk() {
+        assert!(parse_date_to_ms("not a date", false).is_err());
+        assert!(parse_date_to_ms("2025-13-40", false).is_err());
+    }
+
+    #[test]
+    fn dispatch_search_conversation_history_round_trips() {
+        let s = new_server();
+        insert_email(
+            &s,
+            "m1",
+            "discord",
+            "kickoff",
+            "discussed the launch plan",
+            1_700_000_000_000,
+        );
+        let req = McpRequest {
+            jsonrpc: "2.0".into(),
+            id: json!(7),
+            method: "tools/call".into(),
+            params: Some(json!({
+                "name": "search_conversation_history",
+                "arguments": { "keyword": "launch" }
+            })),
+        };
+        let resp = s.dispatch(&req);
+        let body = resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("search text");
+        assert!(body.contains("launch"), "expected hit in body: {body}");
+        assert!(body.contains("\"channel\": \"discord\""), "channel: {body}");
+    }
+
+    #[test]
+    fn dispatch_search_conversation_history_propagates_filter_error() {
+        let s = new_server();
+        let req = McpRequest {
+            jsonrpc: "2.0".into(),
+            id: json!(8),
+            method: "tools/call".into(),
+            params: Some(json!({
+                "name": "search_conversation_history",
+                "arguments": {}
+            })),
+        };
+        let resp = s.dispatch(&req);
+        // Missing-filter is a tool-level (`-32000`) error, not a protocol
+        // error — the call reached the handler, it just refused.
+        assert_eq!(resp["error"]["code"], -32000);
+        let msg = resp["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("keyword"), "got: {msg}");
     }
 
     #[test]
