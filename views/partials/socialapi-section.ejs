@@ -1,0 +1,78 @@
+<% if (socialApiError) { %>
+  <p class="text-sm text-red-400 mb-3"><%= socialApiError %></p>
+<% } %>
+
+<!-- API key -->
+<% if (socialApiKeyMasked) { %>
+  <div class="flex items-center justify-between py-2 px-3 mb-3 rounded-lg bg-gray-800/50">
+    <div class="flex items-center gap-3">
+      <span class="w-2 h-2 rounded-full bg-green-500"></span>
+      <span class="text-sm text-gray-300">API key set</span>
+      <code class="text-xs text-gray-500"><%= socialApiKeyMasked %></code>
+    </div>
+    <button
+      hx-post="/api/socialapi/key/clear"
+      hx-target="#socialapi-section"
+      hx-swap="innerHTML"
+      hx-confirm="Clear the SocialAPI.ai API key?"
+      class="text-gray-600 hover:text-red-400 transition-colors text-sm">
+      Clear
+    </button>
+  </div>
+  <form hx-post="/api/socialapi/sync" hx-target="#socialapi-section" hx-swap="innerHTML" class="mb-4">
+    <button type="submit"
+            class="px-4 py-2 bg-green-600 hover:bg-green-500 rounded-md text-sm font-medium transition-colors">
+      Sync accounts
+    </button>
+  </form>
+<% } else { %>
+  <form hx-post="/api/socialapi/key" hx-target="#socialapi-section" hx-swap="innerHTML"
+        class="flex gap-3 items-end mb-4">
+    <input type="hidden" name="key" value="socialapi_api_key" />
+    <div class="flex-1">
+      <label class="block text-sm text-gray-400 mb-1">SocialAPI.ai API Key</label>
+      <input type="password" name="value" placeholder="sk-..."
+             class="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500" />
+    </div>
+    <button type="submit" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-md text-sm font-medium transition-colors">
+      Save
+    </button>
+  </form>
+<% } %>
+
+<!-- Connected accounts -->
+<% if (socialApiKeyMasked) { %>
+  <% if (socialApiAccounts.length === 0) { %>
+    <p class="text-sm text-gray-500 py-2">No accounts yet. Click "Sync accounts" to pull your connected handles.</p>
+  <% } else { %>
+    <% socialApiAccounts.forEach(function(acct) { %>
+      <div id="socialapi-acct-<%= acct.id %>"
+           class="flex items-center justify-between py-2 px-3 rounded-lg hover:bg-gray-800/50 group">
+        <div class="flex items-center gap-3">
+          <button
+            hx-patch="/api/socialapi/accounts/<%= acct.id %>/toggle"
+            hx-target="#socialapi-section"
+            hx-swap="innerHTML"
+            class="w-4 h-4 rounded border flex items-center justify-center text-xs
+                   <%= acct.active ? 'bg-green-600 border-green-500 text-white' : 'border-gray-600 text-transparent' %>">
+            <% if (acct.active) { %>&#10003;<% } %>
+          </button>
+          <div>
+            <span class="text-sm <%= acct.active ? 'text-white' : 'text-gray-500 line-through' %>">
+              <%= acct.display_name || acct.account_handle || acct.id %>
+            </span>
+            <span class="text-xs text-gray-500 ml-2"><%= acct.platform %><% if (acct.account_handle && acct.display_name) { %> · <%= acct.account_handle %><% } %></span>
+          </div>
+        </div>
+        <button
+          hx-delete="/api/socialapi/accounts/<%= acct.id %>"
+          hx-target="#socialapi-section"
+          hx-swap="innerHTML"
+          hx-confirm="Remove this account from the registry?"
+          class="text-gray-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity text-sm">
+          Remove
+        </button>
+      </div>
+    <% }); %>
+  <% } %>
+<% } %>

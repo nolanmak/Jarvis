@@ -164,6 +164,22 @@
     </div>
   </div>
 
+  <!-- SocialAPI.ai -->
+  <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
+    <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-4">SocialAPI.ai</h2>
+    <p class="text-xs text-gray-500 mb-4">
+      Paste your SocialAPI.ai API key, then sync to list your connected accounts.
+      Enable or disable each account to control which ones the agent manages.
+    </p>
+    <div id="socialapi-section">
+      <%- include('partials/socialapi-section', {
+        socialApiKeyMasked: socialApiKeyMasked,
+        socialApiAccounts: socialApiAccounts,
+        socialApiError: socialApiError
+      }) %>
+    </div>
+  </div>
+
   <!-- Senders -->
   <div class="bg-gray-900 border border-gray-800 rounded-lg p-6">
     <h2 class="text-sm font-medium text-gray-400 uppercase tracking-wide mb-4">Tracked Senders</h2>
