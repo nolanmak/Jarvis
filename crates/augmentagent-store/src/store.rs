@@ -2212,20 +2212,49 @@ impl Store {
 
     /// Expire every pending action created on or before `cutoff_ms` by
     /// flipping it to `timed_out` (the existing terminal status for
-    /// abandoned approvals). Returns the number of rows swept. Backs both
-    /// the Serve-loop stale-draft sweep and `approvals discard-older` (#99).
-    pub fn expire_pending_older_than(&self, cutoff_ms: i64) -> StoreResult<usize> {
+    /// abandoned approvals). Returns the ids of the rows that were swept,
+    /// so callers can audit-log per-row (the Serve-loop periodic sweep
+    /// emits one line per id; #220) or summarize by `.len()` (the
+    /// `approvals discard-older` CLI; #99).
+    ///
+    /// Implementation: select the matching ids first, then UPDATE only
+    /// those ids in a single statement, so the returned set and the set
+    /// flipped are guaranteed to be the same rows (no torn read where a
+    /// row transitions between the SELECT and the UPDATE).
+    pub fn expire_pending_older_than(&self, cutoff_ms: i64) -> StoreResult<Vec<String>> {
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
-        let n = guard.execute(
+        let mut stmt = guard.prepare(
+            "SELECT id FROM actions \
+             WHERE status = 'pending' AND createdAt <= ?1",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map(params![cutoff_ms], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        // Build the IN-list placeholder string for the UPDATE. Rusqlite
+        // doesn't expand `Vec` into an IN-clause; do it manually. Safe
+        // because the placeholders are `?N`, not user input.
+        let placeholders: String = (0..ids.len())
+            .map(|i| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
             "UPDATE actions \
              SET status = 'timed_out', \
                  errorMessage = COALESCE(NULLIF(errorMessage, ''), 'expired: stale pending draft'), \
-                 updatedAt = ?2 \
-             WHERE status = 'pending' AND createdAt <= ?1",
-            params![cutoff_ms, now],
-        )?;
-        Ok(n)
+                 updatedAt = ?1 \
+             WHERE status = 'pending' AND id IN ({placeholders})"
+        );
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 1);
+        params_vec.push(&now);
+        for id in &ids {
+            params_vec.push(id);
+        }
+        guard.execute(&sql, params_vec.as_slice())?;
+        Ok(ids)
     }
 
     /// Resolve a single pending action to `approved` (used by
@@ -6696,16 +6725,91 @@ mod tests {
             .log_action("ex", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
             .unwrap();
         // Cutoff in the past → nothing expired (row is fresh).
-        assert_eq!(s.expire_pending_older_than(0).unwrap(), 0);
+        assert!(s.expire_pending_older_than(0).unwrap().is_empty());
         assert_eq!(s.pending_reply_count().unwrap(), 1);
         // Cutoff in the future → the fresh row is now "older than" and swept.
         let future = now_millis() + 60_000;
-        assert_eq!(s.expire_pending_older_than(future).unwrap(), 1);
+        let swept = s.expire_pending_older_than(future).unwrap();
+        assert_eq!(swept, vec![id.clone()]);
         assert_eq!(s.pending_reply_count().unwrap(), 0);
         // Re-sweep is a no-op (already terminal).
-        assert_eq!(s.expire_pending_older_than(future).unwrap(), 0);
+        assert!(s.expire_pending_older_than(future).unwrap().is_empty());
         let a = s.get_action_with_email(&id).unwrap().unwrap();
         assert_eq!(a.action.status, "timed_out");
+    }
+
+    /// #220 — the periodic sweep cares about a *cohort* of rows with
+    /// different ages, not just one. Build three pending rows
+    /// backdated to 10d, 5d, and 1d ago; assert that with a 7-day
+    /// cutoff only the 10d row transitions and its id is returned.
+    /// Then assert that re-running with cutoff far in the past (the
+    /// "disabled equivalent" at the store layer) is a no-op even with
+    /// the 5d and 1d rows still pending.
+    #[test]
+    fn expire_pending_older_than_picks_only_the_stale_cohort() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("old10")).unwrap();
+        s.upsert_email(&sample_email("mid5")).unwrap();
+        s.upsert_email(&sample_email("fresh1")).unwrap();
+        let id_old = s // pii-ok
+            .log_action("old10", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
+            .unwrap();
+        let id_mid = s // pii-ok
+            .log_action("mid5", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
+            .unwrap();
+        let id_fresh = s // pii-ok
+            .log_action("fresh1", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
+            .unwrap();
+
+        // Backdate createdAt directly so we can model real wall-clock
+        // ages without sleeping. log_action stamps `now`; rewrite each
+        // row's createdAt to the desired age below.
+        let now = now_millis();
+        let day = 24i64 * 60 * 60 * 1000;
+        {
+            let guard = s.conn.lock().unwrap();
+            guard
+                .execute(
+                    "UPDATE actions SET createdAt = ?1 WHERE id = ?2",
+                    params![now - 10 * day, id_old],
+                )
+                .unwrap();
+            guard
+                .execute(
+                    "UPDATE actions SET createdAt = ?1 WHERE id = ?2",
+                    params![now - 5 * day, id_mid],
+                )
+                .unwrap();
+            guard
+                .execute(
+                    "UPDATE actions SET createdAt = ?1 WHERE id = ?2",
+                    params![now - 1 * day, id_fresh],
+                )
+                .unwrap();
+        }
+
+        // 7-day cutoff → only the 10d-old row crosses it.
+        let cutoff_7d = now - 7 * day;
+        let swept = s.expire_pending_older_than(cutoff_7d).unwrap();
+        assert_eq!(swept, vec![id_old.clone()]);
+        assert_eq!(s.pending_reply_count().unwrap(), 2);
+
+        // Re-run with a cutoff so far in the past that no surviving
+        // pending row qualifies (the "0-day = disabled" equivalent at
+        // the sweep layer: see [`sweep_stale_drafts_tick`] for the
+        // env-level disable). Must be a no-op even though stale rows
+        // are still pending — proves the cutoff is honored strictly.
+        let far_past = i64::MIN / 2;
+        assert!(s.expire_pending_older_than(far_past).unwrap().is_empty());
+        assert_eq!(s.pending_reply_count().unwrap(), 2);
+
+        // Sanity: the 10d row is `timed_out`, the others stay `pending`.
+        let a_old = s.get_action_with_email(&id_old).unwrap().unwrap();
+        assert_eq!(a_old.action.status, "timed_out");
+        let a_mid = s.get_action_with_email(&id_mid).unwrap().unwrap();
+        assert_eq!(a_mid.action.status, "pending");
+        let a_fresh = s.get_action_with_email(&id_fresh).unwrap().unwrap();
+        assert_eq!(a_fresh.action.status, "pending");
     }
 
     #[test]
