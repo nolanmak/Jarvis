@@ -245,6 +245,12 @@ enum Cmd {
         #[command(subcommand)]
         op: RedditOp,
     },
+    /// SocialAPI.ai-managed social accounts (#245): list/disable the local
+    /// account registry and drive the proxied OAuth connect flow.
+    Socialapi {
+        #[command(subcommand)]
+        op: SocialapiOp,
+    },
     /// Meetup.com group events → Discord digest (multi-tenant; no email).
     Meetup {
         #[command(subcommand)]
@@ -940,6 +946,34 @@ enum RedditOp {
         code: String,
         #[arg(long)]
         redirect_uri: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SocialapiOp {
+    /// List every SocialAPI.ai account in the local registry (active first,
+    /// then inactive).
+    List {
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Disable an account by id (sets `active = 0`), removing it from the
+    /// polling/posting loop without deleting its row.
+    Disable {
+        /// The SocialAPI.ai-managed account id (see `socialapi list`).
+        account_id: String,
+    },
+    /// Drive the proxied OAuth connect flow — same as
+    /// `setup oauth --provider socialapi`. Opens / prints the dashboard
+    /// start URL and polls the rollup for a newly-appeared account. The
+    /// dashboard `/oauth/socialapi/start` route itself lands in #247.
+    Connect {
+        /// Maximum seconds to wait for a new account before giving up.
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+        /// Whether to attempt `xdg-open` on the start URL (headless: false).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        open_browser: bool,
     },
 }
 
@@ -2664,6 +2698,74 @@ async fn main() -> Result<()> {
                     .context("persist reddit creds")?;
                 println!("{{\"ok\":true}}");
                 Ok(())
+            }
+        },
+        Cmd::Socialapi { ref op } => match op {
+            SocialapiOp::List { json } => {
+                let accounts = store
+                    .list_socialapi_accounts()
+                    .context("list socialapi accounts")?;
+                if *json {
+                    let arr: Vec<serde_json::Value> = accounts
+                        .iter()
+                        .map(|a| {
+                            serde_json::json!({
+                                "id": a.id,
+                                "brand_id": a.brand_id,
+                                "platform": a.platform,
+                                "display_name": a.display_name,
+                                "account_handle": a.account_handle,
+                                "active": a.active,
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&arr)?);
+                } else if accounts.is_empty() {
+                    println!("(no socialapi accounts)");
+                } else {
+                    for a in &accounts {
+                        println!(
+                            "{}\tplatform={}\thandle={}\tactive={}",
+                            a.id,
+                            a.platform,
+                            a.account_handle.as_deref().unwrap_or("-"),
+                            a.active
+                        );
+                    }
+                }
+                Ok(())
+            }
+            SocialapiOp::Disable { account_id } => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let n = store
+                    .set_socialapi_account_active(account_id, false, now_ms)
+                    .context("disable socialapi account")?;
+                if n == 0 {
+                    println!(
+                        "{}",
+                        serde_json::json!({"ok": false, "error": "unknown account_id", "account_id": account_id})
+                    );
+                } else {
+                    println!(
+                        "{}",
+                        serde_json::json!({"ok": true, "account_id": account_id, "active": false})
+                    );
+                }
+                Ok(())
+            }
+            SocialapiOp::Connect {
+                timeout_secs,
+                open_browser,
+            } => {
+                // Same path as `setup oauth --provider socialapi`: drive the
+                // shared OAuth runner against the dashboard's proxied flow.
+                let args = setup::oauth::OauthArgs {
+                    provider: setup::oauth::OauthProvider::Socialapi,
+                    timeout_secs: *timeout_secs,
+                    open_browser: *open_browser,
+                    json: true,
+                };
+                setup::oauth::run(&args).await
             }
         },
         Cmd::Github { ref op } => match op {
