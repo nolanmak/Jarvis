@@ -1,0 +1,203 @@
+name: Issue to PR (autonomous)
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number to fix'
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: issue-to-pr-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Label + secret gate
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.label.name == 'automation/ready' &&
+       github.event.issue.user.login != 'github-actions[bot]' &&
+       github.event.issue.user.login != 'dependabot[bot]')
+    outputs:
+      issue_number: ${{ steps.resolve.outputs.issue_number }}
+      branch_name: ${{ steps.resolve.outputs.branch_name }}
+      protected_patterns: ${{ steps.load.outputs.patterns }}
+      has_secret: ${{ steps.secret.outputs.present }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - id: secret
+        run: |
+          if [ -n "${{ secrets.ANTHROPIC_API_KEY }}" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::ANTHROPIC_API_KEY not set — workflow will no-op. Add the secret to enable autonomous fixes."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      - id: resolve
+        run: |
+          NUM="${{ github.event.issue.number || inputs.issue_number }}"
+          BRANCH="auto/issue-${NUM}"
+          echo "issue_number=${NUM}" >> "$GITHUB_OUTPUT"
+          echo "branch_name=${BRANCH}" >> "$GITHUB_OUTPUT"
+      - id: load
+        run: |
+          PATTERNS=$(jq -c '.protected_patterns' .github/config/protected-paths.json)
+          echo "patterns=${PATTERNS}" >> "$GITHUB_OUTPUT"
+
+  implement:
+    name: Implement fix
+    runs-on: ubuntu-latest
+    needs: gate
+    if: needs.gate.outputs.has_secret == 'true'
+    timeout-minutes: 45
+    env:
+      ISSUE_NUM: ${{ needs.gate.outputs.issue_number }}
+      BRANCH_NAME: ${{ needs.gate.outputs.branch_name }}
+      PROTECTED_PATTERNS: ${{ needs.gate.outputs.protected_patterns }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create branch
+        run: |
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git checkout -b "$BRANCH_NAME"
+          git push -u origin "$BRANCH_NAME"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Claude fix
+        id: claude
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt_file: .github/prompts/issue-to-pr.md
+          prompt: |
+            ISSUE_NUMBER: ${{ env.ISSUE_NUM }}
+            PROTECTED_PATTERNS: ${{ env.PROTECTED_PATTERNS }}
+          claude_args: >-
+            --allowed-tools
+            "Bash(cargo check *),Bash(cargo clippy *),Bash(cargo test *),Bash(cargo fmt *),Bash(git *),Bash(gh issue view:*),Bash(gh pr create:*),Read,Write,Edit,Glob,Grep"
+            --max-turns 40
+
+  guardrails:
+    name: Post-implementation guardrails
+    runs-on: ubuntu-latest
+    needs: [gate, implement]
+    if: always() && needs.implement.result == 'success'
+    timeout-minutes: 20
+    env:
+      ISSUE_NUM: ${{ needs.gate.outputs.issue_number }}
+      BRANCH_NAME: ${{ needs.gate.outputs.branch_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH_NAME }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Revert any edits to protected paths
+        id: revert
+        run: |
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          set -euo pipefail
+          mapfile -t PROTECTED < <(jq -r '.protected_patterns[]' .github/config/protected-paths.json)
+          CHANGED=$(git diff --name-only origin/main...HEAD)
+          REVERTED=()
+          for f in $CHANGED; do
+            for p in "${PROTECTED[@]}"; do
+              if [[ "$f" == $p ]] || [[ "$f" == ${p%/**}/* && "$p" == *"/**" ]]; then
+                git checkout origin/main -- "$f" || rm -f "$f"
+                REVERTED+=("$f")
+                break
+              fi
+            done
+          done
+          if [ ${#REVERTED[@]} -gt 0 ]; then
+            printf 'reverted=%s\n' "${REVERTED[*]}" >> "$GITHUB_OUTPUT"
+            git add -A
+            git commit -m "revert: protected-path enforcement (${#REVERTED[@]} files)"
+          else
+            echo "reverted=" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Detect touched crates
+        id: crates
+        run: |
+          CRATES=$(git diff --name-only origin/main...HEAD | grep -oE '^crates/[^/]+' | sort -u | sed 's|^crates/||' | tr '\n' ' ')
+          echo "list=${CRATES}" >> "$GITHUB_OUTPUT"
+      - name: cargo check (per touched crate)
+        if: steps.crates.outputs.list != ''
+        run: |
+          for c in ${{ steps.crates.outputs.list }}; do
+            echo "::group::cargo check -p $c"
+            cargo check -p "$c"
+            echo "::endgroup::"
+          done
+      - name: cargo clippy (per touched crate)
+        if: steps.crates.outputs.list != ''
+        run: |
+          for c in ${{ steps.crates.outputs.list }}; do
+            echo "::group::cargo clippy -p $c -- -Dwarnings"
+            cargo clippy -p "$c" -- -D warnings
+            echo "::endgroup::"
+          done
+      - name: cargo test (per touched crate)
+        if: steps.crates.outputs.list != ''
+        run: |
+          for c in ${{ steps.crates.outputs.list }}; do
+            echo "::group::cargo test -p $c"
+            cargo test -p "$c"
+            echo "::endgroup::"
+          done
+      - name: Push guardrail commits
+        if: always()
+        run: |
+          git push origin "$BRANCH_NAME" || true
+      - name: Open draft PR
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVERTED: ${{ steps.revert.outputs.reverted }}
+          CRATES: ${{ steps.crates.outputs.list }}
+        run: |
+          if gh pr view "$BRANCH_NAME" --json number >/dev/null 2>&1; then
+            echo "PR already exists."
+            exit 0
+          fi
+          BODY=$(cat <<EOF
+          Closes #${ISSUE_NUM}
+
+          Machine-generated by \`.github/workflows/issue-to-pr.yml\`. Human review required.
+
+          Reverted protected-path edits: ${REVERTED:-none}
+          Touched crates: ${CRATES:-none}
+
+          Local gates passed: cargo check, cargo clippy -Dwarnings, cargo test (per touched crate).
+          EOF
+          )
+          gh pr create \
+            --base main --head "$BRANCH_NAME" --draft \
+            --title "auto: fix from #${ISSUE_NUM}" \
+            --body "$BODY" \
+            --label "automation/proposed"
