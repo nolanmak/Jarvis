@@ -1,11 +1,12 @@
-//! `augmentagent loop list|stop` (#212).
+//! `augmentagent loop list|stop|create` (#212, #221).
 //!
 //! Cross-surface control of `user_loops` — the sqlite-backed scheduler the
 //! Discord `/loop` command writes into (#104, ticked by
 //! `augmentagent_approval_discord::loops::LoopScheduler`). When a user asks
-//! the bot in plain English "kill the hello world loop", *this* is the
-//! table they actually want stopped — the loop is firing from the daemon
-//! itself, not from any `claude` CLI process.
+//! the bot in plain English "kill the hello world loop" or "schedule a
+//! morning ping", *this* is the table they actually want touched — the
+//! loop is firing from the daemon itself, not from any `claude` CLI
+//! process.
 //!
 //! NOT to be confused with `augmentagent loops` (plural, #175): that one
 //! signals OS-level `claude` PIDs, for the orphan-Claude-Code-session case
@@ -19,6 +20,9 @@ use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use serde::Serialize;
 
+use augmentagent_approval_discord::{
+    max_active_per_user, min_interval_secs, parse_interval,
+};
 use augmentagent_store::{rusqlite, Store};
 
 #[derive(Debug, Clone, Subcommand)]
@@ -44,6 +48,38 @@ pub enum LoopOp {
         /// Stop every active loop. Mutually exclusive with passing an id.
         #[arg(long, default_value_t = false)]
         all: bool,
+    },
+    /// Create a new user-scheduled loop. This is the CLI surface the wiki
+    /// agent calls when the user asks for a scheduled task in natural
+    /// language ("ping me every morning"). Owner + channel default to the
+    /// env-configured Discord identity so the agent doesn't have to thread
+    /// them through.
+    Create {
+        /// Tick cadence — accepts `45s`, `30m`, `2h`, `1d`, or a bare
+        /// integer interpreted as minutes (same grammar as `/loop`).
+        #[arg(long)]
+        interval: String,
+        /// Prompt the scheduler runs each tick. Quote multi-word prompts.
+        #[arg(long)]
+        prompt: String,
+        /// Discord channel/DM id to post results back to. Defaults to
+        /// `DISCORD_CHANNEL_ID` env var.
+        #[arg(long)]
+        channel_ref: Option<String>,
+        /// Discord user id that owns the loop (counts against the per-user
+        /// cap and gates `/loop stop`). Defaults to `DISCORD_ALLOWED_USER_ID`.
+        #[arg(long)]
+        owner: Option<String>,
+        /// Optional auto-stop deadline — accepts the same grammar as
+        /// `--interval`. The scheduler grants one interval of grace so the
+        /// boundary iteration fires (mirrors `/loop`'s #108 fix).
+        #[arg(long)]
+        expires_in: Option<String>,
+        /// Emit JSON `{"id":"<uuid>","interval_secs":N,...}` instead of
+        /// plain `<uuid>` on stdout. Lets callers parse the loop id without
+        /// regex.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -118,7 +154,180 @@ pub fn run_with(store: &Store, op: LoopOp) -> Result<i32> {
                 Ok(1)
             }
         }
+        LoopOp::Create {
+            interval,
+            prompt,
+            channel_ref,
+            owner,
+            expires_in,
+            json,
+        } => {
+            let args = CreateArgs {
+                interval,
+                prompt,
+                channel_ref,
+                owner,
+                expires_in,
+            };
+            let resolved = resolve_create_args(args, env_lookup)?;
+            let id = store.create_user_loop(
+                &resolved.owner,
+                "discord",
+                &resolved.channel_ref,
+                resolved.interval_secs,
+                &resolved.prompt,
+                resolved.expires_at_ms,
+            )?;
+            if json {
+                let payload = serde_json::json!({
+                    "id": id,
+                    "interval_secs": resolved.interval_secs,
+                    "owner": resolved.owner,
+                    "channel_ref": resolved.channel_ref,
+                    "expires_at_ms": resolved.expires_at_ms,
+                });
+                println!("{}", serde_json::to_string(&payload)?);
+            } else {
+                println!("{}", id);
+            }
+            // Soft post-hoc cap check. We don't pre-check (cheap race vs.
+            // concurrent /loop in Discord), but if the agent just blew past
+            // the cap we surface it on stderr so the operator notices —
+            // the row still went in, matching how `/loop` reports it.
+            let cap = max_active_per_user();
+            if cap < i64::MAX {
+                let active = count_active_for(store, &resolved.owner)?;
+                if active > cap {
+                    eprintln!(
+                        "warning: owner `{}` now has {} active loops (cap is {})",
+                        resolved.owner, active, cap
+                    );
+                }
+            }
+            Ok(0)
+        }
     }
+}
+
+#[derive(Debug, Clone)]
+struct CreateArgs {
+    interval: String,
+    prompt: String,
+    channel_ref: Option<String>,
+    owner: Option<String>,
+    expires_in: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedCreate {
+    interval_secs: i64,
+    prompt: String,
+    channel_ref: String,
+    owner: String,
+    expires_at_ms: Option<i64>,
+}
+
+/// Live env lookup. Split out as a function pointer so tests can inject a
+/// deterministic stub instead of mutating process env (which races with
+/// other tests in the same binary).
+fn env_lookup(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+fn resolve_create_args<F>(args: CreateArgs, env: F) -> Result<ResolvedCreate>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    resolve_create_args_with(args, env, min_interval_secs())
+}
+
+/// Floor-injected core. Live callers use `min_interval_secs()`; tests pass
+/// an explicit floor so they don't have to mutate process env.
+fn resolve_create_args_with<F>(
+    args: CreateArgs,
+    env: F,
+    floor: i64,
+) -> Result<ResolvedCreate>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let interval_secs = parse_interval(&args.interval).ok_or_else(|| {
+        anyhow!(
+            "--interval: couldn't parse `{}`; use e.g. `30m`, `2h`, `1d`",
+            args.interval
+        )
+    })?;
+    if floor > 0 && interval_secs < floor {
+        return Err(anyhow!(
+            "--interval: {}s is below the configured floor of {}s \
+             (AUGMENTAGENT_LOOP_MIN_INTERVAL_SECS)",
+            interval_secs,
+            floor
+        ));
+    }
+    let prompt = args.prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err(anyhow!("--prompt cannot be empty"));
+    }
+    let owner = args
+        .owner
+        .or_else(|| env("DISCORD_ALLOWED_USER_ID"))
+        .ok_or_else(|| {
+            anyhow!(
+                "--owner not given and DISCORD_ALLOWED_USER_ID is not set"
+            )
+        })?;
+    let channel_ref = args
+        .channel_ref
+        .or_else(|| env("DISCORD_CHANNEL_ID"))
+        .ok_or_else(|| {
+            anyhow!(
+                "--channel-ref not given and DISCORD_CHANNEL_ID is not set"
+            )
+        })?;
+    let expires_at_ms = match args.expires_in.as_deref() {
+        None => None,
+        Some(raw) => {
+            let dur = parse_interval(raw).ok_or_else(|| {
+                anyhow!(
+                    "--expires-in: couldn't parse `{}`; use e.g. `7d`, `2h`",
+                    raw
+                )
+            })?;
+            if dur < interval_secs {
+                return Err(anyhow!(
+                    "--expires-in: {}s is shorter than --interval {}s — \
+                     loop would never fire",
+                    dur,
+                    interval_secs
+                ));
+            }
+            // Mirror `/loop`'s #108 grace: add one full interval so the
+            // boundary tick lands before the expiry sweep claims the row.
+            let grace = interval_secs;
+            let total_ms = dur.saturating_add(grace).saturating_mul(1000);
+            Some(now_millis().saturating_add(total_ms))
+        }
+    };
+    Ok(ResolvedCreate {
+        interval_secs,
+        prompt,
+        channel_ref,
+        owner,
+        expires_at_ms,
+    })
+}
+
+fn count_active_for(store: &Store, owner: &str) -> Result<i64> {
+    let n = store.with_conn(|c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM user_loops \
+              WHERE owner = ?1 AND status = 'active'",
+            rusqlite::params![owner],
+            |r| r.get::<_, i64>(0),
+        )
+    })?;
+    Ok(n)
 }
 
 fn list_rows(store: &Store, all: bool) -> Result<Vec<LoopRow>> {
@@ -396,5 +605,218 @@ mod tests {
         let code =
             run_with(&s, LoopOp::List { all: false, json: true }).unwrap();
         assert_eq!(code, 0);
+    }
+
+    fn fake_env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |k: &str| {
+            owned
+                .iter()
+                .find(|(kk, _)| kk == k)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    #[test]
+    fn resolve_create_args_uses_env_defaults() {
+        let args = CreateArgs {
+            interval: "30m".into(),
+            prompt: "  ping me  ".into(),
+            channel_ref: None,
+            owner: None,
+            expires_in: None,
+        };
+        let env = fake_env(&[
+            ("DISCORD_ALLOWED_USER_ID", "user-from-env"),
+            ("DISCORD_CHANNEL_ID", "chan-from-env"),
+        ]);
+        let r = resolve_create_args(args, env).unwrap();
+        assert_eq!(r.interval_secs, 1800);
+        assert_eq!(r.prompt, "ping me");
+        assert_eq!(r.owner, "user-from-env");
+        assert_eq!(r.channel_ref, "chan-from-env");
+        assert!(r.expires_at_ms.is_none());
+    }
+
+    #[test]
+    fn resolve_create_args_explicit_flags_win() {
+        let args = CreateArgs {
+            interval: "2h".into(),
+            prompt: "hi".into(),
+            channel_ref: Some("override-chan".into()),
+            owner: Some("override-owner".into()),
+            expires_in: None,
+        };
+        // Env has different values; explicit flags should win.
+        let env = fake_env(&[
+            ("DISCORD_ALLOWED_USER_ID", "should-not-be-used"),
+            ("DISCORD_CHANNEL_ID", "should-not-be-used"),
+        ]);
+        let r = resolve_create_args(args, env).unwrap();
+        assert_eq!(r.interval_secs, 7200);
+        assert_eq!(r.owner, "override-owner");
+        assert_eq!(r.channel_ref, "override-chan");
+    }
+
+    #[test]
+    fn resolve_create_args_rejects_bad_interval() {
+        let args = CreateArgs {
+            interval: "garbage".into(),
+            prompt: "hi".into(),
+            channel_ref: Some("c".into()),
+            owner: Some("o".into()),
+            expires_in: None,
+        };
+        let err = resolve_create_args(args, |_| None).unwrap_err();
+        assert!(err.to_string().contains("--interval"));
+    }
+
+    #[test]
+    fn resolve_create_args_rejects_empty_prompt() {
+        let args = CreateArgs {
+            interval: "1h".into(),
+            prompt: "   ".into(),
+            channel_ref: Some("c".into()),
+            owner: Some("o".into()),
+            expires_in: None,
+        };
+        let err = resolve_create_args(args, |_| None).unwrap_err();
+        assert!(err.to_string().contains("--prompt"));
+    }
+
+    #[test]
+    fn resolve_create_args_missing_owner_errors() {
+        let args = CreateArgs {
+            interval: "1h".into(),
+            prompt: "hi".into(),
+            channel_ref: Some("c".into()),
+            owner: None,
+            expires_in: None,
+        };
+        let err = resolve_create_args(args, |_| None).unwrap_err();
+        assert!(err.to_string().contains("--owner"));
+    }
+
+    #[test]
+    fn resolve_create_args_missing_channel_errors() {
+        let args = CreateArgs {
+            interval: "1h".into(),
+            prompt: "hi".into(),
+            channel_ref: None,
+            owner: Some("o".into()),
+            expires_in: None,
+        };
+        let err = resolve_create_args(args, |_| None).unwrap_err();
+        assert!(err.to_string().contains("--channel-ref"));
+    }
+
+    #[test]
+    fn resolve_create_args_expires_in_shorter_than_interval_errors() {
+        let args = CreateArgs {
+            interval: "1h".into(),
+            prompt: "hi".into(),
+            channel_ref: Some("c".into()),
+            owner: Some("o".into()),
+            expires_in: Some("5m".into()),
+        };
+        let err = resolve_create_args(args, |_| None).unwrap_err();
+        assert!(err.to_string().contains("shorter than"));
+    }
+
+    #[test]
+    fn resolve_create_args_floor_rejects_too_short_interval() {
+        // 30m, floor 1h → reject.
+        let args = CreateArgs {
+            interval: "30m".into(),
+            prompt: "hi".into(),
+            channel_ref: Some("c".into()),
+            owner: Some("o".into()),
+            expires_in: None,
+        };
+        let err = resolve_create_args_with(args, |_| None, 3600).unwrap_err();
+        assert!(err.to_string().contains("floor"));
+    }
+
+    #[test]
+    fn resolve_create_args_floor_zero_allows_anything_positive() {
+        // Floor 0 (default) disables the check — short intervals OK.
+        let args = CreateArgs {
+            interval: "45s".into(),
+            prompt: "hi".into(),
+            channel_ref: Some("c".into()),
+            owner: Some("o".into()),
+            expires_in: None,
+        };
+        let r = resolve_create_args_with(args, |_| None, 0).unwrap();
+        assert_eq!(r.interval_secs, 45);
+    }
+
+    #[test]
+    fn resolve_create_args_expires_in_grants_grace_interval() {
+        let args = CreateArgs {
+            interval: "1h".into(),
+            prompt: "hi".into(),
+            channel_ref: Some("c".into()),
+            owner: Some("o".into()),
+            expires_in: Some("2h".into()),
+        };
+        let before = now_millis();
+        let r = resolve_create_args(args, |_| None).unwrap();
+        let after = now_millis();
+        let exp = r.expires_at_ms.expect("expires_at_ms set");
+        // 2h + 1h grace = 3h = 10_800_000ms past now.
+        let target = 10_800_000i64;
+        assert!(exp - before >= target);
+        assert!(exp - after <= target + 5_000);
+    }
+
+    #[test]
+    fn run_create_writes_row_with_explicit_flags() {
+        let (_tmp, s) = seed_store();
+        // No env mutation — pass everything explicitly so this test is
+        // safe to run in parallel with other env-touching tests.
+        let code = run_with(
+            &s,
+            LoopOp::Create {
+                interval: "30m".into(),
+                prompt: "say hi".into(),
+                channel_ref: Some("test-channel".into()),
+                owner: Some("test-owner".into()),
+                expires_in: None,
+                json: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        // One more active row for test-owner now (the seeded ones use "u1").
+        let n = count_active_for(&s, "test-owner").unwrap();
+        assert_eq!(n, 1);
+        // Confirm the row has the expected shape.
+        let row: (String, String, String, i64, String) = s
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT prompt, channel, channel_ref, interval_secs, status \
+                       FROM user_loops WHERE owner = 'test-owner'",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                        ))
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(row.0, "say hi");
+        assert_eq!(row.1, "discord");
+        assert_eq!(row.2, "test-channel");
+        assert_eq!(row.3, 1800);
+        assert_eq!(row.4, "active");
     }
 }
