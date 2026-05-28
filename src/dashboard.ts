@@ -1107,6 +1107,188 @@ router.delete("/api/socialapi/accounts/:id", (req, res) => {
   renderSocialApiSection(res);
 });
 
+// --- SocialAPI.ai proxied OAuth connect (#247) ---
+//
+// Mirrors the Gmail/Composio OAuth shape: /start asks SocialAPI.ai to mint a
+// hosted auth URL (POST /v1/accounts/connect → { auth_url }), stashes a snapshot
+// of the currently-known account IDs as pending state, and redirects the user to
+// the provider consent screen. After consent the provider returns to /callback,
+// which resolves the freshly-connected account (preferring callback params, then
+// falling back to listing GET /v1/accounts and diffing against the snapshot),
+// upserts it into socialapi_accounts so it shows up in /api/v1/oauth/status, and
+// clears the pending state.
+
+// Render an OAuth error page consistent with the Gmail/Slack flows.
+function socialApiOAuthError(res: any, msg: string) {
+  res.status(500).send(`
+    <div class="p-4 bg-gray-950 text-gray-100 min-h-screen">
+      <h2 class="text-lg font-semibold text-red-400 mb-2">SocialAPI.ai OAuth Error</h2>
+      <p class="text-sm text-gray-300 mb-4">${msg}</p>
+      <a href="/settings" class="text-blue-400 hover:underline">Back to Settings</a>
+    </div>
+  `);
+}
+
+// Tolerant extractor for a single account object from a SocialAPI.ai payload.
+function pickSocialApiAccount(a: any): { id: string; platform: string; brandId: string | null; displayName: string | null; accountHandle: string | null } | null {
+  const id = (a?.id ?? a?.account_id ?? a?.uuid ?? "").toString();
+  if (!id) return null;
+  return {
+    id,
+    platform: (a?.platform ?? a?.network ?? a?.provider ?? "unknown").toString(),
+    brandId: a?.brand_id ?? a?.brandId ?? null,
+    displayName: a?.display_name ?? a?.displayName ?? a?.name ?? null,
+    accountHandle: a?.account_handle ?? a?.handle ?? a?.username ?? null,
+  };
+}
+
+router.get("/oauth/socialapi/start", async (_req, res) => {
+  try {
+    const key = getConfig("socialapi_api_key");
+    if (!key) {
+      socialApiOAuthError(res, "No SocialAPI.ai API key set. Paste your key in Settings and save it first.");
+      return;
+    }
+
+    const dashboardPort = process.env.DASHBOARD_PORT || "3000";
+    const callbackUrl = `http://localhost:${dashboardPort}/oauth/socialapi/callback`;
+
+    const resp = await fetch(`${SOCIALAPI_BASE}/accounts/connect`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({ redirect_uri: callbackUrl }),
+    });
+
+    if (!resp.ok) {
+      const detail = resp.status === 401 || resp.status === 403
+        ? "Invalid or unauthorized API key."
+        : `SocialAPI.ai returned HTTP ${resp.status}.`;
+      socialApiOAuthError(res, `Connect failed: ${detail}`);
+      return;
+    }
+
+    const body: any = await resp.json().catch(() => null);
+    const authUrl = (body?.auth_url ?? body?.authUrl ?? body?.url ?? body?.redirect_url ?? "").toString();
+    if (!authUrl) {
+      socialApiOAuthError(res, "SocialAPI.ai did not return an auth_url.");
+      return;
+    }
+
+    // Stash a snapshot of existing account IDs so the callback can diff to find
+    // the newly-connected one. Also persist any connect-token the API hands back.
+    setConfig("socialapi_pending_known_ids", JSON.stringify(getSocialApiAccounts().map((a) => a.id)));
+    const connectToken = (body?.connect_token ?? body?.token ?? body?.id ?? "").toString();
+    if (connectToken) {
+      setConfig("socialapi_pending_connect_token", connectToken);
+    } else {
+      deleteConfig("socialapi_pending_connect_token");
+    }
+
+    console.log("[socialapi] OAuth connect initiated, redirecting to provider consent...");
+    res.redirect(authUrl);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[socialapi] OAuth start failed:", msg);
+    socialApiOAuthError(res, msg);
+  }
+});
+
+router.get("/oauth/socialapi/callback", async (req, res) => {
+  console.log("[socialapi] OAuth callback hit. Query params:", JSON.stringify(req.query));
+  const key = getConfig("socialapi_api_key");
+  if (!key) {
+    deleteConfig("socialapi_pending_known_ids");
+    deleteConfig("socialapi_pending_connect_token");
+    res.redirect("/settings?socialapi=error");
+    return;
+  }
+
+  try {
+    let recorded = false;
+
+    // 1) Prefer an account id handed back directly on the callback URL.
+    const directId = (req.query.account_id ?? req.query.id ?? "").toString();
+    if (directId) {
+      // Try to enrich via GET /v1/accounts; fall back to bare id if it fails.
+      let enriched = false;
+      try {
+        const resp = await fetch(`${SOCIALAPI_BASE}/accounts`, {
+          headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+        });
+        if (resp.ok) {
+          const body: any = await resp.json().catch(() => null);
+          const list: any[] = Array.isArray(body) ? body : (body?.accounts ?? body?.data ?? []);
+          const match = list.map(pickSocialApiAccount).find((a) => a && a.id === directId);
+          if (match) {
+            upsertSocialApiAccount(match.id, match.platform, {
+              brandId: match.brandId,
+              displayName: match.displayName,
+              accountHandle: match.accountHandle,
+            });
+            recorded = true;
+            enriched = true;
+          }
+        }
+      } catch (err) {
+        console.error("[socialapi] callback enrich failed:", err instanceof Error ? err.message : err);
+      }
+      if (!enriched) {
+        upsertSocialApiAccount(directId, "unknown", {});
+        recorded = true;
+      }
+    }
+
+    // 2) Fallback discovery: list accounts and diff against the pre-connect snapshot.
+    if (!recorded) {
+      let knownIds: string[] = [];
+      try {
+        knownIds = JSON.parse(getConfig("socialapi_pending_known_ids") || "[]");
+      } catch {
+        knownIds = [];
+      }
+      const knownSet = new Set(knownIds);
+
+      const resp = await fetch(`${SOCIALAPI_BASE}/accounts`, {
+        headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+      });
+      if (resp.ok) {
+        const body: any = await resp.json().catch(() => null);
+        const list: any[] = Array.isArray(body) ? body : (body?.accounts ?? body?.data ?? []);
+        for (const raw of list) {
+          const acct = pickSocialApiAccount(raw);
+          if (acct && !knownSet.has(acct.id)) {
+            upsertSocialApiAccount(acct.id, acct.platform, {
+              brandId: acct.brandId,
+              displayName: acct.displayName,
+              accountHandle: acct.accountHandle,
+            });
+            recorded = true;
+            console.log(`[socialapi] discovered new account via diff: ${acct.id}`);
+          }
+        }
+      } else {
+        const detail = resp.status === 401 || resp.status === 403
+          ? "Invalid or unauthorized API key."
+          : `HTTP ${resp.status}`;
+        console.error(`[socialapi] callback list failed: ${detail}`);
+      }
+    }
+
+    deleteConfig("socialapi_pending_known_ids");
+    deleteConfig("socialapi_pending_connect_token");
+    res.redirect(recorded ? "/settings?socialapi=connected" : "/settings?socialapi=error");
+  } catch (err) {
+    console.error("[socialapi] OAuth callback error:", err instanceof Error ? err.message : err);
+    deleteConfig("socialapi_pending_known_ids");
+    deleteConfig("socialapi_pending_connect_token");
+    res.redirect("/settings?socialapi=error");
+  }
+});
+
 // --- Composio OAuth for Slack (multi-workspace) ---
 // Mirrors the Gmail flow: start → Composio hosted consent → callback polls for
 // ACTIVE status → shell to Rust CLI to persist auth in Keychain + DB.
