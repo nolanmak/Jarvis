@@ -42,6 +42,7 @@ import {
   getActiveGmailAccounts,
   getActiveDriveAccounts,
   getActiveSlackWorkspaces,
+  getActiveSocialApiAccounts,
   getConfig,
 } from "./db";
 import type { ActionStatus } from "./types";
@@ -161,11 +162,18 @@ v1.get("/oauth/status", (_req, res) => {
     user_id: w.userId,
   }));
   const redditConnected = !!getConfig("reddit_refresh_token");
+  const socialApiAccounts = getActiveSocialApiAccounts().map((a) => ({
+    id: a.id,
+    platform: a.platform,
+    display_name: a.display_name,
+    account_handle: a.account_handle,
+  }));
   res.json({
     gmail: { accounts: gmailAccounts, lastError: null },
     googledrive: { accounts: driveAccounts, lastError: null },
     slack: { workspaces: slackWorkspaces, lastError: null },
     reddit: { connected: redditConnected },
+    socialapi: { accounts: socialApiAccounts, lastError: null },
   });
 });
 

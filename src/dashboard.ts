@@ -28,6 +28,10 @@ import {
   getActiveDriveAccounts,
   addDriveAccount,
   removeDriveAccount,
+  getSocialApiAccounts,
+  upsertSocialApiAccount,
+  setSocialApiAccountActive,
+  removeSocialApiAccount,
   hasAnyGmailAccount,
   getEmailCount,
   purgeOldEmails,
@@ -147,6 +151,14 @@ router.get("/history", (req, res) => {
   });
 });
 
+// Mask a secret for display: show the first 4 and last 4 chars, dots between.
+// Short keys are fully masked. Returns null when no key is set.
+function maskSecret(raw: string | null): string | null {
+  if (!raw) return null;
+  if (raw.length <= 8) return "•".repeat(raw.length);
+  return `${raw.slice(0, 4)}${"•".repeat(8)}${raw.slice(-4)}`;
+}
+
 router.get("/settings", (_req, res) => {
   const senders = getSenders();
   const configStatus = getConfigStatus();
@@ -159,6 +171,9 @@ router.get("/settings", (_req, res) => {
     emailRetention,
     emailCount,
     invoice,
+    socialApiKeyMasked: maskSecret(getConfig("socialapi_api_key")),
+    socialApiAccounts: getSocialApiAccounts(),
+    socialApiError: null,
     page: "settings",
   });
 });
@@ -992,6 +1007,104 @@ router.delete("/api/oauth/googledrive/:id", async (req, res) => {
     removeDriveAccount(req.params.id);
   }
   res.json({ ok: true });
+});
+
+// --- SocialAPI.ai hosted-first setup (#246) ---
+//
+// The simplest connect path: the operator pastes their SocialAPI.ai API key,
+// we store it in `config` (masked when surfaced), then "sync" hits the hosted
+// accounts endpoint and upserts each connected handle into socialapi_accounts.
+// Each account row can be enabled/disabled to control what the daemon manages,
+// or removed entirely. (The proxied-OAuth flow is a separate issue, #247.)
+
+const SOCIALAPI_BASE = "https://api.social-api.ai/v1";
+
+// Render the SocialAPI Settings card back into the page after a mutation.
+function renderSocialApiSection(res: any, error: string | null = null) {
+  res.render("partials/socialapi-section", {
+    socialApiKeyMasked: maskSecret(getConfig("socialapi_api_key")),
+    socialApiAccounts: getSocialApiAccounts(),
+    socialApiError: error,
+  });
+}
+
+// Save (or clear) the SocialAPI.ai API key.
+router.post("/api/socialapi/key", (req, res) => {
+  const value = (req.body?.value ?? "").toString().trim();
+  if (value) {
+    setConfig("socialapi_api_key", value);
+  } else {
+    deleteConfig("socialapi_api_key");
+  }
+  renderSocialApiSection(res);
+});
+
+router.post("/api/socialapi/key/clear", (_req, res) => {
+  deleteConfig("socialapi_api_key");
+  renderSocialApiSection(res);
+});
+
+// Sync accounts: GET <base>/accounts with Bearer auth, upsert each into
+// socialapi_accounts. Tolerant of a few common response envelopes
+// ({accounts:[...]}, {data:[...]}, or a bare array) and missing fields.
+router.post("/api/socialapi/sync", async (_req, res) => {
+  const key = getConfig("socialapi_api_key");
+  if (!key) {
+    renderSocialApiSection(res, "No API key set. Paste your SocialAPI.ai key and save it first.");
+    return;
+  }
+  try {
+    const resp = await fetch(`${SOCIALAPI_BASE}/accounts`, {
+      headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+    });
+    if (!resp.ok) {
+      const detail = resp.status === 401 || resp.status === 403
+        ? "Invalid or unauthorized API key."
+        : `SocialAPI.ai returned HTTP ${resp.status}.`;
+      renderSocialApiSection(res, `Sync failed: ${detail}`);
+      return;
+    }
+    const body: any = await resp.json().catch(() => null);
+    const list: any[] = Array.isArray(body)
+      ? body
+      : Array.isArray(body?.accounts)
+        ? body.accounts
+        : Array.isArray(body?.data)
+          ? body.data
+          : [];
+    let synced = 0;
+    for (const a of list) {
+      const id = (a?.id ?? a?.account_id ?? a?.uuid ?? "").toString();
+      if (!id) continue;
+      const platform = (a?.platform ?? a?.network ?? a?.provider ?? "unknown").toString();
+      upsertSocialApiAccount(id, platform, {
+        brandId: a?.brand_id ?? a?.brandId ?? null,
+        displayName: a?.display_name ?? a?.displayName ?? a?.name ?? null,
+        accountHandle: a?.account_handle ?? a?.handle ?? a?.username ?? null,
+      });
+      synced++;
+    }
+    renderSocialApiSection(res, synced === 0 ? "Sync succeeded but no accounts were returned." : null);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[socialapi] sync failed:", msg);
+    renderSocialApiSection(res, `Sync failed: ${msg}`);
+  }
+});
+
+// Toggle a connected account active/inactive.
+router.patch("/api/socialapi/accounts/:id/toggle", (req, res) => {
+  const account = getSocialApiAccounts().find((a) => a.id === req.params.id);
+  if (account) {
+    setSocialApiAccountActive(account.id, !account.active);
+  }
+  renderSocialApiSection(res);
+});
+
+// Remove a connected account from the local registry.
+router.delete("/api/socialapi/accounts/:id", (req, res) => {
+  removeSocialApiAccount(req.params.id);
+  renderSocialApiSection(res);
 });
 
 // --- Composio OAuth for Slack (multi-workspace) ---
