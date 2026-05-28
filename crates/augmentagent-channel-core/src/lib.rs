@@ -44,8 +44,8 @@ pub use memory_nudge::{default_cycles_root, CycleLogger, CycleSummary, CycleSurf
 pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerOpts};
 pub use skills::{SkillEntry, SkillRegistry};
 pub use tool_audit::{
-    default_audit_log_path, format_notice, is_high_risk, parse_stream_event, truncate_stream,
-    AuditLogger, AuditNotifier, AuditRecord, ToolEvent,
+    build_audit_record, default_audit_log_path, format_notice, is_high_risk, parse_stream_event,
+    truncate_stream, AuditLogger, AuditNotifier, AuditRecord, ToolEvent,
 };
 pub use trigger::{
     kind as work_item_kind, ChannelRunner, DigestSource, FriendFeedSource, FriendFeedTrigger,

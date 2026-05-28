@@ -176,6 +176,9 @@ fn extract_opts() -> ReasonerOpts {
         env: vec![],
         settings_json: None,
         restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
     }
 }
 

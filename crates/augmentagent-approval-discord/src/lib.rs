@@ -204,7 +204,44 @@ pub trait ApprovalActionHandler: Send + Sync {
 }
 
 /// Plugged into the broker to answer wiki queries that arrive as Discord messages.
+///
+/// Implementations receive an audit context per request so the underlying
+/// reasoner can populate `ReasonerOpts.session_id` + `ReasonerOpts.audit_notifier`
+/// without this crate having to depend on `augmentagent-channel-core` at
+/// the type level (channel-core already depends on us — see
+/// `engagement.rs::ApprovalBroker` — so a back-reference would cycle the
+/// workspace). The `WikiQuerier` impl in the CLI crate is the natural
+/// bridge: it sees both serenity (for `http` / `channel_id`) and
+/// channel-core (for `AuditNotifier`), and assembles the real notifier
+/// there (#132 / #201).
 #[async_trait]
 pub trait QueryHandler: Send + Sync {
-    async fn answer(&self, question: &str) -> anyhow::Result<String>;
+    async fn answer(&self, ctx: &AuditCtx, question: &str) -> anyhow::Result<String>;
+}
+
+/// Per-request audit context handed to [`QueryHandler::answer`].
+///
+/// Holds the logical session id (typically `format!("{channel}:{msg}")`)
+/// plus the raw serenity bits a Discord-side `AuditNotifier`
+/// implementation needs to post side-channel messages back to the
+/// originating channel. The CLI crate's `WikiQuerier` constructs the
+/// real notifier from these bits, since this crate cannot depend on
+/// `augmentagent-channel-core`'s `AuditNotifier` trait without a
+/// workspace cycle.
+pub struct AuditCtx {
+    pub session_id: String,
+    pub http: Option<std::sync::Arc<serenity::http::Http>>,
+    pub channel_id: Option<serenity::model::id::ChannelId>,
+}
+
+impl AuditCtx {
+    /// Build an empty context — useful for tests / non-Discord callers
+    /// that still need to satisfy the [`QueryHandler::answer`] signature.
+    pub fn empty() -> Self {
+        Self {
+            session_id: String::from("-"),
+            http: None,
+            channel_id: None,
+        }
+    }
 }
