@@ -38,6 +38,12 @@ use crate::api::{DiscordClient, DiscordError};
 use crate::types::Message;
 use crate::{PLATFORM, ACCOUNT_ENTITY_ID_PREFIX};
 
+/// Per-attachment download cap (200 KB). Discord uploads can be large; we
+/// only need enough to seed the agent's context.
+pub const MAX_ATTACHMENT_BYTES: usize = 200 * 1024;
+/// Aggregate cap across all attachments in a single message (500 KB).
+pub const MAX_ATTACHMENTS_TOTAL_BYTES: usize = 500 * 1024;
+
 /// Default poll interval — mirror LinkedIn's 4h cadence per the user's locked
 /// decision. 4h × 30min jitter keeps the fingerprint human-looking.
 pub const DEFAULT_POLL_SECS: u64 = 4 * 60 * 60;
@@ -229,6 +235,8 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
                 continue;
             }
 
+            let mut msg = msg;
+            self.inline_text_attachments(&mut msg).await;
             if let Err(e) = self.handle_message(sub, msg, outcome).await {
                 outcome.errors += 1;
                 error!(sub_id = %sub.id, "handle_message failed: {e:#}");
@@ -268,6 +276,62 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
                     .mark_email_processed(&email.message_id, TriageResult::DigestOnly)?;
                 Ok(())
             }
+        }
+    }
+
+    /// Download text-like attachments (`.txt`, `.md`, `.log`, `text/*`, etc.)
+    /// and append their decoded UTF-8 bodies onto `msg.content`, labeled
+    /// per-file. Non-text attachments are skipped silently. Enforces a per-
+    /// attachment cap ([`MAX_ATTACHMENT_BYTES`]) and a per-message total cap
+    /// ([`MAX_ATTACHMENTS_TOTAL_BYTES`]); oversize files get a `[truncated]`
+    /// marker rather than being dropped or blowing the agent context.
+    /// Download failures are logged and the attachment is skipped — we never
+    /// surface an error here, since the message itself is still actionable.
+    async fn inline_text_attachments(&self, msg: &mut Message) {
+        if msg.attachments.is_empty() {
+            return;
+        }
+        let mut total = 0usize;
+        let mut appended = String::new();
+        for att in msg.attachments.iter() {
+            if !att.is_text_like() {
+                debug!(filename = %att.filename, "skipping non-text discord attachment");
+                continue;
+            }
+            if total >= MAX_ATTACHMENTS_TOTAL_BYTES {
+                appended.push_str(&format!(
+                    "\n\n[Attachment: {} skipped — message attachment-total cap reached]\n",
+                    att.filename
+                ));
+                continue;
+            }
+            let remaining_total = MAX_ATTACHMENTS_TOTAL_BYTES - total;
+            let cap = MAX_ATTACHMENT_BYTES.min(remaining_total);
+            match self.client.download_attachment(&att.url, cap).await {
+                Ok((bytes, truncated)) => {
+                    total += bytes.len();
+                    let body = String::from_utf8_lossy(&bytes);
+                    let trail = if truncated { "\n[truncated]\n" } else { "\n" };
+                    appended.push_str(&format!(
+                        "\n\n[Attachment: {} ({} bytes{})]\n{}{}",
+                        att.filename,
+                        bytes.len(),
+                        if truncated { ", truncated" } else { "" },
+                        body,
+                        trail,
+                    ));
+                }
+                Err(e) => {
+                    warn!(
+                        filename = %att.filename,
+                        url = %att.url,
+                        "failed to download discord attachment: {e}"
+                    );
+                }
+            }
+        }
+        if !appended.is_empty() {
+            msg.content.push_str(&appended);
         }
     }
 
