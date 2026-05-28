@@ -97,9 +97,35 @@ MATCHED=""
 while IFS= read -r f; do
   [[ -z "$f" ]] && continue
   case "$f" in
+    # Original (#216) match set: agent prompts, skills, reasoner config.
     schema/*.md)                                        MATCHED+="$f"$'\n' ;;
     skills/*/SKILL.md|skills/*/*.md|skills/*.md)        MATCHED+="$f"$'\n' ;;
     crates/augmentagent-channel-core/src/reasoner.rs)   MATCHED+="$f"$'\n' ;;
+    # #229 widening: any channel triage / poller / observer logic. Every
+    # PR in the 217/218/219/220/222 batch unit-tested clean but went
+    # unverified against live email — the user was burned twice trusting
+    # "cargo test passes" as proof of working triage. Files in this set
+    # change runtime behaviour the unit tests can't fully model (LLM
+    # gating order, Gmail API responses, sweep timing) and demand a real
+    # exercise against the running daemon or a `poll-once` invocation
+    # before merge.
+    crates/augmentagent-channel-email/src/channel.rs)      MATCHED+="$f"$'\n' ;;
+    crates/augmentagent-channel-email/src/outbound.rs)     MATCHED+="$f"$'\n' ;;
+    crates/augmentagent-channel-email/src/trigger.rs)      MATCHED+="$f"$'\n' ;;
+    crates/augmentagent-channel-core/src/trigger.rs)       MATCHED+="$f"$'\n' ;;
+    crates/augmentagent-channel-core/src/governor/*.rs)    MATCHED+="$f"$'\n' ;;
+    # Any new triage / observer file under a channel crate — catches
+    # future modules like sigextract.rs additions that change triage
+    # classification.
+    crates/augmentagent-channel-*/src/sigextract.rs)       MATCHED+="$f"$'\n' ;;
+    crates/augmentagent-channel-*/src/tone.rs)             MATCHED+="$f"$'\n' ;;
+    # The Discord broker's message handler — same class of runtime
+    # behaviour gap (e.g. !invoice / !loops / `/loop` dispatch). Past
+    # PRs here have shipped clean-compiling but actually-broken
+    # invocations because cargo test doesn't exercise serenity events.
+    crates/augmentagent-approval-discord/src/event_handler.rs)   MATCHED+="$f"$'\n' ;;
+    crates/augmentagent-approval-discord/src/loops.rs)           MATCHED+="$f"$'\n' ;;
+    crates/augmentagent-approval-discord/src/process_loops.rs)   MATCHED+="$f"$'\n' ;;
   esac
 done <<<"$CHANGED"
 
@@ -122,37 +148,55 @@ fi
 # path", so spell out the command, the receipt path, and a one-line
 # explanation of why.
 REASON=$(cat <<EOF
-This PR's diff vs ${DIFF_BASE} touches agent-facing prompt / skill / reasoner-config files:
+This PR's diff vs ${DIFF_BASE} touches runtime-behaviour files that cargo test cannot fully model:
 
 $(printf '%s' "$MATCHED" | sed 's/^/  - /')
 
-Those changes can pass cargo test + compile cleanly while still being silently rejected at runtime by the claude permission matcher (see #214). The project's gate requires a local end-to-end verification before opening a PR.
+The gate exists because PRs in this codebase have repeatedly compiled clean + passed unit tests while being silently broken at runtime (see #214, and the entire #217/#218/#219/#220/#222 batch where 5 of 6 PRs shipped without ever being exercised against live email / running daemon). "cargo test passes" is not proof the change works. The project requires a real end-to-end exercise before opening a PR.
 
-How to satisfy the gate:
+How to satisfy the gate — pick the verification path matching your changed file:
 
-  1. Pick the right verification path for what you changed:
-     - schema/wiki-ask.md or any \`ask_opts\` allowlist / prompt change:
-         ./target/release/augmentagent --wiki-dir ./wiki wiki ask "<question that exercises the change>"
-     - schema/wiki-skill.md or wiki-ingest path change:
-         ./target/release/augmentagent --wiki-dir ./wiki --wiki-schema ./schema/wiki-skill.md poll-once
-     - other reasoner _opts function or schema/*.md:
-         drive the matching CLI subcommand and confirm output.
-     - skills/<name>/SKILL.md:
-         invoke the skill in a fresh claude session and confirm behaviour.
+  schema/wiki-ask.md OR crates/augmentagent-channel-core/src/reasoner.rs (ask_opts/allowlist/prompt):
+      ./target/release/augmentagent --wiki-dir ./wiki wiki ask "<question that exercises the change>"
+      → observe: the agent actually invokes the new tool / sees the new prompt section.
 
-  2. Write the receipt:
-       mkdir -p .claude/agent-test-receipts
-       echo "command: <what you ran>" > .claude/agent-test-receipts/${HEAD_SHA}.txt
-       echo "observed: <one-line summary of the output>" >> .claude/agent-test-receipts/${HEAD_SHA}.txt
-       echo "verifies: <which changed file the test exercises>" >> .claude/agent-test-receipts/${HEAD_SHA}.txt
+  schema/wiki-skill.md OR wiki-ingest path:
+      ./target/release/augmentagent --wiki-dir ./wiki --wiki-schema ./schema/wiki-skill.md poll-once
+      → observe: ingest writes the expected wiki/people or wiki/log entry.
 
-  3. Re-run \`gh pr create\`. The receipt path is keyed by HEAD sha, so a
-     rebase or amend voids the receipt — re-verify after any rewrite.
+  crates/augmentagent-channel-email/src/channel.rs (triage gate logic):
+      Seed a synthetic email in the emails table OR set AUGMENTAGENT_DRY_RUN=true and trigger poll-once,
+      then watch ~/.local/state/augmentagent/stdout.log for your new log prefix
+      ([skip:automated], [ingest-only:event-blast], [skip:already-replied], etc.).
+      → observe: the log line your gate emits actually appears for a matching input.
 
-The receipt is on-disk paper trail for human review; the hook does not
-parse its contents. The gate exists because #209/#211/#213 (and the
-follow-on #215 that finally fixed the root cause) all shipped untested
-and broke the agent for ~24h. Don't repeat that.
+  crates/augmentagent-channel-email/src/outbound.rs OR sigextract/tone (signal extraction):
+      cargo run --release -p augmentagent-cli -- <relevant subcommand> on a known input,
+      OR add an integration test that runs against a fixture file and assert the observable signal.
+
+  crates/augmentagent-channel-*/src/trigger.rs OR core/governor (poller / rate logic):
+      Run the daemon briefly (./target/release/augmentagent serve --dry-run true) and confirm the new
+      behaviour appears in stdout/stderr logs within one poll cycle.
+
+  crates/augmentagent-approval-discord/src/event_handler.rs OR loops.rs OR process_loops.rs:
+      Test against a live Discord DM (cheapest) OR run the local repro with serenity's test harness
+      if one exists. cargo test alone has historically missed serenity-event bugs.
+
+  skills/<name>/SKILL.md:
+      Invoke the skill in a fresh claude session and confirm the behaviour.
+
+Then write the receipt (this satisfies the gate — content is for human review, not parsed):
+
+  mkdir -p .claude/agent-test-receipts
+  cat > .claude/agent-test-receipts/${HEAD_SHA}.txt <<RECEIPT
+  command: <what you ran>
+  observed: <one-line summary; quote the relevant log line / output snippet>
+  verifies: <which changed file the test exercises>
+  RECEIPT
+
+Re-run \`gh pr create\`. The receipt path is keyed by HEAD sha, so any rebase or amend voids the receipt — re-verify after any rewrite.
+
+If you genuinely cannot live-exercise a change (e.g. a refactor with no observable behaviour delta), say so in the receipt — write "command: n/a refactor", "observed: cargo test green + no behaviour delta possible", "verifies: <files>". The hook does not parse the receipt; it only checks that the file exists and is non-empty. But document HONESTLY — a future agent reading the audit trail will catch lies.
 EOF
 )
 
