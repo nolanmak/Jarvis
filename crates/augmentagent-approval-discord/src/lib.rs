@@ -27,8 +27,8 @@ pub use event_handler::{chunk_for_discord, post_invoice_draft_card};
 pub use layout::{append_needs_input_marker, split_needs_input, NeedsInput};
 pub use loops::{
     handle_loop_command, match_loop_prefix, max_active_per_user, min_interval_secs,
-    parse_interval, pause_after_failures, LoopCommandParser, LoopPoster, LoopRunner,
-    LoopScheduler, ParsedLoop,
+    next_cron_firing_ms, normalize_and_validate_cron, parse_interval, pause_after_failures,
+    validate_tz, LoopCommandParser, LoopPoster, LoopRunner, LoopScheduler, ParsedLoop,
 };
 pub use nudge::NudgeScheduler;
 pub use status_bus::{StatusBus, StatusChanged};

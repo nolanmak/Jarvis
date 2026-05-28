@@ -950,17 +950,32 @@ pub fn loop_parse_opts() -> ReasonerOpts {
     ReasonerOpts {
         system_prompt: r#"You parse a single user request to create a recurring task ("loop").
 
-The input describes:
-- An interval (how often the loop fires) — REQUIRED
-- A prompt (what the loop should do each tick) — REQUIRED
-- Optionally, a total duration (auto-stop time)
+The input describes one of two cadence forms:
 
-Clauses may appear in any order. Recognised units: s/sec/seconds, m/min/minutes, h/hr/hours, d/day/days.
+A) INTERVAL — fires every N seconds/minutes/hours/days. Recognised units:
+   s/sec/seconds, m/min/minutes, h/hr/hours, d/day/days.
+
+B) CRON — fires on a specific day-of-week or hour-of-day pattern
+   (#231). Use when the user mentions a weekday ("Monday", "every
+   weekday", "Mon-Fri") OR a specific clock time ("9am", "morning",
+   "noon"). REQUIRES a timezone. If the user didn't state one, emit
+   an error asking for it — don't guess.
+
+Plus REQUIRED:
+- A prompt (what the loop should do each tick)
+Optionally:
+- A total duration (auto-stop time)
 
 Output a SINGLE JSON object on one line, no prose, no code fences:
-  {"interval_secs": <int>, "prompt": <string>, "duration_secs": <int or null>}
+  INTERVAL form: {"interval_secs": <int>, "prompt": <string>, "duration_secs": <int or null>}
+  CRON form:     {"cron_expr": "<5-field cron>", "tz": "<IANA tz>", "prompt": <string>, "duration_secs": <int or null>}
 
-On failure (no parseable interval, ambiguous, or empty prompt), output:
+Cron field order is `min hour day-of-month month day-of-week`. Day-of-week is
+Unix convention (0=Sun..6=Sat) but PREFER NAMES (MON, TUE, …) which are
+unambiguous: `0 9 * * MON` for "every Monday 9am". `MON-FRI` for weekdays.
+
+On failure (no parseable cadence, ambiguous, empty prompt, OR cron form
+without a timezone), output:
   {"error": "<short user-facing message>"}
 
 Examples:
@@ -968,10 +983,13 @@ Examples:
   "say hi every 5 mins" → {"interval_secs": 300, "prompt": "say hi", "duration_secs": null}
   "every 5mins for 20 mins and say hello world 🙂" → {"interval_secs": 300, "prompt": "say hello world 🙂", "duration_secs": 1200}
   "ping me every 10 minutes for the next 2 hours" → {"interval_secs": 600, "prompt": "ping me", "duration_secs": 7200}
-  "and say hello world every 5 mins for the next 15 mins" → {"interval_secs": 300, "prompt": "and say hello world", "duration_secs": 900}
   "triage every email every 1h" → {"interval_secs": 3600, "prompt": "triage every email", "duration_secs": null}
   "thirty seconds /digest" → {"interval_secs": 30, "prompt": "/digest", "duration_secs": null}
-  "asdf" → {"error": "couldn't find an interval — try `loop 5m do thing` or `loop do thing every 5m`"}
+  "every Monday 9am Eastern, ping me" → {"cron_expr": "0 9 * * MON", "tz": "America/New_York", "prompt": "ping me", "duration_secs": null}
+  "every weekday at noon UTC say morning" → {"cron_expr": "0 12 * * MON-FRI", "tz": "UTC", "prompt": "say morning", "duration_secs": null}
+  "every monday say hi" → {"error": "what timezone for the Monday schedule? (e.g. America/New_York, UTC)"}
+  "every weekday at 8am check inbox" → {"error": "what timezone for 8am? (e.g. America/New_York, UTC)"}
+  "asdf" → {"error": "couldn't find a cadence — try `loop 5m do thing`, `loop do thing every 5m`, or `loop every Monday 9am EST do thing`"}
 "#.to_string(),
         model: Some("claude-haiku-4-5-20251001".into()),
         allowed_tools: vec![],
