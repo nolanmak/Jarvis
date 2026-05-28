@@ -1041,6 +1041,30 @@ impl Store {
             [],
         )?;
 
+        // #218 — per-thread log of outbound messages the OutboundObserver has
+        // classified. Lets the inbound triage gate cheaply answer "has the
+        // user already replied on this thread after timestamp X?" without a
+        // live Gmail API call. One row per (entity_id, message_id); duplicates
+        // are ignored (idempotent re-poll). The cheap-signal companion to
+        // `outbound_state`'s cursor. Index on (thread_id, sent_at_ms) makes
+        // the "any newer reply?" query a covered point-lookup.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS outbound_thread_log (\
+                 entity_id    TEXT NOT NULL,\
+                 message_id   TEXT NOT NULL,\
+                 thread_id    TEXT,\
+                 sent_at_ms   INTEGER NOT NULL,\
+                 recorded_at_ms INTEGER NOT NULL,\
+                 PRIMARY KEY (entity_id, message_id)\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outbound_thread_log_thread_sent \
+             ON outbound_thread_log (thread_id, sent_at_ms)",
+            [],
+        )?;
+
         // #57 — proactive-nudge user actions. One row per user gesture
         // (snooze a signal, dismiss it, mute a person, mute a rule). The
         // proactive runner read-throughs this before dispatch; the dashboard
@@ -2356,6 +2380,70 @@ impl Store {
             params![entity_id, last_seen_sent_at_ms, now],
         )?;
         Ok(())
+    }
+
+    /// #218 — record one classified outbound message in the per-thread log.
+    /// Called by the OutboundObserver on every `Classification::Emit`.
+    /// Idempotent: re-inserting the same `(entity_id, message_id)` is a
+    /// no-op (`INSERT OR IGNORE`), so the observer can safely re-poll a
+    /// page without producing duplicate rows. Messages without a thread_id
+    /// are still recorded — they just won't satisfy the inbound
+    /// already-replied lookup (which requires a thread match).
+    pub fn record_outbound_thread_event(
+        &self,
+        entity_id: &str,
+        message_id: &str,
+        thread_id: Option<&str>,
+        sent_at_ms: i64,
+    ) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT OR IGNORE INTO outbound_thread_log \
+                 (entity_id, message_id, thread_id, sent_at_ms, recorded_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![entity_id, message_id, thread_id, sent_at_ms, now],
+        )?;
+        Ok(())
+    }
+
+    /// #218 — has the user sent any outbound message on `thread_id` whose
+    /// `sent_at_ms` is strictly greater than `after_ms`? The cheap-signal
+    /// half of the inbound-side "skip drafting when the user already
+    /// replied" check; the live Gmail thread-fetch fallback is deferred.
+    ///
+    /// Returns `Ok(false)` (not an error) when the `outbound_thread_log`
+    /// table doesn't exist yet — keeps the inbound gate working on old
+    /// stores that pre-date this migration. Same defensive shape used by
+    /// other recently-added read methods that probe migration-new tables.
+    pub fn thread_has_user_reply_after(
+        &self,
+        thread_id: &str,
+        after_ms: i64,
+    ) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let res = guard.query_row(
+            "SELECT 1 FROM outbound_thread_log \
+                 WHERE thread_id = ?1 AND sent_at_ms > ?2 LIMIT 1",
+            params![thread_id, after_ms],
+            |_| Ok(()),
+        );
+        match res {
+            Ok(()) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => {
+                // Old stores may not yet have the migration applied (e.g.
+                // an external snapshot opened read-only). Treat
+                // missing-table as "no recorded reply" rather than an
+                // error so the caller still drafts as before.
+                let msg = e.to_string();
+                if msg.contains("no such table") {
+                    Ok(false)
+                } else {
+                    Err(e.into())
+                }
+            }
+        }
     }
 
     /// Load a single action row plus its email body. Used by the Discord
@@ -7523,5 +7611,57 @@ mod tests {
         assert_eq!(s.outbound_last_seen("ent-2").unwrap(), None);
         s.set_outbound_last_seen("ent-2", 42).unwrap();
         assert_eq!(s.outbound_last_seen("ent-2").unwrap(), Some(42));
+    }
+
+    /// #218 — the per-thread outbound log answers the "user already
+    /// replied?" question with strict `> after_ms` semantics, is keyed by
+    /// thread so other threads don't shadow it, and is idempotent on
+    /// repeated inserts of the same `(entity_id, message_id)`.
+    #[test]
+    fn thread_has_user_reply_after_strict_and_per_thread() {
+        let (s, _f) = fresh_store();
+
+        // Empty log: every query is false.
+        assert!(!s.thread_has_user_reply_after("T1", 0).unwrap());
+        assert!(!s.thread_has_user_reply_after("T1", i64::MAX).unwrap());
+
+        // Record an outbound on T1 at 2_000.
+        s.record_outbound_thread_event("ent-1", "msg-A", Some("T1"), 2_000)
+            .unwrap();
+
+        // Strictly greater than: equal does NOT match.
+        assert!(s.thread_has_user_reply_after("T1", 1_999).unwrap());
+        assert!(!s.thread_has_user_reply_after("T1", 2_000).unwrap());
+        assert!(!s.thread_has_user_reply_after("T1", 2_001).unwrap());
+
+        // Different thread: never matches.
+        assert!(!s.thread_has_user_reply_after("T2", 0).unwrap());
+
+        // Add a second outbound on T2 — T1 lookups still see only T1 rows.
+        s.record_outbound_thread_event("ent-1", "msg-B", Some("T2"), 5_000)
+            .unwrap();
+        assert!(s.thread_has_user_reply_after("T2", 4_999).unwrap());
+        assert!(!s.thread_has_user_reply_after("T1", 4_999).unwrap());
+
+        // Idempotent: re-inserting the same (entity_id, message_id) is a
+        // no-op. The original timestamp wins.
+        s.record_outbound_thread_event("ent-1", "msg-A", Some("T1"), 99_999)
+            .unwrap();
+        assert!(!s.thread_has_user_reply_after("T1", 50_000).unwrap());
+
+        // A second outbound on T1 from a DIFFERENT entity with a newer
+        // timestamp is recorded independently and DOES make the lookup
+        // true past the original timestamp.
+        s.record_outbound_thread_event("ent-2", "msg-C", Some("T1"), 10_000)
+            .unwrap();
+        assert!(s.thread_has_user_reply_after("T1", 9_999).unwrap());
+
+        // NULL thread_id is recordable but never satisfies a thread
+        // lookup (SQL: `thread_id = ?` is unknown for NULL). After
+        // inserting a NULL-thread row at t=20_000, T-other still has no
+        // matching reply even though a numerically-newer row exists.
+        s.record_outbound_thread_event("ent-1", "msg-noth", None, 20_000)
+            .unwrap();
+        assert!(!s.thread_has_user_reply_after("T-other", 0).unwrap());
     }
 }
