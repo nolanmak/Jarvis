@@ -53,6 +53,7 @@ mod env_cfg;
 mod installers;
 mod invoice;
 mod logs;
+mod loop_cmd;
 mod loops;
 mod self_improve;
 mod service;
@@ -444,12 +445,23 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// #212 — list + stop user-scheduled loops in the sqlite `user_loops`
+    /// table. This is the surface for the Discord `/loop` scheduler (#104),
+    /// the common case when a user asks the bot "kill the hello world
+    /// loop": the row is in sqlite, the daemon ticks it, killing claude
+    /// PIDs does nothing. Distinct from `loops` (plural, #175) which is
+    /// OS-level process control for orphan Claude Code sessions.
+    Loop {
+        #[command(subcommand)]
+        op: loop_cmd::LoopOp,
+    },
     /// #175 — list + signal `claude` CLI processes on this host. Addresses
-    /// the orphaned-`/loop` bug (#174): a wakeup scheduled in one Claude
-    /// session keeps firing into Discord but no other session can see or
-    /// cancel it. `loops list` shows every claude PID; `loops stop <PID>`
-    /// sends SIGTERM (or SIGKILL with `--force`). `--all-but-current` nukes
-    /// every claude process except the caller's ancestor chain.
+    /// orphan Claude Code sessions whose `/loop` skill kept firing after the
+    /// session closed (the cross-session-state half of #174). `loops list`
+    /// shows every claude PID; `loops stop <PID>` sends SIGTERM (or SIGKILL
+    /// with `--force`). For Discord-scheduled `/loop` rows, use `loop`
+    /// (singular) instead — those run inside the daemon, no claude PID
+    /// involved.
     Loops {
         #[command(subcommand)]
         op: loops::LoopsOp,
@@ -2767,6 +2779,7 @@ async fn main() -> Result<()> {
             since,
             json,
         } => logs::run_logs(unit, follow, lines, since, json).await,
+        Cmd::Loop { op } => loop_cmd::run(store, op).await,
         Cmd::Loops { op } => loops::run(op).await,
         Cmd::Service { op, ref unit, json } => service::run_service(op, unit, json).await,
         Cmd::Setup { ref op } => setup::run_setup(op).await,
