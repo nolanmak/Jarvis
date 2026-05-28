@@ -134,6 +134,29 @@ export function initDb(dbPath?: string): Database.Database {
       page_token    TEXT NOT NULL,
       updated_at_ms INTEGER NOT NULL
     );
+    -- #238: SocialAPI.ai integration. Mirrors the Rust store migration so
+    -- both daemons share an identical schema. socialapi_accounts is the
+    -- registry of managed handles; socialapi_seen_comments dedupes inbound
+    -- comments per post.
+    CREATE TABLE IF NOT EXISTS socialapi_accounts (
+      id             TEXT PRIMARY KEY,
+      brand_id       TEXT,
+      platform       TEXT NOT NULL,
+      display_name   TEXT,
+      account_handle TEXT,
+      active         INTEGER NOT NULL DEFAULT 1,
+      created_at_ms  INTEGER NOT NULL,
+      updated_at_ms  INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_socialapi_accounts_active ON socialapi_accounts(active);
+    CREATE TABLE IF NOT EXISTS socialapi_seen_comments (
+      post_id       TEXT NOT NULL,
+      comment_id    TEXT NOT NULL,
+      author        TEXT,
+      text          TEXT,
+      seen_at_ms    INTEGER NOT NULL,
+      PRIMARY KEY (post_id, comment_id)
+    );
   `);
 
   // Additive migrations for existing DBs created before the platform/kind columns landed.
