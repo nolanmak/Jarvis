@@ -1,0 +1,16 @@
+{
+  "_comment": "Project-scoped Claude Code settings. The single hook below blocks `gh pr create` when the branch's diff vs origin/main touches any agent prompt / skill / reasoner-config file unless a verification receipt exists at `.claude/agent-test-receipts/<HEAD-sha>.txt`. Background: PRs #209/#211/#213 each claimed to fix #174/#212, all shipped untested via the actual code path, all left the bug live for ~24h. The receipt-keyed-by-HEAD design forces a fresh test on every rebase/amend. See scripts/agent-pr-verify-gate.sh for the full rationale and the agent-facing block message.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/scripts/agent-pr-verify-gate.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
