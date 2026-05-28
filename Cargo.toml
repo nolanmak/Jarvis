@@ -20,6 +20,7 @@ members = [
     "crates/augmentagent-channel-reddit",
     "crates/augmentagent-channel-socialapi",
     "crates/augmentagent-channel-meetup",
+    "crates/augmentagent-channel-luma",
     "crates/augmentagent-channel-gdrive",
     "crates/augmentagent-channel-contacts",
     "crates/augmentagent-channel-deft",
