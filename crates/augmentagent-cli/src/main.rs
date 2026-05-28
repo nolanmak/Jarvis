@@ -4904,6 +4904,10 @@ struct ReplyApprover {
     /// Optional GitHub REST client. `None` = no PAT in keyring; any
     /// github-tagged action hits `Failed`.
     github: Option<Arc<augmentagent_channel_github::GithubClient>>,
+    /// Optional SocialAPI.ai client. `None` = no `SOCIALAPI_API_KEY` /
+    /// keyring entry this run; any socialapi-tagged action hits `Failed`.
+    /// Drives the comment-reply / DM-reply send on Approve (#244).
+    socialapi: Option<Arc<augmentagent_channel_socialapi::SocialApiClient>>,
     reasoner: Arc<ClaudeCliReasoner>,
     draft_skill: String,
     wiki_root: Option<PathBuf>,
@@ -5186,6 +5190,147 @@ impl ReplyApprover {
             .store
             .mark_email_processed(&action.email.message_id, TriageResult::Reply);
         ApprovalActionOutcome::Skipped
+    }
+
+    /// Approve→send for SocialAPI.ai (#244). Routes by the action's `kind`:
+    ///   - `own_post_comment` → `reply_comment(post_id, …)` where the parent
+    ///     post id rides on `email.thread_id` (see own_posts.rs `into_email`).
+    ///   - `dm` → `send_dm(conversation_id, …)` where the conversation id
+    ///     rides on `email.thread_id` (see inbound.rs `into_email`).
+    /// On success marks the action `sent` (recording the returned external id
+    /// in the audit cause) and marks the source message processed; failures
+    /// surface as `Failed` and stamp the action `error`, mirroring the other
+    /// channels. The human approval gate has already passed by the time this
+    /// runs.
+    async fn approve_socialapi(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        let Some(client) = self.socialapi.as_ref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "SocialAPI.ai is not configured (no SOCIALAPI_API_KEY); \
+                          run `setup oauth --provider socialapi`"
+                    .into(),
+            };
+        };
+        let Some(body) = action.action.draft_body.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no draft body on action; cannot send".into(),
+            };
+        };
+        // Both comment-reply and DM-reply carry their send target on
+        // `email.thread_id` (parent post id / conversation id respectively).
+        let Some(target) = action.email.thread_id.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no thread id on email; cannot send socialapi reply".into(),
+            };
+        };
+        let req = augmentagent_channel_socialapi::ReplyRequest {
+            text: body.to_string(),
+        };
+
+        let kind = action.email.kind.as_str();
+        let send_result: anyhow::Result<String> = match kind {
+            k if k == augmentagent_channel_core::trigger::kind::OWN_POST_COMMENT => {
+                client.reply_comment(target, &req).await.map(|c| c.id)
+            }
+            k if k == augmentagent_channel_core::trigger::kind::DM => {
+                client.send_dm(target, &req).await.map(|m| m.id)
+            }
+            other => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("unsupported socialapi action kind `{other}`"),
+                };
+            }
+        };
+
+        match send_result {
+            Ok(external_id) => {
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Sent,
+                    Some(body),
+                    Some(&format!("socialapi {kind} -> {external_id}")),
+                );
+                let _ = self
+                    .store
+                    .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                tracing::info!(
+                    action_id,
+                    kind,
+                    external_id = %external_id,
+                    "socialapi reply sent via approval handler"
+                );
+                ApprovalActionOutcome::Approved
+            }
+            Err(e) => {
+                let msg = format!("socialapi {kind} send: {e}");
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                ApprovalActionOutcome::Failed { message: msg }
+            }
+        }
+    }
+
+    fn skip_socialapi(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        // Nothing to delete server-side — SocialAPI.ai has no draft concept.
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Rejected,
+            None,
+            Some("skipped by approver"),
+        );
+        let _ = self
+            .store
+            .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+        ApprovalActionOutcome::Skipped
+    }
+
+    async fn revise_socialapi(
+        &self,
+        action_id: &str,
+        feedback: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        // SocialAPI.ai has no server-side draft — we just regenerate the reply
+        // text, update the action row in place, and let the broker re-post the
+        // card. Mirrors `revise_discord` / `revise_linkedin`.
+        let previous_draft = action.action.draft_body.clone().unwrap_or_default();
+        let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
+        let prompt = augmentagent_channel_core::prompt::redraft_message(
+            &action.email,
+            &previous_draft,
+            feedback,
+        );
+        let redraft = match self.reasoner.call(&opts, &prompt).await {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("redraft call failed: {e}"),
+                };
+            }
+        };
+        let _ = self.store.update_action_status(
+            action_id,
+            ActionStatus::Pending,
+            Some(&redraft),
+            None,
+        );
+        let _ = self.store.reset_nudge_schedule(action_id);
+        tracing::info!(action_id, "socialapi revise: new draft persisted");
+        ApprovalActionOutcome::Revised {
+            email: action.email,
+            draft: redraft,
+        }
     }
 
     async fn approve_telegram(
@@ -5620,6 +5765,9 @@ impl ReplyApprover {
         if action.email.platform == "github" {
             return self.approve_github(action_id, action).await;
         }
+        if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
+            return self.approve_socialapi(action_id, action).await;
+        }
         if is_linkedin_email(&action.email) {
             return self.approve_linkedin(action_id, action).await;
         }
@@ -5688,6 +5836,9 @@ impl ReplyApprover {
         if action.email.platform == "github" {
             return self.skip_github(action_id, action);
         }
+        if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
+            return self.skip_socialapi(action_id, action);
+        }
         if is_linkedin_email(&action.email) {
             return self.skip_linkedin(action_id, action);
         }
@@ -5732,6 +5883,9 @@ impl ReplyApprover {
         }
         if action.email.platform == "github" {
             return self.revise_github(action_id, feedback, action).await;
+        }
+        if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
+            return self.revise_socialapi(action_id, feedback, action).await;
         }
         if is_linkedin_email(&action.email) {
             return self.revise_linkedin(action_id, feedback, action).await;
@@ -5872,6 +6026,7 @@ async fn build_broker(
     let slack = load_slack_clients(&store);
     let telegram = load_telegram_bot_clients(&store);
     let github = load_github_client();
+    let socialapi = load_socialapi_client();
     // Keep handles for the broker before `store` is moved into the approver:
     // the `!invoice` config command and #37 Revise-triple capture.
     let invoice_store = Arc::clone(&store);
@@ -5887,6 +6042,7 @@ async fn build_broker(
         slack,
         telegram,
         github,
+        socialapi,
         reasoner: Arc::clone(&reasoner),
         draft_skill,
         wiki_root: cli.wiki_dir.clone(),
@@ -7395,6 +7551,23 @@ fn load_github_client() -> Option<Arc<augmentagent_channel_github::GithubClient>
         },
         Err(e) => {
             info!("github auth not loaded: {e:#} (github outbound disabled this run)");
+            None
+        }
+    }
+}
+
+/// Best-effort SocialAPI.ai client load for the approver (#244). `None` ⇒
+/// socialapi outbound (comment-reply / DM-reply send on Approve) disabled this
+/// run; the comment/DM pollers still surface approval cards, but Approve will
+/// surface a `Failed` until the key is configured. Gated on
+/// `SOCIALAPI_API_KEY` / keyring, mirroring `load_discord_client`.
+fn load_socialapi_client() -> Option<Arc<augmentagent_channel_socialapi::SocialApiClient>> {
+    match augmentagent_channel_socialapi::SocialApiAuth::load() {
+        Ok(auth) => Some(Arc::new(augmentagent_channel_socialapi::SocialApiClient::new(
+            auth,
+        ))),
+        Err(e) => {
+            info!("socialapi auth not loaded: {e} (socialapi send disabled this run)");
             None
         }
     }

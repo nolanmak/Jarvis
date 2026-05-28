@@ -161,6 +161,33 @@ impl InboundSource for SocialApiDmSource {
                 }
             };
             for conv in conversations {
+                // #244 supersede: if the user has manually replied in this
+                // thread (an outbound message we didn't send via Approve),
+                // flip any still-pending socialapi draft on the conversation to
+                // `superseded` so a stale card never re-sends what the user
+                // already answered. Mirrors the email outbound observer. Keyed
+                // on the conversation id, which is the draft's `thread_id`.
+                // Best-effort: a store error here must not block fetching new
+                // inbound work.
+                let user_replied = conv.messages.iter().any(|m| !is_inbound(&conv, m));
+                if user_replied {
+                    match self.store.mark_pending_drafts_superseded_by_thread(
+                        &conv.id,
+                        "superseded by manual reply",
+                    ) {
+                        Ok(ids) if !ids.is_empty() => {
+                            info!(
+                                conversation = %conv.id,
+                                superseded = ids.len(),
+                                "socialapi dm source: superseded pending drafts after manual reply"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(conversation = %conv.id, "socialapi dm source: supersede failed: {e}");
+                        }
+                    }
+                }
                 for msg in &conv.messages {
                     if budget == 0 {
                         break;
@@ -557,6 +584,58 @@ mod tests {
         // Second poll → all already in socialapi_seen_dms → empty.
         let second = source.fetch_new().await.unwrap();
         assert!(second.is_empty());
+    }
+
+    /// #244 supersede: a manual (outbound) reply in a conversation flips any
+    /// still-pending socialapi draft on that thread to `superseded` on the
+    /// next source poll, mirroring the email outbound observer.
+    #[tokio::test]
+    async fn source_supersedes_pending_draft_on_manual_reply() {
+        let (store, _f) = tmp_store();
+        // Seed a pending socialapi DM draft on conversation conv_1.
+        let email = SocialApiDmPayload {
+            conversation_id: "conv_1".into(),
+            account_id: "acc_1".into(),
+            with: "jane".into(),
+            message_id: "m1".into(),
+            author: "jane".into(),
+            text: "hey".into(),
+            created_at: "2026-05-28T00:00:00Z".into(),
+        }
+        .into_email();
+        store.upsert_email(&email).unwrap();
+        let action_id = store
+            .log_action(
+                &email.message_id,
+                email.thread_id.as_deref(),
+                &email.from,
+                &email.subject,
+                Some(&email.body),
+                Some("a pending draft reply"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+
+        // Conversation now shows our own outbound message → the user replied.
+        let server = MockServer::start().await;
+        mount_conversations(
+            &server,
+            serde_json::json!([
+                {
+                    "id": "conv_1", "account_id": "acc_1", "with": "jane",
+                    "messages": [
+                        {"id":"m1","author":"jane","text":"hey","created_at":"2026-05-28T00:00:00Z"},
+                        {"id":"m2","author":"me","text":"manual reply","created_at":"2026-05-28T00:05:00Z"}
+                    ]
+                }
+            ]),
+        )
+        .await;
+        let source = SocialApiDmSource::new(client(&server), Arc::clone(&store), 10);
+        let _ = source.fetch_new().await.unwrap();
+
+        let row = store.get_action_with_email(&action_id).unwrap().unwrap();
+        assert_eq!(row.action.status, "superseded");
     }
 
     #[tokio::test]
