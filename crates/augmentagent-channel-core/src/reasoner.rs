@@ -608,8 +608,14 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // without forcing the user to know the prefix. Destructive but
     // explicitly authorised — the system prompt requires the agent to
     // resolve the target via `loops list` before calling `loops stop`.
-    let bash_loops_list = format!("Bash({} loops list*)", bin.display());
-    let bash_loops_stop = format!("Bash({} loops stop *)", bin.display());
+    //
+    // #210: original pair `loops list*` + `loops stop *` was wrong. The
+    // claude permission glob only expands `*` after a separator (space) —
+    // `list*` without a separating space falls through to "requires
+    // approval". Collapsed to a single `loops *` rule that mirrors the
+    // `gmail *` pattern and covers list / list --json / stop <pid> /
+    // stop <pid> --force / stop --all-but-current in one entry.
+    let bash_loops = format!("Bash({} loops *)", bin.display());
     // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
     // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
     // resolves the db regardless of cwd.
@@ -668,8 +674,7 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_invoice_set_recipient,
             bash_invoice_set_entity,
             bash_invoice_set_auto_draft,
-            bash_loops_list,
-            bash_loops_stop,
+            bash_loops,
             format!("Bash({} issue create *)", aa_gh.display()),
             format!("Bash({} issue list *)", aa_gh.display()),
             format!("Bash({} issue view *)", aa_gh.display()),
