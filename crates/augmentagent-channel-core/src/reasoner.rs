@@ -777,12 +777,26 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // are dead letters (shell would fail with "command not found" even
     // if the harness allowed the string). The systemd unit's PATH does
     // not include `target/release` by default.
+    //
+    // Same rationale extends to `scripts/` for the `aa-gh` shim: the
+    // bare-form `Bash(aa-gh issue ... *)` patterns registered below are
+    // only useful if the shim actually resolves on PATH. PR #199 wired
+    // up `aa-gh` by absolute path only, so the bare form the model
+    // tends to type (matching the schema's command examples) hit
+    // "command not found" / "This command requires approval" in
+    // production. Putting `scripts/` on PATH closes that loop.
     if let Some(parent) = bin.parent() {
+        let scripts_dir = repo_root.join("scripts");
         let existing = std::env::var("PATH").unwrap_or_default();
         let prepended = if existing.is_empty() {
-            parent.to_string_lossy().into_owned()
+            format!("{}:{}", parent.display(), scripts_dir.display())
         } else {
-            format!("{}:{}", parent.display(), existing)
+            format!(
+                "{}:{}:{}",
+                parent.display(),
+                scripts_dir.display(),
+                existing
+            )
         };
         env.push(("PATH".into(), prepended));
     }
@@ -823,6 +837,19 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             format!("Bash({} issue list *)", aa_gh.display()),
             format!("Bash({} issue view *)", aa_gh.display()),
             format!("Bash({} issue comment *)", aa_gh.display()),
+            // Bare form. The model tends to copy the bare `aa-gh ...`
+            // shape from the schema's command examples even when the
+            // surrounding prose says "absolute path required" — the
+            // claude permission matcher does literal string matching,
+            // so the absolute-path patterns above don't cover the bare
+            // form. Without these four entries the wiki-query agent
+            // hits "This command requires approval" on perfectly
+            // legitimate issue-filing calls. (PATH wired above; same
+            // pattern as `augmentagent` subcommands per #214.)
+            "Bash(aa-gh issue create *)".to_string(),
+            "Bash(aa-gh issue list *)".to_string(),
+            "Bash(aa-gh issue view *)".to_string(),
+            "Bash(aa-gh issue comment *)".to_string(),
         ],
         add_dirs: vec![wiki_root.clone()],
         permission_mode: "acceptEdits".into(),
@@ -1429,6 +1456,60 @@ mod tests {
             .map(|(_, v)| v.clone())
             .expect("WIKI_ROOT env var must be forwarded to the guard");
         assert_eq!(wiki_env, wiki.path().to_string_lossy());
+    }
+
+    /// Regression test for the PR #199 follow-up: `aa-gh` must be
+    /// reachable both as bare `aa-gh ...` and by absolute path, and
+    /// `<repo>/scripts/` must be on PATH so the bare form actually
+    /// resolves in shell. The original wire-in only registered the
+    /// absolute-path patterns and did not extend PATH, which left the
+    /// wiki-query agent hitting "This command requires approval" on
+    /// every bare-form issue-filing call (the same shape used by the
+    /// command examples in `schema/wiki-ask.md`).
+    #[test]
+    fn ask_opts_allows_aa_gh_both_forms_and_extends_path() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        let _guard = EnvGuard::unset("AUGMENTAGENT_DB");
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+
+        let joined = opts.allowed_tools.join("\n");
+        for bare in [
+            "Bash(aa-gh issue create *)",
+            "Bash(aa-gh issue list *)",
+            "Bash(aa-gh issue view *)",
+            "Bash(aa-gh issue comment *)",
+        ] {
+            assert!(
+                opts.allowed_tools.iter().any(|e| e == bare),
+                "expected bare-form allowlist entry {bare}; got:\n{joined}"
+            );
+        }
+        let aa_gh_abs = repo
+            .path()
+            .join("scripts/aa-gh")
+            .display()
+            .to_string();
+        for sub in ["issue create *", "issue list *", "issue view *", "issue comment *"] {
+            let needle = format!("Bash({aa_gh_abs} {sub})");
+            assert!(
+                opts.allowed_tools.iter().any(|e| e == &needle),
+                "expected absolute-path allowlist entry {needle}; got:\n{joined}"
+            );
+        }
+
+        let path_env = opts
+            .env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .expect("PATH env var must be forwarded to the spawned agent");
+        let scripts_dir = repo.path().join("scripts").display().to_string();
+        assert!(
+            path_env.split(':').any(|seg| seg == scripts_dir),
+            "PATH must contain {scripts_dir} so bare `aa-gh` resolves; got: {path_env}"
+        );
     }
 
     /// Load-bearing safety invariant: the LLM must never be able to invoke

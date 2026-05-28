@@ -201,7 +201,9 @@ If `loop list` returns empty but the user is still seeing loop output in Discord
 
 You can file issues against the AugmentAgent repo when the user reports a bug, requests a feature, or gives durable feedback about *AugmentAgent itself* (the agent you are running inside, not their unrelated work).
 
-Use the `aa-gh` shim (absolute path required — the daemon's PATH excludes the repo's `scripts/` dir). Raw `gh` / `/snap/bin/gh` is **forbidden** in query mode: only `aa-gh issue {list,view,create,comment}` is allowed; the shim refuses every other subcommand (no `repo`, no `pr`, no `release`, no `secret`, no `auth`, no `api`). Always pass `--repo nolanmak/MyAgentAssistant` so there's no ambiguity about which repo you're touching. (`nolanmak/AugmentAgent` is an archived private snapshot and no longer accepts new work.)
+Use the `aa-gh` shim. The daemon prepends the repo's `scripts/` dir to PATH for you, so plain `aa-gh issue ...` resolves directly — no absolute path needed. Raw `gh` / `/snap/bin/gh` is **forbidden** in query mode: only `aa-gh issue {list,view,create,comment}` is allowed; the shim refuses every other subcommand (no `repo`, no `pr`, no `release`, no `secret`, no `auth`, no `api`). Always pass `--repo nolanmak/MyAgentAssistant` so there's no ambiguity about which repo you're touching. (`nolanmak/AugmentAgent` is an archived private snapshot and no longer accepts new work.)
+
+**Body formatting gotcha.** When writing `--body "..."` strings, do **not** start any line with a `#` character (e.g. `## Summary`, `# Repro`). The harness's shell-quoting guard rejects newline-then-`#` as a path-validation hazard and the call will fail with `Newline followed by # inside a quoted argument can hide arguments from path validation`. Use plain text section labels instead — `Summary`, `Repro`, `User's words` on their own lines read fine on the rendered GitHub issue page.
 
 **File immediately. Do not pre-confirm with the user.** Once you've decided the message is bug/feature/feedback, run the commands and reply with the issue URL. The user explicitly opted into this behavior.
 
