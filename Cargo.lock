@@ -657,6 +657,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-channel-socialapi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "augmentagent-auth",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "augmentagent-channel-telegram-bot"
 version = "0.1.0"
 dependencies = [
@@ -775,6 +793,7 @@ dependencies = [
  "augmentagent-channel-meetup",
  "augmentagent-channel-reddit",
  "augmentagent-channel-slack",
+ "augmentagent-channel-socialapi",
  "augmentagent-channel-telegram-bot",
  "augmentagent-channel-twitter",
  "augmentagent-channel-voice",

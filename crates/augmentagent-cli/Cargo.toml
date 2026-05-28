@@ -17,6 +17,8 @@ augmentagent-channel-reddit = { path = "../augmentagent-channel-reddit" }
 augmentagent-channel-email = { path = "../augmentagent-channel-email" }
 augmentagent-channel-linkedin = { path = "../augmentagent-channel-linkedin" }
 augmentagent-channel-twitter = { path = "../augmentagent-channel-twitter" }
+# #240 — SocialAPI.ai outbound publisher arm in MultiPlatformPublisher.
+augmentagent-channel-socialapi = { path = "../augmentagent-channel-socialapi" }
 augmentagent-channel-discord-dm = { path = "../augmentagent-channel-discord-dm" }
 augmentagent-channel-slack = { path = "../augmentagent-channel-slack" }
 augmentagent-channel-github = { path = "../augmentagent-channel-github" }
