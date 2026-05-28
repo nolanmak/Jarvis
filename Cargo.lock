@@ -262,9 +262,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "augmentagent-loops",
  "augmentagent-store",
  "chrono",
  "dashmap 6.1.0",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -773,6 +775,7 @@ dependencies = [
  "augmentagent-channel-twitter",
  "augmentagent-channel-voice",
  "augmentagent-content-adapter",
+ "augmentagent-loops",
  "augmentagent-proactive",
  "augmentagent-renderer-client",
  "augmentagent-store",
@@ -812,6 +815,16 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "augmentagent-loops"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "tokio",
 ]
 
 [[package]]

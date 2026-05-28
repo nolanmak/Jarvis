@@ -14,6 +14,7 @@ mod event_handler;
 mod layout;
 mod loops;
 mod nudge;
+mod process_loops;
 mod status_bus;
 mod surface;
 mod presets;

@@ -38,6 +38,9 @@ augmentagent-renderer-client = { path = "../augmentagent-renderer-client" }
 augmentagent-proactive = { path = "../augmentagent-proactive" }
 augmentagent-channel-voice = { path = "../augmentagent-channel-voice" }
 augmentagent-content-adapter = { path = "../augmentagent-content-adapter" }
+# #176 — shared /proc walker + signal primitive consumed by both `loops`
+# and the Discord `!loops` command (avoids a circular dep through the cli bin).
+augmentagent-loops = { path = "../augmentagent-loops" }
 
 async-trait = { workspace = true }
 serenity = { workspace = true }
@@ -59,10 +62,9 @@ uuid = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 
-# #175 — `augmentagent loops` walks /proc directly and signals PIDs via
-# `libc::kill`. `libc` is the lightest std-extension that covers the SIGTERM
-# / SIGKILL / ESRCH constants and `sysconf(_SC_CLK_TCK)` for elapsed-time
-# math; pulling `nix` for ~3 calls would be heavier than needed.
+# #175/#176 — clap layer + test helpers still need libc constants for the
+# fake `Signaler` that returns ESRCH; the real walker + kill live in the
+# `augmentagent-loops` shared crate so the Discord channel can call them.
 libc = "0.2"
 
 # #14 — snapshot test for the `augmentagent status --json` schema. `insta`
