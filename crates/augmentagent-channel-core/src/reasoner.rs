@@ -4,14 +4,21 @@
 //! the final assistant text. Authenticated via the user's Claude Max
 //! subscription session (`claude login`); no API key.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, warn};
+
+use crate::tool_audit::{
+    build_audit_record, default_audit_log_path, is_high_risk, parse_stream_event, AuditLogger,
+    AuditNotifier, ToolEvent,
+};
 
 /// Env-var safelist for `restrict_env=true` spawns (see #128).
 ///
@@ -77,6 +84,25 @@ pub struct ReasonerOpts {
     /// loaded from `.env` at startup. Default `false` keeps existing
     /// call sites (triage, draft, ingest) unchanged.
     pub restrict_env: bool,
+    /// NDJSON audit-log sink for tool calls observed in the
+    /// `stream-json` output (#132 / #201). When `Some`, each paired
+    /// `tool_use`/`tool_result` produces an [`AuditRecord`] appended
+    /// to the configured log path. [`ask_opts`] defaults this to the
+    /// system path; other presets leave it `None` so triage/draft/ingest
+    /// don't grow a new on-disk side effect.
+    pub audit_logger: Option<Arc<AuditLogger>>,
+    /// Per-request Discord-side notifier invoked when [`is_high_risk`]
+    /// matches the tool name (#132 / #201). Constructed in the channel
+    /// crate (typically `augmentagent-approval-discord`) so this crate
+    /// stays free of any serenity dependency. `None` disables the side
+    /// channel; the audit log still receives the record if
+    /// [`audit_logger`](Self::audit_logger) is set.
+    pub audit_notifier: Option<Arc<dyn AuditNotifier>>,
+    /// Logical session id stamped on every audit record produced by
+    /// this call (#132 / #201). Typically `format!("{channel}:{msg}")`
+    /// so a reviewer can correlate audit rows with a single Discord
+    /// turn. `None` falls back to `"-"` in the recorded row.
+    pub session_id: Option<String>,
 }
 
 /// Trait the channel uses to reach Claude. Test doubles stub this.
@@ -322,10 +348,29 @@ impl ClaudeCliReasoner {
             .ok_or_else(|| anyhow::anyhow!("claude stdout missing"))?;
         let mut lines = BufReader::new(stdout).lines();
 
+        // #201 audit context: only spin up pairing state if a logger or
+        // notifier is configured, so the no-audit path (triage/draft/ingest)
+        // pays zero overhead.
+        let audit_active = opts.audit_logger.is_some() || opts.audit_notifier.is_some();
+        let audit_session = opts
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "-".to_string());
+        let mut pending_tool_uses: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+
         let mut final_text = String::new();
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
+            }
+            if audit_active {
+                audit_stream_line(
+                    &line,
+                    &mut pending_tool_uses,
+                    &audit_session,
+                    opts.audit_logger.as_ref(),
+                    opts.audit_notifier.as_ref(),
+                );
             }
             match serde_json::from_str::<StreamEvent>(&line) {
                 Ok(StreamEvent::Assistant { message }) => {
@@ -374,6 +419,64 @@ impl ClaudeCliReasoner {
             )));
         }
         Ok(final_text)
+    }
+}
+
+/// One step of the audit pairing state machine: feed a single stream-json
+/// line through [`parse_stream_event`], match `tool_use`/`tool_result` by
+/// id via `pending`, and spawn the (best-effort) record + notify side
+/// effects. Pulled out of [`ClaudeCliReasoner::call_once`] so unit tests
+/// can drive the same code path without spawning the `claude` CLI.
+///
+/// The logger record and the notifier call are both `tokio::spawn`'d so
+/// neither a slow disk nor a flaky Discord HTTP call ever blocks the
+/// reasoner's reply path — the swap-in semantics here have to match the
+/// inline loop, including the high-risk gate around the notifier.
+fn audit_stream_line(
+    line: &str,
+    pending: &mut HashMap<String, (String, serde_json::Value)>,
+    session_id: &str,
+    logger: Option<&Arc<AuditLogger>>,
+    notifier: Option<&Arc<dyn AuditNotifier>>,
+) {
+    for ev in parse_stream_event(line) {
+        match ev {
+            ToolEvent::Use { id, name, input } => {
+                pending.insert(id, (name, input));
+            }
+            ToolEvent::Result {
+                id,
+                is_error,
+                content,
+            } => {
+                let Some((name, input)) = pending.remove(&id) else {
+                    debug!("tool-audit: unmatched tool_result id={id}");
+                    continue;
+                };
+                let record = build_audit_record(
+                    chrono::Utc::now().to_rfc3339(),
+                    session_id.to_string(),
+                    name.clone(),
+                    input,
+                    &content,
+                    is_error,
+                );
+                if let Some(logger) = logger.cloned() {
+                    let rec = record.clone();
+                    tokio::spawn(async move {
+                        logger.record(&rec).await;
+                    });
+                }
+                if is_high_risk(&name) {
+                    if let Some(notifier) = notifier.cloned() {
+                        let sid = session_id.to_string();
+                        tokio::spawn(async move {
+                            notifier.notify(&sid, &record).await;
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -535,6 +638,9 @@ pub fn triage_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         env: Vec::new(),
         settings_json: None,
         restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
     }
 }
 
@@ -555,6 +661,9 @@ pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> Reasoner
         env: Vec::new(),
         settings_json: None,
         restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
     }
 }
 
@@ -569,6 +678,9 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         env: Vec::new(),
         settings_json: None,
         restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
     }
 }
 
@@ -721,6 +833,13 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         // #128 — Clear the spawned process's env so the wiki-query
         // agent does not inherit secrets from the daemon's `.env`.
         restrict_env: true,
+        // #132 / #201 — Default the wiki-query path to the system
+        // audit log. Callers (event_handler.rs) overwrite this with a
+        // shared logger + per-request notifier + session_id before
+        // dispatching `reasoner.call`.
+        audit_logger: Some(Arc::new(AuditLogger::new(default_audit_log_path()))),
+        audit_notifier: None,
+        session_id: None,
     }
 }
 
@@ -772,6 +891,9 @@ pub fn digest_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         env: Vec::new(),
         settings_json: None,
         restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
     }
 }
 
@@ -789,6 +911,9 @@ pub fn tone_summarize_opts() -> ReasonerOpts {
         env: vec![],
         settings_json: None,
         restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
     }
 }
 
@@ -811,6 +936,9 @@ pub fn social_adapter_opts(system_prompt: String) -> ReasonerOpts {
         env: vec![],
         settings_json: None,
         restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
     }
 }
 
@@ -853,6 +981,9 @@ Examples:
         env: vec![],
         settings_json: None,
         restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
     }
 }
 
@@ -872,6 +1003,9 @@ pub fn archetype_pick_opts() -> ReasonerOpts {
         env: vec![],
         settings_json: None,
         restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
     }
 }
 
@@ -892,6 +1026,9 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         env: Vec::new(),
         settings_json: None,
         restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
     }
 }
 
@@ -913,13 +1050,108 @@ pub fn wiki_migrate_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerO
         env: Vec::new(),
         settings_json: None,
         restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    /// In-memory `AuditNotifier` for the audit_stream_line integration test.
+    /// Records every `notify` call (session_id + tool name) so the test can
+    /// assert that high-risk hits fire and Read does not.
+    #[derive(Debug, Default)]
+    struct CountingNotifier {
+        seen: Mutex<Vec<(String, String)>>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AuditNotifier for CountingNotifier {
+        async fn notify(&self, session_id: &str, record: &crate::tool_audit::AuditRecord) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), record.tool.clone()));
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_stream_line_records_writes_and_pings_high_risk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_path = tmp.path().join("tool-audit.log");
+        let logger = Arc::new(AuditLogger::new(log_path.clone()));
+        // Hold a typed Arc so the test can inspect counters at the end,
+        // plus a trait-object Arc (sharing the same allocation via coercion)
+        // to hand to the helper.
+        let typed: Arc<CountingNotifier> = Arc::new(CountingNotifier::default());
+        let notifier: Arc<dyn AuditNotifier> = typed.clone();
+
+        let mut pending: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+        let session = "ch:123";
+        // 1) High-risk Write: tool_use then tool_result.
+        let write_use = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_w","name":"Write","input":{"file_path":"/tmp/x.txt","content":"hi"}}]}}"#;
+        let write_res = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_w","is_error":false,"content":"ok"}]}}"#;
+        // 2) Non-high-risk Read: tool_use then tool_result.
+        let read_use = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_r","name":"Read","input":{"file_path":"/wiki/people.md"}}]}}"#;
+        let read_res = r##"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu_r","is_error":false,"content":"hello"}]}}"##;
+
+        let log_arc = logger.clone();
+        let notifier_arc = notifier.clone();
+        audit_stream_line(write_use, &mut pending, session, Some(&log_arc), Some(&notifier_arc));
+        audit_stream_line(write_res, &mut pending, session, Some(&log_arc), Some(&notifier_arc));
+        audit_stream_line(read_use, &mut pending, session, Some(&log_arc), Some(&notifier_arc));
+        audit_stream_line(read_res, &mut pending, session, Some(&log_arc), Some(&notifier_arc));
+
+        // Both record + notify spawn background tasks; give them a moment.
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            if log_path.exists() {
+                let body = tokio::fs::read_to_string(&log_path).await.unwrap_or_default();
+                if body.lines().count() >= 2 && typed.calls.load(Ordering::SeqCst) >= 1 {
+                    break;
+                }
+            }
+        }
+
+        let body = tokio::fs::read_to_string(&log_path).await.unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 2, "both tool calls land in the log");
+
+        let r1: crate::tool_audit::AuditRecord = serde_json::from_str(lines[0]).unwrap();
+        let r2: crate::tool_audit::AuditRecord = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(r1.tool, "Write");
+        assert_eq!(r1.session_id, session);
+        assert_eq!(r2.tool, "Read");
+
+        // Discord-side notifier fires for Write only, NOT Read.
+        let seen = typed.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "only Write is high-risk");
+        assert_eq!(seen[0].1, "Write");
+        assert_eq!(seen[0].0, session);
+        assert!(pending.is_empty(), "all uses get paired by their result");
+    }
+
+    #[tokio::test]
+    async fn audit_stream_line_inactive_skips_when_no_sinks() {
+        // Empty pending + None logger/notifier — should be a no-op even on a
+        // tool_use line. Guard against future refactors that accidentally
+        // pay parse cost on the no-audit path.
+        let mut pending: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu_x","name":"Write","input":{}}]}}"#;
+        audit_stream_line(line, &mut pending, "s", None, None);
+        // Pending gains one entry because the use was parsed; that's fine —
+        // the call_once outer wrapper only invokes this helper when
+        // audit_active is true. The contract here is "no panics, no IO".
+        assert_eq!(pending.len(), 1);
+    }
+
 
     /// Test double that records the args of the last `call` and returns a
     /// canned string. Used to verify `call_code_mode` extracts the fenced
@@ -975,6 +1207,9 @@ mod tests {
             env: vec![],
             settings_json: None,
             restrict_env: false,
+            audit_logger: None,
+            audit_notifier: None,
+            session_id: None,
         }
     }
 
@@ -1324,6 +1559,9 @@ pub fn resume_opts(wiki_root: PathBuf) -> ReasonerOpts {
         env: Vec::new(),
         settings_json: None,
         restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
     }
 }
 

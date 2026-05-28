@@ -4437,9 +4437,50 @@ struct WikiQuerier {
 
 #[async_trait]
 impl QueryHandler for WikiQuerier {
-    async fn answer(&self, question: &str) -> anyhow::Result<String> {
-        let opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
+    async fn answer(
+        &self,
+        ctx: &augmentagent_approval_discord::AuditCtx,
+        question: &str,
+    ) -> anyhow::Result<String> {
+        let mut opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
+        // #132 / #201 — Stamp this request's session id onto every audit
+        // record produced by the spawn, and (if we have the bits from the
+        // Discord side) plug in a per-request notifier so high-risk tool
+        // calls ping back to the originating channel.
+        opts.session_id = Some(ctx.session_id.clone());
+        if let (Some(http), Some(channel_id)) = (ctx.http.clone(), ctx.channel_id) {
+            opts.audit_notifier = Some(std::sync::Arc::new(DiscordAuditNotifier {
+                http,
+                channel_id,
+            }));
+        }
         self.reasoner.call(&opts, question).await
+    }
+}
+
+/// Bridge: turns the raw serenity bits in `AuditCtx` into a channel-core
+/// [`AuditNotifier`] impl. Lives in the CLI crate because it's the only
+/// crate that depends on BOTH the discord crate (for `serenity` + `AuditCtx`)
+/// and channel-core (for the trait). Sees `&AuditRecord` directly so it can
+/// reuse [`augmentagent_channel_core::format_notice`] verbatim.
+#[derive(Debug, Clone)]
+struct DiscordAuditNotifier {
+    http: std::sync::Arc<serenity::http::Http>,
+    channel_id: serenity::model::id::ChannelId,
+}
+
+#[async_trait]
+impl augmentagent_channel_core::AuditNotifier for DiscordAuditNotifier {
+    async fn notify(
+        &self,
+        _session_id: &str,
+        record: &augmentagent_channel_core::AuditRecord,
+    ) {
+        let body = augmentagent_channel_core::format_notice(record);
+        let builder = serenity::builder::CreateMessage::new().content(body);
+        if let Err(e) = self.channel_id.send_message(&*self.http, builder).await {
+            tracing::warn!("tool-audit notify failed: {e}");
+        }
     }
 }
 
