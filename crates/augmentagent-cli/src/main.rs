@@ -2154,10 +2154,19 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
-                // Stale-draft sweep (#99): periodically expire pending
-                // approvals older than AUGMENTAGENT_STALE_DRAFT_DAYS (default
-                // 7d) to `timed_out`, so an abandoned backlog can't sit
-                // forever blocking new triage via backpressure. Runs hourly.
+                // Approval auto-expire sweep (#99 / #220): periodically
+                // expire pending approvals older than
+                // AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_DAYS (default 7d,
+                // `0` = disabled, legacy alias
+                // AUGMENTAGENT_STALE_DRAFT_DAYS) to `timed_out`, so an
+                // abandoned backlog can't sit forever blocking new triage
+                // via backpressure (#99). Tick interval is
+                // AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_INTERVAL_SECS
+                // (default 3600 = 1h). Per-id audit lines (#220) land in
+                // stdout for grep-ability. NOTE: the Discord card for
+                // each expired id is NOT edited/deleted in this pass —
+                // that hygiene pass is a deliberate follow-on; we ship
+                // the sweep first.
                 let sweep_store = Arc::clone(&store);
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move {
@@ -2917,7 +2926,8 @@ fn run_approvals_discard_older(store: Arc<Store>, days: i64, yes: bool) -> Resul
         }
         return Ok(());
     }
-    let swept = store.expire_pending_older_than(cutoff_ms)?;
+    let swept_ids = store.expire_pending_older_than(cutoff_ms)?;
+    let swept = swept_ids.len();
     info!(swept, days, "approvals discard-older complete");
     for (id, from, subject, age_ms) in &stale {
         println!(
@@ -3616,10 +3626,6 @@ async fn backfill_gmail_emails(store: &Store, only_missing: bool) -> Result<Vec<
     Ok(lines)
 }
 
-/// Hourly stale-draft sweep (#99). Expires pending approvals older than
-/// `AUGMENTAGENT_STALE_DRAFT_DAYS` (default 7) to `timed_out` so an abandoned
-/// backlog can't permanently wedge new triage behind backpressure. Best-effort
-/// — a failed sweep logs and retries next tick; it never takes the daemon down.
 /// #219 — periodically observe outbound (SENT) Gmail and supersede stale
 /// pending drafts on threads the user replied to out-of-band.
 ///
@@ -3676,38 +3682,122 @@ async fn run_outbound_observer(
     }
 }
 
-async fn run_stale_draft_sweep(
-    store: Arc<Store>,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let days: i64 = std::env::var("AUGMENTAGENT_STALE_DRAFT_DAYS")
+/// Configured cutoff (in days) for the periodic auto-expire sweep (#220).
+///
+/// Resolution order:
+/// 1. `AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_DAYS` (the #220 canonical name).
+/// 2. `AUGMENTAGENT_STALE_DRAFT_DAYS` (the #99 legacy name — kept so
+///    existing deploys don't silently flip back to defaults on upgrade).
+/// 3. Default `7` (one week — matches the user's verbatim request).
+///
+/// Returns `None` when the effective value is `0`, the user-facing
+/// "disabled" toggle (e.g. on vacation, where we *want* the backlog to
+/// pile up rather than auto-expire genuinely-important drafts).
+fn auto_expire_days_from_env() -> Option<i64> {
+    let raw = std::env::var("AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_DAYS")
+        .or_else(|_| std::env::var("AUGMENTAGENT_STALE_DRAFT_DAYS"))
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .filter(|n| *n >= 0)
         .unwrap_or(7);
-    let mut ticker = tokio::time::interval(Duration::from_secs(60 * 60));
-    info!(stale_draft_days = days, "stale-draft sweep started (hourly)");
+    if raw == 0 {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
+/// Configured tick interval (in seconds) for the periodic auto-expire
+/// sweep (#220). Env-tunable via
+/// `AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_INTERVAL_SECS`; defaults to one
+/// hour. Clamped to a minimum of 1s so a fat-fingered `0` can't busy-loop
+/// the sweeper.
+fn auto_expire_interval_secs_from_env() -> u64 {
+    std::env::var("AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(60 * 60)
+}
+
+/// One tick of the auto-expire sweep, extracted from the async loop so
+/// unit tests can drive it deterministically against a fresh store
+/// without spinning a tokio runtime. Returns the ids that were
+/// transitioned this tick (empty when `days == None`, i.e. the sweep is
+/// disabled — the test contract from #220).
+fn sweep_stale_drafts_tick(store: &Store, days: Option<i64>) -> Result<Vec<String>> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let Some(days) = days else {
+        return Ok(Vec::new());
+    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let cutoff_ms = now_ms - days * 24 * 60 * 60 * 1000;
+    Ok(store.expire_pending_older_than(cutoff_ms)?)
+}
+
+/// Periodic stale-draft auto-expire (#99 / #220). Expires pending
+/// approvals older than `AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_DAYS` (default
+/// 7, `0` = disabled, legacy alias `AUGMENTAGENT_STALE_DRAFT_DAYS`) to
+/// `timed_out`, so an abandoned backlog can't permanently wedge new
+/// triage behind the cap-at-25 backpressure (#99). Tick interval is
+/// `AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_INTERVAL_SECS` (default 3600).
+///
+/// Best-effort: a failed sweep logs and retries next tick; it never
+/// takes the daemon down. Per #220, emits one `info!` line per expired
+/// id so the audit trail is grep-able in the stdout log.
+///
+/// When the cutoff is `0` (disabled) the function logs the disabled
+/// state once and returns immediately — no idle tokio task burning a
+/// timer slot. This is the vacation-mode toggle.
+async fn run_stale_draft_sweep(
+    store: Arc<Store>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let days = auto_expire_days_from_env();
+    let Some(days) = days else {
+        info!(
+            "approval auto-expire sweep disabled \
+             (AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_DAYS=0)"
+        );
+        return Ok(());
+    };
+    let interval_secs = auto_expire_interval_secs_from_env();
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+    info!(
+        auto_expire_days = days,
+        interval_secs,
+        "approval auto-expire sweep started"
+    );
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
-                info!("stale-draft sweep: shutdown signal received");
+                info!("approval auto-expire sweep: shutdown signal received");
                 return Ok(());
             }
             _ = ticker.tick() => {
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                let cutoff_ms = now_ms - days * 24 * 60 * 60 * 1000;
-                match store.expire_pending_older_than(cutoff_ms) {
-                    Ok(0) => {}
-                    Ok(n) => info!(
-                        swept = n,
-                        stale_draft_days = days,
-                        "stale-draft sweep: expired abandoned pending drafts"
-                    ),
-                    Err(e) => warn!("stale-draft sweep failed: {e:#}"),
+                match sweep_stale_drafts_tick(&store, Some(days)) {
+                    Ok(ids) if ids.is_empty() => {}
+                    Ok(ids) => {
+                        // Per-id audit line so the operator can `grep`
+                        // the stdout log for "auto-expired <id>" and
+                        // see exactly which drafts went away.
+                        for id in &ids {
+                            info!(
+                                action_id = %id,
+                                auto_expire_days = days,
+                                "approval auto-expire: expired stale pending draft"
+                            );
+                        }
+                        info!(
+                            swept = ids.len(),
+                            auto_expire_days = days,
+                            "approval auto-expire sweep: summary"
+                        );
+                    }
+                    Err(e) => warn!("approval auto-expire sweep failed: {e:#}"),
                 }
             }
         }
@@ -9175,4 +9265,242 @@ async fn run_compose_fan_out(
         println!("{} variant card(s) posted for approval", variants.len());
     }
     Ok(())
+}
+
+/// #220 — periodic approval auto-expire sweep wiring.
+///
+/// Verifies the env parser (canonical name wins; legacy alias is the
+/// fallback; `0` becomes the disabled `None`), the interval clamping,
+/// and the tick helper's disabled-mode contract (no rows expired even
+/// when stale rows are present).
+#[cfg(test)]
+mod auto_expire_sweep_tests {
+    use super::*;
+    use augmentagent_store::{ActionStatus, Email};
+    use rusqlite::{params as rparams, Connection};
+    use tempfile::TempDir;
+
+    /// Hold an env-var-mutation gate so parallel tests don't read each
+    /// other's `set_var` writes. The env-parser tests all touch the
+    /// same two env keys; serializing them keeps the suite portable
+    /// to `cargo test -- --test-threads=N`.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Reset both #220 env keys plus the #99 legacy alias to a clean
+    /// state at the start of each env-parser test (and at the end, via
+    /// `_lock` going out of scope, when the next test acquires the
+    /// guard). Idempotent.
+    fn clear_auto_expire_env() {
+        std::env::remove_var("AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_DAYS");
+        std::env::remove_var("AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_INTERVAL_SECS");
+        std::env::remove_var("AUGMENTAGENT_STALE_DRAFT_DAYS");
+    }
+
+    /// Same legacy-table preamble the status snapshot test uses —
+    /// `Store::open` runs `ALTER TABLE actions ...` migrations and
+    /// aborts on a fresh sqlite without the base tables. Kept inline
+    /// here so the test file doesn't need to depend on a sibling
+    /// module's test helpers.
+    const LEGACY_SCHEMA_PREAMBLE: &str = r#"
+        CREATE TABLE actions (
+            id TEXT PRIMARY KEY,
+            messageId TEXT NOT NULL,
+            threadId TEXT,
+            fromEmail TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            originalBody TEXT,
+            draftBody TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            errorMessage TEXT,
+            createdAt INTEGER NOT NULL,
+            updatedAt INTEGER NOT NULL
+        );
+        CREATE TABLE emails (
+            messageId TEXT PRIMARY KEY,
+            threadId TEXT,
+            fromEmail TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            body TEXT,
+            receivedAt TEXT,
+            accountEntityId TEXT,
+            firstSeenAt INTEGER NOT NULL,
+            triageResult TEXT,
+            agentProcessedAt INTEGER,
+            platform TEXT NOT NULL DEFAULT 'gmail',
+            kind TEXT NOT NULL DEFAULT 'dm'
+        );
+        CREATE TABLE gmail_accounts (
+            id TEXT PRIMARY KEY,
+            connectionId TEXT NOT NULL,
+            email TEXT,
+            label TEXT,
+            entityId TEXT NOT NULL,
+            active INTEGER DEFAULT 1,
+            createdAt INTEGER NOT NULL
+        );
+    "#;
+
+    fn fresh_store() -> (Store, TempDir) {
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("data.db");
+        {
+            let c = Connection::open(&db_path).expect("open seed");
+            c.execute_batch(LEGACY_SCHEMA_PREAMBLE).expect("seed schema");
+        }
+        let store = Store::open(&db_path).expect("Store::open after seed");
+        (store, tmp)
+    }
+
+    fn sample_email(message_id: &str) -> Email {
+        Email {
+            message_id: message_id.into(),
+            thread_id: None,
+            from: "a@b.com".into(), // pii-ok
+            subject: "hi".into(),
+            body: "hello".into(),
+            date: "2026-04-13T12:00:00Z".into(),
+            account_entity_id: Some("acc".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        }
+    }
+
+    /// Backdate an existing action row's `createdAt` directly so we can
+    /// model real wall-clock ages without sleeping. The store doesn't
+    /// expose its connection, but it opens a sqlite file we already
+    /// know the path of via the TempDir.
+    fn backdate(db_path: &std::path::Path, id: &str, days_ago: i64) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let day = 24i64 * 60 * 60 * 1000;
+        let c = Connection::open(db_path).expect("reopen for backdate");
+        c.execute(
+            "UPDATE actions SET createdAt = ?1 WHERE id = ?2",
+            rparams![now_ms - days_ago * day, id],
+        )
+        .expect("backdate update");
+    }
+
+    /// Default cutoff is 7 days (#220 hard requirement: matches the
+    /// user's verbatim "over a week" ask).
+    #[test]
+    fn auto_expire_days_defaults_to_seven() {
+        let _lock = ENV_GUARD.lock().unwrap();
+        clear_auto_expire_env();
+        assert_eq!(auto_expire_days_from_env(), Some(7));
+    }
+
+    /// `0` is the disabled toggle (the vacation-mode escape hatch).
+    /// Returning `None` means the sweeper short-circuits without ever
+    /// touching the store.
+    #[test]
+    fn auto_expire_days_zero_is_disabled() {
+        let _lock = ENV_GUARD.lock().unwrap();
+        clear_auto_expire_env();
+        std::env::set_var("AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_DAYS", "0");
+        let got = auto_expire_days_from_env();
+        clear_auto_expire_env();
+        assert_eq!(got, None);
+    }
+
+    /// Canonical #220 name wins over the #99 legacy alias when both
+    /// are set. Lets us migrate operators forward without coordination.
+    #[test]
+    fn auto_expire_days_canonical_wins_over_legacy() {
+        let _lock = ENV_GUARD.lock().unwrap();
+        clear_auto_expire_env();
+        std::env::set_var("AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_DAYS", "3");
+        std::env::set_var("AUGMENTAGENT_STALE_DRAFT_DAYS", "14");
+        let got = auto_expire_days_from_env();
+        clear_auto_expire_env();
+        assert_eq!(got, Some(3));
+    }
+
+    /// Legacy alias is honored when the canonical name is absent (so
+    /// existing deploys don't silently flip back to defaults on
+    /// upgrade).
+    #[test]
+    fn auto_expire_days_legacy_alias_fallback() {
+        let _lock = ENV_GUARD.lock().unwrap();
+        clear_auto_expire_env();
+        std::env::set_var("AUGMENTAGENT_STALE_DRAFT_DAYS", "14");
+        let got = auto_expire_days_from_env();
+        clear_auto_expire_env();
+        assert_eq!(got, Some(14));
+    }
+
+    /// Default interval is one hour. Non-positive override clamps back
+    /// to the default so a `0` doesn't busy-loop the sweeper.
+    #[test]
+    fn auto_expire_interval_default_and_clamps_zero() {
+        let _lock = ENV_GUARD.lock().unwrap();
+        clear_auto_expire_env();
+        assert_eq!(auto_expire_interval_secs_from_env(), 3600);
+        std::env::set_var("AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_INTERVAL_SECS", "0");
+        assert_eq!(auto_expire_interval_secs_from_env(), 3600);
+        std::env::set_var("AUGMENTAGENT_APPROVAL_AUTO_EXPIRE_INTERVAL_SECS", "120");
+        let got = auto_expire_interval_secs_from_env();
+        clear_auto_expire_env();
+        assert_eq!(got, 120);
+    }
+
+    /// End-to-end-ish: stash three pending rows backdated to 10d / 5d /
+    /// 1d ago, run one sweep tick at the 7-day default, and assert only
+    /// the 10d row was returned (the other two still pending).
+    #[test]
+    fn sweep_tick_seven_day_default_only_expires_ten_day_row() {
+        let (store, tmp) = fresh_store();
+        let db_path = tmp.path().join("data.db");
+        store.upsert_email(&sample_email("old10")).unwrap();
+        store.upsert_email(&sample_email("mid5")).unwrap();
+        store.upsert_email(&sample_email("fresh1")).unwrap();
+        let id_old = store // pii-ok
+            .log_action("old10", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
+            .unwrap();
+        let id_mid = store // pii-ok
+            .log_action("mid5", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
+            .unwrap();
+        let id_fresh = store // pii-ok
+            .log_action("fresh1", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
+            .unwrap();
+        backdate(&db_path, &id_old, 10);
+        backdate(&db_path, &id_mid, 5);
+        backdate(&db_path, &id_fresh, 1);
+
+        let swept = sweep_stale_drafts_tick(&store, Some(7)).unwrap();
+        assert_eq!(swept, vec![id_old.clone()]);
+        assert_eq!(store.pending_reply_count().unwrap(), 2);
+        let a_mid = store.get_action_with_email(&id_mid).unwrap().unwrap();
+        assert_eq!(a_mid.action.status, "pending");
+        let a_fresh = store.get_action_with_email(&id_fresh).unwrap().unwrap();
+        assert_eq!(a_fresh.action.status, "pending");
+    }
+
+    /// Disabled mode (`days == None`) is a no-op even with stale rows
+    /// sitting in the table — the exact vacation-mode contract from
+    /// #220.
+    #[test]
+    fn sweep_tick_disabled_is_noop_even_with_stale_rows() {
+        let (store, tmp) = fresh_store();
+        let db_path = tmp.path().join("data.db");
+        store.upsert_email(&sample_email("old99")).unwrap();
+        let id_old = store // pii-ok
+            .log_action("old99", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
+            .unwrap();
+        backdate(&db_path, &id_old, 99);
+
+        // Pre-condition: row is stale and still pending.
+        assert_eq!(store.pending_reply_count().unwrap(), 1);
+
+        let swept = sweep_stale_drafts_tick(&store, None).unwrap();
+        assert!(swept.is_empty(), "disabled sweep must not touch any row");
+        assert_eq!(
+            store.pending_reply_count().unwrap(),
+            1,
+            "stale row must survive disabled sweep"
+        );
+    }
 }
