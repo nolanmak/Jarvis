@@ -111,6 +111,41 @@ impl DiscordClient {
         self.get_json(&path).await
     }
 
+    /// Download an attachment by its CDN URL. Discord's `attachments[].url`
+    /// is pre-signed and does NOT take auth headers; we just GET it. Caps the
+    /// download at `max_bytes` to keep a hostile/oversized payload from
+    /// blowing the agent context — returns `(bytes, truncated)`.
+    pub async fn download_attachment(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, bool), DiscordError> {
+        use futures::StreamExt;
+        let resp = self.http.get(url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(DiscordError::Server {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        let mut truncated = false;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if buf.len() + chunk.len() > max_bytes {
+                let remaining = max_bytes.saturating_sub(buf.len());
+                buf.extend_from_slice(&chunk[..remaining]);
+                truncated = true;
+                break;
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok((buf, truncated))
+    }
+
     /// `POST /channels/{id}/messages` — send a message. Works for DMs and guild
     /// channels uniformly.
     pub async fn send_message(
@@ -399,6 +434,41 @@ mod tests {
         let n = generate_nonce();
         assert!(n.chars().all(|c| c.is_ascii_digit()));
         assert!(!n.is_empty());
+    }
+
+    #[tokio::test]
+    async fn download_attachment_returns_body_under_cap() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/file.txt")
+            .with_status(200)
+            .with_body("hello world")
+            .create_async()
+            .await;
+
+        let client = DiscordClient::with_base_url(test_auth(), "http://unused");
+        let url = format!("{}/file.txt", server.url());
+        let (body, truncated) = client.download_attachment(&url, 1024).await.unwrap();
+        assert_eq!(&body, b"hello world");
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn download_attachment_truncates_at_cap() {
+        let mut server = mockito::Server::new_async().await;
+        let big = "a".repeat(10_000);
+        let _m = server
+            .mock("GET", "/big.txt")
+            .with_status(200)
+            .with_body(big)
+            .create_async()
+            .await;
+
+        let client = DiscordClient::with_base_url(test_auth(), "http://unused");
+        let url = format!("{}/big.txt", server.url());
+        let (body, truncated) = client.download_attachment(&url, 256).await.unwrap();
+        assert_eq!(body.len(), 256);
+        assert!(truncated);
     }
 
     #[tokio::test]
