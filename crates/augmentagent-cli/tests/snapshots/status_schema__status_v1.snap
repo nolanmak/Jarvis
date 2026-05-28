@@ -104,6 +104,15 @@ expression: json
         "login"
       ]
     },
+    "socialapi": {
+      "accounts": 0,
+      "armed": false,
+      "configured": false,
+      "last_poll_unix": null,
+      "needs": [
+        "login"
+      ]
+    },
     "telegram": {
       "accounts": 0,
       "armed": false,
