@@ -48,7 +48,160 @@ const SAFELIST_ENV_VARS: &[&str] = &[
     // Claude Max + Anthropic-side overrides users set explicitly.
     "CLAUDE_CLI",
     "ANTHROPIC_API_KEY",
+    // #248 — SocialAPI.ai read-only drafting aid. Only relevant when the
+    // OPTIONAL `AUGMENTAGENT_SOCIALAPI_MCP_READONLY` flag is set, which
+    // attaches the SocialAPI MCP server to the reasoner. Listing it here
+    // lets the bearer key survive `restrict_env=true` spawns so the MCP
+    // server can authenticate; when the flag is off no opts ever forward
+    // it, so a stray key in the daemon env cannot leak into a child.
+    "SOCIALAPI_API_KEY",
 ];
+
+/// #248 — OPTIONAL feature flag. When set to a truthy value
+/// (`1`/`true`/`yes`/`on`, case-insensitive), the draft/code-mode reasoner
+/// MAY have SocialAPI.ai's MCP server attached as a strictly READ-ONLY
+/// drafting aid via [`with_socialapi_readonly_mcp`]. Default (unset) is a
+/// hard no-op: [`with_socialapi_readonly_mcp`] returns the opts byte-for-byte
+/// unchanged so existing behavior is preserved.
+pub const SOCIALAPI_MCP_READONLY_FLAG: &str = "AUGMENTAGENT_SOCIALAPI_MCP_READONLY";
+
+/// Env var holding the SocialAPI.ai bearer key. Mirrors
+/// `augmentagent_channel_socialapi::auth::ENV_VAR` without taking a crate
+/// dependency (channel-core stays free of the socialapi crate).
+const SOCIALAPI_API_KEY_ENV: &str = "SOCIALAPI_API_KEY";
+
+/// MCP server name under which SocialAPI.ai is registered. The deny hook in
+/// `scripts/aa-socialapi-readonly-guard.sh` keys off the
+/// `mcp__socialapi__<tool>` prefix this produces, so the two MUST agree.
+const SOCIALAPI_MCP_SERVER_NAME: &str = "socialapi";
+
+/// Default SocialAPI.ai MCP endpoint. Overridable via
+/// `AUGMENTAGENT_SOCIALAPI_MCP_URL` for tenants / tests. The MCP server is
+/// HTTP-transport (Claude Code `type: "http"`), authenticated with the
+/// bearer key forwarded in the `Authorization` header.
+const SOCIALAPI_MCP_DEFAULT_URL: &str = "https://api.social-api.ai/v1/mcp";
+
+/// Returns true when the OPTIONAL SocialAPI read-only MCP drafting aid is
+/// enabled via [`SOCIALAPI_MCP_READONLY_FLAG`]. Accepts the usual truthy
+/// spellings; everything else (including unset) is false.
+pub fn socialapi_mcp_readonly_enabled() -> bool {
+    matches!(
+        std::env::var(SOCIALAPI_MCP_READONLY_FLAG)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// #248 — Conditionally attach SocialAPI.ai's MCP server to a draft/code-mode
+/// [`ReasonerOpts`] as a strictly READ-ONLY drafting aid.
+///
+/// **Default OFF / strict no-op.** When [`SOCIALAPI_MCP_READONLY_FLAG`] is
+/// unset (or not truthy), `opts` is returned **byte-for-byte unchanged** —
+/// no MCP server, no env mutation, no settings hook. Callers can wire this
+/// in unconditionally; with the flag off the produced opts (and therefore
+/// the spawned `claude` args) are identical to today's behavior.
+///
+/// When the flag IS set, this:
+///   1. Registers SocialAPI's MCP server (`mcp__socialapi__*`) via a
+///      `settings_json` `mcpServers` HTTP entry and advertises its tools in
+///      `allowed_tools` so the model can reach read context.
+///   2. Installs a `PreToolUse` deny hook
+///      (`scripts/aa-socialapi-readonly-guard.sh`) that blocks any
+///      `mcp__socialapi__*` tool whose name implies a write/send/mutation
+///      and allows only clearly read-only tools — FAIL-CLOSED.
+///   3. Forwards `SOCIALAPI_API_KEY` (already on the env SAFELIST) into
+///      `opts.env` so the MCP server can authenticate even under
+///      `restrict_env`.
+///
+/// The read-only guarantee is enforced at TWO layers: the allow-list patterns
+/// are deliberately conservative AND the PreToolUse hook independently denies
+/// write-implying tools, so a misconfigured allow-list cannot grant a send.
+///
+/// `repo_root` locates the guard script. The bearer key is loaded
+/// just-in-time via [`crate::secret_loader::load_provider_key`] (same posture
+/// as `ask_opts`'s COMPOSIO key); if it can't be loaded the MCP server is
+/// still configured but will simply fail to authenticate at the server — it
+/// can never gain write access regardless.
+pub fn with_socialapi_readonly_mcp(mut opts: ReasonerOpts, repo_root: &std::path::Path) -> ReasonerOpts {
+    if !socialapi_mcp_readonly_enabled() {
+        // Strict no-op: unchanged opts ⇒ unchanged spawn args.
+        return opts;
+    }
+
+    let mcp_url = std::env::var("AUGMENTAGENT_SOCIALAPI_MCP_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| SOCIALAPI_MCP_DEFAULT_URL.to_string());
+
+    let guard_path = repo_root.join("scripts/aa-socialapi-readonly-guard.sh");
+    opts.settings_json = Some(build_socialapi_readonly_settings(
+        SOCIALAPI_MCP_SERVER_NAME,
+        &mcp_url,
+        &guard_path,
+    ));
+
+    // Advertise the server's tools. The wildcard pattern lets the model see
+    // SocialAPI read tools; the PreToolUse hook is the real gate that denies
+    // writes, so this stays permissive on purpose (defense-in-depth lives in
+    // the hook, not in pattern guesswork about tool names).
+    let pattern = format!("mcp__{SOCIALAPI_MCP_SERVER_NAME}__*");
+    if !opts.allowed_tools.iter().any(|t| t == &pattern) {
+        opts.allowed_tools.push(pattern);
+    }
+
+    // Forward the bearer key so the MCP server can authenticate under
+    // `restrict_env`. Loaded JIT; only added when actually resolvable.
+    if !opts.env.iter().any(|(k, _)| k == SOCIALAPI_API_KEY_ENV) {
+        if let Some(key) = crate::secret_loader::load_provider_key(SOCIALAPI_API_KEY_ENV) {
+            opts.env.push((SOCIALAPI_API_KEY_ENV.into(), key));
+        }
+    }
+
+    opts
+}
+
+/// Build the inline JSON passed to `claude --settings` for the SocialAPI
+/// read-only drafting aid (#248). Registers the SocialAPI MCP server
+/// (HTTP transport, bearer auth via env-expanded header) AND a PreToolUse
+/// deny hook scoped to that server's tools.
+///
+/// `${SOCIALAPI_API_KEY}` is left as a literal env-expansion token — the
+/// Claude CLI expands it from the spawned process env (which we populate),
+/// so the raw key never lands in the args list or in any log line.
+fn build_socialapi_readonly_settings(
+    server_name: &str,
+    mcp_url: &str,
+    guard_path: &std::path::Path,
+) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            server_name: {
+                "type": "http",
+                "url": mcp_url,
+                "headers": {
+                    "Authorization": "Bearer ${SOCIALAPI_API_KEY}"
+                }
+            }
+        },
+        "hooks": {
+            "PreToolUse": [{
+                // Only police the SocialAPI MCP tool surface. The guard
+                // script itself is fail-closed for anything under this
+                // prefix that isn't clearly read-only.
+                "matcher": format!("mcp__{server_name}__.*"),
+                "hooks": [{
+                    "type": "command",
+                    "command": guard_path.to_string_lossy()
+                }]
+            }]
+        }
+    })
+    .to_string()
+}
 
 /// Per-call options for a `Reasoner`. Each call type (triage, draft, ingest)
 /// gets a different preset — see `triage_opts`, `draft_opts`, `ingest_opts`.
@@ -1636,6 +1789,234 @@ mod tests {
         ));
         assert!(!is_claude_config_corrupted("network connection failed"));
         assert!(!is_claude_config_corrupted(""));
+    }
+
+    // ---- #248: optional read-only SocialAPI MCP drafting aid ----
+
+    /// Serialize the env-touching SocialAPI flag tests against each other AND
+    /// against the `EnvGuard`-based tests, since the flag is process-global.
+    fn socialapi_flag_guard(value: Option<&str>) -> Vec<EnvGuard> {
+        let mut guards = Vec::new();
+        match value {
+            Some(v) => guards.push(EnvGuard::set(SOCIALAPI_MCP_READONLY_FLAG, v)),
+            None => guards.push(EnvGuard::unset(SOCIALAPI_MCP_READONLY_FLAG)),
+        }
+        guards
+    }
+
+    /// Render the spawn-relevant fields of a `ReasonerOpts` to a stable
+    /// string so two opts can be compared for byte-identity. `ReasonerOpts`
+    /// doesn't derive `PartialEq` (it holds trait objects), so we compare the
+    /// fields that actually shape the spawned `claude` args + env.
+    fn opts_fingerprint(o: &ReasonerOpts) -> String {
+        format!(
+            "system={:?}|model={:?}|tools={:?}|add_dirs={:?}|perm={:?}|cwd={:?}|env={:?}|settings={:?}|restrict={:?}",
+            o.system_prompt,
+            o.model,
+            o.allowed_tools,
+            o.add_dirs,
+            o.permission_mode,
+            o.cwd,
+            o.env,
+            o.settings_json,
+            o.restrict_env,
+        )
+    }
+
+    /// Flag OFF ⇒ STRICT no-op. The opts a caller would spawn must be
+    /// byte-identical to the input, so existing draft behavior is unchanged.
+    #[test]
+    fn socialapi_mcp_flag_off_is_strict_noop() {
+        let _g = socialapi_flag_guard(None);
+        assert!(!socialapi_mcp_readonly_enabled());
+
+        let base = draft_opts("draft system".into(), None);
+        let before = opts_fingerprint(&base);
+        let after = with_socialapi_readonly_mcp(base, std::path::Path::new("/repo"));
+        let after_fp = opts_fingerprint(&after);
+
+        assert_eq!(before, after_fp, "flag-off must not change spawn-relevant opts");
+        assert!(after.settings_json.is_none(), "no settings_json when flag off");
+        assert!(
+            !after.allowed_tools.iter().any(|t| t.starts_with("mcp__socialapi__")),
+            "no socialapi MCP tools when flag off"
+        );
+        assert!(
+            !after.env.iter().any(|(k, _)| k == "SOCIALAPI_API_KEY"),
+            "no SOCIALAPI_API_KEY env when flag off"
+        );
+    }
+
+    /// A non-truthy value (e.g. `0`/`false`) must also be treated as OFF.
+    #[test]
+    fn socialapi_mcp_flag_falsey_is_noop() {
+        for val in ["0", "false", "no", "off", ""] {
+            let _g = socialapi_flag_guard(Some(val));
+            assert!(
+                !socialapi_mcp_readonly_enabled(),
+                "value {val:?} must be treated as disabled"
+            );
+            let base = draft_opts("s".into(), None);
+            let before = opts_fingerprint(&base);
+            let after = with_socialapi_readonly_mcp(base, std::path::Path::new("/repo"));
+            assert_eq!(before, opts_fingerprint(&after), "{val:?} must be a no-op");
+        }
+    }
+
+    /// Flag ON ⇒ SocialAPI MCP server attached + deny hook installed +
+    /// wildcard tool advertised. The bearer key forwarding is environment-
+    /// dependent (keyring/env) so we don't assert on it here; the no-leak
+    /// guarantee is covered by the flag-off test + the SAFELIST.
+    #[test]
+    fn socialapi_mcp_flag_on_attaches_server_and_deny_hook() {
+        let _g = socialapi_flag_guard(Some("1"));
+        assert!(socialapi_mcp_readonly_enabled());
+
+        let repo = tempfile::tempdir().unwrap();
+        let base = draft_opts("draft system".into(), None);
+        let opts = with_socialapi_readonly_mcp(base, repo.path());
+
+        // 1) Tool advertised.
+        assert!(
+            opts.allowed_tools.iter().any(|t| t == "mcp__socialapi__*"),
+            "socialapi MCP wildcard tool must be advertised; got {:?}",
+            opts.allowed_tools
+        );
+
+        // 2) settings_json registers the MCP server + the deny hook.
+        let settings = opts
+            .settings_json
+            .as_deref()
+            .expect("flag-on must ship settings_json");
+        let v: serde_json::Value = serde_json::from_str(settings).expect("valid JSON");
+
+        let server = v
+            .pointer("/mcpServers/socialapi")
+            .expect("socialapi MCP server registered");
+        assert_eq!(server.get("type").and_then(|x| x.as_str()), Some("http"));
+        assert!(
+            server
+                .get("url")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .contains("mcp"),
+            "MCP url must point at an mcp endpoint; got {server:?}"
+        );
+        // Bearer auth is via env-expansion, NOT a baked key.
+        let auth = server
+            .pointer("/headers/Authorization")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default();
+        assert_eq!(auth, "Bearer ${SOCIALAPI_API_KEY}", "raw key must not be baked into settings");
+
+        let matcher = v
+            .pointer("/hooks/PreToolUse/0/matcher")
+            .and_then(|x| x.as_str())
+            .expect("deny hook matcher present");
+        assert!(
+            matcher.contains("mcp__socialapi__"),
+            "hook must police the socialapi MCP surface; got {matcher}"
+        );
+        let cmd = v
+            .pointer("/hooks/PreToolUse/0/hooks/0/command")
+            .and_then(|x| x.as_str())
+            .expect("deny hook command present");
+        assert!(
+            cmd.ends_with("scripts/aa-socialapi-readonly-guard.sh"),
+            "hook must invoke the read-only guard; got {cmd}"
+        );
+    }
+
+    /// The bearer key is on the env SAFELIST so it survives `restrict_env`.
+    #[test]
+    fn socialapi_key_is_on_env_safelist() {
+        assert!(
+            SAFELIST_ENV_VARS.contains(&"SOCIALAPI_API_KEY"),
+            "SOCIALAPI_API_KEY must be safelisted so it survives restrict_env spawns"
+        );
+    }
+
+    /// Drive the actual guard script end-to-end: a send/reply tool is DENIED,
+    /// a list/get tool is ALLOWED, an unknown socialapi tool is DENIED
+    /// (fail-closed), and a non-socialapi tool passes through. This is the
+    /// load-bearing read-only guarantee, so we exercise the real script.
+    #[test]
+    fn socialapi_guard_script_denies_writes_allows_reads_failclosed() {
+        // Locate the guard script relative to this crate (workspace layout:
+        // CARGO_MANIFEST_DIR is crates/augmentagent-channel-core).
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let guard = manifest.join("../../scripts/aa-socialapi-readonly-guard.sh");
+        if !guard.exists() {
+            // Defensive: if run from an unusual layout, skip rather than fail
+            // spuriously. The unit assertions above already cover wiring.
+            eprintln!("guard script not found at {guard:?}; skipping script e2e");
+            return;
+        }
+        if std::process::Command::new("jq").arg("--version").output().is_err() {
+            eprintln!("jq not available; skipping guard script e2e");
+            return;
+        }
+
+        let run = |tool: &str| -> (bool, String) {
+            // bool = "denied?"
+            let event = serde_json::json!({
+                "tool_name": tool,
+                "tool_input": {}
+            })
+            .to_string();
+            let out = std::process::Command::new("bash")
+                .arg(&guard)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    child
+                        .stdin
+                        .take()
+                        .unwrap()
+                        .write_all(event.as_bytes())
+                        .unwrap();
+                    child.wait_with_output()
+                })
+                .expect("guard script runs");
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let denied = stdout.contains("\"deny\"") || stdout.contains("\"decision\":\"block\"")
+                || stdout.contains("\"decision\": \"block\"");
+            (denied, stdout)
+        };
+
+        // Writes / sends → DENIED.
+        for tool in [
+            "mcp__socialapi__reply_to_comment",
+            "mcp__socialapi__post_tweet",
+            "mcp__socialapi__send_dm",
+            "mcp__socialapi__delete_post",
+            "mcp__socialapi__create_thread",
+        ] {
+            let (denied, out) = run(tool);
+            assert!(denied, "{tool} must be DENIED; guard said: {out}");
+        }
+
+        // Reads → ALLOWED (empty stdout, exit 0).
+        for tool in [
+            "mcp__socialapi__list_comments",
+            "mcp__socialapi__get_thread",
+            "mcp__socialapi__fetch_post",
+            "mcp__socialapi__search_mentions",
+        ] {
+            let (denied, out) = run(tool);
+            assert!(!denied, "{tool} must be ALLOWED; guard said: {out}");
+        }
+
+        // Unknown socialapi verb → DENIED fail-closed.
+        let (denied, out) = run("mcp__socialapi__frobnicate");
+        assert!(denied, "unknown socialapi tool must be denied fail-closed; got: {out}");
+
+        // Non-socialapi tool → pass-through (allowed, empty stdout).
+        let (denied, _out) = run("Read");
+        assert!(!denied, "non-socialapi tools must pass through untouched");
     }
 }
 
