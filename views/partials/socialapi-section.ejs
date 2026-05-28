@@ -19,12 +19,18 @@
       Clear
     </button>
   </div>
-  <form hx-post="/api/socialapi/sync" hx-target="#socialapi-section" hx-swap="innerHTML" class="mb-4">
-    <button type="submit"
-            class="px-4 py-2 bg-green-600 hover:bg-green-500 rounded-md text-sm font-medium transition-colors">
-      Sync accounts
-    </button>
-  </form>
+  <div class="flex gap-3 items-center mb-4">
+    <form hx-post="/api/socialapi/sync" hx-target="#socialapi-section" hx-swap="innerHTML">
+      <button type="submit"
+              class="px-4 py-2 bg-green-600 hover:bg-green-500 rounded-md text-sm font-medium transition-colors">
+        Sync accounts
+      </button>
+    </form>
+    <a href="/oauth/socialapi/start"
+       class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-md text-sm font-medium transition-colors">
+      Connect account (OAuth)
+    </a>
+  </div>
 <% } else { %>
   <form hx-post="/api/socialapi/key" hx-target="#socialapi-section" hx-swap="innerHTML"
         class="flex gap-3 items-end mb-4">
@@ -43,7 +49,7 @@
 <!-- Connected accounts -->
 <% if (socialApiKeyMasked) { %>
   <% if (socialApiAccounts.length === 0) { %>
-    <p class="text-sm text-gray-500 py-2">No accounts yet. Click "Sync accounts" to pull your connected handles.</p>
+    <p class="text-sm text-gray-500 py-2">No accounts yet. Click "Connect account (OAuth)" to link a new handle, or "Sync accounts" to pull existing connected handles.</p>
   <% } else { %>
     <% socialApiAccounts.forEach(function(acct) { %>
       <div id="socialapi-acct-<%= acct.id %>"
