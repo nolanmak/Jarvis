@@ -8,10 +8,12 @@ pub mod media;
 pub mod preview;
 pub mod prompts;
 pub mod publish;
+pub mod socialapi;
 pub mod types;
 
 pub use adapter::fan_out;
 pub use preview::{preview_all, variant_card};
+pub use socialapi::{family_card, fan_out_socialapi, SocialTarget, TargetVariant};
 pub use publish::{
     fan_out_publish, FanOutReport, FanOutTargets, PostContent, PublishOpts, PublishOutcome,
     PublishTarget, SocialPublisher,
