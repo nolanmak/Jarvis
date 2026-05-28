@@ -39,6 +39,11 @@ pub enum ActionStatus {
     Skipped,
     Flagged,
     DryRun,
+    /// #219 — pending draft displaced by an out-of-band user reply on the
+    /// thread. Terminal: like `timed_out`, the queue stops surfacing the
+    /// card. The reason (e.g. "superseded by manual reply") is stashed in
+    /// `errorMessage` at transition time so the dashboard can show context.
+    Superseded,
 }
 
 impl ActionStatus {
@@ -53,6 +58,7 @@ impl ActionStatus {
             Self::Skipped => "skipped",
             Self::Flagged => "flagged",
             Self::DryRun => "dry_run",
+            Self::Superseded => "superseded",
         }
     }
 }

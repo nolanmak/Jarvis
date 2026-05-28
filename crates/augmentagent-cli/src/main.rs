@@ -21,7 +21,7 @@ use augmentagent_channel_email::sigextract::{
     detect_signature_block, is_human_sender, signature_patch, strip_quoted_reply,
     SignatureExtractor,
 };
-use augmentagent_channel_email::{GmailChannel, GmailChannelConfig};
+use augmentagent_channel_email::{GmailChannel, GmailChannelConfig, OutboundObserver};
 use augmentagent_channel_linkedin::{
     build_normshares_body, default_auth_path, is_linkedin_email, ConnectionRequestEngagement,
     FriendFeedEngagement, InvitationsTrigger, LinkedInApi, LinkedInAuth,
@@ -2163,6 +2163,31 @@ async fn main() -> Result<()> {
                 tasks.push(tokio::spawn(async move {
                     run_stale_draft_sweep(sweep_store, sd).await
                 }));
+
+                // #219 — outbound observer: when the user replies via Gmail
+                // web/mobile, the pending approval card on that thread is
+                // stale; this task superseded those drafts on a 5-min tick.
+                // DEFAULT-OFF — opt in with AUGMENTAGENT_OUTBOUND_OBSERVER=1.
+                // Self-disables on Gmail-less ("--no-email") tenants. Wiki
+                // ingest of the user's outbound is intentionally NOT shipped
+                // here; the observer emits OutboundEvents that a follow-on
+                // can hand to the ingest pipeline (see
+                // `crates/augmentagent-channel-email/src/outbound.rs` doc).
+                let outbound_enabled = std::env::var("AUGMENTAGENT_OUTBOUND_OBSERVER")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if outbound_enabled && !no_email {
+                    let obs_store = Arc::clone(&store);
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        run_outbound_observer(obs_store, sd).await
+                    }));
+                } else if outbound_enabled && no_email {
+                    info!(
+                        "outbound observer requested but --no-email is set; \
+                         observer is Gmail-only and will NOT be started"
+                    );
+                }
             }
 
             // Self-healing: backfill any connected-Gmail addresses Composio
@@ -3595,6 +3620,62 @@ async fn backfill_gmail_emails(store: &Store, only_missing: bool) -> Result<Vec<
 /// `AUGMENTAGENT_STALE_DRAFT_DAYS` (default 7) to `timed_out` so an abandoned
 /// backlog can't permanently wedge new triage behind backpressure. Best-effort
 /// — a failed sweep logs and retries next tick; it never takes the daemon down.
+/// #219 — periodically observe outbound (SENT) Gmail and supersede stale
+/// pending drafts on threads the user replied to out-of-band.
+///
+/// DEFAULT-OFF: gated on `AUGMENTAGENT_OUTBOUND_OBSERVER=1`. The caller
+/// already checks the env var before spawning this — this function assumes
+/// it should run. Tick interval defaults to 5 min, override via
+/// `AUGMENTAGENT_OUTBOUND_OBSERVER_INTERVAL_SECS`. Failure of a single
+/// `poll_once` is logged and swallowed; the daemon must never crash on a
+/// transient Composio hiccup. Wiki-ingest of the emitted events is
+/// intentionally deferred to a follow-on (see `outbound.rs` doc).
+async fn run_outbound_observer(
+    store: Arc<Store>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let api_key = match std::env::var("COMPOSIO_API_KEY") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            warn!(
+                "outbound observer requested (AUGMENTAGENT_OUTBOUND_OBSERVER=1) but \
+                 COMPOSIO_API_KEY is unset — observer NOT started"
+            );
+            return Ok(());
+        }
+    };
+    let interval_secs: u64 = std::env::var("AUGMENTAGENT_OUTBOUND_OBSERVER_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n >= 30)
+        .unwrap_or(300);
+    let gmail = Arc::new(ComposioClient::new(api_key));
+    let observer = OutboundObserver::new(store, gmail, 200);
+    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+    info!(
+        interval_secs,
+        "outbound observer started (AUGMENTAGENT_OUTBOUND_OBSERVER=1)"
+    );
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("outbound observer: shutdown signal received");
+                return Ok(());
+            }
+            _ = ticker.tick() => {
+                match observer.poll_once().await {
+                    Ok(events) if events.is_empty() => {}
+                    Ok(events) => info!(
+                        new_outbound = events.len(),
+                        "outbound observer: classified user-authored sends"
+                    ),
+                    Err(e) => warn!("outbound observer: poll_once failed: {e:#}"),
+                }
+            }
+        }
+    }
+}
+
 async fn run_stale_draft_sweep(
     store: Arc<Store>,
     shutdown: CancellationToken,
