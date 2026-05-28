@@ -5337,6 +5337,46 @@ impl Store {
         Ok(())
     }
 
+    // ---- #243 SocialAPI.ai own-post comment engagement query surface ----
+
+    /// Record a freshly-seen SocialAPI.ai comment. Returns `false` if the
+    /// `(post_id, comment_id)` pair was already seen so the own-post poller
+    /// only synthesizes a WorkItem for genuinely new comments. Mirrors
+    /// [`Store::record_seen_comment`] but against the `socialapi_seen_comments`
+    /// ledger added in #238.
+    pub fn record_seen_socialapi_comment(
+        &self,
+        post_id: &str,
+        comment_id: &str,
+        author: Option<&str>,
+        text: Option<&str>,
+    ) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "INSERT OR IGNORE INTO socialapi_seen_comments \
+                (post_id, comment_id, author, text, seen_at_ms) \
+             VALUES (?1,?2,?3,?4,?5)",
+            params![post_id, comment_id, author, text, now],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Account ids of the active (polling-enabled) SocialAPI.ai accounts. The
+    /// own-post comment poller iterates these to scope `list_comments` per
+    /// account. Empty when no accounts are registered yet, which makes the
+    /// engagement inert (always-spawn-empty-is-free).
+    pub fn active_socialapi_account_ids(&self) -> StoreResult<Vec<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id FROM socialapi_accounts WHERE active = 1 ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // ---- #58.3 friend-feed engagement query surface ----
 
     /// Active (not paused) friend watches for `platform`. The friend-feed
@@ -7152,6 +7192,46 @@ mod tests {
         assert!(s
             .record_seen_comment(&post, "c2", Some("bob"), Some("congrats"))
             .unwrap());
+    }
+
+    #[test]
+    fn socialapi_seen_comment_dedup_is_one_shot() {
+        let (s, _f) = fresh_store();
+        // First sighting of (post, comment) → true; repeat → false.
+        assert!(s
+            .record_seen_socialapi_comment("post_1", "cmt_1", Some("jane"), Some("nice!"))
+            .unwrap());
+        assert!(!s
+            .record_seen_socialapi_comment("post_1", "cmt_1", Some("jane"), Some("nice!"))
+            .unwrap());
+        // A new comment on the same post is still surfaced.
+        assert!(s
+            .record_seen_socialapi_comment("post_1", "cmt_2", Some("bob"), Some("gg"))
+            .unwrap());
+        // Same comment id on a *different* post is a distinct ledger key.
+        assert!(s
+            .record_seen_socialapi_comment("post_2", "cmt_1", None, None)
+            .unwrap());
+    }
+
+    #[test]
+    fn active_socialapi_account_ids_lists_only_active() {
+        let (s, _f) = fresh_store();
+        assert!(s.active_socialapi_account_ids().unwrap().is_empty());
+        let guard = s.conn.lock().unwrap();
+        guard
+            .execute(
+                "INSERT INTO socialapi_accounts \
+                    (id, platform, active, created_at_ms, updated_at_ms) \
+                 VALUES ('acc_a','twitter',1,0,0), \
+                        ('acc_b','instagram',0,0,0), \
+                        ('acc_c','linkedin',1,0,0)",
+                [],
+            )
+            .unwrap();
+        drop(guard);
+        let ids = s.active_socialapi_account_ids().unwrap();
+        assert_eq!(ids, vec!["acc_a".to_string(), "acc_c".to_string()]);
     }
 
     #[test]
