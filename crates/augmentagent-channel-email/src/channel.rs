@@ -33,7 +33,7 @@ use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{ActionStatus, RetryableReply, Store, TriageResult, NUDGE_INTERVAL_MS};
 
 use crate::gmail::{extract_bare_email, GmailApi};
-use crate::sigextract::is_human_sender;
+use crate::sigextract::{is_event_blast, is_human_sender};
 
 #[derive(Clone, Debug)]
 pub struct GmailChannelConfig {
@@ -91,6 +91,9 @@ pub struct PollOutcome {
     pub flagged: usize,
     pub replied_dry_run: usize,
     pub awaiting_approval: usize,
+    /// #222: emails classified as event-platform / signup-confirmation
+    /// blasts — wiki ingest ran, but no draft and no Discord notice.
+    pub ingest_only: usize,
     pub errors: usize,
 }
 
@@ -292,6 +295,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                                 Some(DispatchOutcome::AwaitingApproval) => {
                                     outcome.awaiting_approval += 1
                                 }
+                                Some(DispatchOutcome::IngestOnly) => outcome.ingest_only += 1,
                                 None => {}
                             },
                             Err(e) => {
@@ -308,8 +312,11 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             }
         }
 
-        outcome.new_emails =
-            outcome.skipped + outcome.flagged + outcome.replied_dry_run + outcome.awaiting_approval;
+        outcome.new_emails = outcome.skipped
+            + outcome.flagged
+            + outcome.replied_dry_run
+            + outcome.awaiting_approval
+            + outcome.ingest_only;
         Ok(outcome)
     }
 
@@ -483,6 +490,52 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                         IngestTrigger::Triaged,
                     );
                     return Ok(Some(DispatchOutcome::Skipped));
+                }
+
+                // --- 1a'. EVENT-BLAST INGEST-ONLY GUARD (#222). After the
+                // automated-sender skip (#217 above) but before the
+                // backpressure check (so event blasts don't burn the
+                // ingest-only routing budget against the draft-queue cap).
+                // The user signed up via a script for many NYC tech
+                // events — Partiful, Luma, Meetup, Eventbrite, Covent,
+                // Hopin, Zoom, plus generic `noreply@calendar.*` invites
+                // and "See you Wed" / "Registration Confirmed" / "RSVP"
+                // subjects — and explicitly doesn't want a draft, an
+                // approval card, OR a Discord flag notice for any of
+                // them. The wiki ingest still runs so the CRM keeps
+                // learning about organizers, events, and attendees
+                // (groundwork for the v2 events ledger and "who's at NY
+                // Tech Week next week" queries). See `sigextract.rs::
+                // is_event_blast` for the curated domain/subject/body
+                // detection rules.
+                if is_event_blast(&email.from, &email.subject, &email.body) {
+                    self.store.log_action(
+                        &email.message_id,
+                        email.thread_id.as_deref(),
+                        &email.from,
+                        &email.subject,
+                        Some(&email.body),
+                        None,
+                        ActionStatus::Skipped,
+                    )?;
+                    self.store
+                        .mark_email_processed(&email.message_id, TriageResult::Flag)?;
+                    println!(
+                        "[ingest-only:event-blast] {} from={}",
+                        email.message_id, email.from,
+                    );
+                    // Wiki ingest still runs — CRM learns about the event,
+                    // organizer, location, attendees. Intentionally NO
+                    // `post_flag_notice` (no Discord noise — user-stated
+                    // preference).
+                    self.maybe_ingest(
+                        &email,
+                        DecisionKind::Flag,
+                        Some("event-blast (ingest-only, no draft)"),
+                        None,
+                        IngestTrigger::Triaged,
+                    );
+                    return Ok(Some(DispatchOutcome::IngestOnly));
                 }
 
                 // --- 1b. BACKPRESSURE (#99). Before spending an Opus draft
@@ -1344,6 +1397,11 @@ pub enum DispatchOutcome {
     /// Draft created, approval card posted. Terminal outcome happens
     /// asynchronously when the user clicks a button in Discord.
     AwaitingApproval,
+    /// #222: terminal — sender classified as event-platform /
+    /// signup-confirmation blast. Wiki ingest ran (CRM still learns about
+    /// the organizer, event, attendees), but no draft was generated, no
+    /// Discord approval card was queued, and no flag notice was posted.
+    IngestOnly,
 }
 
 // Silence dead_code warning for TRIAGE_SYSTEM constant which is exported for
@@ -1770,6 +1828,89 @@ mod tests {
         assert_eq!(broker.flag_posts.lock().unwrap().len(), 0);
         // Email is terminally processed so the next tick won't re-spawn.
         assert!(store.is_email_complete("m-bot").unwrap());
+    }
+
+    /// #222: a Partiful "Registration Confirmed" event blast where the
+    /// triage model returns `reply` (the failure mode we're guarding
+    /// against — the model occasionally treats RSVP confirmations as
+    /// reply-worthy). The new event-blast gate must intercept after the
+    /// is_human_sender check and before the backpressure block, routing
+    /// to IngestOnly: no approval card, no flag notice, no Opus draft
+    /// call. The wiki ingest path is still spawned (asserted indirectly
+    /// via the action row + `IngestOnly` outcome — actual ingest is a
+    /// best-effort fire-and-forget that's separately covered).
+    #[tokio::test]
+    async fn event_blast_sender_routes_to_ingest_only() {
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                message_id: "m-event".into(),
+                thread_id: Some("t-event".into()),
+                // Partiful invite domain — matches the curated
+                // EVENT_BLAST_DOMAIN_PATTERNS list. Local part is a
+                // plausible human-looking display name to ensure we're
+                // matching on the domain rule, not just bouncing on
+                // `noreply@` (which the #217 guard would catch first).
+                // Use an innocuous local part so the #217 `is_human_sender`
+                // guard doesn't fire first — we want to assert the new
+                // event-blast gate is what intercepts this, classifying
+                // on the Partiful domain rule.
+                from: "\"Partiful\" <invites@partiful-mail.com>".into(), // pii-ok: synthetic test fixture
+                subject: "Registration Confirmed: NY Tech Week Drinks".into(),
+                body: "You're confirmed. Add to calendar: https://example.com/cal.ics".into(),
+                date: "2026-05-27".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        // Triage returns `reply` so we exercise the Reply arm. If the
+        // gate didn't fire, the second scripted response would be
+        // consumed by the draft phase and an approval card would post.
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"confirm attendance"}"#,
+            "See you there!",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        // Terminal outcome is IngestOnly, NOT replied / awaiting / flagged.
+        assert_eq!(out.ingest_only, 1, "event blast must be ingest-only");
+        assert_eq!(out.awaiting_approval, 0, "no approval card for event blast");
+        assert_eq!(out.replied_dry_run, 0);
+        assert_eq!(out.flagged, 0);
+        assert_eq!(out.skipped, 0, "did not fall through to is_human_sender skip");
+        // Discord broker is silent on BOTH rails — explicit user preference:
+        // no notice for event blasts.
+        assert_eq!(
+            broker.posts.lock().unwrap().len(),
+            0,
+            "no approval card posted",
+        );
+        assert_eq!(
+            broker.flag_posts.lock().unwrap().len(),
+            0,
+            "no flag notice posted — event blasts must be silent",
+        );
+        // Email is terminally processed; the next poll tick must not
+        // re-spawn a draft for the same message.
+        assert!(store.is_email_complete("m-event").unwrap());
+
+        // Re-polling the same unread email must remain a no-op.
+        let out2 = ch.poll_once().await.unwrap();
+        assert_eq!(out2.ingest_only, 0);
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+        assert_eq!(broker.flag_posts.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]
