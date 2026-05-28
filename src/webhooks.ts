@@ -25,6 +25,7 @@ import crypto from "crypto";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { getConfig, insertSocialApiWebhookEvent } from "./db";
 
 const SPOOL =
   process.env.AUGMENTAGENT_WEBHOOK_SPOOL ||
@@ -310,5 +311,174 @@ router.post(
   }
 );
 
+// ---------------------------------------------------------------------------
+// SocialAPI.ai inbound webhook receiver — #249 (near-real-time inbox).
+//
+// SocialAPI.ai can PUSH new comment/DM events to us so engagement doesn't have
+// to wait for the next poll tick. This receiver:
+//   1. verifies an HMAC-SHA256 signature over the RAW body, keyed by the secret
+//      from config (`socialapi_webhook_secret`) or env
+//      `SOCIALAPI_WEBHOOK_SECRET`; rejects 401 on mismatch and FAILS CLOSED
+//      (401) when no secret is configured — an unauthenticated push surface is
+//      never opened by accident,
+//   2. parses each `comment` / `dm` event out of the body, and
+//   3. persists it idempotently into `socialapi_webhook_events` (de-duped by
+//      provider event id) for the Rust daemon to DRAIN as a fast-path.
+//
+// It does NOT itself triage/draft — it only durably hands the event off. The
+// Rust side reuses socialapi_seen_{dms,comments} so a webhook-delivered item
+// and a later poll of the same item collapse to a single draft. The signature
+// header is `x-socialapi-signature` (hex HMAC) — fall back to `sha256=<hex>`
+// GitHub-style framing if present.
+//
+// Event shapes accepted (a single event object, or `{events:[...]}` /
+// `{data:[...]}`, or a bare top-level array). Each event is normalized so the
+// stored payload_json is exactly what the Rust drain needs to rebuild a
+// WorkItem payload without another API call:
+//   DM:      { type:"dm",      id, conversation_id, account_id, with, author,
+//              text, created_at }
+//   Comment: { type:"comment", id, post_id, author, text, created_at }
+
+interface NormalizedWebhookEvent {
+  kind: "dm" | "comment";
+  id: string;
+  payload: Record<string, unknown>;
+  accountId: string | null;
+}
+
+function socialapiWebhookSecret(): string {
+  return getConfig("socialapi_webhook_secret") || process.env.SOCIALAPI_WEBHOOK_SECRET || "";
+}
+
+// Pull the signature out of either `x-socialapi-signature` (bare hex) or a
+// GitHub-style `sha256=<hex>` value in the same header.
+function extractSig(raw: string): string {
+  const v = raw.trim();
+  const eq = v.indexOf("=");
+  if (eq > 0 && v.slice(0, eq).toLowerCase() === "sha256") return v.slice(eq + 1).trim();
+  return v;
+}
+
+function eventType(ev: Record<string, unknown>): "dm" | "comment" | null {
+  const t = String(ev.type || ev.kind || ev.event || "").toLowerCase();
+  if (t === "dm" || t === "direct_message" || t === "message") return "dm";
+  if (t === "comment" || t === "own_post_comment") return "comment";
+  // Infer from shape when the discriminator is absent.
+  if ("conversation_id" in ev || "message_id" in ev) return "dm";
+  if ("post_id" in ev || "comment_id" in ev) return "comment";
+  return null;
+}
+
+function str(ev: Record<string, unknown>, ...keys: string[]): string {
+  for (const k of keys) {
+    const v = ev[k];
+    if (typeof v === "string" && v.length > 0) return v;
+    if (typeof v === "number") return String(v);
+  }
+  return "";
+}
+
+// Normalize one raw event into the canonical shape the Rust drain consumes.
+// Returns null if it can't be classified or lacks a usable id (so the receiver
+// skips it rather than persisting an unprocessable row).
+function normalizeSocialApiEvent(ev: Record<string, unknown>): NormalizedWebhookEvent | null {
+  const kind = eventType(ev);
+  if (!kind) return null;
+  if (kind === "dm") {
+    const messageId = str(ev, "message_id", "id");
+    const conversationId = str(ev, "conversation_id", "thread_id");
+    if (!messageId || !conversationId) return null;
+    const accountId = str(ev, "account_id") || null;
+    return {
+      kind,
+      id: `socialapi:dm:${conversationId}:${messageId}`,
+      accountId,
+      payload: {
+        type: "dm",
+        id: messageId,
+        conversation_id: conversationId,
+        account_id: accountId || "",
+        with: str(ev, "with", "author"),
+        author: str(ev, "author", "from", "with"),
+        text: str(ev, "text", "body", "message"),
+        created_at: str(ev, "created_at", "timestamp", "ts"),
+      },
+    };
+  }
+  // comment
+  const commentId = str(ev, "comment_id", "id");
+  const postId = str(ev, "post_id");
+  if (!commentId || !postId) return null;
+  return {
+    kind,
+    id: `socialapi:comment:${postId}:${commentId}`,
+    accountId: str(ev, "account_id") || null,
+    payload: {
+      type: "comment",
+      id: commentId,
+      post_id: postId,
+      author: str(ev, "author", "from"),
+      text: str(ev, "text", "body", "message"),
+      created_at: str(ev, "created_at", "timestamp", "ts"),
+    },
+  };
+}
+
+function extractSocialApiEvents(body: unknown): Record<string, unknown>[] {
+  if (Array.isArray(body)) return body.filter((e) => e && typeof e === "object") as Record<string, unknown>[];
+  if (!body || typeof body !== "object") return [];
+  const obj = body as Record<string, unknown>;
+  const arr =
+    (Array.isArray(obj.events) && obj.events) ||
+    (Array.isArray(obj.data) && obj.data) ||
+    null;
+  if (arr) return (arr as unknown[]).filter((e) => e && typeof e === "object") as Record<string, unknown>[];
+  return [obj];
+}
+
+router.post("/webhooks/socialapi", express.raw({ type: "*/*" }), (req, res) => {
+  const secret = socialapiWebhookSecret();
+  const raw: Buffer = req.body instanceof Buffer ? req.body : Buffer.from("");
+  const provided = extractSig(String(req.header("x-socialapi-signature") || ""));
+  // Fail CLOSED: no secret configured → never accept an unauthenticated push.
+  if (!secret || !provided || !timingSafeEqualStr(hmacHex(secret, raw), provided)) {
+    res.status(401).json({ error: "bad signature" });
+    return;
+  }
+  let parsed: unknown = {};
+  try {
+    parsed = JSON.parse(raw.toString("utf8"));
+  } catch {
+    res.status(400).json({ error: "bad json" });
+    return;
+  }
+  let accepted = 0;
+  let duplicates = 0;
+  let skipped = 0;
+  for (const ev of extractSocialApiEvents(parsed)) {
+    const norm = normalizeSocialApiEvent(ev);
+    if (!norm) {
+      skipped++;
+      continue;
+    }
+    try {
+      const isNew = insertSocialApiWebhookEvent(
+        norm.id,
+        norm.kind,
+        norm.accountId,
+        JSON.stringify(norm.payload)
+      );
+      if (isNew) accepted++;
+      else duplicates++;
+    } catch (e) {
+      console.warn(`[webhooks] socialapi persist failed: ${(e as Error).message}`);
+      skipped++;
+    }
+  }
+  // 202 even on all-duplicate so the provider doesn't retry-storm us; the body
+  // reports the split. The Rust daemon drains accepted rows on its next tick.
+  res.status(202).json({ ok: true, accepted, duplicates, skipped });
+});
+
 export default router;
-export { hmacHex, SPOOL, DEFT_SEEN };
+export { hmacHex, SPOOL, DEFT_SEEN, normalizeSocialApiEvent, extractSocialApiEvents };

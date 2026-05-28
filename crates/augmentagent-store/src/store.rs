@@ -13,7 +13,7 @@ use crate::models::{
     ConnectionRequestRow, DriveAccount, Email, FriendWatch, InvoiceDraft, LearnedPattern,
     LinkedInConnectionSync, OwnPost, PhoneIdentity, RateAuditRow, RateHalt,
     RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace, SocialapiAccount,
-    SubscriptionMode, TelegramBot,
+    SocialapiWebhookEvent, SubscriptionMode, TelegramBot,
     ToneExample, ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 
@@ -1398,6 +1398,31 @@ impl Store {
                  seen_at_ms      INTEGER NOT NULL,\
                  PRIMARY KEY (conversation_id, message_id)\
              )",
+            [],
+        )?;
+        // #249 — SocialAPI.ai inbound webhook events (near-real-time inbox).
+        // The Express dashboard receives + verifies + persists each pushed
+        // comment/DM event here; the daemon DRAINS unprocessed rows as a
+        // fast-path alongside its API poll, reusing socialapi_seen_{dms,
+        // comments} for downstream dedup so a webhook-delivered item and a
+        // later poll of the same item don't both produce a draft. `id` is the
+        // provider event id (idempotent dedup); `kind` is 'dm' | 'comment';
+        // `processed` flips to 1 once the daemon emits the WorkItem. Mirrors
+        // the TS schema in src/db.ts so both daemons share an identical shape.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS socialapi_webhook_events (\
+                 id             TEXT PRIMARY KEY,\
+                 kind           TEXT NOT NULL,\
+                 account_id     TEXT,\
+                 payload_json   TEXT NOT NULL,\
+                 received_at_ms INTEGER NOT NULL,\
+                 processed      INTEGER NOT NULL DEFAULT 0\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_socialapi_webhook_events_unprocessed \
+                ON socialapi_webhook_events(processed, received_at_ms)",
             [],
         )?;
 
@@ -5436,6 +5461,79 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Insert one inbound SocialAPI.ai webhook event (#249) idempotently,
+    /// de-duped by provider event `id`. Returns `true` when the row was newly
+    /// inserted (`false` on a duplicate id). The Express webhook receiver is
+    /// the normal writer; this method exists so the Rust side can also seed
+    /// events in tests and stays the single schema source. New rows land with
+    /// `processed = 0` and are picked up by
+    /// [`Store::take_unprocessed_socialapi_webhook_events`].
+    pub fn insert_socialapi_webhook_event(
+        &self,
+        id: &str,
+        kind: &str,
+        account_id: Option<&str>,
+        payload_json: &str,
+    ) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "INSERT OR IGNORE INTO socialapi_webhook_events \
+                (id, kind, account_id, payload_json, received_at_ms, processed) \
+             VALUES (?1,?2,?3,?4,?5,0)",
+            params![id, kind, account_id, payload_json, now],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Drain unprocessed inbound SocialAPI.ai webhook events (#249), oldest
+    /// first. These are the near-real-time fast-path rows the Express receiver
+    /// persisted; the DM source and own-post comment trigger read them ahead of
+    /// the API poll and emit the corresponding WorkItems, then mark each
+    /// processed via [`Store::mark_socialapi_webhook_event_processed`]. Reusing
+    /// `socialapi_seen_{dms,comments}` downstream means a webhook-delivered item
+    /// and a later poll of the same item collapse to a single draft. Reads do
+    /// not mutate — the caller marks each row processed only after it has
+    /// durably recorded the item in the seen-ledger, so a crash mid-drain just
+    /// re-drains (and the seen-ledger dedups).
+    pub fn take_unprocessed_socialapi_webhook_events(
+        &self,
+        kind: &str,
+        limit: u32,
+    ) -> StoreResult<Vec<SocialapiWebhookEvent>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id, kind, account_id, payload_json, received_at_ms \
+               FROM socialapi_webhook_events \
+              WHERE processed = 0 AND kind = ?1 \
+              ORDER BY received_at_ms ASC, id ASC \
+              LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![kind, limit], |r| {
+                Ok(SocialapiWebhookEvent {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    account_id: r.get::<_, Option<String>>(2)?,
+                    payload_json: r.get(3)?,
+                    received_at_ms: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Mark one drained SocialAPI.ai webhook event processed (#249) so the next
+    /// drain skips it. Returns the rows touched (0 when `id` is unknown).
+    pub fn mark_socialapi_webhook_event_processed(&self, id: &str) -> StoreResult<usize> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE socialapi_webhook_events SET processed = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(n)
+    }
+
     /// Account ids of the active (polling-enabled) SocialAPI.ai accounts. The
     /// own-post comment poller iterates these to scope `list_comments` per
     /// account. Empty when no accounts are registered yet, which makes the
@@ -6060,7 +6158,12 @@ mod tests {
     fn socialapi_tables_exist_after_migrate() {
         let (s, _f) = fresh_store();
         let guard = s.conn.lock().unwrap();
-        for tbl in ["socialapi_accounts", "socialapi_seen_comments", "socialapi_seen_dms"] {
+        for tbl in [
+            "socialapi_accounts",
+            "socialapi_seen_comments",
+            "socialapi_seen_dms",
+            "socialapi_webhook_events",
+        ] {
             let n: i64 = guard
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -7352,6 +7455,57 @@ mod tests {
         assert!(s
             .record_seen_socialapi_dm("conv_2", "msg_1", None, None)
             .unwrap());
+    }
+
+    #[test]
+    fn socialapi_webhook_event_insert_dedup_drain_and_mark() {
+        let (s, _f) = fresh_store();
+        // Insert two dm events + one comment event; a duplicate id is ignored.
+        assert!(s
+            .insert_socialapi_webhook_event("e1", "dm", Some("acc_1"), "{\"id\":\"m1\"}")
+            .unwrap());
+        assert!(s
+            .insert_socialapi_webhook_event("e2", "dm", None, "{\"id\":\"m2\"}")
+            .unwrap());
+        assert!(s
+            .insert_socialapi_webhook_event("e3", "comment", None, "{\"id\":\"c1\"}")
+            .unwrap());
+        // Duplicate id → false, no second row.
+        assert!(!s
+            .insert_socialapi_webhook_event("e1", "dm", Some("acc_1"), "{\"id\":\"m1\"}")
+            .unwrap());
+
+        // Drain is kind-scoped: only the two dm events come back, oldest first.
+        let dms = s
+            .take_unprocessed_socialapi_webhook_events("dm", 10)
+            .unwrap();
+        assert_eq!(dms.len(), 2);
+        assert_eq!(dms[0].id, "e1");
+        assert_eq!(dms[0].account_id.as_deref(), Some("acc_1"));
+        assert_eq!(dms[1].id, "e2");
+
+        // Limit is honored.
+        let one = s
+            .take_unprocessed_socialapi_webhook_events("dm", 1)
+            .unwrap();
+        assert_eq!(one.len(), 1);
+
+        // Marking processed removes it from the next drain.
+        assert_eq!(s.mark_socialapi_webhook_event_processed("e1").unwrap(), 1);
+        let after = s
+            .take_unprocessed_socialapi_webhook_events("dm", 10)
+            .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, "e2");
+        // Unknown id → 0 rows touched.
+        assert_eq!(s.mark_socialapi_webhook_event_processed("nope").unwrap(), 0);
+
+        // Comment kind still drains independently.
+        let comments = s
+            .take_unprocessed_socialapi_webhook_events("comment", 10)
+            .unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].id, "e3");
     }
 
     #[test]

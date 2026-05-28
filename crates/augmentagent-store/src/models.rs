@@ -136,6 +136,22 @@ pub struct SocialapiAccount {
     pub active: bool,
 }
 
+/// One inbound SocialAPI.ai webhook event (#249) drained from the
+/// `socialapi_webhook_events` table. The Express dashboard verifies + persists
+/// these; the daemon drains unprocessed rows as a near-real-time fast-path,
+/// reusing `socialapi_seen_{dms,comments}` for downstream dedup. `payload_json`
+/// is the normalized event body the receiver stored — exactly what the drain
+/// needs to rebuild a WorkItem payload without another API call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialapiWebhookEvent {
+    pub id: String,
+    /// `"dm"` | `"comment"`.
+    pub kind: String,
+    pub account_id: Option<String>,
+    pub payload_json: String,
+    pub received_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LearnedPattern {
     pub pattern_type: String,
