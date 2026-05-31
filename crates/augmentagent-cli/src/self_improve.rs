@@ -189,12 +189,24 @@ fn env_name_is_secret(name: &str) -> bool {
 /// and repopulated from [`gate_env`] (full inherited env minus provider
 /// secrets). Used for the build/test gate so a hostile `build.rs` /
 /// `postinstall` cannot read provider API keys out of the daemon env.
-///
-/// Note: this strips secrets only. Network-egress denial is not enforced
-/// here (no in-process sandbox primitive on this host); the multi-repo path
-/// runs in an ephemeral clone and the single-repo path now refuses to build
-/// untrusted-authored issues at all (#300), so the secret strip is the
-/// load-bearing control for the honest-fix path.
+//
+// SECURITY: This "sandbox" is env-isolation only, NOT a full sandbox.
+//   - What it DOES: clears the inherited environment and re-injects only
+//     non-secret vars (`gate_env`), so a hostile build/test script
+//     (`build.rs`, proc-macro, `npm` `postinstall`, a repo's `build_cmd`)
+//     cannot read provider API keys / tokens out of the daemon's process env
+//     and exfiltrate them.
+//   - What it does NOT do: it does NOT block network egress. The child can
+//     still open arbitrary outbound sockets in-process; a hostile script
+//     could fetch a payload or POST data it scrapes from the checkout. There
+//     is no in-process primitive that prevents this. Full isolation requires
+//     running this gate inside a container or a network namespace (e.g. an
+//     ephemeral, no-network sandbox) — deliberately out of scope here.
+//   - PRIMARY defense is upstream, not here: untrusted-authored issues are
+//     refused before reaching this gate (#300 trust gate), and the multi-repo
+//     path operates on an ephemeral throwaway clone. Secret-stripping is the
+//     defense-in-depth control for the honest-fix path, not the sole barrier
+//     against a hostile author.
 async fn run_sandboxed(
     cmd: &str,
     args: &[&str],
@@ -901,16 +913,66 @@ fn agent_workdir() -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir().join("augmentagent-agent-repos"))
 }
 
+/// Resolve symlinks for the portion of `path` that exists, then re-append any
+/// trailing components that do not exist yet.
+///
+/// `Path::canonicalize` requires every component to exist. For overlap checks we
+/// must normalize symlinks (so `/tmp` and `/private/tmp` compare equal on macOS)
+/// even when the leaf (e.g. a not-yet-created checkout dir) is absent. We walk up
+/// to the deepest existing ancestor, canonicalize that, and rebuild the path by
+/// appending the remaining components verbatim. No filesystem entries are
+/// created.
+fn canonicalize_lexically(path: &Path) -> std::io::Result<PathBuf> {
+    // Fast path: the whole path exists.
+    if let Ok(resolved) = path.canonicalize() {
+        return Ok(resolved);
+    }
+
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    loop {
+        match cursor.canonicalize() {
+            Ok(mut base) => {
+                for component in tail.iter().rev() {
+                    base.push(component);
+                }
+                return Ok(base);
+            }
+            Err(_) => {
+                let file_name = cursor.file_name().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no existing ancestor for {}", path.display()),
+                    )
+                })?;
+                tail.push(file_name.to_os_string());
+                cursor = cursor.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no existing ancestor for {}", path.display()),
+                    )
+                })?;
+            }
+        }
+    }
+}
+
 /// Refuse a clone target that resolves inside the deploy checkout. This is
 /// the multi-repo analogue of #103's "never touch main": a third-party
 /// clone must never land on top of (or inside) our own running tree.
 fn assert_outside_deploy(workspace: &Path, deploy_root: &Path) -> Result<()> {
-    let ws = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    let dep = deploy_root
-        .canonicalize()
-        .unwrap_or_else(|_| deploy_root.to_path_buf());
+    // Canonicalize symlinks before the overlap check. The checkout leaf may not
+    // exist yet, so we canonicalize the deepest existing ancestor and re-append
+    // the missing components (see `canonicalize_lexically`). This is required
+    // for correctness on macOS, where `/tmp` -> `/private/tmp`: canonicalizing
+    // only the parent (or falling back to the raw path when the leaf is absent)
+    // would leave one side as `/tmp/...` and the other as `/private/tmp/...`,
+    // defeating `starts_with` and silently ALLOWING an overlapping checkout. We
+    // fall back to the raw path only if no ancestor resolves at all (extremely
+    // unlikely for an absolute path); the conservative `starts_with` overlap
+    // test below still runs in that case.
+    let ws = canonicalize_lexically(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let dep = canonicalize_lexically(deploy_root).unwrap_or_else(|_| deploy_root.to_path_buf());
     if ws.starts_with(&dep) || dep.starts_with(&ws) {
         bail!(
             "refusing: agent workspace {} overlaps the deploy checkout {} \
