@@ -18,6 +18,17 @@ wiki/groceries/orders/*
 !wiki/groceries/orders/.gitkeep
 
 .env
+.env.*
+
+# Browser/grocery session-cookie profile dirs — live session cookies
+# (Giant, social, Gmail). Never commit; treat as secret.
+**/chrome-profile/
+**/*-chrome-profile/
+
+# Webhook spool + dedupe ledger — local runtime state, may contain PII.
+augmentagent-webhooks.jsonl
+augmentagent-deft-seen.jsonl
+
 *.db
 *.db-shm
 *.db-wal

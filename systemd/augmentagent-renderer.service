@@ -4,11 +4,11 @@ After=default.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/nolan-makatche/AugmentAgent/sidecars/renderer
+WorkingDirectory=%h/AugmentAgent/sidecars/renderer
 Environment=NODE_ENV=production
 Environment=AUGMENTAGENT_RENDERER_SOCK=%t/augmentagent/renderer.sock
 ExecStartPre=/usr/bin/mkdir -p %t/augmentagent
-ExecStart=/usr/bin/node /home/nolan-makatche/AugmentAgent/sidecars/renderer/server.mjs
+ExecStart=/usr/bin/node %h/AugmentAgent/sidecars/renderer/server.mjs
 Restart=on-failure
 RestartSec=5
 StartLimitBurst=5

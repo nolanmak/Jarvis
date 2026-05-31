@@ -11,7 +11,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/home/nolan-makatche/AugmentAgent/target/release/augmentagent tone refresh-stale --threshold 5
-Environment=AUGMENTAGENT_DB=/home/nolan-makatche/AugmentAgent/data.db
-StandardOutput=append:/home/nolan-makatche/.local/state/augmentagent/tone-refresh.log
-StandardError=append:/home/nolan-makatche/.local/state/augmentagent/tone-refresh.log
+ExecStart=%h/AugmentAgent/target/release/augmentagent tone refresh-stale --threshold 5
+Environment=AUGMENTAGENT_DB=%h/AugmentAgent/data.db
+StandardOutput=append:%h/.local/state/augmentagent/tone-refresh.log
+StandardError=append:%h/.local/state/augmentagent/tone-refresh.log
