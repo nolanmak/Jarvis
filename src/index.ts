@@ -22,6 +22,30 @@ const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT || "3000");
 
+// --- Auto-update signature gate (security #298) ---------------------------
+// This host holds live session credentials. The auto-updater pulls + builds +
+// restarts whatever lands on `main`. The git *author* field is spoofable, so we
+// must NOT trust it. Instead we require the target revision to carry a valid
+// cryptographic signature from an allowlisted (owner) key before we ever pull,
+// install, build, or restart. See src/index.ts checkForUpdates().
+//
+// Env knobs:
+//   AUGMENTAGENT_UPDATE_ALLOWED_SIGNERS  Path to an SSH/GPG allowed-signers file
+//                                        (the trust anchor). Required when
+//                                        signature verification is enforced and
+//                                        no allowedSignersFile is already wired
+//                                        into git config.
+//   AUGMENTAGENT_UPDATE_REQUIRE_SIGNATURE  "false" disables the gate (escape
+//                                        hatch for users who cannot sign).
+//                                        Default = enforce (any other value /
+//                                        unset = require signature).
+const UPDATE_REQUIRE_SIGNATURE =
+  (process.env.AUGMENTAGENT_UPDATE_REQUIRE_SIGNATURE || "").trim().toLowerCase() !==
+  "false";
+const UPDATE_ALLOWED_SIGNERS = (
+  process.env.AUGMENTAGENT_UPDATE_ALLOWED_SIGNERS || ""
+).trim();
+
 async function pollAndProcess(): Promise<void> {
   const accounts = getActiveGmailAccounts();
   if (accounts.length === 0) {
@@ -160,12 +184,92 @@ async function main(): Promise<void> {
   );
 }
 
+/**
+ * Best-effort Discord alert for security-relevant auto-update events.
+ * Uses the simple webhook (no bot required) so it works even before/without the
+ * Discord bot being ready. Never throws — alerting must not break the caller.
+ */
+function alertUpdateSecurity(message: string): void {
+  const webhook = (process.env.DISCORD_WEBHOOK_URL || "").trim();
+  if (!webhook) return;
+  // fire-and-forget; swallow all errors so a flaky webhook can't crash the loop
+  void fetch(webhook, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content: `⚠️ AugmentAgent auto-update: ${message}` }),
+  }).catch(() => {
+    /* alerting is best-effort */
+  });
+}
+
+/**
+ * Verify that `sha` (origin/main HEAD) is cryptographically signed by an
+ * allowlisted key. Returns true only when git confirms a GOOD signature from a
+ * trusted signer; returns false for unsigned, bad, or untrusted-signer commits.
+ *
+ * Trust anchor: an allowed-signers file. We pass it explicitly via
+ * AUGMENTAGENT_UPDATE_ALLOWED_SIGNERS when provided so the owner's key is the
+ * only thing that can authorize a deploy; otherwise we rely on git's already
+ * configured gpg.ssh.allowedSignersFile / GPG keyring. The git *author* field is
+ * never consulted — only the signature.
+ */
+function isRevisionSignedByOwner(cwd: string, sha: string): boolean {
+  // Build a `-c` override so the allowed-signers file is the trust anchor for
+  // this invocation only (does not mutate repo/global git config).
+  const signersOverride = UPDATE_ALLOWED_SIGNERS
+    ? `-c gpg.ssh.allowedSignersFile=${JSON.stringify(UPDATE_ALLOWED_SIGNERS)} `
+    : "";
+
+  // Prefer a signed release tag pointing at this revision (decouples "deploy"
+  // from "every push to main"); fall back to a signed commit on the revision.
+  const candidates = [
+    // signed tag exactly at origin/main HEAD, verified against allowed signers
+    `git ${signersOverride}tag --points-at ${sha} --format='%(refname:short)'`,
+  ];
+
+  // 1) If a tag points at this sha, require git verify-tag to pass for it.
+  try {
+    const tags = execSync(candidates[0]!, { cwd, stdio: "pipe" })
+      .toString()
+      .split("\n")
+      .map((t) => t.trim())
+      .filter(Boolean);
+    for (const tag of tags) {
+      try {
+        execSync(`git ${signersOverride}verify-tag ${JSON.stringify(tag)}`, {
+          cwd,
+          stdio: "pipe",
+        });
+        console.log(
+          `[${new Date().toISOString()}] Signature OK: tag ${tag} -> ${sha.slice(0, 7)} verified.`
+        );
+        return true;
+      } catch {
+        // this tag failed verification; keep checking others / fall through
+      }
+    }
+  } catch {
+    // tag enumeration failed; fall through to commit verification
+  }
+
+  // 2) Otherwise require the commit itself to be signed by an allowed key.
+  try {
+    execSync(`git ${signersOverride}verify-commit ${sha}`, { cwd, stdio: "pipe" });
+    console.log(
+      `[${new Date().toISOString()}] Signature OK: commit ${sha.slice(0, 7)} verified.`
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function checkForUpdates(): void {
   try {
     const cwd = process.cwd();
 
-    // Fetch latest from remote
-    execSync("git fetch origin main", { cwd, stdio: "pipe" });
+    // Fetch latest from remote (and any signed tags). Fetching does not run code.
+    execSync("git fetch origin main --tags", { cwd, stdio: "pipe" });
 
     // Compare local HEAD vs remote HEAD
     const local = execSync("git rev-parse HEAD", { cwd, stdio: "pipe" }).toString().trim();
@@ -176,8 +280,47 @@ function checkForUpdates(): void {
       return;
     }
 
+    // SECURITY GATE (#298): never pull/build/restart an unverified revision.
+    // The candidate is origin/main HEAD. It must be signed by the owner's key
+    // (verified cryptographically — NOT by the spoofable author field).
+    if (UPDATE_REQUIRE_SIGNATURE) {
+      if (!UPDATE_ALLOWED_SIGNERS) {
+        // No explicit trust anchor configured. We still attempt verification via
+        // git's own configured allowed-signers/keyring, but warn loudly because
+        // a misconfigured host could otherwise silently fail closed forever.
+        console.warn(
+          `[${new Date().toISOString()}] AUGMENTAGENT_UPDATE_ALLOWED_SIGNERS not set; ` +
+            `relying on git's configured signer trust anchor for verification.`
+        );
+      }
+
+      if (!isRevisionSignedByOwner(cwd, remote)) {
+        const msg =
+          `SKIPPED update to ${remote.slice(0, 7)}: revision is unsigned, has an ` +
+          `invalid signature, or is not signed by an allowed key. No pull/build/` +
+          `restart performed.`;
+        console.warn(`[${new Date().toISOString()}] ${msg}`);
+        alertUpdateSecurity(msg);
+        return;
+      }
+    } else {
+      // Escape hatch explicitly enabled — verification disabled by operator.
+      console.warn(
+        `[${new Date().toISOString()}] WARNING: signature verification DISABLED ` +
+          `(AUGMENTAGENT_UPDATE_REQUIRE_SIGNATURE=false). Deploying ${remote.slice(0, 7)} unverified.`
+      );
+    }
+
     console.log(`[${new Date().toISOString()}] New commits detected (${local.slice(0, 7)} → ${remote.slice(0, 7)}). Updating...`);
-    execSync("git pull origin main && npm install --production && npm run build", { cwd, stdio: "inherit" });
+    // Use `npm ci --omit=dev` (matches the previous --production intent) and
+    // --ignore-scripts so untrusted dependency lifecycle scripts cannot run on a
+    // credential-bearing host. The repo build is still run explicitly via
+    // `npm run build` below; this package has no install lifecycle scripts, so
+    // --ignore-scripts does not break the build.
+    execSync(
+      "git pull origin main && npm ci --omit=dev --ignore-scripts && npm run build",
+      { cwd, stdio: "inherit" }
+    );
 
     console.log(`[${new Date().toISOString()}] Build complete. Restarting via pm2...`);
     execSync("pm2 restart augmentagent", { cwd, stdio: "inherit" });
