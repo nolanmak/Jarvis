@@ -4,6 +4,7 @@ import { FirecrawlLayer } from "./layers/firecrawl.js";
 import { BrightDataLayer } from "./layers/brightdata.js";
 import { assessQuality } from "./quality.js";
 import { FetchError } from "./errors.js";
+import { assertUrlAllowed, SsrfBlockedError } from "./ssrf.js";
 import type { FetchOptions, FetchResult, Layer, LayerAttempt, LayerId, LayerOutput } from "./types.js";
 
 const DEFAULT_ORDER: LayerId[] = ["http", "render", "firecrawl", "brightdata"];
@@ -29,6 +30,18 @@ export class LayeredFetcher {
   async fetch(opts: FetchOptions): Promise<FetchResult> {
     if (!opts.url || !/^https?:\/\//i.test(opts.url)) {
       throw new FetchError("InvalidUrl", `url must start with http(s)://, got: ${opts.url}`);
+    }
+    // Up-front SSRF guard: reject non-http(s) schemes and internal/reserved
+    // destinations before dispatching to any layer. The http and render layers
+    // ALSO re-validate (including after redirects), so the guard holds
+    // regardless of which layer runs or how it follows redirects.
+    try {
+      await assertUrlAllowed(opts.url);
+    } catch (e) {
+      if (e instanceof SsrfBlockedError) {
+        throw new FetchError("InvalidUrl", e.message);
+      }
+      throw e;
     }
     const order = (opts.layers ?? DEFAULT_ORDER).filter((id) => this.layers.has(id));
     const minChars = opts.min_quality_chars ?? 400;
