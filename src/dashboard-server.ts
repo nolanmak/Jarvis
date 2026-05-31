@@ -7,13 +7,31 @@ import { initDb } from "./db";
 import dashboardRouter from "./dashboard";
 import apiV1Router from "./apiV1";
 import webhooksRouter from "./webhooks";
+import {
+  getBindHost,
+  getDashboardPort,
+  resolveApiKey,
+  hostOriginGuard,
+  contentSecurityPolicy,
+  loginPageHandler,
+  loginSubmitHandler,
+} from "./security";
 
-const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT || "3000");
+const DASHBOARD_PORT = getDashboardPort();
+const DASHBOARD_HOST = getBindHost();
 
 function main(): void {
   initDb();
 
   const app = express();
+
+  // Ensure auth is initialized (generates+persists+logs a key on first run).
+  resolveApiKey();
+
+  // #297: DNS-rebinding (Host allow-list) + CSRF (Origin/Referer) guard and
+  // strict CSP/security headers, applied before any handler.
+  app.use(hostOriginGuard);
+  app.use(contentSecurityPolicy);
 
   // Provider webhooks need the raw body for HMAC verification — mount
   // BEFORE express.json() so the JSON parser doesn't consume the stream.
@@ -25,6 +43,10 @@ function main(): void {
   app.set("view engine", "ejs");
   app.set("views", path.join(__dirname, "..", "views"));
 
+  // #297: unauthenticated login surface (issues the session cookie the UI uses).
+  app.get("/login", loginPageHandler);
+  app.post("/login", loginSubmitHandler);
+
   // Routes — versioned JSON API first (split-deployment surface from #1),
   // then the EJS-rendered dashboard UI. Without these mounts, /api/v1/*
   // and /webhooks/* both 404 in production: the dashboard-server entry
@@ -32,8 +54,8 @@ function main(): void {
   app.use(apiV1Router);
   app.use(dashboardRouter);
 
-  app.listen(DASHBOARD_PORT, () => {
-    console.log(`Dashboard running at http://localhost:${DASHBOARD_PORT}`);
+  app.listen(DASHBOARD_PORT, DASHBOARD_HOST, () => {
+    console.log(`Dashboard running at http://${DASHBOARD_HOST}:${DASHBOARD_PORT}`);
   });
 }
 

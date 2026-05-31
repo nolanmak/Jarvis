@@ -23,11 +23,12 @@
 // in-process tokio broadcast is the daemon-side analogue; this is the
 // HTTP-side bus for the web surface.
 
-import { Router, Request, Response, NextFunction } from "express";
+import { Router, Request, Response } from "express";
 import { EventEmitter } from "events";
 import { execFile } from "child_process";
 import path from "path";
 import fs from "fs";
+import { requireAuth, newRedditState, consumeRedditState } from "./security";
 import {
   getActions,
   getActionById,
@@ -49,7 +50,6 @@ import type { ActionStatus } from "./types";
 import { isPlausibleEmail } from "./types";
 
 export const MODE = (process.env.MODE || "local").toLowerCase();
-const API_KEY = process.env.AUGMENTAGENT_API_KEY || "";
 
 // In-process bus shared with the dashboard for cross-surface sync (#47).
 export const stateBus = new EventEmitter();
@@ -65,27 +65,13 @@ export function publishStatusChange(
   stateBus.emit("status", { actionId, newStatus, source, at: Date.now() });
 }
 
-// API-key middleware. In split mode a key is mandatory; in local mode it's
-// only enforced if one is set (so existing single-host setups keep working).
-// Exported so the dashboard router can gate the #117 /repos admin surface
-// behind the SAME key check (the dashboard process doesn't mount the v1
-// router, so it can't inherit `v1.use(requireApiKey)` — it reuses this).
-export function requireApiKey(req: Request, res: Response, next: NextFunction): void {
-  if (MODE === "split" && !API_KEY) {
-    res
-      .status(503)
-      .json({ error: "MODE=split requires AUGMENTAGENT_API_KEY to be set" });
-    return;
-  }
-  if (API_KEY) {
-    const provided = req.header("x-api-key");
-    if (provided !== API_KEY) {
-      res.status(401).json({ error: "invalid or missing x-api-key" });
-      return;
-    }
-  }
-  next();
-}
+// #297: auth is now ALWAYS enforced (fail-closed). `requireAuth` resolves a
+// key from AUGMENTAGENT_API_KEY or a persisted/auto-generated key, and accepts
+// a Bearer/x-api-key header (machine clients) OR a signed session cookie
+// (browser UI). Re-exported under the historical `requireApiKey` name so the
+// dashboard router and the #117 /repos admin surface share one credential and
+// one middleware without further edits.
+export const requireApiKey = requireAuth;
 
 // Process start timestamp — used by `/api/v1/health` so we report uptime
 // against THIS process, not the system clock. Captured at module-load
@@ -131,7 +117,7 @@ publicV1.get("/health", (_req, res) => {
 });
 
 const v1 = Router();
-v1.use(requireApiKey);
+v1.use(requireAuth);
 
 // GET /api/v1/stats — same numbers the dashboard stats partial renders.
 v1.get("/stats", (_req, res) => {
@@ -377,6 +363,9 @@ const redditAuthHandler = (_req: Request, res: Response): void => {
     res.status(503).send("REDDIT_CLIENT_ID not configured");
     return;
   }
+  // #297: generate a random per-flow state and persist it; validated on the
+  // callback to defeat OAuth CSRF / code-fixation (was hardcoded "augmentagent").
+  const state = newRedditState();
   execFile(
     cliPath(),
     [
@@ -387,7 +376,7 @@ const redditAuthHandler = (_req: Request, res: Response): void => {
       "--redirect-uri",
       REDDIT_REDIRECT,
       "--state",
-      "augmentagent",
+      state,
     ],
     (err, stdout) => {
       if (err) {
@@ -403,6 +392,12 @@ const redditCallbackHandler = (req: Request, res: Response): void => {
   const code = String(req.query.code || "");
   if (!code) {
     res.status(400).send("missing ?code");
+    return;
+  }
+  // #297: validate the per-flow state before exchanging the code.
+  const state = String(req.query.state || "");
+  if (!consumeRedditState(state)) {
+    res.status(403).send("invalid or missing OAuth state");
     return;
   }
   execFile(
