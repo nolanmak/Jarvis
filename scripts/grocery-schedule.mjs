@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // grocery-schedule.mjs — create / list / clear systemd user timers that
-// fire `node /home/nolan-makatche/AugmentAgent/scripts/grocery-weekly.mjs`
+// fire `node <repo>/scripts/grocery-weekly.mjs`
 // on either a recurring OnCalendar schedule (single slot, replaces any
 // existing recurring unit atomically) or as one-off transient units via
 // `systemd-run --user --on-calendar=...`.
@@ -20,9 +20,18 @@ import { spawn, spawnSync } from "node:child_process";
 import { writeFile, mkdir, readdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath } from "node:url";
 
-const NODE_BIN = "/usr/bin/node";
-const WEEKLY_SCRIPT = "/home/nolan-makatche/AugmentAgent/scripts/grocery-weekly.mjs";
+// Resolve script/project paths relative to this file and the running user's
+// home directory, so the emitted units are correct on both Linux and macOS
+// regardless of the operator's username (no hardcoded /home/<user>).
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PROJECT_DIR = path.dirname(SCRIPT_DIR);
+const HOME = os.homedir();
+
+const NODE_BIN = process.execPath;
+const WEEKLY_SCRIPT = path.join(SCRIPT_DIR, "grocery-weekly.mjs");
+const STATE_DIR = path.join(HOME, ".local", "state", "augmentagent");
 const UNIT_DIR = path.join(os.homedir(), ".config", "systemd", "user");
 const RECURRING_BASE = "augmentagent-grocery";
 const ONESHOT_PREFIX = "augmentagent-grocery-oneshot-";
@@ -191,11 +200,12 @@ async function setRecurring(spec, nextElapse) {
     `\n` +
     `[Service]\n` +
     `Type=oneshot\n` +
-    `WorkingDirectory=/home/nolan-makatche/AugmentAgent\n` +
+    `WorkingDirectory=${PROJECT_DIR}\n` +
     `ExecStart=${NODE_BIN} ${WEEKLY_SCRIPT}\n` +
-    `Environment=PATH=/home/nolan-makatche/.local/bin:/home/nolan-makatche/.cargo/bin:/usr/local/bin:/usr/bin:/bin\n` +
-    `StandardOutput=append:/home/nolan-makatche/.local/state/augmentagent/grocery.stdout.log\n` +
-    `StandardError=append:/home/nolan-makatche/.local/state/augmentagent/grocery.stderr.log\n`;
+    // %h is expanded by systemd to the running user's home directory.
+    `Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin\n` +
+    `StandardOutput=append:${path.join(STATE_DIR, "grocery.stdout.log")}\n` +
+    `StandardError=append:${path.join(STATE_DIR, "grocery.stderr.log")}\n`;
 
   const timerUnit =
     `[Unit]\n` +
