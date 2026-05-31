@@ -16,11 +16,21 @@ import { runAgent, redraftWithFeedback } from "./agent";
 import dashboardRouter from "./dashboard";
 import apiV1Router, { MODE } from "./apiV1";
 import webhooksRouter from "./webhooks";
+import {
+  getBindHost,
+  getDashboardPort,
+  resolveApiKey,
+  hostOriginGuard,
+  contentSecurityPolicy,
+  loginPageHandler,
+  loginSubmitHandler,
+} from "./security";
 import type { Email } from "./types";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT || "3000");
+const DASHBOARD_PORT = getDashboardPort();
+const DASHBOARD_HOST = getBindHost();
 
 async function pollAndProcess(): Promise<void> {
   const accounts = getActiveGmailAccounts();
@@ -94,6 +104,15 @@ You have ${newEmails.length} new email(s) to triage. The emails are provided abo
 function startDashboard(): void {
   const app = express();
 
+  // Ensure auth is initialized (generates+persists+logs a key on first run).
+  resolveApiKey();
+
+  // #297: DNS-rebinding (Host allow-list) + CSRF (Origin/Referer) guard, plus
+  // strict CSP/security headers, applied to EVERY route before any handler —
+  // including webhooks and the OAuth callbacks.
+  app.use(hostOriginGuard);
+  app.use(contentSecurityPolicy);
+
   // Provider webhooks need the raw body for HMAC — mount before json().
   app.use(webhooksRouter);
 
@@ -107,12 +126,18 @@ function startDashboard(): void {
   app.set("view engine", "ejs");
   app.set("views", path.join(__dirname, "..", "views"));
 
+  // #297: unauthenticated login surface (issues the session cookie the UI uses).
+  app.get("/login", loginPageHandler);
+  app.post("/login", loginSubmitHandler);
+
   // Routes — versioned JSON API first (split-deployment, #1), then UI.
   app.use(apiV1Router);
   app.use(dashboardRouter);
 
-  app.listen(DASHBOARD_PORT, () => {
-    console.log(`Dashboard running at http://localhost:${DASHBOARD_PORT} (MODE=${MODE})`);
+  app.listen(DASHBOARD_PORT, DASHBOARD_HOST, () => {
+    console.log(
+      `Dashboard running at http://${DASHBOARD_HOST}:${DASHBOARD_PORT} (MODE=${MODE})`
+    );
   });
 }
 
