@@ -447,9 +447,25 @@ impl ClaudeCliReasoner {
         // `--settings <json>` wires in per-call settings — notably the
         // PreToolUse hook that path-scopes Read/Write/Edit/Glob/Grep to
         // `WIKI_ROOT` for the wiki-query agent (#127).
+        //
+        // #317 — Claude Code does NOT load MCP servers declared under
+        // `--settings`; they only come from `--mcp-config`. So if the
+        // settings JSON carries an `mcpServers` object, split it out: the
+        // servers go to `--mcp-config` (plus `--strict-mcp-config`, so the
+        // agent's tool surface stays exactly what we declare and never
+        // picks up the host's global MCP config), and the remaining
+        // settings (hooks, etc.) go to `--settings`.
         if let Some(settings) = &opts.settings_json {
-            args.push("--settings".into());
-            args.push(settings.clone());
+            let (settings_only, mcp_config) = split_mcp_from_settings(settings);
+            if let Some(mcp_json) = mcp_config {
+                args.push("--mcp-config".into());
+                args.push(mcp_json);
+                args.push("--strict-mcp-config".into());
+            }
+            if let Some(s) = settings_only {
+                args.push("--settings".into());
+                args.push(s);
+            }
         }
 
         let mut cmd = Command::new(&self.bin);
@@ -909,7 +925,18 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // is forwarded as an env var so the hook script can resolve it without
     // baking the absolute path into the JSON.
     let guard_path = repo_root.join("scripts/aa-wiki-scope-guard.sh");
-    let settings_json = build_wiki_scope_settings(&guard_path);
+    // #317 — Conversation recall. The wiki-query agent only ever received a
+    // short `<conversation_history>` window injected into the prompt; it had
+    // no tool to reach earlier turns or its own past drafts, so it would
+    // flatly fail to recall work it did the same morning. The
+    // `augmentagent-mcp-memory` stdio server (built but never wired into ask
+    // mode) exposes exactly that: `search_conversation_history` searches the
+    // `emails` + `actions` tables (inbound messages + agent drafts) across
+    // all channels, and `memory_search`/`memory_recent` reach the curated
+    // memory store. Register it as a stdio MCP server scoped to the daemon
+    // db, alongside the path-scope hook.
+    let memory_bin = repo_root.join("target/release/augmentagent-mcp-memory");
+    let settings_json = build_wiki_scope_settings(&guard_path, &memory_bin, &db_path);
 
     // #128 — Provider secrets are loaded from the Linux Secret Service
     // just-in-time so the `Read` tool can never exfiltrate them from
@@ -984,6 +1011,13 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             "Edit".into(),
             "WebSearch".into(),
             "WebFetch".into(),
+            // #317 — read-only conversation/memory recall via the memory MCP
+            // server registered in settings_json below. Explicit tool names
+            // (not a wildcard) so the write tool `memory_write` is NOT exposed
+            // here — durable-fact persistence is a separate, deliberate surface.
+            "mcp__memory__search_conversation_history".into(),
+            "mcp__memory__memory_search".into(),
+            "mcp__memory__memory_recent".into(),
             bash_gmail_abs,
             bash_gmail_bare,
             bash_invoice_status_abs,
@@ -1041,20 +1075,75 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     }
 }
 
+/// Split an `mcpServers` object out of a `--settings` JSON blob.
+///
+/// Returns `(settings_without_mcp, mcp_config_json)`:
+/// - `settings_without_mcp` — the original object minus `mcpServers`,
+///   serialized, or `None` when nothing is left (so we don't pass an empty
+///   `--settings {}`).
+/// - `mcp_config_json` — `{"mcpServers": {...}}` ready for `--mcp-config`,
+///   or `None` when the settings carried no servers.
+///
+/// Claude Code reads MCP servers only from `--mcp-config`, never from
+/// `--settings`, so presets that want both a hook and an MCP server (e.g.
+/// [`ask_opts`]) declare both in `settings_json` and rely on the reasoner to
+/// route each to the right flag (#317). On any JSON parse failure the input
+/// is passed through unchanged as settings (fail-open to today's behaviour).
+fn split_mcp_from_settings(raw: &str) -> (Option<String>, Option<String>) {
+    let parsed: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return (Some(raw.to_string()), None),
+    };
+    let serde_json::Value::Object(mut map) = parsed else {
+        return (Some(raw.to_string()), None);
+    };
+    let mcp_config = map.remove("mcpServers").map(|servers| {
+        serde_json::json!({ "mcpServers": servers }).to_string()
+    });
+    let settings_only = if map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(map).to_string())
+    };
+    (settings_only, mcp_config)
+}
+
 /// Build the inline JSON passed to `claude --settings` for wiki-query mode.
 ///
-/// Registers a single PreToolUse hook covering the five file tools Claude
-/// Code does not natively path-scope (Read/Write/Edit/Glob/Grep). The hook
-/// is a shell script that reads the tool-call JSON from stdin and emits a
-/// `decision: "block"` reply when the path resolves outside `WIKI_ROOT`.
+/// Registers two things:
+/// 1. A PreToolUse hook covering the five file tools Claude Code does not
+///    natively path-scope (Read/Write/Edit/Glob/Grep). The hook is a shell
+///    script that reads the tool-call JSON from stdin and emits a
+///    `decision: "block"` reply when the path resolves outside `WIKI_ROOT`.
+/// 2. The `memory` stdio MCP server (#317) — `augmentagent-mcp-memory` —
+///    scoped to the daemon db via its own `AUGMENTAGENT_DB` env so the
+///    conversation-recall tools work under `restrict_env`. The Claude CLI
+///    spawns and owns the server's lifecycle; we only declare it here.
 ///
 /// Returns a one-line JSON string so it survives `--settings` arg passing
 /// without shell-quoting heartburn.
-fn build_wiki_scope_settings(guard_path: &std::path::Path) -> String {
+fn build_wiki_scope_settings(
+    guard_path: &std::path::Path,
+    memory_bin: &std::path::Path,
+    db_path: &std::path::Path,
+) -> String {
     // Use serde_json to ensure the guard path is JSON-escaped correctly
     // (spaces, quotes, backslashes). The settings shape is the Claude Code
     // hook spec: `hooks.PreToolUse[].matcher` (regex) + `hooks[].command`.
     serde_json::json!({
+        "mcpServers": {
+            "memory": {
+                "command": memory_bin.to_string_lossy(),
+                "args": [],
+                // Scope the server to the daemon db explicitly. The MCP
+                // server is spawned by the Claude CLI as a child; under
+                // `restrict_env` it cannot rely on inheriting AUGMENTAGENT_DB
+                // from the daemon, so we pin it per-server here.
+                "env": {
+                    "AUGMENTAGENT_DB": db_path.to_string_lossy()
+                }
+            }
+        },
         "hooks": {
             "PreToolUse": [{
                 "matcher": "Read|Write|Edit|Glob|Grep",
@@ -1574,6 +1663,95 @@ mod tests {
                 "expected allowed_tools to contain {needle}; got:\n{joined}"
             );
         }
+    }
+
+    /// #317 — the reasoner routes `mcpServers` to `--mcp-config` and keeps
+    /// the rest on `--settings`.
+    #[test]
+    fn split_mcp_from_settings_routes_servers_and_keeps_hooks() {
+        let raw = r#"{"mcpServers":{"memory":{"command":"x"}},"hooks":{"PreToolUse":[]}}"#;
+        let (settings, mcp) = split_mcp_from_settings(raw);
+        // mcp_config carries the server wrapped in {"mcpServers": …}.
+        let mcp_v: serde_json::Value =
+            serde_json::from_str(&mcp.expect("mcp config present")).unwrap();
+        assert!(mcp_v.pointer("/mcpServers/memory/command").is_some());
+        // settings keeps hooks and DROPS mcpServers.
+        let s_v: serde_json::Value =
+            serde_json::from_str(&settings.expect("settings present")).unwrap();
+        assert!(s_v.pointer("/hooks/PreToolUse").is_some());
+        assert!(s_v.pointer("/mcpServers").is_none());
+    }
+
+    #[test]
+    fn split_mcp_from_settings_no_servers_passes_through() {
+        let raw = r#"{"hooks":{"PreToolUse":[]}}"#;
+        let (settings, mcp) = split_mcp_from_settings(raw);
+        assert!(mcp.is_none());
+        assert_eq!(settings.as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn split_mcp_from_settings_only_servers_yields_no_settings() {
+        let raw = r#"{"mcpServers":{"memory":{"command":"x"}}}"#;
+        let (settings, mcp) = split_mcp_from_settings(raw);
+        assert!(settings.is_none(), "empty residual settings must be None");
+        assert!(mcp.is_some());
+    }
+
+    /// #317 — `ask_opts` must register the `memory` stdio MCP server (scoped
+    /// to the daemon db) AND advertise the read-only recall tools, while
+    /// keeping the path-scope hook and NOT exposing the write tool.
+    #[test]
+    fn ask_opts_registers_memory_mcp_server_and_recall_tools() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        let _guard = EnvGuard::unset("AUGMENTAGENT_DB");
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+
+        // Recall tools advertised; write tool deliberately absent here.
+        let joined = opts.allowed_tools.join("\n");
+        for needle in [
+            "mcp__memory__search_conversation_history",
+            "mcp__memory__memory_search",
+            "mcp__memory__memory_recent",
+        ] {
+            assert!(
+                opts.allowed_tools.iter().any(|t| t == needle),
+                "expected recall tool {needle}; got:\n{joined}"
+            );
+        }
+        assert!(
+            !opts.allowed_tools.iter().any(|t| t == "mcp__memory__memory_write"),
+            "memory_write must NOT be exposed in ask mode allowlist"
+        );
+
+        // Settings JSON registers the stdio server, db-scoped, and STILL
+        // carries the path-scope PreToolUse hook (we add alongside, not
+        // replace).
+        let settings = opts.settings_json.expect("settings_json present");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&settings).expect("settings_json is valid JSON");
+        let cmd = parsed
+            .pointer("/mcpServers/memory/command")
+            .and_then(|v| v.as_str())
+            .expect("memory server command present");
+        assert!(
+            cmd.ends_with("augmentagent-mcp-memory"),
+            "memory command should point at the mcp-memory binary; got {cmd}"
+        );
+        let db = parsed
+            .pointer("/mcpServers/memory/env/AUGMENTAGENT_DB")
+            .and_then(|v| v.as_str())
+            .expect("memory server AUGMENTAGENT_DB env present");
+        assert!(
+            std::path::Path::new(db).is_absolute(),
+            "memory server db path must be absolute; got {db}"
+        );
+        assert!(
+            parsed.pointer("/hooks/PreToolUse/0/matcher").is_some(),
+            "path-scope PreToolUse hook must survive alongside mcpServers"
+        );
     }
 
     /// #127 — `ask_opts` must wire up a PreToolUse hook so the harness
