@@ -164,7 +164,7 @@ impl MeetupChannel {
     }
 }
 
-fn render_event(ev: &MeetupEvent) -> String {
+pub fn render_event(ev: &MeetupEvent) -> String {
     let when = ev.date_time.as_deref().unwrap_or("(date TBD)");
     let where_ = if ev.is_online {
         "online".to_string()
