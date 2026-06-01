@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -29,7 +29,7 @@ pub enum MeetupError {
     Runtime(String),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MeetupVenue {
     #[serde(default)]
     pub name: String,
@@ -39,7 +39,7 @@ pub struct MeetupVenue {
     pub state: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MeetupEvent {
     pub id: String,
