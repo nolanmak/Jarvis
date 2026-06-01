@@ -44,10 +44,32 @@ pub trait InvoiceDraftPoster: Send + Sync {
 // than mailing a baked-in personal address.
 const DEFAULT_RECIPIENT: &str = "";
 
-/// Where the vendored Python tooling lives. Override with `INVOICE_SCRIPTS_DIR`
-/// (the daemon's cwd is the repo root, where `data.db` sits).
+/// Where the vendored Python tooling lives. Override with `INVOICE_SCRIPTS_DIR`.
+///
+/// Resolution order:
+/// 1. `INVOICE_SCRIPTS_DIR` env var (explicit override; tests, packaged installs).
+/// 2. Walk up from the running binary (`target/release/augmentagent`) and pick the
+///    first ancestor containing `scripts/invoice/send_invoice.py`. This is what
+///    makes wiki-ask and other sub-CLI invocations work — the spawned CLI's cwd
+///    is pinned to the wiki root (so Write/Edit can't escape the wiki), but
+///    `scripts/invoice/` lives at the repo root. Before this fallback, the
+///    relative lookup resolved to `<wiki>/scripts/invoice/send_invoice.py`,
+///    which doesn't exist → the script appeared to be "missing" (see #316).
+/// 3. Last-resort relative path, preserving the original cwd-relative behavior
+///    for unit tests that run from arbitrary tmpdirs.
 fn scripts_dir() -> String {
-    std::env::var("INVOICE_SCRIPTS_DIR").unwrap_or_else(|_| "scripts/invoice".to_string())
+    if let Ok(v) = std::env::var("INVOICE_SCRIPTS_DIR") {
+        return v;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors().skip(1) {
+            let candidate = ancestor.join("scripts").join("invoice");
+            if candidate.join("send_invoice.py").is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "scripts/invoice".to_string()
 }
 
 pub struct InvoiceScheduler {
