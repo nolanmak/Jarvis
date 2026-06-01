@@ -888,6 +888,14 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // system prompt points at `loop` first.
     let bash_loops_abs = format!("Bash({} loops *)", bin.display());
     let bash_loops_bare = "Bash(augmentagent loops *)".to_string();
+    // #319 — `meetup events <urlname>` is the on-demand, read-only event
+    // lookup query mode uses to answer "what are our Meetup events this
+    // week". Scoped to the `events` subcommand only — `subscribe`,
+    // `unsubscribe`, and `poll-once` (which posts a Discord card) stay out
+    // of the agent's reach. Both forms, same `#214` bare-resolves-on-PATH
+    // rationale as the other `augmentagent` subcommands.
+    let bash_meetup_events_abs = format!("Bash({} meetup events *)", bin.display());
+    let bash_meetup_events_bare = "Bash(augmentagent meetup events *)".to_string();
     // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
     // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
     // resolves the db regardless of cwd.
@@ -923,6 +931,14 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         // WIKI_ROOT is consumed by `scripts/aa-wiki-scope-guard.sh` to
         // know which prefix is permitted for file tools.
         ("WIKI_ROOT".into(), wiki_root.to_string_lossy().into_owned()),
+        // #319/#322 — query mode pins cwd to the wiki root, so any sub-CLI
+        // that shells to a repo-relative helper (e.g. `meetup events` →
+        // scripts/meetup-events.mjs) can't find it via current_dir().
+        // Hand it the repo root explicitly.
+        (
+            "AUGMENTAGENT_REPO_ROOT".into(),
+            repo_root.to_string_lossy().into_owned(),
+        ),
     ];
     // #214 — Prepend the release bin's dir to PATH so the agent's bare
     // `augmentagent <subcommand>` invocations actually resolve to OUR
@@ -986,6 +1002,8 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_loop_bare,
             bash_loops_abs,
             bash_loops_bare,
+            bash_meetup_events_abs,
+            bash_meetup_events_bare,
             format!("Bash({} issue create *)", aa_gh.display()),
             format!("Bash({} issue list *)", aa_gh.display()),
             format!("Bash({} issue view *)", aa_gh.display()),
