@@ -1070,6 +1070,18 @@ enum MeetupOp {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
     },
+    /// On-demand: list a group's upcoming events. No subscription or db
+    /// needed — fetches live via the Meetup GraphQL client. This is the
+    /// read-only surface query mode reaches through the `augmentagent
+    /// meetup events` Bash allowlist entry (#319).
+    Events {
+        /// Group url-name slug, e.g. `code-coffee-philly`.
+        urlname: String,
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2823,6 +2835,11 @@ async fn main() -> Result<()> {
                 println!("{out:#?}");
                 Ok(())
             }
+            MeetupOp::Events {
+                urlname,
+                limit,
+                json,
+            } => run_meetup_events(urlname.clone(), *limit, *json).await,
         },
         Cmd::Gdrive { ref op } => match op {
             GdriveOp::Accounts { json } => run_gdrive_accounts(store, *json),
@@ -8990,6 +9007,72 @@ fn run_meetup_subscriptions(store: Arc<Store>, json: bool) -> Result<()> {
 fn run_meetup_unsubscribe(store: Arc<Store>, id: String) -> Result<()> {
     store.delete_subscription(&id).context("delete subscription")?;
     println!("subscription {id} deactivated");
+    Ok(())
+}
+
+/// On-demand event lookup for a single group (#319). Unlike `poll-once`,
+/// this needs neither a subscription row nor the daemon db — it shells
+/// straight to the Meetup client and prints the result. Query mode calls
+/// this (via the `augmentagent meetup events …` allowlist entry) when the
+/// user asks "what are our Meetup events this week".
+///
+/// `--json` emits the raw event array (camelCase keys, same shape the
+/// digest consumes) so the LLM can post-process; the default human render
+/// reuses `render_event` so on-demand output matches the Discord digest.
+/// Resolve the repo root for the `scripts/meetup-events.mjs` shell-out,
+/// independent of cwd. Query mode pins cwd to the wiki root, so the
+/// daemon's `current_dir() == repo_root` assumption breaks there (#319/#322).
+///
+/// Order: explicit `AUGMENTAGENT_REPO_ROOT` (set by `ask_opts`) → derive
+/// from the binary's own path (`<repo>/target/<profile>/augmentagent`, so
+/// the repo is three ancestors up) → fall back to cwd (daemon context,
+/// where cwd already is the repo root).
+fn resolve_meetup_repo_root() -> PathBuf {
+    if let Ok(v) = std::env::var("AUGMENTAGENT_REPO_ROOT") {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(root) = exe.ancestors().nth(3) {
+            if root.join("scripts/meetup-events.mjs").is_file() {
+                return root.to_path_buf();
+            }
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+async fn run_meetup_events(urlname: String, limit: usize, json: bool) -> Result<()> {
+    let normalized = urlname.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        anyhow::bail!("urlname (group slug) is required");
+    }
+    // scripts/meetup-events.mjs lives at the repo root. In query mode the
+    // cwd is pinned to the WIKI root (not the repo), so `current_dir()` —
+    // which build_meetup_channel can rely on because the daemon's cwd IS
+    // the repo root — would miss the script and the Node shell-out would
+    // fail with MODULE_NOT_FOUND. Resolve the repo root independent of cwd.
+    let repo_root = resolve_meetup_repo_root();
+    let client = augmentagent_channel_meetup::MeetupClient::new(&repo_root);
+    let events = client
+        .upcoming_events(&normalized, limit)
+        .await
+        .with_context(|| format!("fetch upcoming meetup events for `{normalized}`"))?;
+    if json {
+        println!("{}", serde_json::to_string(&events)?);
+    } else if events.is_empty() {
+        println!("No upcoming events for group `{normalized}`.");
+    } else {
+        println!(
+            "{} upcoming event(s) for `{normalized}`:\n",
+            events.len()
+        );
+        for ev in &events {
+            println!("{}", augmentagent_channel_meetup::render_event(ev));
+        }
+    }
     Ok(())
 }
 
