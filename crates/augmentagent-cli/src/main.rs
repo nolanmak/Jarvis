@@ -2654,7 +2654,7 @@ async fn main() -> Result<()> {
                     ),
                     None => None,
                 };
-                let msg = invoice::run_invoice(&store, we, *dry_run, *force, None).await?;
+                let msg = invoice::run_invoice(&store, we, *dry_run, *force).await?;
                 println!("{msg}");
                 Ok(())
             }
@@ -4919,15 +4919,11 @@ impl InvoiceOps for CliInvoiceOps {
         })
     }
 
-    async fn send(
-        &self,
-        week_end: chrono::NaiveDate,
-        invoice_number: u32,
-    ) -> anyhow::Result<String> {
-        // Send with the draft's stored number (not a re-peek), and keep the
-        // guards on (force = false) so approving a stale card for an
-        // already-covered week or an already-issued number is refused.
-        invoice::run_invoice(&self.store, Some(week_end), false, false, Some(invoice_number)).await
+    async fn send(&self, week_end: chrono::NaiveDate) -> anyhow::Result<String> {
+        // Authoritative number is peeked at send (force = false keeps the
+        // covered-week guard on), so each approved draft takes the next
+        // sequential number — see invoice::run_invoice.
+        invoice::run_invoice(&self.store, Some(week_end), false, false).await
     }
 }
 
