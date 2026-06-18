@@ -48,6 +48,8 @@ const DEFAULT_RECIPIENT: &str = "";
 ///
 /// Resolution order:
 /// 1. `INVOICE_SCRIPTS_DIR` env var (explicit override; tests, packaged installs).
+///    A blank/whitespace-only value is treated as unset so it can't short-circuit
+///    to an invalid `/send_invoice.py` path — resolution falls through to (2).
 /// 2. Walk up from the running binary (`target/release/augmentagent`) and pick the
 ///    first ancestor containing `scripts/invoice/send_invoice.py`. This is what
 ///    makes wiki-ask and other sub-CLI invocations work — the spawned CLI's cwd
@@ -59,7 +61,9 @@ const DEFAULT_RECIPIENT: &str = "";
 ///    for unit tests that run from arbitrary tmpdirs.
 fn scripts_dir() -> String {
     if let Ok(v) = std::env::var("INVOICE_SCRIPTS_DIR") {
-        return v;
+        if !v.trim().is_empty() {
+            return v;
+        }
     }
     if let Ok(exe) = std::env::current_exe() {
         for ancestor in exe.ancestors().skip(1) {
@@ -381,6 +385,25 @@ mod tests {
             most_recent_sunday(sat),
             NaiveDate::from_ymd_opt(2026, 5, 10).unwrap()
         );
+    }
+
+    #[test]
+    fn blank_scripts_dir_env_is_ignored() {
+        // A blank/whitespace INVOICE_SCRIPTS_DIR must not short-circuit to an
+        // invalid path (regression for the `/send_invoice.py` foot-gun flagged
+        // in review). With it blank, scripts_dir() falls through to the
+        // binary-ancestor search or the relative fallback — either way the
+        // result is a non-empty path that is NOT the blank value.
+        // Only this test touches INVOICE_SCRIPTS_DIR, so the env write is
+        // isolated from other tests' reads.
+        std::env::set_var("INVOICE_SCRIPTS_DIR", "   ");
+        let dir = scripts_dir();
+        std::env::remove_var("INVOICE_SCRIPTS_DIR");
+        assert!(
+            !dir.trim().is_empty(),
+            "blank env must not yield a blank scripts dir, got {dir:?}"
+        );
+        assert_ne!(dir.trim(), "", "scripts dir should never be the blank override");
     }
 
     #[test]
