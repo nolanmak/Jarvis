@@ -448,6 +448,28 @@ mod tests {
         assert_eq!(emails[0].from, "me@example.com");
     }
 
+    // #331 follow-up: some Composio builds emit `internalDate` as epoch-ms (a
+    // JSON number). The timestamp field must accept that without hard-failing
+    // the whole decode — the number is stringified into Email.date so the
+    // downstream epoch-ms parser can use it.
+    #[tokio::test]
+    async fn fetch_with_query_accepts_numeric_internal_date() {
+        let body = r#"{"data":{"messages":[{"id":"MSG9","from":"sender@example.com","subject":"Re: ping","internalDate":1737147069000,"messageText":"hi"}]}}"#;
+        let addr = spawn_repeating_http(200, body).await;
+        let base = format!("http://{addr}");
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(base);
+
+        let emails = client
+            .fetch_with_query("entity-x", "in:inbox", 1)
+            .await
+            .expect("a numeric internalDate must not fail the decode");
+
+        assert_eq!(emails.len(), 1, "expected the message to parse, not error out");
+        assert_eq!(emails[0].message_id, "MSG9");
+        // The epoch-ms number is stringified into date (parse_date_ms handles it).
+        assert_eq!(emails[0].date, "1737147069000");
+    }
+
     #[tokio::test]
     async fn composio_401_propagates_status_and_message_to_error_display() {
         let body =
@@ -564,10 +586,43 @@ struct FetchMessage {
     /// `messageTimestamp` (RFC-3339, e.g. `2026-01-17T21:11:09Z`) — NOT under
     /// `date`/`receivedTime` — so the `date` column came back empty (#331).
     /// The `camelCase` rename already maps this field to `messageTimestamp`;
-    /// the explicit aliases also accept `internalDate` (epoch-ms on some
-    /// Composio builds), both of which the downstream date parsers handle.
-    #[serde(alias = "internalDate", alias = "internal_date")]
+    /// the aliases also accept `internalDate`, which some Composio builds emit
+    /// as **epoch-ms** — and epoch-ms is a JSON *number*. A plain
+    /// `Option<String>` would hard-fail the entire response decode on a numeric
+    /// `internalDate` (`invalid type: integer, expected a string`), so
+    /// `de_num_or_string` accepts a string OR a number (stringifying the
+    /// latter). Downstream `parse_date_ms` handles both RFC-3339 and epoch-ms.
+    #[serde(
+        default,
+        alias = "internalDate",
+        alias = "internal_date",
+        deserialize_with = "de_num_or_string"
+    )]
     message_timestamp: Option<String>,
+}
+
+/// Deserialize a field that Composio may send as either a JSON string
+/// (`messageTimestamp` RFC-3339) or a JSON number (`internalDate` epoch-ms),
+/// yielding `Option<String>`. Absent/null → `None`; a number is stringified so
+/// it still reaches `Email.date` (and the epoch-ms branch of `parse_date_ms`).
+/// Without this, a numeric value aborts the whole `FetchResp` decode (#331).
+fn de_num_or_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        S(String),
+        I(i64),
+        F(f64),
+    }
+    Ok(match Option::<NumOrStr>::deserialize(d)? {
+        Some(NumOrStr::S(s)) => Some(s),
+        Some(NumOrStr::I(n)) => Some(n.to_string()),
+        Some(NumOrStr::F(f)) => Some((f as i64).to_string()),
+        None => None,
+    })
 }
 
 impl FetchMessage {
