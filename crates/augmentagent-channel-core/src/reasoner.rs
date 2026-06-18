@@ -861,6 +861,20 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
 /// wiki via Write/Edit. The spawned CLI's cwd is pinned to `wiki_root` so
 /// Write/Edit cannot escape into the source tree.
 pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
+    // #337 — WIKI_ROOT must be ABSOLUTE. The daemon launches with
+    // `--wiki-dir ./wiki` (relative), and the scope guard resolves WIKI_ROOT
+    // with `readlink -f` from the spawned CLI's cwd — which `ask_opts` pins to
+    // the wiki root itself. A relative `./wiki` therefore resolves a SECOND
+    // time to `<wiki>/wiki`, so every legitimate page path (`projects/x.md`,
+    // `about/me.md`, …) falls outside the guard root and the durable-facts
+    // write is rejected. Canonicalize up front so cwd, the WIKI_ROOT env, and
+    // `--add-dir` all carry the same absolute path. Falls back to joining the
+    // current dir when the path doesn't exist yet (keeps tests hermetic).
+    let wiki_root = std::fs::canonicalize(&wiki_root).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|d| d.join(&wiki_root))
+            .unwrap_or(wiki_root)
+    });
     let bin = repo_root.join("target/release/augmentagent");
     // Scoped Bash patterns. The claude permission matcher does literal
     // string comparison — `augmentagent foo` (bare) and `/abs/path/augmentagent
@@ -1804,7 +1818,38 @@ mod tests {
             .find(|(k, _)| k == "WIKI_ROOT")
             .map(|(_, v)| v.clone())
             .expect("WIKI_ROOT env var must be forwarded to the guard");
-        assert_eq!(wiki_env, wiki.path().to_string_lossy());
+        // #337 — WIKI_ROOT is canonicalized inside ask_opts; compare against
+        // the canonical form of the tempdir (symlinked /tmp on some hosts).
+        let expected = std::fs::canonicalize(wiki.path()).unwrap();
+        assert_eq!(wiki_env, expected.to_string_lossy());
+    }
+
+    /// #337 — a RELATIVE `--wiki-dir` (the daemon passes `./wiki`) must be
+    /// absolutized before it reaches WIKI_ROOT. Otherwise the guard's
+    /// `readlink -f` re-resolves it against the spawned CLI's cwd (already the
+    /// wiki root) to `<wiki>/wiki`, and every real page path is rejected.
+    #[test]
+    fn ask_opts_absolutizes_relative_wiki_root() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        let _guard = EnvGuard::unset("AUGMENTAGENT_DB");
+        // A relative wiki dir, exactly like the systemd unit's `--wiki-dir ./wiki`.
+        let rel = std::path::PathBuf::from("rel-wiki-xyz");
+        let opts = ask_opts(rel, repo.path().to_path_buf());
+        let wiki_env = opts
+            .env
+            .iter()
+            .find(|(k, _)| k == "WIKI_ROOT")
+            .map(|(_, v)| v.clone())
+            .expect("WIKI_ROOT env var must be forwarded to the guard");
+        assert!(
+            std::path::Path::new(&wiki_env).is_absolute(),
+            "WIKI_ROOT must be absolute even for a relative --wiki-dir; got {wiki_env}"
+        );
+        assert!(
+            !wiki_env.contains("rel-wiki-xyz/rel-wiki-xyz"),
+            "relative wiki dir must not be doubled into <wiki>/wiki; got {wiki_env}"
+        );
     }
 
     /// Regression test for the PR #199 follow-up: `aa-gh` must be
