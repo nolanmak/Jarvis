@@ -246,7 +246,7 @@ pub async fn generate_pdf(
         .get_invoice_config("from_entity")?
         .unwrap_or_default();
     let number = store.invoice_counter()?;
-    let pdf_path = pdf_path_for(number);
+    let pdf_path = pdf_path_for(number, end);
     if let Some(parent) = pdf_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
@@ -294,14 +294,16 @@ pub async fn generate_pdf(
     })
 }
 
-/// Deterministic PDF path for `send_invoice.py`. Mirrors the script's
-/// default output (`INVOICE_OUT_DIR` || /tmp/invoices / `Orchid_Invoice_N.pdf`)
-/// so Rust can pass `--out` explicitly and then read the file back to attach
-/// it to the Discord card.
-pub fn pdf_path_for(number: u32) -> PathBuf {
+/// Deterministic preview-PDF path for a draft, under `INVOICE_OUT_DIR`
+/// (default `/tmp/invoices`). The filename includes BOTH the tentative number
+/// and the `week_end` so that several drafts sharing the same peeked number
+/// (all pending, none approved yet) don't clobber each other on disk — each
+/// draft card attaches its own PDF (#330 follow-up). The real send regenerates
+/// the PDF at its authoritative number, so this path is preview-only.
+pub fn pdf_path_for(number: u32, week_end: NaiveDate) -> PathBuf {
     let dir =
         std::env::var("INVOICE_OUT_DIR").unwrap_or_else(|_| "/tmp/invoices".to_string());
-    PathBuf::from(dir).join(format!("Orchid_Invoice_{number}.pdf"))
+    PathBuf::from(dir).join(format!("Orchid_Invoice_{number}_{week_end}.pdf"))
 }
 
 /// Generate (and unless `dry_run`, send) the invoice for the Sun→Sun week
@@ -309,20 +311,19 @@ pub fn pdf_path_for(number: u32) -> PathBuf {
 /// real send, advances the counter and records the billed week **atomically**
 /// (`commit_invoice_sent`) so it can't double-fire or leave state half-written.
 ///
-/// `number_override` lets the Approve path send with the draft row's stored
-/// invoice number instead of re-peeking the live counter (which can drift
-/// between draft and approve); the direct CLI passes `None` and peeks.
+/// The authoritative invoice number is the live counter peeked at SEND time,
+/// so several pending weekly drafts each get a distinct, sequential number as
+/// they're approved (each approval peeks the counter the prior one advanced).
+/// The draft card's number is only a tentative preview.
 ///
 /// Unless `force`, a real send is refused when the week is already covered
-/// (`ensure_week_billable`) or when the chosen number was already issued
-/// (`number < current counter`) — the double-billing / counter-collision
-/// guards from #330. Returns a human-readable summary line.
+/// (`ensure_week_billable`) — the double-billing guard from #330. Returns a
+/// human-readable summary line (which carries the actual number sent).
 pub async fn run_invoice(
     store: &Store,
     week_end: Option<NaiveDate>,
     dry_run: bool,
     force: bool,
-    number_override: Option<u32>,
 ) -> Result<String> {
     let end = match week_end {
         Some(d) => d,
@@ -344,26 +345,17 @@ pub async fn run_invoice(
     let from_entity = store
         .get_invoice_config("from_entity")?
         .unwrap_or_default();
-    // Use the draft's stored number on the Approve path; otherwise peek (don't
-    // burn) the live counter — only commit it on a successful send.
-    let number = match number_override {
-        Some(n) => n,
-        None => store.invoice_counter()?,
-    };
+    // Peek (don't burn) the live counter — it advances atomically in
+    // commit_invoice_sent below, on success only, so a failed send never burns
+    // a number. Peeking at send (rather than pinning a draft-time number) is
+    // what makes multiple pending drafts approve cleanly: each takes the next
+    // sequential number.
+    let number = store.invoice_counter()?;
 
-    // Double-billing guards apply only to real sends (a dry-run preview is
+    // Covered-week guard applies only to real sends (a dry-run preview is
     // harmless and must stay available even for an already-billed week).
     if !dry_run {
         ensure_week_billable(store, end, force)?;
-        if !force {
-            let current = store.invoice_counter()?;
-            if number < current {
-                anyhow::bail!(
-                    "invoice #{number} was already issued (counter is at {current}) — \
-                     refusing to re-send a used number and collide. Pass --force to override."
-                );
-            }
-        }
     }
 
     let dir = scripts_dir();
@@ -500,10 +492,15 @@ mod tests {
         // Using a sentinel rather than removing it so a parallel test that
         // also touches INVOICE_OUT_DIR doesn't see a missing value.
         std::env::set_var("INVOICE_OUT_DIR", "/tmp/aa-invoice-test");
-        let p = pdf_path_for(42);
+        let wk = NaiveDate::from_ymd_opt(2026, 5, 31).unwrap();
+        let p = pdf_path_for(42, wk);
         assert_eq!(
             p,
-            std::path::PathBuf::from("/tmp/aa-invoice-test/Orchid_Invoice_42.pdf")
+            std::path::PathBuf::from("/tmp/aa-invoice-test/Orchid_Invoice_42_2026-05-31.pdf")
         );
+        // Two drafts sharing a peeked number but different weeks must not
+        // resolve to the same file (the #330 clobber).
+        let wk2 = NaiveDate::from_ymd_opt(2026, 6, 7).unwrap();
+        assert_ne!(pdf_path_for(42, wk), pdf_path_for(42, wk2));
     }
 }
