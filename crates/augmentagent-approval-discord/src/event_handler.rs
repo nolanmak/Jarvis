@@ -1122,7 +1122,7 @@ pub(crate) async fn invoice_approve_draft(
             };
         }
     };
-    match ops.send(week_end, draft.invoice_number as u32).await {
+    match ops.send(week_end).await {
         Ok(msg) => {
             if let Err(e) =
                 store.mark_invoice_draft_resolved(draft_id, "approved", user_id)
@@ -1132,14 +1132,17 @@ pub(crate) async fn invoice_approve_draft(
             info!(
                 draft_id = %draft_id,
                 user_id = %user_id,
-                number = draft.invoice_number,
-                "invoice approve: sent"
+                "invoice approve: sent — {msg}"
             );
+            // `msg` carries the ACTUAL number assigned at send time (the draft's
+            // number is only a tentative preview and may differ when several
+            // drafts are pending), so the card edit shows the send summary
+            // rather than re-asserting the stale draft number (#330).
             InvoiceClickResult {
                 followup: format!("Approved — {msg}"),
                 source_edit: Some(format!(
-                    ":white_check_mark: Sent #{} (week {})",
-                    draft.invoice_number, draft.week_end
+                    ":white_check_mark: Sent (week {}) — {msg}",
+                    draft.week_end
                 )),
             }
         }
