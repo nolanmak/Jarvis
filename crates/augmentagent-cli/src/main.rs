@@ -10,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use augmentagent_approval_discord::{
-    ApprovalActionHandler, ApprovalActionOutcome, ApprovalBroker, DiscordApprovalBroker,
-    DiscordConfig, InvoiceDraftPdf, InvoiceOps, LoopPoster, LoopRunner, LoopScheduler, NoopBroker,
-    QueryHandler,
+    post_invoice_draft_card, ApprovalActionHandler, ApprovalActionOutcome, ApprovalBroker,
+    DiscordApprovalBroker, DiscordConfig, InvoiceDraftPdf, InvoiceOps, LoopPoster, LoopRunner,
+    LoopScheduler, NoopBroker, QueryHandler,
 };
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
@@ -622,6 +622,13 @@ enum InvoiceOp {
         /// (overrides the duplicate-invoice guard).
         #[arg(long, default_value_t = false)]
         force: bool,
+        /// Post the approval card (with the PDF attached) to the Discord
+        /// invoice channel instead of only rendering a local preview. Needs
+        /// DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID (the daemon's `.env`). This is
+        /// what actually queues the invoice for Approve — the same path the
+        /// Discord `!invoice draft` command uses.
+        #[arg(long, default_value_t = false)]
+        post: bool,
     },
     /// Mark a week (ending Sunday, YYYY-MM-DD) as already billed so the
     /// scheduler won't (re)draft it. Use at cutover: the backlog covered
@@ -2586,7 +2593,7 @@ async fn main() -> Result<()> {
                 );
                 Ok(())
             }
-            InvoiceOp::Draft { week_end, force } => {
+            InvoiceOp::Draft { week_end, force, post } => {
                 let we = match week_end {
                     Some(s) => Some(
                         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -2594,9 +2601,42 @@ async fn main() -> Result<()> {
                     ),
                     None => None,
                 };
+                if *post {
+                    // Post the approvable card (PDF attached) to the Discord
+                    // invoice channel — the same path `!invoice draft` uses, via
+                    // a one-shot serenity Http (mirrors the digest poster). The
+                    // running daemon's event loop handles the Approve click.
+                    if *force {
+                        // generate_pdf inside post_invoice_draft_card uses
+                        // force=false; surface the limitation rather than silently
+                        // ignoring --force on this path.
+                        anyhow::bail!("--force is not supported with --post; drop --force or use a local preview");
+                    }
+                    let token = std::env::var("DISCORD_BOT_TOKEN")
+                        .context("DISCORD_BOT_TOKEN required for --post (set it in the daemon's .env)")?;
+                    let cid: u64 = std::env::var("DISCORD_CHANNEL_ID")
+                        .context("DISCORD_CHANNEL_ID required for --post")?
+                        .parse()
+                        .context("DISCORD_CHANNEL_ID must be numeric")?;
+                    let http = serenity::http::Http::new(&token);
+                    let channel = serenity::all::ChannelId::new(cid);
+                    let ops = CliInvoiceOps {
+                        store: Arc::clone(&store),
+                    };
+                    let reply = post_invoice_draft_card(
+                        &store,
+                        &ops,
+                        &http,
+                        channel,
+                        week_end.as_deref(),
+                    )
+                    .await;
+                    println!("{reply}");
+                    return Ok(());
+                }
                 let pdf = invoice::generate_pdf(&store, we, *force).await?;
                 println!(
-                    "invoice #{} {}→{} drafted (PDF: {}) — post via Discord `!invoice draft` to queue for approval",
+                    "invoice #{} {}→{} drafted (PDF: {}) — run again with `--post` (or Discord `!invoice draft`) to queue the approval card",
                     pdf.number,
                     pdf.week_start,
                     pdf.week_end,
