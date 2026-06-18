@@ -3,6 +3,9 @@
 //! Thin wrapper: one function per Composio action we use. The channel adapter
 //! depends on the `GmailApi` trait so Phase 1 tests can inject a fake.
 
+use std::collections::HashSet;
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde::Deserialize;
 use thiserror::Error;
@@ -195,6 +198,103 @@ impl ComposioClient {
             ))
         })
     }
+
+    /// Shared paginated fetch for `GMAIL_FETCH_EMAILS`. Walks pages up to
+    /// `max_total` messages (in `PAGE_SIZE` chunks), deduping by `message_id`
+    /// and guarding against a non-advancing pagination cursor.
+    ///
+    /// Composio has been observed to echo the SAME `next_page_token` (or repeat
+    /// the first message) across pages; without dedup + a token-advance guard
+    /// the loop happily re-appends one message until it fills `max_total`,
+    /// producing N identical rows (#331). We therefore keep a `seen` set and
+    /// only collect new ids, and stop when there is no next token, the token
+    /// did not change, or a non-empty page contributed zero new messages.
+    ///
+    /// `max_pages` caps the walk (10 for interactive search, 25 for the tone
+    /// backfill); `sleep_between_pages`, when set, adds an inter-page delay to
+    /// stay under Composio's observed ~5 req/s ceiling.
+    async fn fetch_paged(
+        &self,
+        entity_id: &str,
+        query: &str,
+        max_total: u32,
+        max_pages: u32,
+        sleep_between_pages: Option<Duration>,
+    ) -> Result<Vec<Email>, GmailError> {
+        const PAGE_SIZE: u32 = 20;
+
+        let mut collected: Vec<Email> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut page_token: Option<String> = None;
+
+        for page in 0..max_pages {
+            let want = (max_total as usize).saturating_sub(collected.len());
+            if want == 0 {
+                break;
+            }
+            let this_page = (want as u32).min(PAGE_SIZE);
+
+            let mut args = serde_json::json!({
+                "query": query,
+                "max_results": this_page,
+            });
+            if let Some(tok) = &page_token {
+                args["page_token"] = serde_json::Value::String(tok.clone());
+            }
+
+            let v = self.execute("GMAIL_FETCH_EMAILS", entity_id, args).await?;
+            let parsed: FetchResp =
+                serde_json::from_value(v).map_err(|e| GmailError::Decode(e.to_string()))?;
+
+            let next_token = parsed.data.next_page_token.clone();
+            let msgs = parsed.data.messages;
+            let returned = msgs.len();
+
+            let mut new_this_page = 0usize;
+            for m in msgs {
+                if let Some(email) = m.into_email(entity_id) {
+                    // Dedup by message id: a repeated message never gets added
+                    // twice, no matter how many times Composio re-serves it.
+                    if seen.insert(email.message_id.clone()) {
+                        collected.push(email);
+                        new_this_page += 1;
+                        if collected.len() >= max_total as usize {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if collected.len() >= max_total as usize {
+                break;
+            }
+            // No further pages.
+            if next_token.is_none() {
+                break;
+            }
+            // Cursor did not advance — Composio is re-serving the same page;
+            // continuing would loop until we hit `max_pages` for nothing.
+            if next_token == page_token {
+                break;
+            }
+            // A non-empty page that yielded zero new messages means results are
+            // repeating behind a churning token; stop rather than spin.
+            if returned > 0 && new_this_page == 0 {
+                break;
+            }
+            page_token = next_token;
+
+            if let Some(delay) = sleep_between_pages {
+                if page + 1 < max_pages {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+
+        // Cheap invariant: never return more than asked for.
+        collected.truncate(max_total as usize);
+        Ok(collected)
+    }
 }
 
 fn is_transient_reqwest(e: &reqwest::Error) -> bool {
@@ -281,6 +381,93 @@ mod tests {
             let _ = socket.shutdown().await;
         });
         addr
+    }
+
+    /// A mock that replies with the SAME `body`/`status` to EVERY request it
+    /// receives (each on a fresh `Connection: close` socket), so a paginated
+    /// caller that keeps requesting sees the same page repeated — the Composio
+    /// "stuck cursor" shape behind #331.
+    async fn spawn_repeating_http(status: u16, body: &'static str) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Length: {len}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                        len = body.len(),
+                        body = body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    // ---- #331: dedup + timestamp regressions ----
+    //
+    // Composio returned the same message (one messageId) across pages while
+    // echoing a non-advancing next_page_token. The old loop blindly extended
+    // its result vec, so a `--limit N` search came back as N identical rows
+    // with empty date fields. This test reproduces that exact shape and
+    // asserts: (1) the result is deduped to a single message, (2) the loop
+    // terminates (token-advance guard, not the page cap), and (3) the
+    // `messageTimestamp` field populates Email.date.
+    #[tokio::test]
+    async fn fetch_with_query_dedups_repeated_message_and_parses_timestamp() {
+        let body = r#"{"data":{"messages":[{"id":"MSG1","from":"me@example.com","subject":"Invoice #35","messageTimestamp":"2026-01-17T21:11:09Z","messageText":"hi"}],"nextPageToken":"STUCK_CURSOR"}}"#;
+        let addr = spawn_repeating_http(200, body).await;
+        let base = format!("http://{addr}");
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(base);
+
+        let emails = client
+            .fetch_with_query("entity-x", "subject:Invoice #35 from:me", 3)
+            .await
+            .expect("search should succeed");
+
+        // Bug 1: a stuck cursor re-serving one message must NOT fill the limit
+        // with duplicates — exactly one distinct message comes back.
+        assert_eq!(
+            emails.len(),
+            1,
+            "expected dedup to a single message, got {} rows",
+            emails.len()
+        );
+        assert_eq!(emails[0].message_id, "MSG1");
+        // Bug 2: messageTimestamp must land in Email.date (was blank before).
+        assert_eq!(emails[0].date, "2026-01-17T21:11:09Z");
+        // And the coincidentally-covered fields still populate.
+        assert_eq!(emails[0].subject, "Invoice #35");
+        assert_eq!(emails[0].from, "me@example.com");
+    }
+
+    // #331 follow-up: some Composio builds emit `internalDate` as epoch-ms (a
+    // JSON number). The timestamp field must accept that without hard-failing
+    // the whole decode — the number is stringified into Email.date so the
+    // downstream epoch-ms parser can use it.
+    #[tokio::test]
+    async fn fetch_with_query_accepts_numeric_internal_date() {
+        let body = r#"{"data":{"messages":[{"id":"MSG9","from":"sender@example.com","subject":"Re: ping","internalDate":1737147069000,"messageText":"hi"}]}}"#;
+        let addr = spawn_repeating_http(200, body).await;
+        let base = format!("http://{addr}");
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(base);
+
+        let emails = client
+            .fetch_with_query("entity-x", "in:inbox", 1)
+            .await
+            .expect("a numeric internalDate must not fail the decode");
+
+        assert_eq!(emails.len(), 1, "expected the message to parse, not error out");
+        assert_eq!(emails[0].message_id, "MSG9");
+        // The epoch-ms number is stringified into date (parse_date_ms handles it).
+        assert_eq!(emails[0].date, "1737147069000");
     }
 
     #[tokio::test]
@@ -395,6 +582,47 @@ struct FetchMessage {
     body: Option<String>,
     date: Option<String>,
     received_time: Option<String>,
+    /// Composio's `GMAIL_FETCH_EMAILS` returns the message timestamp under
+    /// `messageTimestamp` (RFC-3339, e.g. `2026-01-17T21:11:09Z`) — NOT under
+    /// `date`/`receivedTime` — so the `date` column came back empty (#331).
+    /// The `camelCase` rename already maps this field to `messageTimestamp`;
+    /// the aliases also accept `internalDate`, which some Composio builds emit
+    /// as **epoch-ms** — and epoch-ms is a JSON *number*. A plain
+    /// `Option<String>` would hard-fail the entire response decode on a numeric
+    /// `internalDate` (`invalid type: integer, expected a string`), so
+    /// `de_num_or_string` accepts a string OR a number (stringifying the
+    /// latter). Downstream `parse_date_ms` handles both RFC-3339 and epoch-ms.
+    #[serde(
+        default,
+        alias = "internalDate",
+        alias = "internal_date",
+        deserialize_with = "de_num_or_string"
+    )]
+    message_timestamp: Option<String>,
+}
+
+/// Deserialize a field that Composio may send as either a JSON string
+/// (`messageTimestamp` RFC-3339) or a JSON number (`internalDate` epoch-ms),
+/// yielding `Option<String>`. Absent/null → `None`; a number is stringified so
+/// it still reaches `Email.date` (and the epoch-ms branch of `parse_date_ms`).
+/// Without this, a numeric value aborts the whole `FetchResp` decode (#331).
+fn de_num_or_string<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        S(String),
+        I(i64),
+        F(f64),
+    }
+    Ok(match Option::<NumOrStr>::deserialize(d)? {
+        Some(NumOrStr::S(s)) => Some(s),
+        Some(NumOrStr::I(n)) => Some(n.to_string()),
+        Some(NumOrStr::F(f)) => Some((f as i64).to_string()),
+        None => None,
+    })
 }
 
 impl FetchMessage {
@@ -406,7 +634,13 @@ impl FetchMessage {
             from: self.from.or(self.sender).unwrap_or_default(),
             subject: self.subject.unwrap_or_default(),
             body: self.body.unwrap_or_default(),
-            date: self.date.or(self.received_time).unwrap_or_default(),
+            // Prefer the real Composio field (`messageTimestamp`); fall back to
+            // the legacy keys defensively. See the struct field doc for #331.
+            date: self
+                .message_timestamp
+                .or(self.date)
+                .or(self.received_time)
+                .unwrap_or_default(),
             account_entity_id: Some(account.to_string()),
             platform: "gmail".into(),
             kind: "dm".into(),
@@ -432,51 +666,10 @@ impl GmailApi for ComposioClient {
         max_total: u32,
     ) -> Result<Vec<Email>, GmailError> {
         // Composio caps response payload size (seen 413 above ~40 KB of bodies),
-        // so paginate in 20-email pages up to `max_total`.
-        const PAGE_SIZE: u32 = 20;
-        const MAX_PAGES: u32 = 10; // safety guard against runaway loops
-
-        let mut collected: Vec<Email> = Vec::new();
-        let mut page_token: Option<String> = None;
-
-        for _page in 0..MAX_PAGES {
-            let want = (max_total as usize).saturating_sub(collected.len());
-            if want == 0 {
-                break;
-            }
-            let this_page = (want as u32).min(PAGE_SIZE);
-
-            let mut args = serde_json::json!({
-                "query": query,
-                "max_results": this_page,
-            });
-            if let Some(tok) = &page_token {
-                args["page_token"] = serde_json::Value::String(tok.clone());
-            }
-
-            let v = self.execute("GMAIL_FETCH_EMAILS", entity_id, args).await?;
-            let parsed: FetchResp =
-                serde_json::from_value(v).map_err(|e| GmailError::Decode(e.to_string()))?;
-
-            let page_emails: Vec<Email> = parsed
-                .data
-                .messages
-                .into_iter()
-                .filter_map(|m| m.into_email(entity_id))
-                .collect();
-
-            if page_emails.is_empty() && parsed.data.next_page_token.is_none() {
-                break;
-            }
-
-            collected.extend(page_emails);
-            page_token = parsed.data.next_page_token;
-            if page_token.is_none() {
-                break;
-            }
-        }
-
-        Ok(collected)
+        // so `fetch_paged` walks 20-email pages up to `max_total`. 10-page
+        // safety cap, no inter-page delay for the interactive path.
+        self.fetch_paged(entity_id, query, max_total, 10, None)
+            .await
     }
 
     async fn fetch_sent_history(
@@ -485,63 +678,22 @@ impl GmailApi for ComposioClient {
         since_iso: Option<&str>,
         max_total: u32,
     ) -> Result<Vec<Email>, GmailError> {
-        // Same paginated loop as `fetch_with_query`, but with a higher page
-        // cap so the backfill caller can pull up to ~500 messages in one
-        // shot (25 pages × 20 per page). Inter-page sleep stays under the
-        // observed ~5 req/s ceiling on Composio's GMAIL_FETCH_EMAILS path.
-        const PAGE_SIZE: u32 = 20;
-        const MAX_PAGES: u32 = 25;
-
         let mut query = String::from("in:sent");
         if let Some(d) = since_iso {
             query.push_str(" after:");
             query.push_str(d);
         }
-
-        let mut collected: Vec<Email> = Vec::new();
-        let mut page_token: Option<String> = None;
-
-        for page in 0..MAX_PAGES {
-            let want = (max_total as usize).saturating_sub(collected.len());
-            if want == 0 {
-                break;
-            }
-            let this_page = (want as u32).min(PAGE_SIZE);
-
-            let mut args = serde_json::json!({
-                "query": &query,
-                "max_results": this_page,
-            });
-            if let Some(tok) = &page_token {
-                args["page_token"] = serde_json::Value::String(tok.clone());
-            }
-
-            let v = self.execute("GMAIL_FETCH_EMAILS", entity_id, args).await?;
-            let parsed: FetchResp =
-                serde_json::from_value(v).map_err(|e| GmailError::Decode(e.to_string()))?;
-
-            let page_emails: Vec<Email> = parsed
-                .data
-                .messages
-                .into_iter()
-                .filter_map(|m| m.into_email(entity_id))
-                .collect();
-
-            if page_emails.is_empty() && parsed.data.next_page_token.is_none() {
-                break;
-            }
-            collected.extend(page_emails);
-            page_token = parsed.data.next_page_token;
-            if page_token.is_none() {
-                break;
-            }
-            // Be polite to Composio between pages — observed limit is ~5 req/s.
-            // Skip the sleep on the last page to keep wallclock tight.
-            if page + 1 < MAX_PAGES {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-        }
-        Ok(collected)
+        // Higher page cap (25 = 500/20) so the backfill can pull ~500 messages
+        // in one shot; a 200ms inter-page sleep stays under the observed
+        // ~5 req/s ceiling on Composio's GMAIL_FETCH_EMAILS path.
+        self.fetch_paged(
+            entity_id,
+            &query,
+            max_total,
+            25,
+            Some(Duration::from_millis(200)),
+        )
+        .await
     }
 
     async fn fetch_thread_messages(
