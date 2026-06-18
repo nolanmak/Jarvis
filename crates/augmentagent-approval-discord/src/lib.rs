@@ -167,10 +167,13 @@ pub trait InvoiceOps: Send + Sync {
 
     /// Real-send path. Calls the same code path as `augmentagent invoice run
     /// --dry-run false`: emails the PDF, advances the counter, records the
-    /// billed week.
+    /// billed week. `invoice_number` is the draft row's stored number, so the
+    /// send uses exactly the number the approval card showed rather than
+    /// re-peeking a counter that may have drifted (#330).
     async fn send(
         &self,
         week_end: chrono::NaiveDate,
+        invoice_number: u32,
     ) -> anyhow::Result<String>;
 }
 

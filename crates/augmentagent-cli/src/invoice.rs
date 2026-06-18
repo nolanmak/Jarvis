@@ -177,19 +177,58 @@ pub struct GeneratedPdf {
     pub recipient: String,
 }
 
+/// Bail if `end` is already covered by `last_billed_week_end` (i.e. an invoice
+/// has already been issued through that Sunday), unless `force`. This is the
+/// double-billing guard for #330: once state is reconciled, drafting/sending a
+/// week at or before the last billed week is refused so the agent can't re-issue
+/// a week a prior invoice already covers. An empty/unparseable last-billed value
+/// means "nothing billed yet" and never blocks.
+fn ensure_week_billable(store: &Store, end: NaiveDate, force: bool) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+    let last_billed = store
+        .get_invoice_config("last_billed_week_end")?
+        .filter(|s| !s.is_empty());
+    if week_is_covered(last_billed.as_deref(), end) {
+        anyhow::bail!(
+            "week ending {end} is already covered by billing through {} — \
+             refusing to draft/send a duplicate invoice. Pass --force to override.",
+            last_billed.unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// Pure predicate behind [`ensure_week_billable`]: is the Sun→Sun week ending
+/// `end` already covered by `last_billed` (a YYYY-MM-DD string)? An
+/// empty/unparseable last-billed means nothing is billed yet → not covered.
+fn week_is_covered(last_billed: Option<&str>, end: NaiveDate) -> bool {
+    match last_billed
+        .filter(|s| !s.is_empty())
+        .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+    {
+        Some(last) => end <= last,
+        None => false,
+    }
+}
+
 /// Generate the PDF for `week_end` (defaults to the most recent Sunday) via
 /// the python script in dry-run mode. Does NOT mutate the counter or the
 /// `invoice_drafts` table — that's the caller's job, ensuring the counter
 /// only advances on a real send and one draft row exists per
-/// (recipient, week_end).
+/// (recipient, week_end). Refuses an already-covered week unless `force`
+/// (the covered-week guard, #330).
 pub async fn generate_pdf(
     store: &Store,
     week_end: Option<NaiveDate>,
+    force: bool,
 ) -> Result<GeneratedPdf> {
     let end = match week_end {
         Some(d) => d,
         None => most_recent_sunday(Local::now().date_naive()),
     };
+    ensure_week_billable(store, end, force)?;
     let start = end - ChronoDuration::days(7);
     let today = Local::now().date_naive();
 
@@ -267,12 +306,23 @@ pub fn pdf_path_for(number: u32) -> PathBuf {
 
 /// Generate (and unless `dry_run`, send) the invoice for the Sun→Sun week
 /// ending `week_end` (defaults to the most recent Sunday). On a successful
-/// real send, advances the counter and records the billed week so it can't
-/// double-fire. Returns a human-readable summary line.
+/// real send, advances the counter and records the billed week **atomically**
+/// (`commit_invoice_sent`) so it can't double-fire or leave state half-written.
+///
+/// `number_override` lets the Approve path send with the draft row's stored
+/// invoice number instead of re-peeking the live counter (which can drift
+/// between draft and approve); the direct CLI passes `None` and peeks.
+///
+/// Unless `force`, a real send is refused when the week is already covered
+/// (`ensure_week_billable`) or when the chosen number was already issued
+/// (`number < current counter`) — the double-billing / counter-collision
+/// guards from #330. Returns a human-readable summary line.
 pub async fn run_invoice(
     store: &Store,
     week_end: Option<NaiveDate>,
     dry_run: bool,
+    force: bool,
+    number_override: Option<u32>,
 ) -> Result<String> {
     let end = match week_end {
         Some(d) => d,
@@ -294,8 +344,27 @@ pub async fn run_invoice(
     let from_entity = store
         .get_invoice_config("from_entity")?
         .unwrap_or_default();
-    // Peek (don't burn) the number — only commit it on a successful send.
-    let number = store.invoice_counter()?;
+    // Use the draft's stored number on the Approve path; otherwise peek (don't
+    // burn) the live counter — only commit it on a successful send.
+    let number = match number_override {
+        Some(n) => n,
+        None => store.invoice_counter()?,
+    };
+
+    // Double-billing guards apply only to real sends (a dry-run preview is
+    // harmless and must stay available even for an already-billed week).
+    if !dry_run {
+        ensure_week_billable(store, end, force)?;
+        if !force {
+            let current = store.invoice_counter()?;
+            if number < current {
+                anyhow::bail!(
+                    "invoice #{number} was already issued (counter is at {current}) — \
+                     refusing to re-send a used number and collide. Pass --force to override."
+                );
+            }
+        }
+    }
 
     let dir = scripts_dir();
     let script = format!("{dir}/send_invoice.py");
@@ -327,9 +396,9 @@ pub async fn run_invoice(
 
     if !dry_run {
         // Commit only after the send succeeded so a failure never burns a
-        // number or marks the week billed.
-        store.set_invoice_config("invoice_counter", &(number + 1).to_string())?;
-        store.set_invoice_config("last_billed_week_end", &end.to_string())?;
+        // number or marks the week billed. Atomic + monotonic: counter and
+        // billed-week advance together (or not at all).
+        store.commit_invoice_sent(number, &end.to_string())?;
     }
     Ok(format!(
         "invoice #{number} {start}→{end} {} ({})",
@@ -385,6 +454,22 @@ mod tests {
             most_recent_sunday(sat),
             NaiveDate::from_ymd_opt(2026, 5, 10).unwrap()
         );
+    }
+
+    #[test]
+    fn week_is_covered_blocks_already_billed_weeks() {
+        let billed = "2026-05-24";
+        let d = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+        // The exact billed week and anything earlier are covered (would dup).
+        assert!(week_is_covered(Some(billed), d("2026-05-24")));
+        assert!(week_is_covered(Some(billed), d("2026-05-17")));
+        // Later weeks are still billable.
+        assert!(!week_is_covered(Some(billed), d("2026-05-31")));
+        assert!(!week_is_covered(Some(billed), d("2026-06-07")));
+        // No/blank/garbage last-billed never blocks.
+        assert!(!week_is_covered(None, d("2026-05-24")));
+        assert!(!week_is_covered(Some(""), d("2026-05-24")));
+        assert!(!week_is_covered(Some("not-a-date"), d("2026-05-24")));
     }
 
     #[test]
