@@ -3358,11 +3358,21 @@ impl Store {
         Ok(())
     }
 
-    /// Atomically take the current invoice number and advance the counter.
-    /// Returns the number to use for the invoice being generated now.
-    pub fn next_invoice_number(&self) -> StoreResult<u32> {
-        let guard = self.conn.lock().expect("store mutex poisoned");
-        let cur: u32 = guard
+    /// Reconcile durable invoice state after a successful send, atomically:
+    /// advance `invoice_counter` past `number_used` and move
+    /// `last_billed_week_end` forward to `week_end` (a YYYY-MM-DD ISO date) in a
+    /// single transaction, so a crash can never leave the two keys disagreeing
+    /// (the desync behind #330).
+    ///
+    /// Both moves are **monotonic** — neither value is ever moved backward — so
+    /// a replay, a double-approve, or the repair/reconcile command is
+    /// idempotent and can't rewind the counter or un-bill a later week. ISO
+    /// dates sort lexicographically, so a string `>=` compare is a date compare.
+    pub fn commit_invoice_sent(&self, number_used: u32, week_end: &str) -> StoreResult<()> {
+        let mut guard = self.conn.lock().expect("store mutex poisoned");
+        let tx = guard.transaction()?;
+
+        let cur_counter: u32 = tx
             .query_row(
                 "SELECT value FROM invoice_config WHERE key = 'invoice_counter'",
                 [],
@@ -3371,14 +3381,38 @@ impl Store {
             .optional()?
             .and_then(|s| s.parse().ok())
             .unwrap_or(35);
-        guard.execute(
+        let new_counter = cur_counter.max(number_used + 1);
+
+        let cur_week: Option<String> = tx
+            .query_row(
+                "SELECT value FROM invoice_config WHERE key = 'last_billed_week_end'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        let new_week = match cur_week {
+            // Keep the existing week if it already covers `week_end` or later.
+            Some(w) if w.as_str() >= week_end => w,
+            _ => week_end.to_string(),
+        };
+
+        let now = now_millis();
+        tx.execute(
             "INSERT INTO invoice_config (key, value, updated_at) \
                  VALUES ('invoice_counter', ?1, ?2) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
                  updated_at = excluded.updated_at",
-            params![(cur + 1).to_string(), now_millis()],
+            params![new_counter.to_string(), now],
         )?;
-        Ok(cur)
+        tx.execute(
+            "INSERT INTO invoice_config (key, value, updated_at) \
+                 VALUES ('last_billed_week_end', ?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, \
+                 updated_at = excluded.updated_at",
+            params![new_week, now],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     // --- telegram_bots (#74) ---
@@ -6130,6 +6164,49 @@ mod tests {
             .unwrap();
         }
         (Store::open(file.path()).unwrap(), file)
+    }
+
+    #[test]
+    fn commit_invoice_sent_advances_atomically_and_is_monotonic() {
+        let (store, _f) = fresh_store();
+        // Seeded state: counter 35, last_billed 2026-05-17.
+        assert_eq!(store.invoice_counter().unwrap(), 35);
+        assert_eq!(
+            store.get_invoice_config("last_billed_week_end").unwrap().as_deref(),
+            Some("2026-05-17")
+        );
+
+        // Sending #35 for week ending 2026-05-24 advances BOTH keys together.
+        store.commit_invoice_sent(35, "2026-05-24").unwrap();
+        assert_eq!(store.invoice_counter().unwrap(), 36);
+        assert_eq!(
+            store.get_invoice_config("last_billed_week_end").unwrap().as_deref(),
+            Some("2026-05-24")
+        );
+
+        // Replaying the same commit is idempotent — never rewinds.
+        store.commit_invoice_sent(35, "2026-05-24").unwrap();
+        assert_eq!(store.invoice_counter().unwrap(), 36);
+        assert_eq!(
+            store.get_invoice_config("last_billed_week_end").unwrap().as_deref(),
+            Some("2026-05-24")
+        );
+
+        // A stale/lower number or earlier week can't move state backward.
+        store.commit_invoice_sent(10, "2026-04-01").unwrap();
+        assert_eq!(store.invoice_counter().unwrap(), 36);
+        assert_eq!(
+            store.get_invoice_config("last_billed_week_end").unwrap().as_deref(),
+            Some("2026-05-24")
+        );
+
+        // A genuine forward send advances again.
+        store.commit_invoice_sent(36, "2026-05-31").unwrap();
+        assert_eq!(store.invoice_counter().unwrap(), 37);
+        assert_eq!(
+            store.get_invoice_config("last_billed_week_end").unwrap().as_deref(),
+            Some("2026-05-31")
+        );
     }
 
     fn sample_email(message_id: &str) -> Email {

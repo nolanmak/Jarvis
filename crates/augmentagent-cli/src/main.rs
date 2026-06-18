@@ -618,6 +618,10 @@ enum InvoiceOp {
         /// Week-ending Sunday, YYYY-MM-DD. Omit for the most recent Sunday.
         #[arg(long)]
         week_end: Option<String>,
+        /// Draft even if the week is already covered by the last billed week
+        /// (overrides the duplicate-invoice guard).
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
     /// Mark a week (ending Sunday, YYYY-MM-DD) as already billed so the
     /// scheduler won't (re)draft it. Use at cutover: the backlog covered
@@ -625,6 +629,20 @@ enum InvoiceOp {
     MarkBilled {
         #[arg(long)]
         week_end: String,
+    },
+    /// Reconcile durable invoice state after an out-of-band send (#330):
+    /// atomically set `last_billed_week_end` to the covered week and advance
+    /// `invoice_counter` to `--counter`, then resolve any lingering pending
+    /// draft for that week. Monotonic — only ever moves state forward. Use when
+    /// an invoice was issued outside the agent (so the Approve path never ran)
+    /// and `invoice status` is stuck behind reality.
+    Reconcile {
+        /// The week the issued invoice covers (ending Sunday, YYYY-MM-DD).
+        #[arg(long)]
+        week_end: String,
+        /// The NEXT invoice number to hand out (i.e. one past the issued one).
+        #[arg(long)]
+        counter: u32,
     },
     /// List Composio-connected Gmail accounts (email → entity).
     ListAccounts,
@@ -637,6 +655,10 @@ enum InvoiceOp {
         /// true (default) = generate only; `--dry-run false` actually sends.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+        /// Send even if the week is already covered or the number was already
+        /// issued (overrides the double-billing guards).
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 }
 
@@ -2564,7 +2586,7 @@ async fn main() -> Result<()> {
                 );
                 Ok(())
             }
-            InvoiceOp::Draft { week_end } => {
+            InvoiceOp::Draft { week_end, force } => {
                 let we = match week_end {
                     Some(s) => Some(
                         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -2572,7 +2594,7 @@ async fn main() -> Result<()> {
                     ),
                     None => None,
                 };
-                let pdf = invoice::generate_pdf(&store, we).await?;
+                let pdf = invoice::generate_pdf(&store, we, *force).await?;
                 println!(
                     "invoice #{} {}→{} drafted (PDF: {}) — post via Discord `!invoice draft` to queue for approval",
                     pdf.number,
@@ -2589,11 +2611,42 @@ async fn main() -> Result<()> {
                 println!("marked {week_end} as already billed (scheduler will skip it)");
                 Ok(())
             }
+            InvoiceOp::Reconcile { week_end, counter } => {
+                chrono::NaiveDate::parse_from_str(week_end, "%Y-%m-%d")
+                    .context("--week-end must be YYYY-MM-DD")?;
+                let before_counter = store.invoice_counter()?;
+                let before_week = store
+                    .get_invoice_config("last_billed_week_end")?
+                    .unwrap_or_default();
+                println!(
+                    "before: invoice_counter={before_counter}, last_billed_week_end={}",
+                    if before_week.is_empty() { "(never)" } else { &before_week }
+                );
+                // Atomic + monotonic: counter -> max(cur, counter),
+                // last_billed -> max(cur, week_end). number_used = counter-1 so
+                // the next number handed out is exactly `counter`.
+                store.commit_invoice_sent(counter.saturating_sub(1), week_end)?;
+                // An out-of-band send means the draft (if any) never reached the
+                // Approve button; close it so it can't be re-approved into a dup.
+                if let Some(d) = store.get_pending_invoice_draft_for_week(week_end)? {
+                    store.mark_invoice_draft_resolved(&d.id, "approved", "reconcile-330")?;
+                    println!(
+                        "resolved lingering pending draft {} (#{}) for {week_end} -> approved",
+                        d.id, d.invoice_number
+                    );
+                }
+                println!(
+                    "after:  invoice_counter={}, last_billed_week_end={}",
+                    store.invoice_counter()?,
+                    store.get_invoice_config("last_billed_week_end")?.unwrap_or_default()
+                );
+                Ok(())
+            }
             InvoiceOp::ListAccounts => {
                 println!("{}", invoice::list_accounts().await?);
                 Ok(())
             }
-            InvoiceOp::Run { week_end, dry_run } => {
+            InvoiceOp::Run { week_end, dry_run, force } => {
                 let we = match week_end {
                     Some(s) => Some(
                         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
@@ -2601,7 +2654,7 @@ async fn main() -> Result<()> {
                     ),
                     None => None,
                 };
-                let msg = invoice::run_invoice(&store, we, *dry_run).await?;
+                let msg = invoice::run_invoice(&store, we, *dry_run, *force, None).await?;
                 println!("{msg}");
                 Ok(())
             }
@@ -4852,7 +4905,11 @@ impl InvoiceOps for CliInvoiceOps {
         &self,
         week_end: Option<chrono::NaiveDate>,
     ) -> anyhow::Result<InvoiceDraftPdf> {
-        let g = invoice::generate_pdf(&self.store, week_end).await?;
+        // The Discord `!invoice draft` and Sunday-scheduler paths respect the
+        // covered-week guard (force = false): they must not draft a week a
+        // prior invoice already covers. A human who genuinely needs to re-issue
+        // uses the CLI `invoice draft --force`.
+        let g = invoice::generate_pdf(&self.store, week_end, false).await?;
         Ok(InvoiceDraftPdf {
             number: g.number,
             week_start: g.week_start,
@@ -4862,8 +4919,15 @@ impl InvoiceOps for CliInvoiceOps {
         })
     }
 
-    async fn send(&self, week_end: chrono::NaiveDate) -> anyhow::Result<String> {
-        invoice::run_invoice(&self.store, Some(week_end), false).await
+    async fn send(
+        &self,
+        week_end: chrono::NaiveDate,
+        invoice_number: u32,
+    ) -> anyhow::Result<String> {
+        // Send with the draft's stored number (not a re-peek), and keep the
+        // guards on (force = false) so approving a stale card for an
+        // already-covered week or an already-issued number is refused.
+        invoice::run_invoice(&self.store, Some(week_end), false, false, Some(invoice_number)).await
     }
 }
 
