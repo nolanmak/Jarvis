@@ -1122,7 +1122,7 @@ pub(crate) async fn invoice_approve_draft(
             };
         }
     };
-    match ops.send(week_end).await {
+    match ops.send(week_end, draft.invoice_number as u32).await {
         Ok(msg) => {
             if let Err(e) =
                 store.mark_invoice_draft_resolved(draft_id, "approved", user_id)
