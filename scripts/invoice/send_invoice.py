@@ -23,7 +23,7 @@ Env (set in .env — gitignored; never hardcode personal/business data):
   INVOICE_BILL_TO     client / bill-to name
   INVOICE_HOURS, INVOICE_RATE   billing quantity + rate
 """
-import argparse, datetime, os, sys, pathlib
+import argparse, datetime, os, sys, pathlib, json
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from invoice_gen import build, fetch_prs, DEFAULT_GH_REPO  # noqa: E402
@@ -35,9 +35,18 @@ def fmt(d: datetime.date) -> str:        # MM/DD/YYYY, matches the PDF summary
     return f"{d.month:02d}/{d.day:02d}/{d.year}"
 
 
+def _sender_name() -> str:
+    """Owner's name for the email sign-off, from INVOICE_FROM_LINES
+    ("Business|Name|Street|City, ST ZIP|Phone"). Empty if not configured."""
+    parts = os.environ.get("INVOICE_FROM_LINES", "").split("|")
+    return parts[1].strip() if len(parts) >= 2 else ""
+
+
 def email_body(start_d, end_d) -> str:
     rng = f"{fmt(start_d)}-{fmt(end_d)}"
-    return f"Hello,\n\nHere is my weekly invoice for {rng}.\n\nThank you!"
+    name = _sender_name()
+    signoff = f"Thank you,\n{name}" if name else "Thank you!"
+    return f"Hello,\n\nHere is my weekly invoice for {rng}.\n\n{signoff}"
 
 
 def _composio_client(api_key, upload_dir=None):
@@ -174,6 +183,9 @@ def main():
     print(f"  To:      {a.to}")
     print(f"  Subject: {subject}")
     print(f"  Body:    {body!r}")
+    # Machine-readable exact subject/body so the Rust draft path can render
+    # them on the Discord approval card (the card shows exactly what's sent).
+    print("AA_EMAIL_META " + json.dumps({"subject": subject, "body": body}))
 
     if dry:
         print("  [dry-run] not sent. Re-run with --dry-run false to send.")

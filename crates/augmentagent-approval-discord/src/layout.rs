@@ -168,19 +168,40 @@ pub fn invoice_draft_components(draft_id: &str) -> Vec<CreateActionRow> {
 /// Human-readable body for an invoice draft card. Kept separate from the
 /// button row so the post helper can mix it with `CreateAttachment` of the
 /// PDF in either a fresh `CreateMessage` or as an edit-source preamble.
+#[allow(clippy::too_many_arguments)]
 pub fn invoice_draft_content(
     number: u32,
     week_start: &str,
     week_end: &str,
     recipient: &str,
+    subject: &str,
+    body: &str,
     pdf_filename: &str,
 ) -> String {
+    // Show the exact outgoing email (subject + body) the approver is about to
+    // send, mirroring how the reply-approval card surfaces the draft (#346).
+    // Body is rendered as a blockquote so newlines read cleanly in Discord.
+    let body_quoted = if body.trim().is_empty() {
+        "_(no body)_".to_string()
+    } else {
+        body.lines()
+            .map(|l| format!("> {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let subject_line = if subject.trim().is_empty() {
+        String::new()
+    } else {
+        format!("**Subject:** {subject}\n")
+    };
     format!(
         "**Invoice #{number} draft**\n\
          Week: {week_start} → {week_end}\n\
-         Recipient: `{recipient}`\n\
-         File: `{pdf_filename}`\n\
-         _Approve to email it, Reject to discard._"
+         To: `{recipient}`\n\
+         {subject_line}\n\
+         **Email body:**\n{body_quoted}\n\n\
+         Attachment: `{pdf_filename}`\n\
+         _Approve & Send to email it, Reject to discard._"
     )
 }
 

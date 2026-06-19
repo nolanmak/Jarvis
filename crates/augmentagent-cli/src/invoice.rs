@@ -175,6 +175,30 @@ pub struct GeneratedPdf {
     pub week_end: NaiveDate,
     pub pdf_path: PathBuf,
     pub recipient: String,
+    /// The exact outgoing email subject + body the send will use, parsed from
+    /// the script's `AA_EMAIL_META` line so the approval card shows precisely
+    /// what gets emailed (#346). Empty if the script didn't emit it.
+    pub subject: String,
+    pub body: String,
+}
+
+/// Pull the exact email subject/body the script emitted on its `AA_EMAIL_META`
+/// JSON line. Returns empties if absent/unparseable (card just omits them).
+fn parse_email_meta(stdout: &str) -> (String, String) {
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("AA_EMAIL_META ") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(rest.trim()) {
+                let get = |k: &str| {
+                    v.get(k)
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                return (get("subject"), get("body"));
+            }
+        }
+    }
+    (String::new(), String::new())
 }
 
 /// Bail if `end` is already covered by `last_billed_week_end` (i.e. an invoice
@@ -285,12 +309,15 @@ pub async fn generate_pdf(
             pdf_path.display()
         );
     }
+    let (subject, body) = parse_email_meta(&String::from_utf8_lossy(&out.stdout));
     Ok(GeneratedPdf {
         number,
         week_start: start,
         week_end: end,
         pdf_path,
         recipient,
+        subject,
+        body,
     })
 }
 

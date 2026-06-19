@@ -1280,6 +1280,8 @@ pub async fn post_invoice_draft_card(
         &pdf.week_start.to_string(),
         &pdf.week_end.to_string(),
         &pdf.recipient,
+        &pdf.subject,
+        &pdf.body,
         &pdf_filename,
     );
     let builder = CreateMessage::new()
