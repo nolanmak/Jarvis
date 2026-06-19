@@ -4956,6 +4956,8 @@ impl InvoiceOps for CliInvoiceOps {
             week_end: g.week_end,
             pdf_path: g.pdf_path,
             recipient: g.recipient,
+            subject: g.subject,
+            body: g.body,
         })
     }
 

@@ -185,6 +185,10 @@ pub struct InvoiceDraftPdf {
     pub week_end: chrono::NaiveDate,
     pub pdf_path: std::path::PathBuf,
     pub recipient: String,
+    /// Exact outgoing email subject + body, shown on the approval card so the
+    /// approver sees what gets emailed (#346).
+    pub subject: String,
+    pub body: String,
 }
 
 /// Executes the user's button click against the product side (gmail send /
