@@ -40,17 +40,28 @@ def email_body(start_d, end_d) -> str:
     return f"Hello,\n\nHere is my weekly invoice for {rng}.\n\nThank you!"
 
 
-def _composio_client(api_key):
+def _composio_client(api_key, upload_dir=None):
     try:
         from composio import Composio
     except ImportError as e:
         raise SystemExit(
             "composio SDK not installed. `pip install composio` "
             f"(import error: {e})")
-    return Composio(
+    # composio 1.0.0-rc2+ enforces an auto-upload allowlist that defaults to
+    # ~/.composio/temp. Our PDF lives elsewhere (default /tmp/invoices), so the
+    # attachment upload is refused with FileUploadPathNotAllowedError unless we
+    # allowlist its directory. `file_upload_dirs` REPLACES the default, so we
+    # only pass it on the send path (where we have a PDF to upload); listing
+    # accounts never uploads and keeps the default. (#344)
+    kwargs = dict(
         api_key=api_key,
         dangerously_allow_auto_upload_download_files=True,
     )
+    if upload_dir is not None:
+        kwargs["file_upload_dirs"] = [
+            str(pathlib.Path(upload_dir).expanduser().resolve())
+        ]
+    return Composio(**kwargs)
 
 
 def list_accounts(api_key):
@@ -82,7 +93,9 @@ def list_accounts(api_key):
 
 def send_via_composio(api_key, from_entity, to, subject, body, pdf_path):
     """Send through the Composio Python SDK with auto file-upload enabled."""
-    client = _composio_client(api_key)
+    # Allowlist the PDF's own directory for auto-upload (follows --out /
+    # INVOICE_OUT_DIR automatically). See #344.
+    client = _composio_client(api_key, upload_dir=pathlib.Path(pdf_path).parent)
     result = client.tools.execute(
         GMAIL_ACTION,
         user_id=from_entity,
