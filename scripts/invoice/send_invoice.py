@@ -106,6 +106,11 @@ def send_via_composio(api_key, from_entity, to, subject, body, pdf_path):
             "is_html": False,
             "attachment": str(pdf_path),   # SDK uploads + rewrites to s3 descriptor
         },
+        # composio 1.0.0-rc2 raises ToolVersionRequiredError when the resolved
+        # toolkit version is "latest" unless this is passed AT EXECUTE TIME
+        # (it's an execute() param, not a constructor one). Restores the
+        # pre-upgrade "use current version" behavior that #35 sent under. (#348)
+        dangerously_skip_version_check=True,
     )
     ok = bool(getattr(result, "successful", None)
               or (isinstance(result, dict) and result.get("successful")))
