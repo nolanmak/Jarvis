@@ -23,8 +23,9 @@ use augmentagent_store::Store;
 use crate::broker::BrokerState;
 use crate::custom_id::{CustomId, Verb};
 use crate::layout::{
-    approval_message, extract_feedback, extract_fill_values, fill_ask_modal, fill_feedback,
-    invoice_draft_components, invoice_draft_content, revise_modal, split_needs_input,
+    approval_message, extract_feedback, extract_fill_values, extract_invoice_email, fill_ask_modal,
+    fill_feedback, invoice_draft_components, invoice_draft_content, invoice_revise_modal,
+    revise_modal, split_needs_input,
 };
 use crate::{ApprovalActionOutcome, InvoiceOps};
 
@@ -582,8 +583,28 @@ impl EventHandler for Handler {
                             }
                         });
                     }
-                    Verb::ReviseModal | Verb::FillAskModal => {
+                    Verb::ReviseModal | Verb::FillAskModal | Verb::InvoiceReviseModal => {
                         debug!("unexpected modal verb on component interaction");
+                    }
+                    Verb::InvoiceRevise => {
+                        // Open the edit modal pre-filled with the current email
+                        // (mirrors the reply card's Revise → modal). The store
+                        // read is fast, so opening the modal IS the response.
+                        let (subject, body) = self
+                            .state
+                            .invoice_store
+                            .as_deref()
+                            .and_then(|s| {
+                                s.get_invoice_draft_email(&cid.action_id).ok().flatten()
+                            })
+                            .unwrap_or_default();
+                        let modal = invoice_revise_modal(&cid.action_id, &subject, &body);
+                        if let Err(e) = comp
+                            .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+                            .await
+                        {
+                            warn!("failed to open invoice revise modal: {e}");
+                        }
                     }
                     Verb::InvoiceApprove => {
                         if let Err(e) = defer_ephemeral(&ctx, &comp).await {
@@ -650,7 +671,10 @@ impl EventHandler for Handler {
                 let Some(cid) = CustomId::parse(&modal.data.custom_id) else {
                     return;
                 };
-                if !matches!(cid.verb, Verb::ReviseModal | Verb::FillAskModal) {
+                if !matches!(
+                    cid.verb,
+                    Verb::ReviseModal | Verb::FillAskModal | Verb::InvoiceReviseModal
+                ) {
                     return;
                 }
                 if let Some(allowed) = self.state.allowed_user_id {
@@ -668,6 +692,95 @@ impl EventHandler for Handler {
                         return;
                     }
                 }
+                // Invoice email revise: store the edited subject+body and
+                // re-render the card. Separate from the reasoner-driven reply
+                // revise below — an invoice email is a template, not an LLM draft.
+                if cid.verb == Verb::InvoiceReviseModal {
+                    if let Err(e) = modal
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Defer(
+                                CreateInteractionResponseMessage::new().ephemeral(true),
+                            ),
+                        )
+                        .await
+                    {
+                        warn!("failed to defer invoice revise modal: {e}");
+                        return;
+                    }
+                    let (subject, body) = extract_invoice_email(&modal.data.components);
+                    let store = self.state.invoice_store.clone();
+                    let draft_id = cid.action_id.clone();
+                    let ctx_clone = ctx.clone();
+                    let modal_clone = modal.clone();
+                    tokio::spawn(async move {
+                        let ack = |text: String| {
+                            let ctx = ctx_clone.clone();
+                            let m = modal_clone.clone();
+                            async move {
+                                let _ = m
+                                    .create_followup(
+                                        &ctx.http,
+                                        CreateInteractionResponseFollowup::new()
+                                            .content(text)
+                                            .ephemeral(true),
+                                    )
+                                    .await;
+                            }
+                        };
+                        let Some(store) = store.as_deref() else {
+                            ack("Invoice store not wired.".into()).await;
+                            return;
+                        };
+                        if let Err(e) = store.set_invoice_draft_email(&draft_id, &subject, &body) {
+                            warn!(draft_id = %draft_id, "invoice revise: store failed: {e}");
+                            ack(format!("Revise failed: {e}")).await;
+                            return;
+                        }
+                        // Re-render the source card with the new subject/body.
+                        if let Ok(Some(d)) = store.get_invoice_draft(&draft_id) {
+                            let week_start =
+                                chrono::NaiveDate::parse_from_str(&d.week_end, "%Y-%m-%d")
+                                    .ok()
+                                    .map(|e| (e - chrono::Duration::days(7)).to_string())
+                                    .unwrap_or_default();
+                            let recipient = store
+                                .get_invoice_config("recipient_email")
+                                .ok()
+                                .flatten()
+                                .unwrap_or_default();
+                            let pdf_filename = std::path::Path::new(&d.pdf_path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| d.pdf_path.clone());
+                            let content = invoice_draft_content(
+                                d.invoice_number as u32,
+                                &week_start,
+                                &d.week_end,
+                                &recipient,
+                                &subject,
+                                &body,
+                                &pdf_filename,
+                            );
+                            if let Some(msg) = modal_clone.message.as_ref() {
+                                let edit = EditMessage::new()
+                                    .content(content)
+                                    .components(invoice_draft_components(&draft_id));
+                                if let Err(e) = msg
+                                    .channel_id
+                                    .edit_message(&ctx_clone.http, msg.id, edit)
+                                    .await
+                                {
+                                    warn!(draft_id = %draft_id, "invoice revise: card edit failed: {e}");
+                                }
+                            }
+                        }
+                        ack("Invoice email revised — review the card, then Approve & Send.".into())
+                            .await;
+                    });
+                    return;
+                }
+
                 // Defer the modal submission immediately — the revise work
                 // (reasoner call, create_draft, delete_draft) takes well over
                 // 3s, which is Discord's interaction ack deadline.
@@ -1122,7 +1235,9 @@ pub(crate) async fn invoice_approve_draft(
             };
         }
     };
-    match ops.send(week_end).await {
+    // Use the (possibly Revised) email stored for this draft; None = template.
+    let email = store.get_invoice_draft_email(draft_id).ok().flatten();
+    match ops.send(week_end, email).await {
         Ok(msg) => {
             if let Err(e) =
                 store.mark_invoice_draft_resolved(draft_id, "approved", user_id)
@@ -1261,6 +1376,11 @@ pub async fn post_invoice_draft_card(
         Ok(id) => id,
         Err(e) => return format!(":warning: store insert failed: {e}"),
     };
+    // Seed the editable email (subject+body) from the template so Revise can
+    // pre-fill it and the send uses it (#352). Best-effort.
+    if let Err(e) = store.set_invoice_draft_email(&draft_id, &pdf.subject, &pdf.body) {
+        warn!(draft_id = %draft_id, "invoice draft: seed email failed: {e}");
+    }
     let attachment = match CreateAttachment::path(&pdf.pdf_path).await {
         Ok(a) => a,
         Err(e) => {

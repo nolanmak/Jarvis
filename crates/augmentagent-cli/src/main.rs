@@ -2694,7 +2694,7 @@ async fn main() -> Result<()> {
                     ),
                     None => None,
                 };
-                let msg = invoice::run_invoice(&store, we, *dry_run, *force).await?;
+                let msg = invoice::run_invoice(&store, we, *dry_run, *force, None).await?;
                 println!("{msg}");
                 Ok(())
             }
@@ -4961,11 +4961,14 @@ impl InvoiceOps for CliInvoiceOps {
         })
     }
 
-    async fn send(&self, week_end: chrono::NaiveDate) -> anyhow::Result<String> {
-        // Authoritative number is peeked at send (force = false keeps the
-        // covered-week guard on), so each approved draft takes the next
-        // sequential number — see invoice::run_invoice.
-        invoice::run_invoice(&self.store, Some(week_end), false, false).await
+    async fn send(
+        &self,
+        week_end: chrono::NaiveDate,
+        email: Option<(String, String)>,
+    ) -> anyhow::Result<String> {
+        // force = false keeps the covered-week guard on; `email` is the Revised
+        // subject/body when the user edited it on the card (#352).
+        invoice::run_invoice(&self.store, Some(week_end), false, false, email).await
     }
 }
 

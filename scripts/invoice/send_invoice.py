@@ -136,6 +136,10 @@ def main():
     ap.add_argument("--start", help="work-week start (Sunday) YYYY-MM-DD")
     ap.add_argument("--end", help="work-week end (Sunday) YYYY-MM-DD")
     ap.add_argument("--to", help="recipient email")
+    ap.add_argument("--subject", default="",
+                    help="override the email subject (Revised on the card, #352)")
+    ap.add_argument("--body", default="",
+                    help="override the email body (Revised on the card, #352)")
     ap.add_argument("--from-entity", default=os.environ.get("INVOICE_FROM_ENTITY", ""),
                     help="Composio user_id/entity for the sending Gmail account")
     ap.add_argument("--invoice-date", default="",
@@ -178,6 +182,11 @@ def main():
         f" ({_bill_to})" if _bill_to else ""
     )
     body = email_body(start_d, end_d)
+    # Revised subject/body from the approval card override the template (#352).
+    if a.subject:
+        subject = a.subject
+    if a.body:
+        body = a.body
 
     print(f"Invoice #{n}: {rng}  {tot} PRs  -> {path}")
     print(f"  To:      {a.to}")
