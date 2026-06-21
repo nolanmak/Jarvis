@@ -1013,6 +1013,22 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     if let Some(key) = crate::secret_loader::load_provider_key("COMPOSIO_API_KEY") {
         env.push(("COMPOSIO_API_KEY".into(), key));
     }
+    // #352 — Forward the Discord bot token + approval channel so
+    // `augmentagent gmail compose --post` can spin a one-shot serenity Http
+    // and surface a Discord approval card for the draft instead of dumping
+    // prose into chat. Scope is narrow: the wiki-ask agent's Bash allowlist
+    // only lets it run `augmentagent gmail …` subcommands, and `--post`
+    // ultimately only sends one message to the existing approval channel.
+    if let Ok(tok) = std::env::var("DISCORD_BOT_TOKEN") {
+        if !tok.is_empty() {
+            env.push(("DISCORD_BOT_TOKEN".into(), tok));
+        }
+    }
+    if let Ok(cid) = std::env::var("DISCORD_CHANNEL_ID") {
+        if !cid.is_empty() {
+            env.push(("DISCORD_CHANNEL_ID".into(), cid));
+        }
+    }
 
     ReasonerOpts {
         system_prompt: include_str!("../../../schema/wiki-ask.md").to_string(),
