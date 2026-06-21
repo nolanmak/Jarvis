@@ -237,6 +237,31 @@ fn week_is_covered(last_billed: Option<&str>, end: NaiveDate) -> bool {
     }
 }
 
+/// The invoice number for the Sun→Sun week ending `week_end`, **derived from
+/// the week** rather than a draft-order counter — so each week always maps to
+/// the SAME number no matter the draft/approve order (e.g. #35 ↔ week ending
+/// 2026-05-24 ⇒ 5/31 is #36, 6/07 is #37, 6/14 is #38). Anchored on the
+/// invariant that `invoice_counter - 1` is the number of the last billed week
+/// (`last_billed_week_end`); each Sunday further out adds 1, earlier subtracts
+/// 1. Falls back to the bare counter when no week has been billed yet.
+fn invoice_number_for_week(store: &Store, week_end: NaiveDate) -> Result<u32> {
+    let counter = store.invoice_counter()?;
+    let last_billed = store
+        .get_invoice_config("last_billed_week_end")?
+        .filter(|s| !s.is_empty())
+        .and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok());
+    Ok(derive_invoice_number(counter, last_billed, week_end))
+}
+
+/// Pure core of [`invoice_number_for_week`]: `counter - 1` is the last billed
+/// week's number; each Sunday past `last_billed` adds 1.
+fn derive_invoice_number(counter: u32, last_billed: Option<NaiveDate>, week_end: NaiveDate) -> u32 {
+    match last_billed {
+        Some(lb) => (((counter as i64) - 1) + (week_end - lb).num_days() / 7).max(1) as u32,
+        None => counter,
+    }
+}
+
 /// Generate the PDF for `week_end` (defaults to the most recent Sunday) via
 /// the python script in dry-run mode. Does NOT mutate the counter or the
 /// `invoice_drafts` table — that's the caller's job, ensuring the counter
@@ -269,7 +294,7 @@ pub async fn generate_pdf(
     let from_entity = store
         .get_invoice_config("from_entity")?
         .unwrap_or_default();
-    let number = store.invoice_counter()?;
+    let number = invoice_number_for_week(store, end)?;
     let pdf_path = pdf_path_for(number, end);
     if let Some(parent) = pdf_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
@@ -372,12 +397,11 @@ pub async fn run_invoice(
     let from_entity = store
         .get_invoice_config("from_entity")?
         .unwrap_or_default();
-    // Peek (don't burn) the live counter — it advances atomically in
-    // commit_invoice_sent below, on success only, so a failed send never burns
-    // a number. Peeking at send (rather than pinning a draft-time number) is
-    // what makes multiple pending drafts approve cleanly: each takes the next
-    // sequential number.
-    let number = store.invoice_counter()?;
+    // The invoice number is DERIVED from the week (not a draft-order counter),
+    // so each week always gets the same sequential number regardless of approve
+    // order. commit_invoice_sent below advances last_billed/counter on success
+    // (a failed send never burns a number — the next draft re-derives the same).
+    let number = invoice_number_for_week(store, end)?;
 
     // Covered-week guard applies only to real sends (a dry-run preview is
     // harmless and must stay available even for an already-billed week).
@@ -489,6 +513,26 @@ mod tests {
         assert!(!week_is_covered(None, d("2026-05-24")));
         assert!(!week_is_covered(Some(""), d("2026-05-24")));
         assert!(!week_is_covered(Some("not-a-date"), d("2026-05-24")));
+    }
+
+    #[test]
+    fn derive_invoice_number_maps_each_week_to_a_fixed_number() {
+        let d = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+        // After #35 (week ending 5/24): counter=36, last_billed=5/24.
+        let lb = Some(d("2026-05-24"));
+        assert_eq!(derive_invoice_number(36, lb, d("2026-05-31")), 36);
+        assert_eq!(derive_invoice_number(36, lb, d("2026-06-07")), 37);
+        assert_eq!(derive_invoice_number(36, lb, d("2026-06-14")), 38);
+        // The already-billed week derives back to its own number.
+        assert_eq!(derive_invoice_number(36, lb, d("2026-05-24")), 35);
+        // Order-independent: even after billing 5/31 (counter 37 / lb 5/31),
+        // 6/14 still derives to 38 — the number is a function of the week.
+        assert_eq!(
+            derive_invoice_number(37, Some(d("2026-05-31")), d("2026-06-14")),
+            38
+        );
+        // No anchor yet → bare counter.
+        assert_eq!(derive_invoice_number(36, None, d("2026-05-31")), 36);
     }
 
     #[test]
