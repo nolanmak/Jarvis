@@ -376,6 +376,7 @@ pub async fn run_invoice(
     week_end: Option<NaiveDate>,
     dry_run: bool,
     force: bool,
+    email: Option<(String, String)>,
 ) -> Result<String> {
     let end = match week_end {
         Some(d) => d,
@@ -419,8 +420,12 @@ pub async fn run_invoice(
         .arg("--invoice-date").arg(today.to_string())
         .arg("--to").arg(&recipient)
         .arg("--from-entity").arg(&from_entity)
-        .arg("--dry-run").arg(if dry_run { "true" } else { "false" })
-        .stdin(Stdio::null())
+        .arg("--dry-run").arg(if dry_run { "true" } else { "false" });
+    // Revised subject/body override the template (#352).
+    if let Some((subject, body)) = &email {
+        cmd.arg("--subject").arg(subject).arg("--body").arg(body);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

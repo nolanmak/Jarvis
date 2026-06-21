@@ -36,6 +36,12 @@ pub enum Verb {
     /// Reject the weekly invoice draft (no send, no state mutation beyond
     /// marking the draft row rejected).
     InvoiceReject,
+    /// Revise the invoice email — opens a modal pre-filled with the current
+    /// subject + body (mirrors `Revise` on the reply card). `action_id` is an
+    /// `invoice_drafts.id`.
+    InvoiceRevise,
+    /// Submission of the invoice-revise modal: the edited subject + body.
+    InvoiceReviseModal,
 }
 
 impl Verb {
@@ -50,6 +56,8 @@ impl Verb {
             Self::FillAskModal => "fill_ask_modal",
             Self::InvoiceApprove => "invoice_approve",
             Self::InvoiceReject => "invoice_reject",
+            Self::InvoiceRevise => "invoice_revise",
+            Self::InvoiceReviseModal => "invoice_revise_modal",
         }
     }
 
@@ -64,6 +72,8 @@ impl Verb {
             "fill_ask_modal" => Self::FillAskModal,
             "invoice_approve" => Self::InvoiceApprove,
             "invoice_reject" => Self::InvoiceReject,
+            "invoice_revise" => Self::InvoiceRevise,
+            "invoice_revise_modal" => Self::InvoiceReviseModal,
             _ => return None,
         })
     }
@@ -117,6 +127,8 @@ mod tests {
             Verb::FillAskModal,
             Verb::InvoiceApprove,
             Verb::InvoiceReject,
+            Verb::InvoiceRevise,
+            Verb::InvoiceReviseModal,
         ] {
             let cid = CustomId::new("550e8400-e29b-41d4-a716-446655440000", v);
             let s = cid.to_string();

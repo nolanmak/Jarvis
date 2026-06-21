@@ -468,6 +468,19 @@ impl Store {
                 ON invoice_drafts(status)",
             [],
         )?;
+        // Editable outgoing email (subject + body) for an invoice draft. Seeded
+        // from the template at draft time; overwritten when the user clicks
+        // Revise on the card; read at send time so the edited text is what
+        // actually goes out. Separate table so no migration on invoice_drafts.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS invoice_draft_email (\
+                 draft_id  TEXT PRIMARY KEY,\
+                 subject   TEXT NOT NULL,\
+                 body      TEXT NOT NULL,\
+                 updated_at INTEGER NOT NULL\
+             )",
+            [],
+        )?;
 
         // ----------------------------------------------------------------
         // Wave-A foundation: tables for the parallel feature PRs branching
@@ -3356,6 +3369,42 @@ impl Store {
             params![id, status, now_millis(), resolved_by],
         )?;
         Ok(())
+    }
+
+    /// Upsert the editable outgoing email (subject + body) for an invoice
+    /// draft. Seeded from the template at draft time and overwritten by Revise.
+    pub fn set_invoice_draft_email(
+        &self,
+        draft_id: &str,
+        subject: &str,
+        body: &str,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO invoice_draft_email (draft_id, subject, body, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(draft_id) DO UPDATE SET subject = excluded.subject, \
+                 body = excluded.body, updated_at = excluded.updated_at",
+            params![draft_id, subject, body, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// The current (possibly Revised) email subject+body for an invoice draft,
+    /// or None if never seeded (e.g. a draft from before this feature).
+    pub fn get_invoice_draft_email(
+        &self,
+        draft_id: &str,
+    ) -> StoreResult<Option<(String, String)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT subject, body FROM invoice_draft_email WHERE draft_id = ?1",
+                params![draft_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// Reconcile durable invoice state after a successful send, atomically:

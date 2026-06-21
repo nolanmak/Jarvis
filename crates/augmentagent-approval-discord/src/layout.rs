@@ -159,10 +159,53 @@ pub fn invoice_draft_components(draft_id: &str) -> Vec<CreateActionRow> {
         CreateButton::new(CustomId::new(draft_id, Verb::InvoiceApprove).to_string())
             .label("Approve & Send")
             .style(ButtonStyle::Success),
+        CreateButton::new(CustomId::new(draft_id, Verb::InvoiceRevise).to_string())
+            .label("Revise")
+            .style(ButtonStyle::Primary),
         CreateButton::new(CustomId::new(draft_id, Verb::InvoiceReject).to_string())
             .label("Reject")
             .style(ButtonStyle::Danger),
     ])]
+}
+
+/// Modal to edit an invoice email's subject + body, pre-filled with the
+/// current values. Mirrors the reply card's `revise_modal`, but collects the
+/// final text directly (no LLM redraft — an invoice email is a template). The
+/// two inputs are read back in order by [`extract_invoice_email`].
+pub fn invoice_revise_modal(draft_id: &str, subject: &str, body: &str) -> CreateModal {
+    let subject_input = CreateInputText::new(InputTextStyle::Short, "Subject", "invoice_subject")
+        .required(true)
+        .max_length(200)
+        .value(subject);
+    let body_input = CreateInputText::new(InputTextStyle::Paragraph, "Email body", "invoice_body")
+        .required(true)
+        .max_length(2000)
+        .value(body);
+    CreateModal::new(
+        CustomId::new(draft_id, Verb::InvoiceReviseModal).to_string(),
+        "Revise invoice email",
+    )
+    .components(vec![
+        CreateActionRow::InputText(subject_input),
+        CreateActionRow::InputText(body_input),
+    ])
+}
+
+/// Read (subject, body) back from an invoice-revise modal submission, by input
+/// order (subject first, body second — matching [`invoice_revise_modal`]).
+pub fn extract_invoice_email(rows: &[serenity::all::ActionRow]) -> (String, String) {
+    let mut vals: Vec<String> = Vec::new();
+    for row in rows {
+        for c in &row.components {
+            if let ActionRowComponent::InputText(input) = c {
+                vals.push(input.value.clone().unwrap_or_default());
+            }
+        }
+    }
+    (
+        vals.first().cloned().unwrap_or_default(),
+        vals.get(1).cloned().unwrap_or_default(),
+    )
 }
 
 /// Human-readable body for an invoice draft card. Kept separate from the
