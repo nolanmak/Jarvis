@@ -24,7 +24,7 @@ pub use event_handler::{chunk_for_discord, post_invoice_draft_card};
 // #35 Phase 5: the email channel appends the needs-input marker to the
 // persisted draft via this; the card decodes it on render. `NeedsInput` is
 // re-exported for the channel/test surface.
-pub use layout::{append_needs_input_marker, split_needs_input, NeedsInput};
+pub use layout::{append_needs_input_marker, approval_message, split_needs_input, NeedsInput};
 pub use loops::{
     handle_loop_command, match_loop_prefix, max_active_per_user, min_interval_secs,
     next_cron_firing_ms, normalize_and_validate_cron, parse_interval, pause_after_failures,
