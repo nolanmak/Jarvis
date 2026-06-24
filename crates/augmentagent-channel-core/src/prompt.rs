@@ -286,7 +286,19 @@ Return ONLY the reply text — no JSON, no quotes, no commentary, no subject lin
 /// byte-stable too — Claude's prompt cache can key on the prefix.
 pub const CODE_MODE_SYSTEM_PREFIX: &str = r#"You are writing a TypeScript program that drafts a reply on behalf of Nolan.
 
-Output one TypeScript program in a single fenced ```ts code block. No prose outside the fence. Put any reasoning in code comments above the function body.
+Response format — non-negotiable:
+
+Your ENTIRE response MUST be a single fenced ```ts code block and nothing else. No prose before. No prose after. No explanation, no apology, no "Here is the program:" preamble. The runner parses your output by extracting the first fenced ts (or typescript / js / javascript) block; if none is present, your response is discarded and a self-repair retry burns budget. Put any reasoning inside code comments above `main`.
+
+Required response shape (replace the comment and the draft call with the real program):
+
+```ts
+async function main(): Promise<void> {
+  // ... gather context via tools.* as needed ...
+  await tools.draft("gmail", "reply body here", "one-sentence reason");
+}
+await main();
+```
 
 Hard rules — the runner WILL reject programs that violate any of these:
 
@@ -398,14 +410,76 @@ Return ONLY a single fenced ```ts code block containing the program — no prose
     )
 }
 
+/// Build the tail appended to a Code-Mode user message on a repair retry.
+///
+/// Two shapes, chosen by `prior_source`:
+///
+/// * **Non-empty `prior_source`** — the previous attempt produced a program
+///   that failed at runtime. Show the program and the error, ask for a
+///   correction. The cache prefix (base user message) is unchanged across
+///   attempts.
+/// * **Empty `prior_source`** — the previous attempt did not produce a
+///   fenced program block at all (the failure mode reported in #205-#208,
+///   where both first attempt and repair returned prose). Show the error,
+///   include a minimal valid program template, and make the format
+///   requirement maximally explicit. Models drift from the format when the
+///   reminder is buried among other instructions; an in-context example
+///   pulls them back.
+///
+/// Both shapes end with the same closing instruction so the
+/// extractor-side contract ("a single fenced ```ts code block") is
+/// reaffirmed last.
+pub fn code_mode_repair_tail(prior_source: &str, prior_error: &str) -> String {
+    if prior_source.trim().is_empty() {
+        format!(
+            r#"
+The previous attempt produced NO fenced code block — your response was treated as prose and discarded. Do not explain, narrate, or apologize. Respond with exactly one fenced ```ts code block and nothing else.
+
+<prior_error>
+{prior_error}
+</prior_error>
+
+The shape your response MUST take (replace the comment + draft call with the real program):
+
+```ts
+async function main(): Promise<void> {{
+  // ... gather context via tools.* as needed ...
+  await tools.draft("gmail", "reply body here", "one-sentence reason");
+}}
+await main();
+```
+
+Return ONLY a single fenced ```ts code block containing the corrected program.
+"#
+        )
+    } else {
+        format!(
+            r#"
+The previous attempt failed. Read the program and the error, then output a corrected program. Same hard rules apply.
+
+<prior_program>
+{prior_source}
+</prior_program>
+
+<prior_error>
+{prior_error}
+</prior_error>
+
+Return ONLY a single fenced ```ts code block containing the corrected program.
+"#
+        )
+    }
+}
+
 /// Build the Code-Mode user message for a self-repair retry.
 ///
 /// Re-uses [`code_mode_user_message`] for the inbound context (so the
 /// archetype / thread / resolved-asks blocks are byte-identical to the
-/// failed attempt), then appends the prior failed program and the error
-/// message and asks for a corrected version. The appended blocks sit AFTER
-/// the original user message body so the cache prefix (system + the same
-/// initial blocks) is unchanged across the attempt.
+/// failed attempt), then appends [`code_mode_repair_tail`] which either
+/// shows the failed program (non-empty `prior_source`) or supplies a
+/// minimal template (empty `prior_source`, e.g. when the prior attempt
+/// returned no fenced block at all). The cache prefix (system + base
+/// blocks) is unchanged across the attempt.
 #[allow(clippy::too_many_arguments)]
 pub fn code_mode_repair_user_message(
     email: &Email,
@@ -425,21 +499,8 @@ pub fn code_mode_repair_user_message(
         archetype_block,
         resolved_asks_block,
     );
-    format!(
-        r#"{base}
-The previous attempt failed. Read the program and the error, then output a corrected program. Same hard rules apply.
-
-<prior_program>
-{prior_source}
-</prior_program>
-
-<prior_error>
-{prior_error}
-</prior_error>
-
-Return ONLY a single fenced ```ts code block containing the corrected program.
-"#
-    )
+    let tail = code_mode_repair_tail(prior_source, prior_error);
+    format!("{base}{tail}")
 }
 
 /// Build the redraft prompt when the user clicks "Revise" in Discord.
@@ -721,5 +782,45 @@ mod tests {
         assert!(out.contains("Error: boom"));
         // Closing instruction asks for ts again.
         assert!(out.contains("Return ONLY a single fenced ```ts code block"));
+    }
+
+    #[test]
+    fn code_mode_repair_tail_empty_program_switches_to_forceful_template() {
+        // The #205-#208 failure mode: first attempt returned no fenced block,
+        // so `prior_source` is empty. The repair tail must NOT contain a
+        // `<prior_program>` block (there was none), must explicitly call
+        // out the missing-fence failure, and must include a minimal template
+        // so the model has an in-context example to copy.
+        let tail = code_mode_repair_tail(
+            "",
+            "no fenced ```ts/```typescript code block in assistant response",
+        );
+        assert!(
+            !tail.contains("<prior_program>"),
+            "empty-source tail should not include a <prior_program> block"
+        );
+        assert!(
+            tail.contains("NO fenced code block"),
+            "empty-source tail must call out the missing-fence failure"
+        );
+        assert!(
+            tail.contains("async function main(): Promise<void>"),
+            "empty-source tail must include a minimal template"
+        );
+        assert!(tail.contains("await tools.draft("));
+        assert!(tail.contains("Return ONLY a single fenced ```ts code block"));
+        // The prior_error contents must still be surfaced so the model can
+        // diagnose what went wrong on the previous attempt.
+        assert!(tail.contains("<prior_error>"));
+        assert!(tail.contains("no fenced"));
+    }
+
+    #[test]
+    fn code_mode_repair_tail_whitespace_only_program_treated_as_empty() {
+        // Whitespace-only is the same observable state as empty —
+        // there's nothing to learn from. Use the forceful template.
+        let tail = code_mode_repair_tail("\n   \n", "some error");
+        assert!(!tail.contains("<prior_program>"));
+        assert!(tail.contains("NO fenced code block"));
     }
 }
