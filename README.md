@@ -5,8 +5,10 @@ across many channels, drafts replies in your voice, and routes everything
 through a human approval step before anything is sent — plus a proactive CRM
 layer, a personal wiki, and a growing set of social/posting integrations.
 
-> **Private repository.** This codebase contains deployment and integration
-> details for a single operator's environment. Do not make it public.
+> **Self-hosted & single-operator.** An open-source personal-assistant daemon
+> built around one operator's environment. It handles your live accounts and
+> session credentials, so review the configuration and security notes before
+> running it — and never commit real secrets.
 
 ## What it does
 
