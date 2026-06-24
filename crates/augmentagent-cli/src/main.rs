@@ -10,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use augmentagent_approval_discord::{
-    post_invoice_draft_card, ApprovalActionHandler, ApprovalActionOutcome, ApprovalBroker,
-    DiscordApprovalBroker, DiscordConfig, InvoiceDraftPdf, InvoiceOps, LoopPoster, LoopRunner,
-    LoopScheduler, NoopBroker, QueryHandler,
+    approval_message, post_invoice_draft_card, ApprovalActionHandler, ApprovalActionOutcome,
+    ApprovalBroker, DiscordApprovalBroker, DiscordConfig, InvoiceDraftPdf, InvoiceOps, LoopPoster,
+    LoopRunner, LoopScheduler, NoopBroker, QueryHandler,
 };
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
@@ -1378,6 +1378,13 @@ enum GmailOp {
     },
     /// Create a new draft in Gmail. Returns the draft id (and a Gmail URL
     /// to open it in the web UI). Use `--thread-id` for a reply draft.
+    ///
+    /// When `--post` is set, also surface a Discord approval card (Approve /
+    /// Revise / Skip) wired into the existing event handler, so the user can
+    /// send straight from chat instead of copy/pasting the draft into Gmail
+    /// (#352). Requires `--thread-id` and `--reply-to-message-id` so the
+    /// Approve handler can find the right Gmail draft and the Revise handler
+    /// has an original message to redraft against.
     Compose {
         /// Email address (e.g. `me@example.com`) or Composio entity_id of the
         /// sending account. Required when more than one account is connected.
@@ -1399,6 +1406,32 @@ enum GmailOp {
         thread_id: Option<String>,
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         json: bool,
+        /// Also post a Discord approval card for this draft (#352). Implies
+        /// reply context: requires `--thread-id` and `--reply-to-message-id`.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        post: bool,
+        /// Gmail messageId of the inbound message we're replying to. Used as
+        /// the action row's messageId so the Approve / Revise / Skip handlers
+        /// resolve the same way they do for auto-triage replies. Required
+        /// with `--post`.
+        #[arg(long)]
+        reply_to_message_id: Option<String>,
+        /// Original sender address (shown on the approval card's `From`
+        /// field). Defaults to `--to` when omitted, which is correct for a
+        /// straight reply.
+        #[arg(long)]
+        reply_to_from: Option<String>,
+        /// Original subject (used as the approval card's title). Defaults to
+        /// the outgoing `--subject` with any leading `Re:` stripped.
+        #[arg(long)]
+        reply_to_subject: Option<String>,
+        /// Original message body, used as the card's context block above the
+        /// draft. Provide via `--reply-to-body-file -` for stdin. Empty when
+        /// omitted (card still renders, just without inline context).
+        #[arg(long)]
+        reply_to_body: Option<String>,
+        #[arg(long)]
+        reply_to_body_file: Option<String>,
     },
     /// Replace the body of an existing draft.
     UpdateDraft {
@@ -2381,6 +2414,8 @@ async fn main() -> Result<()> {
             GmailOp::Accounts { json } => run_gmail_accounts(store, *json).await,
             GmailOp::Compose {
                 account, to, subject, body, body_file, thread_id, json,
+                post, reply_to_message_id, reply_to_from, reply_to_subject,
+                reply_to_body, reply_to_body_file,
             } => {
                 run_gmail_compose(
                     store,
@@ -2391,6 +2426,12 @@ async fn main() -> Result<()> {
                     body_file.clone(),
                     thread_id.clone(),
                     *json,
+                    *post,
+                    reply_to_message_id.clone(),
+                    reply_to_from.clone(),
+                    reply_to_subject.clone(),
+                    reply_to_body.clone(),
+                    reply_to_body_file.clone(),
                 )
                 .await
             }
@@ -3739,6 +3780,7 @@ async fn run_gmail_accounts(store: Arc<Store>, json: bool) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn run_gmail_compose(
     store: Arc<Store>,
     account: Option<String>,
@@ -3748,6 +3790,12 @@ async fn run_gmail_compose(
     body_file: Option<String>,
     thread_id: Option<String>,
     json: bool,
+    post: bool,
+    reply_to_message_id: Option<String>,
+    reply_to_from: Option<String>,
+    reply_to_subject: Option<String>,
+    reply_to_body: Option<String>,
+    reply_to_body_file: Option<String>,
 ) -> Result<()> {
     let body_str = read_body(body, body_file)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
@@ -3757,6 +3805,41 @@ async fn run_gmail_compose(
         .create_draft(&entity_id, &to, &subject, &body_str, thread_id.as_deref())
         .await
         .context("create_draft via Composio failed")?;
+    if post {
+        post_reply_approval_card(
+            &store,
+            &entity_id,
+            &email,
+            &draft_id,
+            &to,
+            &subject,
+            &body_str,
+            thread_id.as_deref(),
+            reply_to_message_id.as_deref(),
+            reply_to_from.as_deref(),
+            reply_to_subject.as_deref(),
+            reply_to_body.as_deref(),
+            reply_to_body_file.as_deref(),
+        )
+        .await?;
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "draft_id": draft_id,
+                    "account": email,
+                    "entity_id": entity_id,
+                    "to": to,
+                    "subject": subject,
+                    "thread_id": thread_id,
+                    "approval_card_posted": true,
+                })
+            );
+        } else {
+            println!("approval card posted to Discord for draft {draft_id}");
+        }
+        return Ok(());
+    }
     if json {
         println!(
             "{}",
@@ -3777,6 +3860,110 @@ async fn run_gmail_compose(
         println!("subject: {subject}");
         println!("open in gmail: https://mail.google.com/mail/u/0/#drafts?compose={draft_id}");
     }
+    Ok(())
+}
+
+/// #352 — Post a Discord approval card for a draft the wiki-ask agent just
+/// composed in a chat session. Writes the same `actions`-table shape as the
+/// auto-triage path so the daemon's Approve/Revise/Skip handlers don't need
+/// to distinguish where the card came from. Upserts an `emails` row when one
+/// isn't already present so the Revise redraft path has the original body to
+/// work against.
+#[allow(clippy::too_many_arguments)]
+async fn post_reply_approval_card(
+    store: &Store,
+    entity_id: &str,
+    account_email: &str,
+    draft_id: &str,
+    to: &str,
+    out_subject: &str,
+    draft_body: &str,
+    thread_id: Option<&str>,
+    reply_to_message_id: Option<&str>,
+    reply_to_from: Option<&str>,
+    reply_to_subject: Option<&str>,
+    reply_to_body: Option<&str>,
+    reply_to_body_file: Option<&str>,
+) -> Result<()> {
+    use augmentagent_store::Email as StoreEmail;
+
+    let thread = thread_id
+        .filter(|t| !t.is_empty())
+        .context("--post requires --thread-id (the Gmail thread this reply attaches to)")?;
+    let reply_msg_id = reply_to_message_id
+        .filter(|s| !s.is_empty())
+        .context("--post requires --reply-to-message-id (the inbound messageId being replied to)")?;
+    let token = std::env::var("DISCORD_BOT_TOKEN")
+        .context("DISCORD_BOT_TOKEN required for --post (set it in the daemon's .env)")?;
+    let cid: u64 = std::env::var("DISCORD_CHANNEL_ID")
+        .context("DISCORD_CHANNEL_ID required for --post")?
+        .parse()
+        .context("DISCORD_CHANNEL_ID must be numeric")?;
+
+    let original_body = match (reply_to_body, reply_to_body_file) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--reply-to-body and --reply-to-body-file are mutually exclusive");
+        }
+        (Some(b), None) => b.to_string(),
+        (None, Some(p)) => read_body(None, Some(p.to_string()))?,
+        (None, None) => String::new(),
+    };
+    let original_from = reply_to_from.unwrap_or(to).to_string();
+    let stripped = out_subject
+        .strip_prefix("Re:")
+        .or_else(|| out_subject.strip_prefix("re:"))
+        .or_else(|| out_subject.strip_prefix("RE:"))
+        .unwrap_or(out_subject)
+        .trim_start()
+        .to_string();
+    let original_subject = reply_to_subject
+        .map(str::to_string)
+        .unwrap_or_else(|| if stripped.is_empty() { out_subject.to_string() } else { stripped });
+
+    // Upsert an inbound row when the daemon hasn't already ingested this
+    // message. The Revise handler reads `emails.body` to redraft against the
+    // original; without a row, revise has nothing to redraft. When the row
+    // already exists (the auto-triage path saw it first), upsert refreshes
+    // its bytes — same shape the email channel writes.
+    let inbound = StoreEmail {
+        message_id: reply_msg_id.to_string(),
+        thread_id: Some(thread.to_string()),
+        from: original_from.clone(),
+        subject: original_subject.clone(),
+        body: original_body.clone(),
+        date: String::new(),
+        account_entity_id: Some(entity_id.to_string()),
+        platform: "gmail".into(),
+        kind: "dm".into(),
+    };
+    store
+        .upsert_email(&inbound)
+        .context("upsert inbound email for action linkage")?;
+
+    let action_id = store
+        .log_action(
+            reply_msg_id,
+            Some(thread),
+            &original_from,
+            &original_subject,
+            Some(&original_body),
+            Some(draft_body),
+            ActionStatus::Pending,
+        )
+        .context("log action row")?;
+    store
+        .set_action_draft_id(&action_id, draft_id)
+        .context("set action draft id")?;
+
+    let http = serenity::http::Http::new(&token);
+    let channel = serenity::all::ChannelId::new(cid);
+    let card = approval_message(&action_id, &inbound, draft_body, 0);
+    channel
+        .send_message(&http, card)
+        .await
+        .context("send approval card to Discord")?;
+
+    let _ = account_email;
     Ok(())
 }
 

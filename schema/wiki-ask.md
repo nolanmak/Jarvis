@@ -161,6 +161,41 @@ augmentagent gmail compose \
 
 For multi-line or long bodies, write the body to a tempfile and pass `--body-file /path/to/body.txt` (or `--body-file -` to read stdin). Returns a `draft_id` and a Gmail URL the user can open to review/send.
 
+### Reply with a Discord approval card (#352)
+
+When the user asks you to draft a reply they want to **act on** — "draft my reply to <person>", "respond to that email", "what should I say back?" — add `--post` to `compose` so the daemon surfaces a Discord approval card (Approve / Revise / Skip) wired into the same handler the auto-triage path uses. The user clicks **Approve** and the draft sends; no copy/paste, no follow-up command.
+
+Required additional flags with `--post` (the card needs the inbound context):
+
+- `--thread-id <id>` — the Gmail thread (so the reply attaches correctly).
+- `--reply-to-message-id <id>` — the original inbound `messageId` (used to dedupe and to give the Revise handler something to redraft against).
+- `--reply-to-from <addr>` — the original sender (the person you're replying to). Defaults to `--to`.
+- `--reply-to-subject <s>` — the original subject. Defaults to `--subject` with the leading `Re:` stripped.
+- `--reply-to-body-file -` (or `--reply-to-body "<text>"`) — the original message body for the card's context block. Strongly preferred so Revise has the inbound to work against.
+
+Workflow:
+
+1. `augmentagent gmail search --query "from:<addr> ..." --full true` to find the message and grab `messageId`, `threadId`, `from`, `subject`, body.
+2. Draft the reply body in your usual voice-matched style.
+3. Run `compose --post` with the inbound fields wired in. Example:
+
+```
+augmentagent gmail compose --post \
+  --account me@example.com \
+  --to "someone@example.com" \
+  --subject "Re: deadline" \
+  --body-file /tmp/reply.txt \
+  --thread-id 18f… \
+  --reply-to-message-id 18e… \
+  --reply-to-from "someone@example.com" \
+  --reply-to-subject "deadline" \
+  --reply-to-body-file /tmp/inbound.txt
+```
+
+4. Tell the user the card is up ("posted an approval card in Discord — Approve to send, Revise for changes, Skip to discard"). **Do not also paste the draft body in your chat response** — the card already shows it; a duplicate paste defeats the whole point.
+
+**When NOT to use `--post`:** if the user asked for a *preview* of what you'd write ("draft me something I could send to X", "give me a starting point") or wants to copy the body into their own client, just use plain `compose` (or no command at all — describe the draft in chat). `--post` is for "I want to act on this", not "I want to see this".
+
 ### Update an existing draft
 
 ```
@@ -198,6 +233,7 @@ augmentagent gmail delete-draft --account me@example.com --draft-id <id>
 - **Confirm the recipient.** If you're inferring an address from the wiki, cite the source page. If multiple people match, ask which one.
 - **Never invent addresses, names, or commitments.** Use the wiki / `gmail search` to ground claims; if you can't find a real address, ask the user.
 - **Replies belong on the same thread.** If the user is responding to an email, find the original via `gmail search`, extract its `messageId` and `threadId`, and pass `--thread-id` to `compose`/`send-now`.
+- **For actionable replies, prefer `compose --post`.** When the user clearly wants to act on a reply (not just preview prose), use `compose --post` so a Discord approval card appears with Approve / Revise / Skip. Pasting the draft into chat as text is the fallback — it forces the user to copy/paste into Gmail, which is the friction `--post` exists to remove.
 
 ## Invoice actions
 
