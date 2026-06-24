@@ -66,12 +66,17 @@ pub enum CodeModeError {
     ReasonerFailed(#[source] anyhow::Error),
 }
 
-/// Extract the first fenced ```ts``` or ```typescript``` block from `text`.
+/// Extract the first fenced program block from `text`.
 ///
-/// The language tag is matched case-insensitively (the model occasionally
-/// emits `TypeScript`). Other fenced blocks (e.g. ```js, ```python, bare
-/// ``` ``` blocks) are skipped — this extractor is stricter than "first
-/// fenced block" on purpose so the model is forced to label its program.
+/// Accepted language tags (case-insensitive): `ts`, `typescript`, `js`,
+/// `javascript`. The Deno runner transpiles either flavor identically via
+/// `data:application/typescript` module loading, so accepting `js`-tagged
+/// blocks rescues the not-uncommon model failure mode of emitting the
+/// wrong fence label (the program itself is usually fine).
+///
+/// Other fenced blocks (e.g. ```python, ```rust, bare ``` ``` blocks with
+/// no language tag) are skipped — the extractor still requires a label so
+/// it can be confident the block is meant as program source, not prose.
 ///
 /// The returned string is the raw inner source with leading / trailing
 /// whitespace trimmed; the body's internal whitespace is preserved verbatim.
@@ -100,7 +105,7 @@ pub fn extract_ts_block(text: &str) -> Result<String, CodeModeError> {
             .unwrap_or("")
             .trim()
             .to_ascii_lowercase();
-        if tag == "ts" || tag == "typescript" {
+        if matches!(tag.as_str(), "ts" | "typescript" | "js" | "javascript") {
             // Body starts at the byte after the opener-line newline. If the
             // opener has no newline before EOF, treat that as malformed.
             if line_end >= text.len() {
@@ -113,8 +118,8 @@ pub fn extract_ts_block(text: &str) -> Result<String, CodeModeError> {
             let body_end = body_start + close_rel;
             return Ok(text[body_start..body_end].trim().to_string());
         }
-        // Not a ts/typescript block — jump past this fence's closer (if any)
-        // and keep scanning. If there's no closer, no ts block can exist.
+        // Not a recognized program block — jump past this fence's closer (if any)
+        // and keep scanning. If there's no closer, no program block can exist.
         match text[line_end..].find("```") {
             Some(close_rel) => {
                 cursor = line_end + close_rel + 3;
@@ -153,9 +158,26 @@ mod tests {
     }
 
     #[test]
-    fn skips_non_ts_block_then_finds_ts() {
-        let resp = "Some context.\n```js\n// not this one\n```\nAnd the real program:\n```ts\nbar();\n```\n";
+    fn skips_non_program_block_then_finds_ts() {
+        // A python block is not a program block — keep scanning past it.
+        let resp = "Some context.\n```python\n# not this one\n```\nAnd the real program:\n```ts\nbar();\n```\n";
         assert_eq!(extract_ts_block(resp).unwrap(), "bar();");
+    }
+
+    #[test]
+    fn accepts_js_fence_as_equivalent_to_ts() {
+        // Models sometimes emit ```js when ```ts was requested. The Deno
+        // runner transpiles either way, so we accept it as a valid program
+        // block rather than fail-and-repair.
+        let resp = "```js\nasync function main() { await tools.draft(\"gmail\", \"hi\", \"r\"); }\nmain();\n```";
+        let got = extract_ts_block(resp).expect("must accept js-tagged block");
+        assert!(got.contains("tools.draft"));
+    }
+
+    #[test]
+    fn accepts_javascript_fence_case_insensitive() {
+        let resp = "```JavaScript\nfoo();\n```";
+        assert_eq!(extract_ts_block(resp).unwrap(), "foo();");
     }
 
     #[test]
@@ -166,7 +188,9 @@ mod tests {
 
     #[test]
     fn untagged_fence_is_rejected() {
-        // A bare ``` ... ``` block has no `ts`/`typescript` tag → not a match.
+        // A bare ``` ... ``` block has no label → not a match. We still
+        // require an explicit ts/typescript/js/javascript tag so prose-style
+        // code samples don't get executed by accident.
         let resp = "```\nasync function main() {}\n```";
         let err = extract_ts_block(resp).unwrap_err();
         assert!(matches!(err, CodeModeError::NoCodeBlock));

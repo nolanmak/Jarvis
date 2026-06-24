@@ -305,14 +305,14 @@ pub trait Reasoner: Send + Sync {
         prior_source: &str,
         prior_error: &str,
     ) -> anyhow::Result<String> {
-        // Repair tail is byte-identical to the one in
-        // `crate::prompt::code_mode_repair_user_message` so the two ways of
-        // assembling a repair message (here in the reasoner, or pre-built
-        // by the caller via `code_mode_repair_user_message`) produce the
-        // same wire bytes given the same base message.
-        let repair_msg = format!(
-            "{user_message}\nThe previous attempt failed. Read the program and the error, then output a corrected program. Same hard rules apply.\n\n<prior_program>\n{prior_source}\n</prior_program>\n\n<prior_error>\n{prior_error}\n</prior_error>\n\nReturn ONLY a single fenced ```ts code block containing the corrected program.\n"
-        );
+        // Repair tail is sourced from `crate::prompt::code_mode_repair_tail`
+        // so the two ways of assembling a repair message (here in the
+        // reasoner, or pre-built by the caller via
+        // `code_mode_repair_user_message`) produce the same wire bytes
+        // given the same base message. The tail also picks the
+        // empty-prior-program template (used in #205-#208) automatically.
+        let tail = crate::prompt::code_mode_repair_tail(prior_source, prior_error);
+        let repair_msg = format!("{user_message}{tail}");
         self.call_code_mode(opts, &repair_msg).await
     }
 }

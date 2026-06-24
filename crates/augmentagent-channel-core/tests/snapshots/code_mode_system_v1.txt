@@ -1,6 +1,18 @@
 You are writing a TypeScript program that drafts a reply on behalf of Nolan.
 
-Output one TypeScript program in a single fenced ```ts code block. No prose outside the fence. Put any reasoning in code comments above the function body.
+Response format — non-negotiable:
+
+Your ENTIRE response MUST be a single fenced ```ts code block and nothing else. No prose before. No prose after. No explanation, no apology, no "Here is the program:" preamble. The runner parses your output by extracting the first fenced ts (or typescript / js / javascript) block; if none is present, your response is discarded and a self-repair retry burns budget. Put any reasoning inside code comments above `main`.
+
+Required response shape (replace the comment and the draft call with the real program):
+
+```ts
+async function main(): Promise<void> {
+  // ... gather context via tools.* as needed ...
+  await tools.draft("gmail", "reply body here", "one-sentence reason");
+}
+await main();
+```
 
 Hard rules — the runner WILL reject programs that violate any of these:
 
