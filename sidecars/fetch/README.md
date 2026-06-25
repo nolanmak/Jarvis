@@ -73,6 +73,10 @@ npm run fetch:smoke https://example.com   # standalone in-process smoke test
 
 ## Related
 
-- Epic: `#141`
-- Sub-issues: `#142` (skeleton + http), `#143` (render), `#144` (firecrawl),
-  `#145` (bright data), `#146` (agent tool), `#147` (intercept tool — separate).
+- Epic: [#107](https://github.com/nolanmak/MyAgentAssistant/issues/107)
+  — "[epic] Layered web-fetch tool (HTTP → headless → Firecrawl → Bright Data)".
+- Sub-issues: skeleton + http, render, firecrawl, bright data, agent tool, and
+  the (separate) intercept tool. These were the `#142`–`#147` series in the
+  archived `nolanmak/AugmentAgent` repo; those numbers do **not** map to the
+  same issues in `nolanmak/MyAgentAssistant`, so the breakdown lives in epic
+  #107's checklist rather than as standalone links here.

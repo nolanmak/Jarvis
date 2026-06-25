@@ -1,5 +1,23 @@
 # Instagram & X (Twitter) DM Channels — Decision Doc (#46)
 
+> **SUPERSEDED — DO NOT TREAT AS THE AS-BUILT DESIGN.**
+>
+> This decision doc recommended an **official-API-only, no-sidecar** path for
+> both platforms. The project ultimately reversed both recommendations and
+> shipped the **unofficial** channels this doc rejected:
+> - **Instagram** ships `augmentagent-channel-instagram` — the private web API
+>   (`https://www.instagram.com/api/v1`, `sessionid`-cookie auth), **with DM
+>   send**, plus a **logged-in Chromium browser sidecar** (Playwright/CDP) for
+>   feed posting. It does **not** use the Meta Messaging API.
+> - **X / Twitter** ships `augmentagent-channel-twitter` — the scraped GraphQL /
+>   private endpoints (`x.com`, `auth_token`/`ct0` cookies), **with DM send**.
+>   It does **not** use `api.twitter.com/2`.
+>
+> Ban-risk is managed via the governor caps and approval-gating, not by
+> avoiding the unofficial transport. For the as-built protocols see
+> **`docs/instagram-protocol.md`** and **`docs/twitter-protocol.md`**. The
+> sections below are retained only as the historical decision record.
+
 Status: **research / decision** — no code in this PR (`Refs #46 — research doc`).
 Audience: whoever picks up the IG-DM (#17–#19, #50, #76) and X-DM (#14–#16,
 #79) implementation tracks. This doc fixes the *approach* so those tracks
@@ -136,6 +154,13 @@ credential-driving subprocess. Today only WhatsApp does. Revisit a shared
 `SidecarRunner` trait *iff* a future platform forces an unofficial
 subprocess path — IG/X under this decision do not.
 
+> **SUPERSEDED:** the as-built Instagram channel drives a logged-in Chromium
+> browser sidecar (Playwright/CDP) for feed posting — see
+> `docs/instagram-protocol.md` "Browser posting" and
+> `crates/augmentagent-browser-client` + `sidecars/browser`. So WhatsApp is no
+> longer the *only* channel using a credential-driving subprocess, and the
+> "no sidecar needed for IG" premise above no longer holds.
+
 ---
 
 ## 6. One-line summary
@@ -148,3 +173,8 @@ subprocess path — IG/X under this decision do not.
   + suspension risk); scraping stays scoped to read/engagement tracks.
 - Both fit the existing direct-`reqwest`/Trigger + webhook + OAuth-callback +
   `ApprovalSurface` machinery; **no shared sidecar-runner needed**.
+
+> **SUPERSEDED:** see the banner at the top of this doc. The shipped channels
+> are unofficial (cookie-based IG/X with DM send) and the Instagram path does
+> use a browser sidecar for feed posting. As-built: `docs/instagram-protocol.md`,
+> `docs/twitter-protocol.md`.

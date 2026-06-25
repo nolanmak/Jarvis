@@ -82,9 +82,15 @@ Base URL: `https://www.instagram.com/api/v1`
 
 ### `GET /api/v1/users/web_profile_info/?username=<u>`
 
-Resolve a username → numeric user id + profile metadata. Primary use:
-validate a session after harvest, and resolve `instagram:<handle>` wiki
-identities to the `user_id` the feed endpoint needs.
+**Documented but not yet implemented.** A public-knowledge spec endpoint that
+resolves a username → numeric user id + profile metadata. Intended use:
+resolve `instagram:<handle>` wiki identities to the `user_id` the feed
+endpoint needs. **It is not wired today** — the `InstagramApi` trait
+(`src/api.rs`) implements only `fetch_inbox`, `send_dm`, `fetch_user_feed`,
+and `post_comment`; there is no username-resolution / `web_profile_info`
+method. Session validation after harvest is currently done by the
+`augmentagent-instagram-validate` harness's `auth` + `inbox` probes
+(`src/validate.rs`), not this endpoint.
 
 Response (excerpt): `data.user.id`, `data.user.full_name`,
 `data.user.edge_owner_to_timeline_media`.

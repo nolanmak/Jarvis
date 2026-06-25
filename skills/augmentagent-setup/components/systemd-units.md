@@ -2,10 +2,12 @@
 
 Reference for every user-mode systemd unit the AugmentAgent stack ships.
 The skill consults this file when a triage branch needs to install,
-check, or restart a unit. Every install/uninstall verb wraps the
-matching `scripts/install-<name>.sh` (or unit-template copy for the
-browser sidecar) via the `augmentagent install <component>` shim from
-issue #6.
+check, or restart a unit. Where a unit has an `augmentagent install
+<component>` shim, that verb wraps the matching
+`scripts/install-<name>.sh` (or unit-template copy for the browser
+sidecar) via the shim from issue #6. The renderer, telegram-capture,
+and tone-refresh units have no `install` component and are installed by
+hand (see below).
 
 ## Units at a glance
 
@@ -20,6 +22,10 @@ issue #6.
 | `augmentagent-xvfb.service`             | `browser-sidecar`    | Headless X server for the headed Chromium profile.                   |
 | `augmentagent-chromium.service`         | `browser-sidecar`    | Headed Chromium pointed at the Xvfb display.                         |
 | `augmentagent-browser-sidecar.service`  | `browser-sidecar`    | Python sidecar that drives the Chromium instance.                    |
+| `augmentagent-renderer.service`         | (no install shim)    | Node Remotion renderer sidecar. Copy unit by hand; see `systemd/README.md`. |
+| `augmentagent-telegram-capture.service` | (no install shim)    | Voice-memo capture listener (#80). Copy unit by hand.                |
+| `augmentagent-tone-refresh.timer`       | (no install shim)    | Nightly trigger (03:30) for the tone-profile refresh (#73).         |
+| `augmentagent-tone-refresh.service`     | (no install shim)    | One-shot `tone refresh-stale` the timer triggers. Alias `tone-refresh`/`tone`. |
 | `augmentagent-<tenant>.service`         | `tenant --name <n>`  | Multi-tenant per-Discord-server isolated daemon.                     |
 
 ## Install
@@ -47,6 +53,19 @@ The browser sidecar variant is unique: it copies three `.service` files
 from `systemd/` to `~/.config/systemd/user/`, runs `daemon-reload`, then
 `enable --now` on all three. The dashboard install variant has no
 upstream uninstall script.
+
+The renderer, telegram-capture, and tone-refresh units have no
+`augmentagent install` shim. Install each by copying the unit into
+`~/.config/systemd/user/` then enabling it:
+
+```
+cp systemd/augmentagent-renderer.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now augmentagent-renderer.service
+```
+
+(For tone-refresh, copy both `.service` and `.timer` and enable the
+`.timer`. Run `sidecars/renderer/setup.sh` before enabling the renderer.)
 
 ## Check
 

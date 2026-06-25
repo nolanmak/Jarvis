@@ -5,16 +5,18 @@ session. The Rust daemon talks to it via NDJSON over
 `${XDG_RUNTIME_DIR}/augmentagent/wa.sock` — same wire shape as the browser
 sidecar (`sidecars/browser/`).
 
-Implements [#12](https://github.com/nolanmak/AugmentAgent/issues/12) (DM
-channel) and [#102](https://github.com/nolanmak/AugmentAgent/issues/102)
-(agent control/approval surface). Rust foundation crate:
-`crates/augmentagent-channel-whatsapp`.
+Implements the WhatsApp DM channel and the agent control/approval surface.
+(These were tracked as `#12` / `#102` in the archived `nolanmak/AugmentAgent`
+repo; those numbers do not map to the same issues in the canonical
+[nolanmak/MyAgentAssistant](https://github.com/nolanmak/MyAgentAssistant) repo.)
+Rust foundation crate: `crates/augmentagent-channel-whatsapp`.
 
 > **Build status:** the Rust side, the JSON-RPC contract, and mock-socket
 > tests are complete and green (`cargo test -p augmentagent-channel-whatsapp`
 > — 36 tests). The Go sidecar source is committed but **uncompiled**: this
 > host has no Go toolchain. `go mod tidy && go build` once Go is installed
-> (see #74 — "Go sidecar build pending").
+> (tracked as "Go sidecar build pending" — formerly `#74` in the archived
+> AugmentAgent repo).
 
 ## Layout
 
@@ -59,7 +61,7 @@ The whatsmeow session persists to
 reconnect silently. A server-side logout emits `logged-out` and the daemon
 flips the `whatsapp_devices` row to `logged_out` — re-run `whatsapp login`.
 
-## Ban-risk gate (#40 / #74 / #102)
+## Ban-risk gate
 
 WhatsApp bans bot-like accounts aggressively. The channel is conservative:
 

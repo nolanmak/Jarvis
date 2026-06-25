@@ -1,8 +1,9 @@
 # Setup Skill Troubleshooting
 
 Quick lookup table the skill consults when `augmentagent status --json`
-fails outright, or when a channel reports `validated=false` without an
-obvious cause. Start small; this file will grow as Phases 2 and 3 land.
+fails outright, or when a channel reports `configured=false` or a
+non-empty `needs[]` without an obvious cause. Start small; this file
+will grow as Phases 2 and 3 land.
 
 ## Symptom to cause to fix
 
@@ -10,13 +11,13 @@ obvious cause. Start small; this file will grow as Phases 2 and 3 land.
 | --- | --- | --- |
 | `augmentagent status` exits with "command not found" or "No such file" | The release binary has not been built or is not on PATH. | Run `cargo build --release -p augmentagent-cli`, then re-run with the full path `./target/release/augmentagent status --json`. If the user wants it on PATH, symlink into `~/.cargo/bin/`. |
 | `status --json` returns valid JSON with `summary: "daemon_down"` and `daemon.active=false` | The main daemon is not running. | Run `augmentagent service start --unit daemon` (or `systemctl --user start augmentagent.service`). Re-check status. If it fails immediately, pull `augmentagent logs --unit augmentagent.service` and surface the last 50 lines verbatim. |
-| `dashboard.running=false` and `dashboard.installed=false` | The dashboard sidecar was never installed. | Tell the user the dashboard is optional in Phase 1. If they want it, run `./scripts/install-dashboard.sh` and re-run status. Do not flag this as a fault. |
-| Any channel reports `gates.<VAR>="unset"` for a var the user expects to be set | `.env` is missing the line, or the daemon was started before `.env` was edited. | Tell the user which env var to add, point them at the matching block in `.env.example`, then run `augmentagent service restart` so the daemon re-reads `.env`. |
+| `dashboard.active=false` and `dashboard.reachable=false` | The dashboard sidecar is not running (no `installed` flag exists; absence is inferred from both being false). | Tell the user the dashboard is optional in Phase 1. If they want it, run `./scripts/install-dashboard.sh` and re-run status. Do not flag this as a fault. |
+| A channel reports `armed=false` (gate off) or a non-empty `needs[]` for creds the user expects to be set | `.env` is missing the line / the gate was never set, or the daemon was started before the config was changed. | Apply the value with `augmentagent env set <KEY> <VALUE>` (or `augmentagent channel <name> arm` for the arming gate), point them at the matching block in `.env.example`, then run `augmentagent service restart` so the daemon re-reads its config. |
 | Channel validation fails with a keyring error (e.g. "Cannot autolaunch D-Bus", "secret service not available") | The D-Bus session has no unlocked secret service. Common on SSH or freshly-rebooted headless boxes. | Have the user log into a graphical session once to unlock the keyring, or wrap the daemon start in `dbus-run-session` for fully headless flows. Re-run channel validate. |
 | Instagram or Twitter validate fails with "browser sidecar timeout" | The browser sidecar needs a display or a headed launch profile and there is none. | If the user is on pure SSH with no DISPLAY, this is expected; tell them to run the validation from a graphical session, or to enable the sidecar's headless profile if their channel build supports it. Do not retry. |
 | `service restart` succeeds but the unit drops back to `inactive` within seconds | A unit dependency is failing (typically a sidecar or the database). | Run `systemctl --user status augmentagent.service --no-pager` and surface verbatim. Look for "Failed to start" lines in the dependency chain. Route the user to the failing sub-unit's logs. |
 | `status --json` hangs or takes more than ten seconds | The CLI is trying to reach a live channel during status collection. | Should not happen with the Phase 1 aggregator; if it does, file a bug against issue #1. Interrupt with Ctrl+C and report the stderr. |
-| `auto-update` looks stale (binary built more than a week ago) | The auto-updater unit is not active, or has not picked up new commits. | Tell the user to run `scripts/check-for-updates.sh` once manually and check that `augmentagent-autoupdate.timer` is enabled via `systemctl --user list-timers`. |
+| `auto-update` looks stale (binary built more than a week ago) | The auto-updater unit is not active, or has not picked up new commits. | Tell the user to run `scripts/check-for-updates.sh` once manually and check that `augmentagent-update.timer` is enabled via `systemctl --user list-timers`. |
 | The skill itself emits an emoji or an emdash | The skill output is being post-processed somewhere outside the skill, or the model ignored the writing-style rules. | Regenerate the message. If it repeats, file a bug against issue #5. |
 
 ## Doctor findings
@@ -152,6 +153,21 @@ Fix. The suggested_cmd is `cp .env.example .env && $EDITOR .env`. Tell
 the user which env vars are missing from the install (read `core_keys`
 in the status JSON for the canonical list) and offer to set them via
 `augmentagent env set <KEY> <VALUE>` instead of editing the file.
+
+## socialapi
+
+What it means. The doctor probes the SocialAPI.ai integration (#245): is
+`SOCIALAPI_API_KEY` set (sqlite `config.socialapi_api_key`, env-var
+fallback), and is there at least one active account in the local
+`socialapi_accounts` registry. This check runs unconditionally, not
+behind `--deep`. An `ok` means the key is set and at least one account
+is active; a `warn` means the key is set but no accounts are connected,
+or no key is set at all (the integration is optional, so it never
+errors).
+
+Fix. The suggested_cmd is `augmentagent socialapi connect` (or connect
+via the dashboard). For the no-key case, set the key with `augmentagent
+env set SOCIALAPI_API_KEY <key>` first, then connect an account.
 
 ## composio_api (--deep)
 

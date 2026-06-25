@@ -2,9 +2,13 @@
 
 AugmentAgent renders short vertical videos (1080×1920) for outbound social
 content. This document covers the design and the phased rollout. **Phase 0
-(this PR) is the only thing built so far** — a manually-triggerable,
-end-to-end "render an mp4 from JSON props" path. Everything in Phases 1+ is
-roadmap, not code.
+shipped first** — a manually-triggerable, end-to-end "render an mp4 from JSON
+props" path. Since then much of the surrounding pipeline has landed too: the
+content-adapter fan-out (Phase 1), governor `ActionKind::Post` wiring (Phase
+2), and the Instagram / Twitter(X) / LinkedIn posting channels (Phase 5) are
+all built. What remains genuinely unbuilt is the renderer→adapter wiring (no
+crate calls `RendererClient::render` for a `MediaSpec` yet) and end-to-end
+video publish. See the [phase status table](#phase-status) below.
 
 ## Why Remotion (and what was considered)
 
@@ -44,13 +48,18 @@ sidecars/renderer/server.mjs          (Node, long-running)
 
 ```
 Request : {"request_id": "<uuid>", "op": "<name>", "params": {...},
-           "timeout_ms": 300000}
+           "timeout_ms": 120000}
 Success : {"request_id": "...", "ok": true,  "result": {...},
            "elapsed_ms": 8123}
 Failure : {"request_id": "...", "ok": false,
            "error": {"kind": "<Kind>", "message": "..."},
-           "elapsed_ms": 300000}
+           "elapsed_ms": 120000}
 ```
+
+`timeout_ms` is per-op, not a single fixed envelope value: the sidecar
+defaults to `120000` when the field is omitted (`server.mjs`), while the Rust
+client sends `5000` for `ping` and `DEFAULT_RENDER_TIMEOUT_MS = 300000` for
+`render`.
 
 Ops:
 
@@ -86,7 +95,18 @@ controls clip length without the sidecar re-bundling.
 
 ## Phased roadmap
 
-### Phase 0 — render path (THIS PR) ✅
+### Phase status
+
+| Phase | Scope | Status |
+|-------|-------|--------|
+| 0 | Render path (sidecar + client + CLI) | ✅ Done |
+| 1 | content-adapter fan-out (`SourceDraft` → `PlatformVariant`/`MediaSpec`) | ✅ Done (#53, #172, #241); renderer→adapter wiring still unbuilt |
+| 2 | governor `ActionKind::Post` wiring | ✅ Done (#58) |
+| 3 | `ApprovalBroker` media attachment | ◻ Planned |
+| 4 | Outbound trigger/scheduler | ◻ Planned |
+| 5 | Platform publish (LinkedIn / Instagram / Twitter channels) | ◐ Partial — channels built; video publish wiring unbuilt |
+
+### Phase 0 — render path ✅
 
 - `sidecars/renderer/` Node service: Remotion project + NDJSON Unix-socket
   server, bundle caching, typed errors.
@@ -105,23 +125,36 @@ gets its own focused review):
 - No `ApprovalBroker` changes.
 - No content-adapter fan-out.
 
-### Phase 1 — content-adapter fan-out
+### Phase 1 — content-adapter fan-out ✅ (#53)
 
-Implement the stubbed types in `crates/augmentagent-content-adapter`
-(`SourceDraft`, `PlatformVariant`, `MediaSpec` — today a placeholder in
-`types.rs`). A `SourceDraft` (an approved long-form idea) fans out to
-per-platform `PlatformVariant`s, each carrying a `MediaSpec` that maps onto
-`ShortCard` inputProps. Adapter calls `RendererClient::render` to produce the
-mp4 per variant.
+`crates/augmentagent-content-adapter` is implemented. `SourceDraft`,
+`PlatformVariant`, and `MediaSpec` are real types in `types.rs` (with
+builders, per-platform char limits, thread/over-limit handling, and unit
+tests). A `SourceDraft` (an approved long-form idea) fans out to per-platform
+`PlatformVariant`s via `adapter::fan_out`, each carrying a `MediaSpec` that
+maps onto `ShortCard` inputProps. The crate also ships `preview::preview_all`
+/ `variant_card` preview rendering, a SocialAPI.ai cross-post fan-out
+(`socialapi.rs`, #241), and a post-time publish orchestrator
+(`publish.rs`, #172).
 
-### Phase 2 — governor `ActionKind::Post` wiring
+**Still unbuilt — renderer→adapter wiring.** The adapter is a pure text
+transform: it emits a `MediaSpec` (sizing + alt text), it does **not** invoke
+the renderer or produce an mp4 (`crates/augmentagent-content-adapter` has no
+dependency on `augmentagent-renderer-client`, and `types.rs` notes the
+`MediaSpec` is the *spec a downstream renderer/uploader consumes*, not
+pixels). Nothing yet takes a `MediaSpec` and calls `RendererClient::render`
+to produce the mp4 per variant — that wiring remains future work.
 
-`crates/augmentagent-channel-core/src/governor` already models
-`ActionKind::Post` in the 2025 cap matrix
-(`governor/limits.rs`) but nothing emits Post actions yet. Wire the content
-pipeline through the `RateGovernor` with warmup ramp, jitter, and
-quiet-hours so automated posting can't trip platform anti-spam. This is the
-first phase that touches rate-safety and must get its own review.
+### Phase 2 — governor `ActionKind::Post` wiring ✅ (#58)
+
+`crates/augmentagent-channel-core/src/governor` models `ActionKind::Post` in
+the 2025/26 cap matrix (`governor/limits.rs`), and the engagement engine now
+emits it: `engagement.rs`'s scheduled-post fire loop (`fire_one`) builds an
+`ActionRequest { action: ActionKind::Post, … }` and runs it through the
+`RateGovernor` permit/record envelope before publishing. This is the first
+phase that touches rate-safety. Any remaining hardening (warmup-ramp tuning,
+jitter, quiet-hours edge cases) builds on top of this wiring rather than
+introducing the Post emitter from scratch.
 
 ### Phase 3 — ApprovalBroker media attachment
 
@@ -137,18 +170,29 @@ trigger/scheduler so content posts can be queued and time-released
 (respecting Phase 2's governor) rather than only manually `augmentagent
 render`'d.
 
-### Phase 5 — platform publish
+### Phase 5 — platform publish ◐ (channels built)
 
-Actually publish. **Status of the platform surface today:**
+The per-platform channel crates — auth + DM + posting — already exist.
+**Status of the platform surface today:**
 
-- **LinkedIn**: a DM channel crate exists
-  (`crates/augmentagent-channel-linkedin`) but **feed/post publishing is
-  unimplemented** — only messaging is wired.
-- **Instagram / Twitter(X)**: **no crates exist.** Net-new channel work,
-  each with its own auth + ToS review.
+- **LinkedIn** (`crates/augmentagent-channel-linkedin`): feed posting is
+  implemented in `posting.rs` (#51 / #77) via Voyager
+  `contentcreation/normShares` — **text** and **single-image** posts, with
+  `ShareUrn` / `Visibility` types and own-post comment polling (`own_posts.rs`,
+  #58.2). Deferred to a later sub-phase: video, polls, scheduling, articles,
+  and multi-image.
+- **Instagram** (`crates/augmentagent-channel-instagram`): exists with auth +
+  DM surfaces and a browser-driven `Composer` (`composer.rs`) for
+  Feed/Carousel/Reel/Story posting (#50 / #76).
+- **Twitter(X)** (`crates/augmentagent-channel-twitter`): exists with auth +
+  DM surfaces and a `CreateTweetClient` (#79) that posts via the `CreateTweet`
+  GraphQL op behind a hard 15/day quota preflight and a dry-run gate.
 
-Every publish path in this phase is ToS-bearing and rate-sensitive; it is
-deliberately the last phase and gated on Phases 2–4.
+**Still unbuilt — video publish wiring.** What remains is connecting the
+renderer-produced mp4 (Phase 1's `MediaSpec` → rendered clip) through these
+channels' posting paths; the channels currently post text/image, not the
+rendered short. Every publish path here is ToS-bearing and rate-sensitive, so
+the remaining video-publish wiring stays gated on Phases 2–4.
 
 ## Operational
 

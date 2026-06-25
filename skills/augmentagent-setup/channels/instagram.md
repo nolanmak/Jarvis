@@ -1,5 +1,15 @@
 # Instagram Setup
 
+> NOT YET WIRED. Instagram is surfaced in `augmentagent status` (it has
+> an arming gate in `arming_keys_for`) and the harvest schema emits an
+> `instagram` next_cmd, but there is no top-level `augmentagent
+> instagram` command and `instagram` is not a `ChannelName` variant in
+> `crates/augmentagent-cli/src/channel_router.rs`. As a result
+> `augmentagent instagram login` and every `augmentagent channel
+> instagram <op>` (validate / arm / disarm) fail with a clap parse
+> error today. The steps below are the intended flow; do not run the
+> `instagram` CLI verbs until the command and the router variant land.
+
 ## Category
 
 cookie harvest
@@ -32,7 +42,9 @@ sub-flow") with `--channel instagram`. The mechanical sequence:
    ```
    Schema lists seven fields: `ds_user_id`, `username` (optional),
    `sessionid`, `csrftoken`, `mid`, `ig_did`, `rur` (optional). The
-   `next_cmd` template is `augmentagent instagram login --cookies-json <path>`.
+   `next_cmd` template is `augmentagent instagram login --cookies-json <path>`,
+   but that top-level command does not exist yet (see the NOT YET WIRED
+   note above), so the command in step 5 will fail until it lands.
 2. Echo `doc_steps` verbatim.
 3. AskUserQuestion per field. Mask `sessionid`, `csrftoken`, `mid`,
    `ig_did`, `rur` (`secret = true`). `username` and `rur` are optional;
