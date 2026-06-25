@@ -51,6 +51,7 @@ they must agree.
     "meetup":    { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
     "reddit":    { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
     "slack":     { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
+    "socialapi": { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
     "telegram":  { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
     "twitter":   { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
     "voice":     { "configured": false, "armed": false, "accounts": 0, "last_poll_unix": null, "needs": ["login"] },
@@ -138,8 +139,8 @@ An object keyed by channel name (lowercase, matches what
 emitted by `BTreeMap` (alphabetical):
 
 `calendar`, `contacts`, `discord`, `gdrive`, `github`, `gmail`,
-`instagram`, `linkedin`, `meetup`, `reddit`, `slack`, `telegram`,
-`twitter`, `voice`, `whatsapp`.
+`instagram`, `linkedin`, `meetup`, `reddit`, `slack`, `socialapi`,
+`telegram`, `twitter`, `voice`, `whatsapp`.
 
 Each value is an object:
 
@@ -148,13 +149,15 @@ Each value is an object:
   Composio key plus at least one row in the gmail-accounts table;
   gdrive counts active drive accounts; the rest probe their canonical
   sqlite config key (with env-var fallback).
-- `armed` (boolean): the user's arming gate. Hard-wired to `false`
-  today; flips to a real value once issue #7 ships the arm/disarm verbs.
-  The skill must not write through this field — bumping it on the
-  client side will be ignored by the daemon.
-- `accounts` (integer): connected-account count. Only populated for
-  `gmail` and `gdrive`; `0` everywhere else until per-channel last-poll
-  tables land in #7.
+- `armed` (boolean): the user's arming gate. Reads the per-channel
+  arming gate from the sqlite `config` table (set by `augmentagent
+  channel <name> arm`), falling back to the matching env var; sqlite
+  wins on conflict. Channels without an arming gate report `false`. The
+  skill must not write through this field — bumping it on the client
+  side will be ignored by the daemon.
+- `accounts` (integer): connected-account count. Populated for
+  `gmail`, `gdrive`, and `socialapi`; `0` everywhere else until
+  per-channel last-poll tables land.
 - `last_poll_unix` (integer or null): unix-seconds timestamp of the most
   recent successful poll. Always `null` today; reserved for #7.
 - `needs` (array of strings): what's missing. `["login"]` when

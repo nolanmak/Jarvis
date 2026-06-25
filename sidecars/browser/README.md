@@ -3,14 +3,16 @@
 Python asyncio sidecar that owns the long-running Chromium attached over CDP.
 The Rust daemon talks to it via NDJSON over `${XDG_RUNTIME_DIR}/augmentagent/browser.sock`.
 
-Implements [#75](https://github.com/nolanmak/AugmentAgent/issues/75). Foundation
-crate: `crates/augmentagent-browser-client`.
+Implements the browser-sidecar spec (originally `#75` in the archived
+`nolanmak/AugmentAgent` repo; that number does not map to the same issue in
+the canonical [nolanmak/MyAgentAssistant](https://github.com/nolanmak/MyAgentAssistant)
+repo). Foundation crate: `crates/augmentagent-browser-client`.
 
 ## Layout
 
 ```
 sidecars/browser/
-  sidecar.py        # asyncio Unix-socket server, 9 ops, typed errors
+  sidecar.py        # asyncio Unix-socket server, 13 ops, typed errors
   requirements.txt  # playwright==1.49.1 + browser-use==0.12.6
   pyproject.toml    # editable-install metadata
   setup.sh          # one-shot venv + playwright install chromium
@@ -120,7 +122,8 @@ exact request/response envelope and `crates/augmentagent-browser-client/src/lib.
 for the Rust side.
 
 Ops: `ping`, `navigate`, `click`, `type`, `screenshot`, `get_text`,
-`set_input_files`, `wait_for`, `evaluate`.
+`set_input_files`, `wait_for`, `evaluate`, `count`, `press_key`, `drag`,
+`bounding_box`.
 
 Typed error kinds: `AuthRequired`, `CaptchaDetected`, `ChromiumDisconnected`,
 `Timeout`, `SelectorNotFound`, `Navigation`, `Internal`. The first two carry a

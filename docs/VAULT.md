@@ -2,12 +2,14 @@
 
 This doc covers the optional encrypted-at-rest vault (macOS sparse bundle) and the Discord query feature. Both are opt-in. The Rust daemon and Node dashboard work fine without them; enabling them locks down `wiki/` + `data.db` and lets you ask the wiki questions from Discord.
 
+> **Scope:** The encrypted vault is a **macOS-only, opt-in** feature. The standard production deployment is **Linux + systemd user units** (see README → *Process management*). On Linux the daemon runs against plaintext `./wiki` and `./data.db`, and `vault-mount.sh` is a no-op.
+
 ## Quick decision
 
 | You want… | Do this |
 |---|---|
 | Just encryption for the wiki/db | Run `./scripts/vault-init.sh` once, then use `./scripts/run-rs.sh` + `./scripts/run-dashboard.sh` to launch things. |
-| Discord querying of the wiki | Set `DISCORD_QUERY_CHANNEL_ID` and `DISCORD_ALLOWED_USER_ID` in `.env`, enable MESSAGE CONTENT intent in Discord dev portal, pass `--wiki-dir ./wiki` to the Rust daemon. |
+| Discord querying of the wiki | Pass `--wiki-dir ./wiki` to the Rust daemon and enable MESSAGE CONTENT intent in the Discord dev portal. Optionally set `DISCORD_QUERY_CHANNEL_ID` / `DISCORD_ALLOWED_USER_ID` in `.env` to scope it. |
 | Both | Do both; they compose cleanly. |
 
 ## One-time vault setup
@@ -28,45 +30,38 @@ After this:
 
 **Vault lifecycle.** After a reboot, run `./scripts/vault-mount.sh` (idempotent) before the daemon starts. The `run-rs.sh` and `run-dashboard.sh` wrappers do this automatically. To detach: `./scripts/vault-umount.sh`.
 
-## pm2 recommended config (when you cut over to Rust)
+**Path/service overrides.** The values above are defaults, not hardcoded. The scripts read these env vars:
 
-Replace the existing `ecosystem.config.js` with this when you're ready to run the Rust daemon in production:
+| Env var | Default |
+|---|---|
+| `AUGMENTAGENT_VAULT_PATH` | `~/augmentagent-vault.sparsebundle` |
+| `AUGMENTAGENT_MOUNT_POINT` | `/Volumes/augmentagent` |
+| `AUGMENTAGENT_VOLNAME` | `augmentagent` |
+| `AUGMENTAGENT_VAULT_SERVICE` | `augmentagent-vault` |
+| `AUGMENTAGENT_VAULT_SIZE` | `2g` (sparse, grows on demand) |
 
-```js
-module.exports = {
-  apps: [
-    {
-      name: "augmentagent-rs",
-      script: "./scripts/run-rs.sh",
-      args: "serve --dry-run false --wiki-dir ./wiki",
-      watch: false,
-      env: { RUST_LOG: "info" },
-      max_memory_restart: "256M",
-      autorestart: true,
-    },
-    {
-      name: "augmentagent-dashboard",
-      script: "./scripts/run-dashboard.sh",
-      watch: false,
-      env: { NODE_ENV: "production" },
-      max_memory_restart: "256M",
-      autorestart: true,
-    },
-  ],
-};
+## Autostart (production)
+
+Register both services with the OS process manager — a launchd LaunchAgent on macOS, a systemd user unit on Linux. The installers are idempotent (re-running reloads with the current config):
+
+```bash
+./scripts/install-autostart.sh    # Rust daemon (launchd: com.nolanmak.augmentagent / systemd: augmentagent.service)
+./scripts/install-dashboard.sh    # Node dashboard
 ```
 
-The wrapper scripts mount the vault before exec'ing each process, so pm2 restarts after a reboot recover cleanly as long as the login keychain is unlocked.
+Both installers launch through the `run-rs.sh` / `run-dashboard.sh` wrappers, which call `vault-mount.sh` before exec — so the vault is already mounted before each process starts. Restarts are handled by launchd `KeepAlive` (macOS) / systemd `Restart=on-failure` (Linux), so after a reboot they recover cleanly as long as the login keychain is unlocked (macOS) / Secret Service is available (Linux). To remove the services: `./scripts/uninstall-autostart.sh`.
+
+> The legacy `ecosystem.config.js` (pm2) runs the old Node `augmentagent` + fetch-sidecar, not the Rust daemon — it is superseded by the autostart installers above and not the recommended path for the Rust daemon.
 
 ## Discord query setup
 
 1. In the [Discord developer portal](https://discord.com/developers/applications), select your bot app → **Bot** → enable **MESSAGE CONTENT INTENT** (privileged). Save.
-2. Set env vars in `.env`:
+2. (Optional) Set env vars in `.env` to scope the feature:
    ```
-   DISCORD_QUERY_CHANNEL_ID=<channel id where you want to ask questions>
-   DISCORD_ALLOWED_USER_ID=<your Discord user ID>
+   DISCORD_QUERY_CHANNEL_ID=<channel id where you want to ask questions>  # optional; defaults to DISCORD_CHANNEL_ID
+   DISCORD_ALLOWED_USER_ID=<your Discord user ID>                         # optional; unset means no user filter
    ```
-3. Launch the daemon with `--wiki-dir ./wiki` (enables the query handler):
+3. Launch the daemon with `--wiki-dir ./wiki` — this is what actually enables the query handler:
    ```bash
    ./target/release/augmentagent serve --dry-run false --wiki-dir ./wiki
    ```

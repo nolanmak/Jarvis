@@ -11,7 +11,7 @@ data, or secrets may live in tracked source.** This doc is the contract.
 | Discord user creds (bookmarklet) | `discord-creds.json` / OS keyring | ❌ gitignored |
 | Recipient email, invoice counter, sending entity | sqlite `data.db` (set via dashboard / `!invoice`) | ❌ gitignored (`*.db`) |
 | Invoice identity: name, address, phone, client, rate, gh repo/author | `.env` (`INVOICE_*`) | ❌ gitignored |
-| Wiki / people pages (PII) | `wiki/` | ❌ gitignored |
+| Wiki / people pages (PII) | `wiki/` | ❌ gitignored (except committed grocery KG scaffold) |
 | **Placeholders & shape of the above** | `.env.example` | ✅ committed |
 
 Rule of thumb: if a value is specific to a person, a client, money, or grants
@@ -44,7 +44,7 @@ Not sensitive — fine in a public repo (don't churn these):
 The hook blocks staged changes containing secret shapes (PEM keys, `ghp_`,
 `xox*-`, `sk-`, `AIza…`, `secret/api_key/token = "…"`), US phone numbers, real
 email addresses (anything not `@example.com`/`localhost`), and ever tracking
-`.env` / `*.db` / `*creds*.json` / `tenant.env` / key files. It is a backstop,
+`.env` / `*.db` / `discord-creds*.json` / `tenant.env` / key files. It is a backstop,
 not a substitute for not hardcoding data. Override a confirmed false positive
 (e.g. an `*.example` template) with `git commit --no-verify`.
 
@@ -67,6 +67,10 @@ Order matters:
 
 - [ ] `./scripts/check-no-personal-data.sh --tracked` passes
 - [ ] `git log -p | rg -i '<your email>|<address>|<client>'` is clean (history)
-- [ ] `.env`, `*.db`, `discord-creds.json`, `wiki/`, `tenant.env` are gitignored
-      and not tracked (`git ls-files | rg -i 'env|\.db|creds'` → only `.example`)
+- [ ] `.env`, `*.db`, `discord-creds.json`, and `wiki/` people/PII pages are
+      gitignored and not tracked — `wiki/*` is ignored except the committed
+      grocery KG scaffold (`wiki/groceries/*.md`)
+      (`git ls-files | rg -i 'env|\.db|creds'` → only `.example`)
+- [ ] `tenant.env` is not tracked — it isn't in `.gitignore` but the pre-commit
+      scanner blocks it by name (`tenant\.env$` in `BANNED_NAMES`)
 - [ ] `.env.example` has every required key as a placeholder, no real values

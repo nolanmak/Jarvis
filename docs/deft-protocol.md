@@ -92,8 +92,11 @@ Workspace metadata. Use: validate a freshly-pasted token at
 `augmentagent deft login` time (analogue of GitHub `whoami`).
 
 ### `GET /forms`
-All forms in the workspace + their fields. Use: discover form IDs
-(`OUm6T9`-shaped) and let the user pick which form(s) are the C&C surface.
+All forms in the workspace — each decoded as `DeftForm { id, name,
+created_at }` (per-form *fields* are a separate endpoint, `GET
+/forms/{id}/fields`, below). Use: workspace form auto-discovery (#157) — list
+form IDs (`OUm6T9`-shaped) so the operator does not maintain a manual list,
+and let the user pick which form(s) are the C&C surface.
 
 ### `GET /forms/{id}/fields`
 Fields of one form: each field has a stable `uuid`, a human `label`, and an
@@ -263,13 +266,24 @@ mapping mirrors the WhatsApp control surface
 | `agent_command` = `revise` + `agent_arg` | `ApprovalActionHandler::revise(arg)` |
 | `agent_command` = anything else (or a free-text `agent_query` field) | `QueryHandler::answer` (wiki/email/web question, same as Discord query mode) |
 
+> **Direction note (#158/#159):** this command-and-control framing
+> (`agent_command`/`agent_arg`/`agent_query` → `ApprovalActionHandler` /
+> `QueryHandler`) is being superseded by **inbound-message semantics**:
+> `DeftSubmission::into_email` + `FormFieldHints` (submitter-email detection +
+> a `Q:`/`A:` body), already implemented and tested in `types.rs`. The channel
+> still emits the legacy C&C conversion (`into_command_email`, gated on
+> `CommandFieldMap`) **pending the channel-side rewire in #159**, so the
+> runtime behavior described here is current — but new code should target the
+> inbound-message path.
+
 The submission is normalized into the shared `Email` shape
 (`platform="deft"`, `kind="dm"`, `account_entity_id="deft:<workspace_id>"`)
 so it flows through the **exact** triage→draft→approval pipeline every other
 channel uses — no bespoke downstream code. **Which `custom_key`s the operator
 actually wires on their form is REQUIRES LIVE VALIDATION** (it's the user's
 form; the scaffold's mapping is the documented default + is config-overridable
-via `command_field_key` / `arg_field_key` / `query_field_key`).
+via `field_map.{command_key, arg_key, query_key}` — the `CommandFieldMap`
+fields on `DeftChannelConfig`).
 
 ---
 
@@ -281,8 +295,10 @@ Crate: `crates/augmentagent-channel-deft/` — layout mirrors
 
 - `types.rs` — `DeftSubmission`/`DeftField` (wire shape, **tightened to the
   §4 webhook payload as the canonical shape** (#116), still defensively
-  decoded for envelope drift), `command_from_submission` (the §5 mapping,
-  fully unit-tested offline), `into_email` conversion, and
+  decoded for envelope drift), `command_from_submission` + `CommandFieldMap`
+  (the §5 mapping, fully unit-tested offline — **legacy C&C framing, being
+  superseded by inbound-message semantics in #158/#159**), the new
+  `into_email` conversion + `FormFieldHints` (the inbound-message path), and
   `webhook_submissions` (extracts submissions from any of the three §4
   frames — mirrors the Express receiver's `extractDeftSubmissions` so push
   and poll converge on identical `DeftSubmission`s).

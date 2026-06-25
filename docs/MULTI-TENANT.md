@@ -54,7 +54,19 @@ Then follow the printed checklist:
    ```
 3. Meetup: `./target/release/augmentagent --db "$DB" meetup subscribe <group-urlname> --mode digest`
 4. Google Drive: run the dashboard with `AUGMENTAGENT_DB="$DB"` and click
-   **Connect Google Drive** (writes the tenant's `drive_accounts` row).
+   **Connect Google Drive** (intended to write the tenant's `drive_accounts`
+   row).
+
+   > **⚠️ Known bug (issue #360): tenant Drive isolation does NOT work today.**
+   > The Node dashboard currently **ignores `AUGMENTAGENT_DB`**. Its entrypoints
+   > call `initDb()` with no argument, and `initDb` resolves the db path to
+   > `process.cwd()/data.db` (`src/db.ts`). Because the launch wrappers
+   > (`scripts/run-dashboard.sh`, and the systemd `WorkingDirectory` from
+   > `install-dashboard.sh`) `cd` into the repo root, **the dashboard always
+   > opens the production `data.db`**. Setting `AUGMENTAGENT_DB="$DB"` has no
+   > effect, so **Connect Google Drive writes the `drive_accounts` row into the
+   > prod db**, violating the zero-shared-state invariant below. Do not rely on
+   > this step for tenant Drive isolation until #360 is fixed.
 5. Start: `systemctl --user restart augmentagent-tenant-code-coffee.service`
    then `journalctl --user -u augmentagent-tenant-code-coffee -f`.
 

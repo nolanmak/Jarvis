@@ -4,6 +4,18 @@ Status: design proposal (medium confidence)
 Issue: [#123](https://github.com/nolanmak/MyAgentAssistant/issues/123)
 Related: #121 (skip capture), #122 (sender-type gate), #124 (closed-loop framing)
 
+> **Update (2026-06-24):** Partially superseded. A per-pattern `learn_pattern`
+> writer *does* ship in the TS triage agent — `src/agent.ts` (`case
+> "learn_pattern"` → `saveLearnedPattern()`) writes
+> `skills/email-triage/learned/<type>-patterns.json`, which is exactly what the
+> Rust reader `SkillPrompt::load_learned` consumes. So the writer→reader loop is
+> closed for discrete triage patterns, and the `notify({action: "learn_pattern"})`
+> hook documented in `SKILL.md` does exist. The remaining gap this spike still
+> addresses is the **synthesis / per-sender tone overlay** writer — there is no
+> writer for `tone_profile` / per-sender behavior overlays. Read the "nothing
+> writes learned files" framing below as scoped to that overlay surface, not to
+> learned files in general.
+
 ## Problem
 
 The user's framing is the entire spec: **"learning is changed behavior."** Today the agent collects operator signal (revisions, skips, approves) and the prompt layer has *readers* for "learned" content, but nothing in the system actually *writes* those learned files. The next draft for sender X reads the same as the last one the operator rejected. So no learning has happened — only logging.
@@ -35,7 +47,7 @@ Skip capture is the gap addressed by atom #121 — once it lands, the negative-s
 
 ### The gap
 
-Nothing in the Rust workspace writes `learned/*.json`. `SKILL.md` documents a `notify({action: "learn_pattern"})` hook that does not exist. The `tone_profile` block is plumbed but the tone descriptor itself has to be constructed from somewhere — today it is either empty or hand-edited. End-to-end:
+Nothing in the *Rust workspace* writes `learned/*.json` (the writer is the TS triage agent — see the Update at the top; `SKILL.md`'s `notify({action: "learn_pattern"})` hook does exist there). The real remaining gap is the `tone_profile` block: it is plumbed but the tone descriptor itself has to be constructed from somewhere — today it is either empty or hand-edited. End-to-end:
 
 ```
 [skip / revise / approve] → SQLite rows → ??? → learned/*.json / tone_profile → next prompt

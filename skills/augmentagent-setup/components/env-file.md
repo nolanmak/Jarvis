@@ -2,9 +2,10 @@
 
 `.env` at the repo root is the canonical source of channel arming gates,
 feature flags, and the core API keys the daemon needs at startup. The
-skill treats it as a read-only checklist; the Phase 3 env subcommand
-(issue #12) will own writes. Until that lands, the user edits `.env` by
-hand and the skill points at which line to change.
+skill never hand-edits `.env`; writes go through `augmentagent env set
+<KEY> <VALUE>` (issue #12, shipped), which persists to the sqlite
+`config` table (which wins over `.env` at startup). The skill reads
+`.env.example` as a checklist and uses `env set` to apply changes.
 
 ## Gate semantics
 
@@ -33,8 +34,17 @@ The arming map lives in `crates/augmentagent-cli/src/channel_router.rs`
 
 Channels not in this map are on-by-default once credentials are in
 place (gmail, gdrive, slack, discord, github, reddit, meetup,
-telegram-bot, deftform). The arm/disarm CLI verbs return "no arming
-gate" for those; that is expected.
+telegram-bot). For the ones that are routable through `augmentagent
+channel <name>` (the `ChannelName` variants), the arm/disarm CLI verbs
+return "no arming gate"; that is expected.
+
+Note: not every channel that appears in `arming_keys_for` or in the
+docs is a `ChannelName` variant. `instagram` has an arming gate but is
+NOT a `ChannelName` variant, so `augmentagent channel instagram
+arm/disarm` fails today. `deftform`/`deft` and `socialapi` are also NOT
+`ChannelName` variants; they use dedicated subcommands (`augmentagent
+deft …`, `augmentagent socialapi …`) rather than `augmentagent channel
+<name>`.
 
 ## arm / disarm verbs
 
@@ -91,16 +101,16 @@ are empty.
 
 ## Editing the file
 
-The skill never writes to `.env`. Instead:
+The skill never hand-edits `.env`. Instead:
 
-1. Identify the line that needs to change (read `.env.example` for the
-   canonical comment header for each block).
-2. Tell the user: "Open `.env` and set `<VAR>=<value>` under the
-   `<block-header>` section."
-3. Tell the user to run `augmentagent service restart` so the daemon
-   re-reads the file.
+1. Identify the variable that needs to change (read `.env.example` for
+   the canonical comment header for each block).
+2. Run `augmentagent env set <KEY> <VALUE>`, which upserts the sqlite
+   `config` row that wins over `.env` at startup.
+3. Run `augmentagent service restart` so the daemon picks up the change.
 
-The Phase 3 env subcommand (issue #12) is the only sanctioned writer.
+`augmentagent env set` / `env unset` (issue #12) is the sanctioned
+writer; the skill does not edit `.env` by hand.
 
 ## Pitfalls
 
@@ -112,5 +122,9 @@ The Phase 3 env subcommand (issue #12) is the only sanctioned writer.
   restart. There is no SIGHUP support today.
 - `.env.example` is the canonical comment header and gate list. If a
   channel name is missing from this file, the daemon does not know about
-  it; cross-check `crates/augmentagent-cli/src/channel_router.rs`
-  `ChannelName` for the true enumeration.
+  it. The `ChannelName` enum in
+  `crates/augmentagent-cli/src/channel_router.rs` lists only the
+  channels routable through `augmentagent channel <name>`; it is NOT a
+  complete enumeration of every channel — gated channels like
+  `instagram` and documented ones like `deftform`/`socialapi` are absent
+  from it and use dedicated subcommands instead.

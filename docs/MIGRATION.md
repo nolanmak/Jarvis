@@ -105,7 +105,7 @@ cargo build --release -p augmentagent-cli
 
 After this:
 - The daemon auto-starts on login and auto-restarts on crash (every reboot, just unlock your login keychain once and it keeps running).
-- Every 5 minutes the updater pulls `origin/main`. If it sees new commits it rebuilds (only if `crates/` or `Cargo.*` changed) and kicks the daemon over to the new binary. Push to GitHub from anywhere → this laptop picks it up.
+- Every 5 minutes the updater pulls `origin/main`. If it sees new commits it rebuilds (only if `crates/`, `Cargo.*`, or `rust-toolchain.toml` changed) and kicks the daemon over to the new binary. Push to GitHub from anywhere → this laptop picks it up.
 
 ### 3d. Verify
 
@@ -134,7 +134,7 @@ every 5 minutes:
   if LOCAL == REMOTE: done
   else:
     git pull
-    if crates/ or Cargo.* changed: cargo build --release
+    if crates/, Cargo.*, or rust-toolchain.toml changed: cargo build --release
       if build failed: do NOT restart daemon (stays on old binary); log and exit
       if build succeeded: launchctl kickstart → daemon picks up new binary
     else: launchctl kickstart anyway (wiki/schema changes could want a refresh)

@@ -327,16 +327,17 @@ match the channel slug the CLI accepts (lowercase, kebab-case for
 When to use, Prereqs, Steps, Validate, Common errors and fixes, Disarm /
 undo. The Steps section is enough for the skill to execute mechanically.
 
-The 12 channels split into three setup categories:
+The 13 channels split into three setup categories:
 
 ### callback OAuth (dashboard hosts the callback)
 
-| Channel | Sub-file                  | Dashboard start URL                                     |
-| ------- | ------------------------- | ------------------------------------------------------- |
-| gmail   | `channels/gmail.md`       | `http://localhost:<port>/oauth/gmail/start`             |
-| drive   | `channels/drive.md`       | `http://localhost:<port>/oauth/googledrive/start`       |
-| slack   | `channels/slack.md`       | `http://localhost:<port>/oauth/slack/start`             |
-| reddit  | `channels/reddit.md`      | `http://localhost:<port>/api/reddit/auth`               |
+| Channel   | Sub-file                  | Dashboard start URL                                     |
+| --------- | ------------------------- | ------------------------------------------------------- |
+| gmail     | `channels/gmail.md`       | `http://localhost:<port>/oauth/gmail/start`             |
+| drive     | `channels/drive.md`       | `http://localhost:<port>/oauth/googledrive/start`       |
+| slack     | `channels/slack.md`       | `http://localhost:<port>/oauth/slack/start`             |
+| reddit    | `channels/reddit.md`      | `http://localhost:<port>/oauth/reddit/start`            |
+| socialapi | (no sub-file; `augmentagent socialapi`) | `http://localhost:<port>/oauth/socialapi/start`         |
 
 Dashboard must be installed and reachable. Read
 `components/systemd-units.md` first if `dashboard.reachable = false`.
@@ -350,7 +351,11 @@ Dashboard must be installed and reachable. Read
 | linkedin  | `channels/linkedin.md`    | `augmentagent setup harvest linkedin …`        |
 | instagram | `channels/instagram.md`   | `augmentagent setup harvest instagram …`       |
 
-Every cookie-harvest channel uses the in-skill loop below.
+Every cookie-harvest channel uses the in-skill loop below. Note:
+`instagram` is not yet fully wired — its harvest schema emits an
+`augmentagent instagram login` next_cmd, but that top-level command does
+not exist and `instagram` is not a `ChannelName` variant, so the login
+and `channel instagram <op>` steps fail today. See `channels/instagram.md`.
 
 ### token paste (user copies a token from a vendor portal)
 
@@ -389,8 +394,9 @@ only sanctioned way to initialise it.
 
 ## OAuth orchestration
 
-The callback-OAuth channels (gmail, drive, slack, reddit) delegate the
-browser dance to a single Rust orchestrator. The skill drives it via:
+The callback-OAuth channels (gmail, drive, slack, reddit, socialapi)
+delegate the browser dance to a single Rust orchestrator. The skill
+drives it via:
 
 ```
 augmentagent setup oauth <provider> --json
@@ -402,7 +408,9 @@ Providers (the value enum is locked):
 - `drive`     → `/oauth/googledrive/start` (the provider slug in JSON
                 output is `googledrive`, not `drive`)
 - `slack`     → `/oauth/slack/start`
-- `reddit`    → `/api/reddit/auth`
+- `reddit`    → `/oauth/reddit/start` (the legacy `/api/reddit/auth`
+                path is still served as a backward-compat alias)
+- `socialapi` → `/oauth/socialapi/start`
 
 The orchestrator preflights the dashboard, snapshots the current connection
 set, opens `xdg-open` (or prints the URL when `$DISPLAY` is empty / when
@@ -500,7 +508,7 @@ See `reference/troubleshooting.md` for the per-finding "What it means" /
 `status_collect`, `sqlite_open`, `sqlite_migrated`, `keyring_reachable`,
 `dashboard_reachable`, `claude_cli_in_path`, `python3_in_path`,
 `node_in_path`, `rust_binary_freshness`, `dashboard_build_present`,
-`env_file_present`. With `--deep`: `composio_api` plus one
+`env_file_present`, `socialapi`. With `--deep`: `composio_api` plus one
 `channel.<name>.validate` per configured channel.
 
 ## /setup --fix CHANNEL
@@ -621,9 +629,10 @@ on, do this:
    them which line of `.env` to set and what the live-credential prerequisite
    is (cookies, token, QR pairing, OAuth callback, and so on).
 
-Do not edit `.env` from inside the skill. The Phase 3 env subcommand
-(issue #12) will own writes; until it lands, the skill is read-only on
-configuration files.
+Do not hand-edit `.env` from inside the skill. Writes go through
+`augmentagent env set <KEY> <VALUE>` (issue #12, shipped), which
+persists to the sqlite `config` table (which wins over `.env` at
+startup); the skill never edits `.env` directly.
 
 The `.env.example` is also the place to discover new channels added between
 skill updates. If `status --json` reports a channel name the skill has never

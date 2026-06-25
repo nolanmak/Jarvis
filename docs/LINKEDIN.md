@@ -55,7 +55,7 @@ LINKEDIN_SSH_TARGET=nolan-makatche@100.91.92.24 ./scripts/linkedin-harvest.sh
 
 Paste each of the four values when prompted. The script:
 
-1. Writes `linkedin-auth.json` (chmod 600) with the values formatted correctly
+1. Writes `linkedin-cookies.json` (chmod 600) with the values formatted correctly
 2. If `LINKEDIN_SSH_TARGET` is set, `scp`s it to the Linux host, runs `augmentagent linkedin login` remotely, and deletes the temp file
 3. Otherwise prints the exact two commands to run yourself
 
@@ -105,6 +105,7 @@ On the Linux daemon host, the usual case is #3 — lives in `~/AugmentAgent/link
 2. Validates shape: non-empty `member_urn`, cookies include `li_at` and `JSESSIONID`
 3. Probes voyager by fetching your recent conversations — fails fast if cookies are bad
 4. Writes the validated JSON to `default_auth_path()` with `harvested_at_ms` stamped
+5. Also stores the credentials in the macOS Keychain (`augmentagent/linkedin/default`) — production loads go through the Keychain, the file is the legacy fallback. The first-time Keychain write triggers a macOS permission prompt; click **Always Allow** so subsequent boots don't re-prompt.
 
 If step 3 fails, nothing is persisted and the existing auth file (if any) is untouched.
 
@@ -143,7 +144,7 @@ multi-image, browser fallback.
 
 ## Tuning
 
-- `AUGMENTAGENT_LINKEDIN_POLL_SECS=14400` — override the default 4h DM poll interval (min 60)
+- `AUGMENTAGENT_LINKEDIN_POLL_SECS=14400` — override the default 4h DM poll interval (no floor; the value is honored verbatim, an unparseable value falls back to the 4h default)
 - `AUGMENTAGENT_LINKEDIN_FEED_POLL_SECS=21600` — override the default 6h feed-engagement poll
 - `AUGMENTAGENT_LINKEDIN_MAX_ENGAGEMENTS=5` — override the daily friend-post engagement cap
 - `AUGMENTAGENT_LINKEDIN_CONVERSATIONS_QUERY_ID=messengerConversations.xxx` — override if LinkedIn rotates the DM queryId (error text includes the current one)
