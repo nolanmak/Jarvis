@@ -366,18 +366,24 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             Ok(d) => d,
             Err(e) => {
                 error!(message_id = %email.message_id, "triage parse failed: {e}; raw={raw}");
-                self.store.log_action(
-                    &email.message_id,
-                    email.thread_id.as_deref(),
-                    &email.from,
-                    &email.subject,
-                    Some(&email.body),
-                    None,
-                    ActionStatus::Error,
-                )?;
-                // NOT mark_email_processed: a triage parse failure is transient
-                // (Claude flakiness). Leave agentProcessedAt NULL so the retry
-                // tick can pick it up.
+                // Do NOT log an action row here, and do NOT mark_email_processed.
+                // A triage-stage failure (typically a transient model 529 that
+                // surfaces as non-JSON text) has run NONE of the reply gates
+                // (is_human_sender / is_event_blast / already-replied /
+                // backpressure) and produced no draft, so it must be RE-TRIAGED
+                // from scratch — never retried as a reply.
+                //
+                // Logging a `status='error'` row here is what made the #217
+                // automated-sender filter leak: the row (1) tripped
+                // `has_open_action`, permanently blocking the poll loop from
+                // re-running this pipeline (the only place the gates live), and
+                // (2) was scooped by `list_retryable_replies` into `retry_once`
+                // -> `dispatch_reply`, which force-drafts an empty body and
+                // skips every gate — surfacing newsletters/marketing as approval
+                // cards. Returning Err with NO action row leaves
+                // agentProcessedAt NULL and the message unread, so the next poll
+                // cycle re-runs full triage — identical to how a network Err
+                // from `reasoner.call` (the `?` above) already behaves.
                 return Err(e.into());
             }
         };
@@ -2407,6 +2413,94 @@ mod tests {
         );
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
         assert!(store.is_email_complete("m-broker-fail").unwrap());
+    }
+
+    /// #217 REGRESSION: a triage-STAGE failure (a model 529 surfacing as
+    /// non-JSON) must NOT create a retryable reply action. Before the fix, the
+    /// parse-fail branch logged a `status='error'` row that (a) tripped
+    /// `has_open_action`, blocking the poll loop from ever re-triaging, and (b)
+    /// was scooped by the retry tick into `dispatch_reply`, which force-drafted
+    /// an empty body and posted an approval card WITHOUT the is_human_sender
+    /// gate — leaking newsletters/marketing (e.g. substack.com) as cards. With
+    /// the fix there is NO action row, so the next poll re-runs full triage and
+    /// the automated-sender gate skips it. This reproduces the production
+    /// scenario (a Substack newsletter whose first triage 529s) through the
+    /// real process_email + retry_once code paths.
+    #[tokio::test]
+    async fn triage_parse_failure_does_not_create_retryable_action() {
+        let (store, _f) = tmp_store();
+        // Automated sender: substack.com is in NON_HUMAN_DOMAIN_PATTERNS, and
+        // the realistic display-name form also exercises extract_bare.
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                message_id: "m-529".into(),
+                thread_id: None,
+                from: "Royal Box Weekly <royalbox@substack.com>".into(), // pii-ok: synthetic substack fixture
+                subject: "The Royal Box at Wimbledon".into(),
+                body: "I want to switch gears this week to my favorite sport: Tennis.".into(),
+                date: "2026-06-24".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            // 1st triage call: model overloaded — non-JSON, reproduces the
+            // production `raw` that broke parse_decision.
+            "API Error: 529 Overloaded. This is a server-side issue, usually temporary.",
+            // 2nd triage call (next poll): now succeeds and even says "reply" —
+            // proving it's the is_human_sender gate, not the triage verdict,
+            // that skips the newsletter.
+            r#"{"decision":"reply","reason":"actionable"}"#,
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                retry_min_gap: Duration::from_millis(0),
+                retry_interval: Duration::from_millis(50),
+                ..Default::default()
+            },
+        );
+
+        // --- Pass 1: triage 529s. The parse failure surfaces as an error, but
+        // NO action row is logged and the email stays incomplete (unread).
+        let out1 = ch.poll_once().await.unwrap();
+        assert_eq!(out1.errors, 1, "triage parse failure should surface as an error");
+        assert_eq!(out1.awaiting_approval, 0);
+        assert_eq!(out1.skipped, 0);
+        // Core regression assertion: no open (pending/error) action row. Pre-fix
+        // this was TRUE (an Error row was logged) — the root of the leak.
+        assert!(
+            !store.has_open_action("m-529").unwrap(),
+            "a triage-stage failure must NOT create an action row"
+        );
+        assert!(!store.is_email_complete("m-529").unwrap());
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+
+        // --- Retry tick: with no errored row, nothing is retryable, so the leak
+        // path (retry_once -> dispatch_reply, ungated) never runs.
+        let retried = ch.retry_once().await.unwrap();
+        assert_eq!(retried, 0, "a triage-stage failure must not be retried as a reply");
+        assert_eq!(
+            broker.posts.lock().unwrap().len(),
+            0,
+            "no approval card may be posted for a newsletter"
+        );
+
+        // --- Pass 2: the poll loop re-triages from scratch. Triage now returns
+        // 'reply', but is_human_sender skips the substack sender BEFORE drafting,
+        // so still no card — and the email is now terminally processed (Skip).
+        let out2 = ch.poll_once().await.unwrap();
+        assert_eq!(out2.skipped, 1, "re-triage routes the automated sender to the skip gate");
+        assert_eq!(out2.awaiting_approval, 0);
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+        assert!(store.is_email_complete("m-529").unwrap());
     }
 
     // --- tone-mirror lookup (#73 §4) ---
