@@ -99,6 +99,34 @@ impl Store {
         Ok(())
     }
 
+    /// Daily research pipeline — has this arXiv paper id already been
+    /// surfaced on a previous run? Drives dedup so a re-run never re-issues
+    /// the same paper.
+    pub fn research_seen(&self, arxiv_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let hit: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM research_seen WHERE arxiv_id = ?1",
+                params![arxiv_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(hit.is_some())
+    }
+
+    /// Daily research pipeline — mark an arXiv paper id as surfaced. Idempotent
+    /// (ON CONFLICT DO NOTHING) so a partial earlier run can be safely retried.
+    pub fn mark_research_seen(&self, arxiv_id: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO research_seen (arxiv_id, seen_at) VALUES (?1, ?2) \
+             ON CONFLICT(arxiv_id) DO NOTHING",
+            params![arxiv_id, now],
+        )?;
+        Ok(())
+    }
+
     /// #35 — record one detected ask (shadow telemetry). Cheap insert; never
     /// dedups (we want the full shadow stream for analysis).
     #[allow(clippy::too_many_arguments)]
@@ -1470,6 +1498,19 @@ impl Store {
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_channel_drafts_target \
                 ON channel_drafts(target_channel, status)",
+            [],
+        )?;
+
+        // Daily research pipeline — dedup ledger. One row per arXiv paper id
+        // we've already surfaced, so a daily re-run never re-issues a GitHub
+        // issue (or re-summarizes) the same paper. Rust-only (not mirrored in
+        // Node's initDb), additive, idempotent — same proven-safe shape as
+        // `voice_capture_state`.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS research_seen (\
+                 arxiv_id  TEXT PRIMARY KEY,\
+                 seen_at   INTEGER NOT NULL\
+             )",
             [],
         )?;
 
