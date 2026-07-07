@@ -67,6 +67,9 @@ uuid = { workspace = true }
 # crate drops its reqwest dep in the future.
 reqwest = { workspace = true }
 serde = { workspace = true }
+# Daily research pipeline — arXiv's API returns Atom XML; quick-xml is already
+# in the lock (transitive) so this pins the same 0.38 without a new download.
+quick-xml = "0.38"
 
 # #175/#176 — clap layer + test helpers still need libc constants for the
 # fake `Signaler` that returns ESRCH; the real walker + kill live in the

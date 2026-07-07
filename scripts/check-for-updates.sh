@@ -244,5 +244,7 @@ auto_register() {
 # the install-*.sh script in the repo.
 auto_register "install-digest.sh" "augmentagent-digest.timer"  # Linux
 auto_register "install-digest.sh" "com.nolanmak.augmentagent.digest"  # macOS label (uname gate inside)
+auto_register "install-research.sh" "augmentagent-research.timer"  # Linux
+auto_register "install-research.sh" "com.nolanmak.augmentagent.research"  # macOS label (uname gate inside)
 auto_register "install-dashboard.sh" "augmentagent-dashboard.service"  # Linux
 auto_register "install-dashboard.sh" "com.nolanmak.augmentagent-dashboard"  # macOS label (uname gate inside)

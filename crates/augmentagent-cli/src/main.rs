@@ -55,6 +55,7 @@ mod invoice;
 mod logs;
 mod loop_cmd;
 mod loops;
+mod research;
 mod self_improve;
 mod service;
 mod setup;
@@ -162,6 +163,26 @@ enum Cmd {
         /// Also post to DISCORD_CHANNEL_ID (uses DISCORD_BOT_TOKEN). Otherwise stdout only.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         post_discord: bool,
+    },
+    /// Daily automated research: pull recent arXiv AI/agent papers + the
+    /// latest from the leapmodel repo, compare them against our agent
+    /// process via a swappable LLM driver (RESEARCH_LLM_CMD), file GitHub
+    /// issues for the top gaps, and post a digest to Discord.
+    Research {
+        /// Look-back window in hours for arXiv submissions / leapmodel commits.
+        #[arg(long, default_value_t = 24)]
+        since_hours: u32,
+        /// Also post the digest to DISCORD_CHANNEL_ID. Otherwise stdout only.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        post_discord: bool,
+        /// Dry-run (default true): print the issues that would be filed and
+        /// the digest, but create no GitHub issues.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+        /// Cap on GitHub issues created this run (flag overrides
+        /// RESEARCH_MAX_ISSUES env, which overrides the default of 3).
+        #[arg(long)]
+        max_issues: Option<u32>,
     },
     /// Gmail inbox tooling for Claude to invoke via Bash when the wiki
     /// can't answer a question.
@@ -2407,6 +2428,12 @@ async fn main() -> Result<()> {
             since,
             post_discord,
         } => run_digest(&cli, store, since, post_discord).await,
+        Cmd::Research {
+            since_hours,
+            post_discord,
+            dry_run,
+            max_issues,
+        } => research::run_research(store, since_hours, post_discord, dry_run, max_issues).await,
         Cmd::Gmail { ref op } => match op {
             GmailOp::Search { query, limit, full } => {
                 run_gmail_search(store, query.clone(), *limit, *full).await
@@ -4397,7 +4424,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// Post the digest text to DISCORD_CHANNEL_ID using a bare serenity::Http
 /// client (no gateway, no state). Works as a one-shot from a cron-like job.
 /// Splits on paragraph boundaries for Discord's 2000-char limit.
-async fn post_digest_to_discord(digest: &str) -> Result<()> {
+pub(crate) async fn post_digest_to_discord(digest: &str) -> Result<()> {
     use serenity::all::{ChannelId, CreateMessage};
     use serenity::http::Http;
 
