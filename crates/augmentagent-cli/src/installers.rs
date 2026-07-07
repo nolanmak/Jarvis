@@ -111,6 +111,13 @@ pub enum InstallComponent {
         #[command(flatten)]
         flags: InstallFlags,
     },
+    /// Calendar ingest timer (`scripts/install-calendar.sh`, #376). The
+    /// calendar channel is not spawned by `serve` — this timer drives it.
+    /// Honours `AUGMENTAGENT_CALENDAR_INTERVAL_MIN` (default 30).
+    Calendar {
+        #[command(flatten)]
+        flags: InstallFlags,
+    },
     /// Multi-tenant daemon (`scripts/install-tenant.sh <name>`). The slug
     /// must be lowercase `[a-z0-9-]`; the underlying script enforces this.
     Tenant {
@@ -154,6 +161,11 @@ pub enum UninstallComponent {
         #[command(flatten)]
         flags: UninstallFlags,
     },
+    /// Calendar ingest timer (`scripts/uninstall-calendar.sh`).
+    Calendar {
+        #[command(flatten)]
+        flags: UninstallFlags,
+    },
     /// Multi-tenant daemon (`scripts/uninstall-tenant.sh <name>`).
     Tenant {
         /// Tenant slug (lowercase `[a-z0-9-]`, no leading/trailing `-`).
@@ -177,6 +189,7 @@ impl InstallComponent {
             | InstallComponent::Autoupdate { flags }
             | InstallComponent::Dashboard { flags }
             | InstallComponent::Digest { flags }
+            | InstallComponent::Calendar { flags }
             | InstallComponent::Tenant { flags, .. }
             | InstallComponent::BrowserSidecar { flags } => flags,
         }
@@ -187,6 +200,7 @@ impl InstallComponent {
             InstallComponent::Autoupdate { .. } => "autoupdate".into(),
             InstallComponent::Dashboard { .. } => "dashboard".into(),
             InstallComponent::Digest { .. } => "digest".into(),
+            InstallComponent::Calendar { .. } => "calendar".into(),
             InstallComponent::Tenant { name, .. } => format!("tenant:{name}"),
             InstallComponent::BrowserSidecar { .. } => "browser-sidecar".into(),
         }
@@ -200,6 +214,7 @@ impl UninstallComponent {
             | UninstallComponent::Autoupdate { flags }
             | UninstallComponent::Dashboard { flags }
             | UninstallComponent::Digest { flags }
+            | UninstallComponent::Calendar { flags }
             | UninstallComponent::Tenant { flags, .. }
             | UninstallComponent::BrowserSidecar { flags } => flags,
         }
@@ -210,6 +225,7 @@ impl UninstallComponent {
             UninstallComponent::Autoupdate { .. } => "autoupdate".into(),
             UninstallComponent::Dashboard { .. } => "dashboard".into(),
             UninstallComponent::Digest { .. } => "digest".into(),
+            UninstallComponent::Calendar { .. } => "calendar".into(),
             UninstallComponent::Tenant { name, .. } => format!("tenant:{name}"),
             UninstallComponent::BrowserSidecar { .. } => "browser-sidecar".into(),
         }
@@ -444,6 +460,9 @@ pub async fn run_install(component: InstallComponent) -> Result<()> {
         InstallComponent::Digest { .. } => {
             run_script("install-digest.sh", &[], flags.json, &mut cap).await?
         }
+        InstallComponent::Calendar { .. } => {
+            run_script("install-calendar.sh", &[], flags.json, &mut cap).await?
+        }
         InstallComponent::Tenant { name, .. } => {
             run_script("install-tenant.sh", &[name.as_str()], flags.json, &mut cap).await?
         }
@@ -493,6 +512,9 @@ pub async fn run_uninstall(component: UninstallComponent) -> Result<()> {
         }
         UninstallComponent::Digest { .. } => {
             run_script("uninstall-digest.sh", &[], json, &mut cap).await?
+        }
+        UninstallComponent::Calendar { .. } => {
+            run_script("uninstall-calendar.sh", &[], json, &mut cap).await?
         }
         UninstallComponent::Tenant { name, .. } => {
             run_script("uninstall-tenant.sh", &[name.as_str()], json, &mut cap).await?
