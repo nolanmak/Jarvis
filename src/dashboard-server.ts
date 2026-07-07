@@ -1,6 +1,17 @@
 import dotenv from "dotenv";
 dotenv.config();
 
+// #375 — prefix every console line with a UTC timestamp. The dashboard's
+// stdout/stderr land in append-only files via systemd; without timestamps,
+// failures (e.g. the stale-key OAuth 401s #375 chased) can't be dated
+// against key rotations or restarts. Installed before any other import
+// runs so early startup logging is covered too.
+for (const level of ["log", "info", "warn", "error"] as const) {
+  const orig = console[level].bind(console);
+  console[level] = (...args: unknown[]) =>
+    orig(`[${new Date().toISOString()}]`, ...args);
+}
+
 import express from "express";
 import path from "path";
 import { initDb } from "./db";
