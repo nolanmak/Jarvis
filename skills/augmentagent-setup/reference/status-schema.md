@@ -138,23 +138,28 @@ An object keyed by channel name (lowercase, matches what
 emitted by `BTreeMap` (alphabetical):
 
 `calendar`, `contacts`, `discord`, `gdrive`, `github`, `gmail`,
-`instagram`, `linkedin`, `meetup`, `reddit`, `slack`, `telegram`,
-`twitter`, `voice`, `whatsapp`.
+`instagram`, `linkedin`, `meetup`, `reddit`, `slack`, `socialapi`,
+`telegram`, `twitter`, `voice`, `whatsapp`.
 
 Each value is an object:
 
-- `configured` (boolean): the daemon found enough creds to consider this
-  channel set up. The probe is best-effort per channel — gmail wants a
-  Composio key plus at least one row in the gmail-accounts table;
-  gdrive counts active drive accounts; the rest probe their canonical
-  sqlite config key (with env-var fallback).
-- `armed` (boolean): the user's arming gate. Hard-wired to `false`
-  today; flips to a real value once issue #7 ships the arm/disarm verbs.
-  The skill must not write through this field — bumping it on the
-  client side will be ignored by the daemon.
-- `accounts` (integer): connected-account count. Only populated for
-  `gmail` and `gdrive`; `0` everywhere else until per-channel last-poll
-  tables land in #7.
+- `configured` (boolean): the credential / prerequisite the serve loop
+  actually checks is present (#374): keyring slot (e.g.
+  `augmentagent/linkedin/default`), legacy credential file (each
+  channel's `default_auth_path`, env overrides honoured), or store rows
+  (slack workspaces, telegram bots, meetup subscriptions, gmail/drive/
+  socialapi accounts).
+- `armed` (boolean): the serve daemon would run a poller/listener for
+  this channel right now. Always `false` for channels serve never
+  spawns — `twitter` and `instagram` (posting/CLI only), `whatsapp`
+  (unimplemented), `telegram` (inbound is CLI `poll-once`), `calendar`
+  (driven by `augmentagent-calendar.timer`), `contacts` (CLI sync).
+  Read-only: derived from the same gates as `configured`, not from the
+  legacy config-table arming keys, which serve never consults.
+- `accounts` (integer): connected-entity count where one exists in the
+  store — `gmail`, `gdrive`, `socialapi` (accounts), `slack`
+  (workspaces), `telegram` (bots), `meetup` (subscriptions); `0` for
+  credential-only channels.
 - `last_poll_unix` (integer or null): unix-seconds timestamp of the most
   recent successful poll. Always `null` today; reserved for #7.
 - `needs` (array of strings): what's missing. `["login"]` when

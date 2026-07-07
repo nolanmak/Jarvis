@@ -1,153 +1,120 @@
 ---
 source: crates/augmentagent-cli/tests/status_schema.rs
-assertion_line: 188
 expression: json
 ---
 {
   "channels": {
     "calendar": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "contacts": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "discord": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "gdrive": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "github": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "gmail": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "instagram": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "linkedin": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "meetup": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "reddit": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "slack": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "socialapi": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "telegram": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "twitter": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "voice": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     },
     "whatsapp": {
       "accounts": 0,
-      "armed": false,
-      "configured": false,
+      "armed": "[volatile]",
+      "configured": "[volatile]",
       "last_poll_unix": null,
-      "needs": [
-        "login"
-      ]
+      "needs": "[volatile]"
     }
   },
   "core_keys": {
