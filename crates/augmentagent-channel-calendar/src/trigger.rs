@@ -23,7 +23,7 @@ use crate::gcal::{CalendarApi, CalendarError};
 use crate::types::MeetingPayload;
 use crate::PLATFORM;
 
-/// Hot-window: now-1h .. now+24h, per #82 §12.
+/// Hot-window: now-1h .. now+24h, per archived AugmentAgent#82 §12.
 pub const HOT_LOOKBACK_HOURS: i64 = 1;
 pub const HOT_LOOKAHEAD_HOURS: i64 = 24;
 
