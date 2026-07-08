@@ -167,7 +167,7 @@ When the user asks you to draft a reply they want to **act on** — "draft my re
 
 Required additional flags with `--post` (the card needs the inbound context):
 
-- `--thread-id <id>` — the Gmail thread (so the reply attaches correctly).
+- `--thread-id <id>` — the Gmail thread (so the reply attaches correctly). `gmail search` prints a `threadId` per result — use that; a `messageId` also works (it's auto-resolved to its thread). The id must live in the `--account` mailbox: ids from one account don't exist in another, so pick the account whose search results you're replying to.
 - `--reply-to-message-id <id>` — the original inbound `messageId` (used to dedupe and to give the Revise handler something to redraft against).
 - `--reply-to-from <addr>` — the original sender (the person you're replying to). Defaults to `--to`.
 - `--reply-to-subject <s>` — the original subject. Defaults to `--subject` with the leading `Re:` stripped.
@@ -204,6 +204,8 @@ augmentagent gmail update-draft \
   --draft-id <id> \
   --to ... --subject ... --body ...
 ```
+
+Gmail-side update-in-place isn't available, so this **replaces** the draft: it prints a **new** `draft_id` and the old one stops working — use the new id for any later `send`/`delete-draft`. The old draft's thread is preserved automatically; pass `--thread-id` (threadId or messageId) to set it explicitly.
 
 ### Send a draft
 
