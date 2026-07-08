@@ -21,6 +21,9 @@ if [ -f .env ]; then
   set +a
 fi
 
+# Live/dry toggle. poll-once defaults to dry-run; set
+# AUGMENTAGENT_CALENDAR_DRY_RUN=false in .env to enable real wiki ingest
+# and Discord alerts (#396/#397).
 exec ./target/release/augmentagent \
   --wiki-dir ./wiki \
-  calendar poll-once
+  calendar poll-once --dry-run "${AUGMENTAGENT_CALENDAR_DRY_RUN:-true}"
