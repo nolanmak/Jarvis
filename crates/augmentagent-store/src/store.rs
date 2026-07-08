@@ -99,6 +99,37 @@ impl Store {
         Ok(())
     }
 
+    /// #396/#397 — calendar alert dedup: the fingerprint recorded when the
+    /// alert `key` last fired, or `None` if it never has.
+    pub fn calendar_alert_fingerprint(&self, key: &str) -> StoreResult<Option<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let v: Option<String> = guard
+            .query_row(
+                "SELECT fingerprint FROM calendar_alerts WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// #396/#397 — record that alert `key` fired describing `fingerprint`
+    /// (event start/end times). A later fingerprint change (reschedule)
+    /// re-arms the alert; an identical one stays deduped.
+    pub fn upsert_calendar_alert(&self, key: &str, fingerprint: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO calendar_alerts (key, fingerprint, sent_at_ms) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(key) DO UPDATE SET \
+                fingerprint = excluded.fingerprint, \
+                sent_at_ms  = excluded.sent_at_ms",
+            params![key, fingerprint, now],
+        )?;
+        Ok(())
+    }
+
     /// Daily research pipeline — has this arXiv paper id already been
     /// surfaced on a previous run? Drives dedup so a re-run never re-issues
     /// the same paper.
@@ -1095,6 +1126,19 @@ impl Store {
                  bot_key         TEXT PRIMARY KEY,\
                  last_update_id  INTEGER NOT NULL DEFAULT 0,\
                  updated_at_ms   INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
+        // #396/#397 — calendar alert dedup ledger. One row per alert key
+        // (`upcoming:<event_id>`, `conflict:<idA>:<idB>`, `agenda:<date>`);
+        // the fingerprint captures the event time(s) the alert described,
+        // so a reschedule re-arms the alert while a re-poll stays silent.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS calendar_alerts (\
+                 key          TEXT PRIMARY KEY,\
+                 fingerprint  TEXT NOT NULL,\
+                 sent_at_ms   INTEGER NOT NULL\
              )",
             [],
         )?;

@@ -8,6 +8,7 @@
 //! calendar only, one log line per event instance. Phase 2 (#400) adds
 //! nightly sweep, recurrence collapse, multi-calendar, and backfill.
 
+pub mod alerts;
 pub mod channel;
 pub mod filter;
 pub mod gcal;
@@ -19,6 +20,7 @@ pub mod types;
 /// meeting events.
 pub const PLATFORM: &str = "gcal";
 
+pub use alerts::{AlertCandidate, AlertSink};
 pub use channel::{
     poll_window, synthetic_attendee_email, CalendarChannel, CalendarChannelConfig,
     PollOutcome,

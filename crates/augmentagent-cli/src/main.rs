@@ -9646,16 +9646,83 @@ async fn run_calendar_poll_once(
         .as_ref()
         .map(|_| PathBuf::from("schema/wiki-skill.md"));
 
+    // #396/#397 alert knobs. Lead window must exceed the poll cadence
+    // (AUGMENTAGENT_CALENDAR_INTERVAL_MIN, default 30) or events can slip
+    // between polls.
+    let alert_lead_min = std::env::var("AUGMENTAGENT_CALENDAR_ALERT_LEAD_MIN")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(60);
+    let agenda_local_hour = match std::env::var("AUGMENTAGENT_CALENDAR_AGENDA_HOUR") {
+        Err(_) => Some(8),
+        Ok(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            if t.is_empty() || t == "off" || t == "none" {
+                None
+            } else {
+                t.parse::<u32>().ok().filter(|h| *h < 24).or(Some(8))
+            }
+        }
+    };
+
     let config = CalendarChannelConfig {
         dry_run,
         wiki_root: wiki_dir,
         wiki_schema_path,
+        alert_lead_min,
+        agenda_local_hour,
         ..Default::default()
     };
-    let channel = CalendarChannel::new(store, gcal, reasoner, config);
+    let mut channel = CalendarChannel::new(store, gcal, reasoner, config);
+    match build_calendar_alert_sink() {
+        Some(sink) => channel = channel.with_alert_sink(sink),
+        None => info!("calendar alerts: DISCORD_BOT_TOKEN/DISCORD_CHANNEL_ID unset; alert delivery disabled"),
+    }
     let outcome = channel.poll_once().await?;
     println!("{:#?}", outcome);
     Ok(())
+}
+
+/// #396/#397 — Discord transport for calendar alerts. Bare HTTP client (no
+/// gateway, no state), same pattern as `post_digest_to_discord`, aimed at
+/// the shared DISCORD_CHANNEL_ID.
+struct DiscordAlertSink {
+    http: serenity::http::Http,
+    channel: serenity::all::ChannelId,
+}
+
+#[async_trait]
+impl augmentagent_channel_calendar::AlertSink for DiscordAlertSink {
+    async fn send(&self, text: &str) -> anyhow::Result<()> {
+        use serenity::all::CreateMessage;
+        for chunk in augmentagent_approval_discord::chunk_for_discord(text) {
+            self.channel
+                .send_message(&self.http, CreateMessage::new().content(chunk))
+                .await
+                .context("discord send_message")?;
+        }
+        Ok(())
+    }
+}
+
+fn build_calendar_alert_sink(
+) -> Option<Arc<dyn augmentagent_channel_calendar::AlertSink>> {
+    let token = std::env::var("DISCORD_BOT_TOKEN").ok()?;
+    let cid = std::env::var("DISCORD_CHANNEL_ID").ok()?;
+    if token.trim().is_empty() {
+        return None;
+    }
+    let cid: u64 = match cid.trim().parse() {
+        Ok(v) => v,
+        Err(_) => {
+            warn!("calendar alerts: DISCORD_CHANNEL_ID is not numeric; alert delivery disabled");
+            return None;
+        }
+    };
+    Some(Arc::new(DiscordAlertSink {
+        http: serenity::http::Http::new(&token),
+        channel: serenity::all::ChannelId::new(cid),
+    }))
 }
 
 fn run_calendar_subscriptions(store: Arc<Store>, json: bool) -> Result<()> {
