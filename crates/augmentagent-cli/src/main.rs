@@ -953,6 +953,36 @@ enum CalendarOp {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         json: bool,
     },
+    /// #398 — propose an event and post a Discord approval card. The event
+    /// is NOT created (and no invites go out) until the operator clicks
+    /// Approve on the card; there is no unattended write path.
+    CreateEvent {
+        /// Event title
+        #[arg(long)]
+        summary: String,
+        /// RFC3339 start with offset, e.g. 2026-07-10T15:00:00-04:00
+        #[arg(long)]
+        start: String,
+        /// Duration in minutes (5-480)
+        #[arg(long, default_value_t = 30)]
+        duration_min: i64,
+        /// Comma-separated attendee emails; each gets an invite on Approve
+        #[arg(long, default_value = "")]
+        attendees: String,
+        /// Optional event description
+        #[arg(long)]
+        description: Option<String>,
+        /// Attach a Google Meet room
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        meet: bool,
+        /// Account email to create from (default: first active account)
+        #[arg(long)]
+        account: Option<String>,
+        /// Post the Discord approval card. Without it this prints a
+        /// preview and exits — nothing is written anywhere.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        post: bool,
+    },
     /// #399 — read-only schedule lookup across active accounts. Query
     /// mode's calendar tool; applies NO engagement filter (solo events,
     /// focus blocks, and all-day entries all show).
@@ -2873,6 +2903,30 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 run_calendar_list_events(store, from, to, days, json).await?;
+                Ok(())
+            }
+            CalendarOp::CreateEvent {
+                summary,
+                start,
+                duration_min,
+                attendees,
+                description,
+                meet,
+                account,
+                post,
+            } => {
+                run_calendar_create_event(
+                    store,
+                    summary,
+                    start,
+                    duration_min,
+                    attendees,
+                    description,
+                    meet,
+                    account,
+                    post,
+                )
+                .await?;
                 Ok(())
             }
         },
@@ -5312,6 +5366,9 @@ impl invoice::InvoiceDraftPoster for DiscordInvoicePoster {
 struct ReplyApprover {
     store: Arc<Store>,
     gmail: Arc<ComposioClient>,
+    /// Composio Google Calendar client. Executes calendar-event proposals
+    /// on Approve (#398). Same API key as `gmail`.
+    calendar: Arc<augmentagent_channel_calendar::ComposioCalendarClient>,
     /// Optional voyager client. `None` = LinkedIn disabled for this run
     /// (cookies not configured). Any LinkedIn-tagged action hitting this
     /// approver with a None client surfaces as `Failed`.
@@ -6194,6 +6251,9 @@ impl ReplyApprover {
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.approve_socialapi(action_id, action).await;
         }
+        if action.email.platform == "gcal" {
+            return self.approve_gcal(action_id, action).await;
+        }
         if is_linkedin_email(&action.email) {
             return self.approve_linkedin(action_id, action).await;
         }
@@ -6239,6 +6299,87 @@ impl ReplyApprover {
         }
         tracing::info!(action_id, "reply sent via approval handler");
         ApprovalActionOutcome::Approved
+    }
+
+    /// #398 — Approve on a calendar-event card: parse the machine payload
+    /// (EventDraft JSON) from the emails row and execute the create. The
+    /// event exists — and invites go out — only after this succeeds.
+    async fn approve_gcal(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        use augmentagent_channel_calendar::{CalendarApi, CalendarError, EventDraft};
+
+        let Some(entity_id) = action.email.account_entity_id.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no accountEntityId on gcal action; cannot create".into(),
+            };
+        };
+        let draft: EventDraft = match serde_json::from_str(&action.email.body) {
+            Ok(d) => d,
+            Err(e) => {
+                let msg = format!("gcal proposal payload parse failed: {e}");
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                return ApprovalActionOutcome::Failed { message: msg };
+            }
+        };
+        match self.calendar.create_event(entity_id, "primary", &draft).await {
+            Ok(created) => {
+                let link = created
+                    .html_link
+                    .clone()
+                    .unwrap_or_else(|| "(no link returned)".into());
+                let final_body = format!(
+                    "{}\ncreated: {link}",
+                    action.action.draft_body.clone().unwrap_or_default()
+                );
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Sent,
+                    Some(&final_body),
+                    None,
+                );
+                let _ = self
+                    .store
+                    .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                tracing::info!(
+                    action_id,
+                    event_id = ?created.id,
+                    link,
+                    "gcal event created"
+                );
+                ApprovalActionOutcome::Approved
+            }
+            Err(CalendarError::Forbidden { message }) => {
+                let msg = format!(
+                    "calendar write scope missing — re-consent the Google connection \
+                     with calendar.events, then re-propose the event: {message}"
+                );
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                ApprovalActionOutcome::Failed { message: msg }
+            }
+            Err(e) => {
+                let msg = format!("create_event: {e}");
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                ApprovalActionOutcome::Failed { message: msg }
+            }
+        }
     }
 
     async fn run_skip(&self, action_id: &str) -> ApprovalActionOutcome {
@@ -6296,6 +6437,16 @@ impl ReplyApprover {
         if action.action.status != "pending" {
             return ApprovalActionOutcome::AlreadyResolved {
                 status: action.action.status,
+            };
+        }
+        if action.email.platform == "gcal" {
+            // v1 (#398): no LLM re-draft for calendar proposals. The card
+            // stays pending — the operator can Skip and re-ask query mode
+            // with the changes.
+            return ApprovalActionOutcome::Failed {
+                message: "Revise isn't supported for calendar-event cards yet — \
+                          Skip this card and ask again with the changes."
+                    .into(),
             };
         }
         if action.email.platform == "discord" {
@@ -6440,6 +6591,9 @@ async fn build_broker(
     // reasoner for revise, and the skill body for the redraft prompt.
     let api_key =
         std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
+    let calendar = Arc::new(
+        augmentagent_channel_calendar::ComposioCalendarClient::new(api_key.clone()),
+    );
     let gmail = Arc::new(ComposioClient::new(api_key));
     let skill_dir = cli.skill_dir.clone();
     let draft_skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap_or_default();
@@ -6463,6 +6617,7 @@ async fn build_broker(
     let approver = Arc::new(ReplyApprover {
         store,
         gmail,
+        calendar,
         linkedin,
         discord,
         slack,
@@ -9965,6 +10120,205 @@ async fn run_calendar_list_events(
             Err(msg) => println!("\naccount {}: ERROR — {}", a.email, msg),
         }
     }
+    Ok(())
+}
+
+/// #398 — propose a calendar event. Prints a preview, or with `--post true`
+/// writes the proposal into sqlite (emails row = machine payload, actions
+/// row = pending approval) and posts a Discord approval card. The event is
+/// created ONLY when the operator clicks Approve — handled by the serve
+/// daemon's `ReplyApprover::approve_gcal`. No unattended write path exists.
+#[allow(clippy::too_many_arguments)]
+async fn run_calendar_create_event(
+    store: Arc<Store>,
+    summary: String,
+    start: String,
+    duration_min: i64,
+    attendees: String,
+    description: Option<String>,
+    meet: bool,
+    account: Option<String>,
+    post: bool,
+) -> Result<()> {
+    use augmentagent_channel_calendar::{
+        AlertCandidate, CalendarApi, ComposioCalendarClient, EventDraft,
+    };
+    use chrono::{DateTime, Local, Utc};
+
+    let start_dt = DateTime::parse_from_rfc3339(&start).context(
+        "--start must be RFC3339 with offset, e.g. 2026-07-10T15:00:00-04:00 \
+         (compute the date from `calendar list-events`'s now: header)",
+    )?;
+    let start_utc = start_dt.with_timezone(&Utc);
+    let now = Utc::now();
+    if start_utc < now - chrono::Duration::minutes(5) {
+        anyhow::bail!(
+            "--start {} is in the past (now: {})",
+            start,
+            now.with_timezone(&Local).to_rfc3339()
+        );
+    }
+    if !(5..=480).contains(&duration_min) {
+        anyhow::bail!("--duration-min must be 5-480 (got {duration_min})");
+    }
+    let attendee_list: Vec<String> = attendees
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for a in &attendee_list {
+        if !a.contains('@') || a.contains(' ') {
+            anyhow::bail!("attendee '{a}' does not look like an email address");
+        }
+    }
+
+    let accounts = store.get_active_gmail_accounts()?;
+    let acct = match &account {
+        Some(email) => accounts
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case(email))
+            .with_context(|| format!("no active account matching {email}"))?,
+        None => accounts
+            .first()
+            .context("no active Google accounts — connect Gmail first")?,
+    };
+
+    let end_utc = start_utc + chrono::Duration::minutes(duration_min);
+
+    // Best-effort conflict check (read-only, #397's busy rules): warn on the
+    // card, never block — the operator decides.
+    let mut conflict_lines: Vec<String> = Vec::new();
+    match std::env::var("COMPOSIO_API_KEY") {
+        Ok(key) => {
+            let client = ComposioCalendarClient::new(key);
+            match client
+                .list_events(&acct.entity_id, "primary", start_utc, end_utc)
+                .await
+            {
+                Ok(events) => {
+                    for ev in &events {
+                        let Some(c) =
+                            AlertCandidate::from_event(ev, &acct.entity_id, "primary")
+                        else {
+                            continue;
+                        };
+                        if c.all_day || c.transparent || c.declined_by_self {
+                            continue;
+                        }
+                        if c.payload.start < end_utc && start_utc < c.payload.end {
+                            conflict_lines.push(format!(
+                                "⚠ conflicts with \"{}\" ({}–{})",
+                                c.payload.summary,
+                                c.payload
+                                    .start
+                                    .with_timezone(&Local)
+                                    .format("%H:%M"),
+                                c.payload.end.with_timezone(&Local).format("%H:%M"),
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    conflict_lines.push(format!("(conflict check unavailable: {e})"))
+                }
+            }
+        }
+        Err(_) => conflict_lines
+            .push("(conflict check unavailable: COMPOSIO_API_KEY unset)".into()),
+    }
+
+    let draft = EventDraft {
+        summary: summary.clone(),
+        start_datetime: start.clone(),
+        duration_minutes: duration_min,
+        attendees: attendee_list.clone(),
+        description: description.clone(),
+        create_meeting_room: meet,
+    };
+    let payload_json =
+        serde_json::to_string_pretty(&draft).context("serialize event draft")?;
+
+    let local_start = start_utc.with_timezone(&Local);
+    let local_end = end_utc.with_timezone(&Local);
+    let mut human = format!(
+        "Create calendar event (invites go out on Approve):\n\
+         • title:     {summary}\n\
+         • when:      {} {}–{} ({})\n\
+         • attendees: {}\n\
+         • meet room: {}\n\
+         • account:   {}\n",
+        local_start.format("%a %Y-%m-%d"),
+        local_start.format("%H:%M"),
+        local_end.format("%H:%M"),
+        local_start.format("%Z"),
+        if attendee_list.is_empty() {
+            "(none)".to_string()
+        } else {
+            attendee_list.join(", ")
+        },
+        if meet { "yes" } else { "no" },
+        acct.email,
+    );
+    if let Some(d) = &description {
+        human.push_str(&format!("• notes:     {d}\n"));
+    }
+    for line in &conflict_lines {
+        human.push_str(&format!("{line}\n"));
+    }
+
+    if !post {
+        println!("{human}");
+        println!("payload:\n{payload_json}");
+        println!("(preview only — nothing written; re-run with --post true to surface the approval card)");
+        return Ok(());
+    }
+
+    let token = std::env::var("DISCORD_BOT_TOKEN")
+        .context("DISCORD_BOT_TOKEN required for --post (set it in the daemon's .env)")?;
+    let cid: u64 = std::env::var("DISCORD_CHANNEL_ID")
+        .context("DISCORD_CHANNEL_ID required for --post")?
+        .parse()
+        .context("DISCORD_CHANNEL_ID must be numeric")?;
+
+    // Same actions-table shape as #352's gmail card so the daemon's
+    // Approve/Skip handlers work unchanged; the emails row body carries the
+    // exact machine payload approve_gcal will execute.
+    let message_id = format!("gcal-create:{}", uuid::Uuid::new_v4());
+    let inbound = augmentagent_store::Email {
+        message_id: message_id.clone(),
+        thread_id: None,
+        from: acct.email.clone(),
+        subject: format!("Create event: {summary}"),
+        body: payload_json.clone(),
+        date: start.clone(),
+        account_entity_id: Some(acct.entity_id.clone()),
+        platform: "gcal".into(),
+        kind: "create_event".into(),
+    };
+    store
+        .upsert_email(&inbound)
+        .context("upsert gcal proposal row")?;
+    let action_id = store
+        .log_action(
+            &message_id,
+            None,
+            &inbound.from,
+            &inbound.subject,
+            Some(&payload_json),
+            Some(&human),
+            ActionStatus::Pending,
+        )
+        .context("log gcal action row")?;
+
+    let http = serenity::http::Http::new(&token);
+    let channel = serenity::all::ChannelId::new(cid);
+    let card = approval_message(&action_id, &inbound, &human, 0);
+    channel
+        .send_message(&http, card)
+        .await
+        .context("post gcal approval card")?;
+    println!("approval card posted: action_id={action_id}");
+    println!("{human}");
     Ok(())
 }
 
