@@ -11,11 +11,40 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 
 use crate::types::CalendarEvent;
+
+/// Proposed event for `GOOGLECALENDAR_CREATE_EVENT` (#398). This is the
+/// machine payload the approval flow round-trips through sqlite: the
+/// query-mode CLI serializes it into the `emails` row, and the daemon's
+/// Approve handler parses it back and executes it. Keep it serde-stable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventDraft {
+    pub summary: String,
+    /// RFC3339 with offset, e.g. `2026-07-10T15:00:00-04:00`.
+    pub start_datetime: String,
+    pub duration_minutes: i64,
+    /// Attendee emails; invites go out on create (`send_updates=all`).
+    #[serde(default)]
+    pub attendees: Vec<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Attach a Google Meet room.
+    #[serde(default)]
+    pub create_meeting_room: bool,
+}
+
+/// Handle returned by a successful create.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CreatedEvent {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default, rename = "htmlLink")]
+    pub html_link: Option<String>,
+}
 
 #[derive(Debug, Error)]
 pub enum CalendarError {
@@ -56,6 +85,18 @@ pub trait CalendarApi: Send + Sync {
         calendar_id: &str,
         event_id: &str,
     ) -> Result<CalendarEvent, CalendarError>;
+
+    /// #398 — create an event with attendees (`GOOGLECALENDAR_CREATE_EVENT`,
+    /// `send_updates=all` so invites go out). Requires the `calendar.events`
+    /// scope on the Google connection — a 403 surfaces as
+    /// [`CalendarError::Forbidden`]. Only ever called from the daemon's
+    /// Approve handler; there is no unattended write path.
+    async fn create_event(
+        &self,
+        entity_id: &str,
+        calendar_id: &str,
+        draft: &EventDraft,
+    ) -> Result<CreatedEvent, CalendarError>;
 }
 
 pub struct ComposioCalendarClient {
@@ -260,6 +301,57 @@ impl CalendarApi for ComposioCalendarClient {
             serde_json::to_string(&v).unwrap_or_default()
         )))
     }
+
+    async fn create_event(
+        &self,
+        entity_id: &str,
+        calendar_id: &str,
+        draft: &EventDraft,
+    ) -> Result<CreatedEvent, CalendarError> {
+        // Param names per Composio's GOOGLECALENDAR_CREATE_EVENT schema
+        // (snake_case, unlike EVENTS_LIST's Google-native camelCase).
+        let mins = draft.duration_minutes.max(1);
+        let mut args = serde_json::json!({
+            "calendar_id": calendar_id,
+            "summary": draft.summary,
+            "start_datetime": draft.start_datetime,
+            "event_duration_hour": mins / 60,
+            "event_duration_minutes": mins % 60,
+            "attendees": draft.attendees,
+            "send_updates": "all",
+        });
+        if let Some(desc) = &draft.description {
+            args["description"] = serde_json::Value::String(desc.clone());
+        }
+        if draft.create_meeting_room {
+            args["create_meeting_room"] = serde_json::Value::Bool(true);
+        }
+
+        let v = self
+            .execute("GOOGLECALENDAR_CREATE_EVENT", entity_id, args)
+            .await?;
+        // id + htmlLink live under data.response_data; tolerate flatter
+        // shapes the same way the read paths do.
+        let candidates = [
+            v.get("data").and_then(|d| d.get("response_data")),
+            v.get("data"),
+            Some(&v),
+        ];
+        for cand in candidates.into_iter().flatten() {
+            if let Ok(created) = serde_json::from_value::<CreatedEvent>(cand.clone()) {
+                if created.id.is_some() || created.html_link.is_some() {
+                    return Ok(created);
+                }
+            }
+        }
+        // Created but couldn't pick out the handle — succeed with an empty
+        // handle rather than erroring after a real write.
+        warn!(
+            "events.create: response shape carried no id/htmlLink: {}",
+            serde_json::to_string(&v).unwrap_or_default()
+        );
+        Ok(CreatedEvent::default())
+    }
 }
 
 fn fallback_list_resp(v: &serde_json::Value) -> ListResp {
@@ -387,6 +479,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_event_sends_expected_args_and_parses_handle() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJson(serde_json::json!({
+                    "user_id": "ent",
+                    "arguments": {
+                        "calendar_id": "primary",
+                        "summary": "Coffee chat",
+                        "start_datetime": "2026-07-10T15:00:00-04:00",
+                        "event_duration_hour": 0,
+                        "event_duration_minutes": 30,
+                        "attendees": ["sarah@acme.com"],
+                        "send_updates": "all",
+                    }
+                })),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"response_data":{"id":"new-evt-1","htmlLink":"https://calendar.google.com/event?eid=abc"}},"successful":true}"#,
+            )
+            .create_async()
+            .await;
+        let client =
+            ComposioCalendarClient::new("k".into()).with_base_url(server.url());
+        let draft = EventDraft {
+            summary: "Coffee chat".into(),
+            start_datetime: "2026-07-10T15:00:00-04:00".into(),
+            duration_minutes: 30,
+            attendees: vec!["sarah@acme.com".into()],
+            description: None,
+            create_meeting_room: false,
+        };
+        let created = client.create_event("ent", "primary", &draft).await.unwrap();
+        assert_eq!(created.id.as_deref(), Some("new-evt-1"));
+        assert!(created.html_link.as_deref().unwrap().contains("calendar.google.com"));
+    }
+
+    #[tokio::test]
+    async fn create_event_forbidden_surfaces_scope_error() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/v3/tools/execute/GOOGLECALENDAR_CREATE_EVENT")
+            .with_status(403)
+            .with_body("insufficient_scope: calendar.events")
+            .create_async()
+            .await;
+        let client =
+            ComposioCalendarClient::new("k".into()).with_base_url(server.url());
+        let draft = EventDraft {
+            summary: "x".into(),
+            start_datetime: "2026-07-10T15:00:00-04:00".into(),
+            duration_minutes: 90,
+            attendees: vec![],
+            description: None,
+            create_meeting_room: false,
+        };
+        let err = client.create_event("ent", "primary", &draft).await.unwrap_err();
+        assert!(matches!(err, CalendarError::Forbidden { .. }));
     }
 
     #[tokio::test]

@@ -528,6 +528,14 @@ mod tests {
         ) -> Result<CalendarEvent, CalendarError> {
             Err(CalendarError::Decode("stub".into()))
         }
+        async fn create_event(
+            &self,
+            _e: &str,
+            _c: &str,
+            _d: &crate::gcal::EventDraft,
+        ) -> Result<crate::gcal::CreatedEvent, CalendarError> {
+            Err(CalendarError::Decode("stub".into()))
+        }
     }
 
     struct ForbiddenApi;
@@ -550,6 +558,14 @@ mod tests {
             _c: &str,
             _id: &str,
         ) -> Result<CalendarEvent, CalendarError> {
+            Err(CalendarError::Decode("stub".into()))
+        }
+        async fn create_event(
+            &self,
+            _e: &str,
+            _c: &str,
+            _d: &crate::gcal::EventDraft,
+        ) -> Result<crate::gcal::CreatedEvent, CalendarError> {
             Err(CalendarError::Decode("stub".into()))
         }
     }

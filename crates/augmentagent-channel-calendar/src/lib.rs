@@ -26,7 +26,9 @@ pub use channel::{
     PollOutcome,
 };
 pub use filter::{passes_filter, SkipReason};
-pub use gcal::{CalendarApi, CalendarError, ComposioCalendarClient};
+pub use gcal::{
+    CalendarApi, CalendarError, ComposioCalendarClient, CreatedEvent, EventDraft,
+};
 pub use trigger::{CalendarTrigger, HOT_LOOKAHEAD_HOURS, HOT_LOOKBACK_HOURS};
 pub use types::{
     render_meeting_body, truncate, CalendarEvent, EventTime, MeetingAttendee,
