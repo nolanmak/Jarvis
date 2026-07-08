@@ -26,7 +26,7 @@ pub enum IngestTrigger {
     /// Wave-A: voice channel.
     VoiceMemo,
     /// Calendar event observation logged to attendee wiki pages. Pairs with
-    /// `DecisionKind::Meeting`. Wave-A: gcal channel (#82).
+    /// `DecisionKind::Meeting`. Wave-A: gcal channel (archived AugmentAgent#82).
     Meeting,
 }
 

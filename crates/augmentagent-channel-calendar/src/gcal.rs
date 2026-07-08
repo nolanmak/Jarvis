@@ -7,7 +7,7 @@
 //!
 //! Phase 1 surfaces only `list_events` (the `GOOGLECALENDAR_EVENTS_LIST`
 //! action) and `get_event` (`GOOGLECALENDAR_EVENTS_GET`). Recurrence-master
-//! fetch + `CALENDARLIST_LIST` land in Phase 2.
+//! fetch + `CALENDARLIST_LIST` land in Phase 2 (#400).
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -25,8 +25,8 @@ pub enum CalendarError {
     Composio { message: String },
     /// Composio returned 403. The user likely needs to re-consent to grant
     /// `calendar.readonly` on top of the existing Google connection. Phase 1
-    /// surfaces this once per account and skips the account; Phase 2 will
-    /// wire the dashboard re-consent banner.
+    /// surfaces this once per account and skips the account; Phase 2 (#400)
+    /// will wire the dashboard re-consent banner.
     #[error("forbidden: calendar scope likely missing — re-consent required ({message})")]
     Forbidden { message: String },
     #[error("decode: {0}")]

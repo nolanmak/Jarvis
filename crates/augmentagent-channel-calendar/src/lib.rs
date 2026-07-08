@@ -1,11 +1,12 @@
 //! Google Calendar -> wiki Meeting log ingestion. Polls Composio's calendar
 //! toolkit, projects each event into a privacy-allowlisted [`MeetingPayload`],
 //! and feeds attendee-keyed synthetic emails into the shared wiki ingest
-//! pipeline. See issue #82.
+//! pipeline. Original spec: archived AugmentAgent#82; Phase 2 scope is
+//! tracked in #400.
 //!
-//! Phase 1 cut (#82 §12): hot ticker only, primary calendar only, one log
-//! line per event instance. Phase 2 adds nightly sweep, recurrence collapse,
-//! multi-calendar, and backfill.
+//! Phase 1 cut (archived AugmentAgent#82 §12): hot ticker only, primary
+//! calendar only, one log line per event instance. Phase 2 (#400) adds
+//! nightly sweep, recurrence collapse, multi-calendar, and backfill.
 
 pub mod channel;
 pub mod filter;

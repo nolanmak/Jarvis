@@ -1,6 +1,8 @@
-//! RRULE -> Cadence collapse — deferred to Phase 2 of #82.
+//! RRULE -> Cadence collapse — deferred to Phase 2 (#400; spec in archived
+//! AugmentAgent#82).
 //!
-//! Phase 1 logs one Meeting-log line per event instance (per #82 §12), so
+//! Phase 1 logs one Meeting-log line per event instance (per archived
+//! AugmentAgent#82 §12), so
 //! the daemon never needs to parse RRULEs yet. The module is reserved for
 //! Phase 2's "fetch master, collapse 52 weekly bullets into one" pass.
 

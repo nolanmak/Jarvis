@@ -236,7 +236,7 @@ enum Cmd {
         #[command(subcommand)]
         op: WhatsappOp,
     },
-    /// Google Calendar -> wiki Meeting log ingestion (#82). All ops are
+    /// Google Calendar -> wiki Meeting log ingestion (archived AugmentAgent#82). All ops are
     /// stubs in foundation/swarm-v1; impls land in the calendar feature PR.
     Calendar {
         #[command(subcommand)]
@@ -2839,7 +2839,7 @@ async fn main() -> Result<()> {
         Cmd::Calendar { op } => match op {
             CalendarOp::Backfill { .. } => {
                 anyhow::bail!(
-                    "calendar backfill is Phase 2 — see issue #82 §12 ('In' / 'Out')"
+                    "calendar backfill is Phase 2 — see issue #400 (scope ported from archived AugmentAgent#82 §12)"
                 )
             }
             CalendarOp::PollOnce { dry_run } => {
@@ -9624,7 +9624,7 @@ fn load_any_github_auth() -> Result<augmentagent_channel_github::GithubAuth> {
 }
 
 // ---------------------------------------------------------------------------
-// Calendar (#82) — Phase 1 CLI helpers.
+// Calendar (archived AugmentAgent#82) — Phase 1 CLI helpers.
 // ---------------------------------------------------------------------------
 
 async fn run_calendar_poll_once(

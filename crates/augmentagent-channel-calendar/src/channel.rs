@@ -1,6 +1,6 @@
 //! `CalendarChannel` — 15-min hot ticker over the user's primary calendar.
 //!
-//! Phase 1 cut (#82 §12):
+//! Phase 1 cut (archived AugmentAgent#82 §12):
 //! - Hot ticker only (no nightly sweep).
 //! - Window: now-1h .. now+24h.
 //! - Single calendar (`primary`).
