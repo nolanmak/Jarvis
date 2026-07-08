@@ -40,7 +40,8 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use augmentagent_approval_discord::{
-    ApprovalActionHandler, ApprovalActionOutcome, ApprovalBroker, ApprovalError, QueryHandler,
+    ApprovalActionHandler, ApprovalActionOutcome, ApprovalBroker, ApprovalError, AuditCtx,
+    QueryHandler,
 };
 use augmentagent_store::{Email, Store};
 
@@ -207,7 +208,15 @@ impl WhatsappControlSurface {
                     self.send_to_control("Query mode is not enabled.").await.ok();
                     return Ok(true);
                 };
-                match qh.answer(&q).await {
+                // WhatsApp has no Discord http/channel for side-channel audit
+                // notifications; the chat JID as session id still keys the
+                // reasoner's NDJSON audit log (#201).
+                let audit_ctx = AuditCtx {
+                    session_id: format!("wa:{chat_jid}"),
+                    http: None,
+                    channel_id: None,
+                };
+                match qh.answer(&audit_ctx, &q).await {
                     Ok(answer) => {
                         for chunk in chunk_for_whatsapp(&answer) {
                             if let Err(e) = self.send_to_control(&chunk).await {
