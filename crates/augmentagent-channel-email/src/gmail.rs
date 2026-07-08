@@ -88,7 +88,15 @@ pub trait GmailApi: Send + Sync {
         thread_id: Option<&str>,
     ) -> Result<String, GmailError>;
 
-    /// Replace the body of an existing draft (used by the revise flow).
+    /// Replace an existing draft's content. Returns the NEW draft id — the
+    /// old id is invalid afterwards.
+    ///
+    /// Composio has no update-draft tool (`GMAIL_UPDATE_DRAFT` 404s with
+    /// Tool_ToolNotFound — #382), so "update" is modeled as create-then-delete
+    /// using the two tools that do exist. `thread_id` re-attaches the new
+    /// draft to a thread; pass the old draft's thread to keep a reply
+    /// threaded. Delete failure is non-fatal (the caller's goal — a draft
+    /// with the new content — is met); the orphaned old draft is logged.
     async fn update_draft(
         &self,
         entity_id: &str,
@@ -96,7 +104,20 @@ pub trait GmailApi: Send + Sync {
         to: &str,
         subject: &str,
         body: &str,
-    ) -> Result<(), GmailError>;
+        thread_id: Option<&str>,
+    ) -> Result<String, GmailError> {
+        let new_id = self
+            .create_draft(entity_id, to, subject, body, thread_id)
+            .await?;
+        if let Err(e) = self.delete_draft(entity_id, draft_id).await {
+            tracing::warn!(
+                old_draft_id = draft_id,
+                new_draft_id = %new_id,
+                "update_draft: new draft created but old draft not deleted: {e}"
+            );
+        }
+        Ok(new_id)
+    }
 
     /// Send an existing draft.
     async fn send_draft(&self, entity_id: &str, draft_id: &str) -> Result<(), GmailError>;
@@ -197,6 +218,114 @@ impl ComposioClient {
                 serde_json::to_string(&v).unwrap_or_default()
             ))
         })
+    }
+
+    /// Resolve a Gmail id — message id OR thread id — to the thread id it
+    /// belongs to, scoped to one account's mailbox (#381).
+    ///
+    /// `GMAIL_CREATE_EMAIL_DRAFT`'s `thread_id` must be a real Gmail thread
+    /// id; a message id 404s ("Requested entity was not found"). Callers
+    /// usually hold a messageId from `gmail search`, so we accept either:
+    ///
+    /// 1. Try `users.messages.get` (format=minimal — tiny payload). A message
+    ///    id resolves to its `threadId`; a thread-HEAD id also succeeds
+    ///    (Gmail thread ids equal the first message's id) and maps to itself.
+    /// 2. Fall back to `users.threads.get` for the rare valid thread id whose
+    ///    head message was deleted.
+    ///
+    /// Both failing means the id isn't in THIS account's mailbox at all —
+    /// commonly the thread lives in a different connected account.
+    pub async fn resolve_thread_id(
+        &self,
+        entity_id: &str,
+        id: &str,
+    ) -> Result<String, GmailError> {
+        // NOTE: no inline `user_id` in the arguments. The Gmail tools forward
+        // it as the Gmail API `users/<user_id>/…` path segment, where only
+        // 'me' or an email address is valid — a Composio entity id 403s with
+        // "Delegation denied". Account routing is the execute() envelope's job.
+        let args = serde_json::json!({
+            "message_id": id,
+            "format": "minimal",
+        });
+        if let Ok(v) = self
+            .execute("GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID", entity_id, args)
+            .await
+        {
+            let ok = v
+                .get("successful")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            if ok {
+                if let Some(t) = find_string_field(&v, &["threadId", "thread_id"]) {
+                    return Ok(t);
+                }
+            }
+        }
+        match self.fetch_thread_messages(entity_id, id, 1).await {
+            Ok(msgs) if !msgs.is_empty() => Ok(id.to_string()),
+            _ => Err(GmailError::Composio {
+                message: format!(
+                    "id {id} is neither a message nor a thread in this account's mailbox"
+                ),
+            }),
+        }
+    }
+
+    /// Look up the thread an existing draft is attached to, via
+    /// `GMAIL_LIST_DRAFTS` (there is no get-draft tool in the Composio
+    /// catalog). Returns `Ok(None)` when the draft is standalone — Gmail
+    /// gives an unthreaded draft its own thread (threadId == message id),
+    /// and recreating against that thread would 404 once the draft is
+    /// deleted — or when the draft isn't in the first `MAX_PAGES` pages.
+    pub async fn get_draft_thread_id(
+        &self,
+        entity_id: &str,
+        draft_id: &str,
+    ) -> Result<Option<String>, GmailError> {
+        const MAX_PAGES: u32 = 5;
+        let mut page_token: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            // No inline user_id — see resolve_thread_id for why.
+            let mut args = serde_json::json!({
+                "max_results": 100,
+                "verbose": false,
+            });
+            if let Some(t) = &page_token {
+                args["page_token"] = serde_json::Value::String(t.clone());
+            }
+            let v = self.execute("GMAIL_LIST_DRAFTS", entity_id, args).await?;
+            let drafts = v
+                .pointer("/data/drafts")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for d in &drafts {
+                if d.get("id").and_then(serde_json::Value::as_str) != Some(draft_id) {
+                    continue;
+                }
+                let msg_id = d
+                    .pointer("/message/id")
+                    .and_then(serde_json::Value::as_str);
+                let thread_id = d
+                    .pointer("/message/threadId")
+                    .or_else(|| d.pointer("/message/thread_id"))
+                    .and_then(serde_json::Value::as_str);
+                return Ok(match (msg_id, thread_id) {
+                    (Some(m), Some(t)) if m != t => Some(t.to_string()),
+                    _ => None,
+                });
+            }
+            page_token = v
+                .pointer("/data/next_page_token")
+                .or_else(|| v.pointer("/data/nextPageToken"))
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            if page_token.is_none() {
+                break;
+            }
+        }
+        Ok(None)
     }
 
     /// Shared paginated fetch for `GMAIL_FETCH_EMAILS`. Walks pages up to
@@ -507,6 +636,89 @@ mod tests {
             "missing action in error display: {display}"
         );
     }
+
+    // ---- #381: --thread-id resolution ----
+
+    // A messageId (the only id `gmail search` used to print) must resolve to
+    // the thread it belongs to via users.messages.get, so compose can accept
+    // either id form.
+    #[tokio::test]
+    async fn resolve_thread_id_maps_message_id_to_thread() {
+        let body = r#"{"successful":true,"data":{"id":"MSG2","threadId":"THREAD1","labelIds":["INBOX"]}}"#;
+        let addr = spawn_one_shot_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let t = client
+            .resolve_thread_id("entity-x", "MSG2")
+            .await
+            .expect("message id should resolve");
+        assert_eq!(t, "THREAD1");
+    }
+
+    // An id that is neither a message nor a thread in this mailbox (the
+    // wrong-account case behind #381) must fail with an actionable error,
+    // not a raw Gmail 404.
+    #[tokio::test]
+    async fn resolve_thread_id_rejects_unknown_id() {
+        // Served for BOTH the messages.get and threads.get attempts.
+        let body = r#"{"successful":false,"error":"Requested entity was not found.","data":{}}"#;
+        let addr = spawn_repeating_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let err = client
+            .resolve_thread_id("entity-x", "BOGUS")
+            .await
+            .expect_err("unknown id must not resolve");
+        let display = format!("{err}");
+        assert!(
+            display.contains("neither a message nor a thread"),
+            "unhelpful error: {display}"
+        );
+    }
+
+    // ---- #382: update_draft = create new + delete old ----
+
+    // GMAIL_UPDATE_DRAFT doesn't exist in the Composio catalog, so the
+    // default impl recreates the draft. The caller must get the NEW id back.
+    #[tokio::test]
+    async fn update_draft_recreates_and_returns_new_id() {
+        // Same body serves both the create (draft id lookup) and the delete.
+        let body = r#"{"successful":true,"data":{"id":"NEWDRAFT"}}"#;
+        let addr = spawn_repeating_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let new_id = client
+            .update_draft("entity-x", "OLDDRAFT", "to@example.com", "subj", "body", None)
+            .await
+            .expect("update via recreate should succeed");
+        assert_eq!(new_id, "NEWDRAFT");
+    }
+
+    // Thread preservation source for update-draft: a threaded draft reports
+    // its thread; a standalone draft (its message IS the thread head) must
+    // report None, because recreating against a thread that only contained
+    // the deleted draft 404s.
+    #[tokio::test]
+    async fn get_draft_thread_id_distinguishes_threaded_from_standalone() {
+        let body = r#"{"successful":true,"data":{"drafts":[
+            {"id":"D1","message":{"id":"M1","threadId":"T9"}},
+            {"id":"D2","message":{"id":"M2","threadId":"M2"}}
+        ]}}"#;
+        let addr = spawn_repeating_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let threaded = client
+            .get_draft_thread_id("entity-x", "D1")
+            .await
+            .expect("list should succeed");
+        assert_eq!(threaded.as_deref(), Some("T9"));
+
+        let standalone = client
+            .get_draft_thread_id("entity-x", "D2")
+            .await
+            .expect("list should succeed");
+        assert_eq!(standalone, None);
+    }
 }
 
 /// Recursively search a JSON value for the first string-valued field whose
@@ -706,11 +918,12 @@ impl GmailApi for ComposioClient {
         // the thread in one shot (a thread is small relative to the inbox, so
         // no pagination is needed). We trim to the last `max` here and let the
         // prompt layer apply the hard char cap.
+        // No inline user_id: it is NOT a harmless duplicate of the envelope
+        // user_id — the tool forwards it as the Gmail API `users/<id>/…` path
+        // segment, and a Composio entity id there 403s with "Delegation
+        // denied", killing thread context entirely. Verified live 2026-07-08.
         let args = serde_json::json!({
             "thread_id": thread_id,
-            // Some Composio builds accept user_id inline; execute() also sets
-            // it at the top level. Harmless duplicate; keeps older builds happy.
-            "user_id": entity_id,
         });
         let v = self
             .execute("GMAIL_FETCH_MESSAGE_BY_THREAD_ID", entity_id, args)
@@ -762,24 +975,6 @@ impl GmailApi for ComposioClient {
             "missing draft id in response: {}",
             serde_json::to_string(&v).unwrap_or_default()
         )))
-    }
-
-    async fn update_draft(
-        &self,
-        entity_id: &str,
-        draft_id: &str,
-        to: &str,
-        subject: &str,
-        body: &str,
-    ) -> Result<(), GmailError> {
-        let args = serde_json::json!({
-            "draft_id": draft_id,
-            "recipient_email": extract_bare_email(to),
-            "subject": subject,
-            "body": body,
-        });
-        self.execute("GMAIL_UPDATE_DRAFT", entity_id, args).await?;
-        Ok(())
     }
 
     async fn send_draft(&self, entity_id: &str, draft_id: &str) -> Result<(), GmailError> {

@@ -1379,7 +1379,8 @@ enum DiscordOp {
 enum GmailOp {
     /// Search all connected Gmail accounts with a Gmail query string
     /// (e.g. `from:jeremy@acme.com`, `subject:deadline after:2026/04/01`).
-    /// Prints a short listing (from / subject / date / messageId) by default.
+    /// Prints a short listing (from / subject / date / messageId / threadId)
+    /// by default.
     Search {
         /// Gmail search query. Supports all operators `from:`, `to:`,
         /// `subject:`, `has:`, `after:`, `before:`, etc.
@@ -1422,7 +1423,10 @@ enum GmailOp {
         /// exclusive with `--body`.
         #[arg(long)]
         body_file: Option<String>,
-        /// Thread to attach the draft to (makes it a reply).
+        /// Thread to attach the draft to (makes it a reply). Accepts a Gmail
+        /// threadId or a messageId from `gmail search` — a messageId is
+        /// resolved to its thread automatically (#381). Must belong to the
+        /// mailbox picked by `--account`.
         #[arg(long)]
         thread_id: Option<String>,
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
@@ -1454,7 +1458,9 @@ enum GmailOp {
         #[arg(long)]
         reply_to_body_file: Option<String>,
     },
-    /// Replace the body of an existing draft.
+    /// Replace an existing draft's content. Composio has no update-in-place
+    /// tool (#382), so this creates a replacement draft and deletes the old
+    /// one — it prints a NEW draft id; the old id stops working.
     UpdateDraft {
         #[arg(long)]
         account: Option<String>,
@@ -1468,6 +1474,11 @@ enum GmailOp {
         body: Option<String>,
         #[arg(long)]
         body_file: Option<String>,
+        /// Thread to attach the replacement draft to. Accepts a threadId or a
+        /// messageId (auto-resolved). When omitted, the old draft's thread is
+        /// detected and preserved automatically where possible.
+        #[arg(long)]
+        thread_id: Option<String>,
     },
     /// Send an existing draft.
     Send {
@@ -2463,7 +2474,7 @@ async fn main() -> Result<()> {
                 .await
             }
             GmailOp::UpdateDraft {
-                account, draft_id, to, subject, body, body_file,
+                account, draft_id, to, subject, body, body_file, thread_id,
             } => {
                 run_gmail_update_draft(
                     store,
@@ -2473,6 +2484,7 @@ async fn main() -> Result<()> {
                     subject.clone(),
                     body.clone(),
                     body_file.clone(),
+                    thread_id.clone(),
                 )
                 .await
             }
@@ -3471,13 +3483,17 @@ async fn run_gmail_search(
             emails.len()
         );
         for (i, email) in emails.iter().enumerate() {
+            // threadId is what compose --thread-id / send-now --thread-id
+            // actually need; printing only messageId forced callers to guess
+            // (#381).
             println!(
-                "[{:>2}] from: {}\n     subject: {}\n     date: {}\n     messageId: {}",
+                "[{:>2}] from: {}\n     subject: {}\n     date: {}\n     messageId: {}\n     threadId: {}",
                 i + 1,
                 email.from,
                 email.subject,
                 email.date,
-                email.message_id
+                email.message_id,
+                email.thread_id.as_deref().unwrap_or("-")
             );
             if full {
                 println!("     body:\n{}\n", indent_body(&email.body, 7));
@@ -3808,6 +3824,31 @@ async fn run_gmail_accounts(store: Arc<Store>, json: bool) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+/// Canonicalize a user-supplied `--thread-id` before any draft is created
+/// (#381). Accepts a Gmail threadId or a messageId (resolved to its thread);
+/// fails with an actionable message when the id isn't in `account_email`'s
+/// mailbox — the raw Gmail 404 ("Requested entity was not found") gave the
+/// caller nothing to act on.
+async fn resolve_compose_thread_id(
+    gmail: &ComposioClient,
+    entity_id: &str,
+    account_email: &str,
+    thread_id: Option<String>,
+) -> Result<Option<String>> {
+    let Some(t) = thread_id.filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    let resolved = gmail.resolve_thread_id(entity_id, &t).await.with_context(|| {
+        format!(
+            "--thread-id {t} was not found in account {account_email}. Pass the threadId \
+             printed by `gmail search` (a messageId also works), and make sure --account \
+             is the account that actually contains the thread — ids from one mailbox \
+             don't exist in another."
+        )
+    })?;
+    Ok(Some(resolved))
+}
+
 async fn run_gmail_compose(
     store: Arc<Store>,
     account: Option<String>,
@@ -3828,6 +3869,7 @@ async fn run_gmail_compose(
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
+    let thread_id = resolve_compose_thread_id(&gmail, &entity_id, &email, thread_id).await?;
     let draft_id = gmail
         .create_draft(&entity_id, &to, &subject, &body_str, thread_id.as_deref())
         .await
@@ -4002,16 +4044,38 @@ async fn run_gmail_update_draft(
     subject: String,
     body: Option<String>,
     body_file: Option<String>,
+    thread_id: Option<String>,
 ) -> Result<()> {
     let body_str = read_body(body, body_file)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
-    gmail
-        .update_draft(&entity_id, &draft_id, &to, &subject, &body_str)
+    // Update = create replacement + delete old (#382). Keep the reply
+    // threaded: use the explicit --thread-id when given, otherwise detect
+    // the old draft's thread. Detection is best-effort — a lookup failure
+    // downgrades to an unthreaded draft rather than blocking the update.
+    let thread_id = match thread_id.filter(|t| !t.is_empty()) {
+        Some(t) => resolve_compose_thread_id(&gmail, &entity_id, &email, Some(t)).await?,
+        None => match gmail.get_draft_thread_id(&entity_id, &draft_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "warning: could not determine draft {draft_id}'s thread ({e}); \
+                     the replacement draft will start a new thread"
+                );
+                None
+            }
+        },
+    };
+    let new_id = gmail
+        .update_draft(&entity_id, &draft_id, &to, &subject, &body_str, thread_id.as_deref())
         .await
-        .context("update_draft via Composio failed")?;
-    println!("draft updated: id={draft_id} account={email}");
+        .context("update_draft (create replacement + delete old) via Composio failed")?;
+    println!("draft updated: new id={new_id} (replaces {draft_id}) account={email}");
+    if let Some(t) = thread_id {
+        println!("thread:  {t}");
+    }
+    println!("open in gmail: https://mail.google.com/mail/u/0/#drafts?compose={new_id}");
     Ok(())
 }
 
@@ -4060,6 +4124,7 @@ async fn run_gmail_send_now(
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
+    let thread_id = resolve_compose_thread_id(&gmail, &entity_id, &email, thread_id).await?;
     let draft_id = gmail
         .create_draft(&entity_id, &to, &subject, &body_str, thread_id.as_deref())
         .await

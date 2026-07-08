@@ -1538,16 +1538,6 @@ mod tests {
         ) -> Result<String, crate::gmail::GmailError> {
             Ok("draft".into())
         }
-        async fn update_draft(
-            &self,
-            _e: &str,
-            _d: &str,
-            _t: &str,
-            _s: &str,
-            _b: &str,
-        ) -> Result<(), crate::gmail::GmailError> {
-            Ok(())
-        }
         async fn send_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
             Ok(())
         }
@@ -2172,16 +2162,6 @@ mod tests {
         ) -> Result<Vec<Email>, crate::gmail::GmailError> {
             Ok(self.emails.clone())
         }
-        async fn update_draft(
-            &self,
-            _e: &str,
-            _d: &str,
-            _t: &str,
-            _s: &str,
-            _b: &str,
-        ) -> Result<(), crate::gmail::GmailError> {
-            Ok(())
-        }
         async fn create_draft(
             &self,
             _e: &str,
@@ -2283,16 +2263,6 @@ mod tests {
             _l: u32,
         ) -> Result<Vec<Email>, crate::gmail::GmailError> {
             Ok(self.emails.clone())
-        }
-        async fn update_draft(
-            &self,
-            _e: &str,
-            _d: &str,
-            _t: &str,
-            _s: &str,
-            _b: &str,
-        ) -> Result<(), crate::gmail::GmailError> {
-            Ok(())
         }
         async fn create_draft(
             &self,
