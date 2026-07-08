@@ -939,6 +939,16 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         format!("Bash({} calendar list-events)", bin.display());
     let bash_calendar_list_bare_noargs =
         "Bash(augmentagent calendar list-events)".to_string();
+    // #398 — `calendar create-event` PROPOSES an event: it writes a pending
+    // action row and posts a Discord approval card; the event is created
+    // (and invites sent) only when the operator clicks Approve. Safe to
+    // allowlist for the same reason `gmail compose --post` is (#352): the
+    // command's only externally visible effect is one card in the existing
+    // approval channel. Args are always required, so no no-arg form.
+    let bash_calendar_create_abs =
+        format!("Bash({} calendar create-event *)", bin.display());
+    let bash_calendar_create_bare =
+        "Bash(augmentagent calendar create-event *)".to_string();
     // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
     // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
     // resolves the db regardless of cwd.
@@ -1085,6 +1095,8 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_calendar_list_bare,
             bash_calendar_list_abs_noargs,
             bash_calendar_list_bare_noargs,
+            bash_calendar_create_abs,
+            bash_calendar_create_bare,
             format!("Bash({} issue create *)", aa_gh.display()),
             format!("Bash({} issue list *)", aa_gh.display()),
             format!("Bash({} issue view *)", aa_gh.display()),
