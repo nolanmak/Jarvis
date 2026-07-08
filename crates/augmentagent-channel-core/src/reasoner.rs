@@ -926,6 +926,19 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // rationale as the other `augmentagent` subcommands.
     let bash_meetup_events_abs = format!("Bash({} meetup events *)", bin.display());
     let bash_meetup_events_bare = "Bash(augmentagent meetup events *)".to_string();
+    // #399 — `calendar list-events` is the on-demand, read-only schedule
+    // lookup query mode uses to answer "what's on my calendar this week" /
+    // "am I free Thursday". Scoped to `list-events` only — `poll-once`
+    // (writes dedup rows, sends alerts) and `backfill` stay out of the
+    // agent's reach. The no-arg forms are needed because the `*` patterns
+    // only match invocations WITH trailing args, and the bare no-arg call
+    // (defaults to the next 7 days) is the common one.
+    let bash_calendar_list_abs = format!("Bash({} calendar list-events *)", bin.display());
+    let bash_calendar_list_bare = "Bash(augmentagent calendar list-events *)".to_string();
+    let bash_calendar_list_abs_noargs =
+        format!("Bash({} calendar list-events)", bin.display());
+    let bash_calendar_list_bare_noargs =
+        "Bash(augmentagent calendar list-events)".to_string();
     // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
     // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
     // resolves the db regardless of cwd.
@@ -1068,6 +1081,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_loops_bare,
             bash_meetup_events_abs,
             bash_meetup_events_bare,
+            bash_calendar_list_abs,
+            bash_calendar_list_bare,
+            bash_calendar_list_abs_noargs,
+            bash_calendar_list_bare_noargs,
             format!("Bash({} issue create *)", aa_gh.display()),
             format!("Bash({} issue list *)", aa_gh.display()),
             format!("Bash({} issue view *)", aa_gh.display()),

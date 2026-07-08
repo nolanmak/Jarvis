@@ -953,6 +953,22 @@ enum CalendarOp {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         json: bool,
     },
+    /// #399 — read-only schedule lookup across active accounts. Query
+    /// mode's calendar tool; applies NO engagement filter (solo events,
+    /// focus blocks, and all-day entries all show).
+    ListEvents {
+        /// RFC3339 window start (default: now)
+        #[arg(long)]
+        from: Option<String>,
+        /// RFC3339 window end (default: --from + --days)
+        #[arg(long)]
+        to: Option<String>,
+        /// Window length in days when --to is absent (clamped to 1-60)
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2848,6 +2864,15 @@ async fn main() -> Result<()> {
             }
             CalendarOp::Subscriptions { json } => {
                 run_calendar_subscriptions(store, json)?;
+                Ok(())
+            }
+            CalendarOp::ListEvents {
+                from,
+                to,
+                days,
+                json,
+            } => {
+                run_calendar_list_events(store, from, to, days, json).await?;
                 Ok(())
             }
         },
@@ -9723,6 +9748,224 @@ fn build_calendar_alert_sink(
         http: serenity::http::Http::new(&token),
         channel: serenity::all::ChannelId::new(cid),
     }))
+}
+
+/// #399 — read-only schedule lookup for query mode ("what's on my calendar
+/// this week?"). Unlike the ingest poll this applies NO engagement filter:
+/// solo events, focus blocks, and all-day entries all show. Output carries
+/// only privacy-allowlisted `MeetingPayload` fields plus an all-day flag,
+/// and leads with the current local time — query mode has no other clock
+/// (#236), so the header doubles as its time source.
+async fn run_calendar_list_events(
+    store: Arc<Store>,
+    from: Option<String>,
+    to: Option<String>,
+    days: i64,
+    json: bool,
+) -> Result<()> {
+    use augmentagent_channel_calendar::{
+        CalendarApi, ComposioCalendarClient, MeetingPayload,
+    };
+    use chrono::{DateTime, Local, Utc};
+
+    let api_key =
+        std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
+    let client = ComposioCalendarClient::new(api_key);
+
+    let now = Utc::now();
+    let parse = |label: &str, s: &str| -> Result<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(s)
+            .map(|d| d.with_timezone(&Utc))
+            .with_context(|| {
+                format!("--{label} must be RFC3339, e.g. 2026-07-09T00:00:00-04:00")
+            })
+    };
+    let time_min = match &from {
+        Some(s) => parse("from", s)?,
+        None => now,
+    };
+    let time_max = match &to {
+        Some(s) => parse("to", s)?,
+        None => time_min + chrono::Duration::days(days.clamp(1, 60)),
+    };
+    if time_max <= time_min {
+        anyhow::bail!("--to must be after --from");
+    }
+
+    let accounts = store.get_active_gmail_accounts()?;
+    if accounts.is_empty() {
+        anyhow::bail!("no active Google accounts — connect Gmail first (dashboard → Subscriptions)");
+    }
+
+    struct AccountEvents {
+        email: String,
+        result: std::result::Result<Vec<(MeetingPayload, bool)>, String>,
+    }
+
+    let mut per_account: Vec<AccountEvents> = Vec::new();
+    for account in accounts {
+        match client
+            .list_events(&account.entity_id, "primary", time_min, time_max)
+            .await
+        {
+            Ok(events) => {
+                let mut items: Vec<(MeetingPayload, bool)> = events
+                    .iter()
+                    .filter(|ev| {
+                        !ev.status
+                            .as_deref()
+                            .map(|s| s.eq_ignore_ascii_case("cancelled"))
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|ev| {
+                        let p = MeetingPayload::from_event(
+                            ev,
+                            &account.entity_id,
+                            "primary",
+                        )?;
+                        let all_day = ev
+                            .start
+                            .as_ref()
+                            .map(|s| s.date_time.is_none())
+                            .unwrap_or(false);
+                        Some((p, all_day))
+                    })
+                    .collect();
+                items.sort_by_key(|(p, _)| p.start);
+                per_account.push(AccountEvents {
+                    email: account.email.clone(),
+                    result: Ok(items),
+                });
+            }
+            Err(e) => {
+                let mut msg = e.to_string();
+                if msg.contains("ConnectedAccountNotFound")
+                    || msg.contains("No connected account")
+                {
+                    msg.push_str(
+                        " — Google Calendar is not connected in Composio for this \
+                         account; the operator must link the googlecalendar toolkit \
+                         first. Surface this instead of retrying.",
+                    );
+                }
+                per_account.push(AccountEvents {
+                    email: account.email.clone(),
+                    result: Err(msg),
+                });
+            }
+        }
+    }
+
+    let attendee_line = |p: &MeetingPayload| -> String {
+        let others: Vec<String> = p
+            .attendees
+            .iter()
+            .filter(|a| !a.is_self && !a.is_resource)
+            .map(|a| match &a.display_name {
+                Some(n) => format!("{n} <{}>", a.email),
+                None => a.email.clone(),
+            })
+            .collect();
+        if others.is_empty() {
+            String::new()
+        } else {
+            format!(" — with {}", others.join(", "))
+        }
+    };
+
+    if json {
+        let accounts_json: Vec<serde_json::Value> = per_account
+            .iter()
+            .map(|a| match &a.result {
+                Ok(items) => serde_json::json!({
+                    "email": a.email,
+                    "error": serde_json::Value::Null,
+                    "events": items.iter().map(|(p, all_day)| serde_json::json!({
+                        "event_id": p.event_id,
+                        "summary": p.summary,
+                        "start": p.start.to_rfc3339(),
+                        "end": p.end.to_rfc3339(),
+                        "start_local": p.start.with_timezone(&Local).to_rfc3339(),
+                        "end_local": p.end.with_timezone(&Local).to_rfc3339(),
+                        "all_day": all_day,
+                        "attendees": p.attendees.iter().filter(|at| !at.is_resource).map(|at| serde_json::json!({
+                            "email": at.email,
+                            "display_name": at.display_name,
+                            "response_status": at.response_status,
+                            "is_self": at.is_self,
+                        })).collect::<Vec<_>>(),
+                        "organizer_email": p.organizer_email,
+                        "conference_kind": p.conference_kind,
+                        "virtual_meeting": p.virtual_meeting,
+                        "recurring_event_id": p.recurring_event_id,
+                    })).collect::<Vec<_>>(),
+                }),
+                Err(msg) => serde_json::json!({
+                    "email": a.email,
+                    "error": msg,
+                    "events": [],
+                }),
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "now": Local::now().to_rfc3339(),
+                "window": {
+                    "from": time_min.with_timezone(&Local).to_rfc3339(),
+                    "to": time_max.with_timezone(&Local).to_rfc3339(),
+                },
+                "accounts": accounts_json,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("now: {}", Local::now().format("%A %Y-%m-%d %H:%M %Z"));
+    println!(
+        "window: {} → {}",
+        time_min.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
+        time_max.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+    );
+    for a in &per_account {
+        match &a.result {
+            Ok(items) => {
+                println!(
+                    "\naccount {}: {} event{}",
+                    a.email,
+                    items.len(),
+                    if items.len() == 1 { "" } else { "s" }
+                );
+                for (p, all_day) in items {
+                    let local_start = p.start.with_timezone(&Local);
+                    if *all_day {
+                        println!(
+                            "  - {} (all day)  {}",
+                            local_start.format("%a %Y-%m-%d"),
+                            p.summary
+                        );
+                        continue;
+                    }
+                    let conf = p
+                        .conference_kind
+                        .as_deref()
+                        .map(|k| format!(" [{k}]"))
+                        .unwrap_or_default();
+                    println!(
+                        "  - {} {}–{}  {}{}{}",
+                        local_start.format("%a %Y-%m-%d"),
+                        local_start.format("%H:%M"),
+                        p.end.with_timezone(&Local).format("%H:%M"),
+                        p.summary,
+                        attendee_line(p),
+                        conf
+                    );
+                }
+            }
+            Err(msg) => println!("\naccount {}: ERROR — {}", a.email, msg),
+        }
+    }
+    Ok(())
 }
 
 fn run_calendar_subscriptions(store: Arc<Store>, json: bool) -> Result<()> {
