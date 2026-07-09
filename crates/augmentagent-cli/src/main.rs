@@ -1436,12 +1436,12 @@ enum GmailOp {
         #[arg(long, default_value_t = 20)]
         limit: u32,
         /// Also include the email body in the output.
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         full: bool,
     },
     /// List active Gmail accounts (so the chat agent can pick `--account`).
     Accounts {
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
     },
     /// Create a new draft in Gmail. Returns the draft id (and a Gmail URL
@@ -1476,13 +1476,17 @@ enum GmailOp {
         /// mailbox picked by `--account`.
         #[arg(long)]
         thread_id: Option<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
         /// Also post a Discord approval card for this draft (#352, #412).
         /// For a reply card pass `--thread-id` + `--reply-to-message-id`;
         /// for a new-email card pass neither.
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         post: bool,
+        /// Skip the duplicate guard (#419): create the draft/card even when a
+        /// pending approval card already exists for this recipient + subject.
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        allow_duplicate: bool,
         /// Gmail messageId of the inbound message we're replying to. Used as
         /// the action row's messageId so the Approve / Revise / Skip handlers
         /// resolve the same way they do for auto-triage replies. Pass it
@@ -2500,8 +2504,8 @@ async fn main() -> Result<()> {
             GmailOp::Accounts { json } => run_gmail_accounts(store, *json).await,
             GmailOp::Compose {
                 account, to, subject, body, body_file, thread_id, json,
-                post, reply_to_message_id, reply_to_from, reply_to_subject,
-                reply_to_body, reply_to_body_file,
+                post, allow_duplicate, reply_to_message_id, reply_to_from,
+                reply_to_subject, reply_to_body, reply_to_body_file,
             } => {
                 run_gmail_compose(
                     store,
@@ -2513,6 +2517,7 @@ async fn main() -> Result<()> {
                     thread_id.clone(),
                     *json,
                     *post,
+                    *allow_duplicate,
                     reply_to_message_id.clone(),
                     reply_to_from.clone(),
                     reply_to_subject.clone(),
@@ -3862,7 +3867,13 @@ fn resolve_gmail_entity_id(
 fn read_body(body: Option<String>, body_file: Option<String>) -> Result<String> {
     match (body, body_file) {
         (Some(_), Some(_)) => anyhow::bail!("pass --body OR --body-file, not both"),
-        (Some(b), None) => Ok(b),
+        // Inline --body values get backslash escapes interpreted (#418):
+        // callers (humans and the wiki-ask agent alike) write
+        // `--body "line1\n\nline2"`, and in shell double quotes that \n is a
+        // literal backslash+n which Gmail then DISPLAYS as text — the "ugly
+        // formatting" bug. No real email body wants a visible backslash-n.
+        // File/stdin bodies are passed through verbatim.
+        (Some(b), None) => Ok(unescape_body(&b)),
         (None, Some(p)) => {
             if p == "-" {
                 let mut buf = String::new();
@@ -3875,6 +3886,50 @@ fn read_body(body: Option<String>, body_file: Option<String>) -> Result<String> 
         }
         (None, None) => anyhow::bail!("either --body or --body-file is required"),
     }
+}
+
+/// Interpret the escape sequences `\n`, `\t`, and `\r\n`→`\n` in an inline
+/// `--body` string (#418). `\\` escapes a backslash so a deliberate literal
+/// `\n` remains expressible as `\\n`. Anything else after a backslash is
+/// passed through untouched.
+fn unescape_body(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('n') => {
+                chars.next();
+                out.push('\n');
+            }
+            Some('t') => {
+                chars.next();
+                out.push('\t');
+            }
+            // \r\n (escaped CRLF) collapses to one newline; a lone \r too.
+            Some('r') => {
+                chars.next();
+                if chars.peek() == Some(&'\\') {
+                    let mut ahead = chars.clone();
+                    ahead.next();
+                    if ahead.peek() == Some(&'n') {
+                        chars.next();
+                        chars.next();
+                    }
+                }
+                out.push('\n');
+            }
+            Some('\\') => {
+                chars.next();
+                out.push('\\');
+            }
+            _ => out.push('\\'),
+        }
+    }
+    out
 }
 
 async fn run_gmail_accounts(store: Arc<Store>, json: bool) -> Result<()> {
@@ -3940,6 +3995,7 @@ async fn run_gmail_compose(
     thread_id: Option<String>,
     json: bool,
     post: bool,
+    allow_duplicate: bool,
     reply_to_message_id: Option<String>,
     reply_to_from: Option<String>,
     reply_to_subject: Option<String>,
@@ -3959,6 +4015,25 @@ async fn run_gmail_compose(
         );
     }
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
+    // #419 — duplicate guard, also BEFORE any Gmail write. Concurrent or
+    // repeated asks for the same email produced 3 drafts + 2 cards in one
+    // observed session; refuse the repeat and point at the existing card.
+    if post && !allow_duplicate {
+        let bare_to = augmentagent_channel_email::gmail::extract_bare_email(&to);
+        if let Some((action_id, draft_id)) = store
+            .find_pending_action_for_recipient(&entity_id, &bare_to, &subject)
+            .context("duplicate-guard lookup")?
+        {
+            anyhow::bail!(
+                "a pending approval card already exists for {bare_to} / \"{subject}\" \
+                 (action {action_id}, draft {draft}). Revise it from the card, or update \
+                 the draft in place with `gmail update-draft --draft-id {draft} ...` — \
+                 the card follows the new draft automatically. Pass --allow-duplicate \
+                 to force a second card.",
+                draft = draft_id.as_deref().unwrap_or("<none>")
+            );
+        }
+    }
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
     let thread_id = resolve_compose_thread_id(&gmail, &entity_id, &email, thread_id).await?;
@@ -4199,6 +4274,24 @@ async fn run_gmail_update_draft(
         .update_draft(&entity_id, &draft_id, &to, &subject, &body_str, thread_id.as_deref())
         .await
         .context("update_draft (create replacement + delete old) via Composio failed")?;
+    // #419 card-sync — any pending approval card pointing at the replaced
+    // draft would otherwise Approve a deleted id. Repoint it at the new
+    // draft and refresh the stored body so Revise sees the current text.
+    match store.find_pending_action_ids_by_draft_id(&draft_id) {
+        Ok(ids) => {
+            for action_id in ids {
+                if let Err(e) = store.set_action_draft_id(&action_id, &new_id) {
+                    eprintln!("warning: card {action_id} not repointed to new draft: {e}");
+                    continue;
+                }
+                if let Err(e) = store.set_action_draft_body(&action_id, &body_str) {
+                    eprintln!("warning: card {action_id} body not refreshed: {e}");
+                }
+                println!("approval card {action_id} now follows the new draft");
+            }
+        }
+        Err(e) => eprintln!("warning: card-sync lookup failed: {e}"),
+    }
     println!("draft updated: new id={new_id} (replaces {draft_id}) account={email}");
     if let Some(t) = thread_id {
         println!("thread:  {t}");
@@ -5358,6 +5451,45 @@ fn parse_loop_json(raw: &str) -> std::result::Result<augmentagent_approval_disco
         cron_expr,
         tz,
     })
+}
+
+#[cfg(test)]
+mod unescape_body_tests {
+    use super::unescape_body;
+
+    #[test]
+    fn newline_and_tab_escapes_interpret() {
+        assert_eq!(unescape_body("a\\n\\nb\\tc"), "a\n\nb\tc");
+    }
+
+    #[test]
+    fn the_john_repro_renders_paragraphs() {
+        let body = "Hey John,\\n\\nGreat catching up on the phone today.\\n\\nBest,\\nNolan";
+        let out = unescape_body(body);
+        assert!(out.contains("Hey John,\n\nGreat"));
+        assert!(!out.contains('\\'), "no backslashes may survive: {out}");
+    }
+
+    #[test]
+    fn plain_text_and_real_newlines_untouched() {
+        assert_eq!(unescape_body("line1\nline2"), "line1\nline2");
+        assert_eq!(unescape_body("no escapes here"), "no escapes here");
+    }
+
+    #[test]
+    fn double_backslash_yields_literal_backslash_n() {
+        assert_eq!(unescape_body("show \\\\n literally"), "show \\n literally");
+    }
+
+    #[test]
+    fn crlf_escape_collapses_to_newline() {
+        assert_eq!(unescape_body("a\\r\\nb"), "a\nb");
+    }
+
+    #[test]
+    fn unknown_escape_passes_through() {
+        assert_eq!(unescape_body("path\\qthing"), "path\\qthing");
+    }
 }
 
 #[cfg(test)]
