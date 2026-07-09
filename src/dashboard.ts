@@ -87,8 +87,40 @@ function getComposioClient(): Composio | null {
 // indefinite-stale state #179 describes.
 const GMAIL_LIVENESS_STALE_MS = 5 * 60 * 1000;
 
+// #398/#400 — per-entity Google Calendar connection status, cached 60s so
+// config-status renders (every htmx swap hits it) don't each round-trip to
+// Composio. The callback route nulls the cache so a fresh connect flips the
+// badge immediately.
+let calendarStatusCache: { at: number; entities: string[] } | null = null;
+
+async function getCalendarConnectedEntities(): Promise<string[]> {
+  const client = getComposioClient();
+  if (!client) return [];
+  if (calendarStatusCache && Date.now() - calendarStatusCache.at < 60_000) {
+    return calendarStatusCache.entities;
+  }
+  try {
+    const conns = await client.connectedAccounts.list({
+      toolkit_slugs: ["googlecalendar"],
+    });
+    const entities = conns.items
+      .filter((c) => c.status === "ACTIVE")
+      .map((c) => (c as any).user_id || (c as any).entity_id)
+      .filter(Boolean);
+    calendarStatusCache = { at: Date.now(), entities };
+    return entities;
+  } catch (err) {
+    console.error(
+      "[calendar] connection status check failed:",
+      err instanceof Error ? err.message : err,
+    );
+    // Stale beats missing: keep showing the last known state on a blip.
+    return calendarStatusCache?.entities ?? [];
+  }
+}
+
 // Check both DB config and env vars for integration status
-function getConfigStatus() {
+async function getConfigStatus() {
   const gmailAccounts = getGmailAccounts();
   // #179 — "connected" means the most recent poll *succeeded* recently.
   // `active=1` alone doesn't prove the connection still works at Composio
@@ -110,6 +142,9 @@ function getConfigStatus() {
     composioKey: !!(getConfig("composio_api_key") || process.env.COMPOSIO_API_KEY),
     gmailAccounts,
     gmailConnected,
+    // Entity ids with an ACTIVE googlecalendar connection (#398/#400) —
+    // the template matches these against gmailAccounts[].entityId.
+    calendarEntities: await getCalendarConnectedEntities(),
     discordWebhook: !!(getConfig("discord_webhook_url") || process.env.DISCORD_WEBHOOK_URL),
     discordBotToken: !!(getConfig("discord_bot_token") || process.env.DISCORD_BOT_TOKEN),
     emailRetentionDays: getConfig("email_retention_days") || "0",
@@ -159,9 +194,9 @@ function maskSecret(raw: string | null): string | null {
   return `${raw.slice(0, 4)}${"•".repeat(8)}${raw.slice(-4)}`;
 }
 
-router.get("/settings", (_req, res) => {
+router.get("/settings", async (_req, res) => {
   const senders = getSenders();
-  const configStatus = getConfigStatus();
+  const configStatus = await getConfigStatus();
   const emailRetention = getConfig("email_retention_days") || "0";
   const emailCount = getEmailCount();
   const invoice = getInvoiceSettings();
@@ -557,7 +592,7 @@ router.patch("/api/senders/:id/toggle", (req, res) => {
 
 // --- Config API ---
 
-router.post("/api/config", (req, res) => {
+router.post("/api/config", async (req, res) => {
   const { key, value } = req.body;
   const allowedKeys = [
     "groq_api_key",
@@ -585,13 +620,13 @@ router.post("/api/config", (req, res) => {
     deleteConfig(key);
   }
 
-  const configStatus = getConfigStatus();
+  const configStatus = await getConfigStatus();
 
   res.render("partials/config-status", { configStatus });
 });
 
-router.get("/api/config/status", (_req, res) => {
-  const configStatus = getConfigStatus();
+router.get("/api/config/status", async (_req, res) => {
+  const configStatus = await getConfigStatus();
   res.render("partials/config-status", { configStatus });
 });
 
@@ -884,8 +919,117 @@ router.delete("/api/oauth/gmail/:id", async (req, res) => {
     removeGmailAccount(req.params.id);
   }
 
-  const configStatus = getConfigStatus();
+  const configStatus = await getConfigStatus();
   res.render("partials/config-status", { configStatus });
+});
+
+// --- Composio OAuth for Google Calendar (#398/#400) ---
+// Same shape as the Gmail/Drive flows with one deliberate difference: the
+// connection REUSES an existing Gmail account's entity id instead of
+// minting a fresh one. The Rust daemon resolves calendar connections by
+// iterating gmail_accounts entity ids (Phase 1 reuses them as the Calendar
+// entity list), so a fresh entity would leave the connection orphaned.
+// One click per account = one fresh single-use consent link per account,
+// which is also why connecting two Googles through one link fails with
+// Composio's "expired state" redis error.
+
+router.get("/oauth/calendar/start", async (req, res) => {
+  try {
+    const client = getComposioClient();
+    if (!client) {
+      res.status(400).send("Composio API key not configured. Add it in Settings first.");
+      return;
+    }
+    const entityId = String(req.query.entity || "");
+    const account = getGmailAccounts().find((a) => a.entityId === entityId);
+    if (!account) {
+      res
+        .status(400)
+        .send("Unknown entity id — connect the Gmail account first, then its calendar.");
+      return;
+    }
+
+    const authConfigId = await getOrCreateAuthConfig(client, "googlecalendar");
+    const dashboardPort = process.env.DASHBOARD_PORT || "3000";
+    const callbackUrl = `http://localhost:${dashboardPort}/oauth/calendar/callback`;
+    const linkResponse = await client.link.create({
+      user_id: entityId,
+      auth_config_id: authConfigId,
+      callback_url: callbackUrl,
+    });
+    if (!linkResponse.redirect_url) {
+      throw new Error("No redirect URL returned from Composio");
+    }
+    if (linkResponse.connected_account_id) {
+      setConfig("calendar_pending_connection_id", linkResponse.connected_account_id);
+      setConfig("calendar_pending_entity_id", entityId);
+    }
+    console.log(
+      `[oauth] Calendar OAuth initiated for entity ${entityId} (${account.email || "unlabeled"})`,
+    );
+    res.redirect(linkResponse.redirect_url);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[oauth] Calendar OAuth start failed:", msg);
+    res.status(500).send(`
+      <div class="p-4 bg-gray-950 text-gray-100 min-h-screen">
+        <h2 class="text-lg font-semibold text-red-400 mb-2">OAuth Error</h2>
+        <p class="text-sm text-gray-300 mb-4">${msg}</p>
+        <a href="/settings" class="text-blue-400 hover:underline">Back to Settings</a>
+      </div>
+    `);
+  }
+});
+
+router.get("/oauth/calendar/callback", async (req, res) => {
+  console.log("[oauth] calendar callback. Query:", JSON.stringify(req.query));
+  try {
+    const connectionId = getConfig("calendar_pending_connection_id");
+    const entityId = getConfig("calendar_pending_entity_id");
+    const client = getComposioClient();
+
+    let status = "unknown";
+    if (connectionId && client) {
+      let retries = 3;
+      while (retries > 0) {
+        try {
+          const account = await client.connectedAccounts.retrieve(connectionId);
+          status = (account as any).status || "unknown";
+          if (status === "ACTIVE") break;
+        } catch (err) {
+          console.log(
+            "[oauth] calendar retrieve failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+        retries--;
+        if (retries > 0) await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+    // No DB row to write — the daemon finds the connection by entity id.
+    deleteConfig("calendar_pending_connection_id");
+    deleteConfig("calendar_pending_entity_id");
+    calendarStatusCache = null;
+    console.log(`[oauth] Calendar callback: entity=${entityId}, status=${status}`);
+    res.redirect(status === "ACTIVE" ? "/settings?calendar=connected" : "/settings?calendar=error");
+  } catch (err) {
+    console.error("[oauth] Calendar OAuth callback error:", err);
+    res.redirect("/settings?calendar=error");
+  }
+});
+
+// Per-account calendar connection status (JSON, mirrors gmail/status).
+router.get("/api/oauth/calendar/status", async (_req, res) => {
+  const entities = await getCalendarConnectedEntities();
+  const accounts = getGmailAccounts();
+  res.json({
+    accounts: accounts.map((a) => ({
+      id: a.id,
+      email: a.email,
+      entityId: a.entityId,
+      calendarConnected: entities.includes(a.entityId),
+    })),
+  });
 });
 
 // --- Composio OAuth for Google Drive (multi-tenant) ---
