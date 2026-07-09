@@ -16,7 +16,7 @@ use augmentagent_approval_discord::{
 };
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
-use augmentagent_channel_email::gmail::{ComposioClient, GmailApi};
+use augmentagent_channel_email::gmail::{Attachment, ComposioClient, GmailApi};
 use augmentagent_channel_email::sigextract::{
     detect_signature_block, is_human_sender, signature_patch, strip_quoted_reply,
     SignatureExtractor,
@@ -1487,6 +1487,10 @@ enum GmailOp {
         /// pending approval card already exists for this recipient + subject.
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         allow_duplicate: bool,
+        /// Attach a local file to the draft (#417). One file; uploaded via
+        /// Composio's attachment store before the draft is created.
+        #[arg(long)]
+        attach: Option<PathBuf>,
         /// Gmail messageId of the inbound message we're replying to. Used as
         /// the action row's messageId so the Approve / Revise / Skip handlers
         /// resolve the same way they do for auto-triage replies. Pass it
@@ -1531,6 +1535,11 @@ enum GmailOp {
         /// detected and preserved automatically where possible.
         #[arg(long)]
         thread_id: Option<String>,
+        /// Attach a local file to the REPLACEMENT draft (#417). Note: the
+        /// replacement carries only what you pass here — an attachment on
+        /// the old draft is NOT carried over (Composio can't read it back).
+        #[arg(long)]
+        attach: Option<PathBuf>,
     },
     /// Send an existing draft.
     Send {
@@ -1561,6 +1570,9 @@ enum GmailOp {
         body_file: Option<String>,
         #[arg(long)]
         thread_id: Option<String>,
+        /// Attach a local file (#417).
+        #[arg(long)]
+        attach: Option<PathBuf>,
     },
 }
 
@@ -2504,7 +2516,7 @@ async fn main() -> Result<()> {
             GmailOp::Accounts { json } => run_gmail_accounts(store, *json).await,
             GmailOp::Compose {
                 account, to, subject, body, body_file, thread_id, json,
-                post, allow_duplicate, reply_to_message_id, reply_to_from,
+                post, allow_duplicate, attach, reply_to_message_id, reply_to_from,
                 reply_to_subject, reply_to_body, reply_to_body_file,
             } => {
                 run_gmail_compose(
@@ -2518,6 +2530,7 @@ async fn main() -> Result<()> {
                     *json,
                     *post,
                     *allow_duplicate,
+                    attach.clone(),
                     reply_to_message_id.clone(),
                     reply_to_from.clone(),
                     reply_to_subject.clone(),
@@ -2527,7 +2540,7 @@ async fn main() -> Result<()> {
                 .await
             }
             GmailOp::UpdateDraft {
-                account, draft_id, to, subject, body, body_file, thread_id,
+                account, draft_id, to, subject, body, body_file, thread_id, attach,
             } => {
                 run_gmail_update_draft(
                     store,
@@ -2538,6 +2551,7 @@ async fn main() -> Result<()> {
                     body.clone(),
                     body_file.clone(),
                     thread_id.clone(),
+                    attach.clone(),
                 )
                 .await
             }
@@ -2548,7 +2562,7 @@ async fn main() -> Result<()> {
                 run_gmail_delete_draft(store, account.clone(), draft_id.clone()).await
             }
             GmailOp::SendNow {
-                account, to, subject, body, body_file, thread_id,
+                account, to, subject, body, body_file, thread_id, attach,
             } => {
                 run_gmail_send_now(
                     store,
@@ -2558,6 +2572,7 @@ async fn main() -> Result<()> {
                     body.clone(),
                     body_file.clone(),
                     thread_id.clone(),
+                    attach.clone(),
                 )
                 .await
             }
@@ -3960,6 +3975,29 @@ async fn run_gmail_accounts(store: Arc<Store>, json: bool) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+/// #417 — Upload `--attach` (when given) to Composio's attachment store,
+/// printing what was attached so the operator can SEE it happened. Fails
+/// loudly on a missing/unreadable file before any draft is created.
+async fn upload_attach_if_given(
+    gmail: &ComposioClient,
+    attach: Option<PathBuf>,
+) -> Result<Option<Attachment>> {
+    let Some(path) = attach else { return Ok(None) };
+    let meta = std::fs::metadata(&path)
+        .with_context(|| format!("attachment not found: {}", path.display()))?;
+    let att = gmail
+        .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", &path)
+        .await
+        .context("attachment upload failed")?;
+    println!(
+        "attached: {} ({} KB, {})",
+        att.name,
+        meta.len().div_ceil(1024),
+        att.mimetype
+    );
+    Ok(Some(att))
+}
+
 /// Canonicalize a user-supplied `--thread-id` before any draft is created
 /// (#381). Accepts a Gmail threadId or a messageId (resolved to its thread);
 /// fails with an actionable message when the id isn't in `account_email`'s
@@ -3996,6 +4034,7 @@ async fn run_gmail_compose(
     json: bool,
     post: bool,
     allow_duplicate: bool,
+    attach: Option<PathBuf>,
     reply_to_message_id: Option<String>,
     reply_to_from: Option<String>,
     reply_to_subject: Option<String>,
@@ -4036,9 +4075,17 @@ async fn run_gmail_compose(
     }
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
+    let attachment = upload_attach_if_given(&gmail, attach).await?;
     let thread_id = resolve_compose_thread_id(&gmail, &entity_id, &email, thread_id).await?;
     let draft_id = gmail
-        .create_draft(&entity_id, &to, &subject, &body_str, thread_id.as_deref())
+        .create_draft_with_attachment(
+            &entity_id,
+            &to,
+            &subject,
+            &body_str,
+            thread_id.as_deref(),
+            attachment.as_ref(),
+        )
         .await
         .context("create_draft via Composio failed")?;
     if post {
@@ -4050,6 +4097,7 @@ async fn run_gmail_compose(
             &to,
             &subject,
             &body_str,
+            attachment.as_ref().map(|a| a.name.as_str()),
             thread_id.as_deref(),
             reply_to_message_id.as_deref(),
             reply_to_from.as_deref(),
@@ -4068,6 +4116,7 @@ async fn run_gmail_compose(
                     "to": to,
                     "subject": subject,
                     "thread_id": thread_id,
+                    "attachment": attachment.as_ref().map(|a| a.name.clone()),
                     "approval_card_posted": true,
                 })
             );
@@ -4086,6 +4135,7 @@ async fn run_gmail_compose(
                 "to": to,
                 "subject": subject,
                 "thread_id": thread_id,
+                "attachment": attachment.as_ref().map(|a| a.name.clone()),
                 "open_in_gmail": format!("https://mail.google.com/mail/u/0/#drafts?compose={draft_id}"),
             })
         );
@@ -4094,6 +4144,9 @@ async fn run_gmail_compose(
         println!("account: {email}");
         println!("to:      {to}");
         println!("subject: {subject}");
+        if let Some(a) = &attachment {
+            println!("attachment: {} ({})", a.name, a.mimetype);
+        }
         println!("open in gmail: https://mail.google.com/mail/u/0/#drafts?compose={draft_id}");
     }
     Ok(())
@@ -4123,6 +4176,7 @@ async fn post_reply_approval_card(
     to: &str,
     out_subject: &str,
     draft_body: &str,
+    attachment_name: Option<&str>,
     thread_id: Option<&str>,
     reply_to_message_id: Option<&str>,
     reply_to_from: Option<&str>,
@@ -4215,7 +4269,14 @@ async fn post_reply_approval_card(
 
     let http = serenity::http::Http::new(&token);
     let channel = serenity::all::ChannelId::new(cid);
-    let card = approval_message(&action_id, &inbound, draft_body, 0);
+    // The card must SHOW the attachment (#417 — "can't see they've been
+    // attached"). Display-only: the actions row keeps the clean body so the
+    // Revise redraft prompt isn't polluted with the marker line.
+    let card_body = match attachment_name {
+        Some(name) => format!("{draft_body}\n\n[attachment: {name}]"),
+        None => draft_body.to_string(),
+    };
+    let card = approval_message(&action_id, &inbound, &card_body, 0);
     channel
         .send_message(&http, card)
         .await
@@ -4248,11 +4309,13 @@ async fn run_gmail_update_draft(
     body: Option<String>,
     body_file: Option<String>,
     thread_id: Option<String>,
+    attach: Option<PathBuf>,
 ) -> Result<()> {
     let body_str = read_body(body, body_file)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
+    let attachment = upload_attach_if_given(&gmail, attach).await?;
     // Update = create replacement + delete old (#382). Keep the reply
     // threaded: use the explicit --thread-id when given, otherwise detect
     // the old draft's thread. Detection is best-effort — a lookup failure
@@ -4271,7 +4334,15 @@ async fn run_gmail_update_draft(
         },
     };
     let new_id = gmail
-        .update_draft(&entity_id, &draft_id, &to, &subject, &body_str, thread_id.as_deref())
+        .update_draft_with_attachment(
+            &entity_id,
+            &draft_id,
+            &to,
+            &subject,
+            &body_str,
+            thread_id.as_deref(),
+            attachment.as_ref(),
+        )
         .await
         .context("update_draft (create replacement + delete old) via Composio failed")?;
     // #419 card-sync — any pending approval card pointing at the replaced
@@ -4340,14 +4411,23 @@ async fn run_gmail_send_now(
     body: Option<String>,
     body_file: Option<String>,
     thread_id: Option<String>,
+    attach: Option<PathBuf>,
 ) -> Result<()> {
     let body_str = read_body(body, body_file)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
+    let attachment = upload_attach_if_given(&gmail, attach).await?;
     let thread_id = resolve_compose_thread_id(&gmail, &entity_id, &email, thread_id).await?;
     let draft_id = gmail
-        .create_draft(&entity_id, &to, &subject, &body_str, thread_id.as_deref())
+        .create_draft_with_attachment(
+            &entity_id,
+            &to,
+            &subject,
+            &body_str,
+            thread_id.as_deref(),
+            attachment.as_ref(),
+        )
         .await
         .context("create_draft (send-now) failed")?;
     gmail

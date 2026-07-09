@@ -325,6 +325,157 @@ impl ComposioClient {
         Ok(None)
     }
 
+    /// #417 — Upload a local file into Composio's attachment store and return
+    /// the `{name, mimetype, s3key}` triple the Gmail tools take as their
+    /// `attachment` argument.
+    ///
+    /// Flow (probed live 2026-07-09): POST `/api/v3/files/upload/request`
+    /// with `{toolkit_slug, tool_slug, tool_input_field: "attachment",
+    /// filename, mimetype, md5}` → `{key, new_presigned_url}`; PUT the raw
+    /// bytes to the presigned URL (Content-Type must match the one signed
+    /// into the URL); pass `key` as `s3key`. When the same md5 was uploaded
+    /// before, the response can omit `new_presigned_url` — the object
+    /// already exists and `key` is reusable as-is.
+    pub async fn upload_attachment(
+        &self,
+        tool_slug: &str,
+        path: &std::path::Path,
+    ) -> Result<Attachment, GmailError> {
+        use md5::{Digest, Md5};
+
+        let bytes = std::fs::read(path).map_err(|e| {
+            GmailError::Decode(format!("read attachment {}: {e}", path.display()))
+        })?;
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        let mimetype = guess_mimetype(&name).to_string();
+        let md5_hex = format!("{:x}", Md5::digest(&bytes));
+
+        let url = format!("{}/api/v3/files/upload/request", self.base_url);
+        let req = serde_json::json!({
+            "toolkit_slug": "gmail",
+            "tool_slug": tool_slug,
+            "tool_input_field": "attachment",
+            "filename": name,
+            "mimetype": mimetype,
+            "md5": md5_hex,
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .header("x-api-key", &self.api_key)
+            .json(&req)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(GmailError::Composio {
+                message: format!("files/upload/request → {status}: {text}"),
+            });
+        }
+        let v: serde_json::Value = resp.json().await?;
+        let key = v
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                GmailError::Decode(format!(
+                    "no key in upload response: {}",
+                    serde_json::to_string(&v).unwrap_or_default()
+                ))
+            })?
+            .to_string();
+        if let Some(put_url) = v.get("new_presigned_url").and_then(serde_json::Value::as_str) {
+            let put = self
+                .http
+                .put(put_url)
+                .header("content-type", &mimetype)
+                .body(bytes)
+                .send()
+                .await?;
+            if !put.status().is_success() {
+                let s = put.status();
+                let t = put.text().await.unwrap_or_default();
+                return Err(GmailError::Composio {
+                    message: format!("attachment upload PUT → {s}: {t}"),
+                });
+            }
+        }
+        Ok(Attachment {
+            name,
+            mimetype,
+            s3key: key,
+        })
+    }
+
+    /// `create_draft` with an optional uploaded attachment (#417). Inherent
+    /// (not on the `GmailApi` trait) so test fakes and the triage channel —
+    /// which never attach — stay untouched.
+    pub async fn create_draft_with_attachment(
+        &self,
+        entity_id: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+        thread_id: Option<&str>,
+        attachment: Option<&Attachment>,
+    ) -> Result<String, GmailError> {
+        let bare_to = extract_bare_email(to);
+        let mut args = serde_json::json!({
+            "recipient_email": bare_to,
+            "subject": subject,
+            "body": body,
+        });
+        if let Some(t) = thread_id {
+            args["thread_id"] = serde_json::Value::String(t.to_string());
+        }
+        if let Some(att) = attachment {
+            args["attachment"] = serde_json::json!({
+                "name": att.name,
+                "mimetype": att.mimetype,
+                "s3key": att.s3key,
+            });
+        }
+        let v = self.execute("GMAIL_CREATE_EMAIL_DRAFT", entity_id, args).await?;
+        const DRAFT_ID_KEYS: &[&str] = &["draft_id", "draftId", "id"];
+        if let Some(id) = find_string_field(&v, DRAFT_ID_KEYS) {
+            return Ok(id);
+        }
+        Err(GmailError::Decode(format!(
+            "missing draft id in response: {}",
+            serde_json::to_string(&v).unwrap_or_default()
+        )))
+    }
+
+    /// `update_draft` (create replacement + delete old) with an optional
+    /// attachment for the replacement (#417). Mirrors the trait default;
+    /// returns the NEW draft id.
+    pub async fn update_draft_with_attachment(
+        &self,
+        entity_id: &str,
+        draft_id: &str,
+        to: &str,
+        subject: &str,
+        body: &str,
+        thread_id: Option<&str>,
+        attachment: Option<&Attachment>,
+    ) -> Result<String, GmailError> {
+        let new_id = self
+            .create_draft_with_attachment(entity_id, to, subject, body, thread_id, attachment)
+            .await?;
+        if let Err(e) = self.delete_draft(entity_id, draft_id).await {
+            tracing::warn!(
+                old_draft_id = draft_id,
+                new_draft_id = %new_id,
+                "update_draft: new draft created but old draft not deleted: {e}"
+            );
+        }
+        Ok(new_id)
+    }
+
     /// Shared paginated fetch for `GMAIL_FETCH_EMAILS`. Walks pages up to
     /// `max_total` messages (in `PAGE_SIZE` chunks), deduping by `message_id`
     /// and guarding against a non-advancing pagination cursor.
@@ -425,6 +576,41 @@ impl ComposioClient {
 
 fn is_transient_reqwest(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request()
+}
+
+/// An uploaded Composio attachment, ready to pass to the Gmail draft/send
+/// tools as their `attachment` argument (#417).
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    pub name: String,
+    pub mimetype: String,
+    pub s3key: String,
+}
+
+/// Best-effort mimetype from the filename extension. Composio requires one
+/// for the presigned upload; unknown extensions fall back to octet-stream
+/// (Gmail still attaches them fine).
+pub fn guess_mimetype(filename: &str) -> &'static str {
+    let ext = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "pdf" => "application/pdf",
+        "txt" | "text" | "log" => "text/plain",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Extract the bare email address from an RFC 5322 header-style string.
@@ -689,6 +875,67 @@ mod tests {
             .await
             .expect("update via recreate should succeed");
         assert_eq!(new_id, "NEWDRAFT");
+    }
+
+    // ---- #417: attachment upload flow ----
+
+    // upload_attachment: request a presigned URL (mock A), PUT the bytes to
+    // it (mock B), return {name, mimetype, s3key} with the server's key.
+    #[tokio::test]
+    async fn upload_attachment_requests_url_puts_bytes_and_returns_key() {
+        // Mock B accepts the PUT.
+        let put_addr = spawn_one_shot_http(200, "").await;
+        // Mock A hands out the presigned URL pointing at mock B. Body must be
+        // built at runtime (addr), so spawn_repeating_http can't be used with
+        // a static str — inline a one-shot with a leaked String instead.
+        let body: &'static str = Box::leak(
+            format!(
+                r#"{{"id":"up_1","key":"317291/gmail/GMAIL_CREATE_EMAIL_DRAFT/request/abc","new_presigned_url":"http://{put_addr}/put"}}"#
+            )
+            .into_boxed_str(),
+        );
+        let req_addr = spawn_one_shot_http(200, body).await;
+        let client =
+            ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{req_addr}"));
+
+        let tmp = tempfile::NamedTempFile::with_suffix(".pdf").unwrap();
+        std::fs::write(tmp.path(), b"%PDF-1.4 fake resume bytes").unwrap();
+
+        let att = client
+            .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", tmp.path())
+            .await
+            .expect("upload should succeed");
+        assert!(att.name.ends_with(".pdf"));
+        assert_eq!(att.mimetype, "application/pdf");
+        assert_eq!(att.s3key, "317291/gmail/GMAIL_CREATE_EMAIL_DRAFT/request/abc");
+    }
+
+    // Re-upload of an already-known file: response carries the key but no
+    // presigned URL — must succeed without attempting a PUT.
+    #[tokio::test]
+    async fn upload_attachment_reuses_existing_object_without_put() {
+        let body = r#"{"id":"up_2","key":"existing/key/xyz"}"#;
+        let addr = spawn_one_shot_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        std::fs::write(tmp.path(), b"hello").unwrap();
+
+        let att = client
+            .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", tmp.path())
+            .await
+            .expect("existing object should be reused");
+        assert_eq!(att.s3key, "existing/key/xyz");
+        assert_eq!(att.mimetype, "text/plain");
+    }
+
+    #[test]
+    fn mimetype_guesses_cover_common_files() {
+        assert_eq!(guess_mimetype("resume.pdf"), "application/pdf");
+        assert_eq!(guess_mimetype("notes.MD"), "text/markdown");
+        assert_eq!(guess_mimetype("photo.JPG"), "image/jpeg");
+        assert_eq!(guess_mimetype("weird.bin"), "application/octet-stream");
+        assert_eq!(guess_mimetype("noext"), "application/octet-stream");
     }
 
     // ---- #402: HTTP 200 + successful:false must be an error, not success ----
@@ -1034,29 +1281,10 @@ impl GmailApi for ComposioClient {
         body: &str,
         thread_id: Option<&str>,
     ) -> Result<String, GmailError> {
-        // Composio's GMAIL_CREATE_EMAIL_DRAFT expects a bare email address in
-        // `recipient_email` — not the full RFC 5322 form with a display name.
-        // Strip `Name <x@y.com>` → `x@y.com`. Leave already-bare addresses alone.
-        let bare_to = extract_bare_email(to);
-        let mut args = serde_json::json!({
-            "recipient_email": bare_to,
-            "subject": subject,
-            "body": body,
-        });
-        if let Some(t) = thread_id {
-            args["thread_id"] = serde_json::Value::String(t.to_string());
-        }
-        let v = self.execute("GMAIL_CREATE_EMAIL_DRAFT", entity_id, args).await?;
-        // Composio response shapes vary across actions; recursively search for
-        // any of the common draft-id key names.
-        const DRAFT_ID_KEYS: &[&str] = &["draft_id", "draftId", "id"];
-        if let Some(id) = find_string_field(&v, DRAFT_ID_KEYS) {
-            return Ok(id);
-        }
-        Err(GmailError::Decode(format!(
-            "missing draft id in response: {}",
-            serde_json::to_string(&v).unwrap_or_default()
-        )))
+        // Full logic (incl. the bare-address handling for `recipient_email`)
+        // lives in the inherent attachment-aware variant (#417).
+        self.create_draft_with_attachment(entity_id, to, subject, body, thread_id, None)
+            .await
     }
 
     async fn send_draft(&self, entity_id: &str, draft_id: &str) -> Result<(), GmailError> {
