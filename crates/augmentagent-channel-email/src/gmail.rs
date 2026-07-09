@@ -429,7 +429,7 @@ fn is_transient_reqwest(e: &reqwest::Error) -> bool {
 
 /// Extract the bare email address from an RFC 5322 header-style string.
 /// `Name <x@y.com>` → `x@y.com`. Already-bare addresses pass through.
-pub(crate) fn extract_bare_email(raw: &str) -> String {
+pub fn extract_bare_email(raw: &str) -> String {
     if let (Some(open), Some(close)) = (raw.find('<'), raw.rfind('>')) {
         if open < close {
             return raw[open + 1..close].trim().to_string();
