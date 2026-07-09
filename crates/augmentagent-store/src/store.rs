@@ -2747,6 +2747,65 @@ impl Store {
         Ok(())
     }
 
+    /// #419 duplicate guard — the newest PENDING action for this
+    /// account + recipient + subject, as `(action_id, draft_id)`.
+    /// `fromEmail` holds the recipient for compose-originated cards (the
+    /// card's From field shows who the mail goes to), so matching on it plus
+    /// the emails-row entity id catches "the same email asked twice".
+    pub fn find_pending_action_for_recipient(
+        &self,
+        account_entity_id: &str,
+        recipient: &str,
+        subject: &str,
+    ) -> StoreResult<Option<(String, Option<String>)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT a.id, a.draftId FROM actions a \
+                 JOIN emails e ON a.messageId = e.messageId \
+                 WHERE a.status = 'pending' \
+                   AND e.accountEntityId = ?1 \
+                   AND LOWER(a.fromEmail) = LOWER(?2) \
+                   AND a.subject = ?3 \
+                 ORDER BY a.createdAt DESC LIMIT 1",
+                params![account_entity_id, recipient, subject],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// #419 card-sync — ids of PENDING actions currently pointing at
+    /// `draft_id`. `update-draft` replaces a Gmail draft with a new id; any
+    /// live approval card for the old draft must be repointed or its Approve
+    /// button sends a deleted draft.
+    pub fn find_pending_action_ids_by_draft_id(
+        &self,
+        draft_id: &str,
+    ) -> StoreResult<Vec<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT id FROM actions WHERE status = 'pending' AND draftId = ?1",
+        )?;
+        let ids = stmt
+            .query_map(params![draft_id], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// #419 card-sync — refresh the stored draft body WITHOUT touching
+    /// status/error (update_action_status would also stamp those). Keeps the
+    /// card's Revise context in step with the Gmail draft after update-draft.
+    pub fn set_action_draft_body(&self, action_id: &str, body: &str) -> StoreResult<()> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE actions SET draftBody = ?2, updatedAt = ?3 WHERE id = ?1",
+            params![action_id, body, now],
+        )?;
+        Ok(())
+    }
+
     /// Record a quick-refine preset choice and bump the redraft counter (#34).
     ///
     /// Called once per Quick-refine select. `preset_id` is `None` for a
@@ -6443,6 +6502,64 @@ mod tests {
     fn redraft_count_zero_for_unknown_action() {
         let (s, _f) = fresh_store();
         assert_eq!(s.redraft_count("does-not-exist").unwrap(), 0);
+    }
+
+    // --- #419: duplicate guard + card-sync queries ---
+
+    #[test]
+    fn find_pending_action_for_recipient_matches_case_insensitive_and_status() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("m1")).unwrap();
+        let id = s
+            .log_action("m1", None, "John@Example.com", "Call Follow-up", None, Some("d"), ActionStatus::Pending)
+            .unwrap();
+        s.set_action_draft_id(&id, "r-draft-1").unwrap();
+
+        // Case-insensitive recipient match, exact subject, entity from the
+        // joined emails row ("acc" in sample_email).
+        let hit = s
+            .find_pending_action_for_recipient("acc", "john@example.com", "Call Follow-up")
+            .unwrap();
+        assert_eq!(hit, Some((id.clone(), Some("r-draft-1".into()))));
+
+        // Different subject, different entity, or resolved status → no hit.
+        assert!(s.find_pending_action_for_recipient("acc", "john@example.com", "Other").unwrap().is_none());
+        assert!(s.find_pending_action_for_recipient("acc2", "john@example.com", "Call Follow-up").unwrap().is_none());
+        s.update_action_status(&id, ActionStatus::Sent, None, None).unwrap();
+        assert!(
+            s.find_pending_action_for_recipient("acc", "john@example.com", "Call Follow-up").unwrap().is_none(),
+            "resolved actions must not trigger the duplicate guard"
+        );
+    }
+
+    #[test]
+    fn card_sync_queries_find_and_update_pending_actions_by_draft() {
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("m1")).unwrap();
+        s.upsert_email(&sample_email("m2")).unwrap();
+        let a1 = s
+            .log_action("m1", None, "a@b.com", "s1", None, Some("old body"), ActionStatus::Pending)
+            .unwrap();
+        let a2 = s
+            .log_action("m2", None, "a@b.com", "s2", None, Some("x"), ActionStatus::Pending)
+            .unwrap();
+        s.set_action_draft_id(&a1, "r-old").unwrap();
+        s.set_action_draft_id(&a2, "r-other").unwrap();
+
+        let ids = s.find_pending_action_ids_by_draft_id("r-old").unwrap();
+        assert_eq!(ids, vec![a1.clone()]);
+
+        // Repoint + refresh body — the update-draft card-sync sequence.
+        s.set_action_draft_id(&a1, "r-new").unwrap();
+        s.set_action_draft_body(&a1, "new body").unwrap();
+        let got = s.get_action_with_email(&a1).unwrap().unwrap();
+        assert_eq!(got.draft_id.as_deref(), Some("r-new"));
+        assert_eq!(got.action.draft_body.as_deref(), Some("new body"));
+        assert_eq!(got.action.status, "pending", "body refresh must not touch status");
+
+        // A resolved action no longer follows draft-id lookups.
+        s.update_action_status(&a2, ActionStatus::Rejected, None, None).unwrap();
+        assert!(s.find_pending_action_ids_by_draft_id("r-other").unwrap().is_empty());
     }
 
     // --- nudge loop ---
