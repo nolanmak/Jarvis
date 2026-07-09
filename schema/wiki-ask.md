@@ -171,7 +171,11 @@ augmentagent gmail compose \
   --body "Hi Jeremy,\n\n…"
 ```
 
-For multi-line or long bodies, write the body to a tempfile and pass `--body-file /path/to/body.txt` (or `--body-file -` to read stdin). Returns a `draft_id` and a Gmail URL the user can open to review/send.
+For multi-line or long bodies, write the body to a tempfile and pass `--body-file /path/to/body.txt` (or `--body-file -` to read stdin). Inline `--body` values interpret `\n` and `\t` escapes as real newlines/tabs (write `\\n` for a literal backslash-n), so short multi-paragraph bodies work inline too. Returns a `draft_id` and a Gmail URL the user can open to review/send.
+
+**Attachments:** pass `--attach /path/to/file` (one file) on `compose`, `send-now`, or `update-draft`. When the user drops a file in Discord it lands at a `/tmp/aa-doc-…` path you can Read — pass that same path to `--attach` to put it on the email. The command output prints `attached: <name>` and the approval card shows `[attachment: <name>]`; if you don't see those, the file is NOT attached — never claim it is. Note: `update-draft` and card **Revise** create a replacement draft that only carries what's passed at that moment — re-pass `--attach` on update, and warn the user that Revise drops attachments.
+
+**One email = one card.** If a pending approval card already exists for the same recipient + subject, `compose --post` refuses and names the existing draft — follow its instruction (`gmail update-draft --draft-id <id> …`, which the existing card follows automatically) instead of forcing a duplicate. Never work around the guard with `--allow-duplicate` unless the user explicitly wants a second, different email to the same person under the same subject.
 
 ### Surface a Discord approval card (#352, #412) — the DEFAULT for actionable email asks
 
@@ -230,7 +234,7 @@ augmentagent gmail update-draft \
   --to ... --subject ... --body ...
 ```
 
-Gmail-side update-in-place isn't available, so this **replaces** the draft: it prints a **new** `draft_id` and the old one stops working — use the new id for any later `send`/`delete-draft`. The old draft's thread is preserved automatically; pass `--thread-id` (threadId or messageId) to set it explicitly.
+Gmail-side update-in-place isn't available, so this **replaces** the draft: it prints a **new** `draft_id` and the old one stops working — use the new id for any later `send`/`delete-draft`. The old draft's thread is preserved automatically; pass `--thread-id` (threadId or messageId) to set it explicitly. Any pending approval card pointing at the old draft is repointed to the new one automatically (it prints `approval card <id> now follows the new draft`), so updating a card-backed draft is safe — the card's Approve sends the updated text. Attachments are NOT carried over; re-pass `--attach` if the draft had one.
 
 ### Send a draft
 
