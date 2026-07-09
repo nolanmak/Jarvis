@@ -4714,6 +4714,17 @@ async fn run_wiki_ask(cli: &Cli, question: String) -> Result<()> {
     let repo_root = std::env::current_dir().context("current_dir")?;
     let opts = augmentagent_channel_core::reasoner::ask_opts(wiki_root.clone(), repo_root);
     info!(wiki = %wiki_root.display(), "wiki ask");
+    // #389 — same owner-rules preamble the Discord query path injects, so
+    // CLI asks behave identically (and the injection is testable headless).
+    let question = match owner_rules_block(&wiki_root) {
+        Some(rules) => format!(
+            "<owner_rules>\nStanding rules from the owner (wiki/about/me.md). These are \
+             HIGHEST PRIORITY: when they conflict with any default behavior in your \
+             instructions, the owner's rules win. Apply them on the first attempt, \
+             without being asked.\n\n{rules}</owner_rules>\n\n{question}"
+        ),
+        None => question,
+    };
     let answer = reasoner.call(&opts, &question).await?;
     println!("{answer}");
     Ok(())
@@ -5105,6 +5116,76 @@ struct WikiQuerier {
     repo_root: PathBuf,
 }
 
+/// #389 — Owner rules travel with EVERY query-mode prompt, injected at
+/// request time rather than left for the model to (maybe) read.
+///
+/// The system prompt used to only *instruct* the model to read `about/me.md`
+/// "before drafting anything" — loading was conditional on the model first
+/// classifying the turn as drafting, so corrections the user filed there
+/// were dead letters exactly when the turn was misclassified (observed
+/// 2026-07-09: both Bo Motlagh sessions read me.md first and still ignored
+/// the deliverable-placement rule; a wiki file can't outrank prompt
+/// structure). Injecting the sections as a highest-priority preamble removes
+/// the classification step entirely, and — unlike the compile-embedded
+/// schema — picks up new corrections on the very next turn, no rebuild.
+///
+/// Returns `None` when me.md is missing or has none of the wanted sections
+/// (fresh installs) — the prompt then behaves exactly as before.
+fn owner_rules_block(wiki_root: &std::path::Path) -> Option<String> {
+    // "Writing style preferences" = how drafts read; "Agent behavior rules"
+    // = how turns are conducted (deliverable placement, routing). The split
+    // is documented in schema/wiki-ask.md's durable-facts pass.
+    const SECTIONS: [&str; 2] = ["Writing style preferences", "Agent behavior rules"];
+    // Generous cap: me.md rule sections are a handful of bullets today;
+    // truncation is a guard against unbounded growth, not an expectation.
+    const MAX_BLOCK_CHARS: usize = 4000;
+
+    let me = std::fs::read_to_string(wiki_root.join("about").join("me.md")).ok()?;
+    let mut block = String::new();
+    for sec in SECTIONS {
+        if let Some(body) = extract_md_section(&me, sec) {
+            let body = body.trim();
+            if !body.is_empty() {
+                block.push_str("### ");
+                block.push_str(sec);
+                block.push('\n');
+                block.push_str(body);
+                block.push_str("\n\n");
+            }
+        }
+    }
+    if block.trim().is_empty() {
+        return None;
+    }
+    if block.len() > MAX_BLOCK_CHARS {
+        let mut end = MAX_BLOCK_CHARS;
+        while end > 0 && !block.is_char_boundary(end) {
+            end -= 1;
+        }
+        block.truncate(end);
+        block.push_str("\n[truncated — read wiki/about/me.md for the rest]\n");
+    }
+    Some(block)
+}
+
+/// Return the body of the `## <heading>` section of a markdown doc: the text
+/// after the heading line up to (not including) the next `## ` heading or
+/// EOF. Exact heading match after the `## ` prefix (trimmed).
+fn extract_md_section<'a>(md: &'a str, heading: &str) -> Option<&'a str> {
+    let mut start: Option<usize> = None;
+    for line in md.lines() {
+        let idx = line.as_ptr() as usize - md.as_ptr() as usize;
+        if let Some(h) = line.strip_prefix("## ") {
+            match start {
+                None if h.trim() == heading => start = Some(idx + line.len()),
+                Some(s) => return Some(&md[s..idx]),
+                None => {}
+            }
+        }
+    }
+    start.map(|s| &md[s..])
+}
+
 #[async_trait]
 impl QueryHandler for WikiQuerier {
     async fn answer(
@@ -5124,7 +5205,18 @@ impl QueryHandler for WikiQuerier {
                 channel_id,
             }));
         }
-        self.reasoner.call(&opts, question).await
+        // #389 — prepend the owner's standing rules as a highest-priority
+        // block so they apply on the first attempt, every turn.
+        let prompt = match owner_rules_block(&self.wiki_root) {
+            Some(rules) => format!(
+                "<owner_rules>\nStanding rules from the owner (wiki/about/me.md). These are \
+                 HIGHEST PRIORITY: when they conflict with any default behavior in your \
+                 instructions, the owner's rules win. Apply them on the first attempt, \
+                 without being asked.\n\n{rules}</owner_rules>\n\n{question}"
+            ),
+            None => question.to_string(),
+        };
+        self.reasoner.call(&opts, &prompt).await
     }
 }
 
@@ -5167,7 +5259,17 @@ struct LoopReasonerRunner {
 impl LoopRunner for LoopReasonerRunner {
     async fn run_prompt(&self, prompt: &str) -> anyhow::Result<String> {
         let opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
-        self.reasoner.call(&opts, prompt).await
+        // #389 — loops fire through the same query toolbelt, so they carry
+        // the same owner-rules preamble as interactive asks.
+        let prompt = match owner_rules_block(&self.wiki_root) {
+            Some(rules) => format!(
+                "<owner_rules>\nStanding rules from the owner (wiki/about/me.md). These are \
+                 HIGHEST PRIORITY: when they conflict with any default behavior in your \
+                 instructions, the owner's rules win.\n\n{rules}</owner_rules>\n\n{prompt}"
+            ),
+            None => prompt.to_string(),
+        };
+        self.reasoner.call(&opts, &prompt).await
     }
 }
 
@@ -5256,6 +5358,66 @@ fn parse_loop_json(raw: &str) -> std::result::Result<augmentagent_approval_disco
         cron_expr,
         tz,
     })
+}
+
+#[cfg(test)]
+mod owner_rules_tests {
+    use super::{extract_md_section, owner_rules_block};
+
+    const ME_MD: &str = "# About Me\n\n## Identity\n\nNolan.\n\n## Writing style preferences\n\n- No em-dashes. (user said, 2026-05-04)\n- Deliverable is the text itself. (user said, 2026-07-08)\n\n## Agent behavior rules\n\n- Email asks end with an approval card.\n\n## Routing preferences\n\n- VIPs flagged.\n";
+
+    #[test]
+    fn extracts_section_body_up_to_next_heading() {
+        let body = extract_md_section(ME_MD, "Writing style preferences").unwrap();
+        assert!(body.contains("No em-dashes"));
+        assert!(body.contains("Deliverable is the text itself"));
+        assert!(!body.contains("approval card"), "must stop at next ## heading");
+    }
+
+    #[test]
+    fn extracts_last_section_to_eof() {
+        let body = extract_md_section(ME_MD, "Routing preferences").unwrap();
+        assert!(body.contains("VIPs flagged"));
+    }
+
+    #[test]
+    fn missing_section_returns_none() {
+        assert!(extract_md_section(ME_MD, "Nonexistent").is_none());
+    }
+
+    #[test]
+    fn block_includes_style_and_behavior_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        std::fs::write(tmp.path().join("about").join("me.md"), ME_MD).unwrap();
+        let block = owner_rules_block(tmp.path()).expect("block should build");
+        assert!(block.contains("### Writing style preferences"));
+        assert!(block.contains("### Agent behavior rules"));
+        assert!(block.contains("approval card"));
+        // Non-rule sections must NOT leak into every prompt.
+        assert!(!block.contains("VIPs flagged"));
+        assert!(!block.contains("Nolan."));
+    }
+
+    #[test]
+    fn missing_me_md_yields_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(owner_rules_block(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn oversized_block_truncates_with_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        let big = format!(
+            "## Writing style preferences\n\n{}\n",
+            "- rule with some padding text to inflate the size\n".repeat(200)
+        );
+        std::fs::write(tmp.path().join("about").join("me.md"), big).unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+        assert!(block.len() < 4200, "cap not applied: {} chars", block.len());
+        assert!(block.contains("[truncated"), "missing truncation marker");
+    }
 }
 
 #[cfg(test)]
