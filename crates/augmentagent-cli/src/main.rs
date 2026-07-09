@@ -1450,9 +1450,10 @@ enum GmailOp {
     /// When `--post` is set, also surface a Discord approval card (Approve /
     /// Revise / Skip) wired into the existing event handler, so the user can
     /// send straight from chat instead of copy/pasting the draft into Gmail
-    /// (#352). Requires `--thread-id` and `--reply-to-message-id` so the
-    /// Approve handler can find the right Gmail draft and the Revise handler
-    /// has an original message to redraft against.
+    /// (#352). Works for replies AND brand-new emails (#412): pass
+    /// `--thread-id` + `--reply-to-message-id` together for a reply card, or
+    /// neither for a new-email card (the action is keyed on a synthetic
+    /// `compose:<draft_id>` id and Revise redrafts against the draft body).
     Compose {
         /// Email address (e.g. `me@example.com`) or Composio entity_id of the
         /// sending account. Required when more than one account is connected.
@@ -1477,14 +1478,15 @@ enum GmailOp {
         thread_id: Option<String>,
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         json: bool,
-        /// Also post a Discord approval card for this draft (#352). Implies
-        /// reply context: requires `--thread-id` and `--reply-to-message-id`.
+        /// Also post a Discord approval card for this draft (#352, #412).
+        /// For a reply card pass `--thread-id` + `--reply-to-message-id`;
+        /// for a new-email card pass neither.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         post: bool,
         /// Gmail messageId of the inbound message we're replying to. Used as
         /// the action row's messageId so the Approve / Revise / Skip handlers
-        /// resolve the same way they do for auto-triage replies. Required
-        /// with `--post`.
+        /// resolve the same way they do for auto-triage replies. Pass it
+        /// (with `--thread-id`) for reply cards; omit for new-email cards.
         #[arg(long)]
         reply_to_message_id: Option<String>,
         /// Original sender address (shown on the approval card's `From`
@@ -3945,6 +3947,17 @@ async fn run_gmail_compose(
     reply_to_body_file: Option<String>,
 ) -> Result<()> {
     let body_str = read_body(body, body_file)?;
+    // Validate the --post flag pairing BEFORE any Gmail write, so a usage
+    // error can't strand an orphan draft in the mailbox (#412).
+    if post
+        && thread_id.as_deref().map_or(false, |t| !t.is_empty())
+            != reply_to_message_id.as_deref().map_or(false, |m| !m.is_empty())
+    {
+        anyhow::bail!(
+            "--thread-id and --reply-to-message-id go together: pass both (reply card) \
+             or neither (new-email card)"
+        );
+    }
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
@@ -4011,12 +4024,21 @@ async fn run_gmail_compose(
     Ok(())
 }
 
-/// #352 — Post a Discord approval card for a draft the wiki-ask agent just
-/// composed in a chat session. Writes the same `actions`-table shape as the
-/// auto-triage path so the daemon's Approve/Revise/Skip handlers don't need
-/// to distinguish where the card came from. Upserts an `emails` row when one
-/// isn't already present so the Revise redraft path has the original body to
-/// work against.
+/// #352 / #412 — Post a Discord approval card for a draft the wiki-ask agent
+/// just composed in a chat session. Writes the same `actions`-table shape as
+/// the auto-triage path so the daemon's Approve/Revise/Skip handlers don't
+/// need to distinguish where the card came from. Upserts an `emails` row when
+/// one isn't already present so the Revise redraft path has the original body
+/// to work against.
+///
+/// Two shapes (#412):
+/// - **Reply**: `--thread-id` + `--reply-to-message-id` present — the card is
+///   anchored to the real inbound message, exactly the #352 flow.
+/// - **New email**: both absent — there is no inbound, so the action is keyed
+///   on a synthetic `compose:<draft_id>` message id (the same convention the
+///   compose fan-out uses), the card's From field shows the recipient, and
+///   Revise redrafts against the draft body alone. Approve → send_draft,
+///   Skip → delete_draft, identical to replies.
 #[allow(clippy::too_many_arguments)]
 async fn post_reply_approval_card(
     store: &Store,
@@ -4035,12 +4057,23 @@ async fn post_reply_approval_card(
 ) -> Result<()> {
     use augmentagent_store::Email as StoreEmail;
 
-    let thread = thread_id
-        .filter(|t| !t.is_empty())
-        .context("--post requires --thread-id (the Gmail thread this reply attaches to)")?;
-    let reply_msg_id = reply_to_message_id
-        .filter(|s| !s.is_empty())
-        .context("--post requires --reply-to-message-id (the inbound messageId being replied to)")?;
+    let thread = thread_id.filter(|t| !t.is_empty());
+    let reply_msg_id = reply_to_message_id.filter(|s| !s.is_empty());
+    // A reply anchor only makes sense as a pair: a message id without its
+    // thread (or vice versa) would post a card whose Approve sends an
+    // unthreaded reply while claiming otherwise. run_gmail_compose validates
+    // this BEFORE creating the draft; re-check defensively for other callers.
+    anyhow::ensure!(
+        thread.is_some() == reply_msg_id.is_some(),
+        "--thread-id and --reply-to-message-id go together: pass both (reply card) \
+         or neither (new-email card)"
+    );
+    // New-email cards (#412): key the action on a synthetic message id so the
+    // approve/skip/revise handlers — which join actions→emails on messageId —
+    // find the upserted row below. `compose:` prefix matches the fan-out
+    // convention and can never collide with a real Gmail hex id.
+    let synthetic_msg_id = format!("compose:{draft_id}");
+    let msg_id: &str = reply_msg_id.unwrap_or(&synthetic_msg_id);
     let token = std::env::var("DISCORD_BOT_TOKEN")
         .context("DISCORD_BOT_TOKEN required for --post (set it in the daemon's .env)")?;
     let cid: u64 = std::env::var("DISCORD_CHANNEL_ID")
@@ -4072,10 +4105,12 @@ async fn post_reply_approval_card(
     // message. The Revise handler reads `emails.body` to redraft against the
     // original; without a row, revise has nothing to redraft. When the row
     // already exists (the auto-triage path saw it first), upsert refreshes
-    // its bytes — same shape the email channel writes.
+    // its bytes — same shape the email channel writes. For a new-email card
+    // the row is purely synthetic (empty body, no thread): it exists so the
+    // actions→emails join resolves and Approve can find the entity id.
     let inbound = StoreEmail {
-        message_id: reply_msg_id.to_string(),
-        thread_id: Some(thread.to_string()),
+        message_id: msg_id.to_string(),
+        thread_id: thread.map(str::to_string),
         from: original_from.clone(),
         subject: original_subject.clone(),
         body: original_body.clone(),
@@ -4090,8 +4125,8 @@ async fn post_reply_approval_card(
 
     let action_id = store
         .log_action(
-            reply_msg_id,
-            Some(thread),
+            msg_id,
+            thread,
             &original_from,
             &original_subject,
             Some(&original_body),
@@ -4110,6 +4145,20 @@ async fn post_reply_approval_card(
         .send_message(&http, card)
         .await
         .context("send approval card to Discord")?;
+
+    // Mark this action as the ACTIVE nudge (count 0 → 1). Without this the
+    // daemon's serial-queue scheduler sees a pending row with nudgeCount=0
+    // and promotes it — posting a duplicate card for the draft the user is
+    // already looking at (#412; latent since #352).
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0i64);
+    if let Err(e) =
+        store.record_nudge(&action_id, now_ms + augmentagent_store::NUDGE_INTERVAL_MS)
+    {
+        tracing::warn!(action_id, "record_nudge after compose card failed: {e}");
+    }
 
     let _ = account_email;
     Ok(())

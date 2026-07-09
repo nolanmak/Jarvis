@@ -175,7 +175,8 @@ impl ComposioClient {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        return resp.json::<serde_json::Value>().await.map_err(Into::into);
+                        let v = resp.json::<serde_json::Value>().await?;
+                        return check_envelope(action, v);
                     }
                     // Retry 5xx and 429; surface 4xx (other than 429) immediately.
                     let retryable = status.as_u16() == 429 || status.is_server_error();
@@ -248,18 +249,14 @@ impl ComposioClient {
             "message_id": id,
             "format": "minimal",
         });
+        // execute() rejects successful:false envelopes centrally (#402), so
+        // an Ok here is a real hit.
         if let Ok(v) = self
             .execute("GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID", entity_id, args)
             .await
         {
-            let ok = v
-                .get("successful")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(true);
-            if ok {
-                if let Some(t) = find_string_field(&v, &["threadId", "thread_id"]) {
-                    return Ok(t);
-                }
+            if let Some(t) = find_string_field(&v, &["threadId", "thread_id"]) {
+                return Ok(t);
             }
         }
         match self.fetch_thread_messages(entity_id, id, 1).await {
@@ -694,6 +691,56 @@ mod tests {
         assert_eq!(new_id, "NEWDRAFT");
     }
 
+    // ---- #402: HTTP 200 + successful:false must be an error, not success ----
+
+    // delete_draft was the live failure: `deleted:` printed while the draft
+    // stayed in the mailbox. The envelope error text and log_id must surface.
+    #[tokio::test]
+    async fn successful_false_envelope_fails_delete_draft() {
+        let body = r#"{"successful":false,"error":"Invalid delete request","log_id":"log_abc123","data":{}}"#;
+        let addr = spawn_one_shot_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let err = client
+            .delete_draft("entity-x", "19f42a66139fbe45")
+            .await
+            .expect_err("successful:false must not report success");
+        let display = format!("{err}");
+        assert!(display.contains("successful:false"), "missing marker: {display}");
+        assert!(display.contains("Invalid delete request"), "missing upstream error: {display}");
+        assert!(display.contains("log_abc123"), "missing log_id: {display}");
+        assert!(display.contains("GMAIL_DELETE_DRAFT"), "missing action: {display}");
+    }
+
+    // send_draft is the scariest variant: a false success here marks an
+    // approval action Sent while no mail went out.
+    #[tokio::test]
+    async fn successful_false_envelope_fails_send_draft() {
+        let body = r#"{"successful":false,"error":"Requested entity was not found.","data":{}}"#;
+        let addr = spawn_one_shot_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        assert!(
+            client.send_draft("entity-x", "r-nonexistent").await.is_err(),
+            "send_draft must fail on successful:false"
+        );
+    }
+
+    // Leniency guard: envelopes WITHOUT the `successful` key (older builds,
+    // fetch shapes) must keep working — only an explicit false fails.
+    #[tokio::test]
+    async fn envelope_without_successful_key_still_succeeds() {
+        let body = r#"{"data":{"id":"DRAFT_OK"}}"#;
+        let addr = spawn_one_shot_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let id = client
+            .create_draft("entity-x", "to@example.com", "subj", "body", None)
+            .await
+            .expect("missing successful key must not fail");
+        assert_eq!(id, "DRAFT_OK");
+    }
+
     // Thread preservation source for update-draft: a threaded draft reports
     // its thread; a standalone draft (its message IS the thread head) must
     // report None, because recreating against a thread that only contained
@@ -719,6 +766,41 @@ mod tests {
             .expect("list should succeed");
         assert_eq!(standalone, None);
     }
+}
+
+/// Composio v3 wraps TOOL-level failures in an HTTP 200 envelope:
+/// `{"successful": false, "error": "…", "log_id": "…"}`. Treating 2xx as
+/// success made every void operation (delete_draft, send_draft) report
+/// false success — `delete-draft` printed `deleted:` while the draft stayed
+/// live in the mailbox, and an Approve could claim "sent" having sent
+/// nothing (#402, observed live 2026-07-08). Fail here, centrally, so every
+/// caller sees the truth.
+///
+/// Lenient on shape: only an explicit `"successful": false` (or a non-null
+/// string `"error"` alongside it) fails; envelopes without the key (older
+/// builds, mock tests) pass through untouched.
+fn check_envelope(
+    action: &str,
+    v: serde_json::Value,
+) -> Result<serde_json::Value, GmailError> {
+    let unsuccessful = v.get("successful").and_then(serde_json::Value::as_bool) == Some(false);
+    if !unsuccessful {
+        return Ok(v);
+    }
+    let err_text = v
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("(no error field in envelope)");
+    let log_id = v
+        .get("log_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    Err(GmailError::Composio {
+        message: format!(
+            "{action} reported successful:false — {} (composio log_id {log_id})",
+            err_text.trim()
+        ),
+    })
 }
 
 /// Recursively search a JSON value for the first string-valued field whose
