@@ -121,6 +121,8 @@ pub enum JournalError {
     Signing(String),
     #[error("response decode: {0}")]
     Decode(#[from] serde_json::Error),
+    #[error("store: {0}")]
+    Store(String),
 }
 
 /// The seam higher layers (ingest poller, Discord write-back) depend on.
