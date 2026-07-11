@@ -1,0 +1,40 @@
+[package]
+name = "augmentagent-channel-journal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+augmentagent-channel-core = { path = "../augmentagent-channel-core" }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+uuid = { workspace = true }
+
+# IAM SigV4 signing for AppSync + KMS envelope keys. The ShadowNote
+# integration deliberately uses IAM (never Cognito user auth) so the daemon
+# needs no interactive sign-in and no refresh-token renewal — see the
+# integration epic. Default features keep the SDK on rustls.
+http = "1"
+aws-config = "1"
+aws-credential-types = "1"
+aws-sigv4 = "1"
+aws-sdk-kms = "1"
+
+# CryptoJS/OpenSSL-EVP compatible entry-content crypto (pure Rust, no
+# openssl linkage): Salted__ header, MD5 EVP_BytesToKey, AES-256-CBC.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+md-5 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+
+[dev-dependencies]
+mockito = "1"
