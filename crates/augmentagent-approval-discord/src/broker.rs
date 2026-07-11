@@ -14,7 +14,7 @@ use augmentagent_store::{Email, Store};
 use crate::event_handler::Handler;
 use crate::layout::{approval_message, flag_notice_message};
 use crate::loops::LoopCommandParser;
-use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, InvoiceOps, QueryHandler};
+use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, InvoiceOps, JournalOps, QueryHandler};
 
 #[derive(Clone)]
 pub struct DiscordConfig {
@@ -45,6 +45,9 @@ pub struct DiscordConfig {
     /// path (list / stop / help still work). The CLI wires this with a Claude
     /// reasoner; tests can omit it.
     pub loop_parser: Option<Arc<dyn LoopCommandParser>>,
+    /// Bridge into the cli's ShadowNote journaling flow (#428). `None`
+    /// leaves `!journal` answering with a not-configured notice.
+    pub journal_ops: Option<Arc<dyn JournalOps>>,
 }
 
 pub(crate) struct BrokerState {
@@ -61,6 +64,8 @@ pub(crate) struct BrokerState {
     pub(crate) store: Option<Arc<Store>>,
     /// LLM parser for `/loop` create text. `None` disables the create path.
     pub(crate) loop_parser: Option<Arc<dyn LoopCommandParser>>,
+    /// ShadowNote journaling bridge for `!journal` (#428).
+    pub(crate) journal_ops: Option<Arc<dyn JournalOps>>,
     /// Populated once, from the first `Ready` event. Used to distinguish the
     /// bot's own messages from the user's when building conversation context.
     pub(crate) bot_user_id: std::sync::OnceLock<UserId>,
@@ -78,6 +83,7 @@ impl BrokerState {
         invoice_ops: Option<Arc<dyn InvoiceOps>>,
         store: Option<Arc<Store>>,
         loop_parser: Option<Arc<dyn LoopCommandParser>>,
+        journal_ops: Option<Arc<dyn JournalOps>>,
     ) -> Self {
         Self {
             ready: Arc::new(Notify::new()),
@@ -91,6 +97,7 @@ impl BrokerState {
             invoice_ops,
             store,
             loop_parser,
+            journal_ops,
             bot_user_id: std::sync::OnceLock::new(),
         }
     }
@@ -130,6 +137,7 @@ impl DiscordApprovalBroker {
             config.invoice_ops.clone(),
             config.store.clone(),
             config.loop_parser.clone(),
+            config.journal_ops.clone(),
         ));
 
         let mut intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES;

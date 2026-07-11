@@ -11,6 +11,7 @@
 mod broker;
 mod custom_id;
 mod event_handler;
+mod journal_cmd;
 mod layout;
 mod loops;
 mod nudge;
@@ -20,6 +21,7 @@ mod surface;
 mod presets;
 
 pub use broker::{DiscordApprovalBroker, DiscordConfig};
+pub use journal_cmd::{parse_journal_command, JournalCmd, JOURNAL_NOT_CONFIGURED, JOURNAL_USAGE};
 pub use event_handler::{chunk_for_discord, post_invoice_draft_card};
 // #35 Phase 5: the email channel appends the needs-input marker to the
 // persisted draft via this; the card decodes it on render. `NeedsInput` is
@@ -175,6 +177,29 @@ pub trait InvoiceOps: Send + Sync {
         week_end: chrono::NaiveDate,
         email: Option<(String, String)>,
     ) -> anyhow::Result<String>;
+}
+
+/// Bridge into the ShadowNote journaling flow (#428) — same shape as
+/// [`InvoiceOps`]: this crate owns the `!journal` grammar + dispatch, the
+/// cli implements the encrypt/AppSync/wiki-ingest plumbing, no circular
+/// dep and no AWS dependencies here.
+///
+/// Both methods return the user-facing reply line. The `Err` string is
+/// ALSO user-facing and must carry enough of the entry text that a failed
+/// save never silently loses what the user wrote.
+#[async_trait]
+pub trait JournalOps: Send + Sync {
+    /// `!journal <text>` — save the raw message text as an entry (the
+    /// impl wraps it into the app's paragraph HTML).
+    async fn save_text(&self, title: Option<String>, text: &str) -> Result<String, String>;
+
+    /// `!journal done [title]` — compose an entry from the conversation
+    /// excerpt and save it. `title_override` wins over the composed title.
+    async fn compose_and_save(
+        &self,
+        history: &str,
+        title_override: Option<String>,
+    ) -> Result<String, String>;
 }
 
 /// What [`InvoiceOps::draft_pdf`] returns: enough to post a Discord card
