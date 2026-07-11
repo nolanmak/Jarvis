@@ -116,6 +116,59 @@ impl EventHandler for Handler {
             return;
         }
 
+        // `!journal` — ShadowNote journaling write-back (#428).
+        // Handled inline, never routed to wiki-ask. The slow
+        // path (compose LLM call + KMS + AppSync) runs off the event loop.
+        if let Some(cmd) = crate::journal_cmd::parse_journal_command(&user_text) {
+            use crate::journal_cmd::{JournalCmd, JOURNAL_NOT_CONFIGURED, JOURNAL_USAGE};
+            let ops = self.state.journal_ops.clone();
+            let ctx_for_history = ctx.clone();
+            let http = ctx.http.clone();
+            let channel_id = msg.channel_id;
+            let msg_id = msg.id;
+            let bot_user_id = self.state.bot_user_id.get().copied();
+            let allowed_user_id = self.state.allowed_user_id;
+            tokio::spawn(async move {
+                let reply = match (ops, cmd) {
+                    (_, JournalCmd::Usage) => JOURNAL_USAGE.to_string(),
+                    (None, _) => JOURNAL_NOT_CONFIGURED.to_string(),
+                    (Some(ops), JournalCmd::Text(text)) => ops
+                        .save_text(None, &text)
+                        .await
+                        .unwrap_or_else(|user_facing_err| user_facing_err),
+                    (Some(ops), JournalCmd::Done { title }) => {
+                        let history = fetch_conversation_context(
+                            &ctx_for_history,
+                            channel_id,
+                            msg_id,
+                            bot_user_id,
+                            allowed_user_id,
+                        )
+                        .await;
+                        if history.trim().is_empty() {
+                            "I couldn't read any recent conversation to compose from — \
+                             write the entry directly with `!journal <text>`."
+                                .to_string()
+                        } else {
+                            ops.compose_and_save(&history, title)
+                                .await
+                                .unwrap_or_else(|user_facing_err| user_facing_err)
+                        }
+                    }
+                };
+                send_chunks_reply_chain(
+                    &http,
+                    channel_id,
+                    msg_id,
+                    chunk_for_discord(&reply),
+                    Vec::new(),
+                    "journal command reply",
+                )
+                .await;
+            });
+            return;
+        }
+
         // `!loops` — list / stop running `claude` CLI processes (#176).
         // Distinct from `/loop` below (which is the in-process scheduler).
         // Matched first because the visual similarity to `/loop` makes

@@ -14,7 +14,7 @@ use augmentagent_store::{Email, Store};
 use crate::event_handler::Handler;
 use crate::layout::{approval_message, flag_notice_message, scheduled_notice_message};
 use crate::loops::LoopCommandParser;
-use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, QueryHandler};
+use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, JournalOps, QueryHandler};
 
 #[derive(Clone)]
 pub struct DiscordConfig {
@@ -43,6 +43,9 @@ pub struct DiscordConfig {
     /// wiki-ask answers resolve against (and are confined to) this directory;
     /// `None` refuses every marker with a visible note in the reply.
     pub wiki_root: Option<std::path::PathBuf>,
+    /// Bridge into the cli's ShadowNote journaling flow (#428). `None`
+    /// leaves `!journal` answering with a not-configured notice.
+    pub journal_ops: Option<Arc<dyn JournalOps>>,
 }
 
 pub(crate) struct BrokerState {
@@ -59,6 +62,8 @@ pub(crate) struct BrokerState {
     pub(crate) loop_parser: Option<Arc<dyn LoopCommandParser>>,
     /// Wiki root that `ATTACH:` answer markers are confined to (#440).
     pub(crate) wiki_root: Option<std::path::PathBuf>,
+    /// ShadowNote journaling bridge for `!journal` (#428).
+    pub(crate) journal_ops: Option<Arc<dyn JournalOps>>,
     /// Populated once, from the first `Ready` event. Used to distinguish the
     /// bot's own messages from the user's when building conversation context.
     pub(crate) bot_user_id: std::sync::OnceLock<UserId>,
@@ -75,6 +80,7 @@ impl BrokerState {
         store: Option<Arc<Store>>,
         loop_parser: Option<Arc<dyn LoopCommandParser>>,
         wiki_root: Option<std::path::PathBuf>,
+        journal_ops: Option<Arc<dyn JournalOps>>,
     ) -> Self {
         Self {
             ready: Arc::new(Notify::new()),
@@ -87,6 +93,7 @@ impl BrokerState {
             store,
             loop_parser,
             wiki_root,
+            journal_ops,
             bot_user_id: std::sync::OnceLock::new(),
         }
     }
@@ -125,6 +132,7 @@ impl DiscordApprovalBroker {
             config.store.clone(),
             config.loop_parser.clone(),
             config.wiki_root.clone(),
+            config.journal_ops.clone(),
         ));
 
         if state.allowed_user_id.is_none() {
