@@ -551,8 +551,10 @@ name = "augmentagent-channel-journal"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "anyhow",
  "async-trait",
  "augmentagent-channel-core",
+ "augmentagent-store",
  "aws-config",
  "aws-credential-types",
  "aws-sdk-kms",
@@ -566,8 +568,10 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -855,6 +859,7 @@ dependencies = [
  "augmentagent-channel-email",
  "augmentagent-channel-gdrive",
  "augmentagent-channel-github",
+ "augmentagent-channel-journal",
  "augmentagent-channel-linkedin",
  "augmentagent-channel-meetup",
  "augmentagent-channel-reddit",

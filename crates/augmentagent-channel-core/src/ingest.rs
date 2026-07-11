@@ -28,6 +28,9 @@ pub enum IngestTrigger {
     /// Calendar event observation logged to attendee wiki pages. Pairs with
     /// `DecisionKind::Meeting`. Wave-A: gcal channel (archived AugmentAgent#82).
     Meeting,
+    /// ShadowNote journal entry synced into the wiki (#427). Pairs with
+    /// `DecisionKind::Capture`, like voice memos.
+    Journal,
 }
 
 impl IngestTrigger {
@@ -40,6 +43,7 @@ impl IngestTrigger {
             Self::Rejected => "rejected",
             Self::VoiceMemo => "voice-memo",
             Self::Meeting => "meeting",
+            Self::Journal => "journal",
         }
     }
 }
