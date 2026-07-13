@@ -20,6 +20,8 @@ pub enum GmailError {
     Composio { message: String },
     #[error("decode: {0}")]
     Decode(String),
+    #[error("invalid input: {0}")]
+    Invalid(String),
 }
 
 #[async_trait]
@@ -411,9 +413,18 @@ impl ComposioClient {
         })
     }
 
-    /// `create_draft` with an optional uploaded attachment (#417). Inherent
-    /// (not on the `GmailApi` trait) so test fakes and the triage channel —
-    /// which never attach — stay untouched.
+    /// `create_draft` with an optional uploaded attachment (#417) and
+    /// optional cc/bcc lists (#439). Inherent (not on the `GmailApi` trait)
+    /// so test fakes and the triage channel — which never attach or cc —
+    /// stay untouched.
+    ///
+    /// `to` may carry SEVERAL addresses (`a@x.com, b@y.com`, display names
+    /// allowed). Composio's `GMAIL_CREATE_EMAIL_DRAFT` takes exactly one
+    /// `recipient_email` string plus an `extra_recipients` array — a
+    /// comma-joined string is rejected as "Invalid email format" (#439) —
+    /// so the split lives HERE rather than at each caller: the Revise
+    /// redraft path round-trips the joined list through `emails.from` and
+    /// must keep everyone on it.
     pub async fn create_draft_with_attachment(
         &self,
         entity_id: &str,
@@ -422,13 +433,29 @@ impl ComposioClient {
         body: &str,
         thread_id: Option<&str>,
         attachment: Option<&Attachment>,
+        cc: &[String],
+        bcc: &[String],
     ) -> Result<String, GmailError> {
-        let bare_to = extract_bare_email(to);
+        let recipients = split_recipients(to);
+        let (first, rest) = recipients
+            .split_first()
+            .ok_or_else(|| GmailError::Invalid(format!("no recipient address in {to:?}")))?;
         let mut args = serde_json::json!({
-            "recipient_email": bare_to,
+            "recipient_email": first,
             "subject": subject,
             "body": body,
         });
+        if !rest.is_empty() {
+            args["extra_recipients"] = serde_json::json!(rest);
+        }
+        let cc: Vec<String> = cc.iter().flat_map(|s| split_recipients(s)).collect();
+        if !cc.is_empty() {
+            args["cc"] = serde_json::json!(cc);
+        }
+        let bcc: Vec<String> = bcc.iter().flat_map(|s| split_recipients(s)).collect();
+        if !bcc.is_empty() {
+            args["bcc"] = serde_json::json!(bcc);
+        }
         if let Some(t) = thread_id {
             args["thread_id"] = serde_json::Value::String(t.to_string());
         }
@@ -451,8 +478,9 @@ impl ComposioClient {
     }
 
     /// `update_draft` (create replacement + delete old) with an optional
-    /// attachment for the replacement (#417). Mirrors the trait default;
-    /// returns the NEW draft id.
+    /// attachment (#417) and cc/bcc lists (#439) for the replacement.
+    /// Mirrors the trait default; returns the NEW draft id.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_draft_with_attachment(
         &self,
         entity_id: &str,
@@ -462,9 +490,13 @@ impl ComposioClient {
         body: &str,
         thread_id: Option<&str>,
         attachment: Option<&Attachment>,
+        cc: &[String],
+        bcc: &[String],
     ) -> Result<String, GmailError> {
         let new_id = self
-            .create_draft_with_attachment(entity_id, to, subject, body, thread_id, attachment)
+            .create_draft_with_attachment(
+                entity_id, to, subject, body, thread_id, attachment, cc, bcc,
+            )
             .await?;
         if let Err(e) = self.delete_draft(entity_id, draft_id).await {
             tracing::warn!(
@@ -624,6 +656,41 @@ pub fn extract_bare_email(raw: &str) -> String {
     raw.trim().to_string()
 }
 
+/// Split an RFC 5322-style recipient list into bare addresses (#439).
+/// Commas inside double quotes (`"Doe, John" <j@x.com>`) or angle brackets
+/// don't split; each part is then reduced via [`extract_bare_email`] and
+/// empty parts are dropped.
+pub fn split_recipients(raw: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut in_angle = false;
+    for c in raw.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                cur.push(c);
+            }
+            '<' if !in_quotes => {
+                in_angle = true;
+                cur.push(c);
+            }
+            '>' if !in_quotes => {
+                in_angle = false;
+                cur.push(c);
+            }
+            ',' if !in_quotes && !in_angle => parts.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    parts.push(cur);
+    parts
+        .iter()
+        .map(|p| extract_bare_email(p))
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,6 +713,42 @@ mod tests {
             extract_bare_email("User <user+tag@example.com>"),
             "user+tag@example.com"
         );
+    }
+
+    // ---- #439: multi-recipient splitting ----
+
+    #[test]
+    fn split_recipients_comma_list() {
+        assert_eq!(
+            split_recipients("nayra@example.com,bo@example.com"),
+            vec!["nayra@example.com", "bo@example.com"]
+        );
+        // The space-after-comma variant from the second failure log.
+        assert_eq!(
+            split_recipients("nayra@example.com, bo@example.com"),
+            vec!["nayra@example.com", "bo@example.com"]
+        );
+    }
+
+    #[test]
+    fn split_recipients_single_passthrough() {
+        assert_eq!(split_recipients("x@y.com"), vec!["x@y.com"]);
+        assert_eq!(split_recipients("Name <x@y.com>"), vec!["x@y.com"]);
+    }
+
+    #[test]
+    fn split_recipients_display_names_with_quoted_comma() {
+        assert_eq!(
+            split_recipients(r#""Doe, John" <j@x.com>, Jane <jane@y.com>"#),
+            vec!["j@x.com", "jane@y.com"]
+        );
+    }
+
+    #[test]
+    fn split_recipients_drops_empty_parts() {
+        assert_eq!(split_recipients("a@x.com,, b@y.com,"), vec!["a@x.com", "b@y.com"]);
+        assert!(split_recipients("").is_empty());
+        assert!(split_recipients(" , ").is_empty());
     }
 
     // ---- #164: tool-error propagation ----
@@ -721,6 +824,117 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// One-shot mock that CAPTURES the request (headers + body) and sends it
+    /// down the returned channel, so a test can assert on the exact JSON the
+    /// client put on the wire (#439). Replies 200 with `body`.
+    async fn spawn_capturing_http(
+        body: &'static str,
+    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // Read until the headers are complete AND Content-Length bytes of
+            // body have arrived — a single read can return a partial request.
+            let mut raw: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let Ok(n) = socket.read(&mut buf).await else { break };
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw);
+                if let Some(header_end) = text.find("\r\n\r\n") {
+                    let content_len = text
+                        .lines()
+                        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(str::trim).map(str::to_string))
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if raw.len() >= header_end + 4 + content_len {
+                        break;
+                    }
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&raw).into_owned());
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                len = body.len(),
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+        (addr, rx)
+    }
+
+    // ---- #439: multi-recipient / cc / bcc land as the array params Composio
+    // actually accepts, not a comma-joined `recipient_email` string ----
+
+    #[tokio::test]
+    async fn create_draft_splits_to_into_recipient_email_and_extra_recipients() {
+        let resp = r#"{"successful":true,"data":{"response_data":{"id":"DRAFT439"}}}"#;
+        let (addr, captured) = spawn_capturing_http(resp).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let id = client
+            .create_draft_with_attachment(
+                "entity-x",
+                "nayra@example.com, Bo <bo@example.com>",
+                "subj",
+                "body",
+                None,
+                None,
+                &["cc1@x.com,cc2@y.com".into()],
+                &["hidden@z.com".into()],
+            )
+            .await
+            .expect("multi-recipient draft must succeed");
+        assert_eq!(id, "DRAFT439");
+
+        let raw = captured.await.expect("request captured");
+        let json_start = raw.find("\r\n\r\n").expect("has body") + 4;
+        let v: serde_json::Value = serde_json::from_str(&raw[json_start..]).expect("json body");
+        let args = &v["arguments"];
+        assert_eq!(args["recipient_email"], "nayra@example.com");
+        assert_eq!(args["extra_recipients"], serde_json::json!(["bo@example.com"]));
+        assert_eq!(args["cc"], serde_json::json!(["cc1@x.com", "cc2@y.com"]));
+        assert_eq!(args["bcc"], serde_json::json!(["hidden@z.com"]));
+    }
+
+    #[tokio::test]
+    async fn create_draft_single_recipient_omits_array_params() {
+        let resp = r#"{"successful":true,"data":{"response_data":{"id":"DRAFT1"}}}"#;
+        let (addr, captured) = spawn_capturing_http(resp).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        client
+            .create_draft("entity-x", "solo@x.com", "s", "b", None)
+            .await
+            .expect("single-recipient draft");
+
+        let raw = captured.await.expect("request captured");
+        let json_start = raw.find("\r\n\r\n").expect("has body") + 4;
+        let v: serde_json::Value = serde_json::from_str(&raw[json_start..]).expect("json body");
+        let args = &v["arguments"];
+        assert_eq!(args["recipient_email"], "solo@x.com");
+        // Absent — Composio treats empty arrays fine, but the pre-#439 wire
+        // shape (no extra keys) is preserved for the single case.
+        assert!(args.get("extra_recipients").is_none());
+        assert!(args.get("cc").is_none());
+        assert!(args.get("bcc").is_none());
+    }
+
+    #[tokio::test]
+    async fn create_draft_rejects_empty_recipient_list() {
+        let client = ComposioClient::new("ak_fake".into());
+        let err = client
+            .create_draft("entity-x", " , ", "s", "b", None)
+            .await
+            .expect_err("empty recipient list must fail client-side");
+        assert!(matches!(err, GmailError::Invalid(_)), "got: {err}");
     }
 
     // ---- #331: dedup + timestamp regressions ----
@@ -1281,9 +1495,10 @@ impl GmailApi for ComposioClient {
         body: &str,
         thread_id: Option<&str>,
     ) -> Result<String, GmailError> {
-        // Full logic (incl. the bare-address handling for `recipient_email`)
-        // lives in the inherent attachment-aware variant (#417).
-        self.create_draft_with_attachment(entity_id, to, subject, body, thread_id, None)
+        // Full logic (incl. the multi-recipient split for `recipient_email` /
+        // `extra_recipients`, #439) lives in the inherent attachment-aware
+        // variant (#417).
+        self.create_draft_with_attachment(entity_id, to, subject, body, thread_id, None, &[], &[])
             .await
     }
 
