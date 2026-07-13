@@ -1459,8 +1459,17 @@ enum GmailOp {
         /// sending account. Required when more than one account is connected.
         #[arg(long)]
         account: Option<String>,
+        /// Recipient address(es). Repeat the flag or pass a comma-separated
+        /// list for multiple To recipients (#439): `--to a@x.com --to b@y.com`
+        /// or `--to 'a@x.com, b@y.com'`. Display names are stripped.
+        #[arg(long, required = true)]
+        to: Vec<String>,
+        /// Cc recipient(s). Repeatable / comma-separated like `--to` (#439).
         #[arg(long)]
-        to: String,
+        cc: Vec<String>,
+        /// Bcc recipient(s). Repeatable / comma-separated like `--to` (#439).
+        #[arg(long)]
+        bcc: Vec<String>,
         #[arg(long)]
         subject: String,
         /// Body text. Use `--body-file -` to read from stdin instead.
@@ -1522,8 +1531,17 @@ enum GmailOp {
         account: Option<String>,
         #[arg(long)]
         draft_id: String,
+        /// Recipient address(es); repeatable / comma-separated (#439).
+        #[arg(long, required = true)]
+        to: Vec<String>,
+        /// Cc recipient(s) for the REPLACEMENT draft; repeatable /
+        /// comma-separated. Like --attach, cc/bcc on the old draft are NOT
+        /// carried over — re-pass them here (#439).
         #[arg(long)]
-        to: String,
+        cc: Vec<String>,
+        /// Bcc recipient(s) for the replacement draft (#439).
+        #[arg(long)]
+        bcc: Vec<String>,
         #[arg(long)]
         subject: String,
         #[arg(long)]
@@ -1560,8 +1578,15 @@ enum GmailOp {
     SendNow {
         #[arg(long)]
         account: Option<String>,
+        /// Recipient address(es); repeatable / comma-separated (#439).
+        #[arg(long, required = true)]
+        to: Vec<String>,
+        /// Cc recipient(s); repeatable / comma-separated (#439).
         #[arg(long)]
-        to: String,
+        cc: Vec<String>,
+        /// Bcc recipient(s); repeatable / comma-separated (#439).
+        #[arg(long)]
+        bcc: Vec<String>,
         #[arg(long)]
         subject: String,
         #[arg(long)]
@@ -2520,7 +2545,7 @@ async fn main() -> Result<()> {
             }
             GmailOp::Accounts { json } => run_gmail_accounts(store, *json).await,
             GmailOp::Compose {
-                account, to, subject, body, body_file, thread_id, json,
+                account, to, cc, bcc, subject, body, body_file, thread_id, json,
                 post, allow_duplicate, attach, reply_to_message_id, reply_to_from,
                 reply_to_subject, reply_to_body, reply_to_body_file,
             } => {
@@ -2528,6 +2553,8 @@ async fn main() -> Result<()> {
                     store,
                     account.clone(),
                     to.clone(),
+                    cc.clone(),
+                    bcc.clone(),
                     subject.clone(),
                     body.clone(),
                     body_file.clone(),
@@ -2545,13 +2572,15 @@ async fn main() -> Result<()> {
                 .await
             }
             GmailOp::UpdateDraft {
-                account, draft_id, to, subject, body, body_file, thread_id, attach,
+                account, draft_id, to, cc, bcc, subject, body, body_file, thread_id, attach,
             } => {
                 run_gmail_update_draft(
                     store,
                     account.clone(),
                     draft_id.clone(),
                     to.clone(),
+                    cc.clone(),
+                    bcc.clone(),
                     subject.clone(),
                     body.clone(),
                     body_file.clone(),
@@ -2567,12 +2596,14 @@ async fn main() -> Result<()> {
                 run_gmail_delete_draft(store, account.clone(), draft_id.clone()).await
             }
             GmailOp::SendNow {
-                account, to, subject, body, body_file, thread_id, attach,
+                account, to, cc, bcc, subject, body, body_file, thread_id, attach,
             } => {
                 run_gmail_send_now(
                     store,
                     account.clone(),
                     to.clone(),
+                    cc.clone(),
+                    bcc.clone(),
                     subject.clone(),
                     body.clone(),
                     body_file.clone(),
@@ -4028,10 +4059,31 @@ async fn resolve_compose_thread_id(
     Ok(Some(resolved))
 }
 
+/// #439 — flatten repeated `--to`/`--cc`/`--bcc` values (each possibly a
+/// comma-separated list, display names allowed) into bare addresses, failing
+/// fast on anything that doesn't look like an address rather than letting
+/// Composio reject the whole draft after the attachment/thread work is done.
+fn normalize_recipients(flag: &str, values: &[String]) -> Result<Vec<String>> {
+    let list: Vec<String> = values
+        .iter()
+        .flat_map(|v| augmentagent_channel_email::gmail::split_recipients(v))
+        .collect();
+    for addr in &list {
+        anyhow::ensure!(
+            addr.contains('@') && !addr.contains(char::is_whitespace),
+            "{flag} value {addr:?} doesn't look like an email address"
+        );
+    }
+    Ok(list)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_gmail_compose(
     store: Arc<Store>,
     account: Option<String>,
-    to: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
     subject: String,
     body: Option<String>,
     body_file: Option<String>,
@@ -4046,6 +4098,17 @@ async fn run_gmail_compose(
     reply_to_body: Option<String>,
     reply_to_body_file: Option<String>,
 ) -> Result<()> {
+    // Normalize recipients up front (#439): `to` becomes one canonical
+    // comma-joined string of bare addresses. Everything downstream — the
+    // duplicate guard, the approval card's From field (which the Revise
+    // redraft round-trips back into create_draft), the JSON output — carries
+    // the full list, and the Composio client re-splits it into
+    // recipient_email + extra_recipients at the wire.
+    let to = normalize_recipients("--to", &to)?;
+    anyhow::ensure!(!to.is_empty(), "--to requires at least one email address");
+    let to = to.join(", ");
+    let cc = normalize_recipients("--cc", &cc)?;
+    let bcc = normalize_recipients("--bcc", &bcc)?;
     let body_str = read_body(body, body_file)?;
     // Validate the --post flag pairing BEFORE any Gmail write, so a usage
     // error can't strand an orphan draft in the mailbox (#412).
@@ -4063,7 +4126,10 @@ async fn run_gmail_compose(
     // repeated asks for the same email produced 3 drafts + 2 cards in one
     // observed session; refuse the repeat and point at the existing card.
     if post && !allow_duplicate {
-        let bare_to = augmentagent_channel_email::gmail::extract_bare_email(&to);
+        // `to` is already the normalized bare-address list (#439), so it IS
+        // the guard key — same single-address behavior as before, and a
+        // multi-recipient repeat matches the earlier card's identical list.
+        let bare_to = to.clone();
         if let Some((action_id, draft_id)) = store
             .find_pending_action_for_recipient(&entity_id, &bare_to, &subject)
             .context("duplicate-guard lookup")?
@@ -4090,6 +4156,8 @@ async fn run_gmail_compose(
             &body_str,
             thread_id.as_deref(),
             attachment.as_ref(),
+            &cc,
+            &bcc,
         )
         .await
         .context("create_draft via Composio failed")?;
@@ -4100,6 +4168,8 @@ async fn run_gmail_compose(
             &email,
             &draft_id,
             &to,
+            &cc,
+            &bcc,
             &subject,
             &body_str,
             attachment.as_ref().map(|a| a.name.as_str()),
@@ -4119,6 +4189,8 @@ async fn run_gmail_compose(
                     "account": email,
                     "entity_id": entity_id,
                     "to": to,
+                    "cc": cc,
+                    "bcc": bcc,
                     "subject": subject,
                     "thread_id": thread_id,
                     "attachment": attachment.as_ref().map(|a| a.name.clone()),
@@ -4138,6 +4210,8 @@ async fn run_gmail_compose(
                 "account": email,
                 "entity_id": entity_id,
                 "to": to,
+                "cc": cc,
+                "bcc": bcc,
                 "subject": subject,
                 "thread_id": thread_id,
                 "attachment": attachment.as_ref().map(|a| a.name.clone()),
@@ -4148,6 +4222,12 @@ async fn run_gmail_compose(
         println!("draft created: id={draft_id}");
         println!("account: {email}");
         println!("to:      {to}");
+        if !cc.is_empty() {
+            println!("cc:      {}", cc.join(", "));
+        }
+        if !bcc.is_empty() {
+            println!("bcc:     {}", bcc.join(", "));
+        }
         println!("subject: {subject}");
         if let Some(a) = &attachment {
             println!("attachment: {} ({})", a.name, a.mimetype);
@@ -4179,6 +4259,8 @@ async fn post_reply_approval_card(
     account_email: &str,
     draft_id: &str,
     to: &str,
+    cc: &[String],
+    bcc: &[String],
     out_subject: &str,
     draft_body: &str,
     attachment_name: Option<&str>,
@@ -4275,11 +4357,23 @@ async fn post_reply_approval_card(
     let http = serenity::http::Http::new(&token);
     let channel = serenity::all::ChannelId::new(cid);
     // The card must SHOW the attachment (#417 — "can't see they've been
-    // attached"). Display-only: the actions row keeps the clean body so the
-    // Revise redraft prompt isn't polluted with the marker line.
-    let card_body = match attachment_name {
-        Some(name) => format!("{draft_body}\n\n[attachment: {name}]"),
-        None => draft_body.to_string(),
+    // attached") and any cc/bcc (#439 — "render all recipients"). Display
+    // only: the actions row keeps the clean body so the Revise redraft
+    // prompt isn't polluted with the marker lines.
+    let mut markers = String::new();
+    if !cc.is_empty() {
+        markers.push_str(&format!("\n[cc: {}]", cc.join(", ")));
+    }
+    if !bcc.is_empty() {
+        markers.push_str(&format!("\n[bcc: {}]", bcc.join(", ")));
+    }
+    if let Some(name) = attachment_name {
+        markers.push_str(&format!("\n[attachment: {name}]"));
+    }
+    let card_body = if markers.is_empty() {
+        draft_body.to_string()
+    } else {
+        format!("{draft_body}\n{markers}")
     };
     let card = approval_message(&action_id, &inbound, &card_body, 0);
     channel
@@ -4305,17 +4399,25 @@ async fn post_reply_approval_card(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_gmail_update_draft(
     store: Arc<Store>,
     account: Option<String>,
     draft_id: String,
-    to: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
     subject: String,
     body: Option<String>,
     body_file: Option<String>,
     thread_id: Option<String>,
     attach: Option<PathBuf>,
 ) -> Result<()> {
+    let to = normalize_recipients("--to", &to)?;
+    anyhow::ensure!(!to.is_empty(), "--to requires at least one email address");
+    let to = to.join(", ");
+    let cc = normalize_recipients("--cc", &cc)?;
+    let bcc = normalize_recipients("--bcc", &bcc)?;
     let body_str = read_body(body, body_file)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
@@ -4347,6 +4449,8 @@ async fn run_gmail_update_draft(
             &body_str,
             thread_id.as_deref(),
             attachment.as_ref(),
+            &cc,
+            &bcc,
         )
         .await
         .context("update_draft (create replacement + delete old) via Composio failed")?;
@@ -4408,16 +4512,24 @@ async fn run_gmail_delete_draft(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_gmail_send_now(
     store: Arc<Store>,
     account: Option<String>,
-    to: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
     subject: String,
     body: Option<String>,
     body_file: Option<String>,
     thread_id: Option<String>,
     attach: Option<PathBuf>,
 ) -> Result<()> {
+    let to = normalize_recipients("--to", &to)?;
+    anyhow::ensure!(!to.is_empty(), "--to requires at least one email address");
+    let to = to.join(", ");
+    let cc = normalize_recipients("--cc", &cc)?;
+    let bcc = normalize_recipients("--bcc", &bcc)?;
     let body_str = read_body(body, body_file)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
@@ -4432,6 +4544,8 @@ async fn run_gmail_send_now(
             &body_str,
             thread_id.as_deref(),
             attachment.as_ref(),
+            &cc,
+            &bcc,
         )
         .await
         .context("create_draft (send-now) failed")?;
@@ -4439,7 +4553,14 @@ async fn run_gmail_send_now(
         .send_draft(&entity_id, &draft_id)
         .await
         .context("send_draft (send-now) failed")?;
-    println!("sent: account={email} to={to} subject=\"{subject}\" draft_id={draft_id}");
+    print!("sent: account={email} to={to}");
+    if !cc.is_empty() {
+        print!(" cc={}", cc.join(", "));
+    }
+    if !bcc.is_empty() {
+        print!(" bcc={}", bcc.join(", "));
+    }
+    println!(" subject=\"{subject}\" draft_id={draft_id}");
     Ok(())
 }
 
