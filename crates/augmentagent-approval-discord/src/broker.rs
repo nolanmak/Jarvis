@@ -45,6 +45,10 @@ pub struct DiscordConfig {
     /// path (list / stop / help still work). The CLI wires this with a Claude
     /// reasoner; tests can omit it.
     pub loop_parser: Option<Arc<dyn LoopCommandParser>>,
+    /// Wiki root for outbound answer attachments (#440). `ATTACH:` markers in
+    /// wiki-ask answers resolve against (and are confined to) this directory;
+    /// `None` refuses every marker with a visible note in the reply.
+    pub wiki_root: Option<std::path::PathBuf>,
 }
 
 pub(crate) struct BrokerState {
@@ -61,6 +65,8 @@ pub(crate) struct BrokerState {
     pub(crate) store: Option<Arc<Store>>,
     /// LLM parser for `/loop` create text. `None` disables the create path.
     pub(crate) loop_parser: Option<Arc<dyn LoopCommandParser>>,
+    /// Wiki root that `ATTACH:` answer markers are confined to (#440).
+    pub(crate) wiki_root: Option<std::path::PathBuf>,
     /// Populated once, from the first `Ready` event. Used to distinguish the
     /// bot's own messages from the user's when building conversation context.
     pub(crate) bot_user_id: std::sync::OnceLock<UserId>,
@@ -78,6 +84,7 @@ impl BrokerState {
         invoice_ops: Option<Arc<dyn InvoiceOps>>,
         store: Option<Arc<Store>>,
         loop_parser: Option<Arc<dyn LoopCommandParser>>,
+        wiki_root: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             ready: Arc::new(Notify::new()),
@@ -91,6 +98,7 @@ impl BrokerState {
             invoice_ops,
             store,
             loop_parser,
+            wiki_root,
             bot_user_id: std::sync::OnceLock::new(),
         }
     }
@@ -130,6 +138,7 @@ impl DiscordApprovalBroker {
             config.invoice_ops.clone(),
             config.store.clone(),
             config.loop_parser.clone(),
+            config.wiki_root.clone(),
         ));
 
         let mut intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES;

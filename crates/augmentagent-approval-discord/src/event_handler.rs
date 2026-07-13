@@ -208,6 +208,7 @@ impl EventHandler for Handler {
                 msg.channel_id,
                 msg.id,
                 chunk_for_discord(&reply),
+                Vec::new(),
                 "loop command reply",
             )
             .await;
@@ -221,6 +222,7 @@ impl EventHandler for Handler {
         let msg_id = msg.id;
         let bot_user_id = self.state.bot_user_id.get().copied();
         let allowed_user_id = self.state.allowed_user_id;
+        let wiki_root = self.state.wiki_root.clone();
 
         tokio::spawn(async move {
             // Fetch recent messages in this channel/DM so follow-up questions
@@ -283,7 +285,12 @@ impl EventHandler for Handler {
             let footer = format_rejection_footer(&rejected);
 
             match result {
-                Ok(mut answer) => {
+                Ok(answer) => {
+                    // #440 — pull `ATTACH:` markers out of the answer and
+                    // deliver the referenced wiki files on the first chunk.
+                    let (mut answer, attachments) =
+                        crate::attachments::prepare_answer_delivery(&answer, wiki_root.as_deref())
+                            .await;
                     if let Some(f) = &footer {
                         // Append before chunking so a long answer's footer
                         // still ends up in the final Discord message.
@@ -295,6 +302,7 @@ impl EventHandler for Handler {
                         channel_id,
                         msg_id,
                         chunk_for_discord(&answer),
+                        attachments,
                         "wiki answer chunk",
                     )
                     .await;
@@ -2180,6 +2188,7 @@ async fn send_chunks_reply_chain(
     channel_id: ChannelId,
     root_msg: MessageId,
     chunks: Vec<String>,
+    attachments: Vec<CreateAttachment>,
     label: &str,
 ) {
     let total = chunks.len();
@@ -2198,7 +2207,11 @@ async fn send_chunks_reply_chain(
             prev_msg_id
         };
 
-        match send_one_with_retry(http, channel_id, reply_target, &chunk, label).await {
+        // #440 — outbound files ride on the first chunk only.
+        let chunk_files: &[CreateAttachment] = if idx == 0 { &attachments } else { &[] };
+
+        match send_one_with_retry(http, channel_id, reply_target, &chunk, chunk_files, label).await
+        {
             Some(sent_id) => {
                 prev_msg_id = Some(sent_id);
             }
@@ -2234,6 +2247,7 @@ async fn send_one_with_retry(
     channel_id: ChannelId,
     reply_target: Option<MessageId>,
     chunk: &str,
+    attachments: &[CreateAttachment],
     label: &str,
 ) -> Option<MessageId> {
     let attempts: [(u64, bool); 3] = [(0, true), (250, true), (750, false)];
@@ -2243,6 +2257,11 @@ async fn send_one_with_retry(
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
         let mut builder = CreateMessage::new().content(chunk);
+        if !attachments.is_empty() {
+            // Rebuilt per attempt — CreateAttachment is Clone and the builder
+            // consumes its files on send.
+            builder = builder.add_files(attachments.iter().cloned());
+        }
         if use_reference {
             if let Some(target) = reply_target {
                 builder = builder.reference_message(MessageReference::from((channel_id, target)));

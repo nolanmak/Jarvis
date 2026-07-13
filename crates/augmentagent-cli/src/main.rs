@@ -1714,6 +1714,11 @@ enum WikiOp {
     Ask {
         /// The question. Wrap in quotes if multi-word.
         question: String,
+        /// Also post the answer to the Discord approval channel via a
+        /// one-shot HTTP client, honoring `ATTACH:` file markers (#440).
+        /// Needs DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID in the env.
+        #[arg(long, default_value_t = false)]
+        post: bool,
     },
     /// Backfill v2 schema fields onto cold person pages via Haiku. See #78.
     ///
@@ -2478,7 +2483,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Wiki { ref op } => match op {
             WikiOp::Lint { out } => run_wiki_lint(&cli, out.clone()).await,
-            WikiOp::Ask { question } => run_wiki_ask(&cli, question.clone()).await,
+            WikiOp::Ask { question, post } => run_wiki_ask(&cli, question.clone(), *post).await,
             WikiOp::Migrate {
                 to,
                 dry_run,
@@ -4877,7 +4882,7 @@ fn extract_resume_text(path: &std::path::Path) -> Result<String> {
     }
 }
 
-async fn run_wiki_ask(cli: &Cli, question: String) -> Result<()> {
+async fn run_wiki_ask(cli: &Cli, question: String, post: bool) -> Result<()> {
     let wiki_root = cli
         .wiki_dir
         .clone()
@@ -4900,6 +4905,45 @@ async fn run_wiki_ask(cli: &Cli, question: String) -> Result<()> {
     };
     let answer = reasoner.call(&opts, &question).await?;
     println!("{answer}");
+
+    // #440 — `--post` pushes the answer through the same ATTACH-marker
+    // pipeline the Discord query path uses, via a one-shot HTTP client (no
+    // gateway). This is the CLI end-to-end for outbound file delivery: a
+    // real message, with real attachments, lands in the approval channel.
+    if post {
+        use augmentagent_approval_discord::attachments::prepare_answer_delivery;
+        use serenity::builder::CreateMessage;
+        use serenity::model::id::ChannelId;
+
+        let token =
+            std::env::var("DISCORD_BOT_TOKEN").context("DISCORD_BOT_TOKEN required for --post")?;
+        let channel: u64 = std::env::var("DISCORD_CHANNEL_ID")
+            .context("DISCORD_CHANNEL_ID required for --post")?
+            .parse()
+            .context("DISCORD_CHANNEL_ID must be numeric")?;
+        let http = serenity::http::Http::new(&token);
+
+        let (text, attachments) = prepare_answer_delivery(&answer, Some(&wiki_root)).await;
+        let n_files = attachments.len();
+        let chunks = augmentagent_approval_discord::chunk_for_discord(&text);
+        let total = chunks.len();
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            let mut builder = CreateMessage::new().content(chunk);
+            if idx == 0 && !attachments.is_empty() {
+                builder = builder.add_files(attachments.iter().cloned());
+            }
+            ChannelId::new(channel)
+                .send_message(&http, builder)
+                .await
+                .with_context(|| format!("post answer chunk {}/{total} to discord", idx + 1))?;
+            if idx + 1 < total {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+        println!(
+            "posted to discord channel {channel}: {total} message(s), {n_files} attachment(s)"
+        );
+    }
     Ok(())
 }
 
@@ -7070,6 +7114,7 @@ async fn build_broker(
         invoice_ops: Some(invoice_ops),
         store: Some(store_for_broker),
         loop_parser,
+        wiki_root: cli.wiki_dir.clone(),
     })
     .await
     .context("start discord broker")?;
