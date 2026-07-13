@@ -8,6 +8,7 @@
 //! This means cards never "expire" — they stay live as long as the action is
 //! still `pending`, across daemon restarts, unlimited timeouts.
 
+pub mod attachments;
 mod broker;
 mod custom_id;
 mod event_handler;
