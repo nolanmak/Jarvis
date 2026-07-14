@@ -953,6 +953,25 @@ fn triage_model() -> String {
     std::env::var("AUGMENTAGENT_TRIAGE_MODEL").unwrap_or_else(|_| TRIAGE_MODEL.to_string())
 }
 
+/// The Opus tier every quality-critical preset asks for in its comment
+/// (`draft`, `lint`, `ask`, `digest`, `social_adapter`, `resume`).
+///
+/// #448 — those presets all *said* "Opus" in a comment while passing
+/// `model: None`, which emits no `--model` flag and so silently inherits
+/// whatever the OWNER last picked for their own interactive Claude Code in
+/// `~/.claude/settings.json`. That is not a default, it's a leak: the owner
+/// selecting `opus[1m]` @ `xhigh` for a coding session re-tiered every
+/// background draft, digest and answer onto their Max subscription. Saying
+/// "Opus" out loud makes the intent real and the daemon immune to `/model`.
+///
+/// Overridable via `AUGMENTAGENT_OPUS_MODEL` for a no-rebuild tier change.
+fn opus_model() -> String {
+    std::env::var("AUGMENTAGENT_OPUS_MODEL").unwrap_or_else(|_| OPUS_MODEL.to_string())
+}
+
+/// Default tier for the quality-critical presets. See [`opus_model`].
+const OPUS_MODEL: &str = "claude-opus-4-8";
+
 /// Default triage tier. Opus is a deliberate quality call (see `triage_opts`) —
 /// what #448 removes is the *inherited* `opus[1m]` / `xhigh` variant, not Opus.
 const TRIAGE_MODEL: &str = "claude-opus-4-8";
@@ -1005,7 +1024,7 @@ pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> Reasoner
     }
     ReasonerOpts {
         system_prompt,
-        model: None,
+        model: Some(opus_model()),
         allowed_tools,
         add_dirs,
         permission_mode: "default".into(),
@@ -1022,7 +1041,7 @@ pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> Reasoner
 pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
     ReasonerOpts {
         system_prompt,
-        model: None, // Opus — lint is reasoning-heavy, low volume
+        model: Some(opus_model()), // Opus — lint is reasoning-heavy, low volume
         allowed_tools: vec!["Read".into(), "Grep".into(), "Glob".into()],
         add_dirs: vec![wiki_root],
         permission_mode: "default".into(),
@@ -1238,7 +1257,7 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
 
     ReasonerOpts {
         system_prompt: include_str!("../../../schema/wiki-ask.md").to_string(),
-        model: None, // Opus — quality matters for answer coherence
+        model: Some(opus_model()), // Opus — quality matters for answer coherence
         allowed_tools: vec![
             "Read".into(),
             "Grep".into(),
@@ -1412,7 +1431,7 @@ pub fn digest_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
     }
     ReasonerOpts {
         system_prompt: include_str!("../../../schema/digest-prompt.md").to_string(),
-        model: None, // Opus — digest tone + coverage benefit from quality
+        model: Some(opus_model()), // Opus — digest tone + coverage benefit from quality
         allowed_tools,
         add_dirs,
         permission_mode: "default".into(),
@@ -1457,7 +1476,7 @@ pub fn tone_summarize_opts() -> ReasonerOpts {
 pub fn social_adapter_opts(system_prompt: String) -> ReasonerOpts {
     ReasonerOpts {
         system_prompt,
-        model: None, // Opus — voice + format fidelity matter, volume is low
+        model: Some(opus_model()), // Opus — voice + format fidelity matter, volume is low
         allowed_tools: vec![],
         add_dirs: vec![],
         permission_mode: "default".into(),
@@ -2579,7 +2598,7 @@ mod tests {
 pub fn resume_opts(wiki_root: PathBuf) -> ReasonerOpts {
     ReasonerOpts {
         system_prompt: include_str!("../../../schema/resume-ingest.md").to_string(),
-        model: None, // Opus — seeding the wiki is high-leverage and one-shot
+        model: Some(opus_model()), // Opus — seeding the wiki is high-leverage and one-shot
         allowed_tools: vec![
             "Read".into(),
             "Grep".into(),
@@ -2663,5 +2682,64 @@ mod rate_limit_tests {
         ] {
             assert!(!is_rate_limited(ok), "false positive on: {ok}");
         }
+    }
+}
+
+#[cfg(test)]
+mod model_pin_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// #448 — the regression guard. A preset with `model: None` emits no
+    /// `--model` flag, so the spawned CLI inherits the OWNER's interactive
+    /// `~/.claude/settings.json`. That is how ~250 background email
+    /// classifications a day ended up on `opus[1m]` @ `xhigh`, billed to the
+    /// owner's Max subscription, purely because they'd picked that model for
+    /// their own coding.
+    ///
+    /// Every preset the daemon runs unattended must name its model out loud.
+    /// If you add a preset, pin it — do not let `None` back in.
+    #[test]
+    fn no_daemon_preset_inherits_the_owners_interactive_model() {
+        let wiki = PathBuf::from("/tmp/wiki");
+        let repo = PathBuf::from("/tmp/repo");
+        let presets: Vec<(&str, ReasonerOpts)> = vec![
+            ("triage", triage_opts(Some(wiki.clone()))),
+            ("draft", draft_opts("sys".into(), Some(wiki.clone()))),
+            ("lint", lint_opts("sys".into(), wiki.clone())),
+            ("ask", ask_opts(wiki.clone(), repo.clone())),
+            ("digest", digest_opts(Some(wiki.clone()))),
+            ("social_adapter", social_adapter_opts("sys".into())),
+            ("resume", resume_opts(wiki.clone())),
+            ("tone_summarize", tone_summarize_opts()),
+            ("loop_parse", loop_parse_opts()),
+            ("archetype_pick", archetype_pick_opts()),
+            ("ingest", ingest_opts("sys".into(), wiki.clone())),
+            ("wiki_migrate", wiki_migrate_opts("sys".into(), wiki.clone())),
+        ];
+        for (name, opts) in presets {
+            let model = opts.model.as_deref().unwrap_or("");
+            assert!(
+                !model.is_empty(),
+                "{name}_opts has model: None — it will inherit the owner's \
+                 interactive /model choice and bill their subscription (#448)"
+            );
+            // The inherited value we're defending against is literally the
+            // 1M-context alias from the owner's settings.json.
+            assert!(
+                !model.contains("[1m]"),
+                "{name}_opts pins a context-window alias ({model}); pin a real \
+                 model id so the tier can't drift"
+            );
+        }
+    }
+
+    /// The env overrides exist so a tier change needs no rebuild.
+    #[test]
+    fn env_overrides_take_precedence() {
+        // Defaults, with no env set, are real model ids.
+        assert_eq!(TRIAGE_MODEL, "claude-opus-4-8");
+        assert_eq!(OPUS_MODEL, "claude-opus-4-8");
+        assert!(!TRIAGE_MODEL.contains("[1m]"));
     }
 }
