@@ -2643,6 +2643,25 @@ impl Store {
         Ok(())
     }
 
+    /// #455 — `createdAt` of the oldest still-pending approval card, if any.
+    ///
+    /// This is exactly how far back the OutboundObserver needs to look on its
+    /// very first tick. A reply the user sent BEFORE the oldest pending card
+    /// was raised cannot make any current card stale, so there is no reason to
+    /// walk further back through their SENT history than this.
+    pub fn oldest_pending_action_created_at(&self) -> StoreResult<Option<i64>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let v: Option<i64> = guard
+            .query_row(
+                "SELECT MIN(createdAt) FROM actions WHERE status = 'pending'",
+                [],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(v)
+    }
+
     /// #449 — the Gmail message ids of daemon sends within the last
     /// `cutoff_ms`. Feeds `classify_outbound`'s `SkipDaemonSent` arm.
     pub fn self_sent_message_ids_since(

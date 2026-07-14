@@ -78,6 +78,14 @@ pub const ACTION_ID_HEADER: &str = "X-AugmentAgent-Action-Id";
 /// permanently suppressing drafts on the thread.
 const SELF_SEND_PROXIMITY_MS: i64 = 120_000;
 
+const ONE_DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// #455 — hard floor on how far the observer's FIRST tick will look back
+/// through SENT. The cursor is normally seeded from the oldest pending approval
+/// card; this caps that at 30 days so a single ancient, abandoned card cannot
+/// turn a cold start into a crawl through the user's whole SENT history.
+const FIRST_TICK_MAX_LOOKBACK_MS: i64 = 30 * ONE_DAY_MS;
+
 /// A newly-observed outbound message that was NOT sent by the daemon —
 /// i.e. the user replied out-of-band and we need to react.
 ///
@@ -239,30 +247,51 @@ impl<G: GmailApi> OutboundObserver<G> {
                 .outbound_last_seen(&account.entity_id)
                 .unwrap_or(None)
                 .unwrap_or(0);
-            // First-tick guard: when `last_seen` is 0 we don't want to
-            // ingest the user's entire SENT history. Seed the cursor to
-            // wallclock-now and emit nothing this tick; subsequent ticks
-            // pick up only genuinely new outbound. The hook for a full
-            // backfill is `augmentagent-channel-email::tone::backfill`
-            // (an explicit operator command), not the live observer.
-            if last_seen == 0 {
+            // First-tick cursor (#455). We still refuse to ingest the user's
+            // ENTIRE SENT history — that's what
+            // `augmentagent-channel-email::tone::backfill` is for. But seeding
+            // the cursor to wallclock-now (the pre-#455 behaviour) made the
+            // observer blind to exactly the mail that matters on a cold start:
+            // it would only ever notice replies sent from this moment forward,
+            // so every approval card ALREADY sitting in the queue for a thread
+            // the user had answered stayed there. That is the stale carousel in
+            // #449 — the observer shipping "on" did not, by itself, clear it.
+            //
+            // So look back precisely as far as there is something to retire:
+            // the oldest still-pending card. A reply sent before that card was
+            // raised cannot make any current card stale. Bounded below by
+            // FIRST_TICK_MAX_LOOKBACK_MS so a very old abandoned card can't
+            // turn the first tick into an unbounded history crawl, and given a
+            // day of slack because Gmail's `after:` filter is date-granular.
+            let first_tick = last_seen == 0;
+            let last_seen = if first_tick {
                 let now_ms = wallclock_ms();
-                if let Err(e) = self
-                    .store
-                    .set_outbound_last_seen(&account.entity_id, now_ms)
-                {
-                    warn!(
-                        account = %account.entity_id,
-                        "outbound observer: failed to seed last_seen: {e:#}"
-                    );
-                }
-                debug!(
+                let floor_ms = now_ms - FIRST_TICK_MAX_LOOKBACK_MS;
+                let seed = match self.store.oldest_pending_action_created_at() {
+                    Ok(Some(oldest)) => (oldest - ONE_DAY_MS).max(floor_ms).min(now_ms),
+                    // Nothing pending ⇒ nothing to retire ⇒ no reason to look
+                    // back at all. Start from now.
+                    Ok(None) => now_ms,
+                    Err(e) => {
+                        warn!(
+                            account = %account.entity_id,
+                            "outbound observer: oldest_pending_action_created_at \
+                             failed, starting cursor at now: {e:#}"
+                        );
+                        now_ms
+                    }
+                };
+                info!(
                     account = %account.entity_id,
-                    seeded_at_ms = now_ms,
-                    "outbound observer: first tick — seeding cursor, skipping backfill"
+                    seeded_at_ms = seed,
+                    lookback_days = (now_ms - seed) / ONE_DAY_MS,
+                    "outbound observer: first tick — seeding cursor to cover the \
+                     pending-approval backlog"
                 );
-                continue;
-            }
+                seed
+            } else {
+                last_seen
+            };
             // Convert the cursor to Gmail's `after:YYYY/MM/DD` filter. We
             // err generous (one calendar day earlier) and re-dedupe via the
             // numeric cursor, because Gmail's after: granularity is a day,
@@ -416,7 +445,11 @@ impl<G: GmailApi> OutboundObserver<G> {
                     }
                 }
             }
-            if newest_seen > last_seen {
+            // Persist when we advanced, and always on the first tick — the
+            // cold-start cursor (#455) has to be written down even if this tick
+            // found nothing newer, or the next tick would treat itself as a
+            // first tick again and re-derive the whole lookback window.
+            if newest_seen > last_seen || first_tick {
                 if let Err(e) = self
                     .store
                     .set_outbound_last_seen(&account.entity_id, newest_seen)
@@ -797,6 +830,99 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status, "superseded");
+    }
+
+    /// #455 — on a cold start the observer must look back far enough to retire
+    /// the cards ALREADY in the queue. Seeding the cursor at wallclock-now (the
+    /// old behaviour) meant a card for a thread the user had already answered
+    /// stayed in the carousel forever, because the reply that made it stale was
+    /// sent before the observer ever looked. That was the user-visible half of
+    /// #449 that switching the observer on did not, by itself, fix.
+    #[tokio::test]
+    async fn first_tick_looks_back_far_enough_to_retire_an_already_answered_card() {
+        let (store, _f) = mk_store(&["ent-1"]);
+        // No cursor at all — a genuine cold start.
+        assert!(store.outbound_last_seen("ent-1").unwrap().is_none());
+
+        // A pending card raised 3 days ago, on a thread the user has since
+        // answered from Gmail web. The reply is in SENT; we have never seen it.
+        let pending = store
+            .log_action(
+                "inbound-old",
+                Some("T-answered"),
+                "alice@example.com",
+                "subj",
+                None,
+                Some("draft body"),
+                augmentagent_store::ActionStatus::Pending,
+            )
+            .unwrap();
+        let three_days_ago = wallclock_ms() - 3 * ONE_DAY_MS;
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE actions SET createdAt = ?1 WHERE id = ?2",
+                    augmentagent_store::rusqlite::params![three_days_ago, pending],
+                )
+            })
+            .unwrap();
+
+        // The user's reply, sent two days ago — i.e. BEFORE now, which the old
+        // wallclock-now cursor would have skipped straight past.
+        let two_days_ago = wallclock_ms() - 2 * ONE_DAY_MS;
+        let mut user_reply = mk_email("user-reply-old", Some("T-answered"), "ent-1");
+        user_reply.date = two_days_ago.to_string();
+        let gmail = Arc::new(FakeGmail::new());
+        gmail
+            .sent_by_entity
+            .lock()
+            .unwrap()
+            .insert("ent-1".into(), vec![user_reply]);
+
+        let observer = OutboundObserver::new(Arc::clone(&store), gmail, 50);
+        let events = observer.poll_once().await.unwrap();
+
+        assert_eq!(
+            events.len(),
+            1,
+            "the first tick must see the reply that makes the queued card stale"
+        );
+        let status: String = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT status FROM actions WHERE id = ?1",
+                    augmentagent_store::rusqlite::params![pending],
+                    |r| r.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            status, "superseded",
+            "a card whose thread was already answered must be retired on the first tick"
+        );
+    }
+
+    /// ...but with an empty queue there is nothing to retire, so a cold start
+    /// must NOT go trawling through SENT history.
+    #[tokio::test]
+    async fn first_tick_with_no_pending_cards_does_not_backfill() {
+        let (store, _f) = mk_store(&["ent-1"]);
+        let mut old = mk_email("ancient-sent", Some("T-old"), "ent-1");
+        old.date = (wallclock_ms() - 10 * ONE_DAY_MS).to_string();
+        let gmail = Arc::new(FakeGmail::new());
+        gmail
+            .sent_by_entity
+            .lock()
+            .unwrap()
+            .insert("ent-1".into(), vec![old]);
+
+        let observer = OutboundObserver::new(Arc::clone(&store), gmail, 50);
+        let events = observer.poll_once().await.unwrap();
+        assert!(
+            events.is_empty(),
+            "nothing pending ⇒ nothing to retire ⇒ no history crawl: {events:?}"
+        );
+        assert!(store.outbound_last_seen("ent-1").unwrap().is_some());
     }
 
     /// #449 REGRESSION — the bug that kept the whole observer switched off.
