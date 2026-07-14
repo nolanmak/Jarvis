@@ -379,6 +379,18 @@ impl ClaudeCliReasoner {
         // user-facing error instead of the raw multi-line stderr blob.
         match self.call_once(opts, user_message, capture).await {
             Ok(text) => Ok(text),
+            // #448 — do NOT retry. Retrying a quota refusal is exactly the
+            // amplification that kept the daemon pinned against the limit.
+            // Log it once, loudly and honestly, and let the caller give up for
+            // this cycle. The old behaviour buried this as a parse failure.
+            Err(CallError::RateLimited { message }) => {
+                warn!(
+                    "claude REFUSED ON QUOTA (not retrying): {message} — \
+                     the daemon spends the owner's Claude subscription; set \
+                     ANTHROPIC_API_KEY to bill API credits instead (see #448)"
+                );
+                Err(anyhow::anyhow!("claude rate limit: {message}"))
+            }
             Err(CallError::ConfigCorrupted { stderr }) => {
                 let recovered = match restore_latest_claude_backup() {
                     Ok(Some(_)) => true,
@@ -393,6 +405,10 @@ impl ClaudeCliReasoner {
                         Ok(text) => return Ok(text),
                         Err(CallError::ConfigCorrupted { stderr }) => {
                             return Err(anyhow::anyhow!(sanitize_claude_error(&stderr)));
+                        }
+                        Err(CallError::RateLimited { message }) => {
+                            warn!("claude REFUSED ON QUOTA after config recovery: {message}");
+                            return Err(anyhow::anyhow!("claude rate limit: {message}"));
                         }
                         Err(CallError::Other(e)) => return Err(e),
                     }
@@ -429,6 +445,11 @@ enum CallError {
     /// "Configuration error … JSON Parse error" / "is corrupted" pattern the
     /// subprocess emits when `~/.claude.json` is unreadable.
     ConfigCorrupted { stderr: String },
+    /// #448 — the CLI refused on quota. Arrives as a *successful* completion
+    /// whose text is "You've hit your session limit · resets …", so without
+    /// this variant it masquerades as a malformed model answer and gets
+    /// retried. Distinct so callers can back off until the reset instead.
+    RateLimited { message: String },
     /// Any other failure: spawn errors, IO errors, non-config exit failures.
     Other(anyhow::Error),
 }
@@ -694,6 +715,14 @@ impl ClaudeCliReasoner {
                 "claude produced no assistant text"
             )));
         }
+        // #448 — the quota refusal is a *successful* completion. Catch it here,
+        // before it reaches a JSON parser that would mislabel it a parse error
+        // and trigger a retry storm against a wall we're already up against.
+        if is_rate_limited(&final_text) {
+            return Err(CallError::RateLimited {
+                message: final_text.trim().to_string(),
+            });
+        }
         Ok(final_text)
     }
 }
@@ -766,6 +795,32 @@ fn is_claude_config_corrupted(stderr: &str) -> bool {
     (needle.contains("configuration error") && needle.contains("json parse error"))
         || needle.contains("is corrupted")
         || needle.contains(".claude.json is corrupted")
+}
+
+/// #448 — Recognise the CLI's quota refusal, which it returns as ordinary
+/// *assistant text* (exit 0), not an error:
+///
+/// ```text
+/// You've hit your session limit · resets 9:30am (America/New_York)
+/// ```
+///
+/// Because it arrives as a successful completion, every JSON-parsing caller
+/// treated it as a malformed model answer. The logs are full of the resulting
+/// lie:
+///
+/// ```text
+/// ERROR channel: triage parse failed: no JSON object found in model output;
+///                raw=You've hit your session limit · resets 9:30am
+/// ```
+///
+/// That misdiagnosis is expensive: a "parse failure" looks transient, so the
+/// email is left in an error state and the action layer retries it (max=5)
+/// while the 2-minute poll keeps feeding new work into the same wall. Naming
+/// the condition lets callers back off instead of hammering it.
+fn is_rate_limited(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    (t.contains("session limit") || t.contains("usage limit") || t.contains("rate limit"))
+        && (t.contains("hit your") || t.contains("reached your") || t.contains("resets"))
 }
 
 /// Locate the most recent `.claude.json.backup.*` file under
@@ -891,6 +946,17 @@ fn resolve_db_path(repo_root: &std::path::Path) -> PathBuf {
 }
 
 /// Preset builders for the three call types.
+/// Model pinned for email triage (#448). Explicit rather than `None`, so the
+/// daemon can never again inherit the owner's interactive model choice.
+/// Overridable without a rebuild via `AUGMENTAGENT_TRIAGE_MODEL`.
+fn triage_model() -> String {
+    std::env::var("AUGMENTAGENT_TRIAGE_MODEL").unwrap_or_else(|_| TRIAGE_MODEL.to_string())
+}
+
+/// Default triage tier. Opus is a deliberate quality call (see `triage_opts`) —
+/// what #448 removes is the *inherited* `opus[1m]` / `xhigh` variant, not Opus.
+const TRIAGE_MODEL: &str = "claude-opus-4-8";
+
 pub fn triage_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
     // Opus for triage. Haiku was too narrow on "flag" — missed personal
     // messages from known contacts asking for engagement. Volume is ~70
@@ -906,7 +972,17 @@ pub fn triage_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
     }
     ReasonerOpts {
         system_prompt: crate::prompt::TRIAGE_SYSTEM.to_string(),
-        model: None,
+        // #448 — PIN the model. `None` meant "no --model flag", which made the
+        // spawned CLI inherit whatever the OWNER had set for their own
+        // interactive Claude Code in ~/.claude/settings.json. That silently
+        // upgraded ~250 background classifications/day to whatever tier the
+        // owner happened to pick for coding (observed: `opus[1m]` at `xhigh`
+        // effort) and billed it to their Max subscription — the daemon's own
+        // subprocess is what kept hitting "You've hit your session limit".
+        // Keep Opus (the comment above is a deliberate quality call), but say
+        // so explicitly so a `/model` change by the owner can never again
+        // re-tier the daemon.
+        model: Some(triage_model()),
         allowed_tools,
         add_dirs,
         permission_mode: "default".into(),
@@ -2551,4 +2627,41 @@ enum ContentBlock {
     },
     #[serde(other)]
     Other,
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+
+    /// #448 — the exact string the CLI returned to the daemon on 2026-07-14,
+    /// copied from ~/.local/state/augmentagent/stderr.log. It arrived as a
+    /// successful completion, so triage logged it as
+    /// "triage parse failed: no JSON object found in model output" and the
+    /// action layer retried (max=5) against a wall we were already up against.
+    #[test]
+    fn detects_the_real_session_limit_refusal() {
+        assert!(is_rate_limited(
+            "You've hit your session limit · resets 9:30am (America/New_York)"
+        ));
+        assert!(is_rate_limited("You've reached your usage limit. Resets at 3pm."));
+        assert!(is_rate_limited(
+            "Rate limit exceeded — resets in 12 minutes"
+        ));
+    }
+
+    /// Must NOT fire on a legitimate triage answer, or every email about
+    /// billing/quotas would be dropped instead of classified. This is the
+    /// dangerous false positive.
+    #[test]
+    fn does_not_fire_on_ordinary_model_output() {
+        for ok in [
+            r#"{"decision":"skip","reason":"Marketing blast from a no-reply sender."}"#,
+            // An email that legitimately discusses limits.
+            r#"{"decision":"flag","reason":"Vendor says we hit our API rate limit in prod."}"#,
+            r#"{"decision":"reply","reason":"Asks about our session limit policy."}"#,
+            "",
+        ] {
+            assert!(!is_rate_limited(ok), "false positive on: {ok}");
+        }
+    }
 }
