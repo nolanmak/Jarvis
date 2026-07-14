@@ -5024,7 +5024,10 @@ async fn run_wiki_ask(cli: &Cli, question: String, post: bool) -> Result<()> {
         ),
         None => question,
     };
-    let answer = reasoner.call(&opts, &question).await?;
+    // #446 — `call_transcript`, not `call`: the ask prompt puts the deliverable
+    // first and the wiki-filing receipt last, and `call` keeps only the final
+    // text block, so the receipt would overwrite the answer.
+    let answer = reasoner.call_transcript(&opts, &question).await?;
     println!("{answer}");
 
     // #440 — `--post` pushes the answer through the same ATTACH-marker
@@ -5554,7 +5557,9 @@ impl QueryHandler for WikiQuerier {
             ),
             None => question.to_string(),
         };
-        self.reasoner.call(&opts, &prompt).await
+        // #446 — see `wiki ask`: the Discord reply must carry every text block
+        // the model emitted, not just the trailing wiki-filing receipt.
+        self.reasoner.call_transcript(&opts, &prompt).await
     }
 }
 
@@ -5607,7 +5612,8 @@ impl LoopRunner for LoopReasonerRunner {
             ),
             None => prompt.to_string(),
         };
-        self.reasoner.call(&opts, &prompt).await
+        // #446 — loops render their output to Discord too; same reasoning.
+        self.reasoner.call_transcript(&opts, &prompt).await
     }
 }
 
