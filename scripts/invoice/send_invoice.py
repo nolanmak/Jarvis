@@ -168,12 +168,35 @@ def main():
     end_d = datetime.date.fromisoformat(a.end)
     dry = a.dry_run.lower() not in ("false", "0", "no")
 
+    # #458 — the old default was /tmp/invoices. /tmp gets cleared, and it did:
+    # invoice #39 sat pending for three weeks and its PDF is simply gone. An
+    # unapproved financial artifact has to outlive a reboot. The Rust caller
+    # exports INVOICE_OUT_DIR, so in practice this fallback only fires for a
+    # bare `python3 send_invoice.py` invocation -- point it somewhere durable
+    # anyway.
     out = a.out or str(pathlib.Path(
-        os.environ.get("INVOICE_OUT_DIR", "/tmp/invoices"))
+        os.environ.get("INVOICE_OUT_DIR")
+        or (pathlib.Path(os.environ.get(
+            "XDG_STATE_HOME", pathlib.Path.home() / ".local" / "state"))
+            / "augmentagent" / "invoices"))
         / f"Orchid_Invoice_{a.number}.pdf")
     pathlib.Path(out).parent.mkdir(parents=True, exist_ok=True)
 
-    rows = fetch_prs(a.gh_repo, a.prs)
+    # #458 — fetch_prs() reaches GitHub for the line items. When the billing
+    # repo is unreachable (renamed, access revoked, SSO lapsed) this raised a
+    # bare traceback that died inside the scheduler and reached nobody, so the
+    # pipeline was dead for three weeks in silence. Name the failure precisely
+    # so the Discord alert the scheduler now posts is actionable.
+    try:
+        rows = fetch_prs(a.gh_repo, a.prs)
+    except Exception as e:
+        repo = a.gh_repo or "<unset INVOICE_GH_REPO>"
+        raise SystemExit(
+            f"cannot reach the billing repo '{repo}' -- no invoice can be built.\n"
+            f"  underlying error: {e}\n"
+            f"  check: `gh repo view {repo}` (renamed? access revoked? SSO "
+            f"authorization lapsed?) and INVOICE_GH_REPO in .env"
+        )
     n, rng, tot, path = build(a.number, a.start, a.end, rows, out,
                               invoice_date=a.invoice_date or None)
 

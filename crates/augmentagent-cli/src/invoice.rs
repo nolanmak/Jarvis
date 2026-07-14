@@ -36,6 +36,20 @@ pub trait InvoiceDraftPoster: Send + Sync {
     /// re-runs — the scheduler also guards via
     /// `Store::get_pending_invoice_draft_for_week`.
     async fn dispatch_draft(&self, week_end: NaiveDate) -> Result<String>;
+
+    /// Tell the owner, out of band, that a weekly draft could not be produced.
+    ///
+    /// #458 — the scheduler used to swallow this into
+    /// `warn!("draft post failed, will retry next tick")`. It ticks hourly but
+    /// only acts on Sundays, so a persistent failure retried once a week, into
+    /// a log file nobody reads. The invoice generator had in fact been dead
+    /// since late June (`gh` could no longer resolve the billing repo, so
+    /// `fetch_prs` crashed and no PDF or card was ever created) and the first
+    /// anyone knew of it was three unbilled weeks later.
+    ///
+    /// A billing pipeline that stops must SAY so. Default is a no-op, so the
+    /// test double and any non-Discord poster stay unaffected.
+    async fn notify_failure(&self, _week_end: NaiveDate, _error: &str) {}
 }
 
 // No hardcoded recipient — the real value lives in the gitignored
@@ -158,9 +172,16 @@ impl InvoiceScheduler {
         };
         match poster.dispatch_draft(week_end).await {
             Ok(msg) => info!("invoice scheduler: {msg}"),
-            Err(e) => warn!(
-                "invoice scheduler: draft post failed, will retry next tick: {e:#}"
-            ),
+            Err(e) => {
+                // #458 — do NOT just log. "Will retry next tick" is a lie for a
+                // Sunday-only scheduler: the retry is a week away, and if the
+                // cause is persistent (an unreachable billing repo) it fails
+                // again, silently, forever. Three weeks and ~$11k went unbilled
+                // exactly this way. Tell the owner.
+                let err = format!("{e:#}");
+                error!("invoice scheduler: draft FAILED for {week_end}: {err}");
+                poster.notify_failure(week_end, &err).await;
+            }
         }
         Ok(())
     }
@@ -311,6 +332,9 @@ pub async fn generate_pdf(
         .arg("--to").arg(&recipient)
         .arg("--from-entity").arg(&from_entity)
         .arg("--out").arg(&pdf_path)
+        // #458 — keep the Python side's own default in lockstep with ours, so
+        // the two halves can never write the PDF to different directories.
+        .env("INVOICE_OUT_DIR", invoice_out_dir())
         .arg("--dry-run").arg("true")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -353,9 +377,30 @@ pub async fn generate_pdf(
 /// draft card attaches its own PDF (#330 follow-up). The real send regenerates
 /// the PDF at its authoritative number, so this path is preview-only.
 pub fn pdf_path_for(number: u32, week_end: NaiveDate) -> PathBuf {
-    let dir =
-        std::env::var("INVOICE_OUT_DIR").unwrap_or_else(|_| "/tmp/invoices".to_string());
-    PathBuf::from(dir).join(format!("Orchid_Invoice_{number}_{week_end}.pdf"))
+    PathBuf::from(invoice_out_dir()).join(format!("Orchid_Invoice_{number}_{week_end}.pdf"))
+}
+
+/// Where generated invoice PDFs land.
+///
+/// #458 — this used to default to `/tmp/invoices`. `/tmp` gets cleared, and it
+/// did: invoice **#39** sat `pending` for three weeks and its PDF is simply
+/// gone, so the only record of what it would have billed no longer exists. A
+/// financial artifact awaiting human approval must outlive a reboot.
+///
+/// Defaults to `$XDG_STATE_HOME/augmentagent/invoices` (i.e.
+/// `~/.local/state/augmentagent/invoices`, alongside the daemon's other durable
+/// state). `INVOICE_OUT_DIR` still overrides, and the Python side reads the
+/// same variable — the Rust layer exports it before spawning the script so both
+/// halves cannot disagree about where the PDF went.
+pub fn invoice_out_dir() -> String {
+    if let Ok(dir) = std::env::var("INVOICE_OUT_DIR") {
+        return dir;
+    }
+    let state = std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        format!("{home}/.local/state")
+    });
+    format!("{state}/augmentagent/invoices")
 }
 
 /// Generate (and unless `dry_run`, send) the invoice for the Sun→Sun week
@@ -420,6 +465,9 @@ pub async fn run_invoice(
         .arg("--invoice-date").arg(today.to_string())
         .arg("--to").arg(&recipient)
         .arg("--from-entity").arg(&from_entity)
+        // #458 — this path passes no `--out`, so the script fell back to its own
+        // `/tmp/invoices` default. That is how #39's PDF was lost. Pin it.
+        .env("INVOICE_OUT_DIR", invoice_out_dir())
         .arg("--dry-run").arg(if dry_run { "true" } else { "false" });
     // Revised subject/body override the template (#352).
     if let Some((subject, body)) = &email {
@@ -487,6 +535,82 @@ fn most_recent_sunday(d: NaiveDate) -> NaiveDate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// #458 — a poster whose draft always fails, counting how many times the
+    /// scheduler told the owner about it.
+    struct FailingPoster {
+        alerts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl InvoiceDraftPoster for FailingPoster {
+        async fn dispatch_draft(&self, _week_end: NaiveDate) -> Result<String> {
+            // The real failure: GraphQL could not resolve the billing repo, so
+            // fetch_prs() died and no PDF/card was ever produced.
+            anyhow::bail!(
+                "invoice script failed: GraphQL: Could not resolve to a \
+                 Repository with the name 'DSado88/orchid'."
+            )
+        }
+        async fn notify_failure(&self, _week_end: NaiveDate, error: &str) {
+            assert!(
+                error.contains("Could not resolve"),
+                "the alert must carry the real cause, got: {error}"
+            );
+            self.alerts.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The #458 regression. The scheduler used to swallow a failed draft into
+    /// `warn!("will retry next tick")` — but it only acts on Sundays, so a
+    /// persistent failure (an unreachable billing repo) retried once a week,
+    /// silently, forever. Three weeks and ~$11k went unbilled before a human
+    /// noticed. A failed draft MUST reach the owner.
+    #[test]
+    fn a_failed_draft_alerts_the_owner_rather_than_only_logging() {
+        let alerts = Arc::new(AtomicUsize::new(0));
+        let poster = FailingPoster { alerts: alerts.clone() };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let week_end = NaiveDate::from_ymd_opt(2026, 7, 5).unwrap();
+
+        rt.block_on(async {
+            // Drive the exact arm the scheduler takes on Err.
+            match poster.dispatch_draft(week_end).await {
+                Ok(_) => panic!("this poster must fail"),
+                Err(e) => poster.notify_failure(week_end, &format!("{e:#}")).await,
+            }
+        });
+
+        assert_eq!(
+            alerts.load(Ordering::SeqCst),
+            1,
+            "a failed weekly invoice draft must notify the owner exactly once"
+        );
+    }
+
+    /// #458 — invoice PDFs must not live in /tmp: #39 sat pending for three
+    /// weeks and /tmp was cleared, destroying the only record of what it billed.
+    #[test]
+    fn generated_pdfs_land_somewhere_durable_not_tmp() {
+        // With no override, the default must be durable state, not /tmp.
+        std::env::remove_var("INVOICE_OUT_DIR");
+        let dir = invoice_out_dir();
+        assert!(
+            !dir.starts_with("/tmp"),
+            "invoice PDFs must outlive a reboot; got {dir}"
+        );
+        assert!(dir.contains("augmentagent/invoices"), "got {dir}");
+
+        // The explicit override still wins.
+        std::env::set_var("INVOICE_OUT_DIR", "/srv/invoices");
+        assert_eq!(invoice_out_dir(), "/srv/invoices");
+        std::env::remove_var("INVOICE_OUT_DIR");
+    }
+
 
     #[test]
     fn sunday_anchor() {

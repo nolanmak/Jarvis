@@ -6129,6 +6129,34 @@ impl invoice::InvoiceDraftPoster for DiscordInvoicePoster {
         .await;
         Ok(reply)
     }
+
+    /// #458 — a billing pipeline that stops must say so. Previously this failure
+    /// went to `warn!` in a log file; the generator had been dead since late June
+    /// (the billing repo stopped resolving, so PR fetch crashed and no card was
+    /// ever posted) and three weeks / ~$11k passed before anyone noticed.
+    async fn notify_failure(&self, week_end: chrono::NaiveDate, error: &str) {
+        // Keep it inside Discord's 2000-char limit; the full error is in the log.
+        let detail: String = error.chars().take(1_200).collect();
+        let msg = format!(
+            "⚠️ **Invoice draft FAILED for week ending {week_end}** — no card was \
+             posted, so this week is currently **unbilled**.\n\
+             This will keep failing every Sunday until it's fixed.\n\n\
+             ```\n{detail}\n```\n\
+             Common cause: the billing repo is unreachable (`INVOICE_GH_REPO` in \
+             `.env`) — renamed, access revoked, or SSO authorization lapsed. \
+             Check with `gh repo view <slug>`."
+        );
+        if let Err(e) = self
+            .approval_channel
+            .say(&self.http, msg)
+            .await
+        {
+            // Last resort only — if even Discord is down, the log is all we have.
+            tracing::error!(
+                "invoice scheduler: could not post failure alert to Discord: {e:#}"
+            );
+        }
+    }
 }
 
 /// Executes Approve / Revise / Skip clicks against sqlite + Composio +
