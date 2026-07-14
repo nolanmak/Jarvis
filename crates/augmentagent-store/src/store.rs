@@ -1181,6 +1181,39 @@ impl Store {
             [],
         )?;
 
+        // #449 — every message the DAEMON itself put in the SENT folder, keyed
+        // by the Gmail message id the send call returned. The OutboundObserver
+        // scans SENT to detect replies the *user* wrote in Gmail web/mobile;
+        // without this table it cannot tell those apart from its own sends.
+        //
+        // The pre-#449 code tried to do that by matching SENT-folder ids
+        // against `actions.messageId`, but that column holds the *inbound*
+        // email's id — the two id spaces never intersect, so every agent reply
+        // was misread as a manual user reply. That made enabling the observer
+        // actively harmful (it would supersede live drafts and suppress
+        // drafting on any thread the agent had ever answered), which is why it
+        // shipped default-OFF and stayed off.
+        //
+        // `thread_id` + `sent_at_ms` back the proximity fallback used when
+        // Composio's send response omits the message id (see
+        // `has_daemon_send_near`), so a decoding gap degrades to "don't
+        // supersede" rather than "corrupt the user-reply signal".
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS self_sent_messages (\
+                 message_id   TEXT PRIMARY KEY,\
+                 thread_id    TEXT,\
+                 entity_id    TEXT,\
+                 action_id    TEXT,\
+                 sent_at_ms   INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_self_sent_messages_thread_sent \
+             ON self_sent_messages (thread_id, sent_at_ms)",
+            [],
+        )?;
+
         // #57 — proactive-nudge user actions. One row per user gesture
         // (snooze a signal, dismiss it, mute a person, mute a rule). The
         // proactive runner read-throughs this before dispatch; the dashboard
@@ -2581,6 +2614,141 @@ impl Store {
             params![thread_id, reason, now],
         )?;
         Ok(ids)
+    }
+
+    /// #449 — record a message the daemon itself just sent, so the
+    /// OutboundObserver can skip it when it scans the SENT folder instead of
+    /// misreading it as a reply the user typed by hand.
+    ///
+    /// Idempotent: re-sending the same Gmail message id is a no-op, so a
+    /// retried send or a re-polled observer tick can't double-insert.
+    pub fn record_self_sent_message(
+        &self,
+        message_id: &str,
+        thread_id: Option<&str>,
+        entity_id: Option<&str>,
+        action_id: Option<&str>,
+    ) -> StoreResult<()> {
+        // Stamped here rather than by the caller: this is called immediately
+        // after the send returns, and every caller would otherwise need the
+        // store's private clock.
+        let sent_at_ms = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT OR IGNORE INTO self_sent_messages \
+                 (message_id, thread_id, entity_id, action_id, sent_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![message_id, thread_id, entity_id, action_id, sent_at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// #449 — the Gmail message ids of daemon sends within the last
+    /// `cutoff_ms`. Feeds `classify_outbound`'s `SkipDaemonSent` arm.
+    pub fn self_sent_message_ids_since(
+        &self,
+        cutoff_ms: i64,
+    ) -> StoreResult<std::collections::HashSet<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT message_id FROM self_sent_messages WHERE sent_at_ms >= ?1",
+        )?;
+        let rows = stmt.query_map(params![cutoff_ms], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+
+    /// #449 — proximity fallback for the id-matching path above. If Composio's
+    /// send response omitted the message id we have no exact id to match on,
+    /// but we still logged the thread and the send time. A SENT-folder message
+    /// on the same thread within `window_ms` of one of our own sends is far
+    /// more likely to BE that send than a user reply typed in the same instant,
+    /// so we treat it as ours.
+    ///
+    /// The failure mode is deliberately one-sided: a false positive means we
+    /// skip superseding a card (the user sees one stale card), whereas a false
+    /// negative would mean recording an agent send as a user reply and
+    /// suppressing drafts on that thread forever. Prefer the harmless error.
+    pub fn has_daemon_send_near(
+        &self,
+        thread_id: &str,
+        at_ms: i64,
+        window_ms: i64,
+    ) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let hit: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM self_sent_messages \
+                 WHERE thread_id = ?1 AND ABS(sent_at_ms - ?2) <= ?3 LIMIT 1",
+                params![thread_id, at_ms, window_ms],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(hit.is_some())
+    }
+
+    /// #449 — every pending approval card, with the sender/subject/body the
+    /// staleness rules need. Powers the reconciliation sweep that retires
+    /// cards the user has already dealt with (or that should never have been
+    /// raised) without the user having to ask.
+    pub fn pending_actions_for_reconcile(&self) -> StoreResult<Vec<PendingActionRow>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT a.id, a.threadId, a.fromEmail, a.subject, \
+                    COALESCE(a.originalBody, '') \
+               FROM actions a \
+              WHERE a.status = 'pending' \
+              ORDER BY a.createdAt ASC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PendingActionRow {
+                id: r.get(0)?,
+                thread_id: r.get(1)?,
+                from_email: r.get(2)?,
+                subject: r.get(3)?,
+                body: r.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(StoreError::from)
+    }
+
+    /// #449 — flip an explicit set of pending action ids to `superseded`.
+    /// Companion to `mark_pending_drafts_superseded_by_thread` for the cases
+    /// where staleness is decided per-card (bulk sender) rather than
+    /// per-thread (user already replied). Returns the number of rows flipped.
+    pub fn mark_pending_superseded_by_ids(
+        &self,
+        ids: &[String],
+        reason: &str,
+    ) -> StoreResult<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let placeholders: String = (0..ids.len())
+            .map(|i| format!("?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE actions \
+             SET status = 'superseded', \
+                 errorMessage = COALESCE(NULLIF(?1, ''), 'superseded: stale'), \
+                 updatedAt = ?2 \
+             WHERE status = 'pending' AND id IN ({placeholders})"
+        );
+        let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 2);
+        params_vec.push(&reason);
+        params_vec.push(&now);
+        for id in ids {
+            params_vec.push(id);
+        }
+        let n = guard.execute(&sql, params_vec.as_slice())?;
+        Ok(n)
     }
 
     /// #219 — read the high-water `sent` timestamp the outbound observer has
@@ -6131,6 +6299,18 @@ pub struct RetryableReply {
     pub action: ActionRecord,
     pub retry_count: i64,
     pub email: Email,
+}
+
+/// #449 — one pending approval card, reduced to the fields the staleness
+/// reconciliation sweep needs to decide whether it still deserves the user's
+/// attention. Returned by [`Store::pending_actions_for_reconcile`].
+#[derive(Debug, Clone)]
+pub struct PendingActionRow {
+    pub id: String,
+    pub thread_id: Option<String>,
+    pub from_email: String,
+    pub subject: String,
+    pub body: String,
 }
 
 /// #48 — the three code-mode columns on `actions`, returned by

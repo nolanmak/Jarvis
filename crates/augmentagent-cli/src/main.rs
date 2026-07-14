@@ -2456,18 +2456,26 @@ async fn main() -> Result<()> {
                     run_stale_draft_sweep(sweep_store, sd).await
                 }));
 
-                // #219 — outbound observer: when the user replies via Gmail
-                // web/mobile, the pending approval card on that thread is
-                // stale; this task superseded those drafts on a 5-min tick.
-                // DEFAULT-OFF — opt in with AUGMENTAGENT_OUTBOUND_OBSERVER=1.
-                // Self-disables on Gmail-less ("--no-email") tenants. Wiki
-                // ingest of the user's outbound is intentionally NOT shipped
-                // here; the observer emits OutboundEvents that a follow-on
-                // can hand to the ingest pipeline (see
-                // `crates/augmentagent-channel-email/src/outbound.rs` doc).
+                // #219/#449 — outbound observer: when the user replies via
+                // Gmail web/mobile, the pending approval card on that thread is
+                // stale; this task supersedes those drafts on a 5-min tick.
+                //
+                // DEFAULT-ON as of #449. It shipped default-off because
+                // `classify_outbound` could not recognize the daemon's own
+                // sends (it compared SENT-folder ids against `actions.messageId`,
+                // which holds *inbound* ids), so turning it on would have
+                // recorded every agent reply as a manual user reply. That is
+                // fixed: sends are now logged to `self_sent_messages` from the
+                // id Gmail returns, so the observer can safely run for real.
+                //
+                // Leaving it off is what made the approval queue accumulate
+                // cards for mail the user had already answered — the carousel
+                // staleness in #449. Opt out with
+                // AUGMENTAGENT_OUTBOUND_OBSERVER=0. Self-disables on
+                // Gmail-less ("--no-email") tenants.
                 let outbound_enabled = std::env::var("AUGMENTAGENT_OUTBOUND_OBSERVER")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
+                    .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                    .unwrap_or(true);
                 if outbound_enabled && !no_email {
                     let obs_store = Arc::clone(&store);
                     let sd = shutdown.clone();
@@ -2476,10 +2484,26 @@ async fn main() -> Result<()> {
                     }));
                 } else if outbound_enabled && no_email {
                     info!(
-                        "outbound observer requested but --no-email is set; \
+                        "outbound observer enabled but --no-email is set; \
                          observer is Gmail-only and will NOT be started"
                     );
+                } else {
+                    info!(
+                        "outbound observer disabled via AUGMENTAGENT_OUTBOUND_OBSERVER=0; \
+                         approval cards will NOT be retired when you reply from Gmail \
+                         web/mobile"
+                    );
                 }
+
+                // #449 — staleness reconciliation. The user should never have
+                // to tell us a card is stale; the daemon should already know.
+                // Runs once at startup (to clear whatever accumulated while the
+                // observer was off) and then on a slow tick.
+                let reconcile_store = Arc::clone(&store);
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move {
+                    run_stale_approval_reconcile(reconcile_store, sd).await
+                }));
             }
 
             // Self-healing: backfill any connected-Gmail addresses Composio
@@ -4480,6 +4504,36 @@ async fn run_gmail_update_draft(
     Ok(())
 }
 
+/// #449 — remember that WE sent this message, so the OutboundObserver's SENT
+/// scan skips it instead of recording it as a reply the user wrote by hand.
+///
+/// Every daemon send path must funnel through here. Missing a call site is not
+/// cosmetic: the observer would treat that send as the user replying, supersede
+/// the live drafts on the thread, and make the already-replied guard silently
+/// suppress every future draft on it.
+///
+/// Best-effort by construction — the mail has already gone out by the time we
+/// are called, so a bookkeeping failure must never surface as a send failure.
+/// It is logged loudly instead.
+fn record_self_send(
+    store: &Store,
+    sent_message_id: Option<&str>,
+    thread_id: Option<&str>,
+    entity_id: Option<&str>,
+    action_id: Option<&str>,
+) {
+    let Some(mid) = sent_message_id.filter(|s| !s.is_empty()) else {
+        return;
+    };
+    if let Err(e) = store.record_self_sent_message(mid, thread_id, entity_id, action_id) {
+        tracing::warn!(
+            message_id = mid,
+            "failed to record self-sent message; the outbound observer may \
+             misread this send as a manual user reply (#449): {e:#}"
+        );
+    }
+}
+
 async fn run_gmail_send_draft(
     store: Arc<Store>,
     account: Option<String>,
@@ -4488,10 +4542,11 @@ async fn run_gmail_send_draft(
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
-    gmail
+    let sent_id = gmail
         .send_draft(&entity_id, &draft_id)
         .await
         .context("send_draft via Composio failed")?;
+    record_self_send(&store, sent_id.as_deref(), None, Some(&entity_id), None);
     println!("sent: draft={draft_id} account={email}");
     Ok(())
 }
@@ -4549,10 +4604,17 @@ async fn run_gmail_send_now(
         )
         .await
         .context("create_draft (send-now) failed")?;
-    gmail
+    let sent_id = gmail
         .send_draft(&entity_id, &draft_id)
         .await
         .context("send_draft (send-now) failed")?;
+    record_self_send(
+        &store,
+        sent_id.as_deref(),
+        thread_id.as_deref(),
+        Some(&entity_id),
+        None,
+    );
     print!("sent: account={email} to={to}");
     if !cc.is_empty() {
         print!(" cc={}", cc.join(", "));
@@ -4598,9 +4660,9 @@ async fn backfill_gmail_emails(store: &Store, only_missing: bool) -> Result<Vec<
 /// #219 — periodically observe outbound (SENT) Gmail and supersede stale
 /// pending drafts on threads the user replied to out-of-band.
 ///
-/// DEFAULT-OFF: gated on `AUGMENTAGENT_OUTBOUND_OBSERVER=1`. The caller
-/// already checks the env var before spawning this — this function assumes
-/// it should run. Tick interval defaults to 5 min, override via
+/// DEFAULT-ON as of #449 (opt out with `AUGMENTAGENT_OUTBOUND_OBSERVER=0`).
+/// The caller already checks the env var before spawning this — this function
+/// assumes it should run. Tick interval defaults to 5 min, override via
 /// `AUGMENTAGENT_OUTBOUND_OBSERVER_INTERVAL_SECS`. Failure of a single
 /// `poll_once` is logged and swallowed; the daemon must never crash on a
 /// transient Composio hiccup. Wiki-ingest of the emitted events is
@@ -4613,8 +4675,9 @@ async fn run_outbound_observer(
         Ok(v) if !v.is_empty() => v,
         _ => {
             warn!(
-                "outbound observer requested (AUGMENTAGENT_OUTBOUND_OBSERVER=1) but \
-                 COMPOSIO_API_KEY is unset — observer NOT started"
+                "outbound observer enabled but COMPOSIO_API_KEY is unset — \
+                 observer NOT started; approval cards will not be retired when \
+                 you reply from Gmail web/mobile"
             );
             return Ok(());
         }
@@ -4627,10 +4690,7 @@ async fn run_outbound_observer(
     let gmail = Arc::new(ComposioClient::new(api_key));
     let observer = OutboundObserver::new(store, gmail, 200);
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-    info!(
-        interval_secs,
-        "outbound observer started (AUGMENTAGENT_OUTBOUND_OBSERVER=1)"
-    );
+    info!(interval_secs, "outbound observer started");
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -4721,6 +4781,126 @@ fn sweep_stale_drafts_tick(store: &Store, days: Option<i64>) -> Result<Vec<Strin
 /// When the cutoff is `0` (disabled) the function logs the disabled
 /// state once and returns immediately — no idle tokio task burning a
 /// timer slot. This is the vacation-mode toggle.
+/// #449 — how often the staleness reconciliation re-checks the queue. The
+/// observer supersedes threads the instant it sees a user reply, so this loop
+/// is the slow backstop for the rules the observer can't see (bulk senders) and
+/// for anything that accumulated while the observer was off. 30 minutes.
+const STALE_RECONCILE_INTERVAL_SECS: u64 = 1800;
+
+/// #449 — retire approval cards that no longer deserve the user's attention,
+/// without being asked to.
+///
+/// Two rules, both decidable from state we already hold:
+///
+/// 1. **The user already answered the thread.** `outbound_thread_log` (fed by
+///    the OutboundObserver) knows every reply the user sent from Gmail
+///    web/mobile. A pending card on such a thread is asking the user to answer
+///    mail they have already answered.
+/// 2. **The sender is a bulk/marketing address.** These should never have been
+///    drafted at all (#451). Under the tightened `is_human_sender` rules they
+///    no longer will be — but ~100 of them are already sitting in the queue,
+///    and they are what pushed it past the old backpressure cap and starved
+///    real threads of drafts (#450).
+///
+/// Superseding (not deleting) keeps the audit trail: the row stays, with the
+/// reason in `errorMessage`, and simply stops being served by the carousel.
+async fn run_stale_approval_reconcile(
+    store: Arc<Store>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let mut ticker = tokio::time::interval(Duration::from_secs(STALE_RECONCILE_INTERVAL_SECS));
+    info!(
+        interval_secs = STALE_RECONCILE_INTERVAL_SECS,
+        "stale approval reconciliation started"
+    );
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("stale approval reconciliation: shutdown signal received");
+                return Ok(());
+            }
+            // Fires immediately on the first tick, which is what clears the
+            // backlog left behind by the observer having been off.
+            _ = ticker.tick() => {
+                match reconcile_stale_approvals_tick(&store) {
+                    Ok(0) => {}
+                    Ok(n) => info!(
+                        retired = n,
+                        "stale approval reconciliation: retired stale cards"
+                    ),
+                    Err(e) => warn!("stale approval reconciliation failed: {e:#}"),
+                }
+            }
+        }
+    }
+}
+
+/// One reconciliation pass. Returns how many cards were retired. Split out from
+/// the loop so it is directly unit-testable.
+fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
+    let pending = store.pending_actions_for_reconcile()?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let mut bulk_ids: Vec<String> = Vec::new();
+    let mut answered_threads: Vec<String> = Vec::new();
+
+    for row in &pending {
+        // Rule 2 — bulk/marketing sender. Cheap, purely local, so check first.
+        if !is_human_sender(&row.from_email, &row.body) {
+            info!(
+                action_id = %row.id,
+                from = %row.from_email,
+                subject = %row.subject,
+                "stale approval: retiring card from bulk/automated sender"
+            );
+            bulk_ids.push(row.id.clone());
+            continue;
+        }
+        // Rule 1 — the user already replied on this thread. `i64::MIN` as the
+        // "after" bound asks the broad question ("any user reply on this thread
+        // at all?"), which is the right one for a card that is still sitting
+        // unanswered in the queue: if the user has spoken on this thread since
+        // we raised it, the draft we are holding is stale by definition.
+        let Some(tid) = row.thread_id.as_deref() else {
+            continue;
+        };
+        match store.thread_has_user_reply_after(tid, i64::MIN) {
+            Ok(true) => {
+                info!(
+                    action_id = %row.id,
+                    thread = %tid,
+                    from = %row.from_email,
+                    "stale approval: retiring card, user already replied on thread"
+                );
+                answered_threads.push(tid.to_string());
+            }
+            Ok(false) => {}
+            Err(e) => warn!(
+                action_id = %row.id,
+                thread = %tid,
+                "stale approval: thread_has_user_reply_after failed: {e:#}"
+            ),
+        }
+    }
+
+    let mut retired = store.mark_pending_superseded_by_ids(
+        &bulk_ids,
+        "superseded: bulk/automated sender, no reply needed",
+    )?;
+    answered_threads.sort();
+    answered_threads.dedup();
+    for tid in &answered_threads {
+        let ids = store.mark_pending_drafts_superseded_by_thread(
+            tid,
+            "superseded: you already replied on this thread",
+        )?;
+        retired += ids.len();
+    }
+    Ok(retired)
+}
+
 async fn run_stale_draft_sweep(
     store: Arc<Store>,
     shutdown: CancellationToken,
@@ -6862,16 +7042,29 @@ impl ReplyApprover {
             };
         };
 
-        if let Err(e) = self.gmail.send_draft(entity_id, draft_id).await {
-            let msg = format!("send_draft: {e}");
-            let _ = self.store.update_action_status(
-                action_id,
-                ActionStatus::Error,
-                None,
-                Some(&msg),
-            );
-            return ApprovalActionOutcome::Failed { message: msg };
-        }
+        let sent_id = match self.gmail.send_draft(entity_id, draft_id).await {
+            Ok(id) => id,
+            Err(e) => {
+                let msg = format!("send_draft: {e}");
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                return ApprovalActionOutcome::Failed { message: msg };
+            }
+        };
+        // #449 — the approve button is the daemon's primary send path. Record
+        // the id BEFORE flipping status, so an observer tick racing this send
+        // can never catch the message in SENT without knowing it was ours.
+        record_self_send(
+            &self.store,
+            sent_id.as_deref(),
+            action.email.thread_id.as_deref(),
+            Some(entity_id),
+            Some(action_id),
+        );
         let _ = self.store.update_action_status(
             action_id,
             ActionStatus::Sent,
@@ -11926,5 +12119,133 @@ mod auto_expire_sweep_tests {
             1,
             "stale row must survive disabled sweep"
         );
+    }
+}
+
+/// #449 — the staleness reconciliation sweep. The user should never have to
+/// tell the daemon a card is stale; these are the two rules that let it work
+/// that out for itself.
+#[cfg(test)]
+mod stale_reconcile_tests {
+    use super::*;
+    use augmentagent_store::{ActionStatus, Email};
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    const SCHEMA: &str = r#"
+        CREATE TABLE actions (
+            id TEXT PRIMARY KEY, messageId TEXT NOT NULL, threadId TEXT,
+            fromEmail TEXT NOT NULL, subject TEXT NOT NULL, originalBody TEXT,
+            draftBody TEXT, status TEXT NOT NULL DEFAULT 'pending',
+            errorMessage TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+        );
+        CREATE TABLE emails (
+            messageId TEXT PRIMARY KEY, threadId TEXT, fromEmail TEXT NOT NULL,
+            subject TEXT NOT NULL, body TEXT, receivedAt TEXT, accountEntityId TEXT,
+            firstSeenAt INTEGER NOT NULL, triageResult TEXT, agentProcessedAt INTEGER,
+            platform TEXT NOT NULL DEFAULT 'gmail', kind TEXT NOT NULL DEFAULT 'dm'
+        );
+        CREATE TABLE gmail_accounts (
+            id TEXT PRIMARY KEY, connectionId TEXT NOT NULL, email TEXT, label TEXT,
+            entityId TEXT NOT NULL, active INTEGER DEFAULT 1, createdAt INTEGER NOT NULL
+        );
+    "#;
+
+    fn fresh_store() -> (Store, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("data.db");
+        Connection::open(&db).unwrap().execute_batch(SCHEMA).unwrap();
+        (Store::open(&db).unwrap(), tmp)
+    }
+
+    fn seed_pending(store: &Store, msg: &str, thread: Option<&str>, from: &str) -> String {
+        store
+            .upsert_email(&Email {
+                message_id: msg.into(),
+                thread_id: thread.map(String::from),
+                from: from.into(),
+                subject: "subj".into(),
+                body: "body".into(),
+                date: "2026-07-13T12:00:00Z".into(),
+                account_entity_id: Some("acc".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            })
+            .unwrap();
+        store
+            .log_action(
+                msg,
+                thread,
+                from,
+                "subj",
+                Some("body"),
+                Some("a draft"),
+                ActionStatus::Pending,
+            )
+            .unwrap()
+    }
+
+    fn status_of(store: &Store, id: &str) -> String {
+        store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT status FROM actions WHERE id = ?1",
+                    augmentagent_store::rusqlite::params![id],
+                    |r| r.get::<_, String>(0),
+                )
+            })
+            .unwrap()
+    }
+
+    /// Rule 1: the user answered the thread from Gmail web/mobile. The card we
+    /// are still holding is asking them to reply to mail they already replied
+    /// to — exactly the stale carousel the user reported.
+    #[test]
+    fn retires_cards_on_threads_the_user_already_answered() {
+        let (store, _t) = fresh_store();
+        let answered = seed_pending(&store, "m-1", Some("T-answered"), "dana@example-labs.ai"); // pii-ok: synthetic
+        let untouched = seed_pending(&store, "m-2", Some("T-open"), "sam@example-labs.ai"); // pii-ok: synthetic
+
+        // The OutboundObserver saw the user reply on T-answered.
+        store
+            .record_outbound_thread_event("acc", "user-reply-1", Some("T-answered"), 9_000_000)
+            .unwrap();
+
+        let n = reconcile_stale_approvals_tick(&store).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(status_of(&store, &answered), "superseded");
+        assert_eq!(
+            status_of(&store, &untouched),
+            "pending",
+            "a thread the user has NOT answered must stay in the queue"
+        );
+    }
+
+    /// Rule 2: bulk senders. These are the ~100 cards that jammed the live
+    /// queue and, through the old backpressure cap, starved real threads.
+    #[test]
+    fn retires_cards_from_bulk_senders() {
+        let (store, _t) = fresh_store();
+        let blast =
+            seed_pending(&store, "m-3", Some("T-3"), "Brand <marketing@engage.examplebrand.com>"); // pii-ok: synthetic
+        let human = seed_pending(&store, "m-4", Some("T-4"), "Dana Rivera <dana@example-labs.ai>"); // pii-ok: synthetic
+
+        let n = reconcile_stale_approvals_tick(&store).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(status_of(&store, &blast), "superseded");
+        assert_eq!(
+            status_of(&store, &human),
+            "pending",
+            "a real person's card must never be swept as bulk"
+        );
+    }
+
+    /// The sweep must be safe to run on every tick forever.
+    #[test]
+    fn reconcile_is_idempotent_and_noop_on_a_clean_queue() {
+        let (store, _t) = fresh_store();
+        seed_pending(&store, "m-5", Some("T-5"), "Dana Rivera <dana@example-labs.ai>"); // pii-ok: synthetic
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
     }
 }
