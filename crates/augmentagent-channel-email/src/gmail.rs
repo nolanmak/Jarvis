@@ -121,8 +121,19 @@ pub trait GmailApi: Send + Sync {
         Ok(new_id)
     }
 
-    /// Send an existing draft.
-    async fn send_draft(&self, entity_id: &str, draft_id: &str) -> Result<(), GmailError>;
+    /// Send an existing draft. Returns the Gmail message id of the message
+    /// that landed in SENT, when the provider reports one.
+    ///
+    /// #449: the id is what lets the OutboundObserver tell the daemon's own
+    /// replies apart from replies the user typed in Gmail web/mobile. Callers
+    /// MUST hand it to `Store::record_self_sent_message`. `None` means the
+    /// provider didn't return an id — the send still succeeded, and the
+    /// observer falls back to `Store::has_daemon_send_near`.
+    async fn send_draft(
+        &self,
+        entity_id: &str,
+        draft_id: &str,
+    ) -> Result<Option<String>, GmailError>;
 
     /// Delete an unsent draft from Gmail/Drafts. Used to clean up orphans
     /// after revise and to discard drafts the approver chose to skip.
@@ -1502,10 +1513,29 @@ impl GmailApi for ComposioClient {
             .await
     }
 
-    async fn send_draft(&self, entity_id: &str, draft_id: &str) -> Result<(), GmailError> {
+    async fn send_draft(
+        &self,
+        entity_id: &str,
+        draft_id: &str,
+    ) -> Result<Option<String>, GmailError> {
         let args = serde_json::json!({ "draft_id": draft_id });
-        self.execute("GMAIL_SEND_DRAFT", entity_id, args).await?;
-        Ok(())
+        let v = self.execute("GMAIL_SEND_DRAFT", entity_id, args).await?;
+        // Gmail's drafts.send returns the resulting Message resource, so `id`
+        // here is the SENT message's id (not the draft's — that one is
+        // consumed by the send). Key order matters: prefer the explicit
+        // message-id spellings before falling back to a bare `id`.
+        const SENT_ID_KEYS: &[&str] = &["message_id", "messageId", "id"];
+        let sent_id = find_string_field(&v, SENT_ID_KEYS);
+        if sent_id.is_none() {
+            // Not fatal — the mail went out. But self-send recognition now
+            // leans on the thread+time fallback, so make the gap visible.
+            tracing::warn!(
+                draft_id,
+                "GMAIL_SEND_DRAFT returned no message id; \
+                 falling back to thread-proximity self-send detection (#449)"
+            );
+        }
+        Ok(sent_id)
     }
 
     async fn delete_draft(&self, entity_id: &str, draft_id: &str) -> Result<(), GmailError> {

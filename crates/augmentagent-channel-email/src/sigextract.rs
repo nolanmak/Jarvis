@@ -62,6 +62,45 @@ const NON_HUMAN_LOCAL_PATTERNS: &[&str] = &[
     "contact@",
     "auto-confirm",
     "automated",
+    "customerservice",
+    "customer-service",
+    // #451 — local-parts observed on mail that actually reached the approval
+    // queue as a "reply-worthy" draft. An `offers@` sender was the one that
+    // proved the list was too short.
+    "offers",
+    "offer@",
+    "promo",
+    "promotions",
+    "sales@",
+    "store@",
+    "shop@",
+    "orders",
+    "email@",
+    "mail@",
+    "mailer",
+    "subscriptions",
+    "subscribe",
+    "unsubscribe",
+    "campaign",
+    "broadcast",
+    "announce",
+    "events@",
+    "community@",
+    "membership",
+];
+
+/// #451 — sending *subdomains* that ESPs and retailers use for bulk mail.
+/// Matched as a dotted label on the domain, so `e.nordstromrack.com` and
+/// `engage.canva.com` are caught while a real company domain that merely
+/// contains the letters (`email-security.io`) is not.
+///
+/// Anchored to a leading label to keep the match honest: we look for the
+/// pattern as a full dot-delimited segment (`mail.acme.com`), never as a bare
+/// substring (`gmail.com` must NOT match `mail`).
+const BULK_SENDING_SUBDOMAINS: &[&str] = &[
+    "e", "em", "mail", "email", "mkt", "marketing", "send", "sending", "engage", "news",
+    "newsletter", "campaign", "campaigns", "notify", "notifications", "reply", "info", "go",
+    "links", "link", "click", "cts", "message", "messages", "bulk", "blast",
 ];
 
 /// Domain suffixes / substrings owned by ESPs and bulk senders. Mail
@@ -170,6 +209,23 @@ pub fn is_human_sender(from: &str, body: &str) -> bool {
     for pat in NON_HUMAN_DOMAIN_PATTERNS {
         if domain.contains(pat) {
             return false;
+        }
+    }
+
+    // 4. #451 — bulk sending subdomains. A real person does not write to you
+    //    from `e.nordstromrack.com` or `engage.canva.com`. Compare whole
+    //    dot-delimited labels, and only the leading ones: the last two labels
+    //    are the registrable domain (`nordstromrack.com`), and a company whose
+    //    apex happens to be `mail.com` or `news.com` is a real counterpart, not
+    //    a blast. `gmail.com` therefore cannot match `mail`, because `gmail` is
+    //    a single label and is part of the apex.
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels.len() > 2 {
+        let leading = &labels[..labels.len() - 2];
+        for label in leading {
+            if BULK_SENDING_SUBDOMAINS.contains(label) {
+                return false;
+            }
         }
     }
 
@@ -1190,5 +1246,65 @@ mod tests {
             ex.extract("Jane Doe\nSenior Person").await,
             Err(SigError::Parse)
         ));
+    }
+}
+
+#[cfg(test)]
+mod bulk_sender_449 {
+    use super::is_human_sender;
+
+    /// Shapes that actually reached the live approval queue as "reply-worthy"
+    /// drafts (#451). Addresses are synthetic stand-ins for the real senders;
+    /// what matters is the shape each one probes.
+    #[test]
+    fn bulk_senders_from_the_live_queue_are_not_human() {
+        for from in [
+            // bulk local-part on a sending subdomain
+            "Brand <marketing@engage.examplebrand.com>", // pii-ok: synthetic test fixture
+            // `offers@` — the local-part that proved the list was too short
+            "\"Example News\" <offers@examplenews.com>", // pii-ok: synthetic test fixture
+            // single-letter `e.` sending subdomain
+            "EXAMPLE RACK <rack@e.examplerack.com>", // pii-ok: synthetic test fixture
+            // known ESP domain
+            "A Writer <writer-c0ed52@mail.beehiiv.com>", // pii-ok: synthetic test fixture
+            // `newsletter@` local-part
+            "Example Digest <newsletter@digest.example.com>", // pii-ok: synthetic test fixture
+            // `events@` local-part
+            "Example Events <events@example.io>", // pii-ok: synthetic test fixture
+        ] {
+            assert!(
+                !is_human_sender(from, ""),
+                "expected bulk sender to be filtered: {from}"
+            );
+        }
+    }
+
+    /// The filter is default-allow by design — tightening it must not start
+    /// swallowing the real people the whole product exists to reply to. These
+    /// mirror the senders whose threads went undrafted in #450.
+    #[test]
+    fn real_humans_are_still_human() {
+        for from in [
+            "Dana Rivera <dana@example-labs.ai>", // pii-ok: synthetic test fixture
+            "Sam Okafor <sam@example-labs.ai>",   // pii-ok: synthetic test fixture
+            "Alex Chen <alex@examplesoft.net>",   // pii-ok: synthetic test fixture
+            "A Person <a.person@gmail.com>",      // pii-ok: synthetic test fixture
+            "Someone <someone@hey.com>",          // pii-ok: synthetic test fixture
+        ] {
+            assert!(
+                is_human_sender(from, ""),
+                "expected human sender to pass: {from}"
+            );
+        }
+    }
+
+    /// `gmail.com` must never match the `mail` bulk-subdomain label: `gmail` is
+    /// one apex label, not a leading sending subdomain. Only the leading labels
+    /// of a 3+-label domain are considered.
+    #[test]
+    fn apex_domains_are_not_mistaken_for_sending_subdomains() {
+        assert!(is_human_sender("A <a@gmail.com>", "")); // pii-ok: synthetic test fixture
+        assert!(!is_human_sender("C <c@news.example.com>", "")); // pii-ok: synthetic
+        assert!(!is_human_sender("D <d@e.retailer.com>", "")); // pii-ok: synthetic
     }
 }
