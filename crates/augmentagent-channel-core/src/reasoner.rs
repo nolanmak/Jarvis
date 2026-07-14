@@ -268,6 +268,26 @@ pub struct ReasonerOpts {
 pub trait Reasoner: Send + Sync {
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String>;
 
+    /// Like [`call`](Reasoner::call), but returns **everything the model said**
+    /// across the turn rather than just its final text block.
+    ///
+    /// Use this for any caller whose output is prose shown to a human (the
+    /// wiki-ask / Discord answer path). `call` keeps only the last block, which
+    /// is correct for callers that end their prompt with "emit JSON" but is
+    /// actively wrong here: the ask prompt orders the model to write the
+    /// deliverable *first* and file a wiki receipt *last*, so last-block-wins
+    /// posts the receipt and silently drops the deliverable (#446).
+    ///
+    /// Defaults to `call` so test doubles and non-CLI reasoners need not
+    /// implement it; [`ClaudeCliReasoner`] overrides it.
+    async fn call_transcript(
+        &self,
+        opts: &ReasonerOpts,
+        user_message: &str,
+    ) -> anyhow::Result<String> {
+        self.call(opts, user_message).await
+    }
+
     /// Code-Mode entrypoint. Spawns `claude` exactly like [`Reasoner::call`]
     /// using the caller-provided system prompt (which should be built via
     /// [`crate::prompt::code_mode_system`] from a manifest), parses the
@@ -342,16 +362,22 @@ impl ClaudeCliReasoner {
     }
 }
 
-#[async_trait]
-impl Reasoner for ClaudeCliReasoner {
-    async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
+impl ClaudeCliReasoner {
+    /// Shared body of [`Reasoner::call`] and [`Reasoner::call_transcript`] —
+    /// identical except for how the stream's text blocks are reduced.
+    async fn call_with_capture(
+        &self,
+        opts: &ReasonerOpts,
+        user_message: &str,
+        capture: TextCapture,
+    ) -> anyhow::Result<String> {
         // #141 — Try the subprocess once. If it fails because the user's
         // `~/.claude.json` is corrupted (the CLI itself writes the corruption
         // diagnostics into stderr and exits non-zero), attempt a one-shot
         // auto-recovery from the most recent on-disk backup and retry. If the
         // retry also fails or no backup exists, surface a short sanitized
         // user-facing error instead of the raw multi-line stderr blob.
-        match self.call_once(opts, user_message).await {
+        match self.call_once(opts, user_message, capture).await {
             Ok(text) => Ok(text),
             Err(CallError::ConfigCorrupted { stderr }) => {
                 let recovered = match restore_latest_claude_backup() {
@@ -363,7 +389,7 @@ impl Reasoner for ClaudeCliReasoner {
                     }
                 };
                 if recovered {
-                    match self.call_once(opts, user_message).await {
+                    match self.call_once(opts, user_message, capture).await {
                         Ok(text) => return Ok(text),
                         Err(CallError::ConfigCorrupted { stderr }) => {
                             return Err(anyhow::anyhow!(sanitize_claude_error(&stderr)));
@@ -375,6 +401,23 @@ impl Reasoner for ClaudeCliReasoner {
             }
             Err(CallError::Other(e)) => Err(e),
         }
+    }
+}
+
+#[async_trait]
+impl Reasoner for ClaudeCliReasoner {
+    async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
+        self.call_with_capture(opts, user_message, TextCapture::LastBlock)
+            .await
+    }
+
+    async fn call_transcript(
+        &self,
+        opts: &ReasonerOpts,
+        user_message: &str,
+    ) -> anyhow::Result<String> {
+        self.call_with_capture(opts, user_message, TextCapture::AllBlocks)
+            .await
     }
 }
 
@@ -402,6 +445,60 @@ impl From<std::io::Error> for CallError {
     }
 }
 
+/// How [`ClaudeCliReasoner::call_once`] turns a multi-event `stream-json`
+/// session into the single `String` the caller gets back.
+///
+/// An agentic turn emits **many** `assistant` events interleaved with
+/// `tool_use`, so "the model's text" is a *list* of blocks, not one value.
+/// The two callers want opposite halves of it:
+///
+/// - [`LastBlock`](TextCapture::LastBlock) — machine-readable callers
+///   (`triage_opts`, `digest_opts`, `loop_parse_opts`, …) whose prompts end
+///   with "emit JSON". The payload is the model's *final* word; any earlier
+///   block is scratch reasoning that would corrupt the parse. This is the
+///   historical behaviour and stays the default.
+/// - [`AllBlocks`](TextCapture::AllBlocks) — human-facing prose callers
+///   (`ask_opts`). Here every block is part of the answer.
+///
+/// See #446: the ask path was pinned to `LastBlock`, so a turn that wrote the
+/// deliverable *before* filing it to the wiki lost the deliverable — the
+/// trailing "filed it to X" receipt overwrote it and was all Discord ever saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextCapture {
+    /// Keep only the last non-empty text block (or the `result` event).
+    LastBlock,
+    /// Keep every text block, in order, joined by a blank line.
+    AllBlocks,
+}
+
+/// Reduce the text blocks observed across one `stream-json` session down to
+/// the string the caller receives.
+///
+/// `result` is the `result` event's payload, which the CLI populates with the
+/// **final** assistant message. Under [`TextCapture::AllBlocks`] it is
+/// therefore a duplicate of the last entry in `blocks` and is deliberately
+/// ignored — it is only consulted as a fallback when the model produced no
+/// assistant text at all (e.g. a session that ended in a tool call).
+///
+/// Split out of [`ClaudeCliReasoner::call_once`] — which spawns a subprocess
+/// and so can't be unit-tested — following the same pattern as
+/// [`audit_stream_line`].
+fn select_final_text(blocks: &[String], result: Option<&str>, capture: TextCapture) -> String {
+    match capture {
+        TextCapture::AllBlocks => {
+            if blocks.is_empty() {
+                result.unwrap_or_default().to_string()
+            } else {
+                blocks.join("\n\n")
+            }
+        }
+        TextCapture::LastBlock => result
+            .map(str::to_string)
+            .or_else(|| blocks.last().cloned())
+            .unwrap_or_default(),
+    }
+}
+
 impl ClaudeCliReasoner {
     /// Single-shot spawn-and-read. Pulled out of [`Reasoner::call`] so the
     /// outer wrapper can retry on a recoverable failure (corrupted
@@ -410,6 +507,7 @@ impl ClaudeCliReasoner {
         &self,
         opts: &ReasonerOpts,
         user_message: &str,
+        capture: TextCapture,
     ) -> Result<String, CallError> {
         let mut args: Vec<String> = vec![
             "-p".into(),
@@ -527,7 +625,13 @@ impl ClaudeCliReasoner {
             .unwrap_or_else(|| "-".to_string());
         let mut pending_tool_uses: HashMap<String, (String, serde_json::Value)> = HashMap::new();
 
-        let mut final_text = String::new();
+        // Every non-empty text block the model emitted, in stream order, plus
+        // the terminal `result` payload. Reducing these to one string is
+        // `select_final_text`'s job — do NOT collapse them here, or a turn
+        // that speaks before its last tool call loses everything it said
+        // (#446).
+        let mut text_blocks: Vec<String> = Vec::new();
+        let mut result_text: Option<String> = None;
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
@@ -545,14 +649,16 @@ impl ClaudeCliReasoner {
                 Ok(StreamEvent::Assistant { message }) => {
                     for block in message.content {
                         if let ContentBlock::Text { text } = block {
-                            final_text = text;
+                            if !text.trim().is_empty() {
+                                text_blocks.push(text);
+                            }
                         }
                     }
                 }
                 Ok(StreamEvent::Result { result }) => {
                     if let Some(r) = result {
                         if !r.trim().is_empty() {
-                            final_text = r;
+                            result_text = Some(r);
                         }
                     }
                 }
@@ -560,6 +666,7 @@ impl ClaudeCliReasoner {
                 Err(e) => debug!("stream-json parse skip: {e} line={line}"),
             }
         }
+        let final_text = select_final_text(&text_blocks, result_text.as_deref(), capture);
 
         let status = child.wait().await?;
         if !status.success() {
@@ -1653,6 +1760,91 @@ mod tests {
         assert!(sent.contains("throw new Error('boom')"));
         assert!(sent.contains("<prior_error>"));
         assert!(sent.contains("Error: boom"));
+    }
+
+    /// #446 regression. The ask prompt orders the model to emit the
+    /// deliverable first and file a durable-facts wiki receipt last, so a
+    /// content turn streams as: text(post) → tool_use(Write) → text(receipt).
+    /// Under the old last-block-wins extraction Discord only ever saw the
+    /// receipt — the post itself was silently discarded, with no error, while
+    /// the wiki file it referenced was written correctly. This is the bug the
+    /// owner hit three times in a row on 2026-07-14.
+    #[test]
+    fn all_blocks_keeps_a_deliverable_written_before_the_wiki_receipt() {
+        let post = "Tomorrow at Blockspace: the OG Coffee&Code.\n\nNo panels, no pitches.";
+        let receipt = "Filed the event details in projects/blockspace-philly.md.";
+        let blocks = vec![post.to_string(), receipt.to_string()];
+
+        // The `result` event echoes the model's FINAL message, i.e. the
+        // receipt. AllBlocks must ignore it rather than let it win.
+        let got = select_final_text(&blocks, Some(receipt), TextCapture::AllBlocks);
+
+        assert!(
+            got.starts_with(post),
+            "the deliverable must lead the reply, got: {got:?}"
+        );
+        assert!(got.contains(receipt), "the filing note is kept too");
+        assert_eq!(got, format!("{post}\n\n{receipt}"));
+    }
+
+    /// The other half of the contract: JSON callers (`triage_opts`,
+    /// `digest_opts`, `loop_parse_opts`, …) must keep last-block-wins. Their
+    /// prompts end with "emit JSON", and the triage prompt has the model
+    /// Read/Grep the wiki first — so scratch prose routinely precedes the
+    /// payload. Concatenating it would put prose in front of the object and
+    /// break `no JSON object found in model output`.
+    #[test]
+    fn last_block_capture_still_isolates_the_json_payload() {
+        let json = r#"{"decision":"skip","reason":"marketing blast"}"#;
+        let blocks = vec![
+            "Let me check the wiki for this sender.".to_string(),
+            json.to_string(),
+        ];
+
+        let got = select_final_text(&blocks, Some(json), TextCapture::LastBlock);
+
+        assert_eq!(got, json, "scratch reasoning must not reach the parser");
+        assert!(serde_json::from_str::<serde_json::Value>(&got).is_ok());
+    }
+
+    /// A session that ends on a tool call emits no trailing assistant text.
+    /// Both modes fall back to the `result` payload rather than returning ""
+    /// (which would trip the "claude produced no assistant text" error).
+    #[test]
+    fn both_modes_fall_back_to_the_result_event_when_no_text_blocks() {
+        let blocks: Vec<String> = Vec::new();
+        assert_eq!(
+            select_final_text(&blocks, Some("done"), TextCapture::AllBlocks),
+            "done"
+        );
+        assert_eq!(
+            select_final_text(&blocks, Some("done"), TextCapture::LastBlock),
+            "done"
+        );
+    }
+
+    /// And with neither text nor result, both modes yield empty — the caller's
+    /// existing `final_text.is_empty()` guard is what turns that into an error.
+    #[test]
+    fn no_text_and_no_result_yields_empty_for_both_modes() {
+        let blocks: Vec<String> = Vec::new();
+        assert!(select_final_text(&blocks, None, TextCapture::AllBlocks).is_empty());
+        assert!(select_final_text(&blocks, None, TextCapture::LastBlock).is_empty());
+    }
+
+    /// Missing `result` event (stream cut short): LastBlock still returns the
+    /// most recent block, preserving pre-#446 behaviour.
+    #[test]
+    fn last_block_capture_uses_the_final_block_when_result_is_absent() {
+        let blocks = vec!["first".to_string(), "second".to_string()];
+        assert_eq!(
+            select_final_text(&blocks, None, TextCapture::LastBlock),
+            "second"
+        );
+        assert_eq!(
+            select_final_text(&blocks, None, TextCapture::AllBlocks),
+            "first\n\nsecond"
+        );
     }
 
     #[test]
