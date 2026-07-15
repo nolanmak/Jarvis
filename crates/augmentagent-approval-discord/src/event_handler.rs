@@ -13,21 +13,18 @@ use std::sync::Arc;
 use serenity::all::{
     ActionRowComponent, Attachment, ButtonKind, ChannelId, Context, CreateAttachment,
     CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateMessage, EditMessage, EventHandler, GetMessages, Http, Interaction, Message, MessageId,
+    CreateMessage, EventHandler, GetMessages, Http, Interaction, Message, MessageId,
     MessageReference, Ready, UserId,
 };
 use tracing::{debug, info, warn};
 
-use augmentagent_store::Store;
-
 use crate::broker::BrokerState;
 use crate::custom_id::{CustomId, Verb};
 use crate::layout::{
-    approval_message, extract_feedback, extract_fill_values, extract_invoice_email, fill_ask_modal,
-    fill_feedback, invoice_draft_components, invoice_draft_content, invoice_revise_modal,
+    approval_message, extract_feedback, extract_fill_values, fill_ask_modal, fill_feedback,
     revise_modal, split_needs_input,
 };
-use crate::{ApprovalActionOutcome, InvoiceOps};
+use crate::ApprovalActionOutcome;
 
 const DISCORD_MSG_LIMIT: usize = 1900;
 
@@ -110,55 +107,6 @@ impl EventHandler for Handler {
             return;
         }
 
-        // Invoice config command — handled inline, not routed to the wiki
-        // query handler. Allowlist was already enforced above. `draft` is
-        // the only side-effectful subcommand and is dispatched separately
-        // so it can borrow the http + spawn the slow PDF generation off the
-        // event loop without blocking other Discord events.
-        if user_text.starts_with("!invoice") {
-            let parts: Vec<&str> = user_text.split_whitespace().collect();
-            if parts.get(1).copied() == Some("draft") {
-                let store = self.state.invoice_store.clone();
-                let ops = self.state.invoice_ops.clone();
-                let approval_channel = self.state.approval_channel_id;
-                let week_end_arg = parts.get(2).map(|s| s.to_string());
-                let http = ctx.http.clone();
-                let channel_id = msg.channel_id;
-                let msg_id = msg.id;
-                tokio::spawn(async move {
-                    let reply = match (store, ops) {
-                        (Some(store), Some(ops)) => {
-                            post_invoice_draft_card(
-                                &store,
-                                ops.as_ref(),
-                                &http,
-                                approval_channel,
-                                week_end_arg.as_deref(),
-                            )
-                            .await
-                        }
-                        (None, _) => "invoice store not wired — cannot draft".to_string(),
-                        (_, None) => "invoice ops not wired — cannot draft".to_string(),
-                    };
-                    let builder = CreateMessage::new()
-                        .content(reply)
-                        .reference_message(MessageReference::from((channel_id, msg_id)));
-                    if let Err(e) = channel_id.send_message(&*http, builder).await {
-                        warn!("failed to post invoice draft reply: {e}");
-                    }
-                });
-                return;
-            }
-            let reply = handle_invoice_command(self.state.invoice_store.as_deref(), &user_text);
-            let builder = CreateMessage::new()
-                .content(reply)
-                .reference_message(MessageReference::from((msg.channel_id, msg.id)));
-            if let Err(e) = msg.channel_id.send_message(&ctx.http, builder).await {
-                warn!("failed to post invoice command reply: {e}");
-            }
-            return;
-        }
-
         // `!loops` — list / stop running `claude` CLI processes (#176).
         // Distinct from `/loop` below (which is the in-process scheduler).
         // Matched first because the visual similarity to `/loop` makes
@@ -189,7 +137,7 @@ impl EventHandler for Handler {
         }
 
         // `loop` / `/loop` — user-defined scheduled tasks (#104). Handled
-        // inline like `!invoice`; never routed to the wiki query handler.
+        // inline; never routed to the wiki query handler.
         // Leading `/` is optional — `match_loop_prefix` accepts either form
         // as long as it's word-bounded (so `loops are nice` isn't matched).
         if crate::loops::match_loop_prefix(&user_text).is_some() {
@@ -591,87 +539,8 @@ impl EventHandler for Handler {
                             }
                         });
                     }
-                    Verb::ReviseModal | Verb::FillAskModal | Verb::InvoiceReviseModal => {
+                    Verb::ReviseModal | Verb::FillAskModal => {
                         debug!("unexpected modal verb on component interaction");
-                    }
-                    Verb::InvoiceRevise => {
-                        // Open the edit modal pre-filled with the current email
-                        // (mirrors the reply card's Revise → modal). The store
-                        // read is fast, so opening the modal IS the response.
-                        let (subject, body) = self
-                            .state
-                            .invoice_store
-                            .as_deref()
-                            .and_then(|s| {
-                                s.get_invoice_draft_email(&cid.action_id).ok().flatten()
-                            })
-                            .unwrap_or_default();
-                        let modal = invoice_revise_modal(&cid.action_id, &subject, &body);
-                        if let Err(e) = comp
-                            .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
-                            .await
-                        {
-                            warn!("failed to open invoice revise modal: {e}");
-                        }
-                    }
-                    Verb::InvoiceApprove => {
-                        if let Err(e) = defer_ephemeral(&ctx, &comp).await {
-                            warn!("failed to defer InvoiceApprove: {e}");
-                            return;
-                        }
-                        let store = self.state.invoice_store.clone();
-                        let ops = self.state.invoice_ops.clone();
-                        let action_id = cid.action_id.clone();
-                        let user_id = comp.user.id.get().to_string();
-                        let ctx_clone = ctx.clone();
-                        let comp_clone = comp.clone();
-                        tokio::spawn(async move {
-                            let result = invoice_approve_draft(
-                                store.as_deref(),
-                                ops.as_deref(),
-                                &action_id,
-                                &user_id,
-                            )
-                            .await;
-                            followup(&ctx_clone, &comp_clone, &result.followup).await;
-                            if let Some(edit) = result.source_edit {
-                                edit_source_message(
-                                    &ctx_clone,
-                                    comp_clone.channel_id,
-                                    comp_clone.message.id,
-                                    &edit,
-                                )
-                                .await;
-                            }
-                        });
-                    }
-                    Verb::InvoiceReject => {
-                        if let Err(e) = defer_ephemeral(&ctx, &comp).await {
-                            warn!("failed to defer InvoiceReject: {e}");
-                            return;
-                        }
-                        let store = self.state.invoice_store.clone();
-                        let action_id = cid.action_id.clone();
-                        let user_id = comp.user.id.get().to_string();
-                        let ctx_clone = ctx.clone();
-                        let comp_clone = comp.clone();
-                        tokio::spawn(async move {
-                            let result = invoice_reject_draft(
-                                store.as_deref(),
-                                &action_id,
-                                &user_id,
-                            );
-                            followup(&ctx_clone, &comp_clone, &result.followup).await;
-                            if let Some(edit) = result.source_edit {
-                                edit_source_message(
-                                    &ctx_clone,
-                                    comp_clone.channel_id,
-                                    comp_clone.message.id,
-                                    &edit,
-                                )
-                                .await;
-                            }
-                        });
                     }
                 }
             }
@@ -679,10 +548,7 @@ impl EventHandler for Handler {
                 let Some(cid) = CustomId::parse(&modal.data.custom_id) else {
                     return;
                 };
-                if !matches!(
-                    cid.verb,
-                    Verb::ReviseModal | Verb::FillAskModal | Verb::InvoiceReviseModal
-                ) {
+                if !matches!(cid.verb, Verb::ReviseModal | Verb::FillAskModal) {
                     return;
                 }
                 if let Some(allowed) = self.state.allowed_user_id {
@@ -700,95 +566,6 @@ impl EventHandler for Handler {
                         return;
                     }
                 }
-                // Invoice email revise: store the edited subject+body and
-                // re-render the card. Separate from the reasoner-driven reply
-                // revise below — an invoice email is a template, not an LLM draft.
-                if cid.verb == Verb::InvoiceReviseModal {
-                    if let Err(e) = modal
-                        .create_response(
-                            &ctx.http,
-                            CreateInteractionResponse::Defer(
-                                CreateInteractionResponseMessage::new().ephemeral(true),
-                            ),
-                        )
-                        .await
-                    {
-                        warn!("failed to defer invoice revise modal: {e}");
-                        return;
-                    }
-                    let (subject, body) = extract_invoice_email(&modal.data.components);
-                    let store = self.state.invoice_store.clone();
-                    let draft_id = cid.action_id.clone();
-                    let ctx_clone = ctx.clone();
-                    let modal_clone = modal.clone();
-                    tokio::spawn(async move {
-                        let ack = |text: String| {
-                            let ctx = ctx_clone.clone();
-                            let m = modal_clone.clone();
-                            async move {
-                                let _ = m
-                                    .create_followup(
-                                        &ctx.http,
-                                        CreateInteractionResponseFollowup::new()
-                                            .content(text)
-                                            .ephemeral(true),
-                                    )
-                                    .await;
-                            }
-                        };
-                        let Some(store) = store.as_deref() else {
-                            ack("Invoice store not wired.".into()).await;
-                            return;
-                        };
-                        if let Err(e) = store.set_invoice_draft_email(&draft_id, &subject, &body) {
-                            warn!(draft_id = %draft_id, "invoice revise: store failed: {e}");
-                            ack(format!("Revise failed: {e}")).await;
-                            return;
-                        }
-                        // Re-render the source card with the new subject/body.
-                        if let Ok(Some(d)) = store.get_invoice_draft(&draft_id) {
-                            let week_start =
-                                chrono::NaiveDate::parse_from_str(&d.week_end, "%Y-%m-%d")
-                                    .ok()
-                                    .map(|e| (e - chrono::Duration::days(7)).to_string())
-                                    .unwrap_or_default();
-                            let recipient = store
-                                .get_invoice_config("recipient_email")
-                                .ok()
-                                .flatten()
-                                .unwrap_or_default();
-                            let pdf_filename = std::path::Path::new(&d.pdf_path)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| d.pdf_path.clone());
-                            let content = invoice_draft_content(
-                                d.invoice_number as u32,
-                                &week_start,
-                                &d.week_end,
-                                &recipient,
-                                &subject,
-                                &body,
-                                &pdf_filename,
-                            );
-                            if let Some(msg) = modal_clone.message.as_ref() {
-                                let edit = EditMessage::new()
-                                    .content(content)
-                                    .components(invoice_draft_components(&draft_id));
-                                if let Err(e) = msg
-                                    .channel_id
-                                    .edit_message(&ctx_clone.http, msg.id, edit)
-                                    .await
-                                {
-                                    warn!(draft_id = %draft_id, "invoice revise: card edit failed: {e}");
-                                }
-                            }
-                        }
-                        ack("Invoice email revised — review the card, then Approve & Send.".into())
-                            .await;
-                    });
-                    return;
-                }
-
                 // Defer the modal submission immediately — the revise work
                 // (reasoner call, create_draft, delete_draft) takes well over
                 // 3s, which is Discord's interaction ack deadline.
@@ -1155,22 +932,13 @@ async fn sweep_resolved_cards(
 
 /// Walk a message's components looking for the first parseable content-draft
 /// `custom_id`. Returns the `action_id` if found; `None` for any message that
-/// isn't one of our cards. Invoice draft cards encode a `draft_id` under the
-/// `InvoiceApprove` / `InvoiceReject` verbs — those are NOT actions, so the
-/// startup sweep skips them.
+/// isn't one of our cards.
 fn action_id_from_message(msg: &Message) -> Option<String> {
     for row in &msg.components {
         for component in &row.components {
             if let ActionRowComponent::Button(button) = component {
                 if let ButtonKind::NonLink { custom_id, .. } = &button.data {
                     if let Some(parsed) = crate::custom_id::CustomId::parse(custom_id) {
-                        if matches!(
-                            parsed.verb,
-                            crate::custom_id::Verb::InvoiceApprove
-                                | crate::custom_id::Verb::InvoiceReject
-                        ) {
-                            continue;
-                        }
                         return Some(parsed.action_id);
                     }
                 }
@@ -1178,352 +946,6 @@ fn action_id_from_message(msg: &Message) -> Option<String> {
         }
     }
     None
-}
-
-/// Result of an invoice button-click helper. Two pieces: the ephemeral
-/// follow-up shown to the clicker, and (optionally) a new content to edit
-/// the source card to so the channel reflects the final state.
-pub(crate) struct InvoiceClickResult {
-    pub followup: String,
-    pub source_edit: Option<String>,
-}
-
-/// Approve the invoice draft `draft_id`: call the real-send path via
-/// `InvoiceOps::send`, mark the draft approved, and return the human
-/// follow-up + source-edit text. Trusts the caller to have enforced the
-/// allowlist already (the event handler does this at the top of the
-/// component branch).
-pub(crate) async fn invoice_approve_draft(
-    store: Option<&Store>,
-    ops: Option<&(dyn InvoiceOps + 'static)>,
-    draft_id: &str,
-    user_id: &str,
-) -> InvoiceClickResult {
-    let Some(store) = store else {
-        return InvoiceClickResult {
-            followup: "Invoice store not wired — cannot approve.".into(),
-            source_edit: None,
-        };
-    };
-    let Some(ops) = ops else {
-        return InvoiceClickResult {
-            followup: "Invoice ops not wired — cannot approve.".into(),
-            source_edit: None,
-        };
-    };
-    let draft = match store.get_invoice_draft(draft_id) {
-        Ok(Some(d)) => d,
-        Ok(None) => {
-            return InvoiceClickResult {
-                followup: "Draft not found — it may have been cleared.".into(),
-                source_edit: None,
-            };
-        }
-        Err(e) => {
-            warn!(draft_id = %draft_id, "invoice approve: store read failed: {e}");
-            return InvoiceClickResult {
-                followup: format!("Store error: {e}"),
-                source_edit: None,
-            };
-        }
-    };
-    if draft.status != "pending" {
-        return InvoiceClickResult {
-            followup: format!("Already resolved ({}).", draft.status),
-            source_edit: None,
-        };
-    }
-    let week_end = match chrono::NaiveDate::parse_from_str(&draft.week_end, "%Y-%m-%d") {
-        Ok(d) => d,
-        Err(e) => {
-            warn!(draft_id = %draft_id, "invoice approve: bad week_end: {e}");
-            return InvoiceClickResult {
-                followup: format!("Corrupt draft row: bad week_end `{}`", draft.week_end),
-                source_edit: None,
-            };
-        }
-    };
-    // Use the (possibly Revised) email stored for this draft; None = template.
-    let email = store.get_invoice_draft_email(draft_id).ok().flatten();
-    match ops.send(week_end, email).await {
-        Ok(msg) => {
-            if let Err(e) =
-                store.mark_invoice_draft_resolved(draft_id, "approved", user_id)
-            {
-                warn!(draft_id = %draft_id, "invoice approve: mark resolved failed: {e}");
-            }
-            info!(
-                draft_id = %draft_id,
-                user_id = %user_id,
-                "invoice approve: sent — {msg}"
-            );
-            // `msg` carries the ACTUAL number assigned at send time (the draft's
-            // number is only a tentative preview and may differ when several
-            // drafts are pending), so the card edit shows the send summary
-            // rather than re-asserting the stale draft number (#330).
-            InvoiceClickResult {
-                followup: format!("Approved — {msg}"),
-                source_edit: Some(format!(
-                    ":white_check_mark: Sent (week {}) — {msg}",
-                    draft.week_end
-                )),
-            }
-        }
-        Err(e) => {
-            warn!(draft_id = %draft_id, "invoice approve: send failed: {e:#}");
-            if let Err(mark_err) =
-                store.mark_invoice_draft_resolved(draft_id, "failed", user_id)
-            {
-                warn!(draft_id = %draft_id, "invoice approve: mark failed failed: {mark_err}");
-            }
-            InvoiceClickResult {
-                followup: format!("Send failed: {e}"),
-                source_edit: Some(format!(
-                    ":warning: Send failed for #{}: {}",
-                    draft.invoice_number, e
-                )),
-            }
-        }
-    }
-}
-
-/// Reject the invoice draft `draft_id`. Marks it rejected, no state mutation
-/// beyond the draft row. Synchronous (no I/O outside sqlite) so the caller
-/// can spawn it on a task without await complexity.
-pub(crate) fn invoice_reject_draft(
-    store: Option<&Store>,
-    draft_id: &str,
-    user_id: &str,
-) -> InvoiceClickResult {
-    let Some(store) = store else {
-        return InvoiceClickResult {
-            followup: "Invoice store not wired — cannot reject.".into(),
-            source_edit: None,
-        };
-    };
-    let draft = match store.get_invoice_draft(draft_id) {
-        Ok(Some(d)) => d,
-        Ok(None) => {
-            return InvoiceClickResult {
-                followup: "Draft not found.".into(),
-                source_edit: None,
-            };
-        }
-        Err(e) => {
-            warn!(draft_id = %draft_id, "invoice reject: store read failed: {e}");
-            return InvoiceClickResult {
-                followup: format!("Store error: {e}"),
-                source_edit: None,
-            };
-        }
-    };
-    if draft.status != "pending" {
-        return InvoiceClickResult {
-            followup: format!("Already resolved ({}).", draft.status),
-            source_edit: None,
-        };
-    }
-    if let Err(e) = store.mark_invoice_draft_resolved(draft_id, "rejected", user_id) {
-        warn!(draft_id = %draft_id, "invoice reject: mark resolved failed: {e}");
-        return InvoiceClickResult {
-            followup: format!("Store error: {e}"),
-            source_edit: None,
-        };
-    }
-    info!(draft_id = %draft_id, user_id = %user_id, "invoice reject");
-    InvoiceClickResult {
-        followup: "Rejected — nothing sent.".into(),
-        source_edit: Some(format!(
-            ":no_entry: Rejected — nothing sent (week {}, #{})",
-            draft.week_end, draft.invoice_number
-        )),
-    }
-}
-
-/// Generate the PDF (via `ops`), post the card with the PDF attached, and
-/// record the draft row. Returns a user-facing reply.
-pub async fn post_invoice_draft_card(
-    store: &Store,
-    ops: &dyn InvoiceOps,
-    http: &Http,
-    approval_channel: ChannelId,
-    week_end_arg: Option<&str>,
-) -> String {
-    let week_end_opt = match week_end_arg {
-        Some(s) => match chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-            Ok(d) => Some(d),
-            Err(_) => {
-                return format!(
-                    "usage: `!invoice draft [YYYY-MM-DD]` (got `{s}` — not a date)"
-                );
-            }
-        },
-        None => None,
-    };
-    let pdf = match ops.draft_pdf(week_end_opt).await {
-        Ok(p) => p,
-        Err(e) => return format!(":warning: draft failed: {e}"),
-    };
-    if store
-        .get_pending_invoice_draft_for_week(&pdf.week_end.to_string())
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        return format!(
-            ":information_source: a pending draft already exists for week {} — \
-             reject it before drafting a replacement",
-            pdf.week_end
-        );
-    }
-    let draft_id = match store.insert_invoice_draft(
-        &pdf.week_end.to_string(),
-        pdf.number,
-        &pdf.pdf_path.to_string_lossy(),
-    ) {
-        Ok(id) => id,
-        Err(e) => return format!(":warning: store insert failed: {e}"),
-    };
-    // Seed the editable email (subject+body) from the template so Revise can
-    // pre-fill it and the send uses it (#352). Best-effort.
-    if let Err(e) = store.set_invoice_draft_email(&draft_id, &pdf.subject, &pdf.body) {
-        warn!(draft_id = %draft_id, "invoice draft: seed email failed: {e}");
-    }
-    let attachment = match CreateAttachment::path(&pdf.pdf_path).await {
-        Ok(a) => a,
-        Err(e) => {
-            return format!(
-                ":warning: read PDF for attach failed ({}): {e}",
-                pdf.pdf_path.display()
-            );
-        }
-    };
-    let pdf_filename = pdf
-        .pdf_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| pdf.pdf_path.to_string_lossy().into_owned());
-    let content = invoice_draft_content(
-        pdf.number,
-        &pdf.week_start.to_string(),
-        &pdf.week_end.to_string(),
-        &pdf.recipient,
-        &pdf.subject,
-        &pdf.body,
-        &pdf_filename,
-    );
-    let builder = CreateMessage::new()
-        .content(content)
-        .add_file(attachment)
-        .components(invoice_draft_components(&draft_id));
-    match approval_channel.send_message(http, builder).await {
-        Ok(posted) => {
-            if let Err(e) = store.update_invoice_draft_message(
-                &draft_id,
-                &approval_channel.get().to_string(),
-                &posted.id.get().to_string(),
-            ) {
-                warn!(draft_id = %draft_id, "post_invoice_draft_card: update msg id failed: {e}");
-            }
-            format!(":outbox_tray: drafted invoice #{} for week {}", pdf.number, pdf.week_end)
-        }
-        Err(e) => {
-            warn!(draft_id = %draft_id, "post_invoice_draft_card: send_message failed: {e}");
-            format!(":warning: posting draft to approval channel failed: {e}")
-        }
-    }
-}
-
-/// Best-effort edit of a posted card after the user clicks Approve/Reject.
-async fn edit_source_message(
-    ctx: &Context,
-    channel_id: ChannelId,
-    message_id: MessageId,
-    new_content: &str,
-) {
-    let edit = EditMessage::new()
-        .content(new_content)
-        .components(vec![]);
-    if let Err(e) = channel_id
-        .edit_message(&ctx.http, message_id, edit)
-        .await
-    {
-        warn!("failed to edit invoice draft card: {e}");
-    }
-}
-
-/// Keep only attachments whose Discord-reported `content_type` looks like an
-/// image. Discord populates this from the upload, so it's reliable enough to
-/// gate which attachments we hand to the vision model.
-/// Handle a `!invoice …` config command. Pure: reads/writes the invoice_config
-/// store rows and returns the text to reply with. Recognized:
-///   `!invoice status`
-///   `!invoice recipient <email>`
-///   `!invoice entity <composio_entity_id>`
-///   `!invoice autodraft on|off`
-///
-/// `!invoice draft [YYYY-MM-DD]` is handled by the caller (it's
-/// side-effectful and async) — see `post_invoice_draft_card`.
-fn handle_invoice_command(store: Option<&Store>, text: &str) -> String {
-    let Some(store) = store else {
-        return "invoice config unavailable (store not wired)".to_string();
-    };
-    let parts: Vec<&str> = text.split_whitespace().collect();
-    let g = |k: &str| store.get_invoice_config(k).ok().flatten().unwrap_or_default();
-    match parts.get(1).copied() {
-        Some("status") => {
-            let recipient = {
-                let r = g("recipient_email");
-                if r.is_empty() { "(unset — set via dashboard or `!invoice recipient`)".to_string() } else { r }
-            };
-            let entity = g("from_entity");
-            let last = g("last_billed_week_end");
-            let autodraft = g("auto_draft_enabled") == "true";
-            format!(
-                "📄 **Invoice config**\n• auto-draft: **{}**\n• recipient: `{}`\n• next #: `{}`\n• sending entity: `{}`\n• last billed week: `{}`",
-                if autodraft { "ON" } else { "OFF (scheduler will not post drafts)" },
-                recipient,
-                store.invoice_counter().unwrap_or(35),
-                if entity.is_empty() { "(unset)".to_string() } else { entity },
-                if last.is_empty() { "(never)".to_string() } else { last },
-            )
-        }
-        Some("recipient") => match parts.get(2) {
-            Some(email) if email.contains('@') && email.contains('.') => {
-                match store.set_invoice_config("recipient_email", email) {
-                    Ok(()) => format!("✅ invoice recipient set to `{email}`"),
-                    Err(e) => format!("⚠️ failed to set recipient: {e}"),
-                }
-            }
-            _ => "usage: `!invoice recipient you@example.com`".to_string(),
-        },
-        Some("entity") => match parts.get(2) {
-            Some(ent) if !ent.is_empty() => {
-                match store.set_invoice_config("from_entity", ent) {
-                    Ok(()) => format!("✅ sending entity set to `{ent}`"),
-                    Err(e) => format!("⚠️ failed to set entity: {e}"),
-                }
-            }
-            _ => "usage: `!invoice entity <composio_entity_id>`".to_string(),
-        },
-        Some("autodraft") => match parts.get(2).map(|s| s.to_ascii_lowercase()) {
-            Some(v) if v == "on" || v == "true" => {
-                match store.set_invoice_config("auto_draft_enabled", "true") {
-                    Ok(()) => "✅ invoice auto-draft **ON** — the scheduler will post a Sunday draft for approval".to_string(),
-                    Err(e) => format!("⚠️ failed to enable auto-draft: {e}"),
-                }
-            }
-            Some(v) if v == "off" || v == "false" => {
-                match store.set_invoice_config("auto_draft_enabled", "false") {
-                    Ok(()) => "🛑 invoice auto-draft **OFF** — the scheduler will not post drafts".to_string(),
-                    Err(e) => format!("⚠️ failed to disable auto-draft: {e}"),
-                }
-            }
-            _ => "usage: `!invoice autodraft on|off`".to_string(),
-        },
-        _ => "invoice commands:\n• `!invoice status`\n• `!invoice draft [YYYY-MM-DD]`\n• `!invoice recipient <email>`\n• `!invoice entity <composio_entity_id>`\n• `!invoice autodraft on|off`"
-            .to_string(),
-    }
 }
 
 /// Soft cap on how much of a text file we feed into the prompt. Files larger
