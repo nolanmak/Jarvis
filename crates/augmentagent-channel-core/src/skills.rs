@@ -217,10 +217,6 @@ const STARTER_SKILLS: &[(&str, &str)] = &[
         "Reusable reply scaffolds (decline, defer, confirm, intro) for outbound drafts.",
     ),
     (
-        "invoice-status",
-        "Look up current invoice status, draft entries, and recipient/entity config.",
-    ),
-    (
         "wiki-search",
         "Search the user's wiki for prior context before answering an ad-hoc question.",
     ),
@@ -250,7 +246,6 @@ mod tests {
         assert!(reg.contains("email-triage"));
         assert!(reg.contains("grocery"));
         assert!(reg.contains("wiki-search"));
-        assert!(reg.contains("invoice-status"));
         assert!(!reg.is_empty());
     }
 
