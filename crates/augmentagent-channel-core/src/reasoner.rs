@@ -1090,26 +1090,6 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     let aa_gh = repo_root.join("scripts/aa-gh");
     let bash_gmail_abs = format!("Bash({} gmail *)", bin.display());
     let bash_gmail_bare = "Bash(augmentagent gmail *)".to_string();
-    // Invoice subcommands the LLM can autonomously invoke. `invoice run` is
-    // intentionally absent — the only real-send path is the user clicking
-    // Approve on a draft card. `status` and `list-accounts` omit the trailing
-    // `*` because they take no args (clap would reject extras anyway).
-    let bash_invoice_status_abs = format!("Bash({} invoice status)", bin.display());
-    let bash_invoice_draft_abs = format!("Bash({} invoice draft *)", bin.display());
-    let bash_invoice_list_accounts_abs = format!("Bash({} invoice list-accounts)", bin.display());
-    let bash_invoice_set_recipient_abs = format!("Bash({} invoice set-recipient *)", bin.display());
-    let bash_invoice_set_entity_abs = format!("Bash({} invoice set-entity *)", bin.display());
-    let bash_invoice_set_auto_draft_abs =
-        format!("Bash({} invoice set-auto-draft *)", bin.display());
-    let bash_invoice_status_bare = "Bash(augmentagent invoice status)".to_string();
-    let bash_invoice_draft_bare = "Bash(augmentagent invoice draft *)".to_string();
-    let bash_invoice_list_accounts_bare =
-        "Bash(augmentagent invoice list-accounts)".to_string();
-    let bash_invoice_set_recipient_bare =
-        "Bash(augmentagent invoice set-recipient *)".to_string();
-    let bash_invoice_set_entity_bare = "Bash(augmentagent invoice set-entity *)".to_string();
-    let bash_invoice_set_auto_draft_bare =
-        "Bash(augmentagent invoice set-auto-draft *)".to_string();
     // #212 — `loop` (singular) reads/updates the sqlite `user_loops` table
     // that backs the Discord `/loop` scheduler (#104). The COMMON case for
     // "kill the hello world loop" — runs inside the daemon, no claude PID.
@@ -1275,18 +1255,6 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             "mcp__memory__memory_recent".into(),
             bash_gmail_abs,
             bash_gmail_bare,
-            bash_invoice_status_abs,
-            bash_invoice_status_bare,
-            bash_invoice_draft_abs,
-            bash_invoice_draft_bare,
-            bash_invoice_list_accounts_abs,
-            bash_invoice_list_accounts_bare,
-            bash_invoice_set_recipient_abs,
-            bash_invoice_set_recipient_bare,
-            bash_invoice_set_entity_abs,
-            bash_invoice_set_entity_bare,
-            bash_invoice_set_auto_draft_abs,
-            bash_invoice_set_auto_draft_bare,
             bash_loop_abs,
             bash_loop_bare,
             bash_loops_abs,
@@ -1987,30 +1955,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ask_opts_includes_invoice_read_and_config_tools() {
-        let repo = tempfile::tempdir().expect("repo tmpdir");
-        let wiki = tempfile::tempdir().expect("wiki tmpdir");
-        std::fs::write(repo.path().join("data.db"), b"").unwrap();
-        let _guard = EnvGuard::unset("AUGMENTAGENT_DB");
-        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
-
-        let joined = opts.allowed_tools.join("\n");
-        for needle in [
-            "invoice status)",
-            "invoice draft *)",
-            "invoice list-accounts)",
-            "invoice set-recipient *)",
-            "invoice set-entity *)",
-            "invoice set-auto-draft *)",
-        ] {
-            assert!(
-                joined.contains(needle),
-                "expected allowed_tools to contain {needle}; got:\n{joined}"
-            );
-        }
-    }
-
     /// #317 — the reasoner routes `mcpServers` to `--mcp-config` and keeps
     /// the rest on `--settings`.
     #[test]
@@ -2236,24 +2180,6 @@ mod tests {
             path_env.split(':').any(|seg| seg == scripts_dir),
             "PATH must contain {scripts_dir} so bare `aa-gh` resolves; got: {path_env}"
         );
-    }
-
-    /// Load-bearing safety invariant: the LLM must never be able to invoke
-    /// the real-send path. Only the Discord Approve button can call `run`.
-    #[test]
-    fn ask_opts_excludes_invoice_run() {
-        let repo = tempfile::tempdir().expect("repo tmpdir");
-        let wiki = tempfile::tempdir().expect("wiki tmpdir");
-        std::fs::write(repo.path().join("data.db"), b"").unwrap();
-        let _guard = EnvGuard::unset("AUGMENTAGENT_DB");
-        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
-
-        for entry in &opts.allowed_tools {
-            assert!(
-                !entry.contains("invoice run"),
-                "allowed_tools must NEVER expose `invoice run` to the LLM: {entry}"
-            );
-        }
     }
 
     /// Serialize env-var mutations across the two tests so they don't race.

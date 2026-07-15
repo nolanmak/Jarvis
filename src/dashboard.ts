@@ -17,8 +17,6 @@ import {
   getConfig,
   setConfig,
   deleteConfig,
-  setInvoiceConfig,
-  getInvoiceSettings,
   getActionCount,
   getGmailAccounts,
   getActiveGmailAccounts,
@@ -199,13 +197,11 @@ router.get("/settings", async (_req, res) => {
   const configStatus = await getConfigStatus();
   const emailRetention = getConfig("email_retention_days") || "0";
   const emailCount = getEmailCount();
-  const invoice = getInvoiceSettings();
   res.render("settings", {
     senders,
     configStatus,
     emailRetention,
     emailCount,
-    invoice,
     socialApiKeyMasked: maskSecret(getConfig("socialapi_api_key")),
     socialApiAccounts: getSocialApiAccounts(),
     socialApiError: null,
@@ -648,43 +644,6 @@ router.post("/api/ask", async (req, res) => {
     console.error("/api/ask failed:", message);
     res.status(500).json({ error: message });
   }
-});
-
-// --- Weekly invoice automation ---
-// Writes the same `invoice_config` rows the Rust scheduler reads. The master
-// kill switch (`auto_draft_enabled`) is seeded OFF by the daemon migration;
-// nothing auto-drafts until it's flipped on here (or via `!invoice autodraft`).
-// When ON, the Sunday scheduler posts a draft card with the PDF + Approve/
-// Reject buttons; a human still has to click Approve for anything to send.
-router.post("/api/invoice-config", (req, res) => {
-  const { key, value } = req.body as { key?: string; value?: string };
-
-  if (key === "auto_draft_enabled") {
-    // Normalize a checkbox/string to exactly the "true"/"false" the Rust
-    // scheduler compares against.
-    const on = value === "true" || value === "on" || value === "1";
-    setInvoiceConfig("auto_draft_enabled", on ? "true" : "false");
-  } else if (key === "recipient_email") {
-    const email = (value || "").trim();
-    if (!email.includes("@") || !email.includes(".")) {
-      res
-        .status(400)
-        .send('<p class="text-red-400 text-sm">Enter a valid email address.</p>');
-      return;
-    }
-    setInvoiceConfig("recipient_email", email);
-  } else {
-    res
-      .status(400)
-      .send('<p class="text-red-400 text-sm">Invalid invoice config key</p>');
-    return;
-  }
-
-  res.render("partials/invoice-config", { invoice: getInvoiceSettings() });
-});
-
-router.get("/api/invoice-config", (_req, res) => {
-  res.render("partials/invoice-config", { invoice: getInvoiceSettings() });
 });
 
 // --- Composio OAuth (same pattern as Orchid) ---
