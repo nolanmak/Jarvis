@@ -1686,6 +1686,22 @@ enum WikiOp {
         #[arg(long)]
         force: bool,
     },
+    /// Two-way sync the wiki with its private GitHub mirror (epic #474).
+    ///
+    /// Commits local page changes, pulls owner edits made on GitHub
+    /// (owner-wins on same-line conflicts), then pushes. Auth is the
+    /// ambient `gh` credential — no token in `.env`. The wiki dir must
+    /// already be a git repo with a private `origin` (bootstrap runs once
+    /// out of band; see KB sync #1).
+    Sync {
+        /// Print the plan (local changes, ahead/behind) without mutating.
+        #[arg(long)]
+        dry_run: bool,
+        /// Push-only: skip the pull/rebase step. Used for the very first
+        /// push when `origin/main` doesn't exist yet.
+        #[arg(long)]
+        no_pull: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2432,6 +2448,7 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
+            WikiOp::Sync { dry_run, no_pull } => run_wiki_sync(&cli, *dry_run, *no_pull).await,
         },
         Cmd::Digest {
             since,
@@ -5353,6 +5370,203 @@ async fn git_commit_batch(
         eprintln!("[commit] batch {batch_no}: {} pages", paths.len());
     }
     Ok(())
+}
+
+/// Files that must NEVER reach the private mirror: the daemon's SQLite
+/// store (+ WAL/SHM sidecars), secrets, and per-page lock files. The
+/// wiki-local `.gitignore` already excludes these; the sync guard is
+/// belt-and-suspenders against an accidental `git add -f` or a botched
+/// `.gitignore` edit (KB sync #4).
+const WIKI_SYNC_FORBIDDEN: &[&str] = &["data.db", "data.db-wal", "data.db-shm", ".env"];
+
+fn wiki_sync_check_forbidden(list: &str, what: &str) -> Result<()> {
+    for f in list.lines() {
+        let f = f.trim();
+        if f.is_empty() {
+            continue;
+        }
+        let base = f.rsplit('/').next().unwrap_or(f);
+        if WIKI_SYNC_FORBIDDEN.contains(&base) || base.ends_with(".lock") {
+            anyhow::bail!(
+                "wiki sync refused: sensitive/non-content file `{f}` is {what} in the wiki repo. \
+                 Fix wiki/.gitignore before syncing — this must never reach the mirror."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Run `git -C <dir> <args>`; return whether it exited 0.
+async fn git_run(dir: &std::path::Path, args: &[&str]) -> Result<bool> {
+    let st = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .status()
+        .await
+        .with_context(|| format!("spawn git {}", args.join(" ")))?;
+    Ok(st.success())
+}
+
+/// Run `git -C <dir> <args>` and capture stdout; bail on non-zero.
+async fn git_capture(dir: &std::path::Path, args: &[&str]) -> Result<String> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("spawn git {}", args.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Push current HEAD to `origin/main`. If the remote moved under us
+/// (someone edited on GitHub between our fetch and push), re-pull
+/// owner-wins once and retry.
+async fn wiki_sync_push(dir: &std::path::Path) -> Result<()> {
+    for attempt in 0..2 {
+        if git_run(dir, &["push", "origin", "HEAD:main"]).await? {
+            println!("[wiki sync] pushed to origin/main");
+            return Ok(());
+        }
+        if attempt == 0 {
+            eprintln!("[wiki sync] push rejected (remote moved); re-pulling owner-wins and retrying");
+            let _ = git_run(dir, &["fetch", "origin", "main"]).await;
+            let _ = git_run(dir, &["pull", "--rebase", "-X", "ours", "origin", "main"]).await;
+        }
+    }
+    anyhow::bail!("wiki sync: push to origin/main failed after one retry");
+}
+
+/// `wiki sync` — reconcile the local knowledge base with its private
+/// GitHub mirror. Two-way: commit local page changes, pull owner edits
+/// (owner-wins), push. Reuses the ambient `gh` credential. See epic #474.
+async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for wiki sync")?;
+    let wiki_root = wiki_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize wiki dir {}", wiki_root.display()))?;
+
+    // The wiki must be its own git repo. Bootstrap (git init + private
+    // remote) runs once, out of band — see KB sync #1.
+    if !wiki_root.join(".git").exists() {
+        anyhow::bail!(
+            "{} is not a git repo — bootstrap it first (git init + private origin). See epic #474 / KB sync #1.",
+            wiki_root.display()
+        );
+    }
+
+    // Guard: nothing sensitive/non-content may already be tracked.
+    let tracked = git_capture(&wiki_root, &["ls-files"]).await?;
+    wiki_sync_check_forbidden(&tracked, "tracked")?;
+
+    let porcelain = git_capture(&wiki_root, &["status", "--porcelain"]).await?;
+    let dirty: Vec<&str> = porcelain
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    if dry_run {
+        println!("[wiki sync] dry-run against {}", wiki_root.display());
+        println!("  local changes: {}", dirty.len());
+        for l in &dirty {
+            println!("    {l}");
+        }
+        let _ = git_run(&wiki_root, &["fetch", "origin", "main"]).await;
+        if let Ok(counts) = git_capture(
+            &wiki_root,
+            &["rev-list", "--left-right", "--count", "origin/main...HEAD"],
+        )
+        .await
+        {
+            println!("  behind/ahead vs origin/main: {}", counts.trim());
+        }
+        return Ok(());
+    }
+
+    // 1. Stage + commit local changes.
+    let git_author_name = std::env::var("AUGMENTAGENT_GIT_AUTHOR_NAME")
+        .unwrap_or_else(|_| "AugmentAgent".to_string());
+    let git_author_email = std::env::var("AUGMENTAGENT_GIT_AUTHOR_EMAIL")
+        .unwrap_or_else(|_| "augmentagent@localhost".to_string());
+
+    if !dirty.is_empty() {
+        if !git_run(&wiki_root, &["add", "-A"]).await? {
+            anyhow::bail!("git add -A failed");
+        }
+        // Re-check the STAGED set before we commit anything.
+        let staged = git_capture(&wiki_root, &["diff", "--cached", "--name-only"]).await?;
+        wiki_sync_check_forbidden(&staged, "staged")?;
+
+        let msg = format!("wiki: sync {} change(s)", dirty.len());
+        let committed = git_run(
+            &wiki_root,
+            &[
+                "-c",
+                &format!("user.name={git_author_name}"),
+                "-c",
+                &format!("user.email={git_author_email}"),
+                "commit",
+                "-m",
+                &msg,
+            ],
+        )
+        .await?;
+        if committed {
+            println!("[wiki sync] committed {} local change(s)", dirty.len());
+        }
+    } else {
+        println!("[wiki sync] no local changes");
+    }
+
+    if no_pull {
+        // First-push / push-only mode (origin/main may not exist yet).
+        return wiki_sync_push(&wiki_root).await;
+    }
+
+    // 2. Pull owner edits (owner-wins). `git pull --rebase` replays our
+    // local commits onto origin/main; in rebase terms the upstream
+    // (owner's GitHub state) is "ours", so `-X ours` makes OWNER edits win
+    // same-line conflicts — the confirmed policy. Non-conflicting edits on
+    // both sides still merge cleanly.
+    if !git_run(&wiki_root, &["fetch", "origin", "main"]).await? {
+        // No remote branch yet or offline — nothing to reconcile; push.
+        return wiki_sync_push(&wiki_root).await;
+    }
+    let pre_pull_head = git_capture(&wiki_root, &["rev-parse", "HEAD"]).await?;
+    let pre_pull_head = pre_pull_head.trim().to_string();
+    let pulled = git_run(
+        &wiki_root,
+        &["pull", "--rebase", "-X", "ours", "origin", "main"],
+    )
+    .await?;
+    if !pulled {
+        // Rebase couldn't auto-resolve (e.g. delete/modify). Preserve the
+        // daemon's work on a backup branch, abort, and fail loudly. NO
+        // data is lost — the owner reconciles manually (KB sync #4).
+        let _ = git_run(&wiki_root, &["rebase", "--abort"]).await;
+        let short: String = pre_pull_head.chars().take(8).collect();
+        let backup = format!("kb-conflict-{short}");
+        let _ = git_run(&wiki_root, &["branch", "-f", &backup, &pre_pull_head]).await;
+        let _ = git_run(&wiki_root, &["push", "origin", &format!("{backup}:{backup}")]).await;
+        anyhow::bail!(
+            "wiki sync: unresolved rebase conflict. Daemon commits preserved on branch `{backup}` \
+             (pushed to origin). Owner must reconcile manually. NO data lost."
+        );
+    }
+
+    // 3. Push.
+    wiki_sync_push(&wiki_root).await
 }
 
 /// Adapter: bridges the Discord broker's `QueryHandler` trait to our
