@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic AugmentAgent knowledge-base mirror sync
+
+[Timer]
+# First run shortly after boot, then every 10 minutes. Persistent so a
+# missed window (host asleep) fires on next wake.
+OnBootSec=3min
+OnUnitActiveSec=10min
+Persistent=true
+Unit=augmentagent-wiki-sync.service
+
+[Install]
+WantedBy=timers.target
