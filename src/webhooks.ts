@@ -27,9 +27,41 @@ import path from "path";
 import os from "os";
 import { getConfig, insertSocialApiWebhookEvent } from "./db";
 
+// Per-user state dir (0700), NOT world-writable /tmp. Prefer the runtime dir
+// when set (matches the Rust crates' UDS/state convention), else fall back to
+// ~/.local/state/augmentagent. Keeps the spool out of a predictable, shared,
+// sticky-bit path an unprivileged local process could pre-plant or poison.
+function stateDir(): string {
+  const runtime = process.env.XDG_RUNTIME_DIR;
+  if (runtime) return path.join(runtime, "augmentagent");
+  return path.join(os.homedir(), ".local", "state", "augmentagent");
+}
+
 const SPOOL =
   process.env.AUGMENTAGENT_WEBHOOK_SPOOL ||
-  path.join(os.tmpdir(), "augmentagent-webhooks.jsonl");
+  path.join(stateDir(), "augmentagent-webhooks.jsonl");
+
+// Append flags that REFUSE to follow a symlink at the target (O_NOFOLLOW →
+// openSync throws ELOOP instead of redirecting our writes into an attacker
+// file) and create the spool 0600 so only the owner can read/write it.
+const SPOOL_APPEND_FLAGS =
+  fs.constants.O_APPEND |
+  fs.constants.O_CREAT |
+  fs.constants.O_WRONLY |
+  fs.constants.O_NOFOLLOW;
+
+// Append `data` to `file` with the hardened flags above, creating the parent
+// state dir 0700 first (recursive, ignore-if-exists). Throws on symlink/ELOOP
+// so callers' existing try/catch logs the refusal and the route still 200s.
+function appendHardened(file: string, data: string): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const fd = fs.openSync(file, SPOOL_APPEND_FLAGS, 0o600);
+  try {
+    fs.writeSync(fd, data);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
 
 function hmacHex(secret: string, body: Buffer): string {
   return crypto.createHmac("sha256", secret).update(body).digest("hex");
@@ -50,7 +82,7 @@ function timingSafeEqualStr(a: string, b: string): boolean {
 
 function spool(platform: string, payload: unknown): void {
   try {
-    fs.appendFileSync(
+    appendHardened(
       SPOOL,
       JSON.stringify({ platform, at: Date.now(), payload }) + "\n"
     );
@@ -82,7 +114,7 @@ function spool(platform: string, payload: unknown): void {
 
 const DEFT_SEEN =
   process.env.AUGMENTAGENT_DEFT_SEEN ||
-  path.join(os.tmpdir(), "augmentagent-deft-seen.jsonl");
+  path.join(stateDir(), "augmentagent-deft-seen.jsonl");
 
 // Bound the in-memory mirror so a long-lived process can't grow unboundedly;
 // the persisted file + the daemon's is_message_processed remain authoritative
@@ -116,7 +148,7 @@ function deftMarkSeen(dedupId: string): boolean {
     if (oldest !== undefined) deftSeenMem.delete(oldest);
   }
   try {
-    fs.appendFileSync(DEFT_SEEN, dedupId + "\n");
+    appendHardened(DEFT_SEEN, dedupId + "\n");
   } catch (e) {
     console.warn(`[webhooks] deft seen write failed: ${(e as Error).message}`);
   }
