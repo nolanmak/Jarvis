@@ -10,7 +10,7 @@ Environment=XAUTHORITY=
 ExecStart=/usr/bin/chromium \
     --remote-debugging-port=9223 \
     --remote-debugging-address=127.0.0.1 \
-    --user-data-dir=/home/nolan-makatche/.local/state/augmentagent/browser-profile \
+    --user-data-dir=%h/.local/state/augmentagent/browser-profile \
     --no-first-run \
     --no-default-browser-check \
     --disable-features=IsolateOrigins,site-per-process \

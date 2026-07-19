@@ -19,15 +19,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/nolan-makatche/AugmentAgent
-ExecStart=/home/nolan-makatche/AugmentAgent/target/release/augmentagent --wiki-dir /home/nolan-makatche/AugmentAgent/wiki voice serve --dry-run false
-Environment=AUGMENTAGENT_DB=/home/nolan-makatche/AugmentAgent/data.db
+WorkingDirectory=%h/AugmentAgent
+ExecStart=%h/AugmentAgent/target/release/augmentagent --wiki-dir %h/AugmentAgent/wiki voice serve --dry-run false
+Environment=AUGMENTAGENT_DB=%h/AugmentAgent/data.db
 Restart=on-failure
 RestartSec=10
 StartLimitBurst=5
 StartLimitIntervalSec=120
-StandardOutput=append:/home/nolan-makatche/.local/state/augmentagent/telegram-capture.stdout.log
-StandardError=append:/home/nolan-makatche/.local/state/augmentagent/telegram-capture.stderr.log
+StandardOutput=append:%h/.local/state/augmentagent/telegram-capture.stdout.log
+StandardError=append:%h/.local/state/augmentagent/telegram-capture.stderr.log
 
 [Install]
 WantedBy=default.target
