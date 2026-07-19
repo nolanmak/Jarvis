@@ -383,9 +383,14 @@ pub fn is_event_blast(from: &str, subject: &str, body: &str) -> bool {
 /// Pull the bare `local@domain` from a raw `From:` header value that may
 /// include a display name (`"Foo" <foo@bar.com>` or `Foo <foo@bar.com>`). // pii-ok
 /// Falls back to the trimmed input if no angle-bracket pattern is found.
+///
+/// Uses the LAST `<addr>` pair: RFC 5322 puts the addr-spec after the display
+/// name, so a spoofed bracketed fragment inside the display name (e.g.
+/// `"<a@gmail.com>" <noreply@stripe.com>`) must not shadow the real address // pii-ok
+/// and bypass the human-sender / event-blast gates (#253).
 fn extract_bare(from: &str) -> String {
     let trimmed = from.trim();
-    if let Some(start) = trimmed.find('<') {
+    if let Some(start) = trimmed.rfind('<') {
         if let Some(end) = trimmed[start + 1..].find('>') {
             return trimmed[start + 1..start + 1 + end].trim().to_string();
         }
@@ -1306,5 +1311,31 @@ mod bulk_sender_449 {
         assert!(is_human_sender("A <a@gmail.com>", "")); // pii-ok: synthetic test fixture
         assert!(!is_human_sender("C <c@news.example.com>", "")); // pii-ok: synthetic
         assert!(!is_human_sender("D <d@e.retailer.com>", "")); // pii-ok: synthetic
+    }
+
+    /// #253: the real address is the LAST `<addr>` pair. A bracketed fragment
+    /// hidden in the display name must not shadow it.
+    #[test]
+    fn extract_bare_takes_the_last_bracketed_address() {
+        use super::extract_bare;
+        assert_eq!(extract_bare("Foo <foo@bar.com>"), "foo@bar.com"); // pii-ok: synthetic
+        assert_eq!(
+            extract_bare("\"<a@gmail.com>\" <noreply@stripe.com>"), // pii-ok: synthetic
+            "noreply@stripe.com" // pii-ok: synthetic
+        );
+        assert_eq!(extract_bare("plain@nobrackets.com"), "plain@nobrackets.com"); // pii-ok: synthetic
+    }
+
+    /// #253: a bulk sender that hides a human-looking address in its display
+    /// name must still be filtered — the true addr-spec (last `<...>`) is
+    /// `noreply@`, not the spoofed gmail fragment.
+    #[test]
+    fn is_human_rejects_embedded_bracket_spoof() {
+        assert!(
+            !is_human_sender("\"<a@gmail.com>\" <noreply@stripe.com>", ""), // pii-ok: synthetic
+            "embedded-bracket spoof must not bypass the human-sender gate"
+        );
+        // Regression: a genuine human is unaffected by the rfind change.
+        assert!(is_human_sender("A Person <a.person@gmail.com>", "")); // pii-ok: synthetic
     }
 }

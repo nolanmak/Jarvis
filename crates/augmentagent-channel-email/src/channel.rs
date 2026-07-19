@@ -2271,14 +2271,16 @@ mod tests {
     /// #451 REGRESSION — the bug that filled the queue with 102 empty cards.
     ///
     /// When TRIAGE throws (a Claude session-limit reply is the common case) the
-    /// action is logged as Error with NO draft body. The retry tick used to
-    /// hand that straight to `dispatch_reply`, which (a) published an approval
-    /// card whose draft was the empty string and (b) began *after* triage, so
-    /// it skipped the automated-sender guard entirely. Newsletters that triage
-    /// would never have drafted sailed into the queue.
+    /// old code logged an Error action with NO draft body; the retry tick then
+    /// handed that straight to `dispatch_reply`, which (a) published an approval
+    /// card whose draft was the empty string and (b) began *after* triage, so it
+    /// skipped the automated-sender guard entirely. Newsletters that triage would
+    /// never have drafted sailed into the queue.
     ///
-    /// The retry must instead re-run the full pipeline, guards included — so a
-    /// marketing blast ends up skipped, with no card and no empty draft.
+    /// Per #363 a triage-stage failure now logs NO action at all, so the retry
+    /// tick has nothing to pick up (`retry_once == 0`) and the next poll re-runs
+    /// the full pipeline, guards included — a marketing blast ends up skipped,
+    /// with no card and no empty draft.
     #[tokio::test]
     async fn retry_of_triage_failure_re_triages_instead_of_publishing_empty_draft() {
         let (store, _f) = tmp_store();
@@ -2316,14 +2318,26 @@ mod tests {
             },
         );
 
-        // Pass 1: triage fails -> Error action, no draft, no card.
+        // Pass 1: triage fails -> NO action row (per #363), no draft, no card.
         let out1 = ch.poll_once().await.unwrap();
         assert_eq!(out1.errors, 1);
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
 
-        // Pass 2: the retry tick.
-        let retried = ch.retry_once().await.unwrap();
-        assert_eq!(retried, 1);
+        // The retry tick must find nothing: a triage-stage failure logs no
+        // retryable action.
+        assert_eq!(
+            ch.retry_once().await.unwrap(),
+            0,
+            "a triage-stage failure must not be retried as a reply"
+        );
+
+        // Pass 2: the next poll re-runs the full pipeline. Triage now returns
+        // `reply`, but the automated-sender guard fires before drafting.
+        let out2 = ch.poll_once().await.unwrap();
+        assert_eq!(
+            out2.skipped, 1,
+            "re-triage must route the marketing sender to the skip gate"
+        );
 
         // The load-bearing assertions. Re-triage ran, the automated-sender
         // guard fired, and NO approval card exists.
@@ -2352,19 +2366,20 @@ mod tests {
         assert_eq!(empty_drafts, 0, "empty-draft approval cards must not exist");
 
         // Non-vacuity: both scripted responses must have been consumed. If the
-        // retry had NOT re-triaged, response #2 would still be queued — and an
+        // re-triage had NOT run, response #2 would still be queued — and an
         // exhausted ScriptedReasoner returns a `skip` stub, which would make
         // this test pass for entirely the wrong reason.
         assert!(
             reasoner.responses.lock().unwrap().is_empty(),
-            "retry must have re-run triage (which returned `reply`); the skip \
-             therefore came from the automated-sender guard, not from a stub"
+            "the next poll must have re-run triage (which returned `reply`); the \
+             skip therefore came from the automated-sender guard, not from a stub"
         );
     }
 
     /// The counterpart: a real person whose triage transiently failed must
-    /// still get a proper draft on retry. The fix must not throw away
-    /// legitimate retries — only stop the empty/unguarded ones.
+    /// still get a proper draft — via the next poll's re-triage (per #363),
+    /// not via the retry tick. The fix must not throw away legitimate drafts,
+    /// only stop the empty/unguarded ones.
     #[tokio::test]
     async fn retry_of_triage_failure_still_drafts_for_a_human_sender() {
         let (store, _f) = tmp_store();
@@ -2407,12 +2422,15 @@ mod tests {
         );
 
         assert_eq!(ch.poll_once().await.unwrap().errors, 1);
-        assert_eq!(ch.retry_once().await.unwrap(), 1);
+        // A triage-stage failure isn't retried; the next poll re-triages and
+        // this time drafts for the human sender.
+        assert_eq!(ch.retry_once().await.unwrap(), 0);
+        assert_eq!(ch.poll_once().await.unwrap().awaiting_approval, 1);
 
         assert_eq!(
             broker.posts.lock().unwrap().len(),
             1,
-            "human sender must get a card on retry"
+            "human sender must get a card once triage succeeds on re-poll"
         );
         // The card must carry the REAL draft, not the empty string that the
         // old retry path would have published.
