@@ -1352,6 +1352,13 @@ enum GmailOp {
         /// Also include the email body in the output.
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         full: bool,
+        /// Restrict the search to a single account instead of fanning out over
+        /// all connected ones (#482). Matches the account's entity id (exact)
+        /// or email (case-insensitive substring), so either a short handle or
+        /// the full address selects the same account. Lets you route around a
+        /// throttled account.
+        #[arg(long)]
+        account: Option<String>,
     },
     /// List active Gmail accounts (so the chat agent can pick `--account`).
     Accounts {
@@ -2461,8 +2468,8 @@ async fn main() -> Result<()> {
             max_issues,
         } => research::run_research(store, since_hours, post_discord, dry_run, max_issues).await,
         Cmd::Gmail { ref op } => match op {
-            GmailOp::Search { query, limit, full } => {
-                run_gmail_search(store, query.clone(), *limit, *full).await
+            GmailOp::Search { query, limit, full, account } => {
+                run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await
             }
             GmailOp::Accounts { json } => run_gmail_accounts(store, *json).await,
             GmailOp::Compose {
@@ -3351,65 +3358,126 @@ fn run_ratelimit_caps() -> Result<()> {
     Ok(())
 }
 
+/// Match an account against a `--account` filter (#482): exact entity-id match,
+/// or a case-insensitive substring of the email — so `nolanmak7` and the full
+/// address both select the same account.
+fn account_matches(account: &augmentagent_store::Account, filter: &str) -> bool {
+    let f = filter.trim();
+    if f.is_empty() {
+        return false;
+    }
+    account.entity_id == f
+        || account
+            .email
+            .to_ascii_lowercase()
+            .contains(&f.to_ascii_lowercase())
+}
+
 async fn run_gmail_search(
     store: Arc<Store>,
     query: String,
     limit: u32,
     full: bool,
+    account_filter: Option<String>,
 ) -> Result<()> {
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
-    let accounts = store.get_active_gmail_accounts()?;
+    let mut accounts = store.get_active_gmail_accounts()?;
     if accounts.is_empty() {
         println!("(no active gmail accounts)");
         return Ok(());
     }
 
-    let mut any = false;
-    for account in &accounts {
-        let emails = match gmail
-            .fetch_with_query(&account.entity_id, &query, limit)
-            .await
-        {
-            Ok(es) => es,
-            Err(e) => {
-                eprintln!("account {} search failed: {e}", account.entity_id);
-                continue;
-            }
-        };
-        if emails.is_empty() {
-            continue;
+    // #482: optionally scope to a single account so the user can route around a
+    // throttled one, since search otherwise fans out over every account.
+    if let Some(filter) = account_filter.as_deref() {
+        accounts.retain(|a| account_matches(a, filter));
+        if accounts.is_empty() {
+            println!("(no active gmail account matches --account {filter:?})");
+            return Ok(());
         }
-        any = true;
-        println!(
-            "## account {} ({}) — {} results",
-            account.entity_id,
-            account.email,
-            emails.len()
-        );
-        for (i, email) in emails.iter().enumerate() {
-            // threadId is what compose --thread-id / send-now --thread-id
-            // actually need; printing only messageId forced callers to guess
-            // (#381).
-            println!(
-                "[{:>2}] from: {}\n     subject: {}\n     date: {}\n     messageId: {}\n     threadId: {}",
-                i + 1,
-                email.from,
-                email.subject,
-                email.date,
-                email.message_id,
-                email.thread_id.as_deref().unwrap_or("-")
-            );
-            if full {
-                println!("     body:\n{}\n", indent_body(&email.body, 7));
-            }
-        }
-        println!();
     }
-    if !any {
-        println!("(no results)");
+
+    // #482: emit a per-account status line for EVERY account on stdout. A
+    // failure on one account must never silently blank it out — the user has
+    // to be able to tell "0 results" apart from "skipped: <error>", and the
+    // healthy accounts' results always come through regardless.
+    let mut total = 0usize;
+    for account in &accounts {
+        match gmail.fetch_with_query(&account.entity_id, &query, limit).await {
+            Err(e) => {
+                // Also mirror to stderr so it shows up in logs, but stdout is
+                // what the user sees — never a silent skip.
+                eprintln!("account {} search failed: {e}", account.entity_id);
+                println!(
+                    "## account {} ({}) — SKIPPED: {e}",
+                    account.entity_id, account.email
+                );
+            }
+            Ok(emails) if emails.is_empty() => {
+                println!(
+                    "## account {} ({}) — 0 results",
+                    account.entity_id, account.email
+                );
+            }
+            Ok(emails) => {
+                total += emails.len();
+                println!(
+                    "## account {} ({}) — {} results",
+                    account.entity_id,
+                    account.email,
+                    emails.len()
+                );
+                for (i, email) in emails.iter().enumerate() {
+                    // threadId is what compose --thread-id / send-now --thread-id
+                    // actually need; printing only messageId forced callers to
+                    // guess (#381).
+                    println!(
+                        "[{:>2}] from: {}\n     subject: {}\n     date: {}\n     messageId: {}\n     threadId: {}",
+                        i + 1,
+                        email.from,
+                        email.subject,
+                        email.date,
+                        email.message_id,
+                        email.thread_id.as_deref().unwrap_or("-")
+                    );
+                    if full {
+                        println!("     body:\n{}\n", indent_body(&email.body, 7));
+                    }
+                }
+                println!();
+            }
+        }
+    }
+    if total == 0 {
+        println!("(no results across {} account(s))", accounts.len());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod gmail_search_account_filter_tests {
+    use augmentagent_store::Account;
+
+    fn acct(entity_id: &str, email: &str) -> Account {
+        Account {
+            id: entity_id.to_string(),
+            connection_id: None,
+            entity_id: entity_id.to_string(),
+            email: email.to_string(),
+            active: true,
+        }
+    }
+
+    #[test]
+    fn account_matches_by_entity_id_and_email_substring() {
+        let a = acct("augmentagent-123", "nolanmak7@gmail.com"); // pii-ok: synthetic
+        assert!(super::account_matches(&a, "augmentagent-123")); // exact entity id
+        assert!(super::account_matches(&a, "NOLANMAK7@gmail.com")); // pii-ok: full email, case-insensitive
+        assert!(super::account_matches(&a, "nolanmak7")); // pii-ok: email substring (the ergonomic form)
+        assert!(!super::account_matches(&a, "someone-else")); // pii-ok: non-match
+        assert!(!super::account_matches(&a, "")); // empty never matches
+    }
 }
 
 fn indent_body(body: &str, cols: usize) -> String {
