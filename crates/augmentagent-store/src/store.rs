@@ -2644,7 +2644,8 @@ impl Store {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
             "SELECT a.id, a.threadId, a.fromEmail, a.subject, \
-                    COALESCE(a.originalBody, '') \
+                    COALESCE(a.originalBody, ''), \
+                    (a.draftBody IS NULL OR TRIM(a.draftBody, ' \t\r\n') = '') \
                FROM actions a \
               WHERE a.status = 'pending' \
               ORDER BY a.createdAt ASC",
@@ -2656,6 +2657,7 @@ impl Store {
                 from_email: r.get(2)?,
                 subject: r.get(3)?,
                 body: r.get(4)?,
+                draft_empty: r.get(5)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -6018,6 +6020,9 @@ pub struct PendingActionRow {
     pub from_email: String,
     pub subject: String,
     pub body: String,
+    /// True when this card has no draft to approve (draftBody NULL/blank).
+    /// A card with nothing to approve is stale on its face (#484).
+    pub draft_empty: bool,
 }
 
 /// #48 — the three code-mode columns on `actions`, returned by

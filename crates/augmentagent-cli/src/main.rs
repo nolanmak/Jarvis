@@ -4588,9 +4588,26 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
     }
 
     let mut bulk_ids: Vec<String> = Vec::new();
+    let mut empty_ids: Vec<String> = Vec::new();
     let mut answered_threads: Vec<String> = Vec::new();
 
     for row in &pending {
+        // Rule 3 (#484) — the card has no draft to approve. This happens when a
+        // draft was published with an empty body (historically the retry path
+        // did this on a triage failure, fixed in #454; kept as a rule because
+        // ANY path that leaves an empty draft produces a permanently-stale card
+        // — there is nothing to approve, so it never drains and just sits in the
+        // carousel until the 7-day expire). Retire it regardless of sender.
+        if row.draft_empty {
+            info!(
+                action_id = %row.id,
+                from = %row.from_email,
+                subject = %row.subject,
+                "stale approval: retiring card with no draft to approve"
+            );
+            empty_ids.push(row.id.clone());
+            continue;
+        }
         // Rule 2 — bulk/marketing sender. Cheap, purely local, so check first.
         if !is_human_sender(&row.from_email, &row.body) {
             info!(
@@ -4632,6 +4649,10 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
     let mut retired = store.mark_pending_superseded_by_ids(
         &bulk_ids,
         "superseded: bulk/automated sender, no reply needed",
+    )?;
+    retired += store.mark_pending_superseded_by_ids(
+        &empty_ids,
+        "superseded: no draft to approve (empty draft body)",
     )?;
     answered_threads.sort();
     answered_threads.dedup();
@@ -12026,6 +12047,16 @@ mod stale_reconcile_tests {
     }
 
     fn seed_pending(store: &Store, msg: &str, thread: Option<&str>, from: &str) -> String {
+        seed_pending_draft(store, msg, thread, from, Some("a draft"))
+    }
+
+    fn seed_pending_draft(
+        store: &Store,
+        msg: &str,
+        thread: Option<&str>,
+        from: &str,
+        draft: Option<&str>,
+    ) -> String {
         store
             .upsert_email(&Email {
                 message_id: msg.into(),
@@ -12046,7 +12077,7 @@ mod stale_reconcile_tests {
                 from,
                 "subj",
                 Some("body"),
-                Some("a draft"),
+                draft,
                 ActionStatus::Pending,
             )
             .unwrap()
@@ -12114,5 +12145,42 @@ mod stale_reconcile_tests {
         seed_pending(&store, "m-5", Some("T-5"), "Dana Rivera <dana@example-labs.ai>"); // pii-ok: synthetic
         assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
         assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+    }
+
+    /// Rule 3 (#484): a card with an empty draft body is stale on its face —
+    /// there is nothing to approve, so it never drains. Retire it even when the
+    /// sender is a real human on a thread they have NOT replied to (the case the
+    /// bulk-sender and already-replied rules both miss). These are the residue
+    /// of the pre-#454 retry bug that survived the first reconcile pass.
+    #[test]
+    fn retires_cards_with_an_empty_draft_regardless_of_sender() {
+        let (store, _t) = fresh_store();
+        // A real person, unanswered thread, but the draft body is blank.
+        let empty = seed_pending_draft(
+            &store,
+            "m-6",
+            Some("T-6"),
+            "Dana Rivera <dana@example-labs.ai>", // pii-ok: synthetic
+            None,
+        );
+        let whitespace = seed_pending_draft(
+            &store,
+            "m-7",
+            Some("T-7"),
+            "Sam Okafor <sam@example-labs.ai>", // pii-ok: synthetic
+            Some("   \n  "),
+        );
+        // A real person with a real draft must be left alone.
+        let good = seed_pending(&store, "m-8", Some("T-8"), "Alex Chen <alex@examplesoft.net>"); // pii-ok: synthetic
+
+        let n = reconcile_stale_approvals_tick(&store).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(status_of(&store, &empty), "superseded");
+        assert_eq!(status_of(&store, &whitespace), "superseded");
+        assert_eq!(
+            status_of(&store, &good),
+            "pending",
+            "a card with a real draft for a real person must stay in the queue"
+        );
     }
 }
