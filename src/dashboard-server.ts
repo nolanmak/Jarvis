@@ -22,7 +22,10 @@ import webhooksRouter from "./webhooks";
 const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT || "3000");
 
 function main(): void {
-  initDb();
+  // #360: honor AUGMENTAGENT_DB so a tenant/test DB isn't silently ignored in
+  // favor of the default ./data.db. `initDb` falls back to the default when
+  // this is undefined.
+  initDb(process.env.AUGMENTAGENT_DB);
 
   const app = express();
 

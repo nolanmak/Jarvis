@@ -119,8 +119,9 @@ function startDashboard(): void {
 async function main(): Promise<void> {
   console.log("AugmentAgent starting...");
 
-  // Initialize database
-  initDb();
+  // Initialize database — #360: honor AUGMENTAGENT_DB (falls back to the
+  // default ./data.db when unset) so a tenant/test DB isn't silently ignored.
+  initDb(process.env.AUGMENTAGENT_DB);
   console.log("Database initialized.");
 
   // Start web dashboard
