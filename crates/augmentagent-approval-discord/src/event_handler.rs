@@ -1801,6 +1801,75 @@ fn hard_split(s: &str, max: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    // ---- #473: envelope markers on the reposted (post-Revise) card ----
+
+    fn store_with_envelope(
+        to: Option<&str>,
+        cc: Option<&str>,
+        bcc: Option<&str>,
+    ) -> (augmentagent_store::Store, String, tempfile::NamedTempFile) {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let s = augmentagent_store::Store::open(f.path()).unwrap();
+        let id = s
+            .log_action(
+                "m-473",
+                None,
+                "josh@x.com",
+                "intro",
+                None,
+                Some("draft"),
+                augmentagent_store::ActionStatus::Pending,
+            )
+            .unwrap();
+        s.set_action_envelope(&id, to, cc, bcc).unwrap();
+        (s, id, f)
+    }
+
+    #[test]
+    fn envelope_markers_show_overridden_to_and_bcc() {
+        let (s, id, _f) =
+            store_with_envelope(Some("omer@y.com"), None, Some("josh@x.com"));
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "josh@x.com");
+        assert!(out.contains("[to: omer@y.com]"), "missing to marker: {out}");
+        assert!(out.contains("[bcc: josh@x.com]"), "missing bcc marker: {out}");
+        assert!(out.starts_with("body"), "body must lead: {out}");
+    }
+
+    #[test]
+    fn envelope_markers_omit_to_when_it_matches_card_from() {
+        // New-email cards: the card's From line already IS the recipient
+        // list, so a [to:] marker would be redundant noise.
+        let (s, id, _f) =
+            store_with_envelope(Some("a@b.com"), Some("cc@d.com"), None);
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "a@b.com");
+        assert!(!out.contains("[to:"), "redundant to marker: {out}");
+        assert!(out.contains("[cc: cc@d.com]"), "missing cc marker: {out}");
+    }
+
+    #[test]
+    fn no_envelope_or_no_store_passes_body_through() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let s = augmentagent_store::Store::open(f.path()).unwrap();
+        let id = s
+            .log_action(
+                "m-none",
+                None,
+                "a@b.com",
+                "s",
+                None,
+                Some("d"),
+                augmentagent_store::ActionStatus::Pending,
+            )
+            .unwrap();
+        // Row exists but no envelope was ever recorded (auto-triage shape).
+        assert_eq!(
+            append_envelope_markers("body".into(), Some(&s), &id, "a@b.com"),
+            "body"
+        );
+        // No store wired at all.
+        assert_eq!(append_envelope_markers("body".into(), None, &id, "a@b.com"), "body");
+    }
+
     #[test]
     fn short_answer_is_one_chunk() {
         let chunks = chunk_for_discord("hi there");
