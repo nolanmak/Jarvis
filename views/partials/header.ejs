@@ -63,6 +63,12 @@
                   <%= page === 'resume' ? 'bg-gray-800 text-white' : 'text-gray-400 hover:text-white hover:bg-gray-800/50' %>">
           Resume
         </a>
+        <% if (typeof kbUrl !== 'undefined' && kbUrl) { %>
+        <a href="<%= kbUrl %>" target="_blank" rel="noopener"
+           class="px-3 py-1.5 rounded-md text-sm font-medium text-gray-400 hover:text-white hover:bg-gray-800/50 transition-colors">
+          Knowledge base &#8599;
+        </a>
+        <% } %>
       </div>
       <div class="ml-auto">
         <span class="text-xs text-gray-500">v1.0.0</span>
