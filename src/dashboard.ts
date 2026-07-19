@@ -1,5 +1,5 @@
 import { Router, Request } from "express";
-import { exec, spawn } from "child_process";
+import { exec, execSync, spawn } from "child_process";
 import crypto from "crypto";
 import fs from "fs";
 import os from "os";
@@ -67,6 +67,15 @@ import {
   runCli,
 } from "./slackApi";
 import { requireApiKey } from "./apiV1";
+// Auto-update signature gate (security #298). Shared with the 5-min poller in
+// index.ts so both auto-update paths enforce the same owner-signature
+// requirement before any pull/build/restart. See src/updateGuard.ts.
+import {
+  UPDATE_REQUIRE_SIGNATURE,
+  UPDATE_ALLOWED_SIGNERS,
+  alertUpdateSecurity,
+  isRevisionSignedByOwner,
+} from "./updateGuard";
 
 const router = Router();
 
@@ -1694,21 +1703,82 @@ router.post("/api/webhook/github", (req, res) => {
     return;
   }
 
+  const pusher = req.body?.pusher?.name || "unknown";
+  const cwd = process.cwd();
+
+  // SECURITY GATE (#298): a valid HMAC only proves the *delivery* came from
+  // GitHub — NOT that the pushed commit was authored/signed by the owner. The
+  // git author field is spoofable, so before we pull/build/restart on a
+  // credential-bearing host we require the target revision (origin/main HEAD)
+  // to carry a valid cryptographic signature from an allowlisted owner key.
+  // This mirrors the 5-min poller in index.ts (shared via src/updateGuard.ts).
+  let remote: string;
+  try {
+    // Fetch latest from remote (and any signed tags). Fetching does not run code.
+    execSync("git fetch origin main --tags", { cwd, stdio: "pipe" });
+    remote = execSync("git rev-parse origin/main", { cwd, stdio: "pipe" })
+      .toString()
+      .trim();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[webhook] Failed to resolve origin/main before update:", msg);
+    res.status(500).json({ status: "error", reason: "git fetch/rev-parse failed" });
+    return;
+  }
+
+  if (UPDATE_REQUIRE_SIGNATURE) {
+    if (!UPDATE_ALLOWED_SIGNERS) {
+      // No explicit trust anchor configured. We still attempt verification via
+      // git's own configured allowed-signers/keyring, but warn loudly because
+      // a misconfigured host could otherwise silently fail closed forever.
+      console.warn(
+        `[webhook] AUGMENTAGENT_UPDATE_ALLOWED_SIGNERS not set; ` +
+          `relying on git's configured signer trust anchor for verification.`
+      );
+    }
+
+    if (!isRevisionSignedByOwner(cwd, remote)) {
+      const msg =
+        `SKIPPED webhook update to ${remote.slice(0, 7)} (pushed by ${pusher}): ` +
+        `revision is unsigned, has an invalid signature, or is not signed by an ` +
+        `allowed key. HMAC was valid but that only proves delivery from GitHub, ` +
+        `not owner authorship. No pull/build/restart performed.`;
+      console.warn(`[webhook] ${msg}`);
+      alertUpdateSecurity(msg);
+      res.status(202).json({
+        status: "skipped",
+        reason: "revision not signed by an allowed owner key",
+        revision: remote.slice(0, 7),
+      });
+      return;
+    }
+  } else {
+    // Escape hatch explicitly enabled — verification disabled by operator.
+    console.warn(
+      `[webhook] WARNING: signature verification DISABLED ` +
+        `(AUGMENTAGENT_UPDATE_REQUIRE_SIGNATURE=false). Deploying ${remote.slice(0, 7)} unverified.`
+    );
+  }
+
   // Respond immediately, run update in background
-  res.json({ status: "updating" });
+  res.json({ status: "updating", revision: remote.slice(0, 7) });
   updateInProgress = true;
 
-  const pusher = req.body?.pusher?.name || "unknown";
   console.log(`[webhook] Push to main by ${pusher} — starting update...`);
 
+  // Match index.ts: `npm ci --omit=dev` (the previous --production intent) and
+  // --ignore-scripts so untrusted dependency lifecycle scripts cannot run on a
+  // credential-bearing host. The repo build is still run explicitly via
+  // `npm run build`; this package has no install lifecycle scripts, so
+  // --ignore-scripts does not break the build.
   const updateCmd = [
     "git pull origin main",
-    "npm install --production",
+    "npm ci --omit=dev --ignore-scripts",
     "npm run build",
     "pm2 restart augmentagent",
   ].join(" && ");
 
-  exec(updateCmd, { cwd: process.cwd() }, (err, stdout, stderr) => {
+  exec(updateCmd, { cwd }, (err, stdout, stderr) => {
     updateInProgress = false;
     if (err) {
       console.error("[webhook] Update failed:", err.message);
