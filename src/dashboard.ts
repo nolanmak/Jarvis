@@ -70,6 +70,26 @@ import { requireApiKey } from "./apiV1";
 
 const router = Router();
 
+// #479: derive a browsable https URL for the private knowledge-base repo from
+// AUGMENTAGENT_WIKI_REMOTE (a git remote URL or an `owner/repo` slug). Returns
+// "" when unset, so the dashboard simply hides the link rather than pointing at
+// a hardcoded operator repo.
+function knowledgeBaseUrl(): string {
+  const raw = (process.env.AUGMENTAGENT_WIKI_REMOTE || "").trim();
+  if (!raw) return "";
+  let u = raw.replace(/\.git$/, "");
+  const ssh = u.match(/^git@([^:]+):(.+)$/); // scp-style ssh remote -> https
+  if (ssh) u = `https://${ssh[1]}/${ssh[2]}`;
+  else if (/^[\w.-]+\/[\w.-]+$/.test(u)) u = `https://github.com/${u}`; // bare slug
+  return u;
+}
+
+// Expose it to every dashboard view (the header partial reads `kbUrl`).
+router.use((_req, res, next) => {
+  res.locals.kbUrl = knowledgeBaseUrl();
+  next();
+});
+
 function getComposioClient(): Composio | null {
   const apiKey = getConfig("composio_api_key") || process.env.COMPOSIO_API_KEY;
   if (!apiKey) return null;
