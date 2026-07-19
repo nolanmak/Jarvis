@@ -67,6 +67,7 @@ import {
   runCli,
 } from "./slackApi";
 import { requireApiKey } from "./apiV1";
+import { requireAuth } from "./security";
 // Auto-update signature gate (security #298). Shared with the 5-min poller in
 // index.ts so both auto-update paths enforce the same owner-signature
 // requirement before any pull/build/restart. See src/updateGuard.ts.
@@ -78,6 +79,53 @@ import {
 } from "./updateGuard";
 
 const router = Router();
+
+// --- #297: token-gate the dashboard UI router ---
+//
+// Everything on THIS router now requires a dashboard API key (Bearer/x-api-key)
+// or a valid signed session cookie, EXCEPT a small allow-list of endpoints that
+// must be reachable by a third party that cannot present the dashboard key:
+//
+//   - POST /api/webhook/github   — GitHub signs deliveries with HMAC-SHA256; the
+//                                  signature IS the auth. GitHub can't send a key.
+//   - GET  /oauth/*/callback     — the provider redirects the operator's browser
+//                                  back here after consent. A browser arriving
+//                                  from the provider carries no key/cookie, and
+//                                  these callbacks have their own protection: the
+//                                  matching /oauth/*/start route (which IS gated)
+//                                  set server-side pending-connection state that
+//                                  the callback validates against.
+//   - /api/discord/creds (+OPTIONS) — cross-origin bookmarklet target running on
+//                                  discord.com; it can't present our key and is
+//                                  protected by its own discord.com Origin allow.
+//
+// The matching /oauth/*/start routes are deliberately NOT exempt: they are
+// triggered from the authenticated Settings/Subscriptions UI and writing pending
+// OAuth state should require auth.
+//
+// NOTE: the provider webhook receivers (/webhooks/socialapi, /webhooks/reddit/*,
+// /webhooks/composio, etc.) and the Reddit/Composio OAuth callbacks live on a
+// SEPARATE router (webhooks.ts), mounted ahead of this one in the entrypoints,
+// so they are already reachable unauthenticated and are NOT affected here.
+const AUTH_EXEMPT_PREFIXES = [
+  "/api/webhook/github",
+  "/api/discord/creds",
+];
+
+function isOAuthCallback(path: string): boolean {
+  return /^\/oauth\/[^/]+\/callback$/.test(path);
+}
+
+router.use((req, res, next) => {
+  if (
+    AUTH_EXEMPT_PREFIXES.includes(req.path) ||
+    isOAuthCallback(req.path)
+  ) {
+    next();
+    return;
+  }
+  requireAuth(req, res, next);
+});
 
 // #479: derive a browsable https URL for the private knowledge-base repo from
 // AUGMENTAGENT_WIKI_REMOTE (a git remote URL or an `owner/repo` slug). Returns
