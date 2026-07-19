@@ -101,8 +101,8 @@ if [[ -z "${INSTAGRAM_SSH_TARGET:-}" ]]; then
 No INSTAGRAM_SSH_TARGET set, so cookies stayed on this machine. To install
 them on the daemon host:
 
-  scp '$OUT_LOCAL' nolan-makatche@100.91.92.24:~/instagram-cookies.json
-  ssh nolan-makatche@100.91.92.24 \\
+  scp '$OUT_LOCAL' <user>@<host>:~/instagram-cookies.json
+  ssh <user>@<host> \\
       'cd ~/AugmentAgent && ./target/release/augmentagent instagram login --cookies-json ~/instagram-cookies.json && rm ~/instagram-cookies.json'
 
 Or re-run with INSTAGRAM_SSH_TARGET=<user>@<host> to do it in one shot.
