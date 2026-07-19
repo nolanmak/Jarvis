@@ -704,6 +704,19 @@ impl EventHandler for Handler {
                             }),
                             None => 0,
                         };
+                        // #473 — the revise flow recreates the Gmail draft
+                        // with the card's stored envelope, so the reposted
+                        // card must keep SHOWING it: a BCC that is applied
+                        // but invisible is exactly the body/envelope mismatch
+                        // the issue is about. Display-only (the captured
+                        // triple and stored draftBody above stay clean);
+                        // no envelope recorded → body passes through as-is.
+                        let draft = append_envelope_markers(
+                            draft,
+                            store_for_capture.as_deref(),
+                            &action_id,
+                            &email.from,
+                        );
                         let msg = approval_message(&action_id, &email, &draft, count);
                         match approval_channel.send_message(&ctx_clone.http, msg).await {
                             Ok(_) => new_card_posted = true,
@@ -846,6 +859,40 @@ fn describe(outcome: &ApprovalActionOutcome) -> String {
         ApprovalActionOutcome::Skipped => "Skipped — draft discarded.".into(),
         ApprovalActionOutcome::Revised { .. } => "Revising — new draft posted below.".into(),
         ApprovalActionOutcome::Failed { message } => format!("Failed: {message}"),
+    }
+}
+
+/// #473 — append the stored compose envelope to a reposted card body as the
+/// same display markers the original card carried (`[to: …]`/`[cc: …]`/
+/// `[bcc: …]`). `[to:]` is shown only when it differs from `card_from` (the
+/// card's From line), matching compose-time behavior. No store or no
+/// recorded envelope (auto-triage replies, non-gmail platforms) → the body
+/// passes through unchanged.
+fn append_envelope_markers(
+    body: String,
+    store: Option<&augmentagent_store::Store>,
+    action_id: &str,
+    card_from: &str,
+) -> String {
+    let Some(env) = store.and_then(|s| s.get_action_envelope(action_id).ok().flatten()) else {
+        return body;
+    };
+    let mut markers = String::new();
+    if let Some(to) = env.to.as_deref() {
+        if !to.eq_ignore_ascii_case(card_from) {
+            markers.push_str(&format!("\n[to: {to}]"));
+        }
+    }
+    if let Some(cc) = env.cc.as_deref() {
+        markers.push_str(&format!("\n[cc: {cc}]"));
+    }
+    if let Some(bcc) = env.bcc.as_deref() {
+        markers.push_str(&format!("\n[bcc: {bcc}]"));
+    }
+    if markers.is_empty() {
+        body
+    } else {
+        format!("{body}\n{markers}")
     }
 }
 
@@ -1753,6 +1800,75 @@ fn hard_split(s: &str, max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- #473: envelope markers on the reposted (post-Revise) card ----
+
+    fn store_with_envelope(
+        to: Option<&str>,
+        cc: Option<&str>,
+        bcc: Option<&str>,
+    ) -> (augmentagent_store::Store, String, tempfile::NamedTempFile) {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let s = augmentagent_store::Store::open(f.path()).unwrap();
+        let id = s
+            .log_action(
+                "m-473",
+                None,
+                "josh@x.com",
+                "intro",
+                None,
+                Some("draft"),
+                augmentagent_store::ActionStatus::Pending,
+            )
+            .unwrap();
+        s.set_action_envelope(&id, to, cc, bcc).unwrap();
+        (s, id, f)
+    }
+
+    #[test]
+    fn envelope_markers_show_overridden_to_and_bcc() {
+        let (s, id, _f) =
+            store_with_envelope(Some("omer@y.com"), None, Some("josh@x.com"));
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "josh@x.com");
+        assert!(out.contains("[to: omer@y.com]"), "missing to marker: {out}");
+        assert!(out.contains("[bcc: josh@x.com]"), "missing bcc marker: {out}");
+        assert!(out.starts_with("body"), "body must lead: {out}");
+    }
+
+    #[test]
+    fn envelope_markers_omit_to_when_it_matches_card_from() {
+        // New-email cards: the card's From line already IS the recipient
+        // list, so a [to:] marker would be redundant noise.
+        let (s, id, _f) =
+            store_with_envelope(Some("a@b.com"), Some("cc@d.com"), None);
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "a@b.com");
+        assert!(!out.contains("[to:"), "redundant to marker: {out}");
+        assert!(out.contains("[cc: cc@d.com]"), "missing cc marker: {out}");
+    }
+
+    #[test]
+    fn no_envelope_or_no_store_passes_body_through() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let s = augmentagent_store::Store::open(f.path()).unwrap();
+        let id = s
+            .log_action(
+                "m-none",
+                None,
+                "a@b.com",
+                "s",
+                None,
+                Some("d"),
+                augmentagent_store::ActionStatus::Pending,
+            )
+            .unwrap();
+        // Row exists but no envelope was ever recorded (auto-triage shape).
+        assert_eq!(
+            append_envelope_markers("body".into(), Some(&s), &id, "a@b.com"),
+            "body"
+        );
+        // No store wired at all.
+        assert_eq!(append_envelope_markers("body".into(), None, &id, "a@b.com"), "body");
+    }
 
     #[test]
     fn short_answer_is_one_chunk() {
