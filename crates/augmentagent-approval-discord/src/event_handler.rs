@@ -28,6 +28,16 @@ use crate::ApprovalActionOutcome;
 
 const DISCORD_MSG_LIMIT: usize = 1900;
 
+/// Fail-closed owner-allowlist check (#303). Returns `true` only when an
+/// allowlist is configured (`DISCORD_ALLOWED_USER_ID`) *and* the actor matches
+/// it. When `allowed_user_id` is `None` this returns `false`, so every gated
+/// action is refused rather than served to an arbitrary Discord user — the
+/// opposite of the previous `if let Some(allowed) = …` guards, which skipped
+/// the check entirely (fail-open) when no allowlist was configured.
+fn is_authorized(allowed_user_id: Option<UserId>, actor: UserId) -> bool {
+    matches!(allowed_user_id, Some(allowed) if allowed == actor)
+}
+
 pub struct Handler {
     pub state: Arc<BrokerState>,
 }
@@ -72,14 +82,13 @@ impl EventHandler for Handler {
             return;
         }
 
-        if let Some(allowed) = self.state.allowed_user_id {
-            if msg.author.id != allowed {
-                debug!(
-                    "ignoring message from non-allowed user {}",
-                    msg.author.id.get()
-                );
-                return;
-            }
+        if !is_authorized(self.state.allowed_user_id, msg.author.id) {
+            debug!(
+                "ignoring message from unauthorized user {} (allowlist configured: {})",
+                msg.author.id.get(),
+                self.state.allowed_user_id.is_some()
+            );
+            return;
         }
 
         let user_text = msg.content.trim().to_string();
@@ -280,16 +289,14 @@ impl EventHandler for Handler {
                     return;
                 };
                 // Enforce user allowlist on clicks.
-                if let Some(allowed) = self.state.allowed_user_id {
-                    if comp.user.id != allowed {
-                        ack_ephemeral(
-                            &ctx,
-                            &comp,
-                            "You are not authorized to approve replies on this bot.",
-                        )
-                        .await;
-                        return;
-                    }
+                if !is_authorized(self.state.allowed_user_id, comp.user.id) {
+                    ack_ephemeral(
+                        &ctx,
+                        &comp,
+                        "You are not authorized to approve replies on this bot.",
+                    )
+                    .await;
+                    return;
                 }
                 match cid.verb {
                     Verb::Approve => {
@@ -551,20 +558,18 @@ impl EventHandler for Handler {
                 if !matches!(cid.verb, Verb::ReviseModal | Verb::FillAskModal) {
                     return;
                 }
-                if let Some(allowed) = self.state.allowed_user_id {
-                    if modal.user.id != allowed {
-                        let _ = modal
-                            .create_response(
-                                &ctx.http,
-                                CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content("Not authorized.")
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await;
-                        return;
-                    }
+                if !is_authorized(self.state.allowed_user_id, modal.user.id) {
+                    let _ = modal
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("Not authorized.")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
+                    return;
                 }
                 // Defer the modal submission immediately — the revise work
                 // (reasoner call, create_draft, delete_draft) takes well over
@@ -1580,11 +1585,13 @@ async fn fetch_conversation_context(
         }
         let role = if bot_user_id == Some(m.author.id) {
             "assistant"
+        } else if is_authorized(allowed_user_id, m.author.id) {
+            "user"
         } else {
-            match allowed_user_id {
-                Some(allowed) if m.author.id != allowed => continue,
-                _ => "user",
-            }
+            // Fail-closed (#303): with no configured allowlist, or for any
+            // non-owner author, don't fold their messages into the owner's
+            // conversation context.
+            continue;
         };
         let mut body = m.content.trim().to_string();
         if !m.attachments.is_empty() {
@@ -1800,6 +1807,20 @@ fn hard_split(s: &str, max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- #303: fail-closed owner-allowlist check ----
+
+    #[test]
+    fn is_authorized_fails_closed_without_allowlist() {
+        let owner = UserId::new(111);
+        let other = UserId::new(222);
+        // No allowlist configured -> everyone is refused (fail-closed).
+        assert!(!is_authorized(None, owner));
+        assert!(!is_authorized(None, other));
+        // Allowlist configured -> only the configured owner passes.
+        assert!(is_authorized(Some(owner), owner));
+        assert!(!is_authorized(Some(owner), other));
+    }
 
     // ---- #473: envelope markers on the reposted (post-Revise) card ----
 
