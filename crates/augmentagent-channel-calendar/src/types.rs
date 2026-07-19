@@ -7,7 +7,7 @@
 //!   `description` and full `location`. This struct is local to the channel
 //!   and never serialized to disk or to a downstream LLM.
 //! - [`MeetingPayload`] is the **privacy-allowlisted** projection that does
-//!   leave the channel. Only fields enumerated in #82 §10's allowlist are
+//!   leave the channel. Only fields enumerated in archived AugmentAgent#82 §10's allowlist are
 //!   present; in particular there is **no `description` field and no raw
 //!   `location` field**. A unit test (see bottom) round-trips a fixture event
 //!   with both populated and asserts neither leaks into Debug output.
@@ -50,7 +50,7 @@ pub struct CalendarEvent {
     pub status: Option<String>,
     pub summary: Option<String>,
     /// Free-text body. Privacy-sensitive: never persisted, never logged,
-    /// never shipped to an LLM. See §10 of #82.
+    /// never shipped to an LLM. See §10 of archived AugmentAgent#82.
     pub description: Option<String>,
     pub start: Option<EventTime>,
     pub end: Option<EventTime>,
@@ -160,7 +160,7 @@ pub struct EntryPoint {
 /// Privacy-allowlisted projection of a Calendar event. This is the *only*
 /// shape that gets serialized into a `WorkItem` payload, written to sqlite,
 /// or shipped to the wiki ingest LLM. There is no `description` field and
-/// no raw `location` — both are intentionally omitted per #82 §10. The
+/// no raw `location` — both are intentionally omitted per archived AugmentAgent#82 §10. The
 /// `unit tests at the bottom enforce this.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingPayload {

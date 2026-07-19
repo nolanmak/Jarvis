@@ -1,4 +1,5 @@
 import { htmlToMarkdown, extractTitle } from "../markdown.js";
+import { safeFetch } from "../ssrf.js";
 import type { FetchOptions, Layer, LayerOutput } from "../types.js";
 
 const DEFAULT_TIMEOUT_MS = 15000;
@@ -13,9 +14,10 @@ export class HttpLayer implements Layer {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), opts.timeout_ms ?? DEFAULT_TIMEOUT_MS);
     try {
-      const res = await fetch(opts.url, {
+      // safeFetch validates the target (and every redirect hop) against the
+      // SSRF denylist, using redirect: 'manual' internally.
+      const res = await safeFetch(opts.url, {
         method: "GET",
-        redirect: "follow",
         signal: ctl.signal,
         headers: {
           "User-Agent": UA,

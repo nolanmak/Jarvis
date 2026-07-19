@@ -9,7 +9,7 @@
 pub mod channel;
 pub mod client;
 
-pub use channel::{MeetupChannel, MeetupChannelConfig, PollOutcome, DEFAULT_POLL_SECS};
+pub use channel::{render_event, MeetupChannel, MeetupChannelConfig, PollOutcome, DEFAULT_POLL_SECS};
 pub use client::{MeetupClient, MeetupError, MeetupEvent};
 
 /// `channel_subscriptions.platform` discriminator for Meetup rows.

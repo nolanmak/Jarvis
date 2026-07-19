@@ -169,6 +169,8 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
     findings.push(check_env_file_present());
     // 11. socialapi — key present? accounts active? (#245)
     findings.push(check_socialapi(&store));
+    // 12. calendar — configured (Composio + gmail entities) but unscheduled? (#376)
+    findings.push(check_calendar_scheduled(&store));
 
     // --- Deep checks (off by default).
     if deep {
@@ -610,6 +612,53 @@ fn socialapi_key_present() -> bool {
         |r| r.get(0),
     );
     matches!(val, Ok(v) if !v.is_empty())
+}
+
+/// #376 — the calendar channel is deliberately not spawned by `serve`; an
+/// external timer drives `calendar poll-once`. Its prerequisites (Composio
+/// key + ≥1 gmail account as the entity list) are often satisfied long
+/// before anyone schedules it, leaving the feature silently dead. Surface
+/// that state. Linux-only probe: the timer is a systemd user unit.
+fn check_calendar_scheduled(store: &Store) -> Finding {
+    let composio = std::env::var("COMPOSIO_API_KEY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let gmail_accounts = store
+        .get_active_gmail_accounts()
+        .map(|v| v.len())
+        .unwrap_or(0);
+    if !composio || gmail_accounts == 0 {
+        return Finding::ok(
+            "calendar_scheduled",
+            "calendar not configured (needs COMPOSIO_API_KEY + a connected gmail account) — skipped".to_string(),
+        );
+    }
+    if !cfg!(target_os = "linux") {
+        return Finding::ok(
+            "calendar_scheduled",
+            "non-Linux host — timer probe skipped".to_string(),
+        );
+    }
+    let unit_dir = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
+        })
+        .join("systemd/user");
+    if unit_dir.join("augmentagent-calendar.timer").exists() {
+        Finding::ok(
+            "calendar_scheduled",
+            format!("augmentagent-calendar.timer installed ({gmail_accounts} gmail entity(ies))"),
+        )
+    } else {
+        Finding::warn(
+            "calendar_scheduled",
+            format!(
+                "calendar ingest is configured ({gmail_accounts} gmail entity(ies), Composio key set) but nothing schedules it"
+            ),
+            Some("augmentagent install calendar"),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

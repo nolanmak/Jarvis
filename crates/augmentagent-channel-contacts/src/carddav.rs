@@ -187,9 +187,23 @@ impl ContactsSource for CardDavSource {
 
         // 3. GET each .vcf, concatenate, parse once.
         let base = url_origin(&self.collection_url);
+        let allowed_host = url_host(&self.collection_url);
         let mut buf = String::new();
         for href in hrefs {
             let url = if href.starts_with("http") {
+                // SSRF guard: a malicious addressbook server can place absolute
+                // hrefs pointing at loopback / RFC1918 / metadata endpoints in
+                // its multistatus XML. Only follow absolute hrefs whose host
+                // matches the configured CardDAV host; reject everything else.
+                let href_host = url_host(&href);
+                if href_host.is_empty() || href_host != allowed_host {
+                    tracing::warn!(
+                        %href,
+                        configured_host = %allowed_host,
+                        "carddav: refusing cross-origin vcf href"
+                    );
+                    continue;
+                }
                 href
             } else {
                 format!("{base}{href}")
@@ -219,6 +233,27 @@ impl ContactsSource for CardDavSource {
             next_sync_token: if ctag.is_empty() { None } else { Some(ctag) },
         })
     }
+}
+
+/// Extract the lowercase `host[:port]` authority from a URL string.
+///
+/// Dependency-free (no `url` crate) to keep the diff minimal. Returns an empty
+/// string if no scheme/authority can be found, which callers treat as "block".
+/// Userinfo (`user:pass@host`) is stripped so it can't spoof the host.
+fn url_host(u: &str) -> String {
+    let after_scheme = match u.find("://") {
+        Some(i) => &u[i + 3..],
+        None => return String::new(),
+    };
+    let end = after_scheme
+        .find(|c| c == '/' || c == '?' || c == '#')
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..end];
+    let host = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    host.to_ascii_lowercase()
 }
 
 /// `https://host:port/path/...` → `https://host:port` for resolving
@@ -262,6 +297,34 @@ mod tests {
             url_origin("https://dav.example.com:8443/addressbooks/u/default/"),
             "https://dav.example.com:8443"
         );
+    }
+
+    #[test]
+    fn url_host_extracts_authority() {
+        assert_eq!(url_host("https://dav.example.com/path"), "dav.example.com");
+        assert_eq!(
+            url_host("https://dav.example.com:8443/p"),
+            "dav.example.com:8443"
+        );
+        assert_eq!(url_host("http://127.0.0.1:6379/x"), "127.0.0.1:6379");
+        // userinfo must not spoof the host
+        assert_eq!(url_host("http://dav.example.com@127.0.0.1/x"), "127.0.0.1");
+        // case-insensitive
+        assert_eq!(url_host("https://DAV.Example.COM/p"), "dav.example.com");
+        // no scheme/authority => empty (blocked by caller)
+        assert_eq!(url_host("/relative/path"), "");
+    }
+
+    #[test]
+    fn cross_origin_href_detection() {
+        let allowed = url_host("https://dav.example.com:8443/addressbooks/u/");
+        // same host (different path) is allowed
+        assert_eq!(url_host("https://dav.example.com:8443/addr/1.vcf"), allowed);
+        // an absolute href at loopback does NOT match the configured host
+        let evil = url_host("http://127.0.0.1:6379/x.vcf");
+        assert!(!evil.is_empty() && evil != allowed);
+        // a metadata-IP href does NOT match either
+        assert_ne!(url_host("http://169.254.169.254/latest/x.vcf"), allowed);
     }
 
     #[test]

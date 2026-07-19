@@ -1,5 +1,5 @@
 import { Router, Request } from "express";
-import { exec, spawn } from "child_process";
+import { exec, execSync, spawn } from "child_process";
 import crypto from "crypto";
 import fs from "fs";
 import os from "os";
@@ -17,8 +17,6 @@ import {
   getConfig,
   setConfig,
   deleteConfig,
-  setInvoiceConfig,
-  getInvoiceSettings,
   getActionCount,
   getGmailAccounts,
   getActiveGmailAccounts,
@@ -70,6 +68,15 @@ import {
 } from "./slackApi";
 import { requireApiKey } from "./apiV1";
 import { requireAuth } from "./security";
+// Auto-update signature gate (security #298). Shared with the 5-min poller in
+// index.ts so both auto-update paths enforce the same owner-signature
+// requirement before any pull/build/restart. See src/updateGuard.ts.
+import {
+  UPDATE_REQUIRE_SIGNATURE,
+  UPDATE_ALLOWED_SIGNERS,
+  alertUpdateSecurity,
+  isRevisionSignedByOwner,
+} from "./updateGuard";
 
 const router = Router();
 
@@ -120,6 +127,26 @@ router.use((req, res, next) => {
   requireAuth(req, res, next);
 });
 
+// #479: derive a browsable https URL for the private knowledge-base repo from
+// AUGMENTAGENT_WIKI_REMOTE (a git remote URL or an `owner/repo` slug). Returns
+// "" when unset, so the dashboard simply hides the link rather than pointing at
+// a hardcoded operator repo.
+function knowledgeBaseUrl(): string {
+  const raw = (process.env.AUGMENTAGENT_WIKI_REMOTE || "").trim();
+  if (!raw) return "";
+  let u = raw.replace(/\.git$/, "");
+  const ssh = u.match(/^git@([^:]+):(.+)$/); // scp-style ssh remote -> https
+  if (ssh) u = `https://${ssh[1]}/${ssh[2]}`;
+  else if (/^[\w.-]+\/[\w.-]+$/.test(u)) u = `https://github.com/${u}`; // bare slug
+  return u;
+}
+
+// Expose it to every dashboard view (the header partial reads `kbUrl`).
+router.use((_req, res, next) => {
+  res.locals.kbUrl = knowledgeBaseUrl();
+  next();
+});
+
 function getComposioClient(): Composio | null {
   const apiKey = getConfig("composio_api_key") || process.env.COMPOSIO_API_KEY;
   if (!apiKey) return null;
@@ -135,8 +162,40 @@ function getComposioClient(): Composio | null {
 // indefinite-stale state #179 describes.
 const GMAIL_LIVENESS_STALE_MS = 5 * 60 * 1000;
 
+// #398/#400 — per-entity Google Calendar connection status, cached 60s so
+// config-status renders (every htmx swap hits it) don't each round-trip to
+// Composio. The callback route nulls the cache so a fresh connect flips the
+// badge immediately.
+let calendarStatusCache: { at: number; entities: string[] } | null = null;
+
+async function getCalendarConnectedEntities(): Promise<string[]> {
+  const client = getComposioClient();
+  if (!client) return [];
+  if (calendarStatusCache && Date.now() - calendarStatusCache.at < 60_000) {
+    return calendarStatusCache.entities;
+  }
+  try {
+    const conns = await client.connectedAccounts.list({
+      toolkit_slugs: ["googlecalendar"],
+    });
+    const entities = conns.items
+      .filter((c) => c.status === "ACTIVE")
+      .map((c) => (c as any).user_id || (c as any).entity_id)
+      .filter(Boolean);
+    calendarStatusCache = { at: Date.now(), entities };
+    return entities;
+  } catch (err) {
+    console.error(
+      "[calendar] connection status check failed:",
+      err instanceof Error ? err.message : err,
+    );
+    // Stale beats missing: keep showing the last known state on a blip.
+    return calendarStatusCache?.entities ?? [];
+  }
+}
+
 // Check both DB config and env vars for integration status
-function getConfigStatus() {
+async function getConfigStatus() {
   const gmailAccounts = getGmailAccounts();
   // #179 — "connected" means the most recent poll *succeeded* recently.
   // `active=1` alone doesn't prove the connection still works at Composio
@@ -158,6 +217,9 @@ function getConfigStatus() {
     composioKey: !!(getConfig("composio_api_key") || process.env.COMPOSIO_API_KEY),
     gmailAccounts,
     gmailConnected,
+    // Entity ids with an ACTIVE googlecalendar connection (#398/#400) —
+    // the template matches these against gmailAccounts[].entityId.
+    calendarEntities: await getCalendarConnectedEntities(),
     discordWebhook: !!(getConfig("discord_webhook_url") || process.env.DISCORD_WEBHOOK_URL),
     discordBotToken: !!(getConfig("discord_bot_token") || process.env.DISCORD_BOT_TOKEN),
     emailRetentionDays: getConfig("email_retention_days") || "0",
@@ -207,18 +269,16 @@ function maskSecret(raw: string | null): string | null {
   return `${raw.slice(0, 4)}${"•".repeat(8)}${raw.slice(-4)}`;
 }
 
-router.get("/settings", (_req, res) => {
+router.get("/settings", async (_req, res) => {
   const senders = getSenders();
-  const configStatus = getConfigStatus();
+  const configStatus = await getConfigStatus();
   const emailRetention = getConfig("email_retention_days") || "0";
   const emailCount = getEmailCount();
-  const invoice = getInvoiceSettings();
   res.render("settings", {
     senders,
     configStatus,
     emailRetention,
     emailCount,
-    invoice,
     socialApiKeyMasked: maskSecret(getConfig("socialapi_api_key")),
     socialApiAccounts: getSocialApiAccounts(),
     socialApiError: null,
@@ -605,7 +665,7 @@ router.patch("/api/senders/:id/toggle", (req, res) => {
 
 // --- Config API ---
 
-router.post("/api/config", (req, res) => {
+router.post("/api/config", async (req, res) => {
   const { key, value } = req.body;
   const allowedKeys = [
     "groq_api_key",
@@ -633,13 +693,13 @@ router.post("/api/config", (req, res) => {
     deleteConfig(key);
   }
 
-  const configStatus = getConfigStatus();
+  const configStatus = await getConfigStatus();
 
   res.render("partials/config-status", { configStatus });
 });
 
-router.get("/api/config/status", (_req, res) => {
-  const configStatus = getConfigStatus();
+router.get("/api/config/status", async (_req, res) => {
+  const configStatus = await getConfigStatus();
   res.render("partials/config-status", { configStatus });
 });
 
@@ -661,43 +721,6 @@ router.post("/api/ask", async (req, res) => {
     console.error("/api/ask failed:", message);
     res.status(500).json({ error: message });
   }
-});
-
-// --- Weekly invoice automation ---
-// Writes the same `invoice_config` rows the Rust scheduler reads. The master
-// kill switch (`auto_draft_enabled`) is seeded OFF by the daemon migration;
-// nothing auto-drafts until it's flipped on here (or via `!invoice autodraft`).
-// When ON, the Sunday scheduler posts a draft card with the PDF + Approve/
-// Reject buttons; a human still has to click Approve for anything to send.
-router.post("/api/invoice-config", (req, res) => {
-  const { key, value } = req.body as { key?: string; value?: string };
-
-  if (key === "auto_draft_enabled") {
-    // Normalize a checkbox/string to exactly the "true"/"false" the Rust
-    // scheduler compares against.
-    const on = value === "true" || value === "on" || value === "1";
-    setInvoiceConfig("auto_draft_enabled", on ? "true" : "false");
-  } else if (key === "recipient_email") {
-    const email = (value || "").trim();
-    if (!email.includes("@") || !email.includes(".")) {
-      res
-        .status(400)
-        .send('<p class="text-red-400 text-sm">Enter a valid email address.</p>');
-      return;
-    }
-    setInvoiceConfig("recipient_email", email);
-  } else {
-    res
-      .status(400)
-      .send('<p class="text-red-400 text-sm">Invalid invoice config key</p>');
-    return;
-  }
-
-  res.render("partials/invoice-config", { invoice: getInvoiceSettings() });
-});
-
-router.get("/api/invoice-config", (_req, res) => {
-  res.render("partials/invoice-config", { invoice: getInvoiceSettings() });
 });
 
 // --- Composio OAuth (same pattern as Orchid) ---
@@ -932,8 +955,117 @@ router.delete("/api/oauth/gmail/:id", async (req, res) => {
     removeGmailAccount(req.params.id);
   }
 
-  const configStatus = getConfigStatus();
+  const configStatus = await getConfigStatus();
   res.render("partials/config-status", { configStatus });
+});
+
+// --- Composio OAuth for Google Calendar (#398/#400) ---
+// Same shape as the Gmail/Drive flows with one deliberate difference: the
+// connection REUSES an existing Gmail account's entity id instead of
+// minting a fresh one. The Rust daemon resolves calendar connections by
+// iterating gmail_accounts entity ids (Phase 1 reuses them as the Calendar
+// entity list), so a fresh entity would leave the connection orphaned.
+// One click per account = one fresh single-use consent link per account,
+// which is also why connecting two Googles through one link fails with
+// Composio's "expired state" redis error.
+
+router.get("/oauth/calendar/start", async (req, res) => {
+  try {
+    const client = getComposioClient();
+    if (!client) {
+      res.status(400).send("Composio API key not configured. Add it in Settings first.");
+      return;
+    }
+    const entityId = String(req.query.entity || "");
+    const account = getGmailAccounts().find((a) => a.entityId === entityId);
+    if (!account) {
+      res
+        .status(400)
+        .send("Unknown entity id — connect the Gmail account first, then its calendar.");
+      return;
+    }
+
+    const authConfigId = await getOrCreateAuthConfig(client, "googlecalendar");
+    const dashboardPort = process.env.DASHBOARD_PORT || "3000";
+    const callbackUrl = `http://localhost:${dashboardPort}/oauth/calendar/callback`;
+    const linkResponse = await client.link.create({
+      user_id: entityId,
+      auth_config_id: authConfigId,
+      callback_url: callbackUrl,
+    });
+    if (!linkResponse.redirect_url) {
+      throw new Error("No redirect URL returned from Composio");
+    }
+    if (linkResponse.connected_account_id) {
+      setConfig("calendar_pending_connection_id", linkResponse.connected_account_id);
+      setConfig("calendar_pending_entity_id", entityId);
+    }
+    console.log(
+      `[oauth] Calendar OAuth initiated for entity ${entityId} (${account.email || "unlabeled"})`,
+    );
+    res.redirect(linkResponse.redirect_url);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[oauth] Calendar OAuth start failed:", msg);
+    res.status(500).send(`
+      <div class="p-4 bg-gray-950 text-gray-100 min-h-screen">
+        <h2 class="text-lg font-semibold text-red-400 mb-2">OAuth Error</h2>
+        <p class="text-sm text-gray-300 mb-4">${msg}</p>
+        <a href="/settings" class="text-blue-400 hover:underline">Back to Settings</a>
+      </div>
+    `);
+  }
+});
+
+router.get("/oauth/calendar/callback", async (req, res) => {
+  console.log("[oauth] calendar callback. Query:", JSON.stringify(req.query));
+  try {
+    const connectionId = getConfig("calendar_pending_connection_id");
+    const entityId = getConfig("calendar_pending_entity_id");
+    const client = getComposioClient();
+
+    let status = "unknown";
+    if (connectionId && client) {
+      let retries = 3;
+      while (retries > 0) {
+        try {
+          const account = await client.connectedAccounts.retrieve(connectionId);
+          status = (account as any).status || "unknown";
+          if (status === "ACTIVE") break;
+        } catch (err) {
+          console.log(
+            "[oauth] calendar retrieve failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
+        retries--;
+        if (retries > 0) await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+    // No DB row to write — the daemon finds the connection by entity id.
+    deleteConfig("calendar_pending_connection_id");
+    deleteConfig("calendar_pending_entity_id");
+    calendarStatusCache = null;
+    console.log(`[oauth] Calendar callback: entity=${entityId}, status=${status}`);
+    res.redirect(status === "ACTIVE" ? "/settings?calendar=connected" : "/settings?calendar=error");
+  } catch (err) {
+    console.error("[oauth] Calendar OAuth callback error:", err);
+    res.redirect("/settings?calendar=error");
+  }
+});
+
+// Per-account calendar connection status (JSON, mirrors gmail/status).
+router.get("/api/oauth/calendar/status", async (_req, res) => {
+  const entities = await getCalendarConnectedEntities();
+  const accounts = getGmailAccounts();
+  res.json({
+    accounts: accounts.map((a) => ({
+      id: a.id,
+      email: a.email,
+      entityId: a.entityId,
+      calendarConnected: entities.includes(a.entityId),
+    })),
+  });
 });
 
 // --- Composio OAuth for Google Drive (multi-tenant) ---
@@ -1619,21 +1751,82 @@ router.post("/api/webhook/github", (req, res) => {
     return;
   }
 
+  const pusher = req.body?.pusher?.name || "unknown";
+  const cwd = process.cwd();
+
+  // SECURITY GATE (#298): a valid HMAC only proves the *delivery* came from
+  // GitHub — NOT that the pushed commit was authored/signed by the owner. The
+  // git author field is spoofable, so before we pull/build/restart on a
+  // credential-bearing host we require the target revision (origin/main HEAD)
+  // to carry a valid cryptographic signature from an allowlisted owner key.
+  // This mirrors the 5-min poller in index.ts (shared via src/updateGuard.ts).
+  let remote: string;
+  try {
+    // Fetch latest from remote (and any signed tags). Fetching does not run code.
+    execSync("git fetch origin main --tags", { cwd, stdio: "pipe" });
+    remote = execSync("git rev-parse origin/main", { cwd, stdio: "pipe" })
+      .toString()
+      .trim();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[webhook] Failed to resolve origin/main before update:", msg);
+    res.status(500).json({ status: "error", reason: "git fetch/rev-parse failed" });
+    return;
+  }
+
+  if (UPDATE_REQUIRE_SIGNATURE) {
+    if (!UPDATE_ALLOWED_SIGNERS) {
+      // No explicit trust anchor configured. We still attempt verification via
+      // git's own configured allowed-signers/keyring, but warn loudly because
+      // a misconfigured host could otherwise silently fail closed forever.
+      console.warn(
+        `[webhook] AUGMENTAGENT_UPDATE_ALLOWED_SIGNERS not set; ` +
+          `relying on git's configured signer trust anchor for verification.`
+      );
+    }
+
+    if (!isRevisionSignedByOwner(cwd, remote)) {
+      const msg =
+        `SKIPPED webhook update to ${remote.slice(0, 7)} (pushed by ${pusher}): ` +
+        `revision is unsigned, has an invalid signature, or is not signed by an ` +
+        `allowed key. HMAC was valid but that only proves delivery from GitHub, ` +
+        `not owner authorship. No pull/build/restart performed.`;
+      console.warn(`[webhook] ${msg}`);
+      alertUpdateSecurity(msg);
+      res.status(202).json({
+        status: "skipped",
+        reason: "revision not signed by an allowed owner key",
+        revision: remote.slice(0, 7),
+      });
+      return;
+    }
+  } else {
+    // Escape hatch explicitly enabled — verification disabled by operator.
+    console.warn(
+      `[webhook] WARNING: signature verification DISABLED ` +
+        `(AUGMENTAGENT_UPDATE_REQUIRE_SIGNATURE=false). Deploying ${remote.slice(0, 7)} unverified.`
+    );
+  }
+
   // Respond immediately, run update in background
-  res.json({ status: "updating" });
+  res.json({ status: "updating", revision: remote.slice(0, 7) });
   updateInProgress = true;
 
-  const pusher = req.body?.pusher?.name || "unknown";
   console.log(`[webhook] Push to main by ${pusher} — starting update...`);
 
+  // Match index.ts: `npm ci --omit=dev` (the previous --production intent) and
+  // --ignore-scripts so untrusted dependency lifecycle scripts cannot run on a
+  // credential-bearing host. The repo build is still run explicitly via
+  // `npm run build`; this package has no install lifecycle scripts, so
+  // --ignore-scripts does not break the build.
   const updateCmd = [
     "git pull origin main",
-    "npm install --production",
+    "npm ci --omit=dev --ignore-scripts",
     "npm run build",
     "pm2 restart augmentagent",
   ].join(" && ");
 
-  exec(updateCmd, { cwd: process.cwd() }, (err, stdout, stderr) => {
+  exec(updateCmd, { cwd }, (err, stdout, stderr) => {
     updateInProgress = false;
     if (err) {
       console.error("[webhook] Update failed:", err.message);

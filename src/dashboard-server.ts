@@ -1,6 +1,17 @@
 import dotenv from "dotenv";
 dotenv.config();
 
+// #375 — prefix every console line with a UTC timestamp. The dashboard's
+// stdout/stderr land in append-only files via systemd; without timestamps,
+// failures (e.g. the stale-key OAuth 401s #375 chased) can't be dated
+// against key rotations or restarts. Installed before any other import
+// runs so early startup logging is covered too.
+for (const level of ["log", "info", "warn", "error"] as const) {
+  const orig = console[level].bind(console);
+  console[level] = (...args: unknown[]) =>
+    orig(`[${new Date().toISOString()}]`, ...args);
+}
+
 import express from "express";
 import path from "path";
 import { initDb } from "./db";
@@ -21,7 +32,10 @@ const DASHBOARD_PORT = getDashboardPort();
 const DASHBOARD_HOST = getBindHost();
 
 function main(): void {
-  initDb();
+  // #360: honor AUGMENTAGENT_DB so a tenant/test DB isn't silently ignored in
+  // favor of the default ./data.db. `initDb` falls back to the default when
+  // this is undefined.
+  initDb(process.env.AUGMENTAGENT_DB);
 
   const app = express();
 

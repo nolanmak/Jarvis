@@ -43,6 +43,52 @@ const MAX_DIFF_LINES: usize = 600;
 /// Consecutive failed attempts before we comment + back off (label marker).
 const MAX_ATTEMPTS: u32 = 3;
 
+/// #300 — Trust gate. Issue bodies are attacker-controllable now that the
+/// repo is public, and the reasoner is granted Write/Edit/Bash(cargo/npm)
+/// with the verification gate running `build.rs`/proc-macros/`npm postinstall`
+/// on the host. To keep untrusted text out of that pipeline, only issues
+/// authored by a trusted login auto-select into a run. Everyone else is
+/// refused at selection time and routed through the explicit
+/// `pending_approval` -> owner-OK flow (the multi-repo path already
+/// implements that handshake).
+///
+/// Trusted authors come from `AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS`
+/// (comma-separated GitHub logins, case-insensitive). If unset, the gate
+/// falls back to the repo owner (`AUGMENTAGENT_GH_OWNER`, else the owner
+/// segment parsed from the repo's `origin` remote). GitHub `authorAssociation`
+/// of `OWNER` / `MEMBER` / `COLLABORATOR` (write-access roles) is also
+/// honored so the owner doesn't have to enumerate every collaborator.
+const TRUSTED_AUTHORS_ENV: &str = "AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS";
+const GH_OWNER_ENV: &str = "AUGMENTAGENT_GH_OWNER";
+
+/// Provider/API-key env vars stripped from the build/test gate's child
+/// process (#300). The gate compiles + tests attacker-influenceable code
+/// (`build.rs`, proc-macros, `npm postinstall`); none of those need a
+/// provider key, so clearing them is behavior-preserving for honest fixes
+/// while denying secret exfiltration to a hostile build script. Matched as
+/// a prefix/suffix denylist over the inherited env (see [`gate_env`]).
+const GATE_SECRET_ENV_SUBSTRINGS: &[&str] = &[
+    "OPENAI",
+    "ANTHROPIC",
+    "CLAUDE",
+    "COMPOSIO",
+    "GROQ",
+    "CEREBRAS",
+    "SOCIALAPI",
+    "DISCORD",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "AWS_",
+    "GCP_",
+    "GOOGLE_",
+    "SECRET",
+    "TOKEN",
+    "API_KEY",
+    "APIKEY",
+    "PASSWORD",
+    "CREDENTIAL",
+];
+
 /// Path fragments that make an issue or a diff "too dangerous to auto-touch".
 /// Conservative on purpose — better to refuse a safe change than ship a
 /// dangerous one unattended.
@@ -70,6 +116,14 @@ pub struct Issue {
     pub number: u64,
     pub title: String,
     pub body: String,
+    /// GitHub login of the issue author (#300). Empty when `gh` did not
+    /// return an author (treated as untrusted).
+    pub author: String,
+    /// Whether [`author`](Self::author) passed the #300 trust gate at
+    /// selection time. `false` ⇒ the body is attacker-controllable and the
+    /// run must require explicit owner approval before any host-side build
+    /// or branch push.
+    pub author_trusted: bool,
 }
 
 /// True if any blast-radius pattern appears in `text` (case-insensitive).
@@ -106,6 +160,75 @@ async fn run(cmd: &str, args: &[&str], cwd: &Path) -> Result<(bool, String, Stri
     ))
 }
 
+/// #300 — Compute the sanitized env for the build/test verification gate.
+///
+/// The gate compiles + tests code that may have been influenced by an
+/// attacker-controlled issue body (`build.rs`, proc-macros, `npm
+/// postinstall` all execute during `cargo build`/`npm run build`). None of
+/// those need provider/API secrets, so we strip every env var whose name
+/// matches a [`GATE_SECRET_ENV_SUBSTRINGS`] token before spawning. This
+/// returns the FULL allowed env (cleared of secrets) so the build still has
+/// `PATH`, `HOME`, `CARGO_*`, etc. — behavior-preserving for honest fixes,
+/// secret-denying for hostile ones.
+fn gate_env() -> Vec<(String, String)> {
+    std::env::vars()
+        .filter(|(k, _)| !env_name_is_secret(k))
+        .collect()
+}
+
+/// True if an env-var name looks like a provider secret (case-insensitive
+/// substring match against [`GATE_SECRET_ENV_SUBSTRINGS`]).
+fn env_name_is_secret(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    GATE_SECRET_ENV_SUBSTRINGS
+        .iter()
+        .any(|frag| upper.contains(frag))
+}
+
+/// Run a command with a sandboxed env: the child's environment is CLEARED
+/// and repopulated from [`gate_env`] (full inherited env minus provider
+/// secrets). Used for the build/test gate so a hostile `build.rs` /
+/// `postinstall` cannot read provider API keys out of the daemon env.
+//
+// SECURITY: This "sandbox" is env-isolation only, NOT a full sandbox.
+//   - What it DOES: clears the inherited environment and re-injects only
+//     non-secret vars (`gate_env`), so a hostile build/test script
+//     (`build.rs`, proc-macro, `npm` `postinstall`, a repo's `build_cmd`)
+//     cannot read provider API keys / tokens out of the daemon's process env
+//     and exfiltrate them.
+//   - What it does NOT do: it does NOT block network egress. The child can
+//     still open arbitrary outbound sockets in-process; a hostile script
+//     could fetch a payload or POST data it scrapes from the checkout. There
+//     is no in-process primitive that prevents this. Full isolation requires
+//     running this gate inside a container or a network namespace (e.g. an
+//     ephemeral, no-network sandbox) — deliberately out of scope here.
+//   - PRIMARY defense is upstream, not here: untrusted-authored issues are
+//     refused before reaching this gate (#300 trust gate), and the multi-repo
+//     path operates on an ephemeral throwaway clone. Secret-stripping is the
+//     defense-in-depth control for the honest-fix path, not the sole barrier
+//     against a hostile author.
+async fn run_sandboxed(
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(String, String)],
+) -> Result<(bool, String, String)> {
+    let out = Command::new(cmd)
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .env_clear()
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .output()
+        .await
+        .with_context(|| format!("spawn (sandboxed) {cmd} {args:?}"))?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
+}
+
 fn gh_bin() -> String {
     // Prod systemd PATH lacks /snap/bin; honor an override, else try snap.
     std::env::var("GH_BIN").unwrap_or_else(|_| {
@@ -117,9 +240,91 @@ fn gh_bin() -> String {
     })
 }
 
+/// #300 — Parse the configured trusted-author allowlist. Comma-separated
+/// logins from `AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS`, normalized to
+/// lowercase. Falls back to the repo owner (`AUGMENTAGENT_GH_OWNER`, else
+/// the owner segment of the repo's `origin` remote) so a single-owner
+/// install needs zero configuration.
+async fn trusted_authors(repo_root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = std::env::var(TRUSTED_AUTHORS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if let Ok(owner) = std::env::var(GH_OWNER_ENV) {
+        let owner = owner.trim().to_ascii_lowercase();
+        if !owner.is_empty() && !out.contains(&owner) {
+            out.push(owner);
+        }
+    }
+    if out.is_empty() {
+        if let Some(owner) = repo_owner_from_remote(repo_root).await {
+            out.push(owner);
+        }
+    }
+    out
+}
+
+/// Best-effort: parse the `owner` segment of the repo's `origin` remote URL
+/// (handles both `git@github.com:owner/repo.git` and
+/// `https://github.com/owner/repo` forms). Used only as the trust-gate
+/// fallback when no explicit trusted-author config is present.
+async fn repo_owner_from_remote(repo_root: &Path) -> Option<String> {
+    let (ok, url, _) = run(
+        "git",
+        &["config", "--get", "remote.origin.url"],
+        repo_root,
+    )
+    .await
+    .ok()?;
+    if !ok {
+        return None;
+    }
+    let url = url.trim().trim_end_matches(".git");
+    // Strip protocol/host: keep everything after the last ':' or the
+    // "host/" boundary, then take the leading path segment as the owner.
+    let path = url
+        .rsplit_once("github.com")
+        .map(|(_, rest)| rest.trim_start_matches([':', '/']))
+        .unwrap_or(url);
+    let owner = path.split('/').next().unwrap_or("").trim();
+    if owner.is_empty() {
+        None
+    } else {
+        Some(owner.to_ascii_lowercase())
+    }
+}
+
+/// #300 — Decide whether an issue's author is trusted for unattended
+/// selection. An author is trusted when EITHER its login is on the
+/// configured allowlist OR GitHub reports a write-access `authorAssociation`
+/// (`OWNER` / `MEMBER` / `COLLABORATOR`). Default-deny: an empty login or an
+/// unknown association is untrusted.
+fn author_is_trusted(login: &str, association: &str, allowlist: &[String]) -> bool {
+    let login = login.trim().to_ascii_lowercase();
+    if login.is_empty() {
+        return false;
+    }
+    if allowlist.iter().any(|a| a == &login) {
+        return true;
+    }
+    matches!(
+        association.trim().to_ascii_uppercase().as_str(),
+        "OWNER" | "MEMBER" | "COLLABORATOR"
+    )
+}
+
 /// Pick the first `agent-fixable` issue that isn't already claimed (open agent
 /// PR) and isn't blast-radius and isn't `agent-gave-up`.
+///
+/// #300 trust gate: the returned [`Issue::author_trusted`] flag records
+/// whether the author passed the trust check. Untrusted-authored issues are
+/// still returned (so the loop can route them through owner approval rather
+/// than silently swallowing them) but are NEVER auto-built or auto-pushed by
+/// [`run_once`].
 async fn pick_issue(repo_root: &Path) -> Result<Option<Issue>> {
+    let allowlist = trusted_authors(repo_root).await;
     let gh = gh_bin();
     let (ok, stdout, stderr) = run(
         &gh,
@@ -131,7 +336,7 @@ async fn pick_issue(repo_root: &Path) -> Result<Option<Issue>> {
             "--state",
             "open",
             "--json",
-            "number,title,body,labels",
+            "number,title,body,labels,author,authorAssociation",
             "--limit",
             "50",
         ],
@@ -181,10 +386,33 @@ async fn pick_issue(repo_root: &Path) -> Result<Option<Issue>> {
             info!(issue = number, "skip: open agent PR exists (dedup)");
             continue;
         }
+        // #300 — capture the author + its write-access association so the
+        // caller can trust-gate before any host-side build/push.
+        let author = iss
+            .get("author")
+            .and_then(|a| a.get("login"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let association = iss
+            .get("authorAssociation")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let author_trusted = author_is_trusted(&author, association, &allowlist);
+        if !author_trusted {
+            info!(
+                issue = number,
+                author = %author,
+                association = %association,
+                "untrusted issue author — requires owner approval before any build/push"
+            );
+        }
         return Ok(Some(Issue {
             number,
             title,
             body,
+            author,
+            author_trusted,
         }));
     }
     Ok(None)
@@ -256,21 +484,28 @@ When done, output a 2-4 sentence summary of what you changed and why.";
 /// Run the verification gate inside the worktree. Returns Ok(()) only if every
 /// configured check passes.
 async fn verification_gate(worktree: &Path) -> Result<()> {
-    info!("verification gate: cargo build");
-    let (ok, _o, e) = run(
+    // #300 — Strip provider secrets from the gate's child env. `cargo
+    // build`/`npm run build` execute `build.rs`/proc-macros/`npm
+    // postinstall`, which the issue body could influence; none need
+    // provider keys, so this is behavior-preserving for honest fixes.
+    let env = gate_env();
+    info!("verification gate: cargo build (sandboxed env)");
+    let (ok, _o, e) = run_sandboxed(
         "bash",
         &["-lc", ". $HOME/.cargo/env && cargo build --workspace 2>&1 | tail -5"],
         worktree,
+        &env,
     )
     .await?;
     if !ok {
         bail!("cargo build failed:\n{e}");
     }
-    info!("verification gate: cargo test");
-    let (ok, _o, e) = run(
+    info!("verification gate: cargo test (sandboxed env)");
+    let (ok, _o, e) = run_sandboxed(
         "bash",
         &["-lc", ". $HOME/.cargo/env && cargo test --workspace 2>&1 | tail -8"],
         worktree,
+        &env,
     )
     .await?;
     if !ok {
@@ -279,8 +514,10 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     // npm build is best-effort: only gate on it if a package.json + node_modules
     // are present (prod has them; a bare CI checkout may not).
     if worktree.join("package.json").exists() && worktree.join("node_modules").exists() {
-        info!("verification gate: npm run build");
-        let (ok, _o, e) = run("bash", &["-lc", "npm run build 2>&1 | tail -5"], worktree).await?;
+        info!("verification gate: npm run build (sandboxed env)");
+        let (ok, _o, e) =
+            run_sandboxed("bash", &["-lc", "npm run build 2>&1 | tail -5"], worktree, &env)
+                .await?;
         if !ok {
             bail!("npm run build failed:\n{e}");
         }
@@ -309,6 +546,42 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         return Ok("no eligible agent-fixable issues".to_string());
     };
     info!(issue = issue.number, title = %issue.title, "selected issue");
+
+    // #300 — Trust gate. If the issue author is not trusted (not the owner /
+    // a write-access collaborator / an allowlisted login), the body is
+    // attacker-controllable. Refuse to run the unattended build/push pipeline
+    // on it: we never create a worktree, never invoke the reasoner on the
+    // untrusted text, never run the host-side build/test gate, and never push
+    // a branch. The owner must explicitly opt the issue in (allowlist the
+    // author via AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS, or drive it through
+    // the multi-repo `pending_approval` -> owner-OK flow). This preserves the
+    // owner's own-issue happy path unchanged while closing the public-issue
+    // RCE/exfil path.
+    if !issue.author_trusted {
+        warn!(
+            issue = issue.number,
+            author = %issue.author,
+            "refusing unattended self-improve on untrusted-authored issue (#300 trust gate)"
+        );
+        backoff_comment(
+            repo_root,
+            issue.number,
+            "Self-improve refused: this issue was not authored by a trusted \
+             maintainer (owner / write-access collaborator / allowlisted \
+             login). Because issue bodies are attacker-controllable, the \
+             unattended fix pipeline (which runs `cargo build`/`npm` and pushes \
+             a branch) will not run on it automatically. A maintainer can opt \
+             this in by adding the author to \
+             `AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS`, or by reviewing and \
+             driving it through the approval flow.",
+        )
+        .await
+        .ok();
+        return Ok(format!(
+            "issue #{}: refused — untrusted author '{}' (requires owner approval)",
+            issue.number, issue.author
+        ));
+    }
 
     let branch = format!("{BRANCH_PREFIX}{}", issue.number);
     let worktree = repo_root
@@ -640,16 +913,66 @@ fn agent_workdir() -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir().join("augmentagent-agent-repos"))
 }
 
+/// Resolve symlinks for the portion of `path` that exists, then re-append any
+/// trailing components that do not exist yet.
+///
+/// `Path::canonicalize` requires every component to exist. For overlap checks we
+/// must normalize symlinks (so `/tmp` and `/private/tmp` compare equal on macOS)
+/// even when the leaf (e.g. a not-yet-created checkout dir) is absent. We walk up
+/// to the deepest existing ancestor, canonicalize that, and rebuild the path by
+/// appending the remaining components verbatim. No filesystem entries are
+/// created.
+fn canonicalize_lexically(path: &Path) -> std::io::Result<PathBuf> {
+    // Fast path: the whole path exists.
+    if let Ok(resolved) = path.canonicalize() {
+        return Ok(resolved);
+    }
+
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = path;
+    loop {
+        match cursor.canonicalize() {
+            Ok(mut base) => {
+                for component in tail.iter().rev() {
+                    base.push(component);
+                }
+                return Ok(base);
+            }
+            Err(_) => {
+                let file_name = cursor.file_name().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no existing ancestor for {}", path.display()),
+                    )
+                })?;
+                tail.push(file_name.to_os_string());
+                cursor = cursor.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("no existing ancestor for {}", path.display()),
+                    )
+                })?;
+            }
+        }
+    }
+}
+
 /// Refuse a clone target that resolves inside the deploy checkout. This is
 /// the multi-repo analogue of #103's "never touch main": a third-party
 /// clone must never land on top of (or inside) our own running tree.
 fn assert_outside_deploy(workspace: &Path, deploy_root: &Path) -> Result<()> {
-    let ws = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    let dep = deploy_root
-        .canonicalize()
-        .unwrap_or_else(|_| deploy_root.to_path_buf());
+    // Canonicalize symlinks before the overlap check. The checkout leaf may not
+    // exist yet, so we canonicalize the deepest existing ancestor and re-append
+    // the missing components (see `canonicalize_lexically`). This is required
+    // for correctness on macOS, where `/tmp` -> `/private/tmp`: canonicalizing
+    // only the parent (or falling back to the raw path when the leaf is absent)
+    // would leave one side as `/tmp/...` and the other as `/private/tmp/...`,
+    // defeating `starts_with` and silently ALLOWING an overlapping checkout. We
+    // fall back to the raw path only if no ancestor resolves at all (extremely
+    // unlikely for an absolute path); the conservative `starts_with` overlap
+    // test below still runs in that case.
+    let ws = canonicalize_lexically(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let dep = canonicalize_lexically(deploy_root).unwrap_or_else(|_| deploy_root.to_path_buf());
     if ws.starts_with(&dep) || dep.starts_with(&ws) {
         bail!(
             "refusing: agent workspace {} overlaps the deploy checkout {} \
@@ -698,7 +1021,7 @@ async fn pick_issue_for_repo(
             "--state",
             "open",
             "--json",
-            "number,title,body,labels",
+            "number,title,body,labels,author",
             "--limit",
             "50",
         ],
@@ -754,10 +1077,22 @@ async fn pick_issue_for_repo(
             info!(repo = %repo.full_name, issue = number, "skip: open agent PR (dedup)");
             continue;
         }
+        let author = iss
+            .get("author")
+            .and_then(|a| a.get("login"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // #300 — the multi-repo path already requires explicit
+        // `pending_approval` -> owner-OK before any PR is opened, so the
+        // author-trust flag isn't load-bearing here; record it for
+        // observability but the approval handshake is the real gate.
         return Ok(Some(Issue {
             number,
             title,
             body,
+            author,
+            author_trusted: false,
         }));
     }
     Ok(None)
@@ -800,9 +1135,13 @@ async fn verification_gate_for_repo(workspace: &Path, repo: &AgentRepo) -> Resul
         info!(repo = %repo.full_name, "verification gate skipped (no build_cmd)");
         return Ok(());
     }
-    info!(repo = %repo.full_name, cmd, "verification gate");
+    info!(repo = %repo.full_name, cmd, "verification gate (sandboxed env)");
     let wrapped = format!(". $HOME/.cargo/env 2>/dev/null; {cmd}");
-    let (ok, _o, e) = run("bash", &["-lc", &wrapped], workspace).await?;
+    // #300 — same secret-stripping as the single-repo gate: the per-repo
+    // `build_cmd` runs attacker-influenceable build scripts and must not
+    // inherit provider keys.
+    let env = gate_env();
+    let (ok, _o, e) = run_sandboxed("bash", &["-lc", &wrapped], workspace, &env).await?;
     if !ok {
         bail!("build_cmd `{cmd}` failed:\n{}", truncate(&e, 1500));
     }
@@ -1161,6 +1500,56 @@ mod tests {
         assert!(is_blast_radius("rotate the DISCORD secret"));
         assert!(!is_blast_radius("fix a typo in the README"));
         assert!(!is_blast_radius("add a unit test to store.rs"));
+    }
+
+    // --- #300 trust gate + gate-env sandbox -----------------------------
+
+    #[test]
+    fn author_trust_honors_allowlist_and_write_associations() {
+        let allow = vec!["owner-login".to_string(), "trusted-bot".to_string()];
+        // Allowlisted login (case-insensitive) is trusted regardless of role.
+        assert!(author_is_trusted("Owner-Login", "NONE", &allow));
+        assert!(author_is_trusted("trusted-bot", "FIRST_TIME_CONTRIBUTOR", &allow));
+        // Write-access associations are trusted even when not allowlisted.
+        assert!(author_is_trusted("someone", "OWNER", &allow));
+        assert!(author_is_trusted("someone", "member", &allow));
+        assert!(author_is_trusted("someone", "Collaborator", &allow));
+    }
+
+    #[test]
+    fn author_trust_denies_strangers_and_empty() {
+        let allow = vec!["owner-login".to_string()];
+        // A random public author with a non-write association is untrusted.
+        assert!(!author_is_trusted("random-attacker", "NONE", &allow));
+        assert!(!author_is_trusted("drive-by", "CONTRIBUTOR", &allow));
+        // Missing login is untrusted (default-deny).
+        assert!(!author_is_trusted("", "OWNER", &allow));
+        assert!(!author_is_trusted("   ", "MEMBER", &allow));
+    }
+
+    #[test]
+    fn gate_env_strips_provider_secrets_by_name() {
+        // Representative provider/secret names must be flagged...
+        for name in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "COMPOSIO_API_KEY",
+            "GROQ_API_KEY",
+            "CEREBRAS_API_KEY",
+            "DISCORD_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "SOME_PASSWORD",
+            "MY_CREDENTIAL_FILE",
+            "x_api_key", // case-insensitive
+        ] {
+            assert!(env_name_is_secret(name), "{name} should be stripped");
+        }
+        // ...while ordinary build env survives.
+        for name in ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "LANG", "TERM"] {
+            assert!(!env_name_is_secret(name), "{name} should survive the gate");
+        }
     }
 
     #[test]

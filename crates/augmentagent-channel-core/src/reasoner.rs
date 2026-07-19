@@ -268,6 +268,26 @@ pub struct ReasonerOpts {
 pub trait Reasoner: Send + Sync {
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String>;
 
+    /// Like [`call`](Reasoner::call), but returns **everything the model said**
+    /// across the turn rather than just its final text block.
+    ///
+    /// Use this for any caller whose output is prose shown to a human (the
+    /// wiki-ask / Discord answer path). `call` keeps only the last block, which
+    /// is correct for callers that end their prompt with "emit JSON" but is
+    /// actively wrong here: the ask prompt orders the model to write the
+    /// deliverable *first* and file a wiki receipt *last*, so last-block-wins
+    /// posts the receipt and silently drops the deliverable (#446).
+    ///
+    /// Defaults to `call` so test doubles and non-CLI reasoners need not
+    /// implement it; [`ClaudeCliReasoner`] overrides it.
+    async fn call_transcript(
+        &self,
+        opts: &ReasonerOpts,
+        user_message: &str,
+    ) -> anyhow::Result<String> {
+        self.call(opts, user_message).await
+    }
+
     /// Code-Mode entrypoint. Spawns `claude` exactly like [`Reasoner::call`]
     /// using the caller-provided system prompt (which should be built via
     /// [`crate::prompt::code_mode_system`] from a manifest), parses the
@@ -305,14 +325,14 @@ pub trait Reasoner: Send + Sync {
         prior_source: &str,
         prior_error: &str,
     ) -> anyhow::Result<String> {
-        // Repair tail is byte-identical to the one in
-        // `crate::prompt::code_mode_repair_user_message` so the two ways of
-        // assembling a repair message (here in the reasoner, or pre-built
-        // by the caller via `code_mode_repair_user_message`) produce the
-        // same wire bytes given the same base message.
-        let repair_msg = format!(
-            "{user_message}\nThe previous attempt failed. Read the program and the error, then output a corrected program. Same hard rules apply.\n\n<prior_program>\n{prior_source}\n</prior_program>\n\n<prior_error>\n{prior_error}\n</prior_error>\n\nReturn ONLY a single fenced ```ts code block containing the corrected program.\n"
-        );
+        // Repair tail is sourced from `crate::prompt::code_mode_repair_tail`
+        // so the two ways of assembling a repair message (here in the
+        // reasoner, or pre-built by the caller via
+        // `code_mode_repair_user_message`) produce the same wire bytes
+        // given the same base message. The tail also picks the
+        // empty-prior-program template (used in #205-#208) automatically.
+        let tail = crate::prompt::code_mode_repair_tail(prior_source, prior_error);
+        let repair_msg = format!("{user_message}{tail}");
         self.call_code_mode(opts, &repair_msg).await
     }
 }
@@ -342,17 +362,35 @@ impl ClaudeCliReasoner {
     }
 }
 
-#[async_trait]
-impl Reasoner for ClaudeCliReasoner {
-    async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
+impl ClaudeCliReasoner {
+    /// Shared body of [`Reasoner::call`] and [`Reasoner::call_transcript`] —
+    /// identical except for how the stream's text blocks are reduced.
+    async fn call_with_capture(
+        &self,
+        opts: &ReasonerOpts,
+        user_message: &str,
+        capture: TextCapture,
+    ) -> anyhow::Result<String> {
         // #141 — Try the subprocess once. If it fails because the user's
         // `~/.claude.json` is corrupted (the CLI itself writes the corruption
         // diagnostics into stderr and exits non-zero), attempt a one-shot
         // auto-recovery from the most recent on-disk backup and retry. If the
         // retry also fails or no backup exists, surface a short sanitized
         // user-facing error instead of the raw multi-line stderr blob.
-        match self.call_once(opts, user_message).await {
+        match self.call_once(opts, user_message, capture).await {
             Ok(text) => Ok(text),
+            // #448 — do NOT retry. Retrying a quota refusal is exactly the
+            // amplification that kept the daemon pinned against the limit.
+            // Log it once, loudly and honestly, and let the caller give up for
+            // this cycle. The old behaviour buried this as a parse failure.
+            Err(CallError::RateLimited { message }) => {
+                warn!(
+                    "claude REFUSED ON QUOTA (not retrying): {message} — \
+                     the daemon spends the owner's Claude subscription; set \
+                     ANTHROPIC_API_KEY to bill API credits instead (see #448)"
+                );
+                Err(anyhow::anyhow!("claude rate limit: {message}"))
+            }
             Err(CallError::ConfigCorrupted { stderr }) => {
                 let recovered = match restore_latest_claude_backup() {
                     Ok(Some(_)) => true,
@@ -363,10 +401,14 @@ impl Reasoner for ClaudeCliReasoner {
                     }
                 };
                 if recovered {
-                    match self.call_once(opts, user_message).await {
+                    match self.call_once(opts, user_message, capture).await {
                         Ok(text) => return Ok(text),
                         Err(CallError::ConfigCorrupted { stderr }) => {
                             return Err(anyhow::anyhow!(sanitize_claude_error(&stderr)));
+                        }
+                        Err(CallError::RateLimited { message }) => {
+                            warn!("claude REFUSED ON QUOTA after config recovery: {message}");
+                            return Err(anyhow::anyhow!("claude rate limit: {message}"));
                         }
                         Err(CallError::Other(e)) => return Err(e),
                     }
@@ -378,6 +420,23 @@ impl Reasoner for ClaudeCliReasoner {
     }
 }
 
+#[async_trait]
+impl Reasoner for ClaudeCliReasoner {
+    async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
+        self.call_with_capture(opts, user_message, TextCapture::LastBlock)
+            .await
+    }
+
+    async fn call_transcript(
+        &self,
+        opts: &ReasonerOpts,
+        user_message: &str,
+    ) -> anyhow::Result<String> {
+        self.call_with_capture(opts, user_message, TextCapture::AllBlocks)
+            .await
+    }
+}
+
 /// Inner-call result. Distinguishes the "corrupted `~/.claude.json`" failure
 /// (which the outer `call` tries to auto-recover from) from any other error
 /// (which is propagated as-is).
@@ -386,6 +445,11 @@ enum CallError {
     /// "Configuration error … JSON Parse error" / "is corrupted" pattern the
     /// subprocess emits when `~/.claude.json` is unreadable.
     ConfigCorrupted { stderr: String },
+    /// #448 — the CLI refused on quota. Arrives as a *successful* completion
+    /// whose text is "You've hit your session limit · resets …", so without
+    /// this variant it masquerades as a malformed model answer and gets
+    /// retried. Distinct so callers can back off until the reset instead.
+    RateLimited { message: String },
     /// Any other failure: spawn errors, IO errors, non-config exit failures.
     Other(anyhow::Error),
 }
@@ -402,6 +466,60 @@ impl From<std::io::Error> for CallError {
     }
 }
 
+/// How [`ClaudeCliReasoner::call_once`] turns a multi-event `stream-json`
+/// session into the single `String` the caller gets back.
+///
+/// An agentic turn emits **many** `assistant` events interleaved with
+/// `tool_use`, so "the model's text" is a *list* of blocks, not one value.
+/// The two callers want opposite halves of it:
+///
+/// - [`LastBlock`](TextCapture::LastBlock) — machine-readable callers
+///   (`triage_opts`, `digest_opts`, `loop_parse_opts`, …) whose prompts end
+///   with "emit JSON". The payload is the model's *final* word; any earlier
+///   block is scratch reasoning that would corrupt the parse. This is the
+///   historical behaviour and stays the default.
+/// - [`AllBlocks`](TextCapture::AllBlocks) — human-facing prose callers
+///   (`ask_opts`). Here every block is part of the answer.
+///
+/// See #446: the ask path was pinned to `LastBlock`, so a turn that wrote the
+/// deliverable *before* filing it to the wiki lost the deliverable — the
+/// trailing "filed it to X" receipt overwrote it and was all Discord ever saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextCapture {
+    /// Keep only the last non-empty text block (or the `result` event).
+    LastBlock,
+    /// Keep every text block, in order, joined by a blank line.
+    AllBlocks,
+}
+
+/// Reduce the text blocks observed across one `stream-json` session down to
+/// the string the caller receives.
+///
+/// `result` is the `result` event's payload, which the CLI populates with the
+/// **final** assistant message. Under [`TextCapture::AllBlocks`] it is
+/// therefore a duplicate of the last entry in `blocks` and is deliberately
+/// ignored — it is only consulted as a fallback when the model produced no
+/// assistant text at all (e.g. a session that ended in a tool call).
+///
+/// Split out of [`ClaudeCliReasoner::call_once`] — which spawns a subprocess
+/// and so can't be unit-tested — following the same pattern as
+/// [`audit_stream_line`].
+fn select_final_text(blocks: &[String], result: Option<&str>, capture: TextCapture) -> String {
+    match capture {
+        TextCapture::AllBlocks => {
+            if blocks.is_empty() {
+                result.unwrap_or_default().to_string()
+            } else {
+                blocks.join("\n\n")
+            }
+        }
+        TextCapture::LastBlock => result
+            .map(str::to_string)
+            .or_else(|| blocks.last().cloned())
+            .unwrap_or_default(),
+    }
+}
+
 impl ClaudeCliReasoner {
     /// Single-shot spawn-and-read. Pulled out of [`Reasoner::call`] so the
     /// outer wrapper can retry on a recoverable failure (corrupted
@@ -410,6 +528,7 @@ impl ClaudeCliReasoner {
         &self,
         opts: &ReasonerOpts,
         user_message: &str,
+        capture: TextCapture,
     ) -> Result<String, CallError> {
         let mut args: Vec<String> = vec![
             "-p".into(),
@@ -447,9 +566,25 @@ impl ClaudeCliReasoner {
         // `--settings <json>` wires in per-call settings — notably the
         // PreToolUse hook that path-scopes Read/Write/Edit/Glob/Grep to
         // `WIKI_ROOT` for the wiki-query agent (#127).
+        //
+        // #317 — Claude Code does NOT load MCP servers declared under
+        // `--settings`; they only come from `--mcp-config`. So if the
+        // settings JSON carries an `mcpServers` object, split it out: the
+        // servers go to `--mcp-config` (plus `--strict-mcp-config`, so the
+        // agent's tool surface stays exactly what we declare and never
+        // picks up the host's global MCP config), and the remaining
+        // settings (hooks, etc.) go to `--settings`.
         if let Some(settings) = &opts.settings_json {
-            args.push("--settings".into());
-            args.push(settings.clone());
+            let (settings_only, mcp_config) = split_mcp_from_settings(settings);
+            if let Some(mcp_json) = mcp_config {
+                args.push("--mcp-config".into());
+                args.push(mcp_json);
+                args.push("--strict-mcp-config".into());
+            }
+            if let Some(s) = settings_only {
+                args.push("--settings".into());
+                args.push(s);
+            }
         }
 
         let mut cmd = Command::new(&self.bin);
@@ -511,7 +646,13 @@ impl ClaudeCliReasoner {
             .unwrap_or_else(|| "-".to_string());
         let mut pending_tool_uses: HashMap<String, (String, serde_json::Value)> = HashMap::new();
 
-        let mut final_text = String::new();
+        // Every non-empty text block the model emitted, in stream order, plus
+        // the terminal `result` payload. Reducing these to one string is
+        // `select_final_text`'s job — do NOT collapse them here, or a turn
+        // that speaks before its last tool call loses everything it said
+        // (#446).
+        let mut text_blocks: Vec<String> = Vec::new();
+        let mut result_text: Option<String> = None;
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
@@ -529,14 +670,16 @@ impl ClaudeCliReasoner {
                 Ok(StreamEvent::Assistant { message }) => {
                     for block in message.content {
                         if let ContentBlock::Text { text } = block {
-                            final_text = text;
+                            if !text.trim().is_empty() {
+                                text_blocks.push(text);
+                            }
                         }
                     }
                 }
                 Ok(StreamEvent::Result { result }) => {
                     if let Some(r) = result {
                         if !r.trim().is_empty() {
-                            final_text = r;
+                            result_text = Some(r);
                         }
                     }
                 }
@@ -544,6 +687,7 @@ impl ClaudeCliReasoner {
                 Err(e) => debug!("stream-json parse skip: {e} line={line}"),
             }
         }
+        let final_text = select_final_text(&text_blocks, result_text.as_deref(), capture);
 
         let status = child.wait().await?;
         if !status.success() {
@@ -570,6 +714,14 @@ impl ClaudeCliReasoner {
             return Err(CallError::Other(anyhow::anyhow!(
                 "claude produced no assistant text"
             )));
+        }
+        // #448 — the quota refusal is a *successful* completion. Catch it here,
+        // before it reaches a JSON parser that would mislabel it a parse error
+        // and trigger a retry storm against a wall we're already up against.
+        if is_rate_limited(&final_text) {
+            return Err(CallError::RateLimited {
+                message: final_text.trim().to_string(),
+            });
         }
         Ok(final_text)
     }
@@ -643,6 +795,32 @@ fn is_claude_config_corrupted(stderr: &str) -> bool {
     (needle.contains("configuration error") && needle.contains("json parse error"))
         || needle.contains("is corrupted")
         || needle.contains(".claude.json is corrupted")
+}
+
+/// #448 — Recognise the CLI's quota refusal, which it returns as ordinary
+/// *assistant text* (exit 0), not an error:
+///
+/// ```text
+/// You've hit your session limit · resets 9:30am (America/New_York)
+/// ```
+///
+/// Because it arrives as a successful completion, every JSON-parsing caller
+/// treated it as a malformed model answer. The logs are full of the resulting
+/// lie:
+///
+/// ```text
+/// ERROR channel: triage parse failed: no JSON object found in model output;
+///                raw=You've hit your session limit · resets 9:30am
+/// ```
+///
+/// That misdiagnosis is expensive: a "parse failure" looks transient, so the
+/// email is left in an error state and the action layer retries it (max=5)
+/// while the 2-minute poll keeps feeding new work into the same wall. Naming
+/// the condition lets callers back off instead of hammering it.
+fn is_rate_limited(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    (t.contains("session limit") || t.contains("usage limit") || t.contains("rate limit"))
+        && (t.contains("hit your") || t.contains("reached your") || t.contains("resets"))
 }
 
 /// Locate the most recent `.claude.json.backup.*` file under
@@ -768,6 +946,36 @@ fn resolve_db_path(repo_root: &std::path::Path) -> PathBuf {
 }
 
 /// Preset builders for the three call types.
+/// Model pinned for email triage (#448). Explicit rather than `None`, so the
+/// daemon can never again inherit the owner's interactive model choice.
+/// Overridable without a rebuild via `AUGMENTAGENT_TRIAGE_MODEL`.
+fn triage_model() -> String {
+    std::env::var("AUGMENTAGENT_TRIAGE_MODEL").unwrap_or_else(|_| TRIAGE_MODEL.to_string())
+}
+
+/// The Opus tier every quality-critical preset asks for in its comment
+/// (`draft`, `lint`, `ask`, `digest`, `social_adapter`, `resume`).
+///
+/// #448 — those presets all *said* "Opus" in a comment while passing
+/// `model: None`, which emits no `--model` flag and so silently inherits
+/// whatever the OWNER last picked for their own interactive Claude Code in
+/// `~/.claude/settings.json`. That is not a default, it's a leak: the owner
+/// selecting `opus[1m]` @ `xhigh` for a coding session re-tiered every
+/// background draft, digest and answer onto their Max subscription. Saying
+/// "Opus" out loud makes the intent real and the daemon immune to `/model`.
+///
+/// Overridable via `AUGMENTAGENT_OPUS_MODEL` for a no-rebuild tier change.
+fn opus_model() -> String {
+    std::env::var("AUGMENTAGENT_OPUS_MODEL").unwrap_or_else(|_| OPUS_MODEL.to_string())
+}
+
+/// Default tier for the quality-critical presets. See [`opus_model`].
+const OPUS_MODEL: &str = "claude-opus-4-8";
+
+/// Default triage tier. Opus is a deliberate quality call (see `triage_opts`) —
+/// what #448 removes is the *inherited* `opus[1m]` / `xhigh` variant, not Opus.
+const TRIAGE_MODEL: &str = "claude-opus-4-8";
+
 pub fn triage_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
     // Opus for triage. Haiku was too narrow on "flag" — missed personal
     // messages from known contacts asking for engagement. Volume is ~70
@@ -783,7 +991,17 @@ pub fn triage_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
     }
     ReasonerOpts {
         system_prompt: crate::prompt::TRIAGE_SYSTEM.to_string(),
-        model: None,
+        // #448 — PIN the model. `None` meant "no --model flag", which made the
+        // spawned CLI inherit whatever the OWNER had set for their own
+        // interactive Claude Code in ~/.claude/settings.json. That silently
+        // upgraded ~250 background classifications/day to whatever tier the
+        // owner happened to pick for coding (observed: `opus[1m]` at `xhigh`
+        // effort) and billed it to their Max subscription — the daemon's own
+        // subprocess is what kept hitting "You've hit your session limit".
+        // Keep Opus (the comment above is a deliberate quality call), but say
+        // so explicitly so a `/model` change by the owner can never again
+        // re-tier the daemon.
+        model: Some(triage_model()),
         allowed_tools,
         add_dirs,
         permission_mode: "default".into(),
@@ -806,7 +1024,7 @@ pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> Reasoner
     }
     ReasonerOpts {
         system_prompt,
-        model: None,
+        model: Some(opus_model()),
         allowed_tools,
         add_dirs,
         permission_mode: "default".into(),
@@ -823,7 +1041,7 @@ pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> Reasoner
 pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
     ReasonerOpts {
         system_prompt,
-        model: None, // Opus — lint is reasoning-heavy, low volume
+        model: Some(opus_model()), // Opus — lint is reasoning-heavy, low volume
         allowed_tools: vec!["Read".into(), "Grep".into(), "Glob".into()],
         add_dirs: vec![wiki_root],
         permission_mode: "default".into(),
@@ -845,6 +1063,20 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
 /// wiki via Write/Edit. The spawned CLI's cwd is pinned to `wiki_root` so
 /// Write/Edit cannot escape into the source tree.
 pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
+    // #337 — WIKI_ROOT must be ABSOLUTE. The daemon launches with
+    // `--wiki-dir ./wiki` (relative), and the scope guard resolves WIKI_ROOT
+    // with `readlink -f` from the spawned CLI's cwd — which `ask_opts` pins to
+    // the wiki root itself. A relative `./wiki` therefore resolves a SECOND
+    // time to `<wiki>/wiki`, so every legitimate page path (`projects/x.md`,
+    // `about/me.md`, …) falls outside the guard root and the durable-facts
+    // write is rejected. Canonicalize up front so cwd, the WIKI_ROOT env, and
+    // `--add-dir` all carry the same absolute path. Falls back to joining the
+    // current dir when the path doesn't exist yet (keeps tests hermetic).
+    let wiki_root = std::fs::canonicalize(&wiki_root).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|d| d.join(&wiki_root))
+            .unwrap_or(wiki_root)
+    });
     let bin = repo_root.join("target/release/augmentagent");
     // Scoped Bash patterns. The claude permission matcher does literal
     // string comparison — `augmentagent foo` (bare) and `/abs/path/augmentagent
@@ -858,26 +1090,6 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     let aa_gh = repo_root.join("scripts/aa-gh");
     let bash_gmail_abs = format!("Bash({} gmail *)", bin.display());
     let bash_gmail_bare = "Bash(augmentagent gmail *)".to_string();
-    // Invoice subcommands the LLM can autonomously invoke. `invoice run` is
-    // intentionally absent — the only real-send path is the user clicking
-    // Approve on a draft card. `status` and `list-accounts` omit the trailing
-    // `*` because they take no args (clap would reject extras anyway).
-    let bash_invoice_status_abs = format!("Bash({} invoice status)", bin.display());
-    let bash_invoice_draft_abs = format!("Bash({} invoice draft *)", bin.display());
-    let bash_invoice_list_accounts_abs = format!("Bash({} invoice list-accounts)", bin.display());
-    let bash_invoice_set_recipient_abs = format!("Bash({} invoice set-recipient *)", bin.display());
-    let bash_invoice_set_entity_abs = format!("Bash({} invoice set-entity *)", bin.display());
-    let bash_invoice_set_auto_draft_abs =
-        format!("Bash({} invoice set-auto-draft *)", bin.display());
-    let bash_invoice_status_bare = "Bash(augmentagent invoice status)".to_string();
-    let bash_invoice_draft_bare = "Bash(augmentagent invoice draft *)".to_string();
-    let bash_invoice_list_accounts_bare =
-        "Bash(augmentagent invoice list-accounts)".to_string();
-    let bash_invoice_set_recipient_bare =
-        "Bash(augmentagent invoice set-recipient *)".to_string();
-    let bash_invoice_set_entity_bare = "Bash(augmentagent invoice set-entity *)".to_string();
-    let bash_invoice_set_auto_draft_bare =
-        "Bash(augmentagent invoice set-auto-draft *)".to_string();
     // #212 — `loop` (singular) reads/updates the sqlite `user_loops` table
     // that backs the Discord `/loop` scheduler (#104). The COMMON case for
     // "kill the hello world loop" — runs inside the daemon, no claude PID.
@@ -888,6 +1100,37 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // system prompt points at `loop` first.
     let bash_loops_abs = format!("Bash({} loops *)", bin.display());
     let bash_loops_bare = "Bash(augmentagent loops *)".to_string();
+    // #319 — `meetup events <urlname>` is the on-demand, read-only event
+    // lookup query mode uses to answer "what are our Meetup events this
+    // week". Scoped to the `events` subcommand only — `subscribe`,
+    // `unsubscribe`, and `poll-once` (which posts a Discord card) stay out
+    // of the agent's reach. Both forms, same `#214` bare-resolves-on-PATH
+    // rationale as the other `augmentagent` subcommands.
+    let bash_meetup_events_abs = format!("Bash({} meetup events *)", bin.display());
+    let bash_meetup_events_bare = "Bash(augmentagent meetup events *)".to_string();
+    // #399 — `calendar list-events` is the on-demand, read-only schedule
+    // lookup query mode uses to answer "what's on my calendar this week" /
+    // "am I free Thursday". Scoped to `list-events` only — `poll-once`
+    // (writes dedup rows, sends alerts) and `backfill` stay out of the
+    // agent's reach. The no-arg forms are needed because the `*` patterns
+    // only match invocations WITH trailing args, and the bare no-arg call
+    // (defaults to the next 7 days) is the common one.
+    let bash_calendar_list_abs = format!("Bash({} calendar list-events *)", bin.display());
+    let bash_calendar_list_bare = "Bash(augmentagent calendar list-events *)".to_string();
+    let bash_calendar_list_abs_noargs =
+        format!("Bash({} calendar list-events)", bin.display());
+    let bash_calendar_list_bare_noargs =
+        "Bash(augmentagent calendar list-events)".to_string();
+    // #398 — `calendar create-event` PROPOSES an event: it writes a pending
+    // action row and posts a Discord approval card; the event is created
+    // (and invites sent) only when the operator clicks Approve. Safe to
+    // allowlist for the same reason `gmail compose --post` is (#352): the
+    // command's only externally visible effect is one card in the existing
+    // approval channel. Args are always required, so no no-arg form.
+    let bash_calendar_create_abs =
+        format!("Bash({} calendar create-event *)", bin.display());
+    let bash_calendar_create_bare =
+        "Bash(augmentagent calendar create-event *)".to_string();
     // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
     // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
     // resolves the db regardless of cwd.
@@ -901,7 +1144,18 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     // is forwarded as an env var so the hook script can resolve it without
     // baking the absolute path into the JSON.
     let guard_path = repo_root.join("scripts/aa-wiki-scope-guard.sh");
-    let settings_json = build_wiki_scope_settings(&guard_path);
+    // #317 — Conversation recall. The wiki-query agent only ever received a
+    // short `<conversation_history>` window injected into the prompt; it had
+    // no tool to reach earlier turns or its own past drafts, so it would
+    // flatly fail to recall work it did the same morning. The
+    // `augmentagent-mcp-memory` stdio server (built but never wired into ask
+    // mode) exposes exactly that: `search_conversation_history` searches the
+    // `emails` + `actions` tables (inbound messages + agent drafts) across
+    // all channels, and `memory_search`/`memory_recent` reach the curated
+    // memory store. Register it as a stdio MCP server scoped to the daemon
+    // db, alongside the path-scope hook.
+    let memory_bin = repo_root.join("target/release/augmentagent-mcp-memory");
+    let settings_json = build_wiki_scope_settings(&guard_path, &memory_bin, &db_path);
 
     // #128 — Provider secrets are loaded from the Linux Secret Service
     // just-in-time so the `Read` tool can never exfiltrate them from
@@ -923,6 +1177,14 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         // WIKI_ROOT is consumed by `scripts/aa-wiki-scope-guard.sh` to
         // know which prefix is permitted for file tools.
         ("WIKI_ROOT".into(), wiki_root.to_string_lossy().into_owned()),
+        // #319/#322 — query mode pins cwd to the wiki root, so any sub-CLI
+        // that shells to a repo-relative helper (e.g. `meetup events` →
+        // scripts/meetup-events.mjs) can't find it via current_dir().
+        // Hand it the repo root explicitly.
+        (
+            "AUGMENTAGENT_REPO_ROOT".into(),
+            repo_root.to_string_lossy().into_owned(),
+        ),
     ];
     // #214 — Prepend the release bin's dir to PATH so the agent's bare
     // `augmentagent <subcommand>` invocations actually resolve to OUR
@@ -956,10 +1218,26 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     if let Some(key) = crate::secret_loader::load_provider_key("COMPOSIO_API_KEY") {
         env.push(("COMPOSIO_API_KEY".into(), key));
     }
+    // #352 — Forward the Discord bot token + approval channel so
+    // `augmentagent gmail compose --post` can spin a one-shot serenity Http
+    // and surface a Discord approval card for the draft instead of dumping
+    // prose into chat. Scope is narrow: the wiki-ask agent's Bash allowlist
+    // only lets it run `augmentagent gmail …` subcommands, and `--post`
+    // ultimately only sends one message to the existing approval channel.
+    if let Ok(tok) = std::env::var("DISCORD_BOT_TOKEN") {
+        if !tok.is_empty() {
+            env.push(("DISCORD_BOT_TOKEN".into(), tok));
+        }
+    }
+    if let Ok(cid) = std::env::var("DISCORD_CHANNEL_ID") {
+        if !cid.is_empty() {
+            env.push(("DISCORD_CHANNEL_ID".into(), cid));
+        }
+    }
 
     ReasonerOpts {
         system_prompt: include_str!("../../../schema/wiki-ask.md").to_string(),
-        model: None, // Opus — quality matters for answer coherence
+        model: Some(opus_model()), // Opus — quality matters for answer coherence
         allowed_tools: vec![
             "Read".into(),
             "Grep".into(),
@@ -968,24 +1246,27 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             "Edit".into(),
             "WebSearch".into(),
             "WebFetch".into(),
+            // #317 — read-only conversation/memory recall via the memory MCP
+            // server registered in settings_json below. Explicit tool names
+            // (not a wildcard) so the write tool `memory_write` is NOT exposed
+            // here — durable-fact persistence is a separate, deliberate surface.
+            "mcp__memory__search_conversation_history".into(),
+            "mcp__memory__memory_search".into(),
+            "mcp__memory__memory_recent".into(),
             bash_gmail_abs,
             bash_gmail_bare,
-            bash_invoice_status_abs,
-            bash_invoice_status_bare,
-            bash_invoice_draft_abs,
-            bash_invoice_draft_bare,
-            bash_invoice_list_accounts_abs,
-            bash_invoice_list_accounts_bare,
-            bash_invoice_set_recipient_abs,
-            bash_invoice_set_recipient_bare,
-            bash_invoice_set_entity_abs,
-            bash_invoice_set_entity_bare,
-            bash_invoice_set_auto_draft_abs,
-            bash_invoice_set_auto_draft_bare,
             bash_loop_abs,
             bash_loop_bare,
             bash_loops_abs,
             bash_loops_bare,
+            bash_meetup_events_abs,
+            bash_meetup_events_bare,
+            bash_calendar_list_abs,
+            bash_calendar_list_bare,
+            bash_calendar_list_abs_noargs,
+            bash_calendar_list_bare_noargs,
+            bash_calendar_create_abs,
+            bash_calendar_create_bare,
             format!("Bash({} issue create *)", aa_gh.display()),
             format!("Bash({} issue list *)", aa_gh.display()),
             format!("Bash({} issue view *)", aa_gh.display()),
@@ -1023,20 +1304,75 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     }
 }
 
+/// Split an `mcpServers` object out of a `--settings` JSON blob.
+///
+/// Returns `(settings_without_mcp, mcp_config_json)`:
+/// - `settings_without_mcp` — the original object minus `mcpServers`,
+///   serialized, or `None` when nothing is left (so we don't pass an empty
+///   `--settings {}`).
+/// - `mcp_config_json` — `{"mcpServers": {...}}` ready for `--mcp-config`,
+///   or `None` when the settings carried no servers.
+///
+/// Claude Code reads MCP servers only from `--mcp-config`, never from
+/// `--settings`, so presets that want both a hook and an MCP server (e.g.
+/// [`ask_opts`]) declare both in `settings_json` and rely on the reasoner to
+/// route each to the right flag (#317). On any JSON parse failure the input
+/// is passed through unchanged as settings (fail-open to today's behaviour).
+fn split_mcp_from_settings(raw: &str) -> (Option<String>, Option<String>) {
+    let parsed: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return (Some(raw.to_string()), None),
+    };
+    let serde_json::Value::Object(mut map) = parsed else {
+        return (Some(raw.to_string()), None);
+    };
+    let mcp_config = map.remove("mcpServers").map(|servers| {
+        serde_json::json!({ "mcpServers": servers }).to_string()
+    });
+    let settings_only = if map.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(map).to_string())
+    };
+    (settings_only, mcp_config)
+}
+
 /// Build the inline JSON passed to `claude --settings` for wiki-query mode.
 ///
-/// Registers a single PreToolUse hook covering the five file tools Claude
-/// Code does not natively path-scope (Read/Write/Edit/Glob/Grep). The hook
-/// is a shell script that reads the tool-call JSON from stdin and emits a
-/// `decision: "block"` reply when the path resolves outside `WIKI_ROOT`.
+/// Registers two things:
+/// 1. A PreToolUse hook covering the five file tools Claude Code does not
+///    natively path-scope (Read/Write/Edit/Glob/Grep). The hook is a shell
+///    script that reads the tool-call JSON from stdin and emits a
+///    `decision: "block"` reply when the path resolves outside `WIKI_ROOT`.
+/// 2. The `memory` stdio MCP server (#317) — `augmentagent-mcp-memory` —
+///    scoped to the daemon db via its own `AUGMENTAGENT_DB` env so the
+///    conversation-recall tools work under `restrict_env`. The Claude CLI
+///    spawns and owns the server's lifecycle; we only declare it here.
 ///
 /// Returns a one-line JSON string so it survives `--settings` arg passing
 /// without shell-quoting heartburn.
-fn build_wiki_scope_settings(guard_path: &std::path::Path) -> String {
+fn build_wiki_scope_settings(
+    guard_path: &std::path::Path,
+    memory_bin: &std::path::Path,
+    db_path: &std::path::Path,
+) -> String {
     // Use serde_json to ensure the guard path is JSON-escaped correctly
     // (spaces, quotes, backslashes). The settings shape is the Claude Code
     // hook spec: `hooks.PreToolUse[].matcher` (regex) + `hooks[].command`.
     serde_json::json!({
+        "mcpServers": {
+            "memory": {
+                "command": memory_bin.to_string_lossy(),
+                "args": [],
+                // Scope the server to the daemon db explicitly. The MCP
+                // server is spawned by the Claude CLI as a child; under
+                // `restrict_env` it cannot rely on inheriting AUGMENTAGENT_DB
+                // from the daemon, so we pin it per-server here.
+                "env": {
+                    "AUGMENTAGENT_DB": db_path.to_string_lossy()
+                }
+            }
+        },
         "hooks": {
             "PreToolUse": [{
                 "matcher": "Read|Write|Edit|Glob|Grep",
@@ -1063,7 +1399,7 @@ pub fn digest_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
     }
     ReasonerOpts {
         system_prompt: include_str!("../../../schema/digest-prompt.md").to_string(),
-        model: None, // Opus — digest tone + coverage benefit from quality
+        model: Some(opus_model()), // Opus — digest tone + coverage benefit from quality
         allowed_tools,
         add_dirs,
         permission_mode: "default".into(),
@@ -1108,7 +1444,7 @@ pub fn tone_summarize_opts() -> ReasonerOpts {
 pub fn social_adapter_opts(system_prompt: String) -> ReasonerOpts {
     ReasonerOpts {
         system_prompt,
-        model: None, // Opus — voice + format fidelity matter, volume is low
+        model: Some(opus_model()), // Opus — voice + format fidelity matter, volume is low
         allowed_tools: vec![],
         add_dirs: vec![],
         permission_mode: "default".into(),
@@ -1489,6 +1825,91 @@ mod tests {
         assert!(sent.contains("Error: boom"));
     }
 
+    /// #446 regression. The ask prompt orders the model to emit the
+    /// deliverable first and file a durable-facts wiki receipt last, so a
+    /// content turn streams as: text(post) → tool_use(Write) → text(receipt).
+    /// Under the old last-block-wins extraction Discord only ever saw the
+    /// receipt — the post itself was silently discarded, with no error, while
+    /// the wiki file it referenced was written correctly. This is the bug the
+    /// owner hit three times in a row on 2026-07-14.
+    #[test]
+    fn all_blocks_keeps_a_deliverable_written_before_the_wiki_receipt() {
+        let post = "Tomorrow at Blockspace: the OG Coffee&Code.\n\nNo panels, no pitches.";
+        let receipt = "Filed the event details in projects/blockspace-philly.md.";
+        let blocks = vec![post.to_string(), receipt.to_string()];
+
+        // The `result` event echoes the model's FINAL message, i.e. the
+        // receipt. AllBlocks must ignore it rather than let it win.
+        let got = select_final_text(&blocks, Some(receipt), TextCapture::AllBlocks);
+
+        assert!(
+            got.starts_with(post),
+            "the deliverable must lead the reply, got: {got:?}"
+        );
+        assert!(got.contains(receipt), "the filing note is kept too");
+        assert_eq!(got, format!("{post}\n\n{receipt}"));
+    }
+
+    /// The other half of the contract: JSON callers (`triage_opts`,
+    /// `digest_opts`, `loop_parse_opts`, …) must keep last-block-wins. Their
+    /// prompts end with "emit JSON", and the triage prompt has the model
+    /// Read/Grep the wiki first — so scratch prose routinely precedes the
+    /// payload. Concatenating it would put prose in front of the object and
+    /// break `no JSON object found in model output`.
+    #[test]
+    fn last_block_capture_still_isolates_the_json_payload() {
+        let json = r#"{"decision":"skip","reason":"marketing blast"}"#;
+        let blocks = vec![
+            "Let me check the wiki for this sender.".to_string(),
+            json.to_string(),
+        ];
+
+        let got = select_final_text(&blocks, Some(json), TextCapture::LastBlock);
+
+        assert_eq!(got, json, "scratch reasoning must not reach the parser");
+        assert!(serde_json::from_str::<serde_json::Value>(&got).is_ok());
+    }
+
+    /// A session that ends on a tool call emits no trailing assistant text.
+    /// Both modes fall back to the `result` payload rather than returning ""
+    /// (which would trip the "claude produced no assistant text" error).
+    #[test]
+    fn both_modes_fall_back_to_the_result_event_when_no_text_blocks() {
+        let blocks: Vec<String> = Vec::new();
+        assert_eq!(
+            select_final_text(&blocks, Some("done"), TextCapture::AllBlocks),
+            "done"
+        );
+        assert_eq!(
+            select_final_text(&blocks, Some("done"), TextCapture::LastBlock),
+            "done"
+        );
+    }
+
+    /// And with neither text nor result, both modes yield empty — the caller's
+    /// existing `final_text.is_empty()` guard is what turns that into an error.
+    #[test]
+    fn no_text_and_no_result_yields_empty_for_both_modes() {
+        let blocks: Vec<String> = Vec::new();
+        assert!(select_final_text(&blocks, None, TextCapture::AllBlocks).is_empty());
+        assert!(select_final_text(&blocks, None, TextCapture::LastBlock).is_empty());
+    }
+
+    /// Missing `result` event (stream cut short): LastBlock still returns the
+    /// most recent block, preserving pre-#446 behaviour.
+    #[test]
+    fn last_block_capture_uses_the_final_block_when_result_is_absent() {
+        let blocks = vec!["first".to_string(), "second".to_string()];
+        assert_eq!(
+            select_final_text(&blocks, None, TextCapture::LastBlock),
+            "second"
+        );
+        assert_eq!(
+            select_final_text(&blocks, None, TextCapture::AllBlocks),
+            "first\n\nsecond"
+        );
+    }
+
     #[test]
     fn ask_opts_ships_absolute_db_env() {
         let repo = tempfile::tempdir().expect("repo tmpdir");
@@ -1534,28 +1955,93 @@ mod tests {
         );
     }
 
+    /// #317 — the reasoner routes `mcpServers` to `--mcp-config` and keeps
+    /// the rest on `--settings`.
     #[test]
-    fn ask_opts_includes_invoice_read_and_config_tools() {
+    fn split_mcp_from_settings_routes_servers_and_keeps_hooks() {
+        let raw = r#"{"mcpServers":{"memory":{"command":"x"}},"hooks":{"PreToolUse":[]}}"#;
+        let (settings, mcp) = split_mcp_from_settings(raw);
+        // mcp_config carries the server wrapped in {"mcpServers": …}.
+        let mcp_v: serde_json::Value =
+            serde_json::from_str(&mcp.expect("mcp config present")).unwrap();
+        assert!(mcp_v.pointer("/mcpServers/memory/command").is_some());
+        // settings keeps hooks and DROPS mcpServers.
+        let s_v: serde_json::Value =
+            serde_json::from_str(&settings.expect("settings present")).unwrap();
+        assert!(s_v.pointer("/hooks/PreToolUse").is_some());
+        assert!(s_v.pointer("/mcpServers").is_none());
+    }
+
+    #[test]
+    fn split_mcp_from_settings_no_servers_passes_through() {
+        let raw = r#"{"hooks":{"PreToolUse":[]}}"#;
+        let (settings, mcp) = split_mcp_from_settings(raw);
+        assert!(mcp.is_none());
+        assert_eq!(settings.as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn split_mcp_from_settings_only_servers_yields_no_settings() {
+        let raw = r#"{"mcpServers":{"memory":{"command":"x"}}}"#;
+        let (settings, mcp) = split_mcp_from_settings(raw);
+        assert!(settings.is_none(), "empty residual settings must be None");
+        assert!(mcp.is_some());
+    }
+
+    /// #317 — `ask_opts` must register the `memory` stdio MCP server (scoped
+    /// to the daemon db) AND advertise the read-only recall tools, while
+    /// keeping the path-scope hook and NOT exposing the write tool.
+    #[test]
+    fn ask_opts_registers_memory_mcp_server_and_recall_tools() {
         let repo = tempfile::tempdir().expect("repo tmpdir");
         let wiki = tempfile::tempdir().expect("wiki tmpdir");
         std::fs::write(repo.path().join("data.db"), b"").unwrap();
         let _guard = EnvGuard::unset("AUGMENTAGENT_DB");
         let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
 
+        // Recall tools advertised; write tool deliberately absent here.
         let joined = opts.allowed_tools.join("\n");
         for needle in [
-            "invoice status)",
-            "invoice draft *)",
-            "invoice list-accounts)",
-            "invoice set-recipient *)",
-            "invoice set-entity *)",
-            "invoice set-auto-draft *)",
+            "mcp__memory__search_conversation_history",
+            "mcp__memory__memory_search",
+            "mcp__memory__memory_recent",
         ] {
             assert!(
-                joined.contains(needle),
-                "expected allowed_tools to contain {needle}; got:\n{joined}"
+                opts.allowed_tools.iter().any(|t| t == needle),
+                "expected recall tool {needle}; got:\n{joined}"
             );
         }
+        assert!(
+            !opts.allowed_tools.iter().any(|t| t == "mcp__memory__memory_write"),
+            "memory_write must NOT be exposed in ask mode allowlist"
+        );
+
+        // Settings JSON registers the stdio server, db-scoped, and STILL
+        // carries the path-scope PreToolUse hook (we add alongside, not
+        // replace).
+        let settings = opts.settings_json.expect("settings_json present");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&settings).expect("settings_json is valid JSON");
+        let cmd = parsed
+            .pointer("/mcpServers/memory/command")
+            .and_then(|v| v.as_str())
+            .expect("memory server command present");
+        assert!(
+            cmd.ends_with("augmentagent-mcp-memory"),
+            "memory command should point at the mcp-memory binary; got {cmd}"
+        );
+        let db = parsed
+            .pointer("/mcpServers/memory/env/AUGMENTAGENT_DB")
+            .and_then(|v| v.as_str())
+            .expect("memory server AUGMENTAGENT_DB env present");
+        assert!(
+            std::path::Path::new(db).is_absolute(),
+            "memory server db path must be absolute; got {db}"
+        );
+        assert!(
+            parsed.pointer("/hooks/PreToolUse/0/matcher").is_some(),
+            "path-scope PreToolUse hook must survive alongside mcpServers"
+        );
     }
 
     /// #127 — `ask_opts` must wire up a PreToolUse hook so the harness
@@ -1608,7 +2094,38 @@ mod tests {
             .find(|(k, _)| k == "WIKI_ROOT")
             .map(|(_, v)| v.clone())
             .expect("WIKI_ROOT env var must be forwarded to the guard");
-        assert_eq!(wiki_env, wiki.path().to_string_lossy());
+        // #337 — WIKI_ROOT is canonicalized inside ask_opts; compare against
+        // the canonical form of the tempdir (symlinked /tmp on some hosts).
+        let expected = std::fs::canonicalize(wiki.path()).unwrap();
+        assert_eq!(wiki_env, expected.to_string_lossy());
+    }
+
+    /// #337 — a RELATIVE `--wiki-dir` (the daemon passes `./wiki`) must be
+    /// absolutized before it reaches WIKI_ROOT. Otherwise the guard's
+    /// `readlink -f` re-resolves it against the spawned CLI's cwd (already the
+    /// wiki root) to `<wiki>/wiki`, and every real page path is rejected.
+    #[test]
+    fn ask_opts_absolutizes_relative_wiki_root() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        let _guard = EnvGuard::unset("AUGMENTAGENT_DB");
+        // A relative wiki dir, exactly like the systemd unit's `--wiki-dir ./wiki`.
+        let rel = std::path::PathBuf::from("rel-wiki-xyz");
+        let opts = ask_opts(rel, repo.path().to_path_buf());
+        let wiki_env = opts
+            .env
+            .iter()
+            .find(|(k, _)| k == "WIKI_ROOT")
+            .map(|(_, v)| v.clone())
+            .expect("WIKI_ROOT env var must be forwarded to the guard");
+        assert!(
+            std::path::Path::new(&wiki_env).is_absolute(),
+            "WIKI_ROOT must be absolute even for a relative --wiki-dir; got {wiki_env}"
+        );
+        assert!(
+            !wiki_env.contains("rel-wiki-xyz/rel-wiki-xyz"),
+            "relative wiki dir must not be doubled into <wiki>/wiki; got {wiki_env}"
+        );
     }
 
     /// Regression test for the PR #199 follow-up: `aa-gh` must be
@@ -1665,24 +2182,6 @@ mod tests {
         );
     }
 
-    /// Load-bearing safety invariant: the LLM must never be able to invoke
-    /// the real-send path. Only the Discord Approve button can call `run`.
-    #[test]
-    fn ask_opts_excludes_invoice_run() {
-        let repo = tempfile::tempdir().expect("repo tmpdir");
-        let wiki = tempfile::tempdir().expect("wiki tmpdir");
-        std::fs::write(repo.path().join("data.db"), b"").unwrap();
-        let _guard = EnvGuard::unset("AUGMENTAGENT_DB");
-        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
-
-        for entry in &opts.allowed_tools {
-            assert!(
-                !entry.contains("invoice run"),
-                "allowed_tools must NEVER expose `invoice run` to the LLM: {entry}"
-            );
-        }
-    }
-
     /// Serialize env-var mutations across the two tests so they don't race.
     /// (`cargo test` runs tests in parallel by default; both touch the same
     /// process-wide `AUGMENTAGENT_DB` var.)
@@ -1733,7 +2232,7 @@ mod tests {
     /// Verbatim sample of the multi-line stderr blob that surfaced in the
     /// Discord bug report — block repeated 4x, leading `ExitStatus(...)`,
     /// absolute home paths.
-    const CORRUPT_4X_STDERR: &str = "Configuration error in /home/nolan-makatche/.claude.json: JSON Parse error: Unexpected EOF\n\nClaude configuration file at /home/nolan-makatche/.claude.json is corrupted: JSON Parse error: Unexpected EOF\nThe corrupted file has already been backed up.\nA backup file exists at: /home/nolan-makatche/.claude/backups/.claude.json.backup.1779736244424\nYou can manually restore it by running: cp \"/home/nolan-makatche/.claude/backups/.claude.json.backup.1779736244424\" \"/home/nolan-makatche/.claude.json\"\n\nConfiguration error in /home/nolan-makatche/.claude.json: JSON Parse error: Unexpected EOF\n\nClaude configuration file at /home/nolan-makatche/.claude.json is corrupted: JSON Parse error: Unexpected EOF\nThe corrupted file has already been backed up.\nA backup file exists at: /home/nolan-makatche/.claude/backups/.claude.json.backup.1779736244424\nYou can manually restore it by running: cp \"/home/nolan-makatche/.claude/backups/.claude.json.backup.1779736244424\" \"/home/nolan-makatche/.claude.json\"\n\nConfiguration error in /home/nolan-makatche/.claude.json: JSON Parse error: Unexpected EOF\n\nClaude configuration file at /home/nolan-makatche/.claude.json is corrupted: JSON Parse error: Unexpected EOF\nThe corrupted file has already been backed up.";
+    const CORRUPT_4X_STDERR: &str = "Configuration error in /home/operator/.claude.json: JSON Parse error: Unexpected EOF\n\nClaude configuration file at /home/operator/.claude.json is corrupted: JSON Parse error: Unexpected EOF\nThe corrupted file has already been backed up.\nA backup file exists at: /home/operator/.claude/backups/.claude.json.backup.1779736244424\nYou can manually restore it by running: cp \"/home/operator/.claude/backups/.claude.json.backup.1779736244424\" \"/home/operator/.claude.json\"\n\nConfiguration error in /home/operator/.claude.json: JSON Parse error: Unexpected EOF\n\nClaude configuration file at /home/operator/.claude.json is corrupted: JSON Parse error: Unexpected EOF\nThe corrupted file has already been backed up.\nA backup file exists at: /home/operator/.claude/backups/.claude.json.backup.1779736244424\nYou can manually restore it by running: cp \"/home/operator/.claude/backups/.claude.json.backup.1779736244424\" \"/home/operator/.claude.json\"\n\nConfiguration error in /home/operator/.claude.json: JSON Parse error: Unexpected EOF\n\nClaude configuration file at /home/operator/.claude.json is corrupted: JSON Parse error: Unexpected EOF\nThe corrupted file has already been backed up.";
 
     #[test]
     fn sanitize_corrupted_config_returns_single_short_line() {
@@ -2025,7 +2524,7 @@ mod tests {
 pub fn resume_opts(wiki_root: PathBuf) -> ReasonerOpts {
     ReasonerOpts {
         system_prompt: include_str!("../../../schema/resume-ingest.md").to_string(),
-        model: None, // Opus — seeding the wiki is high-leverage and one-shot
+        model: Some(opus_model()), // Opus — seeding the wiki is high-leverage and one-shot
         allowed_tools: vec![
             "Read".into(),
             "Grep".into(),
@@ -2073,4 +2572,100 @@ enum ContentBlock {
     },
     #[serde(other)]
     Other,
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+
+    /// #448 — the exact string the CLI returned to the daemon on 2026-07-14,
+    /// copied from ~/.local/state/augmentagent/stderr.log. It arrived as a
+    /// successful completion, so triage logged it as
+    /// "triage parse failed: no JSON object found in model output" and the
+    /// action layer retried (max=5) against a wall we were already up against.
+    #[test]
+    fn detects_the_real_session_limit_refusal() {
+        assert!(is_rate_limited(
+            "You've hit your session limit · resets 9:30am (America/New_York)"
+        ));
+        assert!(is_rate_limited("You've reached your usage limit. Resets at 3pm."));
+        assert!(is_rate_limited(
+            "Rate limit exceeded — resets in 12 minutes"
+        ));
+    }
+
+    /// Must NOT fire on a legitimate triage answer, or every email about
+    /// billing/quotas would be dropped instead of classified. This is the
+    /// dangerous false positive.
+    #[test]
+    fn does_not_fire_on_ordinary_model_output() {
+        for ok in [
+            r#"{"decision":"skip","reason":"Marketing blast from a no-reply sender."}"#,
+            // An email that legitimately discusses limits.
+            r#"{"decision":"flag","reason":"Vendor says we hit our API rate limit in prod."}"#,
+            r#"{"decision":"reply","reason":"Asks about our session limit policy."}"#,
+            "",
+        ] {
+            assert!(!is_rate_limited(ok), "false positive on: {ok}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_pin_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// #448 — the regression guard. A preset with `model: None` emits no
+    /// `--model` flag, so the spawned CLI inherits the OWNER's interactive
+    /// `~/.claude/settings.json`. That is how ~250 background email
+    /// classifications a day ended up on `opus[1m]` @ `xhigh`, billed to the
+    /// owner's Max subscription, purely because they'd picked that model for
+    /// their own coding.
+    ///
+    /// Every preset the daemon runs unattended must name its model out loud.
+    /// If you add a preset, pin it — do not let `None` back in.
+    #[test]
+    fn no_daemon_preset_inherits_the_owners_interactive_model() {
+        let wiki = PathBuf::from("/tmp/wiki");
+        let repo = PathBuf::from("/tmp/repo");
+        let presets: Vec<(&str, ReasonerOpts)> = vec![
+            ("triage", triage_opts(Some(wiki.clone()))),
+            ("draft", draft_opts("sys".into(), Some(wiki.clone()))),
+            ("lint", lint_opts("sys".into(), wiki.clone())),
+            ("ask", ask_opts(wiki.clone(), repo.clone())),
+            ("digest", digest_opts(Some(wiki.clone()))),
+            ("social_adapter", social_adapter_opts("sys".into())),
+            ("resume", resume_opts(wiki.clone())),
+            ("tone_summarize", tone_summarize_opts()),
+            ("loop_parse", loop_parse_opts()),
+            ("archetype_pick", archetype_pick_opts()),
+            ("ingest", ingest_opts("sys".into(), wiki.clone())),
+            ("wiki_migrate", wiki_migrate_opts("sys".into(), wiki.clone())),
+        ];
+        for (name, opts) in presets {
+            let model = opts.model.as_deref().unwrap_or("");
+            assert!(
+                !model.is_empty(),
+                "{name}_opts has model: None — it will inherit the owner's \
+                 interactive /model choice and bill their subscription (#448)"
+            );
+            // The inherited value we're defending against is literally the
+            // 1M-context alias from the owner's settings.json.
+            assert!(
+                !model.contains("[1m]"),
+                "{name}_opts pins a context-window alias ({model}); pin a real \
+                 model id so the tier can't drift"
+            );
+        }
+    }
+
+    /// The env overrides exist so a tier change needs no rebuild.
+    #[test]
+    fn env_overrides_take_precedence() {
+        // Defaults, with no env set, are real model ids.
+        assert_eq!(TRIAGE_MODEL, "claude-opus-4-8");
+        assert_eq!(OPUS_MODEL, "claude-opus-4-8");
+        assert!(!TRIAGE_MODEL.contains("[1m]"));
+    }
 }

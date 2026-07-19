@@ -1,6 +1,6 @@
 //! `CalendarChannel` — 15-min hot ticker over the user's primary calendar.
 //!
-//! Phase 1 cut (#82 §12):
+//! Phase 1 cut (archived AugmentAgent#82 §12):
 //! - Hot ticker only (no nightly sweep).
 //! - Window: now-1h .. now+24h.
 //! - Single calendar (`primary`).
@@ -26,10 +26,11 @@ use augmentagent_channel_core::ingest::{spawn_ingest, IngestTrigger};
 use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{Email, Store, TriageResult};
 
+use crate::alerts::{self, AlertCandidate, AlertSink};
 use crate::filter::passes_filter;
 use crate::gcal::{CalendarApi, CalendarError};
 use crate::trigger::{HOT_LOOKAHEAD_HOURS, HOT_LOOKBACK_HOURS};
-use crate::types::{render_meeting_body, truncate, MeetingPayload};
+use crate::types::{render_meeting_body, truncate, CalendarEvent, MeetingPayload};
 use crate::PLATFORM;
 
 #[derive(Clone, Debug)]
@@ -46,6 +47,13 @@ pub struct CalendarChannelConfig {
     /// Dry-run mode prints the planned WorkItems and synthetic emails to
     /// stdout but does NOT spawn ingest tasks or upsert dedup rows.
     pub dry_run: bool,
+    /// Minutes before start inside which an upcoming-meeting alert fires
+    /// (#396). Must comfortably exceed the poll cadence or an event can
+    /// slip through between two polls.
+    pub alert_lead_min: i64,
+    /// Local hour (0-23) at/after which the once-per-day agenda posts
+    /// (#396). `None` disables the agenda.
+    pub agenda_local_hour: Option<u32>,
 }
 
 impl Default for CalendarChannelConfig {
@@ -56,6 +64,8 @@ impl Default for CalendarChannelConfig {
             wiki_root: None,
             wiki_schema_path: None,
             dry_run: true,
+            alert_lead_min: 60,
+            agenda_local_hour: Some(8),
         }
     }
 }
@@ -69,6 +79,9 @@ pub struct PollOutcome {
     pub fanouts: usize,
     pub forbidden_accounts: usize,
     pub errors: usize,
+    /// Alerts delivered this poll (upcoming + conflict + agenda). In
+    /// dry-run this counts would-send alerts.
+    pub alerts_sent: usize,
 }
 
 pub struct CalendarChannel<C: CalendarApi, R: Reasoner> {
@@ -81,6 +94,9 @@ pub struct CalendarChannel<C: CalendarApi, R: Reasoner> {
     /// Per-account "we already warned about 403" cache so we log the
     /// re-consent message at most once per process per account.
     forbidden_warned: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Operator alert transport (#396/#397). `None` disables live alert
+    /// delivery; dry-run still prints would-send lines.
+    alert_sink: Option<Arc<dyn AlertSink>>,
 }
 
 impl<C: CalendarApi, R: Reasoner + 'static> CalendarChannel<C, R> {
@@ -122,7 +138,15 @@ impl<C: CalendarApi, R: Reasoner + 'static> CalendarChannel<C, R> {
             config,
             wiki_schema,
             forbidden_warned: tokio::sync::Mutex::new(Default::default()),
+            alert_sink: None,
         }
+    }
+
+    /// Attach an operator alert transport (#396/#397). Without one, live
+    /// polls skip the alert pass entirely.
+    pub fn with_alert_sink(mut self, sink: Arc<dyn AlertSink>) -> Self {
+        self.alert_sink = Some(sink);
+        self
     }
 
     pub async fn run(&self, shutdown: CancellationToken) -> anyhow::Result<()> {
@@ -169,6 +193,9 @@ impl<C: CalendarApi, R: Reasoner + 'static> CalendarChannel<C, R> {
             {
                 Ok(events) => {
                     outcome.events_seen += events.len();
+                    outcome.alerts_sent += self
+                        .run_alert_pass(&events, &account.entity_id, now)
+                        .await;
                     for ev in events {
                         if let Err(reason) = passes_filter(&ev) {
                             outcome.events_filtered += 1;
@@ -217,6 +244,127 @@ impl<C: CalendarApi, R: Reasoner + 'static> CalendarChannel<C, R> {
             }
         }
         Ok(outcome)
+    }
+
+    /// #396/#397 — imminent-start, conflict, and daily-agenda alerts over
+    /// the freshly fetched hot window. Detection is in [`crate::alerts`];
+    /// dedup rides the `calendar_alerts` store table so re-polls stay
+    /// silent and reschedules re-arm. Returns alerts delivered (or that
+    /// would deliver, in dry-run). Never fails the poll: store/transport
+    /// errors are logged and swallowed.
+    async fn run_alert_pass(
+        &self,
+        events: &[CalendarEvent],
+        entity_id: &str,
+        now: DateTime<Utc>,
+    ) -> usize {
+        use chrono::Timelike;
+
+        if self.alert_sink.is_none() && !self.config.dry_run {
+            return 0;
+        }
+        let cands: Vec<AlertCandidate> = events
+            .iter()
+            .filter_map(|ev| {
+                AlertCandidate::from_event(ev, entity_id, &self.config.calendar_id)
+            })
+            .collect();
+
+        let mut sent = 0usize;
+
+        // Imminent starts (#396).
+        let lead = chrono::Duration::minutes(self.config.alert_lead_min.max(0));
+        for c in &cands {
+            if !alerts::is_upcoming(c, now, lead) {
+                continue;
+            }
+            let key = alerts::upcoming_key(&c.payload.event_id);
+            let fp = alerts::upcoming_fingerprint(&c.payload);
+            let text = alerts::render_upcoming(&c.payload, now);
+            sent += self.deliver_alert(&key, &fp, &text).await;
+        }
+
+        // Overlaps (#397). Skip pairs whose overlap has already ended.
+        for (x, y) in alerts::conflict_pairs(&cands) {
+            let a = &cands[x].payload;
+            let b = &cands[y].payload;
+            if a.end.min(b.end) <= now {
+                continue;
+            }
+            let key = alerts::conflict_key(a, b);
+            let fp = alerts::conflict_fingerprint(a, b);
+            let text = alerts::render_conflict(a, b);
+            sent += self.deliver_alert(&key, &fp, &text).await;
+        }
+
+        // Once-per-day agenda (#396): first poll at/after the configured
+        // local hour wins; the key is recorded even when the day is empty
+        // so the check is deterministic.
+        if let Some(hour) = self.config.agenda_local_hour {
+            let local_now = now.with_timezone(&chrono::Local);
+            if local_now.hour() >= hour {
+                let key = alerts::agenda_key(local_now.date_naive());
+                let already = self
+                    .store
+                    .calendar_alert_fingerprint(&key)
+                    .unwrap_or_else(|e| {
+                        warn!(key, "agenda dedup lookup failed: {e}");
+                        Some("lookup-failed".into())
+                    })
+                    .is_some();
+                if !already {
+                    let items = alerts::agenda_items(&cands, now);
+                    if items.is_empty() {
+                        if !self.config.dry_run {
+                            if let Err(e) =
+                                self.store.upsert_calendar_alert(&key, "empty")
+                            {
+                                warn!(key, "agenda dedup record failed: {e}");
+                            }
+                        }
+                    } else {
+                        let text = alerts::render_agenda(&items, now);
+                        sent += self.deliver_alert(&key, "sent", &text).await;
+                    }
+                }
+            }
+        }
+
+        sent
+    }
+
+    /// Send one alert unless the store says this (key, fingerprint) pair
+    /// already fired. The dedup row is written only after a successful
+    /// send, so a transport failure retries on the next poll.
+    async fn deliver_alert(&self, key: &str, fingerprint: &str, text: &str) -> usize {
+        match self.store.calendar_alert_fingerprint(key) {
+            Ok(Some(prev)) if prev == fingerprint => return 0,
+            Ok(_) => {}
+            Err(e) => {
+                warn!(key, "calendar alert dedup lookup failed: {e}");
+                return 0;
+            }
+        }
+        if self.config.dry_run {
+            println!("[gcal dry-run] would alert {key}: {text}");
+            return 1;
+        }
+        let Some(sink) = &self.alert_sink else {
+            return 0;
+        };
+        match sink.send(text).await {
+            Ok(()) => {
+                if let Err(e) = self.store.upsert_calendar_alert(key, fingerprint) {
+                    warn!(key, "calendar alert sent but dedup record failed: {e}");
+                }
+                info!(key, "calendar alert sent");
+                1
+            }
+            Err(e) => {
+                warn!(key, "calendar alert send failed: {e:#}");
+                0
+            }
+        }
     }
 
     /// One event → fan out to per-attendee wiki ingests, then mark the event
@@ -380,6 +528,14 @@ mod tests {
         ) -> Result<CalendarEvent, CalendarError> {
             Err(CalendarError::Decode("stub".into()))
         }
+        async fn create_event(
+            &self,
+            _e: &str,
+            _c: &str,
+            _d: &crate::gcal::EventDraft,
+        ) -> Result<crate::gcal::CreatedEvent, CalendarError> {
+            Err(CalendarError::Decode("stub".into()))
+        }
     }
 
     struct ForbiddenApi;
@@ -402,6 +558,14 @@ mod tests {
             _c: &str,
             _id: &str,
         ) -> Result<CalendarEvent, CalendarError> {
+            Err(CalendarError::Decode("stub".into()))
+        }
+        async fn create_event(
+            &self,
+            _e: &str,
+            _c: &str,
+            _d: &crate::gcal::EventDraft,
+        ) -> Result<crate::gcal::CreatedEvent, CalendarError> {
             Err(CalendarError::Decode("stub".into()))
         }
     }
@@ -596,5 +760,167 @@ mod tests {
         assert_eq!(email.platform, "gcal");
         assert_eq!(email.kind, "meeting");
         assert!(email.message_id.starts_with("gcal:e1:"));
+    }
+
+    // ---- #396/#397 alert pass ---------------------------------------------
+
+    struct MockSink {
+        sent: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl MockSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                sent: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn messages(&self) -> Vec<String> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::alerts::AlertSink for MockSink {
+        async fn send(&self, text: &str) -> anyhow::Result<()> {
+            self.sent.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+    }
+
+    fn event_at(id: &str, start: DateTime<Utc>, end: DateTime<Utc>) -> CalendarEvent {
+        let mut ev = standard_event(id);
+        ev.start = Some(EventTime {
+            date_time: Some(start.to_rfc3339()),
+            ..Default::default()
+        });
+        ev.end = Some(EventTime {
+            date_time: Some(end.to_rfc3339()),
+            ..Default::default()
+        });
+        ev
+    }
+
+    fn alert_config() -> CalendarChannelConfig {
+        CalendarChannelConfig {
+            dry_run: false,
+            alert_lead_min: 60,
+            // Keep the (local-time-dependent) agenda out of these tests.
+            agenda_local_hour: None,
+            ..Default::default()
+        }
+    }
+
+    fn channel_with(
+        store: Arc<Store>,
+        events: Vec<CalendarEvent>,
+        sink: Arc<MockSink>,
+        config: CalendarChannelConfig,
+    ) -> CalendarChannel<StubApi, StubReasoner> {
+        CalendarChannel::new(
+            store,
+            Arc::new(StubApi { events }),
+            Arc::new(StubReasoner),
+            config,
+        )
+        .with_alert_sink(sink)
+    }
+
+    #[tokio::test]
+    async fn upcoming_alert_dedups_and_rearms_on_reschedule() {
+        let (store, _f) = tmp_store();
+        let sink = MockSink::new();
+        let now = Utc::now();
+        let start = now + chrono::Duration::minutes(30);
+        let end = start + chrono::Duration::minutes(30);
+
+        let ch = channel_with(
+            store.clone(),
+            vec![event_at("up1", start, end)],
+            sink.clone(),
+            alert_config(),
+        );
+        let o1 = ch.poll_once().await.unwrap();
+        assert_eq!(o1.alerts_sent, 1, "first poll should alert");
+
+        // Same event again: deduped.
+        let ch2 = channel_with(
+            store.clone(),
+            vec![event_at("up1", start, end)],
+            sink.clone(),
+            alert_config(),
+        );
+        let o2 = ch2.poll_once().await.unwrap();
+        assert_eq!(o2.alerts_sent, 0, "re-poll must not re-alert");
+
+        // Rescheduled inside the lead window: re-armed.
+        let start2 = now + chrono::Duration::minutes(45);
+        let ch3 = channel_with(
+            store.clone(),
+            vec![event_at("up1", start2, start2 + chrono::Duration::minutes(30))],
+            sink.clone(),
+            alert_config(),
+        );
+        let o3 = ch3.poll_once().await.unwrap();
+        assert_eq!(o3.alerts_sent, 1, "reschedule should re-alert");
+
+        let msgs = sink.messages();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0].contains("starts in"), "{}", msgs[0]);
+    }
+
+    #[tokio::test]
+    async fn conflict_alert_fires_once_per_pair() {
+        let (store, _f) = tmp_store();
+        let sink = MockSink::new();
+        let now = Utc::now();
+        // Both events beyond the 60-min lead so no upcoming alerts mix in.
+        let a = event_at(
+            "cfa",
+            now + chrono::Duration::minutes(120),
+            now + chrono::Duration::minutes(180),
+        );
+        let b = event_at(
+            "cfb",
+            now + chrono::Duration::minutes(150),
+            now + chrono::Duration::minutes(210),
+        );
+
+        let ch = channel_with(
+            store.clone(),
+            vec![a.clone(), b.clone()],
+            sink.clone(),
+            alert_config(),
+        );
+        let o1 = ch.poll_once().await.unwrap();
+        assert_eq!(o1.alerts_sent, 1, "overlap should alert once");
+        assert!(sink.messages()[0].contains("Schedule conflict"));
+
+        let ch2 = channel_with(store.clone(), vec![a, b], sink.clone(), alert_config());
+        let o2 = ch2.poll_once().await.unwrap();
+        assert_eq!(o2.alerts_sent, 0, "same overlap must not re-alert");
+    }
+
+    #[tokio::test]
+    async fn dry_run_alert_pass_skips_sink_and_store() {
+        let (store, _f) = tmp_store();
+        let sink = MockSink::new();
+        let now = Utc::now();
+        let start = now + chrono::Duration::minutes(30);
+        let mut config = alert_config();
+        config.dry_run = true;
+
+        let ch = channel_with(
+            store.clone(),
+            vec![event_at("dry1", start, start + chrono::Duration::minutes(30))],
+            sink.clone(),
+            config,
+        );
+        let outcome = ch.poll_once().await.unwrap();
+        assert_eq!(outcome.alerts_sent, 1, "dry-run counts would-send alerts");
+        assert!(sink.messages().is_empty(), "dry-run must not hit the sink");
+        assert!(store
+            .calendar_alert_fingerprint("upcoming:dry1")
+            .unwrap()
+            .is_none());
     }
 }

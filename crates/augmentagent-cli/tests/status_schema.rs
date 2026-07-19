@@ -107,7 +107,9 @@ const LEGACY_SCHEMA_PREAMBLE: &str = r#"
 
 /// Env vars `status::collect()` may consult. Cleared in the child process
 /// so the "configured" booleans are deterministic regardless of the
-/// developer's shell environment.
+/// developer's shell environment. (#374 moved most channel probes to the
+/// keyring / store, which env clearing can't isolate — those values are
+/// redacted in the snapshot instead.)
 const ENV_VARS_TO_CLEAR: &[&str] = &[
     "AUGMENTAGENT_API_KEY",
     "DASHBOARD_PORT",
@@ -117,16 +119,11 @@ const ENV_VARS_TO_CLEAR: &[&str] = &[
     "CEREBRAS_API_KEY",
     "DISCORD_BOT_TOKEN",
     // Per-channel env keys (see `collect_channels` in status.rs).
-    "SLACK_BOT_TOKEN",
-    "TWITTER_SESSION_B64",
-    "LINKEDIN_LI_AT",
-    "INSTAGRAM_SESSION_B64",
-    "REDDIT_REFRESH_TOKEN",
-    "GITHUB_TOKEN",
-    "MEETUP_ACCESS_TOKEN",
-    "TELEGRAM_BOT_TOKEN",
-    "WHATSAPP_SESSION_B64",
-    "VOICE_DROP_DIR",
+    "SOCIALAPI_API_KEY",
+    "AUGMENTAGENT_GITHUB_LOGIN",
+    "AUGMENTAGENT_DISCORD_CREDS",
+    "AUGMENTAGENT_INSTAGRAM_AUTH",
+    "AUGMENTAGENT_TWITTER_AUTH",
     "CARDDAV_URL",
 ];
 
@@ -185,6 +182,11 @@ fn status_json_matches_locked_schema_v1() {
     //
     // Volatile values get replaced with `"[volatile]"`. Keys + everything
     // else stays in the snapshot, which is what locks the contract.
+    //
+    // #374: `channels.*.{configured,armed,needs}` are volatile too — they
+    // now probe the user-global keyring and per-host credential files,
+    // which env vars can't isolate. `accounts` stays pinned: it is driven
+    // solely by the (empty, seeded) sqlite store.
     assert_json_snapshot!("status_v1", json, {
         ".daemon.active" => "[volatile]",
         ".daemon.since_unix" => "[volatile]",
@@ -193,5 +195,8 @@ fn status_json_matches_locked_schema_v1() {
         ".updater.timer_active" => "[volatile]",
         ".updater.last_run_unix" => "[volatile]",
         ".summary" => "[volatile]",
+        ".channels.*.configured" => "[volatile]",
+        ".channels.*.armed" => "[volatile]",
+        ".channels.*.needs" => "[volatile]",
     });
 }

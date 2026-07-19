@@ -12,7 +12,7 @@ pub enum DecisionKind {
     Capture,
     /// Calendar event observation: never produces a draft, only logs the
     /// meeting to attendee wiki pages. Pairs with `IngestTrigger::Meeting`.
-    /// Wave-A: gcal channel (#82).
+    /// Wave-A: gcal channel (archived AugmentAgent#82).
     Meeting,
 }
 

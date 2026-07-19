@@ -23,7 +23,7 @@ use crate::gcal::{CalendarApi, CalendarError};
 use crate::types::MeetingPayload;
 use crate::PLATFORM;
 
-/// Hot-window: now-1h .. now+24h, per #82 §12.
+/// Hot-window: now-1h .. now+24h, per archived AugmentAgent#82 §12.
 pub const HOT_LOOKBACK_HOURS: i64 = 1;
 pub const HOT_LOOKAHEAD_HOURS: i64 = 24;
 
@@ -140,6 +140,14 @@ mod tests {
             _c: &str,
             _id: &str,
         ) -> Result<CalendarEvent, CalendarError> {
+            Err(CalendarError::Decode("stub".into()))
+        }
+        async fn create_event(
+            &self,
+            _e: &str,
+            _c: &str,
+            _d: &crate::gcal::EventDraft,
+        ) -> Result<crate::gcal::CreatedEvent, CalendarError> {
             Err(CalendarError::Decode("stub".into()))
         }
     }

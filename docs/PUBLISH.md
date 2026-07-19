@@ -3,10 +3,13 @@
 ## Where this code lives
 
 - **Public, canonical, agent-tracked:** `github.com/nolanmak/MyAgentAssistant`
-  — the deploy box's `origin`. History is scrubbed: no PII in file content,
-  commit messages, or author/committer metadata (all attributed to the GitHub
-  noreply `119541177+nolanmak@users.noreply.github.com`). No `refs/pull/*`
-  baggage (fresh repo).
+  — the deploy box's `origin`. The **current tree** is scrubbed of operator PII
+  (#305/#357). **History is not fully scrubbed yet:** some older commits still
+  carry personal-gmail author/committer metadata and pre-scrub file PII; a
+  `git filter-repo --mailmap` + force-push pass (#358/#359) is still pending.
+  In the meantime CI (`no-gmail-authors.yml`) blocks any *new* gmail-authored
+  commit so the git-config regression can't reappear. No `refs/pull/*` baggage
+  (fresh repo).
 - **Archived snapshot (do NOT push to, do NOT publish):**
   `github.com/nolanmak/AugmentAgent` — kept private and archived on GitHub.
   Its branch history is clean, but GitHub's un-rewritable `refs/pull/*` for

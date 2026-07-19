@@ -182,6 +182,44 @@ async fn unknown_tool_returns_structured_error_and_runner_survives() {
     assert_eq!(out.trace.len(), 0);
 }
 
+/// Regression for #190: programs containing TypeScript type assertions
+/// (e.g. `as unknown as EmailContext`) used to crash the runner with
+/// `SyntaxError: Unexpected token ':'` because the previous runner
+/// `eval`-ed the program as plain JS. PR #204 switched to loading the
+/// program as a `data:application/typescript` module so Deno's native
+/// TS loader strips types before execution. This test pins that fix:
+/// if someone reverts to plain-JS evaluation, the type-cast program will
+/// fail to parse and this test will go red.
+#[tokio::test]
+async fn ts_type_assertions_in_program_do_not_crash_runner() {
+    if maybe_skip("ts_type_assertions_in_program_do_not_crash_runner") {
+        return;
+    }
+    let dispatcher = StubDispatcher::new(vec![("draft".into(), json!(null))]);
+    // Exercises three TS-only syntax forms the runner must tolerate:
+    //   * type alias declaration
+    //   * `as` cast on a literal
+    //   * `as unknown as <Type>` chain (the exact form in #190)
+    let program = r#"
+        type EmailContext = { from: string; messageId: string };
+        async function main(): Promise<void> {
+          const ctx = {
+            from: "alice@example.com",
+            messageId: "abc",
+          } as unknown as EmailContext;
+          const body = "Reply to " + ctx.from;
+          await tools.draft("gmail", body, "regression for #190");
+        }
+        await main();
+    "#;
+
+    let out = run_program(program, &v1_manifest(), &dispatcher)
+        .await
+        .expect("TS-cast program must parse and run under data: TS module loading");
+    assert_eq!(out.trace.len(), 1, "expected single draft call");
+    assert_eq!(out.trace[0].call, "draft");
+}
+
 #[tokio::test]
 async fn infinite_loop_is_killed_under_61s() {
     if maybe_skip("infinite_loop_is_killed_under_61s") {

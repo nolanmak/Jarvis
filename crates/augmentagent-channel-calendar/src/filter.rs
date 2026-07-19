@@ -1,7 +1,7 @@
 //! Pre-WorkItem filter for Calendar events.
 //!
 //! Drops events that aren't real engagements (cancelled, OOO, focus time,
-//! solo blocks) before they pay for an LLM ingest. Mirrors §8 of #82.
+//! solo blocks) before they pay for an LLM ingest. Mirrors §8 of archived AugmentAgent#82.
 
 use crate::types::CalendarEvent;
 
