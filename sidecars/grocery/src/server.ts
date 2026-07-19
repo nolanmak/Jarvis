@@ -14,8 +14,16 @@ import type { GroceryProvider } from "./provider.js";
 
 type Handler = (params: any) => Promise<any>;
 
-const SCHEDULE_HELPER = "/home/nolan-makatche/AugmentAgent/scripts/grocery-schedule.mjs";
-const NODE_BIN = "/usr/bin/node";
+// Resolve the schedule helper relative to the repo root so it works on
+// Linux and macOS. AUGMENTAGENT_HOME (or GROCERY_SCHEDULE_HELPER) overrides
+// the default, which assumes this sidecar runs from <repo>/sidecars/grocery.
+const REPO_ROOT =
+  process.env.AUGMENTAGENT_HOME ?? path.resolve(process.cwd(), "..", "..");
+const SCHEDULE_HELPER =
+  process.env.GROCERY_SCHEDULE_HELPER ??
+  path.join(REPO_ROOT, "scripts", "grocery-schedule.mjs");
+// Use the node binary currently running this process (cross-platform).
+const NODE_BIN = process.env.NODE_BIN ?? process.execPath;
 const SLUG_RE = /^[a-z0-9-]{1,32}$/;
 
 function runHelper(argv: string[]): Promise<any> {

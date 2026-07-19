@@ -219,7 +219,10 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         info!(count = candidates.len(), "retrying errored reply actions");
 
         let skill = SkillPrompt::load(&self.config.skill_dir);
-        let _ = skill.load_learned(); // not needed for retry, but ensures file system is reachable
+        // #451 — a retry whose action never got a draft re-runs the full
+        // pipeline (triage included), so it needs the same prompts poll_once
+        // uses, not just a reachability check on the skill dir.
+        let learned = skill.load_learned();
 
         let mut attempted = 0usize;
         for item in candidates {
@@ -245,6 +248,58 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             );
 
             let draft = item.action.draft_body.clone().unwrap_or_default();
+
+            // #451 — an errored action with NO draft body failed *before* a
+            // draft ever existed: triage threw (a Claude session-limit or a
+            // malformed-JSON reply is the common case) and logged an Error row
+            // with `draft = None`. Handing that to `dispatch_reply` — which is
+            // what this used to do unconditionally — is wrong twice over:
+            //
+            //   1. It publishes an approval card whose draft is the empty
+            //      string, so the user gets a card with nothing in it.
+            //   2. `dispatch_reply` starts AFTER triage, so it skips every
+            //      triage guard: automated-sender (#217), already-replied
+            //      (#218), event-blast (#222). Newsletters that triage would
+            //      never have drafted sail straight into the queue.
+            //
+            // That is how the live queue reached 102 empty-draft cards from
+            // Canva/Marshalls/BetaList — and, via the old backpressure cap,
+            // how real human threads stopped getting drafted at all (#450).
+            //
+            // The Error row's own comment says the retry tick should re-triage.
+            // So actually re-triage: retire the errored row (clearing the
+            // `has_open_action` gate) and re-run the full pipeline, guards
+            // included. `increment_retry_count` above already bounded the
+            // attempts, so this cannot spin.
+            if draft.trim().is_empty() {
+                info!(
+                    action_id = %item.action.id,
+                    from = %item.action.from_email,
+                    "retry: errored action has no draft; re-running triage \
+                     instead of dispatching an empty draft"
+                );
+                if let Err(e) = self.store.update_action_status(
+                    &item.action.id,
+                    ActionStatus::Superseded,
+                    None,
+                    Some("retried: re-triaged from scratch (no draft on errored action)"),
+                ) {
+                    warn!(
+                        action_id = %item.action.id,
+                        "retry: could not retire errored action, skipping: {e:#}"
+                    );
+                    continue;
+                }
+                if let Err(e) = self
+                    .process_email(&skill.system, &learned, &entity_id, item.email.clone())
+                    .await
+                {
+                    warn!(action_id = %item.action.id, "retry re-triage failed: {e:#}");
+                }
+                attempted += 1;
+                continue;
+            }
+
             // Reuse the existing action_id so the Discord card already showing
             // for this action stays valid (the event handler looks up this id
             // in sqlite on click).
@@ -366,18 +421,24 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             Ok(d) => d,
             Err(e) => {
                 error!(message_id = %email.message_id, "triage parse failed: {e}; raw={raw}");
-                self.store.log_action(
-                    &email.message_id,
-                    email.thread_id.as_deref(),
-                    &email.from,
-                    &email.subject,
-                    Some(&email.body),
-                    None,
-                    ActionStatus::Error,
-                )?;
-                // NOT mark_email_processed: a triage parse failure is transient
-                // (Claude flakiness). Leave agentProcessedAt NULL so the retry
-                // tick can pick it up.
+                // Do NOT log an action row here, and do NOT mark_email_processed.
+                // A triage-stage failure (typically a transient model 529 that
+                // surfaces as non-JSON text) has run NONE of the reply gates
+                // (is_human_sender / is_event_blast / already-replied /
+                // backpressure) and produced no draft, so it must be RE-TRIAGED
+                // from scratch — never retried as a reply.
+                //
+                // Logging a `status='error'` row here is what made the #217
+                // automated-sender filter leak: the row (1) tripped
+                // `has_open_action`, permanently blocking the poll loop from
+                // re-running this pipeline (the only place the gates live), and
+                // (2) was scooped by `list_retryable_replies` into `retry_once`
+                // -> `dispatch_reply`, which force-drafts an empty body and
+                // skips every gate — surfacing newsletters/marketing as approval
+                // cards. Returning Err with NO action row leaves
+                // agentProcessedAt NULL and the message unread, so the next poll
+                // cycle re-runs full triage — identical to how a network Err
+                // from `reasoner.call` (the `?` above) already behaves.
                 return Err(e.into());
             }
         };
@@ -608,73 +669,30 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     return Ok(Some(DispatchOutcome::IngestOnly));
                 }
 
-                // --- 1b. BACKPRESSURE (#99). Before spending an Opus draft
-                // call + a Discord card, check the approval backlog. If it's
-                // at/over the cap, downgrade Reply -> Flag: the user still
-                // gets a heads-up but we skip the expensive draft and don't
-                // pile another card onto an already-deep queue. The cap is
-                // env-tunable; default 25 mirrors the digest enumeration cap.
-                let max_pending: i64 = std::env::var("AUGMENTAGENT_MAX_PENDING_DRAFTS")
-                    .ok()
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .filter(|n| *n >= 0)
-                    .unwrap_or(25);
-                let pending_now = self.store.pending_reply_count().unwrap_or(0);
-                if pending_now >= max_pending {
-                    let base = decision.reason.as_deref().unwrap_or("reply-worthy");
-                    let reason = format!(
-                        "draft queue full ({pending_now} pending ≥ cap {max_pending}); \
-                         downgraded to flag — {base}"
-                    );
-                    warn!(
-                        message_id = %email.message_id,
-                        from = %email.from,
-                        pending = pending_now,
-                        cap = max_pending,
-                        "reply downgraded to flag: approval queue at capacity"
-                    );
-                    self.store.log_flagged_action(
-                        &email.message_id,
-                        email.thread_id.as_deref(),
-                        &email.from,
-                        &email.subject,
-                        Some(&email.body),
-                        &reason,
-                    )?;
-                    self.store
-                        .mark_email_processed(&email.message_id, TriageResult::Flag)?;
-                    println!(
-                        "[flag:backpressure] {} from={} pending={} cap={}",
-                        email.message_id, email.from, pending_now, max_pending
-                    );
-                    if let Err(e) = self
-                        .approvals
-                        .post_flag_notice(
-                            &email,
-                            &format!(
-                                "Reply-worthy, but the approval queue is full \
-                                 ({pending_now} drafts waiting). Clear some via \
-                                 `augmentagent approvals` then this can be re-drafted. \
-                                 Context: {base}"
-                            ),
-                        )
-                        .await
-                    {
-                        warn!(
-                            message_id = %email.message_id,
-                            "post_flag_notice (backpressure) failed: {e}"
-                        );
-                    }
-                    self.maybe_ingest(
-                        &email,
-                        DecisionKind::Flag,
-                        decision.reason.as_deref(),
-                        None,
-                        IngestTrigger::Triaged,
-                    );
-                    return Ok(Some(DispatchOutcome::Flagged));
-                }
-
+                // --- 1b. BACKPRESSURE (#99) — REMOVED in #450.
+                //
+                // This used to downgrade Reply -> Flag (no draft, no card)
+                // whenever `pending_reply_count() >= AUGMENTAGENT_MAX_PENDING_DRAFTS`
+                // (default 25). It was meant as a cost guard, but it degraded
+                // into a silent kill switch: the queue could not drain on its
+                // own (the outbound observer that retires answered cards was
+                // off — #449) and it filled with drafts for newsletters that
+                // should never have been drafted (#451). Once it crossed 25 it
+                // stayed there, and from that moment EVERY reply-worthy email
+                // was flagged instead of drafted — including live human
+                // threads. The user's report was simply "it doesn't draft an
+                // email at all for those", and the daemon log agreed:
+                //
+                //   reply downgraded to flag: approval queue at capacity
+                //     from=<a real client on a live thread>  pending=54 cap=25
+                //
+                // A queue-depth number is the wrong thing to hang "does this
+                // person get a reply" on. The volume problem is fixed at the
+                // source instead: bulk senders no longer reach the draft phase
+                // (#451), and answered cards now retire themselves (#449), so
+                // the queue reflects real work. A reply-worthy email always
+                // gets a draft now.
+                //
                 // --- 2. DRAFT phase. Code-mode (#52 / I6) is the production
                 // default; on any code-mode failure we log + fall through to
                 // the classic prompt path so a model hiccup or sandbox glitch
@@ -1096,18 +1114,28 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
 
     /// Build the `<thread_history>` block for thread-aware drafting (#32).
     ///
-    /// Gated behind `AUGMENTAGENT_THREAD_AWARE=1` — unset/anything-else returns
-    /// an empty string, which `draft_user_message` treats as "no thread block"
-    /// (prompt is then byte-identical to pre-#32 behavior). Best-effort: a
-    /// fetch failure logs a warning and degrades to the empty block rather
-    /// than aborting the draft. The inbound message itself is excluded so the
-    /// model doesn't see it twice (it's already in the `<email>` block).
+    /// DEFAULT-ON as of #450 (opt out with `AUGMENTAGENT_THREAD_AWARE=0`).
+    ///
+    /// This was gated behind an opt-in `=1` that was never set in any config,
+    /// so in production the block was always empty and every reply on a
+    /// multi-message thread was drafted as if the thread were one isolated
+    /// message — no memory of what either side had already said. That is half
+    /// of what "it doesn't draft properly for threads" meant in #450; a draft
+    /// written without the back-and-forth isn't worth sending.
+    ///
+    /// Best-effort: a fetch failure logs a warning and degrades to the empty
+    /// block rather than aborting the draft. The inbound message itself is
+    /// excluded so the model doesn't see it twice (it's already in the
+    /// `<email>` block).
     async fn fetch_thread_block(
         &self,
         entity_id: &str,
         email: &augmentagent_store::Email,
     ) -> String {
-        if std::env::var("AUGMENTAGENT_THREAD_AWARE").as_deref() != Ok("1") {
+        let thread_aware = std::env::var("AUGMENTAGENT_THREAD_AWARE")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true);
+        if !thread_aware {
             return String::new();
         }
         let Some(thread_id) = email.thread_id.as_deref() else {
@@ -1538,18 +1566,8 @@ mod tests {
         ) -> Result<String, crate::gmail::GmailError> {
             Ok("draft".into())
         }
-        async fn update_draft(
-            &self,
-            _e: &str,
-            _d: &str,
-            _t: &str,
-            _s: &str,
-            _b: &str,
-        ) -> Result<(), crate::gmail::GmailError> {
-            Ok(())
-        }
-        async fn send_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
-            Ok(())
+        async fn send_draft(&self, _e: &str, _d: &str) -> Result<Option<String>, crate::gmail::GmailError> {
+            Ok(None)
         }
         async fn delete_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
             Ok(())
@@ -2172,16 +2190,6 @@ mod tests {
         ) -> Result<Vec<Email>, crate::gmail::GmailError> {
             Ok(self.emails.clone())
         }
-        async fn update_draft(
-            &self,
-            _e: &str,
-            _d: &str,
-            _t: &str,
-            _s: &str,
-            _b: &str,
-        ) -> Result<(), crate::gmail::GmailError> {
-            Ok(())
-        }
         async fn create_draft(
             &self,
             _e: &str,
@@ -2199,8 +2207,8 @@ mod tests {
             }
             Ok("draft-abc".into())
         }
-        async fn send_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
-            Ok(())
+        async fn send_draft(&self, _e: &str, _d: &str) -> Result<Option<String>, crate::gmail::GmailError> {
+            Ok(None)
         }
         async fn delete_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
             Ok(())
@@ -2260,6 +2268,188 @@ mod tests {
         assert!(store.is_email_complete("m-retry").unwrap());
     }
 
+    /// #451 REGRESSION — the bug that filled the queue with 102 empty cards.
+    ///
+    /// When TRIAGE throws (a Claude session-limit reply is the common case) the
+    /// old code logged an Error action with NO draft body; the retry tick then
+    /// handed that straight to `dispatch_reply`, which (a) published an approval
+    /// card whose draft was the empty string and (b) began *after* triage, so it
+    /// skipped the automated-sender guard entirely. Newsletters that triage would
+    /// never have drafted sailed into the queue.
+    ///
+    /// Per #363 a triage-stage failure now logs NO action at all, so the retry
+    /// tick has nothing to pick up (`retry_once == 0`) and the next poll re-runs
+    /// the full pipeline, guards included — a marketing blast ends up skipped,
+    /// with no card and no empty draft.
+    #[tokio::test]
+    async fn retry_of_triage_failure_re_triages_instead_of_publishing_empty_draft() {
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                message_id: "m-blast".into(),
+                thread_id: Some("t-blast".into()),
+                from: "Brand <marketing@engage.examplebrand.com>".into(), // pii-ok: synthetic
+                subject: "Last chance to get 15% off".into(),
+                body: "Shop the sale now!".into(),
+                date: "Mon, 13 Jul 2026 12:00:00 +0000".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            // 1st pass: triage blows up exactly like the live session-limit
+            // reply did — not JSON, so `parse_decision` errors.
+            "You've hit your session limit \u{b7} resets 9:30am",
+            // Retry pass: triage now answers, and (as it did live) says reply.
+            r#"{"decision":"reply","reason":"promotional but asks for action"}"#,
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            Arc::clone(&reasoner),
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                retry_min_gap: Duration::from_millis(0),
+                ..Default::default()
+            },
+        );
+
+        // Pass 1: triage fails -> NO action row (per #363), no draft, no card.
+        let out1 = ch.poll_once().await.unwrap();
+        assert_eq!(out1.errors, 1);
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+
+        // The retry tick must find nothing: a triage-stage failure logs no
+        // retryable action.
+        assert_eq!(
+            ch.retry_once().await.unwrap(),
+            0,
+            "a triage-stage failure must not be retried as a reply"
+        );
+
+        // Pass 2: the next poll re-runs the full pipeline. Triage now returns
+        // `reply`, but the automated-sender guard fires before drafting.
+        let out2 = ch.poll_once().await.unwrap();
+        assert_eq!(
+            out2.skipped, 1,
+            "re-triage must route the marketing sender to the skip gate"
+        );
+
+        // The load-bearing assertions. Re-triage ran, the automated-sender
+        // guard fired, and NO approval card exists.
+        assert_eq!(
+            broker.posts.lock().unwrap().len(),
+            0,
+            "a marketing blast must never produce an approval card on retry"
+        );
+        let pending: i64 = store.pending_reply_count().unwrap();
+        assert_eq!(
+            pending, 0,
+            "retry must not leave a pending card (this is the empty-draft bug)"
+        );
+        // And crucially: no action anywhere holding an empty draft body.
+        let empty_drafts: i64 = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM actions \
+                     WHERE status = 'pending' \
+                       AND (draftBody IS NULL OR TRIM(draftBody) = '')",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(empty_drafts, 0, "empty-draft approval cards must not exist");
+
+        // Non-vacuity: both scripted responses must have been consumed. If the
+        // re-triage had NOT run, response #2 would still be queued — and an
+        // exhausted ScriptedReasoner returns a `skip` stub, which would make
+        // this test pass for entirely the wrong reason.
+        assert!(
+            reasoner.responses.lock().unwrap().is_empty(),
+            "the next poll must have re-run triage (which returned `reply`); the \
+             skip therefore came from the automated-sender guard, not from a stub"
+        );
+    }
+
+    /// The counterpart: a real person whose triage transiently failed must
+    /// still get a proper draft — via the next poll's re-triage (per #363),
+    /// not via the retry tick. The fix must not throw away legitimate drafts,
+    /// only stop the empty/unguarded ones.
+    #[tokio::test]
+    async fn retry_of_triage_failure_still_drafts_for_a_human_sender() {
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                message_id: "m-human".into(),
+                thread_id: Some("t-human".into()),
+                from: "Dana Rivera <dana@example-labs.ai>".into(), // pii-ok: synthetic
+                subject: "Re: Catching up + next steps".into(),
+                body: "Does Thursday still work for you?".into(),
+                date: "Mon, 13 Jul 2026 12:00:00 +0000".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        // The draft phase may consume more than one reasoner call (code-mode is
+        // tried first and falls back to the classic prompt), so every response
+        // after the triage answer is the draft text — whichever call lands on
+        // it, the draft body is the same.
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            "You've hit your session limit", // triage dies
+            r#"{"decision":"reply","reason":"asks to confirm a time"}"#, // retry triage
+            "Thursday still works — see you then.",
+            "Thursday still works — see you then.",
+            "Thursday still works — see you then.",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                retry_min_gap: Duration::from_millis(0),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(ch.poll_once().await.unwrap().errors, 1);
+        // A triage-stage failure isn't retried; the next poll re-triages and
+        // this time drafts for the human sender.
+        assert_eq!(ch.retry_once().await.unwrap(), 0);
+        assert_eq!(ch.poll_once().await.unwrap().awaiting_approval, 1);
+
+        assert_eq!(
+            broker.posts.lock().unwrap().len(),
+            1,
+            "human sender must get a card once triage succeeds on re-poll"
+        );
+        // The card must carry the REAL draft, not the empty string that the
+        // old retry path would have published.
+        let draft: String = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT COALESCE(draftBody, '') FROM actions \
+                     WHERE status = 'pending' LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert!(
+            draft.contains("Thursday"),
+            "pending card must hold the real draft, got {draft:?}"
+        );
+    }
+
     /// Counts create_draft invocations so the retry-no-double-draft test can
     /// assert Gmail isn't asked for a second draft when the prior attempt
     /// already succeeded at create_draft and only failed at post_approval.
@@ -2284,16 +2474,6 @@ mod tests {
         ) -> Result<Vec<Email>, crate::gmail::GmailError> {
             Ok(self.emails.clone())
         }
-        async fn update_draft(
-            &self,
-            _e: &str,
-            _d: &str,
-            _t: &str,
-            _s: &str,
-            _b: &str,
-        ) -> Result<(), crate::gmail::GmailError> {
-            Ok(())
-        }
         async fn create_draft(
             &self,
             _e: &str,
@@ -2306,8 +2486,8 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok("draft-once".into())
         }
-        async fn send_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
-            Ok(())
+        async fn send_draft(&self, _e: &str, _d: &str) -> Result<Option<String>, crate::gmail::GmailError> {
+            Ok(None)
         }
         async fn delete_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
             Ok(())
@@ -2407,6 +2587,94 @@ mod tests {
         );
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
         assert!(store.is_email_complete("m-broker-fail").unwrap());
+    }
+
+    /// #217 REGRESSION: a triage-STAGE failure (a model 529 surfacing as
+    /// non-JSON) must NOT create a retryable reply action. Before the fix, the
+    /// parse-fail branch logged a `status='error'` row that (a) tripped
+    /// `has_open_action`, blocking the poll loop from ever re-triaging, and (b)
+    /// was scooped by the retry tick into `dispatch_reply`, which force-drafted
+    /// an empty body and posted an approval card WITHOUT the is_human_sender
+    /// gate — leaking newsletters/marketing (e.g. substack.com) as cards. With
+    /// the fix there is NO action row, so the next poll re-runs full triage and
+    /// the automated-sender gate skips it. This reproduces the production
+    /// scenario (a Substack newsletter whose first triage 529s) through the
+    /// real process_email + retry_once code paths.
+    #[tokio::test]
+    async fn triage_parse_failure_does_not_create_retryable_action() {
+        let (store, _f) = tmp_store();
+        // Automated sender: substack.com is in NON_HUMAN_DOMAIN_PATTERNS, and
+        // the realistic display-name form also exercises extract_bare.
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                message_id: "m-529".into(),
+                thread_id: None,
+                from: "Royal Box Weekly <royalbox@substack.com>".into(), // pii-ok: synthetic substack fixture
+                subject: "The Royal Box at Wimbledon".into(),
+                body: "I want to switch gears this week to my favorite sport: Tennis.".into(),
+                date: "2026-06-24".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            // 1st triage call: model overloaded — non-JSON, reproduces the
+            // production `raw` that broke parse_decision.
+            "API Error: 529 Overloaded. This is a server-side issue, usually temporary.",
+            // 2nd triage call (next poll): now succeeds and even says "reply" —
+            // proving it's the is_human_sender gate, not the triage verdict,
+            // that skips the newsletter.
+            r#"{"decision":"reply","reason":"actionable"}"#,
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                retry_min_gap: Duration::from_millis(0),
+                retry_interval: Duration::from_millis(50),
+                ..Default::default()
+            },
+        );
+
+        // --- Pass 1: triage 529s. The parse failure surfaces as an error, but
+        // NO action row is logged and the email stays incomplete (unread).
+        let out1 = ch.poll_once().await.unwrap();
+        assert_eq!(out1.errors, 1, "triage parse failure should surface as an error");
+        assert_eq!(out1.awaiting_approval, 0);
+        assert_eq!(out1.skipped, 0);
+        // Core regression assertion: no open (pending/error) action row. Pre-fix
+        // this was TRUE (an Error row was logged) — the root of the leak.
+        assert!(
+            !store.has_open_action("m-529").unwrap(),
+            "a triage-stage failure must NOT create an action row"
+        );
+        assert!(!store.is_email_complete("m-529").unwrap());
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+
+        // --- Retry tick: with no errored row, nothing is retryable, so the leak
+        // path (retry_once -> dispatch_reply, ungated) never runs.
+        let retried = ch.retry_once().await.unwrap();
+        assert_eq!(retried, 0, "a triage-stage failure must not be retried as a reply");
+        assert_eq!(
+            broker.posts.lock().unwrap().len(),
+            0,
+            "no approval card may be posted for a newsletter"
+        );
+
+        // --- Pass 2: the poll loop re-triages from scratch. Triage now returns
+        // 'reply', but is_human_sender skips the substack sender BEFORE drafting,
+        // so still no card — and the email is now terminally processed (Skip).
+        let out2 = ch.poll_once().await.unwrap();
+        assert_eq!(out2.skipped, 1, "re-triage routes the automated sender to the skip gate");
+        assert_eq!(out2.awaiting_approval, 0);
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+        assert!(store.is_email_complete("m-529").unwrap());
     }
 
     // --- tone-mirror lookup (#73 §4) ---

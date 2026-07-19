@@ -5,10 +5,9 @@
 //! 100 bytes per `custom_id`; our encoding is ~50 bytes — well under.
 //!
 //! Verbs are namespaced informally: the `Approve` / `Revise` / `Skip` /
-//! `QuickRefine` / `Fill*` family targets a content draft (reply email),
-//! whereas `InvoiceApprove` / `InvoiceReject` target an `invoice_drafts.id`
-//! and run a completely separate Approve/Reject workflow. They share the
-//! encoding so the event handler's `CustomId::parse` stays single-shaped.
+//! `QuickRefine` / `Fill*` family targets a content draft (reply email). They
+//! share the encoding so the event handler's `CustomId::parse` stays
+//! single-shaped.
 
 use std::fmt;
 
@@ -30,12 +29,6 @@ pub enum Verb {
     /// Submission of the FillAsk modal. Routed through the existing Revise
     /// plumbing (the supplied values become structured feedback).
     FillAskModal,
-    /// Approve & send the weekly invoice draft attached to this card. The
-    /// `action_id` is an `invoice_drafts.id`, NOT an `actions.id`.
-    InvoiceApprove,
-    /// Reject the weekly invoice draft (no send, no state mutation beyond
-    /// marking the draft row rejected).
-    InvoiceReject,
 }
 
 impl Verb {
@@ -48,8 +41,6 @@ impl Verb {
             Self::QuickRefine => "quick_refine",
             Self::FillAsk => "fill_ask",
             Self::FillAskModal => "fill_ask_modal",
-            Self::InvoiceApprove => "invoice_approve",
-            Self::InvoiceReject => "invoice_reject",
         }
     }
 
@@ -62,8 +53,6 @@ impl Verb {
             "quick_refine" => Self::QuickRefine,
             "fill_ask" => Self::FillAsk,
             "fill_ask_modal" => Self::FillAskModal,
-            "invoice_approve" => Self::InvoiceApprove,
-            "invoice_reject" => Self::InvoiceReject,
             _ => return None,
         })
     }
@@ -115,8 +104,6 @@ mod tests {
             Verb::QuickRefine,
             Verb::FillAsk,
             Verb::FillAskModal,
-            Verb::InvoiceApprove,
-            Verb::InvoiceReject,
         ] {
             let cid = CustomId::new("550e8400-e29b-41d4-a716-446655440000", v);
             let s = cid.to_string();

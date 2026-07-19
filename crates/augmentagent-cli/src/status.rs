@@ -9,14 +9,17 @@
 //!  * **core_keys** — env vars merged over the sqlite `config` table
 //!                   (sqlite wins; mirrors `getConfigStatus()` in
 //!                   `src/dashboard.ts:78`)
-//!  * **channels**  — best-effort `configured` flag per known channel
-//!                   (gmail probes the Composio accounts table; others
-//!                   probe the sqlite `config` table for canonical keys).
-//!                   `armed` reads the per-channel arming gate from the
-//!                   sqlite `config` table (set by
-//!                   `augmentagent channel <x> arm`, #7), falling back to
-//!                   the matching env var. Sqlite wins on conflict —
-//!                   mirrors `getConfigStatus()` in `src/dashboard.ts:78`.
+//!  * **channels**  — per-channel `configured`/`armed` derived from the
+//!                   SAME gates `Cmd::Serve` evaluates (#374): keyring
+//!                   slots via `augmentagent_auth::Auth::exists`, legacy
+//!                   credential files via each channel's
+//!                   `default_auth_path`, and store tables (workspaces,
+//!                   bots, subscriptions, accounts). `configured` = the
+//!                   credential/prereq is present; `armed` = the serve
+//!                   loop would run a poller for it right now. The four
+//!                   config-table arming keys (`twitter_real_enabled`
+//!                   etc.) are NOT consulted — serve never reads them,
+//!                   so they said nothing about runtime state (#374).
 //!  * **queue**     — `pending_reply_count()` from the store
 //!
 //! Output is JSON by default when stdout is piped (CI, dashboard shell-out)
@@ -47,7 +50,6 @@ use tokio::process::Command;
 
 use augmentagent_store::{rusqlite, Store};
 
-use crate::channel_router;
 
 /// JSON schema version. Bump on any breaking change to the document shape.
 /// The CI snapshot test in #14 keys off this constant.
@@ -468,20 +470,6 @@ fn cfg_or_env(cfg: &BTreeMap<String, String>, sqlite_key: &str, env_key: &str) -
     std::env::var(env_key).map(|v| !v.is_empty()).unwrap_or(false)
 }
 
-/// Like `cfg_or_env`, but for arming flags (truthy parse, not "non-empty").
-/// `arm`/`disarm` write the literal strings `"true"` / `"false"` — treating
-/// "non-empty" as armed would invert the disarm path. Sqlite still wins on
-/// conflict, matching `getConfigStatus()` precedence (`src/dashboard.ts:78`).
-fn armed_from(cfg: &BTreeMap<String, String>, sqlite_key: &str, env_key: &str) -> bool {
-    if let Some(v) = cfg.get(sqlite_key) {
-        return channel_router::is_truthy(v);
-    }
-    std::env::var(env_key)
-        .ok()
-        .map(|v| channel_router::is_truthy(&v))
-        .unwrap_or(false)
-}
-
 fn collect_core_keys(cfg: &BTreeMap<String, String>) -> CoreKeys {
     CoreKeys {
         composio: cfg_or_env(cfg, "composio_api_key", "COMPOSIO_API_KEY"),
@@ -495,14 +483,32 @@ fn collect_core_keys(cfg: &BTreeMap<String, String>) -> CoreKeys {
 // Per-channel configured/armed probes.
 // ---------------------------------------------------------------------------
 
-/// Build the channels map. `armed` is hard-coded to `false` until #7 lands
-/// the arm/disarm verbs (the CLI doesn't have a per-channel armed state to
-/// query yet). `accounts` is best-effort and only filled for gmail today.
+/// Build the channels map from the gates `Cmd::Serve` actually evaluates
+/// (#374). Per channel:
+///
+///   * `configured` — the credential / prerequisite serve checks is
+///     present: keyring slot (read-only `Auth::exists`, no migration side
+///     effects), legacy credential file (each channel's `default_auth_path`,
+///     honouring its env override), or store rows.
+///   * `armed` — serve would run a poller/listener for this channel right
+///     now. Channels serve never spawns (twitter, instagram, whatsapp,
+///     telegram inbound, calendar, contacts) report `armed: false` even
+///     when their credential is present — posting/CLI surfaces still work,
+///     but nothing polls.
+///
+/// Caveat shared with the daemon: `Auth::exists` treats a keyring platform
+/// failure as "present" (it can't distinguish unreachable from missing
+/// without reading the secret); `doctor`'s `keyring_reachable` check covers
+/// that failure mode.
 fn collect_channels(
     store: &Store,
     cfg: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, ChannelStatus>> {
+    use augmentagent_auth::{Auth, DEFAULT_ACCOUNT};
+
     let mut out = BTreeMap::new();
+    let repo_root = std::env::current_dir().unwrap_or_default();
+    let composio = cfg_or_env(cfg, "composio_api_key", "COMPOSIO_API_KEY");
     let gmail_accounts: u32 = store
         .get_active_gmail_accounts()
         .map(|v| v.len() as u32)
@@ -513,99 +519,128 @@ fn collect_channels(
         .unwrap_or(0);
 
     for &name in KNOWN_CHANNELS {
-        let (configured, accounts) = match name {
-            "gmail" => {
-                let n = gmail_accounts;
-                // Composio is the auth path for gmail; consider gmail
-                // "configured" iff Composio is set up AND at least one
-                // account is connected.
-                let composio_present = cfg_or_env(cfg, "composio_api_key", "COMPOSIO_API_KEY");
-                (composio_present && n > 0, n)
+        let (configured, armed, accounts) = match name {
+            // Serve spawns the gmail channel whenever the Composio key is
+            // present (`build_channel`); accounts are enumerated per poll.
+            "gmail" => (composio, composio, gmail_accounts),
+            // Serve arms slack when ≥1 workspace row exists; an empty table
+            // falls back to the default keyring slot (`load_slack_clients`).
+            "slack" => {
+                let workspaces = store
+                    .list_active_slack_workspaces()
+                    .map(|v| v.len() as u32)
+                    .unwrap_or(0);
+                let c = workspaces > 0 || Auth::exists("slack", DEFAULT_ACCOUNT);
+                (c, c, workspaces)
             }
-            // Each remaining channel is "configured" iff its canonical
-            // sqlite config key (or env equivalent) is present. The key
-            // names mirror the existing dashboard / channel-crate
-            // conventions; #7 will replace this with first-class
-            // per-channel armed/configured probes.
-            "slack" => (cfg_or_env(cfg, "slack_bot_token", "SLACK_BOT_TOKEN"), 0),
-            "discord" => (
-                cfg_or_env(cfg, "discord_bot_token", "DISCORD_BOT_TOKEN"),
-                0,
-            ),
-            "twitter" => (
-                cfg_or_env(cfg, "twitter_session_b64", "TWITTER_SESSION_B64"),
-                0,
-            ),
-            "linkedin" => (
-                cfg_or_env(cfg, "linkedin_li_at", "LINKEDIN_LI_AT"),
-                0,
-            ),
-            "instagram" => (
-                cfg_or_env(cfg, "instagram_session_b64", "INSTAGRAM_SESSION_B64"),
-                0,
-            ),
-            "reddit" => (
-                cfg_or_env(cfg, "reddit_refresh_token", "REDDIT_REFRESH_TOKEN"),
-                0,
-            ),
-            "github" => (cfg_or_env(cfg, "github_pat", "GITHUB_TOKEN"), 0),
-            "meetup" => (
-                cfg_or_env(cfg, "meetup_access_token", "MEETUP_ACCESS_TOKEN"),
-                0,
-            ),
-            "telegram" => (
-                cfg_or_env(cfg, "telegram_bot_token", "TELEGRAM_BOT_TOKEN"),
-                0,
-            ),
-            "whatsapp" => (
-                cfg_or_env(cfg, "whatsapp_session_b64", "WHATSAPP_SESSION_B64"),
-                0,
-            ),
-            "calendar" => (
-                cfg_or_env(cfg, "composio_api_key", "COMPOSIO_API_KEY"),
-                0,
-            ),
-            "voice" => (
-                cfg_or_env(cfg, "voice_drop_dir", "VOICE_DROP_DIR"),
-                0,
-            ),
+            // Discord-DM channel: keyring, else the creds file at
+            // `default_creds_path` (AUGMENTAGENT_DISCORD_CREDS override).
+            "discord" => {
+                let c = Auth::exists("discord", DEFAULT_ACCOUNT)
+                    || augmentagent_channel_discord_dm::auth::default_creds_path(&repo_root)
+                        .exists();
+                (c, c, 0)
+            }
+            // Session present ⇒ posting + publisher arm work, but serve
+            // runs no twitter poller — inbound is CLI `poll-once` only.
+            "twitter" => {
+                let c = Auth::exists("twitter", DEFAULT_ACCOUNT)
+                    || augmentagent_channel_twitter::auth::default_auth_path(&repo_root)
+                        .exists();
+                (c, false, 0)
+            }
+            // One auth gate arms every LinkedIn serve task (DM poll, feed +
+            // own-post + friend-feed engagement, invite triage).
+            "linkedin" => {
+                let c = Auth::exists("linkedin", DEFAULT_ACCOUNT)
+                    || augmentagent_channel_linkedin::auth::default_auth_path(&repo_root)
+                        .exists();
+                (c, c, 0)
+            }
+            // Keyring slot is keyed by ds_user_id (not enumerable without
+            // reading it), so probe the auth file path only. Path mirrors
+            // the instagram crate's `default_auth_path` (env override, then
+            // repo root) — the crate isn't a dependency of the CLI, and
+            // adding one for an unwired channel isn't worth it. Not in
+            // serve at all — never armed.
+            "instagram" => {
+                let path = std::env::var("AUGMENTAGENT_INSTAGRAM_AUTH")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| repo_root.join("instagram-auth.json"));
+                (path.exists(), false, 0)
+            }
+            "reddit" => {
+                let c = augmentagent_channel_reddit::RedditAuth::exists();
+                (c, c, 0)
+            }
+            // Serve loads whichever PAT slot `AUGMENTAGENT_GITHUB_LOGIN`
+            // names, falling back to `default` (`load_any_github_auth`).
+            "github" => {
+                let login = std::env::var("AUGMENTAGENT_GITHUB_LOGIN")
+                    .unwrap_or_else(|_| DEFAULT_ACCOUNT.to_string());
+                let c = Auth::exists("github", &login);
+                (c, c, 0)
+            }
+            // No credential — serve arms meetup iff ≥1 active subscription.
+            "meetup" => {
+                let subs = store
+                    .list_active_subscriptions("meetup")
+                    .map(|v| v.len() as u32)
+                    .unwrap_or(0);
+                (subs > 0, subs > 0, subs)
+            }
+            // Bot rows enable outbound replies via the approver, but the
+            // inbound long-poll is CLI `telegram-bot poll-once` only.
+            "telegram" => {
+                let bots = store
+                    .list_active_telegram_bots()
+                    .map(|v| v.len() as u32)
+                    .unwrap_or(0);
+                (bots > 0, false, bots)
+            }
+            // Crate compiles but `Cmd::Whatsapp` is unimplemented and serve
+            // has no wiring — credential presence is all we can report.
+            "whatsapp" => (Auth::exists("whatsapp", DEFAULT_ACCOUNT), false, 0),
+            // Driven by the external `augmentagent-calendar.timer`, not
+            // serve; `doctor`'s `calendar_scheduled` check covers the timer.
+            "calendar" => (composio && gmail_accounts > 0, false, 0),
+            "voice" => {
+                use augmentagent_channel_voice::{
+                    default_allowlist_path, load_allowlist, load_token,
+                };
+                let c = load_token().is_some()
+                    && !load_allowlist(&default_allowlist_path()).is_empty();
+                (c, c, 0)
+            }
             "gdrive" => {
                 let drive = store
                     .get_active_drive_accounts()
                     .map(|v| v.len() as u32)
                     .unwrap_or(0);
-                (drive > 0, drive)
+                let c = composio && drive > 0;
+                (c, c, drive)
             }
+            // CLI `contacts sync` only; serve has no contacts task.
             "contacts" => (
-                cfg_or_env(cfg, "carddav_url", "CARDDAV_URL")
-                    || cfg_or_env(cfg, "composio_api_key", "COMPOSIO_API_KEY"),
+                cfg_or_env(cfg, "carddav_url", "CARDDAV_URL") || composio,
+                false,
                 0,
             ),
-            // #245 — SocialAPI.ai. "Configured" iff the API key is in place
-            // (sqlite `socialapi_api_key` or env `SOCIALAPI_API_KEY`) AND at
-            // least one socialapi account is active in the local registry.
-            // Mirrors gmail's "credential present AND ≥1 account" gate.
+            // Serve arms the socialapi pollers on the key alone
+            // (`SocialApiAuth::load`: env, else keyring); they idle until
+            // accounts/posts are registered.
             "socialapi" => {
-                let key_present = cfg_or_env(cfg, "socialapi_api_key", "SOCIALAPI_API_KEY");
-                (key_present && socialapi_accounts > 0, socialapi_accounts)
+                let key = cfg_or_env(cfg, "socialapi_api_key", "SOCIALAPI_API_KEY")
+                    || Auth::exists("socialapi", DEFAULT_ACCOUNT);
+                (key, key, socialapi_accounts)
             }
-            _ => (false, 0),
+            _ => (false, false, 0),
         };
 
         let needs = if configured {
             Vec::new()
         } else {
             vec!["login".to_string()]
-        };
-        // #7 — armed reads from the sqlite `config` table the dashboard
-        // writes (`augmentagent channel <name> arm`), falling back to the
-        // matching env var. Sqlite wins on conflict so the CLI agrees with
-        // the dashboard's `getConfigStatus()` precedence (src/dashboard.ts:78).
-        // Channels without an arming gate (gmail, slack, etc.) read as
-        // `false` — they're on-by-default once their credential is in place.
-        let armed = match channel_router::arming_keys_for(name) {
-            Some((sqlite_key, env_key)) => armed_from(cfg, sqlite_key, env_key),
-            None => false,
         };
         out.insert(
             name.to_string(),

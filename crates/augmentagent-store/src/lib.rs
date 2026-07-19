@@ -10,14 +10,15 @@ mod store;
 
 pub use models::{
     Account, ActionRecord, ActionStatus, AgentPrRun, AgentRepo, ChannelSubscription,
-    ConnectionRequestRow, DriveAccount, Email, FriendWatch, InvoiceDraft, LearnedPattern,
+    ConnectionRequestRow, DriveAccount, Email, FriendWatch, LearnedPattern,
     LinkedInConnectionSync, OwnPost, PhoneIdentity, RateAuditRow,
     RateEvent, RateHalt, RateWarmup, ScheduledPost, ScheduledPostStatus, SlackWorkspace,
     SocialapiAccount, SocialapiWebhookEvent, SubscriptionMode, TelegramBot, ToneExample,
     ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 pub use store::{
-    ActionCodeModeFields, ActionWithEmail, PendingNudge, RetryableReply, RevisionRecord, Store,
+    ActionCodeModeFields, ActionWithEmail, PendingActionRow, PendingNudge, RetryableReply,
+    RevisionRecord, Store,
     StoreError, StoreResult, NUDGE_INTERVAL_MS,
 };
 

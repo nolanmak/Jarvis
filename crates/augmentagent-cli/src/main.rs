@@ -10,13 +10,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use augmentagent_approval_discord::{
-    ApprovalActionHandler, ApprovalActionOutcome, ApprovalBroker, DiscordApprovalBroker,
-    DiscordConfig, InvoiceDraftPdf, InvoiceOps, LoopPoster, LoopRunner, LoopScheduler, NoopBroker,
-    QueryHandler,
+    approval_message, ApprovalActionHandler, ApprovalActionOutcome,
+    ApprovalBroker, DiscordApprovalBroker, DiscordConfig, LoopPoster,
+    LoopRunner, LoopScheduler, NoopBroker, QueryHandler,
 };
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
-use augmentagent_channel_email::gmail::{ComposioClient, GmailApi};
+use augmentagent_channel_email::gmail::{Attachment, ComposioClient, GmailApi};
 use augmentagent_channel_email::sigextract::{
     detect_signature_block, is_human_sender, signature_patch, strip_quoted_reply,
     SignatureExtractor,
@@ -51,10 +51,10 @@ mod code_mode;
 mod doctor;
 mod env_cfg;
 mod installers;
-mod invoice;
 mod logs;
 mod loop_cmd;
 mod loops;
+mod research;
 mod self_improve;
 mod service;
 mod setup;
@@ -163,6 +163,26 @@ enum Cmd {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         post_discord: bool,
     },
+    /// Daily automated research: pull recent arXiv AI/agent papers + the
+    /// latest from the leapmodel repo, compare them against our agent
+    /// process via a swappable LLM driver (RESEARCH_LLM_CMD), file GitHub
+    /// issues for the top gaps, and post a digest to Discord.
+    Research {
+        /// Look-back window in hours for arXiv submissions / leapmodel commits.
+        #[arg(long, default_value_t = 24)]
+        since_hours: u32,
+        /// Also post the digest to DISCORD_CHANNEL_ID. Otherwise stdout only.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        post_discord: bool,
+        /// Dry-run (default true): print the issues that would be filed and
+        /// the digest, but create no GitHub issues.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+        /// Cap on GitHub issues created this run (flag overrides
+        /// RESEARCH_MAX_ISSUES env, which overrides the default of 3).
+        #[arg(long)]
+        max_issues: Option<u32>,
+    },
     /// Gmail inbox tooling for Claude to invoke via Bash when the wiki
     /// can't answer a question.
     Gmail {
@@ -197,11 +217,6 @@ enum Cmd {
         #[command(subcommand)]
         op: SlackOp,
     },
-    /// Weekly Orchid invoice automation (generate + email the PDF).
-    Invoice {
-        #[command(subcommand)]
-        op: InvoiceOp,
-    },
     /// Telegram Bot API channel (#74). Long-poll getUpdates, dispatch through
     /// channel_subscriptions. All ops are stubs in foundation/swarm-v1; impls
     /// land in the telegram-bot feature PR.
@@ -215,7 +230,7 @@ enum Cmd {
         #[command(subcommand)]
         op: WhatsappOp,
     },
-    /// Google Calendar -> wiki Meeting log ingestion (#82). All ops are
+    /// Google Calendar -> wiki Meeting log ingestion (archived AugmentAgent#82). All ops are
     /// stubs in foundation/swarm-v1; impls land in the calendar feature PR.
     Calendar {
         #[command(subcommand)]
@@ -589,57 +604,6 @@ enum SchedulePostOp {
     },
 }
 
-#[derive(Subcommand)]
-enum InvoiceOp {
-    /// Show recipient, next invoice number, sending entity, last billed week.
-    Status,
-    /// Set the recipient email (the Discord command writes the same row).
-    SetRecipient {
-        #[arg(long)]
-        email: String,
-    },
-    /// Set the Composio sending entity (account that sends the email).
-    SetEntity {
-        #[arg(long)]
-        entity: String,
-    },
-    /// Master kill switch for the Sunday auto-draft scheduler. Seeded OFF
-    /// — the scheduler never posts a draft for approval until this is
-    /// explicitly turned on (the human-Approve gate makes auto-send moot).
-    SetAutoDraft {
-        /// true = let the Sunday scheduler post a draft card; false = no-op.
-        #[arg(long, action = clap::ArgAction::Set)]
-        on: bool,
-    },
-    /// Generate the weekly PDF and print where it landed. Doesn't post to
-    /// Discord and doesn't send — for one-off local previews. The Discord
-    /// `!invoice draft` command is the real way to queue an approval.
-    Draft {
-        /// Week-ending Sunday, YYYY-MM-DD. Omit for the most recent Sunday.
-        #[arg(long)]
-        week_end: Option<String>,
-    },
-    /// Mark a week (ending Sunday, YYYY-MM-DD) as already billed so the
-    /// scheduler won't (re)draft it. Use at cutover: the backlog covered
-    /// through 2026-05-17, so seed that to make the first auto-draft 05/24.
-    MarkBilled {
-        #[arg(long)]
-        week_end: String,
-    },
-    /// List Composio-connected Gmail accounts (email → entity).
-    ListAccounts,
-    /// Generate (and unless --dry-run, send) the invoice for a Sun→Sun week.
-    /// Defaults to the most recent Sunday. Dry-run is the default.
-    Run {
-        /// Week-ending Sunday, YYYY-MM-DD. Omit for the most recent Sunday.
-        #[arg(long)]
-        week_end: Option<String>,
-        /// true (default) = generate only; `--dry-run false` actually sends.
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-        dry_run: bool,
-    },
-}
-
 /// #117 — multi-repo agent-coding allowlist management (CLI parity with the
 /// dashboard /repos admin view). Default-deny: a repo is untouchable until
 /// it is `add`ed here (or via the dashboard).
@@ -903,6 +867,52 @@ enum CalendarOp {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         json: bool,
     },
+    /// #398 — propose an event and post a Discord approval card. The event
+    /// is NOT created (and no invites go out) until the operator clicks
+    /// Approve on the card; there is no unattended write path.
+    CreateEvent {
+        /// Event title
+        #[arg(long)]
+        summary: String,
+        /// RFC3339 start with offset, e.g. 2026-07-10T15:00:00-04:00
+        #[arg(long)]
+        start: String,
+        /// Duration in minutes (5-480)
+        #[arg(long, default_value_t = 30)]
+        duration_min: i64,
+        /// Comma-separated attendee emails; each gets an invite on Approve
+        #[arg(long, default_value = "")]
+        attendees: String,
+        /// Optional event description
+        #[arg(long)]
+        description: Option<String>,
+        /// Attach a Google Meet room
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        meet: bool,
+        /// Account email to create from (default: first active account)
+        #[arg(long)]
+        account: Option<String>,
+        /// Post the Discord approval card. Without it this prints a
+        /// preview and exits — nothing is written anywhere.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        post: bool,
+    },
+    /// #399 — read-only schedule lookup across active accounts. Query
+    /// mode's calendar tool; applies NO engagement filter (solo events,
+    /// focus blocks, and all-day entries all show).
+    ListEvents {
+        /// RFC3339 window start (default: now)
+        #[arg(long)]
+        from: Option<String>,
+        /// RFC3339 window end (default: --from + --days)
+        #[arg(long)]
+        to: Option<String>,
+        /// Window length in days when --to is absent (clamped to 1-60)
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1069,6 +1079,18 @@ enum MeetupOp {
     PollOnce {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+    },
+    /// On-demand: list a group's upcoming events. No subscription or db
+    /// needed — fetches live via the Meetup GraphQL client. This is the
+    /// read-only surface query mode reaches through the `augmentagent
+    /// meetup events` Bash allowlist entry (#319).
+    Events {
+        /// Group url-name slug, e.g. `code-coffee-philly`.
+        urlname: String,
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
     },
 }
 
@@ -1317,7 +1339,8 @@ enum DiscordOp {
 enum GmailOp {
     /// Search all connected Gmail accounts with a Gmail query string
     /// (e.g. `from:jeremy@acme.com`, `subject:deadline after:2026/04/01`).
-    /// Prints a short listing (from / subject / date / messageId) by default.
+    /// Prints a short listing (from / subject / date / messageId / threadId)
+    /// by default.
     Search {
         /// Gmail search query. Supports all operators `from:`, `to:`,
         /// `subject:`, `has:`, `after:`, `before:`, etc.
@@ -1327,23 +1350,47 @@ enum GmailOp {
         #[arg(long, default_value_t = 20)]
         limit: u32,
         /// Also include the email body in the output.
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         full: bool,
+        /// Restrict the search to a single account instead of fanning out over
+        /// all connected ones (#482). Matches the account's entity id (exact)
+        /// or email (case-insensitive substring), so either a short handle or
+        /// the full address selects the same account. Lets you route around a
+        /// throttled account.
+        #[arg(long)]
+        account: Option<String>,
     },
     /// List active Gmail accounts (so the chat agent can pick `--account`).
     Accounts {
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
     },
     /// Create a new draft in Gmail. Returns the draft id (and a Gmail URL
     /// to open it in the web UI). Use `--thread-id` for a reply draft.
+    ///
+    /// When `--post` is set, also surface a Discord approval card (Approve /
+    /// Revise / Skip) wired into the existing event handler, so the user can
+    /// send straight from chat instead of copy/pasting the draft into Gmail
+    /// (#352). Works for replies AND brand-new emails (#412): pass
+    /// `--thread-id` + `--reply-to-message-id` together for a reply card, or
+    /// neither for a new-email card (the action is keyed on a synthetic
+    /// `compose:<draft_id>` id and Revise redrafts against the draft body).
     Compose {
         /// Email address (e.g. `me@example.com`) or Composio entity_id of the
         /// sending account. Required when more than one account is connected.
         #[arg(long)]
         account: Option<String>,
+        /// Recipient address(es). Repeat the flag or pass a comma-separated
+        /// list for multiple To recipients (#439): `--to a@x.com --to b@y.com`
+        /// or `--to 'a@x.com, b@y.com'`. Display names are stripped.
+        #[arg(long, required = true)]
+        to: Vec<String>,
+        /// Cc recipient(s). Repeatable / comma-separated like `--to` (#439).
         #[arg(long)]
-        to: String,
+        cc: Vec<String>,
+        /// Bcc recipient(s). Repeatable / comma-separated like `--to` (#439).
+        #[arg(long)]
+        bcc: Vec<String>,
         #[arg(long)]
         subject: String,
         /// Body text. Use `--body-file -` to read from stdin instead.
@@ -1353,26 +1400,85 @@ enum GmailOp {
         /// exclusive with `--body`.
         #[arg(long)]
         body_file: Option<String>,
-        /// Thread to attach the draft to (makes it a reply).
+        /// Thread to attach the draft to (makes it a reply). Accepts a Gmail
+        /// threadId or a messageId from `gmail search` — a messageId is
+        /// resolved to its thread automatically (#381). Must belong to the
+        /// mailbox picked by `--account`.
         #[arg(long)]
         thread_id: Option<String>,
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         json: bool,
+        /// Also post a Discord approval card for this draft (#352, #412).
+        /// For a reply card pass `--thread-id` + `--reply-to-message-id`;
+        /// for a new-email card pass neither.
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        post: bool,
+        /// Skip the duplicate guard (#419): create the draft/card even when a
+        /// pending approval card already exists for this recipient + subject.
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        allow_duplicate: bool,
+        /// Attach a local file to the draft (#417). One file; uploaded via
+        /// Composio's attachment store before the draft is created.
+        #[arg(long)]
+        attach: Option<PathBuf>,
+        /// Gmail messageId of the inbound message we're replying to. Used as
+        /// the action row's messageId so the Approve / Revise / Skip handlers
+        /// resolve the same way they do for auto-triage replies. Pass it
+        /// (with `--thread-id`) for reply cards; omit for new-email cards.
+        #[arg(long)]
+        reply_to_message_id: Option<String>,
+        /// Original sender address (shown on the approval card's `From`
+        /// field). Defaults to `--to` when omitted, which is correct for a
+        /// straight reply.
+        #[arg(long)]
+        reply_to_from: Option<String>,
+        /// Original subject (used as the approval card's title). Defaults to
+        /// the outgoing `--subject` with any leading `Re:` stripped.
+        #[arg(long)]
+        reply_to_subject: Option<String>,
+        /// Original message body, used as the card's context block above the
+        /// draft. Provide via `--reply-to-body-file -` for stdin. Empty when
+        /// omitted (card still renders, just without inline context).
+        #[arg(long)]
+        reply_to_body: Option<String>,
+        #[arg(long)]
+        reply_to_body_file: Option<String>,
     },
-    /// Replace the body of an existing draft.
+    /// Replace an existing draft's content. Composio has no update-in-place
+    /// tool (#382), so this creates a replacement draft and deletes the old
+    /// one — it prints a NEW draft id; the old id stops working.
     UpdateDraft {
         #[arg(long)]
         account: Option<String>,
         #[arg(long)]
         draft_id: String,
+        /// Recipient address(es); repeatable / comma-separated (#439).
+        #[arg(long, required = true)]
+        to: Vec<String>,
+        /// Cc recipient(s) for the REPLACEMENT draft; repeatable /
+        /// comma-separated. Like --attach, cc/bcc on the old draft are NOT
+        /// carried over — re-pass them here (#439).
         #[arg(long)]
-        to: String,
+        cc: Vec<String>,
+        /// Bcc recipient(s) for the replacement draft (#439).
+        #[arg(long)]
+        bcc: Vec<String>,
         #[arg(long)]
         subject: String,
         #[arg(long)]
         body: Option<String>,
         #[arg(long)]
         body_file: Option<String>,
+        /// Thread to attach the replacement draft to. Accepts a threadId or a
+        /// messageId (auto-resolved). When omitted, the old draft's thread is
+        /// detected and preserved automatically where possible.
+        #[arg(long)]
+        thread_id: Option<String>,
+        /// Attach a local file to the REPLACEMENT draft (#417). Note: the
+        /// replacement carries only what you pass here — an attachment on
+        /// the old draft is NOT carried over (Composio can't read it back).
+        #[arg(long)]
+        attach: Option<PathBuf>,
     },
     /// Send an existing draft.
     Send {
@@ -1393,8 +1499,15 @@ enum GmailOp {
     SendNow {
         #[arg(long)]
         account: Option<String>,
+        /// Recipient address(es); repeatable / comma-separated (#439).
+        #[arg(long, required = true)]
+        to: Vec<String>,
+        /// Cc recipient(s); repeatable / comma-separated (#439).
         #[arg(long)]
-        to: String,
+        cc: Vec<String>,
+        /// Bcc recipient(s); repeatable / comma-separated (#439).
+        #[arg(long)]
+        bcc: Vec<String>,
         #[arg(long)]
         subject: String,
         #[arg(long)]
@@ -1403,6 +1516,9 @@ enum GmailOp {
         body_file: Option<String>,
         #[arg(long)]
         thread_id: Option<String>,
+        /// Attach a local file (#417).
+        #[arg(long)]
+        attach: Option<PathBuf>,
     },
 }
 
@@ -1544,6 +1660,11 @@ enum WikiOp {
     Ask {
         /// The question. Wrap in quotes if multi-word.
         question: String,
+        /// Also post the answer to the Discord approval channel via a
+        /// one-shot HTTP client, honoring `ATTACH:` file markers (#440).
+        /// Needs DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID in the env.
+        #[arg(long, default_value_t = false)]
+        post: bool,
     },
     /// Backfill v2 schema fields onto cold person pages via Haiku. See #78.
     ///
@@ -1571,6 +1692,22 @@ enum WikiOp {
         /// to avoid races against live ingest writes.
         #[arg(long)]
         force: bool,
+    },
+    /// Two-way sync the wiki with its private GitHub mirror (epic #474).
+    ///
+    /// Commits local page changes, pulls owner edits made on GitHub
+    /// (owner-wins on same-line conflicts), then pushes. Auth is the
+    /// ambient `gh` credential — no token in `.env`. The wiki dir must
+    /// already be a git repo with a private `origin` (bootstrap runs once
+    /// out of band; see KB sync #1).
+    Sync {
+        /// Print the plan (local changes, ahead/behind) without mutating.
+        #[arg(long)]
+        dry_run: bool,
+        /// Push-only: skip the pull/rebase step. Used for the very first
+        /// push when `origin/main` doesn't exist yet.
+        #[arg(long)]
+        no_pull: bool,
     },
 }
 
@@ -2168,40 +2305,6 @@ async fn main() -> Result<()> {
                 let nudge_for_task = Arc::clone(&nudge);
                 tasks.push(tokio::spawn(async move { nudge_for_task.run(sd).await }));
 
-                // Weekly Orchid invoice scheduler — Sundays only, idempotent.
-                // Gated on !dry_run for the same reason as nudge. Now posts a
-                // human-approval draft (PDF + Approve/Reject buttons) instead
-                // of sending directly; the click handler does the send. The
-                // poster is None when the bot token / channel id aren't
-                // configured — auto_draft_enabled then has nowhere to dispatch
-                // to, so the scheduler logs and skips.
-                let poster: Option<Arc<dyn invoice::InvoiceDraftPoster>> = match (
-                    std::env::var("DISCORD_BOT_TOKEN").ok(),
-                    std::env::var("DISCORD_CHANNEL_ID")
-                        .ok()
-                        .and_then(|s| s.parse::<u64>().ok()),
-                ) {
-                    (Some(token), Some(cid)) => {
-                        let http = Arc::new(serenity::http::Http::new(&token));
-                        let ops: Arc<dyn InvoiceOps> = Arc::new(CliInvoiceOps {
-                            store: Arc::clone(&store),
-                        });
-                        Some(Arc::new(DiscordInvoicePoster {
-                            store: Arc::clone(&store),
-                            ops,
-                            http,
-                            approval_channel: serenity::all::ChannelId::new(cid),
-                        }))
-                    }
-                    _ => None,
-                };
-                let inv = Arc::new(invoice::InvoiceScheduler::new(
-                    Arc::clone(&store),
-                    poster,
-                ));
-                let sd = shutdown.clone();
-                tasks.push(tokio::spawn(async move { inv.run(sd).await }));
-
                 // #104 — /loop scheduled-task scheduler. Runs each due loop's
                 // stored prompt through the wiki-ask reasoner and posts the
                 // result back to the originating Discord channel/DM. Requires
@@ -2256,18 +2359,26 @@ async fn main() -> Result<()> {
                     run_stale_draft_sweep(sweep_store, sd).await
                 }));
 
-                // #219 — outbound observer: when the user replies via Gmail
-                // web/mobile, the pending approval card on that thread is
-                // stale; this task superseded those drafts on a 5-min tick.
-                // DEFAULT-OFF — opt in with AUGMENTAGENT_OUTBOUND_OBSERVER=1.
-                // Self-disables on Gmail-less ("--no-email") tenants. Wiki
-                // ingest of the user's outbound is intentionally NOT shipped
-                // here; the observer emits OutboundEvents that a follow-on
-                // can hand to the ingest pipeline (see
-                // `crates/augmentagent-channel-email/src/outbound.rs` doc).
+                // #219/#449 — outbound observer: when the user replies via
+                // Gmail web/mobile, the pending approval card on that thread is
+                // stale; this task supersedes those drafts on a 5-min tick.
+                //
+                // DEFAULT-ON as of #449. It shipped default-off because
+                // `classify_outbound` could not recognize the daemon's own
+                // sends (it compared SENT-folder ids against `actions.messageId`,
+                // which holds *inbound* ids), so turning it on would have
+                // recorded every agent reply as a manual user reply. That is
+                // fixed: sends are now logged to `self_sent_messages` from the
+                // id Gmail returns, so the observer can safely run for real.
+                //
+                // Leaving it off is what made the approval queue accumulate
+                // cards for mail the user had already answered — the carousel
+                // staleness in #449. Opt out with
+                // AUGMENTAGENT_OUTBOUND_OBSERVER=0. Self-disables on
+                // Gmail-less ("--no-email") tenants.
                 let outbound_enabled = std::env::var("AUGMENTAGENT_OUTBOUND_OBSERVER")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
+                    .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+                    .unwrap_or(true);
                 if outbound_enabled && !no_email {
                     let obs_store = Arc::clone(&store);
                     let sd = shutdown.clone();
@@ -2276,10 +2387,26 @@ async fn main() -> Result<()> {
                     }));
                 } else if outbound_enabled && no_email {
                     info!(
-                        "outbound observer requested but --no-email is set; \
+                        "outbound observer enabled but --no-email is set; \
                          observer is Gmail-only and will NOT be started"
                     );
+                } else {
+                    info!(
+                        "outbound observer disabled via AUGMENTAGENT_OUTBOUND_OBSERVER=0; \
+                         approval cards will NOT be retired when you reply from Gmail \
+                         web/mobile"
+                    );
                 }
+
+                // #449 — staleness reconciliation. The user should never have
+                // to tell us a card is stale; the daemon should already know.
+                // Runs once at startup (to clear whatever accumulated while the
+                // observer was off) and then on a slow tick.
+                let reconcile_store = Arc::clone(&store);
+                let sd = shutdown.clone();
+                tasks.push(tokio::spawn(async move {
+                    run_stale_approval_reconcile(reconcile_store, sd).await
+                }));
             }
 
             // Self-healing: backfill any connected-Gmail addresses Composio
@@ -2308,7 +2435,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Wiki { ref op } => match op {
             WikiOp::Lint { out } => run_wiki_lint(&cli, out.clone()).await,
-            WikiOp::Ask { question } => run_wiki_ask(&cli, question.clone()).await,
+            WikiOp::Ask { question, post } => run_wiki_ask(&cli, question.clone(), *post).await,
             WikiOp::Migrate {
                 to,
                 dry_run,
@@ -2328,42 +2455,65 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
+            WikiOp::Sync { dry_run, no_pull } => run_wiki_sync(&cli, *dry_run, *no_pull).await,
         },
         Cmd::Digest {
             since,
             post_discord,
         } => run_digest(&cli, store, since, post_discord).await,
+        Cmd::Research {
+            since_hours,
+            post_discord,
+            dry_run,
+            max_issues,
+        } => research::run_research(store, since_hours, post_discord, dry_run, max_issues).await,
         Cmd::Gmail { ref op } => match op {
-            GmailOp::Search { query, limit, full } => {
-                run_gmail_search(store, query.clone(), *limit, *full).await
+            GmailOp::Search { query, limit, full, account } => {
+                run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await
             }
             GmailOp::Accounts { json } => run_gmail_accounts(store, *json).await,
             GmailOp::Compose {
-                account, to, subject, body, body_file, thread_id, json,
+                account, to, cc, bcc, subject, body, body_file, thread_id, json,
+                post, allow_duplicate, attach, reply_to_message_id, reply_to_from,
+                reply_to_subject, reply_to_body, reply_to_body_file,
             } => {
                 run_gmail_compose(
                     store,
                     account.clone(),
                     to.clone(),
+                    cc.clone(),
+                    bcc.clone(),
                     subject.clone(),
                     body.clone(),
                     body_file.clone(),
                     thread_id.clone(),
                     *json,
+                    *post,
+                    *allow_duplicate,
+                    attach.clone(),
+                    reply_to_message_id.clone(),
+                    reply_to_from.clone(),
+                    reply_to_subject.clone(),
+                    reply_to_body.clone(),
+                    reply_to_body_file.clone(),
                 )
                 .await
             }
             GmailOp::UpdateDraft {
-                account, draft_id, to, subject, body, body_file,
+                account, draft_id, to, cc, bcc, subject, body, body_file, thread_id, attach,
             } => {
                 run_gmail_update_draft(
                     store,
                     account.clone(),
                     draft_id.clone(),
                     to.clone(),
+                    cc.clone(),
+                    bcc.clone(),
                     subject.clone(),
                     body.clone(),
                     body_file.clone(),
+                    thread_id.clone(),
+                    attach.clone(),
                 )
                 .await
             }
@@ -2374,16 +2524,19 @@ async fn main() -> Result<()> {
                 run_gmail_delete_draft(store, account.clone(), draft_id.clone()).await
             }
             GmailOp::SendNow {
-                account, to, subject, body, body_file, thread_id,
+                account, to, cc, bcc, subject, body, body_file, thread_id, attach,
             } => {
                 run_gmail_send_now(
                     store,
                     account.clone(),
                     to.clone(),
+                    cc.clone(),
+                    bcc.clone(),
                     subject.clone(),
                     body.clone(),
                     body_file.clone(),
                     thread_id.clone(),
+                    attach.clone(),
                 )
                 .await
             }
@@ -2505,95 +2658,6 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
-        Cmd::Invoice { ref op } => match op {
-            InvoiceOp::Status => {
-                let g = |k: &str| store.get_invoice_config(k).ok().flatten().unwrap_or_default();
-                println!("recipient_email     : {}", g("recipient_email"));
-                println!("invoice_counter     : {}", store.invoice_counter()?);
-                println!("from_entity         : {}", {
-                    let e = g("from_entity");
-                    if e.is_empty() { "(unset)".into() } else { e }
-                });
-                println!("last_billed_week_end: {}", {
-                    let w = g("last_billed_week_end");
-                    if w.is_empty() { "(never)".into() } else { w }
-                });
-                println!("auto_draft_enabled  : {}", {
-                    if g("auto_draft_enabled") == "true" {
-                        "ON"
-                    } else {
-                        "OFF (scheduler will not post drafts)"
-                    }
-                });
-                Ok(())
-            }
-            InvoiceOp::SetRecipient { email } => {
-                store.set_invoice_config("recipient_email", email)?;
-                println!("invoice recipient set to {email}");
-                Ok(())
-            }
-            InvoiceOp::SetEntity { entity } => {
-                store.set_invoice_config("from_entity", entity)?;
-                println!("invoice sending entity set to {entity}");
-                Ok(())
-            }
-            InvoiceOp::SetAutoDraft { on } => {
-                store.set_invoice_config(
-                    "auto_draft_enabled",
-                    if *on { "true" } else { "false" },
-                )?;
-                println!(
-                    "invoice auto-draft {}",
-                    if *on {
-                        "ENABLED — Sunday scheduler will post a draft for approval"
-                    } else {
-                        "DISABLED"
-                    }
-                );
-                Ok(())
-            }
-            InvoiceOp::Draft { week_end } => {
-                let we = match week_end {
-                    Some(s) => Some(
-                        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                            .context("--week-end must be YYYY-MM-DD")?,
-                    ),
-                    None => None,
-                };
-                let pdf = invoice::generate_pdf(&store, we).await?;
-                println!(
-                    "invoice #{} {}→{} drafted (PDF: {}) — post via Discord `!invoice draft` to queue for approval",
-                    pdf.number,
-                    pdf.week_start,
-                    pdf.week_end,
-                    pdf.pdf_path.display()
-                );
-                Ok(())
-            }
-            InvoiceOp::MarkBilled { week_end } => {
-                chrono::NaiveDate::parse_from_str(week_end, "%Y-%m-%d")
-                    .context("--week-end must be YYYY-MM-DD")?;
-                store.set_invoice_config("last_billed_week_end", week_end)?;
-                println!("marked {week_end} as already billed (scheduler will skip it)");
-                Ok(())
-            }
-            InvoiceOp::ListAccounts => {
-                println!("{}", invoice::list_accounts().await?);
-                Ok(())
-            }
-            InvoiceOp::Run { week_end, dry_run } => {
-                let we = match week_end {
-                    Some(s) => Some(
-                        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                            .context("--week-end must be YYYY-MM-DD")?,
-                    ),
-                    None => None,
-                };
-                let msg = invoice::run_invoice(&store, we, *dry_run).await?;
-                println!("{msg}");
-                Ok(())
-            }
-        },
         // ----- wave-A foundation stubs --------------------------------
         // Each arm calls unimplemented! pointing at the relevant issue so
         // feature PRs know exactly which arm to fill.
@@ -2654,7 +2718,7 @@ async fn main() -> Result<()> {
         Cmd::Calendar { op } => match op {
             CalendarOp::Backfill { .. } => {
                 anyhow::bail!(
-                    "calendar backfill is Phase 2 — see issue #82 §12 ('In' / 'Out')"
+                    "calendar backfill is Phase 2 — see issue #400 (scope ported from archived AugmentAgent#82 §12)"
                 )
             }
             CalendarOp::PollOnce { dry_run } => {
@@ -2663,6 +2727,39 @@ async fn main() -> Result<()> {
             }
             CalendarOp::Subscriptions { json } => {
                 run_calendar_subscriptions(store, json)?;
+                Ok(())
+            }
+            CalendarOp::ListEvents {
+                from,
+                to,
+                days,
+                json,
+            } => {
+                run_calendar_list_events(store, from, to, days, json).await?;
+                Ok(())
+            }
+            CalendarOp::CreateEvent {
+                summary,
+                start,
+                duration_min,
+                attendees,
+                description,
+                meet,
+                account,
+                post,
+            } => {
+                run_calendar_create_event(
+                    store,
+                    summary,
+                    start,
+                    duration_min,
+                    attendees,
+                    description,
+                    meet,
+                    account,
+                    post,
+                )
+                .await?;
                 Ok(())
             }
         },
@@ -2823,6 +2920,11 @@ async fn main() -> Result<()> {
                 println!("{out:#?}");
                 Ok(())
             }
+            MeetupOp::Events {
+                urlname,
+                limit,
+                json,
+            } => run_meetup_events(urlname.clone(), *limit, *json).await,
         },
         Cmd::Gdrive { ref op } => match op {
             GdriveOp::Accounts { json } => run_gdrive_accounts(store, *json),
@@ -3256,61 +3358,126 @@ fn run_ratelimit_caps() -> Result<()> {
     Ok(())
 }
 
+/// Match an account against a `--account` filter (#482): exact entity-id match,
+/// or a case-insensitive substring of the email — so `nolanmak7` and the full
+/// address both select the same account.
+fn account_matches(account: &augmentagent_store::Account, filter: &str) -> bool {
+    let f = filter.trim();
+    if f.is_empty() {
+        return false;
+    }
+    account.entity_id == f
+        || account
+            .email
+            .to_ascii_lowercase()
+            .contains(&f.to_ascii_lowercase())
+}
+
 async fn run_gmail_search(
     store: Arc<Store>,
     query: String,
     limit: u32,
     full: bool,
+    account_filter: Option<String>,
 ) -> Result<()> {
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
-    let accounts = store.get_active_gmail_accounts()?;
+    let mut accounts = store.get_active_gmail_accounts()?;
     if accounts.is_empty() {
         println!("(no active gmail accounts)");
         return Ok(());
     }
 
-    let mut any = false;
-    for account in &accounts {
-        let emails = match gmail
-            .fetch_with_query(&account.entity_id, &query, limit)
-            .await
-        {
-            Ok(es) => es,
-            Err(e) => {
-                eprintln!("account {} search failed: {e}", account.entity_id);
-                continue;
-            }
-        };
-        if emails.is_empty() {
-            continue;
+    // #482: optionally scope to a single account so the user can route around a
+    // throttled one, since search otherwise fans out over every account.
+    if let Some(filter) = account_filter.as_deref() {
+        accounts.retain(|a| account_matches(a, filter));
+        if accounts.is_empty() {
+            println!("(no active gmail account matches --account {filter:?})");
+            return Ok(());
         }
-        any = true;
-        println!(
-            "## account {} ({}) — {} results",
-            account.entity_id,
-            account.email,
-            emails.len()
-        );
-        for (i, email) in emails.iter().enumerate() {
-            println!(
-                "[{:>2}] from: {}\n     subject: {}\n     date: {}\n     messageId: {}",
-                i + 1,
-                email.from,
-                email.subject,
-                email.date,
-                email.message_id
-            );
-            if full {
-                println!("     body:\n{}\n", indent_body(&email.body, 7));
-            }
-        }
-        println!();
     }
-    if !any {
-        println!("(no results)");
+
+    // #482: emit a per-account status line for EVERY account on stdout. A
+    // failure on one account must never silently blank it out — the user has
+    // to be able to tell "0 results" apart from "skipped: <error>", and the
+    // healthy accounts' results always come through regardless.
+    let mut total = 0usize;
+    for account in &accounts {
+        match gmail.fetch_with_query(&account.entity_id, &query, limit).await {
+            Err(e) => {
+                // Also mirror to stderr so it shows up in logs, but stdout is
+                // what the user sees — never a silent skip.
+                eprintln!("account {} search failed: {e}", account.entity_id);
+                println!(
+                    "## account {} ({}) — SKIPPED: {e}",
+                    account.entity_id, account.email
+                );
+            }
+            Ok(emails) if emails.is_empty() => {
+                println!(
+                    "## account {} ({}) — 0 results",
+                    account.entity_id, account.email
+                );
+            }
+            Ok(emails) => {
+                total += emails.len();
+                println!(
+                    "## account {} ({}) — {} results",
+                    account.entity_id,
+                    account.email,
+                    emails.len()
+                );
+                for (i, email) in emails.iter().enumerate() {
+                    // threadId is what compose --thread-id / send-now --thread-id
+                    // actually need; printing only messageId forced callers to
+                    // guess (#381).
+                    println!(
+                        "[{:>2}] from: {}\n     subject: {}\n     date: {}\n     messageId: {}\n     threadId: {}",
+                        i + 1,
+                        email.from,
+                        email.subject,
+                        email.date,
+                        email.message_id,
+                        email.thread_id.as_deref().unwrap_or("-")
+                    );
+                    if full {
+                        println!("     body:\n{}\n", indent_body(&email.body, 7));
+                    }
+                }
+                println!();
+            }
+        }
+    }
+    if total == 0 {
+        println!("(no results across {} account(s))", accounts.len());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod gmail_search_account_filter_tests {
+    use augmentagent_store::Account;
+
+    fn acct(entity_id: &str, email: &str) -> Account {
+        Account {
+            id: entity_id.to_string(),
+            connection_id: None,
+            entity_id: entity_id.to_string(),
+            email: email.to_string(),
+            active: true,
+        }
+    }
+
+    #[test]
+    fn account_matches_by_entity_id_and_email_substring() {
+        let a = acct("augmentagent-123", "nolanmak7@gmail.com"); // pii-ok: synthetic
+        assert!(super::account_matches(&a, "augmentagent-123")); // exact entity id
+        assert!(super::account_matches(&a, "NOLANMAK7@gmail.com")); // pii-ok: full email, case-insensitive
+        assert!(super::account_matches(&a, "nolanmak7")); // pii-ok: email substring (the ergonomic form)
+        assert!(!super::account_matches(&a, "someone-else")); // pii-ok: non-match
+        assert!(!super::account_matches(&a, "")); // empty never matches
+    }
 }
 
 fn indent_body(body: &str, cols: usize) -> String {
@@ -3587,7 +3754,13 @@ fn resolve_gmail_entity_id(
 fn read_body(body: Option<String>, body_file: Option<String>) -> Result<String> {
     match (body, body_file) {
         (Some(_), Some(_)) => anyhow::bail!("pass --body OR --body-file, not both"),
-        (Some(b), None) => Ok(b),
+        // Inline --body values get backslash escapes interpreted (#418):
+        // callers (humans and the wiki-ask agent alike) write
+        // `--body "line1\n\nline2"`, and in shell double quotes that \n is a
+        // literal backslash+n which Gmail then DISPLAYS as text — the "ugly
+        // formatting" bug. No real email body wants a visible backslash-n.
+        // File/stdin bodies are passed through verbatim.
+        (Some(b), None) => Ok(unescape_body(&b)),
         (None, Some(p)) => {
             if p == "-" {
                 let mut buf = String::new();
@@ -3600,6 +3773,50 @@ fn read_body(body: Option<String>, body_file: Option<String>) -> Result<String> 
         }
         (None, None) => anyhow::bail!("either --body or --body-file is required"),
     }
+}
+
+/// Interpret the escape sequences `\n`, `\t`, and `\r\n`→`\n` in an inline
+/// `--body` string (#418). `\\` escapes a backslash so a deliberate literal
+/// `\n` remains expressible as `\\n`. Anything else after a backslash is
+/// passed through untouched.
+fn unescape_body(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('n') => {
+                chars.next();
+                out.push('\n');
+            }
+            Some('t') => {
+                chars.next();
+                out.push('\t');
+            }
+            // \r\n (escaped CRLF) collapses to one newline; a lone \r too.
+            Some('r') => {
+                chars.next();
+                if chars.peek() == Some(&'\\') {
+                    let mut ahead = chars.clone();
+                    ahead.next();
+                    if ahead.peek() == Some(&'n') {
+                        chars.next();
+                        chars.next();
+                    }
+                }
+                out.push('\n');
+            }
+            Some('\\') => {
+                chars.next();
+                out.push('\\');
+            }
+            _ => out.push('\\'),
+        }
+    }
+    out
 }
 
 async fn run_gmail_accounts(store: Arc<Store>, json: bool) -> Result<()> {
@@ -3629,24 +3846,198 @@ async fn run_gmail_accounts(store: Arc<Store>, json: bool) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+/// #417 — Upload `--attach` (when given) to Composio's attachment store,
+/// printing what was attached so the operator can SEE it happened. Fails
+/// loudly on a missing/unreadable file before any draft is created.
+async fn upload_attach_if_given(
+    gmail: &ComposioClient,
+    attach: Option<PathBuf>,
+) -> Result<Option<Attachment>> {
+    let Some(path) = attach else { return Ok(None) };
+    let meta = std::fs::metadata(&path)
+        .with_context(|| format!("attachment not found: {}", path.display()))?;
+    let att = gmail
+        .upload_attachment("GMAIL_CREATE_EMAIL_DRAFT", &path)
+        .await
+        .context("attachment upload failed")?;
+    println!(
+        "attached: {} ({} KB, {})",
+        att.name,
+        meta.len().div_ceil(1024),
+        att.mimetype
+    );
+    Ok(Some(att))
+}
+
+/// Canonicalize a user-supplied `--thread-id` before any draft is created
+/// (#381). Accepts a Gmail threadId or a messageId (resolved to its thread);
+/// fails with an actionable message when the id isn't in `account_email`'s
+/// mailbox — the raw Gmail 404 ("Requested entity was not found") gave the
+/// caller nothing to act on.
+async fn resolve_compose_thread_id(
+    gmail: &ComposioClient,
+    entity_id: &str,
+    account_email: &str,
+    thread_id: Option<String>,
+) -> Result<Option<String>> {
+    let Some(t) = thread_id.filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    let resolved = gmail.resolve_thread_id(entity_id, &t).await.with_context(|| {
+        format!(
+            "--thread-id {t} was not found in account {account_email}. Pass the threadId \
+             printed by `gmail search` (a messageId also works), and make sure --account \
+             is the account that actually contains the thread — ids from one mailbox \
+             don't exist in another."
+        )
+    })?;
+    Ok(Some(resolved))
+}
+
+/// #439 — flatten repeated `--to`/`--cc`/`--bcc` values (each possibly a
+/// comma-separated list, display names allowed) into bare addresses, failing
+/// fast on anything that doesn't look like an address rather than letting
+/// Composio reject the whole draft after the attachment/thread work is done.
+fn normalize_recipients(flag: &str, values: &[String]) -> Result<Vec<String>> {
+    let list: Vec<String> = values
+        .iter()
+        .flat_map(|v| augmentagent_channel_email::gmail::split_recipients(v))
+        .collect();
+    for addr in &list {
+        anyhow::ensure!(
+            addr.contains('@') && !addr.contains(char::is_whitespace),
+            "{flag} value {addr:?} doesn't look like an email address"
+        );
+    }
+    Ok(list)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_gmail_compose(
     store: Arc<Store>,
     account: Option<String>,
-    to: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
     subject: String,
     body: Option<String>,
     body_file: Option<String>,
     thread_id: Option<String>,
     json: bool,
+    post: bool,
+    allow_duplicate: bool,
+    attach: Option<PathBuf>,
+    reply_to_message_id: Option<String>,
+    reply_to_from: Option<String>,
+    reply_to_subject: Option<String>,
+    reply_to_body: Option<String>,
+    reply_to_body_file: Option<String>,
 ) -> Result<()> {
+    // Normalize recipients up front (#439): `to` becomes one canonical
+    // comma-joined string of bare addresses. Everything downstream — the
+    // duplicate guard, the approval card's From field (which the Revise
+    // redraft round-trips back into create_draft), the JSON output — carries
+    // the full list, and the Composio client re-splits it into
+    // recipient_email + extra_recipients at the wire.
+    let to = normalize_recipients("--to", &to)?;
+    anyhow::ensure!(!to.is_empty(), "--to requires at least one email address");
+    let to = to.join(", ");
+    let cc = normalize_recipients("--cc", &cc)?;
+    let bcc = normalize_recipients("--bcc", &bcc)?;
     let body_str = read_body(body, body_file)?;
+    // Validate the --post flag pairing BEFORE any Gmail write, so a usage
+    // error can't strand an orphan draft in the mailbox (#412).
+    if post
+        && thread_id.as_deref().map_or(false, |t| !t.is_empty())
+            != reply_to_message_id.as_deref().map_or(false, |m| !m.is_empty())
+    {
+        anyhow::bail!(
+            "--thread-id and --reply-to-message-id go together: pass both (reply card) \
+             or neither (new-email card)"
+        );
+    }
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
+    // #419 — duplicate guard, also BEFORE any Gmail write. Concurrent or
+    // repeated asks for the same email produced 3 drafts + 2 cards in one
+    // observed session; refuse the repeat and point at the existing card.
+    if post && !allow_duplicate {
+        // `to` is already the normalized bare-address list (#439), so it IS
+        // the guard key — same single-address behavior as before, and a
+        // multi-recipient repeat matches the earlier card's identical list.
+        let bare_to = to.clone();
+        if let Some((action_id, draft_id)) = store
+            .find_pending_action_for_recipient(&entity_id, &bare_to, &subject)
+            .context("duplicate-guard lookup")?
+        {
+            anyhow::bail!(
+                "a pending approval card already exists for {bare_to} / \"{subject}\" \
+                 (action {action_id}, draft {draft}). Revise it from the card, or update \
+                 the draft in place with `gmail update-draft --draft-id {draft} ...` — \
+                 the card follows the new draft automatically. Pass --allow-duplicate \
+                 to force a second card.",
+                draft = draft_id.as_deref().unwrap_or("<none>")
+            );
+        }
+    }
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
+    let attachment = upload_attach_if_given(&gmail, attach).await?;
+    let thread_id = resolve_compose_thread_id(&gmail, &entity_id, &email, thread_id).await?;
     let draft_id = gmail
-        .create_draft(&entity_id, &to, &subject, &body_str, thread_id.as_deref())
+        .create_draft_with_attachment(
+            &entity_id,
+            &to,
+            &subject,
+            &body_str,
+            thread_id.as_deref(),
+            attachment.as_ref(),
+            &cc,
+            &bcc,
+        )
         .await
         .context("create_draft via Composio failed")?;
+    if post {
+        post_reply_approval_card(
+            &store,
+            &entity_id,
+            &email,
+            &draft_id,
+            &to,
+            &cc,
+            &bcc,
+            &subject,
+            &body_str,
+            attachment.as_ref().map(|a| a.name.as_str()),
+            thread_id.as_deref(),
+            reply_to_message_id.as_deref(),
+            reply_to_from.as_deref(),
+            reply_to_subject.as_deref(),
+            reply_to_body.as_deref(),
+            reply_to_body_file.as_deref(),
+        )
+        .await?;
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "draft_id": draft_id,
+                    "account": email,
+                    "entity_id": entity_id,
+                    "to": to,
+                    "cc": cc,
+                    "bcc": bcc,
+                    "subject": subject,
+                    "thread_id": thread_id,
+                    "attachment": attachment.as_ref().map(|a| a.name.clone()),
+                    "approval_card_posted": true,
+                })
+            );
+        } else {
+            println!("approval card posted to Discord for draft {draft_id}");
+        }
+        return Ok(());
+    }
     if json {
         println!(
             "{}",
@@ -3655,8 +4046,11 @@ async fn run_gmail_compose(
                 "account": email,
                 "entity_id": entity_id,
                 "to": to,
+                "cc": cc,
+                "bcc": bcc,
                 "subject": subject,
                 "thread_id": thread_id,
+                "attachment": attachment.as_ref().map(|a| a.name.clone()),
                 "open_in_gmail": format!("https://mail.google.com/mail/u/0/#drafts?compose={draft_id}"),
             })
         );
@@ -3664,31 +4058,322 @@ async fn run_gmail_compose(
         println!("draft created: id={draft_id}");
         println!("account: {email}");
         println!("to:      {to}");
+        if !cc.is_empty() {
+            println!("cc:      {}", cc.join(", "));
+        }
+        if !bcc.is_empty() {
+            println!("bcc:     {}", bcc.join(", "));
+        }
         println!("subject: {subject}");
+        if let Some(a) = &attachment {
+            println!("attachment: {} ({})", a.name, a.mimetype);
+        }
         println!("open in gmail: https://mail.google.com/mail/u/0/#drafts?compose={draft_id}");
     }
     Ok(())
 }
 
+/// #352 / #412 — Post a Discord approval card for a draft the wiki-ask agent
+/// just composed in a chat session. Writes the same `actions`-table shape as
+/// the auto-triage path so the daemon's Approve/Revise/Skip handlers don't
+/// need to distinguish where the card came from. Upserts an `emails` row when
+/// one isn't already present so the Revise redraft path has the original body
+/// to work against.
+///
+/// Two shapes (#412):
+/// - **Reply**: `--thread-id` + `--reply-to-message-id` present — the card is
+///   anchored to the real inbound message, exactly the #352 flow.
+/// - **New email**: both absent — there is no inbound, so the action is keyed
+///   on a synthetic `compose:<draft_id>` message id (the same convention the
+///   compose fan-out uses), the card's From field shows the recipient, and
+///   Revise redrafts against the draft body alone. Approve → send_draft,
+///   Skip → delete_draft, identical to replies.
+#[allow(clippy::too_many_arguments)]
+async fn post_reply_approval_card(
+    store: &Store,
+    entity_id: &str,
+    account_email: &str,
+    draft_id: &str,
+    to: &str,
+    cc: &[String],
+    bcc: &[String],
+    out_subject: &str,
+    draft_body: &str,
+    attachment_name: Option<&str>,
+    thread_id: Option<&str>,
+    reply_to_message_id: Option<&str>,
+    reply_to_from: Option<&str>,
+    reply_to_subject: Option<&str>,
+    reply_to_body: Option<&str>,
+    reply_to_body_file: Option<&str>,
+) -> Result<()> {
+    use augmentagent_store::Email as StoreEmail;
+
+    let thread = thread_id.filter(|t| !t.is_empty());
+    let reply_msg_id = reply_to_message_id.filter(|s| !s.is_empty());
+    // A reply anchor only makes sense as a pair: a message id without its
+    // thread (or vice versa) would post a card whose Approve sends an
+    // unthreaded reply while claiming otherwise. run_gmail_compose validates
+    // this BEFORE creating the draft; re-check defensively for other callers.
+    anyhow::ensure!(
+        thread.is_some() == reply_msg_id.is_some(),
+        "--thread-id and --reply-to-message-id go together: pass both (reply card) \
+         or neither (new-email card)"
+    );
+    // New-email cards (#412): key the action on a synthetic message id so the
+    // approve/skip/revise handlers — which join actions→emails on messageId —
+    // find the upserted row below. `compose:` prefix matches the fan-out
+    // convention and can never collide with a real Gmail hex id.
+    let synthetic_msg_id = format!("compose:{draft_id}");
+    let msg_id: &str = reply_msg_id.unwrap_or(&synthetic_msg_id);
+    let token = std::env::var("DISCORD_BOT_TOKEN")
+        .context("DISCORD_BOT_TOKEN required for --post (set it in the daemon's .env)")?;
+    let cid: u64 = std::env::var("DISCORD_CHANNEL_ID")
+        .context("DISCORD_CHANNEL_ID required for --post")?
+        .parse()
+        .context("DISCORD_CHANNEL_ID must be numeric")?;
+
+    let original_body = match (reply_to_body, reply_to_body_file) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--reply-to-body and --reply-to-body-file are mutually exclusive");
+        }
+        (Some(b), None) => b.to_string(),
+        (None, Some(p)) => read_body(None, Some(p.to_string()))?,
+        (None, None) => String::new(),
+    };
+    let original_from = reply_to_from.unwrap_or(to).to_string();
+    let stripped = out_subject
+        .strip_prefix("Re:")
+        .or_else(|| out_subject.strip_prefix("re:"))
+        .or_else(|| out_subject.strip_prefix("RE:"))
+        .unwrap_or(out_subject)
+        .trim_start()
+        .to_string();
+    let original_subject = reply_to_subject
+        .map(str::to_string)
+        .unwrap_or_else(|| if stripped.is_empty() { out_subject.to_string() } else { stripped });
+
+    // Upsert an inbound row when the daemon hasn't already ingested this
+    // message. The Revise handler reads `emails.body` to redraft against the
+    // original; without a row, revise has nothing to redraft. When the row
+    // already exists (the auto-triage path saw it first), upsert refreshes
+    // its bytes — same shape the email channel writes. For a new-email card
+    // the row is purely synthetic (empty body, no thread): it exists so the
+    // actions→emails join resolves and Approve can find the entity id.
+    let inbound = StoreEmail {
+        message_id: msg_id.to_string(),
+        thread_id: thread.map(str::to_string),
+        from: original_from.clone(),
+        subject: original_subject.clone(),
+        body: original_body.clone(),
+        date: String::new(),
+        account_entity_id: Some(entity_id.to_string()),
+        platform: "gmail".into(),
+        kind: "dm".into(),
+    };
+    store
+        .upsert_email(&inbound)
+        .context("upsert inbound email for action linkage")?;
+
+    let action_id = store
+        .log_action(
+            msg_id,
+            thread,
+            &original_from,
+            &original_subject,
+            Some(&original_body),
+            Some(draft_body),
+            ActionStatus::Pending,
+        )
+        .context("log action row")?;
+    store
+        .set_action_draft_id(&action_id, draft_id)
+        .context("set action draft id")?;
+    // #473 — record the envelope the draft was actually created with, so the
+    // Revise redraft re-sends to the SAME To/cc/bcc instead of falling back
+    // to the card's From (the original sender on reply cards — which dropped
+    // an overridden To and every cc/bcc). Best-effort: a failure leaves the
+    // pre-#473 from-based revise behavior, never blocks the card.
+    if let Err(e) = store.set_action_envelope(
+        &action_id,
+        Some(to),
+        Some(&cc.join(", ")),
+        Some(&bcc.join(", ")),
+    ) {
+        tracing::warn!(action_id, "set_action_envelope after compose card failed: {e}");
+    }
+
+    let http = serenity::http::Http::new(&token);
+    let channel = serenity::all::ChannelId::new(cid);
+    // The card must SHOW the attachment (#417 — "can't see they've been
+    // attached") and any cc/bcc (#439 — "render all recipients"). Display
+    // only: the actions row keeps the clean body so the Revise redraft
+    // prompt isn't polluted with the marker lines.
+    let mut markers = String::new();
+    // #473 — when the envelope To differs from the card's From display (a
+    // reply card whose routing was overridden, e.g. the intro pattern:
+    // reply-to Josh, To Omer), surface it: the whole bug was body and
+    // envelope disagreeing with nothing on the card to show it.
+    if !original_from.eq_ignore_ascii_case(to) {
+        markers.push_str(&format!("\n[to: {to}]"));
+    }
+    if !cc.is_empty() {
+        markers.push_str(&format!("\n[cc: {}]", cc.join(", ")));
+    }
+    if !bcc.is_empty() {
+        markers.push_str(&format!("\n[bcc: {}]", bcc.join(", ")));
+    }
+    if let Some(name) = attachment_name {
+        markers.push_str(&format!("\n[attachment: {name}]"));
+    }
+    let card_body = if markers.is_empty() {
+        draft_body.to_string()
+    } else {
+        format!("{draft_body}\n{markers}")
+    };
+    let card = approval_message(&action_id, &inbound, &card_body, 0);
+    channel
+        .send_message(&http, card)
+        .await
+        .context("send approval card to Discord")?;
+
+    // Mark this action as the ACTIVE nudge (count 0 → 1). Without this the
+    // daemon's serial-queue scheduler sees a pending row with nudgeCount=0
+    // and promotes it — posting a duplicate card for the draft the user is
+    // already looking at (#412; latent since #352).
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0i64);
+    if let Err(e) =
+        store.record_nudge(&action_id, now_ms + augmentagent_store::NUDGE_INTERVAL_MS)
+    {
+        tracing::warn!(action_id, "record_nudge after compose card failed: {e}");
+    }
+
+    let _ = account_email;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_gmail_update_draft(
     store: Arc<Store>,
     account: Option<String>,
     draft_id: String,
-    to: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
     subject: String,
     body: Option<String>,
     body_file: Option<String>,
+    thread_id: Option<String>,
+    attach: Option<PathBuf>,
 ) -> Result<()> {
+    let to = normalize_recipients("--to", &to)?;
+    anyhow::ensure!(!to.is_empty(), "--to requires at least one email address");
+    let to = to.join(", ");
+    let cc = normalize_recipients("--cc", &cc)?;
+    let bcc = normalize_recipients("--bcc", &bcc)?;
     let body_str = read_body(body, body_file)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
-    gmail
-        .update_draft(&entity_id, &draft_id, &to, &subject, &body_str)
+    let attachment = upload_attach_if_given(&gmail, attach).await?;
+    // Update = create replacement + delete old (#382). Keep the reply
+    // threaded: use the explicit --thread-id when given, otherwise detect
+    // the old draft's thread. Detection is best-effort — a lookup failure
+    // downgrades to an unthreaded draft rather than blocking the update.
+    let thread_id = match thread_id.filter(|t| !t.is_empty()) {
+        Some(t) => resolve_compose_thread_id(&gmail, &entity_id, &email, Some(t)).await?,
+        None => match gmail.get_draft_thread_id(&entity_id, &draft_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "warning: could not determine draft {draft_id}'s thread ({e}); \
+                     the replacement draft will start a new thread"
+                );
+                None
+            }
+        },
+    };
+    let new_id = gmail
+        .update_draft_with_attachment(
+            &entity_id,
+            &draft_id,
+            &to,
+            &subject,
+            &body_str,
+            thread_id.as_deref(),
+            attachment.as_ref(),
+            &cc,
+            &bcc,
+        )
         .await
-        .context("update_draft via Composio failed")?;
-    println!("draft updated: id={draft_id} account={email}");
+        .context("update_draft (create replacement + delete old) via Composio failed")?;
+    // #419 card-sync — any pending approval card pointing at the replaced
+    // draft would otherwise Approve a deleted id. Repoint it at the new
+    // draft and refresh the stored body so Revise sees the current text.
+    match store.find_pending_action_ids_by_draft_id(&draft_id) {
+        Ok(ids) => {
+            for action_id in ids {
+                if let Err(e) = store.set_action_draft_id(&action_id, &new_id) {
+                    eprintln!("warning: card {action_id} not repointed to new draft: {e}");
+                    continue;
+                }
+                if let Err(e) = store.set_action_draft_body(&action_id, &body_str) {
+                    eprintln!("warning: card {action_id} body not refreshed: {e}");
+                }
+                // #473 — the replacement draft's envelope is now the card's
+                // envelope; keep the Revise carry-through in step with it.
+                if let Err(e) = store.set_action_envelope(
+                    &action_id,
+                    Some(&to),
+                    Some(&cc.join(", ")),
+                    Some(&bcc.join(", ")),
+                ) {
+                    eprintln!("warning: card {action_id} envelope not refreshed: {e}");
+                }
+                println!("approval card {action_id} now follows the new draft");
+            }
+        }
+        Err(e) => eprintln!("warning: card-sync lookup failed: {e}"),
+    }
+    println!("draft updated: new id={new_id} (replaces {draft_id}) account={email}");
+    if let Some(t) = thread_id {
+        println!("thread:  {t}");
+    }
+    println!("open in gmail: https://mail.google.com/mail/u/0/#drafts?compose={new_id}");
     Ok(())
+}
+
+/// #449 — remember that WE sent this message, so the OutboundObserver's SENT
+/// scan skips it instead of recording it as a reply the user wrote by hand.
+///
+/// Every daemon send path must funnel through here. Missing a call site is not
+/// cosmetic: the observer would treat that send as the user replying, supersede
+/// the live drafts on the thread, and make the already-replied guard silently
+/// suppress every future draft on it.
+///
+/// Best-effort by construction — the mail has already gone out by the time we
+/// are called, so a bookkeeping failure must never surface as a send failure.
+/// It is logged loudly instead.
+fn record_self_send(
+    store: &Store,
+    sent_message_id: Option<&str>,
+    thread_id: Option<&str>,
+    entity_id: Option<&str>,
+    action_id: Option<&str>,
+) {
+    let Some(mid) = sent_message_id.filter(|s| !s.is_empty()) else {
+        return;
+    };
+    if let Err(e) = store.record_self_sent_message(mid, thread_id, entity_id, action_id) {
+        tracing::warn!(
+            message_id = mid,
+            "failed to record self-sent message; the outbound observer may \
+             misread this send as a manual user reply (#449): {e:#}"
+        );
+    }
 }
 
 async fn run_gmail_send_draft(
@@ -3699,10 +4384,11 @@ async fn run_gmail_send_draft(
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
-    gmail
+    let sent_id = gmail
         .send_draft(&entity_id, &draft_id)
         .await
         .context("send_draft via Composio failed")?;
+    record_self_send(&store, sent_id.as_deref(), None, Some(&entity_id), None);
     println!("sent: draft={draft_id} account={email}");
     Ok(())
 }
@@ -3723,28 +4409,62 @@ async fn run_gmail_delete_draft(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_gmail_send_now(
     store: Arc<Store>,
     account: Option<String>,
-    to: String,
+    to: Vec<String>,
+    cc: Vec<String>,
+    bcc: Vec<String>,
     subject: String,
     body: Option<String>,
     body_file: Option<String>,
     thread_id: Option<String>,
+    attach: Option<PathBuf>,
 ) -> Result<()> {
+    let to = normalize_recipients("--to", &to)?;
+    anyhow::ensure!(!to.is_empty(), "--to requires at least one email address");
+    let to = to.join(", ");
+    let cc = normalize_recipients("--cc", &cc)?;
+    let bcc = normalize_recipients("--bcc", &bcc)?;
     let body_str = read_body(body, body_file)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
+    let attachment = upload_attach_if_given(&gmail, attach).await?;
+    let thread_id = resolve_compose_thread_id(&gmail, &entity_id, &email, thread_id).await?;
     let draft_id = gmail
-        .create_draft(&entity_id, &to, &subject, &body_str, thread_id.as_deref())
+        .create_draft_with_attachment(
+            &entity_id,
+            &to,
+            &subject,
+            &body_str,
+            thread_id.as_deref(),
+            attachment.as_ref(),
+            &cc,
+            &bcc,
+        )
         .await
         .context("create_draft (send-now) failed")?;
-    gmail
+    let sent_id = gmail
         .send_draft(&entity_id, &draft_id)
         .await
         .context("send_draft (send-now) failed")?;
-    println!("sent: account={email} to={to} subject=\"{subject}\" draft_id={draft_id}");
+    record_self_send(
+        &store,
+        sent_id.as_deref(),
+        thread_id.as_deref(),
+        Some(&entity_id),
+        None,
+    );
+    print!("sent: account={email} to={to}");
+    if !cc.is_empty() {
+        print!(" cc={}", cc.join(", "));
+    }
+    if !bcc.is_empty() {
+        print!(" bcc={}", bcc.join(", "));
+    }
+    println!(" subject=\"{subject}\" draft_id={draft_id}");
     Ok(())
 }
 
@@ -3782,9 +4502,9 @@ async fn backfill_gmail_emails(store: &Store, only_missing: bool) -> Result<Vec<
 /// #219 — periodically observe outbound (SENT) Gmail and supersede stale
 /// pending drafts on threads the user replied to out-of-band.
 ///
-/// DEFAULT-OFF: gated on `AUGMENTAGENT_OUTBOUND_OBSERVER=1`. The caller
-/// already checks the env var before spawning this — this function assumes
-/// it should run. Tick interval defaults to 5 min, override via
+/// DEFAULT-ON as of #449 (opt out with `AUGMENTAGENT_OUTBOUND_OBSERVER=0`).
+/// The caller already checks the env var before spawning this — this function
+/// assumes it should run. Tick interval defaults to 5 min, override via
 /// `AUGMENTAGENT_OUTBOUND_OBSERVER_INTERVAL_SECS`. Failure of a single
 /// `poll_once` is logged and swallowed; the daemon must never crash on a
 /// transient Composio hiccup. Wiki-ingest of the emitted events is
@@ -3797,8 +4517,9 @@ async fn run_outbound_observer(
         Ok(v) if !v.is_empty() => v,
         _ => {
             warn!(
-                "outbound observer requested (AUGMENTAGENT_OUTBOUND_OBSERVER=1) but \
-                 COMPOSIO_API_KEY is unset — observer NOT started"
+                "outbound observer enabled but COMPOSIO_API_KEY is unset — \
+                 observer NOT started; approval cards will not be retired when \
+                 you reply from Gmail web/mobile"
             );
             return Ok(());
         }
@@ -3811,10 +4532,7 @@ async fn run_outbound_observer(
     let gmail = Arc::new(ComposioClient::new(api_key));
     let observer = OutboundObserver::new(store, gmail, 200);
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
-    info!(
-        interval_secs,
-        "outbound observer started (AUGMENTAGENT_OUTBOUND_OBSERVER=1)"
-    );
+    info!(interval_secs, "outbound observer started");
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -3905,6 +4623,147 @@ fn sweep_stale_drafts_tick(store: &Store, days: Option<i64>) -> Result<Vec<Strin
 /// When the cutoff is `0` (disabled) the function logs the disabled
 /// state once and returns immediately — no idle tokio task burning a
 /// timer slot. This is the vacation-mode toggle.
+/// #449 — how often the staleness reconciliation re-checks the queue. The
+/// observer supersedes threads the instant it sees a user reply, so this loop
+/// is the slow backstop for the rules the observer can't see (bulk senders) and
+/// for anything that accumulated while the observer was off. 30 minutes.
+const STALE_RECONCILE_INTERVAL_SECS: u64 = 1800;
+
+/// #449 — retire approval cards that no longer deserve the user's attention,
+/// without being asked to.
+///
+/// Two rules, both decidable from state we already hold:
+///
+/// 1. **The user already answered the thread.** `outbound_thread_log` (fed by
+///    the OutboundObserver) knows every reply the user sent from Gmail
+///    web/mobile. A pending card on such a thread is asking the user to answer
+///    mail they have already answered.
+/// 2. **The sender is a bulk/marketing address.** These should never have been
+///    drafted at all (#451). Under the tightened `is_human_sender` rules they
+///    no longer will be — but ~100 of them are already sitting in the queue,
+///    and they are what pushed it past the old backpressure cap and starved
+///    real threads of drafts (#450).
+///
+/// Superseding (not deleting) keeps the audit trail: the row stays, with the
+/// reason in `errorMessage`, and simply stops being served by the carousel.
+async fn run_stale_approval_reconcile(
+    store: Arc<Store>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let mut ticker = tokio::time::interval(Duration::from_secs(STALE_RECONCILE_INTERVAL_SECS));
+    info!(
+        interval_secs = STALE_RECONCILE_INTERVAL_SECS,
+        "stale approval reconciliation started"
+    );
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("stale approval reconciliation: shutdown signal received");
+                return Ok(());
+            }
+            // Fires immediately on the first tick, which is what clears the
+            // backlog left behind by the observer having been off.
+            _ = ticker.tick() => {
+                match reconcile_stale_approvals_tick(&store) {
+                    Ok(0) => {}
+                    Ok(n) => info!(
+                        retired = n,
+                        "stale approval reconciliation: retired stale cards"
+                    ),
+                    Err(e) => warn!("stale approval reconciliation failed: {e:#}"),
+                }
+            }
+        }
+    }
+}
+
+/// One reconciliation pass. Returns how many cards were retired. Split out from
+/// the loop so it is directly unit-testable.
+fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
+    let pending = store.pending_actions_for_reconcile()?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let mut bulk_ids: Vec<String> = Vec::new();
+    let mut empty_ids: Vec<String> = Vec::new();
+    let mut answered_threads: Vec<String> = Vec::new();
+
+    for row in &pending {
+        // Rule 3 (#484) — the card has no draft to approve. This happens when a
+        // draft was published with an empty body (historically the retry path
+        // did this on a triage failure, fixed in #454; kept as a rule because
+        // ANY path that leaves an empty draft produces a permanently-stale card
+        // — there is nothing to approve, so it never drains and just sits in the
+        // carousel until the 7-day expire). Retire it regardless of sender.
+        if row.draft_empty {
+            info!(
+                action_id = %row.id,
+                from = %row.from_email,
+                subject = %row.subject,
+                "stale approval: retiring card with no draft to approve"
+            );
+            empty_ids.push(row.id.clone());
+            continue;
+        }
+        // Rule 2 — bulk/marketing sender. Cheap, purely local, so check first.
+        if !is_human_sender(&row.from_email, &row.body) {
+            info!(
+                action_id = %row.id,
+                from = %row.from_email,
+                subject = %row.subject,
+                "stale approval: retiring card from bulk/automated sender"
+            );
+            bulk_ids.push(row.id.clone());
+            continue;
+        }
+        // Rule 1 — the user already replied on this thread. `i64::MIN` as the
+        // "after" bound asks the broad question ("any user reply on this thread
+        // at all?"), which is the right one for a card that is still sitting
+        // unanswered in the queue: if the user has spoken on this thread since
+        // we raised it, the draft we are holding is stale by definition.
+        let Some(tid) = row.thread_id.as_deref() else {
+            continue;
+        };
+        match store.thread_has_user_reply_after(tid, i64::MIN) {
+            Ok(true) => {
+                info!(
+                    action_id = %row.id,
+                    thread = %tid,
+                    from = %row.from_email,
+                    "stale approval: retiring card, user already replied on thread"
+                );
+                answered_threads.push(tid.to_string());
+            }
+            Ok(false) => {}
+            Err(e) => warn!(
+                action_id = %row.id,
+                thread = %tid,
+                "stale approval: thread_has_user_reply_after failed: {e:#}"
+            ),
+        }
+    }
+
+    let mut retired = store.mark_pending_superseded_by_ids(
+        &bulk_ids,
+        "superseded: bulk/automated sender, no reply needed",
+    )?;
+    retired += store.mark_pending_superseded_by_ids(
+        &empty_ids,
+        "superseded: no draft to approve (empty draft body)",
+    )?;
+    answered_threads.sort();
+    answered_threads.dedup();
+    for tid in &answered_threads {
+        let ids = store.mark_pending_drafts_superseded_by_thread(
+            tid,
+            "superseded: you already replied on this thread",
+        )?;
+        retired += ids.len();
+    }
+    Ok(retired)
+}
+
 async fn run_stale_draft_sweep(
     store: Arc<Store>,
     shutdown: CancellationToken,
@@ -4100,7 +4959,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// Post the digest text to DISCORD_CHANNEL_ID using a bare serenity::Http
 /// client (no gateway, no state). Works as a one-shot from a cron-like job.
 /// Splits on paragraph boundaries for Discord's 2000-char limit.
-async fn post_digest_to_discord(digest: &str) -> Result<()> {
+pub(crate) async fn post_digest_to_discord(digest: &str) -> Result<()> {
     use serenity::all::{ChannelId, CreateMessage};
     use serenity::http::Http;
 
@@ -4187,7 +5046,7 @@ fn extract_resume_text(path: &std::path::Path) -> Result<String> {
     }
 }
 
-async fn run_wiki_ask(cli: &Cli, question: String) -> Result<()> {
+async fn run_wiki_ask(cli: &Cli, question: String, post: bool) -> Result<()> {
     let wiki_root = cli
         .wiki_dir
         .clone()
@@ -4197,8 +5056,61 @@ async fn run_wiki_ask(cli: &Cli, question: String) -> Result<()> {
     let repo_root = std::env::current_dir().context("current_dir")?;
     let opts = augmentagent_channel_core::reasoner::ask_opts(wiki_root.clone(), repo_root);
     info!(wiki = %wiki_root.display(), "wiki ask");
-    let answer = reasoner.call(&opts, &question).await?;
+    // #389 — same owner-rules preamble the Discord query path injects, so
+    // CLI asks behave identically (and the injection is testable headless).
+    let question = match owner_rules_block(&wiki_root) {
+        Some(rules) => format!(
+            "<owner_rules>\nStanding rules from the owner (wiki/about/me.md). These are \
+             HIGHEST PRIORITY: when they conflict with any default behavior in your \
+             instructions, the owner's rules win. Apply them on the first attempt, \
+             without being asked.\n\n{rules}</owner_rules>\n\n{question}"
+        ),
+        None => question,
+    };
+    // #446 — `call_transcript`, not `call`: the ask prompt puts the deliverable
+    // first and the wiki-filing receipt last, and `call` keeps only the final
+    // text block, so the receipt would overwrite the answer.
+    let answer = reasoner.call_transcript(&opts, &question).await?;
     println!("{answer}");
+
+    // #440 — `--post` pushes the answer through the same ATTACH-marker
+    // pipeline the Discord query path uses, via a one-shot HTTP client (no
+    // gateway). This is the CLI end-to-end for outbound file delivery: a
+    // real message, with real attachments, lands in the approval channel.
+    if post {
+        use augmentagent_approval_discord::attachments::prepare_answer_delivery;
+        use serenity::builder::CreateMessage;
+        use serenity::model::id::ChannelId;
+
+        let token =
+            std::env::var("DISCORD_BOT_TOKEN").context("DISCORD_BOT_TOKEN required for --post")?;
+        let channel: u64 = std::env::var("DISCORD_CHANNEL_ID")
+            .context("DISCORD_CHANNEL_ID required for --post")?
+            .parse()
+            .context("DISCORD_CHANNEL_ID must be numeric")?;
+        let http = serenity::http::Http::new(&token);
+
+        let (text, attachments) = prepare_answer_delivery(&answer, Some(&wiki_root)).await;
+        let n_files = attachments.len();
+        let chunks = augmentagent_approval_discord::chunk_for_discord(&text);
+        let total = chunks.len();
+        for (idx, chunk) in chunks.into_iter().enumerate() {
+            let mut builder = CreateMessage::new().content(chunk);
+            if idx == 0 && !attachments.is_empty() {
+                builder = builder.add_files(attachments.iter().cloned());
+            }
+            ChannelId::new(channel)
+                .send_message(&http, builder)
+                .await
+                .with_context(|| format!("post answer chunk {}/{total} to discord", idx + 1))?;
+            if idx + 1 < total {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+        println!(
+            "posted to discord channel {channel}: {total} message(s), {n_files} attachment(s)"
+        );
+    }
     Ok(())
 }
 
@@ -4579,6 +5491,203 @@ async fn git_commit_batch(
     Ok(())
 }
 
+/// Files that must NEVER reach the private mirror: the daemon's SQLite
+/// store (+ WAL/SHM sidecars), secrets, and per-page lock files. The
+/// wiki-local `.gitignore` already excludes these; the sync guard is
+/// belt-and-suspenders against an accidental `git add -f` or a botched
+/// `.gitignore` edit (KB sync #4).
+const WIKI_SYNC_FORBIDDEN: &[&str] = &["data.db", "data.db-wal", "data.db-shm", ".env"];
+
+fn wiki_sync_check_forbidden(list: &str, what: &str) -> Result<()> {
+    for f in list.lines() {
+        let f = f.trim();
+        if f.is_empty() {
+            continue;
+        }
+        let base = f.rsplit('/').next().unwrap_or(f);
+        if WIKI_SYNC_FORBIDDEN.contains(&base) || base.ends_with(".lock") {
+            anyhow::bail!(
+                "wiki sync refused: sensitive/non-content file `{f}` is {what} in the wiki repo. \
+                 Fix wiki/.gitignore before syncing — this must never reach the mirror."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Run `git -C <dir> <args>`; return whether it exited 0.
+async fn git_run(dir: &std::path::Path, args: &[&str]) -> Result<bool> {
+    let st = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .status()
+        .await
+        .with_context(|| format!("spawn git {}", args.join(" ")))?;
+    Ok(st.success())
+}
+
+/// Run `git -C <dir> <args>` and capture stdout; bail on non-zero.
+async fn git_capture(dir: &std::path::Path, args: &[&str]) -> Result<String> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("spawn git {}", args.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Push current HEAD to `origin/main`. If the remote moved under us
+/// (someone edited on GitHub between our fetch and push), re-pull
+/// owner-wins once and retry.
+async fn wiki_sync_push(dir: &std::path::Path) -> Result<()> {
+    for attempt in 0..2 {
+        if git_run(dir, &["push", "origin", "HEAD:main"]).await? {
+            println!("[wiki sync] pushed to origin/main");
+            return Ok(());
+        }
+        if attempt == 0 {
+            eprintln!("[wiki sync] push rejected (remote moved); re-pulling owner-wins and retrying");
+            let _ = git_run(dir, &["fetch", "origin", "main"]).await;
+            let _ = git_run(dir, &["pull", "--rebase", "-X", "ours", "origin", "main"]).await;
+        }
+    }
+    anyhow::bail!("wiki sync: push to origin/main failed after one retry");
+}
+
+/// `wiki sync` — reconcile the local knowledge base with its private
+/// GitHub mirror. Two-way: commit local page changes, pull owner edits
+/// (owner-wins), push. Reuses the ambient `gh` credential. See epic #474.
+async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for wiki sync")?;
+    let wiki_root = wiki_root
+        .canonicalize()
+        .with_context(|| format!("canonicalize wiki dir {}", wiki_root.display()))?;
+
+    // The wiki must be its own git repo. Bootstrap (git init + private
+    // remote) runs once, out of band — see KB sync #1.
+    if !wiki_root.join(".git").exists() {
+        anyhow::bail!(
+            "{} is not a git repo — bootstrap it first (git init + private origin). See epic #474 / KB sync #1.",
+            wiki_root.display()
+        );
+    }
+
+    // Guard: nothing sensitive/non-content may already be tracked.
+    let tracked = git_capture(&wiki_root, &["ls-files"]).await?;
+    wiki_sync_check_forbidden(&tracked, "tracked")?;
+
+    let porcelain = git_capture(&wiki_root, &["status", "--porcelain"]).await?;
+    let dirty: Vec<&str> = porcelain
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    if dry_run {
+        println!("[wiki sync] dry-run against {}", wiki_root.display());
+        println!("  local changes: {}", dirty.len());
+        for l in &dirty {
+            println!("    {l}");
+        }
+        let _ = git_run(&wiki_root, &["fetch", "origin", "main"]).await;
+        if let Ok(counts) = git_capture(
+            &wiki_root,
+            &["rev-list", "--left-right", "--count", "origin/main...HEAD"],
+        )
+        .await
+        {
+            println!("  behind/ahead vs origin/main: {}", counts.trim());
+        }
+        return Ok(());
+    }
+
+    // 1. Stage + commit local changes.
+    let git_author_name = std::env::var("AUGMENTAGENT_GIT_AUTHOR_NAME")
+        .unwrap_or_else(|_| "AugmentAgent".to_string());
+    let git_author_email = std::env::var("AUGMENTAGENT_GIT_AUTHOR_EMAIL")
+        .unwrap_or_else(|_| "augmentagent@localhost".to_string());
+
+    if !dirty.is_empty() {
+        if !git_run(&wiki_root, &["add", "-A"]).await? {
+            anyhow::bail!("git add -A failed");
+        }
+        // Re-check the STAGED set before we commit anything.
+        let staged = git_capture(&wiki_root, &["diff", "--cached", "--name-only"]).await?;
+        wiki_sync_check_forbidden(&staged, "staged")?;
+
+        let msg = format!("wiki: sync {} change(s)", dirty.len());
+        let committed = git_run(
+            &wiki_root,
+            &[
+                "-c",
+                &format!("user.name={git_author_name}"),
+                "-c",
+                &format!("user.email={git_author_email}"),
+                "commit",
+                "-m",
+                &msg,
+            ],
+        )
+        .await?;
+        if committed {
+            println!("[wiki sync] committed {} local change(s)", dirty.len());
+        }
+    } else {
+        println!("[wiki sync] no local changes");
+    }
+
+    if no_pull {
+        // First-push / push-only mode (origin/main may not exist yet).
+        return wiki_sync_push(&wiki_root).await;
+    }
+
+    // 2. Pull owner edits (owner-wins). `git pull --rebase` replays our
+    // local commits onto origin/main; in rebase terms the upstream
+    // (owner's GitHub state) is "ours", so `-X ours` makes OWNER edits win
+    // same-line conflicts — the confirmed policy. Non-conflicting edits on
+    // both sides still merge cleanly.
+    if !git_run(&wiki_root, &["fetch", "origin", "main"]).await? {
+        // No remote branch yet or offline — nothing to reconcile; push.
+        return wiki_sync_push(&wiki_root).await;
+    }
+    let pre_pull_head = git_capture(&wiki_root, &["rev-parse", "HEAD"]).await?;
+    let pre_pull_head = pre_pull_head.trim().to_string();
+    let pulled = git_run(
+        &wiki_root,
+        &["pull", "--rebase", "-X", "ours", "origin", "main"],
+    )
+    .await?;
+    if !pulled {
+        // Rebase couldn't auto-resolve (e.g. delete/modify). Preserve the
+        // daemon's work on a backup branch, abort, and fail loudly. NO
+        // data is lost — the owner reconciles manually (KB sync #4).
+        let _ = git_run(&wiki_root, &["rebase", "--abort"]).await;
+        let short: String = pre_pull_head.chars().take(8).collect();
+        let backup = format!("kb-conflict-{short}");
+        let _ = git_run(&wiki_root, &["branch", "-f", &backup, &pre_pull_head]).await;
+        let _ = git_run(&wiki_root, &["push", "origin", &format!("{backup}:{backup}")]).await;
+        anyhow::bail!(
+            "wiki sync: unresolved rebase conflict. Daemon commits preserved on branch `{backup}` \
+             (pushed to origin). Owner must reconcile manually. NO data lost."
+        );
+    }
+
+    // 3. Push.
+    wiki_sync_push(&wiki_root).await
+}
+
 /// Adapter: bridges the Discord broker's `QueryHandler` trait to our
 /// `ClaudeCliReasoner` + `ask_opts`. Lives in the CLI to avoid a circular
 /// dep between the discord crate and the channel-email crate.
@@ -4586,6 +5695,76 @@ struct WikiQuerier {
     reasoner: Arc<ClaudeCliReasoner>,
     wiki_root: PathBuf,
     repo_root: PathBuf,
+}
+
+/// #389 — Owner rules travel with EVERY query-mode prompt, injected at
+/// request time rather than left for the model to (maybe) read.
+///
+/// The system prompt used to only *instruct* the model to read `about/me.md`
+/// "before drafting anything" — loading was conditional on the model first
+/// classifying the turn as drafting, so corrections the user filed there
+/// were dead letters exactly when the turn was misclassified (observed
+/// 2026-07-09: both Bo Motlagh sessions read me.md first and still ignored
+/// the deliverable-placement rule; a wiki file can't outrank prompt
+/// structure). Injecting the sections as a highest-priority preamble removes
+/// the classification step entirely, and — unlike the compile-embedded
+/// schema — picks up new corrections on the very next turn, no rebuild.
+///
+/// Returns `None` when me.md is missing or has none of the wanted sections
+/// (fresh installs) — the prompt then behaves exactly as before.
+fn owner_rules_block(wiki_root: &std::path::Path) -> Option<String> {
+    // "Writing style preferences" = how drafts read; "Agent behavior rules"
+    // = how turns are conducted (deliverable placement, routing). The split
+    // is documented in schema/wiki-ask.md's durable-facts pass.
+    const SECTIONS: [&str; 2] = ["Writing style preferences", "Agent behavior rules"];
+    // Generous cap: me.md rule sections are a handful of bullets today;
+    // truncation is a guard against unbounded growth, not an expectation.
+    const MAX_BLOCK_CHARS: usize = 4000;
+
+    let me = std::fs::read_to_string(wiki_root.join("about").join("me.md")).ok()?;
+    let mut block = String::new();
+    for sec in SECTIONS {
+        if let Some(body) = extract_md_section(&me, sec) {
+            let body = body.trim();
+            if !body.is_empty() {
+                block.push_str("### ");
+                block.push_str(sec);
+                block.push('\n');
+                block.push_str(body);
+                block.push_str("\n\n");
+            }
+        }
+    }
+    if block.trim().is_empty() {
+        return None;
+    }
+    if block.len() > MAX_BLOCK_CHARS {
+        let mut end = MAX_BLOCK_CHARS;
+        while end > 0 && !block.is_char_boundary(end) {
+            end -= 1;
+        }
+        block.truncate(end);
+        block.push_str("\n[truncated — read wiki/about/me.md for the rest]\n");
+    }
+    Some(block)
+}
+
+/// Return the body of the `## <heading>` section of a markdown doc: the text
+/// after the heading line up to (not including) the next `## ` heading or
+/// EOF. Exact heading match after the `## ` prefix (trimmed).
+fn extract_md_section<'a>(md: &'a str, heading: &str) -> Option<&'a str> {
+    let mut start: Option<usize> = None;
+    for line in md.lines() {
+        let idx = line.as_ptr() as usize - md.as_ptr() as usize;
+        if let Some(h) = line.strip_prefix("## ") {
+            match start {
+                None if h.trim() == heading => start = Some(idx + line.len()),
+                Some(s) => return Some(&md[s..idx]),
+                None => {}
+            }
+        }
+    }
+    start.map(|s| &md[s..])
 }
 
 #[async_trait]
@@ -4607,7 +5786,20 @@ impl QueryHandler for WikiQuerier {
                 channel_id,
             }));
         }
-        self.reasoner.call(&opts, question).await
+        // #389 — prepend the owner's standing rules as a highest-priority
+        // block so they apply on the first attempt, every turn.
+        let prompt = match owner_rules_block(&self.wiki_root) {
+            Some(rules) => format!(
+                "<owner_rules>\nStanding rules from the owner (wiki/about/me.md). These are \
+                 HIGHEST PRIORITY: when they conflict with any default behavior in your \
+                 instructions, the owner's rules win. Apply them on the first attempt, \
+                 without being asked.\n\n{rules}</owner_rules>\n\n{question}"
+            ),
+            None => question.to_string(),
+        };
+        // #446 — see `wiki ask`: the Discord reply must carry every text block
+        // the model emitted, not just the trailing wiki-filing receipt.
+        self.reasoner.call_transcript(&opts, &prompt).await
     }
 }
 
@@ -4650,7 +5842,18 @@ struct LoopReasonerRunner {
 impl LoopRunner for LoopReasonerRunner {
     async fn run_prompt(&self, prompt: &str) -> anyhow::Result<String> {
         let opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
-        self.reasoner.call(&opts, prompt).await
+        // #389 — loops fire through the same query toolbelt, so they carry
+        // the same owner-rules preamble as interactive asks.
+        let prompt = match owner_rules_block(&self.wiki_root) {
+            Some(rules) => format!(
+                "<owner_rules>\nStanding rules from the owner (wiki/about/me.md). These are \
+                 HIGHEST PRIORITY: when they conflict with any default behavior in your \
+                 instructions, the owner's rules win.\n\n{rules}</owner_rules>\n\n{prompt}"
+            ),
+            None => prompt.to_string(),
+        };
+        // #446 — loops render their output to Discord too; same reasoning.
+        self.reasoner.call_transcript(&opts, &prompt).await
     }
 }
 
@@ -4742,6 +5945,105 @@ fn parse_loop_json(raw: &str) -> std::result::Result<augmentagent_approval_disco
 }
 
 #[cfg(test)]
+mod unescape_body_tests {
+    use super::unescape_body;
+
+    #[test]
+    fn newline_and_tab_escapes_interpret() {
+        assert_eq!(unescape_body("a\\n\\nb\\tc"), "a\n\nb\tc");
+    }
+
+    #[test]
+    fn the_john_repro_renders_paragraphs() {
+        let body = "Hey John,\\n\\nGreat catching up on the phone today.\\n\\nBest,\\nNolan";
+        let out = unescape_body(body);
+        assert!(out.contains("Hey John,\n\nGreat"));
+        assert!(!out.contains('\\'), "no backslashes may survive: {out}");
+    }
+
+    #[test]
+    fn plain_text_and_real_newlines_untouched() {
+        assert_eq!(unescape_body("line1\nline2"), "line1\nline2");
+        assert_eq!(unescape_body("no escapes here"), "no escapes here");
+    }
+
+    #[test]
+    fn double_backslash_yields_literal_backslash_n() {
+        assert_eq!(unescape_body("show \\\\n literally"), "show \\n literally");
+    }
+
+    #[test]
+    fn crlf_escape_collapses_to_newline() {
+        assert_eq!(unescape_body("a\\r\\nb"), "a\nb");
+    }
+
+    #[test]
+    fn unknown_escape_passes_through() {
+        assert_eq!(unescape_body("path\\qthing"), "path\\qthing");
+    }
+}
+
+#[cfg(test)]
+mod owner_rules_tests {
+    use super::{extract_md_section, owner_rules_block};
+
+    const ME_MD: &str = "# About Me\n\n## Identity\n\nNolan.\n\n## Writing style preferences\n\n- No em-dashes. (user said, 2026-05-04)\n- Deliverable is the text itself. (user said, 2026-07-08)\n\n## Agent behavior rules\n\n- Email asks end with an approval card.\n\n## Routing preferences\n\n- VIPs flagged.\n";
+
+    #[test]
+    fn extracts_section_body_up_to_next_heading() {
+        let body = extract_md_section(ME_MD, "Writing style preferences").unwrap();
+        assert!(body.contains("No em-dashes"));
+        assert!(body.contains("Deliverable is the text itself"));
+        assert!(!body.contains("approval card"), "must stop at next ## heading");
+    }
+
+    #[test]
+    fn extracts_last_section_to_eof() {
+        let body = extract_md_section(ME_MD, "Routing preferences").unwrap();
+        assert!(body.contains("VIPs flagged"));
+    }
+
+    #[test]
+    fn missing_section_returns_none() {
+        assert!(extract_md_section(ME_MD, "Nonexistent").is_none());
+    }
+
+    #[test]
+    fn block_includes_style_and_behavior_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        std::fs::write(tmp.path().join("about").join("me.md"), ME_MD).unwrap();
+        let block = owner_rules_block(tmp.path()).expect("block should build");
+        assert!(block.contains("### Writing style preferences"));
+        assert!(block.contains("### Agent behavior rules"));
+        assert!(block.contains("approval card"));
+        // Non-rule sections must NOT leak into every prompt.
+        assert!(!block.contains("VIPs flagged"));
+        assert!(!block.contains("Nolan."));
+    }
+
+    #[test]
+    fn missing_me_md_yields_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(owner_rules_block(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn oversized_block_truncates_with_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        let big = format!(
+            "## Writing style preferences\n\n{}\n",
+            "- rule with some padding text to inflate the size\n".repeat(200)
+        );
+        std::fs::write(tmp.path().join("about").join("me.md"), big).unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+        assert!(block.len() < 4200, "cap not applied: {} chars", block.len());
+        assert!(block.contains("[truncated"), "missing truncation marker");
+    }
+}
+
+#[cfg(test)]
 mod loop_parser_tests {
     use super::parse_loop_json;
 
@@ -4821,62 +6123,6 @@ impl LoopPoster for DiscordLoopPoster {
     }
 }
 
-/// Bridge into invoice.rs: thin shim implementing the discord crate's
-/// [`InvoiceOps`] trait so the !invoice draft command + Approve button can
-/// reach into PDF generation and the real-send path without the discord
-/// crate taking a cli dep.
-struct CliInvoiceOps {
-    store: Arc<Store>,
-}
-
-#[async_trait]
-impl InvoiceOps for CliInvoiceOps {
-    async fn draft_pdf(
-        &self,
-        week_end: Option<chrono::NaiveDate>,
-    ) -> anyhow::Result<InvoiceDraftPdf> {
-        let g = invoice::generate_pdf(&self.store, week_end).await?;
-        Ok(InvoiceDraftPdf {
-            number: g.number,
-            week_start: g.week_start,
-            week_end: g.week_end,
-            pdf_path: g.pdf_path,
-            recipient: g.recipient,
-        })
-    }
-
-    async fn send(&self, week_end: chrono::NaiveDate) -> anyhow::Result<String> {
-        invoice::run_invoice(&self.store, Some(week_end), false).await
-    }
-}
-
-/// Bridge for the Sunday scheduler: calls the same `post_invoice_draft_card`
-/// path the manual `!invoice draft` command uses, so behaviour is identical.
-struct DiscordInvoicePoster {
-    store: Arc<Store>,
-    ops: Arc<dyn InvoiceOps>,
-    http: Arc<serenity::http::Http>,
-    approval_channel: serenity::all::ChannelId,
-}
-
-#[async_trait]
-impl invoice::InvoiceDraftPoster for DiscordInvoicePoster {
-    async fn dispatch_draft(
-        &self,
-        week_end: chrono::NaiveDate,
-    ) -> anyhow::Result<String> {
-        let reply = augmentagent_approval_discord::post_invoice_draft_card(
-            &self.store,
-            self.ops.as_ref(),
-            &self.http,
-            self.approval_channel,
-            Some(&week_end.to_string()),
-        )
-        .await;
-        Ok(reply)
-    }
-}
-
 /// Executes Approve / Revise / Skip clicks against sqlite + Composio +
 /// reasoner. Backed entirely by the persistent action row — no in-memory
 /// state — so cards remain valid across daemon restarts and indefinitely.
@@ -4886,6 +6132,9 @@ impl invoice::InvoiceDraftPoster for DiscordInvoicePoster {
 struct ReplyApprover {
     store: Arc<Store>,
     gmail: Arc<ComposioClient>,
+    /// Composio Google Calendar client. Executes calendar-event proposals
+    /// on Approve (#398). Same API key as `gmail`.
+    calendar: Arc<augmentagent_channel_calendar::ComposioCalendarClient>,
     /// Optional voyager client. `None` = LinkedIn disabled for this run
     /// (cookies not configured). Any LinkedIn-tagged action hitting this
     /// approver with a None client surfaces as `Failed`.
@@ -5768,6 +7017,9 @@ impl ReplyApprover {
         if action.email.platform == augmentagent_channel_socialapi::PLATFORM {
             return self.approve_socialapi(action_id, action).await;
         }
+        if action.email.platform == "gcal" {
+            return self.approve_gcal(action_id, action).await;
+        }
         if is_linkedin_email(&action.email) {
             return self.approve_linkedin(action_id, action).await;
         }
@@ -5782,16 +7034,29 @@ impl ReplyApprover {
             };
         };
 
-        if let Err(e) = self.gmail.send_draft(entity_id, draft_id).await {
-            let msg = format!("send_draft: {e}");
-            let _ = self.store.update_action_status(
-                action_id,
-                ActionStatus::Error,
-                None,
-                Some(&msg),
-            );
-            return ApprovalActionOutcome::Failed { message: msg };
-        }
+        let sent_id = match self.gmail.send_draft(entity_id, draft_id).await {
+            Ok(id) => id,
+            Err(e) => {
+                let msg = format!("send_draft: {e}");
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                return ApprovalActionOutcome::Failed { message: msg };
+            }
+        };
+        // #449 — the approve button is the daemon's primary send path. Record
+        // the id BEFORE flipping status, so an observer tick racing this send
+        // can never catch the message in SENT without knowing it was ours.
+        record_self_send(
+            &self.store,
+            sent_id.as_deref(),
+            action.email.thread_id.as_deref(),
+            Some(entity_id),
+            Some(action_id),
+        );
         let _ = self.store.update_action_status(
             action_id,
             ActionStatus::Sent,
@@ -5813,6 +7078,87 @@ impl ReplyApprover {
         }
         tracing::info!(action_id, "reply sent via approval handler");
         ApprovalActionOutcome::Approved
+    }
+
+    /// #398 — Approve on a calendar-event card: parse the machine payload
+    /// (EventDraft JSON) from the emails row and execute the create. The
+    /// event exists — and invites go out — only after this succeeds.
+    async fn approve_gcal(
+        &self,
+        action_id: &str,
+        action: augmentagent_store::ActionWithEmail,
+    ) -> ApprovalActionOutcome {
+        use augmentagent_channel_calendar::{CalendarApi, CalendarError, EventDraft};
+
+        let Some(entity_id) = action.email.account_entity_id.as_deref() else {
+            return ApprovalActionOutcome::Failed {
+                message: "no accountEntityId on gcal action; cannot create".into(),
+            };
+        };
+        let draft: EventDraft = match serde_json::from_str(&action.email.body) {
+            Ok(d) => d,
+            Err(e) => {
+                let msg = format!("gcal proposal payload parse failed: {e}");
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                return ApprovalActionOutcome::Failed { message: msg };
+            }
+        };
+        match self.calendar.create_event(entity_id, "primary", &draft).await {
+            Ok(created) => {
+                let link = created
+                    .html_link
+                    .clone()
+                    .unwrap_or_else(|| "(no link returned)".into());
+                let final_body = format!(
+                    "{}\ncreated: {link}",
+                    action.action.draft_body.clone().unwrap_or_default()
+                );
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Sent,
+                    Some(&final_body),
+                    None,
+                );
+                let _ = self
+                    .store
+                    .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                tracing::info!(
+                    action_id,
+                    event_id = ?created.id,
+                    link,
+                    "gcal event created"
+                );
+                ApprovalActionOutcome::Approved
+            }
+            Err(CalendarError::Forbidden { message }) => {
+                let msg = format!(
+                    "calendar write scope missing — re-consent the Google connection \
+                     with calendar.events, then re-propose the event: {message}"
+                );
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                ApprovalActionOutcome::Failed { message: msg }
+            }
+            Err(e) => {
+                let msg = format!("create_event: {e}");
+                let _ = self.store.update_action_status(
+                    action_id,
+                    ActionStatus::Error,
+                    None,
+                    Some(&msg),
+                );
+                ApprovalActionOutcome::Failed { message: msg }
+            }
+        }
     }
 
     async fn run_skip(&self, action_id: &str) -> ApprovalActionOutcome {
@@ -5872,6 +7218,16 @@ impl ReplyApprover {
                 status: action.action.status,
             };
         }
+        if action.email.platform == "gcal" {
+            // v1 (#398): no LLM re-draft for calendar proposals. The card
+            // stays pending — the operator can Skip and re-ask query mode
+            // with the changes.
+            return ApprovalActionOutcome::Failed {
+                message: "Revise isn't supported for calendar-event cards yet — \
+                          Skip this card and ask again with the changes."
+                    .into(),
+            };
+        }
         if action.email.platform == "discord" {
             return self.revise_discord(action_id, feedback, action).await;
         }
@@ -5922,14 +7278,40 @@ impl ReplyApprover {
         } else {
             format!("Re: {}", action.email.subject)
         };
+        // #473 — recreate the draft with the envelope the card was composed
+        // with, when one was recorded. Pre-#473 behavior (To = emails.from,
+        // no cc/bcc) silently dropped an overridden To and every cc/bcc on
+        // reply cards: the intro pattern ("moving you to BCC") lost its BCC
+        // — and its actual recipient — the moment the user hit Revise.
+        let envelope = self
+            .store
+            .get_action_envelope(action_id)
+            .unwrap_or_else(|e| {
+                tracing::warn!(action_id, "revise: envelope lookup failed: {e}");
+                None
+            });
+        let to = envelope
+            .as_ref()
+            .and_then(|env| env.to.clone())
+            .unwrap_or_else(|| action.email.from.clone());
+        let split = |v: &Option<String>| -> Vec<String> {
+            v.as_deref()
+                .map(augmentagent_channel_email::gmail::split_recipients)
+                .unwrap_or_default()
+        };
+        let cc = envelope.as_ref().map(|env| split(&env.cc)).unwrap_or_default();
+        let bcc = envelope.as_ref().map(|env| split(&env.bcc)).unwrap_or_default();
         let new_draft_id = match self
             .gmail
-            .create_draft(
+            .create_draft_with_attachment(
                 entity_id,
-                &action.email.from,
+                &to,
                 &subject,
                 &redraft,
                 action.email.thread_id.as_deref(),
+                None,
+                &cc,
+                &bcc,
             )
             .await
         {
@@ -6014,6 +7396,9 @@ async fn build_broker(
     // reasoner for revise, and the skill body for the redraft prompt.
     let api_key =
         std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
+    let calendar = Arc::new(
+        augmentagent_channel_calendar::ComposioCalendarClient::new(api_key.clone()),
+    );
     let gmail = Arc::new(ComposioClient::new(api_key));
     let skill_dir = cli.skill_dir.clone();
     let draft_skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap_or_default();
@@ -6028,15 +7413,12 @@ async fn build_broker(
     let github = load_github_client();
     let socialapi = load_socialapi_client();
     // Keep handles for the broker before `store` is moved into the approver:
-    // the `!invoice` config command and #37 Revise-triple capture.
-    let invoice_store = Arc::clone(&store);
+    // the #37 Revise-triple capture.
     let store_for_broker = Arc::clone(&store);
-    let invoice_ops: Arc<dyn InvoiceOps> = Arc::new(CliInvoiceOps {
-        store: Arc::clone(&store),
-    });
     let approver = Arc::new(ReplyApprover {
         store,
         gmail,
+        calendar,
         linkedin,
         discord,
         slack,
@@ -6062,10 +7444,9 @@ async fn build_broker(
         allowed_user_id,
         query_handler,
         action_handler: Some(approver_for_broker),
-        invoice_store: Some(invoice_store),
-        invoice_ops: Some(invoice_ops),
         store: Some(store_for_broker),
         loop_parser,
+        wiki_root: cli.wiki_dir.clone(),
     })
     .await
     .context("start discord broker")?;
@@ -8993,6 +10374,72 @@ fn run_meetup_unsubscribe(store: Arc<Store>, id: String) -> Result<()> {
     Ok(())
 }
 
+/// On-demand event lookup for a single group (#319). Unlike `poll-once`,
+/// this needs neither a subscription row nor the daemon db — it shells
+/// straight to the Meetup client and prints the result. Query mode calls
+/// this (via the `augmentagent meetup events …` allowlist entry) when the
+/// user asks "what are our Meetup events this week".
+///
+/// `--json` emits the raw event array (camelCase keys, same shape the
+/// digest consumes) so the LLM can post-process; the default human render
+/// reuses `render_event` so on-demand output matches the Discord digest.
+/// Resolve the repo root for the `scripts/meetup-events.mjs` shell-out,
+/// independent of cwd. Query mode pins cwd to the wiki root, so the
+/// daemon's `current_dir() == repo_root` assumption breaks there (#319/#322).
+///
+/// Order: explicit `AUGMENTAGENT_REPO_ROOT` (set by `ask_opts`) → derive
+/// from the binary's own path (`<repo>/target/<profile>/augmentagent`, so
+/// the repo is three ancestors up) → fall back to cwd (daemon context,
+/// where cwd already is the repo root).
+fn resolve_meetup_repo_root() -> PathBuf {
+    if let Ok(v) = std::env::var("AUGMENTAGENT_REPO_ROOT") {
+        let trimmed = v.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(root) = exe.ancestors().nth(3) {
+            if root.join("scripts/meetup-events.mjs").is_file() {
+                return root.to_path_buf();
+            }
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+async fn run_meetup_events(urlname: String, limit: usize, json: bool) -> Result<()> {
+    let normalized = urlname.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        anyhow::bail!("urlname (group slug) is required");
+    }
+    // scripts/meetup-events.mjs lives at the repo root. In query mode the
+    // cwd is pinned to the WIKI root (not the repo), so `current_dir()` —
+    // which build_meetup_channel can rely on because the daemon's cwd IS
+    // the repo root — would miss the script and the Node shell-out would
+    // fail with MODULE_NOT_FOUND. Resolve the repo root independent of cwd.
+    let repo_root = resolve_meetup_repo_root();
+    let client = augmentagent_channel_meetup::MeetupClient::new(&repo_root);
+    let events = client
+        .upcoming_events(&normalized, limit)
+        .await
+        .with_context(|| format!("fetch upcoming meetup events for `{normalized}`"))?;
+    if json {
+        println!("{}", serde_json::to_string(&events)?);
+    } else if events.is_empty() {
+        println!("No upcoming events for group `{normalized}`.");
+    } else {
+        println!(
+            "{} upcoming event(s) for `{normalized}`:\n",
+            events.len()
+        );
+        for ev in &events {
+            println!("{}", augmentagent_channel_meetup::render_event(ev));
+        }
+    }
+    Ok(())
+}
+
 /// Build a `MeetupChannel` for `serve` / `poll-once`. Returns `Err` when no
 /// meetup subscription exists yet, so `serve` downgrades it to a warning and
 /// the prod agent (zero meetup subs) never spawns it.
@@ -9157,7 +10604,7 @@ fn load_any_github_auth() -> Result<augmentagent_channel_github::GithubAuth> {
 }
 
 // ---------------------------------------------------------------------------
-// Calendar (#82) — Phase 1 CLI helpers.
+// Calendar (archived AugmentAgent#82) — Phase 1 CLI helpers.
 // ---------------------------------------------------------------------------
 
 async fn run_calendar_poll_once(
@@ -9179,15 +10626,499 @@ async fn run_calendar_poll_once(
         .as_ref()
         .map(|_| PathBuf::from("schema/wiki-skill.md"));
 
+    // #396/#397 alert knobs. Lead window must exceed the poll cadence
+    // (AUGMENTAGENT_CALENDAR_INTERVAL_MIN, default 30) or events can slip
+    // between polls.
+    let alert_lead_min = std::env::var("AUGMENTAGENT_CALENDAR_ALERT_LEAD_MIN")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(60);
+    let agenda_local_hour = match std::env::var("AUGMENTAGENT_CALENDAR_AGENDA_HOUR") {
+        Err(_) => Some(8),
+        Ok(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            if t.is_empty() || t == "off" || t == "none" {
+                None
+            } else {
+                t.parse::<u32>().ok().filter(|h| *h < 24).or(Some(8))
+            }
+        }
+    };
+
     let config = CalendarChannelConfig {
         dry_run,
         wiki_root: wiki_dir,
         wiki_schema_path,
+        alert_lead_min,
+        agenda_local_hour,
         ..Default::default()
     };
-    let channel = CalendarChannel::new(store, gcal, reasoner, config);
+    let mut channel = CalendarChannel::new(store, gcal, reasoner, config);
+    match build_calendar_alert_sink() {
+        Some(sink) => channel = channel.with_alert_sink(sink),
+        None => info!("calendar alerts: DISCORD_BOT_TOKEN/DISCORD_CHANNEL_ID unset; alert delivery disabled"),
+    }
     let outcome = channel.poll_once().await?;
     println!("{:#?}", outcome);
+    Ok(())
+}
+
+/// #396/#397 — Discord transport for calendar alerts. Bare HTTP client (no
+/// gateway, no state), same pattern as `post_digest_to_discord`, aimed at
+/// the shared DISCORD_CHANNEL_ID.
+struct DiscordAlertSink {
+    http: serenity::http::Http,
+    channel: serenity::all::ChannelId,
+}
+
+#[async_trait]
+impl augmentagent_channel_calendar::AlertSink for DiscordAlertSink {
+    async fn send(&self, text: &str) -> anyhow::Result<()> {
+        use serenity::all::CreateMessage;
+        for chunk in augmentagent_approval_discord::chunk_for_discord(text) {
+            self.channel
+                .send_message(&self.http, CreateMessage::new().content(chunk))
+                .await
+                .context("discord send_message")?;
+        }
+        Ok(())
+    }
+}
+
+fn build_calendar_alert_sink(
+) -> Option<Arc<dyn augmentagent_channel_calendar::AlertSink>> {
+    let token = std::env::var("DISCORD_BOT_TOKEN").ok()?;
+    let cid = std::env::var("DISCORD_CHANNEL_ID").ok()?;
+    if token.trim().is_empty() {
+        return None;
+    }
+    let cid: u64 = match cid.trim().parse() {
+        Ok(v) => v,
+        Err(_) => {
+            warn!("calendar alerts: DISCORD_CHANNEL_ID is not numeric; alert delivery disabled");
+            return None;
+        }
+    };
+    Some(Arc::new(DiscordAlertSink {
+        http: serenity::http::Http::new(&token),
+        channel: serenity::all::ChannelId::new(cid),
+    }))
+}
+
+/// #399 — read-only schedule lookup for query mode ("what's on my calendar
+/// this week?"). Unlike the ingest poll this applies NO engagement filter:
+/// solo events, focus blocks, and all-day entries all show. Output carries
+/// only privacy-allowlisted `MeetingPayload` fields plus an all-day flag,
+/// and leads with the current local time — query mode has no other clock
+/// (#236), so the header doubles as its time source.
+async fn run_calendar_list_events(
+    store: Arc<Store>,
+    from: Option<String>,
+    to: Option<String>,
+    days: i64,
+    json: bool,
+) -> Result<()> {
+    use augmentagent_channel_calendar::{
+        CalendarApi, ComposioCalendarClient, MeetingPayload,
+    };
+    use chrono::{DateTime, Local, Utc};
+
+    let api_key =
+        std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
+    let client = ComposioCalendarClient::new(api_key);
+
+    let now = Utc::now();
+    let parse = |label: &str, s: &str| -> Result<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(s)
+            .map(|d| d.with_timezone(&Utc))
+            .with_context(|| {
+                format!("--{label} must be RFC3339, e.g. 2026-07-09T00:00:00-04:00")
+            })
+    };
+    let time_min = match &from {
+        Some(s) => parse("from", s)?,
+        None => now,
+    };
+    let time_max = match &to {
+        Some(s) => parse("to", s)?,
+        None => time_min + chrono::Duration::days(days.clamp(1, 60)),
+    };
+    if time_max <= time_min {
+        anyhow::bail!("--to must be after --from");
+    }
+
+    let accounts = store.get_active_gmail_accounts()?;
+    if accounts.is_empty() {
+        anyhow::bail!("no active Google accounts — connect Gmail first (dashboard → Subscriptions)");
+    }
+
+    struct AccountEvents {
+        email: String,
+        result: std::result::Result<Vec<(MeetingPayload, bool)>, String>,
+    }
+
+    let mut per_account: Vec<AccountEvents> = Vec::new();
+    for account in accounts {
+        match client
+            .list_events(&account.entity_id, "primary", time_min, time_max)
+            .await
+        {
+            Ok(events) => {
+                let mut items: Vec<(MeetingPayload, bool)> = events
+                    .iter()
+                    .filter(|ev| {
+                        !ev.status
+                            .as_deref()
+                            .map(|s| s.eq_ignore_ascii_case("cancelled"))
+                            .unwrap_or(false)
+                    })
+                    .filter_map(|ev| {
+                        let p = MeetingPayload::from_event(
+                            ev,
+                            &account.entity_id,
+                            "primary",
+                        )?;
+                        let all_day = ev
+                            .start
+                            .as_ref()
+                            .map(|s| s.date_time.is_none())
+                            .unwrap_or(false);
+                        Some((p, all_day))
+                    })
+                    .collect();
+                items.sort_by_key(|(p, _)| p.start);
+                per_account.push(AccountEvents {
+                    email: account.email.clone(),
+                    result: Ok(items),
+                });
+            }
+            Err(e) => {
+                let mut msg = e.to_string();
+                if msg.contains("ConnectedAccountNotFound")
+                    || msg.contains("No connected account")
+                {
+                    msg.push_str(
+                        " — Google Calendar is not connected in Composio for this \
+                         account; the operator must link the googlecalendar toolkit \
+                         first. Surface this instead of retrying.",
+                    );
+                }
+                per_account.push(AccountEvents {
+                    email: account.email.clone(),
+                    result: Err(msg),
+                });
+            }
+        }
+    }
+
+    let attendee_line = |p: &MeetingPayload| -> String {
+        let others: Vec<String> = p
+            .attendees
+            .iter()
+            .filter(|a| !a.is_self && !a.is_resource)
+            .map(|a| match &a.display_name {
+                Some(n) => format!("{n} <{}>", a.email),
+                None => a.email.clone(),
+            })
+            .collect();
+        if others.is_empty() {
+            String::new()
+        } else {
+            format!(" — with {}", others.join(", "))
+        }
+    };
+
+    if json {
+        let accounts_json: Vec<serde_json::Value> = per_account
+            .iter()
+            .map(|a| match &a.result {
+                Ok(items) => serde_json::json!({
+                    "email": a.email,
+                    "error": serde_json::Value::Null,
+                    "events": items.iter().map(|(p, all_day)| serde_json::json!({
+                        "event_id": p.event_id,
+                        "summary": p.summary,
+                        "start": p.start.to_rfc3339(),
+                        "end": p.end.to_rfc3339(),
+                        "start_local": p.start.with_timezone(&Local).to_rfc3339(),
+                        "end_local": p.end.with_timezone(&Local).to_rfc3339(),
+                        "all_day": all_day,
+                        "attendees": p.attendees.iter().filter(|at| !at.is_resource).map(|at| serde_json::json!({
+                            "email": at.email,
+                            "display_name": at.display_name,
+                            "response_status": at.response_status,
+                            "is_self": at.is_self,
+                        })).collect::<Vec<_>>(),
+                        "organizer_email": p.organizer_email,
+                        "conference_kind": p.conference_kind,
+                        "virtual_meeting": p.virtual_meeting,
+                        "recurring_event_id": p.recurring_event_id,
+                    })).collect::<Vec<_>>(),
+                }),
+                Err(msg) => serde_json::json!({
+                    "email": a.email,
+                    "error": msg,
+                    "events": [],
+                }),
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "now": Local::now().to_rfc3339(),
+                "window": {
+                    "from": time_min.with_timezone(&Local).to_rfc3339(),
+                    "to": time_max.with_timezone(&Local).to_rfc3339(),
+                },
+                "accounts": accounts_json,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("now: {}", Local::now().format("%A %Y-%m-%d %H:%M %Z"));
+    println!(
+        "window: {} → {}",
+        time_min.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
+        time_max.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+    );
+    for a in &per_account {
+        match &a.result {
+            Ok(items) => {
+                println!(
+                    "\naccount {}: {} event{}",
+                    a.email,
+                    items.len(),
+                    if items.len() == 1 { "" } else { "s" }
+                );
+                for (p, all_day) in items {
+                    let local_start = p.start.with_timezone(&Local);
+                    if *all_day {
+                        println!(
+                            "  - {} (all day)  {}",
+                            local_start.format("%a %Y-%m-%d"),
+                            p.summary
+                        );
+                        continue;
+                    }
+                    let conf = p
+                        .conference_kind
+                        .as_deref()
+                        .map(|k| format!(" [{k}]"))
+                        .unwrap_or_default();
+                    println!(
+                        "  - {} {}–{}  {}{}{}",
+                        local_start.format("%a %Y-%m-%d"),
+                        local_start.format("%H:%M"),
+                        p.end.with_timezone(&Local).format("%H:%M"),
+                        p.summary,
+                        attendee_line(p),
+                        conf
+                    );
+                }
+            }
+            Err(msg) => println!("\naccount {}: ERROR — {}", a.email, msg),
+        }
+    }
+    Ok(())
+}
+
+/// #398 — propose a calendar event. Prints a preview, or with `--post true`
+/// writes the proposal into sqlite (emails row = machine payload, actions
+/// row = pending approval) and posts a Discord approval card. The event is
+/// created ONLY when the operator clicks Approve — handled by the serve
+/// daemon's `ReplyApprover::approve_gcal`. No unattended write path exists.
+#[allow(clippy::too_many_arguments)]
+async fn run_calendar_create_event(
+    store: Arc<Store>,
+    summary: String,
+    start: String,
+    duration_min: i64,
+    attendees: String,
+    description: Option<String>,
+    meet: bool,
+    account: Option<String>,
+    post: bool,
+) -> Result<()> {
+    use augmentagent_channel_calendar::{
+        AlertCandidate, CalendarApi, ComposioCalendarClient, EventDraft,
+    };
+    use chrono::{DateTime, Local, Utc};
+
+    let start_dt = DateTime::parse_from_rfc3339(&start).context(
+        "--start must be RFC3339 with offset, e.g. 2026-07-10T15:00:00-04:00 \
+         (compute the date from `calendar list-events`'s now: header)",
+    )?;
+    let start_utc = start_dt.with_timezone(&Utc);
+    let now = Utc::now();
+    if start_utc < now - chrono::Duration::minutes(5) {
+        anyhow::bail!(
+            "--start {} is in the past (now: {})",
+            start,
+            now.with_timezone(&Local).to_rfc3339()
+        );
+    }
+    if !(5..=480).contains(&duration_min) {
+        anyhow::bail!("--duration-min must be 5-480 (got {duration_min})");
+    }
+    let attendee_list: Vec<String> = attendees
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for a in &attendee_list {
+        if !a.contains('@') || a.contains(' ') {
+            anyhow::bail!("attendee '{a}' does not look like an email address");
+        }
+    }
+
+    let accounts = store.get_active_gmail_accounts()?;
+    let acct = match &account {
+        Some(email) => accounts
+            .iter()
+            .find(|a| a.email.eq_ignore_ascii_case(email))
+            .with_context(|| format!("no active account matching {email}"))?,
+        None => accounts
+            .first()
+            .context("no active Google accounts — connect Gmail first")?,
+    };
+
+    let end_utc = start_utc + chrono::Duration::minutes(duration_min);
+
+    // Best-effort conflict check (read-only, #397's busy rules): warn on the
+    // card, never block — the operator decides.
+    let mut conflict_lines: Vec<String> = Vec::new();
+    match std::env::var("COMPOSIO_API_KEY") {
+        Ok(key) => {
+            let client = ComposioCalendarClient::new(key);
+            match client
+                .list_events(&acct.entity_id, "primary", start_utc, end_utc)
+                .await
+            {
+                Ok(events) => {
+                    for ev in &events {
+                        let Some(c) =
+                            AlertCandidate::from_event(ev, &acct.entity_id, "primary")
+                        else {
+                            continue;
+                        };
+                        if c.all_day || c.transparent || c.declined_by_self {
+                            continue;
+                        }
+                        if c.payload.start < end_utc && start_utc < c.payload.end {
+                            conflict_lines.push(format!(
+                                "⚠ conflicts with \"{}\" ({}–{})",
+                                c.payload.summary,
+                                c.payload
+                                    .start
+                                    .with_timezone(&Local)
+                                    .format("%H:%M"),
+                                c.payload.end.with_timezone(&Local).format("%H:%M"),
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    conflict_lines.push(format!("(conflict check unavailable: {e})"))
+                }
+            }
+        }
+        Err(_) => conflict_lines
+            .push("(conflict check unavailable: COMPOSIO_API_KEY unset)".into()),
+    }
+
+    let draft = EventDraft {
+        summary: summary.clone(),
+        start_datetime: start.clone(),
+        duration_minutes: duration_min,
+        attendees: attendee_list.clone(),
+        description: description.clone(),
+        create_meeting_room: meet,
+    };
+    let payload_json =
+        serde_json::to_string_pretty(&draft).context("serialize event draft")?;
+
+    let local_start = start_utc.with_timezone(&Local);
+    let local_end = end_utc.with_timezone(&Local);
+    let mut human = format!(
+        "Create calendar event (invites go out on Approve):\n\
+         • title:     {summary}\n\
+         • when:      {} {}–{} ({})\n\
+         • attendees: {}\n\
+         • meet room: {}\n\
+         • account:   {}\n",
+        local_start.format("%a %Y-%m-%d"),
+        local_start.format("%H:%M"),
+        local_end.format("%H:%M"),
+        local_start.format("%Z"),
+        if attendee_list.is_empty() {
+            "(none)".to_string()
+        } else {
+            attendee_list.join(", ")
+        },
+        if meet { "yes" } else { "no" },
+        acct.email,
+    );
+    if let Some(d) = &description {
+        human.push_str(&format!("• notes:     {d}\n"));
+    }
+    for line in &conflict_lines {
+        human.push_str(&format!("{line}\n"));
+    }
+
+    if !post {
+        println!("{human}");
+        println!("payload:\n{payload_json}");
+        println!("(preview only — nothing written; re-run with --post true to surface the approval card)");
+        return Ok(());
+    }
+
+    let token = std::env::var("DISCORD_BOT_TOKEN")
+        .context("DISCORD_BOT_TOKEN required for --post (set it in the daemon's .env)")?;
+    let cid: u64 = std::env::var("DISCORD_CHANNEL_ID")
+        .context("DISCORD_CHANNEL_ID required for --post")?
+        .parse()
+        .context("DISCORD_CHANNEL_ID must be numeric")?;
+
+    // Same actions-table shape as #352's gmail card so the daemon's
+    // Approve/Skip handlers work unchanged; the emails row body carries the
+    // exact machine payload approve_gcal will execute.
+    let message_id = format!("gcal-create:{}", uuid::Uuid::new_v4());
+    let inbound = augmentagent_store::Email {
+        message_id: message_id.clone(),
+        thread_id: None,
+        from: acct.email.clone(),
+        subject: format!("Create event: {summary}"),
+        body: payload_json.clone(),
+        date: start.clone(),
+        account_entity_id: Some(acct.entity_id.clone()),
+        platform: "gcal".into(),
+        kind: "create_event".into(),
+    };
+    store
+        .upsert_email(&inbound)
+        .context("upsert gcal proposal row")?;
+    let action_id = store
+        .log_action(
+            &message_id,
+            None,
+            &inbound.from,
+            &inbound.subject,
+            Some(&payload_json),
+            Some(&human),
+            ActionStatus::Pending,
+        )
+        .context("log gcal action row")?;
+
+    let http = serenity::http::Http::new(&token);
+    let channel = serenity::all::ChannelId::new(cid);
+    let card = approval_message(&action_id, &inbound, &human, 0);
+    channel
+        .send_message(&http, card)
+        .await
+        .context("post gcal approval card")?;
+    println!("approval card posted: action_id={action_id}");
+    println!("{human}");
     Ok(())
 }
 
@@ -10199,6 +12130,181 @@ mod auto_expire_sweep_tests {
             store.pending_reply_count().unwrap(),
             1,
             "stale row must survive disabled sweep"
+        );
+    }
+}
+
+/// #449 — the staleness reconciliation sweep. The user should never have to
+/// tell the daemon a card is stale; these are the two rules that let it work
+/// that out for itself.
+#[cfg(test)]
+mod stale_reconcile_tests {
+    use super::*;
+    use augmentagent_store::{ActionStatus, Email};
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    const SCHEMA: &str = r#"
+        CREATE TABLE actions (
+            id TEXT PRIMARY KEY, messageId TEXT NOT NULL, threadId TEXT,
+            fromEmail TEXT NOT NULL, subject TEXT NOT NULL, originalBody TEXT,
+            draftBody TEXT, status TEXT NOT NULL DEFAULT 'pending',
+            errorMessage TEXT, createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL
+        );
+        CREATE TABLE emails (
+            messageId TEXT PRIMARY KEY, threadId TEXT, fromEmail TEXT NOT NULL,
+            subject TEXT NOT NULL, body TEXT, receivedAt TEXT, accountEntityId TEXT,
+            firstSeenAt INTEGER NOT NULL, triageResult TEXT, agentProcessedAt INTEGER,
+            platform TEXT NOT NULL DEFAULT 'gmail', kind TEXT NOT NULL DEFAULT 'dm'
+        );
+        CREATE TABLE gmail_accounts (
+            id TEXT PRIMARY KEY, connectionId TEXT NOT NULL, email TEXT, label TEXT,
+            entityId TEXT NOT NULL, active INTEGER DEFAULT 1, createdAt INTEGER NOT NULL
+        );
+    "#;
+
+    fn fresh_store() -> (Store, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("data.db");
+        Connection::open(&db).unwrap().execute_batch(SCHEMA).unwrap();
+        (Store::open(&db).unwrap(), tmp)
+    }
+
+    fn seed_pending(store: &Store, msg: &str, thread: Option<&str>, from: &str) -> String {
+        seed_pending_draft(store, msg, thread, from, Some("a draft"))
+    }
+
+    fn seed_pending_draft(
+        store: &Store,
+        msg: &str,
+        thread: Option<&str>,
+        from: &str,
+        draft: Option<&str>,
+    ) -> String {
+        store
+            .upsert_email(&Email {
+                message_id: msg.into(),
+                thread_id: thread.map(String::from),
+                from: from.into(),
+                subject: "subj".into(),
+                body: "body".into(),
+                date: "2026-07-13T12:00:00Z".into(),
+                account_entity_id: Some("acc".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            })
+            .unwrap();
+        store
+            .log_action(
+                msg,
+                thread,
+                from,
+                "subj",
+                Some("body"),
+                draft,
+                ActionStatus::Pending,
+            )
+            .unwrap()
+    }
+
+    fn status_of(store: &Store, id: &str) -> String {
+        store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT status FROM actions WHERE id = ?1",
+                    augmentagent_store::rusqlite::params![id],
+                    |r| r.get::<_, String>(0),
+                )
+            })
+            .unwrap()
+    }
+
+    /// Rule 1: the user answered the thread from Gmail web/mobile. The card we
+    /// are still holding is asking them to reply to mail they already replied
+    /// to — exactly the stale carousel the user reported.
+    #[test]
+    fn retires_cards_on_threads_the_user_already_answered() {
+        let (store, _t) = fresh_store();
+        let answered = seed_pending(&store, "m-1", Some("T-answered"), "dana@example-labs.ai"); // pii-ok: synthetic
+        let untouched = seed_pending(&store, "m-2", Some("T-open"), "sam@example-labs.ai"); // pii-ok: synthetic
+
+        // The OutboundObserver saw the user reply on T-answered.
+        store
+            .record_outbound_thread_event("acc", "user-reply-1", Some("T-answered"), 9_000_000)
+            .unwrap();
+
+        let n = reconcile_stale_approvals_tick(&store).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(status_of(&store, &answered), "superseded");
+        assert_eq!(
+            status_of(&store, &untouched),
+            "pending",
+            "a thread the user has NOT answered must stay in the queue"
+        );
+    }
+
+    /// Rule 2: bulk senders. These are the ~100 cards that jammed the live
+    /// queue and, through the old backpressure cap, starved real threads.
+    #[test]
+    fn retires_cards_from_bulk_senders() {
+        let (store, _t) = fresh_store();
+        let blast =
+            seed_pending(&store, "m-3", Some("T-3"), "Brand <marketing@engage.examplebrand.com>"); // pii-ok: synthetic
+        let human = seed_pending(&store, "m-4", Some("T-4"), "Dana Rivera <dana@example-labs.ai>"); // pii-ok: synthetic
+
+        let n = reconcile_stale_approvals_tick(&store).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(status_of(&store, &blast), "superseded");
+        assert_eq!(
+            status_of(&store, &human),
+            "pending",
+            "a real person's card must never be swept as bulk"
+        );
+    }
+
+    /// The sweep must be safe to run on every tick forever.
+    #[test]
+    fn reconcile_is_idempotent_and_noop_on_a_clean_queue() {
+        let (store, _t) = fresh_store();
+        seed_pending(&store, "m-5", Some("T-5"), "Dana Rivera <dana@example-labs.ai>"); // pii-ok: synthetic
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+        assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
+    }
+
+    /// Rule 3 (#484): a card with an empty draft body is stale on its face —
+    /// there is nothing to approve, so it never drains. Retire it even when the
+    /// sender is a real human on a thread they have NOT replied to (the case the
+    /// bulk-sender and already-replied rules both miss). These are the residue
+    /// of the pre-#454 retry bug that survived the first reconcile pass.
+    #[test]
+    fn retires_cards_with_an_empty_draft_regardless_of_sender() {
+        let (store, _t) = fresh_store();
+        // A real person, unanswered thread, but the draft body is blank.
+        let empty = seed_pending_draft(
+            &store,
+            "m-6",
+            Some("T-6"),
+            "Dana Rivera <dana@example-labs.ai>", // pii-ok: synthetic
+            None,
+        );
+        let whitespace = seed_pending_draft(
+            &store,
+            "m-7",
+            Some("T-7"),
+            "Sam Okafor <sam@example-labs.ai>", // pii-ok: synthetic
+            Some("   \n  "),
+        );
+        // A real person with a real draft must be left alone.
+        let good = seed_pending(&store, "m-8", Some("T-8"), "Alex Chen <alex@examplesoft.net>"); // pii-ok: synthetic
+
+        let n = reconcile_stale_approvals_tick(&store).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(status_of(&store, &empty), "superseded");
+        assert_eq!(status_of(&store, &whitespace), "superseded");
+        assert_eq!(
+            status_of(&store, &good),
+            "pending",
+            "a card with a real draft for a real person must stay in the queue"
         );
     }
 }

@@ -174,19 +174,8 @@ mod tests {
             Ok("draft".into())
         }
 
-        async fn update_draft(
-            &self,
-            _e: &str,
-            _d: &str,
-            _t: &str,
-            _s: &str,
-            _b: &str,
-        ) -> Result<(), GmailError> {
-            Ok(())
-        }
-
-        async fn send_draft(&self, _e: &str, _d: &str) -> Result<(), GmailError> {
-            Ok(())
+        async fn send_draft(&self, _e: &str, _d: &str) -> Result<Option<String>, GmailError> {
+            Ok(None)
         }
 
         async fn delete_draft(&self, _e: &str, _d: &str) -> Result<(), GmailError> {

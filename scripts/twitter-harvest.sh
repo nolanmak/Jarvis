@@ -81,8 +81,8 @@ if [[ -z "${TWITTER_SSH_TARGET:-}" ]]; then
 No TWITTER_SSH_TARGET set, so the session stayed on this machine. To install
 it on the daemon host:
 
-  scp '$OUT_LOCAL' nolan-makatche@100.91.92.24:~/twitter-session.json
-  ssh nolan-makatche@100.91.92.24 \\
+  scp '$OUT_LOCAL' <user>@<host>:~/twitter-session.json
+  ssh <user>@<host> \\
       'cd ~/AugmentAgent && ./target/release/augmentagent twitter login --session-json ~/twitter-session.json && rm ~/twitter-session.json'
 
 Or re-run with TWITTER_SSH_TARGET=<user>@<host> to do it in one shot.

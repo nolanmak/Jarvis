@@ -28,8 +28,20 @@
 //!   `Store::mark_pending_drafts_superseded_by_thread` for each new
 //!   outbound event.
 //!
-//! Default-OFF in the daemon — opt-in via `AUGMENTAGENT_OUTBOUND_OBSERVER=1`.
-//! See `serve` wiring in `augmentagent-cli`.
+//! DEFAULT-ON in the daemon as of #449 — opt out with
+//! `AUGMENTAGENT_OUTBOUND_OBSERVER=0`. See `serve` wiring in `augmentagent-cli`.
+//!
+//! It shipped default-off, and stayed off, because it could not recognise the
+//! daemon's own sends: `classify_outbound` matched SENT-folder ids against
+//! `actions.messageId`, which holds *inbound* ids, so the skip arm never fired
+//! and every agent reply would have been recorded as a manual user reply.
+//! Turning it on would have superseded live drafts and suppressed drafting on
+//! every thread the agent had answered. Sends are now recorded in
+//! `self_sent_messages` (from the id Gmail returns at send time), so the
+//! observer can tell its own mail apart and is safe to run.
+//!
+//! Leaving it off is what let the approval queue fill with cards for mail the
+//! user had already answered — the stale carousel in #449.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -50,9 +62,29 @@ use crate::gmail::GmailApi;
 /// current shape). The header check is therefore a best-effort *future*
 /// hook: if/when the send path can stamp it, the classifier already honors
 /// it. The primary skip path today is message-id matching via
-/// `known_self_message_ids`, populated from `actions.messageId` where
-/// `status='sent'`.
+/// `known_self_message_ids`, populated from `self_sent_messages` — the ids
+/// Gmail hands back at send time (#449).
 pub const ACTION_ID_HEADER: &str = "X-AugmentAgent-Action-Id";
+
+/// #449 — how close (ms) a SENT-folder message must be, in time and on the
+/// same thread, to one of our own recorded sends before we treat it as that
+/// send rather than a reply the user wrote by hand.
+///
+/// Only used when the provider gave us no message id to match on exactly.
+/// Two minutes comfortably covers Composio round-trip + Gmail indexing lag
+/// while staying far below any plausible "user replied to this thread by
+/// hand seconds after the agent did" window. Erring long is safe: the cost of
+/// a false positive is one stale card, the cost of a false negative is
+/// permanently suppressing drafts on the thread.
+const SELF_SEND_PROXIMITY_MS: i64 = 120_000;
+
+const ONE_DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// #455 — hard floor on how far the observer's FIRST tick will look back
+/// through SENT. The cursor is normally seeded from the oldest pending approval
+/// card; this caps that at 30 days so a single ancient, abandoned card cannot
+/// turn a cold start into a crawl through the user's whole SENT history.
+const FIRST_TICK_MAX_LOOKBACK_MS: i64 = 30 * ONE_DAY_MS;
 
 /// A newly-observed outbound message that was NOT sent by the daemon —
 /// i.e. the user replied out-of-band and we need to react.
@@ -215,30 +247,51 @@ impl<G: GmailApi> OutboundObserver<G> {
                 .outbound_last_seen(&account.entity_id)
                 .unwrap_or(None)
                 .unwrap_or(0);
-            // First-tick guard: when `last_seen` is 0 we don't want to
-            // ingest the user's entire SENT history. Seed the cursor to
-            // wallclock-now and emit nothing this tick; subsequent ticks
-            // pick up only genuinely new outbound. The hook for a full
-            // backfill is `augmentagent-channel-email::tone::backfill`
-            // (an explicit operator command), not the live observer.
-            if last_seen == 0 {
+            // First-tick cursor (#455). We still refuse to ingest the user's
+            // ENTIRE SENT history — that's what
+            // `augmentagent-channel-email::tone::backfill` is for. But seeding
+            // the cursor to wallclock-now (the pre-#455 behaviour) made the
+            // observer blind to exactly the mail that matters on a cold start:
+            // it would only ever notice replies sent from this moment forward,
+            // so every approval card ALREADY sitting in the queue for a thread
+            // the user had answered stayed there. That is the stale carousel in
+            // #449 — the observer shipping "on" did not, by itself, clear it.
+            //
+            // So look back precisely as far as there is something to retire:
+            // the oldest still-pending card. A reply sent before that card was
+            // raised cannot make any current card stale. Bounded below by
+            // FIRST_TICK_MAX_LOOKBACK_MS so a very old abandoned card can't
+            // turn the first tick into an unbounded history crawl, and given a
+            // day of slack because Gmail's `after:` filter is date-granular.
+            let first_tick = last_seen == 0;
+            let last_seen = if first_tick {
                 let now_ms = wallclock_ms();
-                if let Err(e) = self
-                    .store
-                    .set_outbound_last_seen(&account.entity_id, now_ms)
-                {
-                    warn!(
-                        account = %account.entity_id,
-                        "outbound observer: failed to seed last_seen: {e:#}"
-                    );
-                }
-                debug!(
+                let floor_ms = now_ms - FIRST_TICK_MAX_LOOKBACK_MS;
+                let seed = match self.store.oldest_pending_action_created_at() {
+                    Ok(Some(oldest)) => (oldest - ONE_DAY_MS).max(floor_ms).min(now_ms),
+                    // Nothing pending ⇒ nothing to retire ⇒ no reason to look
+                    // back at all. Start from now.
+                    Ok(None) => now_ms,
+                    Err(e) => {
+                        warn!(
+                            account = %account.entity_id,
+                            "outbound observer: oldest_pending_action_created_at \
+                             failed, starting cursor at now: {e:#}"
+                        );
+                        now_ms
+                    }
+                };
+                info!(
                     account = %account.entity_id,
-                    seeded_at_ms = now_ms,
-                    "outbound observer: first tick — seeding cursor, skipping backfill"
+                    seeded_at_ms = seed,
+                    lookback_days = (now_ms - seed) / ONE_DAY_MS,
+                    "outbound observer: first tick — seeding cursor to cover the \
+                     pending-approval backlog"
                 );
-                continue;
-            }
+                seed
+            } else {
+                last_seen
+            };
             // Convert the cursor to Gmail's `after:YYYY/MM/DD` filter. We
             // err generous (one calendar day earlier) and re-dedupe via the
             // numeric cursor, because Gmail's after: granularity is a day,
@@ -274,6 +327,49 @@ impl<G: GmailApi> OutboundObserver<G> {
                 let headers: HashMap<String, String> = HashMap::new();
                 match classify_outbound(&email, &headers, &known_self_ids) {
                     Classification::Emit(ev) => {
+                        // #449 — proximity fallback. `known_self_ids` only
+                        // covers sends whose provider response carried a
+                        // message id. If one didn't, this SENT message would
+                        // otherwise be emitted as a "manual user reply", which
+                        // is the single most destructive mistake this observer
+                        // can make: it supersedes live drafts and makes the
+                        // already-replied guard suppress the thread. A send of
+                        // ours on the same thread within the window means this
+                        // is almost certainly that send.
+                        if let Some(tid) = ev.thread_id.as_deref() {
+                            match self.store.has_daemon_send_near(
+                                tid,
+                                ev.sent_at_ms,
+                                SELF_SEND_PROXIMITY_MS,
+                            ) {
+                                Ok(true) => {
+                                    debug!(
+                                        account = %account.entity_id,
+                                        message_id = %ev.message_id,
+                                        thread = %tid,
+                                        "outbound observer: skipping daemon-sent \
+                                         message (thread-proximity match)"
+                                    );
+                                    if ev.sent_at_ms > newest_seen {
+                                        newest_seen = ev.sent_at_ms;
+                                    }
+                                    continue;
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    // Fail closed: if we can't rule out that
+                                    // this was our own send, do NOT record it
+                                    // as a user reply.
+                                    warn!(
+                                        account = %account.entity_id,
+                                        thread = %tid,
+                                        "outbound observer: has_daemon_send_near \
+                                         failed, skipping to stay safe: {e:#}"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
                         if ev.sent_at_ms > newest_seen {
                             newest_seen = ev.sent_at_ms;
                         }
@@ -349,7 +445,11 @@ impl<G: GmailApi> OutboundObserver<G> {
                     }
                 }
             }
-            if newest_seen > last_seen {
+            // Persist when we advanced, and always on the first tick — the
+            // cold-start cursor (#455) has to be written down even if this tick
+            // found nothing newer, or the next tick would treat itself as a
+            // first tick again and re-derive the whole lookback window.
+            if newest_seen > last_seen || first_tick {
                 if let Err(e) = self
                     .store
                     .set_outbound_last_seen(&account.entity_id, newest_seen)
@@ -364,27 +464,19 @@ impl<G: GmailApi> OutboundObserver<G> {
         Ok(emitted)
     }
 
-    /// Pull every `actions.messageId` where status='sent' — these are the
-    /// message ids the approve-button path produced, so SENT-folder
-    /// observations matching them must be skipped. Bounded by recency
-    /// (last 30 days) so the set stays small.
+    /// The Gmail message ids of sends the daemon itself made, so SENT-folder
+    /// observations matching them are skipped rather than misread as replies
+    /// the user typed by hand. Bounded by recency (last 30 days) so the set
+    /// stays small.
+    ///
+    /// #449: this used to read `actions.messageId`, which is the *inbound*
+    /// email's id — it never matches a SENT-folder id, so the skip arm was
+    /// dead and every agent reply was classified as a manual user reply. The
+    /// ids now come from `self_sent_messages`, written at send time from the
+    /// id Gmail returns (see `GmailApi::send_draft`).
     fn load_self_sent_message_ids(&self) -> anyhow::Result<std::collections::HashSet<String>> {
         let cutoff_ms = wallclock_ms() - 30 * 24 * 60 * 60 * 1000;
-        let set = self.store.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT messageId FROM actions \
-                 WHERE status = 'sent' AND createdAt >= ?1",
-            )?;
-            let rows = stmt.query_map(augmentagent_store::rusqlite::params![cutoff_ms], |r| {
-                r.get::<_, String>(0)
-            })?;
-            let mut out = std::collections::HashSet::new();
-            for row in rows {
-                out.insert(row?);
-            }
-            Ok(out)
-        })?;
-        Ok(set)
+        Ok(self.store.self_sent_message_ids_since(cutoff_ms)?)
     }
 }
 
@@ -615,19 +707,8 @@ mod tests {
             Ok("draft".into())
         }
 
-        async fn update_draft(
-            &self,
-            _e: &str,
-            _d: &str,
-            _t: &str,
-            _s: &str,
-            _b: &str,
-        ) -> Result<(), GmailError> {
-            Ok(())
-        }
-
-        async fn send_draft(&self, _e: &str, _d: &str) -> Result<(), GmailError> {
-            Ok(())
+        async fn send_draft(&self, _e: &str, _d: &str) -> Result<Option<String>, GmailError> {
+            Ok(None)
         }
 
         async fn delete_draft(&self, _e: &str, _d: &str) -> Result<(), GmailError> {
@@ -751,17 +832,116 @@ mod tests {
         assert_eq!(status, "superseded");
     }
 
-    /// Daemon-sent outbound (message_id matches an `actions` row with
-    /// status='sent') must be skipped — and the pending draft on that
-    /// thread, if any, must NOT be touched.
+    /// #455 — on a cold start the observer must look back far enough to retire
+    /// the cards ALREADY in the queue. Seeding the cursor at wallclock-now (the
+    /// old behaviour) meant a card for a thread the user had already answered
+    /// stayed in the carousel forever, because the reply that made it stale was
+    /// sent before the observer ever looked. That was the user-visible half of
+    /// #449 that switching the observer on did not, by itself, fix.
     #[tokio::test]
-    async fn poll_once_skips_daemon_sent_via_known_message_id() {
+    async fn first_tick_looks_back_far_enough_to_retire_an_already_answered_card() {
+        let (store, _f) = mk_store(&["ent-1"]);
+        // No cursor at all — a genuine cold start.
+        assert!(store.outbound_last_seen("ent-1").unwrap().is_none());
+
+        // A pending card raised 3 days ago, on a thread the user has since
+        // answered from Gmail web. The reply is in SENT; we have never seen it.
+        let pending = store
+            .log_action(
+                "inbound-old",
+                Some("T-answered"),
+                "alice@example.com",
+                "subj",
+                None,
+                Some("draft body"),
+                augmentagent_store::ActionStatus::Pending,
+            )
+            .unwrap();
+        let three_days_ago = wallclock_ms() - 3 * ONE_DAY_MS;
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE actions SET createdAt = ?1 WHERE id = ?2",
+                    augmentagent_store::rusqlite::params![three_days_ago, pending],
+                )
+            })
+            .unwrap();
+
+        // The user's reply, sent two days ago — i.e. BEFORE now, which the old
+        // wallclock-now cursor would have skipped straight past.
+        let two_days_ago = wallclock_ms() - 2 * ONE_DAY_MS;
+        let mut user_reply = mk_email("user-reply-old", Some("T-answered"), "ent-1");
+        user_reply.date = two_days_ago.to_string();
+        let gmail = Arc::new(FakeGmail::new());
+        gmail
+            .sent_by_entity
+            .lock()
+            .unwrap()
+            .insert("ent-1".into(), vec![user_reply]);
+
+        let observer = OutboundObserver::new(Arc::clone(&store), gmail, 50);
+        let events = observer.poll_once().await.unwrap();
+
+        assert_eq!(
+            events.len(),
+            1,
+            "the first tick must see the reply that makes the queued card stale"
+        );
+        let status: String = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT status FROM actions WHERE id = ?1",
+                    augmentagent_store::rusqlite::params![pending],
+                    |r| r.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            status, "superseded",
+            "a card whose thread was already answered must be retired on the first tick"
+        );
+    }
+
+    /// ...but with an empty queue there is nothing to retire, so a cold start
+    /// must NOT go trawling through SENT history.
+    #[tokio::test]
+    async fn first_tick_with_no_pending_cards_does_not_backfill() {
+        let (store, _f) = mk_store(&["ent-1"]);
+        let mut old = mk_email("ancient-sent", Some("T-old"), "ent-1");
+        old.date = (wallclock_ms() - 10 * ONE_DAY_MS).to_string();
+        let gmail = Arc::new(FakeGmail::new());
+        gmail
+            .sent_by_entity
+            .lock()
+            .unwrap()
+            .insert("ent-1".into(), vec![old]);
+
+        let observer = OutboundObserver::new(Arc::clone(&store), gmail, 50);
+        let events = observer.poll_once().await.unwrap();
+        assert!(
+            events.is_empty(),
+            "nothing pending ⇒ nothing to retire ⇒ no history crawl: {events:?}"
+        );
+        assert!(store.outbound_last_seen("ent-1").unwrap().is_some());
+    }
+
+    /// #449 REGRESSION — the bug that kept the whole observer switched off.
+    ///
+    /// The agent replies on a thread. That reply lands in SENT. If the observer
+    /// cannot recognise it as its own, it records it as a reply the *user*
+    /// typed, which (a) supersedes any live draft on the thread and (b) makes
+    /// the already-replied guard silently suppress every future draft there.
+    /// So an agent send must leave `outbound_thread_log` untouched.
+    #[tokio::test]
+    async fn agent_own_send_is_not_recorded_as_a_user_reply() {
         let (store, _f) = mk_store(&["ent-1"]);
         store.set_outbound_last_seen("ent-1", 1_000_000).unwrap();
-        // A `sent` action sharing the same message_id the fake returns.
+        // The inbound email we replied to. Its id is what lands in
+        // `actions.messageId` — deliberately DIFFERENT from the sent id, which
+        // is the whole point: the old code compared these two id spaces.
         store
             .log_action(
-                "sent-msg-1",
+                "inbound-msg-1",
                 Some("T1"),
                 "alice@example.com",
                 "subj",
@@ -769,6 +949,93 @@ mod tests {
                 Some("draft body"),
                 augmentagent_store::ActionStatus::Sent,
             )
+            .unwrap();
+        // The daemon's send, recorded from the id Gmail returned.
+        store
+            .record_self_sent_message("sent-msg-1", Some("T1"), Some("ent-1"), Some("act-1"))
+            .unwrap();
+
+        let gmail = Arc::new(FakeGmail::new());
+        gmail.sent_by_entity.lock().unwrap().insert(
+            "ent-1".into(),
+            vec![mk_email("sent-msg-1", Some("T1"), "ent-1")],
+        );
+
+        let observer = OutboundObserver::new(Arc::clone(&store), gmail, 50);
+        let events = observer.poll_once().await.unwrap();
+        assert!(events.is_empty(), "our own send must not emit: {events:?}");
+
+        // The load-bearing assertion: the thread must NOT look like the user
+        // replied on it, or drafting on this thread is dead forever.
+        assert!(
+            !store.thread_has_user_reply_after("T1", 0).unwrap(),
+            "agent's own send was recorded as a user reply — this is the #449 bug"
+        );
+    }
+
+    /// A genuine user reply (no matching self-send record) MUST still be
+    /// detected — the fix must not swing the other way and make the observer
+    /// blind, which would leave the carousel stale all over again.
+    #[tokio::test]
+    async fn genuine_user_reply_is_still_detected_and_supersedes() {
+        let (store, _f) = mk_store(&["ent-1"]);
+        store.set_outbound_last_seen("ent-1", 1_000_000).unwrap();
+        let pending = store
+            .log_action(
+                "inbound-msg-2",
+                Some("T2"),
+                "alice@example.com",
+                "subj",
+                None,
+                Some("draft body"),
+                augmentagent_store::ActionStatus::Pending,
+            )
+            .unwrap();
+
+        let gmail = Arc::new(FakeGmail::new());
+        gmail.sent_by_entity.lock().unwrap().insert(
+            "ent-1".into(),
+            vec![mk_email("user-typed-msg", Some("T2"), "ent-1")],
+        );
+
+        let observer = OutboundObserver::new(Arc::clone(&store), gmail, 50);
+        let events = observer.poll_once().await.unwrap();
+        assert_eq!(events.len(), 1, "user reply must be observed");
+        assert!(store.thread_has_user_reply_after("T2", 0).unwrap());
+
+        let status: String = store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT status FROM actions WHERE id = ?1",
+                    augmentagent_store::rusqlite::params![pending],
+                    |r| r.get::<_, String>(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            status, "superseded",
+            "the stale card must be retired once the user replies"
+        );
+    }
+
+    /// Daemon-sent outbound must be skipped — and the pending draft on that
+    /// thread, if any, must NOT be touched.
+    ///
+    /// #449: this test used to seed an `actions` row whose `messageId` was the
+    /// SENT-folder id. That situation cannot occur in production —
+    /// `actions.messageId` is the *inbound* email's id — so the test passed
+    /// while the real skip path was dead, and every agent reply was being
+    /// classified as a manual user reply. The daemon now records its sends in
+    /// `self_sent_messages` from the id Gmail returns, and that is what the
+    /// observer matches on, so that is what this test seeds.
+    #[tokio::test]
+    async fn poll_once_skips_daemon_sent_via_known_message_id() {
+        let (store, _f) = mk_store(&["ent-1"]);
+        store.set_outbound_last_seen("ent-1", 1_000_000).unwrap();
+        // The daemon sent this message; `record_self_sent_message` is what the
+        // approve/send path calls with the id Gmail handed back.
+        store
+            .record_self_sent_message("sent-msg-1", Some("T1"), Some("ent-1"), Some("act-1"))
             .unwrap();
         // Separately, an unrelated pending draft on T1 (e.g. a second
         // person on the same thread) — must NOT be touched, the daemon

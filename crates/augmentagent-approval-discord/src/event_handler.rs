@@ -13,22 +13,30 @@ use std::sync::Arc;
 use serenity::all::{
     ActionRowComponent, Attachment, ButtonKind, ChannelId, Context, CreateAttachment,
     CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateMessage, EditMessage, EventHandler, GetMessages, Http, Interaction, Message, MessageId,
+    CreateMessage, EventHandler, GetMessages, Http, Interaction, Message, MessageId,
     MessageReference, Ready, UserId,
 };
 use tracing::{debug, info, warn};
-
-use augmentagent_store::Store;
 
 use crate::broker::BrokerState;
 use crate::custom_id::{CustomId, Verb};
 use crate::layout::{
     approval_message, extract_feedback, extract_fill_values, fill_ask_modal, fill_feedback,
-    invoice_draft_components, invoice_draft_content, revise_modal, split_needs_input,
+    revise_modal, split_needs_input,
 };
-use crate::{ApprovalActionOutcome, InvoiceOps};
+use crate::ApprovalActionOutcome;
 
 const DISCORD_MSG_LIMIT: usize = 1900;
+
+/// Fail-closed owner-allowlist check (#303). Returns `true` only when an
+/// allowlist is configured (`DISCORD_ALLOWED_USER_ID`) *and* the actor matches
+/// it. When `allowed_user_id` is `None` this returns `false`, so every gated
+/// action is refused rather than served to an arbitrary Discord user — the
+/// opposite of the previous `if let Some(allowed) = …` guards, which skipped
+/// the check entirely (fail-open) when no allowlist was configured.
+fn is_authorized(allowed_user_id: Option<UserId>, actor: UserId) -> bool {
+    matches!(allowed_user_id, Some(allowed) if allowed == actor)
+}
 
 pub struct Handler {
     pub state: Arc<BrokerState>,
@@ -74,14 +82,13 @@ impl EventHandler for Handler {
             return;
         }
 
-        if let Some(allowed) = self.state.allowed_user_id {
-            if msg.author.id != allowed {
-                debug!(
-                    "ignoring message from non-allowed user {}",
-                    msg.author.id.get()
-                );
-                return;
-            }
+        if !is_authorized(self.state.allowed_user_id, msg.author.id) {
+            debug!(
+                "ignoring message from unauthorized user {} (allowlist configured: {})",
+                msg.author.id.get(),
+                self.state.allowed_user_id.is_some()
+            );
+            return;
         }
 
         let user_text = msg.content.trim().to_string();
@@ -105,55 +112,6 @@ impl EventHandler for Handler {
                 if let Err(e) = msg.channel_id.send_message(&ctx.http, builder).await {
                     warn!("failed to post rejection footer: {e}");
                 }
-            }
-            return;
-        }
-
-        // Invoice config command — handled inline, not routed to the wiki
-        // query handler. Allowlist was already enforced above. `draft` is
-        // the only side-effectful subcommand and is dispatched separately
-        // so it can borrow the http + spawn the slow PDF generation off the
-        // event loop without blocking other Discord events.
-        if user_text.starts_with("!invoice") {
-            let parts: Vec<&str> = user_text.split_whitespace().collect();
-            if parts.get(1).copied() == Some("draft") {
-                let store = self.state.invoice_store.clone();
-                let ops = self.state.invoice_ops.clone();
-                let approval_channel = self.state.approval_channel_id;
-                let week_end_arg = parts.get(2).map(|s| s.to_string());
-                let http = ctx.http.clone();
-                let channel_id = msg.channel_id;
-                let msg_id = msg.id;
-                tokio::spawn(async move {
-                    let reply = match (store, ops) {
-                        (Some(store), Some(ops)) => {
-                            post_invoice_draft_card(
-                                &store,
-                                ops.as_ref(),
-                                &http,
-                                approval_channel,
-                                week_end_arg.as_deref(),
-                            )
-                            .await
-                        }
-                        (None, _) => "invoice store not wired — cannot draft".to_string(),
-                        (_, None) => "invoice ops not wired — cannot draft".to_string(),
-                    };
-                    let builder = CreateMessage::new()
-                        .content(reply)
-                        .reference_message(MessageReference::from((channel_id, msg_id)));
-                    if let Err(e) = channel_id.send_message(&*http, builder).await {
-                        warn!("failed to post invoice draft reply: {e}");
-                    }
-                });
-                return;
-            }
-            let reply = handle_invoice_command(self.state.invoice_store.as_deref(), &user_text);
-            let builder = CreateMessage::new()
-                .content(reply)
-                .reference_message(MessageReference::from((msg.channel_id, msg.id)));
-            if let Err(e) = msg.channel_id.send_message(&ctx.http, builder).await {
-                warn!("failed to post invoice command reply: {e}");
             }
             return;
         }
@@ -188,7 +146,7 @@ impl EventHandler for Handler {
         }
 
         // `loop` / `/loop` — user-defined scheduled tasks (#104). Handled
-        // inline like `!invoice`; never routed to the wiki query handler.
+        // inline; never routed to the wiki query handler.
         // Leading `/` is optional — `match_loop_prefix` accepts either form
         // as long as it's word-bounded (so `loops are nice` isn't matched).
         if crate::loops::match_loop_prefix(&user_text).is_some() {
@@ -207,6 +165,7 @@ impl EventHandler for Handler {
                 msg.channel_id,
                 msg.id,
                 chunk_for_discord(&reply),
+                Vec::new(),
                 "loop command reply",
             )
             .await;
@@ -220,6 +179,7 @@ impl EventHandler for Handler {
         let msg_id = msg.id;
         let bot_user_id = self.state.bot_user_id.get().copied();
         let allowed_user_id = self.state.allowed_user_id;
+        let wiki_root = self.state.wiki_root.clone();
 
         tokio::spawn(async move {
             // Fetch recent messages in this channel/DM so follow-up questions
@@ -282,7 +242,12 @@ impl EventHandler for Handler {
             let footer = format_rejection_footer(&rejected);
 
             match result {
-                Ok(mut answer) => {
+                Ok(answer) => {
+                    // #440 — pull `ATTACH:` markers out of the answer and
+                    // deliver the referenced wiki files on the first chunk.
+                    let (mut answer, attachments) =
+                        crate::attachments::prepare_answer_delivery(&answer, wiki_root.as_deref())
+                            .await;
                     if let Some(f) = &footer {
                         // Append before chunking so a long answer's footer
                         // still ends up in the final Discord message.
@@ -294,6 +259,7 @@ impl EventHandler for Handler {
                         channel_id,
                         msg_id,
                         chunk_for_discord(&answer),
+                        attachments,
                         "wiki answer chunk",
                     )
                     .await;
@@ -323,16 +289,14 @@ impl EventHandler for Handler {
                     return;
                 };
                 // Enforce user allowlist on clicks.
-                if let Some(allowed) = self.state.allowed_user_id {
-                    if comp.user.id != allowed {
-                        ack_ephemeral(
-                            &ctx,
-                            &comp,
-                            "You are not authorized to approve replies on this bot.",
-                        )
-                        .await;
-                        return;
-                    }
+                if !is_authorized(self.state.allowed_user_id, comp.user.id) {
+                    ack_ephemeral(
+                        &ctx,
+                        &comp,
+                        "You are not authorized to approve replies on this bot.",
+                    )
+                    .await;
+                    return;
                 }
                 match cid.verb {
                     Verb::Approve => {
@@ -585,65 +549,6 @@ impl EventHandler for Handler {
                     Verb::ReviseModal | Verb::FillAskModal => {
                         debug!("unexpected modal verb on component interaction");
                     }
-                    Verb::InvoiceApprove => {
-                        if let Err(e) = defer_ephemeral(&ctx, &comp).await {
-                            warn!("failed to defer InvoiceApprove: {e}");
-                            return;
-                        }
-                        let store = self.state.invoice_store.clone();
-                        let ops = self.state.invoice_ops.clone();
-                        let action_id = cid.action_id.clone();
-                        let user_id = comp.user.id.get().to_string();
-                        let ctx_clone = ctx.clone();
-                        let comp_clone = comp.clone();
-                        tokio::spawn(async move {
-                            let result = invoice_approve_draft(
-                                store.as_deref(),
-                                ops.as_deref(),
-                                &action_id,
-                                &user_id,
-                            )
-                            .await;
-                            followup(&ctx_clone, &comp_clone, &result.followup).await;
-                            if let Some(edit) = result.source_edit {
-                                edit_source_message(
-                                    &ctx_clone,
-                                    comp_clone.channel_id,
-                                    comp_clone.message.id,
-                                    &edit,
-                                )
-                                .await;
-                            }
-                        });
-                    }
-                    Verb::InvoiceReject => {
-                        if let Err(e) = defer_ephemeral(&ctx, &comp).await {
-                            warn!("failed to defer InvoiceReject: {e}");
-                            return;
-                        }
-                        let store = self.state.invoice_store.clone();
-                        let action_id = cid.action_id.clone();
-                        let user_id = comp.user.id.get().to_string();
-                        let ctx_clone = ctx.clone();
-                        let comp_clone = comp.clone();
-                        tokio::spawn(async move {
-                            let result = invoice_reject_draft(
-                                store.as_deref(),
-                                &action_id,
-                                &user_id,
-                            );
-                            followup(&ctx_clone, &comp_clone, &result.followup).await;
-                            if let Some(edit) = result.source_edit {
-                                edit_source_message(
-                                    &ctx_clone,
-                                    comp_clone.channel_id,
-                                    comp_clone.message.id,
-                                    &edit,
-                                )
-                                .await;
-                            }
-                        });
-                    }
                 }
             }
             Interaction::Modal(modal) => {
@@ -653,20 +558,18 @@ impl EventHandler for Handler {
                 if !matches!(cid.verb, Verb::ReviseModal | Verb::FillAskModal) {
                     return;
                 }
-                if let Some(allowed) = self.state.allowed_user_id {
-                    if modal.user.id != allowed {
-                        let _ = modal
-                            .create_response(
-                                &ctx.http,
-                                CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content("Not authorized.")
-                                        .ephemeral(true),
-                                ),
-                            )
-                            .await;
-                        return;
-                    }
+                if !is_authorized(self.state.allowed_user_id, modal.user.id) {
+                    let _ = modal
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("Not authorized.")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
+                    return;
                 }
                 // Defer the modal submission immediately — the revise work
                 // (reasoner call, create_draft, delete_draft) takes well over
@@ -806,6 +709,19 @@ impl EventHandler for Handler {
                             }),
                             None => 0,
                         };
+                        // #473 — the revise flow recreates the Gmail draft
+                        // with the card's stored envelope, so the reposted
+                        // card must keep SHOWING it: a BCC that is applied
+                        // but invisible is exactly the body/envelope mismatch
+                        // the issue is about. Display-only (the captured
+                        // triple and stored draftBody above stay clean);
+                        // no envelope recorded → body passes through as-is.
+                        let draft = append_envelope_markers(
+                            draft,
+                            store_for_capture.as_deref(),
+                            &action_id,
+                            &email.from,
+                        );
                         let msg = approval_message(&action_id, &email, &draft, count);
                         match approval_channel.send_message(&ctx_clone.http, msg).await {
                             Ok(_) => new_card_posted = true,
@@ -951,6 +867,40 @@ fn describe(outcome: &ApprovalActionOutcome) -> String {
     }
 }
 
+/// #473 — append the stored compose envelope to a reposted card body as the
+/// same display markers the original card carried (`[to: …]`/`[cc: …]`/
+/// `[bcc: …]`). `[to:]` is shown only when it differs from `card_from` (the
+/// card's From line), matching compose-time behavior. No store or no
+/// recorded envelope (auto-triage replies, non-gmail platforms) → the body
+/// passes through unchanged.
+fn append_envelope_markers(
+    body: String,
+    store: Option<&augmentagent_store::Store>,
+    action_id: &str,
+    card_from: &str,
+) -> String {
+    let Some(env) = store.and_then(|s| s.get_action_envelope(action_id).ok().flatten()) else {
+        return body;
+    };
+    let mut markers = String::new();
+    if let Some(to) = env.to.as_deref() {
+        if !to.eq_ignore_ascii_case(card_from) {
+            markers.push_str(&format!("\n[to: {to}]"));
+        }
+    }
+    if let Some(cc) = env.cc.as_deref() {
+        markers.push_str(&format!("\n[cc: {cc}]"));
+    }
+    if let Some(bcc) = env.bcc.as_deref() {
+        markers.push_str(&format!("\n[bcc: {bcc}]"));
+    }
+    if markers.is_empty() {
+        body
+    } else {
+        format!("{body}\n{markers}")
+    }
+}
+
 /// Should the source approval card be deleted after this outcome?
 ///
 /// Approved / Skipped / Revised: yes — the card is now stale or superseded.
@@ -1034,22 +984,13 @@ async fn sweep_resolved_cards(
 
 /// Walk a message's components looking for the first parseable content-draft
 /// `custom_id`. Returns the `action_id` if found; `None` for any message that
-/// isn't one of our cards. Invoice draft cards encode a `draft_id` under the
-/// `InvoiceApprove` / `InvoiceReject` verbs — those are NOT actions, so the
-/// startup sweep skips them.
+/// isn't one of our cards.
 fn action_id_from_message(msg: &Message) -> Option<String> {
     for row in &msg.components {
         for component in &row.components {
             if let ActionRowComponent::Button(button) = component {
                 if let ButtonKind::NonLink { custom_id, .. } = &button.data {
                     if let Some(parsed) = crate::custom_id::CustomId::parse(custom_id) {
-                        if matches!(
-                            parsed.verb,
-                            crate::custom_id::Verb::InvoiceApprove
-                                | crate::custom_id::Verb::InvoiceReject
-                        ) {
-                            continue;
-                        }
                         return Some(parsed.action_id);
                     }
                 }
@@ -1057,340 +998,6 @@ fn action_id_from_message(msg: &Message) -> Option<String> {
         }
     }
     None
-}
-
-/// Result of an invoice button-click helper. Two pieces: the ephemeral
-/// follow-up shown to the clicker, and (optionally) a new content to edit
-/// the source card to so the channel reflects the final state.
-pub(crate) struct InvoiceClickResult {
-    pub followup: String,
-    pub source_edit: Option<String>,
-}
-
-/// Approve the invoice draft `draft_id`: call the real-send path via
-/// `InvoiceOps::send`, mark the draft approved, and return the human
-/// follow-up + source-edit text. Trusts the caller to have enforced the
-/// allowlist already (the event handler does this at the top of the
-/// component branch).
-pub(crate) async fn invoice_approve_draft(
-    store: Option<&Store>,
-    ops: Option<&(dyn InvoiceOps + 'static)>,
-    draft_id: &str,
-    user_id: &str,
-) -> InvoiceClickResult {
-    let Some(store) = store else {
-        return InvoiceClickResult {
-            followup: "Invoice store not wired — cannot approve.".into(),
-            source_edit: None,
-        };
-    };
-    let Some(ops) = ops else {
-        return InvoiceClickResult {
-            followup: "Invoice ops not wired — cannot approve.".into(),
-            source_edit: None,
-        };
-    };
-    let draft = match store.get_invoice_draft(draft_id) {
-        Ok(Some(d)) => d,
-        Ok(None) => {
-            return InvoiceClickResult {
-                followup: "Draft not found — it may have been cleared.".into(),
-                source_edit: None,
-            };
-        }
-        Err(e) => {
-            warn!(draft_id = %draft_id, "invoice approve: store read failed: {e}");
-            return InvoiceClickResult {
-                followup: format!("Store error: {e}"),
-                source_edit: None,
-            };
-        }
-    };
-    if draft.status != "pending" {
-        return InvoiceClickResult {
-            followup: format!("Already resolved ({}).", draft.status),
-            source_edit: None,
-        };
-    }
-    let week_end = match chrono::NaiveDate::parse_from_str(&draft.week_end, "%Y-%m-%d") {
-        Ok(d) => d,
-        Err(e) => {
-            warn!(draft_id = %draft_id, "invoice approve: bad week_end: {e}");
-            return InvoiceClickResult {
-                followup: format!("Corrupt draft row: bad week_end `{}`", draft.week_end),
-                source_edit: None,
-            };
-        }
-    };
-    match ops.send(week_end).await {
-        Ok(msg) => {
-            if let Err(e) =
-                store.mark_invoice_draft_resolved(draft_id, "approved", user_id)
-            {
-                warn!(draft_id = %draft_id, "invoice approve: mark resolved failed: {e}");
-            }
-            info!(
-                draft_id = %draft_id,
-                user_id = %user_id,
-                number = draft.invoice_number,
-                "invoice approve: sent"
-            );
-            InvoiceClickResult {
-                followup: format!("Approved — {msg}"),
-                source_edit: Some(format!(
-                    ":white_check_mark: Sent #{} (week {})",
-                    draft.invoice_number, draft.week_end
-                )),
-            }
-        }
-        Err(e) => {
-            warn!(draft_id = %draft_id, "invoice approve: send failed: {e:#}");
-            if let Err(mark_err) =
-                store.mark_invoice_draft_resolved(draft_id, "failed", user_id)
-            {
-                warn!(draft_id = %draft_id, "invoice approve: mark failed failed: {mark_err}");
-            }
-            InvoiceClickResult {
-                followup: format!("Send failed: {e}"),
-                source_edit: Some(format!(
-                    ":warning: Send failed for #{}: {}",
-                    draft.invoice_number, e
-                )),
-            }
-        }
-    }
-}
-
-/// Reject the invoice draft `draft_id`. Marks it rejected, no state mutation
-/// beyond the draft row. Synchronous (no I/O outside sqlite) so the caller
-/// can spawn it on a task without await complexity.
-pub(crate) fn invoice_reject_draft(
-    store: Option<&Store>,
-    draft_id: &str,
-    user_id: &str,
-) -> InvoiceClickResult {
-    let Some(store) = store else {
-        return InvoiceClickResult {
-            followup: "Invoice store not wired — cannot reject.".into(),
-            source_edit: None,
-        };
-    };
-    let draft = match store.get_invoice_draft(draft_id) {
-        Ok(Some(d)) => d,
-        Ok(None) => {
-            return InvoiceClickResult {
-                followup: "Draft not found.".into(),
-                source_edit: None,
-            };
-        }
-        Err(e) => {
-            warn!(draft_id = %draft_id, "invoice reject: store read failed: {e}");
-            return InvoiceClickResult {
-                followup: format!("Store error: {e}"),
-                source_edit: None,
-            };
-        }
-    };
-    if draft.status != "pending" {
-        return InvoiceClickResult {
-            followup: format!("Already resolved ({}).", draft.status),
-            source_edit: None,
-        };
-    }
-    if let Err(e) = store.mark_invoice_draft_resolved(draft_id, "rejected", user_id) {
-        warn!(draft_id = %draft_id, "invoice reject: mark resolved failed: {e}");
-        return InvoiceClickResult {
-            followup: format!("Store error: {e}"),
-            source_edit: None,
-        };
-    }
-    info!(draft_id = %draft_id, user_id = %user_id, "invoice reject");
-    InvoiceClickResult {
-        followup: "Rejected — nothing sent.".into(),
-        source_edit: Some(format!(
-            ":no_entry: Rejected — nothing sent (week {}, #{})",
-            draft.week_end, draft.invoice_number
-        )),
-    }
-}
-
-/// Generate the PDF (via `ops`), post the card with the PDF attached, and
-/// record the draft row. Returns a user-facing reply.
-pub async fn post_invoice_draft_card(
-    store: &Store,
-    ops: &dyn InvoiceOps,
-    http: &Http,
-    approval_channel: ChannelId,
-    week_end_arg: Option<&str>,
-) -> String {
-    let week_end_opt = match week_end_arg {
-        Some(s) => match chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-            Ok(d) => Some(d),
-            Err(_) => {
-                return format!(
-                    "usage: `!invoice draft [YYYY-MM-DD]` (got `{s}` — not a date)"
-                );
-            }
-        },
-        None => None,
-    };
-    let pdf = match ops.draft_pdf(week_end_opt).await {
-        Ok(p) => p,
-        Err(e) => return format!(":warning: draft failed: {e}"),
-    };
-    if store
-        .get_pending_invoice_draft_for_week(&pdf.week_end.to_string())
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        return format!(
-            ":information_source: a pending draft already exists for week {} — \
-             reject it before drafting a replacement",
-            pdf.week_end
-        );
-    }
-    let draft_id = match store.insert_invoice_draft(
-        &pdf.week_end.to_string(),
-        pdf.number,
-        &pdf.pdf_path.to_string_lossy(),
-    ) {
-        Ok(id) => id,
-        Err(e) => return format!(":warning: store insert failed: {e}"),
-    };
-    let attachment = match CreateAttachment::path(&pdf.pdf_path).await {
-        Ok(a) => a,
-        Err(e) => {
-            return format!(
-                ":warning: read PDF for attach failed ({}): {e}",
-                pdf.pdf_path.display()
-            );
-        }
-    };
-    let pdf_filename = pdf
-        .pdf_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| pdf.pdf_path.to_string_lossy().into_owned());
-    let content = invoice_draft_content(
-        pdf.number,
-        &pdf.week_start.to_string(),
-        &pdf.week_end.to_string(),
-        &pdf.recipient,
-        &pdf_filename,
-    );
-    let builder = CreateMessage::new()
-        .content(content)
-        .add_file(attachment)
-        .components(invoice_draft_components(&draft_id));
-    match approval_channel.send_message(http, builder).await {
-        Ok(posted) => {
-            if let Err(e) = store.update_invoice_draft_message(
-                &draft_id,
-                &approval_channel.get().to_string(),
-                &posted.id.get().to_string(),
-            ) {
-                warn!(draft_id = %draft_id, "post_invoice_draft_card: update msg id failed: {e}");
-            }
-            format!(":outbox_tray: drafted invoice #{} for week {}", pdf.number, pdf.week_end)
-        }
-        Err(e) => {
-            warn!(draft_id = %draft_id, "post_invoice_draft_card: send_message failed: {e}");
-            format!(":warning: posting draft to approval channel failed: {e}")
-        }
-    }
-}
-
-/// Best-effort edit of a posted card after the user clicks Approve/Reject.
-async fn edit_source_message(
-    ctx: &Context,
-    channel_id: ChannelId,
-    message_id: MessageId,
-    new_content: &str,
-) {
-    let edit = EditMessage::new()
-        .content(new_content)
-        .components(vec![]);
-    if let Err(e) = channel_id
-        .edit_message(&ctx.http, message_id, edit)
-        .await
-    {
-        warn!("failed to edit invoice draft card: {e}");
-    }
-}
-
-/// Keep only attachments whose Discord-reported `content_type` looks like an
-/// image. Discord populates this from the upload, so it's reliable enough to
-/// gate which attachments we hand to the vision model.
-/// Handle a `!invoice …` config command. Pure: reads/writes the invoice_config
-/// store rows and returns the text to reply with. Recognized:
-///   `!invoice status`
-///   `!invoice recipient <email>`
-///   `!invoice entity <composio_entity_id>`
-///   `!invoice autodraft on|off`
-///
-/// `!invoice draft [YYYY-MM-DD]` is handled by the caller (it's
-/// side-effectful and async) — see `post_invoice_draft_card`.
-fn handle_invoice_command(store: Option<&Store>, text: &str) -> String {
-    let Some(store) = store else {
-        return "invoice config unavailable (store not wired)".to_string();
-    };
-    let parts: Vec<&str> = text.split_whitespace().collect();
-    let g = |k: &str| store.get_invoice_config(k).ok().flatten().unwrap_or_default();
-    match parts.get(1).copied() {
-        Some("status") => {
-            let recipient = {
-                let r = g("recipient_email");
-                if r.is_empty() { "(unset — set via dashboard or `!invoice recipient`)".to_string() } else { r }
-            };
-            let entity = g("from_entity");
-            let last = g("last_billed_week_end");
-            let autodraft = g("auto_draft_enabled") == "true";
-            format!(
-                "📄 **Invoice config**\n• auto-draft: **{}**\n• recipient: `{}`\n• next #: `{}`\n• sending entity: `{}`\n• last billed week: `{}`",
-                if autodraft { "ON" } else { "OFF (scheduler will not post drafts)" },
-                recipient,
-                store.invoice_counter().unwrap_or(35),
-                if entity.is_empty() { "(unset)".to_string() } else { entity },
-                if last.is_empty() { "(never)".to_string() } else { last },
-            )
-        }
-        Some("recipient") => match parts.get(2) {
-            Some(email) if email.contains('@') && email.contains('.') => {
-                match store.set_invoice_config("recipient_email", email) {
-                    Ok(()) => format!("✅ invoice recipient set to `{email}`"),
-                    Err(e) => format!("⚠️ failed to set recipient: {e}"),
-                }
-            }
-            _ => "usage: `!invoice recipient you@example.com`".to_string(),
-        },
-        Some("entity") => match parts.get(2) {
-            Some(ent) if !ent.is_empty() => {
-                match store.set_invoice_config("from_entity", ent) {
-                    Ok(()) => format!("✅ sending entity set to `{ent}`"),
-                    Err(e) => format!("⚠️ failed to set entity: {e}"),
-                }
-            }
-            _ => "usage: `!invoice entity <composio_entity_id>`".to_string(),
-        },
-        Some("autodraft") => match parts.get(2).map(|s| s.to_ascii_lowercase()) {
-            Some(v) if v == "on" || v == "true" => {
-                match store.set_invoice_config("auto_draft_enabled", "true") {
-                    Ok(()) => "✅ invoice auto-draft **ON** — the scheduler will post a Sunday draft for approval".to_string(),
-                    Err(e) => format!("⚠️ failed to enable auto-draft: {e}"),
-                }
-            }
-            Some(v) if v == "off" || v == "false" => {
-                match store.set_invoice_config("auto_draft_enabled", "false") {
-                    Ok(()) => "🛑 invoice auto-draft **OFF** — the scheduler will not post drafts".to_string(),
-                    Err(e) => format!("⚠️ failed to disable auto-draft: {e}"),
-                }
-            }
-            _ => "usage: `!invoice autodraft on|off`".to_string(),
-        },
-        _ => "invoice commands:\n• `!invoice status`\n• `!invoice draft [YYYY-MM-DD]`\n• `!invoice recipient <email>`\n• `!invoice entity <composio_entity_id>`\n• `!invoice autodraft on|off`"
-            .to_string(),
-    }
 }
 
 /// Soft cap on how much of a text file we feed into the prompt. Files larger
@@ -1978,11 +1585,13 @@ async fn fetch_conversation_context(
         }
         let role = if bot_user_id == Some(m.author.id) {
             "assistant"
+        } else if is_authorized(allowed_user_id, m.author.id) {
+            "user"
         } else {
-            match allowed_user_id {
-                Some(allowed) if m.author.id != allowed => continue,
-                _ => "user",
-            }
+            // Fail-closed (#303): with no configured allowlist, or for any
+            // non-owner author, don't fold their messages into the owner's
+            // conversation context.
+            continue;
         };
         let mut body = m.content.trim().to_string();
         if !m.attachments.is_empty() {
@@ -2055,6 +1664,7 @@ async fn send_chunks_reply_chain(
     channel_id: ChannelId,
     root_msg: MessageId,
     chunks: Vec<String>,
+    attachments: Vec<CreateAttachment>,
     label: &str,
 ) {
     let total = chunks.len();
@@ -2073,7 +1683,11 @@ async fn send_chunks_reply_chain(
             prev_msg_id
         };
 
-        match send_one_with_retry(http, channel_id, reply_target, &chunk, label).await {
+        // #440 — outbound files ride on the first chunk only.
+        let chunk_files: &[CreateAttachment] = if idx == 0 { &attachments } else { &[] };
+
+        match send_one_with_retry(http, channel_id, reply_target, &chunk, chunk_files, label).await
+        {
             Some(sent_id) => {
                 prev_msg_id = Some(sent_id);
             }
@@ -2109,6 +1723,7 @@ async fn send_one_with_retry(
     channel_id: ChannelId,
     reply_target: Option<MessageId>,
     chunk: &str,
+    attachments: &[CreateAttachment],
     label: &str,
 ) -> Option<MessageId> {
     let attempts: [(u64, bool); 3] = [(0, true), (250, true), (750, false)];
@@ -2118,6 +1733,11 @@ async fn send_one_with_retry(
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
         let mut builder = CreateMessage::new().content(chunk);
+        if !attachments.is_empty() {
+            // Rebuilt per attempt — CreateAttachment is Clone and the builder
+            // consumes its files on send.
+            builder = builder.add_files(attachments.iter().cloned());
+        }
         if use_reference {
             if let Some(target) = reply_target {
                 builder = builder.reference_message(MessageReference::from((channel_id, target)));
@@ -2187,6 +1807,89 @@ fn hard_split(s: &str, max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- #303: fail-closed owner-allowlist check ----
+
+    #[test]
+    fn is_authorized_fails_closed_without_allowlist() {
+        let owner = UserId::new(111);
+        let other = UserId::new(222);
+        // No allowlist configured -> everyone is refused (fail-closed).
+        assert!(!is_authorized(None, owner));
+        assert!(!is_authorized(None, other));
+        // Allowlist configured -> only the configured owner passes.
+        assert!(is_authorized(Some(owner), owner));
+        assert!(!is_authorized(Some(owner), other));
+    }
+
+    // ---- #473: envelope markers on the reposted (post-Revise) card ----
+
+    fn store_with_envelope(
+        to: Option<&str>,
+        cc: Option<&str>,
+        bcc: Option<&str>,
+    ) -> (augmentagent_store::Store, String, tempfile::NamedTempFile) {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let s = augmentagent_store::Store::open(f.path()).unwrap();
+        let id = s
+            .log_action(
+                "m-473",
+                None,
+                "josh@x.com",
+                "intro",
+                None,
+                Some("draft"),
+                augmentagent_store::ActionStatus::Pending,
+            )
+            .unwrap();
+        s.set_action_envelope(&id, to, cc, bcc).unwrap();
+        (s, id, f)
+    }
+
+    #[test]
+    fn envelope_markers_show_overridden_to_and_bcc() {
+        let (s, id, _f) =
+            store_with_envelope(Some("omer@y.com"), None, Some("josh@x.com"));
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "josh@x.com");
+        assert!(out.contains("[to: omer@y.com]"), "missing to marker: {out}");
+        assert!(out.contains("[bcc: josh@x.com]"), "missing bcc marker: {out}");
+        assert!(out.starts_with("body"), "body must lead: {out}");
+    }
+
+    #[test]
+    fn envelope_markers_omit_to_when_it_matches_card_from() {
+        // New-email cards: the card's From line already IS the recipient
+        // list, so a [to:] marker would be redundant noise.
+        let (s, id, _f) =
+            store_with_envelope(Some("a@b.com"), Some("cc@d.com"), None);
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "a@b.com");
+        assert!(!out.contains("[to:"), "redundant to marker: {out}");
+        assert!(out.contains("[cc: cc@d.com]"), "missing cc marker: {out}");
+    }
+
+    #[test]
+    fn no_envelope_or_no_store_passes_body_through() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let s = augmentagent_store::Store::open(f.path()).unwrap();
+        let id = s
+            .log_action(
+                "m-none",
+                None,
+                "a@b.com",
+                "s",
+                None,
+                Some("d"),
+                augmentagent_store::ActionStatus::Pending,
+            )
+            .unwrap();
+        // Row exists but no envelope was ever recorded (auto-triage shape).
+        assert_eq!(
+            append_envelope_markers("body".into(), Some(&s), &id, "a@b.com"),
+            "body"
+        );
+        // No store wired at all.
+        assert_eq!(append_envelope_markers("body".into(), None, &id, "a@b.com"), "body");
+    }
 
     #[test]
     fn short_answer_is_one_chunk() {

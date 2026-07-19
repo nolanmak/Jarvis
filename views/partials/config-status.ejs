@@ -40,6 +40,7 @@
     <% if (configStatus.gmailAccounts.length > 0) { %>
       <div class="ml-4 space-y-1">
         <% configStatus.gmailAccounts.forEach(function(account) { %>
+          <% var calConnected = (configStatus.calendarEntities || []).indexOf(account.entityId) !== -1; %>
           <div class="flex items-center justify-between py-1 group">
             <div class="flex items-center gap-2 min-w-0">
               <span class="w-1.5 h-1.5 rounded-full <%= account.active ? 'bg-green-400' : 'bg-gray-600' %>"></span>
@@ -47,15 +48,30 @@
                 <%= account.email || account.label || account.connectionId.slice(0, 12) + '...' %>
               </span>
               <code class="text-[10px] text-gray-600 truncate" title="Composio entity — use with: !invoice entity &lt;id&gt;"><%= account.entityId %></code>
+              <% if (calConnected) { %>
+                <span class="flex items-center gap-1 shrink-0" title="Google Calendar connected — alerts, agenda, and scheduling are live for this account">
+                  <span class="w-1.5 h-1.5 rounded-full bg-green-400"></span>
+                  <span class="text-[10px] text-gray-500">Calendar</span>
+                </span>
+              <% } %>
             </div>
-            <button
-              hx-delete="/api/oauth/gmail/<%= account.id %>"
-              hx-target="#config-status"
-              hx-swap="innerHTML"
-              hx-confirm="Remove this Gmail account?"
-              class="text-xs text-gray-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity">
-              Remove
-            </button>
+            <div class="flex items-center gap-2 shrink-0">
+              <% if (!calConnected && configStatus.composioKey) { %>
+                <a href="/oauth/calendar/start?entity=<%= account.entityId %>"
+                   title="Connect this account's Google Calendar (meeting alerts, agenda, scheduling)"
+                   class="px-2 py-0.5 bg-blue-600 hover:bg-blue-500 rounded text-[10px] font-medium transition-colors">
+                  Connect Calendar
+                </a>
+              <% } %>
+              <button
+                hx-delete="/api/oauth/gmail/<%= account.id %>"
+                hx-target="#config-status"
+                hx-swap="innerHTML"
+                hx-confirm="Remove this Gmail account?"
+                class="text-xs text-gray-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity">
+                Remove
+              </button>
+            </div>
           </div>
         <% }); %>
       </div>

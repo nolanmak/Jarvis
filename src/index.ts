@@ -26,6 +26,15 @@ import {
   loginSubmitHandler,
 } from "./security";
 import type { Email } from "./types";
+// Auto-update signature gate (security #298). Shared with the dashboard GitHub
+// webhook receiver so both auto-update paths enforce the same owner-signature
+// requirement. See src/updateGuard.ts.
+import {
+  UPDATE_REQUIRE_SIGNATURE,
+  UPDATE_ALLOWED_SIGNERS,
+  alertUpdateSecurity,
+  isRevisionSignedByOwner,
+} from "./updateGuard";
 
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -144,8 +153,9 @@ function startDashboard(): void {
 async function main(): Promise<void> {
   console.log("AugmentAgent starting...");
 
-  // Initialize database
-  initDb();
+  // Initialize database — #360: honor AUGMENTAGENT_DB (falls back to the
+  // default ./data.db when unset) so a tenant/test DB isn't silently ignored.
+  initDb(process.env.AUGMENTAGENT_DB);
   console.log("Database initialized.");
 
   // Start web dashboard
@@ -189,8 +199,8 @@ function checkForUpdates(): void {
   try {
     const cwd = process.cwd();
 
-    // Fetch latest from remote
-    execSync("git fetch origin main", { cwd, stdio: "pipe" });
+    // Fetch latest from remote (and any signed tags). Fetching does not run code.
+    execSync("git fetch origin main --tags", { cwd, stdio: "pipe" });
 
     // Compare local HEAD vs remote HEAD
     const local = execSync("git rev-parse HEAD", { cwd, stdio: "pipe" }).toString().trim();
@@ -201,8 +211,47 @@ function checkForUpdates(): void {
       return;
     }
 
+    // SECURITY GATE (#298): never pull/build/restart an unverified revision.
+    // The candidate is origin/main HEAD. It must be signed by the owner's key
+    // (verified cryptographically — NOT by the spoofable author field).
+    if (UPDATE_REQUIRE_SIGNATURE) {
+      if (!UPDATE_ALLOWED_SIGNERS) {
+        // No explicit trust anchor configured. We still attempt verification via
+        // git's own configured allowed-signers/keyring, but warn loudly because
+        // a misconfigured host could otherwise silently fail closed forever.
+        console.warn(
+          `[${new Date().toISOString()}] AUGMENTAGENT_UPDATE_ALLOWED_SIGNERS not set; ` +
+            `relying on git's configured signer trust anchor for verification.`
+        );
+      }
+
+      if (!isRevisionSignedByOwner(cwd, remote)) {
+        const msg =
+          `SKIPPED update to ${remote.slice(0, 7)}: revision is unsigned, has an ` +
+          `invalid signature, or is not signed by an allowed key. No pull/build/` +
+          `restart performed.`;
+        console.warn(`[${new Date().toISOString()}] ${msg}`);
+        alertUpdateSecurity(msg);
+        return;
+      }
+    } else {
+      // Escape hatch explicitly enabled — verification disabled by operator.
+      console.warn(
+        `[${new Date().toISOString()}] WARNING: signature verification DISABLED ` +
+          `(AUGMENTAGENT_UPDATE_REQUIRE_SIGNATURE=false). Deploying ${remote.slice(0, 7)} unverified.`
+      );
+    }
+
     console.log(`[${new Date().toISOString()}] New commits detected (${local.slice(0, 7)} → ${remote.slice(0, 7)}). Updating...`);
-    execSync("git pull origin main && npm install --production && npm run build", { cwd, stdio: "inherit" });
+    // Use `npm ci --omit=dev` (matches the previous --production intent) and
+    // --ignore-scripts so untrusted dependency lifecycle scripts cannot run on a
+    // credential-bearing host. The repo build is still run explicitly via
+    // `npm run build` below; this package has no install lifecycle scripts, so
+    // --ignore-scripts does not break the build.
+    execSync(
+      "git pull origin main && npm ci --omit=dev --ignore-scripts && npm run build",
+      { cwd, stdio: "inherit" }
+    );
 
     console.log(`[${new Date().toISOString()}] Build complete. Restarting via pm2...`);
     execSync("pm2 restart augmentagent", { cwd, stdio: "inherit" });

@@ -7,14 +7,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serenity::all::{ChannelId, GatewayIntents, UserId};
 use tokio::sync::Notify;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use augmentagent_store::{Email, Store};
 
 use crate::event_handler::Handler;
 use crate::layout::{approval_message, flag_notice_message};
 use crate::loops::LoopCommandParser;
-use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, InvoiceOps, QueryHandler};
+use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, QueryHandler};
 
 #[derive(Clone)]
 pub struct DiscordConfig {
@@ -31,12 +31,6 @@ pub struct DiscordConfig {
     pub query_handler: Option<Arc<dyn QueryHandler>>,
     /// Handles Approve / Revise / Skip clicks. `None` silently ignores.
     pub action_handler: Option<Arc<dyn ApprovalActionHandler>>,
-    /// Store for the `!invoice` config command (recipient / sending entity).
-    /// `None` disables the command.
-    pub invoice_store: Option<Arc<Store>>,
-    /// Bridge into the cli's invoice flow (PDF generation + real send). `None`
-    /// disables the `!invoice draft` command and the Invoice Approve button.
-    pub invoice_ops: Option<Arc<dyn InvoiceOps>>,
     /// Store handle so the event handler can persist (draft, feedback, revised)
     /// triples to `draft_revisions` after a Revise (#37). `None` disables
     /// persistence — the broker still works, the data just isn't captured.
@@ -45,6 +39,10 @@ pub struct DiscordConfig {
     /// path (list / stop / help still work). The CLI wires this with a Claude
     /// reasoner; tests can omit it.
     pub loop_parser: Option<Arc<dyn LoopCommandParser>>,
+    /// Wiki root for outbound answer attachments (#440). `ATTACH:` markers in
+    /// wiki-ask answers resolve against (and are confined to) this directory;
+    /// `None` refuses every marker with a visible note in the reply.
+    pub wiki_root: Option<std::path::PathBuf>,
 }
 
 pub(crate) struct BrokerState {
@@ -55,12 +53,12 @@ pub(crate) struct BrokerState {
     pub(crate) query_handler: Option<Arc<dyn QueryHandler>>,
     pub(crate) action_handler: Option<Arc<dyn ApprovalActionHandler>>,
     pub(crate) approval_channel_id: ChannelId,
-    pub(crate) invoice_store: Option<Arc<Store>>,
-    pub(crate) invoice_ops: Option<Arc<dyn InvoiceOps>>,
     /// Store handle for persisting Revise triples to `draft_revisions` (#37).
     pub(crate) store: Option<Arc<Store>>,
     /// LLM parser for `/loop` create text. `None` disables the create path.
     pub(crate) loop_parser: Option<Arc<dyn LoopCommandParser>>,
+    /// Wiki root that `ATTACH:` answer markers are confined to (#440).
+    pub(crate) wiki_root: Option<std::path::PathBuf>,
     /// Populated once, from the first `Ready` event. Used to distinguish the
     /// bot's own messages from the user's when building conversation context.
     pub(crate) bot_user_id: std::sync::OnceLock<UserId>,
@@ -74,10 +72,9 @@ impl BrokerState {
         allowed_user_id: Option<UserId>,
         query_handler: Option<Arc<dyn QueryHandler>>,
         action_handler: Option<Arc<dyn ApprovalActionHandler>>,
-        invoice_store: Option<Arc<Store>>,
-        invoice_ops: Option<Arc<dyn InvoiceOps>>,
         store: Option<Arc<Store>>,
         loop_parser: Option<Arc<dyn LoopCommandParser>>,
+        wiki_root: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             ready: Arc::new(Notify::new()),
@@ -87,10 +84,9 @@ impl BrokerState {
             query_handler,
             action_handler,
             approval_channel_id,
-            invoice_store,
-            invoice_ops,
             store,
             loop_parser,
+            wiki_root,
             bot_user_id: std::sync::OnceLock::new(),
         }
     }
@@ -126,11 +122,19 @@ impl DiscordApprovalBroker {
             config.allowed_user_id.map(UserId::new),
             config.query_handler.clone(),
             config.action_handler.clone(),
-            config.invoice_store.clone(),
-            config.invoice_ops.clone(),
             config.store.clone(),
             config.loop_parser.clone(),
+            config.wiki_root.clone(),
         ));
+
+        if state.allowed_user_id.is_none() {
+            warn!(
+                "DISCORD_ALLOWED_USER_ID is not set: the Discord bot has NO owner allowlist and is \
+                 running fail-closed (#303) — all query DMs, button clicks, and modal submits will \
+                 be refused until it is configured. Set DISCORD_ALLOWED_USER_ID to your Discord \
+                 user ID to authorize the owner."
+            );
+        }
 
         let mut intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES;
         if config.query_handler.is_some() {

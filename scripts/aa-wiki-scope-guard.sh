@@ -92,6 +92,19 @@ if [[ "$ABS" == "$WIKI_ROOT_ABS" || "$ABS" == "$WIKI_ROOT_ABS"/* ]]; then
   exit 0
 fi
 
+# Allow Read on Discord-attachment tempfiles. The discord crate
+# (augmentagent-approval-discord) downloads inbound attachments to
+# /tmp/aa-{img,txt,doc}-<msg_id>-<idx>.<ext> and instructs the model to
+# Read them. Without this exception the wiki-root scope check blocks the
+# Read and the user sees "I can't open this attachment". Only Read is
+# permitted on these paths — Write/Edit/Glob/Grep stay scoped to the
+# wiki. The regex pins the canonical filename shape (digits-only ids,
+# alphanumeric extension) so a literal name like `aa-txt-..` cannot
+# slip past as a `/tmp/aa-txt-*` glob would.
+if [[ "$TOOL" == "Read" && "$ABS" =~ ^/tmp/aa-(txt|img|doc)-[0-9]+-[0-9]+\.[a-zA-Z0-9]+$ ]]; then
+  exit 0
+fi
+
 # Block with a clear, structured JSON reason. Claude relays this to the
 # model so it can adjust and try again inside the sandbox.
 REASON="Path is outside the wiki root sandbox. Tool=$TOOL path=$ABS wiki_root=$WIKI_ROOT_ABS. The wiki-query agent may only read/write inside the wiki."
