@@ -4121,6 +4121,19 @@ async fn post_reply_approval_card(
     store
         .set_action_draft_id(&action_id, draft_id)
         .context("set action draft id")?;
+    // #473 — record the envelope the draft was actually created with, so the
+    // Revise redraft re-sends to the SAME To/cc/bcc instead of falling back
+    // to the card's From (the original sender on reply cards — which dropped
+    // an overridden To and every cc/bcc). Best-effort: a failure leaves the
+    // pre-#473 from-based revise behavior, never blocks the card.
+    if let Err(e) = store.set_action_envelope(
+        &action_id,
+        Some(to),
+        Some(&cc.join(", ")),
+        Some(&bcc.join(", ")),
+    ) {
+        tracing::warn!(action_id, "set_action_envelope after compose card failed: {e}");
+    }
 
     let http = serenity::http::Http::new(&token);
     let channel = serenity::all::ChannelId::new(cid);
@@ -4129,6 +4142,13 @@ async fn post_reply_approval_card(
     // only: the actions row keeps the clean body so the Revise redraft
     // prompt isn't polluted with the marker lines.
     let mut markers = String::new();
+    // #473 — when the envelope To differs from the card's From display (a
+    // reply card whose routing was overridden, e.g. the intro pattern:
+    // reply-to Josh, To Omer), surface it: the whole bug was body and
+    // envelope disagreeing with nothing on the card to show it.
+    if !original_from.eq_ignore_ascii_case(to) {
+        markers.push_str(&format!("\n[to: {to}]"));
+    }
     if !cc.is_empty() {
         markers.push_str(&format!("\n[cc: {}]", cc.join(", ")));
     }
@@ -4234,6 +4254,16 @@ async fn run_gmail_update_draft(
                 }
                 if let Err(e) = store.set_action_draft_body(&action_id, &body_str) {
                     eprintln!("warning: card {action_id} body not refreshed: {e}");
+                }
+                // #473 — the replacement draft's envelope is now the card's
+                // envelope; keep the Revise carry-through in step with it.
+                if let Err(e) = store.set_action_envelope(
+                    &action_id,
+                    Some(&to),
+                    Some(&cc.join(", ")),
+                    Some(&bcc.join(", ")),
+                ) {
+                    eprintln!("warning: card {action_id} envelope not refreshed: {e}");
                 }
                 println!("approval card {action_id} now follows the new draft");
             }
@@ -7159,14 +7189,40 @@ impl ReplyApprover {
         } else {
             format!("Re: {}", action.email.subject)
         };
+        // #473 — recreate the draft with the envelope the card was composed
+        // with, when one was recorded. Pre-#473 behavior (To = emails.from,
+        // no cc/bcc) silently dropped an overridden To and every cc/bcc on
+        // reply cards: the intro pattern ("moving you to BCC") lost its BCC
+        // — and its actual recipient — the moment the user hit Revise.
+        let envelope = self
+            .store
+            .get_action_envelope(action_id)
+            .unwrap_or_else(|e| {
+                tracing::warn!(action_id, "revise: envelope lookup failed: {e}");
+                None
+            });
+        let to = envelope
+            .as_ref()
+            .and_then(|env| env.to.clone())
+            .unwrap_or_else(|| action.email.from.clone());
+        let split = |v: &Option<String>| -> Vec<String> {
+            v.as_deref()
+                .map(augmentagent_channel_email::gmail::split_recipients)
+                .unwrap_or_default()
+        };
+        let cc = envelope.as_ref().map(|env| split(&env.cc)).unwrap_or_default();
+        let bcc = envelope.as_ref().map(|env| split(&env.bcc)).unwrap_or_default();
         let new_draft_id = match self
             .gmail
-            .create_draft(
+            .create_draft_with_attachment(
                 entity_id,
-                &action.email.from,
+                &to,
                 &subject,
                 &redraft,
                 action.email.thread_id.as_deref(),
+                None,
+                &cc,
+                &bcc,
             )
             .await
         {

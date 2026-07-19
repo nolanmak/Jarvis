@@ -345,6 +345,22 @@ impl Store {
                 [],
             )?;
         }
+        // #473: the outbound envelope of a compose-originated card, so the
+        // Revise redraft can re-send to the SAME recipients instead of
+        // falling back to `emails.from` (which is the original sender on
+        // reply cards — dropping an overridden To and any cc/bcc). All three
+        // are comma-joined bare-address lists; NULL on rows from flows that
+        // never set an envelope (auto-triage replies, non-gmail platforms),
+        // which keep the pre-#473 from-based behavior.
+        if !column_exists(conn, "actions", "toEmails")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN toEmails TEXT", [])?;
+        }
+        if !column_exists(conn, "actions", "ccEmails")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN ccEmails TEXT", [])?;
+        }
+        if !column_exists(conn, "actions", "bccEmails")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN bccEmails TEXT", [])?;
+        }
         if !column_exists(conn, "actions", "nextNudgeAtMs")? {
             conn.execute("ALTER TABLE actions ADD COLUMN nextNudgeAtMs INTEGER", [])?;
             // One-shot backfill: rows still in 'pending' from before the
@@ -2859,6 +2875,53 @@ impl Store {
             params![action_id, draft_id, now],
         )?;
         Ok(())
+    }
+
+    /// #473 — persist the outbound envelope (To/cc/bcc, comma-joined bare
+    /// addresses) of a compose-originated card. Empty strings are stored as
+    /// NULL so `get_action_envelope` cleanly reports "no envelope recorded".
+    pub fn set_action_envelope(
+        &self,
+        action_id: &str,
+        to: Option<&str>,
+        cc: Option<&str>,
+        bcc: Option<&str>,
+    ) -> StoreResult<()> {
+        fn nz(v: Option<&str>) -> Option<&str> {
+            v.filter(|s| !s.trim().is_empty())
+        }
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE actions SET toEmails = ?2, ccEmails = ?3, bccEmails = ?4, updatedAt = ?5 \
+             WHERE id = ?1",
+            params![action_id, nz(to), nz(cc), nz(bcc), now],
+        )?;
+        Ok(())
+    }
+
+    /// #473 — the envelope recorded by [`set_action_envelope`], or `None`
+    /// when the row doesn't exist or no field was ever set (pre-#473 rows,
+    /// auto-triage replies): callers then fall back to `emails.from`.
+    pub fn get_action_envelope(
+        &self,
+        action_id: &str,
+    ) -> StoreResult<Option<ActionEnvelope>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT toEmails, ccEmails, bccEmails FROM actions WHERE id = ?1",
+                params![action_id],
+                |r| {
+                    Ok(ActionEnvelope {
+                        to: r.get::<_, Option<String>>(0)?,
+                        cc: r.get::<_, Option<String>>(1)?,
+                        bcc: r.get::<_, Option<String>>(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row.filter(|e| e.to.is_some() || e.cc.is_some() || e.bcc.is_some()))
     }
 
     /// #419 duplicate guard — the newest PENDING action for this
@@ -6118,6 +6181,16 @@ fn row_to_pending_nudge(r: &rusqlite::Row) -> rusqlite::Result<PendingNudge> {
     })
 }
 
+/// #473 — the outbound envelope a compose-originated card was created with.
+/// Each field is a comma-joined bare-address list as passed at compose time;
+/// `None` = never set (fall back to `emails.from`, the pre-#473 behavior).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionEnvelope {
+    pub to: Option<String>,
+    pub cc: Option<String>,
+    pub bcc: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ActionWithEmail {
     pub action: ActionRecord,
@@ -6346,6 +6419,36 @@ mod tests {
     fn redraft_count_zero_for_unknown_action() {
         let (s, _f) = fresh_store();
         assert_eq!(s.redraft_count("does-not-exist").unwrap(), 0);
+    }
+
+    // --- #473: compose envelope round-trip ---
+
+    #[test]
+    fn action_envelope_round_trips_and_defaults_to_none() {
+        let (s, _f) = fresh_store();
+        let id = s
+            .log_action("m1", None, "josh@x.com", "intro", None, Some("v0"), ActionStatus::Pending)
+            .unwrap();
+        // Pre-#473 shape: nothing recorded → None, so revise falls back to from.
+        assert_eq!(s.get_action_envelope(&id).unwrap(), None);
+
+        s.set_action_envelope(&id, Some("omer@y.com"), None, Some("josh@x.com"))
+            .unwrap();
+        let env = s.get_action_envelope(&id).unwrap().expect("envelope set");
+        assert_eq!(env.to.as_deref(), Some("omer@y.com"));
+        assert_eq!(env.cc, None);
+        assert_eq!(env.bcc.as_deref(), Some("josh@x.com"));
+
+        // Empty strings are normalized to NULL, not stored as "".
+        s.set_action_envelope(&id, Some("a@b.com, c@d.com"), Some(""), Some("  "))
+            .unwrap();
+        let env = s.get_action_envelope(&id).unwrap().expect("envelope set");
+        assert_eq!(env.to.as_deref(), Some("a@b.com, c@d.com"));
+        assert_eq!(env.cc, None);
+        assert_eq!(env.bcc, None);
+
+        // Unknown action id → None, not an error.
+        assert_eq!(s.get_action_envelope("nope").unwrap(), None);
     }
 
     // --- #419: duplicate guard + card-sync queries ---
