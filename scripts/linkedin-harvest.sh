@@ -83,8 +83,8 @@ if [[ -z "${LINKEDIN_SSH_TARGET:-}" ]]; then
 No LINKEDIN_SSH_TARGET set, so cookies stayed on this machine. To install
 them on the daemon host:
 
-  scp '$OUT_LOCAL' nolan-makatche@100.91.92.24:~/linkedin-cookies.json
-  ssh nolan-makatche@100.91.92.24 \\
+  scp '$OUT_LOCAL' <user>@<host>:~/linkedin-cookies.json
+  ssh <user>@<host> \\
       'cd ~/AugmentAgent && ./target/release/augmentagent linkedin login --cookies-json ~/linkedin-cookies.json && rm ~/linkedin-cookies.json'
 
 Or re-run this script with LINKEDIN_SSH_TARGET=<user>@<host> to do it in one shot.
