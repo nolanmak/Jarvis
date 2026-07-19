@@ -11,7 +11,7 @@ The daemon polls LinkedIn every 4 hours, runs each inbound DM through the same t
 If you've already run `/intercept` and browsed `linkedin.com/messaging/` through the proxy, your cookies are already sitting in the intercept capture DB. One command pulls them out:
 
 ```sh
-LINKEDIN_SSH_TARGET=nolan-makatche@100.91.92.24 \
+LINKEDIN_SSH_TARGET=<user>@<host> \
   ./scripts/linkedin-harvest-from-intercept.sh
 ```
 
@@ -50,7 +50,7 @@ On your Mac (or wherever Chrome is logged in):
 ./scripts/linkedin-harvest.sh
 
 # Option B: script writes + ships + installs in one shot
-LINKEDIN_SSH_TARGET=nolan-makatche@100.91.92.24 ./scripts/linkedin-harvest.sh
+LINKEDIN_SSH_TARGET=<user>@<host> ./scripts/linkedin-harvest.sh
 ```
 
 Paste each of the four values when prompted. The script:
