@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serenity::all::{ChannelId, GatewayIntents, UserId};
 use tokio::sync::Notify;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use augmentagent_store::{Email, Store};
 
@@ -126,6 +126,15 @@ impl DiscordApprovalBroker {
             config.loop_parser.clone(),
             config.wiki_root.clone(),
         ));
+
+        if state.allowed_user_id.is_none() {
+            warn!(
+                "DISCORD_ALLOWED_USER_ID is not set: the Discord bot has NO owner allowlist and is \
+                 running fail-closed (#303) — all query DMs, button clicks, and modal submits will \
+                 be refused until it is configured. Set DISCORD_ALLOWED_USER_ID to your Discord \
+                 user ID to authorize the owner."
+            );
+        }
 
         let mut intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES;
         if config.query_handler.is_some() {
