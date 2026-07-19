@@ -249,6 +249,15 @@ pub(crate) async fn run_research(
 
     // --- E. File issues for the top gaps (skipped in dry-run). --------------
     let cap = cfg.max_issues as usize;
+    // #366: pull the titles of currently-open issues once, so we don't re-file
+    // a near-duplicate of something already open. The daily pipeline had been
+    // filing ~identical issues (e.g. the code-mode postmortems). Best-effort: a
+    // gh failure yields an empty list and filing proceeds exactly as before.
+    let open_titles = if dry_run {
+        Vec::new()
+    } else {
+        fetch_open_issue_titles(&cfg).await
+    };
     let mut created: Vec<(u64, String)> = Vec::new();
     let mut also_noted: Vec<String> = Vec::new();
     for (i, gap) in ranked.iter().enumerate() {
@@ -260,6 +269,12 @@ pub(crate) async fn run_research(
                     "research: [dry-run] would file issue"
                 );
                 also_noted.push(format!("(dry-run) {}", gap.title));
+            } else if title_is_duplicate(&gap.title, &open_titles) {
+                info!(
+                    title = %gap.title,
+                    "research: skipped filing — near-duplicate of an already-open issue (#366)"
+                );
+                also_noted.push(format!("(duplicate of an open issue, not filed) {}", gap.title));
             } else {
                 match create_issue(&cfg, gap).await {
                     Ok(num) => {
@@ -622,6 +637,99 @@ fn slice_json_object(s: &str) -> Option<&str> {
 
 /// File one issue via `gh issue create --repo <repo>`. Returns the issue
 /// number parsed from the URL gh prints on success.
+/// #366: fetch the titles of all currently-open issues so the pipeline can skip
+/// filing a near-duplicate of one that already exists. Best-effort — any gh
+/// failure returns an empty list and filing proceeds as before.
+async fn fetch_open_issue_titles(cfg: &ResearchConfig) -> Vec<String> {
+    let out = tokio::process::Command::new(&cfg.gh_bin)
+        .args(["issue", "list", "--repo"])
+        .arg(&cfg.gh_repo)
+        .args([
+            "--state", "open", "--limit", "400", "--json", "title", "--jq", ".[].title",
+        ])
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        Ok(o) => {
+            warn!(
+                "research: open-issue dedup fetch failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            warn!("research: open-issue dedup fetch could not spawn gh: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
+/// #366: normalized token set of a title — lowercased alphanumeric words of
+/// length ≥ 3 — for similarity comparison.
+fn title_tokens(title: &str) -> std::collections::BTreeSet<String> {
+    title
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3)
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// #366: true when `candidate` is a near-duplicate of any `existing` title by
+/// Jaccard token-set overlap ≥ 0.6. Stops the daily research pipeline from
+/// re-filing an issue that is already open (the source of the code-mode
+/// postmortem dup spam).
+fn title_is_duplicate(candidate: &str, existing: &[String]) -> bool {
+    let cand = title_tokens(candidate);
+    if cand.is_empty() {
+        return false;
+    }
+    existing.iter().any(|e| {
+        let et = title_tokens(e);
+        if et.is_empty() {
+            return false;
+        }
+        let inter = cand.intersection(&et).count();
+        let union = cand.union(&et).count();
+        union > 0 && (inter as f64 / union as f64) >= 0.6
+    })
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::title_is_duplicate;
+
+    #[test]
+    fn near_identical_titles_are_duplicates() {
+        let existing = vec![
+            "[code-mode] reasoner call failed: run_program decode error".to_string(),
+            "Add calibrated confidence to triage decisions".to_string(),
+        ];
+        // Same code-mode postmortem, trivially reworded -> duplicate.
+        assert!(title_is_duplicate(
+            "[code-mode] reasoner call failed: run_program decode",
+            &existing
+        ));
+    }
+
+    #[test]
+    fn distinct_titles_are_not_duplicates() {
+        let existing = vec!["Add a gmail search --account filter".to_string()];
+        assert!(!title_is_duplicate(
+            "Harden the webhook spool directory permissions",
+            &existing
+        ));
+        // Empty candidate / empty corpus never matches.
+        assert!(!title_is_duplicate("", &existing));
+        assert!(!title_is_duplicate("anything at all here", &[]));
+    }
+}
+
 async fn create_issue(cfg: &ResearchConfig, gap: &Gap) -> Result<u64> {
     let body = format!(
         "{}\n\n---\n_Source: {}_\n_Auto-filed by the daily `augmentagent research` pipeline._",
