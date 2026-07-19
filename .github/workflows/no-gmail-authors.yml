@@ -1,0 +1,27 @@
+name: no-gmail-authors
+# Blocks any commit in a PR whose author/committer email is a personal gmail
+# address — the git-config regression #358 exists to stop. Existing history is
+# scrubbed separately (the owner-gated filter-repo pass, #358/#359); this guards
+# new commits going forward so the regression can't reappear.
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reject gmail author/committer emails on new commits
+        run: |
+          range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          bad=$(git log --format='%ae %ce' "$range" | tr ' ' '\n' | grep -iE 'gmail\.com' | sort -u || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Commit(s) in this PR use a personal gmail author/committer address:"
+            echo "$bad"
+            echo "Commit as the nolanmak GitHub noreply instead — see docs/PUBLISH.md and CLAUDE.md."
+            exit 1
+          fi
+          echo "OK: no gmail author/committer emails in this PR's commits."
