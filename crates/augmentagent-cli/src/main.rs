@@ -5046,6 +5046,43 @@ fn extract_resume_text(path: &std::path::Path) -> Result<String> {
     }
 }
 
+/// #236: a current-time stamp prepended to every query-mode user turn. Query
+/// mode previously only knew the date, so time-relative reasoning ("is it too
+/// late to email?", flight urgency) was unreliable. This lives on the
+/// (non-cached) user turn, so it never invalidates the cached system prompt.
+fn now_awareness_line() -> String {
+    format_now_awareness_line(chrono::Local::now())
+}
+
+fn format_now_awareness_line<Tz>(now: chrono::DateTime<Tz>) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    format!(
+        "Current local time: {}. Use this for any time-relative reasoning.\n\n",
+        now.format("%A %Y-%m-%d %H:%M:%S %:z")
+    )
+}
+
+#[cfg(test)]
+mod now_awareness_tests {
+    #[test]
+    fn now_line_carries_datetime_and_offset() {
+        use chrono::{FixedOffset, TimeZone};
+        let dt = FixedOffset::west_opt(4 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2026, 7, 19, 11, 35, 0)
+            .unwrap();
+        let line = super::format_now_awareness_line(dt);
+        assert!(line.starts_with("Current local time: "));
+        assert!(line.contains("2026-07-19"));
+        assert!(line.contains("11:35:00"));
+        assert!(line.contains("-04:00"));
+        assert!(line.ends_with("\n\n"));
+    }
+}
+
 async fn run_wiki_ask(cli: &Cli, question: String, post: bool) -> Result<()> {
     let wiki_root = cli
         .wiki_dir
@@ -5067,6 +5104,8 @@ async fn run_wiki_ask(cli: &Cli, question: String, post: bool) -> Result<()> {
         ),
         None => question,
     };
+    // #236 — prepend the current time so the agent can reason about "now".
+    let question = format!("{}{question}", now_awareness_line());
     // #446 — `call_transcript`, not `call`: the ask prompt puts the deliverable
     // first and the wiki-filing receipt last, and `call` keeps only the final
     // text block, so the receipt would overwrite the answer.
@@ -5886,6 +5925,8 @@ impl QueryHandler for WikiQuerier {
             ),
             None => question.to_string(),
         };
+        // #236 — prepend the current time so the agent can reason about "now".
+        let prompt = format!("{}{prompt}", now_awareness_line());
         // #446 — see `wiki ask`: the Discord reply must carry every text block
         // the model emitted, not just the trailing wiki-filing receipt.
         self.reasoner.call_transcript(&opts, &prompt).await
@@ -5941,6 +5982,8 @@ impl LoopRunner for LoopReasonerRunner {
             ),
             None => prompt.to_string(),
         };
+        // #236 — prepend the current time so loop-driven queries know "now".
+        let prompt = format!("{}{prompt}", now_awareness_line());
         // #446 — loops render their output to Discord too; same reasoning.
         self.reasoner.call_transcript(&opts, &prompt).await
     }
