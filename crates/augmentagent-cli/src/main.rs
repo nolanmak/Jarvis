@@ -5564,6 +5564,65 @@ async fn wiki_sync_push(dir: &std::path::Path) -> Result<()> {
     anyhow::bail!("wiki sync: push to origin/main failed after one retry");
 }
 
+/// #478: validate an owner-facing wiki page that a GitHub-side edit could have
+/// broken, returning a human-readable problem string if the daemon can no
+/// longer parse it the way it relies on. Pure (no I/O) so it is unit-testable.
+///
+/// - `about/me.md`: `owner_rules_block` injects the "Writing style preferences"
+///   / "Agent behavior rules" sections into every query turn (#389). An edit
+///   that renames or empties both sections silently disables that injection.
+/// - `people/*.md`: a valid person page has a YAML frontmatter block; an edit
+///   that breaks the `---` delimiters makes `split_frontmatter` return `None`.
+fn wiki_sync_validate_page(rel_path: &str, content: &str) -> Option<String> {
+    if rel_path == "about/me.md" {
+        let has_rules = ["Writing style preferences", "Agent behavior rules"]
+            .iter()
+            .any(|s| {
+                extract_md_section(content, s)
+                    .map(|b| !b.trim().is_empty())
+                    .unwrap_or(false)
+            });
+        if !has_rules {
+            return Some(format!(
+                "{rel_path}: neither owner-rules section (\"Writing style preferences\" / \
+                 \"Agent behavior rules\") parses — owner-rules injection is now disabled"
+            ));
+        }
+    } else if rel_path.starts_with("people/") && rel_path.ends_with(".md") {
+        if augmentagent_wiki::migrate::split_frontmatter(content).is_none() {
+            return Some(format!("{rel_path}: YAML frontmatter block no longer parses"));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod wiki_sync_validation_tests {
+    #[test]
+    fn me_md_missing_owner_rules_sections_is_flagged() {
+        let ok = "# Me\n\n## Writing style preferences\n- concise\n\n## Agent behavior rules\n- x\n";
+        assert!(super::wiki_sync_validate_page("about/me.md", ok).is_none());
+        // An external edit that dropped both rule sections -> flagged.
+        let broken = "# Me\n\nJust a bio, no rule sections.\n";
+        assert!(super::wiki_sync_validate_page("about/me.md", broken).is_some());
+    }
+
+    #[test]
+    fn person_page_broken_frontmatter_is_flagged() {
+        let ok = "---\nname: Dana\n---\n\n## Tone\nwarm\n"; // pii-ok: synthetic
+        assert!(super::wiki_sync_validate_page("people/dana.md", ok).is_none()); // pii-ok: synthetic
+        // Frontmatter delimiters broken by an edit -> flagged.
+        let broken = "name: Dana\n\nno frontmatter delimiters\n"; // pii-ok: synthetic
+        assert!(super::wiki_sync_validate_page("people/dana.md", broken).is_some()); // pii-ok: synthetic
+    }
+
+    #[test]
+    fn unrelated_paths_are_never_flagged() {
+        assert!(super::wiki_sync_validate_page("threads/x.md", "anything").is_none());
+        assert!(super::wiki_sync_validate_page("index.md", "").is_none());
+    }
+}
+
 /// `wiki sync` — reconcile the local knowledge base with its private
 /// GitHub mirror. Two-way: commit local page changes, pull owner edits
 /// (owner-wins), push. Reuses the ambient `gh` credential. See epic #474.
@@ -5682,6 +5741,36 @@ async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
             "wiki sync: unresolved rebase conflict. Daemon commits preserved on branch `{backup}` \
              (pushed to origin). Owner must reconcile manually. NO data lost."
         );
+    }
+
+    // #478: validate owner-facing structure after the pull, so a GitHub-side
+    // edit that breaks me.md's owner-rules sections or a person-page's
+    // frontmatter is caught and warned about (in wiki-sync.log) rather than
+    // silently degrading. Only inspects files the pull actually changed.
+    let post_pull_head = git_capture(&wiki_root, &["rev-parse", "HEAD"]).await?;
+    if post_pull_head.trim() != pre_pull_head {
+        let changed = git_capture(
+            &wiki_root,
+            &["diff", "--name-only", &format!("{pre_pull_head}..HEAD")],
+        )
+        .await
+        .unwrap_or_default();
+        let mut problems: Vec<String> = Vec::new();
+        for rel in changed.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if let Ok(content) = std::fs::read_to_string(wiki_root.join(rel)) {
+                if let Some(p) = wiki_sync_validate_page(rel, &content) {
+                    problems.push(p);
+                }
+            }
+        }
+        if !problems.is_empty() {
+            warn!(
+                "wiki sync: pulled owner edits, but {} page(s) no longer validate — \
+                 fix them on GitHub:\n  - {}",
+                problems.len(),
+                problems.join("\n  - ")
+            );
+        }
     }
 
     // 3. Push.
