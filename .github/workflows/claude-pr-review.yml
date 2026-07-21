@@ -48,12 +48,12 @@ jobs:
       - id: size
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          FORCE: ${{ contains(github.event.pull_request.labels.*.name, 'force-review') }}
         run: |
           git fetch --no-tags --depth=1 origin "$BASE_REF" >/dev/null 2>&1 || true
           LINES=$(git diff --stat "origin/$BASE_REF...HEAD" | tail -1 | awk '{print $4+$6}')
           LINES=${LINES:-0}
           echo "changed_lines=$LINES" >> "$GITHUB_OUTPUT"
-          FORCE='${{ contains(github.event.pull_request.labels.*.name, ''force-review'') }}'
           if [ "$LINES" -gt 1000 ] && [ "$FORCE" != "true" ]; then
             echo "too_big=true" >> "$GITHUB_OUTPUT"
             echo "::warning::PR >1000 lines ($LINES) — skipping. Add 'force-review' label to override."
