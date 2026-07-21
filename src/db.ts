@@ -338,6 +338,41 @@ export function updateActionStatus(
     .run(...vals, id);
 }
 
+// #500: CAS variant for the API mutation route — flips status only while the
+// row is still 'pending', so a racing writer on the Rust side (a Schedule
+// pick arming `scheduled`, the send engine claiming `sending`) can't be
+// silently overwritten between the route's read-check and its UPDATE.
+// Returns true when this call actually performed the transition.
+export function resolveActionIfPending(
+  id: string,
+  status: ActionStatus,
+  extra?: { draftBody?: string; errorMessage?: string; recipientEmail?: string }
+): boolean {
+  const now = Date.now();
+  const sets: string[] = ["status = ?", "updatedAt = ?"];
+  const vals: unknown[] = [status, now];
+
+  if (extra?.draftBody !== undefined) {
+    sets.push("draftBody = ?");
+    vals.push(extra.draftBody);
+  }
+  if (extra?.errorMessage !== undefined) {
+    sets.push("errorMessage = ?");
+    vals.push(extra.errorMessage);
+  }
+  if (extra?.recipientEmail !== undefined) {
+    sets.push("recipientEmail = ?");
+    vals.push(extra.recipientEmail);
+  }
+
+  const result = getDb()
+    .prepare(
+      `UPDATE actions SET ${sets.join(", ")} WHERE id = ? AND status = 'pending'`
+    )
+    .run(...vals, id);
+  return result.changes > 0;
+}
+
 // #36: standalone update for the "Change To" button on the approval card —
 // keeps the action's status untouched (still pending) and only swaps the
 // recipient. Returns true if a row was updated.

@@ -2322,6 +2322,32 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { engine.run(sd).await }));
             }
+            // #500 — scheduled email send fire loop. Fires `scheduled`
+            // actions when `scheduledAtMs` comes due: CAS claim → Composio
+            // send_draft → the same #449 bookkeeping order as Approve.
+            // Always spawned when Composio is configured — an empty schedule
+            // is a zero-cost tick, and the engine honours dry_run (logs
+            // would-fire lines, sends nothing, leaves rows armed). Also owns
+            // flagging rows stuck mid-send from a previous crash.
+            match std::env::var("COMPOSIO_API_KEY") {
+                Ok(api_key) => {
+                    let engine = augmentagent_channel_email::ScheduledSendEngine::new(
+                        Arc::clone(&store),
+                        Arc::new(ComposioClient::new(api_key)),
+                        Arc::clone(&broker),
+                        dry_run,
+                    )
+                    .with_tick(Duration::from_secs(
+                        scheduled_send_interval_secs_from_env(),
+                    ))
+                    .with_max_retries(scheduled_send_max_retries_from_env());
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move { engine.run(sd).await }));
+                }
+                Err(_) => warn!(
+                    "COMPOSIO_API_KEY not set; scheduled email sends will not fire"
+                ),
+            }
             // #25: Gmail + LinkedIn now run through the generic
             // `ChannelRunner` (`run_arc`) instead of bespoke poll loops.
             // Behavior is unchanged — `run_arc` drives the same per-message
@@ -5405,6 +5431,28 @@ fn sweep_stale_drafts_tick(store: &Store, days: Option<i64>) -> Result<Vec<Strin
 /// for anything that accumulated while the observer was off. 30 minutes.
 const STALE_RECONCILE_INTERVAL_SECS: u64 = 1800;
 
+/// #500 — scheduled-send engine cadence. Values <= 0 or unparsable fall back
+/// to the 60s default.
+fn scheduled_send_interval_secs_from_env() -> u64 {
+    std::env::var("AUGMENTAGENT_SCHEDULED_SEND_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or_else(|| {
+            augmentagent_channel_email::scheduled::DEFAULT_TICK.as_secs()
+        })
+}
+
+/// #500 — in-engine transient send retries before a due row is flipped to a
+/// retry-exempt error.
+fn scheduled_send_max_retries_from_env() -> u32 {
+    std::env::var("AUGMENTAGENT_SCHEDULED_SEND_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(augmentagent_channel_email::scheduled::DEFAULT_MAX_RETRIES)
+}
+
 /// #449 — retire approval cards that no longer deserve the user's attention,
 /// without being asked to.
 ///
@@ -5457,7 +5505,8 @@ async fn run_stale_approval_reconcile(
 /// the loop so it is directly unit-testable.
 fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
     let pending = store.pending_actions_for_reconcile()?;
-    if pending.is_empty() {
+    let scheduled = store.scheduled_actions_for_reconcile()?;
+    if pending.is_empty() && scheduled.is_empty() {
         return Ok(0);
     }
 
@@ -5514,6 +5563,35 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
             Ok(false) => {}
             Err(e) => warn!(
                 action_id = %row.id,
+                thread = %tid,
+                "stale approval: thread_has_user_reply_after failed: {e:#}"
+            ),
+        }
+    }
+
+    // #500 — scheduled sends get Rule 1 ONLY (user already replied on the
+    // thread, bounded to replies AFTER the card was raised). Rule 2 must
+    // never run on them: `fromEmail` on compose cards holds the RECIPIENT,
+    // and the bulk-sender heuristic would cancel a scheduled send to any
+    // newsletter-looking address. Rule 3 (empty draft) doesn't apply — a
+    // draft was required to schedule. This durable pass is the backstop for
+    // the observer's best-effort live supersede AND the engine's fire-time
+    // guard: a transient failure in either would otherwise let the send fire
+    // over the owner's manual reply.
+    for (action_id, tid, created_at_ms) in &scheduled {
+        match store.thread_has_user_reply_after(tid, *created_at_ms) {
+            Ok(true) => {
+                info!(
+                    action_id = %action_id,
+                    thread = %tid,
+                    "stale approval: cancelling scheduled send, user already \
+                     replied on thread"
+                );
+                answered_threads.push(tid.to_string());
+            }
+            Ok(false) => {}
+            Err(e) => warn!(
+                action_id = %action_id,
                 thread = %tid,
                 "stale approval: thread_has_user_reply_after failed: {e:#}"
             ),
@@ -8124,16 +8202,40 @@ impl ReplyApprover {
             };
         };
 
+        // #500 — claim the row (`pending → sending`) before the multi-second
+        // Composio round-trip. The status read at the top of this fn is not a
+        // gate: a Schedule pick, a second Approve click, or the dashboard can
+        // race the send window, and the old unconditional Sent/Error flips
+        // would stomp whatever they wrote. Losing the claim means someone
+        // else resolved the row first — report it, run no side effects.
+        match self.store.claim_action_for_send(
+            action_id,
+            ActionStatus::Pending,
+            "discord",
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                let status = self
+                    .handle_load(action_id)
+                    .map(|a| a.action.status)
+                    .unwrap_or_else(|| "resolved".into());
+                return ApprovalActionOutcome::AlreadyResolved { status };
+            }
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("claim for send failed: {e}"),
+                };
+            }
+        }
+
         let sent_id = match self.gmail.send_draft(entity_id, draft_id).await {
             Ok(id) => id,
             Err(e) => {
                 let msg = format!("send_draft: {e}");
-                let _ = self.store.update_action_status(
-                    action_id,
-                    ActionStatus::Error,
-                    None,
-                    Some(&msg),
-                );
+                // Conditional (`WHERE status = 'sending'`) and WITHOUT the
+                // retry-cap stamp: approve-path failures stay eligible for
+                // the generic retry tick, exactly as before #500.
+                let _ = self.store.finish_send_error(action_id, &msg, None, "discord");
                 return ApprovalActionOutcome::Failed { message: msg };
             }
         };
@@ -8147,12 +8249,7 @@ impl ReplyApprover {
             Some(entity_id),
             Some(action_id),
         );
-        let _ = self.store.update_action_status(
-            action_id,
-            ActionStatus::Sent,
-            action.action.draft_body.as_deref(),
-            None,
-        );
+        let _ = self.store.finish_send_sent(action_id, "discord");
         let _ = self
             .store
             .mark_email_processed(&action.email.message_id, TriageResult::Reply);
