@@ -556,9 +556,10 @@ fn check_env_file_present() -> Finding {
 }
 
 /// SocialAPI.ai readiness probe (#245). Two signals:
-///   * is the API key in place? (sqlite `socialapi_api_key` OR env
-///     `SOCIALAPI_API_KEY` — same precedence as the dashboard's
-///     `getConfigStatus()`), and
+///   * is the API key in place? (env `SOCIALAPI_API_KEY`, then the keyring
+///     slot `augmentagent/socialapi/default`, then sqlite
+///     `config.socialapi_api_key` — the same three steps, in the same order,
+///     that `SocialApiAuth::load_with_store` uses to actually load it), and
 ///   * is there ≥1 active account in the local `socialapi_accounts` registry?
 ///
 /// Maps to:

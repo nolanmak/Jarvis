@@ -7836,13 +7836,6 @@ fn build_own_post_comment_engagement(
     })
 }
 
-/// #243 — SocialAPI.ai own-post comment engagement. Polls the user's
-/// registered own posts (`own_posts` rows with platform `"socialapi"`) for new
-/// comments via the SocialAPI.ai inbox, triages each, surfaces an
-/// approval-gated reply (the actual send lands in #244). Gated on
-/// `SOCIALAPI_API_KEY` / keyring; self-disables with a warning when absent.
-/// Cadence `AUGMENTAGENT_SOCIALAPI_OWNPOST_POLL_SECS`; reply pre-cap
-/// `AUGMENTAGENT_SOCIALAPI_MAX_OWNPOST_REPLIES`.
 /// Engagement-specific rubric for SocialAPI.ai comments and DMs, resolved
 /// alongside the email-triage skill dir the same way LinkedIn does it.
 ///
@@ -7857,6 +7850,14 @@ fn socialapi_triage_skill_dir(cli: &Cli) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("skills/socialapi-triage"))
 }
 
+/// #243 — SocialAPI.ai own-post comment engagement. Polls the user's
+/// registered own posts (`own_posts` rows with platform `"socialapi"`) for new
+/// comments via the SocialAPI.ai inbox, triages each, and surfaces an
+/// approval-gated reply; the send happens when the operator approves (#244).
+/// Gated on the SocialAPI.ai key (env, keyring, or dashboard sqlite config);
+/// self-disables with a warning when absent. Cadence
+/// `AUGMENTAGENT_SOCIALAPI_OWNPOST_POLL_SECS`; per-tick comment pre-cap
+/// `AUGMENTAGENT_SOCIALAPI_MAX_OWNPOST_REPLIES`.
 fn build_socialapi_own_post_engagement(
     cli: &Cli,
     store: Arc<Store>,
