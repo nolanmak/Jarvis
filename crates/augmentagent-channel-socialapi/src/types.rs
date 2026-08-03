@@ -16,6 +16,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Deserialize a value that may be JSON `null` into its `Default`. The live
+/// API nulls out absent scalars rather than omitting them — e.g. an
+/// attachment-only DM carries `"text": null` — and `#[serde(default)]` alone
+/// only covers a MISSING field, not an explicit `null` (#543 follow-up).
+fn null_to_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 /// The `{"data": ..., "pagination": ...}` wrapper every SocialAPI.ai response
 /// uses. `data` is `Option` because the API returns a literal `null` for an
 /// empty collection rather than `[]`.
@@ -23,7 +35,7 @@ use serde::{Deserialize, Serialize};
 pub struct Envelope<T> {
     #[serde(default = "Option::default")]
     pub data: Option<T>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub pagination: Option<Pagination>,
 }
 
@@ -32,30 +44,31 @@ pub struct Envelope<T> {
 /// dedup across ticks), but the cursor is modeled so a consumer *can* walk on.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pagination {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub has_more: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub next_cursor: Option<String>,
 }
 
 /// A connected social account behind the SocialAPI.ai key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub id: String,
     /// Underlying platform, e.g. `"instagram"`, `"linkedin"`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub platform: String,
     /// Display name, e.g. `"Coffee & Code Philadelphia"`.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub name: String,
     /// Public handle / username on the platform (no leading `@`). LinkedIn
     /// personal accounts carry the display name here, spaces and all.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub username: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub brand_id: String,
     /// `"active"` for usable accounts.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub status: String,
 }
 
@@ -64,9 +77,9 @@ pub struct Account {
 /// credentials immediately and return an `account_id` instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub auth_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub account_id: Option<String>,
 }
 
@@ -102,9 +115,9 @@ pub struct CreatePostRequest {
 /// response typically reads `publishing`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreatePostResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub status: String,
 }
 
@@ -115,23 +128,24 @@ pub struct CreatePostResponse {
 /// post caption.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboxPost {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub platform_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub account_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub platform: String,
     /// Post caption/body.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub content: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub permalink: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub comment_count: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub like_count: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub published_at: String,
 }
 
@@ -142,36 +156,37 @@ pub struct InboxPost {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment {
     /// Platform-native comment id — the wire's only identifier.
+    #[serde(default, deserialize_with = "null_to_default")]
     pub platform_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub platform: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub text: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub author_id: String,
     /// Author display name (may be empty; see `author_username`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub author_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub author_username: String,
     /// True when the comment was left by the post's own account — never
     /// draft a reply to ourselves.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub is_owner: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub like_count: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub reply_count: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub has_replies: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub is_hidden: bool,
     /// Parent comment id for threaded replies.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub parent_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub created_at: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub capabilities: CommentCapabilities,
 }
 
@@ -189,15 +204,15 @@ impl Comment {
 /// Per-platform capability flags attached to each comment.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommentCapabilities {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub can_reply: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub can_delete: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub can_hide: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub can_like: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub can_private_reply: bool,
 }
 
@@ -206,27 +221,28 @@ pub struct CommentCapabilities {
 /// ([`crate::client::SocialApiClient::list_messages`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conversation {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub id: String,
     /// SocialAPI.ai account this conversation belongs to.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub account_id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub platform: String,
     /// Other party's platform-native id.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub participant_id: String,
     /// Other party's handle / display name.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub participant_name: String,
     /// Preview text of the newest message (either party's).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub last_message: String,
     /// RFC3339 timestamp of the newest message.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub last_message_at: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub status: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub unread_count: i64,
 }
 
@@ -234,23 +250,24 @@ pub struct Conversation {
 /// (newest first).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DmMessage {
+    #[serde(default, deserialize_with = "null_to_default")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub conversation_id: String,
     /// `"incoming"` (the other party's) or `"outgoing"` (ours). The provider
     /// states direction outright — no handle matching needed (#526).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub direction: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub text: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub sender_id: String,
     /// Sender's handle / display name.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub sender_name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub attachment_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_to_default")]
     pub created_at: String,
 }
 
@@ -444,6 +461,40 @@ mod tests {
         .unwrap();
         assert_eq!(p.id, "17981794083103759");
         assert_eq!(p.account_id, "acc_01KZ2KXNF1W56YBAKP6B7DH9AJ");
+    }
+
+    #[test]
+    fn dm_message_tolerates_explicit_null_scalars() {
+        // Verbatim shape from a live attachment-only DM (2026-08-02):
+        // `text`/`attachment_*` are literal nulls, not omitted. This exact
+        // row failed with "invalid type: null, expected a string" before the
+        // null_to_default deserializer.
+        let m: DmMessage = serde_json::from_value(serde_json::json!({
+            "id": "c8b72ccb-8539-4577-ac8f-9e174fd1bd3c",
+            "conversation_id": "92819f68-6c67-4471-92e1-4a0eb2abe1b9",
+            "direction": "incoming",
+            "text": null,
+            "sender_id": "3194014884125700",
+            "sender_name": "pysolver33",
+            "attachment_type": null,
+            "attachment_url": null,
+            "created_at": "2026-08-02T22:03:38Z"
+        }))
+        .unwrap();
+        assert!(m.is_incoming());
+        assert_eq!(m.text, "");
+        assert_eq!(m.attachment_url, None);
+
+        // Null on every nullable-ish field at once still decodes.
+        let c: Comment = serde_json::from_value(serde_json::json!({
+            "platform_id": "cmt_1", "text": null, "author_name": null,
+            "author_username": null, "is_owner": null, "parent_id": null,
+            "capabilities": null, "created_at": null
+        }))
+        .unwrap();
+        assert_eq!(c.platform_id, "cmt_1");
+        assert_eq!(c.author_display(), "");
+        assert!(!c.capabilities.can_reply);
     }
 
     #[test]
