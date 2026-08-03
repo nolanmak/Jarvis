@@ -401,6 +401,11 @@ impl InboundSource for SocialApiDmSource {
                 if budget == 0 {
                     break;
                 }
+                // Wire ids are null-tolerated at decode; an id-less row is
+                // unusable (no thread to fetch, no dedup key).
+                if conv.id.is_empty() {
+                    continue;
+                }
                 let msgs = match self.client.list_messages(&conv.id).await {
                     Ok(m) => m,
                     Err(e) => {
@@ -441,7 +446,7 @@ impl InboundSource for SocialApiDmSource {
                     if budget == 0 {
                         break;
                     }
-                    if is_own_handle(&own_handles, &msg.sender_name) {
+                    if msg.id.is_empty() || is_own_handle(&own_handles, &msg.sender_name) {
                         continue;
                     }
                     // Durable one-shot dedup keyed on (conversation_id, message_id).
