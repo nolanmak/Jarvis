@@ -11,13 +11,17 @@
 //!
 //! It produces *work items only* — the triage → draft → approval-card path is
 //! [`SocialApiOwnPostCommentEngagement`]'s job (mirrors the LinkedIn own-post
-//! engagement). Every reply still requires Discord approval; the actual send is
-//! issue #244's job. Nothing here auto-posts.
+//! engagement). Every reply requires Discord approval; the send happens when
+//! the operator approves, in the CLI's `approve_socialapi` (#244, merged).
+//! Nothing here auto-posts.
 //!
 //! Durability: `socialapi_seen_comments` is the dedup ledger (a `(post,
 //! comment)` pair becomes a WorkItem exactly once, ever, even across daemon
-//! restarts); `own_posts.last_polled_ms` records cadence so the tick spreads
-//! load (`own_posts_due_for_poll` orders least-recently-polled first).
+//! restarts). Note `own_posts.last_polled_ms` does NOT throttle anything —
+//! `own_posts_due_for_poll` only uses it to ORDER BY least-recently-polled, so
+//! every watched post is re-examined on every tick. `list_comments` likewise
+//! returns the whole account inbox regardless of the watched set, so watching
+//! more posts costs no extra API calls.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -49,10 +53,21 @@ use crate::PLATFORM;
 /// horizon (set when the post is registered) handles "stop eventually".
 pub const DEFAULT_OWN_POST_POLL_SECS: u64 = 30 * 60;
 
-/// Default per-day reply pre-cap. A cheap pre-filter so a viral post can't
-/// flood the triage pipeline with hundreds of LLM calls in one tick; the
-/// RateGovernor `Comment` envelope is the authoritative cap.
-pub const DEFAULT_MAX_REPLIES_PER_DAY: u32 = 10;
+/// Default per-**tick** comment pre-cap. A cheap pre-filter so a viral post
+/// can't flood the triage pipeline with hundreds of LLM calls in one tick.
+///
+/// #532: this was named `DEFAULT_MAX_REPLIES_PER_DAY` and documented as a
+/// daily cap, but the budget is reinitialized on every `next_work_items` call
+/// and nothing persists a daily counter — at the 30-min default cadence the
+/// real ceiling was ~48x the documented one. Renamed rather than made
+/// per-day: a durable daily ledger is a separate change, and the honest name
+/// is what lets an operator size `AUGMENTAGENT_SOCIALAPI_MAX_OWNPOST_REPLIES`
+/// correctly today.
+///
+/// Note the `RateGovernor` `Comment` envelope is NOT a backstop here:
+/// `Platform::parse("socialapi")` returns `None`, so the governor path is
+/// inert for this channel and this pre-cap is the only throttle.
+pub const DEFAULT_MAX_COMMENTS_PER_TICK: u32 = 10;
 
 /// Serialized payload carried in `WorkItem.payload`. The SocialAPI.ai
 /// [`Comment`] plus the watched-post id it was matched against.
@@ -130,15 +145,15 @@ impl SocialApiOwnPostCommentPayload {
 pub struct SocialApiOwnPostCommentTrigger {
     client: Arc<SocialApiClient>,
     store: Arc<Store>,
-    max_per_day: u32,
+    max_per_tick: u32,
 }
 
 impl SocialApiOwnPostCommentTrigger {
-    pub fn new(client: Arc<SocialApiClient>, store: Arc<Store>, max_per_day: u32) -> Self {
+    pub fn new(client: Arc<SocialApiClient>, store: Arc<Store>, max_per_tick: u32) -> Self {
         Self {
             client,
             store,
-            max_per_day: max_per_day.max(1),
+            max_per_tick: max_per_tick.max(1),
         }
     }
 
@@ -212,14 +227,27 @@ impl Trigger for SocialApiOwnPostCommentTrigger {
     ) -> anyhow::Result<Vec<WorkItem>> {
         let now_ms = now_millis();
         let posts = self.store.own_posts_due_for_poll(PLATFORM, now_ms)?;
-        if posts.is_empty() {
-            debug!("socialapi own-post comment poller: no posts in poll window");
-            return Ok(Vec::new());
-        }
         // The set of post ids we actually care about this tick; `list_comments`
         // returns the whole inbox per account, so we filter to watched posts.
         let watched: HashSet<&str> =
             posts.iter().map(|p| p.external_id.as_str()).collect();
+
+        // #527: drain BEFORE the no-watched-posts early return. This used to
+        // sit after it, so with nothing watched the pushed comment events that
+        // this drain is the only thing that marks processed accumulated in
+        // `socialapi_webhook_events` at processed=0 forever. Draining here
+        // marks them regardless; dropping the un-watched ones matches the poll
+        // path's filter and is safe because the poll re-lists the entire
+        // account inbox every tick (no cursor), so a comment dropped now is
+        // rediscovered once its post is registered.
+        let mut budget = self.max_per_tick;
+        let mut out = self.drain_webhook_events(&watched, budget)?;
+        budget = budget.saturating_sub(out.len() as u32);
+
+        if posts.is_empty() {
+            debug!("socialapi own-post comment poller: no posts in poll window");
+            return Ok(out);
+        }
 
         let accounts = self.store.active_socialapi_account_ids()?;
         // No registered accounts → poll the whole inbox once (account_id=None).
@@ -229,14 +257,6 @@ impl Trigger for SocialApiOwnPostCommentTrigger {
             accounts.into_iter().map(Some).collect()
         };
 
-        let mut budget = self.max_per_day;
-        // #249 fast-path: drain webhook-delivered comment events AHEAD of the
-        // API poll so near-real-time pushes don't wait for the next 30-min
-        // tick. Shares the `socialapi_seen_comments` dedup ledger and the
-        // watched-post filter with the poll below, so a webhook item drained
-        // here is skipped when the poll later sees it.
-        let mut out = self.drain_webhook_events(&watched, budget)?;
-        budget = budget.saturating_sub(out.len() as u32);
         for scope in scopes {
             if cancel.is_cancelled() || budget == 0 {
                 break;
@@ -315,7 +335,7 @@ impl Default for SocialApiOwnPostConfig {
 
 /// Drives [`SocialApiOwnPostCommentTrigger`] on a cadence and runs each
 /// surfaced comment through triage → draft → approval-card. The actual reply
-/// send is issue #244; this stops at the approval card. Every dispatch is
+/// send happens on approve (#244); this stops at the approval card. Every dispatch is
 /// wrapped in the merged RateGovernor `Comment` permit/record envelope.
 pub struct SocialApiOwnPostCommentEngagement<R: Reasoner> {
     pub store: Arc<Store>,
@@ -522,7 +542,7 @@ impl<R: Reasoner + 'static> SocialApiOwnPostCommentEngagement<R> {
             return Err(anyhow::anyhow!("post_approval: {e}"));
         }
         // Card surfaced — record the permit as Ok (quota consumed at the point
-        // the user is asked to approve; the actual send is issue #244's job).
+        // the user is asked to approve; the send happens on approve, #244).
         if let Some(p) = permit {
             let _ = self
                 .governor
@@ -656,7 +676,7 @@ mod tests {
         let trigger = Arc::new(SocialApiOwnPostCommentTrigger::new(
             client,
             Arc::clone(&store),
-            DEFAULT_MAX_REPLIES_PER_DAY,
+            DEFAULT_MAX_COMMENTS_PER_TICK,
         ));
         SocialApiOwnPostCommentEngagement {
             store,
@@ -820,5 +840,82 @@ mod tests {
         let n = eng.poll_once(&CancellationToken::new()).await.unwrap();
         assert_eq!(n, 0);
         assert!(broker.posts.lock().unwrap().is_empty());
+    }
+
+    /// #527: pushed comment events used to strand at `processed = 0` forever
+    /// when nothing was in the poll window, because the early return sat ahead
+    /// of the drain that is the only thing marking them processed.
+    #[tokio::test]
+    async fn drain_runs_even_with_no_watched_posts() {
+        let server = MockServer::start().await;
+        let (store, _f) = tmp_store();
+        store
+            .insert_socialapi_webhook_event(
+                "socialapi:comment:post_1:cmt_1",
+                "comment",
+                Some("acc_1"),
+                &serde_json::json!({
+                    "type": "comment", "id": "cmt_1", "post_id": "post_1",
+                    "author": "jane", "text": "nice",
+                    "created_at": "2026-05-28T00:00:00Z"
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        let trigger = SocialApiOwnPostCommentTrigger::new(client(&server), Arc::clone(&store), 10);
+        let items = trigger
+            .next_work_items(&CancellationToken::new())
+            .await
+            .unwrap();
+
+        // Nothing watched, so the comment yields no work...
+        assert!(items.is_empty());
+        // ...but it MUST have been marked processed rather than stranded.
+        assert!(
+            store
+                .take_unprocessed_socialapi_webhook_events("comment", 10)
+                .unwrap()
+                .is_empty(),
+            "comment webhook event stranded at processed=0"
+        );
+    }
+
+    /// A pushed comment on a watched post still becomes a work item via the
+    /// drain, without waiting for the 30-minute poll.
+    #[tokio::test]
+    async fn drain_emits_for_watched_post() {
+        let server = MockServer::start().await;
+        let (store, _f) = tmp_store();
+        store
+            .upsert_own_post(PLATFORM, "post_1", now_millis(), now_millis() + 86_400_000)
+            .unwrap();
+        store
+            .insert_socialapi_webhook_event(
+                "socialapi:comment:post_1:cmt_2",
+                "comment",
+                Some("acc_1"),
+                &serde_json::json!({
+                    "type": "comment", "id": "cmt_2", "post_id": "post_1",
+                    "author": "jane", "text": "how did you build it?",
+                    "created_at": "2026-05-28T00:00:00Z"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/inbox/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let trigger = SocialApiOwnPostCommentTrigger::new(client(&server), Arc::clone(&store), 10);
+        let items = trigger
+            .next_work_items(&CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].external_id, "cmt_2");
+        assert_eq!(items[0].kind, work_item_kind::OWN_POST_COMMENT);
     }
 }

@@ -23,9 +23,17 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+/// The only `kind` values `socialapi_webhook_events` accepts (#529). Kept as a
+/// constant so the runtime guard, the sqlite CHECK, and the drain's filter
+/// can't drift apart — a row whose kind matches none of these is never
+/// selected by the drain and would strand at `processed = 0` forever.
+pub const SOCIALAPI_WEBHOOK_KINDS: [&str; 2] = ["dm", "comment"];
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -1466,14 +1474,21 @@ impl Store {
         // comment/DM event here; the daemon DRAINS unprocessed rows as a
         // fast-path alongside its API poll, reusing socialapi_seen_{dms,
         // comments} for downstream dedup so a webhook-delivered item and a
-        // later poll of the same item don't both produce a draft. `id` is the
-        // provider event id (idempotent dedup); `kind` is 'dm' | 'comment';
+        // later poll of the same item don't both produce a draft. `id` is
+        // SYNTHESIZED by the TS receiver from the item identity
+        // (`socialapi:dm:<conversation>:<message>` /
+        // `socialapi:comment:<post>:<comment>`), NOT the provider's event id
+        // (#529) — so a provider re-send under a new event id still collapses,
+        // and two distinct events about the same message also collapse.
+        // `kind` is 'dm' | 'comment'; the CHECK below plus the guard in
+        // `insert_socialapi_webhook_event` keep an unrecognized value out,
+        // since the drain filters on `kind` and would strand it forever.
         // `processed` flips to 1 once the daemon emits the WorkItem. Mirrors
         // the TS schema in src/db.ts so both daemons share an identical shape.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS socialapi_webhook_events (\
                  id             TEXT PRIMARY KEY,\
-                 kind           TEXT NOT NULL,\
+                 kind           TEXT NOT NULL CHECK (kind IN ('dm', 'comment')),\
                  account_id     TEXT,\
                  payload_json   TEXT NOT NULL,\
                  received_at_ms INTEGER NOT NULL,\
@@ -5629,12 +5644,17 @@ impl Store {
     }
 
     /// Insert one inbound SocialAPI.ai webhook event (#249) idempotently,
-    /// de-duped by provider event `id`. Returns `true` when the row was newly
-    /// inserted (`false` on a duplicate id). The Express webhook receiver is
-    /// the normal writer; this method exists so the Rust side can also seed
-    /// events in tests and stays the single schema source. New rows land with
-    /// `processed = 0` and are picked up by
+    /// de-duped by the receiver-synthesized `id`. Returns `true` when the row
+    /// was newly inserted (`false` on a duplicate id). The Express webhook
+    /// receiver is the normal writer; this method exists so the Rust side can
+    /// also seed events in tests and stays the single schema source. New rows
+    /// land with `processed = 0` and are picked up by
     /// [`Store::take_unprocessed_socialapi_webhook_events`].
+    ///
+    /// #529: `kind` is validated here, not just by the sqlite CHECK. The CHECK
+    /// only exists on databases created after that fix, and a row with an
+    /// unrecognized kind is invisible forever — the drain filters `kind = ?1`,
+    /// so it would sit at `processed = 0` and never be emitted or cleaned up.
     pub fn insert_socialapi_webhook_event(
         &self,
         id: &str,
@@ -5642,6 +5662,11 @@ impl Store {
         account_id: Option<&str>,
         payload_json: &str,
     ) -> StoreResult<bool> {
+        if !SOCIALAPI_WEBHOOK_KINDS.contains(&kind) {
+            return Err(StoreError::InvalidInput(format!(
+                "socialapi webhook event kind must be one of {SOCIALAPI_WEBHOOK_KINDS:?}, got {kind:?}"
+            )));
+        }
         let now = now_millis();
         let guard = self.conn.lock().expect("store mutex poisoned");
         let n = guard.execute(
@@ -5699,6 +5724,51 @@ impl Store {
             params![id],
         )?;
         Ok(n)
+    }
+
+    /// Read one row out of the `config` table — the key/value store the
+    /// Express dashboard writes its pasted secrets into (`setConfig` in
+    /// `src/db.ts`). `Ok(None)` covers both "no such key" and an empty value,
+    /// so callers can treat a blank as unset.
+    ///
+    /// The store deliberately exposed no generic getter before #525, which is
+    /// why every consumer that wanted a dashboard-written key reopened the db
+    /// by hand with a different precedence. Route new ones through here.
+    pub fn get_config(&self, key: &str) -> StoreResult<Option<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let val: rusqlite::Result<String> = guard.query_row(
+            "SELECT value FROM config WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        );
+        match val {
+            Ok(v) if !v.trim().is_empty() => Ok(Some(v.trim().to_string())),
+            Ok(_) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Account handles of every registered SocialAPI.ai account, lowercased
+    /// and stripped of a leading `@`. This is the set of identities that count
+    /// as "us" when deciding whether an inbound-looking DM is really our own
+    /// outbound message (#526). Inactive accounts are included on purpose —
+    /// disabling an account must not make its past outbound messages start
+    /// looking inbound.
+    pub fn socialapi_account_handles(&self) -> StoreResult<Vec<String>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT account_handle FROM socialapi_accounts \
+             WHERE account_handle IS NOT NULL AND TRIM(account_handle) <> ''",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|h| h.trim().trim_start_matches('@').to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect())
     }
 
     /// Account ids of the active (polling-enabled) SocialAPI.ai accounts. The
@@ -8381,5 +8451,86 @@ mod tests {
         s.record_outbound_thread_event("ent-1", "msg-noth", None, 20_000)
             .unwrap();
         assert!(!s.thread_has_user_reply_after("T-other", 0).unwrap());
+    }
+
+    /// #525 — the dashboard's paste-your-key card writes here; the daemon has
+    /// to be able to read it back or the documented primary setup flow leaves
+    /// the channel dead.
+    #[test]
+    fn get_config_reads_dashboard_written_keys() {
+        let (s, _f) = fresh_store();
+        assert_eq!(s.get_config("socialapi_api_key").unwrap(), None);
+        s.with_conn(|c| {
+            c.execute(
+                "INSERT INTO config (key, value, updatedAt) VALUES \
+                    ('socialapi_api_key','  sk_live_abc  ',0), \
+                    ('blank_key','   ',0)",
+                [],
+            )
+        })
+        .unwrap();
+        // Trimmed on the way out.
+        assert_eq!(
+            s.get_config("socialapi_api_key").unwrap().as_deref(),
+            Some("sk_live_abc")
+        );
+        // A whitespace-only value is "unset", not a key made of spaces.
+        assert_eq!(s.get_config("blank_key").unwrap(), None);
+        assert_eq!(s.get_config("never_set").unwrap(), None);
+    }
+
+    /// #526 — the ownership signal for the DM webhook fast path.
+    #[test]
+    fn socialapi_account_handles_normalizes_and_includes_inactive() {
+        let (s, _f) = fresh_store();
+        assert!(s.socialapi_account_handles().unwrap().is_empty());
+        s.with_conn(|c| {
+            c.execute(
+                "INSERT INTO socialapi_accounts \
+                    (id, platform, account_handle, active, created_at_ms, updated_at_ms) \
+                 VALUES ('a','instagram','@Acme',1,0,0), \
+                        ('b','twitter','  BrandX ',0,0,0), \
+                        ('c','linkedin',NULL,1,0,0), \
+                        ('d','tiktok','',1,0,0)",
+                [],
+            )
+        })
+        .unwrap();
+        let mut handles = s.socialapi_account_handles().unwrap();
+        handles.sort();
+        // Lowercased, '@' stripped, trimmed; NULL/empty dropped; the INACTIVE
+        // account is still included — disabling it must not make its past
+        // outbound messages start looking inbound.
+        assert_eq!(handles, vec!["acme".to_string(), "brandx".to_string()]);
+    }
+
+    /// #529 — an unrecognized kind is invisible to the drain (which filters on
+    /// it), so it would sit at processed=0 forever. Reject at the door.
+    #[test]
+    fn insert_socialapi_webhook_event_rejects_unknown_kind() {
+        let (s, _f) = fresh_store();
+        let err = s
+            .insert_socialapi_webhook_event("ev_1", "reaction", None, "{}")
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidInput(ref m) if m.contains("reaction")),
+            "expected InvalidInput naming the bad kind, got {err:?}"
+        );
+        // And nothing was written.
+        assert!(s
+            .take_unprocessed_socialapi_webhook_events("reaction", 10)
+            .unwrap()
+            .is_empty());
+        // Both legal kinds still insert.
+        assert!(s
+            .insert_socialapi_webhook_event("ev_2", "dm", None, "{}")
+            .unwrap());
+        assert!(s
+            .insert_socialapi_webhook_event("ev_3", "comment", None, "{}")
+            .unwrap());
+        // Idempotent on repeat id.
+        assert!(!s
+            .insert_socialapi_webhook_event("ev_2", "dm", None, "{}")
+            .unwrap());
     }
 }

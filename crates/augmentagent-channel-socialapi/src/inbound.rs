@@ -10,9 +10,10 @@
 //!
 //! [`SocialApiDmChannel`] is the [`WorkItemHandler`] that consumes those work
 //! items: it deserializes the payload, runs triage → draft, and posts a Discord
-//! approval card via [`ApprovalBroker`]. It stops at the approval card — the
-//! actual reply *send* is issue #244's job. Every reply still requires Discord
-//! approval; nothing here auto-replies.
+//! approval card via [`ApprovalBroker`]. It stops at the approval card by
+//! design; the send happens when the operator approves, in the CLI's
+//! `approve_socialapi` (#244, merged). Every reply requires Discord approval;
+//! nothing here auto-replies.
 //!
 //! Wrap [`SocialApiDmSource`] in an
 //! [`InboundMessageTrigger`](augmentagent_channel_core::trigger::InboundMessageTrigger)
@@ -70,12 +71,28 @@ struct DmWebhookPayload {
     text: String,
     #[serde(default)]
     created_at: String,
+    /// Provider-stated direction, normalized by the Express receiver's
+    /// `isOutbound`. `true` means the message is ours. Absent (⇒ `false`)
+    /// means *unstated*, not *inbound* — see the drain's attribution walk.
+    #[serde(default)]
+    outbound: bool,
 }
 
 impl From<DmWebhookPayload> for SocialApiDmPayload {
     fn from(w: DmWebhookPayload) -> Self {
-        // `with` is the other party; fall back to `author` if the receiver
-        // couldn't populate it.
+        // `with` is the other party. Falling back to `author` here is a
+        // DISPLAY convenience only — it makes the approval card read sanely
+        // when the push carried no counterparty. It must never be used to
+        // decide direction: the fallback makes `author == with` trivially
+        // true, which is exactly how our own outbound DMs used to be drafted
+        // as inbound (#526). Ownership is decided by the provider's stated
+        // direction and the registered account handles, in the drain's
+        // attribution walk — never here.
+        //
+        // `author` is the right display fallback precisely because the drain
+        // only ever emits INBOUND messages, so for anything that reaches a
+        // card the author IS the counterparty. `recipient`/`to` would be the
+        // opposite: on an inbound DM the destination is us.
         let with = if w.with.is_empty() {
             w.author.clone()
         } else {
@@ -153,8 +170,32 @@ impl SocialApiDmPayload {
 /// tolerated). This is conservative: anything we can't positively attribute to
 /// the other party is skipped so we never draft a "reply to ourselves".
 fn is_inbound(conv: &Conversation, msg: &DmMessage) -> bool {
-    let norm = |s: &str| s.trim().trim_start_matches('@').to_ascii_lowercase();
-    norm(&msg.author) == norm(&conv.with)
+    norm_handle(&msg.author) == norm_handle(&conv.with)
+}
+
+/// Canonical handle form for identity comparisons: trimmed, no leading `@`,
+/// lowercased. Shared by [`is_inbound`] and [`is_own_handle`] so the poll and
+/// webhook paths agree on what counts as the same account.
+fn norm_handle(s: &str) -> String {
+    s.trim().trim_start_matches('@').to_ascii_lowercase()
+}
+
+/// True iff `author` is one of OUR registered SocialAPI.ai account handles —
+/// i.e. the message is our own outbound, not something to draft a reply to.
+///
+/// One half of the ownership signal for the #249 webhook fast path, which has
+/// no conversation to compare against. `handles` comes from
+/// `Store::socialapi_account_handles` and is already normalized; `author` is
+/// normalized here.
+///
+/// Returns false against an EMPTY `handles` — for every author, including our
+/// own. Callers must therefore check `handles.is_empty()` separately and treat
+/// it as *unattributable* rather than *not ours*; the drain does, and defers
+/// those events to the poll path. `is_inbound` is not a backstop here: it only
+/// runs in the poll loop, which a webhook-delivered event never enters.
+fn is_own_handle(handles: &[String], author: &str) -> bool {
+    let a = norm_handle(author);
+    !a.is_empty() && handles.iter().any(|h| h == &a)
 }
 
 /// Polls SocialAPI.ai DM conversations and yields a `dm` WorkItem per genuinely
@@ -191,6 +232,15 @@ impl SocialApiDmSource {
         let events = self
             .store
             .take_unprocessed_socialapi_webhook_events("dm", budget)?;
+        // #526: the pushed event carries no conversation to compare against,
+        // so `is_inbound` is useless here (and the receiver's `with`-from-
+        // `author` display fallback would make it trivially true anyway).
+        // Attribute against our own registered handles instead. Read once per
+        // drain, not per event.
+        let own_handles = self.store.socialapi_account_handles().unwrap_or_else(|e| {
+            warn!("socialapi dm webhook: account handle lookup failed: {e}");
+            Vec::new()
+        });
         let mut out = Vec::new();
         for ev in events {
             // Always mark processed first so a poison row can't be re-drained
@@ -206,7 +256,44 @@ impl SocialApiDmSource {
                     continue;
                 }
             };
+            let stated_outbound = wp.outbound;
             let payload: SocialApiDmPayload = wp.into();
+
+            // Attribution walk (#526). The push has no conversation to compare
+            // against, so we decide direction in this order:
+            //   1. the provider said so outright — authoritative;
+            //   2. the author is one of our registered handles — ours;
+            //   3. we have no handles at all — UNATTRIBUTABLE.
+            //
+            // Case 3 is the one that matters. `is_own_handle` returns false for
+            // every author against an empty set, so treating "no handles" as
+            // "not ours" silently reinstates the bug for any install whose
+            // `account_handle` column is NULL — which is every install that
+            // hasn't run Sync accounts, since the dashboard populates it
+            // best-effort from a third-party payload. Instead we drop the event
+            // WITHOUT writing the seen-ledger: the 5-minute poll re-surfaces
+            // the same message with a real conversation to check `is_inbound`
+            // against. Cost is a few minutes of latency; the alternative is
+            // drafting a reply to ourselves.
+            if stated_outbound || is_own_handle(&own_handles, &payload.author) {
+                debug!(
+                    event = %ev.id,
+                    author = %payload.author,
+                    stated_outbound,
+                    "socialapi dm webhook: skipping our own outbound message"
+                );
+                continue;
+            }
+            if own_handles.is_empty() {
+                warn!(
+                    event = %ev.id,
+                    "socialapi dm webhook: no registered account handles and the push \
+                     did not state direction — cannot tell inbound from outbound, \
+                     deferring to the API poll. Run `Sync accounts` on the dashboard \
+                     to enable the webhook fast path."
+                );
+                continue;
+            }
             // Durable one-shot dedup keyed on (conversation_id, message_id) —
             // the SAME ledger the poll path writes, so no double-draft.
             let is_new = self.store.record_seen_socialapi_dm(
@@ -243,6 +330,10 @@ impl InboundSource for SocialApiDmSource {
         let mut out = self.drain_webhook_events(budget)?;
         budget = budget.saturating_sub(out.len() as u32);
 
+        // Same ownership backstop the drain uses (#526). `is_inbound` below is
+        // the primary direction check on this path; this catches the case
+        // where the API reports us as the conversation counterparty.
+        let own_handles = self.store.socialapi_account_handles().unwrap_or_default();
         let accounts = self.store.active_socialapi_account_ids()?;
         // No registered accounts → poll the whole inbox once (account_id=None),
         // same fallback the own-post comment poller uses.
@@ -295,7 +386,7 @@ impl InboundSource for SocialApiDmSource {
                     if budget == 0 {
                         break;
                     }
-                    if !is_inbound(&conv, msg) {
+                    if !is_inbound(&conv, msg) || is_own_handle(&own_handles, &msg.author) {
                         continue;
                     }
                     // Durable one-shot dedup keyed on (conversation_id, message_id).
@@ -353,7 +444,7 @@ impl Default for SocialApiDmConfig {
 
 /// [`WorkItemHandler`] for inbound SocialAPI.ai DMs. Deserializes the payload,
 /// runs triage → draft, and posts a Discord approval card. Stops at the
-/// approval card — the reply send is issue #244. Wrapped in the merged
+/// approval card — the reply send happens on approve (#244). Wrapped in the merged
 /// RateGovernor `Dm` permit/record envelope (no-op fallthrough until SocialAPI
 /// has `Platform` rate-table rows, exactly like the own-post handler).
 pub struct SocialApiDmChannel<R: Reasoner> {
@@ -841,5 +932,195 @@ mod tests {
         let posted = ch.handle_dm(payload).await.unwrap();
         assert!(!posted);
         assert!(broker.posts.lock().unwrap().is_empty());
+    }
+
+    fn seed_account(store: &Store, id: &str, handle: &str) {
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO socialapi_accounts \
+                        (id, platform, account_handle, active, created_at_ms, updated_at_ms) \
+                     VALUES (?1,'instagram',?2,1,0,0)",
+                    [id, handle],
+                )
+            })
+            .unwrap();
+    }
+
+    fn seed_dm_event(store: &Store, ev_id: &str, payload: serde_json::Value) {
+        store
+            .insert_socialapi_webhook_event(ev_id, "dm", Some("acc_1"), &payload.to_string())
+            .unwrap();
+    }
+
+    #[test]
+    fn is_own_handle_matches_case_and_at_prefix() {
+        let handles = vec!["acme".to_string()];
+        assert!(is_own_handle(&handles, "@Acme"));
+        assert!(is_own_handle(&handles, " acme "));
+        assert!(!is_own_handle(&handles, "someone_else"));
+        // No registered handles ⇒ nothing is attributable to us.
+        assert!(!is_own_handle(&[], "acme"));
+        // An empty author must never match an empty-ish handle set.
+        assert!(!is_own_handle(&handles, "   "));
+    }
+
+    /// #526: a pushed event for OUR OWN outbound DM must not become a work
+    /// item. The receiver's `with`-from-`author` fallback made `is_inbound`
+    /// trivially true, so this used to be drafted as though someone had
+    /// messaged us.
+    #[tokio::test]
+    async fn drain_skips_our_own_outbound_dm() {
+        let server = MockServer::start().await;
+        let (store, _f) = tmp_store();
+        seed_account(&store, "acc_1", "acme");
+        seed_dm_event(
+            &store,
+            "socialapi:dm:conv_1:msg_1",
+            serde_json::json!({
+                "type": "dm", "id": "msg_1", "conversation_id": "conv_1",
+                "account_id": "acc_1", "with": "", "author": "@Acme",
+                "text": "thanks for reaching out", "created_at": "2026-05-28T00:00:00Z"
+            }),
+        );
+        mount_conversations(&server, serde_json::json!([])).await;
+
+        let src = SocialApiDmSource::new(client(&server), Arc::clone(&store), 25);
+        let items = src.fetch_new().await.unwrap();
+        assert!(items.is_empty(), "own outbound DM must not be drafted");
+        // Still marked processed, so it can't wedge the drain queue.
+        assert!(store
+            .take_unprocessed_socialapi_webhook_events("dm", 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The counterpart: a genuine inbound push from someone else still lands.
+    #[tokio::test]
+    async fn drain_emits_genuine_inbound_dm() {
+        let server = MockServer::start().await;
+        let (store, _f) = tmp_store();
+        seed_account(&store, "acc_1", "acme");
+        seed_dm_event(
+            &store,
+            "socialapi:dm:conv_1:msg_2",
+            serde_json::json!({
+                "type": "dm", "id": "msg_2", "conversation_id": "conv_1",
+                "account_id": "acc_1", "with": "jane", "author": "jane",
+                "text": "hey, quick question", "created_at": "2026-05-28T00:00:00Z"
+            }),
+        );
+        mount_conversations(&server, serde_json::json!([])).await;
+
+        let src = SocialApiDmSource::new(client(&server), Arc::clone(&store), 25);
+        let items = src.fetch_new().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].external_id, "msg_2");
+        assert_eq!(items[0].kind, work_item_kind::DM);
+    }
+
+    /// With no registered handles and no stated direction we CANNOT tell
+    /// inbound from outbound. Emitting would reinstate #526 on every install
+    /// whose account_handle column is still NULL, so the drain defers to the
+    /// poll — and must NOT write the seen-ledger, or the poll could never
+    /// resurface the message.
+    #[tokio::test]
+    async fn drain_defers_unattributable_event_to_the_poll() {
+        let server = MockServer::start().await;
+        let (store, _f) = tmp_store();
+        seed_dm_event(
+            &store,
+            "socialapi:dm:conv_9:msg_9",
+            serde_json::json!({
+                "type": "dm", "id": "msg_9", "conversation_id": "conv_9",
+                "account_id": "acc_9", "with": "", "author": "anyone",
+                "text": "hello", "created_at": "2026-05-28T00:00:00Z"
+            }),
+        );
+        mount_conversations(&server, serde_json::json!([])).await;
+
+        let src = SocialApiDmSource::new(client(&server), Arc::clone(&store), 25);
+        assert!(src.fetch_new().await.unwrap().is_empty());
+        // Processed, so it can't wedge the queue...
+        assert!(store
+            .take_unprocessed_socialapi_webhook_events("dm", 10)
+            .unwrap()
+            .is_empty());
+        // ...but NOT in the seen-ledger, so the poll can still surface it with
+        // a real conversation to attribute against. record_seen returns true
+        // only for a genuinely new (conversation, message) pair.
+        assert!(
+            store
+                .record_seen_socialapi_dm("conv_9", "msg_9", None, None)
+                .unwrap(),
+            "unattributable event must not have been recorded as seen"
+        );
+    }
+
+    /// A provider that states direction outright is authoritative — no
+    /// registered handles needed.
+    #[tokio::test]
+    async fn drain_honors_stated_outbound_direction() {
+        let server = MockServer::start().await;
+        let (store, _f) = tmp_store();
+        seed_dm_event(
+            &store,
+            "socialapi:dm:conv_3:msg_3",
+            serde_json::json!({
+                "type": "dm", "id": "msg_3", "conversation_id": "conv_3",
+                "account_id": "acc_3", "with": "jane", "author": "acme",
+                "text": "sent by us", "created_at": "2026-05-28T00:00:00Z",
+                "outbound": true
+            }),
+        );
+        mount_conversations(&server, serde_json::json!([])).await;
+
+        let src = SocialApiDmSource::new(client(&server), Arc::clone(&store), 25);
+        assert!(src.fetch_new().await.unwrap().is_empty());
+    }
+
+    /// ...and a stated INBOUND direction still flows when handles are known.
+    #[tokio::test]
+    async fn drain_emits_when_direction_stated_inbound() {
+        let server = MockServer::start().await;
+        let (store, _f) = tmp_store();
+        seed_account(&store, "acc_1", "acme");
+        seed_dm_event(
+            &store,
+            "socialapi:dm:conv_4:msg_4",
+            serde_json::json!({
+                "type": "dm", "id": "msg_4", "conversation_id": "conv_4",
+                "account_id": "acc_1", "with": "jane", "author": "jane",
+                "text": "hi there", "created_at": "2026-05-28T00:00:00Z",
+                "outbound": false
+            }),
+        );
+        mount_conversations(&server, serde_json::json!([])).await;
+
+        let src = SocialApiDmSource::new(client(&server), Arc::clone(&store), 25);
+        let items = src.fetch_new().await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].external_id, "msg_4");
+    }
+
+    /// The receiver leaves `with` empty when the push doesn't name a
+    /// counterparty; the Rust display fallback must then use `author`, which
+    /// for an emitted (inbound) message IS the counterparty. Regression guard
+    /// against sourcing `with` from `recipient`/`to`, which is us.
+    #[test]
+    fn empty_with_displays_the_author_not_our_own_account() {
+        let payload: SocialApiDmPayload = serde_json::from_value::<DmWebhookPayload>(
+            serde_json::json!({
+                "id": "m1", "conversation_id": "c1", "account_id": "acc_1",
+                "with": "", "author": "jane", "text": "hi",
+                "created_at": "2026-05-28T00:00:00Z"
+            }),
+        )
+        .unwrap()
+        .into();
+        assert_eq!(payload.with, "jane");
+        let email = payload.into_email();
+        assert_eq!(email.subject, "[DM from jane]");
+        assert_eq!(email.from, "jane <socialapi:jane>");
     }
 }

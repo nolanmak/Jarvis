@@ -119,9 +119,12 @@ pub async fn fan_out_socialapi<R: Reasoner + ?Sized>(
                 .unwrap_or_else(|| {
                     PlatformVariant::new(p, vec![src.body.trim().to_string()], None)
                 }),
-            // Unmappable sub-platform: verbatim source body. Instagram's
-            // shape is the most permissive default (long char limit,
-            // single post) and is only used for limit-flagging on the card.
+            // Unmappable sub-platform: verbatim source body, never dropped.
+            // `Platform::Instagram` here is a STRUCTURAL placeholder only —
+            // `PlatformVariant` requires a platform and we have no shape for
+            // this one. It must not reach the operator as an identity: the
+            // card renders these through `unadapted_card`, which names the
+            // real sub-platform and quotes no char limit (#530).
             None => PlatformVariant::new(
                 Platform::Instagram,
                 vec![src.body.trim().to_string()],
@@ -133,6 +136,26 @@ pub async fn fan_out_socialapi<R: Reasoner + ?Sized>(
             variant,
         });
     }
+    out
+}
+
+/// Card section for a target whose sub-platform the text adapter can't render
+/// (#530). Names the real sub-platform, says plainly that the body is the
+/// unadapted source, and reports a raw character count with no limit — we have
+/// no per-platform shape for it, and quoting another platform's limit is worse
+/// than quoting none.
+fn unadapted_card(sub_platform: &str, variant: &PlatformVariant) -> String {
+    let mut out = format!("**{sub_platform} — unadapted (source body verbatim)**\n");
+    for post in &variant.posts {
+        out.push_str("```\n");
+        out.push_str(post);
+        out.push_str("\n```\n");
+        out.push_str(&format!("_{} chars / no limit known_\n", post.chars().count()));
+    }
+    out.push_str(
+        "_No adapter shape for this platform: nothing was rewritten, and no \
+         character limit was checked. Review before approving._\n",
+    );
     out
 }
 
@@ -159,7 +182,17 @@ pub fn family_card(items: &[TargetVariant]) -> String {
             label,
             it.target.sub_platform
         ));
-        out.push_str(&crate::preview::variant_card(&it.variant));
+        // #530: an unmapped sub-platform carries a `Platform::Instagram`
+        // variant purely as a structural placeholder. Rendering it through
+        // `variant_card` printed the header as literal `**instagram**` and a
+        // `/2200 limit` footer, so a TikTok or Threads target read as an
+        // Instagram post held to Instagram's limit. Render those verbatim
+        // instead — no borrowed platform identity, no borrowed char limit.
+        if it.target.platform().is_none() {
+            out.push_str(&unadapted_card(&it.target.sub_platform, &it.variant));
+        } else {
+            out.push_str(&crate::preview::variant_card(&it.variant));
+        }
     }
     out
 }
@@ -264,5 +297,45 @@ mod tests {
         assert!(card.contains("2/2 — Brand LI (linkedin)"));
         assert!(card.contains("cap"));
         assert!(card.contains("a post"));
+    }
+
+    /// #530: an account whose sub-platform the adapter can't render used to be
+    /// shown as `**instagram**` with a `/2200 limit` footer, because the
+    /// fallback variant borrows `Platform::Instagram` as a structural
+    /// placeholder. The card must name the real platform and quote no limit.
+    #[tokio::test]
+    async fn unmapped_target_card_does_not_claim_instagram() {
+        let r = reasoner(&[]);
+        let targets = vec![SocialTarget::new("tk_1", "tiktok").with_label("Brand TT")];
+        let out = fan_out_socialapi(&r, &SourceDraft::new("the source body"), &targets).await;
+        let card = family_card(&out);
+
+        assert!(card.contains("1/1 — Brand TT (tiktok)"));
+        assert!(
+            card.contains("tiktok — unadapted (source body verbatim)"),
+            "card should name the real sub-platform: {card}"
+        );
+        assert!(card.contains("the source body"));
+        assert!(
+            !card.contains("**instagram**"),
+            "must not present a tiktok target as instagram: {card}"
+        );
+        assert!(
+            !card.contains("2200 limit"),
+            "must not borrow another platform's char limit: {card}"
+        );
+        assert!(card.contains("no limit known"));
+    }
+
+    /// Mapped targets keep the normal per-platform card, limit and all.
+    #[tokio::test]
+    async fn mapped_target_card_keeps_platform_and_limit() {
+        let r = reasoner(&[("Platform: X", "a tweet")]);
+        let targets = vec![SocialTarget::new("x_1", "x").with_label("Brand X")];
+        let out = fan_out_socialapi(&r, &SourceDraft::new("news"), &targets).await;
+        let card = family_card(&out);
+        assert!(card.contains("**twitter**"), "{card}");
+        assert!(card.contains("280 limit"), "{card}");
+        assert!(!card.contains("unadapted"), "{card}");
     }
 }
