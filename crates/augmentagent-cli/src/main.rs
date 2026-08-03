@@ -7543,7 +7543,7 @@ async fn build_broker(
     let slack = load_slack_clients(&store);
     let telegram = load_telegram_bot_clients(&store);
     let github = load_github_client();
-    let socialapi = load_socialapi_client();
+    let socialapi = load_socialapi_client(&store);
     // Keep handles for the broker before `store` is moved into the approver:
     // the #37 Revise-triple capture.
     let store_for_broker = Arc::clone(&store);
@@ -7836,12 +7836,27 @@ fn build_own_post_comment_engagement(
     })
 }
 
+/// Engagement-specific rubric for SocialAPI.ai comments and DMs, resolved
+/// alongside the email-triage skill dir the same way LinkedIn does it.
+///
+/// #531: both socialapi builders passed `cli.skill_dir` straight through,
+/// which defaults to `skills/email-triage`, so public comment replies and DMs
+/// were triaged against the *email* rubric and `skills/socialapi-triage/`
+/// was never read by anything.
+fn socialapi_triage_skill_dir(cli: &Cli) -> PathBuf {
+    cli.skill_dir
+        .parent()
+        .map(|p| p.join("socialapi-triage"))
+        .unwrap_or_else(|| PathBuf::from("skills/socialapi-triage"))
+}
+
 /// #243 — SocialAPI.ai own-post comment engagement. Polls the user's
 /// registered own posts (`own_posts` rows with platform `"socialapi"`) for new
-/// comments via the SocialAPI.ai inbox, triages each, surfaces an
-/// approval-gated reply (the actual send lands in #244). Gated on
-/// `SOCIALAPI_API_KEY` / keyring; self-disables with a warning when absent.
-/// Cadence `AUGMENTAGENT_SOCIALAPI_OWNPOST_POLL_SECS`; reply pre-cap
+/// comments via the SocialAPI.ai inbox, triages each, and surfaces an
+/// approval-gated reply; the send happens when the operator approves (#244).
+/// Gated on the SocialAPI.ai key (env, keyring, or dashboard sqlite config);
+/// self-disables with a warning when absent. Cadence
+/// `AUGMENTAGENT_SOCIALAPI_OWNPOST_POLL_SECS`; per-tick comment pre-cap
 /// `AUGMENTAGENT_SOCIALAPI_MAX_OWNPOST_REPLIES`.
 fn build_socialapi_own_post_engagement(
     cli: &Cli,
@@ -7852,34 +7867,34 @@ fn build_socialapi_own_post_engagement(
 {
     use augmentagent_channel_socialapi::{
         SocialApiAuth, SocialApiClient, SocialApiOwnPostCommentEngagement,
-        SocialApiOwnPostCommentTrigger, SocialApiOwnPostConfig, DEFAULT_MAX_REPLIES_PER_DAY,
+        SocialApiOwnPostCommentTrigger, SocialApiOwnPostConfig, DEFAULT_MAX_COMMENTS_PER_TICK,
         DEFAULT_OWN_POST_POLL_SECS,
     };
 
-    let auth = SocialApiAuth::load().context("load socialapi auth")?;
+    let auth = SocialApiAuth::load_with_store(&store).context("load socialapi auth")?;
     let client = Arc::new(SocialApiClient::new(auth));
     let reasoner = Arc::new(ClaudeCliReasoner::new());
     let poll_secs = std::env::var("AUGMENTAGENT_SOCIALAPI_OWNPOST_POLL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_OWN_POST_POLL_SECS);
-    let max_per_day = std::env::var("AUGMENTAGENT_SOCIALAPI_MAX_OWNPOST_REPLIES")
+    let max_per_tick = std::env::var("AUGMENTAGENT_SOCIALAPI_MAX_OWNPOST_REPLIES")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_MAX_REPLIES_PER_DAY);
+        .unwrap_or(DEFAULT_MAX_COMMENTS_PER_TICK);
     let trigger = Arc::new(SocialApiOwnPostCommentTrigger::new(
         Arc::clone(&client),
         Arc::clone(&store),
-        max_per_day,
+        max_per_tick,
     ));
     let config = SocialApiOwnPostConfig {
         dry_run,
         wiki_root: cli.wiki_dir.clone(),
-        skill_dir: cli.skill_dir.clone(),
+        skill_dir: socialapi_triage_skill_dir(cli),
     };
     info!(
         interval_secs = poll_secs,
-        max_per_day, "socialapi own-post comment engagement ready"
+        max_per_tick, "socialapi own-post comment engagement ready"
     );
     Ok(SocialApiOwnPostCommentEngagement {
         store: Arc::clone(&store),
@@ -7918,7 +7933,7 @@ fn build_socialapi_dm_channel(
         DEFAULT_DM_MAX_PER_TICK, DEFAULT_DM_POLL_SECS,
     };
 
-    let auth = SocialApiAuth::load().context("load socialapi auth")?;
+    let auth = SocialApiAuth::load_with_store(&store).context("load socialapi auth")?;
     let client = Arc::new(SocialApiClient::new(auth));
     let reasoner = Arc::new(ClaudeCliReasoner::new());
     let poll_secs = std::env::var("AUGMENTAGENT_SOCIALAPI_DM_POLL_SECS")
@@ -7944,7 +7959,7 @@ fn build_socialapi_dm_channel(
         config: SocialApiDmConfig {
             dry_run,
             wiki_root: cli.wiki_dir.clone(),
-            skill_dir: cli.skill_dir.clone(),
+            skill_dir: socialapi_triage_skill_dir(cli),
         },
     });
     info!(
@@ -8555,7 +8570,7 @@ impl augmentagent_channel_core::PostPublisher for MultiPlatformPublisher {
                         }
                     }
                 };
-                let auth = match SocialApiAuth::load() {
+                let auth = match SocialApiAuth::load_with_store(&self.store) {
                     Ok(a) => a,
                     Err(e) => {
                         return PublishOutcome::Failed {
@@ -9074,8 +9089,10 @@ fn load_github_client() -> Option<Arc<augmentagent_channel_github::GithubClient>
 /// run; the comment/DM pollers still surface approval cards, but Approve will
 /// surface a `Failed` until the key is configured. Gated on
 /// `SOCIALAPI_API_KEY` / keyring, mirroring `load_discord_client`.
-fn load_socialapi_client() -> Option<Arc<augmentagent_channel_socialapi::SocialApiClient>> {
-    match augmentagent_channel_socialapi::SocialApiAuth::load() {
+fn load_socialapi_client(
+    store: &Store,
+) -> Option<Arc<augmentagent_channel_socialapi::SocialApiClient>> {
+    match augmentagent_channel_socialapi::SocialApiAuth::load_with_store(store) {
         Ok(auth) => Some(Arc::new(augmentagent_channel_socialapi::SocialApiClient::new(
             auth,
         ))),

@@ -410,6 +410,20 @@ function str(ev: Record<string, unknown>, ...keys: string[]): string {
   return "";
 }
 
+// True when the push explicitly says this message is OURS (outbound). Covers
+// the shapes providers commonly use; absent/unrecognized means "not stated",
+// which is NOT the same as "inbound" — the Rust drain treats an unstated
+// direction with no registered handles as unattributable and defers to the
+// poll path rather than guessing (#526).
+function isOutbound(ev: Record<string, unknown>): boolean {
+  for (const k of ["is_outbound", "outbound", "from_me", "is_from_me", "outgoing"]) {
+    const v = ev[k];
+    if (typeof v === "boolean") return v;
+  }
+  const dir = String(ev.direction ?? ev.dir ?? "").toLowerCase();
+  return dir === "outbound" || dir === "out" || dir === "sent";
+}
+
 // Normalize one raw event into the canonical shape the Rust drain consumes.
 // Returns null if it can't be classified or lacks a usable id (so the receiver
 // skips it rather than persisting an unprocessable row).
@@ -430,8 +444,19 @@ function normalizeSocialApiEvent(ev: Record<string, unknown>): NormalizedWebhook
         id: messageId,
         conversation_id: conversationId,
         account_id: accountId || "",
-        with: str(ev, "with", "author"),
-        author: str(ev, "author", "from", "with"),
+        // #526: `with` is the counterparty, and it is DISPLAY DATA ONLY —
+        // direction is decided in Rust against the registered account handles
+        // and the `outbound` flag below, never against this field. No alias
+        // fallback: `author` would be right only for inbound, and
+        // `recipient`/`to` is the destination, which on an inbound DM is US.
+        // Leave it empty when the push doesn't say and let the Rust side
+        // pick a display fallback it can reason about.
+        with: str(ev, "with"),
+        author: str(ev, "author", "from"),
+        // Explicit direction when the provider states it. This is the
+        // authoritative ownership signal; the handle comparison is the
+        // fallback for pushes that don't carry it.
+        outbound: isOutbound(ev),
         text: str(ev, "text", "body", "message"),
         created_at: str(ev, "created_at", "timestamp", "ts"),
       },

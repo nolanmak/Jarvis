@@ -556,9 +556,10 @@ fn check_env_file_present() -> Finding {
 }
 
 /// SocialAPI.ai readiness probe (#245). Two signals:
-///   * is the API key in place? (sqlite `socialapi_api_key` OR env
-///     `SOCIALAPI_API_KEY` — same precedence as the dashboard's
-///     `getConfigStatus()`), and
+///   * is the API key in place? (env `SOCIALAPI_API_KEY`, then the keyring
+///     slot `augmentagent/socialapi/default`, then sqlite
+///     `config.socialapi_api_key` — the same three steps, in the same order,
+///     that `SocialApiAuth::load_with_store` uses to actually load it), and
 ///   * is there ≥1 active account in the local `socialapi_accounts` registry?
 ///
 /// Maps to:
@@ -578,40 +579,60 @@ fn check_socialapi(store: &Store) -> Finding {
     match (key_present, accounts) {
         (true, n) if n > 0 => Finding::ok(
             "socialapi",
-            format!("SOCIALAPI_API_KEY set, {n} active account(s)"),
+            format!("SocialAPI.ai key set, {n} active account(s)"),
         ),
         (true, _) => Finding::warn(
             "socialapi",
-            "SOCIALAPI_API_KEY set but no active accounts".to_string(),
+            "SocialAPI.ai key set but no active accounts".to_string(),
             Some(connect_hint),
         ),
         (false, _) => Finding::warn(
             "socialapi",
-            "SOCIALAPI_API_KEY not set (SocialAPI.ai integration inactive)".to_string(),
+            "no SocialAPI.ai key in env, keyring, or dashboard config \
+             (SocialAPI.ai integration inactive)"
+                .to_string(),
             Some(connect_hint),
         ),
     }
 }
 
-/// True iff the SocialAPI.ai key is configured. Checks the sqlite `config`
-/// table first (the dashboard writes `socialapi_api_key` there) then the
-/// `SOCIALAPI_API_KEY` env var — same precedence as `status::cfg_or_env`.
+/// True iff the SocialAPI.ai key is configured, using the SAME three-step
+/// order the daemon actually loads with (`SocialApiAuth::load_with_store`):
+/// `SOCIALAPI_API_KEY` env, then the keyring slot
+/// `augmentagent/socialapi/default`, then sqlite `config.socialapi_api_key`
+/// (where the dashboard writes).
+///
+/// #525: this used to check env-then-sqlite and skip the keyring entirely, so
+/// a key stored the canonical way — which is what `SocialApiAuth` writes and
+/// reads — made doctor report the integration inactive while both channel
+/// loops were running fine. The old doc comment also claimed sqlite was
+/// checked first; the code checked env first.
 fn socialapi_key_present() -> bool {
-    if let Ok(v) = std::env::var("SOCIALAPI_API_KEY") {
-        if !v.is_empty() {
-            return true;
-        }
+    if std::env::var(augmentagent_channel_socialapi::ENV_VAR)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if augmentagent_auth::Auth::get(
+        augmentagent_channel_socialapi::KEYCHAIN_PLATFORM,
+        augmentagent_auth::DEFAULT_ACCOUNT,
+    )
+    .map(|b| !String::from_utf8_lossy(&b).trim().is_empty())
+    .unwrap_or(false)
+    {
+        return true;
     }
     let db_path = std::env::var("AUGMENTAGENT_DB").unwrap_or_else(|_| "data.db".to_string());
     let Ok(conn) = rusqlite::Connection::open(&db_path) else {
         return false;
     };
     let val: rusqlite::Result<String> = conn.query_row(
-        "SELECT value FROM config WHERE key = 'socialapi_api_key'",
-        [],
+        "SELECT value FROM config WHERE key = ?1",
+        [augmentagent_channel_socialapi::CONFIG_KEY],
         |r| r.get(0),
     );
-    matches!(val, Ok(v) if !v.is_empty())
+    matches!(val, Ok(v) if !v.trim().is_empty())
 }
 
 /// #376 — the calendar channel is deliberately not spawned by `serve`; an

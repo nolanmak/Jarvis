@@ -627,7 +627,8 @@ fn collect_channels(
                 0,
             ),
             // Serve arms the socialapi pollers on the key alone
-            // (`SocialApiAuth::load`: env, else keyring); they idle until
+            // (`SocialApiAuth::load_with_store`: env, else keyring, else the
+            // sqlite config row the dashboard writes); they idle until
             // accounts/posts are registered.
             "socialapi" => {
                 let key = cfg_or_env(cfg, "socialapi_api_key", "SOCIALAPI_API_KEY")
