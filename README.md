@@ -114,11 +114,16 @@ are metered (X applies metered pricing underneath). The plan in use is flat
 
 Everything still flows through the daemon's triage → draft → **Discord
 approval** path. Inbound comments and DMs are surfaced, triaged, and a reply is
-drafted, then an approval card is posted to Discord. The merged code stops at
-the approval card; the actual reply *send* and cross-post fan-out are tracked
-in forthcoming issues (#244, #241).
+drafted, then an approval card is posted to Discord. Approving a card sends the
+reply through SocialAPI.ai (#244), and cross-post fan-out turns one draft into
+per-account variants behind a single approval (#241) — both merged.
 
-The engagement skill fragment lives at `skills/socialapi-triage/SKILL.md`.
+Inbound arrives two ways: each channel polls (DMs every 5 min, own-post
+comments every 30 min), and `POST /webhooks/socialapi` accepts pushed events
+for a near-real-time path (#249). Both share the same durable dedup ledgers, so
+a pushed item and a later poll of it collapse to one draft.
+
+The engagement rubric lives at `skills/socialapi-triage/SKILL.md`.
 
 ### Setup
 
@@ -128,13 +133,17 @@ The engagement skill fragment lives at `skills/socialapi-triage/SKILL.md`.
   into the registry; toggle accounts active/inactive or remove them inline.
   (Routes: `/api/socialapi/key`, `/api/socialapi/sync`,
   `/api/socialapi/accounts/*`.)
-- **Env / keyring.** The key resolves from the `SOCIALAPI_API_KEY` environment
-  variable first, falling back to the keyring vault slot
-  `augmentagent/socialapi/default`.
-- **CLI (forthcoming).** A dedicated `augmentagent socialapi` command and a
-  `setup oauth --provider socialapi` flow are planned (#245), along with a
-  proxied OAuth path (#247). These are not yet merged; use the dashboard
-  hosted-key flow or `SOCIALAPI_API_KEY` today.
+- **Key resolution.** Three sources, in order: the `SOCIALAPI_API_KEY`
+  environment variable, then the keyring vault slot
+  `augmentagent/socialapi/default`, then the sqlite `config` table under
+  `socialapi_api_key` — which is where the dashboard card above writes. All
+  three are read by the daemon, `doctor`, and `status` alike (#525).
+- **CLI.** `augmentagent socialapi list` / `disable` / `connect`, and
+  `augmentagent setup oauth --provider socialapi` (#245), which drives the
+  dashboard's proxied OAuth route (#247). `augmentagent engagement watch-post
+  --platform socialapi --external-id <id> --days N` is the only way to put a
+  post in front of the own-post comment poller. `augmentagent compose fan-out
+  --platforms socialapi` runs the cross-post fan-out.
 
 #### Instagram requirements
 

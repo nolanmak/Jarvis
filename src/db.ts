@@ -157,17 +157,36 @@ export function initDb(dbPath?: string): Database.Database {
       seen_at_ms    INTEGER NOT NULL,
       PRIMARY KEY (post_id, comment_id)
     );
+    -- #242: inbound DM dedup ledger. Was missing here while the Rust
+    -- migration created it (#529), so a Node-first boot left the DM poller
+    -- without its dedup table. Column-for-column identical to
+    -- crates/augmentagent-store/src/store.rs.
+    CREATE TABLE IF NOT EXISTS socialapi_seen_dms (
+      conversation_id TEXT NOT NULL,
+      message_id      TEXT NOT NULL,
+      author          TEXT,
+      text            TEXT,
+      seen_at_ms      INTEGER NOT NULL,
+      PRIMARY KEY (conversation_id, message_id)
+    );
     -- #249: SocialAPI.ai inbound webhook events (near-real-time inbox). The
     -- Express dashboard receives + verifies + persists each event here; the
     -- Rust daemon DRAINS unprocessed rows as a fast-path alongside its API
     -- poll, reusing socialapi_seen_{dms,comments} for dedup so a
     -- webhook-delivered item and a later poll of the same item don't both
-    -- produce a draft. id is the provider event id (idempotent dedup);
-    -- kind is 'dm' | 'comment'; processed flips to 1 once the daemon has
-    -- emitted the corresponding WorkItem. Mirrors the Rust store migration.
+    -- produce a draft. id is SYNTHESIZED by this receiver from the item
+    -- identity -- socialapi:dm:<conversation>:<message> /
+    -- socialapi:comment:<post>:<comment>, see normalizeSocialApiEvent -- not
+    -- the provider's event id (#529). So a provider re-send under a new event
+    -- id still collapses, and two distinct events about the same message also
+    -- collapse. kind is 'dm' | 'comment', enforced by the CHECK below and by
+    -- insert_socialapi_webhook_event on the Rust side; an unrecognized kind
+    -- would be silently undrainable, since the drain filters on it.
+    -- processed flips to 1 once the daemon has emitted the corresponding
+    -- WorkItem. Mirrors the Rust store migration.
     CREATE TABLE IF NOT EXISTS socialapi_webhook_events (
       id             TEXT PRIMARY KEY,
-      kind           TEXT NOT NULL,
+      kind           TEXT NOT NULL CHECK (kind IN ('dm', 'comment')),
       account_id     TEXT,
       payload_json   TEXT NOT NULL,
       received_at_ms INTEGER NOT NULL,

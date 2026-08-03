@@ -430,8 +430,14 @@ function normalizeSocialApiEvent(ev: Record<string, unknown>): NormalizedWebhook
         id: messageId,
         conversation_id: conversationId,
         account_id: accountId || "",
-        with: str(ev, "with", "author"),
-        author: str(ev, "author", "from", "with"),
+        // #526: do NOT fall back to `author` here. `with` is the counterparty
+        // and was being used downstream as a direction signal; sourcing it
+        // from `author` made "is this message ours?" trivially false and got
+        // our own outbound DMs drafted as inbound. Leave it empty when the
+        // push doesn't say — the Rust side decides direction against the
+        // registered account handles, not against this field.
+        with: str(ev, "with", "recipient", "to"),
+        author: str(ev, "author", "from"),
         text: str(ev, "text", "body", "message"),
         created_at: str(ev, "created_at", "timestamp", "ts"),
       },
