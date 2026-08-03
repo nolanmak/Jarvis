@@ -318,6 +318,10 @@ impl Trigger for SocialApiOwnPostCommentTrigger {
                     if budget == 0 {
                         break;
                     }
+                    // An id-less comment can't be deduped or replied to.
+                    if c.platform_id.is_empty() {
+                        continue;
+                    }
                     // Never draft a reply to our own comment. `is_owner` is
                     // checked but NOT trusted alone — live responses have
                     // shown it false on the owner's own replies — so the
