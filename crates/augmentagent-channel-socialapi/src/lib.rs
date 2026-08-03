@@ -36,8 +36,8 @@ pub use own_posts::{
     DEFAULT_OWN_POST_POLL_SECS,
 };
 pub use types::{
-    Account, Comment, Conversation, CreatePostRequest, CreatePostResponse, ConnectResponse,
-    DmMessage, MediaUploadRequest, MediaUploadResponse, PostTarget, ReplyRequest,
+    Account, Comment, CommentCapabilities, CommentReplyRequest, ConnectResponse, Conversation,
+    CreatePostRequest, CreatePostResponse, DmMessage, DmSendRequest, InboxPost, PostTarget,
 };
 
 /// Platform discriminator used in `channel_subscriptions.platform` rows and

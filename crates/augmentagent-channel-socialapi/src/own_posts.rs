@@ -2,10 +2,11 @@
 //!
 //! [`SocialApiOwnPostCommentTrigger`] is a [`Trigger`] that, on each tick,
 //! walks the durable `own_posts` table (rows with `platform = "socialapi"`),
-//! lists inbox comments for each active SocialAPI.ai account via
-//! [`SocialApiClient::list_comments`], keeps only the comments that land on a
-//! watched own post, diffs them against the store's `socialapi_seen_comments`
-//! ledger, and yields one
+//! lists our published posts per active account via
+//! [`SocialApiClient::list_inbox_posts`], fetches comments for each WATCHED
+//! post via [`SocialApiClient::list_comments`] (the inbox is two-level on the
+//! live API — #543), drops our own comments (`is_owner`), diffs the rest
+//! against the store's `socialapi_seen_comments` ledger, and yields one
 //! `WorkItem { platform:"socialapi", kind:"own_post_comment" }` per genuinely
 //! new comment.
 //!
@@ -19,9 +20,8 @@
 //! comment)` pair becomes a WorkItem exactly once, ever, even across daemon
 //! restarts). Note `own_posts.last_polled_ms` does NOT throttle anything —
 //! `own_posts_due_for_poll` only uses it to ORDER BY least-recently-polled, so
-//! every watched post is re-examined on every tick. `list_comments` likewise
-//! returns the whole account inbox regardless of the watched set, so watching
-//! more posts costs no extra API calls.
+//! every watched post is re-examined on every tick. Each watched post costs
+//! one extra request per tick (the per-post comments GET).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -45,7 +45,7 @@ use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{ActionStatus, Email, Store, TriageResult};
 
 use crate::client::SocialApiClient;
-use crate::types::Comment;
+use crate::types::{Comment, InboxPost};
 use crate::PLATFORM;
 
 /// Default own-post comment poll cadence (30 min) — matches the LinkedIn
@@ -78,6 +78,11 @@ pub struct SocialApiOwnPostCommentPayload {
     pub author: String,
     pub text: String,
     pub created_at: String,
+    /// SocialAPI.ai account that owns the post — the approve→send reply
+    /// needs it (#543). Defaults empty for payloads queued before this field
+    /// existed; the send then falls back to omitting it.
+    #[serde(default)]
+    pub account_id: String,
 }
 
 /// Normalized comment webhook event body (#249) as persisted by the Express
@@ -94,6 +99,8 @@ struct CommentWebhookPayload {
     text: String,
     #[serde(default)]
     created_at: String,
+    #[serde(default)]
+    account_id: String,
 }
 
 impl From<CommentWebhookPayload> for SocialApiOwnPostCommentPayload {
@@ -104,18 +111,20 @@ impl From<CommentWebhookPayload> for SocialApiOwnPostCommentPayload {
             author: w.author,
             text: w.text,
             created_at: w.created_at,
+            account_id: w.account_id,
         }
     }
 }
 
 impl SocialApiOwnPostCommentPayload {
-    fn from_comment(c: &Comment) -> Self {
+    fn from_comment(post: &InboxPost, c: &Comment) -> Self {
         Self {
-            post_id: c.post_id.clone(),
-            comment_id: c.id.clone(),
-            author: c.author.clone(),
+            post_id: post.id.clone(),
+            comment_id: c.platform_id.clone(),
+            author: c.author_display().to_string(),
             text: c.text.clone(),
             created_at: c.created_at.clone(),
+            account_id: post.account_id.clone(),
         }
     }
 
@@ -126,6 +135,14 @@ impl SocialApiOwnPostCommentPayload {
     fn into_email(self) -> Email {
         let from = format!("{} <socialapi:{}>", self.author, self.author);
         let subject = format!("[Comment on your post by {}]", self.author);
+        // The owning account rides on `account_entity_id` so the approve→send
+        // path can pass it to the reply endpoint (#543). The bare platform
+        // string is the legacy filler for payloads that predate the field.
+        let account_entity = if self.account_id.is_empty() {
+            PLATFORM.to_string()
+        } else {
+            self.account_id
+        };
         Email {
             message_id: self.comment_id,
             thread_id: Some(self.post_id),
@@ -133,7 +150,7 @@ impl SocialApiOwnPostCommentPayload {
             subject,
             body: self.text,
             date: self.created_at,
-            account_entity_id: Some(PLATFORM.to_string()),
+            account_entity_id: Some(account_entity),
             platform: PLATFORM.to_string(),
             kind: work_item_kind::OWN_POST_COMMENT.to_string(),
         }
@@ -256,37 +273,75 @@ impl Trigger for SocialApiOwnPostCommentTrigger {
         } else {
             accounts.into_iter().map(Some).collect()
         };
+        // Ownership backstop: the live API has been observed returning
+        // `is_owner=false` for the post owner's OWN replies (#543), so the
+        // flag alone can't stop us drafting replies to ourselves. Registered
+        // account handles are the reliable signal, same as the DM paths.
+        let own_handles = self.store.socialapi_account_handles().unwrap_or_default();
 
         for scope in scopes {
             if cancel.is_cancelled() || budget == 0 {
                 break;
             }
-            let comments = match self.client.list_comments(scope.as_deref()).await {
-                Ok(c) => c,
+            // Two-level inbox (#543): `GET /inbox/comments` lists our POSTS;
+            // each watched post's comments live one GET deeper.
+            let inbox_posts = match self.client.list_inbox_posts(scope.as_deref()).await {
+                Ok(p) => p,
                 Err(e) => {
-                    warn!(account = ?scope, error = %e, "comment list failed; skipping account");
+                    warn!(account = ?scope, error = %e, "inbox post list failed; skipping account");
                     continue;
                 }
             };
-            for c in comments {
-                if budget == 0 {
+            for post in inbox_posts {
+                if cancel.is_cancelled() || budget == 0 {
                     break;
                 }
-                if !watched.contains(c.post_id.as_str()) {
+                if !watched.contains(post.id.as_str()) {
                     continue;
                 }
-                // Durable one-shot dedup keyed on (post_id, comment_id).
-                let is_new = self.store.record_seen_socialapi_comment(
-                    &c.post_id,
-                    &c.id,
-                    Some(c.author.as_str()),
-                    Some(c.text.as_str()),
-                )?;
-                if !is_new {
-                    continue;
+                // The per-post GET hard-requires the owning account; the post
+                // row carries it even on an unscoped listing.
+                let account = if post.account_id.is_empty() {
+                    scope.clone()
+                } else {
+                    Some(post.account_id.clone())
+                };
+                let comments = match self.client.list_comments(&post.id, account.as_deref()).await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!(post = %post.id, error = %e, "comment list failed; skipping post");
+                        continue;
+                    }
+                };
+                for c in comments {
+                    if budget == 0 {
+                        break;
+                    }
+                    // Never draft a reply to our own comment. `is_owner` is
+                    // checked but NOT trusted alone — live responses have
+                    // shown it false on the owner's own replies — so the
+                    // registered-handle check backstops it on both the
+                    // username and display-name fields.
+                    if c.is_owner
+                        || crate::inbound::is_own_handle(&own_handles, &c.author_username)
+                        || crate::inbound::is_own_handle(&own_handles, &c.author_name)
+                    {
+                        continue;
+                    }
+                    // Durable one-shot dedup keyed on (post_id, comment_id).
+                    let is_new = self.store.record_seen_socialapi_comment(
+                        &post.id,
+                        &c.platform_id,
+                        Some(c.author_display()),
+                        Some(c.text.as_str()),
+                    )?;
+                    if !is_new {
+                        continue;
+                    }
+                    out.push(to_work_item(&post, &c));
+                    budget -= 1;
                 }
-                out.push(to_work_item(&c));
-                budget -= 1;
             }
         }
 
@@ -300,12 +355,12 @@ impl Trigger for SocialApiOwnPostCommentTrigger {
     }
 }
 
-fn to_work_item(c: &Comment) -> WorkItem {
-    let payload = SocialApiOwnPostCommentPayload::from_comment(c);
+fn to_work_item(post: &InboxPost, c: &Comment) -> WorkItem {
+    let payload = SocialApiOwnPostCommentPayload::from_comment(post, c);
     WorkItem {
         platform: PLATFORM.into(),
         kind: work_item_kind::OWN_POST_COMMENT.into(),
-        external_id: c.id.clone(),
+        external_id: c.platform_id.clone(),
         payload: serde_json::to_value(payload).unwrap_or(serde_json::Value::Null),
     }
 }
@@ -581,13 +636,30 @@ mod tests {
         ))
     }
 
-    /// Mounts `GET /inbox/comments` returning the supplied comment JSON array.
-    async fn mount_comments(server: &MockServer, body: serde_json::Value) {
+    /// Mounts `GET /inbox/comments` (which lists our POSTS — #543).
+    async fn mount_inbox_posts(server: &MockServer, body: serde_json::Value) {
         Mock::given(method("GET"))
             .and(path("/inbox/comments"))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .mount(server)
             .await;
+    }
+
+    /// Mounts `GET /inbox/comments/{post_id}` (one post's comments).
+    async fn mount_post_comments(server: &MockServer, post_id: &str, body: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path(format!("/inbox/comments/{post_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    /// A watched-post row in the live posts-list shape.
+    fn post_json(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "platform_id": id, "account_id": "acc_1",
+            "platform": "instagram", "content": "caption", "comment_count": 1
+        })
     }
 
     struct ScriptedReasoner {
@@ -701,19 +773,31 @@ mod tests {
             .upsert_own_post(PLATFORM, "post_1", now, now + 86_400_000)
             .unwrap();
         let server = MockServer::start().await;
-        mount_comments(
+        // Two-level live shape (#543): the posts list, then per-post comments.
+        // `other_post` is unwatched, so its comments endpoint is never hit
+        // (no mock mounted for it — a stray call would 404 and warn).
+        mount_inbox_posts(
             &server,
-            serde_json::json!([
-                {"id":"c1","post_id":"post_1","author":"jane","text":"nice!","created_at":"2026-05-28T00:00:00Z"},
-                {"id":"c2","post_id":"post_1","author":"bob","text":"gg","created_at":"2026-05-28T00:01:00Z"},
-                {"id":"c3","post_id":"other_post","author":"x","text":"ignored","created_at":"2026-05-28T00:02:00Z"}
-            ]),
+            serde_json::json!({"data": [post_json("post_1"), post_json("other_post")]}),
+        )
+        .await;
+        mount_post_comments(
+            &server,
+            "post_1",
+            serde_json::json!({"data": [
+                {"platform_id":"c1","text":"nice!","author_name":"jane","is_owner":false,
+                 "created_at":"2026-05-28T00:00:00Z"},
+                {"platform_id":"c2","text":"gg","author_name":"bob","is_owner":false,
+                 "created_at":"2026-05-28T00:01:00Z"},
+                {"platform_id":"c_ours","text":"thanks all!","author_name":"me","is_owner":true,
+                 "created_at":"2026-05-28T00:02:00Z"}
+            ]}),
         )
         .await;
         let trig = SocialApiOwnPostCommentTrigger::new(client(&server), Arc::clone(&store), 10);
         let cancel = CancellationToken::new();
         let first = trig.next_work_items(&cancel).await.unwrap();
-        // c3 is on an unwatched post → filtered out; only c1, c2 surface.
+        // Our own comment (is_owner) never drafts; only c1, c2 surface.
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].kind, work_item_kind::OWN_POST_COMMENT);
         assert_eq!(first[0].platform, PLATFORM);
@@ -762,11 +846,14 @@ mod tests {
 
         // Poll re-returns c1 → deduped via the seen-ledger written by the drain.
         let server = MockServer::start().await;
-        mount_comments(
+        mount_inbox_posts(&server, serde_json::json!({"data": [post_json("post_1")]})).await;
+        mount_post_comments(
             &server,
-            serde_json::json!([
-                {"id":"c1","post_id":"post_1","author":"jane","text":"nice!","created_at":"2026-05-28T00:00:00Z"}
-            ]),
+            "post_1",
+            serde_json::json!({"data": [
+                {"platform_id":"c1","text":"nice!","author_name":"jane","is_owner":false,
+                 "created_at":"2026-05-28T00:00:00Z"}
+            ]}),
         )
         .await;
         let trig = SocialApiOwnPostCommentTrigger::new(client(&server), Arc::clone(&store), 10);
@@ -787,11 +874,14 @@ mod tests {
             .upsert_own_post(PLATFORM, "post_1", now, now + 86_400_000)
             .unwrap();
         let server = MockServer::start().await;
-        mount_comments(
+        mount_inbox_posts(&server, serde_json::json!({"data": [post_json("post_1")]})).await;
+        mount_post_comments(
             &server,
-            serde_json::json!([
-                {"id":"c1","post_id":"post_1","author":"jane","text":"Congrats on shipping!","created_at":"2026-05-28T00:00:00Z"}
-            ]),
+            "post_1",
+            serde_json::json!({"data": [
+                {"platform_id":"c1","text":"Congrats on shipping!","author_name":"jane",
+                 "is_owner":false,"created_at":"2026-05-28T00:00:00Z"}
+            ]}),
         )
         .await;
         let reasoner = Arc::new(ScriptedReasoner::new([
@@ -819,11 +909,14 @@ mod tests {
             .upsert_own_post(PLATFORM, "post_1", now, now + 86_400_000)
             .unwrap();
         let server = MockServer::start().await;
-        mount_comments(
+        mount_inbox_posts(&server, serde_json::json!({"data": [post_json("post_1")]})).await;
+        mount_post_comments(
             &server,
-            serde_json::json!([
-                {"id":"spam","post_id":"post_1","author":"x","text":"🔥🔥🔥","created_at":"2026-05-28T00:00:00Z"}
-            ]),
+            "post_1",
+            serde_json::json!({"data": [
+                {"platform_id":"spam","text":"🔥🔥🔥","author_name":"x","is_owner":false,
+                 "created_at":"2026-05-28T00:00:00Z"}
+            ]}),
         )
         .await;
         let reasoner = Arc::new(ScriptedReasoner::new([
@@ -881,6 +974,54 @@ mod tests {
         );
     }
 
+    fn seed_account(store: &Store, id: &str, handle: &str) {
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO socialapi_accounts \
+                        (id, platform, account_handle, active, created_at_ms, updated_at_ms) \
+                     VALUES (?1,'instagram',?2,1,0,0)",
+                    [id, handle],
+                )
+            })
+            .unwrap();
+    }
+
+    /// Live API quirk (#543): `is_owner` has been observed FALSE on the post
+    /// owner's OWN replies, so the flag alone can't be trusted. The
+    /// registered-handle backstop must catch them.
+    #[tokio::test]
+    async fn own_reply_with_lying_is_owner_flag_is_skipped() {
+        let (store, _f) = tmp_store();
+        seed_account(&store, "acc_1", "nolan_makatche");
+        let now = now_millis();
+        store
+            .upsert_own_post(PLATFORM, "post_1", now, now + 86_400_000)
+            .unwrap();
+        let server = MockServer::start().await;
+        mount_inbox_posts(&server, serde_json::json!({"data": [post_json("post_1")]})).await;
+        mount_post_comments(
+            &server,
+            "post_1",
+            serde_json::json!({"data": [
+                {"platform_id":"c_owner","text":"@rlee8808 ty!","author_name":"nolan_makatche",
+                 "author_username":"nolan_makatche","is_owner":false,
+                 "created_at":"2026-05-28T00:00:00Z"},
+                {"platform_id":"c_real","text":"Denver baby!","author_name":"rlee8808",
+                 "author_username":"rlee8808","is_owner":false,
+                 "created_at":"2026-05-28T00:01:00Z"}
+            ]}),
+        )
+        .await;
+        let trig = SocialApiOwnPostCommentTrigger::new(client(&server), Arc::clone(&store), 10);
+        let items = trig
+            .next_work_items(&CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1, "only the genuine third-party comment drafts");
+        assert_eq!(items[0].external_id, "c_real");
+    }
+
     /// A pushed comment on a watched post still becomes a work item via the
     /// drain, without waiting for the 30-minute poll.
     #[tokio::test]
@@ -903,9 +1044,12 @@ mod tests {
                 .to_string(),
             )
             .unwrap();
+        // The live API's empty inbox is `{"data":null}`, not `[]` (#543).
         Mock::given(method("GET"))
             .and(path("/inbox/comments"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})),
+            )
             .mount(&server)
             .await;
 

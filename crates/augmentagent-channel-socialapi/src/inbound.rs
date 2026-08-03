@@ -2,11 +2,12 @@
 //!
 //! [`SocialApiDmSource`] is an [`InboundSource`] that, on each `fetch_new`,
 //! lists DM conversations across the active SocialAPI.ai accounts via
-//! [`SocialApiClient::list_conversations`], walks each conversation's messages,
-//! keeps only genuinely *new inbound* messages (the other party's, never our
-//! own outbound), diffs them against the store's `socialapi_seen_dms` ledger,
-//! and yields one `WorkItem { platform:"socialapi", kind:"dm" }` per fresh
-//! inbound message.
+//! [`SocialApiClient::list_conversations`], fetches each thread's messages
+//! via [`SocialApiClient::list_messages`] (the list endpoint embeds none —
+//! #543), keeps only the *unanswered incoming tail* — provider-stated
+//! `direction: incoming` messages newer than our latest outgoing — diffs
+//! them against the store's `socialapi_seen_dms` ledger, and yields one
+//! `WorkItem { platform:"socialapi", kind:"dm" }` per fresh inbound message.
 //!
 //! [`SocialApiDmChannel`] is the [`WorkItemHandler`] that consumes those work
 //! items: it deserializes the payload, runs triage → draft, and posts a Discord
@@ -51,6 +52,19 @@ pub const DEFAULT_DM_POLL_SECS: u64 = 5 * 60;
 /// Default per-tick cap on emitted DM work items. A cheap pre-filter so a flood
 /// of inbound DMs can't enqueue hundreds of LLM calls in a single tick.
 pub const DEFAULT_DM_MAX_PER_TICK: u32 = 25;
+
+/// Max conversations whose messages are fetched per account per tick. The
+/// conversation list is newest-activity-first and reading a thread costs one
+/// extra request per conversation (#543), so this bounds the poll's request
+/// fan-out; a thread with fresh activity re-enters the top of the list, so
+/// nothing is permanently missed.
+pub const DM_CONVERSATIONS_PER_POLL: usize = 10;
+
+/// Ignore unanswered inbound DMs older than this. First-run guard: the seen
+/// ledger starts empty, and without a horizon the first poll after connecting
+/// an account would draft replies to months-old, long-settled threads. Stale
+/// messages are still written to the ledger so they stay permanently skipped.
+pub const DM_MAX_AGE_DAYS: i64 = 3;
 
 /// Normalized inbound-DM webhook event body (#249) as persisted by the Express
 /// receiver into `socialapi_webhook_events.payload_json`. Mirrors the receiver's
@@ -131,12 +145,20 @@ pub struct SocialApiDmPayload {
 
 impl SocialApiDmPayload {
     fn new(conv: &Conversation, msg: &DmMessage) -> Self {
+        // Display fallback mirrors the webhook receiver's: the poll only ever
+        // emits positively-incoming messages, so the sender IS the
+        // counterparty when the conversation carries no participant name.
+        let with = if conv.participant_name.is_empty() {
+            msg.sender_name.clone()
+        } else {
+            conv.participant_name.clone()
+        };
         Self {
             conversation_id: conv.id.clone(),
             account_id: conv.account_id.clone(),
-            with: conv.with.clone(),
+            with,
             message_id: msg.id.clone(),
-            author: msg.author.clone(),
+            author: msg.sender_name.clone(),
             text: msg.text.clone(),
             created_at: msg.created_at.clone(),
         }
@@ -163,14 +185,33 @@ impl SocialApiDmPayload {
     }
 }
 
-/// True iff `msg` is an inbound message (the other party's), not our own
-/// outbound reply. SocialAPI.ai normalises the author as the sender's handle;
-/// the conversation's `with` field is the other party. We treat a message as
-/// inbound when its author matches `with` (case-insensitive, leading `@`
-/// tolerated). This is conservative: anything we can't positively attribute to
-/// the other party is skipped so we never draft a "reply to ourselves".
-fn is_inbound(conv: &Conversation, msg: &DmMessage) -> bool {
-    norm_handle(&msg.author) == norm_handle(&conv.with)
+/// The newest contiguous run of positively-incoming messages — everything the
+/// counterparty sent AFTER our latest reply. `msgs` is newest-first (the
+/// API's order). The scan stops at the first message that is not stated
+/// `incoming` — our own outgoing OR an unstated direction — so an
+/// unattributable message conservatively closes the tail rather than risking
+/// a draft that replies to ourselves (#526's invariant, now provider-stated).
+/// Anything behind that boundary was already answered; we draft nothing for
+/// it.
+fn unanswered_incoming_tail(msgs: &[DmMessage]) -> &[DmMessage] {
+    let end = msgs
+        .iter()
+        .position(|m| !m.is_incoming())
+        .unwrap_or(msgs.len());
+    &msgs[..end]
+}
+
+/// True iff `created_at` (RFC3339) is within [`DM_MAX_AGE_DAYS`] of `now`.
+/// Unparseable timestamps count as within — the seen-ledger still bounds
+/// re-emission to exactly once.
+fn within_horizon(created_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    match chrono::DateTime::parse_from_rfc3339(created_at) {
+        Ok(t) => {
+            now.signed_duration_since(t.with_timezone(&chrono::Utc))
+                <= chrono::Duration::days(DM_MAX_AGE_DAYS)
+        }
+        Err(_) => true,
+    }
 }
 
 /// Canonical handle form for identity comparisons: trimmed, no leading `@`,
@@ -193,7 +234,7 @@ fn norm_handle(s: &str) -> String {
 /// it as *unattributable* rather than *not ours*; the drain does, and defers
 /// those events to the poll path. `is_inbound` is not a backstop here: it only
 /// runs in the poll loop, which a webhook-delivered event never enters.
-fn is_own_handle(handles: &[String], author: &str) -> bool {
+pub(crate) fn is_own_handle(handles: &[String], author: &str) -> bool {
     let a = norm_handle(author);
     !a.is_empty() && handles.iter().any(|h| h == &a)
 }
@@ -330,9 +371,10 @@ impl InboundSource for SocialApiDmSource {
         let mut out = self.drain_webhook_events(budget)?;
         budget = budget.saturating_sub(out.len() as u32);
 
-        // Same ownership backstop the drain uses (#526). `is_inbound` below is
-        // the primary direction check on this path; this catches the case
-        // where the API reports us as the conversation counterparty.
+        // Ownership backstop kept from #526: the messages endpoint states
+        // direction explicitly now, but a sender matching one of our
+        // registered handles is still skipped in case the provider ever
+        // mislabels.
         let own_handles = self.store.socialapi_account_handles().unwrap_or_default();
         let accounts = self.store.active_socialapi_account_ids()?;
         // No registered accounts → poll the whole inbox once (account_id=None),
@@ -342,6 +384,7 @@ impl InboundSource for SocialApiDmSource {
         } else {
             accounts.into_iter().map(Some).collect()
         };
+        let now = chrono::Utc::now();
 
         for scope in scopes {
             if budget == 0 {
@@ -354,17 +397,26 @@ impl InboundSource for SocialApiDmSource {
                     continue;
                 }
             };
-            for conv in conversations {
-                // #244 supersede: if the user has manually replied in this
-                // thread (an outbound message we didn't send via Approve),
-                // flip any still-pending socialapi draft on the conversation to
-                // `superseded` so a stale card never re-sends what the user
-                // already answered. Mirrors the email outbound observer. Keyed
-                // on the conversation id, which is the draft's `thread_id`.
-                // Best-effort: a store error here must not block fetching new
-                // inbound work.
-                let user_replied = conv.messages.iter().any(|m| !is_inbound(&conv, m));
-                if user_replied {
+            for conv in conversations.iter().take(DM_CONVERSATIONS_PER_POLL) {
+                if budget == 0 {
+                    break;
+                }
+                let msgs = match self.client.list_messages(&conv.id).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(conversation = %conv.id, error = %e, "dm message list failed; skipping conversation");
+                        continue;
+                    }
+                };
+                // #244 supersede: the thread's newest message being OURS means
+                // the user already replied (manually, or via Approve out of
+                // band) — flip any still-pending socialapi draft on the
+                // conversation to `superseded` so a stale card never re-sends
+                // what the user already answered. Mirrors the email outbound
+                // observer; keyed on the conversation id, which is the draft's
+                // `thread_id`. Best-effort: a store error here must not block
+                // fetching new inbound work.
+                if msgs.first().is_some_and(|m| m.is_outgoing()) {
                     match self.store.mark_pending_drafts_superseded_by_thread(
                         &conv.id,
                         "superseded by manual reply",
@@ -382,24 +434,36 @@ impl InboundSource for SocialApiDmSource {
                         }
                     }
                 }
-                for msg in &conv.messages {
+                // Only the unanswered tail is draftable; walk it oldest-first
+                // so multiple new messages card up chronologically.
+                let tail = unanswered_incoming_tail(&msgs);
+                for msg in tail.iter().rev() {
                     if budget == 0 {
                         break;
                     }
-                    if !is_inbound(&conv, msg) || is_own_handle(&own_handles, &msg.author) {
+                    if is_own_handle(&own_handles, &msg.sender_name) {
                         continue;
                     }
                     // Durable one-shot dedup keyed on (conversation_id, message_id).
                     let is_new = self.store.record_seen_socialapi_dm(
                         &conv.id,
                         &msg.id,
-                        Some(msg.author.as_str()),
+                        Some(msg.sender_name.as_str()),
                         Some(msg.text.as_str()),
                     )?;
                     if !is_new {
                         continue;
                     }
-                    out.push(to_work_item(&conv, msg));
+                    if !within_horizon(&msg.created_at, now) {
+                        debug!(
+                            conversation = %conv.id,
+                            message = %msg.id,
+                            created_at = %msg.created_at,
+                            "socialapi dm source: skipping stale unanswered DM (recorded as seen)"
+                        );
+                        continue;
+                    }
+                    out.push(to_work_item(conv, msg));
                     budget -= 1;
                 }
             }
@@ -637,6 +701,22 @@ mod tests {
             .await;
     }
 
+    async fn mount_messages(server: &MockServer, conversation_id: &str, body: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/inbox/conversations/{conversation_id}/messages"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    /// RFC3339 timestamp `hours` ago — the DM poll has a freshness horizon
+    /// ([`DM_MAX_AGE_DAYS`]), so fixtures must use relative times.
+    fn rfc3339_ago(hours: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::hours(hours)).to_rfc3339()
+    }
+
     struct ScriptedReasoner {
         responses: std::sync::Mutex<std::collections::VecDeque<String>>,
     }
@@ -726,58 +806,115 @@ mod tests {
     }
 
     #[test]
-    fn is_inbound_matches_other_party_only() {
-        let conv = Conversation {
-            id: "c1".into(),
-            account_id: "acc_1".into(),
-            with: "jane".into(),
-            messages: vec![],
+    fn tail_is_the_incoming_run_newer_than_our_latest_reply() {
+        let m = |id: &str, dir: &str| DmMessage {
+            id: id.into(),
+            direction: dir.into(),
+            ..Default::default()
         };
-        let from_jane = DmMessage {
-            id: "m1".into(),
-            author: "@Jane".into(),
-            text: "hi".into(),
-            created_at: "t".into(),
-        };
-        let from_me = DmMessage {
-            id: "m2".into(),
-            author: "me".into(),
-            text: "reply".into(),
-            created_at: "t".into(),
-        };
-        assert!(is_inbound(&conv, &from_jane));
-        assert!(!is_inbound(&conv, &from_me));
+        // Newest-first: two fresh incoming, then our reply, then older noise.
+        let msgs = vec![
+            m("m4", "incoming"),
+            m("m3", "incoming"),
+            m("m2", "outgoing"),
+            m("m1", "incoming"),
+        ];
+        let tail = unanswered_incoming_tail(&msgs);
+        assert_eq!(
+            tail.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(),
+            ["m4", "m3"]
+        );
+        // Answered thread: newest message is ours → nothing to draft.
+        assert!(unanswered_incoming_tail(&[m("m2", "outgoing"), m("m1", "incoming")]).is_empty());
+        // An unstated direction conservatively closes the tail (#526).
+        assert!(unanswered_incoming_tail(&[m("mx", ""), m("m1", "incoming")]).is_empty());
+    }
+
+    #[test]
+    fn horizon_filters_stale_but_tolerates_garbage() {
+        let now = chrono::Utc::now();
+        assert!(within_horizon(
+            &(now - chrono::Duration::hours(2)).to_rfc3339(),
+            now
+        ));
+        assert!(!within_horizon(
+            &(now - chrono::Duration::days(DM_MAX_AGE_DAYS + 1)).to_rfc3339(),
+            now
+        ));
+        assert!(within_horizon("not-a-time", now));
     }
 
     #[tokio::test]
-    async fn source_yields_new_inbound_messages_once_then_dedups() {
+    async fn source_yields_unanswered_tail_once_then_dedups() {
         let (store, _f) = tmp_store();
         let server = MockServer::start().await;
         mount_conversations(
             &server,
-            serde_json::json!([
-                {
-                    "id": "conv_1", "account_id": "acc_1", "with": "jane",
-                    "messages": [
-                        {"id":"m1","author":"jane","text":"hey there","created_at":"2026-05-28T00:00:00Z"},
-                        {"id":"m2","author":"me","text":"our outbound","created_at":"2026-05-28T00:01:00Z"},
-                        {"id":"m3","author":"jane","text":"you around?","created_at":"2026-05-28T00:02:00Z"}
-                    ]
-                }
-            ]),
+            serde_json::json!({"data": [{
+                "id": "conv_1",
+                "account_id": "acc_1",
+                "participant_name": "jane",
+                "last_message": "you around?",
+                "last_message_at": rfc3339_ago(1)
+            }]}),
+        )
+        .await;
+        // Newest-first, as the live API returns them: jane's fresh follow-up,
+        // our reply, jane's original (already answered by m2).
+        mount_messages(
+            &server,
+            "conv_1",
+            serde_json::json!({"data": [
+                {"id":"m3","direction":"incoming","sender_name":"jane","text":"you around?","created_at": rfc3339_ago(1)},
+                {"id":"m2","direction":"outgoing","sender_name":"me","text":"our outbound","created_at": rfc3339_ago(2)},
+                {"id":"m1","direction":"incoming","sender_name":"jane","text":"hey there","created_at": rfc3339_ago(3)}
+            ]}),
         )
         .await;
         let source = SocialApiDmSource::new(client(&server), Arc::clone(&store), 10);
-        // Only the two inbound (jane) messages surface; our own outbound (me) is
-        // filtered out.
+        // Only the unanswered tail (m3) surfaces: m1 was answered by our m2,
+        // and our own outbound never drafts.
         let first = source.fetch_new().await.unwrap();
-        assert_eq!(first.len(), 2);
+        assert_eq!(first.len(), 1);
         assert_eq!(first[0].kind, work_item_kind::DM);
         assert_eq!(first[0].platform, PLATFORM);
-        assert_eq!(first[0].external_id, "m1");
-        // Second poll → all already in socialapi_seen_dms → empty.
+        assert_eq!(first[0].external_id, "m3");
+        // Second poll → already in socialapi_seen_dms → empty.
         let second = source.fetch_new().await.unwrap();
         assert!(second.is_empty());
+    }
+
+    /// First-poll-after-connect guard: an unanswered DM older than
+    /// [`DM_MAX_AGE_DAYS`] is written to the seen-ledger but never drafted.
+    #[tokio::test]
+    async fn source_skips_stale_unanswered_dms() {
+        let (store, _f) = tmp_store();
+        let server = MockServer::start().await;
+        mount_conversations(
+            &server,
+            serde_json::json!({"data": [{
+                "id": "conv_old", "account_id": "acc_1", "participant_name": "jane"
+            }]}),
+        )
+        .await;
+        mount_messages(
+            &server,
+            "conv_old",
+            serde_json::json!({"data": [
+                {"id":"m_old","direction":"incoming","sender_name":"jane","text":"hello from months ago",
+                 "created_at": rfc3339_ago(24 * (DM_MAX_AGE_DAYS + 2))}
+            ]}),
+        )
+        .await;
+        let source = SocialApiDmSource::new(client(&server), Arc::clone(&store), 10);
+        assert!(source.fetch_new().await.unwrap().is_empty());
+        // Recorded as seen: the same message can never resurface.
+        assert!(
+            !store
+                .record_seen_socialapi_dm("conv_old", "m_old", None, None)
+                .unwrap(),
+            "stale DM must have been written to the seen-ledger"
+        );
     }
 
     /// #244 supersede: a manual (outbound) reply in a conversation flips any
@@ -810,19 +947,22 @@ mod tests {
             )
             .unwrap();
 
-        // Conversation now shows our own outbound message → the user replied.
+        // The thread's newest message is now our own outbound → user replied.
         let server = MockServer::start().await;
         mount_conversations(
             &server,
-            serde_json::json!([
-                {
-                    "id": "conv_1", "account_id": "acc_1", "with": "jane",
-                    "messages": [
-                        {"id":"m1","author":"jane","text":"hey","created_at":"2026-05-28T00:00:00Z"},
-                        {"id":"m2","author":"me","text":"manual reply","created_at":"2026-05-28T00:05:00Z"}
-                    ]
-                }
-            ]),
+            serde_json::json!({"data": [{
+                "id": "conv_1", "account_id": "acc_1", "participant_name": "jane"
+            }]}),
+        )
+        .await;
+        mount_messages(
+            &server,
+            "conv_1",
+            serde_json::json!({"data": [
+                {"id":"m2","direction":"outgoing","sender_name":"me","text":"manual reply","created_at": rfc3339_ago(1)},
+                {"id":"m1","direction":"incoming","sender_name":"jane","text":"hey","created_at": rfc3339_ago(2)}
+            ]}),
         )
         .await;
         let source = SocialApiDmSource::new(client(&server), Arc::clone(&store), 10);
@@ -860,18 +1000,21 @@ mod tests {
             .unwrap();
         assert!(new);
 
-        // The API poll returns the SAME message (m1) plus our own outbound.
+        // The API poll returns the SAME message (m1) as fresh unanswered tail.
         let server = MockServer::start().await;
         mount_conversations(
             &server,
-            serde_json::json!([
-                {
-                    "id": "conv_1", "account_id": "acc_1", "with": "jane",
-                    "messages": [
-                        {"id":"m1","author":"jane","text":"hey there","created_at":"2026-05-28T00:00:00Z"}
-                    ]
-                }
-            ]),
+            serde_json::json!({"data": [{
+                "id": "conv_1", "account_id": "acc_1", "participant_name": "jane"
+            }]}),
+        )
+        .await;
+        mount_messages(
+            &server,
+            "conv_1",
+            serde_json::json!({"data": [
+                {"id":"m1","direction":"incoming","sender_name":"jane","text":"hey there","created_at": rfc3339_ago(1)}
+            ]}),
         )
         .await;
         let source = SocialApiDmSource::new(client(&server), Arc::clone(&store), 10);
@@ -983,7 +1126,8 @@ mod tests {
                 "text": "thanks for reaching out", "created_at": "2026-05-28T00:00:00Z"
             }),
         );
-        mount_conversations(&server, serde_json::json!([])).await;
+        // The live API's empty shape is `{"data":null}`, not `[]` (#543).
+        mount_conversations(&server, serde_json::json!({"data": null})).await;
 
         let src = SocialApiDmSource::new(client(&server), Arc::clone(&store), 25);
         let items = src.fetch_new().await.unwrap();
@@ -1010,7 +1154,8 @@ mod tests {
                 "text": "hey, quick question", "created_at": "2026-05-28T00:00:00Z"
             }),
         );
-        mount_conversations(&server, serde_json::json!([])).await;
+        // The live API's empty shape is `{"data":null}`, not `[]` (#543).
+        mount_conversations(&server, serde_json::json!({"data": null})).await;
 
         let src = SocialApiDmSource::new(client(&server), Arc::clone(&store), 25);
         let items = src.fetch_new().await.unwrap();
@@ -1037,7 +1182,8 @@ mod tests {
                 "text": "hello", "created_at": "2026-05-28T00:00:00Z"
             }),
         );
-        mount_conversations(&server, serde_json::json!([])).await;
+        // The live API's empty shape is `{"data":null}`, not `[]` (#543).
+        mount_conversations(&server, serde_json::json!({"data": null})).await;
 
         let src = SocialApiDmSource::new(client(&server), Arc::clone(&store), 25);
         assert!(src.fetch_new().await.unwrap().is_empty());
@@ -1073,7 +1219,8 @@ mod tests {
                 "outbound": true
             }),
         );
-        mount_conversations(&server, serde_json::json!([])).await;
+        // The live API's empty shape is `{"data":null}`, not `[]` (#543).
+        mount_conversations(&server, serde_json::json!({"data": null})).await;
 
         let src = SocialApiDmSource::new(client(&server), Arc::clone(&store), 25);
         assert!(src.fetch_new().await.unwrap().is_empty());
@@ -1095,7 +1242,8 @@ mod tests {
                 "outbound": false
             }),
         );
-        mount_conversations(&server, serde_json::json!([])).await;
+        // The live API's empty shape is `{"data":null}`, not `[]` (#543).
+        mount_conversations(&server, serde_json::json!({"data": null})).await;
 
         let src = SocialApiDmSource::new(client(&server), Arc::clone(&store), 25);
         let items = src.fetch_new().await.unwrap();
