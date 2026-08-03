@@ -693,6 +693,7 @@ dependencies = [
  "augmentagent-auth",
  "augmentagent-channel-core",
  "augmentagent-store",
+ "chrono",
  "reqwest",
  "serde",
  "serde_json",
