@@ -6607,17 +6607,41 @@ impl ReplyApprover {
                 message: "no thread id on email; cannot send socialapi reply".into(),
             };
         };
-        let req = augmentagent_channel_socialapi::ReplyRequest {
-            text: body.to_string(),
-        };
-
         let kind = action.email.kind.as_str();
         let send_result: anyhow::Result<String> = match kind {
             k if k == augmentagent_channel_core::trigger::kind::OWN_POST_COMMENT => {
-                client.reply_comment(target, &req).await.map(|c| c.id)
+                // The owning account rides on the email row (#543); legacy
+                // rows carry the bare platform string there instead.
+                let account_id = action
+                    .email
+                    .account_entity_id
+                    .clone()
+                    .filter(|a| !a.is_empty() && a != augmentagent_channel_socialapi::PLATFORM);
+                let req = augmentagent_channel_socialapi::CommentReplyRequest {
+                    text: body.to_string(),
+                    // Thread the reply under the comment being answered — the
+                    // email's message_id IS the platform comment id.
+                    comment_id: Some(action.email.message_id.clone()),
+                    private: None,
+                    account_id,
+                };
+                client.reply_comment(target, &req).await
             }
             k if k == augmentagent_channel_core::trigger::kind::DM => {
-                client.send_dm(target, &req).await.map(|m| m.id)
+                // The sending account rides on the email row, set by the DM
+                // source from the conversation. Comment rows stamp the bare
+                // platform string there instead, hence the filter.
+                let account_id = action
+                    .email
+                    .account_entity_id
+                    .clone()
+                    .filter(|a| !a.is_empty() && a != augmentagent_channel_socialapi::PLATFORM);
+                let req = augmentagent_channel_socialapi::DmSendRequest {
+                    text: body.to_string(),
+                    account_id,
+                    attachment_url: None,
+                };
+                client.send_dm(target, &req).await
             }
             other => {
                 return ApprovalActionOutcome::Failed {
@@ -8595,12 +8619,16 @@ impl augmentagent_channel_core::PostPublisher for MultiPlatformPublisher {
                     .filter(|v| !v.is_empty());
                 let client = SocialApiClient::new(auth);
                 let req = CreatePostRequest {
+                    // Wire field is `text` (#543). The scheduler already held
+                    // this post until its fire time — publish immediately.
+                    text: post.body.clone(),
                     targets: vec![PostTarget {
                         account_id,
                         platform: target_platform,
                     }],
-                    body: post.body.clone(),
-                    media,
+                    media_ids: media,
+                    publish_now: Some(true),
+                    scheduled_at: None,
                 };
                 match client.create_post(&req).await {
                     Ok(resp) => PublishOutcome::Posted {
