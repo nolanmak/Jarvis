@@ -90,6 +90,9 @@ struct DmWebhookPayload {
     /// means *unstated*, not *inbound* — see the drain's attribution walk.
     #[serde(default)]
     outbound: bool,
+    /// Underlying network the DM arrived on, when the push states it.
+    #[serde(default)]
+    sub_platform: String,
 }
 
 impl From<DmWebhookPayload> for SocialApiDmPayload {
@@ -113,6 +116,7 @@ impl From<DmWebhookPayload> for SocialApiDmPayload {
             w.with
         };
         SocialApiDmPayload {
+            sub_platform: w.sub_platform,
             conversation_id: w.conversation_id,
             account_id: w.account_id,
             with,
@@ -141,6 +145,34 @@ pub struct SocialApiDmPayload {
     pub author: String,
     pub text: String,
     pub created_at: String,
+    /// Underlying social network this DM actually arrived on ("instagram",
+    /// "x", "linkedin", …). One SocialAPI.ai key fronts several connected
+    /// accounts, so without this the approval card said only "[DM from jane]"
+    /// and there was no way to tell which inbox it came from. Empty when the
+    /// API or push didn't say; `platform_label` degrades gracefully.
+    #[serde(default)]
+    pub sub_platform: String,
+}
+
+/// Human label for a sub-platform, for card titles. Known networks get their
+/// conventional casing; anything unrecognized is passed through as-is rather
+/// than dropped, so a new network shows up readable instead of invisible.
+pub fn platform_label(sub_platform: &str) -> Option<String> {
+    let s = sub_platform.trim();
+    if s.is_empty() {
+        return None;
+    }
+    Some(match s.to_ascii_lowercase().as_str() {
+        "instagram" | "ig" => "Instagram".to_string(),
+        "x" | "twitter" => "X".to_string(),
+        "linkedin" | "li" => "LinkedIn".to_string(),
+        "facebook" | "fb" => "Facebook".to_string(),
+        "threads" => "Threads".to_string(),
+        "tiktok" => "TikTok".to_string(),
+        "youtube" => "YouTube".to_string(),
+        "pinterest" => "Pinterest".to_string(),
+        _ => s.to_string(),
+    })
 }
 
 impl SocialApiDmPayload {
@@ -154,6 +186,7 @@ impl SocialApiDmPayload {
             conv.participant_name.clone()
         };
         Self {
+            sub_platform: conv.platform.clone(),
             conversation_id: conv.id.clone(),
             account_id: conv.account_id.clone(),
             with,
@@ -169,8 +202,19 @@ impl SocialApiDmPayload {
     /// `dm`; `thread_id` carries the conversation id so a later reply targets
     /// the right thread.
     fn into_email(self) -> Email {
-        let from = format!("{} <socialapi:{}>", self.with, self.author);
-        let subject = format!("[DM from {}]", self.with);
+        // Name the network in BOTH the from-line and the subject. The card
+        // renders the subject as its title, and the triage/draft prompts see
+        // both — the model should know it is writing an Instagram DM rather
+        // than a LinkedIn one, since register and length conventions differ.
+        let label = platform_label(&self.sub_platform);
+        let from = match &label {
+            Some(_) => format!("{} <socialapi:{}:{}>", self.with, self.sub_platform, self.author),
+            None => format!("{} <socialapi:{}>", self.with, self.author),
+        };
+        let subject = match &label {
+            Some(p) => format!("[{p} DM from {}]", self.with),
+            None => format!("[DM from {}]", self.with),
+        };
         Email {
             message_id: self.message_id,
             thread_id: Some(self.conversation_id),
@@ -930,6 +974,7 @@ mod tests {
         let (store, _f) = tmp_store();
         // Seed a pending socialapi DM draft on conversation conv_1.
         let email = SocialApiDmPayload {
+            sub_platform: "instagram".into(),
             conversation_id: "conv_1".into(),
             account_id: "acc_1".into(),
             with: "jane".into(),
@@ -1041,6 +1086,7 @@ mod tests {
     async fn reply_decision_posts_approval_card() {
         let (store, _f) = tmp_store();
         let payload = SocialApiDmPayload {
+            sub_platform: "instagram".into(),
             conversation_id: "conv_1".into(),
             account_id: "acc_1".into(),
             with: "jane".into(),
@@ -1064,6 +1110,7 @@ mod tests {
     async fn skip_decision_posts_no_card() {
         let (store, _f) = tmp_store();
         let payload = SocialApiDmPayload {
+            sub_platform: "instagram".into(),
             conversation_id: "conv_1".into(),
             account_id: "acc_1".into(),
             with: "spammer".into(),
@@ -1275,5 +1322,82 @@ mod tests {
         let email = payload.into_email();
         assert_eq!(email.subject, "[DM from jane]");
         assert_eq!(email.from, "jane <socialapi:jane>");
+    }
+
+    // --- card titles must name the network the DM came from ---
+
+    fn dm_payload(sub_platform: &str) -> SocialApiDmPayload {
+        SocialApiDmPayload {
+            sub_platform: sub_platform.into(),
+            conversation_id: "c1".into(),
+            account_id: "acc_1".into(),
+            with: "jane".into(),
+            message_id: "m1".into(),
+            author: "jane".into(),
+            text: "hey".into(),
+            created_at: "2026-08-04T00:00:00Z".into(),
+        }
+    }
+
+    /// One SocialAPI.ai key fronts several networks, so "[DM from jane]" left
+    /// no way to tell which inbox a card came from.
+    #[test]
+    fn dm_subject_names_the_platform() {
+        assert_eq!(
+            dm_payload("instagram").into_email().subject,
+            "[Instagram DM from jane]"
+        );
+        assert_eq!(dm_payload("x").into_email().subject, "[X DM from jane]");
+        assert_eq!(
+            dm_payload("linkedin").into_email().subject,
+            "[LinkedIn DM from jane]"
+        );
+    }
+
+    /// Casing is normalized, and an unknown network is passed through rather
+    /// than dropped — a new platform should read oddly, not vanish.
+    #[test]
+    fn dm_subject_normalizes_known_and_passes_through_unknown() {
+        assert_eq!(
+            dm_payload("INSTAGRAM").into_email().subject,
+            "[Instagram DM from jane]"
+        );
+        assert_eq!(
+            dm_payload("twitter").into_email().subject,
+            "[X DM from jane]"
+        );
+        assert_eq!(
+            dm_payload("mastodon").into_email().subject,
+            "[mastodon DM from jane]"
+        );
+    }
+
+    /// An unstated platform degrades to the old title rather than printing an
+    /// empty bracket like "[ DM from jane]".
+    #[test]
+    fn dm_subject_without_platform_falls_back_cleanly() {
+        let e = dm_payload("").into_email();
+        assert_eq!(e.subject, "[DM from jane]");
+        assert_eq!(e.from, "jane <socialapi:jane>");
+        assert_eq!(dm_payload("   ").into_email().subject, "[DM from jane]");
+    }
+
+    /// The from-line carries the network too, so the triage/draft prompts see
+    /// it — register and length conventions differ per platform.
+    #[test]
+    fn dm_from_line_carries_the_platform() {
+        assert_eq!(
+            dm_payload("instagram").into_email().from,
+            "jane <socialapi:instagram:jane>"
+        );
+    }
+
+    #[test]
+    fn platform_label_maps_aliases() {
+        assert_eq!(platform_label("ig").as_deref(), Some("Instagram"));
+        assert_eq!(platform_label("li").as_deref(), Some("LinkedIn"));
+        assert_eq!(platform_label("tiktok").as_deref(), Some("TikTok"));
+        assert_eq!(platform_label(""), None);
+        assert_eq!(platform_label("  "), None);
     }
 }
