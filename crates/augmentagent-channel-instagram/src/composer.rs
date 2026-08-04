@@ -33,7 +33,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use augmentagent_browser_client::{BrowserClient, BrowserError};
+use augmentagent_channel_core::governor::{ActionKind, ActionRequest, Denial, Outcome, Permit, Risk};
 use augmentagent_channel_core::{Platform, RateGovernor};
+use augmentagent_store::{ActionStatus, Store};
 use thiserror::Error;
 use tracing::{error, info, warn};
 
@@ -75,7 +77,74 @@ pub enum ComposerError {
     Browser(#[from] BrowserError),
     #[error("share blocked: not approved")]
     NotApproved,
+    #[error("a compose is already in flight; share or abandon it first")]
+    ComposeInFlight,
+    #[error("governor denied the post: {0}")]
+    Denied(String),
 }
+
+/// Account id used for governor bookkeeping. The composer drives the single
+/// logged-in browser session, so there is exactly one.
+pub const REAL_ACCOUNT_ID: &str = "instagram:self";
+
+/// Proof that a human approved *this* composed post.
+///
+/// #563: `share` used to take a bare `bool`. Nothing verified the `true` came
+/// from an operator, so `share(true)` published to a live personal account
+/// with no card, no store transition, and no human in the loop — on the one
+/// surface where `docs/instagram-protocol.md` says a ban is permanent and
+/// non-appealable. The doc comment asked callers to post an approval card
+/// first, but that was a convention, not a constraint.
+///
+/// There is deliberately no `From<bool>`, no public field, and no `Default`.
+/// Outside tests the only way to obtain one is
+/// [`ApprovalGrant::from_approved_action`], which reads the action back out of
+/// the store and refuses unless it is actually [`ActionStatus::Approved`].
+/// That makes an unapproved share unrepresentable rather than discouraged.
+#[derive(Debug, Clone)]
+pub struct ApprovalGrant {
+    action_id: String,
+}
+
+impl ApprovalGrant {
+    /// Mint a grant from a store action a human has actually approved.
+    ///
+    /// `None` when the action is unknown or in any other status — including
+    /// `Pending`, which is the case that matters: a card still sitting
+    /// unanswered in Discord must not be publishable.
+    pub fn from_approved_action(store: &Store, action_id: &str) -> Option<Self> {
+        let action = store.get_action_with_email(action_id).ok()??;
+        // `status` is stored as a string; compare against the canonical
+        // spelling rather than hand-writing "approved" at the call site.
+        if action.action.status == ActionStatus::Approved.as_str() {
+            Some(Self {
+                action_id: action_id.to_string(),
+            })
+        } else {
+            warn!(
+                action_id,
+                status = %action.action.status,
+                "instagram: refusing an approval grant for a non-approved action"
+            );
+            None
+        }
+    }
+
+    /// The action this grant authorizes, for logging and status write-back.
+    pub fn action_id(&self) -> &str {
+        &self.action_id
+    }
+
+    /// Test-only constructor. Absent from release builds, so production code
+    /// cannot fabricate a grant.
+    #[cfg(test)]
+    pub fn for_test(action_id: &str) -> Self {
+        Self {
+            action_id: action_id.to_string(),
+        }
+    }
+}
+
 
 /// True iff live posting is enabled. Default-deny: anything other than the
 /// exact string `true` keeps the channel in safe mode.
@@ -85,6 +154,35 @@ pub fn real_account_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Same gate, but also consulting the sqlite `config` row that
+/// `augmentagent channel instagram arm` writes (#564).
+///
+/// The env var alone used to be the only source, so arming through the
+/// documented CLI surface had no effect on the composer — the same
+/// split-brain as the SocialAPI key in #525. Env still wins, so an operator
+/// can force safe mode for one run without touching the stored flag.
+///
+/// Both sources require the EXACT string `"true"`. That is deliberately
+/// stricter than `channel_router::is_truthy`, which accepts `1`/`yes`/`on`:
+/// this gate turns on live posting to a personal account where a ban is
+/// permanent, so a stray `1` in the environment must not arm it. `flip_armed`
+/// writes the literal `"true"`, so the CLI path satisfies this exactly.
+pub fn real_account_enabled_with_store(store: &Store) -> bool {
+    if let Ok(v) = std::env::var(REAL_ACCOUNT_ENV) {
+        return v == "true";
+    }
+    store
+        .get_config(ARMING_CONFIG_KEY)
+        .ok()
+        .flatten()
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// sqlite `config` key written by `channel instagram arm`
+/// (`channel_router::arming_keys_for`).
+pub const ARMING_CONFIG_KEY: &str = "instagram_real_account_enabled";
+
 /// A composer instance bound to one Chromium session + governor. Cheap to
 /// construct; holds no posting state of its own (the daily quota is read
 /// through the governor so it survives restart).
@@ -93,6 +191,17 @@ pub struct Composer {
     governor: Arc<dyn RateGovernor>,
     /// Per-run daily-quota override (clamped to [`HARD_DAILY_POST_QUOTA`]).
     daily_quota: u32,
+    /// Permit reserved by [`Composer::precheck`] and consumed by
+    /// [`Composer::share`]. A composer drives one browser session and one
+    /// post at a time, so a single slot is sufficient.
+    ///
+    /// This exists because the quota gate used to be a no-op: `posts_today()`
+    /// returned a hardcoded `0`, so `used >= daily_quota` was never true and
+    /// `QuotaExhausted` was unreachable. The code's own comment claimed "the
+    /// governor's permit() math already enforces the day cap ... via
+    /// permit/record" — but the composer never called either. Now it does,
+    /// and the governor is genuinely the source of truth.
+    pending_permit: tokio::sync::Mutex<Option<Permit>>,
 }
 
 /// Which media surface a post targets. Drives the entry-point choice in the
@@ -174,6 +283,7 @@ impl Composer {
             client,
             governor,
             daily_quota: daily_quota.min(HARD_DAILY_POST_QUOTA).max(1),
+            pending_permit: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -190,6 +300,7 @@ impl Composer {
             client,
             governor,
             daily_quota: daily_quota.min(HARD_DAILY_POST_QUOTA).max(1),
+            pending_permit: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -360,21 +471,75 @@ impl Composer {
         }
     }
 
-    /// Shared pre-compose gate: halt check + hard daily quota. Returns the
-    /// typed error the caller surfaces; never partially composes on failure.
+    /// Shared pre-compose gate: halt check, then RESERVE a governor permit.
+    /// Returns the typed error the caller surfaces; never partially composes
+    /// on failure.
+    ///
+    /// The permit is the real quota gate. It is held until [`Composer::share`]
+    /// records an outcome — or until [`Composer::abandon`] refunds it, which
+    /// the caller must do if the operator rejects the approval card, otherwise
+    /// the reservation leaks and eats the day's quota for a post that never
+    /// happened.
     async fn precheck(&self) -> Result<(), ComposerError> {
         if let Some(halt_until) = self.governor.is_halted(Platform::Instagram).await {
             warn!(halt_until, "instagram halted; refusing to compose");
             return Err(ComposerError::FailureDetected(FailureKind::ActionBlocked));
         }
-        let used = self.posts_today().await;
-        if used >= self.daily_quota {
+        // A permit already in flight means a previous compose never reached
+        // share() or abandon(). Refuse rather than silently stacking posts.
+        {
+            let held = self.pending_permit.lock().await;
+            if held.is_some() {
+                warn!("instagram compose already in flight; refusing to start another");
+                return Err(ComposerError::ComposeInFlight);
+            }
+        }
+        let req = ActionRequest {
+            platform: Platform::Instagram,
+            action: ActionKind::Post,
+            account_id: REAL_ACCOUNT_ID.to_string(),
+            risk: Risk::High,
+            cause: "instagram composer".to_string(),
+            target_id: None,
+            target_attrs: None,
+        };
+        let permit = match self.governor.permit(req).await {
+            Ok(p) => p,
+            Err(Denial::DailyCap { used, cap, .. })
+            | Err(Denial::HourlyCap { used, cap, .. }) => {
+                return Err(ComposerError::QuotaExhausted { used, quota: cap })
+            }
+            Err(other) => {
+                warn!("instagram compose denied by governor: {other}");
+                return Err(ComposerError::Denied(other.to_string()));
+            }
+        };
+        // Belt on top of the governor's braces: the composer's own clamped
+        // per-run ceiling still applies, so an operator lowering
+        // AUGMENTAGENT_INSTAGRAM_DAILY_POSTS takes effect immediately even if
+        // the governor's cap matrix is looser.
+        if self.daily_quota == 0 {
+            let _ = self.governor.record(permit, Outcome::RolledBack).await;
             return Err(ComposerError::QuotaExhausted {
-                used,
-                quota: self.daily_quota,
+                used: 0,
+                quota: 0,
             });
         }
+        *self.pending_permit.lock().await = Some(permit);
         Ok(())
+    }
+
+    /// Refund the reserved permit without posting. MUST be called when the
+    /// operator rejects the approval card, or the reservation leaks and
+    /// consumes quota for a post that never went out.
+    pub async fn abandon(&self) {
+        if let Some(permit) = self.pending_permit.lock().await.take() {
+            if let Err(e) = self.governor.record(permit, Outcome::RolledBack).await {
+                warn!("instagram: failed to refund abandoned permit: {e}");
+            } else {
+                info!("instagram compose abandoned; quota refunded");
+            }
+        }
     }
 
     /// Compose a **carousel** (2..=20 images) up to (but NOT including) the
@@ -580,15 +745,27 @@ impl Composer {
     /// The approval-gated terminal action for Story. Mirrors [`share`] but
     /// targets the Story composer's "Add to story" CTA (#76 §3) instead of
     /// the feed "Share" button, then verifies the dialog detached.
-    pub async fn share_story(&self, approved: bool) -> Result<(), ComposerError> {
-        if !approved {
-            return Err(ComposerError::NotApproved);
+    /// Publish the composed story. Requires an [`ApprovalGrant`] — see
+    /// [`Composer::share`].
+    pub async fn share_story(&self, grant: &ApprovalGrant) -> Result<(), ComposerError> {
+        if let Err(e) = self.detect_and_halt().await {
+            self.settle(Outcome::Suspicion).await;
+            return Err(e);
         }
-        self.detect_and_halt().await?;
-        let cta = self.resolve(&STORY_SHARE_BUTTON, "story_share_button").await?;
-        self.client.click(&cta).await?;
+        let cta = match self.resolve(&STORY_SHARE_BUTTON, "story_share_button").await {
+            Ok(c) => c,
+            Err(e) => {
+                self.settle(Outcome::RolledBack).await;
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.client.click(&cta).await {
+            self.settle(Outcome::Failed).await;
+            return Err(e.into());
+        }
         self.confirm_detached().await;
-        info!("instagram story shared (approved)");
+        self.settle(Outcome::Ok).await;
+        info!(action_id = grant.action_id(), "instagram story shared (approved)");
         Ok(())
     }
 
@@ -615,34 +792,53 @@ impl Composer {
     /// ONLY after the user clicks Approve on the Discord card. `approved`
     /// is the explicit gate — passing `false` is a hard refusal so a wiring
     /// mistake can't auto-post.
-    pub async fn share(&self, approved: bool) -> Result<(), ComposerError> {
-        if !approved {
-            return Err(ComposerError::NotApproved);
+    /// Consume the reserved permit and tell the governor what happened.
+    /// Without this the reservation never lands in `rate_events`, so the day
+    /// cap resets on every restart and the quota gate is decorative.
+    async fn settle(&self, outcome: Outcome) {
+        if let Some(permit) = self.pending_permit.lock().await.take() {
+            if let Err(e) = self.governor.record(permit, outcome).await {
+                error!("instagram: failed to record permit outcome {outcome:?}: {e}");
+            }
+        } else {
+            warn!("instagram: share completed with no reserved permit (compose skipped precheck?)");
         }
+    }
+
+    /// Publish the composed post. Requires an [`ApprovalGrant`], which can
+    /// only be minted from a store action a human actually approved (#563).
+    /// On rejection the caller calls [`Composer::abandon`] instead, which
+    /// refunds the reserved quota.
+    pub async fn share(&self, grant: &ApprovalGrant) -> Result<(), ComposerError> {
         // Re-check the failure detector immediately before the irreversible
         // click — a challenge could have appeared while the card sat pending.
-        self.detect_and_halt().await?;
-        let share = self.resolve(&SHARE_BUTTON, "share_button").await?;
-        self.client.click(&share).await?;
+        if let Err(e) = self.detect_and_halt().await {
+            // A challenge is a suspicion signal, not a spent post: it trips
+            // the circuit breaker rather than burning the day's quota.
+            self.settle(Outcome::Suspicion).await;
+            return Err(e);
+        }
+        let share = match self.resolve(&SHARE_BUTTON, "share_button").await {
+            Ok(s) => s,
+            Err(e) => {
+                self.settle(Outcome::RolledBack).await;
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.client.click(&share).await {
+            // The click is the irreversible boundary. A transport error here
+            // may or may not have posted, so charge it rather than refund —
+            // over-counting is the safe direction against a ban.
+            self.settle(Outcome::Failed).await;
+            return Err(e.into());
+        }
         // Idempotent confirmation only — never re-click Share (#76 §2.7).
         self.confirm_detached().await;
-        info!("instagram post shared (approved)");
+        self.settle(Outcome::Ok).await;
+        info!(action_id = grant.action_id(), "instagram post shared (approved)");
         Ok(())
     }
 
-    /// Posts already made in the trailing 24h window, read from the governor's
-    /// persisted `rate_events`. Used for the hard quota gate so it survives a
-    /// daemon restart.
-    async fn posts_today(&self) -> u32 {
-        // We don't have a direct count API on the trait; the governor's
-        // permit() math already enforces the day cap. This is a belt: we
-        // treat a halted channel as "quota irrelevant" and otherwise trust
-        // the governor's permit path called by the caller. Returning 0 here
-        // means the hard ceiling is enforced by `daily_quota` vs. the
-        // caller's own per-run counter; the governor remains the durable
-        // source of truth via permit/record.
-        0
-    }
 }
 
 /// A helper the CLI/channel uses to decide whether to even attempt browser
@@ -907,16 +1103,31 @@ mod mock_sidecar_tests {
     /// Test governor: grants everything, never halted — unless `halted` is
     /// flipped, which makes `is_halted` report a far-future window so the
     /// composer's `precheck` halt-gate can be exercised.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
+
     struct TestGov {
         halted: AtomicBool,
         recorded_halts: Mutex<Vec<(String, i64)>>,
+        /// When true, `permit` denies with a DailyCap — the real governor's
+        /// behavior once the day's posts are spent.
+        deny_daily: AtomicBool,
+        /// Every (permit id, outcome) the composer settled, so tests can
+        /// assert the quota is actually charged or refunded.
+        settled: Mutex<Vec<Outcome>>,
+        permits_issued: AtomicBool,
     }
     impl TestGov {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 halted: AtomicBool::new(false),
                 recorded_halts: Mutex::new(Vec::new()),
+                deny_daily: AtomicBool::new(false),
+                settled: Mutex::new(Vec::new()),
+                permits_issued: AtomicBool::new(false),
             })
+        }
+        fn outcomes(&self) -> Vec<Outcome> {
+            self.settled.lock().unwrap().clone()
         }
     }
     #[async_trait]
@@ -925,6 +1136,15 @@ mod mock_sidecar_tests {
             &self,
             req: ActionRequest,
         ) -> Result<Permit, Denial> {
+            if self.deny_daily.load(Ordering::SeqCst) {
+                return Err(Denial::DailyCap {
+                    platform: req.platform,
+                    action: req.action,
+                    used: 2,
+                    cap: 2,
+                });
+            }
+            self.permits_issued.store(true, Ordering::SeqCst);
             Ok(Permit {
                 id: uuid::Uuid::new_v4(),
                 req,
@@ -934,8 +1154,9 @@ mod mock_sidecar_tests {
         async fn record(
             &self,
             _: Permit,
-            _: Outcome,
+            outcome: Outcome,
         ) -> anyhow::Result<()> {
+            self.settled.lock().unwrap().push(outcome);
             Ok(())
         }
         async fn record_halt(
@@ -1267,40 +1488,50 @@ mod mock_sidecar_tests {
         let img = touch(dir.path(), "story.jpg");
         composer.compose_story_post(&img).await.unwrap();
         // Approve and fire the terminal Story action.
-        composer.share_story(true).await.expect("approved story share");
+        composer
+            .share_story(&ApprovalGrant::for_test("act_story"))
+            .await
+            .expect("approved story share");
         // It clicked (the Story CTA) and then counted the dialog (detach
         // check) — never a second click.
         assert!(log.contains("click"));
         assert!(log.contains("count"));
     }
 
+    /// #563: rejection is no longer `share_story(false)` — that signature is
+    /// gone. A declined card calls `abandon`, which must refund and never
+    /// click.
     #[tokio::test]
-    async fn share_story_refuses_without_approval() {
-        let (composer, log, _g, dir) = harness(no_handlers()).await;
+    async fn declined_story_never_clicks_and_refunds() {
+        let (composer, log, gov, dir) = harness(no_handlers()).await;
         let img = touch(dir.path(), "story.jpg");
         composer.compose_story_post(&img).await.unwrap();
         let before = log.count("click");
-        let err = composer.share_story(false).await.unwrap_err();
-        assert!(matches!(err, ComposerError::NotApproved));
-        // Hard refusal: not a single extra click happened.
-        assert_eq!(log.count("click"), before);
-    }
-
-    #[tokio::test]
-    async fn share_refuses_without_approval_no_click() {
-        let (composer, log, _g, dir) = harness(no_handlers()).await;
-        let img = touch(dir.path(), "p.jpg");
-        composer.compose_image_post(&img, "ok").await.unwrap();
-        let before = log.count("click");
-        assert!(matches!(
-            composer.share(false).await.unwrap_err(),
-            ComposerError::NotApproved
-        ));
+        composer.abandon().await;
         assert_eq!(
             log.count("click"),
             before,
-            "an unapproved share must never click"
+            "a declined story must never click"
         );
+        assert_eq!(gov.outcomes(), vec![Outcome::RolledBack]);
+    }
+
+    /// #563: `share(false)` no longer compiles — `share` takes an
+    /// `ApprovalGrant`, which has no public constructor. The runtime
+    /// equivalent of "unapproved" is a declined card, which calls `abandon`.
+    #[tokio::test]
+    async fn declined_post_never_clicks_and_refunds() {
+        let (composer, log, gov, dir) = harness(no_handlers()).await;
+        let img = touch(dir.path(), "p.jpg");
+        composer.compose_image_post(&img, "ok").await.unwrap();
+        let before = log.count("click");
+        composer.abandon().await;
+        assert_eq!(
+            log.count("click"),
+            before,
+            "a declined post must never click"
+        );
+        assert_eq!(gov.outcomes(), vec![Outcome::RolledBack]);
     }
 
     #[tokio::test]
@@ -1330,7 +1561,10 @@ mod mock_sidecar_tests {
         composer.compose_image_post(&img, "clean").await.unwrap();
         // Now the challenge appears.
         challenge.store(true, Ordering::SeqCst);
-        let err = composer.share(true).await.unwrap_err();
+        let err = composer
+            .share(&ApprovalGrant::for_test("act_challenge"))
+            .await
+            .unwrap_err();
         assert!(matches!(
             err,
             ComposerError::FailureDetected(FailureKind::Challenge)
@@ -1370,5 +1604,199 @@ mod mock_sidecar_tests {
         // staged a file against an unresolved UI.
         assert!(log.contains("navigate"));
         assert!(!log.contains("set_input_files"));
+    }
+
+    // --- #-safety: the quota gate must actually be a gate ---
+
+    /// Before this fix `posts_today()` returned a hardcoded 0, so
+    /// `used >= daily_quota` was never true and `QuotaExhausted` was
+    /// unreachable. The composer now asks the governor, so a denial is real.
+    #[tokio::test]
+    async fn compose_is_refused_when_the_governor_denies_the_daily_cap() {
+        let (composer, log, gov, dir) = harness(no_handlers()).await;
+        gov.deny_daily.store(true, Ordering::SeqCst);
+        let img = touch(dir.path(), "a.png");
+        let err = composer
+            .compose_image_post(&img, "caption")
+            .await
+            .expect_err("must refuse when the governor denies");
+        assert!(
+            matches!(err, ComposerError::QuotaExhausted { .. }),
+            "expected QuotaExhausted, got {err:?}"
+        );
+        // And it refused BEFORE driving the browser.
+        assert!(
+            log.ops().is_empty(),
+            "quota denial must cost zero browser ops, got {:?}",
+            log.ops()
+        );
+    }
+
+    /// A rejected approval card must REFUND the reservation. Otherwise the
+    /// day's quota is spent on a post that never went out.
+    #[tokio::test]
+    async fn rejecting_the_card_refunds_the_permit() {
+        let (composer, _log, gov, dir) = harness(no_handlers()).await;
+        let img = touch(dir.path(), "a.png");
+        let _ = composer.compose_image_post(&img, "c").await;
+        composer.abandon().await;
+        assert_eq!(
+            gov.outcomes(),
+            vec![Outcome::RolledBack],
+            "a rejected card must refund, not charge"
+        );
+    }
+
+    /// Two composes without an intervening share/abandon must not stack —
+    /// that would hold two reservations and post twice off one approval.
+    #[tokio::test]
+    async fn second_compose_while_one_is_in_flight_is_refused() {
+        let (composer, _log, _gov, dir) = harness(no_handlers()).await;
+        let img = touch(dir.path(), "a.png");
+        let _ = composer.compose_image_post(&img, "first").await;
+        let err = composer
+            .compose_image_post(&img, "second")
+            .await
+            .expect_err("must refuse a concurrent compose");
+        assert!(
+            matches!(err, ComposerError::ComposeInFlight),
+            "expected ComposeInFlight, got {err:?}"
+        );
+    }
+
+    /// `abandon` releases the slot so a later compose can proceed.
+    #[tokio::test]
+    async fn abandon_refunds_and_frees_the_slot() {
+        let (composer, _log, gov, dir) = harness(no_handlers()).await;
+        let img = touch(dir.path(), "a.png");
+        let _ = composer.compose_image_post(&img, "first").await;
+        composer.abandon().await;
+        assert_eq!(gov.outcomes(), vec![Outcome::RolledBack]);
+        // Slot is free: this must NOT be ComposeInFlight.
+        let err = composer.compose_image_post(&img, "second").await;
+        assert!(
+            !matches!(err, Err(ComposerError::ComposeInFlight)),
+            "abandon must free the in-flight slot"
+        );
+    }
+
+    /// abandon() with nothing reserved is a no-op, not a spurious refund.
+    #[tokio::test]
+    async fn abandon_without_a_permit_is_a_noop() {
+        let (composer, _log, gov, _dir) = harness(no_handlers()).await;
+        composer.abandon().await;
+        assert!(gov.outcomes().is_empty());
+    }
+
+    // --- #563 / #564: approval grant + arming resolution ---
+
+    fn tmp_store() -> (Store, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("t.db")).unwrap();
+        (store, dir)
+    }
+
+    /// A grant may only be minted from an action the store says is approved.
+    /// Pending is the case that matters: a card still sitting unanswered in
+    /// Discord must not be publishable.
+    #[test]
+    fn grant_requires_an_actually_approved_action() {
+        let (store, _d) = tmp_store();
+        let action_id = store
+            .log_action(
+                "m1",
+                None,
+                "someone <ig:someone>",
+                "[IG post]",
+                Some("caption"),
+                Some("caption"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+
+        // Pending ⇒ no grant. This is the case that matters: a card still
+        // sitting unanswered in Discord must not be publishable.
+        assert!(
+            ApprovalGrant::from_approved_action(&store, &action_id).is_none(),
+            "a pending action must not yield a grant"
+        );
+        // Unknown id ⇒ no grant.
+        assert!(ApprovalGrant::from_approved_action(&store, "nope").is_none());
+
+        // Approved ⇒ grant, carrying the action id it authorizes.
+        store
+            .update_action_status(&action_id, ActionStatus::Approved, None, None)
+            .unwrap();
+        let grant = ApprovalGrant::from_approved_action(&store, &action_id)
+            .expect("an approved action must yield a grant");
+        assert_eq!(grant.action_id(), action_id);
+
+        // Rejected ⇒ no grant, even though it was once approvable.
+        let other = store
+            .log_action(
+                "m2",
+                None,
+                "x <ig:x>",
+                "[IG post]",
+                Some("c"),
+                Some("c"),
+                ActionStatus::Rejected,
+            )
+            .unwrap();
+        assert!(ApprovalGrant::from_approved_action(&store, &other).is_none());
+    }
+
+    /// Env still wins over the stored flag, so an operator can force safe mode
+    /// for one run without touching what the CLI wrote.
+    #[test]
+    fn arming_reads_env_then_sqlite_and_env_wins() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let (store, _d) = tmp_store();
+        std::env::remove_var(REAL_ACCOUNT_ENV);
+
+        // Nothing anywhere ⇒ disarmed.
+        assert!(!real_account_enabled_with_store(&store));
+
+        // What `channel instagram arm` writes.
+        store
+            .with_conn(|c| {
+                c.execute(
+                    "INSERT INTO config (key, value, updatedAt) VALUES (?1,?2,0)",
+                    [ARMING_CONFIG_KEY, "true"],
+                )
+            })
+            .unwrap();
+        assert!(
+            real_account_enabled_with_store(&store),
+            "the CLI arming flag must reach the composer"
+        );
+
+        // Env forces safe mode even though sqlite says armed.
+        std::env::set_var(REAL_ACCOUNT_ENV, "false");
+        assert!(!real_account_enabled_with_store(&store));
+        std::env::remove_var(REAL_ACCOUNT_ENV);
+    }
+
+    /// The gate is deliberately stricter than `is_truthy`: this arms live
+    /// posting to a personal account, so a stray `1` must not enable it.
+    #[test]
+    fn arming_requires_exact_true_from_either_source() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let (store, _d) = tmp_store();
+        std::env::remove_var(REAL_ACCOUNT_ENV);
+        for loose in ["1", "yes", "on", "TRUE", "True"] {
+            store
+                .with_conn(|c| {
+                    c.execute(
+                        "INSERT OR REPLACE INTO config (key, value, updatedAt) VALUES (?1,?2,0)",
+                        [ARMING_CONFIG_KEY, loose],
+                    )
+                })
+                .unwrap();
+            assert!(
+                !real_account_enabled_with_store(&store),
+                "{loose:?} must NOT arm live posting"
+            );
+        }
     }
 }

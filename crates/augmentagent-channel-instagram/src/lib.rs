@@ -56,7 +56,8 @@ pub use channel::{
 pub use composer::{
     browser_posting_available, configured_daily_quota, default_pending_image,
     real_account_enabled, ComposeStage, Composer, ComposerError,
-    DeferredPostKind, PostMedia, HARD_DAILY_POST_QUOTA, REAL_ACCOUNT_ENV,
+    ApprovalGrant, DeferredPostKind, PostMedia, ARMING_CONFIG_KEY,
+    HARD_DAILY_POST_QUOTA, REAL_ACCOUNT_ENV,
 };
 pub use failure::{classify_body, classify_dom, FailureKind};
 pub use feed::{
