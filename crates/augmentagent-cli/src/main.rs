@@ -585,7 +585,9 @@ enum SchedulePostOp {
     /// seconds). Status starts `queued`; serve drives it through the
     /// preview → posted lifecycle.
     Add {
-        /// `linkedin` | `twitter` | `instagram`.
+        /// `linkedin` | `twitter` (or `x`) | `socialapi` |
+        /// `socialapi:<sub-platform>`. Case-insensitive. Instagram is NOT
+        /// schedulable — its posting path is the composer, not the scheduler.
         #[arg(long)]
         platform: String,
         /// Post body.
@@ -8505,6 +8507,32 @@ async fn run_backfill_signatures(
 // #58 — engagement-automation scheduled posts
 // ================================================================
 
+/// Canonical form of a `scheduled_posts.platform` value: trimmed and
+/// lowercased. Dispatch used to `match post.platform.as_str()` raw, so `"X"`,
+/// `"Twitter"`, or a stray trailing space fell through to a terminal failure
+/// at fire time (#550). Applied at enqueue AND at dispatch, so old rows
+/// written before this landed still route correctly.
+fn normalize_post_platform(platform: &str) -> String {
+    platform.trim().to_ascii_lowercase()
+}
+
+/// Platforms the scheduled-post publisher can actually deliver, for error
+/// messages and `--platform` validation.
+const SCHEDULABLE_PLATFORMS: &str = "linkedin, twitter (or x), socialapi, socialapi:<sub-platform>";
+
+/// True iff [`MultiPlatformPublisher::publish`] has an arm for `platform`
+/// (already normalized).
+///
+/// #550: `instagram` was advertised as a valid `--platform` on
+/// `schedule-post add` and accepted by `enqueue_scheduled_post`, but the
+/// publisher has no instagram arm — so the row sat `queued` until its fire
+/// time and only then failed terminally. Rejecting at enqueue tells the
+/// operator while they are still looking at the terminal.
+fn is_schedulable_platform(platform: &str) -> bool {
+    matches!(platform, "linkedin" | "twitter" | "x" | "socialapi")
+        || platform.starts_with("socialapi:")
+}
+
 /// Routes a [`ScheduledPost`] to the right per-platform poster. Keeps
 /// `channel-core`'s `PostPublisher` trait satisfied without that crate
 /// depending on the platform crates. Auth is loaded lazily per publish so a
@@ -8523,7 +8551,10 @@ impl augmentagent_channel_core::PostPublisher for MultiPlatformPublisher {
         post: &augmentagent_store::ScheduledPost,
     ) -> augmentagent_channel_core::PublishOutcome {
         use augmentagent_channel_core::PublishOutcome;
-        match post.platform.as_str() {
+        // #550: normalize before dispatch so "X" / "Twitter" / stray
+        // whitespace route correctly instead of hard-failing at fire time.
+        let platform = normalize_post_platform(&post.platform);
+        match platform.as_str() {
             "linkedin" => {
                 let auth = match LinkedInAuth::load_with_migration(&self.repo_root) {
                     Ok(a) => a,
@@ -8607,8 +8638,7 @@ impl augmentagent_channel_core::PostPublisher for MultiPlatformPublisher {
                 }
                 // Sub-platform is the part after "socialapi:" if present;
                 // empty otherwise (the API resolves it from the account id).
-                let target_platform = post
-                    .platform
+                let target_platform = platform
                     .strip_prefix("socialapi:")
                     .unwrap_or("")
                     .to_string();
@@ -8642,7 +8672,8 @@ impl augmentagent_channel_core::PostPublisher for MultiPlatformPublisher {
             other => PublishOutcome::Failed {
                 message: format!(
                     "no scheduled-post publisher wired for platform '{other}' \
-                     (linkedin + twitter + socialapi supported; instagram deferred)"
+                     (supported: {SCHEDULABLE_PLATFORMS}). Instagram posting \
+                     goes through the composer, not the scheduler."
                 ),
             },
         }
@@ -8657,8 +8688,18 @@ async fn run_schedule_post(store: Arc<Store>, op: &SchedulePostOp) -> Result<()>
             at,
         } => {
             let fire_at_ms = parse_fire_at(at)?;
+            // #550: validate HERE, not at fire time. A platform the publisher
+            // can't deliver used to queue happily and fail terminally hours
+            // later, with the operator long gone.
+            let platform = normalize_post_platform(platform);
+            if !is_schedulable_platform(&platform) {
+                anyhow::bail!(
+                    "cannot schedule posts for platform '{platform}' \
+                     (supported: {SCHEDULABLE_PLATFORMS})"
+                );
+            }
             let id = store.enqueue_scheduled_post(
-                platform,
+                &platform,
                 body,
                 None,
                 fire_at_ms,
@@ -12483,5 +12524,53 @@ mod stale_reconcile_tests {
             "pending",
             "a card with a real draft for a real person must stay in the queue"
         );
+    }
+}
+
+#[cfg(test)]
+mod scheduled_post_platform_tests {
+    use super::{is_schedulable_platform, normalize_post_platform};
+
+    #[test]
+    fn normalize_trims_and_lowercases() {
+        assert_eq!(normalize_post_platform("  X  "), "x");
+        assert_eq!(normalize_post_platform("Twitter"), "twitter");
+        assert_eq!(normalize_post_platform("LinkedIn"), "linkedin");
+        assert_eq!(normalize_post_platform("SocialAPI:Instagram"), "socialapi:instagram");
+    }
+
+    /// #550: these all used to fall through the publisher's exact-match arms
+    /// and fail terminally at fire time.
+    #[test]
+    fn case_and_whitespace_variants_are_schedulable() {
+        for p in ["X", "  x", "Twitter ", "LINKEDIN", "SocialAPI"] {
+            let n = normalize_post_platform(p);
+            assert!(
+                is_schedulable_platform(&n),
+                "{p:?} normalized to {n:?} should be schedulable"
+            );
+        }
+    }
+
+    #[test]
+    fn socialapi_sub_platforms_are_schedulable() {
+        assert!(is_schedulable_platform("socialapi"));
+        assert!(is_schedulable_platform("socialapi:instagram"));
+        assert!(is_schedulable_platform("socialapi:linkedin"));
+    }
+
+    /// Instagram has no publisher arm — it must be refused at enqueue rather
+    /// than queued and failed hours later.
+    #[test]
+    fn instagram_is_not_schedulable() {
+        assert!(!is_schedulable_platform("instagram"));
+        assert!(!is_schedulable_platform(&normalize_post_platform("Instagram")));
+    }
+
+    #[test]
+    fn unknown_platforms_are_not_schedulable() {
+        for p in ["bluesky", "tiktok", "", "socialapi-instagram"] {
+            assert!(!is_schedulable_platform(p), "{p:?} should not be schedulable");
+        }
     }
 }
