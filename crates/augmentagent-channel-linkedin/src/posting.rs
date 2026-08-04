@@ -54,14 +54,45 @@ impl Visibility {
     }
 }
 
+/// One image to attach. Borrows its bytes so the caller keeps ownership of
+/// the (potentially large) payload.
+#[derive(Debug, Clone, Copy)]
+pub struct PostImage<'a> {
+    pub bytes: &'a [u8],
+    /// Original filename — drives the register call and the MIME guess on the
+    /// presigned PUT. `None` falls back to a generic `.png` name.
+    pub filename: Option<&'a str>,
+}
+
+impl<'a> PostImage<'a> {
+    pub fn new(bytes: &'a [u8], filename: Option<&'a str>) -> Self {
+        Self { bytes, filename }
+    }
+}
+
+/// Conservative ceiling on images per post. LinkedIn's composer allows
+/// several, but the exact ceiling is a platform limit that shifts and is not
+/// discoverable from this repo — so cap low, fail loudly, and let
+/// `AUGMENTAGENT_LINKEDIN_MAX_IMAGES` raise it without a recompile once a
+/// real capture confirms the true limit.
+pub const DEFAULT_MAX_IMAGES: usize = 9;
+
+/// Effective per-post image cap.
+pub fn max_images() -> usize {
+    std::env::var("AUGMENTAGENT_LINKEDIN_MAX_IMAGES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_IMAGES)
+}
+
 /// One feed post the caller wants published. Borrows its payload so the
 /// caller keeps ownership of the (potentially large) image bytes.
 #[derive(Debug, Clone)]
 pub struct PostDraft<'a> {
     pub text: &'a str,
-    /// Optional single image. Phase 1 caps at one; multi-image is Phase 2.
-    pub image: Option<&'a [u8]>,
-    pub image_filename: Option<&'a str>,
+    /// Images to attach, in display order. Empty for a text-only post.
+    pub images: Vec<PostImage<'a>>,
     pub visibility: Visibility,
 }
 
@@ -70,10 +101,15 @@ impl<'a> PostDraft<'a> {
     pub fn text(text: &'a str) -> Self {
         Self {
             text,
-            image: None,
-            image_filename: None,
+            images: Vec::new(),
             visibility: Visibility::Public,
         }
+    }
+
+    /// Attach one image. Chainable; call repeatedly for a multi-image post.
+    pub fn with_image(mut self, bytes: &'a [u8], filename: Option<&'a str>) -> Self {
+        self.images.push(PostImage::new(bytes, filename));
+        self
     }
 }
 
@@ -104,27 +140,37 @@ fn base_url() -> String {
 // Body builder (snapshot-tested in tests/normshares_body_shape.rs)
 // =============================================================================
 
-/// Build the canonical `normShares` POST body (#77 §1). `media_urn` is the
-/// `urn:li:digitalmediaAsset:...` from a completed image upload, or `None`
-/// for a pure-text post.
+/// Build the canonical `normShares` POST body (#77 §1). `media_urns` are the
+/// `urn:li:digitalmediaAsset:...` values from completed image uploads, in
+/// display order; empty for a pure-text post.
+///
+/// `media` was always a JSON array on the wire — the previous single-image
+/// cap was this function hand-building a one-element literal, not a protocol
+/// constraint. N entries is the natural extension, but see the module docs:
+/// the multi-image shape has NOT been confirmed against a live capture the
+/// way the single-image shape was.
 ///
 /// Pure function — no I/O — so the body shape is unit-/snapshot-testable
 /// without a network mock.
 pub fn build_normshares_body(
     text: &str,
     visibility: Visibility,
-    media_urn: Option<&str>,
+    media_urns: &[&str],
 ) -> serde_json::Value {
-    let media = match media_urn {
-        Some(urn) => serde_json::json!([{
-            "category": "IMAGE",
-            "mediaUrn": urn,
-            "tapTargets": [],
-            "thumbnails": [],
-            "$type": "com.linkedin.voyager.feed.shared.ShareImage"
-        }]),
-        None => serde_json::json!([]),
-    };
+    let media = serde_json::Value::Array(
+        media_urns
+            .iter()
+            .map(|urn| {
+                serde_json::json!({
+                    "category": "IMAGE",
+                    "mediaUrn": urn,
+                    "tapTargets": [],
+                    "thumbnails": [],
+                    "$type": "com.linkedin.voyager.feed.shared.ShareImage"
+                })
+            })
+            .collect(),
+    );
     serde_json::json!({
         "visibleToConnectionsOnly": visibility.connections_only(),
         "externalAudienceProviders": [],
@@ -300,12 +346,30 @@ pub(crate) async fn create_share_impl(
     draft: PostDraft<'_>,
 ) -> Result<ShareUrn, LinkedInError> {
     // 1. optional image upload (register → PUT → asset urn).
-    let media_urn = match draft.image {
-        Some(bytes) => Some(upload_image(client, bytes, draft.image_filename).await?),
-        None => None,
-    };
+    // Cap before uploading anything: exceeding the limit should cost zero
+    // network calls, not N-1 orphaned assets.
+    let cap = max_images();
+    if draft.images.len() > cap {
+        return Err(LinkedInError::Voyager {
+            status: 0,
+            body: format!(
+                "{} images exceeds the per-post cap of {cap} \
+                 (raise AUGMENTAGENT_LINKEDIN_MAX_IMAGES if LinkedIn allows more)",
+                draft.images.len()
+            ),
+        });
+    }
+    // Sequential, not concurrent: each register burns a fresh
+    // x-li-page-instance, and a parallel burst of registers is exactly the
+    // shape that reads as automated on the highest-blast-radius surface here.
+    // Order is preserved, which is the display order.
+    let mut media_urns: Vec<String> = Vec::with_capacity(draft.images.len());
+    for img in &draft.images {
+        media_urns.push(upload_image(client, img.bytes, img.filename).await?);
+    }
     // 2. POST normShares.
-    let body = build_normshares_body(draft.text, draft.visibility, media_urn.as_deref());
+    let urn_refs: Vec<&str> = media_urns.iter().map(String::as_str).collect();
+    let body = build_normshares_body(draft.text, draft.visibility, &urn_refs);
     let normshares_url = format!("{}{NORMSHARES_PATH}", base_url());
     let resp = client
         .http
@@ -347,7 +411,7 @@ mod tests {
 
     #[test]
     fn text_only_body_has_empty_media_and_public() {
-        let b = build_normshares_body("hello world", Visibility::Public, None);
+        let b = build_normshares_body("hello world", Visibility::Public, &[]);
         assert_eq!(b["visibleToConnectionsOnly"], false);
         assert_eq!(b["commentaryV2"]["text"], "hello world");
         assert_eq!(b["commentaryV2"]["attributes"], serde_json::json!([]));
@@ -358,7 +422,7 @@ mod tests {
 
     #[test]
     fn connections_only_flips_flag() {
-        let b = build_normshares_body("x", Visibility::ConnectionsOnly, None);
+        let b = build_normshares_body("x", Visibility::ConnectionsOnly, &[]);
         assert_eq!(b["visibleToConnectionsOnly"], true);
     }
 
@@ -367,7 +431,7 @@ mod tests {
         let b = build_normshares_body(
             "with pic",
             Visibility::Public,
-            Some("urn:li:digitalmediaAsset:D5610AQH"),
+            &["urn:li:digitalmediaAsset:D5610AQH"],
         );
         let media = b["media"].as_array().unwrap();
         assert_eq!(media.len(), 1);
@@ -394,5 +458,86 @@ mod tests {
         assert_eq!(guess_mime("a.PNG"), "image/png");
         assert_eq!(guess_mime("a.jpeg"), "image/jpeg");
         assert_eq!(guess_mime("a.bin"), "application/octet-stream");
+    }
+
+    /// The wire container was always an array — these assert N entries land
+    /// in it, in order, each a well-formed ShareImage.
+    #[test]
+    fn multi_image_body_has_one_entry_per_urn_in_order() {
+        let urns = [
+            "urn:li:digitalmediaAsset:AAA",
+            "urn:li:digitalmediaAsset:BBB",
+            "urn:li:digitalmediaAsset:CCC",
+        ];
+        let b = build_normshares_body("three shots", Visibility::Public, &urns);
+        let media = b["media"].as_array().expect("media array");
+        assert_eq!(media.len(), 3);
+        for (i, urn) in urns.iter().enumerate() {
+            assert_eq!(media[i]["mediaUrn"], *urn, "order must be preserved");
+            assert_eq!(media[i]["category"], "IMAGE");
+            assert_eq!(
+                media[i]["$type"],
+                "com.linkedin.voyager.feed.shared.ShareImage"
+            );
+            assert!(media[i]["tapTargets"].is_array());
+            assert!(media[i]["thumbnails"].is_array());
+        }
+        // Everything outside `media` is untouched by image count.
+        assert_eq!(b["commentaryV2"]["text"], "three shots");
+        assert_eq!(b["postState"], "PUBLISHED");
+    }
+
+    /// A single image must still produce byte-identical output to the
+    /// pre-multi-image builder, so this change is a no-op for existing posts.
+    #[test]
+    fn single_image_body_unchanged_by_multi_image_support() {
+        let b = build_normshares_body(
+            "one shot",
+            Visibility::Public,
+            &["urn:li:digitalmediaAsset:D5610AQH"],
+        );
+        assert_eq!(
+            b["media"],
+            serde_json::json!([{
+                "category": "IMAGE",
+                "mediaUrn": "urn:li:digitalmediaAsset:D5610AQH",
+                "tapTargets": [],
+                "thumbnails": [],
+                "$type": "com.linkedin.voyager.feed.shared.ShareImage"
+            }])
+        );
+    }
+
+    #[test]
+    fn post_draft_with_image_is_chainable_and_ordered() {
+        let a = b"aaa";
+        let c = b"ccc";
+        let d = PostDraft::text("t")
+            .with_image(a, Some("a.png"))
+            .with_image(c, Some("c.jpg"));
+        assert_eq!(d.images.len(), 2);
+        assert_eq!(d.images[0].filename, Some("a.png"));
+        assert_eq!(d.images[1].filename, Some("c.jpg"));
+        assert_eq!(d.images[0].bytes, a);
+    }
+
+    #[test]
+    fn text_draft_has_no_images() {
+        assert!(PostDraft::text("hi").images.is_empty());
+    }
+
+    #[test]
+    fn max_images_defaults_and_env_override_is_respected() {
+        // No override → the conservative default.
+        std::env::remove_var("AUGMENTAGENT_LINKEDIN_MAX_IMAGES");
+        assert_eq!(max_images(), DEFAULT_MAX_IMAGES);
+        std::env::set_var("AUGMENTAGENT_LINKEDIN_MAX_IMAGES", "20");
+        assert_eq!(max_images(), 20);
+        // Garbage and zero fall back rather than disabling images entirely.
+        std::env::set_var("AUGMENTAGENT_LINKEDIN_MAX_IMAGES", "0");
+        assert_eq!(max_images(), DEFAULT_MAX_IMAGES);
+        std::env::set_var("AUGMENTAGENT_LINKEDIN_MAX_IMAGES", "not-a-number");
+        assert_eq!(max_images(), DEFAULT_MAX_IMAGES);
+        std::env::remove_var("AUGMENTAGENT_LINKEDIN_MAX_IMAGES");
     }
 }

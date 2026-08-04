@@ -126,20 +126,40 @@ approval, never auto-posted.
 
 ## Posting to your feed (#51 / #77)
 
-`augmentagent linkedin post --text "..." [--image path] [--visibility public|connections] [--dry-run true]`
+`augmentagent linkedin post --text "..." [--image path]... [--visibility public|connections] [--dry-run true]`
 
-Phase 1 is Voyager-only **text** + **single-image** posts via
-`contentcreation/normShares`. `--dry-run true` prints the exact request body
-without sending. Guards:
+Voyager-only **text** + **N images** via `contentcreation/normShares`. Repeat
+`--image` for a multi-image post; argument order is display order.
+`--dry-run true` prints the exact request body without sending. Guards:
 
 - Rolling-24h cap of **3 posts/day** (preflight; defers with a clear error).
+  This counts *posts*, not images.
 - First 3 lifetime posts require `AUGMENTAGENT_LINKEDIN_POST_CONFIRM=yes` —
   a second-confirmation guard for the highest-blast-radius action.
+- Per-post image cap, default 9, overridable with
+  `AUGMENTAGENT_LINKEDIN_MAX_IMAGES`. Checked *before* any upload, so an
+  over-cap post costs zero network calls instead of leaving orphaned assets.
+- All images are read from disk before the first register call, so a missing
+  file fails before any upload rather than half-way through.
 - The CLI is a manual/test path. The daemon posts through the standard
   Discord approval pipeline.
 
+> **Multi-image is not capture-verified.** The single-image body shape was
+> reverse-engineered from live captures; nothing in this repo captures a 2+
+> image post. `media` was always a JSON array on the wire, so N entries is the
+> natural extension, but two things remain unconfirmed: whether LinkedIn
+> accepts N `ShareImage` entries in one `media` array, and whether the
+> register step needs a `mediaUploadType` other than `FEEDSHARE_IMAGE` for a
+> multi-image asset. Both would fail as an opaque HTTP 400. Confirm with one
+> real multi-image post captured through the intercept proxy before relying
+> on this.
+
+Uploads run **sequentially**, not concurrently: each register burns a fresh
+`x-li-page-instance`, and a parallel burst of registers reads as automated on
+the highest-blast-radius surface here.
+
 Deferred to Phase 2 (`Refs #51`): video, polls, articles, scheduling,
-multi-image, browser fallback.
+browser fallback.
 
 ## Tuning
 

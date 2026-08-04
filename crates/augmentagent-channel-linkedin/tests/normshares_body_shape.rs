@@ -125,8 +125,7 @@ async fn text_plus_image_body_shape() {
     let png = b"\x89PNG\r\n\x1a\n fake bytes".to_vec();
     let draft = PostDraft {
         text: "shipped with a screenshot",
-        image: Some(&png),
-        image_filename: Some("shot.png"),
+        images: vec![augmentagent_channel_linkedin::PostImage::new(&png, Some("shot.png"))],
         visibility: Visibility::ConnectionsOnly,
     };
     let body = capture_normshares_body(&server, draft).await;
