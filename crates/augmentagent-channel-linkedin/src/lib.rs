@@ -51,8 +51,8 @@ pub use own_posts::{
     DEFAULT_MAX_REPLIES_PER_DAY, DEFAULT_OWN_POST_POLL_SECS,
 };
 pub use posting::{
-    build_normshares_body, PostDraft, ShareUrn, Visibility,
-    DEFAULT_MEDIA_UPLOAD_PATH,
+    build_normshares_body, max_images, PostDraft, PostImage, ShareUrn, Visibility,
+    DEFAULT_MAX_IMAGES, DEFAULT_MEDIA_UPLOAD_PATH,
 };
 pub use types::{
     is_linkedin_email, Dm, FeedPost, Invitation, MemberUrn, PostComment,

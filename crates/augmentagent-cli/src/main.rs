@@ -1556,16 +1556,17 @@ enum LinkedinOp {
         #[arg(long)]
         full: bool,
     },
-    /// Publish a feed post via Voyager `normShares` (#51/#77). Phase 1:
-    /// text + optional single image. Manual/test path — the daemon posts
-    /// through the approval pipeline, not this command.
+    /// Publish a feed post via Voyager `normShares` (#51/#77): text plus any
+    /// number of images. Manual/test path — the daemon posts through the
+    /// approval pipeline, not this command.
     Post {
         /// Post body (≤3000 chars; ~140 visible before the "see more" fold).
         #[arg(long)]
         text: String,
-        /// Optional single image to attach.
-        #[arg(long)]
-        image: Option<PathBuf>,
+        /// Image to attach. Repeat for a multi-image post; order is preserved
+        /// as display order. Capped by AUGMENTAGENT_LINKEDIN_MAX_IMAGES.
+        #[arg(long = "image")]
+        images: Vec<PathBuf>,
         /// Audience: `public` (default) or `connections`.
         #[arg(long, default_value = "public")]
         visibility: String,
@@ -2560,14 +2561,14 @@ async fn main() -> Result<()> {
             }
             LinkedinOp::Post {
                 text,
-                image,
+                images,
                 visibility,
                 dry_run,
             } => {
                 run_linkedin_post(
                     Arc::clone(&store),
                     text.clone(),
-                    image.clone(),
+                    images.clone(),
                     visibility.clone(),
                     *dry_run,
                 )
@@ -8767,7 +8768,7 @@ fn parse_fire_at(s: &str) -> Result<i64> {
 async fn run_linkedin_post(
     store: Arc<Store>,
     text: String,
-    image: Option<PathBuf>,
+    images: Vec<PathBuf>,
     visibility: String,
     dry_run: bool,
 ) -> Result<()> {
@@ -8776,10 +8777,16 @@ async fn run_linkedin_post(
 
     // Dry-run: build + print the canonical body, no auth, no send.
     if dry_run {
-        let body = build_normshares_body(&text, vis, image.as_ref().map(|_| "<image-urn>"));
+        // One placeholder urn per image so the dry-run body has the same
+        // shape (and array length) the real post would send.
+        let placeholders: Vec<String> = (0..images.len())
+            .map(|i| format!("<image-urn-{}>", i + 1))
+            .collect();
+        let refs: Vec<&str> = placeholders.iter().map(String::as_str).collect();
+        let body = build_normshares_body(&text, vis, &refs);
         println!(
-            "[linkedin post dry-run] visibility={visibility} image={}\n{}",
-            image.is_some(),
+            "[linkedin post dry-run] visibility={visibility} images={}\n{}",
+            images.len(),
             serde_json::to_string_pretty(&body)?
         );
         return Ok(());
@@ -8824,22 +8831,32 @@ async fn run_linkedin_post(
         .context("load linkedin auth from keychain or legacy file")?;
     let voyager = VoyagerClient::new(auth);
 
-    let image_bytes = match &image {
-        Some(p) => Some(
-            std::fs::read(p).with_context(|| format!("read image {}", p.display()))?,
-        ),
-        None => None,
-    };
-    let image_filename = image
-        .as_ref()
-        .and_then(|p| p.file_name().and_then(|n| n.to_str()));
+    // Read every image up front so a missing file fails before any network
+    // call — a partial upload leaves orphaned assets on LinkedIn's side.
+    let loaded: Vec<(Vec<u8>, Option<String>)> = images
+        .iter()
+        .map(|p| {
+            let bytes = std::fs::read(p)
+                .with_context(|| format!("read image {}", p.display()))?;
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string);
+            Ok::<_, anyhow::Error>((bytes, name))
+        })
+        .collect::<Result<_, _>>()?;
 
-    let draft = PostDraft {
+    let mut draft = PostDraft {
         text: &text,
-        image: image_bytes.as_deref(),
-        image_filename,
+        images: Vec::new(),
         visibility: vis,
     };
+    for (bytes, name) in &loaded {
+        draft.images.push(augmentagent_channel_linkedin::PostImage::new(
+            bytes.as_slice(),
+            name.as_deref(),
+        ));
+    }
 
     let log_id = uuid::Uuid::new_v4().to_string();
     match voyager.create_share(draft).await {
