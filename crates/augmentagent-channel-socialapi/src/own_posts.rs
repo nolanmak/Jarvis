@@ -83,6 +83,10 @@ pub struct SocialApiOwnPostCommentPayload {
     /// existed; the send then falls back to omitting it.
     #[serde(default)]
     pub account_id: String,
+    /// Underlying network the comment landed on ("instagram", "x", …).
+    /// Empty for payloads queued before this field existed.
+    #[serde(default)]
+    pub sub_platform: String,
 }
 
 /// Normalized comment webhook event body (#249) as persisted by the Express
@@ -101,6 +105,9 @@ struct CommentWebhookPayload {
     created_at: String,
     #[serde(default)]
     account_id: String,
+    /// Underlying network, when the push states it.
+    #[serde(default)]
+    sub_platform: String,
 }
 
 impl From<CommentWebhookPayload> for SocialApiOwnPostCommentPayload {
@@ -112,6 +119,7 @@ impl From<CommentWebhookPayload> for SocialApiOwnPostCommentPayload {
             text: w.text,
             created_at: w.created_at,
             account_id: w.account_id,
+            sub_platform: w.sub_platform,
         }
     }
 }
@@ -125,6 +133,13 @@ impl SocialApiOwnPostCommentPayload {
             text: c.text.clone(),
             created_at: c.created_at.clone(),
             account_id: post.account_id.clone(),
+            // The comment states its own network; fall back to the parent
+            // post's when it doesn't.
+            sub_platform: if c.platform.trim().is_empty() {
+                post.platform.clone()
+            } else {
+                c.platform.clone()
+            },
         }
     }
 
@@ -134,7 +149,13 @@ impl SocialApiOwnPostCommentPayload {
     /// later reply (issue #244) targets the right comment thread.
     fn into_email(self) -> Email {
         let from = format!("{} <socialapi:{}>", self.author, self.author);
-        let subject = format!("[Comment on your post by {}]", self.author);
+        // Same reasoning as the DM path: one key fronts several networks, so
+        // "[Comment on your post by jane]" left no way to tell whether a
+        // public reply was going to Instagram or LinkedIn.
+        let subject = match crate::inbound::platform_label(&self.sub_platform) {
+            Some(p) => format!("[{p} comment on your post by {}]", self.author),
+            None => format!("[Comment on your post by {}]", self.author),
+        };
         // The owning account rides on `account_entity_id` so the approve→send
         // path can pass it to the reply endpoint (#543). The bare platform
         // string is the legacy filler for payloads that predate the field.

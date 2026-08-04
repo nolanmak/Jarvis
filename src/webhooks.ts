@@ -457,6 +457,10 @@ function normalizeSocialApiEvent(ev: Record<string, unknown>): NormalizedWebhook
         // authoritative ownership signal; the handle comparison is the
         // fallback for pushes that don't carry it.
         outbound: isOutbound(ev),
+        // Which social network this actually came from. One SocialAPI.ai key
+        // fronts several connected accounts, so without this the approval
+        // card can only say "DM from jane" with no way to tell which inbox.
+        sub_platform: str(ev, "platform", "network", "provider"),
         text: str(ev, "text", "body", "message"),
         created_at: str(ev, "created_at", "timestamp", "ts"),
       },
@@ -474,6 +478,8 @@ function normalizeSocialApiEvent(ev: Record<string, unknown>): NormalizedWebhook
       type: "comment",
       id: commentId,
       post_id: postId,
+      // Which network the comment landed on — see the DM branch above.
+      sub_platform: str(ev, "platform", "network", "provider"),
       author: str(ev, "author", "from"),
       text: str(ev, "text", "body", "message"),
       created_at: str(ev, "created_at", "timestamp", "ts"),
