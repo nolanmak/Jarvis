@@ -27,7 +27,7 @@ pub mod types;
 pub use auth::{SocialApiAuth, AuthError, CONFIG_KEY, ENV_VAR, KEYCHAIN_PLATFORM};
 pub use client::{SocialApiClient, ClientError, DEFAULT_BASE_URL};
 pub use inbound::{
-    SocialApiDmChannel, SocialApiDmConfig, SocialApiDmPayload, SocialApiDmSource,
+    platform_label, SocialApiDmChannel, SocialApiDmConfig, SocialApiDmPayload, SocialApiDmSource,
     DEFAULT_DM_MAX_PER_TICK, DEFAULT_DM_POLL_SECS,
 };
 pub use own_posts::{

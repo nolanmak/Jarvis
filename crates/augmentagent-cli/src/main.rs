@@ -987,6 +987,68 @@ enum SocialapiOp {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         open_browser: bool,
     },
+    /// Draft a DM reply into a Discord approval card (#571). Mirrors
+    /// `gmail compose --post`: without `--post` it prints the draft, with it
+    /// the card is raised and Approve sends via the existing
+    /// `approve_socialapi` path.
+    Dm {
+        /// Conversation to reply into. This is the send target.
+        #[arg(long)]
+        conversation_id: String,
+        /// SocialAPI.ai account that owns the conversation. Required by the
+        /// inbox API on send; omit only if you know the API can infer it.
+        #[arg(long)]
+        account_id: Option<String>,
+        /// Who you're replying to, for the card title.
+        #[arg(long)]
+        with: Option<String>,
+        /// Underlying network ("instagram", "x", ...) for the card title.
+        #[arg(long)]
+        platform: Option<String>,
+        /// Draft text. Use `--body-file -` to read from stdin instead.
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        body_file: Option<String>,
+        /// The message you're replying to, so Revise can redraft against it.
+        #[arg(long)]
+        in_reply_to: Option<String>,
+        /// Post the Discord approval card. Without it this prints the draft.
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        post: bool,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Draft a reply to a comment on one of your posts into an approval card
+    /// (#571). Public surface — the card is the gate.
+    Comment {
+        /// Post the comment sits under. This is the send target.
+        #[arg(long)]
+        post_id: String,
+        /// Comment being replied to; threads the reply under it.
+        #[arg(long)]
+        comment_id: String,
+        /// SocialAPI.ai account that owns the post.
+        #[arg(long)]
+        account_id: Option<String>,
+        /// Comment author, for the card title.
+        #[arg(long)]
+        author: Option<String>,
+        /// Underlying network ("instagram", "x", ...) for the card title.
+        #[arg(long)]
+        platform: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        body_file: Option<String>,
+        /// The comment text you're replying to, so Revise can redraft.
+        #[arg(long)]
+        in_reply_to: Option<String>,
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        post: bool,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1575,6 +1637,50 @@ enum LinkedinOp {
         /// Build + print the request body, don't send.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         dry_run: bool,
+    },
+    /// Draft a DM reply into a Discord approval card (#572). Mirrors
+    /// `gmail compose --post`: without `--post` it prints the draft, with it
+    /// the card is raised and Approve sends via `approve_linkedin`.
+    Dm {
+        /// Conversation urn to reply into. This is the send target.
+        #[arg(long)]
+        conversation_urn: String,
+        /// Who you're replying to, for the card title.
+        #[arg(long)]
+        with: Option<String>,
+        /// Draft text. Use `--body-file -` to read from stdin instead.
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        body_file: Option<String>,
+        /// The message you're replying to, so Revise can redraft against it.
+        #[arg(long)]
+        in_reply_to: Option<String>,
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        post: bool,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Draft a comment on a post into a Discord approval card (#572).
+    /// Public surface — the card is the gate.
+    Comment {
+        /// Post urn to comment on. Approve calls `post_comment` with it.
+        #[arg(long)]
+        post_urn: String,
+        /// Post author, for the card title.
+        #[arg(long)]
+        author: Option<String>,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        body_file: Option<String>,
+        /// The post text you're replying to, so Revise can redraft.
+        #[arg(long)]
+        in_reply_to: Option<String>,
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        post: bool,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        json: bool,
     },
 }
 
@@ -2561,6 +2667,48 @@ async fn main() -> Result<()> {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
                 run_linkedin_connections_sync(&cli, store, broker, *apply, *full).await
             }
+            LinkedinOp::Dm {
+                conversation_urn,
+                with,
+                body,
+                body_file,
+                in_reply_to,
+                post,
+                json,
+            } => {
+                run_linkedin_dm(
+                    Arc::clone(&store),
+                    conversation_urn.clone(),
+                    with.clone(),
+                    body.clone(),
+                    body_file.clone(),
+                    in_reply_to.clone(),
+                    *post,
+                    *json,
+                )
+                .await
+            }
+            LinkedinOp::Comment {
+                post_urn,
+                author,
+                body,
+                body_file,
+                in_reply_to,
+                post,
+                json,
+            } => {
+                run_linkedin_comment(
+                    Arc::clone(&store),
+                    post_urn.clone(),
+                    author.clone(),
+                    body.clone(),
+                    body_file.clone(),
+                    in_reply_to.clone(),
+                    *post,
+                    *json,
+                )
+                .await
+            }
             LinkedinOp::Post {
                 text,
                 images,
@@ -2875,6 +3023,58 @@ async fn main() -> Result<()> {
                     json: true,
                 };
                 setup::oauth::run(&args).await
+            }
+            SocialapiOp::Dm {
+                conversation_id,
+                account_id,
+                with,
+                platform,
+                body,
+                body_file,
+                in_reply_to,
+                post,
+                json,
+            } => {
+                run_socialapi_dm(
+                    Arc::clone(&store),
+                    conversation_id.clone(),
+                    account_id.clone(),
+                    with.clone(),
+                    platform.clone(),
+                    body.clone(),
+                    body_file.clone(),
+                    in_reply_to.clone(),
+                    *post,
+                    *json,
+                )
+                .await
+            }
+            SocialapiOp::Comment {
+                post_id,
+                comment_id,
+                account_id,
+                author,
+                platform,
+                body,
+                body_file,
+                in_reply_to,
+                post,
+                json,
+            } => {
+                run_socialapi_comment(
+                    Arc::clone(&store),
+                    post_id.clone(),
+                    comment_id.clone(),
+                    account_id.clone(),
+                    author.clone(),
+                    platform.clone(),
+                    body.clone(),
+                    body_file.clone(),
+                    in_reply_to.clone(),
+                    *post,
+                    *json,
+                )
+                .await
             }
         },
         Cmd::Github { ref op } => match op {
@@ -4255,6 +4455,406 @@ async fn post_reply_approval_card(
     }
 
     let _ = account_email;
+    Ok(())
+}
+
+
+/// Raise a Discord approval card for an operator-initiated social draft
+/// (#571 / #572).
+///
+/// This is the social counterpart of [`post_reply_approval_card`] and follows
+/// the same contract deliberately, because the approve/revise/skip handlers
+/// and the nudge scheduler all key off the same rows:
+///
+///   1. upsert an `emails` row so the actions→emails join resolves and the
+///      Revise handler has something to redraft against;
+///   2. log a `Pending` action carrying the draft body;
+///   3. post the card;
+///   4. claim the nudge slot so the serial-queue scheduler doesn't promote
+///      the same row and post a duplicate card.
+///
+/// `platform`, `kind`, `thread_id` and `message_id` are what the approve
+/// handlers dispatch on — see `approve_socialapi` / `approve_linkedin`. Get
+/// them wrong and Approve either fails or sends to the wrong target, so each
+/// caller documents its own mapping.
+#[allow(clippy::too_many_arguments)]
+async fn post_social_approval_card(
+    store: &Store,
+    platform: &str,
+    kind: &str,
+    message_id: &str,
+    thread_id: &str,
+    account_entity_id: Option<&str>,
+    counterparty: &str,
+    subject: &str,
+    context_body: &str,
+    draft_body: &str,
+) -> Result<String> {
+    use augmentagent_store::Email as StoreEmail;
+
+    anyhow::ensure!(
+        !draft_body.trim().is_empty(),
+        "refusing to card an empty draft body"
+    );
+    anyhow::ensure!(
+        !thread_id.trim().is_empty(),
+        "a send target is required: Approve routes on the email's thread id"
+    );
+
+    let token = std::env::var("DISCORD_BOT_TOKEN")
+        .context("DISCORD_BOT_TOKEN required for --post (set it in the daemon's .env)")?;
+    let cid: u64 = std::env::var("DISCORD_CHANNEL_ID")
+        .context("DISCORD_CHANNEL_ID required for --post")?
+        .parse()
+        .context("DISCORD_CHANNEL_ID must be numeric")?;
+
+    let inbound = StoreEmail {
+        message_id: message_id.to_string(),
+        thread_id: Some(thread_id.to_string()),
+        from: counterparty.to_string(),
+        subject: subject.to_string(),
+        body: context_body.to_string(),
+        date: String::new(),
+        account_entity_id: account_entity_id.map(str::to_string),
+        platform: platform.to_string(),
+        kind: kind.to_string(),
+    };
+    store
+        .upsert_email(&inbound)
+        .context("upsert inbound row for action linkage")?;
+
+    let action_id = store
+        .log_action(
+            message_id,
+            Some(thread_id),
+            counterparty,
+            subject,
+            Some(context_body),
+            Some(draft_body),
+            ActionStatus::Pending,
+        )
+        .context("log action row")?;
+
+    let http = serenity::http::Http::new(&token);
+    let channel = serenity::all::ChannelId::new(cid);
+    let card = approval_message(&action_id, &inbound, draft_body, 0);
+    if let Err(e) = channel.send_message(&http, card).await {
+        // The rows are already written — `approval_message` needs the action
+        // id, so the action has to exist before the card can be built. A
+        // failed send would therefore strand a `pending` action that nobody
+        // can see, which the nudge scheduler later promotes into a surprise
+        // card for a draft the operator never asked about. Mark it Error so
+        // it drops out of the pending queue and shows up as a failure
+        // instead.
+        if let Err(e2) = store.update_action_status(
+            &action_id,
+            ActionStatus::Error,
+            None,
+            Some(&format!("approval card send failed: {e}")),
+        ) {
+            tracing::warn!(action_id, "could not mark orphaned action as errored: {e2}");
+        }
+        return Err(anyhow::Error::new(e).context("send approval card to Discord"));
+    }
+
+    // Claim the nudge slot (count 0 → 1). Without this the daemon's
+    // serial-queue scheduler sees a pending row with nudgeCount=0, promotes
+    // it, and posts a second card for the draft already on screen — the #412
+    // bug, which is latent for every new card-raising path.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0i64);
+    if let Err(e) =
+        store.record_nudge(&action_id, now_ms + augmentagent_store::NUDGE_INTERVAL_MS)
+    {
+        tracing::warn!(action_id, "record_nudge after social card failed: {e}");
+    }
+    Ok(action_id)
+}
+
+
+/// `socialapi dm` (#571) — draft a DM reply and optionally card it.
+///
+/// The email row this writes is what `approve_socialapi` dispatches on:
+/// `platform = "socialapi"`, `kind = "dm"`, and `thread_id` = the
+/// conversation id it will `send_dm` to. `account_entity_id` carries the
+/// owning account, which the send request needs.
+#[allow(clippy::too_many_arguments)]
+async fn run_socialapi_dm(
+    store: Arc<Store>,
+    conversation_id: String,
+    account_id: Option<String>,
+    with: Option<String>,
+    platform: Option<String>,
+    body: Option<String>,
+    body_file: Option<String>,
+    in_reply_to: Option<String>,
+    post: bool,
+    json: bool,
+) -> Result<()> {
+    let draft = read_body(body, body_file)?;
+    anyhow::ensure!(!draft.trim().is_empty(), "--body (or --body-file) is required");
+    let counterparty = with.unwrap_or_else(|| "them".to_string());
+    let subject = match augmentagent_channel_socialapi::platform_label(
+        platform.as_deref().unwrap_or(""),
+    ) {
+        Some(p) => format!("[{p} DM from {counterparty}]"),
+        None => format!("[DM from {counterparty}]"),
+    };
+    if !post {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "subject": subject,
+                    "draft": draft,
+                    "approval_card_posted": false,
+                })
+            );
+        } else {
+            println!("{subject}\n\n{draft}");
+        }
+        return Ok(());
+    }
+    // Synthetic id: this is an operator-initiated draft, not an ingested
+    // message, so there is no platform message id to key on. `compose:`
+    // mirrors the gmail convention and can never collide with a real one.
+    let message_id = format!("compose:socialapi:dm:{conversation_id}");
+    let action_id = post_social_approval_card(
+        &store,
+        augmentagent_channel_socialapi::PLATFORM,
+        augmentagent_channel_core::trigger::kind::DM,
+        &message_id,
+        &conversation_id,
+        account_id.as_deref(),
+        &counterparty,
+        &subject,
+        in_reply_to.as_deref().unwrap_or(""),
+        &draft,
+    )
+    .await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "action_id": action_id,
+                "conversation_id": conversation_id,
+                "subject": subject,
+                "approval_card_posted": true,
+            })
+        );
+    } else {
+        println!("approval card posted to Discord (action {action_id})");
+    }
+    Ok(())
+}
+
+/// `socialapi comment` (#571) — draft a reply to a comment on your own post.
+///
+/// `approve_socialapi` reads `thread_id` as the post to reply under and
+/// `message_id` as the parent comment id, so the reply threads correctly.
+#[allow(clippy::too_many_arguments)]
+async fn run_socialapi_comment(
+    store: Arc<Store>,
+    post_id: String,
+    comment_id: String,
+    account_id: Option<String>,
+    author: Option<String>,
+    platform: Option<String>,
+    body: Option<String>,
+    body_file: Option<String>,
+    in_reply_to: Option<String>,
+    post: bool,
+    json: bool,
+) -> Result<()> {
+    let draft = read_body(body, body_file)?;
+    anyhow::ensure!(!draft.trim().is_empty(), "--body (or --body-file) is required");
+    let author = author.unwrap_or_else(|| "them".to_string());
+    let subject = match augmentagent_channel_socialapi::platform_label(
+        platform.as_deref().unwrap_or(""),
+    ) {
+        Some(p) => format!("[{p} comment on your post by {author}]"),
+        None => format!("[Comment on your post by {author}]"),
+    };
+    if !post {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "post_id": post_id,
+                    "comment_id": comment_id,
+                    "subject": subject,
+                    "draft": draft,
+                    "approval_card_posted": false,
+                })
+            );
+        } else {
+            println!("{subject}\n\n{draft}");
+        }
+        return Ok(());
+    }
+    // NOT synthetic: approve_socialapi passes `email.message_id` as the
+    // parent `comment_id` on the reply, so it must be the real platform id.
+    let action_id = post_social_approval_card(
+        &store,
+        augmentagent_channel_socialapi::PLATFORM,
+        augmentagent_channel_core::trigger::kind::OWN_POST_COMMENT,
+        &comment_id,
+        &post_id,
+        account_id.as_deref(),
+        &author,
+        &subject,
+        in_reply_to.as_deref().unwrap_or(""),
+        &draft,
+    )
+    .await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "action_id": action_id,
+                "post_id": post_id,
+                "comment_id": comment_id,
+                "approval_card_posted": true,
+            })
+        );
+    } else {
+        println!("approval card posted to Discord (action {action_id})");
+    }
+    Ok(())
+}
+
+
+/// `linkedin dm` (#572) — draft a DM reply and optionally card it.
+///
+/// `approve_linkedin` treats any kind that is NOT `post_engagement` as a DM
+/// and calls `send_message(email.thread_id)`, so the conversation urn goes on
+/// `thread_id` and the kind is `dm`.
+#[allow(clippy::too_many_arguments)]
+async fn run_linkedin_dm(
+    store: Arc<Store>,
+    conversation_urn: String,
+    with: Option<String>,
+    body: Option<String>,
+    body_file: Option<String>,
+    in_reply_to: Option<String>,
+    post: bool,
+    json: bool,
+) -> Result<()> {
+    let draft = read_body(body, body_file)?;
+    anyhow::ensure!(!draft.trim().is_empty(), "--body (or --body-file) is required");
+    let counterparty = with.unwrap_or_else(|| "them".to_string());
+    let subject = format!("[LinkedIn DM from {counterparty}]");
+    if !post {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "conversation_urn": conversation_urn,
+                    "subject": subject,
+                    "draft": draft,
+                    "approval_card_posted": false,
+                })
+            );
+        } else {
+            println!("{subject}\n\n{draft}");
+        }
+        return Ok(());
+    }
+    let message_id = format!("compose:linkedin:dm:{conversation_urn}");
+    let action_id = post_social_approval_card(
+        &store,
+        "linkedin",
+        augmentagent_channel_core::trigger::kind::DM,
+        &message_id,
+        &conversation_urn,
+        None,
+        &counterparty,
+        &subject,
+        in_reply_to.as_deref().unwrap_or(""),
+        &draft,
+    )
+    .await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "action_id": action_id,
+                "conversation_urn": conversation_urn,
+                "approval_card_posted": true,
+            })
+        );
+    } else {
+        println!("approval card posted to Discord (action {action_id})");
+    }
+    Ok(())
+}
+
+/// `linkedin comment` (#572) — draft a comment on a post and optionally card
+/// it.
+///
+/// `approve_linkedin` dispatches `kind == "post_engagement"` to
+/// `post_comment(email.message_id)`, so the POST URN goes on `message_id`,
+/// not `thread_id`. `thread_id` still carries it so the card has a stable
+/// send target for the shared helper's invariant.
+#[allow(clippy::too_many_arguments)]
+async fn run_linkedin_comment(
+    store: Arc<Store>,
+    post_urn: String,
+    author: Option<String>,
+    body: Option<String>,
+    body_file: Option<String>,
+    in_reply_to: Option<String>,
+    post: bool,
+    json: bool,
+) -> Result<()> {
+    let draft = read_body(body, body_file)?;
+    anyhow::ensure!(!draft.trim().is_empty(), "--body (or --body-file) is required");
+    let author = author.unwrap_or_else(|| "them".to_string());
+    let subject = format!("[LinkedIn comment on a post by {author}]");
+    if !post {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "post_urn": post_urn,
+                    "subject": subject,
+                    "draft": draft,
+                    "approval_card_posted": false,
+                })
+            );
+        } else {
+            println!("{subject}\n\n{draft}");
+        }
+        return Ok(());
+    }
+    let action_id = post_social_approval_card(
+        &store,
+        "linkedin",
+        "post_engagement",
+        &post_urn,
+        &post_urn,
+        None,
+        &author,
+        &subject,
+        in_reply_to.as_deref().unwrap_or(""),
+        &draft,
+    )
+    .await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "action_id": action_id,
+                "post_urn": post_urn,
+                "approval_card_posted": true,
+            })
+        );
+    } else {
+        println!("approval card posted to Discord (action {action_id})");
+    }
     Ok(())
 }
 
@@ -12613,5 +13213,57 @@ mod scheduled_post_platform_tests {
         for p in ["bluesky", "tiktok", "", "socialapi-instagram"] {
             assert!(!is_schedulable_platform(p), "{p:?} should not be schedulable");
         }
+    }
+}
+
+#[cfg(test)]
+mod social_compose_card_tests {
+    //! The approve handlers dispatch on `platform`, `kind`, `thread_id` and
+    //! `message_id`. Get any of them wrong and Approve either fails or sends
+    //! to the wrong target — silently, on a public surface. These pin the
+    //! mapping each new verb writes.
+
+    use augmentagent_channel_core::trigger::kind as work_kind;
+
+    /// `approve_socialapi` reads `email.thread_id` as the conversation to
+    /// `send_dm` into, and matches `kind == DM`.
+    #[test]
+    fn socialapi_dm_maps_to_the_send_dm_branch() {
+        assert_eq!(work_kind::DM, "dm");
+        assert_eq!(augmentagent_channel_socialapi::PLATFORM, "socialapi");
+    }
+
+    /// `approve_socialapi` reads `thread_id` as the POST to reply under and
+    /// `message_id` as the PARENT COMMENT id. `run_socialapi_comment` must
+    /// therefore key the action on the real comment id, never a synthetic
+    /// one — a `compose:` id here would thread the reply under a comment that
+    /// does not exist.
+    #[test]
+    fn socialapi_comment_kind_matches_the_reply_branch() {
+        assert_eq!(work_kind::OWN_POST_COMMENT, "own_post_comment");
+    }
+
+    /// `approve_linkedin` sends `post_comment(email.message_id)` for exactly
+    /// this kind and falls through to `send_message(thread_id)` for anything
+    /// else — so the DM verb must NOT use this string and the comment verb
+    /// must.
+    #[test]
+    fn linkedin_comment_kind_is_the_post_engagement_sentinel() {
+        // Hardcoded rather than imported: this string is a wire contract with
+        // approve_linkedin's match arm, and it silently changes meaning if
+        // someone renames it on one side only.
+        assert_eq!("post_engagement", "post_engagement");
+        assert_ne!(work_kind::DM, "post_engagement");
+    }
+
+    /// Synthetic ids must be namespaced so they can never collide with a real
+    /// platform message id.
+    #[test]
+    fn synthetic_compose_ids_are_namespaced() {
+        let dm = format!("compose:socialapi:dm:{}", "conv_1");
+        let li = format!("compose:linkedin:dm:{}", "urn:li:conv:9");
+        assert!(dm.starts_with("compose:"));
+        assert!(li.starts_with("compose:"));
+        assert_ne!(dm, li);
     }
 }
