@@ -8642,11 +8642,33 @@ impl augmentagent_channel_core::PostPublisher for MultiPlatformPublisher {
                     .strip_prefix("socialapi:")
                     .unwrap_or("")
                     .to_string();
-                let media = post
+                // `media_paths` holds LOCAL FILE PATHS (see
+                // `ScheduledPost::media_paths`); `media_ids` wants opaque ids
+                // minted by an upload handshake. Those are not the same thing,
+                // and there is currently NO upload endpoint on the client —
+                // #544 removed the speculative one when the live API was
+                // modelled, and nothing replaced it.
+                //
+                // Passing paths through as ids is worse than useless: a
+                // wrong-shape media array is ignored by the API, so the post
+                // publishes text-only and returns 2xx. The caption ships
+                // without its image and the daemon reports success. Refuse
+                // instead, loudly, until a real upload path exists.
+                if post
                     .media_paths
                     .as_deref()
                     .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
-                    .filter(|v| !v.is_empty());
+                    .is_some_and(|v| !v.is_empty())
+                {
+                    return PublishOutcome::Failed {
+                        message: "socialapi: this post has media attached, but \
+                                  SocialAPI.ai media upload is not implemented \
+                                  (no upload endpoint on the client). Publishing \
+                                  would have silently dropped the media and \
+                                  posted text only — refusing instead."
+                            .to_string(),
+                    };
+                }
                 let client = SocialApiClient::new(auth);
                 let req = CreatePostRequest {
                     // Wire field is `text` (#543). The scheduler already held
@@ -8656,7 +8678,9 @@ impl augmentagent_channel_core::PostPublisher for MultiPlatformPublisher {
                         account_id,
                         platform: target_platform,
                     }],
-                    media_ids: media,
+                    // Always None until an upload handshake exists; the
+                    // guard above rejects any row that wanted media.
+                    media_ids: None,
                     publish_now: Some(true),
                     scheduled_at: None,
                 };
