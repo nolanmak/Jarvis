@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use augmentagent_browser_client::{BrowserClient, BrowserError};
+use augmentagent_channel_core::governor::{ActionKind, ActionRequest, Denial, Outcome, Permit, Risk};
 use augmentagent_channel_core::{Platform, RateGovernor};
 use thiserror::Error;
 use tracing::{error, info, warn};
@@ -75,7 +76,15 @@ pub enum ComposerError {
     Browser(#[from] BrowserError),
     #[error("share blocked: not approved")]
     NotApproved,
+    #[error("a compose is already in flight; share or abandon it first")]
+    ComposeInFlight,
+    #[error("governor denied the post: {0}")]
+    Denied(String),
 }
+
+/// Account id used for governor bookkeeping. The composer drives the single
+/// logged-in browser session, so there is exactly one.
+pub const REAL_ACCOUNT_ID: &str = "instagram:self";
 
 /// True iff live posting is enabled. Default-deny: anything other than the
 /// exact string `true` keeps the channel in safe mode.
@@ -93,6 +102,17 @@ pub struct Composer {
     governor: Arc<dyn RateGovernor>,
     /// Per-run daily-quota override (clamped to [`HARD_DAILY_POST_QUOTA`]).
     daily_quota: u32,
+    /// Permit reserved by [`Composer::precheck`] and consumed by
+    /// [`Composer::share`]. A composer drives one browser session and one
+    /// post at a time, so a single slot is sufficient.
+    ///
+    /// This exists because the quota gate used to be a no-op: `posts_today()`
+    /// returned a hardcoded `0`, so `used >= daily_quota` was never true and
+    /// `QuotaExhausted` was unreachable. The code's own comment claimed "the
+    /// governor's permit() math already enforces the day cap ... via
+    /// permit/record" — but the composer never called either. Now it does,
+    /// and the governor is genuinely the source of truth.
+    pending_permit: tokio::sync::Mutex<Option<Permit>>,
 }
 
 /// Which media surface a post targets. Drives the entry-point choice in the
@@ -174,6 +194,7 @@ impl Composer {
             client,
             governor,
             daily_quota: daily_quota.min(HARD_DAILY_POST_QUOTA).max(1),
+            pending_permit: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -190,6 +211,7 @@ impl Composer {
             client,
             governor,
             daily_quota: daily_quota.min(HARD_DAILY_POST_QUOTA).max(1),
+            pending_permit: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -360,21 +382,75 @@ impl Composer {
         }
     }
 
-    /// Shared pre-compose gate: halt check + hard daily quota. Returns the
-    /// typed error the caller surfaces; never partially composes on failure.
+    /// Shared pre-compose gate: halt check, then RESERVE a governor permit.
+    /// Returns the typed error the caller surfaces; never partially composes
+    /// on failure.
+    ///
+    /// The permit is the real quota gate. It is held until [`Composer::share`]
+    /// records an outcome — or until [`Composer::abandon`] refunds it, which
+    /// the caller must do if the operator rejects the approval card, otherwise
+    /// the reservation leaks and eats the day's quota for a post that never
+    /// happened.
     async fn precheck(&self) -> Result<(), ComposerError> {
         if let Some(halt_until) = self.governor.is_halted(Platform::Instagram).await {
             warn!(halt_until, "instagram halted; refusing to compose");
             return Err(ComposerError::FailureDetected(FailureKind::ActionBlocked));
         }
-        let used = self.posts_today().await;
-        if used >= self.daily_quota {
+        // A permit already in flight means a previous compose never reached
+        // share() or abandon(). Refuse rather than silently stacking posts.
+        {
+            let held = self.pending_permit.lock().await;
+            if held.is_some() {
+                warn!("instagram compose already in flight; refusing to start another");
+                return Err(ComposerError::ComposeInFlight);
+            }
+        }
+        let req = ActionRequest {
+            platform: Platform::Instagram,
+            action: ActionKind::Post,
+            account_id: REAL_ACCOUNT_ID.to_string(),
+            risk: Risk::High,
+            cause: "instagram composer".to_string(),
+            target_id: None,
+            target_attrs: None,
+        };
+        let permit = match self.governor.permit(req).await {
+            Ok(p) => p,
+            Err(Denial::DailyCap { used, cap, .. })
+            | Err(Denial::HourlyCap { used, cap, .. }) => {
+                return Err(ComposerError::QuotaExhausted { used, quota: cap })
+            }
+            Err(other) => {
+                warn!("instagram compose denied by governor: {other}");
+                return Err(ComposerError::Denied(other.to_string()));
+            }
+        };
+        // Belt on top of the governor's braces: the composer's own clamped
+        // per-run ceiling still applies, so an operator lowering
+        // AUGMENTAGENT_INSTAGRAM_DAILY_POSTS takes effect immediately even if
+        // the governor's cap matrix is looser.
+        if self.daily_quota == 0 {
+            let _ = self.governor.record(permit, Outcome::RolledBack).await;
             return Err(ComposerError::QuotaExhausted {
-                used,
-                quota: self.daily_quota,
+                used: 0,
+                quota: 0,
             });
         }
+        *self.pending_permit.lock().await = Some(permit);
         Ok(())
+    }
+
+    /// Refund the reserved permit without posting. MUST be called when the
+    /// operator rejects the approval card, or the reservation leaks and
+    /// consumes quota for a post that never went out.
+    pub async fn abandon(&self) {
+        if let Some(permit) = self.pending_permit.lock().await.take() {
+            if let Err(e) = self.governor.record(permit, Outcome::RolledBack).await {
+                warn!("instagram: failed to refund abandoned permit: {e}");
+            } else {
+                info!("instagram compose abandoned; quota refunded");
+            }
+        }
     }
 
     /// Compose a **carousel** (2..=20 images) up to (but NOT including) the
@@ -582,12 +658,26 @@ impl Composer {
     /// the feed "Share" button, then verifies the dialog detached.
     pub async fn share_story(&self, approved: bool) -> Result<(), ComposerError> {
         if !approved {
+            self.abandon().await;
             return Err(ComposerError::NotApproved);
         }
-        self.detect_and_halt().await?;
-        let cta = self.resolve(&STORY_SHARE_BUTTON, "story_share_button").await?;
-        self.client.click(&cta).await?;
+        if let Err(e) = self.detect_and_halt().await {
+            self.settle(Outcome::Suspicion).await;
+            return Err(e);
+        }
+        let cta = match self.resolve(&STORY_SHARE_BUTTON, "story_share_button").await {
+            Ok(c) => c,
+            Err(e) => {
+                self.settle(Outcome::RolledBack).await;
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.client.click(&cta).await {
+            self.settle(Outcome::Failed).await;
+            return Err(e.into());
+        }
         self.confirm_detached().await;
+        self.settle(Outcome::Ok).await;
         info!("instagram story shared (approved)");
         Ok(())
     }
@@ -615,34 +705,55 @@ impl Composer {
     /// ONLY after the user clicks Approve on the Discord card. `approved`
     /// is the explicit gate — passing `false` is a hard refusal so a wiring
     /// mistake can't auto-post.
+    /// Consume the reserved permit and tell the governor what happened.
+    /// Without this the reservation never lands in `rate_events`, so the day
+    /// cap resets on every restart and the quota gate is decorative.
+    async fn settle(&self, outcome: Outcome) {
+        if let Some(permit) = self.pending_permit.lock().await.take() {
+            if let Err(e) = self.governor.record(permit, outcome).await {
+                error!("instagram: failed to record permit outcome {outcome:?}: {e}");
+            }
+        } else {
+            warn!("instagram: share completed with no reserved permit (compose skipped precheck?)");
+        }
+    }
+
     pub async fn share(&self, approved: bool) -> Result<(), ComposerError> {
         if !approved {
+            // Rejected at the card: refund, don't charge quota for a post
+            // that never went out.
+            self.abandon().await;
             return Err(ComposerError::NotApproved);
         }
         // Re-check the failure detector immediately before the irreversible
         // click — a challenge could have appeared while the card sat pending.
-        self.detect_and_halt().await?;
-        let share = self.resolve(&SHARE_BUTTON, "share_button").await?;
-        self.client.click(&share).await?;
+        if let Err(e) = self.detect_and_halt().await {
+            // A challenge is a suspicion signal, not a spent post: it trips
+            // the circuit breaker rather than burning the day's quota.
+            self.settle(Outcome::Suspicion).await;
+            return Err(e);
+        }
+        let share = match self.resolve(&SHARE_BUTTON, "share_button").await {
+            Ok(s) => s,
+            Err(e) => {
+                self.settle(Outcome::RolledBack).await;
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.client.click(&share).await {
+            // The click is the irreversible boundary. A transport error here
+            // may or may not have posted, so charge it rather than refund —
+            // over-counting is the safe direction against a ban.
+            self.settle(Outcome::Failed).await;
+            return Err(e.into());
+        }
         // Idempotent confirmation only — never re-click Share (#76 §2.7).
         self.confirm_detached().await;
+        self.settle(Outcome::Ok).await;
         info!("instagram post shared (approved)");
         Ok(())
     }
 
-    /// Posts already made in the trailing 24h window, read from the governor's
-    /// persisted `rate_events`. Used for the hard quota gate so it survives a
-    /// daemon restart.
-    async fn posts_today(&self) -> u32 {
-        // We don't have a direct count API on the trait; the governor's
-        // permit() math already enforces the day cap. This is a belt: we
-        // treat a halted channel as "quota irrelevant" and otherwise trust
-        // the governor's permit path called by the caller. Returning 0 here
-        // means the hard ceiling is enforced by `daily_quota` vs. the
-        // caller's own per-run counter; the governor remains the durable
-        // source of truth via permit/record.
-        0
-    }
 }
 
 /// A helper the CLI/channel uses to decide whether to even attempt browser
@@ -910,13 +1021,26 @@ mod mock_sidecar_tests {
     struct TestGov {
         halted: AtomicBool,
         recorded_halts: Mutex<Vec<(String, i64)>>,
+        /// When true, `permit` denies with a DailyCap — the real governor's
+        /// behavior once the day's posts are spent.
+        deny_daily: AtomicBool,
+        /// Every (permit id, outcome) the composer settled, so tests can
+        /// assert the quota is actually charged or refunded.
+        settled: Mutex<Vec<Outcome>>,
+        permits_issued: AtomicBool,
     }
     impl TestGov {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 halted: AtomicBool::new(false),
                 recorded_halts: Mutex::new(Vec::new()),
+                deny_daily: AtomicBool::new(false),
+                settled: Mutex::new(Vec::new()),
+                permits_issued: AtomicBool::new(false),
             })
+        }
+        fn outcomes(&self) -> Vec<Outcome> {
+            self.settled.lock().unwrap().clone()
         }
     }
     #[async_trait]
@@ -925,6 +1049,15 @@ mod mock_sidecar_tests {
             &self,
             req: ActionRequest,
         ) -> Result<Permit, Denial> {
+            if self.deny_daily.load(Ordering::SeqCst) {
+                return Err(Denial::DailyCap {
+                    platform: req.platform,
+                    action: req.action,
+                    used: 2,
+                    cap: 2,
+                });
+            }
+            self.permits_issued.store(true, Ordering::SeqCst);
             Ok(Permit {
                 id: uuid::Uuid::new_v4(),
                 req,
@@ -934,8 +1067,9 @@ mod mock_sidecar_tests {
         async fn record(
             &self,
             _: Permit,
-            _: Outcome,
+            outcome: Outcome,
         ) -> anyhow::Result<()> {
+            self.settled.lock().unwrap().push(outcome);
             Ok(())
         }
         async fn record_halt(
@@ -1370,5 +1504,88 @@ mod mock_sidecar_tests {
         // staged a file against an unresolved UI.
         assert!(log.contains("navigate"));
         assert!(!log.contains("set_input_files"));
+    }
+
+    // --- #-safety: the quota gate must actually be a gate ---
+
+    /// Before this fix `posts_today()` returned a hardcoded 0, so
+    /// `used >= daily_quota` was never true and `QuotaExhausted` was
+    /// unreachable. The composer now asks the governor, so a denial is real.
+    #[tokio::test]
+    async fn compose_is_refused_when_the_governor_denies_the_daily_cap() {
+        let (composer, log, gov, dir) = harness(no_handlers()).await;
+        gov.deny_daily.store(true, Ordering::SeqCst);
+        let img = touch(dir.path(), "a.png");
+        let err = composer
+            .compose_image_post(&img, "caption")
+            .await
+            .expect_err("must refuse when the governor denies");
+        assert!(
+            matches!(err, ComposerError::QuotaExhausted { .. }),
+            "expected QuotaExhausted, got {err:?}"
+        );
+        // And it refused BEFORE driving the browser.
+        assert!(
+            log.ops().is_empty(),
+            "quota denial must cost zero browser ops, got {:?}",
+            log.ops()
+        );
+    }
+
+    /// A rejected approval card must REFUND the reservation. Otherwise the
+    /// day's quota is spent on a post that never went out.
+    #[tokio::test]
+    async fn rejecting_the_card_refunds_the_permit() {
+        let (composer, _log, gov, dir) = harness(no_handlers()).await;
+        let img = touch(dir.path(), "a.png");
+        let _ = composer.compose_image_post(&img, "c").await;
+        let err = composer.share(false).await.expect_err("not approved");
+        assert!(matches!(err, ComposerError::NotApproved));
+        assert_eq!(
+            gov.outcomes(),
+            vec![Outcome::RolledBack],
+            "a rejected card must refund, not charge"
+        );
+    }
+
+    /// Two composes without an intervening share/abandon must not stack —
+    /// that would hold two reservations and post twice off one approval.
+    #[tokio::test]
+    async fn second_compose_while_one_is_in_flight_is_refused() {
+        let (composer, _log, _gov, dir) = harness(no_handlers()).await;
+        let img = touch(dir.path(), "a.png");
+        let _ = composer.compose_image_post(&img, "first").await;
+        let err = composer
+            .compose_image_post(&img, "second")
+            .await
+            .expect_err("must refuse a concurrent compose");
+        assert!(
+            matches!(err, ComposerError::ComposeInFlight),
+            "expected ComposeInFlight, got {err:?}"
+        );
+    }
+
+    /// `abandon` releases the slot so a later compose can proceed.
+    #[tokio::test]
+    async fn abandon_refunds_and_frees_the_slot() {
+        let (composer, _log, gov, dir) = harness(no_handlers()).await;
+        let img = touch(dir.path(), "a.png");
+        let _ = composer.compose_image_post(&img, "first").await;
+        composer.abandon().await;
+        assert_eq!(gov.outcomes(), vec![Outcome::RolledBack]);
+        // Slot is free: this must NOT be ComposeInFlight.
+        let err = composer.compose_image_post(&img, "second").await;
+        assert!(
+            !matches!(err, Err(ComposerError::ComposeInFlight)),
+            "abandon must free the in-flight slot"
+        );
+    }
+
+    /// abandon() with nothing reserved is a no-op, not a spurious refund.
+    #[tokio::test]
+    async fn abandon_without_a_permit_is_a_noop() {
+        let (composer, _log, gov, _dir) = harness(no_handlers()).await;
+        composer.abandon().await;
+        assert!(gov.outcomes().is_empty());
     }
 }
