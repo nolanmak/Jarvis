@@ -9217,8 +9217,49 @@ impl augmentagent_channel_core::PostPublisher for MultiPlatformPublisher {
                 if self.dry_run {
                     return PublishOutcome::DryRun;
                 }
+                // #551 — honor `media_paths`. This arm used to call
+                // `PostDraft::text` unconditionally, so `linkedin post
+                // --image` attached an image but the SAME post scheduled
+                // published text-only, silently and with a success status.
+                let paths: Vec<String> = post
+                    .media_paths
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                    .unwrap_or_default();
+                // Read every file BEFORE the first register call, so a
+                // missing path fails the row cleanly instead of stranding
+                // half-uploaded assets on LinkedIn's side.
+                let mut loaded: Vec<(Vec<u8>, Option<String>)> = Vec::with_capacity(paths.len());
+                for path in &paths {
+                    let p = std::path::Path::new(path);
+                    match std::fs::read(p) {
+                        Ok(bytes) => {
+                            let name = p
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(str::to_string);
+                            loaded.push((bytes, name));
+                        }
+                        Err(e) => {
+                            // Do NOT silently fall back to a text-only post:
+                            // that is the bug this fixes. The row fails and
+                            // the operator sees why.
+                            return PublishOutcome::Failed {
+                                message: format!(
+                                    "linkedin: scheduled post attaches {path}, \
+                                     which could not be read at fire time ({e}). \
+                                     Media paths are resolved on the daemon host, \
+                                     not the machine that queued the post."
+                                ),
+                            };
+                        }
+                    }
+                }
                 let voyager = VoyagerClient::new(auth);
-                let draft = PostDraft::text(&post.body);
+                let mut draft = PostDraft::text(&post.body);
+                for (bytes, name) in &loaded {
+                    draft = draft.with_image(bytes.as_slice(), name.as_deref());
+                }
                 match voyager.create_share(draft).await {
                     Ok(urn) => PublishOutcome::Posted { external_id: urn.0 },
                     Err(e) => PublishOutcome::Failed {
@@ -9227,6 +9268,25 @@ impl augmentagent_channel_core::PostPublisher for MultiPlatformPublisher {
                 }
             }
             "twitter" | "x" => {
+                // #551 — X cannot carry media at all: CreateTweetClient
+                // rejects a non-empty media list outright (media upload is
+                // deferred until the base path is validated live, #552).
+                // Publishing text-only would drop the attachment silently
+                // and report success, so fail the row instead.
+                if post
+                    .media_paths
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                    .is_some_and(|v| !v.is_empty())
+                {
+                    return PublishOutcome::Failed {
+                        message: "twitter: this post has media attached, but X media \
+                                  upload is not implemented (see #552). Publishing \
+                                  would have dropped the media and posted text only \
+                                  — refusing instead."
+                            .to_string(),
+                    };
+                }
                 let auth = match TwitterAuth::load_with_migration(&self.repo_root) {
                     Ok(a) => a,
                     Err(e) => {
