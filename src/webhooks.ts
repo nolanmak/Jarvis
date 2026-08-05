@@ -461,6 +461,10 @@ function normalizeSocialApiEvent(ev: Record<string, unknown>): NormalizedWebhook
         // fronts several connected accounts, so without this the approval
         // card can only say "DM from jane" with no way to tell which inbox.
         sub_platform: str(ev, "platform", "network", "provider"),
+        // #573: a shared Reel/post arrives as media with no text. Without
+        // this the card shows an empty message and the draft says "you sent
+        // nothing".
+        attachment_url: str(ev, "attachment_url", "media_url", "attachment"),
         text: str(ev, "text", "body", "message"),
         created_at: str(ev, "created_at", "timestamp", "ts"),
       },
