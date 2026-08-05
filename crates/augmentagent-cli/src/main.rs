@@ -1638,6 +1638,20 @@ enum LinkedinOp {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         dry_run: bool,
     },
+    /// List recent LinkedIn DM threads with their conversation urns.
+    ///
+    /// Read-only. Exists because `linkedin dm --conversation-urn` needs an id
+    /// the agent otherwise has no way to obtain: a DM that arrived only as a
+    /// notification stub was never ingested, so it has no `thread_id` in the
+    /// store to look up. Gmail has `gmail search` for exactly this; LinkedIn
+    /// had nothing.
+    RecentDms {
+        /// Cap the number of threads listed.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        json: bool,
+    },
     /// Draft a DM reply into a Discord approval card (#572). Mirrors
     /// `gmail compose --post`: without `--post` it prints the draft, with it
     /// the card is raised and Approve sends via `approve_linkedin`.
@@ -2666,6 +2680,11 @@ async fn main() -> Result<()> {
             LinkedinOp::ConnectionsSync { apply, full } => {
                 let (broker, _) = build_broker(&cli, Arc::clone(&store), !apply).await?;
                 run_linkedin_connections_sync(&cli, store, broker, *apply, *full).await
+            }
+            LinkedinOp::RecentDms { limit, json } => {
+                let repo_root =
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                run_linkedin_recent_dms(repo_root, *limit, *json).await
             }
             LinkedinOp::Dm {
                 conversation_urn,
@@ -4854,6 +4873,58 @@ async fn run_linkedin_comment(
         );
     } else {
         println!("approval card posted to Discord (action {action_id})");
+    }
+    Ok(())
+}
+
+
+/// `linkedin recent-dms` — list recent DM threads and their conversation urns.
+///
+/// Read-only: one Voyager GET, no writes, nothing sent. Its whole purpose is
+/// to hand the agent the `--conversation-urn` that `linkedin dm` requires.
+async fn run_linkedin_recent_dms(
+    repo_root: PathBuf,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let auth = LinkedInAuth::load_with_migration(&repo_root)
+        .context("load linkedin auth (run `linkedin login`)")?;
+    let my_urn = auth.member_urn.clone();
+    let voyager = VoyagerClient::new(auth);
+    let dms = voyager
+        .fetch_recent_dms()
+        .await
+        .context("fetch recent linkedin dms")?;
+    // Drop our own outbound messages: you don't reply to yourself, and they
+    // would only pad the list the agent has to disambiguate.
+    let rows: Vec<_> = dms
+        .into_iter()
+        .filter(|d| !d.is_outbound(&my_urn))
+        .take(limit)
+        .collect();
+    if json {
+        let out: Vec<_> = rows
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "conversation_urn": d.conversation_urn,
+                    "message_urn": d.message_urn,
+                    "peer_name": d.peer_name,
+                    "text": d.text,
+                    "delivered_at_ms": d.delivered_at_ms,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("(no recent inbound LinkedIn DMs)");
+        return Ok(());
+    }
+    for d in &rows {
+        let preview: String = d.text.chars().take(70).collect();
+        println!("{}\n  from: {}\n  {}\n", d.conversation_urn, d.peer_name, preview);
     }
     Ok(())
 }

@@ -322,10 +322,14 @@ augmentagent linkedin comment --post-urn <urn> [--author "<name>"] \
 - **Drop `--post` to preview.** Without it the command prints the drafted
   message and exits without touching anything — use that if the user only
   wants to see the wording.
-- **Get the ids off the card.** An inbound social card shows the MessageId and
-  carries the conversation/post id; if you cannot find the id the user means,
-  ask rather than guessing — a wrong id cards a reply into someone else's
-  thread.
+- **Finding the id.** In order: (1) the inbound approval card, which shows the
+  MessageId and carries the conversation/post id; (2)
+  `mcp__memory__search_conversation_history`, which searches ingested messages
+  — a stored LinkedIn DM keeps its conversation urn as `thread_id`; (3) for
+  LinkedIn specifically, `augmentagent linkedin recent-dms` lists recent
+  threads with their urns. Only if all three come up empty, ask the user — a
+  wrong id cards a reply into someone else's thread. Do NOT fall back to
+  "paste this yourself" without trying the lookup first.
 - **Pass `--platform`** when you know it, so the card title reads
   `[Instagram DM from Jane]` rather than a bare `[DM from Jane]`. The user has
   several networks behind one key and cannot tell them apart otherwise.
@@ -337,7 +341,11 @@ augmentagent linkedin comment --post-urn <urn> [--author "<name>"] \
 - **Prefer this over pasting text.** Handing the user prose to copy/paste into
   Instagram is the fallback; the card exists to remove exactly that friction.
 
-You cannot send a social message directly, by design. There is no flag for it.
+**You can always raise the card.** What you cannot do is send without one —
+there is no direct-send flag, by design. "I can't send on LinkedIn" is the
+wrong answer to "reply to X": the right answer is to raise the card and let
+the user click Approve. Handing over prose to copy/paste is the last resort,
+not the default.
 
 ## Invoice actions
 
