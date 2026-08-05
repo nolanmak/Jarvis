@@ -55,11 +55,20 @@ apply_update() {
 
   if [ "$NEEDS_REBUILD" -eq 1 ]; then
     log "rebuilding rust (changed files touched crates/ or Cargo)"
-    if ! cargo build --release -p augmentagent-cli >> "$LOG" 2>&1; then
+    # Build BOTH production binaries. `augmentagent-mcp-memory` is a separate
+    # package that the daemon spawns as a stdio MCP server — ask_opts points
+    # at `target/release/augmentagent-mcp-memory` (see reasoner.rs). It was
+    # not in this build line, so it was never rebuilt by an update: on the
+    # daemon host it was found ~3 weeks stale while the CLI was current, and
+    # every change to that crate had silently never deployed.
+    #
+    # If a new binary is ever referenced from production code, add it here.
+    # `grep -rn "target/release/" crates/*/src/*.rs` lists what is expected.
+    if ! cargo build --release -p augmentagent-cli -p augmentagent-mcp-memory >> "$LOG" 2>&1; then
       log "RUST BUILD FAILED — not restarting; daemon stays on previous binary"
       exit 1
     fi
-    log "rust build ok"
+    log "rust build ok (augmentagent + augmentagent-mcp-memory)"
   else
     log "no rust code changed; skipping rust rebuild"
   fi
