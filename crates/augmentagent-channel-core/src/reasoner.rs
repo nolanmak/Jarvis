@@ -1167,6 +1167,14 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     let bash_socialapi_dm_bare = "Bash(augmentagent socialapi dm *)".to_string();
     let bash_socialapi_comment_abs = format!("Bash({} socialapi comment *)", bin.display());
     let bash_socialapi_comment_bare = "Bash(augmentagent socialapi comment *)".to_string();
+    // Read-only urn lookup. `linkedin dm` needs a `--conversation-urn`, and
+    // a DM that arrived only as a notification stub has no stored thread_id
+    // to recover it from — without this the agent hits a dead end and falls
+    // back to "paste it yourself". Gmail has `gmail search` for exactly this.
+    let bash_linkedin_recent_abs = format!("Bash({} linkedin recent-dms *)", bin.display());
+    let bash_linkedin_recent_bare = "Bash(augmentagent linkedin recent-dms *)".to_string();
+    let bash_linkedin_recent_abs_noargs = format!("Bash({} linkedin recent-dms)", bin.display());
+    let bash_linkedin_recent_bare_noargs = "Bash(augmentagent linkedin recent-dms)".to_string();
     let bash_linkedin_dm_abs = format!("Bash({} linkedin dm *)", bin.display());
     let bash_linkedin_dm_bare = "Bash(augmentagent linkedin dm *)".to_string();
     let bash_linkedin_comment_abs = format!("Bash({} linkedin comment *)", bin.display());
@@ -1311,6 +1319,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_socialapi_dm_bare,
             bash_socialapi_comment_abs,
             bash_socialapi_comment_bare,
+            bash_linkedin_recent_abs,
+            bash_linkedin_recent_bare,
+            bash_linkedin_recent_abs_noargs,
+            bash_linkedin_recent_bare_noargs,
             bash_linkedin_dm_abs,
             bash_linkedin_dm_bare,
             bash_linkedin_comment_abs,
@@ -2787,6 +2799,10 @@ mod ask_mode_social_card_allowlist_tests {
             "socialapi comment *",
             "linkedin dm *",
             "linkedin comment *",
+            // Without a urn lookup the dm verb is unreachable for any thread
+            // that was never ingested — the dead end that made the agent fall
+            // back to "paste it yourself".
+            "linkedin recent-dms",
         ] {
             assert!(
                 tools.iter().any(|t| t.contains(needle)),
