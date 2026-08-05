@@ -6948,8 +6948,57 @@ impl ReplyApprover {
         // the email row's `kind`:
         //  - `post_engagement` (#13): message_id IS the post urn; the
         //    approved draft is a supportive comment → `post_comment`.
+        //  - `connection_request` (#549): thread_id is the invitation urn →
+        //    `act_on_invitation`. Handled first, because it is the one kind
+        //    whose thread_id is NOT a conversation.
         //  - everything else (DM reply): thread_id is the conversationUrn →
-        //    `send_message`.
+        //    `send_message`. Anything new whose thread_id is not a
+        //    conversation MUST get its own branch above rather than falling
+        //    here — that is exactly how #549 happened.
+        if action.email.kind == "connection_request" {
+            let Some(invitation_urn) = action.email.thread_id.as_deref() else {
+                return ApprovalActionOutcome::Failed {
+                    message: "no invitation urn on email; cannot accept".into(),
+                };
+            };
+            return match linkedin.act_on_invitation(invitation_urn, true).await {
+                Ok(()) => {
+                    // The draft body is deliberately NOT sent. An invitation
+                    // urn is not a conversation urn — there is no thread to
+                    // send into until LinkedIn mints one on accept. A welcome
+                    // note is a follow-up action, not part of accepting.
+                    let _ = self.store.update_action_status(
+                        action_id,
+                        ActionStatus::Sent,
+                        Some(body),
+                        None,
+                    );
+                    let _ = self
+                        .store
+                        .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+                    let _ = self.store.log_linkedin_action(
+                        &uuid::Uuid::new_v4().to_string(),
+                        "connection_request",
+                        Some(invitation_urn),
+                        "ok",
+                        chrono::Utc::now().timestamp_millis(),
+                        None,
+                    );
+                    tracing::info!(action_id, "linkedin invitation accepted via approval handler");
+                    ApprovalActionOutcome::Approved
+                }
+                Err(e) => {
+                    let msg = format!("linkedin act_on_invitation: {e}");
+                    let _ = self.store.update_action_status(
+                        action_id,
+                        ActionStatus::Error,
+                        None,
+                        Some(&msg),
+                    );
+                    ApprovalActionOutcome::Failed { message: msg }
+                }
+            };
+        }
         if action.email.kind == "post_engagement" {
             let post_urn = action.email.message_id.as_str();
             match linkedin.post_comment(post_urn, body).await {
@@ -13265,5 +13314,36 @@ mod social_compose_card_tests {
         assert!(dm.starts_with("compose:"));
         assert!(li.starts_with("compose:"));
         assert_ne!(dm, li);
+    }
+}
+
+#[cfg(test)]
+mod linkedin_approve_dispatch_tests {
+    //! #549: `approve_linkedin` branched on exactly one kind and routed
+    //! EVERYTHING else to `send_message(thread_id)`. A connection invitation
+    //! carries the INVITATION urn there, so approving one tried to DM the
+    //! invitation, while `act_on_invitation` — which `invitations.rs` calls
+    //! "the approver's job" — had no production caller at all.
+
+    /// The kinds the handler must distinguish. Anything whose `thread_id` is
+    /// not a conversation needs its own branch, or it inherits the bug.
+    #[test]
+    fn connection_request_is_not_a_dm_kind() {
+        assert_ne!("connection_request", "post_engagement");
+        assert_ne!("connection_request", "dm");
+        let dm_fallthrough_kinds = ["dm", "message"];
+        assert!(
+            !dm_fallthrough_kinds.contains(&"connection_request"),
+            "connection_request must never reach the send_message fall-through"
+        );
+    }
+
+    /// `Invitation::into_email` puts the invitation urn on `thread_id` — the
+    /// exact field the DM branch would have handed to `send_message`.
+    #[test]
+    fn invitation_thread_id_is_not_a_conversation_urn() {
+        let urn = "urn:li:invitation:7280000000000000000";
+        assert!(urn.starts_with("urn:li:invitation:"));
+        assert!(!urn.starts_with("urn:li:conversation:"));
     }
 }
