@@ -93,6 +93,9 @@ struct DmWebhookPayload {
     /// Underlying network the DM arrived on, when the push states it.
     #[serde(default)]
     sub_platform: String,
+    /// Shared media on the pushed message (#573).
+    #[serde(default)]
+    attachment_url: Option<String>,
 }
 
 impl From<DmWebhookPayload> for SocialApiDmPayload {
@@ -117,6 +120,7 @@ impl From<DmWebhookPayload> for SocialApiDmPayload {
         };
         SocialApiDmPayload {
             sub_platform: w.sub_platform,
+            attachment_url: w.attachment_url.filter(|u| !u.trim().is_empty()),
             conversation_id: w.conversation_id,
             account_id: w.account_id,
             with,
@@ -152,6 +156,15 @@ pub struct SocialApiDmPayload {
     /// API or push didn't say; `platform_label` degrades gracefully.
     #[serde(default)]
     pub sub_platform: String,
+    /// Media the sender shared — a Reel, a post, an image (#573).
+    ///
+    /// The API has always returned this on `DmMessage`; it was parsed on every
+    /// poll and then dropped before the payload was built, so a shared Reel
+    /// reached the card as an empty message and the model dutifully drafted
+    /// "came through without any message". It could not see the thing it was
+    /// being asked to reply to.
+    #[serde(default)]
+    pub attachment_url: Option<String>,
 }
 
 /// Human label for a sub-platform, for card titles. Known networks get their
@@ -191,9 +204,10 @@ impl SocialApiDmPayload {
             account_id: conv.account_id.clone(),
             with,
             message_id: msg.id.clone(),
-            author: msg.sender_name.clone(),
+            author: sender_handle(msg),
             text: msg.text.clone(),
             created_at: msg.created_at.clone(),
+            attachment_url: msg.attachment_url.clone().filter(|u| !u.trim().is_empty()),
         }
     }
 
@@ -207,20 +221,39 @@ impl SocialApiDmPayload {
         // both — the model should know it is writing an Instagram DM rather
         // than a LinkedIn one, since register and length conventions differ.
         let label = platform_label(&self.sub_platform);
-        let from = match &label {
-            Some(_) => format!("{} <socialapi:{}:{}>", self.with, self.sub_platform, self.author),
-            None => format!("{} <socialapi:{}>", self.with, self.author),
+        // #574: never emit a dangling `<socialapi:>`. When we have no handle
+        // at all, the display name alone is more honest than an empty field.
+        let handle = self.author.trim();
+        let from = match (&label, handle.is_empty()) {
+            (Some(_), false) => {
+                format!("{} <socialapi:{}:{}>", self.with, self.sub_platform, handle)
+            }
+            (Some(_), true) => format!("{} <socialapi:{}>", self.with, self.sub_platform),
+            (None, false) => format!("{} <socialapi:{}>", self.with, handle),
+            (None, true) => self.with.clone(),
         };
         let subject = match &label {
             Some(p) => format!("[{p} DM from {}]", self.with),
             None => format!("[DM from {}]", self.with),
+        };
+        // #573: put the shared media in the BODY, not just a card marker.
+        // `emails.body` is what the triage and draft prompts read, so this is
+        // the difference between the model knowing "they sent a Reel" and it
+        // reporting that the message was empty. Appended rather than
+        // substituted so a caption plus a Reel keeps both.
+        let body = match self.attachment_url.as_deref() {
+            Some(url) if self.text.trim().is_empty() => {
+                format!("[shared media, no caption]\n{url}")
+            }
+            Some(url) => format!("{}\n\n[shared media]\n{url}", self.text),
+            None => self.text,
         };
         Email {
             message_id: self.message_id,
             thread_id: Some(self.conversation_id),
             from,
             subject,
-            body: self.text,
+            body,
             date: self.created_at,
             account_entity_id: Some(self.account_id),
             platform: PLATFORM.to_string(),
@@ -261,6 +294,19 @@ fn within_horizon(created_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool 
 /// Canonical handle form for identity comparisons: trimmed, no leading `@`,
 /// lowercased. Shared by [`is_inbound`] and [`is_own_handle`] so the poll and
 /// webhook paths agree on what counts as the same account.
+/// Best available handle for the sender (#574).
+///
+/// `sender_name` comes back empty from the live API often enough that cards
+/// rendered as `Muhammad Rashid <socialapi:>` — a display name followed by an
+/// empty handle, which reads as a truncated field. Falls back to the stable
+/// `sender_id` before giving up.
+fn sender_handle(msg: &DmMessage) -> String {
+    if !msg.sender_name.trim().is_empty() {
+        return msg.sender_name.clone();
+    }
+    msg.sender_id.trim().to_string()
+}
+
 fn norm_handle(s: &str) -> String {
     s.trim().trim_start_matches('@').to_ascii_lowercase()
 }
@@ -974,6 +1020,7 @@ mod tests {
         let (store, _f) = tmp_store();
         // Seed a pending socialapi DM draft on conversation conv_1.
         let email = SocialApiDmPayload {
+            attachment_url: None,
             sub_platform: "instagram".into(),
             conversation_id: "conv_1".into(),
             account_id: "acc_1".into(),
@@ -1086,6 +1133,7 @@ mod tests {
     async fn reply_decision_posts_approval_card() {
         let (store, _f) = tmp_store();
         let payload = SocialApiDmPayload {
+            attachment_url: None,
             sub_platform: "instagram".into(),
             conversation_id: "conv_1".into(),
             account_id: "acc_1".into(),
@@ -1110,6 +1158,7 @@ mod tests {
     async fn skip_decision_posts_no_card() {
         let (store, _f) = tmp_store();
         let payload = SocialApiDmPayload {
+            attachment_url: None,
             sub_platform: "instagram".into(),
             conversation_id: "conv_1".into(),
             account_id: "acc_1".into(),
@@ -1328,6 +1377,7 @@ mod tests {
 
     fn dm_payload(sub_platform: &str) -> SocialApiDmPayload {
         SocialApiDmPayload {
+            attachment_url: None,
             sub_platform: sub_platform.into(),
             conversation_id: "c1".into(),
             account_id: "acc_1".into(),
@@ -1399,5 +1449,70 @@ mod tests {
         assert_eq!(platform_label("tiktok").as_deref(), Some("TikTok"));
         assert_eq!(platform_label(""), None);
         assert_eq!(platform_label("  "), None);
+    }
+
+    // --- #573 shared media / #574 empty sender handle ---
+
+    /// The exact case the operator hit: a Reel with no caption. The body must
+    /// carry the URL, because `emails.body` is what the triage and draft
+    /// prompts read — otherwise the model is asked to reply to nothing and
+    /// correctly says so.
+    #[test]
+    fn shared_media_with_no_caption_reaches_the_body() {
+        let mut p = dm_payload("instagram");
+        p.text = String::new();
+        p.attachment_url = Some("https://cdn.example/reel/1.mp4".into());
+        let body = p.into_email().body;
+        assert!(body.contains("https://cdn.example/reel/1.mp4"), "{body}");
+        assert!(body.contains("shared media"), "{body}");
+        assert!(!body.trim().is_empty());
+    }
+
+    /// A caption AND a Reel keeps both — appended, not substituted.
+    #[test]
+    fn caption_plus_media_keeps_both() {
+        let mut p = dm_payload("instagram");
+        p.text = "check this out".into();
+        p.attachment_url = Some("https://cdn.example/reel/2.mp4".into());
+        let body = p.into_email().body;
+        assert!(body.contains("check this out"), "{body}");
+        assert!(body.contains("https://cdn.example/reel/2.mp4"), "{body}");
+    }
+
+    /// A plain text DM is untouched — no marker noise on the common case.
+    #[test]
+    fn text_only_dm_body_is_unchanged() {
+        let mut p = dm_payload("instagram");
+        p.text = "just text".into();
+        p.attachment_url = None;
+        assert_eq!(p.into_email().body, "just text");
+    }
+
+    /// #574: `Muhammad Rashid <socialapi:>` — a display name followed by an
+    /// empty handle. With no handle at all, the name alone is more honest.
+    #[test]
+    fn empty_sender_handle_never_renders_a_dangling_bracket() {
+        let mut p = dm_payload("");
+        p.author = String::new();
+        let from = p.into_email().from;
+        assert_eq!(from, "jane");
+        assert!(!from.contains("socialapi:"), "{from}");
+
+        let mut p2 = dm_payload("instagram");
+        p2.author = "   ".into();
+        let from2 = p2.into_email().from;
+        assert_eq!(from2, "jane <socialapi:instagram>");
+        assert!(!from2.contains("instagram:>"), "{from2}");
+    }
+
+    /// `sender_handle` prefers the name, falls back to the stable id.
+    #[test]
+    fn sender_handle_falls_back_to_sender_id() {
+        let mut msg = DmMessage::default();
+        msg.sender_name = "  ".into();
+        msg.sender_id = "ig_12345".into();
+        assert_eq!(sender_handle(&msg), "ig_12345");
+        msg.sender_name = "jane".into();
+        assert_eq!(sender_handle(&msg), "jane");
     }
 }
