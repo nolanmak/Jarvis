@@ -58,6 +58,20 @@ pub struct ConversationHit {
     pub channel: String,
     /// `user` for inbound messages, `agent` for drafts the agent produced.
     pub role: String,
+    /// Platform-native thread id: the LinkedIn conversation urn, the
+    /// SocialAPI.ai conversation id, the Gmail threadId, etc.
+    ///
+    /// This is the field the card-raising verbs need — `linkedin dm
+    /// --conversation-urn`, `socialapi dm --conversation-id` — and it was
+    /// simply not selected. The agent could read a DM's text out of this tool
+    /// and still be unable to reply to it, because the id was sitting in the
+    /// same row it had just read. `None` for rows with no thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    /// Platform-native message id. `socialapi comment` needs it as the parent
+    /// comment id, and it is how a caller re-finds the exact message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     /// First [`SNIPPET_MAX_CHARS`] chars of the body, with subject prefixed
     /// when present so a single line read tells the agent what it's looking
     /// at.
@@ -257,12 +271,14 @@ impl Server {
         // Order of binds (per leg): keyword_like, keyword_like, since_ms,
         // until_ms, channel.
         let sql = "\
-            SELECT rowid, timestamp_ms, channel, role, snippet FROM ( \
+            SELECT rowid, timestamp_ms, channel, role, snippet, thread_id, message_id FROM ( \
                 SELECT \
                     e.rowid AS rowid, \
                     e.firstSeenAt AS timestamp_ms, \
                     e.platform AS channel, \
                     'user' AS role, \
+                    e.threadId AS thread_id, \
+                    e.messageId AS message_id, \
                     COALESCE(NULLIF(e.subject, '') || ': ', '') || COALESCE(e.body, '') AS snippet \
                 FROM emails e \
                 WHERE (?1 IS NULL \
@@ -277,6 +293,8 @@ impl Server {
                     a.createdAt AS timestamp_ms, \
                     COALESCE(e2.platform, 'unknown') AS channel, \
                     'agent' AS role, \
+                    a.threadId AS thread_id, \
+                    a.messageId AS message_id, \
                     COALESCE(NULLIF(a.subject, '') || ': ', '') || COALESCE(a.draftBody, '') AS snippet \
                 FROM actions a \
                 LEFT JOIN emails e2 ON e2.messageId = a.messageId \
@@ -307,12 +325,17 @@ impl Server {
                 ],
                 |row| {
                     let raw_snippet: String = row.get(4)?;
+                    // Blank-to-None so an empty column doesn't look like a
+                    // usable id to a caller about to pass it to `--conversation-urn`.
+                    let opt = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
                     Ok(ConversationHit {
                         rowid: row.get(0)?,
                         timestamp_ms: row.get(1)?,
                         channel: row.get(2)?,
                         role: row.get(3)?,
                         snippet: truncate_snippet(&raw_snippet),
+                        thread_id: opt(row.get(5)?),
+                        message_id: opt(row.get(6)?),
                     })
                 },
             )
@@ -695,7 +718,7 @@ mod tests {
     /// Test fixture: tempdir + server. The tempdir lives as long as the
     /// fixture so the on-disk db is cleaned up when the test ends. Deref'd
     /// to `Server` so test bodies read like `s.write(...)`.
-    struct Fixture {
+    pub(crate) struct Fixture {
         server: Server,
         _tmp: TempDir,
     }
@@ -707,7 +730,7 @@ mod tests {
         }
     }
 
-    fn new_server() -> Fixture {
+    pub(crate) fn new_server() -> Fixture {
         let tmp = TempDir::new().expect("tempdir");
         let path = tmp.path().join("memory.db");
         let server = Server::open(&path).expect("open server");
@@ -892,7 +915,7 @@ mod tests {
     /// `augmentagent-store` and there isn't a write-path API exposed for
     /// `actions` we can reuse, so tests seed them by raw SQL via the
     /// server's connection.
-    fn insert_email(
+    pub(crate) fn insert_email(
         s: &Server,
         message_id: &str,
         platform: &str,
@@ -900,11 +923,33 @@ mod tests {
         body: &str,
         first_seen_at: i64,
     ) {
+        insert_email_threaded(s, message_id, platform, subject, body, first_seen_at, None)
+    }
+
+    /// Same, with an explicit thread id — the LinkedIn conversation urn /
+    /// SocialAPI conversation id a reply has to target.
+    pub(crate) fn insert_email_threaded(
+        s: &Server,
+        message_id: &str,
+        platform: &str,
+        subject: &str,
+        body: &str,
+        first_seen_at: i64,
+        thread_id: Option<&str>,
+    ) {
         s.conn
             .execute(
                 "INSERT INTO emails (messageId, threadId, fromEmail, subject, body, receivedAt, accountEntityId, firstSeenAt, platform, kind) \
-                 VALUES (?1, NULL, ?2, ?3, ?4, NULL, NULL, ?5, ?6, 'dm')",
-                rusqlite::params![message_id, "sender@example.com", subject, body, first_seen_at, platform],
+                 VALUES (?1, ?7, ?2, ?3, ?4, NULL, NULL, ?5, ?6, 'dm')",
+                rusqlite::params![
+                    message_id,
+                    "sender@example.com",
+                    subject,
+                    body,
+                    first_seen_at,
+                    platform,
+                    thread_id
+                ],
             )
             .expect("seed email");
     }
@@ -1147,5 +1192,74 @@ mod tests {
         };
         let resp = s.dispatch(&req);
         assert_eq!(resp["error"]["code"], -32602);
+    }
+}
+
+#[cfg(test)]
+mod conversation_thread_id_tests {
+    use super::tests::*;
+    use super::*;
+
+    /// The bug this fixes: the agent recalled a LinkedIn DM's text through
+    /// this tool, then reported it could not reply because it had no
+    /// conversation urn — while the urn sat in the very row it had read.
+    /// `thread_id` was in `emails` and simply never selected.
+    #[test]
+    fn search_returns_the_thread_id_a_reply_needs() {
+        let s = new_server();
+        insert_email_threaded(
+            &s,
+            "urn:li:msg:111",
+            "linkedin",
+            "[LinkedIn DM from Mansi Pathak]",
+            "hi, following Code and Coffee",
+            1_700_000_000_000,
+            Some("urn:li:msg_conversation:999"),
+        );
+        let hits = s
+            .search_conversation_history(Some("code and coffee"), None, None, None, Some(10))
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        let hit = &hits[0];
+        assert_eq!(
+            hit.thread_id.as_deref(),
+            Some("urn:li:msg_conversation:999"),
+            "the conversation urn must come back — it is what `linkedin dm \
+             --conversation-urn` requires"
+        );
+        assert_eq!(hit.message_id.as_deref(), Some("urn:li:msg:111"));
+    }
+
+    /// A row with no thread is `None`, not an empty string — a caller must
+    /// never pass "" to `--conversation-urn` believing it has an id.
+    #[test]
+    fn absent_thread_id_is_none_not_empty_string() {
+        let s = new_server();
+        insert_email(&s, "m1", "discord", "subj", "unthreaded body", 1_700_000_000_000);
+        let hits = s
+            .search_conversation_history(Some("unthreaded"), None, None, None, Some(10))
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].thread_id.is_none());
+    }
+
+    /// Blank-but-present ids are normalized to None for the same reason.
+    #[test]
+    fn blank_thread_id_is_normalized_to_none() {
+        let s = new_server();
+        insert_email_threaded(
+            &s,
+            "m2",
+            "linkedin",
+            "subj",
+            "blankthread body",
+            1_700_000_000_000,
+            Some("   "),
+        );
+        let hits = s
+            .search_conversation_history(Some("blankthread"), None, None, None, Some(10))
+            .expect("search");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].thread_id.is_none(), "whitespace is not a usable id");
     }
 }
