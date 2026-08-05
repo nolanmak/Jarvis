@@ -1153,6 +1153,24 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         format!("Bash({} calendar create-event *)", bin.display());
     let bash_calendar_create_bare =
         "Bash(augmentagent calendar create-event *)".to_string();
+    // #571 / #572 — operator-initiated social drafts. Same safety argument
+    // as `gmail compose --post` and `calendar create-event`: these verbs
+    // touch no social API at all. They write a pending action row and post
+    // ONE card to the existing approval channel; the send happens only when
+    // the operator clicks Approve.
+    //
+    // Scoped to the card-raising verbs ONLY — deliberately NOT
+    // `Bash(augmentagent linkedin *)`. A wildcard there would also hand the
+    // agent `linkedin post`, which publishes to the feed directly, and
+    // `linkedin login`. Likewise `socialapi *` would expose `connect`.
+    let bash_socialapi_dm_abs = format!("Bash({} socialapi dm *)", bin.display());
+    let bash_socialapi_dm_bare = "Bash(augmentagent socialapi dm *)".to_string();
+    let bash_socialapi_comment_abs = format!("Bash({} socialapi comment *)", bin.display());
+    let bash_socialapi_comment_bare = "Bash(augmentagent socialapi comment *)".to_string();
+    let bash_linkedin_dm_abs = format!("Bash({} linkedin dm *)", bin.display());
+    let bash_linkedin_dm_bare = "Bash(augmentagent linkedin dm *)".to_string();
+    let bash_linkedin_comment_abs = format!("Bash({} linkedin comment *)", bin.display());
+    let bash_linkedin_comment_bare = "Bash(augmentagent linkedin comment *)".to_string();
     // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
     // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
     // resolves the db regardless of cwd.
@@ -1289,6 +1307,14 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_calendar_list_bare_noargs,
             bash_calendar_create_abs,
             bash_calendar_create_bare,
+            bash_socialapi_dm_abs,
+            bash_socialapi_dm_bare,
+            bash_socialapi_comment_abs,
+            bash_socialapi_comment_bare,
+            bash_linkedin_dm_abs,
+            bash_linkedin_dm_bare,
+            bash_linkedin_comment_abs,
+            bash_linkedin_comment_bare,
             format!("Bash({} issue create *)", aa_gh.display()),
             format!("Bash({} issue list *)", aa_gh.display()),
             format!("Bash({} issue view *)", aa_gh.display()),
@@ -2736,6 +2762,76 @@ mod socialapi_draft_opts_wiring_tests {
         assert!(
             json.contains("aa-socialapi-readonly-guard.sh"),
             "settings must reference the fail-closed guard hook: {json}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ask_mode_social_card_allowlist_tests {
+    use super::*;
+
+    fn ask_allowlist() -> Vec<String> {
+        let tmp = std::env::temp_dir().join("aa-ask-allowlist-test");
+        let _ = std::fs::create_dir_all(&tmp);
+        ask_opts("sys".into(), tmp).allowed_tools
+    }
+
+    /// #571/#572: the agent could not raise a social card because the verbs
+    /// were absent from the ask-mode Bash allowlist — building the CLI verbs
+    /// alone left them unreachable from Discord.
+    #[test]
+    fn social_card_verbs_are_allowlisted() {
+        let tools = ask_allowlist();
+        for needle in [
+            "socialapi dm *",
+            "socialapi comment *",
+            "linkedin dm *",
+            "linkedin comment *",
+        ] {
+            assert!(
+                tools.iter().any(|t| t.contains(needle)),
+                "ask mode must permit `{needle}`; got {tools:?}"
+            );
+        }
+    }
+
+    /// The allowlist must stay SCOPED. A `linkedin *` or `socialapi *`
+    /// wildcard would also hand the agent `linkedin post` — which publishes
+    /// to the feed directly, with no card — and `login` / `connect`.
+    #[test]
+    fn no_broad_wildcard_exposes_direct_send_verbs() {
+        let tools = ask_allowlist();
+        for forbidden in [
+            "Bash(augmentagent linkedin *)",
+            "Bash(augmentagent socialapi *)",
+        ] {
+            assert!(
+                !tools.iter().any(|t| t == forbidden),
+                "`{forbidden}` would expose direct-send verbs"
+            );
+        }
+        // Specifically: nothing may match `linkedin post`.
+        assert!(
+            !tools.iter().any(|t| t.contains("linkedin post")),
+            "linkedin post publishes directly and must never be allowlisted"
+        );
+        assert!(
+            !tools.iter().any(|t| t.contains("socialapi connect")),
+            "socialapi connect drives OAuth and must not be agent-invokable"
+        );
+    }
+
+    /// Both the absolute-path and bare forms are needed: the permission
+    /// matcher does literal string matching, and the model copies the bare
+    /// shape from the schema examples.
+    #[test]
+    fn both_bare_and_absolute_forms_are_present() {
+        let tools = ask_allowlist();
+        assert!(tools.iter().any(|t| t == "Bash(augmentagent socialapi dm *)"));
+        assert!(tools.iter().any(|t| t == "Bash(augmentagent linkedin dm *)"));
+        assert!(
+            tools.iter().filter(|t| t.contains("socialapi dm *")).count() >= 2,
+            "expected both an absolute and a bare form"
         );
     }
 }

@@ -289,7 +289,55 @@ augmentagent gmail delete-draft --account me@example.com --draft-id <id>
 - **Confirm the recipient.** If you're inferring an address from the wiki, cite the source page. If multiple people match, ask which one.
 - **Never invent addresses, names, or commitments.** Use the wiki / `gmail search` to ground claims; if you can't find a real address, ask the user.
 - **Replies belong on the same thread.** If the user is responding to an email, find the original via `gmail search`, extract its `messageId` and `threadId`, and pass `--thread-id` to `compose`/`send-now`.
+- **Social replies get cards too.** The same "prefer a card over pasted prose"
+  rule applies to Instagram/X/LinkedIn DMs and comments — see *Social replies*
+  below for the commands.
 - **For actionable replies, prefer `compose --post`.** When the user clearly wants to act on a reply (not just preview prose), use `compose --post` so a Discord approval card appears with Approve / Revise / Skip. Pasting the draft into chat as text is the fallback — it forces the user to copy/paste into Gmail, which is the friction `--post` exists to remove.
+
+## Social replies (SocialAPI.ai + LinkedIn)
+
+The user gets DMs and post-comments from Instagram, X, LinkedIn and other
+networks, surfaced as Discord approval cards. You can raise the SAME kind of
+card yourself when they ask you to reply to one — the send happens only when
+they click Approve, exactly like `gmail compose --post`.
+
+**These commands post a card. They do not send anything.** Approve does.
+
+```
+augmentagent socialapi dm --conversation-id <id> [--account-id <id>] \
+  [--platform instagram|x|linkedin] [--with "<their name>"] \
+  --body "<your draft>" [--in-reply-to "<what they said>"] --post
+
+augmentagent socialapi comment --post-id <id> --comment-id <id> \
+  [--account-id <id>] [--platform <net>] [--author "<name>"] \
+  --body "<your draft>" --post
+
+augmentagent linkedin dm --conversation-urn <urn> [--with "<name>"] \
+  --body "<your draft>" --post
+
+augmentagent linkedin comment --post-urn <urn> [--author "<name>"] \
+  --body "<your draft>" --post
+```
+
+- **Drop `--post` to preview.** Without it the command prints the drafted
+  message and exits without touching anything — use that if the user only
+  wants to see the wording.
+- **Get the ids off the card.** An inbound social card shows the MessageId and
+  carries the conversation/post id; if you cannot find the id the user means,
+  ask rather than guessing — a wrong id cards a reply into someone else's
+  thread.
+- **Pass `--platform`** when you know it, so the card title reads
+  `[Instagram DM from Jane]` rather than a bare `[DM from Jane]`. The user has
+  several networks behind one key and cannot tell them apart otherwise.
+- **Pass `--in-reply-to`** with the message you are answering. It becomes the
+  context the Revise button redrafts against; without it Revise has nothing to
+  work from.
+- **Comments are public.** Bias toward `--post` and let the user decide — never
+  describe a comment as "sent", because it is not until they approve.
+- **Prefer this over pasting text.** Handing the user prose to copy/paste into
+  Instagram is the fallback; the card exists to remove exactly that friction.
+
+You cannot send a social message directly, by design. There is no flag for it.
 
 ## Invoice actions
 
