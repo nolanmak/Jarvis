@@ -34,7 +34,7 @@ use augmentagent_channel_core::governor::{
     ActionKind, ActionRequest, Denial, Platform, RateGovernor, Risk,
 };
 use augmentagent_channel_core::prompt::{draft_user_message, triage_user_message};
-use augmentagent_channel_core::reasoner::{draft_opts, triage_opts};
+use augmentagent_channel_core::reasoner::{socialapi_draft_opts, triage_opts};
 use augmentagent_channel_core::trigger::kind as work_item_kind;
 use augmentagent_channel_core::trigger::{InboundSource, WorkItem, WorkItemHandler};
 use augmentagent_channel_core::Reasoner;
@@ -690,7 +690,7 @@ impl<R: Reasoner + 'static> SocialApiDmChannel<R> {
 
         let skill_system =
             std::fs::read_to_string(self.config.skill_dir.join("SKILL.md")).unwrap_or_default();
-        let draft_opts = draft_opts(skill_system, self.config.wiki_root.clone());
+        let draft_opts = socialapi_draft_opts(skill_system, self.config.wiki_root.clone());
         let draft_prompt = draft_user_message(&email, "", "", "", "", "");
         let draft = self
             .reasoner

@@ -125,6 +125,28 @@ pub fn socialapi_mcp_readonly_enabled() -> bool {
 /// as `ask_opts`'s COMPOSIO key); if it can't be loaded the MCP server is
 /// still configured but will simply fail to authenticate at the server — it
 /// can never gain write access regardless.
+/// Drafting opts for the SocialAPI.ai channels (#533).
+///
+/// [`draft_opts`] plus the optional read-only SocialAPI MCP aid, so the
+/// drafting model can pull thread/post context it wasn't handed. Scoped to
+/// this channel deliberately: attaching a SocialAPI server to a Gmail draft
+/// would be noise, and the narrower the surface the smaller the blast radius
+/// if the guard hook ever regresses.
+///
+/// Strictly default-off — [`with_socialapi_readonly_mcp`] is a byte-for-byte
+/// no-op unless `AUGMENTAGENT_SOCIALAPI_MCP_READONLY` is set. Before this
+/// existed the helper had no production caller at all, so setting that flag
+/// attached nothing and `scripts/aa-socialapi-readonly-guard.sh` never ran:
+/// a fail-closed guard guarding nothing.
+///
+/// `repo_root` is resolved from the process cwd, which is where the daemon
+/// runs and where the guard script lives.
+pub fn socialapi_draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> ReasonerOpts {
+    let opts = draft_opts(system_prompt, wiki_root);
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    with_socialapi_readonly_mcp(opts, &repo_root)
+}
+
 pub fn with_socialapi_readonly_mcp(mut opts: ReasonerOpts, repo_root: &std::path::Path) -> ReasonerOpts {
     if !socialapi_mcp_readonly_enabled() {
         // Strict no-op: unchanged opts ⇒ unchanged spawn args.
@@ -2667,5 +2689,53 @@ mod model_pin_tests {
         assert_eq!(TRIAGE_MODEL, "claude-opus-4-8");
         assert_eq!(OPUS_MODEL, "claude-opus-4-8");
         assert!(!TRIAGE_MODEL.contains("[1m]"));
+    }
+}
+
+#[cfg(test)]
+mod socialapi_draft_opts_wiring_tests {
+    use super::*;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// #533: the aid must stay strictly default-off. With the flag unset,
+    /// `socialapi_draft_opts` has to be indistinguishable from `draft_opts`.
+    #[test]
+    fn default_off_is_byte_for_byte_plain_draft_opts() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(SOCIALAPI_MCP_READONLY_FLAG);
+        let plain = draft_opts("sys".into(), None);
+        let wired = socialapi_draft_opts("sys".into(), None);
+        assert_eq!(wired.settings_json, plain.settings_json);
+        assert_eq!(wired.allowed_tools, plain.allowed_tools);
+        assert!(wired.settings_json.is_none());
+        assert!(!wired.allowed_tools.iter().any(|t| t.contains("socialapi")));
+    }
+
+    /// With the flag on, the server is attached and its tools advertised —
+    /// which before this wiring never happened, because the helper had no
+    /// production caller.
+    #[test]
+    fn flag_on_attaches_the_server_and_advertises_its_tools() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(SOCIALAPI_MCP_READONLY_FLAG, "1");
+        let wired = socialapi_draft_opts("sys".into(), None);
+        std::env::remove_var(SOCIALAPI_MCP_READONLY_FLAG);
+        assert!(
+            wired.settings_json.is_some(),
+            "the MCP server must be declared when the flag is on"
+        );
+        assert!(
+            wired.allowed_tools.iter().any(|t| t.contains("socialapi")),
+            "the server's tools must be advertised: {:?}",
+            wired.allowed_tools
+        );
+        let json = wired.settings_json.unwrap();
+        // The guard hook is the real gate; it must be wired into the settings
+        // or the read-only promise is unenforced.
+        assert!(
+            json.contains("aa-socialapi-readonly-guard.sh"),
+            "settings must reference the fail-closed guard hook: {json}"
+        );
     }
 }
