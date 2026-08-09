@@ -1,7 +1,7 @@
 import type { FetchOptions, Layer, LayerOutput } from "../types.js";
 import { htmlToMarkdown } from "../markdown.js";
 
-const ENDPOINT = "https://api.firecrawl.dev/v1/scrape";
+const ENDPOINT = "https://api.firecrawl.dev/v2/scrape";
 
 export class FirecrawlLayer implements Layer {
   id = "firecrawl" as const;
@@ -27,7 +27,11 @@ export class FirecrawlLayer implements Layer {
           "Content-Type": "application/json",
           Authorization: `Bearer ${key}`,
         },
-        body: JSON.stringify({ url: opts.url, formats: ["markdown", "html"] }),
+        body: JSON.stringify({
+          url: opts.url,
+          formats: ["markdown", "html"],
+          onlyMainContent: true,
+        }),
       });
       const json: any = await res.json().catch(() => ({}));
       if (!res.ok || json?.success === false) {
@@ -42,7 +46,7 @@ export class FirecrawlLayer implements Layer {
       const markdown: string = data.markdown ?? (html ? htmlToMarkdown(html) : "");
       return {
         ok: true,
-        status: 200,
+        status: res.status,
         final_url: data.metadata?.sourceURL ?? data.metadata?.url ?? opts.url,
         title: data.metadata?.title,
         html,

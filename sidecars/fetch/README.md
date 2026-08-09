@@ -60,6 +60,10 @@ Response frame:
 - Firecrawl is ~$0.001/scrape (scales with rendering complexity).
 - Bright Data Unlocker is ~$1/1000 requests for the basic Unlocker. Materially
   more expensive than Firecrawl; only invoked as the last fallback.
+- Firecrawl uses the current `/v2/scrape` API and requests main-content
+  markdown plus HTML. Bright Data uses the Unlocker `/request` API with
+  `data_format: markdown` and accepts both its raw response and documented
+  JSON `{ body, ... }` envelope.
 - Set `FETCH_DRY_PROVIDERS=1` to skip live provider calls during testing.
 
 ## Install + run

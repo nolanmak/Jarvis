@@ -10,7 +10,7 @@
     "start": "node dist/index.js",
     "dev": "ts-node --esm src/index.ts",
     "smoke": "node dist/smoke.js",
-    "test": "echo 'no tests yet' && exit 0"
+    "test": "npm run build && node --test test/*.test.js"
   },
   "dependencies": {
     "dotenv": "^17.3.1",
