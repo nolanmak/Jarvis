@@ -393,11 +393,24 @@ function extractSig(raw: string): string {
 
 function eventType(ev: Record<string, unknown>): "dm" | "comment" | null {
   const t = String(ev.type || ev.kind || ev.event || "").toLowerCase();
+  // A few Instagram integrations label post mentions as `message` while
+  // still including the post/comment identifiers. Let those identifiers win;
+  // an explicitly named `direct_message` remains a DM even when it contains
+  // a shared-post id.
+  if (
+    t === "message" &&
+    ("post_id" in ev || "comment_id" in ev || "mention_id" in ev)
+  ) {
+    return "comment";
+  }
   if (t === "dm" || t === "direct_message" || t === "message") return "dm";
-  if (t === "comment" || t === "own_post_comment") return "comment";
+  if (t === "comment" || t === "own_post_comment" || t === "mention" || t === "tag") return "comment";
   // Infer from shape when the discriminator is absent.
+  // Some Instagram pushes include a conversation/thread id for a post
+  // mention. The post/comment fields are the stronger signal: treating those
+  // events as DMs creates blank "your message came through empty" cards.
+  if ("post_id" in ev || "comment_id" in ev || "mention_id" in ev) return "comment";
   if ("conversation_id" in ev || "message_id" in ev) return "dm";
-  if ("post_id" in ev || "comment_id" in ev) return "comment";
   return null;
 }
 
@@ -471,8 +484,8 @@ function normalizeSocialApiEvent(ev: Record<string, unknown>): NormalizedWebhook
     };
   }
   // comment
-  const commentId = str(ev, "comment_id", "id");
-  const postId = str(ev, "post_id");
+  const commentId = str(ev, "comment_id", "mention_id", "id");
+  const postId = str(ev, "post_id", "media_id");
   if (!commentId || !postId) return null;
   return {
     kind,

@@ -232,7 +232,9 @@ mod tests {
     #[test]
     fn absolute_path_outside_root_is_refused() {
         let dir = root();
-        let out = extract_attach_markers("ATTACH: /etc/hostname", Some(dir.path()));
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let input = format!("ATTACH: {}", outside.path().display());
+        let out = extract_attach_markers(&input, Some(dir.path()));
         assert!(out.files.is_empty());
         assert_eq!(out.notes.len(), 1);
         assert!(out.notes[0].contains("outside the wiki root"), "{:?}", out.notes);
