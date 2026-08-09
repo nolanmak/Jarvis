@@ -201,6 +201,36 @@ test("socialapi webhook persists verified events idempotently, rejects bad/unsig
   }
 });
 
+test("socialapi post mentions are not misclassified as DMs", async () => {
+  const s = await startServer();
+  const port = s.address().port;
+  try {
+    const body = JSON.stringify({
+      type: "message",
+      id: "mention_1",
+      conversation_id: "thread_for_post",
+      post_id: "post_1",
+      comment_id: "comment_1",
+      platform: "instagram",
+      author: "block_space_phl",
+      text: "@phillyteche",
+    });
+    const res = await post(port, "/webhooks/socialapi", body, {
+      "content-type": "application/json",
+      "x-socialapi-signature": hmacHex("soapisek", body),
+    });
+    assert.strictEqual(res.status, 202);
+    assert.strictEqual(JSON.parse(res.body).accepted, 1);
+    const row = db
+      .getDb()
+      .prepare("SELECT kind FROM socialapi_webhook_events WHERE id = ?")
+      .get("socialapi:comment:post_1:comment_1");
+    assert.strictEqual(row.kind, "comment");
+  } finally {
+    s.close();
+  }
+});
+
 test("socialapi webhook fails closed when no secret configured", async () => {
   const prev = process.env.SOCIALAPI_WEBHOOK_SECRET;
   delete process.env.SOCIALAPI_WEBHOOK_SECRET;

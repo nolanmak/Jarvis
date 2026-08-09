@@ -200,7 +200,7 @@ For multi-line or long bodies, write the body to a tempfile and pass `--body-fil
 
 **Attachments:** pass `--attach /path/to/file` (one file) on `compose`, `send-now`, or `update-draft`. When the user drops a file in Discord it lands at a `/tmp/aa-doc-…` path you can Read — pass that same path to `--attach` to put it on the email. The command output prints `attached: <name>` and the approval card shows `[attachment: <name>]`; if you don't see those, the file is NOT attached — never claim it is. Note: `update-draft` and card **Revise** create a replacement draft that only carries what's passed at that moment — re-pass `--attach` on update, and warn the user that Revise drops attachments.
 
-**One email = one card.** If a pending approval card already exists for the same recipient + subject, `compose --post` refuses and names the existing draft — follow its instruction (`gmail update-draft --draft-id <id> …`, which the existing card follows automatically) instead of forcing a duplicate. Never work around the guard with `--allow-duplicate` unless the user explicitly wants a second, different email to the same person under the same subject.
+**One active email = one card.** If a pending approval card already exists for the same recipient + subject, a normal `compose --post` follow-up creates a replacement draft/card and supersedes the old action after the replacement posts successfully. This lets a conversational clarification (changed body, CC, or BCC) surface a fresh card without leaving competing Approve buttons. Use `--allow-duplicate` only when the user explicitly wants a second, different email to the same person under the same subject.
 
 ### Surface a Discord approval card (#352, #412) — the DEFAULT for actionable email asks
 

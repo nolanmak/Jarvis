@@ -543,7 +543,7 @@ pub fn code_mode_repair_user_message(
 /// Build the redraft prompt when the user clicks "Revise" in Discord.
 pub fn redraft_message(email: &Email, previous_draft: &str, feedback: &str) -> String {
     format!(
-        r#"You are a professional email draft editor. Revise the draft based on the user's feedback and return ONLY the revised email text — no JSON, no quotes, no commentary.
+        r#"You are a professional email draft editor. Revise the draft based on the user's feedback and return ONLY the revised email text — no JSON, no quotes, no commentary. Do not add To:, Cc:, Bcc:, or other recipient/header lines; recipients are managed separately from the email body.
 
 <original_email>
 From: {from}

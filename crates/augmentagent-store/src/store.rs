@@ -1964,6 +1964,9 @@ impl Store {
         &self,
         since_ms: i64,
     ) -> StoreResult<Vec<RevisionRecord>> {
+        if since_ms <= 0 {
+            return Ok(Vec::new());
+        }
         let cutoff = now_millis() - since_ms;
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(

@@ -202,7 +202,7 @@ impl Server {
                     "SELECT id, created_at_ms, surface, subject, body, tags \
                      FROM memory \
                      WHERE surface = ?1 \
-                     ORDER BY created_at_ms DESC \
+                     ORDER BY created_at_ms DESC, rowid DESC \
                      LIMIT ?2",
                 )?;
                 let rows: Result<Vec<_>, _> = stmt
@@ -214,7 +214,7 @@ impl Server {
                 let mut stmt = self.conn.prepare(
                     "SELECT id, created_at_ms, surface, subject, body, tags \
                      FROM memory \
-                     ORDER BY created_at_ms DESC \
+                     ORDER BY created_at_ms DESC, rowid DESC \
                      LIMIT ?1",
                 )?;
                 let rows: Result<Vec<_>, _> = stmt
