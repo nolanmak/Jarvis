@@ -1477,8 +1477,9 @@ enum GmailOp {
         /// for a new-email card pass neither.
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         post: bool,
-        /// Skip the duplicate guard (#419): create the draft/card even when a
-        /// pending approval card already exists for this recipient + subject.
+        /// Allow a second independent draft/card even when a pending approval
+        /// card already exists for this recipient + subject. Without this,
+        /// compose --post replaces the pending follow-up card (#596).
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
         allow_duplicate: bool,
         /// Attach a local file to the draft (#417). One file; uploaded via
@@ -4135,6 +4136,65 @@ fn normalize_recipients(flag: &str, values: &[String]) -> Result<Vec<String>> {
     Ok(list)
 }
 
+/// Remove recipient metadata that is rendered on approval cards but must
+/// never become part of the Gmail message body. Older cards could feed their
+/// display-only `CC:`/`[cc: ...]` line back through the revise prompt, after
+/// which the model occasionally returned it as email text.
+fn strip_approval_envelope_markers(body: &str) -> String {
+    body.lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            let marker = trimmed
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(trimmed);
+            let Some((name, value)) = marker.split_once(':') else {
+                return true;
+            };
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim();
+            let is_recipient_list = !value.is_empty()
+                && value.split(',').all(|recipient| {
+                    let recipient = recipient.trim();
+                    recipient.contains('@') && !recipient.contains(char::is_whitespace)
+                });
+            !(matches!(name.as_str(), "to" | "cc" | "bcc") && is_recipient_list)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end_matches('\n')
+        .to_string()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ComposePendingDisposition {
+    Create,
+    Replace {
+        action_id: String,
+        draft_id: Option<String>,
+    },
+}
+
+/// Decide what an actionable compose should do when an equivalent pending
+/// card already exists. A normal follow-up replaces the pending card's
+/// action; `--allow-duplicate` remains the explicit escape hatch for users
+/// who truly want two separate emails under the same subject.
+fn compose_pending_disposition(
+    post: bool,
+    allow_duplicate: bool,
+    pending: Option<(&str, Option<&str>)>,
+) -> ComposePendingDisposition {
+    if post && !allow_duplicate {
+        if let Some((action_id, draft_id)) = pending {
+            return ComposePendingDisposition::Replace {
+                action_id: action_id.to_string(),
+                draft_id: draft_id.map(str::to_string),
+            };
+        }
+    }
+    ComposePendingDisposition::Create
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_gmail_compose(
     store: Arc<Store>,
@@ -4180,28 +4240,30 @@ async fn run_gmail_compose(
         );
     }
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
-    // #419 — duplicate guard, also BEFORE any Gmail write. Concurrent or
-    // repeated asks for the same email produced 3 drafts + 2 cards in one
-    // observed session; refuse the repeat and point at the existing card.
-    if post && !allow_duplicate {
-        // `to` is already the normalized bare-address list (#439), so it IS
-        // the guard key — same single-address behavior as before, and a
-        // multi-recipient repeat matches the earlier card's identical list.
-        let bare_to = to.clone();
-        if let Some((action_id, draft_id)) = store
-            .find_pending_action_for_recipient(&entity_id, &bare_to, &subject)
+    // #419 / #596 — preserve one active approval identity while allowing a
+    // conversational follow-up to replace its body/envelope. The old action
+    // is superseded only after the replacement Gmail draft and Discord card
+    // both succeed, so a failed follow-up leaves the original actionable.
+    let pending = if post && !allow_duplicate {
+        store
+            .find_pending_action_for_recipient(&entity_id, &to, &subject)
             .context("duplicate-guard lookup")?
-        {
-            anyhow::bail!(
-                "a pending approval card already exists for {bare_to} / \"{subject}\" \
-                 (action {action_id}, draft {draft}). Revise it from the card, or update \
-                 the draft in place with `gmail update-draft --draft-id {draft} ...` — \
-                 the card follows the new draft automatically. Pass --allow-duplicate \
-                 to force a second card.",
-                draft = draft_id.as_deref().unwrap_or("<none>")
-            );
-        }
-    }
+    } else {
+        None
+    };
+    let pending_replacement = match compose_pending_disposition(
+        post,
+        allow_duplicate,
+        pending
+            .as_ref()
+            .map(|(action_id, draft_id)| (action_id.as_str(), draft_id.as_deref())),
+    ) {
+        ComposePendingDisposition::Replace {
+            action_id,
+            draft_id,
+        } => Some((action_id, draft_id)),
+        ComposePendingDisposition::Create => None,
+    };
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
     let attachment = upload_attach_if_given(&gmail, attach).await?;
@@ -4239,6 +4301,35 @@ async fn run_gmail_compose(
             reply_to_body_file.as_deref(),
         )
         .await?;
+        if let Some((old_action_id, old_draft_id)) = pending_replacement {
+            match store.mark_pending_superseded_by_ids(
+                std::slice::from_ref(&old_action_id),
+                "superseded by follow-up compose",
+            ) {
+                Ok(1) => {
+                    if let Some(old_draft_id) = old_draft_id {
+                        if let Err(e) = gmail.delete_draft(&entity_id, &old_draft_id).await {
+                            tracing::warn!(
+                                action_id = %old_action_id,
+                                draft_id = %old_draft_id,
+                                "follow-up compose: delete superseded draft failed: {e}"
+                            );
+                        }
+                    }
+                    println!(
+                        "approval card {old_action_id} superseded by the replacement card"
+                    );
+                }
+                Ok(_) => tracing::warn!(
+                    action_id = %old_action_id,
+                    "follow-up compose: pending action was already resolved"
+                ),
+                Err(e) => tracing::warn!(
+                    action_id = %old_action_id,
+                    "follow-up compose: failed to supersede old action: {e}"
+                ),
+            }
+        }
         if json {
             println!(
                 "{}",
@@ -6790,6 +6881,50 @@ mod unescape_body_tests {
 }
 
 #[cfg(test)]
+mod approval_body_tests {
+    use super::{compose_pending_disposition, strip_approval_envelope_markers, ComposePendingDisposition};
+
+    #[test]
+    fn pending_follow_up_replaces_the_existing_card() {
+        assert_eq!(
+            compose_pending_disposition(true, false, Some(("action-1", Some("draft-1")))),
+            ComposePendingDisposition::Replace {
+                action_id: "action-1".into(),
+                draft_id: Some("draft-1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_duplicate_override_still_creates_another_card() {
+        assert_eq!(
+            compose_pending_disposition(true, true, Some(("action-1", Some("draft-1")))),
+            ComposePendingDisposition::Create
+        );
+    }
+
+    #[test]
+    fn removes_display_only_recipient_lines() {
+        let body = "Hi Bo,\n\nThanks.\n\nCC: ccrimi75@gmail.com";
+        assert_eq!(strip_approval_envelope_markers(body), "Hi Bo,\n\nThanks.");
+        assert_eq!(
+            strip_approval_envelope_markers("Hi\n[cc: ccrimi75@gmail.com]"),
+            "Hi"
+        );
+        assert_eq!(
+            strip_approval_envelope_markers("Hi\nCC: a@example.com, b@example.com"),
+            "Hi"
+        );
+    }
+
+    #[test]
+    fn keeps_normal_prose_and_non_email_colons() {
+        let body = "Hi,\n\nCC: means carbon copy in this sentence.\nTo: the team";
+        assert_eq!(strip_approval_envelope_markers(body), body);
+    }
+}
+
+#[cfg(test)]
 mod owner_rules_tests {
     use super::{extract_md_section, owner_rules_block};
 
@@ -7158,7 +7293,7 @@ impl ReplyApprover {
             feedback,
         );
         let redraft = match self.reasoner.call(&opts, &prompt).await {
-            Ok(s) => s.trim().to_string(),
+            Ok(s) => strip_approval_envelope_markers(s.trim()),
             Err(e) => {
                 return ApprovalActionOutcome::Failed {
                     message: format!("redraft call failed: {e}"),
