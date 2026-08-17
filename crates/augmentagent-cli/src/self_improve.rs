@@ -577,11 +577,17 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
              unattended fix pipeline (which runs `cargo build`/`npm` and pushes \
              a branch) will not run on it automatically. A maintainer can opt \
              this in by adding the author to \
-             `AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS`, or by reviewing and \
-             driving it through the approval flow.",
+             `AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS` and removing the \
+             `agent-gave-up` label, or by reviewing and driving it through \
+             the approval flow.",
         )
         .await
         .ok();
+        // #630 — the refusal is deterministic (the author won't change), so
+        // label it out of the selection pool immediately. Without this, the
+        // unattended loop re-picks the same issue every tick: it head-of-line
+        // blocks every other labeled issue and re-comments daily, forever.
+        label_gave_up(repo_root, issue.number).await.ok();
         return Ok(format!(
             "issue #{}: refused — untrusted author '{}' (requires owner approval)",
             issue.number, issue.author
@@ -644,20 +650,42 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         }
     };
 
-    // Did anything change?
+    // Did anything change? A no-op run still burned a reasoner call, so it
+    // counts as an attempt (#630) — otherwise the unattended loop silently
+    // re-spends its daily cap on an issue the model can't act on.
     let (_ok, diff, _) = run("git", &["diff", "--stat"], &worktree).await?;
     if diff.trim().is_empty() {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
+        let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+        if attempts >= MAX_ATTEMPTS {
+            backoff_comment(
+                repo_root,
+                issue.number,
+                &format!(
+                    "Self-improve gave up after {attempts} attempts: the \
+                     reasoner produced no changes for this issue. Needs a \
+                     human (or a more concrete issue body)."
+                ),
+            )
+            .await
+            .ok();
+            label_gave_up(repo_root, issue.number).await.ok();
+        }
         return Ok(format!(
-            "issue #{}: reasoner made no changes; skipped",
+            "issue #{}: reasoner made no changes; skipped (attempt {attempts})",
             issue.number
         ));
     }
 
-    // Blast-radius + size guard on the actual diff.
+    // Blast-radius + size guard on the actual diff. Each refusal burned a
+    // full reasoner run, so it counts as an attempt (#630): a different
+    // rollout MAY produce an acceptable diff, but after MAX_ATTEMPTS the
+    // gave-up label pulls the issue from the pool — otherwise the unattended
+    // loop would re-spend its whole daily cap on the same issue forever.
     let (_ok, full_diff, _) = run("git", &["diff"], &worktree).await?;
     if is_blast_radius(&full_diff) {
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
+        let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
         backoff_comment(
             repo_root,
             issue.number,
@@ -666,14 +694,18 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         )
         .await
         .ok();
+        if attempts >= MAX_ATTEMPTS {
+            label_gave_up(repo_root, issue.number).await.ok();
+        }
         return Ok(format!(
-            "issue #{}: refused — diff hit blast-radius guard",
+            "issue #{}: refused — diff hit blast-radius guard (attempt {attempts})",
             issue.number
         ));
     }
     let lines = diff_line_count(&full_diff);
     if lines > MAX_DIFF_LINES {
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
+        let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
         backoff_comment(
             repo_root,
             issue.number,
@@ -684,8 +716,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         )
         .await
         .ok();
+        if attempts >= MAX_ATTEMPTS {
+            label_gave_up(repo_root, issue.number).await.ok();
+        }
         return Ok(format!(
-            "issue #{}: refused — diff too large ({lines} lines)",
+            "issue #{}: refused — diff too large ({lines} lines, attempt {attempts})",
             issue.number
         ));
     }
@@ -832,7 +867,10 @@ async fn record_attempt(repo_root: &Path, issue: u64) -> Result<u32> {
             "comment",
             &issue.to_string(),
             "--body",
-            &format!("<!-- self-improve-attempt --> attempt {n} failed the verification gate."),
+            &format!(
+                "<!-- self-improve-attempt --> attempt {n} did not produce an \
+                 acceptable PR (gate failure, refused diff, or no changes)."
+            ),
         ],
         repo_root,
     )
