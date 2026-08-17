@@ -1328,7 +1328,8 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         // needs-input marker (the marker is a Discord-card-only carrier; it
         // lives in `actions.draftBody` so the card can render the field, but
         // it must never reach Gmail). No marker ⇒ unchanged (pre-#35 bytes).
-        let gmail_body = augmentagent_approval_discord::split_needs_input(&initial_draft).0;
+        let (gmail_body, needs_input_asks) =
+            augmentagent_approval_discord::split_needs_input(&initial_draft);
         let draft_id = match existing_draft_id {
             Some(d) => d,
             None => match self
@@ -1362,11 +1363,23 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         // Surface the Cc set on the card the same way #473 compose cards and
         // their reposts do (`append_envelope_markers`): a `[cc: …]` display
         // marker. Card-only — `draftBody` in sqlite and the Gmail draft both
-        // stay the clean reply text.
+        // stay the clean reply text. The marker goes into the HUMAN part with
+        // any #35 needs-input marker re-appended last: `split_needs_input`
+        // (run by every card render) discards text after the marker close,
+        // so appending after it would make the cc invisible on the card.
         let card_body = if cc.is_empty() {
             initial_draft.clone()
         } else {
-            format!("{initial_draft}\n\n[cc: {}]", cc.join(", "))
+            let with_cc = format!("{gmail_body}\n\n[cc: {}]", cc.join(", "));
+            if needs_input_asks.is_empty() {
+                with_cc
+            } else {
+                let pairs: Vec<(String, String)> = needs_input_asks
+                    .iter()
+                    .map(|a| (a.kind.clone(), a.text.clone()))
+                    .collect();
+                augmentagent_approval_discord::append_needs_input_marker(&with_cc, &pairs)
+            }
         };
         if let Err(e) = self
             .approvals
@@ -2482,6 +2495,52 @@ mod tests {
             env.cc.as_deref(),
             Some("will@example.com, zack@example.com, chase@example.com, milan@example.com")
         );
+    }
+
+    #[tokio::test]
+    async fn reply_all_cc_marker_survives_a_needs_input_draft() {
+        // #35 needs-input drafts end with a marker, and split_needs_input
+        // (run by every card render) discards text after it — the [cc:]
+        // marker must land in the human part or it never shows on the card.
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(ThreadedGmail {
+            emails: vec![threaded_inbound()],
+            thread: vec![threaded_inbound()],
+            thread_fetch_fails: false,
+            recorded_cc: std::sync::Mutex::new(None),
+        });
+        let marked_draft = augmentagent_approval_discord::append_needs_input_marker(
+            "Happy to — what time works?",
+            &[("scheduling".to_string(), "meeting time".to_string())],
+        );
+        let broker = Arc::new(BodyRecordingBroker::default());
+        let ch = GmailChannel::new(
+            store,
+            gmail,
+            Arc::new(ScriptedReasoner::new([])),
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        // Drive dispatch_reply directly with the already-marked draft — the
+        // card construction under test lives there, and the upstream
+        // triage→draft→resolver chain would need a fully scripted resolver.
+        let out = ch
+            .dispatch_reply("acc1", threaded_inbound(), marked_draft, None)
+            .await
+            .unwrap();
+        assert!(matches!(out, Some(DispatchOutcome::AwaitingApproval)));
+        let bodies = broker.bodies.lock().unwrap();
+        let (human, asks) = augmentagent_approval_discord::split_needs_input(&bodies[0]);
+        assert!(
+            human.contains("[cc: will@example.com"),
+            "cc marker lost from rendered card body: {}",
+            bodies[0]
+        );
+        assert_eq!(asks.len(), 1, "needs-input ask lost: {}", bodies[0]);
     }
 
     #[tokio::test]

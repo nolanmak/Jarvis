@@ -895,9 +895,22 @@ fn append_envelope_markers(
         markers.push_str(&format!("\n[bcc: {bcc}]"));
     }
     if markers.is_empty() {
-        body
+        return body;
+    }
+    // #629 — insert the markers into the HUMAN part of the draft, keeping any
+    // #35 needs-input marker last: `split_needs_input` (which every card
+    // render runs) discards text after the marker close, so markers appended
+    // blindly after it would silently vanish from the card.
+    let (human, asks) = crate::split_needs_input(&body);
+    let with_markers = format!("{human}\n{markers}");
+    if asks.is_empty() {
+        with_markers
     } else {
-        format!("{body}\n{markers}")
+        let pairs: Vec<(String, String)> = asks
+            .into_iter()
+            .map(|a| (a.kind, a.text))
+            .collect();
+        crate::append_needs_input_marker(&with_markers, &pairs)
     }
 }
 
@@ -1865,6 +1878,27 @@ mod tests {
         let out = append_envelope_markers("body".into(), Some(&s), &id, "a@b.com");
         assert!(!out.contains("[to:"), "redundant to marker: {out}");
         assert!(out.contains("[cc: cc@d.com]"), "missing cc marker: {out}");
+    }
+
+    #[test]
+    fn envelope_markers_stay_visible_on_needs_input_drafts() {
+        // #629 — a needs-input draft carries a trailing #35 marker, and
+        // split_needs_input (run by every card render) discards text after
+        // it. The cc marker must land in the human part or it never renders.
+        let (s, id, _f) =
+            store_with_envelope(Some("a@example.com"), Some("cc@example.com"), None);
+        let body = crate::append_needs_input_marker(
+            "body",
+            &[("scheduling".to_string(), "what time works?".to_string())],
+        );
+        let out = append_envelope_markers(body, Some(&s), &id, "a@example.com");
+        let (human, asks) = crate::split_needs_input(&out);
+        assert!(
+            human.contains("[cc: cc@example.com]"),
+            "cc marker lost from rendered card: {out}"
+        );
+        assert_eq!(asks.len(), 1, "needs-input ask lost: {out}");
+        assert_eq!(asks[0].text, "what time works?");
     }
 
     #[test]

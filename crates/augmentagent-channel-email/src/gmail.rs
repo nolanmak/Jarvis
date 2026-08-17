@@ -832,6 +832,33 @@ mod tests {
         assert_eq!(e.cc, "");
     }
 
+    #[test]
+    fn fetch_message_survives_a_shape_shifted_payload() {
+        // #331 lesson: Composio fields drift shape between builds. A payload
+        // that is a string / number / oddly-typed headers list must degrade
+        // to "no cc", never abort the decode (which would drop every email
+        // in the page).
+        for bad_payload in [
+            serde_json::json!("not an object"),
+            serde_json::json!(42),
+            serde_json::json!({"headers": "nope"}),
+            serde_json::json!({"headers": [{"name": 5}]}),
+            serde_json::Value::Null,
+        ] {
+            let v = serde_json::json!({
+                "messageId": "m4",
+                "sender": "a@example.com",
+                "to": "b@example.com",
+                "payload": bad_payload,
+            });
+            let m: super::FetchMessage =
+                serde_json::from_value(v).expect("lenient payload must not fail decode");
+            let e = m.into_email("acct").unwrap();
+            assert_eq!(e.to, "b@example.com");
+            assert_eq!(e.cc, "");
+        }
+    }
+
     // ---- #164: tool-error propagation ----
     //
     // Regression test for the bug where the reasoner narrated a fabricated
@@ -1418,8 +1445,11 @@ struct FetchMessage {
     /// GMAIL_FETCH_MESSAGE_BY_THREAD_ID message (probed live 2026-08-17).
     to: Option<String>,
     /// Raw RFC-822 headers under `payload.headers`. `Cc:` has no top-level
-    /// field, so it must be dug out of here (#629). Kept optional/defaulted —
-    /// some Composio responses omit `payload` entirely.
+    /// field, so it must be dug out of here (#629). Deserialized leniently —
+    /// an absent, null, or shape-shifted `payload` degrades to `None` (empty
+    /// cc) instead of hard-failing the whole fetch decode, per the #331
+    /// lesson on Composio response drift.
+    #[serde(default, deserialize_with = "de_lenient_payload")]
     payload: Option<FetchPayload>,
     subject: Option<String>,
     #[serde(alias = "snippet", alias = "messageText")]
@@ -1473,6 +1503,18 @@ where
 struct FetchPayload {
     #[serde(default)]
     headers: Vec<FetchHeader>,
+}
+
+/// Accept `payload` in any shape: a well-formed object parses, anything else
+/// (string, number, array, headers items of the wrong type) yields `None`
+/// rather than aborting the entire `FetchResp` decode — losing every email in
+/// the page over one malformed field is exactly the #331 failure mode.
+fn de_lenient_payload<'de, D>(d: D) -> Result<Option<FetchPayload>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).ok())
 }
 
 #[derive(Debug, Deserialize)]
