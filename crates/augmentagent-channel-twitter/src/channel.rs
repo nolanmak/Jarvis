@@ -1233,6 +1233,8 @@ mod tests {
 
     fn tweet_email(message_id: &str) -> Email {
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: message_id.to_string(),
             thread_id: Some(message_id.to_string()),
             from: "Jane <twitter:55>".into(),

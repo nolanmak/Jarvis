@@ -195,6 +195,8 @@ impl ProactiveRunner {
 
     async fn dispatch(&self, sig: &ProactiveSignal) -> anyhow::Result<()> {
         let pseudo = Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: format!("proactive:{}", sig.dedup_key),
             thread_id: None,
             from: sig.person_slug.clone().unwrap_or_else(|| "proactive".into()),

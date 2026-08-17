@@ -817,6 +817,8 @@ pub(crate) fn message_to_email(
         SubscriptionMode::Digest | SubscriptionMode::StoreOnly => "digest_item",
     };
     Email {
+        to: String::new(),
+        cc: String::new(),
         message_id: msg.id.clone(),
         thread_id: Some(msg.channel_id.clone()),
         from,

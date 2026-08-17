@@ -691,6 +691,8 @@ pub fn message_to_email(
         SubscriptionMode::Digest | SubscriptionMode::StoreOnly => "digest_item",
     };
     Email {
+        to: String::new(),
+        cc: String::new(),
         message_id: format!("tg:{}:{}", msg.chat.id, msg.message_id),
         thread_id: Some(msg.chat.id.to_string()),
         from,

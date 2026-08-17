@@ -139,6 +139,8 @@ impl GDriveChannel {
                         continue;
                     }
                     let email = Email {
+                        to: String::new(),
+                        cc: String::new(),
                         message_id: format!(
                             "gdrive:{entity}:{}:{}",
                             ch.file_id, ch.modified_time

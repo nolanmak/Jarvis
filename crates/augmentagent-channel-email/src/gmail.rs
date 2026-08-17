@@ -90,6 +90,24 @@ pub trait GmailApi: Send + Sync {
         thread_id: Option<&str>,
     ) -> Result<String, GmailError>;
 
+    /// Create a reply draft carrying Cc recipients (#629 reply-all). The
+    /// default impl drops `cc` and delegates to [`create_draft`] so test
+    /// fakes that don't model Cc keep compiling; `ComposioClient` overrides
+    /// it to pass the list through `GMAIL_CREATE_EMAIL_DRAFT`'s `cc` param.
+    async fn create_draft_with_cc(
+        &self,
+        entity_id: &str,
+        to: &str,
+        cc: &[String],
+        subject: &str,
+        body: &str,
+        thread_id: Option<&str>,
+    ) -> Result<String, GmailError> {
+        let _ = cc;
+        self.create_draft(entity_id, to, subject, body, thread_id)
+            .await
+    }
+
     /// Replace an existing draft's content. Returns the NEW draft id — the
     /// old id is invalid afterwards.
     ///
@@ -762,6 +780,58 @@ mod tests {
         assert!(split_recipients(" , ").is_empty());
     }
 
+    // ---- #629: To/Cc recovery from the fetch payload ----
+    //
+    // Composio returns the full To list top-level and the Cc only inside
+    // `payload.headers` (probed live 2026-08-17; the header name has been
+    // seen as both `Cc` and `CC`). Reply-all depends on both landing on
+    // `Email`.
+
+    #[test]
+    fn fetch_message_maps_top_level_to_and_cc_header() {
+        let v = serde_json::json!({
+            "messageId": "m1",
+            "threadId": "t1",
+            "sender": "a@example.com",
+            "messageText": "hi",
+            "messageTimestamp": "2026-08-17T00:00:00Z",
+            "to": "Ann <ann@example.com>, bo@example.com",
+            "payload": {"headers": [
+                {"name": "Subject", "value": "irrelevant"},
+                {"name": "CC", "value": "\"cee@example.com\" <cee@example.com>, Dee <dee@example.com>"}
+            ]}
+        });
+        let m: super::FetchMessage = serde_json::from_value(v).unwrap();
+        let e = m.into_email("acct").unwrap();
+        assert_eq!(e.to, "Ann <ann@example.com>, bo@example.com");
+        assert_eq!(
+            e.cc,
+            "\"cee@example.com\" <cee@example.com>, Dee <dee@example.com>"
+        );
+    }
+
+    #[test]
+    fn fetch_message_falls_back_to_the_to_header_and_tolerates_absent_payload() {
+        // No top-level `to` → dig it out of the raw headers.
+        let v = serde_json::json!({
+            "messageId": "m2",
+            "sender": "a@example.com",
+            "payload": {"headers": [{"name": "To", "value": "b@example.com"}]}
+        });
+        let m: super::FetchMessage = serde_json::from_value(v).unwrap();
+        let e = m.into_email("acct").unwrap();
+        assert_eq!(e.to, "b@example.com");
+        assert_eq!(e.cc, "");
+
+        // No payload at all (some Composio responses omit it) → empty, not
+        // a decode failure.
+        let v = serde_json::json!({"messageId": "m3", "sender": "a@example.com"});
+        let m: super::FetchMessage = serde_json::from_value(v).unwrap();
+        let e = m.into_email("acct").unwrap();
+        assert_eq!(e.to, "");
+        assert_eq!(e.cc, "");
+    }
+
     // ---- #164: tool-error propagation ----
     //
     // Regression test for the bug where the reasoner narrated a fabricated
@@ -1343,6 +1413,14 @@ struct FetchMessage {
     thread_id: Option<String>,
     from: Option<String>,
     sender: Option<String>,
+    /// Full `To:` recipient list, comma-joined with display names — Composio
+    /// surfaces it top-level on every GMAIL_FETCH_EMAILS /
+    /// GMAIL_FETCH_MESSAGE_BY_THREAD_ID message (probed live 2026-08-17).
+    to: Option<String>,
+    /// Raw RFC-822 headers under `payload.headers`. `Cc:` has no top-level
+    /// field, so it must be dug out of here (#629). Kept optional/defaulted —
+    /// some Composio responses omit `payload` entirely.
+    payload: Option<FetchPayload>,
     subject: Option<String>,
     #[serde(alias = "snippet", alias = "messageText")]
     body: Option<String>,
@@ -1391,13 +1469,45 @@ where
     })
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct FetchPayload {
+    #[serde(default)]
+    headers: Vec<FetchHeader>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchHeader {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    value: String,
+}
+
 impl FetchMessage {
+    /// The value of the first raw header matching `name`, case-insensitively —
+    /// Gmail emits `Cc`, Composio has been seen relaying `CC`.
+    fn header(&self, name: &str) -> Option<String> {
+        self.payload.as_ref()?.headers.iter().find_map(|h| {
+            (h.name.eq_ignore_ascii_case(name) && !h.value.trim().is_empty())
+                .then(|| h.value.trim().to_string())
+        })
+    }
+
     fn into_email(self, account: &str) -> Option<Email> {
+        let to = self
+            .to
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.header("To"))
+            .unwrap_or_default();
+        let cc = self.header("Cc").unwrap_or_default();
         let message_id = self.message_id?;
         Some(Email {
             message_id,
             thread_id: self.thread_id,
             from: self.from.or(self.sender).unwrap_or_default(),
+            to,
+            cc,
             subject: self.subject.unwrap_or_default(),
             body: self.body.unwrap_or_default(),
             // Prefer the real Composio field (`messageTimestamp`); fall back to
@@ -1510,6 +1620,19 @@ impl GmailApi for ComposioClient {
         // `extra_recipients`, #439) lives in the inherent attachment-aware
         // variant (#417).
         self.create_draft_with_attachment(entity_id, to, subject, body, thread_id, None, &[], &[])
+            .await
+    }
+
+    async fn create_draft_with_cc(
+        &self,
+        entity_id: &str,
+        to: &str,
+        cc: &[String],
+        subject: &str,
+        body: &str,
+        thread_id: Option<&str>,
+    ) -> Result<String, GmailError> {
+        self.create_draft_with_attachment(entity_id, to, subject, body, thread_id, None, cc, &[])
             .await
     }
 
