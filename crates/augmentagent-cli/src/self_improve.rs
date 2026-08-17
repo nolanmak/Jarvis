@@ -9,8 +9,12 @@
 //! - **Verification gate.** `cargo build` + `npm run build` + `cargo test`
 //!   must all pass before a PR is opened. A red gate => no PR, a back-off
 //!   comment on the issue instead.
-//! - **Draft only, never auto-merge.** PRs are opened `--draft`; a human
-//!   merges.
+//! - **Draft by default; human merges.** PRs are opened `--draft`. The one
+//!   exception (#630): with `AUGMENTAGENT_AUTOPR_AUTOMERGE=1`, issues
+//!   authored by the OWNER (or an explicit login allowlist) merge
+//!   automatically after the gate passes — everyone else always gets the
+//!   draft + review flow. On the production box a merge deploys via the
+//!   auto-updater, which is precisely the owner-only opt-in being made.
 //! - **Dedup guard.** Issues that already have an open PR from a previous
 //!   agent run are skipped (branch-name convention + `gh pr list`).
 //! - **Blast-radius refusal.** Issues whose title/body or whose resulting
@@ -447,10 +451,134 @@ async fn has_open_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
 }
 
 /// Reasoner opts scoped to write/edit/bash within the per-attempt worktree.
+/// Model tiers for the two-stage pipeline (#630). Defaults are pinned full
+/// model IDs per the #448 rule — `model: None` silently inherits whatever the
+/// owner last picked for their interactive Claude Code, which is a leak, not
+/// a default (`fix_opts` shipped with exactly that bug until now). Env
+/// overrides let the owner re-tier without a rebuild.
+const AUTOPR_SCOPE_MODEL: &str = "claude-fable-5";
+const AUTOPR_BUILD_MODEL: &str = "claude-opus-5";
+
+fn scope_model() -> String {
+    resolve_model(
+        std::env::var("AUGMENTAGENT_AUTOPR_SCOPE_MODEL").ok().as_deref(),
+        AUTOPR_SCOPE_MODEL,
+    )
+}
+
+fn build_model() -> String {
+    resolve_model(
+        std::env::var("AUGMENTAGENT_AUTOPR_BUILD_MODEL").ok().as_deref(),
+        AUTOPR_BUILD_MODEL,
+    )
+}
+
+fn resolve_model(env_val: Option<&str>, default: &str) -> String {
+    match env_val.map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => default.to_string(),
+    }
+}
+
+/// Stage 1 of the two-stage pipeline: a read-only scoping pass on a stronger
+/// model. Issues filed conversationally (e.g. by the Discord agent on the
+/// owner's behalf) are often under-specified; the scoper reads the actual
+/// code and turns the ask into a concrete implementation spec the builder
+/// can follow, instead of letting the builder guess scope while editing.
+fn scope_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
+    augmentagent_channel_core::ReasonerOpts {
+        system_prompt: SCOPE_SYSTEM.to_string(),
+        model: Some(scope_model()),
+        allowed_tools: vec![
+            "Read".into(),
+            "Grep".into(),
+            "Glob".into(),
+            "Bash(ls *)".into(),
+            "Bash(git log*)".into(),
+            "Bash(git diff*)".into(),
+            "Bash(git status*)".into(),
+        ],
+        add_dirs: vec![worktree.clone()],
+        permission_mode: "default".into(),
+        cwd: Some(worktree),
+        env: Vec::new(),
+        settings_json: None,
+        restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
+    }
+}
+
+const SCOPE_SYSTEM: &str = "You are the scoping pass of a two-stage autonomous \
+fix pipeline for the AugmentAgent codebase. You are given a GitHub issue that \
+may be vague or under-specified. READ the relevant code first, then produce an \
+implementation spec for a second, separate agent that will write the code. \
+Your output MUST contain:\n\
+- Interpretation: what the issue is actually asking for, resolving any \
+ambiguity with the most reasonable reading of the code and stating the \
+assumption you made.\n\
+- Files to touch: concrete paths, with what changes in each and which \
+existing functions/patterns to reuse.\n\
+- The smallest correct approach, and one sentence on why not the \
+alternatives.\n\
+- Edge cases and failure modes the builder must handle.\n\
+- Acceptance criteria: what tests to add/update and what observable \
+behaviour proves the fix.\n\
+Constraints: read-only — do NOT edit files. Stay inside the given working \
+directory. Do NOT touch deploy/auth/secret/CI paths even in your plan \
+(systemd, scripts/check-for-updates, .github/workflows, credentials/keyring/\
+.env) and keep the planned diff small (the pipeline caps at 600 changed \
+lines). Output ONLY the spec, no preamble.";
+
+/// Build the stage-2 prompt: the issue plus (when the scoping pass produced
+/// one) the implementation spec.
+fn build_fix_prompt(issue: &Issue, plan: Option<&str>) -> String {
+    match plan {
+        Some(p) => format!(
+            "GitHub issue #{}: {}\n\n{}\n\n\
+             ## Implementation spec (from a read-only scoping pass on a \
+             stronger model — follow it unless the code contradicts it, and \
+             say so in your summary if it does)\n{}\n\nImplement the fix now.",
+            issue.number, issue.title, issue.body, p
+        ),
+        None => format!(
+            "GitHub issue #{}: {}\n\n{}\n\nImplement the fix now.",
+            issue.number, issue.title, issue.body
+        ),
+    }
+}
+
+/// #630 — auto-merge policy. Off unless `AUGMENTAGENT_AUTOPR_AUTOMERGE=1|true`,
+/// and even then only for issues authored by the owner (or an explicit
+/// `AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS` login list). Everyone else's
+/// issues keep the draft-PR + human-review flow. NOTE the deploy coupling:
+/// on the production box a merge to main is deployed to the live daemon by
+/// the auto-updater within minutes — that is exactly the behaviour the owner
+/// opted into for their own issues, and exactly why nobody else's issues
+/// qualify.
+fn automerge_enabled_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some(x) if x == "1" || x.eq_ignore_ascii_case("true"))
+}
+
+fn automerge_eligible(author: &str, owner: Option<&str>, authors_csv: Option<&str>) -> bool {
+    if author.trim().is_empty() {
+        return false;
+    }
+    match authors_csv.map(str::trim).filter(|s| !s.is_empty()) {
+        // Explicit allowlist set ⇒ it is the whole policy (owner must
+        // list themselves too — no silent unions).
+        Some(csv) => csv
+            .split(',')
+            .any(|a| a.trim().eq_ignore_ascii_case(author.trim())),
+        None => matches!(owner, Some(o) if o.trim().eq_ignore_ascii_case(author.trim())),
+    }
+}
+
 fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     augmentagent_channel_core::ReasonerOpts {
         system_prompt: SELF_IMPROVE_SYSTEM.to_string(),
-        model: None,
+        model: Some(build_model()),
         allowed_tools: vec![
             "Read".into(),
             "Grep".into(),
@@ -635,13 +763,37 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         let _ = run("git", &["branch", "-D", &br], &root).await;
     };
 
-    // Hand the issue to the reasoner inside the worktree.
     let reasoner = Arc::new(ClaudeCliReasoner::new());
-    let opts = fix_opts(worktree.clone());
-    let prompt = format!(
-        "GitHub issue #{}: {}\n\n{}\n\nImplement the fix now.",
+
+    // Stage 1 (#630): read-only scoping pass on a stronger model. Issues
+    // filed conversationally are often under-specified; the scoper expands
+    // the ask into an implementation spec before the builder edits anything.
+    // Scoping failure degrades to the pre-#630 single-stage behaviour — the
+    // spec is an enhancement, not a gate.
+    let scope_prompt = format!(
+        "GitHub issue #{}: {}\n\n{}\n\nProduce the implementation spec now.",
         issue.number, issue.title, issue.body
     );
+    let plan = match reasoner
+        .call(&scope_opts(worktree.clone()), &scope_prompt)
+        .await
+    {
+        Ok(p) => {
+            let p = p.trim().to_string();
+            if p.is_empty() { None } else { Some(p) }
+        }
+        Err(e) => {
+            warn!(
+                issue = issue.number,
+                "scoping pass failed; building without a spec: {e:#}"
+            );
+            None
+        }
+    };
+
+    // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
+    let opts = fix_opts(worktree.clone());
+    let prompt = build_fix_prompt(&issue, plan.as_deref());
     let summary = match reasoner.call(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
@@ -802,43 +954,83 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         bail!("git push failed: {e}");
     }
 
-    // Open a DRAFT PR. Never auto-merge.
+    // Open the PR. Draft + human merge for everyone; owner-authored issues
+    // can auto-merge when the owner opted in (see `automerge_eligible`).
+    let automerge = {
+        let enabled = automerge_enabled_value(
+            std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
+        );
+        if enabled {
+            let owner = std::env::var(GH_OWNER_ENV)
+                .ok()
+                .or(repo_owner_from_remote(repo_root).await);
+            automerge_eligible(
+                &issue.author,
+                owner.as_deref(),
+                std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS")
+                    .ok()
+                    .as_deref(),
+            )
+        } else {
+            false
+        }
+    };
     let gh = gh_bin();
+    let plan_section = plan
+        .as_deref()
+        .map(|p| format!("\n\n## Implementation spec (scoping pass)\n{}", truncate(p, 1500)))
+        .unwrap_or_default();
+    let merge_note = if automerge {
+        "Auto-merged: owner-authored issue with AUGMENTAGENT_AUTOPR_AUTOMERGE=1."
+    } else {
+        "Draft — a human must review and merge."
+    };
     let pr_body = format!(
-        "Automated self-improvement for #{}.\n\n## Summary\n{}\n\n## Verification\n\
+        "Automated self-improvement for #{}.\n\n## Summary\n{}{plan_section}\n\n## Verification\n\
          - `cargo build --workspace`: pass\n- `cargo test --workspace`: pass\n\
          - diff size: {lines} lines (cap {MAX_DIFF_LINES})\n\n\
-         Draft — a human must review and merge. Fixes #{}",
+         {merge_note} Fixes #{}",
         issue.number,
         truncate(&summary, 1500),
         issue.number
     );
-    let (ok, stdout, e) = run(
-        &gh,
-        &[
-            "pr",
-            "create",
-            "--draft",
-            "--base",
-            "main",
-            "--head",
-            &branch,
-            "--title",
-            &format!("fix: {} (#{})", issue.title, issue.number),
-            "--body",
-            &pr_body,
-        ],
-        &worktree,
-    )
-    .await?;
-    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+    let title = format!("fix: {} (#{})", issue.title, issue.number);
+    let mut args = vec!["pr", "create"];
+    if !automerge {
+        args.push("--draft");
+    }
+    args.extend_from_slice(&[
+        "--base", "main", "--head", &branch, "--title", &title, "--body", &pr_body,
+    ]);
+    let (ok, stdout, e) = run(&gh, &args, &worktree).await?;
+    cleanup(worktree, branch.clone(), repo_root.to_path_buf()).await;
     if !ok {
         bail!("gh pr create failed: {e}");
     }
+    let pr_url = stdout.trim().to_string();
+    if !automerge {
+        return Ok(format!("issue #{}: draft PR opened — {pr_url}", issue.number));
+    }
+    // Merge immediately: the verification gate already passed, and `--auto`
+    // needs branch protection this repo doesn't run. A merge failure (main
+    // moved, protection added later) leaves the PR open for a human — never
+    // retried blindly.
+    let (ok, _o, e) = run(
+        &gh,
+        &["pr", "merge", &branch, "--squash", "--delete-branch"],
+        repo_root,
+    )
+    .await?;
+    if !ok {
+        warn!(issue = issue.number, "auto-merge failed; PR left open: {e}");
+        return Ok(format!(
+            "issue #{}: PR opened but auto-merge FAILED (left open for review) — {pr_url}",
+            issue.number
+        ));
+    }
     Ok(format!(
-        "issue #{}: draft PR opened — {}",
-        issue.number,
-        stdout.trim()
+        "issue #{}: PR auto-merged (owner-authored) — {pr_url}",
+        issue.number
     ))
 }
 
@@ -1555,8 +1747,16 @@ pub async fn open_approved_runs(store: &Store) -> Result<String> {
 ///   The counter is in-memory — a restart resets it — so the cap is
 ///   belt-and-suspenders on top of the label gate and per-issue back-off,
 ///   not the primary control.
-/// - **Never auto-merge.** Inherited from `run_once`: PRs are draft, a
-///   human merges. The PR body's `Fixes #N` cross-links it on the issue.
+/// - **Draft + human merge by default.** Inherited from `run_once`; the PR
+///   body's `Fixes #N` cross-links it on the issue. Owner-authored issues
+///   auto-merge only behind the separate `AUGMENTAGENT_AUTOPR_AUTOMERGE`
+///   opt-in (see `automerge_eligible`).
+///
+/// Each engaged run is now TWO reasoner calls (#630): a read-only scoping
+/// pass on `AUGMENTAGENT_AUTOPR_SCOPE_MODEL` (default Fable) that turns an
+/// under-specified issue into an implementation spec, then the build on
+/// `AUGMENTAGENT_AUTOPR_BUILD_MODEL` (default Opus). Budget the daily cap
+/// accordingly.
 pub struct AutoPrLoop {
     repo_root: PathBuf,
     dry_run: bool,
@@ -1842,6 +2042,88 @@ mod tests {
         let l = loop_values(Some("1"), Some("10"), Some("0")).unwrap();
         assert_eq!(l.interval.as_secs(), 300);
         assert_eq!(l.daily_cap, 1);
+    }
+
+    // ---- #630: auto-merge policy + two-stage model pins ----
+
+    #[test]
+    fn automerge_requires_explicit_opt_in_value() {
+        assert!(!automerge_enabled_value(None));
+        assert!(!automerge_enabled_value(Some("")));
+        assert!(!automerge_enabled_value(Some("0")));
+        assert!(!automerge_enabled_value(Some("yes")));
+        assert!(automerge_enabled_value(Some("1")));
+        assert!(automerge_enabled_value(Some("true")));
+        assert!(automerge_enabled_value(Some(" TRUE ")));
+    }
+
+    #[test]
+    fn automerge_eligibility_is_owner_only_by_default() {
+        // Owner match, case-insensitive.
+        assert!(automerge_eligible("nolanmak", Some("nolanmak"), None));
+        assert!(automerge_eligible("NolanMak", Some("nolanmak"), None));
+        // Anyone else — including trusted collaborators — stays draft+review.
+        assert!(!automerge_eligible("collaborator", Some("nolanmak"), None));
+        // No resolvable owner ⇒ never auto-merge.
+        assert!(!automerge_eligible("nolanmak", None, None));
+        // Empty author (gh returned none) ⇒ never.
+        assert!(!automerge_eligible("", Some("nolanmak"), None));
+    }
+
+    #[test]
+    fn automerge_allowlist_replaces_owner_default() {
+        // An explicit allowlist IS the policy — no silent union with owner.
+        assert!(automerge_eligible(
+            "helper",
+            Some("nolanmak"),
+            Some("helper, other")
+        ));
+        assert!(!automerge_eligible(
+            "nolanmak",
+            Some("nolanmak"),
+            Some("helper")
+        ));
+        // Blank allowlist falls back to the owner default.
+        assert!(automerge_eligible("nolanmak", Some("nolanmak"), Some("  ")));
+    }
+
+    #[test]
+    fn two_stage_models_are_pinned_with_env_override() {
+        // #448 — model: None inherits the owner's interactive model; both
+        // stages must pin. Defaults hold when the env is unset/blank.
+        assert_eq!(resolve_model(None, AUTOPR_SCOPE_MODEL), "claude-fable-5");
+        assert_eq!(resolve_model(Some("  "), AUTOPR_BUILD_MODEL), "claude-opus-5");
+        assert_eq!(
+            resolve_model(Some("claude-sonnet-5"), AUTOPR_BUILD_MODEL),
+            "claude-sonnet-5"
+        );
+        // The opts constructors actually pin them.
+        assert!(scope_opts(PathBuf::from("/tmp/wt")).model.is_some());
+        assert!(fix_opts(PathBuf::from("/tmp/wt")).model.is_some());
+    }
+
+    #[test]
+    fn scope_stage_is_read_only_and_fix_prompt_embeds_the_spec() {
+        let opts = scope_opts(PathBuf::from("/tmp/wt"));
+        for t in &opts.allowed_tools {
+            assert!(
+                !t.contains("Write") && !t.contains("Edit"),
+                "scope stage must not be able to edit: {t}"
+            );
+        }
+        let issue = Issue {
+            number: 7,
+            title: "t".into(),
+            body: "b".into(),
+            author: "a".into(),
+            author_trusted: true,
+        };
+        let with = build_fix_prompt(&issue, Some("the spec"));
+        assert!(with.contains("the spec"));
+        assert!(with.contains("Implementation spec"));
+        let without = build_fix_prompt(&issue, None);
+        assert!(!without.contains("Implementation spec"));
+        assert!(without.contains("Implement the fix now."));
     }
 
     #[test]
