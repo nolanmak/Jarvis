@@ -42,6 +42,11 @@ const GAVE_UP_LABEL: &str = "agent-gave-up";
 const MAX_DIFF_LINES: usize = 600;
 /// Consecutive failed attempts before we comment + back off (label marker).
 const MAX_ATTEMPTS: u32 = 3;
+/// What [`run_once`] returns when no labeled issue is waiting. The #630
+/// auto-PR loop matches on this to tell an idle tick (one cheap `gh issue
+/// list`, no reasoner spend) from an engaged run (counts against the daily
+/// cap because it spawned the claude CLI on the owner's subscription, #448).
+const IDLE_MSG: &str = "no eligible agent-fixable issues";
 
 /// #300 — Trust gate. Issue bodies are attacker-controllable now that the
 /// repo is public, and the reasoner is granted Write/Edit/Bash(cargo/npm)
@@ -543,7 +548,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     }
 
     let Some(issue) = pick_issue(repo_root).await? else {
-        return Ok("no eligible agent-fixable issues".to_string());
+        return Ok(IDLE_MSG.to_string());
     };
     info!(issue = issue.number, title = %issue.title, "selected issue");
 
@@ -1488,6 +1493,160 @@ pub async fn open_approved_runs(store: &Store) -> Result<String> {
     Ok(out.join("\n"))
 }
 
+// ---------------------------------------------------------------------------
+// #630 — auto-PR daemon loop
+// ---------------------------------------------------------------------------
+
+/// #630 — in-daemon listener that closes the loop from "issue filed" to
+/// "draft PR up for review": on an interval, run the #103 [`run_once`]
+/// pipeline, which picks the next open `agent-fixable` issue and — behind
+/// its existing guardrails (trust gate #300, blast-radius refusal, diff cap,
+/// verification gate, per-issue attempt back-off, dedup vs open agent PRs,
+/// draft-only, isolated worktree) — ships a draft PR referencing it.
+///
+/// Guardrails this loop adds on top:
+/// - **Opt-in.** Spawned only when `AUGMENTAGENT_AUTOPR=1|true`. Every
+///   engaged run spawns the claude CLI on the owner's Max subscription
+///   (#448), so merging this feature must not silently start billing.
+/// - **Label gate.** Eligibility stays `agent-fixable` — filing an issue is
+///   not consent to auto-build it; labeling it is.
+/// - **Serial + rate-limited.** One pipeline run at a time (single loop),
+///   first tick a full interval after boot (the auto-updater bounces the
+///   daemon on every deploy; a boot tick would burn cap on each restart),
+///   and at most `AUGMENTAGENT_AUTOPR_DAILY_CAP` engaged runs per UTC day.
+///   The counter is in-memory — a restart resets it — so the cap is
+///   belt-and-suspenders on top of the label gate and per-issue back-off,
+///   not the primary control.
+/// - **Never auto-merge.** Inherited from `run_once`: PRs are draft, a
+///   human merges. The PR body's `Fixes #N` cross-links it on the issue.
+pub struct AutoPrLoop {
+    repo_root: PathBuf,
+    dry_run: bool,
+    interval: std::time::Duration,
+    daily_cap: u32,
+}
+
+/// Engaged-run counter with UTC-day rollover. Pure so it's testable.
+#[derive(Default)]
+struct DailyCounter {
+    day: u64,
+    runs: u32,
+}
+
+impl DailyCounter {
+    fn runs_today(&mut self, day: u64) -> u32 {
+        if day != self.day {
+            self.day = day;
+            self.runs = 0;
+        }
+        self.runs
+    }
+
+    fn record(&mut self, day: u64) {
+        let _ = self.runs_today(day);
+        self.runs += 1;
+    }
+}
+
+fn utc_day_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0)
+}
+
+impl AutoPrLoop {
+    const DEFAULT_INTERVAL_SECS: u64 = 1_800;
+    const DEFAULT_DAILY_CAP: u32 = 3;
+
+    /// Env-gated constructor: `None` unless `AUGMENTAGENT_AUTOPR=1|true`.
+    /// `AUGMENTAGENT_AUTOPR_INTERVAL_SECS` (default 1800, floor 300 — the
+    /// tick does a real `gh issue list`) and `AUGMENTAGENT_AUTOPR_DAILY_CAP`
+    /// (default 3) tune cadence and spend ceiling.
+    pub fn from_env(repo_root: PathBuf, dry_run: bool) -> Option<Self> {
+        Self::from_values(
+            repo_root,
+            dry_run,
+            std::env::var("AUGMENTAGENT_AUTOPR").ok().as_deref(),
+            std::env::var("AUGMENTAGENT_AUTOPR_INTERVAL_SECS")
+                .ok()
+                .as_deref(),
+            std::env::var("AUGMENTAGENT_AUTOPR_DAILY_CAP").ok().as_deref(),
+        )
+    }
+
+    fn from_values(
+        repo_root: PathBuf,
+        dry_run: bool,
+        enabled: Option<&str>,
+        interval_secs: Option<&str>,
+        daily_cap: Option<&str>,
+    ) -> Option<Self> {
+        let on = matches!(
+            enabled.map(str::trim),
+            Some(v) if v == "1" || v.eq_ignore_ascii_case("true")
+        );
+        if !on {
+            return None;
+        }
+        let interval = interval_secs
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(Self::DEFAULT_INTERVAL_SECS)
+            .max(300);
+        let daily_cap = daily_cap
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(Self::DEFAULT_DAILY_CAP)
+            .max(1);
+        Some(Self {
+            repo_root,
+            dry_run,
+            interval: std::time::Duration::from_secs(interval),
+            daily_cap,
+        })
+    }
+
+    pub async fn run(self, shutdown: tokio_util::sync::CancellationToken) -> Result<()> {
+        info!(
+            interval_secs = self.interval.as_secs(),
+            daily_cap = self.daily_cap,
+            dry_run = self.dry_run,
+            "auto-PR loop started (#630): polling for agent-fixable issues"
+        );
+        let mut counter = DailyCounter::default();
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("auto-PR loop stopped");
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(self.interval) => {}
+            }
+            let today = utc_day_now();
+            if counter.runs_today(today) >= self.daily_cap {
+                info!(
+                    daily_cap = self.daily_cap,
+                    "auto-PR: daily cap reached; idling until the next UTC day"
+                );
+                continue;
+            }
+            match run_once(&self.repo_root, self.dry_run).await {
+                Ok(msg) if msg == IDLE_MSG => {}
+                Ok(msg) => {
+                    counter.record(today);
+                    info!(
+                        runs_today = counter.runs_today(today),
+                        daily_cap = self.daily_cap,
+                        "auto-PR: {msg}"
+                    );
+                }
+                // Transient refusals (e.g. dirty deploy tree while a sibling
+                // session works, gh/network hiccup) — log and try next tick.
+                Err(e) => warn!("auto-PR tick failed: {e:#}"),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1606,5 +1765,59 @@ mod tests {
         let outside = std::env::temp_dir().join("aa-agent-clones-xyz");
         assert!(assert_outside_deploy(&outside, &deploy).is_ok());
         let _ = std::fs::remove_dir_all(&deploy);
+    }
+
+    // ---- #630: auto-PR loop config + daily cap ----
+
+    fn loop_values(
+        enabled: Option<&str>,
+        interval: Option<&str>,
+        cap: Option<&str>,
+    ) -> Option<AutoPrLoop> {
+        AutoPrLoop::from_values(PathBuf::from("/tmp/repo"), true, enabled, interval, cap)
+    }
+
+    #[test]
+    fn auto_pr_loop_requires_explicit_opt_in() {
+        // Every engaged run spends the owner's subscription (#448) — absent,
+        // empty, "0", or garbage must all leave the loop unspawned.
+        assert!(loop_values(None, None, None).is_none());
+        assert!(loop_values(Some(""), None, None).is_none());
+        assert!(loop_values(Some("0"), None, None).is_none());
+        assert!(loop_values(Some("yes"), None, None).is_none());
+        assert!(loop_values(Some("1"), None, None).is_some());
+        assert!(loop_values(Some("true"), None, None).is_some());
+        assert!(loop_values(Some("TRUE"), None, None).is_some());
+    }
+
+    #[test]
+    fn auto_pr_loop_parses_interval_and_cap_with_floors() {
+        let l = loop_values(Some("1"), Some("600"), Some("5")).unwrap();
+        assert_eq!(l.interval.as_secs(), 600);
+        assert_eq!(l.daily_cap, 5);
+        // Defaults when unset or unparsable.
+        let l = loop_values(Some("1"), Some("nope"), None).unwrap();
+        assert_eq!(l.interval.as_secs(), AutoPrLoop::DEFAULT_INTERVAL_SECS);
+        assert_eq!(l.daily_cap, AutoPrLoop::DEFAULT_DAILY_CAP);
+        // Floors: an interval under 5min would hammer `gh issue list`; a cap
+        // of 0 would make the loop a silent no-op the owner enabled on purpose.
+        let l = loop_values(Some("1"), Some("10"), Some("0")).unwrap();
+        assert_eq!(l.interval.as_secs(), 300);
+        assert_eq!(l.daily_cap, 1);
+    }
+
+    #[test]
+    fn daily_counter_caps_within_a_day_and_resets_on_rollover() {
+        let mut c = DailyCounter::default();
+        assert_eq!(c.runs_today(100), 0);
+        c.record(100);
+        c.record(100);
+        assert_eq!(c.runs_today(100), 2);
+        // Same-day queries don't reset.
+        assert_eq!(c.runs_today(100), 2);
+        // New UTC day ⇒ fresh budget.
+        assert_eq!(c.runs_today(101), 0);
+        c.record(101);
+        assert_eq!(c.runs_today(101), 1);
     }
 }
