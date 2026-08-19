@@ -335,13 +335,16 @@ fn author_is_trusted(login: &str, association: &str, allowlist: &[String]) -> bo
 async fn pick_issue(repo_root: &Path) -> Result<Option<Issue>> {
     let allowlist = trusted_authors(repo_root).await;
     let gh = gh_bin();
+    // #653 — no label gate: every open issue is considered (newest first, up
+    // to 50) and the stage-1 scoping pass decides fixability itself. Issues
+    // it judges not-fixable get the gave-up label + a comment, so each is
+    // scoped at most once. `agent-fixable` is no longer required — it remains
+    // only as documentation on old issues.
     let (ok, stdout, stderr) = run(
         &gh,
         &[
             "issue",
             "list",
-            "--label",
-            FIXABLE_LABEL,
             "--state",
             "open",
             "--json",
@@ -510,11 +513,30 @@ fn scope_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     }
 }
 
-const SCOPE_SYSTEM: &str = "You are the scoping pass of a two-stage autonomous \
-fix pipeline for the AugmentAgent codebase. You are given a GitHub issue that \
-may be vague or under-specified. READ the relevant code first, then produce an \
-implementation spec for a second, separate agent that will write the code. \
-Your output MUST contain:\n\
+const SCOPE_SYSTEM: &str = "You are the scoping pass of a staged autonomous \
+fix pipeline for this codebase. You are given a GitHub issue that may be \
+vague, under-specified, or not actually fixable by a coding agent at all \
+(research asks, epics, infrastructure/purchasing decisions). READ the \
+relevant code first, then judge it and — when fixable — produce an \
+implementation spec for a second, separate agent that will write the code.\n\
+\n\
+Your output MUST start with these two lines EXACTLY (then a blank line):\n\
+VERDICT: fixable | not-fixable\n\
+COMPLEXITY: simple | medium | hard\n\
+\n\
+Verdict guide: 'fixable' means a competent engineer could ship it from the \
+issue text plus the code, as a focused diff under 600 changed lines, \
+verifiable by the test suite. Research questions, multi-week epics, \
+decisions needing the owner, and changes to deploy/auth/secret/CI paths are \
+'not-fixable' — for those, follow the header with a 2-4 sentence reason and \
+stop.\n\
+Complexity guide: 'simple' = localized change, obvious approach, low regression \
+risk. 'medium' = a few files or a subtle interaction, still well-understood. \
+'hard' = cross-cutting, ambiguous, migration-shaped, or high blast radius if \
+wrong. Grade honestly — 'hard' work is NOT auto-merged, it goes to human \
+review.\n\
+\n\
+For fixable issues, after the header produce the spec:\n\
 - Interpretation: what the issue is actually asking for, resolving any \
 ambiguity with the most reasonable reading of the code and stating the \
 assumption you made.\n\
@@ -523,13 +545,147 @@ existing functions/patterns to reuse.\n\
 - The smallest correct approach, and one sentence on why not the \
 alternatives.\n\
 - Edge cases and failure modes the builder must handle.\n\
-- Acceptance criteria: what tests to add/update and what observable \
-behaviour proves the fix.\n\
+- Acceptance criteria: which test to write FIRST (the builder follows TDD), \
+what tests to add/update, and what observable behaviour proves the fix.\n\
 Constraints: read-only — do NOT edit files. Stay inside the given working \
-directory. Do NOT touch deploy/auth/secret/CI paths even in your plan \
-(systemd, scripts/check-for-updates, .github/workflows, credentials/keyring/\
-.env) and keep the planned diff small (the pipeline caps at 600 changed \
-lines). Output ONLY the spec, no preamble.";
+directory. Do NOT plan changes to deploy/auth/secret/CI paths (systemd, \
+scripts/check-for-updates, .github/workflows, credentials/keyring/.env). \
+Output ONLY the header and spec/reason, no preamble.";
+
+/// Complexity grade the scoping pass assigns (#653). Anything above
+/// [`Complexity::Medium`] never auto-merges — it lands as a draft PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Complexity {
+    Simple,
+    Medium,
+    Hard,
+}
+
+impl Complexity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Simple => "simple",
+            Self::Medium => "medium",
+            Self::Hard => "hard",
+        }
+    }
+
+    /// Auto-merge policy (#653): only simple/medium work qualifies.
+    fn auto_mergeable(self) -> bool {
+        !matches!(self, Self::Hard)
+    }
+}
+
+/// Parsed stage-1 output (#653).
+#[derive(Debug)]
+struct ScopeOutcome {
+    fixable: bool,
+    complexity: Complexity,
+    /// The spec (fixable) or the refusal reason (not-fixable) — the raw text
+    /// with the header lines removed.
+    body: String,
+}
+
+/// Parse the scoper's `VERDICT:` / `COMPLEXITY:` header, tolerantly: the
+/// lines may appear anywhere in the first few lines, any case. Missing
+/// verdict defaults to *fixable* (an unparsed run should still attempt the
+/// fix); missing/unknown complexity defaults to *hard* (never auto-merge on
+/// a formatting glitch — the conservative direction).
+fn parse_scope_output(raw: &str) -> ScopeOutcome {
+    let mut fixable = true;
+    let mut complexity = Complexity::Hard;
+    let mut body_lines: Vec<&str> = Vec::new();
+    for (i, line) in raw.lines().enumerate() {
+        let l = line.trim().to_ascii_lowercase();
+        let is_header_zone = i < 10;
+        if is_header_zone && l.starts_with("verdict:") {
+            fixable = !l.contains("not-fixable") && !l.contains("not fixable");
+            continue;
+        }
+        if is_header_zone && l.starts_with("complexity:") {
+            complexity = if l.contains("simple") {
+                Complexity::Simple
+            } else if l.contains("medium") {
+                Complexity::Medium
+            } else {
+                Complexity::Hard
+            };
+            continue;
+        }
+        body_lines.push(line);
+    }
+    ScopeOutcome {
+        fixable,
+        complexity,
+        body: body_lines.join("\n").trim().to_string(),
+    }
+}
+
+/// Stage 3 (#653): read-only QA review of the builder's diff, on the same
+/// stronger tier as the scoper. A rejected review means no PR — it counts as
+/// a failed attempt, exactly like a red verification gate.
+fn review_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
+    augmentagent_channel_core::ReasonerOpts {
+        system_prompt: REVIEW_SYSTEM.to_string(),
+        model: Some(scope_model()),
+        allowed_tools: vec![
+            "Read".into(),
+            "Grep".into(),
+            "Glob".into(),
+            "Bash(ls *)".into(),
+            "Bash(git diff*)".into(),
+            "Bash(git status*)".into(),
+            "Bash(git log*)".into(),
+        ],
+        add_dirs: vec![worktree.clone()],
+        permission_mode: "default".into(),
+        cwd: Some(worktree),
+        env: Vec::new(),
+        settings_json: None,
+        restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
+    }
+}
+
+const REVIEW_SYSTEM: &str = "You are the QA review pass of a staged autonomous \
+fix pipeline. A separate builder agent has just edited this worktree to fix a \
+GitHub issue; the build and test suite already pass. Your job is to review the \
+work like a skeptical senior engineer before it ships. Run `git diff` and read \
+the changed files IN CONTEXT (open the surrounding code, not just the hunks). \
+Check:\n\
+- Correctness: does the diff actually fix what the issue describes? Walk at \
+least one concrete input through the changed code path.\n\
+- Tests: is there a test that would FAIL without this change (TDD)? Bug fixes \
+without a regression test are a reject unless genuinely untestable.\n\
+- Scope: no unrelated edits, no drive-by refactors, no touched \
+deploy/auth/secret/CI paths.\n\
+- Conventions: matches the surrounding code's style, error handling, and \
+logging patterns; comments only where the code can't speak.\n\
+Your output MUST start with this line EXACTLY:\n\
+REVIEW: approve | reject\n\
+Then a blank line, then 2-6 sentences: for approve, what you verified; for \
+reject, the concrete defects (file:line) that must change. Read-only — do NOT \
+edit files. Output ONLY the verdict line and notes.";
+
+/// Parse the reviewer's verdict. Anything that is not an explicit approve —
+/// including unparseable output — is a reject: the conservative direction,
+/// since an approval here can flow straight into an auto-merge.
+fn parse_review_output(raw: &str) -> (bool, String) {
+    let mut approved = false;
+    for (i, line) in raw.lines().enumerate() {
+        if i >= 5 {
+            break;
+        }
+        let l = line.trim().to_ascii_lowercase();
+        if l.starts_with("review:") {
+            approved = l.contains("approve") && !l.contains("reject");
+            break;
+        }
+    }
+    (approved, raw.trim().to_string())
+}
 
 /// Build the stage-2 prompt: the issue plus (when the scoping pass produced
 /// one) the implementation spec.
@@ -604,15 +760,27 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
 }
 
 const SELF_IMPROVE_SYSTEM: &str = "You are an autonomous maintenance engineer for the \
-AugmentAgent codebase. You are given a single GitHub issue. Implement the smallest \
-correct fix. Constraints you MUST honor:\n\
+AugmentAgent codebase. You are given a single GitHub issue (usually with an \
+implementation spec from a scoping pass). Implement the smallest correct fix. \
+Constraints you MUST honor:\n\
+- Follow TDD: for bug-shaped issues, FIRST write a test that reproduces the \
+issue and fails against the current code, then implement until it passes. For \
+features, write the test alongside the change. A fix without a test that \
+would fail without it will be rejected by the QA review that follows you, \
+unless the behaviour is genuinely untestable (say so in your summary).\n\
+- Run the targeted tests for the crates you touched (cargo test -p <crate>) \
+before finishing — do NOT run workspace-wide test builds.\n\
+- Follow the surrounding code's conventions: naming, error handling, logging, \
+comment density. Comments only where the code can't speak for itself.\n\
+- Review your own diff (git diff) before finishing: no unrelated edits, no \
+drive-by refactors, no leftover debug output.\n\
 - Stay within the working directory you were given (a throwaway worktree).\n\
 - Do NOT touch deploy/auth/secret/CI files (systemd units, scripts/check-for-updates, \
 .github/workflows, anything with credentials/keyring/.env).\n\
 - Keep the diff small and focused on the issue.\n\
-- Add or update a test when it is reasonable to do so.\n\
 - Do NOT run git commit, git push, or gh. Just edit files.\n\
-When done, output a 2-4 sentence summary of what you changed and why.";
+When done, output a 2-4 sentence summary of what you changed and why, noting \
+the test that guards it.";
 
 /// Run the verification gate inside the worktree. Returns Ok(()) only if every
 /// configured check passes.
@@ -765,23 +933,21 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
 
     let reasoner = Arc::new(ClaudeCliReasoner::new());
 
-    // Stage 1 (#630): read-only scoping pass on a stronger model. Issues
-    // filed conversationally are often under-specified; the scoper expands
-    // the ask into an implementation spec before the builder edits anything.
-    // Scoping failure degrades to the pre-#630 single-stage behaviour — the
-    // spec is an enhancement, not a gate.
+    // Stage 1 (#630/#653): read-only scoping pass on a stronger model. It
+    // decides fixability on its own (no label required), grades complexity
+    // (which gates auto-merge), and expands the ask into an implementation
+    // spec before the builder edits anything. Scoping failure degrades to
+    // the single-stage behaviour with complexity defaulting to hard.
     let scope_prompt = format!(
-        "GitHub issue #{}: {}\n\n{}\n\nProduce the implementation spec now.",
+        "GitHub issue #{}: {}\n\n{}\n\nProduce the verdict header and (if \
+         fixable) the implementation spec now.",
         issue.number, issue.title, issue.body
     );
-    let plan = match reasoner
+    let scope = match reasoner
         .call(&scope_opts(worktree.clone()), &scope_prompt)
         .await
     {
-        Ok(p) => {
-            let p = p.trim().to_string();
-            if p.is_empty() { None } else { Some(p) }
-        }
+        Ok(p) => Some(parse_scope_output(&p)),
         Err(e) => {
             warn!(
                 issue = issue.number,
@@ -790,6 +956,37 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
             None
         }
     };
+    if let Some(s) = &scope {
+        if !s.fixable {
+            // #653 — the scoper judged this not agent-fixable (research ask,
+            // epic, owner decision, …). Label it out so it is scoped at most
+            // once, and leave the reason on the issue.
+            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+            backoff_comment(
+                repo_root,
+                issue.number,
+                &format!(
+                    "Auto-fix triage: the scoping pass judged this issue not \
+                     agent-fixable, so the pipeline is leaving it for a \
+                     human. Reason:\n\n{}\n\nRemove the `{GAVE_UP_LABEL}` \
+                     label to have it re-triaged.",
+                    truncate(&s.body, 1200)
+                ),
+            )
+            .await
+            .ok();
+            label_gave_up(repo_root, issue.number).await.ok();
+            return Ok(format!(
+                "issue #{}: scoped as not agent-fixable — labeled out",
+                issue.number
+            ));
+        }
+    }
+    let complexity = scope.as_ref().map(|s| s.complexity).unwrap_or(Complexity::Hard);
+    let plan = scope
+        .as_ref()
+        .map(|s| s.body.clone())
+        .filter(|b| !b.is_empty());
 
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
     let opts = fix_opts(worktree.clone());
@@ -902,11 +1099,59 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         ));
     }
 
+    // Stage 3 (#653): QA review of the diff by the stronger tier. A reject
+    // is a failed attempt — same treatment as a red gate. Runs before the
+    // dry-run exit so dry runs exercise the full pipeline.
+    let review_prompt = format!(
+        "GitHub issue #{}: {}\n\n{}\n\nBuilder's summary of its change:\n{}\n\n\
+         Review the worktree's diff now and output your verdict.",
+        issue.number,
+        issue.title,
+        truncate(&issue.body, 2000),
+        truncate(&summary, 1000)
+    );
+    let (review_ok, review_notes) = match reasoner
+        .call(&review_opts(worktree.clone()), &review_prompt)
+        .await
+    {
+        Ok(r) => parse_review_output(&r),
+        Err(e) => {
+            // Transient reviewer failure (session limit etc.) — don't burn an
+            // attempt on infrastructure noise; the next tick retries whole.
+            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+            return Err(e).context("QA review pass failed during self-improve");
+        }
+    };
+    if !review_ok {
+        warn!(issue = issue.number, "QA review rejected the diff");
+        let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+        backoff_comment(
+            repo_root,
+            issue.number,
+            &format!(
+                "Auto-fix QA review rejected the attempt:\n\n{}",
+                truncate(&review_notes, 1200)
+            ),
+        )
+        .await
+        .ok();
+        if attempts >= MAX_ATTEMPTS {
+            label_gave_up(repo_root, issue.number).await.ok();
+        }
+        cleanup(worktree, branch, repo_root.to_path_buf()).await;
+        return Ok(format!(
+            "issue #{}: QA review rejected the diff (attempt {attempts}); no PR opened",
+            issue.number
+        ));
+    }
+
     if dry_run {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
         return Ok(format!(
-            "issue #{}: DRY RUN — gate passed, {lines}-line diff, would open draft PR",
-            issue.number
+            "issue #{}: DRY RUN — gate + QA review passed, {lines}-line diff \
+             (complexity: {}), would open PR",
+            issue.number,
+            complexity.as_str()
         ));
     }
 
@@ -955,12 +1200,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     }
 
     // Open the PR. Draft + human merge for everyone; owner-authored issues
-    // can auto-merge when the owner opted in (see `automerge_eligible`).
+    // auto-merge when the owner opted in AND the scoper graded the work
+    // simple/medium (#653 — hard work always gets human eyes).
     let automerge = {
         let enabled = automerge_enabled_value(
             std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
         );
-        if enabled {
+        if enabled && complexity.auto_mergeable() {
             let owner = std::env::var(GH_OWNER_ENV)
                 .ok()
                 .or(repo_owner_from_remote(repo_root).await);
@@ -981,17 +1227,21 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         .map(|p| format!("\n\n## Implementation spec (scoping pass)\n{}", truncate(p, 1500)))
         .unwrap_or_default();
     let merge_note = if automerge {
-        "Auto-merged: owner-authored issue with AUGMENTAGENT_AUTOPR_AUTOMERGE=1."
+        "Auto-merged: owner-authored issue graded ≤medium, AUGMENTAGENT_AUTOPR_AUTOMERGE=1."
     } else {
         "Draft — a human must review and merge."
     };
     let pr_body = format!(
-        "Automated self-improvement for #{}.\n\n## Summary\n{}{plan_section}\n\n## Verification\n\
+        "Automated self-improvement for #{}.\n\n## Summary\n{}{plan_section}\n\n\
+         ## QA review (approved)\n{}\n\n## Verification\n\
+         - complexity (scoping pass): {}\n\
          - `cargo build --workspace`: pass\n- `cargo test --workspace`: pass\n\
          - diff size: {lines} lines (cap {MAX_DIFF_LINES})\n\n\
          {merge_note} Fixes #{}",
         issue.number,
         truncate(&summary, 1500),
+        truncate(&review_notes, 1000),
+        complexity.as_str(),
         issue.number
     );
     let title = format!("fix: {} (#{})", issue.title, issue.number);
@@ -1740,8 +1990,11 @@ pub async fn open_approved_runs(store: &Store) -> Result<String> {
 /// - **Opt-in.** Spawned only when `AUGMENTAGENT_AUTOPR=1|true`. Every
 ///   engaged run spawns the claude CLI on the owner's Max subscription
 ///   (#448), so merging this feature must not silently start billing.
-/// - **Label gate.** Eligibility stays `agent-fixable` — filing an issue is
-///   not consent to auto-build it; labeling it is.
+/// - **Self-triage, no label required (#653).** Every open issue is
+///   considered; the stage-1 scoping pass judges fixability itself and
+///   labels non-fixable issues out (`agent-gave-up` + reason comment) so
+///   each is scoped at most once. The multi-repo path (other people's
+///   repos) still requires the explicit `agent-fixable` label.
 /// - **Serial + rate-limited.** One pipeline run at a time (single loop),
 ///   first tick a full interval after boot (the auto-updater bounces the
 ///   daemon on every deploy; a boot tick would burn cap on each restart),
@@ -1754,11 +2007,13 @@ pub async fn open_approved_runs(store: &Store) -> Result<String> {
 ///   auto-merge only behind the separate `AUGMENTAGENT_AUTOPR_AUTOMERGE`
 ///   opt-in (see `automerge_eligible`).
 ///
-/// Each engaged run is now TWO reasoner calls (#630): a read-only scoping
-/// pass on `AUGMENTAGENT_AUTOPR_SCOPE_MODEL` (default Fable) that turns an
-/// under-specified issue into an implementation spec, then the build on
-/// `AUGMENTAGENT_AUTOPR_BUILD_MODEL` (default Opus). Budget the daily cap
-/// accordingly.
+/// Each engaged run is up to THREE reasoner calls (#630/#653): a read-only
+/// scoping pass on `AUGMENTAGENT_AUTOPR_SCOPE_MODEL` (default Fable) that
+/// judges fixability, grades complexity, and writes the implementation
+/// spec; the build on `AUGMENTAGENT_AUTOPR_BUILD_MODEL` (default Opus,
+/// TDD-instructed); and a read-only QA review back on the scope tier that
+/// must approve before any PR opens. Not-fixable verdicts stop after one
+/// call. Budget the daily cap accordingly.
 pub struct AutoPrLoop {
     repo_root: PathBuf,
     dry_run: bool,
@@ -1850,7 +2105,7 @@ impl AutoPrLoop {
             interval_secs = self.interval.as_secs(),
             daily_cap = self.daily_cap,
             dry_run = self.dry_run,
-            "auto-PR loop started (#630): polling for agent-fixable issues"
+            "auto-PR loop started (#630/#653): polling open issues (self-triage, no label gate)"
         );
         let mut counter = DailyCounter::default();
         loop {
@@ -2126,6 +2381,61 @@ mod tests {
         let without = build_fix_prompt(&issue, None);
         assert!(!without.contains("Implementation spec"));
         assert!(without.contains("Implement the fix now."));
+    }
+
+    // ---- #653: self-triage verdict, complexity gate, QA review parsing ----
+
+    #[test]
+    fn scope_header_parses_verdict_and_complexity() {
+        let out = parse_scope_output(
+            "VERDICT: fixable\nCOMPLEXITY: medium\n\nInterpretation: do X.\nFiles: a.rs",
+        );
+        assert!(out.fixable);
+        assert_eq!(out.complexity, Complexity::Medium);
+        assert!(out.body.starts_with("Interpretation:"));
+        assert!(!out.body.to_lowercase().contains("verdict:"));
+
+        let out = parse_scope_output("verdict: NOT-FIXABLE\ncomplexity: hard\n\nresearch ask");
+        assert!(!out.fixable);
+        assert_eq!(out.complexity, Complexity::Hard);
+        assert_eq!(out.body, "research ask");
+
+        let out = parse_scope_output("VERDICT: fixable\nCOMPLEXITY: simple\n\nspec");
+        assert_eq!(out.complexity, Complexity::Simple);
+    }
+
+    #[test]
+    fn scope_header_defaults_are_fixable_but_never_automergeable() {
+        // Missing/garbled header: still attempt the fix (fixable), but grade
+        // hard so a formatting glitch can never unlock auto-merge.
+        let out = parse_scope_output("just a spec with no header");
+        assert!(out.fixable);
+        assert_eq!(out.complexity, Complexity::Hard);
+        let out = parse_scope_output("COMPLEXITY: banana\n\nspec");
+        assert_eq!(out.complexity, Complexity::Hard);
+        // Header lines buried late in the output are body, not directives.
+        let late = format!("{}VERDICT: not-fixable", "line\n".repeat(15));
+        assert!(parse_scope_output(&late).fixable);
+    }
+
+    #[test]
+    fn complexity_gates_auto_merge_at_medium() {
+        assert!(Complexity::Simple.auto_mergeable());
+        assert!(Complexity::Medium.auto_mergeable());
+        assert!(!Complexity::Hard.auto_mergeable());
+    }
+
+    #[test]
+    fn review_verdict_defaults_to_reject() {
+        assert!(parse_review_output("REVIEW: approve\n\nchecked X").0);
+        assert!(parse_review_output("review: Approve").0);
+        assert!(!parse_review_output("REVIEW: reject\n\nno test").0);
+        // Unparseable / missing verdict ⇒ reject — an approval can flow
+        // straight into an auto-merge, so the default must be the safe side.
+        assert!(!parse_review_output("looks good to me").0);
+        assert!(!parse_review_output("").0);
+        let (_, notes) = parse_review_output("REVIEW: reject\n\nno regression test");
+        assert!(notes.contains("no regression test"));
     }
 
     #[test]
