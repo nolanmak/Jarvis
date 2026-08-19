@@ -2448,6 +2448,22 @@ async fn main() -> Result<()> {
                 let sd = shutdown.clone();
                 tasks.push(tokio::spawn(async move { gd.run(sd).await }));
             }
+            // #630 — auto-PR loop: poll for open `agent-fixable` issues and
+            // run the #103 self-improve pipeline (draft PR, never merge)
+            // unattended. Opt-in via AUGMENTAGENT_AUTOPR=1 — every engaged
+            // run spawns the claude CLI on the owner's subscription (#448),
+            // so it must never start billing as a side effect of a deploy.
+            // Serve's --dry-run flows through: the gate runs but no PR opens.
+            match self_improve::AutoPrLoop::from_env(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                dry_run,
+            ) {
+                Some(ap) => {
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move { ap.run(sd).await }));
+                }
+                None => info!("auto-PR loop disabled: AUGMENTAGENT_AUTOPR not set"),
+            }
             // #48 — Reddit channel. Self-gates on having completed the
             // dashboard OAuth bootstrap (refresh token in keyring); prod
             // without it never spawns this, exactly like github/meetup gate.
