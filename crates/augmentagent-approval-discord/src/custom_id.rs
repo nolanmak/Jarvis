@@ -29,6 +29,23 @@ pub enum Verb {
     /// Submission of the FillAsk modal. Routed through the existing Revise
     /// plumbing (the supplied values become structured feedback).
     FillAskModal,
+    /// Schedule `StringSelect` on the approval card (#501). The chosen
+    /// symbolic token (`in1h`, `tomorrow-0900`, `custom`, …) arrives as the
+    /// select's value and is resolved to epoch-ms at CLICK time.
+    SchedulePick,
+    /// Submission of the custom-time modal opened by the `custom` schedule
+    /// token (#501). The free text is parsed by `timeparse::parse_send_at`.
+    ScheduleModal,
+    /// "Send Now" on the scheduled notice (#501): direct
+    /// `scheduled → sending` CAS reusing the Approve send tail — never a
+    /// route through `pending`.
+    SendNow,
+    /// "Cancel" on the scheduled notice (#501): `scheduled → rejected`, the
+    /// Gmail draft is deleted (Skip convention).
+    CancelSchedule,
+    /// "Back to queue" on the scheduled notice (#501) — the non-destructive
+    /// mis-click escape: `scheduled → pending`, card reposted.
+    BackToQueue,
 }
 
 impl Verb {
@@ -41,6 +58,11 @@ impl Verb {
             Self::QuickRefine => "quick_refine",
             Self::FillAsk => "fill_ask",
             Self::FillAskModal => "fill_ask_modal",
+            Self::SchedulePick => "schedule_pick",
+            Self::ScheduleModal => "schedule_modal",
+            Self::SendNow => "send_now",
+            Self::CancelSchedule => "cancel_schedule",
+            Self::BackToQueue => "back_to_queue",
         }
     }
 
@@ -53,6 +75,11 @@ impl Verb {
             "quick_refine" => Self::QuickRefine,
             "fill_ask" => Self::FillAsk,
             "fill_ask_modal" => Self::FillAskModal,
+            "schedule_pick" => Self::SchedulePick,
+            "schedule_modal" => Self::ScheduleModal,
+            "send_now" => Self::SendNow,
+            "cancel_schedule" => Self::CancelSchedule,
+            "back_to_queue" => Self::BackToQueue,
             _ => return None,
         })
     }
@@ -104,6 +131,11 @@ mod tests {
             Verb::QuickRefine,
             Verb::FillAsk,
             Verb::FillAskModal,
+            Verb::SchedulePick,
+            Verb::ScheduleModal,
+            Verb::SendNow,
+            Verb::CancelSchedule,
+            Verb::BackToQueue,
         ] {
             let cid = CustomId::new("550e8400-e29b-41d4-a716-446655440000", v);
             let s = cid.to_string();

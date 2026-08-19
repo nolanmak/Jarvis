@@ -19,13 +19,22 @@ mod process_loops;
 mod status_bus;
 mod surface;
 mod presets;
+// #501 — deterministic send-time parsing. Public module: the event handler's
+// select/modal arms resolve here, and `augmentagent-channel-core` re-exports
+// it for the query-mode `--send-at` flag (#502) — channel-core depends on
+// this crate, so the shared implementation must live on this side.
+pub mod timeparse;
 
 pub use broker::{DiscordApprovalBroker, DiscordConfig};
-pub use event_handler::chunk_for_discord;
+// #501 — `append_envelope_markers` is shared with the CLI's Back-to-queue
+// repost so it renders the same To/cc/bcc decoration as the Revise repost.
+pub use event_handler::{append_envelope_markers, chunk_for_discord};
 // #35 Phase 5: the email channel appends the needs-input marker to the
 // persisted draft via this; the card decodes it on render. `NeedsInput` is
 // re-exported for the channel/test surface.
 pub use layout::{append_needs_input_marker, approval_message, split_needs_input, NeedsInput};
+// #501 — scheduled-notice layout, for brokers/tests outside this crate.
+pub use layout::{scheduled_notice_message, schedule_modal, SCHEDULE_CUSTOM_VALUE};
 pub use loops::{
     handle_loop_command, match_loop_prefix, max_active_per_user, min_interval_secs,
     next_cron_firing_ms, normalize_and_validate_cron, parse_interval, pause_after_failures,
@@ -61,6 +70,17 @@ pub enum ApprovalActionOutcome {
     /// Revise succeeded — a new draft was created and should be re-posted as
     /// a fresh approval card with the same `action_id`.
     Revised { email: Email, draft: String },
+    /// Schedule armed (#501) — `pending → scheduled` at `at_ms`. `local` is
+    /// the pre-formatted owner-local fire time for the ephemeral ack; the
+    /// card is retired and a scheduled notice takes its place.
+    Scheduled { at_ms: i64, local: String },
+    /// Back to queue succeeded (#501) — schedule disarmed
+    /// (`scheduled → pending`, `scheduledAtMs` NULLed), approval card
+    /// reposted.
+    Unscheduled,
+    /// Cancel succeeded (#501) — scheduled send cancelled
+    /// (`scheduled → rejected`), Gmail draft deleted like Skip.
+    CancelledSchedule,
     /// The handler attempted the action but hit an error (transient or
     /// permanent). Show the message to the user; the action stays pending so
     /// they can retry.
@@ -123,6 +143,57 @@ pub trait ApprovalBroker: Send + Sync {
         };
         self.post_flag_notice(&email, body).await
     }
+
+    /// #501 — post the compact scheduled-send notice (Send Now / Back to
+    /// queue / Cancel) for a freshly armed schedule. `to_display` is the
+    /// resolved send target (the #473 envelope To when recorded, else the
+    /// card's From). Returns the Discord `(channel_id, message_id)` pair so
+    /// the caller can persist the notice pointers on the action row (the
+    /// engine deletes the notice at fire/cancel time). Default `Ok(None)`:
+    /// brokers without a notice surface (Noop, tests) arm schedules fine —
+    /// there's just no message to clean up later.
+    async fn post_scheduled_notice(
+        &self,
+        action_id: &str,
+        email: &Email,
+        sends_at_local: &str,
+        to_display: &str,
+    ) -> Result<Option<(u64, u64)>, ApprovalError> {
+        let _ = (action_id, email, sends_at_local, to_display);
+        Ok(None)
+    }
+
+    /// #501 — post an approval card and return its Discord
+    /// `(channel_id, message_id)` pair, honoring the persisted redraft count
+    /// (so a refined-to-cap card is reposted WITHOUT the quick-refine row —
+    /// `post_approval` hardcodes count 0). Back-to-queue posts the card
+    /// BEFORE its CAS and needs the ids to take the card back down when the
+    /// CAS loses (#501 review). Default: delegates to
+    /// [`Self::post_approval`] and returns `Ok(None)` — no ids, nothing to
+    /// roll back, fine for brokers with no real message surface.
+    async fn post_approval_card(
+        &self,
+        action_id: &str,
+        email: &Email,
+        draft: &str,
+        redraft_count: u32,
+    ) -> Result<Option<(u64, u64)>, ApprovalError> {
+        let _ = redraft_count;
+        self.post_approval(action_id, email, draft).await?;
+        Ok(None)
+    }
+
+    /// #501 — delete a message this broker previously posted (the scheduled
+    /// notice, at fire/cancel/send-now time). Best-effort by convention at
+    /// every call site; the default no-op keeps notice-less brokers compiling.
+    async fn delete_message(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+    ) -> Result<(), ApprovalError> {
+        let _ = (channel_id, message_id);
+        Ok(())
+    }
 }
 
 /// No-op broker for dry-run mode; returns immediately.
@@ -164,6 +235,58 @@ pub trait ApprovalActionHandler: Send + Sync {
     /// than `Pending` / `DryRun`). Backs the startup scrollback sweep that
     /// deletes stale approval cards from previous runs.
     async fn is_resolved(&self, action_id: &str) -> bool;
+
+    /// #501 — arm a scheduled send: `pending → scheduled` at `at_ms`
+    /// (epoch-ms, already resolved from the select token or modal text). The
+    /// impl owns the central time guard and the CAS. Default: unsupported,
+    /// so handlers without a schedule surface keep compiling.
+    async fn schedule(&self, action_id: &str, at_ms: i64) -> ApprovalActionOutcome {
+        let _ = (action_id, at_ms);
+        ApprovalActionOutcome::Failed {
+            message: "scheduling is not supported by this handler".into(),
+        }
+    }
+
+    /// #501 — "Send Now" on the scheduled notice: direct
+    /// `scheduled → sending` CAS into the Approve send tail. NEVER routes
+    /// through `pending` (that would re-enter the nudge queue and, after
+    /// #502, re-arm the proposal).
+    async fn send_now(&self, action_id: &str) -> ApprovalActionOutcome {
+        let _ = action_id;
+        ApprovalActionOutcome::Failed {
+            message: "scheduling is not supported by this handler".into(),
+        }
+    }
+
+    /// #501 — "Cancel" on the scheduled notice: `scheduled → rejected` with
+    /// the Gmail draft deleted (Skip convention).
+    async fn cancel_schedule(&self, action_id: &str) -> ApprovalActionOutcome {
+        let _ = action_id;
+        ApprovalActionOutcome::Failed {
+            message: "scheduling is not supported by this handler".into(),
+        }
+    }
+
+    /// #501 — "Back to queue" on the scheduled notice: `scheduled → pending`
+    /// (schedule disarmed) with the approval card reposted.
+    async fn back_to_queue(&self, action_id: &str) -> ApprovalActionOutcome {
+        let _ = action_id;
+        ApprovalActionOutcome::Failed {
+            message: "scheduling is not supported by this handler".into(),
+        }
+    }
+
+    /// #501 — true while the action still holds a live schedule (`scheduled`
+    /// or the in-flight `sending` claim). Backs the verb-aware startup
+    /// sweep: a scheduled NOTICE is deleted only when this is false, while
+    /// actionable cards keep using [`Self::is_resolved`] — a blanket
+    /// exemption either way would immortalize one message kind or delete the
+    /// other at every restart. Default `false` (no schedule surface ⇒ any
+    /// leftover notice is stale).
+    async fn is_schedule_live(&self, action_id: &str) -> bool {
+        let _ = action_id;
+        false
+    }
 }
 
 /// Plugged into the broker to answer wiki queries that arrive as Discord messages.
