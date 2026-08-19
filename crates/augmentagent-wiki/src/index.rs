@@ -57,14 +57,26 @@ impl IndexStats {
 
 /// Regenerate `<root>/index.md` from the pages on disk. Atomic: the new
 /// content lands via temp-file + rename, so readers never observe a
-/// half-written index.
+/// half-written index. The temp name is unique per process + call so two
+/// concurrent rebuilds (daemon ingest tail vs. a CLI invocation) can never
+/// write through each other's handle — last rename wins, each rename is
+/// whole. Names keep the `.tmp` suffix the wiki repo's `.gitignore` covers.
 pub fn rebuild_index(root: &Path) -> Result<IndexStats> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let (doc, stats) = render_index(root)?;
-    let tmp = root.join("index.md.tmp");
+    let tmp = root.join(format!(
+        "index.md.{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let dst = root.join("index.md");
     std::fs::write(&tmp, &doc).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, &dst)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), dst.display()))?;
+    std::fs::rename(&tmp, &dst).map_err(|e| {
+        // Never leave a stray temp behind on failure — the wiki dir is
+        // the owner's browsable KB.
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("rename {} -> {}: {e}", tmp.display(), dst.display())
+    })?;
     Ok(stats)
 }
 
@@ -261,7 +273,11 @@ mod tests {
         assert!(doc.contains("- [threads/t1.md](threads/t1.md) — Re: contract"));
         assert!(doc.contains("- [projects/q2.md](projects/q2.md) — Q2 launch."));
         assert!(!doc.contains("notes.txt"));
-        assert!(!root.join("index.md.tmp").exists(), "temp file must be renamed away");
+        let leftover_tmp = std::fs::read_dir(root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover_tmp, "temp file must be renamed away");
     }
 
     #[test]
