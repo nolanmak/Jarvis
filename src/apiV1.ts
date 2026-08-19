@@ -37,7 +37,7 @@ import {
   getSenders,
   addSender,
   removeSender,
-  updateActionStatus,
+  resolveActionIfPending,
   addPushSubscription,
   removePushSubscription,
   getActiveGmailAccounts,
@@ -220,19 +220,29 @@ v1.post("/actions/:id", (req, res) => {
     res.status(400).json({ error: "recipientEmail is not a valid email address" });
     return;
   }
-  // CAS-ish guard: only mutate if still pending, mirroring the Rust
-  // try_resolve_action gate so two surfaces can't double-resolve.
+  // Fast-path 409 with the fresh row for the common "already resolved" case.
   if (action.status !== "pending") {
     res
       .status(409)
       .json({ error: `action already ${action.status}`, action });
     return;
   }
-  updateActionStatus(req.params.id, status as ActionStatus, {
+  // #500: the actual gate is in the SQL (`AND status = 'pending'`) — the JS
+  // read above is advisory only. A Rust-side writer (Schedule pick, send
+  // engine claim) landing between the read and this UPDATE wins, and this
+  // route must not silently disarm it.
+  const resolved = resolveActionIfPending(req.params.id, status as ActionStatus, {
     draftBody,
     errorMessage,
     recipientEmail,
   });
+  if (!resolved) {
+    res.status(409).json({
+      error: "action was resolved by another surface",
+      action: getActionById(req.params.id),
+    });
+    return;
+  }
   publishStatusChange(req.params.id, status, source || "api_v1");
   res.json(getActionById(req.params.id));
 });

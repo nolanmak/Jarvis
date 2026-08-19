@@ -44,6 +44,22 @@ pub enum ActionStatus {
     /// card. The reason (e.g. "superseded by manual reply") is stashed in
     /// `errorMessage` at transition time so the dashboard can show context.
     Superseded,
+    /// #500 — owner approved the draft for a FUTURE send; `scheduledAtMs`
+    /// holds the fire time. Deliberately distinct from `pending` so the
+    /// queue-hygiene sweeps (7-day expiry, reconcile, nudge carousel) skip
+    /// these rows by construction. The ScheduledSendEngine fires the send
+    /// when due. Not terminal: exits to `sending` (fire / Send Now),
+    /// `pending` (back to queue), `rejected` (cancel), or `superseded`
+    /// (owner replied manually on the thread).
+    Scheduled,
+    /// #500 — transient claim state held for the duration of one send
+    /// attempt (Composio round-trip). Both the Discord Approve path and the
+    /// ScheduledSendEngine CAS into this state before calling send_draft, so
+    /// exactly one sender can win a race and the final Sent/Error flip can be
+    /// made conditional (`WHERE status = 'sending'`). Rows stuck here after a
+    /// crash are flipped to `error` (retry-exempt) by the engine's startup
+    /// reconcile — never auto-resent, because the send may have landed.
+    Sending,
 }
 
 impl ActionStatus {
@@ -59,6 +75,8 @@ impl ActionStatus {
             Self::Flagged => "flagged",
             Self::DryRun => "dry_run",
             Self::Superseded => "superseded",
+            Self::Scheduled => "scheduled",
+            Self::Sending => "sending",
         }
     }
 }
