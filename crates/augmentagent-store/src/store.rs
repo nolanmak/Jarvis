@@ -1662,6 +1662,23 @@ impl Store {
         Ok(matches!(row, Some(Some(_))))
     }
 
+    /// `firstSeenAt` (epoch ms) for a known message id. Powers wiki page
+    /// freshness (#642): pages cite messageIds in `sources:` / inline `m:`
+    /// cites, and the first time we saw a message bounds how old the facts
+    /// derived from it are. `None` = unknown id (the caller must treat that
+    /// as "unknown", never "fresh").
+    pub fn email_first_seen_at(&self, message_id: &str) -> StoreResult<Option<i64>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row: Option<i64> = guard
+            .query_row(
+                "SELECT firstSeenAt FROM emails WHERE messageId = ?1",
+                params![message_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     pub fn is_message_processed(&self, message_id: &str) -> StoreResult<bool> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let row: Option<i64> = guard

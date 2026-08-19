@@ -1898,6 +1898,16 @@ async fn main() -> Result<()> {
     info!(db = %db_path.display(), "opening store");
     let store = Arc::new(Store::open(&db_path).context("open store")?);
 
+    // Wiki page freshness (#642): the post-ingest index rebuild stamps every
+    // entry with the age of its cited evidence. Installed here, once, so the
+    // daemon, poll-once, and every wiki subcommand resolve identically.
+    {
+        let store = Arc::clone(&store);
+        augmentagent_channel_core::ingest::set_first_seen_resolver(Arc::new(move |id: &str| {
+            store.email_first_seen_at(id).ok().flatten()
+        }));
+    }
+
     match cli.cmd {
         Cmd::AccountsList => {
             let accounts = store.get_active_gmail_accounts()?;
@@ -2593,7 +2603,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Wiki { ref op } => match op {
-            WikiOp::Lint { out } => run_wiki_lint(&cli, out.clone()).await,
+            WikiOp::Lint { out } => run_wiki_lint(&cli, Arc::clone(&store), out.clone()).await,
             WikiOp::Ask { question, post } => run_wiki_ask(&cli, question.clone(), *post).await,
             WikiOp::Migrate {
                 to,
@@ -2615,7 +2625,7 @@ async fn main() -> Result<()> {
                 .await
             }
             WikiOp::Sync { dry_run, no_pull } => run_wiki_sync(&cli, *dry_run, *no_pull).await,
-            WikiOp::Index { rebuild } => run_wiki_index(&cli, *rebuild),
+            WikiOp::Index { rebuild } => run_wiki_index(&cli, Arc::clone(&store), *rebuild),
         },
         Cmd::Digest {
             since,
@@ -6034,7 +6044,7 @@ async fn run_wiki_ask(cli: &Cli, question: String, post: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_wiki_lint(cli: &Cli, out: Option<PathBuf>) -> Result<()> {
+async fn run_wiki_lint(cli: &Cli, store: Arc<Store>, out: Option<PathBuf>) -> Result<()> {
     let wiki_root = cli
         .wiki_dir
         .clone()
@@ -6046,6 +6056,11 @@ async fn run_wiki_lint(cli: &Cli, out: Option<PathBuf>) -> Result<()> {
     let schema = std::fs::read_to_string(&schema_path)
         .with_context(|| format!("read schema at {}", schema_path.display()))?;
 
+    // Computed freshness (#642) — mechanical, produced before the model
+    // pass so the report carries it even if the reasoner has nothing to say.
+    let freshness_section =
+        wiki_freshness_section(&wiki_root, &|id| store.email_first_seen_at(id).ok().flatten());
+
     let reasoner = ClaudeCliReasoner::new();
     let opts = augmentagent_channel_core::reasoner::lint_opts(schema, wiki_root.clone());
     let user_msg = format!(
@@ -6055,6 +6070,7 @@ async fn run_wiki_lint(cli: &Cli, out: Option<PathBuf>) -> Result<()> {
 
     info!(wiki = %wiki_root.display(), "running wiki lint");
     let report = reasoner.call(&opts, &user_msg).await?;
+    let report = format!("{report}\n\n{freshness_section}");
 
     match out {
         Some(path) => {
@@ -6069,15 +6085,148 @@ async fn run_wiki_lint(cli: &Cli, out: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Pages with computed freshness, worst-first buckets, rendered as a
+/// markdown section appended to the lint report (#642). Mechanical — no
+/// model involvement, so its numbers are exact and reproducible.
+fn wiki_freshness_section(
+    wiki_root: &std::path::Path,
+    resolve: &dyn Fn(&str) -> Option<i64>,
+) -> String {
+    use augmentagent_wiki::freshness::{self, PageStatus};
+
+    const STALE_DAYS: i64 = 90; // matches the schema's lint guidance
+    const LIST_CAP: usize = 20;
+
+    let today = freshness::today_utc();
+    let mut fresh = 0usize;
+    let mut stale: Vec<(String, freshness::Date)> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    let mut deprecated = 0usize;
+    let mut expired: Vec<(String, freshness::Date)> = Vec::new();
+
+    for dir in ["people", "threads", "projects"] {
+        let Ok(rd) = std::fs::read_dir(wiki_root.join(dir)) else {
+            continue;
+        };
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(page) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let rel = format!("{dir}/{}", ent.file_name().to_string_lossy());
+            let f = freshness::compute(&page, resolve);
+            if f.status == PageStatus::Deprecated {
+                deprecated += 1;
+                continue;
+            }
+            if f.past_stale_after(today) {
+                expired.push((rel.clone(), f.stale_after.expect("past implies present")));
+            }
+            match (f.as_of, f.age_days(today)) {
+                (Some(date), Some(age)) if age > STALE_DAYS => stale.push((rel, date)),
+                (Some(_), _) => fresh += 1,
+                (None, _) => unknown.push(rel),
+            }
+        }
+    }
+
+    stale.sort_by_key(|(_, d)| *d); // oldest evidence first
+    unknown.sort();
+    expired.sort();
+
+    let total = fresh + stale.len() + unknown.len() + deprecated;
+    let mut s = String::from("## Freshness (computed)\n\n");
+    s.push_str(
+        "Fact age = newest `emails.firstSeenAt` across each page's cited messageIds \
+         (`sources:` + inline `m:` cites) plus owner `verified:` dates. Pages whose \
+         evidence doesn't resolve are UNKNOWN — that is never \"fresh\" (G1).\n\n",
+    );
+    s.push_str(&format!(
+        "- {total} pages: {fresh} fresh (evidence ≤{STALE_DAYS}d) · {} stale (>{STALE_DAYS}d) · {} unknown evidence · {deprecated} deprecated\n",
+        stale.len(),
+        unknown.len(),
+    ));
+    let fmt_capped = |items: &[String]| -> String {
+        let mut line = items[..items.len().min(LIST_CAP)].join(", ");
+        if items.len() > LIST_CAP {
+            line.push_str(&format!(", … and {} more", items.len() - LIST_CAP));
+        }
+        line
+    };
+    if !expired.is_empty() {
+        let rows: Vec<String> = expired
+            .iter()
+            .map(|(rel, d)| format!("{rel} (stale_after {d})"))
+            .collect();
+        s.push_str(&format!("- past explicit `stale_after:`: {}\n", fmt_capped(&rows)));
+    }
+    if !stale.is_empty() {
+        let rows: Vec<String> = stale
+            .iter()
+            .map(|(rel, d)| format!("{rel} ({d})"))
+            .collect();
+        s.push_str(&format!("- oldest evidence first: {}\n", fmt_capped(&rows)));
+    }
+    if !unknown.is_empty() {
+        s.push_str(&format!("- unknown evidence: {}\n", fmt_capped(&unknown)));
+    }
+    s
+}
+
+#[cfg(test)]
+mod wiki_freshness_section_tests {
+    use super::wiki_freshness_section;
+
+    #[test]
+    fn buckets_and_caps_render() {
+        let td = tempfile::TempDir::new().unwrap();
+        let root = td.path();
+        std::fs::create_dir_all(root.join("people")).unwrap();
+        let mk = |name: &str, fm_extra: &str, source: &str| {
+            std::fs::write(
+                root.join("people").join(name),
+                format!("---\nkind: person\n{fm_extra}sources: [{source}]\n---\n\nx\n"),
+            )
+            .unwrap();
+        };
+        mk("fresh.md", "", "id-fresh");
+        mk("stale.md", "", "id-stale");
+        mk("unknown.md", "", "id-ghost");
+        mk("dead.md", "status: deprecated\n", "id-fresh");
+        mk("expired.md", "stale_after: 2020-01-01\n", "id-fresh");
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let resolve = move |id: &str| match id {
+            "id-fresh" => Some(now_ms),
+            "id-stale" => Some(now_ms - 200 * 86_400_000),
+            _ => None,
+        };
+        let s = wiki_freshness_section(root, &resolve);
+        assert!(
+            s.contains("5 pages: 2 fresh (evidence ≤90d) · 1 stale (>90d) · 1 unknown evidence · 1 deprecated"),
+            "unexpected section:\n{s}"
+        );
+        assert!(s.contains("people/stale.md ("), "stale page must be listed: {s}");
+        assert!(s.contains("- unknown evidence: people/unknown.md"));
+        assert!(s.contains("people/expired.md (stale_after 2020-01-01)"));
+    }
+}
+
 /// `wiki index` — inspect or rebuild the derived index.md (#642).
-fn run_wiki_index(cli: &Cli, rebuild: bool) -> Result<()> {
+fn run_wiki_index(cli: &Cli, store: Arc<Store>, rebuild: bool) -> Result<()> {
     let wiki_root = cli
         .wiki_dir
         .clone()
         .context("--wiki-dir is required for wiki index")?;
 
     if rebuild {
-        let stats = augmentagent_wiki::rebuild_index(&wiki_root)?;
+        let stats =
+            augmentagent_wiki::rebuild_index(&wiki_root, &|id: &str| {
+                store.email_first_seen_at(id).ok().flatten()
+            })?;
         let skipped = if stats.unreadable > 0 {
             format!(", {} unreadable pages skipped", stats.unreadable)
         } else {

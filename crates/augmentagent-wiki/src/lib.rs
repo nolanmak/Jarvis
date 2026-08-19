@@ -6,6 +6,7 @@
 //! knows *where* files go and how to name them.
 
 pub mod crm;
+pub mod freshness;
 pub mod identity;
 pub mod index;
 pub mod layout;
