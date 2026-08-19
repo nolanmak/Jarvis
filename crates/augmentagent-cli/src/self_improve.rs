@@ -9,8 +9,12 @@
 //! - **Verification gate.** `cargo build` + `npm run build` + `cargo test`
 //!   must all pass before a PR is opened. A red gate => no PR, a back-off
 //!   comment on the issue instead.
-//! - **Draft only, never auto-merge.** PRs are opened `--draft`; a human
-//!   merges.
+//! - **Draft by default; human merges.** PRs are opened `--draft`. The one
+//!   exception (#630): with `AUGMENTAGENT_AUTOPR_AUTOMERGE=1`, issues
+//!   authored by the OWNER (or an explicit login allowlist) merge
+//!   automatically after the gate passes — everyone else always gets the
+//!   draft + review flow. On the production box a merge deploys via the
+//!   auto-updater, which is precisely the owner-only opt-in being made.
 //! - **Dedup guard.** Issues that already have an open PR from a previous
 //!   agent run are skipped (branch-name convention + `gh pr list`).
 //! - **Blast-radius refusal.** Issues whose title/body or whose resulting
@@ -42,6 +46,11 @@ const GAVE_UP_LABEL: &str = "agent-gave-up";
 const MAX_DIFF_LINES: usize = 600;
 /// Consecutive failed attempts before we comment + back off (label marker).
 const MAX_ATTEMPTS: u32 = 3;
+/// What [`run_once`] returns when no labeled issue is waiting. The #630
+/// auto-PR loop matches on this to tell an idle tick (one cheap `gh issue
+/// list`, no reasoner spend) from an engaged run (counts against the daily
+/// cap because it spawned the claude CLI on the owner's subscription, #448).
+const IDLE_MSG: &str = "no eligible agent-fixable issues";
 
 /// #300 — Trust gate. Issue bodies are attacker-controllable now that the
 /// repo is public, and the reasoner is granted Write/Edit/Bash(cargo/npm)
@@ -442,10 +451,134 @@ async fn has_open_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
 }
 
 /// Reasoner opts scoped to write/edit/bash within the per-attempt worktree.
+/// Model tiers for the two-stage pipeline (#630). Defaults are pinned full
+/// model IDs per the #448 rule — `model: None` silently inherits whatever the
+/// owner last picked for their interactive Claude Code, which is a leak, not
+/// a default (`fix_opts` shipped with exactly that bug until now). Env
+/// overrides let the owner re-tier without a rebuild.
+const AUTOPR_SCOPE_MODEL: &str = "claude-fable-5";
+const AUTOPR_BUILD_MODEL: &str = "claude-opus-5";
+
+fn scope_model() -> String {
+    resolve_model(
+        std::env::var("AUGMENTAGENT_AUTOPR_SCOPE_MODEL").ok().as_deref(),
+        AUTOPR_SCOPE_MODEL,
+    )
+}
+
+fn build_model() -> String {
+    resolve_model(
+        std::env::var("AUGMENTAGENT_AUTOPR_BUILD_MODEL").ok().as_deref(),
+        AUTOPR_BUILD_MODEL,
+    )
+}
+
+fn resolve_model(env_val: Option<&str>, default: &str) -> String {
+    match env_val.map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => default.to_string(),
+    }
+}
+
+/// Stage 1 of the two-stage pipeline: a read-only scoping pass on a stronger
+/// model. Issues filed conversationally (e.g. by the Discord agent on the
+/// owner's behalf) are often under-specified; the scoper reads the actual
+/// code and turns the ask into a concrete implementation spec the builder
+/// can follow, instead of letting the builder guess scope while editing.
+fn scope_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
+    augmentagent_channel_core::ReasonerOpts {
+        system_prompt: SCOPE_SYSTEM.to_string(),
+        model: Some(scope_model()),
+        allowed_tools: vec![
+            "Read".into(),
+            "Grep".into(),
+            "Glob".into(),
+            "Bash(ls *)".into(),
+            "Bash(git log*)".into(),
+            "Bash(git diff*)".into(),
+            "Bash(git status*)".into(),
+        ],
+        add_dirs: vec![worktree.clone()],
+        permission_mode: "default".into(),
+        cwd: Some(worktree),
+        env: Vec::new(),
+        settings_json: None,
+        restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
+    }
+}
+
+const SCOPE_SYSTEM: &str = "You are the scoping pass of a two-stage autonomous \
+fix pipeline for the AugmentAgent codebase. You are given a GitHub issue that \
+may be vague or under-specified. READ the relevant code first, then produce an \
+implementation spec for a second, separate agent that will write the code. \
+Your output MUST contain:\n\
+- Interpretation: what the issue is actually asking for, resolving any \
+ambiguity with the most reasonable reading of the code and stating the \
+assumption you made.\n\
+- Files to touch: concrete paths, with what changes in each and which \
+existing functions/patterns to reuse.\n\
+- The smallest correct approach, and one sentence on why not the \
+alternatives.\n\
+- Edge cases and failure modes the builder must handle.\n\
+- Acceptance criteria: what tests to add/update and what observable \
+behaviour proves the fix.\n\
+Constraints: read-only — do NOT edit files. Stay inside the given working \
+directory. Do NOT touch deploy/auth/secret/CI paths even in your plan \
+(systemd, scripts/check-for-updates, .github/workflows, credentials/keyring/\
+.env) and keep the planned diff small (the pipeline caps at 600 changed \
+lines). Output ONLY the spec, no preamble.";
+
+/// Build the stage-2 prompt: the issue plus (when the scoping pass produced
+/// one) the implementation spec.
+fn build_fix_prompt(issue: &Issue, plan: Option<&str>) -> String {
+    match plan {
+        Some(p) => format!(
+            "GitHub issue #{}: {}\n\n{}\n\n\
+             ## Implementation spec (from a read-only scoping pass on a \
+             stronger model — follow it unless the code contradicts it, and \
+             say so in your summary if it does)\n{}\n\nImplement the fix now.",
+            issue.number, issue.title, issue.body, p
+        ),
+        None => format!(
+            "GitHub issue #{}: {}\n\n{}\n\nImplement the fix now.",
+            issue.number, issue.title, issue.body
+        ),
+    }
+}
+
+/// #630 — auto-merge policy. Off unless `AUGMENTAGENT_AUTOPR_AUTOMERGE=1|true`,
+/// and even then only for issues authored by the owner (or an explicit
+/// `AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS` login list). Everyone else's
+/// issues keep the draft-PR + human-review flow. NOTE the deploy coupling:
+/// on the production box a merge to main is deployed to the live daemon by
+/// the auto-updater within minutes — that is exactly the behaviour the owner
+/// opted into for their own issues, and exactly why nobody else's issues
+/// qualify.
+fn automerge_enabled_value(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some(x) if x == "1" || x.eq_ignore_ascii_case("true"))
+}
+
+fn automerge_eligible(author: &str, owner: Option<&str>, authors_csv: Option<&str>) -> bool {
+    if author.trim().is_empty() {
+        return false;
+    }
+    match authors_csv.map(str::trim).filter(|s| !s.is_empty()) {
+        // Explicit allowlist set ⇒ it is the whole policy (owner must
+        // list themselves too — no silent unions).
+        Some(csv) => csv
+            .split(',')
+            .any(|a| a.trim().eq_ignore_ascii_case(author.trim())),
+        None => matches!(owner, Some(o) if o.trim().eq_ignore_ascii_case(author.trim())),
+    }
+}
+
 fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     augmentagent_channel_core::ReasonerOpts {
         system_prompt: SELF_IMPROVE_SYSTEM.to_string(),
-        model: None,
+        model: Some(build_model()),
         allowed_tools: vec![
             "Read".into(),
             "Grep".into(),
@@ -543,7 +676,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     }
 
     let Some(issue) = pick_issue(repo_root).await? else {
-        return Ok("no eligible agent-fixable issues".to_string());
+        return Ok(IDLE_MSG.to_string());
     };
     info!(issue = issue.number, title = %issue.title, "selected issue");
 
@@ -572,11 +705,17 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
              unattended fix pipeline (which runs `cargo build`/`npm` and pushes \
              a branch) will not run on it automatically. A maintainer can opt \
              this in by adding the author to \
-             `AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS`, or by reviewing and \
-             driving it through the approval flow.",
+             `AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS` and removing the \
+             `agent-gave-up` label, or by reviewing and driving it through \
+             the approval flow.",
         )
         .await
         .ok();
+        // #630 — the refusal is deterministic (the author won't change), so
+        // label it out of the selection pool immediately. Without this, the
+        // unattended loop re-picks the same issue every tick: it head-of-line
+        // blocks every other labeled issue and re-comments daily, forever.
+        label_gave_up(repo_root, issue.number).await.ok();
         return Ok(format!(
             "issue #{}: refused — untrusted author '{}' (requires owner approval)",
             issue.number, issue.author
@@ -624,13 +763,37 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         let _ = run("git", &["branch", "-D", &br], &root).await;
     };
 
-    // Hand the issue to the reasoner inside the worktree.
     let reasoner = Arc::new(ClaudeCliReasoner::new());
-    let opts = fix_opts(worktree.clone());
-    let prompt = format!(
-        "GitHub issue #{}: {}\n\n{}\n\nImplement the fix now.",
+
+    // Stage 1 (#630): read-only scoping pass on a stronger model. Issues
+    // filed conversationally are often under-specified; the scoper expands
+    // the ask into an implementation spec before the builder edits anything.
+    // Scoping failure degrades to the pre-#630 single-stage behaviour — the
+    // spec is an enhancement, not a gate.
+    let scope_prompt = format!(
+        "GitHub issue #{}: {}\n\n{}\n\nProduce the implementation spec now.",
         issue.number, issue.title, issue.body
     );
+    let plan = match reasoner
+        .call(&scope_opts(worktree.clone()), &scope_prompt)
+        .await
+    {
+        Ok(p) => {
+            let p = p.trim().to_string();
+            if p.is_empty() { None } else { Some(p) }
+        }
+        Err(e) => {
+            warn!(
+                issue = issue.number,
+                "scoping pass failed; building without a spec: {e:#}"
+            );
+            None
+        }
+    };
+
+    // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
+    let opts = fix_opts(worktree.clone());
+    let prompt = build_fix_prompt(&issue, plan.as_deref());
     let summary = match reasoner.call(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
@@ -639,20 +802,42 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         }
     };
 
-    // Did anything change?
+    // Did anything change? A no-op run still burned a reasoner call, so it
+    // counts as an attempt (#630) — otherwise the unattended loop silently
+    // re-spends its daily cap on an issue the model can't act on.
     let (_ok, diff, _) = run("git", &["diff", "--stat"], &worktree).await?;
     if diff.trim().is_empty() {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
+        let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+        if attempts >= MAX_ATTEMPTS {
+            backoff_comment(
+                repo_root,
+                issue.number,
+                &format!(
+                    "Self-improve gave up after {attempts} attempts: the \
+                     reasoner produced no changes for this issue. Needs a \
+                     human (or a more concrete issue body)."
+                ),
+            )
+            .await
+            .ok();
+            label_gave_up(repo_root, issue.number).await.ok();
+        }
         return Ok(format!(
-            "issue #{}: reasoner made no changes; skipped",
+            "issue #{}: reasoner made no changes; skipped (attempt {attempts})",
             issue.number
         ));
     }
 
-    // Blast-radius + size guard on the actual diff.
+    // Blast-radius + size guard on the actual diff. Each refusal burned a
+    // full reasoner run, so it counts as an attempt (#630): a different
+    // rollout MAY produce an acceptable diff, but after MAX_ATTEMPTS the
+    // gave-up label pulls the issue from the pool — otherwise the unattended
+    // loop would re-spend its whole daily cap on the same issue forever.
     let (_ok, full_diff, _) = run("git", &["diff"], &worktree).await?;
     if is_blast_radius(&full_diff) {
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
+        let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
         backoff_comment(
             repo_root,
             issue.number,
@@ -661,14 +846,18 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         )
         .await
         .ok();
+        if attempts >= MAX_ATTEMPTS {
+            label_gave_up(repo_root, issue.number).await.ok();
+        }
         return Ok(format!(
-            "issue #{}: refused — diff hit blast-radius guard",
+            "issue #{}: refused — diff hit blast-radius guard (attempt {attempts})",
             issue.number
         ));
     }
     let lines = diff_line_count(&full_diff);
     if lines > MAX_DIFF_LINES {
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
+        let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
         backoff_comment(
             repo_root,
             issue.number,
@@ -679,8 +868,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         )
         .await
         .ok();
+        if attempts >= MAX_ATTEMPTS {
+            label_gave_up(repo_root, issue.number).await.ok();
+        }
         return Ok(format!(
-            "issue #{}: refused — diff too large ({lines} lines)",
+            "issue #{}: refused — diff too large ({lines} lines, attempt {attempts})",
             issue.number
         ));
     }
@@ -762,43 +954,83 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         bail!("git push failed: {e}");
     }
 
-    // Open a DRAFT PR. Never auto-merge.
+    // Open the PR. Draft + human merge for everyone; owner-authored issues
+    // can auto-merge when the owner opted in (see `automerge_eligible`).
+    let automerge = {
+        let enabled = automerge_enabled_value(
+            std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
+        );
+        if enabled {
+            let owner = std::env::var(GH_OWNER_ENV)
+                .ok()
+                .or(repo_owner_from_remote(repo_root).await);
+            automerge_eligible(
+                &issue.author,
+                owner.as_deref(),
+                std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS")
+                    .ok()
+                    .as_deref(),
+            )
+        } else {
+            false
+        }
+    };
     let gh = gh_bin();
+    let plan_section = plan
+        .as_deref()
+        .map(|p| format!("\n\n## Implementation spec (scoping pass)\n{}", truncate(p, 1500)))
+        .unwrap_or_default();
+    let merge_note = if automerge {
+        "Auto-merged: owner-authored issue with AUGMENTAGENT_AUTOPR_AUTOMERGE=1."
+    } else {
+        "Draft — a human must review and merge."
+    };
     let pr_body = format!(
-        "Automated self-improvement for #{}.\n\n## Summary\n{}\n\n## Verification\n\
+        "Automated self-improvement for #{}.\n\n## Summary\n{}{plan_section}\n\n## Verification\n\
          - `cargo build --workspace`: pass\n- `cargo test --workspace`: pass\n\
          - diff size: {lines} lines (cap {MAX_DIFF_LINES})\n\n\
-         Draft — a human must review and merge. Fixes #{}",
+         {merge_note} Fixes #{}",
         issue.number,
         truncate(&summary, 1500),
         issue.number
     );
-    let (ok, stdout, e) = run(
-        &gh,
-        &[
-            "pr",
-            "create",
-            "--draft",
-            "--base",
-            "main",
-            "--head",
-            &branch,
-            "--title",
-            &format!("fix: {} (#{})", issue.title, issue.number),
-            "--body",
-            &pr_body,
-        ],
-        &worktree,
-    )
-    .await?;
-    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+    let title = format!("fix: {} (#{})", issue.title, issue.number);
+    let mut args = vec!["pr", "create"];
+    if !automerge {
+        args.push("--draft");
+    }
+    args.extend_from_slice(&[
+        "--base", "main", "--head", &branch, "--title", &title, "--body", &pr_body,
+    ]);
+    let (ok, stdout, e) = run(&gh, &args, &worktree).await?;
+    cleanup(worktree, branch.clone(), repo_root.to_path_buf()).await;
     if !ok {
         bail!("gh pr create failed: {e}");
     }
+    let pr_url = stdout.trim().to_string();
+    if !automerge {
+        return Ok(format!("issue #{}: draft PR opened — {pr_url}", issue.number));
+    }
+    // Merge immediately: the verification gate already passed, and `--auto`
+    // needs branch protection this repo doesn't run. A merge failure (main
+    // moved, protection added later) leaves the PR open for a human — never
+    // retried blindly.
+    let (ok, _o, e) = run(
+        &gh,
+        &["pr", "merge", &branch, "--squash", "--delete-branch"],
+        repo_root,
+    )
+    .await?;
+    if !ok {
+        warn!(issue = issue.number, "auto-merge failed; PR left open: {e}");
+        return Ok(format!(
+            "issue #{}: PR opened but auto-merge FAILED (left open for review) — {pr_url}",
+            issue.number
+        ));
+    }
     Ok(format!(
-        "issue #{}: draft PR opened — {}",
-        issue.number,
-        stdout.trim()
+        "issue #{}: PR auto-merged (owner-authored) — {pr_url}",
+        issue.number
     ))
 }
 
@@ -827,7 +1059,10 @@ async fn record_attempt(repo_root: &Path, issue: u64) -> Result<u32> {
             "comment",
             &issue.to_string(),
             "--body",
-            &format!("<!-- self-improve-attempt --> attempt {n} failed the verification gate."),
+            &format!(
+                "<!-- self-improve-attempt --> attempt {n} did not produce an \
+                 acceptable PR (gate failure, refused diff, or no changes)."
+            ),
         ],
         repo_root,
     )
@@ -1490,6 +1725,168 @@ pub async fn open_approved_runs(store: &Store) -> Result<String> {
     Ok(out.join("\n"))
 }
 
+// ---------------------------------------------------------------------------
+// #630 — auto-PR daemon loop
+// ---------------------------------------------------------------------------
+
+/// #630 — in-daemon listener that closes the loop from "issue filed" to
+/// "draft PR up for review": on an interval, run the #103 [`run_once`]
+/// pipeline, which picks the next open `agent-fixable` issue and — behind
+/// its existing guardrails (trust gate #300, blast-radius refusal, diff cap,
+/// verification gate, per-issue attempt back-off, dedup vs open agent PRs,
+/// draft-only, isolated worktree) — ships a draft PR referencing it.
+///
+/// Guardrails this loop adds on top:
+/// - **Opt-in.** Spawned only when `AUGMENTAGENT_AUTOPR=1|true`. Every
+///   engaged run spawns the claude CLI on the owner's Max subscription
+///   (#448), so merging this feature must not silently start billing.
+/// - **Label gate.** Eligibility stays `agent-fixable` — filing an issue is
+///   not consent to auto-build it; labeling it is.
+/// - **Serial + rate-limited.** One pipeline run at a time (single loop),
+///   first tick a full interval after boot (the auto-updater bounces the
+///   daemon on every deploy; a boot tick would burn cap on each restart),
+///   and at most `AUGMENTAGENT_AUTOPR_DAILY_CAP` engaged runs per UTC day.
+///   The counter is in-memory — a restart resets it — so the cap is
+///   belt-and-suspenders on top of the label gate and per-issue back-off,
+///   not the primary control.
+/// - **Draft + human merge by default.** Inherited from `run_once`; the PR
+///   body's `Fixes #N` cross-links it on the issue. Owner-authored issues
+///   auto-merge only behind the separate `AUGMENTAGENT_AUTOPR_AUTOMERGE`
+///   opt-in (see `automerge_eligible`).
+///
+/// Each engaged run is now TWO reasoner calls (#630): a read-only scoping
+/// pass on `AUGMENTAGENT_AUTOPR_SCOPE_MODEL` (default Fable) that turns an
+/// under-specified issue into an implementation spec, then the build on
+/// `AUGMENTAGENT_AUTOPR_BUILD_MODEL` (default Opus). Budget the daily cap
+/// accordingly.
+pub struct AutoPrLoop {
+    repo_root: PathBuf,
+    dry_run: bool,
+    interval: std::time::Duration,
+    daily_cap: u32,
+}
+
+/// Engaged-run counter with UTC-day rollover. Pure so it's testable.
+#[derive(Default)]
+struct DailyCounter {
+    day: u64,
+    runs: u32,
+}
+
+impl DailyCounter {
+    fn runs_today(&mut self, day: u64) -> u32 {
+        if day != self.day {
+            self.day = day;
+            self.runs = 0;
+        }
+        self.runs
+    }
+
+    fn record(&mut self, day: u64) {
+        let _ = self.runs_today(day);
+        self.runs += 1;
+    }
+}
+
+fn utc_day_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0)
+}
+
+impl AutoPrLoop {
+    const DEFAULT_INTERVAL_SECS: u64 = 1_800;
+    const DEFAULT_DAILY_CAP: u32 = 3;
+
+    /// Env-gated constructor: `None` unless `AUGMENTAGENT_AUTOPR=1|true`.
+    /// `AUGMENTAGENT_AUTOPR_INTERVAL_SECS` (default 1800, floor 300 — the
+    /// tick does a real `gh issue list`) and `AUGMENTAGENT_AUTOPR_DAILY_CAP`
+    /// (default 3) tune cadence and spend ceiling.
+    pub fn from_env(repo_root: PathBuf, dry_run: bool) -> Option<Self> {
+        Self::from_values(
+            repo_root,
+            dry_run,
+            std::env::var("AUGMENTAGENT_AUTOPR").ok().as_deref(),
+            std::env::var("AUGMENTAGENT_AUTOPR_INTERVAL_SECS")
+                .ok()
+                .as_deref(),
+            std::env::var("AUGMENTAGENT_AUTOPR_DAILY_CAP").ok().as_deref(),
+        )
+    }
+
+    fn from_values(
+        repo_root: PathBuf,
+        dry_run: bool,
+        enabled: Option<&str>,
+        interval_secs: Option<&str>,
+        daily_cap: Option<&str>,
+    ) -> Option<Self> {
+        let on = matches!(
+            enabled.map(str::trim),
+            Some(v) if v == "1" || v.eq_ignore_ascii_case("true")
+        );
+        if !on {
+            return None;
+        }
+        let interval = interval_secs
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(Self::DEFAULT_INTERVAL_SECS)
+            .max(300);
+        let daily_cap = daily_cap
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(Self::DEFAULT_DAILY_CAP)
+            .max(1);
+        Some(Self {
+            repo_root,
+            dry_run,
+            interval: std::time::Duration::from_secs(interval),
+            daily_cap,
+        })
+    }
+
+    pub async fn run(self, shutdown: tokio_util::sync::CancellationToken) -> Result<()> {
+        info!(
+            interval_secs = self.interval.as_secs(),
+            daily_cap = self.daily_cap,
+            dry_run = self.dry_run,
+            "auto-PR loop started (#630): polling for agent-fixable issues"
+        );
+        let mut counter = DailyCounter::default();
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    info!("auto-PR loop stopped");
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(self.interval) => {}
+            }
+            let today = utc_day_now();
+            if counter.runs_today(today) >= self.daily_cap {
+                info!(
+                    daily_cap = self.daily_cap,
+                    "auto-PR: daily cap reached; idling until the next UTC day"
+                );
+                continue;
+            }
+            match run_once(&self.repo_root, self.dry_run).await {
+                Ok(msg) if msg == IDLE_MSG => {}
+                Ok(msg) => {
+                    counter.record(today);
+                    info!(
+                        runs_today = counter.runs_today(today),
+                        daily_cap = self.daily_cap,
+                        "auto-PR: {msg}"
+                    );
+                }
+                // Transient refusals (e.g. dirty deploy tree while a sibling
+                // session works, gh/network hiccup) — log and try next tick.
+                Err(e) => warn!("auto-PR tick failed: {e:#}"),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1608,5 +2005,141 @@ mod tests {
         let outside = std::env::temp_dir().join("aa-agent-clones-xyz");
         assert!(assert_outside_deploy(&outside, &deploy).is_ok());
         let _ = std::fs::remove_dir_all(&deploy);
+    }
+
+    // ---- #630: auto-PR loop config + daily cap ----
+
+    fn loop_values(
+        enabled: Option<&str>,
+        interval: Option<&str>,
+        cap: Option<&str>,
+    ) -> Option<AutoPrLoop> {
+        AutoPrLoop::from_values(PathBuf::from("/tmp/repo"), true, enabled, interval, cap)
+    }
+
+    #[test]
+    fn auto_pr_loop_requires_explicit_opt_in() {
+        // Every engaged run spends the owner's subscription (#448) — absent,
+        // empty, "0", or garbage must all leave the loop unspawned.
+        assert!(loop_values(None, None, None).is_none());
+        assert!(loop_values(Some(""), None, None).is_none());
+        assert!(loop_values(Some("0"), None, None).is_none());
+        assert!(loop_values(Some("yes"), None, None).is_none());
+        assert!(loop_values(Some("1"), None, None).is_some());
+        assert!(loop_values(Some("true"), None, None).is_some());
+        assert!(loop_values(Some("TRUE"), None, None).is_some());
+    }
+
+    #[test]
+    fn auto_pr_loop_parses_interval_and_cap_with_floors() {
+        let l = loop_values(Some("1"), Some("600"), Some("5")).unwrap();
+        assert_eq!(l.interval.as_secs(), 600);
+        assert_eq!(l.daily_cap, 5);
+        // Defaults when unset or unparsable.
+        let l = loop_values(Some("1"), Some("nope"), None).unwrap();
+        assert_eq!(l.interval.as_secs(), AutoPrLoop::DEFAULT_INTERVAL_SECS);
+        assert_eq!(l.daily_cap, AutoPrLoop::DEFAULT_DAILY_CAP);
+        // Floors: an interval under 5min would hammer `gh issue list`; a cap
+        // of 0 would make the loop a silent no-op the owner enabled on purpose.
+        let l = loop_values(Some("1"), Some("10"), Some("0")).unwrap();
+        assert_eq!(l.interval.as_secs(), 300);
+        assert_eq!(l.daily_cap, 1);
+    }
+
+    // ---- #630: auto-merge policy + two-stage model pins ----
+
+    #[test]
+    fn automerge_requires_explicit_opt_in_value() {
+        assert!(!automerge_enabled_value(None));
+        assert!(!automerge_enabled_value(Some("")));
+        assert!(!automerge_enabled_value(Some("0")));
+        assert!(!automerge_enabled_value(Some("yes")));
+        assert!(automerge_enabled_value(Some("1")));
+        assert!(automerge_enabled_value(Some("true")));
+        assert!(automerge_enabled_value(Some(" TRUE ")));
+    }
+
+    #[test]
+    fn automerge_eligibility_is_owner_only_by_default() {
+        // Owner match, case-insensitive.
+        assert!(automerge_eligible("nolanmak", Some("nolanmak"), None));
+        assert!(automerge_eligible("NolanMak", Some("nolanmak"), None));
+        // Anyone else — including trusted collaborators — stays draft+review.
+        assert!(!automerge_eligible("collaborator", Some("nolanmak"), None));
+        // No resolvable owner ⇒ never auto-merge.
+        assert!(!automerge_eligible("nolanmak", None, None));
+        // Empty author (gh returned none) ⇒ never.
+        assert!(!automerge_eligible("", Some("nolanmak"), None));
+    }
+
+    #[test]
+    fn automerge_allowlist_replaces_owner_default() {
+        // An explicit allowlist IS the policy — no silent union with owner.
+        assert!(automerge_eligible(
+            "helper",
+            Some("nolanmak"),
+            Some("helper, other")
+        ));
+        assert!(!automerge_eligible(
+            "nolanmak",
+            Some("nolanmak"),
+            Some("helper")
+        ));
+        // Blank allowlist falls back to the owner default.
+        assert!(automerge_eligible("nolanmak", Some("nolanmak"), Some("  ")));
+    }
+
+    #[test]
+    fn two_stage_models_are_pinned_with_env_override() {
+        // #448 — model: None inherits the owner's interactive model; both
+        // stages must pin. Defaults hold when the env is unset/blank.
+        assert_eq!(resolve_model(None, AUTOPR_SCOPE_MODEL), "claude-fable-5");
+        assert_eq!(resolve_model(Some("  "), AUTOPR_BUILD_MODEL), "claude-opus-5");
+        assert_eq!(
+            resolve_model(Some("claude-sonnet-5"), AUTOPR_BUILD_MODEL),
+            "claude-sonnet-5"
+        );
+        // The opts constructors actually pin them.
+        assert!(scope_opts(PathBuf::from("/tmp/wt")).model.is_some());
+        assert!(fix_opts(PathBuf::from("/tmp/wt")).model.is_some());
+    }
+
+    #[test]
+    fn scope_stage_is_read_only_and_fix_prompt_embeds_the_spec() {
+        let opts = scope_opts(PathBuf::from("/tmp/wt"));
+        for t in &opts.allowed_tools {
+            assert!(
+                !t.contains("Write") && !t.contains("Edit"),
+                "scope stage must not be able to edit: {t}"
+            );
+        }
+        let issue = Issue {
+            number: 7,
+            title: "t".into(),
+            body: "b".into(),
+            author: "a".into(),
+            author_trusted: true,
+        };
+        let with = build_fix_prompt(&issue, Some("the spec"));
+        assert!(with.contains("the spec"));
+        assert!(with.contains("Implementation spec"));
+        let without = build_fix_prompt(&issue, None);
+        assert!(!without.contains("Implementation spec"));
+        assert!(without.contains("Implement the fix now."));
+    }
+
+    #[test]
+    fn daily_counter_caps_within_a_day_and_resets_on_rollover() {
+        let mut c = DailyCounter::default();
+        assert_eq!(c.runs_today(100), 0);
+        c.record(100);
+        c.record(100);
+        assert_eq!(c.runs_today(100), 2);
+        // Same-day queries don't reset.
+        assert_eq!(c.runs_today(100), 2);
+        // New UTC day ⇒ fresh budget.
+        assert_eq!(c.runs_today(101), 0);
+        c.record(101);
+        assert_eq!(c.runs_today(101), 1);
     }
 }
