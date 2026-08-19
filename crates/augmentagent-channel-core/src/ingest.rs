@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use augmentagent_store::Email;
+use augmentagent_wiki::with_page_lock;
 use tracing::{debug, warn};
 
 use crate::decision::DecisionKind;
@@ -98,7 +99,7 @@ pub fn spawn_ingest<R>(
     R: Reasoner + 'static,
 {
     tokio::spawn(async move {
-        let opts = ingest_opts(schema, wiki_root);
+        let opts = ingest_opts(schema, wiki_root.clone());
         let user_msg = ingest_user_message(
             &email,
             decision,
@@ -123,6 +124,31 @@ pub fn spawn_ingest<R>(
                     "wiki ingest failed: {e:#}"
                 );
             }
+        }
+        // index.md is derived (#642): regenerate it after every ingest so a
+        // page the model just created (or failed to catalog) can't drift out
+        // of the index. Runs even when the ingest call errored — the model
+        // may have written pages before failing, and the rebuild is
+        // idempotent. Page lock serializes concurrent ingest tails in this
+        // process; the write itself is atomic (temp + rename, no lockfile).
+        let index_path = wiki_root.join("index.md");
+        let rebuilt = with_page_lock(&index_path, || async {
+            let root = wiki_root.clone();
+            tokio::task::spawn_blocking(move || augmentagent_wiki::index::rebuild_index(&root))
+                .await
+                .map_err(anyhow::Error::from)?
+        })
+        .await;
+        match rebuilt {
+            Ok(stats) => debug!(
+                pages = stats.total(),
+                message_id = %email.message_id,
+                "wiki index rebuilt"
+            ),
+            Err(e) => warn!(
+                message_id = %email.message_id,
+                "wiki index rebuild failed: {e:#}"
+            ),
         }
     });
 }
