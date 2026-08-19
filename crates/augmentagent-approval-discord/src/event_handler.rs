@@ -1167,6 +1167,9 @@ fn should_delete_source(outcome: &ApprovalActionOutcome) -> bool {
             | ApprovalActionOutcome::Skipped
             | ApprovalActionOutcome::Revised { .. }
             | ApprovalActionOutcome::AlreadyResolved { .. }
+            // #502 — Approve on a --send-at proposal armed the schedule; the
+            // actionable card is replaced by the scheduled notice.
+            | ApprovalActionOutcome::Scheduled { .. }
     )
 }
 
