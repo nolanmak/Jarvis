@@ -5,7 +5,7 @@
 //! and do not affect triage/draft correctness.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use augmentagent_store::Email;
 use augmentagent_wiki::with_page_lock;
@@ -83,6 +83,25 @@ pub fn ingest_user_message(
     )
 }
 
+/// Process-wide messageId → `emails.firstSeenAt` (epoch ms) resolver used
+/// by the post-ingest index rebuild to stamp the freshness column (#642).
+/// A global rather than a `spawn_ingest` parameter because every channel
+/// crate funnels through `spawn_ingest` and none of them needs to know
+/// about freshness; the daemon installs the store-backed resolver once at
+/// startup. Unset (embedders, unit tests) every page renders
+/// "facts unknown" — the safe direction per G1, never fresh.
+static FIRST_SEEN_RESOLVER: OnceLock<Arc<dyn Fn(&str) -> Option<i64> + Send + Sync>> =
+    OnceLock::new();
+
+/// Install the resolver. First call wins; later calls are ignored.
+pub fn set_first_seen_resolver(f: Arc<dyn Fn(&str) -> Option<i64> + Send + Sync>) {
+    let _ = FIRST_SEEN_RESOLVER.set(f);
+}
+
+fn resolve_first_seen(id: &str) -> Option<i64> {
+    FIRST_SEEN_RESOLVER.get().and_then(|f| f(id))
+}
+
 /// Fire-and-forget ingest. Spawns a background tokio task; never errors to
 /// the caller. Returns immediately.
 #[allow(clippy::too_many_arguments)]
@@ -134,9 +153,11 @@ pub fn spawn_ingest<R>(
         let index_path = wiki_root.join("index.md");
         let rebuilt = with_page_lock(&index_path, || async {
             let root = wiki_root.clone();
-            tokio::task::spawn_blocking(move || augmentagent_wiki::index::rebuild_index(&root))
-                .await
-                .map_err(anyhow::Error::from)?
+            tokio::task::spawn_blocking(move || {
+                augmentagent_wiki::index::rebuild_index(&root, &resolve_first_seen)
+            })
+            .await
+            .map_err(anyhow::Error::from)?
         })
         .await;
         match rebuilt {

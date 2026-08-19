@@ -19,7 +19,15 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::freshness::{self, PageStatus};
 use crate::migrate::split_frontmatter;
+
+/// Maps a cited message id to `emails.firstSeenAt` (epoch ms). The index
+/// rebuilder never talks to the store directly — callers inject this so the
+/// crate stays io/schema-agnostic and tests stay hermetic. A resolver that
+/// always returns `None` renders every page "facts unknown" (G1: unknown is
+/// the safe direction, never fresh).
+pub type FirstSeenResolver<'a> = &'a (dyn Fn(&str) -> Option<i64> + 'a);
 
 /// Section order in the generated file. Matches `WikiLayout::bootstrap`.
 const SECTIONS: &[(&str, &str)] = &[
@@ -61,9 +69,9 @@ impl IndexStats {
 /// concurrent rebuilds (daemon ingest tail vs. a CLI invocation) can never
 /// write through each other's handle — last rename wins, each rename is
 /// whole. Names keep the `.tmp` suffix the wiki repo's `.gitignore` covers.
-pub fn rebuild_index(root: &Path) -> Result<IndexStats> {
+pub fn rebuild_index(root: &Path, resolve: FirstSeenResolver) -> Result<IndexStats> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let (doc, stats) = render_index(root)?;
+    let (doc, stats) = render_index(root, resolve)?;
     let tmp = root.join(format!(
         "index.md.{}.{}.tmp",
         std::process::id(),
@@ -81,15 +89,18 @@ pub fn rebuild_index(root: &Path) -> Result<IndexStats> {
 }
 
 /// Render the full index document from the pages on disk without writing.
-pub fn render_index(root: &Path) -> Result<(String, IndexStats)> {
+pub fn render_index(root: &Path, resolve: FirstSeenResolver) -> Result<(String, IndexStats)> {
     let mut stats = IndexStats::default();
     let mut doc = String::from(
         "# Wiki Index\n\n*Derived from the pages on disk by `augmentagent wiki index --rebuild`. \
-         Do not edit by hand — edits are overwritten on the next rebuild.*\n",
+         Do not edit by hand — edits are overwritten on the next rebuild. \
+         `facts as of` = newest cited evidence (`emails.firstSeenAt`) or owner \
+         verification; `facts unknown` = no cited message resolved (never \
+         assume fresh).*\n",
     );
 
     for (title, dir) in SECTIONS {
-        let entries = collect_entries(root, dir, &mut stats.unreadable)?;
+        let entries = collect_entries(root, dir, resolve, &mut stats.unreadable)?;
         match *dir {
             "people" => stats.people = entries.len(),
             "threads" => stats.threads = entries.len(),
@@ -105,11 +116,12 @@ pub fn render_index(root: &Path) -> Result<(String, IndexStats)> {
     Ok((doc, stats))
 }
 
-/// Walk `<root>/<dir>/*.md` and produce `(relative_path, summary)` pairs,
-/// sorted by path for a deterministic, diff-friendly output.
+/// Walk `<root>/<dir>/*.md` and produce `(relative_path, summary · freshness)`
+/// pairs, sorted by path for a deterministic, diff-friendly output.
 fn collect_entries(
     root: &Path,
     dir: &str,
+    resolve: FirstSeenResolver,
     unreadable: &mut usize,
 ) -> Result<Vec<(String, String)>> {
     let abs = root.join(dir);
@@ -134,7 +146,8 @@ fn collect_entries(
         match std::fs::read_to_string(&path) {
             Ok(page) => {
                 let summary = derive_summary(&page).unwrap_or_else(|| NO_SUMMARY.to_string());
-                entries.push((rel, summary));
+                let marker = freshness_marker(&page, resolve);
+                entries.push((rel, format!("{summary} · {marker}")));
             }
             Err(_) => *unreadable += 1,
         }
@@ -178,6 +191,21 @@ pub fn derive_summary(page: &str) -> Option<String> {
         return normalize_summary(line);
     }
     None
+}
+
+/// The freshness column (#642 phase 2): appended after the summary as
+/// `· facts as of YYYY-MM-DD`, `· facts unknown` (G1 — no cited message
+/// resolved; never rendered as fresh), or `· deprecated` (OKF `status:`,
+/// which makes evidence age moot).
+fn freshness_marker(page: &str, resolve: FirstSeenResolver) -> String {
+    let f = freshness::compute(page, resolve);
+    if f.status == PageStatus::Deprecated {
+        return "deprecated".to_string();
+    }
+    match f.as_of {
+        Some(date) => format!("facts as of {date}"),
+        None => "facts unknown".to_string(),
+    }
 }
 
 /// Collapse whitespace and cap length so the entry stays one line.
@@ -260,7 +288,9 @@ mod tests {
         // Non-md and nested files are ignored.
         write(root, "people/notes.txt", "not a page");
 
-        let stats = rebuild_index(root).unwrap();
+        // aa11 (PERSON's source) resolves to 2026-04-18; everything else is unknown.
+        let resolve = |id: &str| (id == "aa11").then_some(1776549330000i64);
+        let stats = rebuild_index(root, &resolve).unwrap();
         assert_eq!(stats.people, 2);
         assert_eq!(stats.threads, 1);
         assert_eq!(stats.projects, 1);
@@ -270,8 +300,12 @@ mod tests {
         let ada = doc.find("- [people/ada.md](people/ada.md) — ").unwrap();
         let zed = doc.find("- [people/zed.md](people/zed.md) — ").unwrap();
         assert!(ada < zed, "entries must be sorted by path");
-        assert!(doc.contains("- [threads/t1.md](threads/t1.md) — Re: contract"));
-        assert!(doc.contains("- [projects/q2.md](projects/q2.md) — Q2 launch."));
+        assert!(
+            doc.contains("- [people/ada.md](people/ada.md) — Ada Lovelace, mathematician at Analytical Engines Ltd. · facts as of 2026-04-18"),
+            "resolved sources must stamp the freshness column: {doc}"
+        );
+        assert!(doc.contains("- [threads/t1.md](threads/t1.md) — Re: contract · facts unknown"));
+        assert!(doc.contains("- [projects/q2.md](projects/q2.md) — Q2 launch. · facts unknown"));
         assert!(!doc.contains("notes.txt"));
         let leftover_tmp = std::fs::read_dir(root)
             .unwrap()
@@ -287,7 +321,7 @@ mod tests {
         std::fs::write(root.join("index.md"), "# Wiki Index\n\n- [people/gone.md](people/gone.md) — stale\n").unwrap();
         write(root, "people/here.md", PERSON);
 
-        let stats = rebuild_index(root).unwrap();
+        let stats = rebuild_index(root, &|_| None).unwrap();
         assert_eq!(stats.total(), 1);
         let doc = std::fs::read_to_string(root.join("index.md")).unwrap();
         assert!(!doc.contains("gone.md"), "stale entries must not survive a rebuild");
@@ -302,8 +336,24 @@ mod tests {
         let td = TempDir::new().unwrap();
         let root = td.path();
         write(root, "people/blank.md", "---\nkind: person\n---\n");
-        rebuild_index(root).unwrap();
+        rebuild_index(root, &|_| None).unwrap();
         let doc = std::fs::read_to_string(root.join("index.md")).unwrap();
-        assert!(doc.contains(&format!("- [people/blank.md](people/blank.md) — {NO_SUMMARY}")));
+        assert!(doc.contains(&format!(
+            "- [people/blank.md](people/blank.md) — {NO_SUMMARY} · facts unknown"
+        )));
+    }
+
+    #[test]
+    fn deprecated_status_wins_the_freshness_column() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        write(
+            root,
+            "projects/old.md",
+            "---\nkind: project\nstatus: deprecated\nsources: [aa11]\n---\n\nRetired effort.\n",
+        );
+        rebuild_index(root, &|_| Some(1776549330000)).unwrap();
+        let doc = std::fs::read_to_string(root.join("index.md")).unwrap();
+        assert!(doc.contains("- [projects/old.md](projects/old.md) — Retired effort. · deprecated"));
     }
 }

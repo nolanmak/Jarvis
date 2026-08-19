@@ -71,7 +71,7 @@ This is the honest description of what the harness blocks, so you do not waste t
 ## Wiki structure
 
 ```
-index.md              Catalog of every page with one-line summaries.
+index.md              Catalog of every page with one-line summaries. Each entry ends with a freshness marker: `facts as of YYYY-MM-DD` (newest cited evidence), `facts unknown` (no cited message resolved — do NOT assume current), or `deprecated`.
 about/me.md           The owner: identity, roles, and **Writing style preferences** (LOAD before drafting anything).
 log.md                Append-only event log, reverse-chronological.
 people/<slug>.md      One page per sender (email address). Contains Identity, Relationship, Recent threads, Commitments, Tone.
