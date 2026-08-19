@@ -1,5 +1,6 @@
-# Wix Events calendar mirror (#633): pull upcoming Meetup group events and
-# create the missing ones on the Wix calendar.
+# Wix Events calendar mirror (#633, #641): pull upcoming events from the
+# configured Meetup groups and Luma calendars and create the missing ones on
+# the Wix calendar. Cross-posted events are deduped before anything is made.
 #
 # CREATE ONLY and idempotent — a second run is a no-op, so a missed timer
 # costs nothing and a double fire is harmless.
