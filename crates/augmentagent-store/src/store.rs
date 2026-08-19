@@ -2580,16 +2580,21 @@ impl Store {
         // UPDATE no-ops on already-superseded rows. The SELECT scope matches
         // the UPDATE WHERE exactly, so the ids we hand back are precisely
         // the ones the UPDATE will (or just did) flip.
-        // #500 — 'scheduled' is in the set: a manual reply on the thread
-        // cancels an armed scheduled send too (the engine's fire-time CAS
-        // then loses against the superseded status and never sends).
-        // 'sending' is deliberately NOT included — the Composio call is
+        // #500 — 'scheduled' is deliberately NOT in this set. This thread-wide
+        // flip is invoked from contexts with no time bound (the reconcile
+        // sweep's pending-row rule asks "any user reply EVER"; the observer
+        // processes replies that may predate the schedule being armed), and an
+        // armed scheduled send must only be cancelled by a reply that came
+        // AFTER the owner armed it. Scheduled rows are cancelled through the
+        // bounded, per-row [`Self::mark_scheduled_superseded`] instead — from
+        // the engine's fire-time guard and the reconcile sweep's dedicated
+        // scheduled pass. 'sending' is also excluded — the Composio call is
         // already in flight and flipping the row under it would let the
         // conditional finish_send report a phantom failure for a send that
         // landed.
         let mut stmt = guard.prepare(
             "SELECT id FROM actions \
-             WHERE threadId = ?1 AND status IN ('pending', 'dry_run', 'scheduled')",
+             WHERE threadId = ?1 AND status IN ('pending', 'dry_run')",
         )?;
         let ids: Vec<String> = stmt
             .query_map(params![thread_id], |r| r.get::<_, String>(0))?
@@ -2602,9 +2607,8 @@ impl Store {
             "UPDATE actions \
              SET status = 'superseded', \
                  errorMessage = COALESCE(NULLIF(?2, ''), 'superseded by manual reply'), \
-                 updatedAt = ?3, \
-                 scheduledAtMs = NULL \
-             WHERE threadId = ?1 AND status IN ('pending', 'dry_run', 'scheduled')",
+                 updatedAt = ?3 \
+             WHERE threadId = ?1 AND status IN ('pending', 'dry_run')",
             params![thread_id, reason, now],
         )?;
         Ok(ids)
@@ -2985,7 +2989,11 @@ impl Store {
 
     /// #419 duplicate guard — the newest open (pending or #500 scheduled)
     /// action for this account + recipient + subject, as
-    /// `(action_id, draft_id)`.
+    /// `(action_id, draft_id, status)`. The status lets the compose path
+    /// distinguish a replaceable pending card from an ARMED scheduled send —
+    /// the latter must be refused, not silently replaced: the supersede in
+    /// the Replace arm is pending-only, so "replacing" a scheduled row would
+    /// leave the old schedule armed alongside the new card (double send).
     /// `fromEmail` holds the recipient for compose-originated cards (the
     /// card's From field shows who the mail goes to), so matching on it plus
     /// the emails-row entity id catches "the same email asked twice".
@@ -2994,11 +3002,11 @@ impl Store {
         account_entity_id: &str,
         recipient: &str,
         subject: &str,
-    ) -> StoreResult<Option<(String, Option<String>)>> {
+    ) -> StoreResult<Option<(String, Option<String>, String)>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let row = guard
             .query_row(
-                "SELECT a.id, a.draftId FROM actions a \
+                "SELECT a.id, a.draftId, a.status FROM actions a \
                  JOIN emails e ON a.messageId = e.messageId \
                  WHERE a.status IN ('pending', 'scheduled') \
                    AND e.accountEntityId = ?1 \
@@ -3006,7 +3014,13 @@ impl Store {
                    AND a.subject = ?3 \
                  ORDER BY a.createdAt DESC LIMIT 1",
                 params![account_entity_id, recipient, subject],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?;
         Ok(row)
@@ -4777,23 +4791,30 @@ impl Store {
     ///
     /// Distinct from `update_action_status`, which is unconditional and used
     /// for re-draft / pending bookkeeping. This is the resolve gate.
+    ///
+    /// `reason`, when given, lands in `errorMessage` (the usual reason slot
+    /// for non-error terminal states — same convention as
+    /// `expire_pending_older_than` / the supersede paths).
     pub fn try_resolve_action(
         &self,
         action_id: &str,
         new_status: ActionStatus,
         source: &str,
+        reason: Option<&str>,
     ) -> StoreResult<bool> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let n = guard.execute(
             "UPDATE actions \
                 SET status = ?2, status_source = ?3, status_updated_at = ?4, \
-                    updatedAt = ?4 \
+                    updatedAt = ?4, \
+                    errorMessage = COALESCE(?5, errorMessage) \
               WHERE id = ?1 AND status = 'pending'",
             params![
                 action_id,
                 new_status.as_str(),
                 source,
                 now_millis(),
+                reason,
             ],
         )?;
         Ok(n == 1)
@@ -4973,15 +4994,23 @@ impl Store {
 
     /// Due scheduled sends, oldest fire time first. `limit` bounds one tick's
     /// work; the engine logs when a backlog is truncated so a burst is never
-    /// silently dropped. Rows are (action_id, scheduledAtMs, createdAt).
+    /// silently dropped. Rows are
+    /// (action_id, scheduledAtMs, armed_at_ms, threadId): `armed_at_ms` is
+    /// the moment the schedule was armed (`status_updated_at` stamped by
+    /// `schedule_action`, falling back to `createdAt` for safety) — the
+    /// correct lower bound for the fire-time "did the owner reply since?"
+    /// guard. Bounding by `createdAt` instead would cancel a schedule the
+    /// owner armed AFTER sending their own quick manual reply.
     pub fn due_scheduled_actions(
         &self,
         now_ms: i64,
         limit: i64,
-    ) -> StoreResult<Vec<(String, i64, i64)>> {
+    ) -> StoreResult<Vec<(String, i64, i64, Option<String>)>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
-            "SELECT id, scheduledAtMs, createdAt FROM actions \
+            "SELECT id, scheduledAtMs, COALESCE(status_updated_at, createdAt), \
+                    threadId \
+               FROM actions \
               WHERE status = 'scheduled' AND scheduledAtMs IS NOT NULL \
                 AND scheduledAtMs <= ?1 \
               ORDER BY scheduledAtMs ASC \
@@ -4993,13 +5022,80 @@ impl Store {
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// Count of armed scheduled sends whose fire time is still in the future
+    /// Bounded, per-row cancellation of an armed scheduled send:
+    /// `scheduled → superseded`. This — never the thread-wide
+    /// `mark_pending_drafts_superseded_by_thread` — is how scheduled rows are
+    /// retired when the owner replied manually, because the callers
+    /// (engine fire-time guard, reconcile scheduled pass) bound the reply
+    /// check to the row's own arming moment first. Notice pointers are left
+    /// intact so the notice message can still be cleaned up afterwards.
+    pub fn mark_scheduled_superseded(
+        &self,
+        action_id: &str,
+        reason: &str,
+        source: &str,
+    ) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+                SET status = 'superseded', scheduledAtMs = NULL, \
+                    errorMessage = COALESCE(NULLIF(?2, ''), 'superseded by manual reply'), \
+                    status_source = ?3, status_updated_at = ?4, updatedAt = ?4 \
+              WHERE id = ?1 AND status = 'scheduled'",
+            params![action_id, reason, source, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// #500 — conditional draft refresh for the Revise tail: writes the new
+    /// draft body only while the row is STILL pending. The reasoner + Gmail
+    /// round-trips inside run_revise take seconds; a Schedule/Approve/
+    /// supersede landing meanwhile must not be stomped back to pending by an
+    /// unconditional write. Returns false when the row moved on (caller
+    /// cleans up its freshly created Gmail draft and reports AlreadyResolved).
+    pub fn refresh_pending_draft(
+        &self,
+        action_id: &str,
+        draft_body: &str,
+    ) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let draft_masked = redact::mask(draft_body);
+        let n = guard.execute(
+            "UPDATE actions \
+                SET draftBody = ?2, updatedAt = ?3 \
+              WHERE id = ?1 AND status = 'pending'",
+            params![action_id, &*draft_masked, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// True while some action row holds `draft_id` in the `sending` claim —
+    /// i.e. a Composio send of exactly this draft is in flight.
+    /// `gmail update-draft` refuses in that window: its create-replacement +
+    /// delete-old sequence would yank the draft out from under the send.
+    pub fn draft_id_in_flight(&self, draft_id: &str) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM actions \
+                  WHERE draftId = ?1 AND status = 'sending' LIMIT 1",
+                params![draft_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row.is_some())
+    }
+
+    /// Count of all armed scheduled sends, regardless of due-ness
     /// (dashboard/status surfaces; the engine uses `due_scheduled_actions`).
     pub fn count_scheduled_actions(&self) -> StoreResult<i64> {
         let guard = self.conn.lock().expect("store mutex poisoned");
@@ -5034,16 +5130,20 @@ impl Store {
 
     /// Armed scheduled rows with a real thread, for the reconcile sweep's
     /// Rule-1-only pass (#500): "did the user reply on this thread since the
-    /// card was raised?" Rule 2 (bulk-sender heuristic) must NOT run on these
-    /// — `fromEmail` on compose cards holds the RECIPIENT, and a scheduled
-    /// send to a newsletter-looking address would be wrongly cancelled.
-    /// Rows are (action_id, thread_id, createdAt).
+    /// schedule was ARMED?" Rule 2 (bulk-sender heuristic) must NOT run on
+    /// these — `fromEmail` on compose cards holds the RECIPIENT, and a
+    /// scheduled send to a newsletter-looking address would be wrongly
+    /// cancelled. Rows are (action_id, thread_id, armed_at_ms) —
+    /// `armed_at_ms` = `COALESCE(status_updated_at, createdAt)`, the same
+    /// arming-moment bound the engine's fire-time guard uses, so a reply the
+    /// owner sent BEFORE deliberately arming the schedule never cancels it.
     pub fn scheduled_actions_for_reconcile(
         &self,
     ) -> StoreResult<Vec<(String, String, i64)>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = guard.prepare(
-            "SELECT id, threadId, createdAt FROM actions \
+            "SELECT id, threadId, COALESCE(status_updated_at, createdAt) \
+               FROM actions \
               WHERE status = 'scheduled' AND threadId IS NOT NULL \
               ORDER BY createdAt ASC",
         )?;
@@ -6915,7 +7015,10 @@ mod tests {
         let hit = s
             .find_pending_action_for_recipient("acc", "john@example.com", "Call Follow-up")
             .unwrap();
-        assert_eq!(hit, Some((id.clone(), Some("r-draft-1".into()))));
+        assert_eq!(
+            hit,
+            Some((id.clone(), Some("r-draft-1".into()), "pending".into()))
+        );
 
         // Different subject, different entity, or resolved status → no hit.
         assert!(s.find_pending_action_for_recipient("acc", "john@example.com", "Other").unwrap().is_none());
@@ -7831,18 +7934,27 @@ mod tests {
                 ActionStatus::Pending,
             )
             .unwrap();
-        // First resolver wins.
+        // First resolver wins, and its reason lands in errorMessage.
         assert!(s
-            .try_resolve_action(&id, ActionStatus::Sent, "discord")
+            .try_resolve_action(&id, ActionStatus::Sent, "discord", Some("done"))
             .unwrap());
         // Second resolver (racing surface) loses — no double side effect.
         assert!(!s
-            .try_resolve_action(&id, ActionStatus::Skipped, "dashboard")
+            .try_resolve_action(&id, ActionStatus::Skipped, "dashboard", None)
             .unwrap());
         assert_eq!(
             s.action_status_source(&id).unwrap().as_deref(),
             Some("discord")
         );
+        let guard = s.conn.lock().unwrap();
+        let reason: Option<String> = guard
+            .query_row(
+                "SELECT errorMessage FROM actions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason.as_deref(), Some("done"));
     }
 
     // ---- #500: scheduled email send — CAS state machine + engine queries ----
@@ -8042,8 +8154,9 @@ mod tests {
     }
 
     #[test]
-    fn supersede_by_thread_cancels_scheduled_but_not_sending() {
+    fn supersede_by_thread_skips_scheduled_and_sending_rows() {
         let (s, _f) = fresh_store();
+        let plain = pending_action(&s, "m-th-0");
         let scheduled = pending_action(&s, "m-th-1");
         let sending = pending_action(&s, "m-th-2");
         s.schedule_action(&scheduled, 1_000, "t").unwrap();
@@ -8054,18 +8167,77 @@ mod tests {
         let ids = s
             .mark_pending_drafts_superseded_by_thread("thread-500", "manual reply")
             .unwrap();
-        assert!(ids.contains(&scheduled));
+        assert!(ids.contains(&plain));
+        // The thread-wide flip has no time bound (reconcile Rule 1 asks "any
+        // reply EVER"), so it must never touch armed schedules — those are
+        // cancelled only through the bounded mark_scheduled_superseded.
+        assert!(!ids.contains(&scheduled));
         assert!(
             !ids.contains(&sending),
             "a row mid-send must not be flipped under the Composio call"
         );
         let (status, at, _) = raw_action_row(&s, &scheduled);
+        assert_eq!(status, "scheduled");
+        assert_eq!(at, Some(1_000));
+    }
+
+    #[test]
+    fn mark_scheduled_superseded_is_targeted_and_cas_gated() {
+        let (s, _f) = fresh_store();
+        let id = pending_action(&s, "m-ss-1");
+        s.schedule_action(&id, 1_000, "t").unwrap();
+        s.set_action_notice(&id, "chan", "msg").unwrap();
+
+        assert!(s
+            .mark_scheduled_superseded(&id, "owner replied after arming", "engine")
+            .unwrap());
+        let (status, at, _) = raw_action_row(&s, &id);
         assert_eq!(status, "superseded");
         assert_eq!(at, None);
-        // The superseded row can no longer be claimed — fire-time CAS loses.
+        // Notice pointers survive so the notice message can still be cleaned.
+        assert!(s.action_notice(&id).unwrap().is_some());
+        // Second call loses; the fire-time claim also loses.
         assert!(!s
-            .claim_action_for_send(&scheduled, ActionStatus::Scheduled, "engine")
+            .mark_scheduled_superseded(&id, "again", "engine")
             .unwrap());
+        assert!(!s
+            .claim_action_for_send(&id, ActionStatus::Scheduled, "engine")
+            .unwrap());
+    }
+
+    #[test]
+    fn refresh_pending_draft_only_writes_while_pending() {
+        let (s, _f) = fresh_store();
+        let id = pending_action(&s, "m-rp-1");
+        assert!(s.refresh_pending_draft(&id, "new body").unwrap());
+        let guard = s.conn.lock().unwrap();
+        let body: String = guard
+            .query_row(
+                "SELECT draftBody FROM actions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(guard);
+        assert_eq!(body, "new body");
+        // Resolved row: the revise tail must lose, not resurrect the row.
+        s.schedule_action(&id, 1_000, "t").unwrap();
+        assert!(!s.refresh_pending_draft(&id, "stomp").unwrap());
+        let (status, ..) = raw_action_row(&s, &id);
+        assert_eq!(status, "scheduled");
+    }
+
+    #[test]
+    fn draft_id_in_flight_tracks_sending_claim() {
+        let (s, _f) = fresh_store();
+        let id = pending_action(&s, "m-if-1");
+        s.set_action_draft_id(&id, "draft-if").unwrap();
+        assert!(!s.draft_id_in_flight("draft-if").unwrap());
+        s.claim_action_for_send(&id, ActionStatus::Pending, "discord")
+            .unwrap();
+        assert!(s.draft_id_in_flight("draft-if").unwrap());
+        s.finish_send_sent(&id, "discord").unwrap();
+        assert!(!s.draft_id_in_flight("draft-if").unwrap());
     }
 
     #[test]

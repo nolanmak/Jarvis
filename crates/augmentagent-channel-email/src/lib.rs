@@ -20,7 +20,10 @@ pub use inbound::{email_to_work_item, GmailInbound};
 pub use outbound::{
     classify_outbound, Classification, OutboundEvent, OutboundObserver, ACTION_ID_HEADER,
 };
-pub use scheduled::{ScheduledSendEngine, TickSummary, RETRY_EXEMPT_RETRY_COUNT};
+pub use scheduled::{
+    record_self_send, ScheduledSendEngine, TickSummary, RETRY_EXEMPT_RETRY_COUNT,
+    SEND_DRAFT_TIMEOUT,
+};
 pub use sigextract::{
     detect_signature_block, is_human_sender, signature_patch, ExtractedFields,
     SignatureBlock, SignatureExtractor, SigError,

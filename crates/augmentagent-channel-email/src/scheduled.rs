@@ -9,6 +9,13 @@
 //! since the crash window includes "Composio accepted the send and we died
 //! before recording it".
 //!
+//! No engine-level send retries: `ComposioClient::execute` already retries
+//! 429/5xx/transport errors internally with backoff, so an error surfacing
+//! here is either deterministic (deleted draft, revoked auth) or a genuine
+//! outage — neither heals inside one tick, and in-tick sleeps would stall
+//! every later due row. A failure is terminal for the schedule and the owner
+//! gets an honest notice.
+//!
 //! Zero LLM calls per tick (#448): pure clock/DB/Composio.
 
 use std::sync::Arc;
@@ -25,14 +32,18 @@ use crate::gmail::GmailApi;
 /// `AUGMENTAGENT_SCHEDULED_SEND_INTERVAL_SECS` (wired in the serve arm).
 pub const DEFAULT_TICK: Duration = Duration::from_secs(60);
 
-/// In-engine transient send retries before a due row is flipped to a
-/// retry-exempt error. Overridable via
-/// `AUGMENTAGENT_SCHEDULED_SEND_MAX_RETRIES`.
-pub const DEFAULT_MAX_RETRIES: u32 = 3;
+/// Hard wall-clock bound on one `send_draft` round-trip. `ComposioClient` is
+/// built on `reqwest::Client::new()` (no request timeout), so without this a
+/// hung connection would stall the tick loop forever — and, worse, outlive
+/// the stuck-claim grace below, letting the reconcile flip a row whose send
+/// is still in flight. Keeping this well under `STUCK_SENDING_GRACE_MS` is
+/// what makes that flip sound. Shared with the Approve path in the CLI.
+pub const SEND_DRAFT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long a row may sit in the `sending` claim before the engine treats it
-/// as a crashed send. Generously above any observed Composio round-trip so a
-/// live in-flight send is never flipped under the caller.
+/// as a crashed send. Must comfortably exceed [`SEND_DRAFT_TIMEOUT`] plus the
+/// Composio client's internal retry backoff, so a live in-flight send can
+/// never be flipped under its caller.
 const STUCK_SENDING_GRACE_MS: i64 = 10 * 60 * 1000;
 
 /// `retryCount` stamp that keeps a row out of `list_retryable_replies` for
@@ -47,15 +58,41 @@ pub const RETRY_EXEMPT_RETRY_COUNT: i64 = 9_999;
 /// later) — never silently dropped.
 const PER_TICK_LIMIT: i64 = 10;
 
+/// Record a daemon-side send in `self_sent_messages`, tolerating a missing
+/// provider id (the observer then falls back to thread-proximity matching).
+/// Every daemon send path must funnel through here or the outbound observer
+/// misreads the send as a manual user reply, supersedes the thread's drafts,
+/// and suppresses future ones (#449). Best-effort by construction — the mail
+/// is already out; bookkeeping failure is logged loudly, never surfaced as a
+/// send failure. Shared by the engine and the CLI's Approve path.
+pub fn record_self_send(
+    store: &Store,
+    sent_message_id: Option<&str>,
+    thread_id: Option<&str>,
+    entity_id: Option<&str>,
+    action_id: Option<&str>,
+) {
+    let Some(mid) = sent_message_id.filter(|s| !s.is_empty()) else {
+        return;
+    };
+    if let Err(e) = store.record_self_sent_message(mid, thread_id, entity_id, action_id) {
+        warn!(
+            message_id = mid,
+            "failed to record self-sent message; the outbound observer may \
+             misread this send as a manual user reply (#449): {e:#}"
+        );
+    }
+}
+
 /// One tick's outcome, for logs and tests.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct TickSummary {
     /// Due rows sent successfully.
     pub fired: usize,
-    /// Due rows flipped to retry-exempt error after exhausting retries.
+    /// Due rows flipped to retry-exempt error.
     pub failed: usize,
-    /// Due rows cancelled at fire time because the owner had replied on the
-    /// thread since the card was raised.
+    /// Due rows cancelled at fire time because the owner replied on the
+    /// thread after arming the schedule.
     pub superseded: usize,
     /// Rows found stuck in the `sending` claim and flagged for the owner.
     pub stuck_flagged: usize,
@@ -67,7 +104,6 @@ pub struct ScheduledSendEngine<G: GmailApi> {
     broker: Arc<dyn ApprovalBroker>,
     dry_run: bool,
     tick: Duration,
-    max_retries: u32,
 }
 
 impl<G: GmailApi> ScheduledSendEngine<G> {
@@ -83,17 +119,11 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
             broker,
             dry_run,
             tick: DEFAULT_TICK,
-            max_retries: DEFAULT_MAX_RETRIES,
         }
     }
 
     pub fn with_tick(mut self, tick: Duration) -> Self {
         self.tick = tick;
-        self
-    }
-
-    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
-        self.max_retries = max_retries;
         self
     }
 
@@ -132,8 +162,29 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
 
     /// One pass: reconcile stuck claims, then fire due rows. Public and
     /// now-parameterized so tests drive it without the timer.
+    ///
+    /// Dry-run gates EVERYTHING — a `serve --dry-run true` must not mutate
+    /// rows, send mail, or post notices; it only reports what it would do.
     pub async fn tick_once(&self, now_ms: i64) -> anyhow::Result<TickSummary> {
         let mut summary = TickSummary::default();
+
+        if self.dry_run {
+            for action_id in self
+                .store
+                .stuck_sending_actions(now_ms, STUCK_SENDING_GRACE_MS)?
+            {
+                info!("[scheduled-send:dry-run] would flag stuck mid-send row {action_id}");
+            }
+            for (action_id, ..) in self
+                .store
+                .due_scheduled_actions(now_ms, PER_TICK_LIMIT)?
+            {
+                // The receipt line the verify gate quotes — keep the exact
+                // prefix stable.
+                info!("[scheduled-send:dry-run] would fire {action_id}");
+            }
+            return Ok(summary);
+        }
 
         summary.stuck_flagged = self.reconcile_stuck_sending(now_ms).await?;
 
@@ -147,15 +198,9 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
                  remainder fires next tick"
             );
         }
-        for (action_id, scheduled_at_ms, created_at_ms) in due {
-            if self.dry_run {
-                // The receipt line the verify gate quotes — keep the exact
-                // prefix stable.
-                info!("[scheduled-send:dry-run] would fire {action_id}");
-                continue;
-            }
+        for (action_id, scheduled_at_ms, armed_at_ms, thread_id) in due {
             match self
-                .fire_one(&action_id, scheduled_at_ms, created_at_ms, now_ms)
+                .fire_one(&action_id, scheduled_at_ms, armed_at_ms, thread_id.as_deref())
                 .await
             {
                 Ok(FireOutcome::Sent) => summary.fired += 1,
@@ -206,46 +251,43 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
         &self,
         action_id: &str,
         scheduled_at_ms: i64,
-        created_at_ms: i64,
-        _now_ms: i64,
+        armed_at_ms: i64,
+        thread_id: Option<&str>,
     ) -> anyhow::Result<FireOutcome> {
-        // Fire-time guard: a manual owner reply on the thread cancels the
-        // send even if the outbound observer's supersede pass missed it
-        // (observer disabled, transient store error, cold cursor). Checked
-        // BEFORE the claim so a superseded row never transitions at all.
-        let action = match self.store.get_action_with_email(action_id)? {
-            Some(a) => a,
-            None => return Ok(FireOutcome::LostClaim),
-        };
-        let thread_id = action.action.thread_id.as_deref();
+        // Fire-time guard: a manual owner reply on the thread SINCE THE
+        // SCHEDULE WAS ARMED cancels the send, even if the reconcile sweep's
+        // scheduled pass missed it (transient store error, 30-min cadence).
+        // Bounded to the arming moment: a quick reply the owner sent BEFORE
+        // deliberately arming this schedule is not a cancellation signal.
+        // The supersede is per-row and CAS-gated; the thread-wide pending
+        // supersede is never used for scheduled rows.
         if let Some(tid) = thread_id {
             if self
                 .store
-                .thread_has_user_reply_after(tid, created_at_ms)
+                .thread_has_user_reply_after(tid, armed_at_ms)
                 .unwrap_or(false)
             {
-                let ids = self.store.mark_pending_drafts_superseded_by_thread(
-                    tid,
-                    "superseded: you replied on this thread before the \
-                     scheduled send fired",
-                )?;
-                if ids.iter().any(|i| i == action_id) {
+                if self.store.mark_scheduled_superseded(
+                    action_id,
+                    "superseded: you replied on this thread after scheduling",
+                    "scheduled-send-engine",
+                )? {
                     info!(
                         action_id,
                         thread = tid,
                         "scheduled-send: cancelled at fire time, owner \
-                         already replied on thread"
+                         replied after arming"
                     );
                     return Ok(FireOutcome::Superseded);
                 }
-                // The supersede didn't cover this row (raced) — fall through
-                // to the claim, which decides authoritatively.
+                // CAS lost — something else resolved the row; treat like a
+                // lost claim.
+                return Ok(FireOutcome::LostClaim);
             }
         }
 
         // The claim: exactly one winner. Losing means Cancel / Send Now /
-        // supersede got there first — never re-check-then-send from a stale
-        // read.
+        // supersede got there first.
         if !self.store.claim_action_for_send(
             action_id,
             ActionStatus::Scheduled,
@@ -254,9 +296,25 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
             return Ok(FireOutcome::LostClaim);
         }
 
-        let draft_id = action.draft_id.clone();
-        let entity_id = action.email.account_entity_id.clone();
-        let (Some(draft_id), Some(entity_id)) = (draft_id, entity_id) else {
+        // Load the row FRESH, after the claim. An `update-draft` repoint can
+        // land between the due query and the claim; a pre-claim snapshot's
+        // draftId would then point at a Gmail draft that no longer exists.
+        let action = match self.store.get_action_with_email(action_id)? {
+            Some(a) => a,
+            None => {
+                let _ = self.store.finish_send_error(
+                    action_id,
+                    "scheduled-send: action row disappeared after claim",
+                    Some(RETRY_EXEMPT_RETRY_COUNT),
+                    "scheduled-send-engine",
+                );
+                return Ok(FireOutcome::Failed);
+            }
+        };
+        let (Some(draft_id), Some(entity_id)) = (
+            action.draft_id.clone(),
+            action.email.account_entity_id.clone(),
+        ) else {
             let msg = "scheduled-send: action has no draftId/accountEntityId; \
                        cannot send";
             let _ = self.store.finish_send_error(
@@ -270,68 +328,61 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
             return Ok(FireOutcome::Failed);
         };
 
-        // Transient-retry loop around the one Composio call. Short backoff:
-        // this runs inside the tick, so total worst-case stall is bounded
-        // (~2+4+6s for the default 3 attempts).
-        let mut last_err = String::new();
-        let mut sent_id: Option<Option<String>> = None;
-        for attempt in 1..=self.max_retries {
-            match self.gmail.send_draft(&entity_id, &draft_id).await {
-                Ok(id) => {
-                    sent_id = Some(id);
-                    break;
-                }
-                Err(e) => {
-                    last_err = format!("send_draft: {e}");
-                    warn!(
-                        action_id,
-                        attempt,
-                        max = self.max_retries,
-                        "scheduled-send attempt failed: {last_err}"
-                    );
-                    if attempt < self.max_retries {
-                        tokio::time::sleep(Duration::from_secs(2 * attempt as u64))
-                            .await;
-                    }
-                }
+        // Single attempt, hard wall-clock bound. The Composio client retries
+        // transients internally; anything surfacing here is terminal for the
+        // schedule. A timeout is an UNKNOWN outcome (the send may have
+        // landed) — same honest wording as the stuck-claim notice, and
+        // retry-exempt so nothing re-sends automatically.
+        let sent_id = match tokio::time::timeout(
+            SEND_DRAFT_TIMEOUT,
+            self.gmail.send_draft(&entity_id, &draft_id),
+        )
+        .await
+        {
+            Ok(Ok(id)) => id,
+            Ok(Err(e)) => {
+                let msg = format!(
+                    "scheduled send failed — not retried automatically: \
+                     send_draft: {e}"
+                );
+                let _ = self.store.finish_send_error(
+                    action_id,
+                    &msg,
+                    Some(RETRY_EXEMPT_RETRY_COUNT),
+                    "scheduled-send-engine",
+                );
+                let _ = self.broker.post_flag_notice(&action.email, &msg).await;
+                return Ok(FireOutcome::Failed);
             }
-        }
-        let Some(sent_id) = sent_id else {
-            let msg = format!(
-                "scheduled send failed after {} attempts — not retried \
-                 automatically: {last_err}",
-                self.max_retries
-            );
-            let _ = self.store.finish_send_error(
-                action_id,
-                &msg,
-                Some(RETRY_EXEMPT_RETRY_COUNT),
-                "scheduled-send-engine",
-            );
-            let _ = self.broker.post_flag_notice(&action.email, &msg).await;
-            return Ok(FireOutcome::Failed);
+            Err(_elapsed) => {
+                let msg = format!(
+                    "scheduled send timed out after {}s — the message may or \
+                     may not have been delivered; check the thread in Gmail \
+                     before resending",
+                    SEND_DRAFT_TIMEOUT.as_secs()
+                );
+                let _ = self.store.finish_send_error(
+                    action_id,
+                    &msg,
+                    Some(RETRY_EXEMPT_RETRY_COUNT),
+                    "scheduled-send-engine",
+                );
+                let _ = self.broker.post_flag_notice(&action.email, &msg).await;
+                return Ok(FireOutcome::Failed);
+            }
         };
 
         // Post-send bookkeeping, in run_approve's exact order (#449): the
         // self-send record lands BEFORE the status flip so an observer tick
         // racing this send can never catch the message in SENT without
         // knowing it was ours.
-        if let Some(mid) = sent_id.as_deref().filter(|s| !s.is_empty()) {
-            if let Err(e) = self.store.record_self_sent_message(
-                mid,
-                action.email.thread_id.as_deref(),
-                Some(entity_id.as_str()),
-                Some(action_id),
-            ) {
-                warn!(
-                    action_id,
-                    message_id = mid,
-                    "scheduled-send: failed to record self-sent message; the \
-                     outbound observer may misread this send as a manual \
-                     user reply (#449): {e:#}"
-                );
-            }
-        }
+        record_self_send(
+            &self.store,
+            sent_id.as_deref(),
+            action.email.thread_id.as_deref(),
+            Some(entity_id.as_str()),
+            Some(action_id),
+        );
         let _ = self
             .store
             .finish_send_sent(action_id, "scheduled-send-engine");
@@ -401,6 +452,9 @@ mod tests {
         }
         fn call_count(&self) -> usize {
             self.calls.lock().unwrap().len()
+        }
+        fn last_draft_id(&self) -> Option<String> {
+            self.calls.lock().unwrap().last().map(|(_, d)| d.clone())
         }
     }
 
@@ -570,29 +624,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dry_run_fires_nothing_and_leaves_row_scheduled() {
+    async fn dry_run_mutates_nothing_including_stuck_rows() {
         let (store, _f) = test_store();
-        let id = seed_scheduled(&store, "m3", 1_000);
+        let due = seed_scheduled(&store, "m3", 1_000);
+        // Also plant a stuck 'sending' row — dry-run must not flip it.
+        let stuck = seed_scheduled(&store, "m3b", 1_000);
+        store
+            .claim_action_for_send(&stuck, ActionStatus::Scheduled, "t")
+            .unwrap();
         let gmail = Arc::new(MockGmail::ok());
+        let broker = Arc::new(RecordingBroker {
+            notices: Mutex::new(Vec::new()),
+        });
         let engine = ScheduledSendEngine::new(
             Arc::clone(&store),
             Arc::clone(&gmail),
-            Arc::new(NoopBroker),
+            Arc::clone(&broker) as Arc<dyn ApprovalBroker>,
             true,
         );
-        let s = engine.tick_once(2_000).await.unwrap();
+        let s = engine
+            .tick_once(now_ms() + STUCK_SENDING_GRACE_MS + 60_000)
+            .await
+            .unwrap();
         assert_eq!(s, TickSummary::default());
         assert_eq!(gmail.call_count(), 0);
-        assert_eq!(status_of(&store, &id), "scheduled");
+        assert_eq!(status_of(&store, &due), "scheduled");
+        assert_eq!(
+            status_of(&store, &stuck),
+            "sending",
+            "dry-run must not flip stuck rows to error"
+        );
+        assert!(broker.notices.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn lost_claim_means_no_send() {
         let (store, _f) = test_store();
         let id = seed_scheduled(&store, "m4", 1_000);
-        // Someone cancels between the due query and the claim — simulate by
-        // cancelling now; the engine's due list was computed against the old
-        // state in real races, but the claim must still lose.
         assert!(store.cancel_scheduled_action(&id, "", "test").unwrap());
         let gmail = Arc::new(MockGmail::ok());
         let engine = ScheduledSendEngine::new(
@@ -608,18 +676,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fire_time_guard_supersedes_on_owner_reply() {
+    async fn fire_time_guard_supersedes_on_reply_after_arming_only() {
         let (store, _f) = test_store();
-        let id = seed_scheduled(&store, "m5", 1_000);
-        // Owner replied on the thread AFTER the card was raised.
+        // Row A: owner replied AFTER arming — must be cancelled.
+        let a = seed_scheduled(&store, "m5", 1_000);
         store
             .record_outbound_thread_event(
                 "entity-1",
-                "sent-by-owner",
+                "reply-after-arm",
                 Some("th-m5"),
-                now_millis_for_test() + 1_000,
+                now_ms() + 1_000,
             )
             .unwrap();
+        // Row B: owner replied BEFORE arming — must still fire. Seed the
+        // reply first, then arm (schedule_action stamps status_updated_at
+        // after the reply's sent_at_ms).
+        store
+            .record_outbound_thread_event(
+                "entity-1",
+                "reply-before-arm",
+                Some("th-m6"),
+                now_ms() - 60_000,
+            )
+            .unwrap();
+        let b = seed_scheduled(&store, "m6", 1_000);
+
         let gmail = Arc::new(MockGmail::ok());
         let engine = ScheduledSendEngine::new(
             Arc::clone(&store),
@@ -627,20 +708,22 @@ mod tests {
             Arc::new(NoopBroker),
             false,
         );
-        let s = engine.tick_once(now_millis_for_test() + 5_000).await.unwrap();
+        let s = engine.tick_once(now_ms() + 5_000).await.unwrap();
         assert_eq!(s.superseded, 1);
-        assert_eq!(gmail.call_count(), 0, "guard must fire before any send");
-        assert_eq!(status_of(&store, &id), "superseded");
+        assert_eq!(s.fired, 1);
+        assert_eq!(status_of(&store, &a), "superseded");
+        assert_eq!(
+            status_of(&store, &b),
+            "sent",
+            "a reply that PREDATES arming is not a cancellation signal"
+        );
     }
 
     #[tokio::test]
-    async fn exhausted_retries_flip_to_retry_exempt_error_and_notify() {
+    async fn send_failure_is_terminal_retry_exempt_and_notifies() {
         let (store, _f) = test_store();
-        let id = seed_scheduled(&store, "m6", 1_000);
-        let gmail = Arc::new(MockGmail::scripted(vec![
-            Err("rate limited".into()),
-            Err("rate limited".into()),
-        ]));
+        let id = seed_scheduled(&store, "m7", 1_000);
+        let gmail = Arc::new(MockGmail::scripted(vec![Err("draft gone".into())]));
         let broker = Arc::new(RecordingBroker {
             notices: Mutex::new(Vec::new()),
         });
@@ -649,15 +732,18 @@ mod tests {
             Arc::clone(&gmail),
             Arc::clone(&broker) as Arc<dyn ApprovalBroker>,
             false,
-        )
-        .with_max_retries(2);
+        );
         let s = engine.tick_once(2_000).await.unwrap();
         assert_eq!(s.failed, 1);
-        assert_eq!(gmail.call_count(), 2);
+        assert_eq!(
+            gmail.call_count(),
+            1,
+            "no engine-level retries — the Composio client retries transients \
+             internally"
+        );
         assert_eq!(status_of(&store, &id), "error");
-        // Retry-exempt: the generic retry queue never sees it.
         let retryable = store
-            .list_retryable_replies(now_millis_for_test(), 86_400_000, 0, 5, 10)
+            .list_retryable_replies(now_ms(), 86_400_000, 0, 5, 10)
             .unwrap();
         assert!(retryable.iter().all(|r| r.action.id != id));
         let notices = broker.notices.lock().unwrap();
@@ -666,30 +752,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_failure_then_success_sends_once() {
+    async fn fire_uses_post_claim_draft_id_after_repoint() {
         let (store, _f) = test_store();
-        let id = seed_scheduled(&store, "m7", 1_000);
-        let gmail = Arc::new(MockGmail::scripted(vec![
-            Err("flake".into()),
-            Ok(Some("sent-2".into())),
-        ]));
+        let id = seed_scheduled(&store, "m8", 1_000);
+        // Simulate an update-draft repoint landing before the tick: the
+        // engine must send the NEW draft id, not a stale snapshot.
+        store.set_action_draft_id(&id, "draft-2-repointed").unwrap();
+        let gmail = Arc::new(MockGmail::ok());
         let engine = ScheduledSendEngine::new(
             Arc::clone(&store),
             Arc::clone(&gmail),
             Arc::new(NoopBroker),
             false,
-        )
-        .with_max_retries(3);
+        );
         let s = engine.tick_once(2_000).await.unwrap();
         assert_eq!(s.fired, 1);
-        assert_eq!(gmail.call_count(), 2);
-        assert_eq!(status_of(&store, &id), "sent");
+        assert_eq!(
+            gmail.last_draft_id().as_deref(),
+            Some("draft-2-repointed"),
+            "must load the row fresh after the claim"
+        );
     }
 
     #[tokio::test]
     async fn stuck_sending_rows_are_flagged_never_resent() {
         let (store, _f) = test_store();
-        let id = seed_scheduled(&store, "m8", 1_000);
+        let id = seed_scheduled(&store, "m9", 1_000);
         store
             .claim_action_for_send(&id, ActionStatus::Scheduled, "engine")
             .unwrap();
@@ -704,7 +792,7 @@ mod tests {
             false,
         );
         // Within the grace window: untouched.
-        let now = now_millis_for_test();
+        let now = now_ms();
         let s = engine.tick_once(now).await.unwrap();
         assert_eq!(s.stuck_flagged, 0);
         assert_eq!(status_of(&store, &id), "sending");
@@ -719,13 +807,5 @@ mod tests {
         let notices = broker.notices.lock().unwrap();
         assert_eq!(notices.len(), 1);
         assert!(notices[0].contains("may or may not have been delivered"));
-    }
-
-    fn now_millis_for_test() -> i64 {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0)
     }
 }

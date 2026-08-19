@@ -311,14 +311,14 @@ export function logAction(action: Omit<ActionRecord, "id" | "createdAt" | "updat
 // "To:" address from the approval UIs before send. Build the UPDATE dynamically
 // so callers can mix-and-match fields (the old draftBody/errorMessage paths
 // kept their previous semantics).
-export function updateActionStatus(
-  id: string,
+// Shared dynamic-SET builder for the two status-mutation entry points below,
+// so their field handling can't drift apart (#500 review).
+function buildActionStatusSet(
   status: ActionStatus,
   extra?: { draftBody?: string; errorMessage?: string; recipientEmail?: string }
-): void {
-  const now = Date.now();
+): { sets: string[]; vals: unknown[] } {
   const sets: string[] = ["status = ?", "updatedAt = ?"];
-  const vals: unknown[] = [status, now];
+  const vals: unknown[] = [status, Date.now()];
 
   if (extra?.draftBody !== undefined) {
     sets.push("draftBody = ?");
@@ -332,7 +332,15 @@ export function updateActionStatus(
     sets.push("recipientEmail = ?");
     vals.push(extra.recipientEmail);
   }
+  return { sets, vals };
+}
 
+export function updateActionStatus(
+  id: string,
+  status: ActionStatus,
+  extra?: { draftBody?: string; errorMessage?: string; recipientEmail?: string }
+): void {
+  const { sets, vals } = buildActionStatusSet(status, extra);
   getDb()
     .prepare(`UPDATE actions SET ${sets.join(", ")} WHERE id = ?`)
     .run(...vals, id);
@@ -348,23 +356,7 @@ export function resolveActionIfPending(
   status: ActionStatus,
   extra?: { draftBody?: string; errorMessage?: string; recipientEmail?: string }
 ): boolean {
-  const now = Date.now();
-  const sets: string[] = ["status = ?", "updatedAt = ?"];
-  const vals: unknown[] = [status, now];
-
-  if (extra?.draftBody !== undefined) {
-    sets.push("draftBody = ?");
-    vals.push(extra.draftBody);
-  }
-  if (extra?.errorMessage !== undefined) {
-    sets.push("errorMessage = ?");
-    vals.push(extra.errorMessage);
-  }
-  if (extra?.recipientEmail !== undefined) {
-    sets.push("recipientEmail = ?");
-    vals.push(extra.recipientEmail);
-  }
-
+  const { sets, vals } = buildActionStatusSet(status, extra);
   const result = getDb()
     .prepare(
       `UPDATE actions SET ${sets.join(", ")} WHERE id = ? AND status = 'pending'`
