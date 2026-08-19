@@ -65,6 +65,8 @@ impl Tweet {
         let subject = format!("[X post by @{}]", self.author_handle);
         let date = ms_to_rfc3339(self.created_at_ms);
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: self.rest_id.clone(),
             // Reply target = the tweet itself (in_reply_to_tweet_id).
             thread_id: Some(self.rest_id),
@@ -106,6 +108,8 @@ impl TwitterDm {
         let subject = format!("[X DM from @{}]", self.sender_handle);
         let date = ms_to_rfc3339(self.created_at_ms);
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: self.event_id,
             thread_id: Some(self.conversation_id),
             from,
@@ -217,6 +221,8 @@ mod tests {
     #[test]
     fn is_twitter_email_rejects_other_sources() {
         let email = Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "m".into(),
             thread_id: None,
             from: "a@b.com".into(),

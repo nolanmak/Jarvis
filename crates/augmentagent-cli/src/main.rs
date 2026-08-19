@@ -3720,6 +3720,15 @@ async fn run_gmail_search(
                         email.message_id,
                         email.thread_id.as_deref().unwrap_or("-")
                     );
+                    // #629 — surface the full recipient set so reply-all /
+                    // compose callers can enumerate everyone on the chain
+                    // instead of only addresses that appear as senders.
+                    if !email.to.is_empty() {
+                        println!("     to: {}", email.to);
+                    }
+                    if !email.cc.is_empty() {
+                        println!("     cc: {}", email.cc);
+                    }
                     if full {
                         println!("     body:\n{}\n", indent_body(&email.body, 7));
                     }
@@ -4571,6 +4580,8 @@ async fn post_reply_approval_card(
     // actions→emails join resolves and Approve can find the entity id.
     let inbound = StoreEmail {
         message_id: msg_id.to_string(),
+        to: String::new(),
+        cc: String::new(),
         thread_id: thread.map(str::to_string),
         from: original_from.clone(),
         subject: original_subject.clone(),
@@ -4733,6 +4744,8 @@ async fn post_social_approval_card(
 
     let inbound = StoreEmail {
         message_id: message_id.to_string(),
+        to: String::new(),
+        cc: String::new(),
         thread_id: Some(thread_id.to_string()),
         from: counterparty.to_string(),
         subject: subject.to_string(),
@@ -13240,6 +13253,8 @@ async fn run_calendar_create_event(
     // exact machine payload approve_gcal will execute.
     let message_id = format!("gcal-create:{}", uuid::Uuid::new_v4());
     let inbound = augmentagent_store::Email {
+        to: String::new(),
+        cc: String::new(),
         message_id: message_id.clone(),
         thread_id: None,
         from: acct.email.clone(),
@@ -13915,6 +13930,8 @@ async fn run_compose_fan_out(
             let (broker, _) = build_broker(cli, Arc::clone(&store), dry_run).await?;
             for (v, card) in variants.iter().zip(cards.iter()) {
                 let pseudo = augmentagent_store::Email {
+                    to: String::new(),
+                    cc: String::new(),
                     message_id: format!("compose:{}", v.platform.as_str()),
                     thread_id: None,
                     from: "content-adapter".into(),
@@ -14015,6 +14032,8 @@ where
     // One approval surface for the whole family.
     let (broker, _) = build_broker(cli, Arc::clone(&store), dry_run).await?;
     let pseudo = augmentagent_store::Email {
+        to: String::new(),
+        cc: String::new(),
         message_id: "compose:socialapi-crosspost".into(),
         thread_id: None,
         from: "content-adapter".into(),
@@ -14137,6 +14156,8 @@ mod auto_expire_sweep_tests {
 
     fn sample_email(message_id: &str) -> Email {
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: message_id.into(),
             thread_id: None,
             from: "a@b.com".into(), // pii-ok
@@ -14338,6 +14359,8 @@ mod stale_reconcile_tests {
     ) -> String {
         store
             .upsert_email(&Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: msg.into(),
                 thread_id: thread.map(String::from),
                 from: from.into(),

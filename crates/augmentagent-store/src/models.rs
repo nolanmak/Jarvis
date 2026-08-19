@@ -5,6 +5,16 @@ pub struct Email {
     pub message_id: String,
     pub thread_id: Option<String>,
     pub from: String,
+    /// Raw `To:` header of the message — comma-joined, display names preserved
+    /// (`Jane <jane@example.com>, bo@example.com`). Empty = unknown: rows persisted before
+    /// #629, platforms without recipient headers, and DB round-trips (the
+    /// emails table doesn't store it; only live fetches populate it). #629
+    /// reply-all reads this to enumerate thread participants.
+    #[serde(default)]
+    pub to: String,
+    /// Raw `Cc:` header, same shape and caveats as `to`.
+    #[serde(default)]
+    pub cc: String,
     pub subject: String,
     pub body: String,
     pub date: String,

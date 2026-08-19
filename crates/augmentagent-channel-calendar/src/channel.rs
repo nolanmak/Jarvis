@@ -450,6 +450,8 @@ impl<C: CalendarApi, R: Reasoner + 'static> CalendarChannel<C, R> {
 /// content lives only in attendee rows that the LLM actually reads.
 fn synthetic_event_email(payload: &MeetingPayload, my_email: &str) -> Email {
     Email {
+        to: String::new(),
+        cc: String::new(),
         message_id: payload.event_id.clone(),
         thread_id: payload.recurring_event_id.clone(),
         from: my_email.to_string(),
@@ -475,6 +477,8 @@ pub fn synthetic_attendee_email(
         .clone()
         .unwrap_or_else(|| attendee.email.clone());
     Email {
+        to: String::new(),
+        cc: String::new(),
         message_id: format!("gcal:{}:{}", payload.event_id, attendee.email),
         thread_id: payload.recurring_event_id.clone(),
         from: format!("{} <{}>", display_name, attendee.email),

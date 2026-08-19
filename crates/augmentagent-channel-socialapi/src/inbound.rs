@@ -249,6 +249,8 @@ impl SocialApiDmPayload {
             None => self.text,
         };
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: self.message_id,
             thread_id: Some(self.conversation_id),
             from,

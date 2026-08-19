@@ -235,6 +235,8 @@ impl ScheduledPostEngine {
                 .map_err(|e| anyhow::anyhow!("broker digest: {e}"))?;
         } else {
             let pseudo = Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: format!("sched:{}", post.id),
                 thread_id: None,
                 from: format!("scheduled:{}", post.platform),
@@ -342,6 +344,8 @@ impl ScheduledPostEngine {
                 // Alert: a failed scheduled post is silent otherwise.
                 if !self.dry_run {
                     let pseudo = Email {
+                        to: String::new(),
+                        cc: String::new(),
                         message_id: format!("sched-fail:{}", post.id),
                         thread_id: None,
                         from: format!("scheduled:{}", post.platform),

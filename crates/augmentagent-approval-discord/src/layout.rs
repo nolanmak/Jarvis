@@ -521,6 +521,8 @@ mod tests {
 
     fn email() -> Email {
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "m1".into(),
             thread_id: Some("t1".into()),
             from: "peer@example.com".into(),

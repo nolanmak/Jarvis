@@ -119,6 +119,8 @@ impl MeetupChannel {
                     continue;
                 }
                 let email = Email {
+                    to: String::new(),
+                    cc: String::new(),
                     message_id: format!("meetup:{}", ev.id),
                     thread_id: Some(sub.channel_id.clone()),
                     from: sub.display_name.clone(),

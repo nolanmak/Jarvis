@@ -435,6 +435,8 @@ mod tests {
     #[test]
     fn render_card_contains_verbs_and_draft() {
         let email = Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "wa:x:1".into(),
             thread_id: Some("x".into()),
             from: "Tony <whatsapp:1@s.whatsapp.net>".into(),

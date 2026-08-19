@@ -343,6 +343,8 @@ impl DeftSubmission {
             DeftCommand::Query(q) => ("query".to_string(), q.clone()),
         };
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: self.dedup_id(),
             thread_id: Some(self.form_id.clone()),
             from: format!("Deft form <deft:{}>", self.form_id),
@@ -463,6 +465,8 @@ impl DeftSubmission {
         }
 
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: self.dedup_id(),
             thread_id: Some(self.form_id.clone()),
             from,

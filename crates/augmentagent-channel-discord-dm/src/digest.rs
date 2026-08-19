@@ -367,6 +367,8 @@ mod tests {
 
     fn mk_email(id: &str, thread: &str, platform: &str) -> Email {
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: id.to_string(),
             thread_id: Some(thread.to_string()),
             from: format!("user-{id}"),

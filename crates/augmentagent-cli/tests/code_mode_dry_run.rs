@@ -91,6 +91,8 @@ fn code_mode_dry_run_writes_code_mode_action() {
     {
         let store = Store::open(&db_path).expect("open store");
         let email = Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: message_id.into(),
             thread_id: Some("thread-1".into()),
             from: "fixture@example.com".into(),

@@ -165,6 +165,8 @@ impl SocialApiOwnPostCommentPayload {
             self.account_id
         };
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: self.comment_id,
             thread_id: Some(self.post_id),
             from,

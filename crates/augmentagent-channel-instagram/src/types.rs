@@ -60,6 +60,8 @@ impl Dm {
         let subject = format!("[Instagram DM from {}]", self.peer_name);
         let date = ms_to_rfc3339(self.timestamp_ms);
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: self.item_id,
             thread_id: Some(self.thread_id),
             from,
@@ -97,6 +99,8 @@ impl FeedPost {
         let from = format!("{} <instagram:{}>", self.author_name, self.author_pk);
         let subject = format!("[Instagram post by {}]", self.author_name);
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: format!("ig:comment:{}", self.media_id),
             thread_id: Some(self.media_id),
             from,
@@ -229,6 +233,8 @@ mod tests {
     #[test]
     fn is_instagram_email_rejects_other_platforms() {
         let email = Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "m".into(),
             thread_id: None,
             from: "a@b.com".into(),

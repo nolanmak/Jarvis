@@ -2010,6 +2010,8 @@ mod tests {
         assert!(out.unresolved.is_empty());
 
         let email = augmentagent_store::Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "m1".into(),
             thread_id: Some("t1".into()),
             from: "a@b.com".into(),

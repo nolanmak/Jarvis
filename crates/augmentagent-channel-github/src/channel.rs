@@ -864,6 +864,8 @@ mod tests {
         });
         // Pre-stamp the email + a logged action so the gate trips.
         let prior_email = Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "gh:600".into(),
             thread_id: Some("a/b#13".into()),
             from: "octocat <github:octocat>".into(),
@@ -939,6 +941,8 @@ mod tests {
     #[test]
     fn outbound_target_round_trips() {
         let email = Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "gh:1".into(),
             thread_id: Some("octocat/Hello-World#7".into()),
             from: "x".into(),
