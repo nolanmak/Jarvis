@@ -2,10 +2,14 @@
 // wix-events-sync.mjs — mirror a Meetup group's upcoming events onto a Wix
 // Events calendar (#633).
 //
-// Source: scripts/meetup-events.mjs (private GraphQL). When that fails with a
-// stale persisted-query hash — exit 2, which happens every time Meetup ships a
-// frontend build — it falls back to scripts/meetup-events-ssr.mjs, which reads
-// the same data out of the server-rendered page and needs no hashes.
+// Sources:
+//   - scripts/meetup-events.mjs (private GraphQL). When that fails with a
+//     stale persisted-query hash — exit 2, which happens every time Meetup
+//     ships a frontend build — it falls back to scripts/meetup-events-ssr.mjs,
+//     which reads the same data out of the server-rendered page.
+//   - scripts/luma-events.mjs (Luma's auth-free per-calendar ICS feed).
+//
+// Events cross-posted to both are deduped before anything is created.
 //
 // Sink: Wix Events v3 REST. CREATE ONLY. This job never updates and never
 // deletes; a Meetup rename must not rewrite a hand-curated listing, and
@@ -23,7 +27,8 @@
 // Env (see .env.example):
 //   AUGMENTAGENT_WIX_API_KEY           Wix account API key, Events read+manage
 //   AUGMENTAGENT_WIX_SITE_ID           target Wix site
-//   AUGMENTAGENT_WIX_MEETUP_GROUPS     comma-separated group slugs
+//   AUGMENTAGENT_WIX_MEETUP_GROUPS     comma-separated Meetup group slugs
+//   AUGMENTAGENT_WIX_LUMA_CALENDARS    comma-separated Luma cal-… ids
 //   AUGMENTAGENT_WIX_SYNC_DRY_RUN      default 1
 //   AUGMENTAGENT_WIX_SYNC_MAX_PER_RUN  default 5
 //   AUGMENTAGENT_WIX_SYNC_REQUIRE_APPROVAL  default 1 — a timer can only plan
@@ -91,6 +96,16 @@ async function fetchGroup(urlname) {
     }
     throw err;
   }
+}
+
+/** Upcoming events for one Luma calendar, via its public ICS feed. */
+async function fetchLumaCalendar(calendarId) {
+  const { stdout } = await run(
+    process.execPath,
+    [resolve(REPO_ROOT, "scripts", "luma-events.mjs"), calendarId, "--json"],
+    { cwd: REPO_ROOT, maxBuffer: 32 * 1024 * 1024 },
+  );
+  return { events: JSON.parse(stdout).events ?? [], source: "luma" };
 }
 
 // ------------------------------------------------------------------ wix
@@ -179,13 +194,55 @@ function toPlanned(event) {
   };
 }
 
-/** Same title, start within a minute — tolerant of Wix echoing a different ISO form. */
+/**
+ * Titles are compared loosely across sources. Luma appends its calendar name
+ * to every SUMMARY, and hosts rarely punctuate a cross-post identically, so an
+ * exact match would create the same event twice on a live public calendar.
+ */
+export function normalizeTitle(title) {
+  return (title ?? "")
+    .toLowerCase()
+    .replace(/[\u2010-\u2015]/g, "-")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+/**
+ * Two listings are the same event when they start at the same minute and one
+ * title contains the other. Containment rather than equality is deliberate:
+ * it still collapses the cross-post if the calendar-name suffix survives the
+ * source-side strip, and duplicating an event on a live public calendar is a
+ * far worse failure than merging two that happen to start together.
+ */
+export function isSameListing(a, b) {
+  if (Math.abs(Date.parse(a.startDate) - Date.parse(b.startDate)) >= 60_000) return false;
+  const [x, y] = [normalizeTitle(a.title), normalizeTitle(b.title)];
+  if (!x || !y) return false;
+  return x === y || x.startsWith(y) || y.startsWith(x);
+}
+
+/** One event, two sources — keep the first and drop the rest. */
+export function dedupeAcrossSources(planned) {
+  const kept = [];
+  for (const p of planned) {
+    if (kept.some((k) => isSameListing(k, p))) continue;
+    kept.push(p);
+  }
+  return kept;
+}
+
+/**
+ * Uses the same containment rule as cross-source dedupe, deliberately. An
+ * event already on Wix may have been created from whichever source got there
+ * first, so it can carry Luma's calendar-name suffix while today's plan came
+ * from Meetup without it. Comparing titles strictly here would let exactly the
+ * duplicate this job exists to prevent through.
+ */
 function alreadyOnWix(planned, existing) {
   return existing.some((e) => {
-    if ((e.title ?? "").trim() !== planned.title.trim()) return false;
     const start = e.dateAndTimeSettings?.startDate;
     if (!start) return false;
-    return Math.abs(Date.parse(start) - Date.parse(planned.startDate)) < 60_000;
+    return isSameListing(planned, { title: e.title, startDate: start });
   });
 }
 
@@ -212,9 +269,12 @@ async function main() {
   loadDotEnv();
   const { yes, flags } = parseArgs(process.argv.slice(2));
 
-  const groups = (flags.get("groups") ?? process.env.AUGMENTAGENT_WIX_MEETUP_GROUPS ?? "")
-    .split(",").map((s) => s.trim()).filter(Boolean);
-  if (groups.length === 0) die("no groups configured — set AUGMENTAGENT_WIX_MEETUP_GROUPS or pass --groups");
+  const split = (v) => (v ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+  const groups = split(flags.get("groups") ?? process.env.AUGMENTAGENT_WIX_MEETUP_GROUPS);
+  const calendars = split(flags.get("luma") ?? process.env.AUGMENTAGENT_WIX_LUMA_CALENDARS);
+  if (groups.length === 0 && calendars.length === 0) {
+    die("no sources configured — set AUGMENTAGENT_WIX_MEETUP_GROUPS and/or AUGMENTAGENT_WIX_LUMA_CALENDARS");
+  }
 
   const windowDays = Number(flags.get("window-days") ?? 90);
   const maxPerRun = Number(flags.get("limit") ?? process.env.AUGMENTAGENT_WIX_SYNC_MAX_PER_RUN ?? 5);
@@ -236,13 +296,31 @@ async function main() {
       warn(`${urlname}: source failed — ${err.message}`);
     }
   }
+  for (const calendarId of calendars) {
+    try {
+      const { events } = await fetchLumaCalendar(calendarId);
+      sourcesOk += 1;
+      log(`${calendarId}: ${events.length} upcoming event(s) via luma`);
+      planned.push(...events.map(toPlanned));
+    } catch (err) {
+      warn(`${calendarId}: Luma source failed — ${err.message}`);
+    }
+  }
   if (sourcesOk === 0) die("every source failed — not treating this as an empty calendar", 2);
 
   const now = new Date();
   const until = new Date(now.getTime() + windowDays * 86_400_000);
-  const inWindow = planned
-    .filter((p) => Date.parse(p.startDate) >= now.getTime() && Date.parse(p.startDate) <= until.getTime())
-    .sort((a, b) => Date.parse(a.startDate) - Date.parse(b.startDate));
+  const inWindow = dedupeAcrossSources(
+    planned
+      .filter((p) => Date.parse(p.startDate) >= now.getTime() && Date.parse(p.startDate) <= until.getTime())
+      .sort((a, b) => Date.parse(a.startDate) - Date.parse(b.startDate)),
+  );
+  // Count only what dedupe collapsed — subtracting from `planned` would also
+  // include everything the date window dropped.
+  const windowed = planned.filter(
+    (p) => Date.parse(p.startDate) >= now.getTime() && Date.parse(p.startDate) <= until.getTime(),
+  );
+  const crossPosted = windowed.length - inWindow.length;
 
   const headers = wixHeaders();
   const existing =
@@ -253,6 +331,7 @@ async function main() {
   const missing = missingAll.slice(0, maxPerRun);
   const heldBack = missingAll.length - missing.length;
 
+  if (crossPosted > 0) log(`\n${crossPosted} cross-posted duplicate(s) collapsed.`);
   log(
     `\n${inWindow.length} upcoming in the next ${windowDays}d · ` +
       `${inWindow.length - missingAll.length} already on Wix · ${missingAll.length} missing\n`,
@@ -281,4 +360,8 @@ async function main() {
   log(`\nDone — created ${missing.length} event(s).`);
 }
 
-main().catch((err) => die(err.message));
+// Guarded so the pure helpers above can be imported by tests without the
+// script running a live sync on import.
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main().catch((err) => die(err.message));
+}
