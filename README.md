@@ -1,4 +1,4 @@
-# AugmentAgent
+# Jarvis
 
 A self-hosted personal-assistant daemon. It triages your inbound messages
 across many channels, drafts replies in your voice, and routes everything
