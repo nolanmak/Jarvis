@@ -1833,6 +1833,16 @@ enum WikiOp {
         #[arg(long)]
         no_pull: bool,
     },
+    /// Inspect or rebuild `index.md` (#642). The index is a derived
+    /// catalog of every page under people/, threads/, projects/ —
+    /// generated, never hand-kept.
+    Index {
+        /// Regenerate index.md from the pages on disk (atomic write).
+        /// Without this flag, print coverage of the current index
+        /// (entries vs. pages on disk) and change nothing.
+        #[arg(long)]
+        rebuild: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2580,6 +2590,7 @@ async fn main() -> Result<()> {
                 .await
             }
             WikiOp::Sync { dry_run, no_pull } => run_wiki_sync(&cli, *dry_run, *no_pull).await,
+            WikiOp::Index { rebuild } => run_wiki_index(&cli, *rebuild),
         },
         Cmd::Digest {
             since,
@@ -5950,6 +5961,71 @@ async fn run_wiki_lint(cli: &Cli, out: Option<PathBuf>) -> Result<()> {
             println!("{report}");
         }
     }
+    Ok(())
+}
+
+/// `wiki index` — inspect or rebuild the derived index.md (#642).
+fn run_wiki_index(cli: &Cli, rebuild: bool) -> Result<()> {
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for wiki index")?;
+
+    if rebuild {
+        let stats = augmentagent_wiki::rebuild_index(&wiki_root)?;
+        let skipped = if stats.unreadable > 0 {
+            format!(", {} unreadable pages skipped", stats.unreadable)
+        } else {
+            String::new()
+        };
+        println!(
+            "index.md rebuilt: {} people, {} threads, {} projects — {} pages{skipped}",
+            stats.people,
+            stats.threads,
+            stats.projects,
+            stats.total(),
+        );
+        return Ok(());
+    }
+
+    // Coverage report: pages on disk vs. entries in the current index.
+    let index = std::fs::read_to_string(wiki_root.join("index.md")).unwrap_or_default();
+    let indexed: std::collections::BTreeSet<String> = index
+        .lines()
+        .filter_map(|l| {
+            let rest = l.strip_prefix("- [")?;
+            let end = rest.find("](")?;
+            Some(rest[..end].to_string())
+        })
+        .collect();
+
+    let mut missing_total = 0usize;
+    for dir in ["people", "threads", "projects"] {
+        let mut on_disk = 0usize;
+        let mut missing = 0usize;
+        if let Ok(rd) = std::fs::read_dir(wiki_root.join(dir)) {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("md") {
+                    on_disk += 1;
+                    let rel = format!("{dir}/{}", ent.file_name().to_string_lossy());
+                    if !indexed.contains(&rel) {
+                        missing += 1;
+                    }
+                }
+            }
+        }
+        missing_total += missing;
+        println!("{dir}: {on_disk} pages on disk, {missing} missing from index");
+    }
+    let dangling = indexed
+        .iter()
+        .filter(|rel| !wiki_root.join(rel.as_str()).is_file())
+        .count();
+    println!(
+        "index entries: {} total, {dangling} pointing at missing files; {missing_total} pages not indexed. Run `wiki index --rebuild` to regenerate.",
+        indexed.len(),
+    );
     Ok(())
 }
 
