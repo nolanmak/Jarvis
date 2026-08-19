@@ -7287,6 +7287,13 @@ struct ReplyApprover {
     /// `Weak` to break the Approver ↔ Scheduler ↔ Broker reference cycle.
     /// Empty in dry-run / one-shot poll commands.
     nudge: std::sync::OnceLock<std::sync::Weak<augmentagent_approval_discord::NudgeScheduler>>,
+    /// #501 — broker handle for the schedule verbs: `schedule` posts the
+    /// scheduled notice, Send Now / Cancel delete it, Back to queue reposts
+    /// the approval card. Same set-after-construction `Weak` pattern as
+    /// `nudge` (the broker's event handler holds this approver strongly, so
+    /// a strong back-reference would cycle). Empty in dry-run / one-shot
+    /// commands — every use is best-effort.
+    broker: std::sync::OnceLock<std::sync::Weak<dyn ApprovalBroker>>,
 }
 
 impl ReplyApprover {
@@ -7312,6 +7319,44 @@ impl ReplyApprover {
         let Some(scheduler) = weak.upgrade() else { return };
         if let Err(e) = scheduler.post_next_if_idle().await {
             tracing::warn!("trigger_next_nudge failed: {e:#}");
+        }
+    }
+
+    /// #501 — upgraded broker handle, if the serve arm wired one. `None`
+    /// (dry-run, one-shot commands, broker torn down) skips notice work —
+    /// the schedule state machine never depends on Discord succeeding.
+    fn broker_handle(&self) -> Option<Arc<dyn ApprovalBroker>> {
+        self.broker.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    /// #501 — delete a previously snapshotted scheduled-notice pointer pair.
+    /// Cancel and Back-to-queue clear the pointers inside their CAS UPDATE,
+    /// so those callers snapshot `action_notice` BEFORE the CAS and pass the
+    /// pair here. Debug-level on failure: the Discord-side event handler
+    /// also deletes the interaction's own message, so "already gone" is the
+    /// common case, not a problem.
+    async fn delete_notice_pair(&self, action_id: &str, notice: Option<(String, String)>) {
+        let Some((chan, msg)) = notice else { return };
+        let Some(broker) = self.broker_handle() else { return };
+        if let (Ok(c), Ok(m)) = (chan.parse::<u64>(), msg.parse::<u64>()) {
+            if let Err(e) = broker.delete_message(c, m).await {
+                tracing::debug!(
+                    action_id,
+                    "notice delete failed (may already be gone): {e}"
+                );
+            }
+        }
+    }
+
+    /// #501 — delete the persisted scheduled-notice message and clear its
+    /// pointers. For rows whose CAS does NOT clear pointers itself (the
+    /// Send Now claim retains them). The verb-aware startup sweep is the
+    /// durable backstop when this best-effort pass misses.
+    async fn delete_stored_notice(&self, action_id: &str) {
+        let notice = self.store.action_notice(action_id).ok().flatten();
+        if notice.is_some() {
+            self.delete_notice_pair(action_id, notice).await;
+            let _ = self.store.clear_action_notice(action_id);
         }
     }
 
@@ -8185,6 +8230,38 @@ impl ApprovalActionHandler for ReplyApprover {
             None => false,
         }
     }
+
+    async fn schedule(&self, action_id: &str, at_ms: i64) -> ApprovalActionOutcome {
+        let outcome = self.run_schedule(action_id, at_ms).await;
+        if matches!(outcome, ApprovalActionOutcome::Scheduled { .. }) {
+            // The scheduled card left the queue — surface the next one, the
+            // same instant-advance approve/skip get.
+            self.trigger_next_nudge().await;
+        }
+        outcome
+    }
+
+    async fn send_now(&self, action_id: &str) -> ApprovalActionOutcome {
+        // No nudge trigger: the row left the carousel at schedule time.
+        self.run_send_now(action_id).await
+    }
+
+    async fn cancel_schedule(&self, action_id: &str) -> ApprovalActionOutcome {
+        self.run_cancel_schedule(action_id).await
+    }
+
+    async fn back_to_queue(&self, action_id: &str) -> ApprovalActionOutcome {
+        // No nudge trigger: the repost + record_nudge inside makes this row
+        // the active card again.
+        self.run_back_to_queue(action_id).await
+    }
+
+    async fn is_schedule_live(&self, action_id: &str) -> bool {
+        match self.handle_load(action_id) {
+            Some(a) => matches!(a.action.status.as_str(), "scheduled" | "sending"),
+            None => false,
+        }
+    }
 }
 
 impl ReplyApprover {
@@ -8255,12 +8332,29 @@ impl ReplyApprover {
             }
         }
 
+        self.send_claimed_gmail(action_id, &action, draft_id, entity_id)
+            .await
+    }
+
+    /// #500/#501 — the post-claim Gmail send tail, shared by Approve
+    /// (`pending → sending`) and Send Now (`scheduled → sending`). The
+    /// caller owns the claim; this owns the bounded Composio round-trip and
+    /// every bookkeeping step in the #449-mandated order (self-send record
+    /// BEFORE the status flip). One failure policy for both callers: a plain
+    /// send error stays retryable (no retry-cap stamp); a timeout is an
+    /// UNKNOWN outcome (the send may have landed) and is retry-EXEMPT with
+    /// an honest message.
+    async fn send_claimed_gmail(
+        &self,
+        action_id: &str,
+        action: &augmentagent_store::ActionWithEmail,
+        draft_id: &str,
+        entity_id: &str,
+    ) -> ApprovalActionOutcome {
         // Hard wall-clock bound (#500): ComposioClient has no request
         // timeout, and a hung send that outlives the engine's stuck-claim
         // grace would be flipped to error under us — then complete anyway,
-        // recording a delivered email as failed. A timeout is an UNKNOWN
-        // outcome (the send may have landed), so it is retry-EXEMPT with an
-        // honest message; a plain error stays retryable exactly as before.
+        // recording a delivered email as failed.
         let sent_id = match tokio::time::timeout(
             augmentagent_channel_email::SEND_DRAFT_TIMEOUT,
             self.gmail.send_draft(entity_id, draft_id),
@@ -8625,6 +8719,298 @@ impl ReplyApprover {
             draft: redraft,
         }
     }
+
+    /// #501 — arm a scheduled send from the card's Schedule control. All
+    /// state changes ride the #500 CAS primitives; the notice post is
+    /// best-effort on top.
+    ///
+    /// TODO(#501): publish a status_bus `StatusChanged` here (and on
+    /// cancel/fire) for dashboard parity once the bus has production
+    /// publishers — today NO surface publishes it (approve/skip included),
+    /// so there is no existing pattern to extend.
+    async fn run_schedule(&self, action_id: &str, at_ms: i64) -> ApprovalActionOutcome {
+        // Central time guard: every entry point (select token, custom modal,
+        // later --send-at) funnels through this ONE validation at the CAS
+        // layer, so no parser can forget it.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Err(message) =
+            augmentagent_channel_core::timeparse::validate_send_at(at_ms, now_ms)
+        {
+            return ApprovalActionOutcome::Failed { message };
+        }
+        let Some(action) = self.handle_load(action_id) else {
+            return ApprovalActionOutcome::NotFound;
+        };
+        // The scheduled pipeline is a deferred Gmail send_draft (#499), but
+        // the Schedule select rides on EVERY card — gate non-email cards out
+        // BEFORE arming, or the engine would claim the row at fire time and
+        // flip it straight to a retry-exempt error. Same dispatch ladder as
+        // run_approve.
+        let non_gmail = matches!(
+            action.email.platform.as_str(),
+            "discord" | "slack" | "telegram" | "github" | "gcal"
+        ) || action.email.platform == augmentagent_channel_socialapi::PLATFORM
+            || is_linkedin_email(&action.email);
+        if non_gmail {
+            return ApprovalActionOutcome::Failed {
+                message: "scheduling is only supported for email drafts".into(),
+            };
+        }
+        if action.draft_id.is_none() {
+            return ApprovalActionOutcome::Failed {
+                message: "no draftId on action; cannot schedule".into(),
+            };
+        }
+        // CAS `pending → scheduled`: a double-pick's loser (or a racing
+        // Approve / supersede) reports the fresh status and runs no side
+        // effects — never a second schedule.
+        match self.store.schedule_action(action_id, at_ms, "discord") {
+            Ok(true) => {}
+            Ok(false) => {
+                let status = self
+                    .handle_load(action_id)
+                    .map(|a| a.action.status)
+                    .unwrap_or_else(|| "resolved".into());
+                return ApprovalActionOutcome::AlreadyResolved { status };
+            }
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("schedule failed: {e}"),
+                };
+            }
+        }
+        let local = format_local_send_time(at_ms);
+        // Post the scheduled notice (Send Now | Back to queue | Cancel) and
+        // persist its pointers so the engine can retire it at fire time.
+        // Best-effort: the schedule is armed either way — the engine cleanup
+        // and the verb-aware startup sweep tolerate a missing notice.
+        match self.broker_handle() {
+            Some(broker) => {
+                match broker
+                    .post_scheduled_notice(action_id, &action.email, &local)
+                    .await
+                {
+                    Ok(Some((channel_id, message_id))) => {
+                        if let Err(e) = self.store.set_action_notice(
+                            action_id,
+                            &channel_id.to_string(),
+                            &message_id.to_string(),
+                        ) {
+                            tracing::warn!(
+                                action_id,
+                                "schedule: persist notice pointers failed: {e}"
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(action_id, "schedule: post notice failed: {e}")
+                    }
+                }
+            }
+            None => tracing::debug!(
+                action_id,
+                "schedule: no broker handle; skipping scheduled notice"
+            ),
+        }
+        tracing::info!(action_id, at_ms, local = %local, "schedule armed via approval handler");
+        ApprovalActionOutcome::Scheduled { at_ms, local }
+    }
+
+    /// #501 — Send Now from the scheduled notice: a direct
+    /// `scheduled → sending` CAS into the shared send tail. NEVER routes
+    /// through `pending` — that would re-enter the nudge queue and, after
+    /// #502, re-arm the proposal.
+    async fn run_send_now(&self, action_id: &str) -> ApprovalActionOutcome {
+        match self.store.claim_action_for_send(
+            action_id,
+            ActionStatus::Scheduled,
+            "discord",
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                let status = self
+                    .handle_load(action_id)
+                    .map(|a| a.action.status)
+                    .unwrap_or_else(|| "resolved".into());
+                return ApprovalActionOutcome::AlreadyResolved { status };
+            }
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("claim for send failed: {e}"),
+                };
+            }
+        }
+        // Load the row FRESH, after the claim (engine pattern): an
+        // update-draft repoint can land while the row sits scheduled, and a
+        // pre-claim snapshot's draftId would point at a Gmail draft that no
+        // longer exists.
+        let Some(action) = self.handle_load(action_id) else {
+            let _ = self.store.finish_send_error(
+                action_id,
+                "send now: action row disappeared after claim",
+                Some(augmentagent_channel_email::RETRY_EXEMPT_RETRY_COUNT),
+                "discord",
+            );
+            return ApprovalActionOutcome::NotFound;
+        };
+        let (Some(draft_id), Some(entity_id)) = (
+            action.draft_id.clone(),
+            action.email.account_entity_id.clone(),
+        ) else {
+            // Deterministic dead end for a claimed schedule-born row — same
+            // retry-exempt stamp as the engine's fire path: the generic
+            // retry tick re-dispatches through dispatch_reply and must never
+            // pick these up.
+            let msg = "send now: action has no draftId/accountEntityId; cannot send";
+            let _ = self.store.finish_send_error(
+                action_id,
+                msg,
+                Some(augmentagent_channel_email::RETRY_EXEMPT_RETRY_COUNT),
+                "discord",
+            );
+            return ApprovalActionOutcome::Failed {
+                message: msg.into(),
+            };
+        };
+        let outcome = self
+            .send_claimed_gmail(action_id, &action, &draft_id, &entity_id)
+            .await;
+        if matches!(outcome, ApprovalActionOutcome::Approved) {
+            // The send happened; retire the notice (the claim retained its
+            // pointers). The event handler also deletes the interaction's
+            // own message — both are best-effort, whichever runs second is
+            // a no-op.
+            self.delete_stored_notice(action_id).await;
+        }
+        outcome
+    }
+
+    /// #501 — Cancel from the scheduled notice: `scheduled → rejected` with
+    /// the unsent Gmail draft deleted, the run_skip convention for a draft
+    /// the owner decided against.
+    async fn run_cancel_schedule(&self, action_id: &str) -> ApprovalActionOutcome {
+        let Some(action) = self.handle_load(action_id) else {
+            return ApprovalActionOutcome::NotFound;
+        };
+        // Snapshot the notice pointers FIRST — the cancel CAS clears them in
+        // the same UPDATE (so a failed delete can't be retried against a
+        // resolved row forever).
+        let notice = self.store.action_notice(action_id).ok().flatten();
+        match self.store.cancel_scheduled_action(
+            action_id,
+            "schedule cancelled by approver",
+            "discord",
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                let status = self
+                    .handle_load(action_id)
+                    .map(|a| a.action.status)
+                    .unwrap_or_else(|| "resolved".into());
+                return ApprovalActionOutcome::AlreadyResolved { status };
+            }
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("cancel: resolve failed: {e}"),
+                };
+            }
+        }
+        // Best-effort cleanup of the unsent Gmail draft — the row is already
+        // Rejected, so a failed delete just leaves an orphan draft.
+        if let (Some(draft_id), Some(entity_id)) = (
+            action.draft_id.as_deref(),
+            action.email.account_entity_id.as_deref(),
+        ) {
+            if let Err(e) = self.gmail.delete_draft(entity_id, draft_id).await {
+                tracing::warn!(action_id, draft_id, "cancel: delete_draft failed: {e}");
+            }
+        }
+        self.delete_notice_pair(action_id, notice).await;
+        let _ = self
+            .store
+            .mark_email_processed(&action.email.message_id, TriageResult::Reply);
+        tracing::info!(action_id, "scheduled send cancelled via approval handler");
+        ApprovalActionOutcome::CancelledSchedule
+    }
+
+    /// #501 — Back to queue, the non-destructive mis-click escape:
+    /// `scheduled → pending` (proposal AND notice pointers cleared inside
+    /// the CAS — a later Approve must send immediately, not re-arm), then
+    /// the approval card is reposted as the active nudge card.
+    async fn run_back_to_queue(&self, action_id: &str) -> ApprovalActionOutcome {
+        // Snapshot the notice pointers FIRST — unschedule clears them in the
+        // same UPDATE.
+        let notice = self.store.action_notice(action_id).ok().flatten();
+        match self.store.unschedule_action(action_id, "discord") {
+            Ok(true) => {}
+            Ok(false) => {
+                let status = self
+                    .handle_load(action_id)
+                    .map(|a| a.action.status)
+                    .unwrap_or_else(|| "resolved".into());
+                return ApprovalActionOutcome::AlreadyResolved { status };
+            }
+            Err(e) => {
+                return ApprovalActionOutcome::Failed {
+                    message: format!("back to queue: resolve failed: {e}"),
+                };
+            }
+        }
+        self.delete_notice_pair(action_id, notice).await;
+        // Repost the approval card and mark it the ACTIVE nudge (count 0→1)
+        // — the post_reply_approval_card pattern (#412): without record_nudge
+        // the serial-queue scheduler would promote the row again and post a
+        // duplicate card. Best-effort: on a failed post the row sits pending
+        // with nudgeCount 0 and the scheduler re-promotes on its next tick.
+        if let Some(broker) = self.broker_handle() {
+            if let Some(action) = self.handle_load(action_id) {
+                let draft = action.action.draft_body.clone().unwrap_or_default();
+                match broker
+                    .post_approval(action_id, &action.email, &draft)
+                    .await
+                {
+                    Ok(()) => {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        if let Err(e) = self.store.record_nudge(
+                            action_id,
+                            now_ms + augmentagent_store::NUDGE_INTERVAL_MS,
+                        ) {
+                            tracing::warn!(
+                                action_id,
+                                "back to queue: record_nudge after repost failed: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        action_id,
+                        "back to queue: card repost failed (nudge scheduler \
+                         will re-promote): {e}"
+                    ),
+                }
+            }
+        }
+        tracing::info!(
+            action_id,
+            "schedule disarmed via approval handler; card reposted"
+        );
+        ApprovalActionOutcome::Unscheduled
+    }
+}
+
+/// #501 — owner-local display string for a scheduled fire time, e.g.
+/// "Mon Sep 1, 9:05 AM". `chrono::Local` follows the daemon host's timezone
+/// — the same zone the schedule was resolved in.
+fn format_local_send_time(at_ms: i64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_millis_opt(at_ms) {
+        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
+            dt.format("%a %b %-d, %-I:%M %p").to_string()
+        }
+        // Out-of-range epoch — unreachable behind the 60-day guard, but a
+        // display path must never panic.
+        chrono::LocalResult::None => format!("epoch+{at_ms}ms"),
+    }
 }
 
 async fn build_broker(
@@ -8706,6 +9092,7 @@ async fn build_broker(
         draft_skill,
         wiki_root: cli.wiki_dir.clone(),
         nudge: std::sync::OnceLock::new(),
+        broker: std::sync::OnceLock::new(),
     });
 
     let approver_for_broker = Arc::clone(&approver);
@@ -8727,7 +9114,13 @@ async fn build_broker(
     })
     .await
     .context("start discord broker")?;
-    Ok((Arc::new(broker), Some(approver)))
+    let broker: Arc<dyn ApprovalBroker> = Arc::new(broker);
+    // #501 — hand the approver a Weak broker handle so the schedule verbs
+    // can post/delete the scheduled notice and repost cards. Weak for the
+    // same cycle-break reason as `nudge` (the broker's event handler holds
+    // this approver strongly).
+    approver.broker.set(Arc::downgrade(&broker)).ok();
+    Ok((broker, Some(approver)))
 }
 
 fn build_channel(

@@ -247,6 +247,23 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
         Ok(flagged)
     }
 
+    /// #501 — best-effort removal of the scheduled-notice Discord message
+    /// once its row leaves the scheduled/sending pair (fired or superseded).
+    /// Pointers are TEXT columns; a parse failure just means there is nothing
+    /// deletable. Cleared afterwards either way so the startup sweep is the
+    /// only remaining backstop, never a second delete attempt from here.
+    async fn delete_notice(&self, action_id: &str) {
+        let Ok(Some((chan, msg))) = self.store.action_notice(action_id) else {
+            return;
+        };
+        if let (Ok(c), Ok(m)) = (chan.parse::<u64>(), msg.parse::<u64>()) {
+            if let Err(e) = self.broker.delete_message(c, m).await {
+                warn!(action_id, "scheduled-send: notice delete failed: {e}");
+            }
+        }
+        let _ = self.store.clear_action_notice(action_id);
+    }
+
     async fn fire_one(
         &self,
         action_id: &str,
@@ -278,6 +295,9 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
                         "scheduled-send: cancelled at fire time, owner \
                          replied after arming"
                     );
+                    // #501 — the supersede leaves the notice pointers intact
+                    // (see mark_scheduled_superseded); retire the notice here.
+                    self.delete_notice(action_id).await;
                     return Ok(FireOutcome::Superseded);
                 }
                 // CAS lost — something else resolved the row; treat like a
@@ -396,6 +416,10 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
                 "scheduled-send: record_user_edit_as_tone_example failed: {e}"
             ),
         }
+        // #501 — the send happened; the scheduled notice (Send Now / Back to
+        // queue / Cancel) is now stale. Best-effort, after all send
+        // bookkeeping: a Discord hiccup here must not shadow a landed send.
+        self.delete_notice(action_id).await;
         info!(
             action_id,
             scheduled_at_ms, "scheduled-send: fired on schedule"
