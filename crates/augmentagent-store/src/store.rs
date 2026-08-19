@@ -4899,9 +4899,12 @@ impl Store {
     }
 
     /// Back to queue: `scheduled → pending`, clearing the proposal AND the
-    /// notice pointers, and re-seeding the nudge queue exactly like a fresh
-    /// `log_action` row (nudgeCount 0 ⇒ eligible for promotion; the caller
-    /// may also repost the card immediately and `record_nudge` it active).
+    /// notice pointers. The row re-enters the queue as the ACTIVE card
+    /// (nudgeCount 1, next re-nudge one interval out) because the caller has
+    /// already reposted the approval card by the time this CAS runs —
+    /// leaving nudgeCount at 0 would make the row instantly promotable and
+    /// the NudgeScheduler's 60s tick could post a SECOND card in the window
+    /// before the caller recorded its own (#501 review).
     /// Clearing `scheduledAtMs` here is load-bearing: a later Approve on the
     /// reposted card must send immediately, not re-arm a stale proposal.
     pub fn unschedule_action(&self, action_id: &str, source: &str) -> StoreResult<bool> {
@@ -4911,10 +4914,37 @@ impl Store {
             "UPDATE actions \
                 SET status = 'pending', scheduledAtMs = NULL, \
                     noticeChannelId = NULL, noticeMessageId = NULL, \
-                    nudgeCount = 0, nextNudgeAtMs = ?2, \
+                    nudgeCount = 1, nextNudgeAtMs = ?2, \
                     status_source = ?3, status_updated_at = ?4, updatedAt = ?4 \
               WHERE id = ?1 AND status = 'scheduled'",
             params![action_id, now + NUDGE_INTERVAL_MS, source, now],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Engine-only claim: `scheduled → sending`, additionally gated on the
+    /// fire time still being due. The tick works from a due-list snapshot
+    /// that can be minutes old (earlier rows' sends are wall-clock bounded
+    /// but slow); without the `scheduledAtMs <= now` predicate, a
+    /// back-to-queue + re-schedule landing in that window would be fired at
+    /// the OLD due moment — up to a day early (#501 review). Send Now keeps
+    /// using the plain claim: firing NOW regardless of the armed time is its
+    /// whole point.
+    pub fn claim_due_action_for_send(
+        &self,
+        action_id: &str,
+        now_ms: i64,
+        source: &str,
+    ) -> StoreResult<bool> {
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE actions \
+                SET status = 'sending', \
+                    status_source = ?3, status_updated_at = ?4, updatedAt = ?4 \
+              WHERE id = ?1 AND status = 'scheduled' \
+                AND scheduledAtMs IS NOT NULL AND scheduledAtMs <= ?2",
+            params![action_id, now_ms, source, now],
         )?;
         Ok(n == 1)
     }
@@ -8030,7 +8060,8 @@ mod tests {
             "back-to-queue MUST clear the proposal or a later Approve re-arms it"
         );
         assert_eq!(s.action_notice(&id).unwrap(), None);
-        // Row is a promotable queue member again.
+        // Row re-enters the queue as the ACTIVE card (caller reposted it) —
+        // nudgeCount 0 would let the NudgeScheduler race a second card in.
         let guard = s.conn.lock().unwrap();
         let (nudge_count, next_at): (i64, Option<i64>) = guard
             .query_row(
@@ -8039,11 +8070,32 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(nudge_count, 0);
+        assert_eq!(nudge_count, 1);
         assert!(next_at.is_some());
         drop(guard);
         // Unschedule on a non-scheduled row is a no-op.
         assert!(!s.unschedule_action(&id, "discord").unwrap());
+    }
+
+    #[test]
+    fn claim_due_rejects_rearmed_future_schedule() {
+        let (s, _f) = fresh_store();
+        let id = pending_action(&s, "m-aba-1");
+        let now = now_millis();
+        s.schedule_action(&id, now - 1_000, "t").unwrap();
+        // ABA: back-to-queue + re-arm for tomorrow while the engine's due
+        // snapshot still lists the row.
+        assert!(s.unschedule_action(&id, "t").unwrap());
+        assert!(s.schedule_action(&id, now + 86_400_000, "t").unwrap());
+        assert!(
+            !s.claim_due_action_for_send(&id, now, "engine").unwrap(),
+            "a re-armed future schedule must not be claimable from a stale \
+             due snapshot"
+        );
+        // Still armed for tomorrow; and once due, the claim works.
+        assert!(s
+            .claim_due_action_for_send(&id, now + 86_500_000, "engine")
+            .unwrap());
     }
 
     #[test]

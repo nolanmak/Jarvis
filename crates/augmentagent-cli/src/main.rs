@@ -8332,7 +8332,7 @@ impl ReplyApprover {
             }
         }
 
-        self.send_claimed_gmail(action_id, &action, draft_id, entity_id)
+        self.send_claimed_gmail(action_id, &action, draft_id, entity_id, false)
             .await
     }
 
@@ -8340,16 +8340,21 @@ impl ReplyApprover {
     /// (`pending → sending`) and Send Now (`scheduled → sending`). The
     /// caller owns the claim; this owns the bounded Composio round-trip and
     /// every bookkeeping step in the #449-mandated order (self-send record
-    /// BEFORE the status flip). One failure policy for both callers: a plain
-    /// send error stays retryable (no retry-cap stamp); a timeout is an
-    /// UNKNOWN outcome (the send may have landed) and is retry-EXEMPT with
-    /// an honest message.
+    /// BEFORE the status flip). A timeout is an UNKNOWN outcome (the send
+    /// may have landed) and is retry-EXEMPT for both callers. A plain send
+    /// error follows `retry_exempt_on_error`: Approve passes `false` (stays
+    /// eligible for the generic retry tick, exactly as before #500); Send
+    /// Now passes `true` — schedule-born rows must NEVER enter
+    /// `list_retryable_replies`, whose re-dispatch through `dispatch_reply`
+    /// would repost a card for a send the owner already resolved (#501
+    /// review).
     async fn send_claimed_gmail(
         &self,
         action_id: &str,
         action: &augmentagent_store::ActionWithEmail,
         draft_id: &str,
         entity_id: &str,
+        retry_exempt_on_error: bool,
     ) -> ApprovalActionOutcome {
         // Hard wall-clock bound (#500): ComposioClient has no request
         // timeout, and a hung send that outlives the engine's stuck-claim
@@ -8364,10 +8369,11 @@ impl ReplyApprover {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => {
                 let msg = format!("send_draft: {e}");
-                // Conditional (`WHERE status = 'sending'`) and WITHOUT the
-                // retry-cap stamp: approve-path failures stay eligible for
-                // the generic retry tick, exactly as before #500.
-                let _ = self.store.finish_send_error(action_id, &msg, None, "discord");
+                // Conditional (`WHERE status = 'sending'`); the retry-cap
+                // stamp is the caller's policy — see the doc comment.
+                let stamp = retry_exempt_on_error
+                    .then_some(augmentagent_channel_email::RETRY_EXEMPT_RETRY_COUNT);
+                let _ = self.store.finish_send_error(action_id, &msg, stamp, "discord");
                 return ApprovalActionOutcome::Failed { message: msg };
             }
             Err(_elapsed) => {
@@ -8679,18 +8685,16 @@ impl ReplyApprover {
             }
         };
 
-        // 3. Delete the now-stale old draft best-effort.
-        if let Some(old) = action.draft_id.as_deref() {
-            if let Err(e) = self.gmail.delete_draft(entity_id, old).await {
-                tracing::warn!(action_id, old_draft = old, "revise: delete old draft failed: {e}");
-            }
-        }
-
-        // 4. Update sqlite: new draft body + new draft id — but only while
+        // 3. Update sqlite: new draft body + new draft id — but only while
         // the row is STILL pending (#500). The reasoner + Gmail round-trips
         // above take seconds; a Schedule pick / Approve / supersede landing
         // meanwhile must not be stomped back to pending by the old
         // unconditional write. Loser cleans up the draft it just created.
+        // The OLD draft is deleted only AFTER this CAS wins (#501 review):
+        // deleting it first left a SchedulePick that landed mid-redraft
+        // armed against an already-deleted draft — the engine would then
+        // fire into a retry-exempt error. The brief window where both
+        // drafts exist in Gmail is harmless.
         match self.store.refresh_pending_draft(action_id, &redraft) {
             Ok(true) => {}
             Ok(false) | Err(_) => {
@@ -8712,6 +8716,14 @@ impl ReplyApprover {
             .store
             .set_action_draft_id(action_id, &new_draft_id);
         let _ = self.store.reset_nudge_schedule(action_id);
+
+        // 4. Delete the now-stale old draft best-effort — the row already
+        // points at the replacement, so nothing can send the old one.
+        if let Some(old) = action.draft_id.as_deref() {
+            if let Err(e) = self.gmail.delete_draft(entity_id, old).await {
+                tracing::warn!(action_id, old_draft = old, "revise: delete old draft failed: {e}");
+            }
+        }
 
         tracing::info!(action_id, new_draft_id, "revise: new draft posted");
         ApprovalActionOutcome::Revised {
@@ -8780,6 +8792,18 @@ impl ReplyApprover {
             }
         }
         let local = format_local_send_time(at_ms);
+        // The notice's "To" line is the ACTUAL send target: the #473
+        // envelope To when one was recorded (compose/intro cards with
+        // overridden routing), else the card's From (#501 review).
+        let to_display = self
+            .store
+            .get_action_envelope(action_id)
+            .unwrap_or_else(|e| {
+                tracing::warn!(action_id, "schedule: envelope lookup failed: {e}");
+                None
+            })
+            .and_then(|env| env.to)
+            .unwrap_or_else(|| action.email.from.clone());
         // Post the scheduled notice (Send Now | Back to queue | Cancel) and
         // persist its pointers so the engine can retire it at fire time.
         // Best-effort: the schedule is armed either way — the engine cleanup
@@ -8787,7 +8811,7 @@ impl ReplyApprover {
         match self.broker_handle() {
             Some(broker) => {
                 match broker
-                    .post_scheduled_notice(action_id, &action.email, &local)
+                    .post_scheduled_notice(action_id, &action.email, &local, &to_display)
                     .await
                 {
                     Ok(Some((channel_id, message_id))) => {
@@ -8852,6 +8876,7 @@ impl ReplyApprover {
                 Some(augmentagent_channel_email::RETRY_EXEMPT_RETRY_COUNT),
                 "discord",
             );
+            self.delete_stored_notice(action_id).await;
             return ApprovalActionOutcome::NotFound;
         };
         let (Some(draft_id), Some(entity_id)) = (
@@ -8869,20 +8894,21 @@ impl ReplyApprover {
                 Some(augmentagent_channel_email::RETRY_EXEMPT_RETRY_COUNT),
                 "discord",
             );
+            self.delete_stored_notice(action_id).await;
             return ApprovalActionOutcome::Failed {
                 message: msg.into(),
             };
         };
         let outcome = self
-            .send_claimed_gmail(action_id, &action, &draft_id, &entity_id)
+            .send_claimed_gmail(action_id, &action, &draft_id, &entity_id, true)
             .await;
-        if matches!(outcome, ApprovalActionOutcome::Approved) {
-            // The send happened; retire the notice (the claim retained its
-            // pointers). The event handler also deletes the interaction's
-            // own message — both are best-effort, whichever runs second is
-            // a no-op.
-            self.delete_stored_notice(action_id).await;
-        }
+        // Sent OR dead, the schedule is over — retire the notice either way
+        // (#501 review): the ephemeral told the owner about a failure, and a
+        // stale "Sends <t>" notice must not keep advertising a row that will
+        // never fire. The event handler also deletes the interaction's own
+        // message on success; both are best-effort, whichever runs second is
+        // a no-op.
+        self.delete_stored_notice(action_id).await;
         outcome
     }
 
@@ -8917,9 +8943,15 @@ impl ReplyApprover {
             }
         }
         // Best-effort cleanup of the unsent Gmail draft — the row is already
-        // Rejected, so a failed delete just leaves an orphan draft.
+        // Rejected, so a failed delete just leaves an orphan draft. The
+        // draft id is re-loaded AFTER the CAS (#501 review): a concurrent
+        // repoint (`gmail update-draft` runs freely on scheduled rows — only
+        // the 'sending' claim blocks it) would leave the pre-CAS snapshot
+        // pointing at a draft that repoint already deleted, while the
+        // REPLACEMENT survived in Gmail forever.
+        let fresh_draft_id = self.handle_load(action_id).and_then(|a| a.draft_id);
         if let (Some(draft_id), Some(entity_id)) = (
-            action.draft_id.as_deref(),
+            fresh_draft_id.as_deref(),
             action.email.account_entity_id.as_deref(),
         ) {
             if let Err(e) = self.gmail.delete_draft(entity_id, draft_id).await {
@@ -8936,59 +8968,85 @@ impl ReplyApprover {
 
     /// #501 — Back to queue, the non-destructive mis-click escape:
     /// `scheduled → pending` (proposal AND notice pointers cleared inside
-    /// the CAS — a later Approve must send immediately, not re-arm), then
-    /// the approval card is reposted as the active nudge card.
+    /// the CAS — a later Approve must send immediately, not re-arm) with
+    /// the approval card reposted. Order matters (#501 review): the card is
+    /// posted BEFORE the CAS, while the row is still 'scheduled' and
+    /// therefore invisible to the NudgeScheduler's promoter — posting after
+    /// the flip left a window where the 60s tick could post a SECOND card.
+    /// The unschedule CAS itself seeds the row as the ACTIVE nudge
+    /// (nudgeCount 1), so no record_nudge follows; a lost CAS rolls the
+    /// pre-posted card back down via its returned message ids.
     async fn run_back_to_queue(&self, action_id: &str) -> ApprovalActionOutcome {
         // Snapshot the notice pointers FIRST — unschedule clears them in the
         // same UPDATE.
         let notice = self.store.action_notice(action_id).ok().flatten();
-        match self.store.unschedule_action(action_id, "discord") {
-            Ok(true) => {}
-            Ok(false) => {
-                let status = self
-                    .handle_load(action_id)
-                    .map(|a| a.action.status)
-                    .unwrap_or_else(|| "resolved".into());
-                return ApprovalActionOutcome::AlreadyResolved { status };
-            }
-            Err(e) => {
-                return ApprovalActionOutcome::Failed {
-                    message: format!("back to queue: resolve failed: {e}"),
-                };
-            }
-        }
-        self.delete_notice_pair(action_id, notice).await;
-        // Repost the approval card and mark it the ACTIVE nudge (count 0→1)
-        // — the post_reply_approval_card pattern (#412): without record_nudge
-        // the serial-queue scheduler would promote the row again and post a
-        // duplicate card. Best-effort: on a failed post the row sits pending
-        // with nudgeCount 0 and the scheduler re-promotes on its next tick.
+        // Repost while still 'scheduled'. The persisted redraft count rides
+        // along so a refined-to-cap card doesn't get its quick-refine row
+        // resurrected, and the envelope markers match what the original
+        // card showed (#473) — same helper the Revise repost uses.
+        let mut reposted: Option<(u64, u64)> = None;
+        let mut repost_failed = false;
         if let Some(broker) = self.broker_handle() {
             if let Some(action) = self.handle_load(action_id) {
-                let draft = action.action.draft_body.clone().unwrap_or_default();
+                let draft = augmentagent_approval_discord::append_envelope_markers(
+                    action.action.draft_body.clone().unwrap_or_default(),
+                    Some(self.store.as_ref()),
+                    action_id,
+                    &action.email.from,
+                );
+                let count =
+                    self.store.redraft_count(action_id).unwrap_or(0).max(0) as u32;
                 match broker
-                    .post_approval(action_id, &action.email, &draft)
+                    .post_approval_card(action_id, &action.email, &draft, count)
                     .await
                 {
-                    Ok(()) => {
-                        let now_ms = chrono::Utc::now().timestamp_millis();
-                        if let Err(e) = self.store.record_nudge(
+                    Ok(ids) => reposted = ids,
+                    Err(e) => {
+                        repost_failed = true;
+                        tracing::warn!(
                             action_id,
-                            now_ms + augmentagent_store::NUDGE_INTERVAL_MS,
-                        ) {
-                            tracing::warn!(
-                                action_id,
-                                "back to queue: record_nudge after repost failed: {e}"
-                            );
-                        }
+                            "back to queue: card repost failed (proceeding; \
+                             re-nudge below covers it): {e}"
+                        );
                     }
-                    Err(e) => tracing::warn!(
-                        action_id,
-                        "back to queue: card repost failed (nudge scheduler \
-                         will re-promote): {e}"
-                    ),
                 }
             }
+        }
+        let cas = self.store.unschedule_action(action_id, "discord");
+        if !matches!(cas, Ok(true)) {
+            // The row never became pending (Send Now / cancel / engine fire
+            // / supersede won meanwhile) — take the pre-posted card back
+            // down; leaving it would advertise an actionable card for a
+            // resolved row until the next startup sweep.
+            if let (Some((c, m)), Some(broker)) = (reposted, self.broker_handle()) {
+                if let Err(e) = broker.delete_message(c, m).await {
+                    tracing::warn!(
+                        action_id,
+                        "back to queue: rollback of pre-posted card failed: {e}"
+                    );
+                }
+            }
+            return match cas {
+                Ok(_) => {
+                    let status = self
+                        .handle_load(action_id)
+                        .map(|a| a.action.status)
+                        .unwrap_or_else(|| "resolved".into());
+                    ApprovalActionOutcome::AlreadyResolved { status }
+                }
+                Err(e) => ApprovalActionOutcome::Failed {
+                    message: format!("back to queue: resolve failed: {e}"),
+                },
+            };
+        }
+        self.delete_notice_pair(action_id, notice).await;
+        if repost_failed {
+            // The CAS seeded the row ACTIVE with a full re-nudge interval,
+            // but no card is actually visible. Pull the timer to now so the
+            // NudgeScheduler's next tick re-posts the card instead of
+            // leaving the owner cardless for six hours.
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let _ = self.store.record_nudge(action_id, now_ms);
         }
         tracing::info!(
             action_id,

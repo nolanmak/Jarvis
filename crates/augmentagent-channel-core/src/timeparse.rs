@@ -17,7 +17,7 @@
 
 pub use augmentagent_approval_discord::timeparse::{
     parse_send_at, parse_send_at_in, resolve_token, resolve_token_in, validate_send_at,
-    MAX_HORIZON_MS, MIN_LEAD_MS,
+    MAX_HORIZON_MS, MIN_LEAD_MS, SKEW_MS,
 };
 
 #[cfg(test)]
@@ -49,16 +49,34 @@ mod tests {
     fn guard_rejects_too_soon_and_too_far() {
         let now = 1_000_000_000;
         assert!(validate_send_at(now, now).is_err(), "now itself is too soon");
-        assert!(
-            validate_send_at(now + MIN_LEAD_MS, now).is_err(),
-            "exactly the lead bound is still too soon (≤)"
-        );
-        let err = validate_send_at(now + MIN_LEAD_MS - 1, now).unwrap_err();
+        // The lead bound carries a skew allowance (#501 review): the exact
+        // minimum must validate (parse-to-validate latency), anything under
+        // the allowance must not.
+        assert!(validate_send_at(now + MIN_LEAD_MS, now).is_ok());
+        assert!(validate_send_at(now + MIN_LEAD_MS - SKEW_MS, now).is_ok());
+        let err =
+            validate_send_at(now + MIN_LEAD_MS - SKEW_MS - 1, now).unwrap_err();
         assert!(err.contains("too soon"), "got: {err}");
-        assert!(validate_send_at(now + MIN_LEAD_MS + 1, now).is_ok());
         assert!(validate_send_at(now + MAX_HORIZON_MS, now).is_ok());
         let err = validate_send_at(now + MAX_HORIZON_MS + 1, now).unwrap_err();
         assert!(err.contains("too far"), "got: {err}");
+    }
+
+    #[test]
+    fn advertised_minimum_lead_actually_validates() {
+        // "in 2m" resolves to exactly now+MIN_LEAD at parse time and reaches
+        // the guard a store round-trip later — the skew allowance is what
+        // makes the advertised minimum usable (#501 review).
+        let now = ny(2026, 7, 20, 10, 0);
+        let now_ms = now.timestamp_millis();
+        let at = parse_send_at_in("in 2m", now).unwrap();
+        assert_eq!(at, now_ms + MIN_LEAD_MS);
+        assert!(validate_send_at(at, now_ms).is_ok());
+        assert!(validate_send_at(at, now_ms + 10_000).is_ok(), "within skew");
+        assert!(
+            validate_send_at(at, now_ms + SKEW_MS + 1_000).is_err(),
+            "beyond the allowance the guard still bites"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -171,6 +189,27 @@ mod tests {
         );
         assert!(parse_send_at_in("in 0h", now).is_err(), "zero offset is a typo");
         assert!(parse_send_at_in("in 3w", now).is_err(), "unknown unit");
+    }
+
+    #[test]
+    fn multibyte_offset_unit_is_rejected_not_a_panic() {
+        // A multi-byte trailing char used to hit a byte-boundary split in
+        // parse_offset and panic (#501 review) — it must parse-fail.
+        let now = ny(2026, 7, 20, 10, 0);
+        for bad in ["in 3ч", "in 3時", "in ч"] {
+            let err = parse_send_at_in(bad, now.clone())
+                .expect_err(&format!("{bad:?} must be rejected"));
+            assert!(err.contains("accepted formats"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn absurd_offsets_error_instead_of_overflowing() {
+        let now = ny(2026, 7, 20, 10, 0);
+        // Multiply overflow inside parse_offset.
+        assert!(parse_send_at_in("in 9223372036854775807m", now.clone()).is_err());
+        // Multiply fits, epoch addition would overflow — checked_add path.
+        assert!(parse_send_at_in("in 153722867280912m", now).is_err());
     }
 
     #[test]

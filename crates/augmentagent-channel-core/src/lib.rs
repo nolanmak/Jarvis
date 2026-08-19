@@ -46,7 +46,9 @@ pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerOpts};
 pub use skills::{SkillEntry, SkillRegistry};
 // #501 — deterministic send-time parsing for scheduled sends (shared with
 // the query-mode `--send-at` flag, #502).
-pub use timeparse::{parse_send_at, resolve_token, validate_send_at, MAX_HORIZON_MS, MIN_LEAD_MS};
+pub use timeparse::{
+    parse_send_at, resolve_token, validate_send_at, MAX_HORIZON_MS, MIN_LEAD_MS, SKEW_MS,
+};
 pub use tool_audit::{
     build_audit_record, default_audit_log_path, format_notice, is_high_risk, parse_stream_event,
     truncate_stream, AuditLogger, AuditNotifier, AuditRecord, ToolEvent,

@@ -26,7 +26,9 @@ mod presets;
 pub mod timeparse;
 
 pub use broker::{DiscordApprovalBroker, DiscordConfig};
-pub use event_handler::chunk_for_discord;
+// #501 — `append_envelope_markers` is shared with the CLI's Back-to-queue
+// repost so it renders the same To/cc/bcc decoration as the Revise repost.
+pub use event_handler::{append_envelope_markers, chunk_for_discord};
 // #35 Phase 5: the email channel appends the needs-input marker to the
 // persisted draft via this; the card decodes it on render. `NeedsInput` is
 // re-exported for the channel/test surface.
@@ -143,19 +145,41 @@ pub trait ApprovalBroker: Send + Sync {
     }
 
     /// #501 — post the compact scheduled-send notice (Send Now / Back to
-    /// queue / Cancel) for a freshly armed schedule. Returns the Discord
-    /// `(channel_id, message_id)` pair so the caller can persist the notice
-    /// pointers on the action row (the engine deletes the notice at
-    /// fire/cancel time). Default `Ok(None)`: brokers without a notice
-    /// surface (Noop, tests) arm schedules fine — there's just no message to
-    /// clean up later.
+    /// queue / Cancel) for a freshly armed schedule. `to_display` is the
+    /// resolved send target (the #473 envelope To when recorded, else the
+    /// card's From). Returns the Discord `(channel_id, message_id)` pair so
+    /// the caller can persist the notice pointers on the action row (the
+    /// engine deletes the notice at fire/cancel time). Default `Ok(None)`:
+    /// brokers without a notice surface (Noop, tests) arm schedules fine —
+    /// there's just no message to clean up later.
     async fn post_scheduled_notice(
         &self,
         action_id: &str,
         email: &Email,
         sends_at_local: &str,
+        to_display: &str,
     ) -> Result<Option<(u64, u64)>, ApprovalError> {
-        let _ = (action_id, email, sends_at_local);
+        let _ = (action_id, email, sends_at_local, to_display);
+        Ok(None)
+    }
+
+    /// #501 — post an approval card and return its Discord
+    /// `(channel_id, message_id)` pair, honoring the persisted redraft count
+    /// (so a refined-to-cap card is reposted WITHOUT the quick-refine row —
+    /// `post_approval` hardcodes count 0). Back-to-queue posts the card
+    /// BEFORE its CAS and needs the ids to take the card back down when the
+    /// CAS loses (#501 review). Default: delegates to
+    /// [`Self::post_approval`] and returns `Ok(None)` — no ids, nothing to
+    /// roll back, fine for brokers with no real message surface.
+    async fn post_approval_card(
+        &self,
+        action_id: &str,
+        email: &Email,
+        draft: &str,
+        redraft_count: u32,
+    ) -> Result<Option<(u64, u64)>, ApprovalError> {
+        let _ = redraft_count;
+        self.post_approval(action_id, email, draft).await?;
         Ok(None)
     }
 

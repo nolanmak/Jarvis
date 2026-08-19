@@ -229,12 +229,32 @@ pub fn approval_message(
     if !at_cap {
         rows.push(quick_refine_row(action_id));
     }
-    // #501 — the Schedule select, UNCONDITIONALLY last: an at-cap card must
-    // still be schedulable, so this sits outside the `!at_cap` gate above.
-    // Worst case is now 4 of Discord's 5 rows (buttons + FillAsk +
-    // QuickRefine + Schedule) — comfortably inside the row budget.
-    rows.push(schedule_row(action_id));
+    // #501 — the Schedule select, last and independent of the `!at_cap`
+    // gate above: an at-cap card must still be schedulable. Offered only on
+    // cards the scheduled pipeline can actually fire (a deferred Gmail
+    // send_draft) — the handler refuses non-email schedules too, but the
+    // control shouldn't be rendered where it can only fail (#501 review).
+    // Worst case is 4 of Discord's 5 rows (buttons + FillAsk + QuickRefine +
+    // Schedule) — comfortably inside the row budget.
+    if is_schedulable(email) {
+        rows.push(schedule_row(action_id));
+    }
     CreateMessage::new().embed(embed).components(rows)
+}
+
+/// #501 — can this card's action ride the scheduled-send pipeline? Only the
+/// Gmail fallthrough path in `run_approve` can: platform `gmail` and not a
+/// LinkedIn-entity row (LinkedIn reuses platform `gmail` on legacy rows and
+/// is identified by its `linkedin:` account-entity prefix — kept as a local
+/// literal because the dep edge to `augmentagent-channel-linkedin` runs the
+/// other way, mirroring `ACCOUNT_PREFIX` there).
+fn is_schedulable(email: &Email) -> bool {
+    email.platform == "gmail"
+        && !email
+            .account_entity_id
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("linkedin:")
 }
 
 /// One bullet per unresolved ask for the card field.
@@ -382,17 +402,19 @@ fn schedule_row(action_id: &str) -> CreateActionRow {
 /// Compact scheduled-notice message (#501) — the card's replacement once a
 /// schedule is armed. Deliberately NOT an approval card: it must never carry
 /// Approve/Revise/Skip (the draft is already approved-for-later), only the
-/// three schedule escape hatches. `email.from` is the counterparty on reply
-/// cards and the recipient on compose cards (#412 keys compose rows that
-/// way), so it is the right "To" line for both shapes.
+/// three schedule escape hatches. `to_display` is the actual send target the
+/// caller resolved — the #473 envelope To when one was recorded, else the
+/// card's From line — so an overridden routing (intro pattern) shows the
+/// real recipient, not the reply-to.
 pub fn scheduled_notice_message(
     action_id: &str,
     email: &Email,
     sends_at_local: &str,
+    to_display: &str,
 ) -> CreateMessage {
     let embed = CreateEmbed::new()
         .title(truncate(&email.subject, 256))
-        .field("To", truncate(&email.from, 256), true)
+        .field("To", truncate(to_display, 256), true)
         .field("Sends", truncate(sends_at_local, 256), true)
         .footer(CreateEmbedFooter::new("AugmentAgent scheduled send"));
     let buttons = CreateActionRow::Buttons(vec![
@@ -501,7 +523,7 @@ mod tests {
         Email {
             message_id: "m1".into(),
             thread_id: Some("t1".into()),
-            from: "a@b.com".into(),
+            from: "peer@example.com".into(),
             subject: "Re: hi".into(),
             body: "the inbound message".into(),
             date: "2026-05-18T00:00:00Z".into(),
@@ -669,8 +691,8 @@ mod tests {
 
     #[test]
     fn schedule_row_is_unconditional_even_at_cap() {
-        // At the refine cap the quick-refine menu is dropped — but the card
-        // must STILL be schedulable (#501).
+        // At the refine cap the quick-refine menu is dropped — but a gmail
+        // card must STILL be schedulable (#501).
         let at_cap = json(&approval_message(
             "act-s1",
             &email(),
@@ -683,6 +705,29 @@ mod tests {
         let fresh = json(&approval_message("act-s1", &email(), "plain draft", 0));
         assert!(fresh.contains("aa:act-s1:schedule_pick"));
         assert!(fresh.contains("quick_refine"));
+    }
+
+    #[test]
+    fn schedule_row_absent_on_unschedulable_cards() {
+        // The scheduled pipeline is a deferred Gmail send_draft — cards the
+        // engine could never fire must not offer the control (#501 review).
+        for platform in ["discord", "slack", "telegram", "github", "gcal"] {
+            let mut e = email();
+            e.platform = platform.into();
+            let v = json(&approval_message("act-s6", &e, "d", 0));
+            assert!(
+                !v.contains("schedule_pick"),
+                "{platform} card must not carry the schedule row"
+            );
+            // The rest of the card is untouched.
+            assert!(v.contains("aa:act-s6:approve"));
+        }
+        // LinkedIn rides platform "gmail" on legacy rows — the entity prefix
+        // is the tell.
+        let mut e = email();
+        e.account_entity_id = Some("linkedin:urn123".into());
+        let v = json(&approval_message("act-s6", &e, "d", 0));
+        assert!(!v.contains("schedule_pick"), "linkedin-entity card gated");
     }
 
     #[test]
@@ -718,6 +763,7 @@ mod tests {
             "act-s4",
             &email(),
             "Mon Sep 1, 9:00 AM",
+            &email().from,
         );
         let v: serde_json::Value =
             serde_json::from_str(&json(&msg)).expect("notice json parses");
@@ -735,6 +781,17 @@ mod tests {
         assert!(!s.contains(":revise"));
         assert!(!s.contains(":skip"));
         assert!(s.contains("Mon Sep 1, 9:00 AM"));
+    }
+
+    #[test]
+    fn scheduled_notice_renders_the_resolved_to_not_the_card_from() {
+        // #473 routing override (#501 review): the notice must show the
+        // ACTUAL recipient the caller resolved from the envelope, not the
+        // card's From line.
+        let msg = scheduled_notice_message("act-s7", &email(), "t", "omer@example.com");
+        let v = json(&msg);
+        assert!(v.contains("omer@example.com"));
+        assert!(!v.contains("peer@example.com"), "card From must not leak into To");
     }
 
     #[test]

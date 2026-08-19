@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use augmentagent_approval_discord::ApprovalBroker;
-use augmentagent_store::{ActionStatus, Store, TriageResult};
+use augmentagent_store::{Store, TriageResult};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -200,7 +200,13 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
         }
         for (action_id, scheduled_at_ms, armed_at_ms, thread_id) in due {
             match self
-                .fire_one(&action_id, scheduled_at_ms, armed_at_ms, thread_id.as_deref())
+                .fire_one(
+                    &action_id,
+                    scheduled_at_ms,
+                    armed_at_ms,
+                    thread_id.as_deref(),
+                    now_ms,
+                )
                 .await
             {
                 Ok(FireOutcome::Sent) => summary.fired += 1,
@@ -243,6 +249,7 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
             if let Ok(Some(a)) = self.store.get_action_with_email(&action_id) {
                 let _ = self.broker.post_flag_notice(&a.email, msg).await;
             }
+            self.delete_notice(&action_id).await;
         }
         Ok(flagged)
     }
@@ -270,6 +277,7 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
         scheduled_at_ms: i64,
         armed_at_ms: i64,
         thread_id: Option<&str>,
+        now_ms: i64,
     ) -> anyhow::Result<FireOutcome> {
         // Fire-time guard: a manual owner reply on the thread SINCE THE
         // SCHEDULE WAS ARMED cancels the send, even if the reconcile sweep's
@@ -306,13 +314,16 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
             }
         }
 
-        // The claim: exactly one winner. Losing means Cancel / Send Now /
-        // supersede got there first.
-        if !self.store.claim_action_for_send(
-            action_id,
-            ActionStatus::Scheduled,
-            "scheduled-send-engine",
-        )? {
+        // The claim: exactly one winner, and DUE-GATED — the tick's due list
+        // is a snapshot that can be minutes old behind slow earlier sends,
+        // and a back-to-queue + re-schedule in that window re-arms the row
+        // with a future fire time. The plain status claim would fire it at
+        // the OLD due moment, up to a day early (#501 review). Losing means
+        // Cancel / Send Now / supersede / re-arm got there first.
+        if !self
+            .store
+            .claim_due_action_for_send(action_id, now_ms, "scheduled-send-engine")?
+        {
             return Ok(FireOutcome::LostClaim);
         }
 
@@ -328,6 +339,7 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
                     Some(RETRY_EXEMPT_RETRY_COUNT),
                     "scheduled-send-engine",
                 );
+                self.delete_notice(action_id).await;
                 return Ok(FireOutcome::Failed);
             }
         };
@@ -345,6 +357,9 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
             );
             warn!(action_id, "{msg}");
             let _ = self.broker.post_flag_notice(&action.email, msg).await;
+            // A dead schedule must not keep advertising "Sends <t>" (#501
+            // review) — retire the notice on every failure path too.
+            self.delete_notice(action_id).await;
             return Ok(FireOutcome::Failed);
         };
 
@@ -372,6 +387,7 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
                     "scheduled-send-engine",
                 );
                 let _ = self.broker.post_flag_notice(&action.email, &msg).await;
+                self.delete_notice(action_id).await;
                 return Ok(FireOutcome::Failed);
             }
             Err(_elapsed) => {
@@ -388,6 +404,7 @@ impl<G: GmailApi> ScheduledSendEngine<G> {
                     "scheduled-send-engine",
                 );
                 let _ = self.broker.post_flag_notice(&action.email, &msg).await;
+                self.delete_notice(action_id).await;
                 return Ok(FireOutcome::Failed);
             }
         };
@@ -449,7 +466,7 @@ mod tests {
     use crate::gmail::GmailError;
     use async_trait::async_trait;
     use augmentagent_approval_discord::{ApprovalError, NoopBroker};
-    use augmentagent_store::Email;
+    use augmentagent_store::{ActionStatus, Email};
     use std::sync::Mutex;
     use tempfile::NamedTempFile;
 

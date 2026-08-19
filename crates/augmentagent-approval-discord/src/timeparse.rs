@@ -38,12 +38,18 @@ pub const MIN_LEAD_MS: i64 = 2 * 60 * 1000;
 /// months out is far more likely a typo'd year than intent.
 pub const MAX_HORIZON_MS: i64 = 60 * 24 * 60 * 60 * 1000;
 
+/// Grace for parse-to-validate latency (#501 review): "in 2m" resolves to
+/// exactly now+[`MIN_LEAD_MS`] at parse time and reaches the guard (a store
+/// round-trip and a fresh clock read later) strictly after — without this
+/// allowance the advertised 2-minute minimum could never actually validate.
+pub const SKEW_MS: i64 = 15_000;
+
 /// The central time guard (#501): one validation shared by the select tokens,
 /// the custom modal, and (later) `--send-at`, enforced at the CAS layer in
 /// `ApprovalActionHandler::schedule` — not per-parser, so no entry point can
 /// forget it.
 pub fn validate_send_at(at_ms: i64, now_ms: i64) -> Result<(), String> {
-    if at_ms <= now_ms + MIN_LEAD_MS {
+    if at_ms < now_ms + MIN_LEAD_MS - SKEW_MS {
         return Err(
             "that time is too soon — schedule at least 2 minutes out".to_string(),
         );
@@ -150,10 +156,12 @@ pub fn parse_send_at_in<Tz: TimeZone>(input: &str, now: DateTime<Tz>) -> Result<
         return Ok(resolve_wall_time(&tz, ndt));
     }
 
-    // "in Nm/Nh/Nd" — instant math.
+    // "in Nm/Nh/Nd" — instant math. `parse_offset` caps the multiply, but a
+    // pathological N can still push the epoch sum past i64 — overflow is a
+    // parse error, never a panic (#501 review).
     if let Some(rest) = s.strip_prefix("in ") {
         let delta = parse_offset(rest.trim()).ok_or_else(format_error)?;
-        return Ok(now_ms + delta);
+        return now_ms.checked_add(delta).ok_or_else(format_error);
     }
 
     // "tomorrow [time]" — calendar day, default 09:00.
@@ -213,17 +221,19 @@ fn resolve_wall_time<Tz: TimeZone>(tz: &Tz, ndt: NaiveDateTime) -> i64 {
 }
 
 /// "3h" / "45m" / "2d" → milliseconds. `None` on anything else (zero
-/// included — "in 0h" is a typo, not a schedule).
+/// included — "in 0h" is a typo, not a schedule). The unit is taken by
+/// `char_indices`, not a byte split: a multi-byte trailing char ("in 3ч")
+/// must parse-fail, not panic on a char boundary (#501 review).
 fn parse_offset(s: &str) -> Option<i64> {
-    let (num, unit) = s.split_at(s.len().checked_sub(1)?);
-    let n: i64 = num.trim().parse().ok()?;
+    let (last_idx, unit) = s.char_indices().last()?;
+    let n: i64 = s[..last_idx].trim().parse().ok()?;
     if n < 1 {
         return None;
     }
     let ms = match unit {
-        "m" => 60_000,
-        "h" => 3_600_000,
-        "d" => 86_400_000,
+        'm' => 60_000,
+        'h' => 3_600_000,
+        'd' => 86_400_000,
         _ => return None,
     };
     n.checked_mul(ms)

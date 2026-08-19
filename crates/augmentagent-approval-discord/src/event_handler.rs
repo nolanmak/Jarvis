@@ -1083,17 +1083,23 @@ fn should_delete_card_after_schedule(outcome: &ApprovalActionOutcome) -> bool {
 
 /// Should the SCHEDULED NOTICE be deleted after this outcome (#501)?
 /// Approved (Send Now fired) / CancelledSchedule / Unscheduled: the schedule
-/// is gone either way. AlreadyResolved: the notice is by definition stale.
-/// Failed / NotFound: keep it so the owner can retry or investigate — same
+/// is gone either way. AlreadyResolved: only when the fresh status says the
+/// schedule is genuinely dead — a Send Now double-click loser sees
+/// `AlreadyResolved{"sending"}` while the winner is mid-send, and deleting
+/// the notice then would remove the only surface showing a send is in
+/// flight (#501 review); `"scheduled"` likewise means still live. Failed /
+/// NotFound: keep it so the owner can retry or investigate — same
 /// philosophy as [`should_delete_source`].
 fn should_delete_notice(outcome: &ApprovalActionOutcome) -> bool {
-    matches!(
-        outcome,
+    match outcome {
         ApprovalActionOutcome::Approved
-            | ApprovalActionOutcome::CancelledSchedule
-            | ApprovalActionOutcome::Unscheduled
-            | ApprovalActionOutcome::AlreadyResolved { .. }
-    )
+        | ApprovalActionOutcome::CancelledSchedule
+        | ApprovalActionOutcome::Unscheduled => true,
+        ApprovalActionOutcome::AlreadyResolved { status } => {
+            status != "scheduled" && status != "sending"
+        }
+        _ => false,
+    }
 }
 
 /// Best-effort delete of the scheduled-notice message an interaction rode in
@@ -1119,8 +1125,9 @@ async fn delete_notice_message(
 /// `[bcc: …]`). `[to:]` is shown only when it differs from `card_from` (the
 /// card's From line), matching compose-time behavior. No store or no
 /// recorded envelope (auto-triage replies, non-gmail platforms) → the body
-/// passes through unchanged.
-fn append_envelope_markers(
+/// passes through unchanged. Public since #501: the Back-to-queue repost in
+/// the CLI reuses it so the reposted card matches the Revise repost exactly.
+pub fn append_envelope_markers(
     body: String,
     store: Option<&augmentagent_store::Store>,
     action_id: &str,
@@ -2242,6 +2249,14 @@ mod tests {
         assert!(should_delete_notice(&ApprovalActionOutcome::Unscheduled));
         assert!(should_delete_notice(&ApprovalActionOutcome::AlreadyResolved {
             status: "sent".into()
+        }));
+        // A double-click loser while the schedule is still live (armed, or
+        // the winner mid-send) must NOT take the notice down (#501 review).
+        assert!(!should_delete_notice(&ApprovalActionOutcome::AlreadyResolved {
+            status: "sending".into()
+        }));
+        assert!(!should_delete_notice(&ApprovalActionOutcome::AlreadyResolved {
+            status: "scheduled".into()
         }));
         assert!(!should_delete_notice(&ApprovalActionOutcome::Failed {
             message: "x".into()
