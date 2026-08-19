@@ -1,0 +1,15 @@
+# Daily trigger for augmentagent-wix-sync.service.
+#
+# 07:15 local — after the overnight digest (07:00) so a fresh calendar is in
+# place before the digest is read, and well clear of the 03:30 tone refresh.
+# Persistent=true so a run missed while the host slept fires on next boot;
+# the sync is idempotent, so a late run is always safe.
+[Unit]
+Description=Daily Wix Events calendar mirror
+
+[Timer]
+OnCalendar=*-*-* 07:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

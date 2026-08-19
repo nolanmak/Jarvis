@@ -1,0 +1,23 @@
+# Wix Events calendar mirror (#633): pull upcoming Meetup group events and
+# create the missing ones on the Wix calendar.
+#
+# CREATE ONLY and idempotent — a second run is a no-op, so a missed timer
+# costs nothing and a double fire is harmless.
+#
+# With AUGMENTAGENT_WIX_SYNC_REQUIRE_APPROVAL=1 (the default) this unit only
+# ever prints a plan; publishing needs a human running it with --yes. Turn
+# that off only once you trust the source.
+#
+# Install: scripts/install-wix-sync.sh
+[Unit]
+Description=AugmentAgent Wix Events calendar mirror
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/AugmentAgent
+ExecStart=/usr/bin/env node %h/AugmentAgent/scripts/wix-events-sync.mjs
+EnvironmentFile=%h/AugmentAgent/.env
+StandardOutput=append:%h/.local/state/augmentagent/wix-sync.log
+StandardError=append:%h/.local/state/augmentagent/wix-sync.log
