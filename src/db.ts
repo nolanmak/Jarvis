@@ -311,14 +311,14 @@ export function logAction(action: Omit<ActionRecord, "id" | "createdAt" | "updat
 // "To:" address from the approval UIs before send. Build the UPDATE dynamically
 // so callers can mix-and-match fields (the old draftBody/errorMessage paths
 // kept their previous semantics).
-export function updateActionStatus(
-  id: string,
+// Shared dynamic-SET builder for the two status-mutation entry points below,
+// so their field handling can't drift apart (#500 review).
+function buildActionStatusSet(
   status: ActionStatus,
   extra?: { draftBody?: string; errorMessage?: string; recipientEmail?: string }
-): void {
-  const now = Date.now();
+): { sets: string[]; vals: unknown[] } {
   const sets: string[] = ["status = ?", "updatedAt = ?"];
-  const vals: unknown[] = [status, now];
+  const vals: unknown[] = [status, Date.now()];
 
   if (extra?.draftBody !== undefined) {
     sets.push("draftBody = ?");
@@ -332,10 +332,37 @@ export function updateActionStatus(
     sets.push("recipientEmail = ?");
     vals.push(extra.recipientEmail);
   }
+  return { sets, vals };
+}
 
+export function updateActionStatus(
+  id: string,
+  status: ActionStatus,
+  extra?: { draftBody?: string; errorMessage?: string; recipientEmail?: string }
+): void {
+  const { sets, vals } = buildActionStatusSet(status, extra);
   getDb()
     .prepare(`UPDATE actions SET ${sets.join(", ")} WHERE id = ?`)
     .run(...vals, id);
+}
+
+// #500: CAS variant for the API mutation route — flips status only while the
+// row is still 'pending', so a racing writer on the Rust side (a Schedule
+// pick arming `scheduled`, the send engine claiming `sending`) can't be
+// silently overwritten between the route's read-check and its UPDATE.
+// Returns true when this call actually performed the transition.
+export function resolveActionIfPending(
+  id: string,
+  status: ActionStatus,
+  extra?: { draftBody?: string; errorMessage?: string; recipientEmail?: string }
+): boolean {
+  const { sets, vals } = buildActionStatusSet(status, extra);
+  const result = getDb()
+    .prepare(
+      `UPDATE actions SET ${sets.join(", ")} WHERE id = ? AND status = 'pending'`
+    )
+    .run(...vals, id);
+  return result.changes > 0;
 }
 
 // #36: standalone update for the "Change To" button on the approval card —
