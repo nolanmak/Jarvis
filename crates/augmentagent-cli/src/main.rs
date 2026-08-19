@@ -1508,6 +1508,15 @@ enum GmailOp {
         reply_to_body: Option<String>,
         #[arg(long)]
         reply_to_body_file: Option<String>,
+        /// #502 — propose a future send time for this draft. Requires
+        /// `--post`: the card shows "[sends: <local time>]" and Approve ARMS
+        /// the schedule instead of sending immediately (the daemon fires it
+        /// when due). Accepts owner-local `YYYY-MM-DD HH:MM` (preferred —
+        /// never hand-compute a future UTC offset across a DST boundary),
+        /// RFC3339, `tomorrow 9am`, weekday forms, or `in Nm/Nh/Nd`.
+        /// Must be between 2 minutes and 60 days out.
+        #[arg(long)]
+        send_at: Option<String>,
     },
     /// Replace an existing draft's content. Composio has no update-in-place
     /// tool (#382), so this creates a replacement draft and deletes the old
@@ -2645,7 +2654,7 @@ async fn main() -> Result<()> {
             GmailOp::Compose {
                 account, to, cc, bcc, subject, body, body_file, thread_id, json,
                 post, allow_duplicate, attach, reply_to_message_id, reply_to_from,
-                reply_to_subject, reply_to_body, reply_to_body_file,
+                reply_to_subject, reply_to_body, reply_to_body_file, send_at,
             } => {
                 run_gmail_compose(
                     store,
@@ -2666,6 +2675,7 @@ async fn main() -> Result<()> {
                     reply_to_subject.clone(),
                     reply_to_body.clone(),
                     reply_to_body_file.clone(),
+                    send_at.clone(),
                 )
                 .await
             }
@@ -4261,7 +4271,31 @@ async fn run_gmail_compose(
     reply_to_subject: Option<String>,
     reply_to_body: Option<String>,
     reply_to_body_file: Option<String>,
+    send_at: Option<String>,
 ) -> Result<()> {
+    // #502 — resolve and bound the proposed send time BEFORE any Gmail
+    // write, so a bad value can't strand an orphan draft (#412 discipline).
+    // Requires --post: a proposal without a card would have no Approve to
+    // arm it and no surface to show it.
+    let send_at_ms = match send_at.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(raw) => {
+            anyhow::ensure!(
+                post,
+                "--send-at requires --post: the proposed time is carried by \
+                 the approval card and armed on Approve"
+            );
+            let now = chrono::Local::now();
+            let at_ms = augmentagent_channel_core::timeparse::parse_send_at(raw, now)
+                .map_err(|e| anyhow::anyhow!("--send-at: {e}"))?;
+            augmentagent_channel_core::timeparse::validate_send_at(
+                at_ms,
+                now.timestamp_millis(),
+            )
+            .map_err(|e| anyhow::anyhow!("--send-at: {e}"))?;
+            Some(at_ms)
+        }
+        None => None,
+    };
     // Normalize recipients up front (#439): `to` becomes one canonical
     // comma-joined string of bare addresses. Everything downstream — the
     // duplicate guard, the approval card's From field (which the Revise
@@ -4359,6 +4393,7 @@ async fn run_gmail_compose(
             reply_to_subject.as_deref(),
             reply_to_body.as_deref(),
             reply_to_body_file.as_deref(),
+            send_at_ms,
         )
         .await?;
         if let Some((old_action_id, old_draft_id)) = pending_replacement {
@@ -4479,6 +4514,7 @@ async fn post_reply_approval_card(
     reply_to_subject: Option<&str>,
     reply_to_body: Option<&str>,
     reply_to_body_file: Option<&str>,
+    send_at_ms: Option<i64>,
 ) -> Result<()> {
     use augmentagent_store::Email as StoreEmail;
 
@@ -4575,6 +4611,18 @@ async fn post_reply_approval_card(
     ) {
         tracing::warn!(action_id, "set_action_envelope after compose card failed: {e}");
     }
+    // #502 — persist the --send-at proposal on the still-PENDING row. The
+    // owner still approves; run_approve sees the future proposal and ARMS
+    // the schedule instead of sending. Back-to-queue and unschedule clear
+    // it, so a reposted card's Approve sends immediately again.
+    if let Some(at_ms) = send_at_ms {
+        if let Err(e) = store.set_action_scheduled_at(&action_id, Some(at_ms)) {
+            tracing::warn!(
+                action_id,
+                "set_action_scheduled_at after compose card failed: {e}"
+            );
+        }
+    }
 
     let http = serenity::http::Http::new(&token);
     let channel = serenity::all::ChannelId::new(cid);
@@ -4598,6 +4646,11 @@ async fn post_reply_approval_card(
     }
     if let Some(name) = attachment_name {
         markers.push_str(&format!("\n[attachment: {name}]"));
+    }
+    // #502 — surface the proposed send time on the card: Approve on this
+    // card arms a schedule, and the owner must see that before clicking.
+    if let Some(at_ms) = send_at_ms {
+        markers.push_str(&format!("\n[sends: {}]", format_local_send_time(at_ms)));
     }
     let card_body = if markers.is_empty() {
         draft_body.to_string()
@@ -5192,6 +5245,15 @@ async fn run_gmail_update_draft(
 /// Best-effort by construction — the mail has already gone out by the time we
 /// are called, so a bookkeeping failure must never surface as a send failure.
 /// It is logged loudly instead.
+/// #502 — is a --send-at proposal still worth arming at Approve time?
+/// A proposal at or inside the minimum lead expired naturally: approving it
+/// means "send it", and run_schedule's validator would reject it anyway —
+/// falling through to the immediate send is both the intuitive outcome and
+/// the only non-dead-end one.
+fn send_at_proposal_is_live(at_ms: i64, now_ms: i64) -> bool {
+    at_ms > now_ms + augmentagent_channel_core::timeparse::MIN_LEAD_MS
+}
+
 fn record_self_send(
     store: &Store,
     sent_message_id: Option<&str>,
@@ -8384,7 +8446,12 @@ impl ReplyApprover {
 impl ApprovalActionHandler for ReplyApprover {
     async fn approve(&self, action_id: &str) -> ApprovalActionOutcome {
         let outcome = self.run_approve(action_id).await;
-        if matches!(outcome, ApprovalActionOutcome::Approved) {
+        // Scheduled: Approve on a --send-at proposal armed the timer (#502)
+        // — the card leaves the queue either way, so advance the carousel.
+        if matches!(
+            outcome,
+            ApprovalActionOutcome::Approved | ApprovalActionOutcome::Scheduled { .. }
+        ) {
             self.trigger_next_nudge().await;
         }
         outcome
@@ -8486,6 +8553,25 @@ impl ReplyApprover {
                 message: "no accountEntityId on email; cannot send".into(),
             };
         };
+
+        // #502 — a card carrying a --send-at proposal: Approve ARMS the
+        // schedule instead of sending now (run_schedule owns the CAS, the
+        // notice, and the carousel advance). A proposal already past — or
+        // inside the minimum lead — expired naturally: fall through to the
+        // immediate send, which is what approving a stale proposal means.
+        // Back-to-queue/unschedule NULL the proposal, so a reposted card's
+        // Approve lands here with None and sends immediately (the #501
+        // review's re-arm loop is impossible by construction).
+        if let Ok(Some(at_ms)) = self.store.action_scheduled_at(action_id) {
+            if send_at_proposal_is_live(at_ms, chrono::Utc::now().timestamp_millis()) {
+                return self.run_schedule(action_id, at_ms).await;
+            }
+            tracing::info!(
+                action_id,
+                at_ms,
+                "approve: --send-at proposal already due; sending immediately"
+            );
+        }
 
         // #500 — claim the row (`pending → sending`) before the multi-second
         // Composio round-trip. The status read at the top of this fn is not a
@@ -14375,6 +14461,27 @@ mod stale_reconcile_tests {
             "pending",
             "a card with a real draft for a real person must stay in the queue"
         );
+    }
+}
+
+#[cfg(test)]
+mod send_at_proposal_tests {
+    use super::send_at_proposal_is_live;
+    use augmentagent_channel_core::timeparse::MIN_LEAD_MS;
+
+    /// #502 — Approve on a --send-at card: future proposal arms the
+    /// schedule; a proposal at/inside the minimum lead (or long past)
+    /// falls through to the immediate send. Boundary is exclusive: exactly
+    /// now+MIN_LEAD would be rejected by run_schedule's validator, so it
+    /// must not take the arming branch.
+    #[test]
+    fn proposal_liveness_boundary() {
+        let now = 1_700_000_000_000_i64;
+        assert!(send_at_proposal_is_live(now + MIN_LEAD_MS + 1, now));
+        assert!(send_at_proposal_is_live(now + 86_400_000, now));
+        assert!(!send_at_proposal_is_live(now + MIN_LEAD_MS, now));
+        assert!(!send_at_proposal_is_live(now, now));
+        assert!(!send_at_proposal_is_live(now - 86_400_000, now));
     }
 }
 
