@@ -415,6 +415,8 @@ pub async fn report_classic_fallback(
         "code-mode failure on action {classic_action_id}; filed issue {issue_str}; fell back to classic."
     );
     let notice_email = Email {
+        to: String::new(),
+        cc: String::new(),
         message_id: format!("code-mode-failure:{classic_action_id}"),
         thread_id: None,
         from: format!("code-mode/{}", ctx.channel),
@@ -757,6 +759,8 @@ mod tests {
 
     fn sample_email() -> Email {
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "msg-i7-test".into(),
             thread_id: Some("t-i7".into()),
             from: "user@example.com".into(),

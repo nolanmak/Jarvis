@@ -232,6 +232,8 @@ mod tests {
 
     fn mk_email(id: &str, entity: &str) -> Email {
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: id.to_string(),
             thread_id: Some(format!("t-{id}")),
             from: "alice@example.com".to_string(),

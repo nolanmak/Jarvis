@@ -835,6 +835,8 @@ pub(crate) fn message_to_email(
         None => format!("{ACCOUNT_ENTITY_ID_PREFIX}:{my_user_id}"),
     };
     Email {
+        to: String::new(),
+        cc: String::new(),
         message_id: format!("{}:{}", sub.channel_id, msg.ts),
         thread_id: Some(sub.channel_id.clone()),
         from,

@@ -527,6 +527,8 @@ mod tests {
 
     fn mk_email(id: &str, thread: Option<&str>, account: &str) -> Email {
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: id.to_string(),
             thread_id: thread.map(String::from),
             from: "them@example.com".to_string(),

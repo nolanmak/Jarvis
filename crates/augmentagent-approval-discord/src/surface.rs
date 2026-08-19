@@ -148,6 +148,8 @@ mod tests {
 
     fn email() -> Email {
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "m".into(),
             thread_id: None,
             from: "a@b.com".into(),

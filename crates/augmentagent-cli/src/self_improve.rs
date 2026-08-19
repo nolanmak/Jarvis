@@ -1164,6 +1164,8 @@ async fn post_pr_prompt(
 ) {
     let synthetic = ApprovalEmail {
         message_id: format!("agent-pr-run:{run_id}"),
+        to: String::new(),
+        cc: String::new(),
         thread_id: None,
         from: format!("agent · {}", repo.full_name),
         subject: format!(

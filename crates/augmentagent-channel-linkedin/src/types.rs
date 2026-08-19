@@ -51,6 +51,8 @@ impl Dm {
         let date = ms_to_rfc3339(self.delivered_at_ms);
         let account_entity_id = format!("linkedin:{my_urn}");
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: self.message_urn,
             thread_id: Some(self.conversation_urn),
             from,
@@ -104,6 +106,8 @@ impl FeedPost {
         let date = ms_to_rfc3339(self.created_at_ms);
         let account_entity_id = format!("linkedin:{my_urn}");
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: self.post_urn,
             thread_id: None,
             from,
@@ -143,6 +147,8 @@ impl PostComment {
         let date = ms_to_rfc3339(self.created_at_ms);
         let account_entity_id = format!("linkedin:{my_urn}");
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: self.comment_urn,
             // thread_id carries the parent post urn so a Reply is posted as a
             // sub-comment on the right activity.
@@ -191,6 +197,8 @@ impl Invitation {
             )
         };
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: self.invitation_urn.clone(),
             thread_id: Some(self.invitation_urn),
             from,
@@ -288,6 +296,8 @@ mod tests {
     #[test]
     fn is_linkedin_email_rejects_gmail() {
         let email = Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "m".into(),
             thread_id: None,
             from: "a@b.com".into(),

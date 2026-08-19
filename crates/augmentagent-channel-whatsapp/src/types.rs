@@ -116,6 +116,8 @@ impl WaMessage {
         };
         let from = format!("{} <whatsapp:{}>", display, self.sender.bare());
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: format!("wa:{}:{}", self.chat.bare(), self.id),
             thread_id: Some(self.chat.bare()),
             from,
@@ -288,6 +290,8 @@ mod tests {
     #[test]
     fn is_whatsapp_email_rejects_other_platforms() {
         let email = Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "m".into(),
             thread_id: None,
             from: "a@b.com".into(),

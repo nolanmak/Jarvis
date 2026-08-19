@@ -1179,6 +1179,73 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         block
     }
 
+    /// #629 — the reply-all Cc set for `email`: every participant seen on the
+    /// thread (From/To/Cc of each message), minus the addressee (`email.from`
+    /// goes on To) and minus every connected account of the owner's. Seeded
+    /// from the inbound message's own headers so a failed thread fetch — or a
+    /// retry row whose Email round-tripped through sqlite without headers —
+    /// degrades to plain reply-all-on-the-latest-message, never to a crash.
+    /// Bare addresses, first-seen order, case-insensitive dedup.
+    async fn reply_all_cc(
+        &self,
+        entity_id: &str,
+        email: &augmentagent_store::Email,
+    ) -> Vec<String> {
+        use crate::gmail::split_recipients;
+        fn push_addrs(
+            raw: &str,
+            seen: &mut std::collections::HashSet<String>,
+            out: &mut Vec<String>,
+        ) {
+            for addr in split_recipients(raw) {
+                if seen.insert(addr.to_ascii_lowercase()) {
+                    out.push(addr);
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        push_addrs(&email.to, &mut seen, &mut out);
+        push_addrs(&email.cc, &mut seen, &mut out);
+        if let Some(tid) = email.thread_id.as_deref() {
+            // The issue asks for ALL prior To+Cc participants, not just the
+            // latest message's — someone dropped from a recent hop (the Code
+            // N Camp case) must still be recoverable from earlier hops.
+            const MAX_PARTICIPANT_SCAN: u32 = 50;
+            match self
+                .gmail
+                .fetch_thread_messages(entity_id, tid, MAX_PARTICIPANT_SCAN)
+                .await
+            {
+                Ok(msgs) => {
+                    for m in &msgs {
+                        push_addrs(&m.from, &mut seen, &mut out);
+                        push_addrs(&m.to, &mut seen, &mut out);
+                        push_addrs(&m.cc, &mut seen, &mut out);
+                    }
+                }
+                Err(e) => warn!(
+                    message_id = %email.message_id,
+                    thread_id = %tid,
+                    "reply-all: thread participant fetch failed; \
+                     using the inbound message's headers only: {e}"
+                ),
+            }
+        }
+        let mut excluded: std::collections::HashSet<String> = std::collections::HashSet::new();
+        excluded.insert(crate::gmail::extract_bare_email(&email.from).to_ascii_lowercase());
+        match self.store.get_active_gmail_accounts() {
+            Ok(accounts) => {
+                for a in accounts {
+                    excluded.insert(a.email.to_ascii_lowercase());
+                }
+            }
+            Err(e) => warn!("reply-all: could not list own accounts for self-exclusion: {e}"),
+        }
+        out.retain(|a| !excluded.contains(&a.to_ascii_lowercase()));
+        out
+    }
+
     /// Non-blocking reply dispatch: create Gmail draft, log/update the action,
     /// post the approval card, return. The subsequent Approve / Revise / Skip
     /// is handled by the Discord event handler against the sqlite row.
@@ -1224,18 +1291,53 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             ),
         };
 
+        // #629 — replies default to reply-all: sender on To, every other
+        // thread participant on Cc. The envelope is computed once per action
+        // and persisted (`set_action_envelope`), so the retry tick reuses it
+        // instead of re-fetching the thread, and Revise (#473) recreates the
+        // draft with the same Cc instead of silently dropping it.
+        let cc: Vec<String> = match self.store.get_action_envelope(&action_id) {
+            Ok(Some(env)) => env
+                .cc
+                .as_deref()
+                .map(crate::gmail::split_recipients)
+                .unwrap_or_default(),
+            Ok(None) => {
+                let cc = self.reply_all_cc(entity_id, &email).await;
+                let to_bare = crate::gmail::extract_bare_email(&email.from);
+                if let Err(e) = self.store.set_action_envelope(
+                    &action_id,
+                    Some(&to_bare),
+                    Some(&cc.join(", ")),
+                    None,
+                ) {
+                    warn!(action_id, "reply-all: envelope persist failed: {e}");
+                }
+                cc
+            }
+            Err(e) => {
+                warn!(
+                    action_id,
+                    "reply-all: envelope lookup failed; drafting sender-only: {e}"
+                );
+                Vec::new()
+            }
+        };
+
         // The Gmail draft must be the clean reply text — strip any #35
         // needs-input marker (the marker is a Discord-card-only carrier; it
         // lives in `actions.draftBody` so the card can render the field, but
         // it must never reach Gmail). No marker ⇒ unchanged (pre-#35 bytes).
-        let gmail_body = augmentagent_approval_discord::split_needs_input(&initial_draft).0;
+        let (gmail_body, needs_input_asks) =
+            augmentagent_approval_discord::split_needs_input(&initial_draft);
         let draft_id = match existing_draft_id {
             Some(d) => d,
             None => match self
                 .gmail
-                .create_draft(
+                .create_draft_with_cc(
                     entity_id,
                     &email.from,
+                    &cc,
                     &reply_subject(&email.subject),
                     &gmail_body,
                     email.thread_id.as_deref(),
@@ -1258,9 +1360,30 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             },
         };
 
+        // Surface the Cc set on the card the same way #473 compose cards and
+        // their reposts do (`append_envelope_markers`): a `[cc: …]` display
+        // marker. Card-only — `draftBody` in sqlite and the Gmail draft both
+        // stay the clean reply text. The marker goes into the HUMAN part with
+        // any #35 needs-input marker re-appended last: `split_needs_input`
+        // (run by every card render) discards text after the marker close,
+        // so appending after it would make the cc invisible on the card.
+        let card_body = if cc.is_empty() {
+            initial_draft.clone()
+        } else {
+            let with_cc = format!("{gmail_body}\n\n[cc: {}]", cc.join(", "));
+            if needs_input_asks.is_empty() {
+                with_cc
+            } else {
+                let pairs: Vec<(String, String)> = needs_input_asks
+                    .iter()
+                    .map(|a| (a.kind.clone(), a.text.clone()))
+                    .collect();
+                augmentagent_approval_discord::append_needs_input_marker(&with_cc, &pairs)
+            }
+        };
         if let Err(e) = self
             .approvals
-            .post_approval(&action_id, &email, &initial_draft)
+            .post_approval(&action_id, &email, &card_body)
             .await
         {
             self.store.update_action_status(
@@ -1635,6 +1758,8 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m1".into(),
                 thread_id: None,
                 from: "noreply@foo.com".into(),
@@ -1669,9 +1794,11 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m2".into(),
                 thread_id: Some("t2".into()),
-                from: "user@client.com".into(),
+                from: "user@example.com".into(),
                 subject: "Question".into(),
                 body: "how do I...".into(),
                 date: "2026-04-13".into(),
@@ -1786,6 +1913,8 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-flag".into(),
                 thread_id: None,
                 from: "friend@edu.com".into(),
@@ -1831,6 +1960,8 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-skip".into(),
                 thread_id: None,
                 from: "noreply@marketing.com".into(),
@@ -1873,6 +2004,8 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-bot".into(),
                 thread_id: Some("t-bot".into()),
                 // Classic automated sender — `noreply@` local part on a
@@ -1935,6 +2068,8 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-event".into(),
                 thread_id: Some("t-event".into()),
                 // Partiful invite domain — matches the curated
@@ -2029,6 +2164,8 @@ mod tests {
             .unwrap();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-already".into(),
                 thread_id: Some("T-already".into()),
                 // Human sender — clears the is_human_sender guard so we
@@ -2088,6 +2225,8 @@ mod tests {
             .unwrap();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-fresh".into(),
                 thread_id: Some("T-fresh".into()),
                 from: "client@example.com".into(), // pii-ok: synthetic test fixture
@@ -2126,9 +2265,11 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m3".into(),
                 thread_id: Some("t3".into()),
-                from: "user@client.com".into(),
+                from: "user@example.com".into(),
                 subject: "Ping".into(),
                 body: "any update?".into(),
                 date: "2026-04-13".into(),
@@ -2166,6 +2307,276 @@ mod tests {
         let out2 = ch.poll_once().await.unwrap();
         assert_eq!(out2.awaiting_approval, 0);
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
+    }
+
+    /// #629 — Gmail stub modeling a thread with To/Cc participants; records
+    /// the Cc list handed to `create_draft_with_cc`.
+    struct ThreadedGmail {
+        emails: Vec<Email>,
+        thread: Vec<Email>,
+        thread_fetch_fails: bool,
+        recorded_cc: std::sync::Mutex<Option<(String, Vec<String>)>>,
+    }
+    #[async_trait]
+    impl GmailApi for ThreadedGmail {
+        async fn fetch_unread(
+            &self,
+            _e: &str,
+            _l: u32,
+        ) -> Result<Vec<Email>, crate::gmail::GmailError> {
+            Ok(self.emails.clone())
+        }
+        async fn fetch_with_query(
+            &self,
+            _e: &str,
+            _q: &str,
+            _l: u32,
+        ) -> Result<Vec<Email>, crate::gmail::GmailError> {
+            Ok(self.emails.clone())
+        }
+        async fn fetch_thread_messages(
+            &self,
+            _e: &str,
+            _t: &str,
+            _m: u32,
+        ) -> Result<Vec<Email>, crate::gmail::GmailError> {
+            if self.thread_fetch_fails {
+                Err(crate::gmail::GmailError::Composio {
+                    message: "thread fetch down".into(),
+                })
+            } else {
+                Ok(self.thread.clone())
+            }
+        }
+        async fn create_draft(
+            &self,
+            _e: &str,
+            _t: &str,
+            _s: &str,
+            _b: &str,
+            _th: Option<&str>,
+        ) -> Result<String, crate::gmail::GmailError> {
+            Ok("draft".into())
+        }
+        async fn create_draft_with_cc(
+            &self,
+            _e: &str,
+            to: &str,
+            cc: &[String],
+            _s: &str,
+            _b: &str,
+            _th: Option<&str>,
+        ) -> Result<String, crate::gmail::GmailError> {
+            *self.recorded_cc.lock().unwrap() = Some((to.to_string(), cc.to_vec()));
+            Ok("draft".into())
+        }
+        async fn send_draft(
+            &self,
+            _e: &str,
+            _d: &str,
+        ) -> Result<Option<String>, crate::gmail::GmailError> {
+            Ok(None)
+        }
+        async fn delete_draft(&self, _e: &str, _d: &str) -> Result<(), crate::gmail::GmailError> {
+            Ok(())
+        }
+    }
+
+    /// Broker capturing the card body so tests can assert display markers.
+    #[derive(Default)]
+    struct BodyRecordingBroker {
+        bodies: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl ApprovalBroker for BodyRecordingBroker {
+        async fn post_approval(
+            &self,
+            _action_id: &str,
+            _email: &Email,
+            draft: &str,
+        ) -> Result<(), augmentagent_approval_discord::ApprovalError> {
+            self.bodies.lock().unwrap().push(draft.to_string());
+            Ok(())
+        }
+        async fn post_flag_notice(
+            &self,
+            _email: &Email,
+            _reason: &str,
+        ) -> Result<(), augmentagent_approval_discord::ApprovalError> {
+            Ok(())
+        }
+    }
+
+    fn threaded_inbound() -> Email {
+        Email {
+            message_id: "m-ra".into(),
+            thread_id: Some("t-ra".into()),
+            from: "Matt Elder <matt@example.com>".into(),
+            to: "me@x.com, Will <will@example.com>".into(), // pii-ok: synthetic; matches tmp_store seed
+            cc: "zack@example.com".into(),
+            subject: "Receipts".into(),
+            body: "can you send those over?".into(),
+            date: "2026-08-17".into(),
+            account_entity_id: Some("acc1".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reply_defaults_to_reply_all_across_thread() {
+        let (store, _f) = tmp_store();
+        // An earlier hop of the thread carries a participant (chase, milan)
+        // who is absent from the latest message's headers — the exact shape
+        // that lost recipients before #629.
+        let mut earlier = threaded_inbound();
+        earlier.message_id = "m-ra0".into();
+        earlier.from = "chase@example.com".into();
+        earlier.to = "matt@example.com, me@x.com".into(); // pii-ok: synthetic; matches tmp_store seed
+        earlier.cc = "milan@example.com".into();
+        let gmail = Arc::new(ThreadedGmail {
+            emails: vec![threaded_inbound()],
+            thread: vec![earlier, threaded_inbound()],
+            thread_fetch_fails: false,
+            recorded_cc: std::sync::Mutex::new(None),
+        });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"asked"}"#,
+            "On it.",
+        ]));
+        let broker = Arc::new(BodyRecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail.clone(),
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.awaiting_approval, 1);
+
+        let (to, cc) = gmail.recorded_cc.lock().unwrap().clone().unwrap();
+        // Sender goes on To (full display form, as before)…
+        assert_eq!(to, "Matt Elder <matt@example.com>");
+        // …and Cc holds every other participant across the thread: the
+        // owner's own account (me@x.com, seeded in tmp_store) and the — pii-ok
+        // sender are excluded; order is first-seen; no duplicates.
+        assert_eq!(
+            cc,
+            vec![
+                "will@example.com".to_string(),
+                "zack@example.com".to_string(),
+                "chase@example.com".to_string(),
+                "milan@example.com".to_string(),
+            ]
+        );
+
+        // Card shows the Cc set as a #473-style display marker.
+        {
+            let bodies = broker.bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 1);
+            assert!(
+                bodies[0].contains("[cc: will@example.com, zack@example.com"),
+                "card body missing cc marker: {}",
+                bodies[0]
+            );
+        }
+
+        // The envelope is persisted so Revise (#473) and the retry tick
+        // rebuild the draft with the same Cc.
+        let (action_id, _, _, _) = store.oldest_pending_actions(1).unwrap().pop().unwrap();
+        let env = store.get_action_envelope(&action_id).unwrap().unwrap();
+        assert_eq!(env.to.as_deref(), Some("matt@example.com"));
+        assert_eq!(
+            env.cc.as_deref(),
+            Some("will@example.com, zack@example.com, chase@example.com, milan@example.com")
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_all_cc_marker_survives_a_needs_input_draft() {
+        // #35 needs-input drafts end with a marker, and split_needs_input
+        // (run by every card render) discards text after it — the [cc:]
+        // marker must land in the human part or it never shows on the card.
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(ThreadedGmail {
+            emails: vec![threaded_inbound()],
+            thread: vec![threaded_inbound()],
+            thread_fetch_fails: false,
+            recorded_cc: std::sync::Mutex::new(None),
+        });
+        let marked_draft = augmentagent_approval_discord::append_needs_input_marker(
+            "Happy to — what time works?",
+            &[("scheduling".to_string(), "meeting time".to_string())],
+        );
+        let broker = Arc::new(BodyRecordingBroker::default());
+        let ch = GmailChannel::new(
+            store,
+            gmail,
+            Arc::new(ScriptedReasoner::new([])),
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        // Drive dispatch_reply directly with the already-marked draft — the
+        // card construction under test lives there, and the upstream
+        // triage→draft→resolver chain would need a fully scripted resolver.
+        let out = ch
+            .dispatch_reply("acc1", threaded_inbound(), marked_draft, None)
+            .await
+            .unwrap();
+        assert!(matches!(out, Some(DispatchOutcome::AwaitingApproval)));
+        let bodies = broker.bodies.lock().unwrap();
+        let (human, asks) = augmentagent_approval_discord::split_needs_input(&bodies[0]);
+        assert!(
+            human.contains("[cc: will@example.com"),
+            "cc marker lost from rendered card body: {}",
+            bodies[0]
+        );
+        assert_eq!(asks.len(), 1, "needs-input ask lost: {}", bodies[0]);
+    }
+
+    #[tokio::test]
+    async fn reply_all_degrades_to_inbound_headers_when_thread_fetch_fails() {
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(ThreadedGmail {
+            emails: vec![threaded_inbound()],
+            thread: vec![],
+            thread_fetch_fails: true,
+            recorded_cc: std::sync::Mutex::new(None),
+        });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"asked"}"#,
+            "On it.",
+        ]));
+        let broker = Arc::new(BodyRecordingBroker::default());
+        let ch = GmailChannel::new(
+            store,
+            gmail.clone(),
+            reasoner,
+            broker,
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.awaiting_approval, 1);
+        let (_, cc) = gmail.recorded_cc.lock().unwrap().clone().unwrap();
+        // Thread history unavailable ⇒ still reply-all on the inbound
+        // message's own To+Cc (minus self), never a crash or sender-only.
+        assert_eq!(
+            cc,
+            vec!["will@example.com".to_string(), "zack@example.com".to_string()]
+        );
     }
 
     /// A Gmail stub that fails create_draft the first N times, then succeeds.
@@ -2220,9 +2631,11 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(FlakyGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-retry".into(),
                 thread_id: Some("t-retry".into()),
-                from: "user@client.com".into(),
+                from: "user@example.com".into(),
                 subject: "quick q".into(),
                 body: "free Thursday?".into(),
                 date: "2026-04-18".into(),
@@ -2286,6 +2699,8 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-blast".into(),
                 thread_id: Some("t-blast".into()),
                 from: "Brand <marketing@engage.examplebrand.com>".into(), // pii-ok: synthetic
@@ -2385,6 +2800,8 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-human".into(),
                 thread_id: Some("t-human".into()),
                 from: "Dana Rivera <dana@example-labs.ai>".into(), // pii-ok: synthetic
@@ -2535,9 +2952,11 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(CountingGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-broker-fail".into(),
                 thread_id: Some("t1".into()),
-                from: "user@client.com".into(),
+                from: "user@example.com".into(),
                 subject: "ping".into(),
                 body: "free Friday?".into(),
                 date: "2026-04-20".into(),
@@ -2607,6 +3026,8 @@ mod tests {
         // the realistic display-name form also exercises extract_bare.
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-529".into(),
                 thread_id: None,
                 from: "Royal Box Weekly <royalbox@substack.com>".into(), // pii-ok: synthetic substack fixture
@@ -2781,9 +3202,11 @@ mod tests {
     async fn channel_runner_handler_reply_flow_matches_poll_once() {
         let (store, _f) = tmp_store();
         let email = Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "cr-reply".into(),
             thread_id: Some("t-cr".into()),
-            from: "user@client.com".into(),
+            from: "user@example.com".into(),
             subject: "Ping".into(),
             body: "any update?".into(),
             date: "2026-05-18".into(),
@@ -2829,6 +3252,8 @@ mod tests {
     async fn channel_runner_handler_skip_and_flag_match_poll_once() {
         let (store, _f) = tmp_store();
         let skip_email = Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "cr-skip".into(),
             thread_id: None,
             from: "noreply@marketing.com".into(),
@@ -2840,6 +3265,8 @@ mod tests {
             kind: "dm".into(),
         };
         let flag_email = Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "cr-flag".into(),
             thread_id: None,
             from: "friend@edu.com".into(),
@@ -2962,9 +3389,11 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-cm-dryrun".into(),
                 thread_id: Some("t-cm".into()),
-                from: "user@client.com".into(),
+                from: "user@example.com".into(),
                 subject: "Quick q".into(),
                 body: "any update?".into(),
                 date: "2026-05-22".into(),
@@ -3060,9 +3489,11 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-cm-fallback".into(),
                 thread_id: Some("t-cm-fb".into()),
-                from: "user@client.com".into(),
+                from: "user@example.com".into(),
                 subject: "Ping".into(),
                 body: "u there?".into(),
                 date: "2026-05-22".into(),
@@ -3149,9 +3580,11 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-cm-repair-ok".into(),
                 thread_id: Some("t-cm-r".into()),
-                from: "user@client.com".into(),
+                from: "user@example.com".into(),
                 subject: "Re: postmortem".into(),
                 body: "still good?".into(),
                 date: "2026-05-22".into(),
@@ -3232,9 +3665,11 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                to: String::new(),
+                cc: String::new(),
                 message_id: "m-cm-repair-fail".into(),
                 thread_id: Some("t-cm-rf".into()),
-                from: "user@client.com".into(),
+                from: "user@example.com".into(),
                 subject: "Quick q".into(),
                 body: "thoughts?".into(),
                 date: "2026-05-22".into(),

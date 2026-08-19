@@ -103,6 +103,8 @@ mod tests {
 
     fn email(from: &str, thread_id: Option<&str>) -> Email {
         Email {
+            to: String::new(),
+            cc: String::new(),
             message_id: "m1".into(),
             thread_id: thread_id.map(str::to_string),
             from: from.into(),
