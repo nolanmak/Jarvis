@@ -6680,6 +6680,39 @@ async fn git_capture(dir: &std::path::Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The env-driven git identity every wiki-repo write commits with (G3 of
+/// #642: one identity, or GitHub contribution attribution breaks).
+fn wiki_git_identity() -> (String, String) {
+    let name = std::env::var("AUGMENTAGENT_GIT_AUTHOR_NAME")
+        .unwrap_or_else(|_| "AugmentAgent".to_string());
+    let email = std::env::var("AUGMENTAGENT_GIT_AUTHOR_EMAIL")
+        .unwrap_or_else(|_| "augmentagent@localhost".to_string());
+    (name, email)
+}
+
+/// `git_run` with the wiki identity injected via `-c user.name/-c user.email`.
+/// Required for any git verb that CREATES commits — `pull --rebase` replays
+/// local commits and needs a committer identity. Global git config is
+/// intentionally unset on the daemon host, so a bare rebase dies with
+/// "unable to auto-detect email address" the first time local and remote
+/// main diverge — turning every owner-side GitHub edit into a kb-conflict
+/// branch instead of the documented owner-wins resolution.
+async fn git_run_as_committer(dir: &std::path::Path, args: &[&str]) -> Result<bool> {
+    let (name, email) = wiki_git_identity();
+    let st = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("-c")
+        .arg(format!("user.name={name}"))
+        .arg("-c")
+        .arg(format!("user.email={email}"))
+        .args(args)
+        .status()
+        .await
+        .with_context(|| format!("spawn git {}", args.join(" ")))?;
+    Ok(st.success())
+}
+
 /// Push current HEAD to `origin/main`. If the remote moved under us
 /// (someone edited on GitHub between our fetch and push), re-pull
 /// owner-wins once and retry.
@@ -6692,7 +6725,9 @@ async fn wiki_sync_push(dir: &std::path::Path) -> Result<()> {
         if attempt == 0 {
             eprintln!("[wiki sync] push rejected (remote moved); re-pulling owner-wins and retrying");
             let _ = git_run(dir, &["fetch", "origin", "main"]).await;
-            let _ = git_run(dir, &["pull", "--rebase", "-X", "ours", "origin", "main"]).await;
+            let _ =
+                git_run_as_committer(dir, &["pull", "--rebase", "-X", "ours", "origin", "main"])
+                    .await;
         }
     }
     anyhow::bail!("wiki sync: push to origin/main failed after one retry");
@@ -6807,10 +6842,7 @@ async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
     }
 
     // 1. Stage + commit local changes.
-    let git_author_name = std::env::var("AUGMENTAGENT_GIT_AUTHOR_NAME")
-        .unwrap_or_else(|_| "AugmentAgent".to_string());
-    let git_author_email = std::env::var("AUGMENTAGENT_GIT_AUTHOR_EMAIL")
-        .unwrap_or_else(|_| "augmentagent@localhost".to_string());
+    let (git_author_name, git_author_email) = wiki_git_identity();
 
     if !dirty.is_empty() {
         if !git_run(&wiki_root, &["add", "-A"]).await? {
@@ -6857,7 +6889,7 @@ async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
     }
     let pre_pull_head = git_capture(&wiki_root, &["rev-parse", "HEAD"]).await?;
     let pre_pull_head = pre_pull_head.trim().to_string();
-    let pulled = git_run(
+    let pulled = git_run_as_committer(
         &wiki_root,
         &["pull", "--rebase", "-X", "ours", "origin", "main"],
     )
