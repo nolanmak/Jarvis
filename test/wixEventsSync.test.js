@@ -69,6 +69,19 @@ test("the same title at a different time is a different event", async () => {
   assert.equal(kept.length, 2, "a recurring series must not collapse to a single event");
 });
 
+test("a Wix event carrying the calendar suffix still matches a Meetup plan", async () => {
+  // Whichever source reached Wix first owns the stored title. Comparing
+  // strictly here would recreate the event from the other source.
+  const { isSameListing } = await import(syncUrl);
+  assert.equal(
+    isSameListing(
+      at(START, "Founder Junto Coworking"),
+      at(START, "Founder Junto Coworking - Philly Tech Entrepreneurs"),
+    ),
+    true,
+  );
+});
+
 test("a minute of clock skew still counts as the same event", async () => {
   const { isSameListing } = await import(syncUrl);
   assert.equal(isSameListing(at(START, "X"), at("2026-08-25T16:00:30.000Z", "X")), true);

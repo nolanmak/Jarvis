@@ -22,6 +22,7 @@
 // Exit codes: 0 ok · 1 runtime/network error · 3 feed shape changed
 
 const ICS_ENDPOINT = "https://api.lu.ma/ics/get";
+const FETCH_TIMEOUT_MS = 15_000;
 
 class FeedShapeChanged extends Error {}
 
@@ -135,7 +136,11 @@ function normalize(raw, calName) {
 
 export async function fetchCalendar(calendarId) {
   const url = `${ICS_ENDPOINT}?entity=calendar&id=${encodeURIComponent(calendarId)}`;
-  const res = await fetch(url, { headers: { accept: "text/calendar" } });
+  // A hung request must not wedge the unattended timer job.
+  const res = await fetch(url, {
+    headers: { accept: "text/calendar" },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
   if (!res.ok) throw new Error(`lu.ma returned ${res.status} for ${calendarId}`);
 
   const text = await res.text();
@@ -157,7 +162,16 @@ async function main() {
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--json") json = true;
-    else if (a === "--limit") limit = Number(argv[++i]);
+    else if (a === "--limit") {
+      // Number("abc") is NaN and slice(0, NaN) silently yields nothing — the
+      // exact "looks like an empty calendar" failure this mirror guards against.
+      const raw = argv[++i];
+      limit = Number(raw);
+      if (!Number.isSafeInteger(limit) || limit < 0) {
+        console.error(`--limit must be a non-negative whole number, got "${raw}"`);
+        process.exit(1);
+      }
+    }
     else if (!a.startsWith("--") && !calendarId) calendarId = a;
     else { console.error(`Unknown option: ${a}`); process.exit(1); }
   }

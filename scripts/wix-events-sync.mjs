@@ -231,13 +231,18 @@ export function dedupeAcrossSources(planned) {
   return kept;
 }
 
-/** Same title, start within a minute — tolerant of Wix echoing a different ISO form. */
+/**
+ * Uses the same containment rule as cross-source dedupe, deliberately. An
+ * event already on Wix may have been created from whichever source got there
+ * first, so it can carry Luma's calendar-name suffix while today's plan came
+ * from Meetup without it. Comparing titles strictly here would let exactly the
+ * duplicate this job exists to prevent through.
+ */
 function alreadyOnWix(planned, existing) {
   return existing.some((e) => {
-    if (normalizeTitle(e.title) !== normalizeTitle(planned.title)) return false;
     const start = e.dateAndTimeSettings?.startDate;
     if (!start) return false;
-    return Math.abs(Date.parse(start) - Date.parse(planned.startDate)) < 60_000;
+    return isSameListing(planned, { title: e.title, startDate: start });
   });
 }
 
@@ -310,7 +315,12 @@ async function main() {
       .filter((p) => Date.parse(p.startDate) >= now.getTime() && Date.parse(p.startDate) <= until.getTime())
       .sort((a, b) => Date.parse(a.startDate) - Date.parse(b.startDate)),
   );
-  const crossPosted = planned.length - inWindow.length;
+  // Count only what dedupe collapsed — subtracting from `planned` would also
+  // include everything the date window dropped.
+  const windowed = planned.filter(
+    (p) => Date.parse(p.startDate) >= now.getTime() && Date.parse(p.startDate) <= until.getTime(),
+  );
+  const crossPosted = windowed.length - inWindow.length;
 
   const headers = wixHeaders();
   const existing =
