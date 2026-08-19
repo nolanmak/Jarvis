@@ -22,7 +22,7 @@ use crate::broker::BrokerState;
 use crate::custom_id::{CustomId, Verb};
 use crate::layout::{
     approval_message, extract_feedback, extract_fill_values, fill_ask_modal, fill_feedback,
-    revise_modal, split_needs_input,
+    revise_modal, schedule_modal, split_needs_input, SCHEDULE_CUSTOM_VALUE,
 };
 use crate::ApprovalActionOutcome;
 
@@ -546,7 +546,127 @@ impl EventHandler for Handler {
                             }
                         });
                     }
-                    Verb::ReviseModal | Verb::FillAskModal => {
+                    Verb::SchedulePick => {
+                        // Schedule select on the card (#501). The symbolic
+                        // value is resolved to epoch-ms at CLICK time —
+                        // cards sit for hours/days, so render-time
+                        // resolution would drift.
+                        let selected = match &comp.data.kind {
+                            serenity::all::ComponentInteractionDataKind::StringSelect {
+                                values,
+                            } => values.first().cloned(),
+                            _ => None,
+                        };
+                        let Some(token) = selected else {
+                            debug!("schedule_pick: no option selected");
+                            return;
+                        };
+                        if token == SCHEDULE_CUSTOM_VALUE {
+                            // "Custom…" opens the free-text modal — a Modal
+                            // response to a select interaction is legal in
+                            // serenity 0.12 (same shape as Revise). Known
+                            // cosmetic artifact: dismissing the modal leaves
+                            // the select displaying "Custom…"; re-picking
+                            // still works.
+                            let modal = schedule_modal(&cid.action_id);
+                            if let Err(e) = comp
+                                .create_response(
+                                    &ctx.http,
+                                    CreateInteractionResponse::Modal(modal),
+                                )
+                                .await
+                            {
+                                warn!("failed to open schedule modal: {e}");
+                            }
+                            return;
+                        }
+                        let at_ms = match crate::timeparse::resolve_token(
+                            &token,
+                            chrono::Local::now(),
+                        ) {
+                            Ok(v) => v,
+                            Err(msg) => {
+                                ack_ephemeral(&ctx, &comp, &msg).await;
+                                return;
+                            }
+                        };
+                        // Defer: the handler does store CAS + a Discord
+                        // notice post — too slow for the 3s ack budget.
+                        if let Err(e) = defer_ephemeral(&ctx, &comp).await {
+                            warn!("failed to defer SchedulePick: {e}");
+                            return;
+                        }
+                        let handler = self.state.action_handler.clone();
+                        let action_id = cid.action_id.clone();
+                        let ctx_clone = ctx.clone();
+                        let comp_clone = comp.clone();
+                        tokio::spawn(async move {
+                            let outcome = match handler {
+                                Some(h) => h.schedule(&action_id, at_ms).await,
+                                None => ApprovalActionOutcome::Failed {
+                                    message: "no action handler configured".into(),
+                                },
+                            };
+                            followup(&ctx_clone, &comp_clone, &describe(&outcome)).await;
+                            // The handler posted the scheduled notice; the
+                            // actionable card is now retired (Scheduled) or
+                            // was already stale (AlreadyResolved). The
+                            // carousel advance happens on the handler side.
+                            if should_delete_card_after_schedule(&outcome) {
+                                delete_source_message(
+                                    &ctx_clone,
+                                    comp_clone.channel_id,
+                                    comp_clone.message.id,
+                                    &action_id,
+                                )
+                                .await;
+                            }
+                        });
+                    }
+                    Verb::SendNow | Verb::CancelSchedule | Verb::BackToQueue => {
+                        // Scheduled-notice buttons (#501). Defer first —
+                        // Send Now runs a full Composio send; Cancel and
+                        // Back-to-queue do Gmail/store round-trips.
+                        if let Err(e) = defer_ephemeral(&ctx, &comp).await {
+                            warn!("failed to defer {:?}: {e}", cid.verb);
+                            return;
+                        }
+                        let verb = cid.verb;
+                        let handler = self.state.action_handler.clone();
+                        let action_id = cid.action_id.clone();
+                        let ctx_clone = ctx.clone();
+                        let comp_clone = comp.clone();
+                        tokio::spawn(async move {
+                            let outcome = match handler {
+                                Some(h) => match verb {
+                                    Verb::SendNow => h.send_now(&action_id).await,
+                                    Verb::CancelSchedule => {
+                                        h.cancel_schedule(&action_id).await
+                                    }
+                                    _ => h.back_to_queue(&action_id).await,
+                                },
+                                None => ApprovalActionOutcome::Failed {
+                                    message: "no action handler configured".into(),
+                                },
+                            };
+                            followup(&ctx_clone, &comp_clone, &describe(&outcome)).await;
+                            // The interaction's own message IS the notice
+                            // for these verbs — remove it once the schedule
+                            // left the scheduled state. Quiet best-effort:
+                            // the handler usually already deleted it via the
+                            // stored pointers.
+                            if should_delete_notice(&outcome) {
+                                delete_notice_message(
+                                    &ctx_clone,
+                                    comp_clone.channel_id,
+                                    comp_clone.message.id,
+                                    &action_id,
+                                )
+                                .await;
+                            }
+                        });
+                    }
+                    Verb::ReviseModal | Verb::FillAskModal | Verb::ScheduleModal => {
                         debug!("unexpected modal verb on component interaction");
                     }
                 }
@@ -555,7 +675,10 @@ impl EventHandler for Handler {
                 let Some(cid) = CustomId::parse(&modal.data.custom_id) else {
                     return;
                 };
-                if !matches!(cid.verb, Verb::ReviseModal | Verb::FillAskModal) {
+                if !matches!(
+                    cid.verb,
+                    Verb::ReviseModal | Verb::FillAskModal | Verb::ScheduleModal
+                ) {
                     return;
                 }
                 if !is_authorized(self.state.allowed_user_id, modal.user.id) {
@@ -584,6 +707,55 @@ impl EventHandler for Handler {
                     .await
                 {
                     warn!("failed to defer modal submit: {e}");
+                    return;
+                }
+
+                // #501 — custom-time schedule modal: parse the free text,
+                // then the same `handler.schedule` path as a select pick.
+                // Parse failure is an ephemeral followup and the card stays.
+                if matches!(cid.verb, Verb::ScheduleModal) {
+                    let input = extract_feedback(&modal.data.components).unwrap_or_default();
+                    let handler = self.state.action_handler.clone();
+                    let action_id = cid.action_id.clone();
+                    let ctx_clone = ctx.clone();
+                    let modal_clone = modal.clone();
+                    tokio::spawn(async move {
+                        let at_ms = match crate::timeparse::parse_send_at(
+                            &input,
+                            chrono::Local::now(),
+                        ) {
+                            Ok(v) => v,
+                            Err(msg) => {
+                                modal_followup(&ctx_clone, &modal_clone, &msg, &action_id)
+                                    .await;
+                                return;
+                            }
+                        };
+                        let outcome = match handler {
+                            Some(h) => h.schedule(&action_id, at_ms).await,
+                            None => ApprovalActionOutcome::Failed {
+                                message: "no action handler configured".into(),
+                            },
+                        };
+                        modal_followup(
+                            &ctx_clone,
+                            &modal_clone,
+                            &describe(&outcome),
+                            &action_id,
+                        )
+                        .await;
+                        if should_delete_card_after_schedule(&outcome) {
+                            if let Some(src) = modal_clone.message.as_ref() {
+                                delete_source_message(
+                                    &ctx_clone,
+                                    modal_clone.channel_id,
+                                    src.id,
+                                    &action_id,
+                                )
+                                .await;
+                            }
+                        }
+                    });
                     return;
                 }
 
@@ -863,7 +1035,88 @@ fn describe(outcome: &ApprovalActionOutcome) -> String {
         ApprovalActionOutcome::Approved => "Approved — sending.".into(),
         ApprovalActionOutcome::Skipped => "Skipped — draft discarded.".into(),
         ApprovalActionOutcome::Revised { .. } => "Revising — new draft posted below.".into(),
+        ApprovalActionOutcome::Scheduled { local, .. } => {
+            format!("Scheduled — sends {local}.")
+        }
+        ApprovalActionOutcome::Unscheduled => {
+            "Back in the queue — approval card reposted.".into()
+        }
+        ApprovalActionOutcome::CancelledSchedule => {
+            "Schedule cancelled — draft discarded.".into()
+        }
         ApprovalActionOutcome::Failed { message } => format!("Failed: {message}"),
+    }
+}
+
+/// Ephemeral followup on a deferred MODAL interaction (#501). Mirror of
+/// [`followup`] for the component shape.
+async fn modal_followup(
+    ctx: &Context,
+    modal: &serenity::all::ModalInteraction,
+    message: &str,
+    action_id: &str,
+) {
+    if let Err(e) = modal
+        .create_followup(
+            &ctx.http,
+            CreateInteractionResponseFollowup::new()
+                .content(message)
+                .ephemeral(true),
+        )
+        .await
+    {
+        warn!(action_id = %action_id, "schedule modal: followup failed: {e}");
+    }
+}
+
+/// Should the ACTIONABLE CARD be deleted after a schedule attempt (#501)?
+/// Scheduled: the notice replaces it. AlreadyResolved: stale by definition.
+/// Failed (guard rejection, CAS error): keep the card so the owner can pick
+/// a different time.
+fn should_delete_card_after_schedule(outcome: &ApprovalActionOutcome) -> bool {
+    matches!(
+        outcome,
+        ApprovalActionOutcome::Scheduled { .. }
+            | ApprovalActionOutcome::AlreadyResolved { .. }
+    )
+}
+
+/// Should the SCHEDULED NOTICE be deleted after this outcome (#501)?
+/// Approved (Send Now fired) / CancelledSchedule / Unscheduled: the schedule
+/// is gone either way. AlreadyResolved: only when the fresh status says the
+/// schedule is genuinely dead — a Send Now double-click loser sees
+/// `AlreadyResolved{"sending"}` while the winner is mid-send, and deleting
+/// the notice then would remove the only surface showing a send is in
+/// flight (#501 review); `"scheduled"` likewise means still live. Failed /
+/// NotFound: keep it so the owner can retry or investigate — same
+/// philosophy as [`should_delete_source`].
+fn should_delete_notice(outcome: &ApprovalActionOutcome) -> bool {
+    match outcome {
+        ApprovalActionOutcome::Approved
+        | ApprovalActionOutcome::CancelledSchedule
+        | ApprovalActionOutcome::Unscheduled => true,
+        ApprovalActionOutcome::AlreadyResolved { status } => {
+            status != "scheduled" && status != "sending"
+        }
+        _ => false,
+    }
+}
+
+/// Best-effort delete of the scheduled-notice message an interaction rode in
+/// on (#501). Logged at debug, not warn: the handler usually already deleted
+/// it via the stored pointers, so "Unknown Message" here is the expected
+/// case, not a problem.
+async fn delete_notice_message(
+    ctx: &Context,
+    channel_id: ChannelId,
+    message_id: MessageId,
+    action_id: &str,
+) {
+    if let Err(e) = channel_id.delete_message(&ctx.http, message_id).await {
+        debug!(
+            action_id = %action_id,
+            "scheduled notice already gone or delete failed: {e}"
+        );
     }
 }
 
@@ -872,8 +1125,9 @@ fn describe(outcome: &ApprovalActionOutcome) -> String {
 /// `[bcc: …]`). `[to:]` is shown only when it differs from `card_from` (the
 /// card's From line), matching compose-time behavior. No store or no
 /// recorded envelope (auto-triage replies, non-gmail platforms) → the body
-/// passes through unchanged.
-fn append_envelope_markers(
+/// passes through unchanged. Public since #501: the Back-to-queue repost in
+/// the CLI reuses it so the reposted card matches the Revise repost exactly.
+pub fn append_envelope_markers(
     body: String,
     store: Option<&augmentagent_store::Store>,
     action_id: &str,
@@ -933,9 +1187,15 @@ async fn delete_source_message(
 }
 
 /// On startup, scan the most recent ~100 messages in the approval channel and
-/// delete any approval cards whose underlying action is already resolved
-/// (sent / rejected / etc). This handles cards left over from prior runs or
-/// from interactions that crashed before the active-path cleanup ran.
+/// delete our stale messages. Verb-aware since #501, because two message
+/// kinds now live in the channel:
+///
+/// - **Actionable cards** (Approve verb family): stale once the action is
+///   resolved (status ≠ pending) — unchanged behavior.
+/// - **Scheduled notices** (SendNow/CancelSchedule/BackToQueue): stale once
+///   the action is NOT scheduled/sending. Without this split the old sweep
+///   would delete every live notice at restart, while a blanket
+///   scheduled-exemption would instead immortalize leftover actionable cards.
 async fn sweep_resolved_cards(
     ctx: &Context,
     channel_id: ChannelId,
@@ -959,11 +1219,16 @@ async fn sweep_resolved_cards(
         if msg.author.id != bot_user_id {
             continue;
         }
-        let Some(action_id) = action_id_from_message(&msg) else {
+        let Some((action_id, kind)) = action_id_from_message(&msg) else {
             continue;
         };
         scanned += 1;
-        if !handler.is_resolved(&action_id).await {
+        let stale = sweep_should_delete(
+            kind,
+            handler.is_resolved(&action_id).await,
+            handler.is_schedule_live(&action_id).await,
+        );
+        if !stale {
             continue;
         }
         if let Err(e) = channel_id.delete_message(&ctx.http, msg.id).await {
@@ -982,22 +1247,60 @@ async fn sweep_resolved_cards(
     );
 }
 
-/// Walk a message's components looking for the first parseable content-draft
-/// `custom_id`. Returns the `action_id` if found; `None` for any message that
-/// isn't one of our cards.
-fn action_id_from_message(msg: &Message) -> Option<String> {
+/// Which of our two message kinds a bot message is (#501). Determines the
+/// staleness rule the startup sweep applies to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweptKind {
+    /// Actionable approval card — carries the Approve verb family.
+    Card,
+    /// Scheduled notice — carries SendNow/CancelSchedule/BackToQueue.
+    Notice,
+}
+
+/// The sweep's delete decision, pure so the kind × status matrix is unit
+/// testable: cards die when resolved; notices die when the schedule is no
+/// longer live (not `scheduled`/`sending`).
+fn sweep_should_delete(kind: SweptKind, is_resolved: bool, schedule_live: bool) -> bool {
+    match kind {
+        SweptKind::Card => is_resolved,
+        SweptKind::Notice => !schedule_live,
+    }
+}
+
+/// Walk a message's components looking for the first parseable `aa:`
+/// button `custom_id` that identifies a message kind. Returns the
+/// `(action_id, kind)` pair if found; `None` for any message that isn't one
+/// of ours.
+fn action_id_from_message(msg: &Message) -> Option<(String, SweptKind)> {
     for row in &msg.components {
         for component in &row.components {
             if let ActionRowComponent::Button(button) = component {
                 if let ButtonKind::NonLink { custom_id, .. } = &button.data {
-                    if let Some(parsed) = crate::custom_id::CustomId::parse(custom_id) {
-                        return Some(parsed.action_id);
+                    if let Some(classified) = classify_custom_id(custom_id) {
+                        return Some(classified);
                     }
                 }
             }
         }
     }
     None
+}
+
+/// Classify one `aa:` custom_id into the message kind it implies (#501).
+/// `None` for unparseable ids and for verbs that never ride on a message
+/// button (select/modal verbs), so a stray one can't misclassify a message.
+fn classify_custom_id(raw: &str) -> Option<(String, SweptKind)> {
+    let parsed = crate::custom_id::CustomId::parse(raw)?;
+    let kind = match parsed.verb {
+        Verb::Approve | Verb::Revise | Verb::Skip | Verb::FillAsk => SweptKind::Card,
+        Verb::SendNow | Verb::CancelSchedule | Verb::BackToQueue => SweptKind::Notice,
+        Verb::ReviseModal
+        | Verb::FillAskModal
+        | Verb::QuickRefine
+        | Verb::SchedulePick
+        | Verb::ScheduleModal => return None,
+    };
+    Some((parsed.action_id, kind))
 }
 
 /// Soft cap on how much of a text file we feed into the prompt. Files larger
@@ -1889,6 +2192,97 @@ mod tests {
         );
         // No store wired at all.
         assert_eq!(append_envelope_markers("body".into(), None, &id, "a@b.com"), "body");
+    }
+
+    // ---- #501: verb-aware startup sweep ----
+
+    #[test]
+    fn classify_custom_id_maps_verb_families() {
+        // Approve verb family → actionable card.
+        for v in ["approve", "revise", "skip", "fill_ask"] {
+            let (id, kind) = classify_custom_id(&format!("aa:a1:{v}")).unwrap();
+            assert_eq!(id, "a1");
+            assert_eq!(kind, SweptKind::Card, "{v} must classify as Card");
+        }
+        // Notice verb family → scheduled notice.
+        for v in ["send_now", "cancel_schedule", "back_to_queue"] {
+            let (id, kind) = classify_custom_id(&format!("aa:a2:{v}")).unwrap();
+            assert_eq!(id, "a2");
+            assert_eq!(kind, SweptKind::Notice, "{v} must classify as Notice");
+        }
+        // Select/modal verbs never identify a message kind.
+        for v in [
+            "quick_refine",
+            "schedule_pick",
+            "schedule_modal",
+            "revise_modal",
+            "fill_ask_modal",
+        ] {
+            assert!(classify_custom_id(&format!("aa:a3:{v}")).is_none());
+        }
+        // Foreign ids don't classify.
+        assert!(classify_custom_id("other:a4:approve").is_none());
+    }
+
+    #[test]
+    fn sweep_matrix_cards_die_when_resolved_notices_when_schedule_dead() {
+        // Actionable card: only the resolved flag matters.
+        assert!(!sweep_should_delete(SweptKind::Card, false, false));
+        assert!(!sweep_should_delete(SweptKind::Card, false, true));
+        assert!(sweep_should_delete(SweptKind::Card, true, false));
+        assert!(sweep_should_delete(SweptKind::Card, true, true));
+        // Scheduled notice: only schedule liveness matters — a notice for a
+        // live scheduled/sending row survives restart, everything else dies
+        // (including pending: a back-to-queue'd row's notice is stale).
+        assert!(sweep_should_delete(SweptKind::Notice, false, false));
+        assert!(sweep_should_delete(SweptKind::Notice, true, false));
+        assert!(!sweep_should_delete(SweptKind::Notice, false, true));
+        assert!(!sweep_should_delete(SweptKind::Notice, true, true));
+    }
+
+    // ---- #501: outcome → message-cleanup decisions ----
+
+    #[test]
+    fn notice_deletion_covers_terminal_outcomes_only() {
+        assert!(should_delete_notice(&ApprovalActionOutcome::Approved));
+        assert!(should_delete_notice(&ApprovalActionOutcome::CancelledSchedule));
+        assert!(should_delete_notice(&ApprovalActionOutcome::Unscheduled));
+        assert!(should_delete_notice(&ApprovalActionOutcome::AlreadyResolved {
+            status: "sent".into()
+        }));
+        // A double-click loser while the schedule is still live (armed, or
+        // the winner mid-send) must NOT take the notice down (#501 review).
+        assert!(!should_delete_notice(&ApprovalActionOutcome::AlreadyResolved {
+            status: "sending".into()
+        }));
+        assert!(!should_delete_notice(&ApprovalActionOutcome::AlreadyResolved {
+            status: "scheduled".into()
+        }));
+        assert!(!should_delete_notice(&ApprovalActionOutcome::Failed {
+            message: "x".into()
+        }));
+        assert!(!should_delete_notice(&ApprovalActionOutcome::NotFound));
+    }
+
+    #[test]
+    fn card_deletion_after_schedule_keeps_failed_cards() {
+        assert!(should_delete_card_after_schedule(
+            &ApprovalActionOutcome::Scheduled {
+                at_ms: 1,
+                local: "t".into()
+            }
+        ));
+        assert!(should_delete_card_after_schedule(
+            &ApprovalActionOutcome::AlreadyResolved {
+                status: "scheduled".into()
+            }
+        ));
+        // A guard rejection must leave the card so the owner picks again.
+        assert!(!should_delete_card_after_schedule(
+            &ApprovalActionOutcome::Failed {
+                message: "too soon".into()
+            }
+        ));
     }
 
     #[test]

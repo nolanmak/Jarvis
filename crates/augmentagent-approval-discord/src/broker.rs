@@ -5,14 +5,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serenity::all::{ChannelId, GatewayIntents, UserId};
+use serenity::all::{ChannelId, GatewayIntents, MessageId, UserId};
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 use augmentagent_store::{Email, Store};
 
 use crate::event_handler::Handler;
-use crate::layout::{approval_message, flag_notice_message};
+use crate::layout::{approval_message, flag_notice_message, scheduled_notice_message};
 use crate::loops::LoopCommandParser;
 use crate::{ApprovalActionHandler, ApprovalBroker, ApprovalError, QueryHandler};
 
@@ -205,5 +205,55 @@ impl ApprovalBroker for DiscordApprovalBroker {
             .await
             .map_err(|e| ApprovalError::Discord(e.to_string()))?;
         Ok(())
+    }
+
+    async fn post_scheduled_notice(
+        &self,
+        action_id: &str,
+        email: &Email,
+        sends_at_local: &str,
+        to_display: &str,
+    ) -> Result<Option<(u64, u64)>, ApprovalError> {
+        // Same approval channel as the cards — the notice IS the card's
+        // replacement in the carousel (#501). The returned ids are persisted
+        // by the caller so the engine can retire the notice at fire time.
+        let message =
+            scheduled_notice_message(action_id, email, sends_at_local, to_display);
+        let sent = self
+            .channel_id
+            .send_message(&*self.http, message)
+            .await
+            .map_err(|e| ApprovalError::Discord(e.to_string()))?;
+        Ok(Some((sent.channel_id.get(), sent.id.get())))
+    }
+
+    async fn post_approval_card(
+        &self,
+        action_id: &str,
+        email: &Email,
+        draft: &str,
+        redraft_count: u32,
+    ) -> Result<Option<(u64, u64)>, ApprovalError> {
+        // Back-to-queue repost (#501): honor the persisted redraft count so
+        // a refined-to-cap card doesn't get its quick-refine row back, and
+        // return the ids so the caller can roll the post back on a lost CAS.
+        let message = approval_message(action_id, email, draft, i64::from(redraft_count));
+        let sent = self
+            .channel_id
+            .send_message(&*self.http, message)
+            .await
+            .map_err(|e| ApprovalError::Discord(e.to_string()))?;
+        Ok(Some((sent.channel_id.get(), sent.id.get())))
+    }
+
+    async fn delete_message(
+        &self,
+        channel_id: u64,
+        message_id: u64,
+    ) -> Result<(), ApprovalError> {
+        ChannelId::new(channel_id)
+            .delete_message(&*self.http, MessageId::new(message_id))
+            .await
+            .map_err(|e| ApprovalError::Discord(e.to_string()))
     }
 }

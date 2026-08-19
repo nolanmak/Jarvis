@@ -229,7 +229,32 @@ pub fn approval_message(
     if !at_cap {
         rows.push(quick_refine_row(action_id));
     }
+    // #501 — the Schedule select, last and independent of the `!at_cap`
+    // gate above: an at-cap card must still be schedulable. Offered only on
+    // cards the scheduled pipeline can actually fire (a deferred Gmail
+    // send_draft) — the handler refuses non-email schedules too, but the
+    // control shouldn't be rendered where it can only fail (#501 review).
+    // Worst case is 4 of Discord's 5 rows (buttons + FillAsk + QuickRefine +
+    // Schedule) — comfortably inside the row budget.
+    if is_schedulable(email) {
+        rows.push(schedule_row(action_id));
+    }
     CreateMessage::new().embed(embed).components(rows)
+}
+
+/// #501 — can this card's action ride the scheduled-send pipeline? Only the
+/// Gmail fallthrough path in `run_approve` can: platform `gmail` and not a
+/// LinkedIn-entity row (LinkedIn reuses platform `gmail` on legacy rows and
+/// is identified by its `linkedin:` account-entity prefix — kept as a local
+/// literal because the dep edge to `augmentagent-channel-linkedin` runs the
+/// other way, mirroring `ACCOUNT_PREFIX` there).
+fn is_schedulable(email: &Email) -> bool {
+    email.platform == "gmail"
+        && !email
+            .account_entity_id
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("linkedin:")
 }
 
 /// One bullet per unresolved ask for the card field.
@@ -338,6 +363,90 @@ fn quick_refine_row(action_id: &str) -> CreateActionRow {
     CreateActionRow::SelectMenu(menu)
 }
 
+/// Select value that opens the custom-time modal instead of resolving to a
+/// concrete offset (#501). Kept as a named constant so the event handler's
+/// branch and the option list below can't drift apart.
+pub const SCHEDULE_CUSTOM_VALUE: &str = "custom";
+
+/// The Schedule select's options: label → SYMBOLIC value (#501). Values are
+/// resolved to epoch-ms at CLICK time by `timeparse::resolve_token`, never at
+/// render time — cards sit for hours/days, and a render-time "in 1 hour"
+/// would be stale by the time it's picked.
+const SCHEDULE_OPTIONS: &[(&str, &str)] = &[
+    ("In 1 hour", "in1h"),
+    ("In 3 hours", "in3h"),
+    ("Tonight 7pm", "tonight-1900"),
+    ("Tomorrow 9am", "tomorrow-0900"),
+    ("Tomorrow 2pm", "tomorrow-1400"),
+    ("Next Monday 9am", "next-monday-0900"),
+    ("Custom…", SCHEDULE_CUSTOM_VALUE),
+];
+
+/// The "Schedule send…" `StringSelect` action row (#501). Attached to EVERY
+/// approval card (including at-cap re-renders — see `approval_message`).
+fn schedule_row(action_id: &str) -> CreateActionRow {
+    let options: Vec<CreateSelectMenuOption> = SCHEDULE_OPTIONS
+        .iter()
+        .map(|(label, value)| CreateSelectMenuOption::new(*label, *value))
+        .collect();
+    let menu = CreateSelectMenu::new(
+        CustomId::new(action_id, Verb::SchedulePick).to_string(),
+        CreateSelectMenuKind::String { options },
+    )
+    .placeholder("Schedule send…")
+    .min_values(1)
+    .max_values(1);
+    CreateActionRow::SelectMenu(menu)
+}
+
+/// Compact scheduled-notice message (#501) — the card's replacement once a
+/// schedule is armed. Deliberately NOT an approval card: it must never carry
+/// Approve/Revise/Skip (the draft is already approved-for-later), only the
+/// three schedule escape hatches. `to_display` is the actual send target the
+/// caller resolved — the #473 envelope To when one was recorded, else the
+/// card's From line — so an overridden routing (intro pattern) shows the
+/// real recipient, not the reply-to.
+pub fn scheduled_notice_message(
+    action_id: &str,
+    email: &Email,
+    sends_at_local: &str,
+    to_display: &str,
+) -> CreateMessage {
+    let embed = CreateEmbed::new()
+        .title(truncate(&email.subject, 256))
+        .field("To", truncate(to_display, 256), true)
+        .field("Sends", truncate(sends_at_local, 256), true)
+        .footer(CreateEmbedFooter::new("AugmentAgent scheduled send"));
+    let buttons = CreateActionRow::Buttons(vec![
+        CreateButton::new(CustomId::new(action_id, Verb::SendNow).to_string())
+            .label("Send Now")
+            .style(ButtonStyle::Success),
+        CreateButton::new(CustomId::new(action_id, Verb::BackToQueue).to_string())
+            .label("Back to queue")
+            .style(ButtonStyle::Secondary),
+        CreateButton::new(CustomId::new(action_id, Verb::CancelSchedule).to_string())
+            .label("Cancel")
+            .style(ButtonStyle::Danger),
+    ]);
+    CreateMessage::new().embed(embed).components(vec![buttons])
+}
+
+/// Custom-time modal opened by the `custom` schedule token (#501). One short
+/// text input; the placeholder doubles as the format cheat-sheet. Known
+/// cosmetic artifact: dismissing the modal leaves the select displaying
+/// "Custom…" — re-picking still works.
+pub fn schedule_modal(action_id: &str) -> CreateModal {
+    let input = CreateInputText::new(InputTextStyle::Short, "When?", "when")
+        .required(true)
+        .placeholder("tomorrow 9am / fri 14:30 / in 3h / 2026-09-01 09:00")
+        .max_length(100);
+    CreateModal::new(
+        CustomId::new(action_id, Verb::ScheduleModal).to_string(),
+        "Schedule send",
+    )
+    .components(vec![CreateActionRow::InputText(input)])
+}
+
 pub fn revise_modal(action_id: &str, previous_feedback: Option<&str>) -> CreateModal {
     let input = CreateInputText::new(InputTextStyle::Paragraph, "Revision feedback", "feedback")
         .required(true)
@@ -414,7 +523,7 @@ mod tests {
         Email {
             message_id: "m1".into(),
             thread_id: Some("t1".into()),
-            from: "a@b.com".into(),
+            from: "peer@example.com".into(),
             subject: "Re: hi".into(),
             body: "the inbound message".into(),
             date: "2026-05-18T00:00:00Z".into(),
@@ -567,6 +676,131 @@ mod tests {
         assert!(fb.contains("drive.google.com/file/Q4"));
         assert!(fb.contains("Introduction"));
         assert!(fb.contains("Sarah Chen"));
+    }
+
+    // ---------------------------------------------------------------------
+    // #501: schedule row / scheduled notice / custom-time modal.
+    // ---------------------------------------------------------------------
+
+    /// Count action rows in a serialized CreateMessage.
+    fn row_count(m: &CreateMessage) -> usize {
+        let v: serde_json::Value =
+            serde_json::from_str(&json(m)).expect("card json parses");
+        v["components"].as_array().map(|a| a.len()).unwrap_or(0)
+    }
+
+    #[test]
+    fn schedule_row_is_unconditional_even_at_cap() {
+        // At the refine cap the quick-refine menu is dropped — but a gmail
+        // card must STILL be schedulable (#501).
+        let at_cap = json(&approval_message(
+            "act-s1",
+            &email(),
+            "plain draft",
+            MAX_REDRAFT_ITERATIONS,
+        ));
+        assert!(at_cap.contains("aa:act-s1:schedule_pick"));
+        assert!(!at_cap.contains("quick_refine"), "cap must drop the menu");
+        // And on a fresh card alongside the quick-refine menu.
+        let fresh = json(&approval_message("act-s1", &email(), "plain draft", 0));
+        assert!(fresh.contains("aa:act-s1:schedule_pick"));
+        assert!(fresh.contains("quick_refine"));
+    }
+
+    #[test]
+    fn schedule_row_absent_on_unschedulable_cards() {
+        // The scheduled pipeline is a deferred Gmail send_draft — cards the
+        // engine could never fire must not offer the control (#501 review).
+        for platform in ["discord", "slack", "telegram", "github", "gcal"] {
+            let mut e = email();
+            e.platform = platform.into();
+            let v = json(&approval_message("act-s6", &e, "d", 0));
+            assert!(
+                !v.contains("schedule_pick"),
+                "{platform} card must not carry the schedule row"
+            );
+            // The rest of the card is untouched.
+            assert!(v.contains("aa:act-s6:approve"));
+        }
+        // LinkedIn rides platform "gmail" on legacy rows — the entity prefix
+        // is the tell.
+        let mut e = email();
+        e.account_entity_id = Some("linkedin:urn123".into());
+        let v = json(&approval_message("act-s6", &e, "d", 0));
+        assert!(!v.contains("schedule_pick"), "linkedin-entity card gated");
+    }
+
+    #[test]
+    fn worst_case_card_is_four_rows_with_schedule_last() {
+        // needs-input + under-cap: buttons + FillAsk + QuickRefine + Schedule
+        // = 4 of Discord's 5 rows — the documented worst case.
+        let marked = append_needs_input_marker(
+            "draft",
+            &[("share_doc".into(), "the deck".into())],
+        );
+        let msg = approval_message("act-s2", &email(), &marked, 0);
+        assert_eq!(row_count(&msg), 4);
+        let v = json(&msg);
+        assert!(v.contains("aa:act-s2:schedule_pick"));
+        assert!(v.contains("aa:act-s2:fill_ask"));
+        assert!(v.contains("quick_refine"));
+        // Plain fresh card: buttons + QuickRefine + Schedule = 3 rows.
+        assert_eq!(row_count(&approval_message("a", &email(), "d", 0)), 3);
+    }
+
+    #[test]
+    fn schedule_row_carries_all_symbolic_tokens() {
+        let v = json(&approval_message("act-s3", &email(), "d", 0));
+        for (_, value) in SCHEDULE_OPTIONS {
+            assert!(v.contains(value), "missing schedule option value {value}");
+        }
+        assert!(v.contains("Schedule send…"));
+    }
+
+    #[test]
+    fn scheduled_notice_has_exactly_three_buttons_and_no_approve() {
+        let msg = scheduled_notice_message(
+            "act-s4",
+            &email(),
+            "Mon Sep 1, 9:00 AM",
+            &email().from,
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&json(&msg)).expect("notice json parses");
+        let rows = v["components"].as_array().expect("components");
+        assert_eq!(rows.len(), 1, "notice has ONE button row");
+        let buttons = rows[0]["components"].as_array().expect("buttons");
+        assert_eq!(buttons.len(), 3, "exactly Send Now | Back to queue | Cancel");
+        let s = json(&msg);
+        assert!(s.contains("aa:act-s4:send_now"));
+        assert!(s.contains("aa:act-s4:back_to_queue"));
+        assert!(s.contains("aa:act-s4:cancel_schedule"));
+        // Must NOT carry the approval-card verbs — the draft is already
+        // approved-for-later.
+        assert!(!s.contains(":approve"));
+        assert!(!s.contains(":revise"));
+        assert!(!s.contains(":skip"));
+        assert!(s.contains("Mon Sep 1, 9:00 AM"));
+    }
+
+    #[test]
+    fn scheduled_notice_renders_the_resolved_to_not_the_card_from() {
+        // #473 routing override (#501 review): the notice must show the
+        // ACTUAL recipient the caller resolved from the envelope, not the
+        // card's From line.
+        let msg = scheduled_notice_message("act-s7", &email(), "t", "omer@example.com");
+        let v = json(&msg);
+        assert!(v.contains("omer@example.com"));
+        assert!(!v.contains("peer@example.com"), "card From must not leak into To");
+    }
+
+    #[test]
+    fn schedule_modal_has_single_when_input() {
+        let modal = schedule_modal("act-s5");
+        let v = serde_json::to_string(&modal).expect("modal serializes");
+        assert!(v.contains("aa:act-s5:schedule_modal"));
+        assert!(v.contains("\"when\""));
+        assert!(v.contains("tomorrow 9am"));
     }
 
     #[test]

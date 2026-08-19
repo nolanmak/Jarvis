@@ -35,6 +35,9 @@ reqwest = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 futures = { workspace = true }
+# #501 — timeparse DST fixture tests pin America/New_York (chrono::Local
+# reads TZ once at process start, so env-pinning in tests is unreliable).
+chrono-tz = { workspace = true }
 # Tests pre-create the Node-tree-owned tables before opening Store, so the
 # additive migrations don't trip on missing parent tables.
 rusqlite = { workspace = true }
