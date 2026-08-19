@@ -250,6 +250,16 @@ augmentagent gmail compose --post \
 
 **When NOT to use `--post`:** if the user asked for a *preview* of what you'd write ("draft me something I could send to X", "give me a starting point", "what would you say") or wants to copy the body into their own client, just use plain `compose` (or no command at all — put the draft text in your chat reply). `--post` is for "I want to act on this", not "I want to see this". When in doubt on an actionable-sounding ask, prefer `--post` — a card the user Skips costs one click; a missing card costs the whole flow.
 
+### Schedule a send for later (#502)
+
+When the user names a future send time — "email X tomorrow at 9am", "reply Friday evening", "send this in two hours" — add `--send-at "<time>"` to the same `compose --post` command. The card shows `[sends: <local time>]`; **Approve arms the schedule** (the daemon fires the send at that time) instead of sending immediately. The user can later Send Now, put it Back in the queue, or Cancel from the scheduled notice.
+
+- **Time format: owner-local `YYYY-MM-DD HH:MM`, resolved from the `Current local time` line at the top of this conversation.** Do the date arithmetic yourself ("tomorrow", "next Friday") but leave the wall-clock time naive — do **NOT** hand-compute a UTC offset for a future date: across a DST boundary that silently shifts the send by an hour. (`tomorrow 9am`, weekday names, and `in Nm/Nh/Nd` are also accepted verbatim; RFC3339 is accepted but discouraged for the offset reason.)
+- Bounds: at least 2 minutes and at most 60 days out. Out-of-range values are rejected before any draft is created — relay the error and ask the user for a new time; never round-trip a guess.
+- Never guess a timezone: the daemon resolves naive times in the owner's local zone. If the user names another zone ("9am Lisbon time"), convert to owner-local wall clock yourself and say so in your reply ("scheduled for 4:00 AM your time = 9:00 Lisbon").
+- If a scheduled send already exists for the same recipient + subject, `compose` refuses — tell the user about the existing schedule (its Discord notice has Send Now / Back to queue / Cancel) instead of forcing `--allow-duplicate`.
+- In your chat reply, confirm the armed time explicitly ("card posted — on Approve it sends tomorrow at 9:00 AM"), because approval and sending now happen at different moments.
+
 ### Update an existing draft
 
 ```
