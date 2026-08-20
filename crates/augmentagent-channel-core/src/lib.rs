@@ -9,13 +9,18 @@
 
 pub mod archetype;
 pub mod code_mode;
+pub mod codex;
+pub mod cooldown;
 pub mod decision;
 pub mod engagement;
+pub mod fallback;
+pub mod gemini;
 pub mod governor;
 pub mod ingest;
 pub mod mcp;
 pub mod memory_nudge;
 pub mod prompt;
+pub mod providers;
 pub mod reasoner;
 pub mod resolve;
 pub mod secret_loader;
@@ -42,7 +47,11 @@ pub use governor::{
 };
 pub use mcp::{default_mcp_config_path, McpConfig, McpServerConfig};
 pub use memory_nudge::{default_cycles_root, CycleLogger, CycleSummary, CycleSurface};
-pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerOpts};
+pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerError, ReasonerOpts};
+// #655 — multi-provider failover: one Reasoner seam, N provider adapters.
+pub use cooldown::CooldownLatch;
+pub use fallback::{build_reasoner, FallbackReasoner};
+pub use providers::{CapabilityClass, ModelTier, ProviderKind};
 pub use skills::{SkillEntry, SkillRegistry};
 // #501 — deterministic send-time parsing for scheduled sends (shared with
 // the query-mode `--send-at` flag, #502).
