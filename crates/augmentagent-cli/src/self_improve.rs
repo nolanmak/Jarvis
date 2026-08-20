@@ -810,6 +810,15 @@ the test that guards it.";
 
 /// Run the verification gate inside the worktree. Returns Ok(()) only if every
 /// configured check passes.
+/// Wrap a gate shell command so a failure in ANY pipe stage fails the gate.
+/// #681 — without `set -o pipefail`, `cargo build … | tail -5` reports
+/// `tail`'s exit status (always 0): every gate command had passed
+/// unconditionally since #103, letting a non-compiling diff reach the PR
+/// stage. Caught live on the first real #653 pipeline run.
+fn gate_sh(cmd: &str) -> String {
+    format!("set -o pipefail; {cmd}")
+}
+
 async fn verification_gate(worktree: &Path) -> Result<()> {
     // #300 — Strip provider secrets from the gate's child env. `cargo
     // build`/`npm run build` execute `build.rs`/proc-macros/`npm
@@ -819,7 +828,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     info!("verification gate: cargo build (sandboxed env)");
     let (ok, _o, e) = run_sandboxed(
         "bash",
-        &["-lc", ". $HOME/.cargo/env && cargo build --workspace 2>&1 | tail -5"],
+        &["-lc", &gate_sh(". $HOME/.cargo/env && cargo build --workspace 2>&1 | tail -5")],
         worktree,
         &env,
     )
@@ -830,7 +839,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     info!("verification gate: cargo test (sandboxed env)");
     let (ok, _o, e) = run_sandboxed(
         "bash",
-        &["-lc", ". $HOME/.cargo/env && cargo test --workspace 2>&1 | tail -8"],
+        &["-lc", &gate_sh(". $HOME/.cargo/env && cargo test --workspace 2>&1 | tail -8")],
         worktree,
         &env,
     )
@@ -843,7 +852,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     if worktree.join("package.json").exists() && worktree.join("node_modules").exists() {
         info!("verification gate: npm run build (sandboxed env)");
         let (ok, _o, e) =
-            run_sandboxed("bash", &["-lc", "npm run build 2>&1 | tail -5"], worktree, &env)
+            run_sandboxed("bash", &["-lc", &gate_sh("npm run build 2>&1 | tail -5")], worktree, &env)
                 .await?;
         if !ok {
             bail!("npm run build failed:\n{e}");
@@ -1647,7 +1656,7 @@ async fn verification_gate_for_repo(workspace: &Path, repo: &AgentRepo) -> Resul
         return Ok(());
     }
     info!(repo = %repo.full_name, cmd, "verification gate (sandboxed env)");
-    let wrapped = format!(". $HOME/.cargo/env 2>/dev/null; {cmd}");
+    let wrapped = gate_sh(&format!(". $HOME/.cargo/env 2>/dev/null; {cmd}"));
     // #300 — same secret-stripping as the single-repo gate: the per-repo
     // `build_cmd` runs attacker-influenceable build scripts and must not
     // inherit provider keys.
@@ -2407,6 +2416,32 @@ mod tests {
         let without = build_fix_prompt(&issue, None);
         assert!(!without.contains("Implementation spec"));
         assert!(without.contains("Implement the fix now."));
+    }
+
+    // ---- #681: gate commands must fail when the piped stage fails ----
+
+    #[test]
+    fn gate_sh_prefixes_pipefail() {
+        assert!(gate_sh("cargo build | tail -5").starts_with("set -o pipefail; "));
+    }
+
+    #[test]
+    fn gate_sh_makes_a_failing_pipe_stage_fail_the_command() {
+        // The exact failure that slipped through live (#681): first stage
+        // fails, `| tail` succeeds. Run both shapes through real bash.
+        let status = |cmd: &str| {
+            std::process::Command::new("bash")
+                .args(["-lc", cmd])
+                .status()
+                .expect("spawn bash")
+                .success()
+        };
+        // Unwrapped: tail masks the failure (the bug).
+        assert!(status("false 2>&1 | tail -1"));
+        // Wrapped: the failure propagates.
+        assert!(!status(&gate_sh("false 2>&1 | tail -1")));
+        // Wrapped success still succeeds.
+        assert!(status(&gate_sh("true 2>&1 | tail -1")));
     }
 
     // ---- #676: REST issue-candidate parsing ----
