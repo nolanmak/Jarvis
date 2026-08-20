@@ -858,7 +858,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     info!("verification gate: cargo test (sandboxed env)");
     let (ok, _o, e) = run_sandboxed(
         "bash",
-        &["-lc", &gate_sh(". $HOME/.cargo/env && cargo test --workspace 2>&1 | tail -8")],
+        &["-lc", &gate_sh(". $HOME/.cargo/env && cargo test --workspace -- --test-threads=1 2>&1 | tail -8")],
         worktree,
         &env,
     )
