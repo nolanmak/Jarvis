@@ -200,8 +200,16 @@ mod tests {
         assert_eq!(parsed.user_agent, a.user_agent);
     }
 
+    /// Serializes the two tests that mutate AUGMENTAGENT_DISCORD_CREDS:
+    /// process env is shared across test threads, so without this lock
+    /// `honors_env` racing `falls_back_to_repo` makes the latter observe
+    /// the override and fail — the flake that broke auto-PR gate runs
+    /// (the gate runs `cargo test --workspace`).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn default_creds_path_honors_env() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let repo = tempfile::tempdir().unwrap();
         std::env::set_var("AUGMENTAGENT_DISCORD_CREDS", "/tmp/custom-discord.json");
         assert_eq!(
@@ -213,6 +221,7 @@ mod tests {
 
     #[test]
     fn default_creds_path_falls_back_to_repo() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // Ensure no env override interferes; vault dir won't exist on CI.
         std::env::remove_var("AUGMENTAGENT_DISCORD_CREDS");
         let repo = tempfile::tempdir().unwrap();

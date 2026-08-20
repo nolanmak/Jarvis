@@ -853,7 +853,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     )
     .await?;
     if !ok {
-        bail!("cargo build failed:\n{e}");
+        bail!("cargo build failed:\n{o}{e}", o = _o.trim());
     }
     info!("verification gate: cargo test (sandboxed env)");
     let (ok, _o, e) = run_sandboxed(
@@ -864,7 +864,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     )
     .await?;
     if !ok {
-        bail!("cargo test failed:\n{e}");
+        bail!("cargo test failed:\n{o}{e}", o = _o.trim());
     }
     // npm build is best-effort: only gate on it if a package.json + node_modules
     // are present (prod has them; a bare CI checkout may not).
@@ -874,7 +874,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
             run_sandboxed("bash", &["-lc", &gate_sh("npm run build 2>&1 | tail -5")], worktree, &env)
                 .await?;
         if !ok {
-            bail!("npm run build failed:\n{e}");
+            bail!("npm run build failed:\n{o}{e}", o = _o.trim());
         }
     } else {
         info!("verification gate: npm build skipped (no node_modules)");
