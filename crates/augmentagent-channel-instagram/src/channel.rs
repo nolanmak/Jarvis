@@ -834,6 +834,17 @@ enum Dispatch {
 
 #[cfg(test)]
 mod tests {
+
+    /// Disable `gh issue create` for this test binary — channel tests build
+    /// the production channel (which wires GhCliIssueRunner), and without
+    /// this every `cargo test --workspace` files REAL postmortem issues on
+    /// the repo (#780: ~70 filed by test runs). Mirrors the email crate.
+    static GH_DISABLE_INIT: std::sync::Once = std::sync::Once::new();
+    fn disable_gh_for_tests() {
+        GH_DISABLE_INIT.call_once(|| {
+            std::env::set_var("AUGMENTAGENT_GH_DISABLE", "1");
+        });
+    }
     use super::*;
     use augmentagent_approval_discord::ApprovalError;
     use augmentagent_channel_core::{
@@ -1014,6 +1025,7 @@ mod tests {
         broker: Arc<RecordingBroker>,
     ) -> InstagramChannel<StubApi, R> {
         let gov = governor(store.clone());
+        disable_gh_for_tests();
         InstagramChannel::new(
             store,
             api,
