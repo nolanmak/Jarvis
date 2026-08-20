@@ -15,14 +15,16 @@
 //! | class        | claude | codex | gemini | cerebras |
 //! |--------------|--------|-------|--------|----------|
 //! | text-only    |   ✓    |   ✓   |   ✓    |    ✓     |
-//! | read-tools   |   ✓    |   ✓   |   ✓    |    ✗ (¹) |
+//! | read-tools   |   ✓    |  ✗(²) |   ✓    |    ✗ (¹) |
 //! | write-tools  |   ✓    |   ✗   |   ✗    |    ✗ (²) |
 //! | full-agentic |   ✓    |   ✗   |   ✗    |    ✗ (²) |
 //!
 //! (¹) Cerebras read-tools is gated on the offline triage eval (#665).
-//! (²) Write/agentic failover is gated on the security-parity probes (#664)
-//!     — the guard hooks that enforce wiki path scoping are Claude-specific
-//!     today and both codex and gemini have documented fail-open hook traps.
+//! (²) Gated on the security-parity probes (#664): codex's sandbox does not
+//!     path-scope READS (whole-disk read + always-on shell — see
+//!     [`allowed_for`]), and the guard hooks that enforce wiki path scoping
+//!     are Claude-specific today with documented fail-open traps on both
+//!     codex and gemini.
 
 use crate::reasoner::ReasonerOpts;
 
@@ -112,21 +114,42 @@ pub fn classify(opts: &ReasonerOpts) -> CapabilityClass {
     {
         return CapabilityClass::WriteTools;
     }
+    // FAIL-CLOSED (#655 review): only tools we positively know are read-only
+    // may classify as ReadTools. A bare "Bash", "Task", "WebFetch", or any
+    // future tool name lands in FullAgentic (claude-only) rather than
+    // silently widening a fallback provider's surface.
     if !opts.allowed_tools.is_empty() {
-        return CapabilityClass::ReadTools;
+        let known_read_only =
+            |t: &String| matches!(t.as_str(), "Read" | "Grep" | "Glob" | "LS" | "WebSearch");
+        if opts.allowed_tools.iter().all(known_read_only) {
+            return CapabilityClass::ReadTools;
+        }
+        return CapabilityClass::FullAgentic;
     }
     CapabilityClass::TextOnly
 }
 
 /// May `kind` serve a call of `class`? See the module-level policy table.
+///
+/// Codex is TEXT-ONLY for now (#655 review / #664): its read-only sandbox
+/// confines writes and network but NOT reads — the model's shell can read
+/// any file on disk (`.env`, `~/.claude/.credentials.json`, `~/.ssh`), and
+/// read-tools presets feed it untrusted email content. Until the #664
+/// managed PreToolUse deny-hook ships and the escape probes pass, only
+/// no-tool text transforms may route there (their outputs are human-gated
+/// drafts / narrow parsed fields). Gemini KEEPS read-tools: its file tools
+/// are workspace-confined to the pinned cwd and our per-spawn settings strip
+/// the shell tool entirely (`tools.core` allowlist).
 pub fn allowed_for(kind: ProviderKind, class: CapabilityClass) -> bool {
     match kind {
         ProviderKind::Claude => true,
-        ProviderKind::Codex | ProviderKind::Gemini => matches!(
+        ProviderKind::Gemini => matches!(
             class,
             CapabilityClass::TextOnly | CapabilityClass::ReadTools
         ),
-        ProviderKind::Cerebras => matches!(class, CapabilityClass::TextOnly),
+        ProviderKind::Codex | ProviderKind::Cerebras => {
+            matches!(class, CapabilityClass::TextOnly)
+        }
     }
 }
 
@@ -263,8 +286,12 @@ mod tests {
         assert_eq!(tier_of(&opts(vec![], None)), ModelTier::Quality);
 
         assert!(allowed_for(ProviderKind::Claude, CapabilityClass::FullAgentic));
-        assert!(allowed_for(ProviderKind::Codex, CapabilityClass::ReadTools));
+        // Codex is text-only until #664 probes: its sandbox cannot
+        // path-scope reads and its shell is always on.
+        assert!(allowed_for(ProviderKind::Codex, CapabilityClass::TextOnly));
+        assert!(!allowed_for(ProviderKind::Codex, CapabilityClass::ReadTools));
         assert!(!allowed_for(ProviderKind::Codex, CapabilityClass::WriteTools));
+        assert!(allowed_for(ProviderKind::Gemini, CapabilityClass::ReadTools));
         assert!(!allowed_for(ProviderKind::Gemini, CapabilityClass::FullAgentic));
         assert!(allowed_for(ProviderKind::Cerebras, CapabilityClass::TextOnly));
         assert!(!allowed_for(ProviderKind::Cerebras, CapabilityClass::ReadTools));

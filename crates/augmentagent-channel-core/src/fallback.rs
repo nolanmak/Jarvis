@@ -45,15 +45,25 @@ fn default_ratelimit_cooldown() -> chrono::Duration {
     chrono::Duration::seconds(secs)
 }
 
-/// Cooldown for outage-shaped failures (timeout / unavailable). Shorter than
-/// the rate-limit latch: outages end unannounced, so we re-probe sooner.
+/// Cooldown for outage-shaped failures (timeout / unavailable). Deliberately
+/// SHORT (#655 review): with the default claude-only chain a latch is a
+/// hard no-service window, so one transient non-zero exit must cost ~a
+/// minute of fast-fails, not five — real outages just re-latch on the next
+/// probe, which still caps spawn pressure at ~1/min instead of every call.
 fn default_unavailable_cooldown() -> chrono::Duration {
     let secs = std::env::var("AUGMENTAGENT_COOLDOWN_UNAVAILABLE_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|s| *s > 0)
-        .unwrap_or(300);
+        .unwrap_or(60);
     chrono::Duration::seconds(secs)
+}
+
+/// Hard ceiling on any latch derived from a PARSED reset hint (#655 review).
+/// Claude session windows are 5-hourly; anything longer means the hint came
+/// from quoted/stale text and must not black the provider out for a day.
+fn max_ratelimit_latch() -> chrono::Duration {
+    chrono::Duration::hours(6)
 }
 
 struct Entry {
@@ -188,6 +198,11 @@ impl FallbackReasoner {
     ) -> anyhow::Result<String> {
         let class = classify(opts);
         let primary = self.entries.first().map(|e| e.kind);
+        // The PRIMARY's provider-side error is what callers must see when
+        // the whole chain fails (#655 review): a trailing Local fault from a
+        // misconfigured fallback would otherwise mask the rate limit and
+        // defeat the #660 provider-side downcast in code-mode.
+        let mut first_provider_err: Option<anyhow::Error> = None;
         let mut last_err: Option<anyhow::Error> = None;
         let mut skipped_latched = 0usize;
 
@@ -220,22 +235,48 @@ impl FallbackReasoner {
                 }
                 Err(err) => match ReasonerError::find_in(&err) {
                     Some(re) if re.is_provider_side() => {
-                        let until = match re {
-                            ReasonerError::RateLimited {
-                                reset_at: Some(at), ..
-                            } => *at,
-                            ReasonerError::RateLimited { .. } => {
-                                Utc::now() + default_ratelimit_cooldown()
-                            }
-                            _ => Utc::now() + default_unavailable_cooldown(),
-                        };
-                        warn!(
-                            provider = name,
-                            %until,
-                            "provider failed provider-side ({re}); latched, trying next in chain"
-                        );
-                        self.latch.latch(name, until, &re.to_string());
-                        last_err = Some(err);
+                        // Timeout on an agentic/write run is "this one call
+                        // ran long", not "provider down" (#655 review) —
+                        // don't take unrelated triage/draft calls down with
+                        // a latch; still try the rest of the chain.
+                        let latchworthy = !matches!(re, ReasonerError::Timeout { .. })
+                            || matches!(
+                                class,
+                                crate::providers::CapabilityClass::TextOnly
+                                    | crate::providers::CapabilityClass::ReadTools
+                            );
+                        if latchworthy {
+                            let until = match re {
+                                ReasonerError::RateLimited {
+                                    reset_at: Some(at), ..
+                                } => {
+                                    // Clamp even a parsed reset (#655 review
+                                    // — belt to parse_reset_hint's suspenders).
+                                    (*at).min(Utc::now() + max_ratelimit_latch())
+                                }
+                                ReasonerError::RateLimited { .. } => {
+                                    Utc::now() + default_ratelimit_cooldown()
+                                }
+                                _ => Utc::now() + default_unavailable_cooldown(),
+                            };
+                            warn!(
+                                provider = name,
+                                %until,
+                                "provider failed provider-side ({re}); latched, trying next in chain"
+                            );
+                            self.latch.latch(name, until, &re.to_string());
+                        } else {
+                            warn!(
+                                provider = name,
+                                "provider timed out on a long-running {class:?} call; \
+                                 NOT latching (one slow call is not an outage)"
+                            );
+                        }
+                        if first_provider_err.is_none() {
+                            first_provider_err = Some(err);
+                        } else {
+                            last_err = Some(err);
+                        }
                         continue;
                     }
                     Some(ReasonerError::Local { message }) => {
@@ -243,7 +284,9 @@ impl FallbackReasoner {
                         // never latched — a fixed config should work on the
                         // very next call.
                         warn!(provider = name, "provider local fault ({message}); trying next");
-                        last_err = Some(err);
+                        if last_err.is_none() {
+                            last_err = Some(err);
+                        }
                         continue;
                     }
                     _ => return Err(err),
@@ -251,7 +294,7 @@ impl FallbackReasoner {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| {
+        Err(first_provider_err.or(last_err).unwrap_or_else(|| {
             anyhow::Error::new(ReasonerError::Unavailable {
                 provider: "chain".into(),
                 message: format!(

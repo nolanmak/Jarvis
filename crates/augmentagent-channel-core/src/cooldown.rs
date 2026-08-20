@@ -83,7 +83,18 @@ impl CooldownLatch {
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let tmp = self.path.with_extension("json.tmp");
+        // Unique tmp per writer (#655 review): a fixed tmp name let two
+        // concurrent processes interleave write/rename and publish a torn
+        // file. Read-modify-write lost updates remain possible and are
+        // accepted — a lost latch costs one extra probe, a lost clear costs
+        // one skipped probe until expiry; a torn file would have wiped ALL
+        // latches at once.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = self.path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let body = match serde_json::to_vec_pretty(map) {
             Ok(b) => b,
             Err(e) => {
@@ -121,13 +132,17 @@ impl CooldownLatch {
             return;
         }
         debug!(provider, %until, "latching provider cooldown");
-        map.insert(
-            provider.to_string(),
-            CooldownEntry {
-                until,
-                reason: reason.chars().take(300).collect(),
-            },
-        );
+        // Single-line, short reason: this file is durable local state and
+        // `reasoner-selftest` prints it — never persist a wall of raw model
+        // output or provider stderr here (#655 review).
+        let reason: String = reason
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(160)
+            .collect();
+        map.insert(provider.to_string(), CooldownEntry { until, reason });
         self.write_all(&map);
     }
 

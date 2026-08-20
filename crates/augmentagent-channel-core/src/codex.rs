@@ -14,10 +14,11 @@
 //!
 //! - **No `--system-prompt` flag**: the preset's system prompt is written to
 //!   a temp file and wired via `-c model_instructions_file=…`, which fully
-//!   replaces codex's base instructions. The spawn `cwd` is pinned, and we
-//!   pass `--ignore-user-config` so neither the owner's interactive
-//!   `~/.codex/config.toml` nor an AGENTS.md in the daemon repo can leak
-//!   into background calls (the #448 leak class, codex edition).
+//!   replaces codex's base instructions. The spawn `cwd` is pinned;
+//!   `--ignore-user-config` keeps the owner's interactive
+//!   `~/.codex/config.toml` out, and `-c project_doc_max_bytes=0` keeps
+//!   repo AGENTS.md out (it is project-doc discovery, which
+//!   --ignore-user-config does NOT cover — verified live 2026-08-19).
 //! - **Sandbox `read-only` always**: the eligibility policy only routes
 //!   text-only and read-tools presets here (#658), and codex's kernel
 //!   sandbox (Landlock) enforcing "no writes, no network for commands" is
@@ -96,6 +97,12 @@ impl CodexCliReasoner {
         let provider = self.provider_name();
         let dur = reasoner_timeout();
         match tokio::time::timeout(dur, self.call_once(opts, user_message, all_blocks)).await {
+            // Post-classify any untyped failure (stdin EPIPE, read/wait IO)
+            // as provider-side Unavailable (#655 review) — an untyped error
+            // would abort the whole chain instead of failing over.
+            Ok(Err(e)) if ReasonerError::find_in(&e).is_none() => {
+                Err(crate::reasoner::classify_other(provider, e))
+            }
             Ok(r) => r,
             Err(_) => {
                 warn!(
@@ -147,6 +154,11 @@ impl CodexCliReasoner {
             "read-only".into(),
             "-c".into(),
             "approval_policy=never".into(),
+            // AGENTS.md is project-doc discovery, NOT user config — verified
+            // live that --ignore-user-config does not stop it. Zero the
+            // budget so repo instructions can't inject into background calls.
+            "-c".into(),
+            "project_doc_max_bytes=0".into(),
             "-c".into(),
             format!("model_instructions_file={}", instructions.display()),
             "-m".into(),
@@ -185,9 +197,11 @@ impl CodexCliReasoner {
             cmd.env("CODEX_API_KEY", key);
         }
         // else: auth.json under CODEX_HOME carries ChatGPT-plan auth.
-        if !opts.env.is_empty() {
-            cmd.envs(opts.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        }
+        //
+        // opts.env is deliberately NOT forwarded (#655 review): it exists
+        // for the full-agentic ask preset's sub-CLIs (AUGMENTAGENT_DB,
+        // COMPOSIO/Discord secrets), and no preset eligible to route here
+        // needs any of it. Fail-closed beats convenient.
 
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -207,6 +221,18 @@ impl CodexCliReasoner {
             stdin.shutdown().await?;
         }
 
+        // Drain stderr CONCURRENTLY (#655 review): a child writing >64KB of
+        // progress/log output to a full stderr pipe would block, stdout
+        // would never reach EOF, and the call would sit until the watchdog
+        // instead of failing over in seconds.
+        let stderr_task = child.stderr.take().map(|mut err| {
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = String::new();
+                let _ = err.read_to_string(&mut buf).await;
+                buf
+            })
+        });
         let stdout = child
             .stdout
             .take()
@@ -264,11 +290,10 @@ impl CodexCliReasoner {
         }
 
         let status = child.wait().await?;
-        let mut stderr_buf = String::new();
-        if let Some(mut err) = child.stderr.take() {
-            use tokio::io::AsyncReadExt;
-            let _ = err.read_to_string(&mut stderr_buf).await;
-        }
+        let stderr_buf = match stderr_task {
+            Some(t) => t.await.unwrap_or_default(),
+            None => String::new(),
+        };
 
         let final_text = if all_blocks {
             messages.join("\n\n")
@@ -309,15 +334,22 @@ impl CodexCliReasoner {
 /// / 402 credits-exhausted (a spend wall latches exactly like a rate wall).
 fn looks_rate_limited(detail: &str) -> bool {
     let d = detail.to_ascii_lowercase();
+    // Status codes match as standalone digit tokens only (#655 review):
+    // bare substring "429" fired inside unrelated numbers like request ids.
+    let has_code = |code: &str| {
+        d.split(|c: char| !c.is_ascii_digit())
+            .any(|tok| tok == code)
+    };
     d.contains("usage limit")
         || d.contains("rate limit")
         || d.contains("rate_limit")
         || d.contains("insufficient_quota")
         || d.contains("resource_exhausted")
-        || d.contains("429")
-        || d.contains("402")
         || d.contains("payment required")
-        || d.contains("quota")
+        || d.contains("quota exceeded")
+        || d.contains("quota exhausted")
+        || has_code("429")
+        || has_code("402")
 }
 
 fn rate_limit_err(provider: &str, message: String) -> anyhow::Error {

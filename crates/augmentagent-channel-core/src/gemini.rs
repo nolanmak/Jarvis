@@ -76,6 +76,12 @@ impl GeminiCliReasoner {
     ) -> anyhow::Result<String> {
         let dur = reasoner_timeout();
         match tokio::time::timeout(dur, self.call_once(opts, user_message)).await {
+            // Post-classify untyped failures (stdin EPIPE, read/wait IO) as
+            // provider-side Unavailable (#655 review) so they fail over
+            // instead of aborting the whole chain.
+            Ok(Err(e)) if ReasonerError::find_in(&e).is_none() => {
+                Err(crate::reasoner::classify_other("gemini", e))
+            }
             Ok(r) => r,
             Err(_) => {
                 warn!("gemini call exceeded the {}s watchdog; child killed", dur.as_secs());
@@ -141,12 +147,16 @@ impl GeminiCliReasoner {
 
         // cwd pin: preset cwd, else the first add_dir (wiki root — gemini's
         // file tools are hard-confined to the workspace root, so this is
-        // what makes Read-on-the-wiki actually work), else daemon cwd.
+        // what makes Read-on-the-wiki actually work), else the per-spawn
+        // TEMPDIR. Never the daemon cwd (#655 review): gemini-cli auto-loads
+        // `./.gemini/.env` from its cwd chain, and the daemon runs with
+        // cwd = repo root, whose `.env` holds every daemon secret — a
+        // text-only spawn rooted there would import all of them.
         let cwd = opts
             .cwd
             .clone()
             .or_else(|| opts.add_dirs.first().cloned())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+            .unwrap_or_else(|| tmp.path().to_path_buf());
 
         let mut cmd = Command::new(&self.bin);
         cmd.args(&args)
@@ -170,9 +180,9 @@ impl GeminiCliReasoner {
         if let Some(key) = crate::secret_loader::load_provider_key("GEMINI_API_KEY") {
             cmd.env("GEMINI_API_KEY", key);
         }
-        if !opts.env.is_empty() {
-            cmd.envs(opts.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        }
+        // opts.env is deliberately NOT forwarded (#655 review): it carries
+        // the full-agentic ask preset's sub-CLI secrets, and no preset
+        // eligible to route here needs any of it.
 
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -192,14 +202,24 @@ impl GeminiCliReasoner {
             stdin.shutdown().await?;
         }
 
+        // Drain stderr CONCURRENTLY (#655 review): the CLI logs retry
+        // chatter to stderr mid-run; >64KB of it with stdout still open
+        // would deadlock the pipe pair until the watchdog.
+        let stderr_task = child.stderr.take().map(|mut err| {
+            tokio::spawn(async move {
+                let mut buf = String::new();
+                let _ = err.read_to_string(&mut buf).await;
+                buf
+            })
+        });
         let mut stdout_buf = String::new();
         if let Some(mut out) = child.stdout.take() {
             out.read_to_string(&mut stdout_buf).await?;
         }
-        let mut stderr_buf = String::new();
-        if let Some(mut err) = child.stderr.take() {
-            let _ = err.read_to_string(&mut stderr_buf).await;
-        }
+        let stderr_buf = match stderr_task {
+            Some(t) => t.await.unwrap_or_default(),
+            None => String::new(),
+        };
         let status = child.wait().await?;
 
         // json mode: one object with .response (+ .error on failure). The

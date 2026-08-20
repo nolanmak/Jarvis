@@ -296,6 +296,19 @@ pub fn reasoner_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+/// Class-aware watchdog (#655 review): full-agentic and write-tools runs
+/// (wiki-ask, auto-PR builds that compile code) legitimately run far longer
+/// than a triage/draft call — give them 2× the base budget so the watchdog
+/// catches hangs, not honest work.
+pub(crate) fn reasoner_timeout_for(opts: &ReasonerOpts) -> std::time::Duration {
+    use crate::providers::{classify, CapabilityClass};
+    let base = reasoner_timeout();
+    match classify(opts) {
+        CapabilityClass::FullAgentic | CapabilityClass::WriteTools => base * 2,
+        _ => base,
+    }
+}
+
 /// Best-effort parse of the Claude CLI quota refusal's reset hint:
 ///
 /// ```text
@@ -334,8 +347,9 @@ pub fn parse_reset_hint(message: &str) -> Option<chrono::DateTime<chrono::Utc>> 
         (h, true) => h + 12,
         (h, false) => h,
     };
-    // Timezone token: "(America/New_York)". Absent → assume the daemon's
-    // local offset is close enough (the latch only needs coarse accuracy).
+    // Timezone token: "(America/New_York)". Absent → UTC is assumed, which
+    // can be hours wrong — tolerable ONLY because of the plausibility cap
+    // below, which bounds any tz mistake at a short latch or a None.
     let tz: chrono_tz::Tz = rest
         .find('(')
         .and_then(|open| {
@@ -352,7 +366,17 @@ pub fn parse_reset_hint(message: &str) -> Option<chrono::DateTime<chrono::Utc>> 
     } else {
         candidate
     };
-    Some(candidate.with_timezone(&chrono::Utc))
+    // Plausibility cap (#655 review): Claude session windows are 5-hourly,
+    // so a genuine reset is never more than ~5h out. Anything further means
+    // we parsed quoted/stale text, hit the day-rollover on a just-expired
+    // window, or mis-assumed the timezone — returning None makes the latch
+    // fall back to its short default cooldown, which self-heals, instead of
+    // latching the provider for up to a day.
+    let candidate_utc = candidate.with_timezone(&chrono::Utc);
+    if candidate_utc - chrono::Utc::now() > chrono::Duration::hours(6) {
+        return None;
+    }
+    Some(candidate_utc)
 }
 
 /// Wrap an untyped `CallError::Other` in the matching [`ReasonerError`]
@@ -360,7 +384,7 @@ pub fn parse_reset_hint(message: &str) -> Option<chrono::DateTime<chrono::Utc>> 
 /// is fine, latching is not); everything else — connection failures, non-zero
 /// exits, empty output — is `Unavailable`, the "provider might be down"
 /// bucket. The original error stays in the chain for diagnostics.
-fn classify_other(provider: &str, e: anyhow::Error) -> anyhow::Error {
+pub(crate) fn classify_other(provider: &str, e: anyhow::Error) -> anyhow::Error {
     let not_found = e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
@@ -579,6 +603,11 @@ impl ClaudeCliReasoner {
                 provider: "claude".into(),
                 secs,
             })),
+            // Untyped on purpose — content-level, neither latches nor fails
+            // over (#655 review).
+            Err(CallError::EmptyOutput) => {
+                Err(anyhow::anyhow!("claude produced no assistant text"))
+            }
             Err(CallError::ConfigCorrupted { stderr }) => {
                 let recovered = match restore_latest_claude_backup() {
                     Ok(Some(_)) => true,
@@ -606,6 +635,9 @@ impl ClaudeCliReasoner {
                                 secs,
                             }));
                         }
+                        Err(CallError::EmptyOutput) => {
+                            return Err(anyhow::anyhow!("claude produced no assistant text"));
+                        }
                         Err(CallError::Other(e)) => return Err(classify_other("claude", e)),
                     }
                 }
@@ -626,7 +658,7 @@ impl ClaudeCliReasoner {
         user_message: &str,
         capture: TextCapture,
     ) -> Result<String, CallError> {
-        let dur = reasoner_timeout();
+        let dur = reasoner_timeout_for(opts);
         match tokio::time::timeout(dur, self.call_once(opts, user_message, capture)).await {
             Ok(r) => r,
             Err(_) => {
@@ -688,6 +720,10 @@ enum CallError {
     /// killed via `kill_on_drop`; distinct so the outer wrapper can surface
     /// a typed, failover-eligible [`ReasonerError::Timeout`].
     Timeout { secs: u64 },
+    /// The CLI exited 0 but produced no assistant text. Content-level, NOT
+    /// provider-side (#655 review): surfaced untyped so it neither latches
+    /// the provider nor triggers failover.
+    EmptyOutput,
     /// Any other failure: spawn errors, IO errors, non-config exit failures.
     Other(anyhow::Error),
 }
@@ -953,9 +989,7 @@ impl ClaudeCliReasoner {
             }
         }
         if final_text.is_empty() {
-            return Err(CallError::Other(anyhow::anyhow!(
-                "claude produced no assistant text"
-            )));
+            return Err(CallError::EmptyOutput);
         }
         // #448 — the quota refusal is a *successful* completion. Catch it here,
         // before it reaches a JSON parser that would mislabel it a parse error
@@ -1060,8 +1094,29 @@ fn is_claude_config_corrupted(stderr: &str) -> bool {
 /// while the 2-minute poll keeps feeding new work into the same wall. Naming
 /// the condition lets callers back off instead of hammering it.
 pub(crate) fn is_rate_limited(text: &str) -> bool {
-    let t = text.to_ascii_lowercase();
-    (t.contains("session limit") || t.contains("usage limit") || t.contains("rate limit"))
+    // #655 review hardening: this check runs on SUCCESSFUL model output, and
+    // post-#655 a positive doesn't just fail one call — it latches the
+    // provider in the shared cooldown file. So it must only fire when the
+    // refusal IS the message, not merely appears in it (a digest summarizing
+    // "the owner forwarded a limit notice", or a wiki-ask transcript quoting
+    // log.md, legitimately CONTAINS refusal wording). Two gates on top of
+    // the phrase pair: genuine CLI refusals are one short line (length cap)
+    // and start with the refusal itself (anchor) — a JSON answer starts with
+    // '{', prose quoting starts elsewhere.
+    let t = text.trim();
+    if t.len() > 300 {
+        return false;
+    }
+    let t = t.to_ascii_lowercase();
+    let anchored = t.starts_with("you've hit your")
+        || t.starts_with("you've reached your")
+        || t.starts_with("you have hit your")
+        || t.starts_with("you have reached your")
+        || t.starts_with("rate limit")
+        || t.starts_with("usage limit")
+        || t.starts_with("session limit");
+    anchored
+        && (t.contains("session limit") || t.contains("usage limit") || t.contains("rate limit"))
         && (t.contains("hit your") || t.contains("reached your") || t.contains("resets"))
 }
 
@@ -2889,6 +2944,33 @@ mod rate_limit_tests {
             assert!(!is_rate_limited(ok), "false positive on: {ok}");
         }
     }
+
+    /// #655 review — post-#655 a false positive doesn't fail one call, it
+    /// LATCHES the provider in shared state. Output that merely CONTAINS or
+    /// QUOTES refusal wording must never match: the refusal must be the
+    /// whole (short, anchored) message.
+    #[test]
+    fn quoted_refusals_inside_answers_do_not_latch() {
+        for ok in [
+            // Short triage answer quoting a forwarded limit notice.
+            r#"{"decision":"flag","reason":"Owner forwarded: You've hit your usage limit · resets 9:30am"}"#,
+            // Digest line summarizing yesterday's incident.
+            "Yesterday's incidents: two triage calls failed with \
+             'You've hit your session limit · resets 9:30am (America/New_York)'.",
+            // Long transcript with the refusal mid-text (length cap).
+            &format!(
+                "{}\nYou've hit your session limit · resets 9:30am\n{}",
+                "context ".repeat(50),
+                "more context ".repeat(50)
+            ),
+        ] {
+            assert!(!is_rate_limited(ok), "quoted refusal must not match: {ok}");
+        }
+        // The genuine refusal itself still matches, of course.
+        assert!(is_rate_limited(
+            "You've hit your session limit · resets 9:30am (America/New_York)"
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -3098,21 +3180,46 @@ mod failover_error_tests {
     }
 
     #[test]
-    fn parse_reset_hint_reads_time_and_timezone() {
-        let msg = "You've hit your session limit · resets 9:30am (America/New_York)";
-        let at = parse_reset_hint(msg).expect("must parse");
+    fn parse_reset_hint_reads_time_and_caps_horizon() {
+        use chrono::Timelike;
+
+        // A genuinely-near reset (2h ahead, UTC) parses to the right minute.
+        // Built dynamically so the test is independent of wall-clock time.
+        let near = chrono::Utc::now() + chrono::Duration::hours(2);
+        let (h12, ampm) = match near.hour() {
+            0 => (12, "am"),
+            h @ 1..=11 => (h, "am"),
+            12 => (12, "pm"),
+            h => (h - 12, "pm"),
+        };
+        let msg = format!(
+            "You've hit your session limit · resets {h12}:{:02}{ampm} (UTC)",
+            near.minute()
+        );
+        let at = parse_reset_hint(&msg).expect("near reset must parse");
         assert!(at > chrono::Utc::now(), "reset must be in the future");
         assert!(
-            at <= chrono::Utc::now() + chrono::Duration::hours(25),
-            "reset lands within a day"
+            at <= chrono::Utc::now() + chrono::Duration::hours(6),
+            "cap holds"
         );
-        // Minute precision survives the round trip into the named tz.
-        use chrono::Timelike;
-        let ny = at.with_timezone(&chrono_tz::America::New_York);
-        assert_eq!((ny.hour(), ny.minute()), (9, 30));
+        assert_eq!((at.hour(), at.minute()), (near.hour(), near.minute()));
 
-        // No-timezone and hour-only forms still parse (UTC assumed).
-        assert!(parse_reset_hint("resets 10pm").is_some());
+        // Plausibility cap (#655 review): a reset >6h out can only come from
+        // quoted/stale text or a day-rollover on a just-expired window —
+        // it must be rejected (None ⇒ short default cooldown, self-healing).
+        let far = chrono::Utc::now() + chrono::Duration::hours(12);
+        let (fh12, fampm) = match far.hour() {
+            0 => (12, "am"),
+            h @ 1..=11 => (h, "am"),
+            12 => (12, "pm"),
+            h => (h - 12, "pm"),
+        };
+        let far_msg = format!("resets {fh12}:{:02}{fampm} (UTC)", far.minute());
+        assert!(
+            parse_reset_hint(&far_msg).is_none(),
+            "distant reset must be capped to None: {far_msg}"
+        );
+
         // Garbage shapes degrade to None, never panic.
         assert!(parse_reset_hint("no reset here").is_none());
         assert!(parse_reset_hint("resets whenever").is_none());
@@ -3158,7 +3265,13 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
                 provider, reset_at, ..
             }) => {
                 assert_eq!(provider, "claude");
-                assert!(reset_at.is_some(), "tz-stamped refusal must parse a reset");
+                // The stub's fixed "9:30am (America/New_York)" is >6h away
+                // for most of the day, in which case the plausibility cap
+                // deliberately yields None (short default cooldown). When it
+                // IS within the window, it must be bounded by the cap.
+                if let Some(at) = reset_at {
+                    assert!(*at <= chrono::Utc::now() + chrono::Duration::hours(6));
+                }
             }
             other => panic!("expected RateLimited, got {other:?} (err: {err:#})"),
         }
