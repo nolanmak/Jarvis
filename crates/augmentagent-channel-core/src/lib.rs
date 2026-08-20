@@ -8,6 +8,7 @@
 //! one work-source contract instead of inventing their own per platform.
 
 pub mod archetype;
+pub mod cerebras;
 pub mod code_mode;
 pub mod codex;
 pub mod cooldown;

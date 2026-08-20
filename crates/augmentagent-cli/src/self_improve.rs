@@ -34,7 +34,7 @@ use anyhow::{bail, Context, Result};
 use tokio::process::Command;
 use tracing::{info, warn};
 
-use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
+use augmentagent_channel_core::{build_reasoner, FallbackReasoner, Reasoner};
 
 /// Branch/worktree prefix so the dedup guard can recognize agent PRs.
 const BRANCH_PREFIX: &str = "agent-fix/issue-";
@@ -931,7 +931,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         let _ = run("git", &["branch", "-D", &br], &root).await;
     };
 
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
 
     // Stage 1 (#630/#653): read-only scoping pass on a stronger model. It
     // decides fixability on its own (no label required), grades complexity
@@ -1707,7 +1707,7 @@ pub async fn run_multi_repo_once(
         .await
         .with_context(|| format!("mkdir {}", workroot.display()))?;
 
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
     let mut report: Vec<String> = Vec::new();
 
     for repo in &repos {
@@ -1727,7 +1727,7 @@ async fn process_one_repo(
     broker: &dyn ApprovalBroker,
     repo: &AgentRepo,
     workroot: &Path,
-    reasoner: &Arc<ClaudeCliReasoner>,
+    reasoner: &Arc<FallbackReasoner>,
     dry_run: bool,
 ) -> Result<String> {
     let slug = repo.full_name.replace('/', "__");

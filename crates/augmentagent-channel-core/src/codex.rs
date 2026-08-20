@@ -1,5 +1,4 @@
-//! Codex CLI reasoner adapter (#655/#661) — and, via a custom
-//! `model_provider`, the Cerebras tier (#663).
+//! Codex CLI reasoner adapter (#655/#661).
 //!
 //! Translates the same [`ReasonerOpts`] every preset already builds into a
 //! `codex exec` spawn:
@@ -8,7 +7,7 @@
 //! CODEX_HOME=<home> codex exec --json --skip-git-repo-check \
 //!     --ignore-user-config -C <cwd> -s read-only \
 //!     -c approval_policy=never -c model_instructions_file=<tmp>/instructions.md \
-//!     -m <model> [cerebras -c overrides] -
+//!     -m <model> -
 //! ```
 //!
 //! Design notes (researched 2026-08-19, developers.openai.com/codex):
@@ -27,12 +26,10 @@
 //!   `codex exec`) when present, else the `auth.json` under the resolved
 //!   CODEX_HOME (ChatGPT-plan login; token refresh writes back because the
 //!   home is persistent, not a per-spawn tempdir).
-//! - **Cerebras backend**: same spawn, plus `-c model_provider=cerebras`
-//!   and a `[model_providers.cerebras]` table injected as `-c` overrides
-//!   (`base_url=https://api.cerebras.ai/v1`, `env_key=CEREBRAS_API_KEY`,
-//!   `wire_api=chat` — Cerebras has no Responses API). The key is JIT-loaded
-//!   and injected ONLY into cerebras-routed spawns, mirroring the
-//!   COMPOSIO_API_KEY pattern (#128) — never the env SAFELIST.
+//!   (NB: the Cerebras tier was planned to ride this adapter via a custom
+//!   `model_provider`, but codex ≥0.148 removed `wire_api = "chat"` and
+//!   Cerebras has no Responses API — verified live 2026-08-19. Cerebras is a
+//!   thin chat-completions client instead: see `crate::cerebras`, #663.)
 //! - **Failure mapping**: quota exhaustion surfaces as `turn.failed` (+
 //!   non-zero exit) with a usage-limit message — mapped to
 //!   [`ReasonerError::RateLimited`]. Connection/5xx → `Unavailable`.
@@ -77,40 +74,17 @@ pub fn codex_auth_available() -> bool {
         || codex_home().join("auth.json").is_file()
 }
 
-/// Which upstream the codex CLI talks to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Backend {
-    /// OpenAI (ChatGPT-plan or CODEX_API_KEY).
-    OpenAi,
-    /// Cerebras via custom model_provider (#663).
-    Cerebras,
-}
-
 pub struct CodexCliReasoner {
     bin: String,
-    backend: Backend,
 }
 
 impl CodexCliReasoner {
     pub fn openai() -> Self {
-        Self {
-            bin: codex_bin(),
-            backend: Backend::OpenAi,
-        }
-    }
-
-    pub fn cerebras() -> Self {
-        Self {
-            bin: codex_bin(),
-            backend: Backend::Cerebras,
-        }
+        Self { bin: codex_bin() }
     }
 
     fn provider_name(&self) -> &'static str {
-        match self.backend {
-            Backend::OpenAi => ProviderKind::Codex.name(),
-            Backend::Cerebras => ProviderKind::Cerebras.name(),
-        }
+        ProviderKind::Codex.name()
     }
 
     async fn call_capture(
@@ -143,11 +117,7 @@ impl CodexCliReasoner {
         all_blocks: bool,
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
-        let kind = match self.backend {
-            Backend::OpenAi => ProviderKind::Codex,
-            Backend::Cerebras => ProviderKind::Cerebras,
-        };
-        let model = model_for(kind, tier_of(opts));
+        let model = model_for(ProviderKind::Codex, tier_of(opts));
 
         // System prompt travels via a temp file (`model_instructions_file`
         // has no inline-string form). TempDir must outlive the child.
@@ -182,18 +152,6 @@ impl CodexCliReasoner {
             "-m".into(),
             model.clone(),
         ];
-        if self.backend == Backend::Cerebras {
-            for kv in [
-                "model_provider=cerebras".to_string(),
-                "model_providers.cerebras.name=Cerebras".to_string(),
-                "model_providers.cerebras.base_url=https://api.cerebras.ai/v1".to_string(),
-                "model_providers.cerebras.env_key=CEREBRAS_API_KEY".to_string(),
-                "model_providers.cerebras.wire_api=chat".to_string(),
-            ] {
-                args.push("-c".into());
-                args.push(kv);
-            }
-        }
         // cwd: preset pin wins; else the first --add-dir (wiki root for the
         // read-tools presets); else the daemon cwd.
         let cwd = opts
@@ -223,19 +181,10 @@ impl CodexCliReasoner {
             }
         }
         cmd.env("CODEX_HOME", codex_home());
-        match self.backend {
-            Backend::OpenAi => {
-                if let Some(key) = crate::secret_loader::load_provider_key("CODEX_API_KEY") {
-                    cmd.env("CODEX_API_KEY", key);
-                }
-                // else: auth.json under CODEX_HOME carries ChatGPT-plan auth.
-            }
-            Backend::Cerebras => {
-                if let Some(key) = crate::secret_loader::load_provider_key("CEREBRAS_API_KEY") {
-                    cmd.env("CEREBRAS_API_KEY", key);
-                }
-            }
+        if let Some(key) = crate::secret_loader::load_provider_key("CODEX_API_KEY") {
+            cmd.env("CODEX_API_KEY", key);
         }
+        // else: auth.json under CODEX_HOME carries ChatGPT-plan auth.
         if !opts.env.is_empty() {
             cmd.envs(opts.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         }
@@ -443,10 +392,7 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"{\"decisio
 echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
 "#,
         );
-        let r = CodexCliReasoner {
-            bin,
-            backend: Backend::OpenAi,
-        };
+        let r = CodexCliReasoner { bin };
         let got = r.call(&opts(), "classify this").await.unwrap();
         assert_eq!(got, "{\"decision\":\"reply\"}", "LastBlock keeps the final message");
         let all = r.call_transcript(&opts(), "classify this").await.unwrap();
@@ -465,10 +411,7 @@ echo '{"type":"turn.failed","error":{"message":"You'\''ve hit your usage limit. 
 exit 1
 "#,
         );
-        let r = CodexCliReasoner {
-            bin,
-            backend: Backend::OpenAi,
-        };
+        let r = CodexCliReasoner { bin };
         let err = r.call(&opts(), "hi").await.unwrap_err();
         match ReasonerError::find_in(&err) {
             Some(ReasonerError::RateLimited { provider, .. }) => assert_eq!(provider, "codex"),
@@ -480,7 +423,6 @@ exit 1
     async fn missing_binary_is_local_not_failoverable_noise() {
         let r = CodexCliReasoner {
             bin: "/nonexistent/codex-bin".into(),
-            backend: Backend::OpenAi,
         };
         let err = r.call(&opts(), "hi").await.unwrap_err();
         assert!(matches!(
@@ -489,41 +431,4 @@ exit 1
         ));
     }
 
-    #[tokio::test]
-    async fn cerebras_backend_passes_provider_overrides_and_key() {
-        let dir = tempfile::tempdir().unwrap();
-        // Stub records argv + selected env to a file, then answers.
-        let record = dir.path().join("record.txt");
-        // NB: presence-only probe — this box's keyring holds the REAL
-        // CEREBRAS_API_KEY, so the stub must never echo the value.
-        let bin = stub(
-            &dir,
-            "fake-codex-args",
-            &format!(
-                r#"
-cat >/dev/null
-printf '%s\n' "$@" > {record}
-echo "CEREBRAS_KEY_PRESENT=${{CEREBRAS_API_KEY:+yes}}" >> {record}
-echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"ok"}}}}'
-"#,
-                record = record.display()
-            ),
-        );
-        // Env fallback covers machines without a keyring entry; on this box
-        // the keyring value wins, which is equally fine for a presence check.
-        std::env::set_var("CEREBRAS_API_KEY", "test-key-123");
-        let r = CodexCliReasoner {
-            bin,
-            backend: Backend::Cerebras,
-        };
-        let got = r.call(&opts(), "hi").await.unwrap();
-        std::env::remove_var("CEREBRAS_API_KEY");
-        assert_eq!(got, "ok");
-        let rec = std::fs::read_to_string(&record).unwrap();
-        assert!(rec.contains("model_provider=cerebras"), "rec: {rec}");
-        assert!(rec.contains("model_providers.cerebras.base_url=https://api.cerebras.ai/v1"));
-        assert!(rec.contains("model_providers.cerebras.wire_api=chat"));
-        assert!(rec.contains("CEREBRAS_KEY_PRESENT=yes"), "JIT key must reach the spawn env");
-        assert!(rec.contains("gpt-oss-120b"), "cerebras quality tier model");
-    }
 }

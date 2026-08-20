@@ -117,18 +117,15 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
                 });
             }
             ProviderKind::Cerebras => {
-                let bin = crate::codex::codex_bin();
-                if !bin_resolves(&bin) {
-                    info!("reasoner chain: cerebras skipped (codex CLI {bin:?} not installed)");
-                    continue;
-                }
+                // Thin chat-completions client (#663 plan B — codex ≥0.148
+                // removed wire_api=chat and Cerebras has no Responses API).
                 if crate::secret_loader::load_provider_key("CEREBRAS_API_KEY").is_none() {
                     info!("reasoner chain: cerebras skipped (no CEREBRAS_API_KEY in keyring/env)");
                     continue;
                 }
                 entries.push(Entry {
                     kind,
-                    reasoner: Arc::new(crate::codex::CodexCliReasoner::cerebras()),
+                    reasoner: Arc::new(crate::cerebras::CerebrasHttpReasoner::new()),
                 });
             }
         }
