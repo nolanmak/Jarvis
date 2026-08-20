@@ -270,6 +270,30 @@ impl WhatsappControlSurface {
                     .await
                     .ok();
             }
+            // #501 scheduled-send outcomes. WhatsApp control can't raise
+            // these itself yet (no schedule verbs here), but the shared
+            // handler can return them — ack with the same wording as the
+            // Discord surface. Unscheduled has no email/draft payload to
+            // re-post a card from, so the pointer is cleared and the nudge
+            // queue re-surfaces the pending draft on its own.
+            ApprovalActionOutcome::Scheduled { local, .. } => {
+                self.active_card.lock().await.remove(chat_jid);
+                self.send_to_control(&format!("Scheduled — sends {local}."))
+                    .await
+                    .ok();
+            }
+            ApprovalActionOutcome::Unscheduled => {
+                self.active_card.lock().await.remove(chat_jid);
+                self.send_to_control("Back in the queue — draft pending again.")
+                    .await
+                    .ok();
+            }
+            ApprovalActionOutcome::CancelledSchedule => {
+                self.active_card.lock().await.remove(chat_jid);
+                self.send_to_control("Scheduled send cancelled — draft discarded.")
+                    .await
+                    .ok();
+            }
         }
     }
 
