@@ -415,6 +415,18 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         deep: bool,
     },
+    /// #655/#667 — one live round-trip through the provider fallback chain.
+    /// Builds the production reasoner (AUGMENTAGENT_REASONER_CHAIN +
+    /// eligibility checks), sends a trivial text-only prompt, and prints the
+    /// configured chain, active cooldown latches, and the response. This is
+    /// the reproducible e2e probe for failover changes: point CLAUDE_CLI at
+    /// a stub that refuses on quota and watch the call get served by the
+    /// next provider.
+    ReasonerSelftest {
+        /// Prompt to send (default asks for a one-word reply).
+        #[arg(long, default_value = "Reply with exactly one word: PONG")]
+        prompt: String,
+    },
     /// Issue #12 — read/write the sqlite `config` table so the `/setup`
     /// skill never has to parse or rewrite `.env`. Reads merge config over
     /// `process.env` (config wins) — same precedence as the dashboard.
@@ -3355,6 +3367,7 @@ async fn main() -> Result<()> {
             std::process::exit(code);
         }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
+        Cmd::ReasonerSelftest { ref prompt } => run_reasoner_selftest(prompt).await,
         Cmd::Install { component } => installers::run_install(component).await,
         Cmd::Logs {
             unit,
@@ -7035,6 +7048,57 @@ async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
 }
 
 /// Adapter: bridges the Discord broker's `QueryHandler` trait to our
+/// #655/#667 — `reasoner-selftest`: one live text-only round-trip through
+/// the production provider chain. Prints the chain, any active cooldown
+/// latches, and the answer. Exit non-zero when the whole chain fails, so a
+/// timer/doctor wrapper can alert on it.
+async fn run_reasoner_selftest(prompt: &str) -> Result<()> {
+    use augmentagent_channel_core::{CooldownLatch, ReasonerOpts};
+
+    let reasoner = build_reasoner();
+    println!("chain: {}", reasoner.provider_names().join(" → "));
+    let latches = CooldownLatch::system().active();
+    if latches.is_empty() {
+        println!("cooldowns: none active");
+    } else {
+        for (provider, entry) in &latches {
+            println!("cooldowns: {provider} latched until {} ({})", entry.until, entry.reason);
+        }
+    }
+
+    // Text-only opts (no tools) so every configured provider is eligible —
+    // this is the widest possible probe of the chain. Quality tier keeps the
+    // probe on the same models the important presets use.
+    let opts = ReasonerOpts {
+        system_prompt: "You are a diagnostic probe. Follow the user's instruction exactly, \
+                        with no preamble."
+            .into(),
+        model: Some(
+            std::env::var("AUGMENTAGENT_OPUS_MODEL").unwrap_or_else(|_| "claude-opus-4-8".into()),
+        ),
+        allowed_tools: vec![],
+        add_dirs: vec![],
+        permission_mode: "default".into(),
+        cwd: None,
+        env: vec![],
+        settings_json: None,
+        restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
+    };
+    match reasoner.call(&opts, prompt).await {
+        Ok(text) => {
+            println!("response: {text}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("selftest FAILED: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// `FallbackReasoner` + `ask_opts`. Lives in the CLI to avoid a circular
 /// dep between the discord crate and the channel-email crate.
 struct WikiQuerier {
