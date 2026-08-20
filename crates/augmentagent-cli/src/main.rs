@@ -4289,6 +4289,17 @@ fn compose_pending_disposition(
     ComposePendingDisposition::Create
 }
 
+/// Subject to recreate a revised Gmail draft with. `thread_id` is what makes a
+/// card a reply — the same field the recreated draft is threaded off — so the
+/// `Re:` prefix follows it: new-email compose cards (#675) keep the subject the
+/// user passed to `--subject` verbatim.
+fn revise_subject(original: &str, thread_id: Option<&str>) -> String {
+    if thread_id.is_none() || original.to_ascii_lowercase().starts_with("re:") {
+        return original.to_string();
+    }
+    format!("Re: {original}")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_gmail_compose(
     store: Arc<Store>,
@@ -7399,7 +7410,10 @@ mod unescape_body_tests {
 
 #[cfg(test)]
 mod approval_body_tests {
-    use super::{compose_pending_disposition, strip_approval_envelope_markers, ComposePendingDisposition};
+    use super::{
+        compose_pending_disposition, revise_subject, strip_approval_envelope_markers,
+        ComposePendingDisposition,
+    };
 
     #[test]
     fn pending_follow_up_replaces_the_existing_card() {
@@ -7438,6 +7452,29 @@ mod approval_body_tests {
     fn keeps_normal_prose_and_non_email_colons() {
         let body = "Hi,\n\nCC: means carbon copy in this sentence.\nTo: the team";
         assert_eq!(strip_approval_envelope_markers(body), body);
+    }
+
+    #[test]
+    fn revising_a_new_email_card_never_prefixes_re() {
+        assert_eq!(
+            revise_subject("Ship Systems x EFS", None),
+            "Ship Systems x EFS"
+        );
+    }
+
+    #[test]
+    fn revising_a_reply_card_prefixes_re_at_most_once() {
+        assert_eq!(
+            revise_subject("Ship Systems x EFS", Some("t1")),
+            "Re: Ship Systems x EFS"
+        );
+        assert_eq!(revise_subject("Re: hi", Some("t1")), "Re: hi");
+        assert_eq!(revise_subject("RE: hi", Some("t1")), "RE: hi");
+    }
+
+    #[test]
+    fn a_user_written_re_subject_survives_on_a_new_email_card() {
+        assert_eq!(revise_subject("Re: hi", None), "Re: hi");
     }
 }
 
@@ -8995,11 +9032,7 @@ impl ReplyApprover {
         };
 
         // 2. Create a fresh Gmail draft with the revised body.
-        let subject = if action.email.subject.to_ascii_lowercase().starts_with("re:") {
-            action.email.subject.clone()
-        } else {
-            format!("Re: {}", action.email.subject)
-        };
+        let subject = revise_subject(&action.email.subject, action.email.thread_id.as_deref());
         // #473 — recreate the draft with the envelope the card was composed
         // with, when one was recorded. Pre-#473 behavior (To = emails.from,
         // no cc/bcc) silently dropped an overridden To and every cc/bcc on
