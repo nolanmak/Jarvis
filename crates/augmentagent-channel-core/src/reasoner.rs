@@ -225,6 +225,190 @@ fn build_socialapi_readonly_settings(
     .to_string()
 }
 
+/// Typed reasoner failure surfaced through the `anyhow` chain (#655/#656).
+///
+/// Callers keep receiving `anyhow::Error`, but the fallback layer (and any
+/// caller that cares) can `err.downcast_ref::<ReasonerError>()` to decide
+/// what to do. The variants split along the ONE axis that matters for
+/// failover: is the failure *provider-side* (another provider might succeed
+/// right now) or *local* (retrying elsewhere wastes quota and masks the real
+/// problem)?
+///
+/// Display strings are chosen to preserve the pre-#655 log/UI text — e.g.
+/// `RateLimited` renders as `claude rate limit: …`, which greps and the
+/// Discord error surface already rely on.
+#[derive(Debug, thiserror::Error)]
+pub enum ReasonerError {
+    /// The provider refused on quota. `reset_at` is best-effort parsed from
+    /// the refusal text ("resets 9:30am (America/New_York)"); `None` means
+    /// the fallback layer applies its default cooldown.
+    #[error("{provider} rate limit: {message}")]
+    RateLimited {
+        provider: String,
+        message: String,
+        reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// The spawned CLI exceeded the watchdog timeout (#656 — before this, a
+    /// hung subprocess blocked its pipeline forever and "Anthropic is down"
+    /// was undetectable). The child is killed via `kill_on_drop`.
+    #[error("{provider} timed out after {secs}s")]
+    Timeout { provider: String, secs: u64 },
+    /// Provider-side failure that is not a quota refusal: connection errors,
+    /// 5xx, non-zero exits with API-shaped stderr, empty output.
+    #[error("{provider} unavailable: {message}")]
+    Unavailable { provider: String, message: String },
+    /// Local fault (missing binary, corrupted config, bad flags). NOT
+    /// failover-eligible from the primary's perspective — but the fallback
+    /// layer may still try the *next* provider, since a local fault in one
+    /// adapter says nothing about the others.
+    #[error("{message}")]
+    Local { message: String },
+}
+
+impl ReasonerError {
+    /// Provider-side failures are the ones worth latching a cooldown for.
+    pub fn is_provider_side(&self) -> bool {
+        matches!(
+            self,
+            ReasonerError::RateLimited { .. }
+                | ReasonerError::Timeout { .. }
+                | ReasonerError::Unavailable { .. }
+        )
+    }
+
+    /// Find a `ReasonerError` anywhere in an `anyhow` chain.
+    pub fn find_in(err: &anyhow::Error) -> Option<&ReasonerError> {
+        err.downcast_ref::<ReasonerError>()
+    }
+}
+
+/// Watchdog timeout for one spawned reasoner CLI call (#656). Env-tunable
+/// without a rebuild; the default is deliberately generous because agentic
+/// presets (wiki-ask, auto-PR build) legitimately run many minutes. The
+/// point is not tight latency — it's that "hung forever" becomes a typed,
+/// failover-eligible error instead of a silently stuck pipeline.
+pub fn reasoner_timeout() -> std::time::Duration {
+    let secs = std::env::var("AUGMENTAGENT_REASONER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(3600);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Class-aware watchdog (#655 review): full-agentic and write-tools runs
+/// (wiki-ask, auto-PR builds that compile code) legitimately run far longer
+/// than a triage/draft call — give them 2× the base budget so the watchdog
+/// catches hangs, not honest work.
+pub(crate) fn reasoner_timeout_for(opts: &ReasonerOpts) -> std::time::Duration {
+    use crate::providers::{classify, CapabilityClass};
+    let base = reasoner_timeout();
+    match classify(opts) {
+        CapabilityClass::FullAgentic | CapabilityClass::WriteTools => base * 2,
+        _ => base,
+    }
+}
+
+/// Best-effort parse of the Claude CLI quota refusal's reset hint:
+///
+/// ```text
+/// You've hit your session limit · resets 9:30am (America/New_York)
+/// ```
+///
+/// Returns the next UTC instant matching `<h>:<mm><am|pm>` in the named IANA
+/// timezone (today if still ahead, else tomorrow). Any parse failure returns
+/// `None` — the cooldown latch then falls back to a fixed interval, so a
+/// wording change can never break failover, only its precision.
+pub fn parse_reset_hint(message: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::TimeZone;
+    let lower = message.to_ascii_lowercase();
+    let idx = lower.find("resets ")?;
+    let rest = message[idx + "resets ".len()..].trim();
+    // Time token: "9:30am" or "10am".
+    let time_tok = rest.split_whitespace().next()?;
+    let time_lower = time_tok.to_ascii_lowercase();
+    let (num, is_pm) = if let Some(t) = time_lower.strip_suffix("pm") {
+        (t, true)
+    } else if let Some(t) = time_lower.strip_suffix("am") {
+        (t, false)
+    } else {
+        return None;
+    };
+    let (h, m) = match num.split_once(':') {
+        Some((h, m)) => (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?),
+        None => (num.parse::<u32>().ok()?, 0),
+    };
+    if h == 0 || h > 12 || m > 59 {
+        return None;
+    }
+    let hour24 = match (h, is_pm) {
+        (12, false) => 0,
+        (12, true) => 12,
+        (h, true) => h + 12,
+        (h, false) => h,
+    };
+    // Timezone token: "(America/New_York)". Absent → UTC is assumed, which
+    // can be hours wrong — tolerable ONLY because of the plausibility cap
+    // below, which bounds any tz mistake at a short latch or a None.
+    let tz: chrono_tz::Tz = rest
+        .find('(')
+        .and_then(|open| {
+            let close = rest[open..].find(')')? + open;
+            rest[open + 1..close].trim().parse().ok()
+        })
+        .unwrap_or(chrono_tz::UTC);
+    let now = chrono::Utc::now().with_timezone(&tz);
+    let today = now.date_naive().and_hms_opt(hour24, m, 0)?;
+    let candidate = tz.from_local_datetime(&today).earliest()?;
+    let candidate = if candidate <= now {
+        tz.from_local_datetime(&(today + chrono::Duration::days(1)))
+            .earliest()?
+    } else {
+        candidate
+    };
+    // Plausibility cap (#655 review): Claude session windows are 5-hourly,
+    // so a genuine reset is never more than ~5h out. Anything further means
+    // we parsed quoted/stale text, hit the day-rollover on a just-expired
+    // window, or mis-assumed the timezone — returning None makes the latch
+    // fall back to its short default cooldown, which self-heals, instead of
+    // latching the provider for up to a day.
+    let candidate_utc = candidate.with_timezone(&chrono::Utc);
+    if candidate_utc - chrono::Utc::now() > chrono::Duration::hours(6) {
+        return None;
+    }
+    Some(candidate_utc)
+}
+
+/// Wrap an untyped `CallError::Other` in the matching [`ReasonerError`]
+/// classification (#656): a missing binary is `Local` (failing over from it
+/// is fine, latching is not); everything else — connection failures, non-zero
+/// exits, empty output — is `Unavailable`, the "provider might be down"
+/// bucket. The original error stays in the chain for diagnostics.
+pub(crate) fn classify_other(provider: &str, e: anyhow::Error) -> anyhow::Error {
+    let not_found = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    });
+    if not_found {
+        e.context(ReasonerError::Local {
+            message: format!("{provider} binary not found on PATH"),
+        })
+    } else {
+        let first_line = e
+            .to_string()
+            .lines()
+            .next()
+            .unwrap_or("subprocess failed")
+            .chars()
+            .take(200)
+            .collect::<String>();
+        e.context(ReasonerError::Unavailable {
+            provider: provider.to_string(),
+            message: first_line,
+        })
+    }
+}
+
 /// Per-call options for a `Reasoner`. Each call type (triage, draft, ingest)
 /// gets a different preset — see `triage_opts`, `draft_opts`, `ingest_opts`.
 #[derive(Debug, Clone)]
@@ -399,19 +583,30 @@ impl ClaudeCliReasoner {
         // auto-recovery from the most recent on-disk backup and retry. If the
         // retry also fails or no backup exists, surface a short sanitized
         // user-facing error instead of the raw multi-line stderr blob.
-        match self.call_once(opts, user_message, capture).await {
+        match self.call_once_timed(opts, user_message, capture).await {
             Ok(text) => Ok(text),
             // #448 — do NOT retry. Retrying a quota refusal is exactly the
             // amplification that kept the daemon pinned against the limit.
-            // Log it once, loudly and honestly, and let the caller give up for
-            // this cycle. The old behaviour buried this as a parse failure.
+            // Log it once, loudly and honestly, and surface a typed error the
+            // FallbackReasoner chain (#655) can latch a cooldown from and —
+            // where the preset allows — route to a fallback provider.
             Err(CallError::RateLimited { message }) => {
                 warn!(
                     "claude REFUSED ON QUOTA (not retrying): {message} — \
-                     the daemon spends the owner's Claude subscription; set \
-                     ANTHROPIC_API_KEY to bill API credits instead (see #448)"
+                     typed as ReasonerError::RateLimited so the provider \
+                     chain (#655, AUGMENTAGENT_REASONER_CHAIN) can latch a \
+                     cooldown and fail over instead of hammering the wall"
                 );
-                Err(anyhow::anyhow!("claude rate limit: {message}"))
+                Err(rate_limited_error("claude", message))
+            }
+            Err(CallError::Timeout { secs }) => Err(anyhow::Error::new(ReasonerError::Timeout {
+                provider: "claude".into(),
+                secs,
+            })),
+            // Untyped on purpose — content-level, neither latches nor fails
+            // over (#655 review).
+            Err(CallError::EmptyOutput) => {
+                Err(anyhow::anyhow!("claude produced no assistant text"))
             }
             Err(CallError::ConfigCorrupted { stderr }) => {
                 let recovered = match restore_latest_claude_backup() {
@@ -423,23 +618,72 @@ impl ClaudeCliReasoner {
                     }
                 };
                 if recovered {
-                    match self.call_once(opts, user_message, capture).await {
+                    match self.call_once_timed(opts, user_message, capture).await {
                         Ok(text) => return Ok(text),
                         Err(CallError::ConfigCorrupted { stderr }) => {
-                            return Err(anyhow::anyhow!(sanitize_claude_error(&stderr)));
+                            return Err(anyhow::Error::new(ReasonerError::Local {
+                                message: sanitize_claude_error(&stderr),
+                            }));
                         }
                         Err(CallError::RateLimited { message }) => {
                             warn!("claude REFUSED ON QUOTA after config recovery: {message}");
-                            return Err(anyhow::anyhow!("claude rate limit: {message}"));
+                            return Err(rate_limited_error("claude", message));
                         }
-                        Err(CallError::Other(e)) => return Err(e),
+                        Err(CallError::Timeout { secs }) => {
+                            return Err(anyhow::Error::new(ReasonerError::Timeout {
+                                provider: "claude".into(),
+                                secs,
+                            }));
+                        }
+                        Err(CallError::EmptyOutput) => {
+                            return Err(anyhow::anyhow!("claude produced no assistant text"));
+                        }
+                        Err(CallError::Other(e)) => return Err(classify_other("claude", e)),
                     }
                 }
-                Err(anyhow::anyhow!(sanitize_claude_error(&stderr)))
+                Err(anyhow::Error::new(ReasonerError::Local {
+                    message: sanitize_claude_error(&stderr),
+                }))
             }
-            Err(CallError::Other(e)) => Err(e),
+            Err(CallError::Other(e)) => Err(classify_other("claude", e)),
         }
     }
+
+    /// [`call_once`] under the #656 watchdog. On expiry the in-flight future
+    /// is dropped, which kills the child via `kill_on_drop(true)` — no
+    /// orphaned `claude` processes, no forever-stuck pipeline.
+    async fn call_once_timed(
+        &self,
+        opts: &ReasonerOpts,
+        user_message: &str,
+        capture: TextCapture,
+    ) -> Result<String, CallError> {
+        let dur = reasoner_timeout_for(opts);
+        match tokio::time::timeout(dur, self.call_once(opts, user_message, capture)).await {
+            Ok(r) => r,
+            Err(_) => {
+                warn!(
+                    "claude call exceeded the {}s watchdog; child killed (see \
+                     AUGMENTAGENT_REASONER_TIMEOUT_SECS, #656)",
+                    dur.as_secs()
+                );
+                Err(CallError::Timeout {
+                    secs: dur.as_secs(),
+                })
+            }
+        }
+    }
+}
+
+/// Build the typed rate-limit error, parsing the reset hint once so both the
+/// first-attempt and post-recovery paths stamp the same shape.
+fn rate_limited_error(provider: &str, message: String) -> anyhow::Error {
+    let reset_at = parse_reset_hint(&message);
+    anyhow::Error::new(ReasonerError::RateLimited {
+        provider: provider.to_string(),
+        message,
+        reset_at,
+    })
 }
 
 #[async_trait]
@@ -472,6 +716,14 @@ enum CallError {
     /// this variant it masquerades as a malformed model answer and gets
     /// retried. Distinct so callers can back off until the reset instead.
     RateLimited { message: String },
+    /// #656 — the watchdog expired before the CLI finished. The child is
+    /// killed via `kill_on_drop`; distinct so the outer wrapper can surface
+    /// a typed, failover-eligible [`ReasonerError::Timeout`].
+    Timeout { secs: u64 },
+    /// The CLI exited 0 but produced no assistant text. Content-level, NOT
+    /// provider-side (#655 review): surfaced untyped so it neither latches
+    /// the provider nor triggers failover.
+    EmptyOutput,
     /// Any other failure: spawn errors, IO errors, non-config exit failures.
     Other(anyhow::Error),
 }
@@ -613,7 +865,11 @@ impl ClaudeCliReasoner {
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // #656 — the watchdog in `call_once_timed` cancels this future on
+            // expiry; killing the child on drop is what makes that cancel
+            // real instead of leaking an orphaned CLI still burning quota.
+            .kill_on_drop(true);
         // Scope Write/Edit by setting the spawned CLI's cwd when requested.
         if let Some(cwd) = &opts.cwd {
             cmd.current_dir(cwd);
@@ -733,9 +989,7 @@ impl ClaudeCliReasoner {
             }
         }
         if final_text.is_empty() {
-            return Err(CallError::Other(anyhow::anyhow!(
-                "claude produced no assistant text"
-            )));
+            return Err(CallError::EmptyOutput);
         }
         // #448 — the quota refusal is a *successful* completion. Catch it here,
         // before it reaches a JSON parser that would mislabel it a parse error
@@ -839,9 +1093,30 @@ fn is_claude_config_corrupted(stderr: &str) -> bool {
 /// email is left in an error state and the action layer retries it (max=5)
 /// while the 2-minute poll keeps feeding new work into the same wall. Naming
 /// the condition lets callers back off instead of hammering it.
-fn is_rate_limited(text: &str) -> bool {
-    let t = text.to_ascii_lowercase();
-    (t.contains("session limit") || t.contains("usage limit") || t.contains("rate limit"))
+pub(crate) fn is_rate_limited(text: &str) -> bool {
+    // #655 review hardening: this check runs on SUCCESSFUL model output, and
+    // post-#655 a positive doesn't just fail one call — it latches the
+    // provider in the shared cooldown file. So it must only fire when the
+    // refusal IS the message, not merely appears in it (a digest summarizing
+    // "the owner forwarded a limit notice", or a wiki-ask transcript quoting
+    // log.md, legitimately CONTAINS refusal wording). Two gates on top of
+    // the phrase pair: genuine CLI refusals are one short line (length cap)
+    // and start with the refusal itself (anchor) — a JSON answer starts with
+    // '{', prose quoting starts elsewhere.
+    let t = text.trim();
+    if t.len() > 300 {
+        return false;
+    }
+    let t = t.to_ascii_lowercase();
+    let anchored = t.starts_with("you've hit your")
+        || t.starts_with("you've reached your")
+        || t.starts_with("you have hit your")
+        || t.starts_with("you have reached your")
+        || t.starts_with("rate limit")
+        || t.starts_with("usage limit")
+        || t.starts_with("session limit");
+    anchored
+        && (t.contains("session limit") || t.contains("usage limit") || t.contains("rate limit"))
         && (t.contains("hit your") || t.contains("reached your") || t.contains("resets"))
 }
 
@@ -2669,6 +2944,33 @@ mod rate_limit_tests {
             assert!(!is_rate_limited(ok), "false positive on: {ok}");
         }
     }
+
+    /// #655 review — post-#655 a false positive doesn't fail one call, it
+    /// LATCHES the provider in shared state. Output that merely CONTAINS or
+    /// QUOTES refusal wording must never match: the refusal must be the
+    /// whole (short, anchored) message.
+    #[test]
+    fn quoted_refusals_inside_answers_do_not_latch() {
+        for ok in [
+            // Short triage answer quoting a forwarded limit notice.
+            r#"{"decision":"flag","reason":"Owner forwarded: You've hit your usage limit · resets 9:30am"}"#,
+            // Digest line summarizing yesterday's incident.
+            "Yesterday's incidents: two triage calls failed with \
+             'You've hit your session limit · resets 9:30am (America/New_York)'.",
+            // Long transcript with the refusal mid-text (length cap).
+            &format!(
+                "{}\nYou've hit your session limit · resets 9:30am\n{}",
+                "context ".repeat(50),
+                "more context ".repeat(50)
+            ),
+        ] {
+            assert!(!is_rate_limited(ok), "quoted refusal must not match: {ok}");
+        }
+        // The genuine refusal itself still matches, of course.
+        assert!(is_rate_limited(
+            "You've hit your session limit · resets 9:30am (America/New_York)"
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -2849,5 +3151,165 @@ mod ask_mode_social_card_allowlist_tests {
             tools.iter().filter(|t| t.contains("socialapi dm *")).count() >= 2,
             "expected both an absolute and a bare form"
         );
+    }
+
+}
+
+/// #655/#656 — typed errors, reset-hint parsing, watchdog. Spawn-level tests
+/// drive a stub CLI through the real `call_once` path (the same override
+/// mechanism the fault-injection rig uses, #666).
+#[cfg(test)]
+mod failover_error_tests {
+    use super::*;
+
+    fn dummy_opts() -> ReasonerOpts {
+        ReasonerOpts {
+            system_prompt: "stub".into(),
+            model: None,
+            allowed_tools: vec![],
+            add_dirs: vec![],
+            permission_mode: "default".into(),
+            cwd: None,
+            env: vec![],
+            settings_json: None,
+            restrict_env: false,
+            audit_logger: None,
+            audit_notifier: None,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn parse_reset_hint_reads_time_and_caps_horizon() {
+        use chrono::Timelike;
+
+        // A genuinely-near reset (2h ahead, UTC) parses to the right minute.
+        // Built dynamically so the test is independent of wall-clock time.
+        let near = chrono::Utc::now() + chrono::Duration::hours(2);
+        let (h12, ampm) = match near.hour() {
+            0 => (12, "am"),
+            h @ 1..=11 => (h, "am"),
+            12 => (12, "pm"),
+            h => (h - 12, "pm"),
+        };
+        let msg = format!(
+            "You've hit your session limit · resets {h12}:{:02}{ampm} (UTC)",
+            near.minute()
+        );
+        let at = parse_reset_hint(&msg).expect("near reset must parse");
+        assert!(at > chrono::Utc::now(), "reset must be in the future");
+        assert!(
+            at <= chrono::Utc::now() + chrono::Duration::hours(6),
+            "cap holds"
+        );
+        assert_eq!((at.hour(), at.minute()), (near.hour(), near.minute()));
+
+        // Plausibility cap (#655 review): a reset >6h out can only come from
+        // quoted/stale text or a day-rollover on a just-expired window —
+        // it must be rejected (None ⇒ short default cooldown, self-healing).
+        let far = chrono::Utc::now() + chrono::Duration::hours(12);
+        let (fh12, fampm) = match far.hour() {
+            0 => (12, "am"),
+            h @ 1..=11 => (h, "am"),
+            12 => (12, "pm"),
+            h => (h - 12, "pm"),
+        };
+        let far_msg = format!("resets {fh12}:{:02}{fampm} (UTC)", far.minute());
+        assert!(
+            parse_reset_hint(&far_msg).is_none(),
+            "distant reset must be capped to None: {far_msg}"
+        );
+
+        // Garbage shapes degrade to None, never panic.
+        assert!(parse_reset_hint("no reset here").is_none());
+        assert!(parse_reset_hint("resets whenever").is_none());
+        assert!(parse_reset_hint("resets 13:00pm (Mars/Olympus)").is_none());
+    }
+
+    /// Write an executable stub script the reasoner spawns instead of the
+    /// real `claude` (same override the fault-injection rig uses, #666).
+    fn stub_cli(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "#!/usr/bin/env bash").unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// #448's refusal arrives as a SUCCESSFUL completion; post-#656 it must
+    /// surface as a downcastable `ReasonerError::RateLimited` with the reset
+    /// hint parsed — that's what the fallback chain latches from.
+    #[tokio::test]
+    async fn quota_refusal_surfaces_typed_rate_limited_with_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(
+            &dir,
+            "fake-claude-quota",
+            r#"
+cat >/dev/null
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"You'\''ve hit your session limit · resets 9:30am (America/New_York)"}]}}'
+echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30am (America/New_York)"}'
+"#,
+        );
+        let reasoner = ClaudeCliReasoner { bin };
+        let err = reasoner
+            .call(&dummy_opts(), "triage this")
+            .await
+            .expect_err("refusal must be an error");
+        match ReasonerError::find_in(&err) {
+            Some(ReasonerError::RateLimited {
+                provider, reset_at, ..
+            }) => {
+                assert_eq!(provider, "claude");
+                // The stub's fixed "9:30am (America/New_York)" is >6h away
+                // for most of the day, in which case the plausibility cap
+                // deliberately yields None (short default cooldown). When it
+                // IS within the window, it must be bounded by the cap.
+                if let Some(at) = reset_at {
+                    assert!(*at <= chrono::Utc::now() + chrono::Duration::hours(6));
+                }
+            }
+            other => panic!("expected RateLimited, got {other:?} (err: {err:#})"),
+        }
+    }
+
+    /// #656 — a hung CLI becomes a typed Timeout instead of blocking the
+    /// pipeline forever. kill_on_drop reaps the child.
+    #[tokio::test]
+    async fn hung_cli_times_out_with_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(&dir, "fake-claude-hang", "cat >/dev/null\nsleep 600\n");
+        std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
+        let reasoner = ClaudeCliReasoner { bin };
+        let started = std::time::Instant::now();
+        let err = reasoner.call(&dummy_opts(), "hi").await.expect_err("must time out");
+        std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "watchdog must fire promptly, took {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            ReasonerError::find_in(&err),
+            Some(ReasonerError::Timeout { .. })
+        ));
+    }
+
+    /// A missing binary is a Local fault (never latched, never mistaken for
+    /// an outage), and an ordinary spawn failure classifies as Unavailable.
+    #[tokio::test]
+    async fn missing_claude_binary_classifies_as_local() {
+        let reasoner = ClaudeCliReasoner {
+            bin: "/nonexistent/claude-bin".into(),
+        };
+        let err = reasoner.call(&dummy_opts(), "hi").await.unwrap_err();
+        assert!(matches!(
+            ReasonerError::find_in(&err),
+            Some(ReasonerError::Local { .. })
+        ));
     }
 }

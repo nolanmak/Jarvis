@@ -28,12 +28,17 @@ serde_json = { workspace = true }
 # RateGovernor (#83) — uuid for permit ids, chrono for quiet-hours TZ math.
 uuid = { workspace = true }
 chrono = { workspace = true }
+# #655/#656 — parse the quota refusal's "resets 9:30am (America/New_York)"
+# hint into a UTC instant for the fallback chain's cooldown latch.
+chrono-tz = { workspace = true }
+# #655 — provider adapters (codex/gemini) pass system prompts and per-spawn
+# settings via temp files (neither CLI takes them as an argument string).
+tempfile = "3"
 # #35 Phase 2 — Composio-backed free/busy + Drive search resolver clients.
 # Self-contained reqwest client (intentional duplication, see resolve.rs).
 reqwest = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
 futures = { workspace = true }
 # #501 — timeparse DST fixture tests pin America/New_York (chrono::Local
 # reads TZ once at process start, so env-pinning in tests is unreliable).
