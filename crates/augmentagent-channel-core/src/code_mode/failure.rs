@@ -258,6 +258,36 @@ pub async fn handle_code_mode_failure(
 ) -> DraftOutcome {
     let original_error = original_err.to_string();
 
+    // #660 — self-repair exists for "the model wrote a bad program", not for
+    // "the provider is gone". A quota refusal / outage / timeout would fail
+    // the repair call identically (and, pre-#655, one rate-limited email
+    // burned three back-to-back spawns: code-mode → repair → classic — the
+    // exact #448 amplification shape). Skip straight to the classic signal;
+    // the classic attempt fails fast against the cooldown latch.
+    if let CodeModeError::ReasonerFailed(inner) = original_err {
+        if crate::reasoner::ReasonerError::find_in(inner).is_some_and(|re| re.is_provider_side()) {
+            warn!(
+                message_id = %ctx.email.message_id,
+                channel = %ctx.channel,
+                "code-mode failed provider-side ({original_error}); skipping \
+                 self-repair — retrying a rate-limited/unavailable provider \
+                 only amplifies (#448/#660)"
+            );
+            return DraftOutcome::ClassicNeeded(FailureRecord {
+                original_source: original_source.to_string(),
+                original_error,
+                original_stage,
+                repair_source: None,
+                repair_error: Some(
+                    "skipped: provider-side failure (rate limit / outage / timeout) — \
+                     self-repair would amplify, see #660"
+                        .into(),
+                ),
+                repair_stage: Some(FailureStage::RepairCallCodeMode),
+            });
+        }
+    }
+
     info!(
         message_id = %ctx.email.message_id,
         channel = %ctx.channel,
@@ -858,6 +888,57 @@ mod tests {
         let multi = "line1\nline2\nline3";
         let t2 = build_issue_title(multi);
         assert!(!t2.contains('\n'));
+    }
+
+    /// #660 — a provider-side reasoner failure (rate limit / outage /
+    /// timeout) must skip the self-repair spawn entirely. Pre-#655 one
+    /// rate-limited email burned three back-to-back CLI spawns (code-mode →
+    /// repair → classic); the repair leg is the one this module owns.
+    #[tokio::test]
+    async fn provider_side_failure_skips_self_repair() {
+        let store = tmp_store();
+        let broker: Arc<dyn ApprovalBroker> = Arc::new(NoopBroker);
+        let gh: Arc<dyn GhIssueRunner> = Arc::new(RecordingGh::new(1));
+        // One canned response queued: if repair ran, it would be consumed.
+        let r = ScriptedReasoner::new(["```ts\nawait main();\n```"]);
+        let ctx = build_ctx(&r, store, broker, gh, sample_email());
+
+        let quota = CodeModeError::ReasonerFailed(anyhow::Error::new(
+            crate::reasoner::ReasonerError::RateLimited {
+                provider: "claude".into(),
+                message: "You've hit your session limit · resets 9:30am".into(),
+                reset_at: None,
+            },
+        ));
+        let out =
+            handle_code_mode_failure(&ctx, "", &quota, FailureStage::CallCodeMode).await;
+        match out {
+            DraftOutcome::ClassicNeeded(rec) => {
+                assert!(rec.repair_source.is_none(), "no repair program must exist");
+                assert!(
+                    rec.repair_error.as_deref().unwrap_or("").contains("skipped"),
+                    "record must say the repair was skipped: {:?}",
+                    rec.repair_error
+                );
+            }
+            other => panic!("expected ClassicNeeded, got {other:?}"),
+        }
+        assert_eq!(
+            r.responses.lock().unwrap().len(),
+            1,
+            "the repair reasoner call must never fire on a provider-side failure"
+        );
+
+        // Contrast: a content-level failure (NoCodeBlock) still repairs.
+        let content = CodeModeError::NoCodeBlock;
+        let out2 =
+            handle_code_mode_failure(&ctx, "", &content, FailureStage::CallCodeMode).await;
+        assert_eq!(
+            r.responses.lock().unwrap().len(),
+            0,
+            "content-level failures must still attempt self-repair"
+        );
+        drop(out2);
     }
 
     #[tokio::test]

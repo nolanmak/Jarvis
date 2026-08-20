@@ -15,7 +15,7 @@ use augmentagent_approval_discord::{
     LoopRunner, LoopScheduler, NoopBroker, QueryHandler,
 };
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
-use augmentagent_channel_core::{ClaudeCliReasoner, Reasoner};
+use augmentagent_channel_core::{build_reasoner, FallbackReasoner, Reasoner};
 use augmentagent_channel_email::gmail::{Attachment, ComposioClient, GmailApi};
 use augmentagent_channel_email::sigextract::{
     detect_signature_block, is_human_sender, signature_patch, strip_quoted_reply,
@@ -414,6 +414,18 @@ enum Cmd {
         /// summaries sourced from `status`).
         #[arg(long, default_value_t = false)]
         deep: bool,
+    },
+    /// #655/#667 — one live round-trip through the provider fallback chain.
+    /// Builds the production reasoner (AUGMENTAGENT_REASONER_CHAIN +
+    /// eligibility checks), sends a trivial text-only prompt, and prints the
+    /// configured chain, active cooldown latches, and the response. This is
+    /// the reproducible e2e probe for failover changes: point CLAUDE_CLI at
+    /// a stub that refuses on quota and watch the call get served by the
+    /// next provider.
+    ReasonerSelftest {
+        /// Prompt to send (default asks for a one-word reply).
+        #[arg(long, default_value = "Reply with exactly one word: PONG")]
+        prompt: String,
     },
     /// Issue #12 — read/write the sqlite `config` table so the `/setup`
     /// skill never has to parse or rewrite `.env`. Reads merge config over
@@ -2413,7 +2425,7 @@ async fn main() -> Result<()> {
                 // Discord is enabled. Skips cleanly when no Digest-mode subs.
                 let digest = augmentagent_channel_discord_dm::digest::DigestScheduler::new(
                     Arc::clone(&store),
-                    Arc::new(ClaudeCliReasoner::new()),
+                    build_reasoner(),
                     Arc::clone(&broker),
                     cli.wiki_dir.clone(),
                 );
@@ -2429,7 +2441,7 @@ async fn main() -> Result<()> {
                 // when there are no Digest-mode Slack subscriptions.
                 let slack_digest = augmentagent_channel_slack::slack_digest_scheduler(
                     Arc::clone(&store),
-                    Arc::new(ClaudeCliReasoner::new()),
+                    build_reasoner(),
                     Arc::clone(&broker),
                     cli.wiki_dir.clone(),
                 );
@@ -2513,7 +2525,7 @@ async fn main() -> Result<()> {
                         let repo_root = std::env::current_dir()
                             .unwrap_or_else(|_| PathBuf::from("."));
                         let runner = Arc::new(LoopReasonerRunner {
-                            reasoner: Arc::new(ClaudeCliReasoner::new()),
+                            reasoner: build_reasoner(),
                             wiki_root,
                             repo_root,
                         });
@@ -3355,6 +3367,7 @@ async fn main() -> Result<()> {
             std::process::exit(code);
         }
         Cmd::Env { ref op, json } => env_cfg::run_env(op, json),
+        Cmd::ReasonerSelftest { ref prompt } => run_reasoner_selftest(prompt).await,
         Cmd::Install { component } => installers::run_install(component).await,
         Cmd::Logs {
             unit,
@@ -5892,7 +5905,7 @@ async fn run_digest(
     }
 
     // Compose the digest via Claude.
-    let reasoner = ClaudeCliReasoner::new();
+    let reasoner = build_reasoner();
     let opts = digest_opts(cli.wiki_dir.clone());
     info!(window_hours = since_hours, post_discord, "composing digest");
     let digest = reasoner.call(&opts, &ctx).await?;
@@ -5988,7 +6001,7 @@ async fn run_resume_ingest(cli: &Cli, file: PathBuf) -> Result<()> {
     );
 
     info!(wiki = %wiki_root.display(), file = %file.display(), "running resume ingest");
-    let reasoner = ClaudeCliReasoner::new();
+    let reasoner = build_reasoner();
     let report = reasoner.call(&opts, &user_msg).await?;
     println!("{report}");
     Ok(())
@@ -6071,7 +6084,7 @@ async fn run_wiki_ask(cli: &Cli, question: String, post: bool) -> Result<()> {
         .clone()
         .context("--wiki-dir is required for wiki ask")?;
 
-    let reasoner = ClaudeCliReasoner::new();
+    let reasoner = build_reasoner();
     let repo_root = std::env::current_dir().context("current_dir")?;
     let opts = augmentagent_channel_core::reasoner::ask_opts(wiki_root.clone(), repo_root);
     info!(wiki = %wiki_root.display(), "wiki ask");
@@ -6152,7 +6165,7 @@ async fn run_wiki_lint(cli: &Cli, store: Arc<Store>, out: Option<PathBuf>) -> Re
     let freshness_section =
         wiki_freshness_section(&wiki_root, &|id| store.email_first_seen_at(id).ok().flatten());
 
-    let reasoner = ClaudeCliReasoner::new();
+    let reasoner = build_reasoner();
     let opts = augmentagent_channel_core::reasoner::lint_opts(schema, wiki_root.clone());
     let user_msg = format!(
         "Run the lint workflow from your system prompt against the wiki at `{}`. Produce a markdown report listing findings by category (contradictions, orphans, stale, missing pages, broken links). Use relative paths. End with a short summary line.\n",
@@ -6518,7 +6531,7 @@ async fn run_wiki_migrate(
     let today_iso = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let system_prompt = migration_system_prompt(&schema);
     let opts = std::sync::Arc::new(wiki_migrate_opts(system_prompt, wiki_root.clone()));
-    let reasoner = std::sync::Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
     let sem = std::sync::Arc::new(Semaphore::new(concurrency.max(1)));
 
     let migrated = std::sync::Arc::new(AtomicUsize::new(0));
@@ -7035,10 +7048,61 @@ async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
 }
 
 /// Adapter: bridges the Discord broker's `QueryHandler` trait to our
-/// `ClaudeCliReasoner` + `ask_opts`. Lives in the CLI to avoid a circular
+/// #655/#667 — `reasoner-selftest`: one live text-only round-trip through
+/// the production provider chain. Prints the chain, any active cooldown
+/// latches, and the answer. Exit non-zero when the whole chain fails, so a
+/// timer/doctor wrapper can alert on it.
+async fn run_reasoner_selftest(prompt: &str) -> Result<()> {
+    use augmentagent_channel_core::{CooldownLatch, ReasonerOpts};
+
+    let reasoner = build_reasoner();
+    println!("chain: {}", reasoner.provider_names().join(" → "));
+    let latches = CooldownLatch::system().active();
+    if latches.is_empty() {
+        println!("cooldowns: none active");
+    } else {
+        for (provider, entry) in &latches {
+            println!("cooldowns: {provider} latched until {} ({})", entry.until, entry.reason);
+        }
+    }
+
+    // Text-only opts (no tools) so every configured provider is eligible —
+    // this is the widest possible probe of the chain. Quality tier keeps the
+    // probe on the same models the important presets use.
+    let opts = ReasonerOpts {
+        system_prompt: "You are a diagnostic probe. Follow the user's instruction exactly, \
+                        with no preamble."
+            .into(),
+        model: Some(
+            std::env::var("AUGMENTAGENT_OPUS_MODEL").unwrap_or_else(|_| "claude-opus-4-8".into()),
+        ),
+        allowed_tools: vec![],
+        add_dirs: vec![],
+        permission_mode: "default".into(),
+        cwd: None,
+        env: vec![],
+        settings_json: None,
+        restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
+    };
+    match reasoner.call(&opts, prompt).await {
+        Ok(text) => {
+            println!("response: {text}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("selftest FAILED: {e:#}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `FallbackReasoner` + `ask_opts`. Lives in the CLI to avoid a circular
 /// dep between the discord crate and the channel-email crate.
 struct WikiQuerier {
-    reasoner: Arc<ClaudeCliReasoner>,
+    reasoner: Arc<FallbackReasoner>,
     wiki_root: PathBuf,
     repo_root: PathBuf,
 }
@@ -7181,7 +7245,7 @@ impl augmentagent_channel_core::AuditNotifier for DiscordAuditNotifier {
 /// `claude` reasoner + `ask_opts` toolbelt the wiki-ask path uses, so
 /// `/loop 1h what's new in my inbox` behaves identically to asking the bot.
 struct LoopReasonerRunner {
-    reasoner: Arc<ClaudeCliReasoner>,
+    reasoner: Arc<FallbackReasoner>,
     wiki_root: PathBuf,
     repo_root: PathBuf,
 }
@@ -7210,7 +7274,7 @@ impl LoopRunner for LoopReasonerRunner {
 /// `loop` command parser: asks Haiku to extract {interval, prompt, duration?}
 /// from arbitrary phrasing. See `loop_parse_opts` for the system prompt.
 struct LoopReasonerParser {
-    reasoner: Arc<ClaudeCliReasoner>,
+    reasoner: Arc<FallbackReasoner>,
 }
 
 #[async_trait]
@@ -7551,7 +7615,7 @@ struct ReplyApprover {
     /// keyring entry this run; any socialapi-tagged action hits `Failed`.
     /// Drives the comment-reply / DM-reply send on Approve (#244).
     socialapi: Option<Arc<augmentagent_channel_socialapi::SocialApiClient>>,
-    reasoner: Arc<ClaudeCliReasoner>,
+    reasoner: Arc<FallbackReasoner>,
     draft_skill: String,
     wiki_root: Option<PathBuf>,
     /// Set after construction (in serve) to allow approve/skip handlers to
@@ -9397,7 +9461,7 @@ async fn build_broker(
         .ok()
         .and_then(|s| s.parse().ok());
 
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
 
     let repo_root = std::env::current_dir().context("current_dir")?;
     let query_handler: Option<Arc<dyn QueryHandler>> = cli.wiki_dir.as_ref().map(|root| {
@@ -9483,10 +9547,10 @@ fn build_channel(
     broker: Arc<dyn ApprovalBroker>,
     dry_run: bool,
     interval_secs: u64,
-) -> Result<GmailChannel<ComposioClient, ClaudeCliReasoner>> {
+) -> Result<GmailChannel<ComposioClient, FallbackReasoner>> {
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = Arc::new(ComposioClient::new(api_key));
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
 
     // Resolve wiki enable/disable and schema path.
     let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
@@ -9520,14 +9584,14 @@ fn build_linkedin_channel(
     store: Arc<Store>,
     broker: Arc<dyn ApprovalBroker>,
     dry_run: bool,
-) -> Result<LinkedInChannel<VoyagerClient, ClaudeCliReasoner>> {
+) -> Result<LinkedInChannel<VoyagerClient, FallbackReasoner>> {
     let repo_root = std::env::current_dir().context("current_dir")?;
     let auth = LinkedInAuth::load_with_migration(&repo_root).with_context(|| {
         "load linkedin auth from keychain or legacy file — run `augmentagent linkedin login --cookies-json <file>`"
     })?;
     let member_urn = auth.member_urn.clone();
     let voyager = Arc::new(VoyagerClient::new(auth));
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
 
     let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
         Some(root) => {
@@ -9571,13 +9635,13 @@ fn build_linkedin_feed_engagement(
     store: Arc<Store>,
     broker: Arc<dyn ApprovalBroker>,
     dry_run: bool,
-) -> Result<LinkedInFeedEngagement<VoyagerClient, ClaudeCliReasoner>> {
+) -> Result<LinkedInFeedEngagement<VoyagerClient, FallbackReasoner>> {
     let repo_root = std::env::current_dir().context("current_dir")?;
     let auth = LinkedInAuth::load_with_migration(&repo_root)
         .context("load linkedin auth (feed engagement)")?;
     let member_urn = auth.member_urn.clone();
     let voyager = Arc::new(VoyagerClient::new(auth));
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
 
     let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
         Some(root) => {
@@ -9693,10 +9757,10 @@ fn build_own_post_comment_engagement(
     store: Arc<Store>,
     broker: Arc<dyn ApprovalBroker>,
     dry_run: bool,
-) -> Result<OwnPostCommentEngagement<VoyagerClient, ClaudeCliReasoner>> {
+) -> Result<OwnPostCommentEngagement<VoyagerClient, FallbackReasoner>> {
     let (voyager, member_urn, mut config, _) = linkedin_engagement_ctx(cli)?;
     config.dry_run = dry_run;
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
     let poll_secs = std::env::var("AUGMENTAGENT_LINKEDIN_OWNPOST_POLL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -9755,7 +9819,7 @@ fn build_socialapi_own_post_engagement(
     store: Arc<Store>,
     broker: Arc<dyn ApprovalBroker>,
     dry_run: bool,
-) -> Result<augmentagent_channel_socialapi::SocialApiOwnPostCommentEngagement<ClaudeCliReasoner>>
+) -> Result<augmentagent_channel_socialapi::SocialApiOwnPostCommentEngagement<FallbackReasoner>>
 {
     use augmentagent_channel_socialapi::{
         SocialApiAuth, SocialApiClient, SocialApiOwnPostCommentEngagement,
@@ -9765,7 +9829,7 @@ fn build_socialapi_own_post_engagement(
 
     let auth = SocialApiAuth::load_with_store(&store).context("load socialapi auth")?;
     let client = Arc::new(SocialApiClient::new(auth));
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
     let poll_secs = std::env::var("AUGMENTAGENT_SOCIALAPI_OWNPOST_POLL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -9816,7 +9880,7 @@ fn build_socialapi_dm_channel(
         augmentagent_channel_core::trigger::InboundMessageTrigger<
             augmentagent_channel_socialapi::SocialApiDmSource,
         >,
-        augmentagent_channel_socialapi::SocialApiDmChannel<ClaudeCliReasoner>,
+        augmentagent_channel_socialapi::SocialApiDmChannel<FallbackReasoner>,
     >,
 > {
     use augmentagent_channel_core::trigger::{ChannelRunner, InboundMessageTrigger};
@@ -9827,7 +9891,7 @@ fn build_socialapi_dm_channel(
 
     let auth = SocialApiAuth::load_with_store(&store).context("load socialapi auth")?;
     let client = Arc::new(SocialApiClient::new(auth));
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
     let poll_secs = std::env::var("AUGMENTAGENT_SOCIALAPI_DM_POLL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -9875,10 +9939,10 @@ fn build_friend_feed_engagement(
     store: Arc<Store>,
     broker: Arc<dyn ApprovalBroker>,
     dry_run: bool,
-) -> Result<FriendFeedEngagement<VoyagerClient, ClaudeCliReasoner>> {
+) -> Result<FriendFeedEngagement<VoyagerClient, FallbackReasoner>> {
     let (voyager, member_urn, mut config, _) = linkedin_engagement_ctx(cli)?;
     config.dry_run = dry_run;
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
     let poll_secs = std::env::var("AUGMENTAGENT_LINKEDIN_FRIENDFEED_POLL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -9918,10 +9982,10 @@ fn build_connection_request_engagement(
     store: Arc<Store>,
     broker: Arc<dyn ApprovalBroker>,
     dry_run: bool,
-) -> Result<ConnectionRequestEngagement<VoyagerClient, ClaudeCliReasoner>> {
+) -> Result<ConnectionRequestEngagement<VoyagerClient, FallbackReasoner>> {
     let (voyager, member_urn, mut config, _) = linkedin_engagement_ctx(cli)?;
     config.dry_run = dry_run;
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
     let poll_secs = std::env::var("AUGMENTAGENT_LINKEDIN_INVITE_POLL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
@@ -10251,8 +10315,8 @@ async fn run_backfill_signatures(
         .email_bodies_since(since_ms, limit)
         .context("read email bodies for signature backfill")?;
 
-    let reasoner = ClaudeCliReasoner::new();
-    let extractor = SignatureExtractor::new(&reasoner);
+    let reasoner = build_reasoner();
+    let extractor = SignatureExtractor::new(reasoner.as_ref());
 
     let mut scanned = 0usize;
     let mut sig_found = 0usize;
@@ -11293,7 +11357,7 @@ fn build_discord_channel(
     store: Arc<Store>,
     broker: Arc<dyn ApprovalBroker>,
     dry_run: bool,
-) -> Result<augmentagent_channel_discord_dm::DiscordChannel<ClaudeCliReasoner>> {
+) -> Result<augmentagent_channel_discord_dm::DiscordChannel<FallbackReasoner>> {
     use augmentagent_channel_discord_dm::{DiscordAuth, DiscordChannel, DiscordChannelConfig};
     let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let auth = DiscordAuth::load_with_migration(&repo_root).context(
@@ -11304,7 +11368,7 @@ fn build_discord_channel(
         augmentagent_channel_discord_dm::DiscordClient::new(auth)
             .context("build discord client")?,
     );
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
 
     let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
         Some(root) => {
@@ -11721,9 +11785,9 @@ fn build_slack_channel(
     store: Arc<Store>,
     broker: Arc<dyn ApprovalBroker>,
     dry_run: bool,
-) -> Result<augmentagent_channel_slack::SlackChannel<ClaudeCliReasoner>> {
+) -> Result<augmentagent_channel_slack::SlackChannel<FallbackReasoner>> {
     use augmentagent_channel_slack::{SlackChannel, SlackChannelConfig};
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
 
     let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
         Some(root) => {
@@ -12010,9 +12074,9 @@ fn build_telegram_bot_channel(
     store: Arc<Store>,
     broker: Arc<dyn ApprovalBroker>,
     dry_run: bool,
-) -> Result<augmentagent_channel_telegram_bot::TelegramBotChannel<ClaudeCliReasoner>> {
+) -> Result<augmentagent_channel_telegram_bot::TelegramBotChannel<FallbackReasoner>> {
     use augmentagent_channel_telegram_bot::{TelegramBotChannel, TelegramBotChannelConfig};
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
 
     let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
         Some(root) => {
@@ -12728,7 +12792,7 @@ fn build_github_channel(
 ) -> Result<
     augmentagent_channel_github::GithubChannel<
         augmentagent_channel_github::GithubClient,
-        ClaudeCliReasoner,
+        FallbackReasoner,
     >,
 > {
     use augmentagent_channel_github::{
@@ -12740,7 +12804,7 @@ fn build_github_channel(
     )?;
     let my_login = auth.username.clone();
     let client = Arc::new(GithubClient::new(auth).context("build github client")?);
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
 
     let (wiki_root, wiki_schema_path) = match &cli.wiki_dir {
         Some(root) => {
@@ -12803,7 +12867,7 @@ async fn run_calendar_poll_once(
     let api_key =
         std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gcal = Arc::new(ComposioCalendarClient::new(api_key));
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
 
     // Wiki schema path defaults next to wiki_dir, mirroring gmail's wiring.
     let wiki_schema_path = wiki_dir
@@ -13580,7 +13644,7 @@ async fn refresh_one_tone_profile(
     }
     corpus.push_str("</corpus>\n");
 
-    let reasoner = ClaudeCliReasoner::new();
+    let reasoner = build_reasoner();
     let opts = tone_summarize_opts();
     let summary = reasoner
         .call(&opts, &corpus)
@@ -13795,7 +13859,7 @@ fn build_voice_listener(
     dry_run: bool,
 ) -> Option<
     augmentagent_channel_voice::VoiceListener<
-        ClaudeCliReasoner,
+        FallbackReasoner,
         augmentagent_channel_voice::WhisperCppTranscriber,
     >,
 > {
@@ -13828,7 +13892,7 @@ fn build_voice_listener(
     Some(VoiceListener {
         client,
         store,
-        reasoner: Arc::new(ClaudeCliReasoner::new()),
+        reasoner: build_reasoner(),
         transcriber: WhisperCppTranscriber::from_repo_root(&repo_root),
         allowed_chats: allowed,
         wiki_root,
@@ -13925,7 +13989,7 @@ async fn run_compose_fan_out(
     }
 
     let src = SourceDraft::new(body);
-    let reasoner = Arc::new(ClaudeCliReasoner::new());
+    let reasoner = build_reasoner();
 
     // ---- direct per-platform variants (#53): one independently-gated card each
     if !platforms.is_empty() {
