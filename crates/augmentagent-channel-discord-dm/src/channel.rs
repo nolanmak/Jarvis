@@ -41,6 +41,14 @@ use crate::{PLATFORM, ACCOUNT_ENTITY_ID_PREFIX};
 /// Per-attachment download cap (200 KB). Discord uploads can be large; we
 /// only need enough to seed the agent's context.
 pub const MAX_ATTACHMENT_BYTES: usize = 200 * 1024;
+
+/// Per-image download cap. Images aren't inlined into the prompt (no context
+/// cost) — this only bounds disk/download; 5 MiB covers phone screenshots.
+pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Max images saved per message. Mirrors the query path's restraint; more
+/// than a few images per DM is noise for triage/draft anyway.
+pub const MAX_IMAGE_ATTACHMENTS: usize = 4;
 /// Aggregate cap across all attachments in a single message (500 KB).
 pub const MAX_ATTACHMENTS_TOTAL_BYTES: usize = 500 * 1024;
 
@@ -279,21 +287,88 @@ impl<R: Reasoner + 'static> DiscordChannel<R> {
         }
     }
 
-    /// Download text-like attachments (`.txt`, `.md`, `.log`, `text/*`, etc.)
-    /// and append their decoded UTF-8 bodies onto `msg.content`, labeled
-    /// per-file. Non-text attachments are skipped silently. Enforces a per-
-    /// attachment cap ([`MAX_ATTACHMENT_BYTES`]) and a per-message total cap
-    /// ([`MAX_ATTACHMENTS_TOTAL_BYTES`]); oversize files get a `[truncated]`
-    /// marker rather than being dropped or blowing the agent context.
-    /// Download failures are logged and the attachment is skipped — we never
-    /// surface an error here, since the message itself is still actionable.
+    /// Inline text-like attachments (`.txt`, `.md`, `.log`, `text/*`, etc.)
+    /// as decoded UTF-8 bodies, and save image attachments to
+    /// `/tmp/aa-img-<msgid>-<idx>.<ext>` referenced via `IMAGE:` marker
+    /// lines (the cross-provider convention — see
+    /// `augmentagent_channel_core::images`). Anything neither text- nor
+    /// image-like is skipped with a debug log. Enforces a per-text-file cap
+    /// ([`MAX_ATTACHMENT_BYTES`]), a per-message text total
+    /// ([`MAX_ATTACHMENTS_TOTAL_BYTES`]), a per-image cap
+    /// ([`MAX_IMAGE_BYTES`], oversize = skipped with a visible note, never a
+    /// corrupt truncation) and an image count cap
+    /// ([`MAX_IMAGE_ATTACHMENTS`]). Download failures are logged and the
+    /// attachment is skipped — the message itself is still actionable.
     async fn inline_text_attachments(&self, msg: &mut Message) {
         if msg.attachments.is_empty() {
             return;
         }
         let mut total = 0usize;
         let mut appended = String::new();
-        for att in msg.attachments.iter() {
+        let mut images_saved = 0usize;
+        for (idx, att) in msg.attachments.iter().enumerate() {
+            // Images: download to /tmp/aa-img-* and reference via `IMAGE:`
+            // marker lines (the cross-provider convention in
+            // augmentagent_channel_core::images) instead of dropping them
+            // silently — claude's Read renders images natively, and a codex
+            // failover attaches them via `-i`. Previously every image DM'd
+            // to the bot was invisible to the agent.
+            if att.is_image_like() {
+                if images_saved >= MAX_IMAGE_ATTACHMENTS {
+                    appended.push_str(&format!(
+                        "\n[Attachment: {} skipped — image cap ({MAX_IMAGE_ATTACHMENTS}) reached]\n",
+                        att.filename
+                    ));
+                    continue;
+                }
+                match self
+                    .client
+                    .download_attachment(&att.url, MAX_IMAGE_BYTES)
+                    .await
+                {
+                    Ok((bytes, truncated)) => {
+                        if truncated {
+                            // A truncated image is a corrupt image — say so
+                            // rather than hand the model a broken file.
+                            appended.push_str(&format!(
+                                "\n[Attachment: {} skipped — larger than the {} image cap]\n",
+                                att.filename,
+                                MAX_IMAGE_BYTES
+                            ));
+                            continue;
+                        }
+                        let ext = std::path::Path::new(&att.filename)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("png")
+                            .to_ascii_lowercase();
+                        let path = std::path::PathBuf::from(format!(
+                            "/tmp/aa-img-{}-{idx}.{ext}",
+                            msg.id
+                        ));
+                        match tokio::fs::write(&path, &bytes).await {
+                            Ok(()) => {
+                                images_saved += 1;
+                                appended.push_str(&format!(
+                                    "\n{}\n",
+                                    augmentagent_channel_core::image_marker_line(&path)
+                                ));
+                            }
+                            Err(e) => warn!(
+                                filename = %att.filename,
+                                "failed to write image tempfile {}: {e}",
+                                path.display()
+                            ),
+                        }
+                    }
+                    Err(e) => warn!(
+                        filename = %att.filename,
+                        url = %att.url,
+                        "failed to download discord image attachment: {e}"
+                    ),
+                }
+                continue;
+            }
             if !att.is_text_like() {
                 debug!(filename = %att.filename, "skipping non-text discord attachment");
                 continue;

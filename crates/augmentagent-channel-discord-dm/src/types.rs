@@ -109,6 +109,28 @@ pub struct Attachment {
 }
 
 impl Attachment {
+    /// `true` if this attachment is an image the reasoner can view — either
+    /// an `image/*` mime type or an extension on the shared allowlist
+    /// (`augmentagent_channel_core::images::IMAGE_EXT_ALLOWLIST`). Images are
+    /// downloaded to `/tmp/aa-img-*` and referenced via `IMAGE:` marker
+    /// lines rather than inlined (they aren't UTF-8).
+    pub fn is_image_like(&self) -> bool {
+        if let Some(ct) = self.content_type.as_deref() {
+            let ct = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            if ct.starts_with("image/") {
+                return true;
+            }
+        }
+        std::path::Path::new(&self.filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                augmentagent_channel_core::images::IMAGE_EXT_ALLOWLIST
+                    .contains(&e.to_ascii_lowercase().as_str())
+            })
+            .unwrap_or(false)
+    }
+
     /// `true` if this attachment looks like a plain-text file we can usefully
     /// inline into the agent prompt — either a `text/*` mime type or one of a
     /// short allowlist of common extensions.

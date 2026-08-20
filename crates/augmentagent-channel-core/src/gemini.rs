@@ -96,6 +96,12 @@ impl GeminiCliReasoner {
     async fn call_once(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
         let model = model_for(ProviderKind::Gemini, tier_of(opts));
 
+        // `IMAGE:` markers can't be viewed here (json headless mode, file
+        // tools stripped/workspace-confined) — replace them with an honest
+        // note instead of leaving a dead /tmp path the model might
+        // hallucinate having opened (see crate::images).
+        let user_message = &crate::images::strip_markers_with_note(user_message);
+
         let tmp = tempfile::tempdir().map_err(|e| {
             anyhow::Error::new(ReasonerError::Local {
                 message: format!("gemini: tempdir failed: {e}"),
