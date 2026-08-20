@@ -74,6 +74,9 @@ impl CerebrasHttpReasoner {
         } else {
             &opts.system_prompt
         };
+        // Text-only wire: `IMAGE:` markers degrade to an honest note (see
+        // crate::images).
+        let user_message = &crate::images::strip_markers_with_note(user_message);
         let body = serde_json::json!({
             "model": model,
             "messages": [

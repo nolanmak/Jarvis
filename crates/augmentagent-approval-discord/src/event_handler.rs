@@ -1823,11 +1823,16 @@ fn build_prompt(
         s.push_str("\n\n");
     }
     if !images.is_empty() {
-        s.push_str("[attached images to analyze]\n");
+        // `IMAGE:` marker lines are the cross-provider convention defined in
+        // `augmentagent_channel_core::images`: claude Reads the path directly
+        // (scope-guard carve-out for /tmp/aa-img-*), a codex failover turns
+        // each marker into a native `-i` attachment, and text-only providers
+        // replace them with an honest note. The prefix is MIRRORED here as a
+        // literal — this crate must stay free of a channel-core dependency
+        // (channel-core depends on us), same pattern as SOCIALAPI_API_KEY_ENV.
+        s.push_str("[attached images to analyze — open each IMAGE path]\n");
         for path in images {
-            s.push_str("- ");
-            s.push_str(&path.display().to_string());
-            s.push('\n');
+            s.push_str(&format!("IMAGE: {}\n", path.display()));
         }
     }
     if !text_files.is_empty() {
@@ -2450,8 +2455,11 @@ mod tests {
     fn build_prompt_with_only_images_does_not_panic_on_empty_text() {
         let images = vec![PathBuf::from("/tmp/aa-img-42-0.png")];
         let prompt = build_prompt("", &images, &[]);
-        assert!(prompt.contains("[attached images to analyze]"));
-        assert!(prompt.contains("/tmp/aa-img-42-0.png"));
+        assert!(prompt.contains("[attached images to analyze"));
+        // Images are referenced as cross-provider `IMAGE:` marker lines
+        // (mirrors augmentagent_channel_core::images) so a codex failover
+        // can translate them into native `-i` attachments.
+        assert!(prompt.contains("IMAGE: /tmp/aa-img-42-0.png"));
         assert!(prompt.contains("Use the Read tool"));
     }
 
@@ -2499,7 +2507,7 @@ mod tests {
         let images = vec![PathBuf::from("/tmp/aa-img-1-0.png")];
         let txts = vec![fresh_txt("/tmp/aa-txt-1-0.md")];
         let prompt = build_prompt("what do these say?", &images, &txts);
-        let img_idx = prompt.find("[attached images to analyze]").expect("image block");
+        let img_idx = prompt.find("[attached images to analyze").expect("image block");
         let txt_idx = prompt.find("[attached text files to read]").expect("text block");
         assert!(img_idx < txt_idx);
         assert!(prompt.contains("/tmp/aa-img-1-0.png"));
