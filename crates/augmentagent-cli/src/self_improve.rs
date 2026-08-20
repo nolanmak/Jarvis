@@ -236,9 +236,26 @@ async fn run(cmd: &str, args: &[&str], cwd: &Path) -> Result<(bool, String, Stri
 /// `PATH`, `HOME`, `CARGO_*`, etc. — behavior-preserving for honest fixes,
 /// secret-denying for hostile ones.
 fn gate_env() -> Vec<(String, String)> {
-    std::env::vars()
+    let mut env: Vec<(String, String)> = std::env::vars()
         .filter(|(k, _)| !env_name_is_secret(k))
-        .collect()
+        .collect();
+    // #692 — persist workspace build artifacts across gate runs. Without
+    // this every per-issue worktree cold-builds the whole workspace
+    // (~30G+ / tens of minutes on this box). Overridable; an explicit
+    // CARGO_TARGET_DIR in the parent env wins.
+    if !env.iter().any(|(k, _)| k == "CARGO_TARGET_DIR") {
+        env.push(("CARGO_TARGET_DIR".into(), gate_target_dir()));
+    }
+    env
+}
+
+/// Shared cargo target dir for gate + builder runs (#692).
+/// `AUGMENTAGENT_GATE_TARGET_DIR` overrides; defaults under `~/.cache`.
+fn gate_target_dir() -> String {
+    std::env::var("AUGMENTAGENT_GATE_TARGET_DIR").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        format!("{home}/.cache/augmentagent-gate-target")
+    })
 }
 
 /// True if an env-var name looks like a provider secret (case-insensitive
@@ -761,6 +778,9 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     augmentagent_channel_core::ReasonerOpts {
         system_prompt: SELF_IMPROVE_SYSTEM.to_string(),
         model: Some(build_model()),
+        // #692 — the builder's own `cargo check/test -p` self-verification
+        // reuses the shared gate cache instead of cold-building per issue.
+        env: vec![("CARGO_TARGET_DIR".into(), gate_target_dir())],
         allowed_tools: vec![
             "Read".into(),
             "Grep".into(),
@@ -776,7 +796,6 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
         add_dirs: vec![worktree.clone()],
         permission_mode: "acceptEdits".into(),
         cwd: Some(worktree),
-        env: Vec::new(),
         settings_json: None,
         restrict_env: false,
         audit_logger: None,
@@ -926,9 +945,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     }
 
     let branch = format!("{BRANCH_PREFIX}{}", issue.number);
-    let worktree = repo_root
-        .join(".self-improve-worktrees")
-        .join(format!("issue-{}", issue.number));
+    // #692 — a FIXED path, force-recreated per issue (the branch stays
+    // per-issue). Test binaries bake `env!("CARGO_MANIFEST_DIR")` at compile
+    // time; with the shared gate target cache, binaries compiled under a
+    // deleted per-issue path get reused from later runs and panic reading
+    // fixtures. A stable path keeps every baked path resolvable.
+    let worktree = repo_root.join(".self-improve-worktrees").join("current");
 
     // Clean any stale worktree from a crashed prior run.
     let _ = run(
@@ -2416,6 +2438,22 @@ mod tests {
         let without = build_fix_prompt(&issue, None);
         assert!(!without.contains("Implementation spec"));
         assert!(without.contains("Implement the fix now."));
+    }
+
+    // ---- #692: shared gate target cache + stable worktree path ----
+
+    #[test]
+    fn gate_env_provides_a_shared_cargo_target_dir() {
+        let env = gate_env();
+        let target = env.iter().find(|(k, _)| k == "CARGO_TARGET_DIR");
+        assert!(
+            target.is_some(),
+            "gate env must pin CARGO_TARGET_DIR or every issue cold-builds the workspace"
+        );
+        assert!(!target.unwrap().1.is_empty());
+        // The builder stage shares the same cache.
+        let opts = fix_opts(PathBuf::from("/tmp/wt"));
+        assert!(opts.env.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"));
     }
 
     // ---- #681: gate commands must fail when the piped stage fails ----
