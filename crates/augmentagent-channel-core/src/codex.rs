@@ -126,6 +126,25 @@ impl CodexCliReasoner {
         let provider = self.provider_name();
         let model = model_for(ProviderKind::Codex, tier_of(opts));
 
+        // `IMAGE:` markers → native `-i` attachments (see crate::images).
+        // The marker lines are stripped from the stdin prompt; codex embeds
+        // the images in the request itself, so an image turn survives a
+        // claude→codex failover instead of arriving as a dead file path.
+        let extracted = crate::images::extract_image_markers(user_message);
+        let (user_message, image_paths) = if extracted.images.is_empty() {
+            (user_message.to_string(), Vec::new())
+        } else {
+            (
+                format!(
+                    "{}\n\n[{} image attachment(s) are embedded in this prompt]",
+                    extracted.text,
+                    extracted.images.len()
+                ),
+                extracted.images,
+            )
+        };
+        let user_message = user_message.as_str();
+
         // System prompt travels via a temp file (`model_instructions_file`
         // has no inline-string form). TempDir must outlive the child.
         let tmp = tempfile::tempdir().map_err(|e| {
@@ -164,6 +183,10 @@ impl CodexCliReasoner {
             "-m".into(),
             model.clone(),
         ];
+        for img in &image_paths {
+            args.push("-i".into());
+            args.push(img.to_string_lossy().into_owned());
+        }
         // cwd: preset pin wins; else the first --add-dir (wiki root for the
         // read-tools presets); else the daemon cwd.
         let cwd = opts
@@ -449,6 +472,41 @@ exit 1
             Some(ReasonerError::RateLimited { provider, .. }) => assert_eq!(provider, "codex"),
             other => panic!("expected RateLimited, got {other:?}"),
         }
+    }
+
+    /// `IMAGE:` markers become native `-i` attachments and the marker lines
+    /// leave the stdin prompt (crate::images convention).
+    #[tokio::test]
+    async fn image_markers_translate_to_i_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("aa-img-7-0.png");
+        std::fs::write(&img, b"\x89PNG fake").unwrap();
+        let record = dir.path().join("record.txt");
+        let bin = stub(
+            &dir,
+            "fake-codex-img",
+            &format!(
+                r#"
+STDIN=$(cat)
+printf '%s\n' "$@" > {record}
+printf 'STDIN<<%s>>\n' "$STDIN" >> {record}
+echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"a red square"}}}}'
+"#,
+                record = record.display()
+            ),
+        );
+        let r = CodexCliReasoner { bin };
+        let msg = format!("what is in this image?\nIMAGE: {}", img.display());
+        let got = r.call(&opts(), &msg).await.unwrap();
+        assert_eq!(got, "a red square");
+        let rec = std::fs::read_to_string(&record).unwrap();
+        assert!(rec.contains("-i\n"), "must pass -i flag: {rec}");
+        assert!(rec.contains("aa-img-7-0.png"), "image path in argv");
+        assert!(
+            !rec.contains(&format!("IMAGE: {}", img.display())),
+            "marker line must be stripped from stdin"
+        );
+        assert!(rec.contains("image attachment(s) are embedded"));
     }
 
     #[tokio::test]
