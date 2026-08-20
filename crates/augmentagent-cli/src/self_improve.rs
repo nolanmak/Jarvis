@@ -135,6 +135,62 @@ pub struct Issue {
     pub author_trusted: bool,
 }
 
+/// One candidate issue as parsed from the REST `repos/*/issues` response
+/// (#676). Only the fields the picker needs.
+#[derive(Debug, PartialEq)]
+struct RestIssue {
+    number: u64,
+    title: String,
+    body: String,
+    author: String,
+    association: String,
+}
+
+/// Map the REST issues array into pick candidates, dropping what can never
+/// be picked: pull requests (the REST issues endpoint interleaves them —
+/// they carry a `pull_request` key), rows without a number, and issues
+/// already labeled [`GAVE_UP_LABEL`]. Order is preserved (the query sorts
+/// newest-first).
+fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter(|iss| iss.get("pull_request").is_none())
+        .filter_map(|iss| {
+            let number = iss.get("number").and_then(serde_json::Value::as_u64)?;
+            let gave_up = iss
+                .get("labels")
+                .and_then(serde_json::Value::as_array)
+                .map(|ls| {
+                    ls.iter()
+                        .any(|l| l.get("name").and_then(|n| n.as_str()) == Some(GAVE_UP_LABEL))
+                })
+                .unwrap_or(false);
+            if gave_up {
+                return None;
+            }
+            let s = |k: &str| {
+                iss.get(k)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            Some(RestIssue {
+                number,
+                title: s("title"),
+                body: s("body"),
+                author: iss
+                    .pointer("/user/login")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                association: s("author_association"),
+            })
+        })
+        .collect()
+}
+
 /// True if any blast-radius pattern appears in `text` (case-insensitive).
 pub fn is_blast_radius(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
@@ -340,56 +396,36 @@ async fn pick_issue(repo_root: &Path) -> Result<Option<Issue>> {
     // it judges not-fixable get the gave-up label + a comment, so each is
     // scoped at most once. `agent-fixable` is no longer required — it remains
     // only as documentation on old issues.
+    //
+    // #676 — fetched via the REST API, not `gh issue list --json`: the
+    // installed gh build rejects `authorAssociation` as a list field
+    // ("Unknown JSON field"), which killed every tick. `author_association`
+    // is part of the REST issue schema on every gh version. The `{owner}/
+    // {repo}` placeholders resolve from the cwd repo's origin, same as the
+    // list command did.
     let (ok, stdout, stderr) = run(
         &gh,
         &[
-            "issue",
-            "list",
-            "--state",
-            "open",
-            "--json",
-            "number,title,body,labels,author,authorAssociation",
-            "--limit",
-            "50",
+            "api",
+            "repos/{owner}/{repo}/issues?state=open&per_page=50&sort=created&direction=desc",
         ],
         repo_root,
     )
     .await?;
     if !ok {
-        bail!("gh issue list failed: {stderr}");
+        bail!("gh api issues failed: {stderr}");
     }
     let issues: serde_json::Value =
-        serde_json::from_str(&stdout).context("parse gh issue list")?;
-    let arr = issues.as_array().cloned().unwrap_or_default();
+        serde_json::from_str(&stdout).context("parse gh api issues")?;
 
-    for iss in arr {
-        let number = iss.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
-        if number == 0 {
-            continue;
-        }
-        let title = iss
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let body = iss
-            .get("body")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let gave_up = iss
-            .get("labels")
-            .and_then(|v| v.as_array())
-            .map(|ls| {
-                ls.iter().any(|l| {
-                    l.get("name").and_then(|n| n.as_str()) == Some(GAVE_UP_LABEL)
-                })
-            })
-            .unwrap_or(false);
-        if gave_up {
-            info!(issue = number, "skip: agent-gave-up");
-            continue;
-        }
+    for iss in rest_issue_candidates(&issues) {
+        let RestIssue {
+            number,
+            title,
+            body,
+            author,
+            association,
+        } = iss;
         if is_blast_radius(&format!("{title} {body}")) {
             info!(issue = number, "skip: blast-radius keyword in issue");
             continue;
@@ -398,19 +434,9 @@ async fn pick_issue(repo_root: &Path) -> Result<Option<Issue>> {
             info!(issue = number, "skip: open agent PR exists (dedup)");
             continue;
         }
-        // #300 — capture the author + its write-access association so the
-        // caller can trust-gate before any host-side build/push.
-        let author = iss
-            .get("author")
-            .and_then(|a| a.get("login"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let association = iss
-            .get("authorAssociation")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let author_trusted = author_is_trusted(&author, association, &allowlist);
+        // #300 — trust-gate on the author + its write-access association
+        // before any host-side build/push.
+        let author_trusted = author_is_trusted(&author, &association, &allowlist);
         if !author_trusted {
             info!(
                 issue = number,
@@ -2381,6 +2407,37 @@ mod tests {
         let without = build_fix_prompt(&issue, None);
         assert!(!without.contains("Implementation spec"));
         assert!(without.contains("Implement the fix now."));
+    }
+
+    // ---- #676: REST issue-candidate parsing ----
+
+    #[test]
+    fn rest_candidates_drop_prs_gave_up_and_body_nulls() {
+        let v = serde_json::json!([
+            // A PR interleaved by the REST issues endpoint — must be dropped.
+            {"number": 10, "title": "a pr", "pull_request": {"url": "x"},
+             "user": {"login": "nolanmak"}, "author_association": "OWNER"},
+            // Already given up — dropped.
+            {"number": 11, "title": "old", "body": "b",
+             "labels": [{"name": "agent-gave-up"}],
+             "user": {"login": "nolanmak"}, "author_association": "OWNER"},
+            // Null body (GitHub sends null, not "") — must not panic.
+            {"number": 12, "title": "good", "body": null,
+             "labels": [{"name": "bug"}],
+             "user": {"login": "nolanmak"}, "author_association": "OWNER"},
+            {"number": 13, "title": "second", "body": "text",
+             "user": {"login": "stranger"}, "author_association": "NONE"}
+        ]);
+        let out = rest_issue_candidates(&v);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].number, 12);
+        assert_eq!(out[0].body, "");
+        assert_eq!(out[0].author, "nolanmak");
+        assert_eq!(out[0].association, "OWNER");
+        assert_eq!(out[1].number, 13);
+        assert_eq!(out[1].association, "NONE");
+        // Non-array (error payload) ⇒ empty, not a panic.
+        assert!(rest_issue_candidates(&serde_json::json!({"message": "rate limited"})).is_empty());
     }
 
     // ---- #653: self-triage verdict, complexity gate, QA review parsing ----
