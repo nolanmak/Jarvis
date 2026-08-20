@@ -3070,4 +3070,133 @@ mod ask_mode_social_card_allowlist_tests {
             "expected both an absolute and a bare form"
         );
     }
+
+}
+
+/// #655/#656 — typed errors, reset-hint parsing, watchdog. Spawn-level tests
+/// drive a stub CLI through the real `call_once` path (the same override
+/// mechanism the fault-injection rig uses, #666).
+#[cfg(test)]
+mod failover_error_tests {
+    use super::*;
+
+    fn dummy_opts() -> ReasonerOpts {
+        ReasonerOpts {
+            system_prompt: "stub".into(),
+            model: None,
+            allowed_tools: vec![],
+            add_dirs: vec![],
+            permission_mode: "default".into(),
+            cwd: None,
+            env: vec![],
+            settings_json: None,
+            restrict_env: false,
+            audit_logger: None,
+            audit_notifier: None,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn parse_reset_hint_reads_time_and_timezone() {
+        let msg = "You've hit your session limit · resets 9:30am (America/New_York)";
+        let at = parse_reset_hint(msg).expect("must parse");
+        assert!(at > chrono::Utc::now(), "reset must be in the future");
+        assert!(
+            at <= chrono::Utc::now() + chrono::Duration::hours(25),
+            "reset lands within a day"
+        );
+        // Minute precision survives the round trip into the named tz.
+        use chrono::Timelike;
+        let ny = at.with_timezone(&chrono_tz::America::New_York);
+        assert_eq!((ny.hour(), ny.minute()), (9, 30));
+
+        // No-timezone and hour-only forms still parse (UTC assumed).
+        assert!(parse_reset_hint("resets 10pm").is_some());
+        // Garbage shapes degrade to None, never panic.
+        assert!(parse_reset_hint("no reset here").is_none());
+        assert!(parse_reset_hint("resets whenever").is_none());
+        assert!(parse_reset_hint("resets 13:00pm (Mars/Olympus)").is_none());
+    }
+
+    /// Write an executable stub script the reasoner spawns instead of the
+    /// real `claude` (same override the fault-injection rig uses, #666).
+    fn stub_cli(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "#!/usr/bin/env bash").unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        drop(f);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// #448's refusal arrives as a SUCCESSFUL completion; post-#656 it must
+    /// surface as a downcastable `ReasonerError::RateLimited` with the reset
+    /// hint parsed — that's what the fallback chain latches from.
+    #[tokio::test]
+    async fn quota_refusal_surfaces_typed_rate_limited_with_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(
+            &dir,
+            "fake-claude-quota",
+            r#"
+cat >/dev/null
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"You'\''ve hit your session limit · resets 9:30am (America/New_York)"}]}}'
+echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30am (America/New_York)"}'
+"#,
+        );
+        let reasoner = ClaudeCliReasoner { bin };
+        let err = reasoner
+            .call(&dummy_opts(), "triage this")
+            .await
+            .expect_err("refusal must be an error");
+        match ReasonerError::find_in(&err) {
+            Some(ReasonerError::RateLimited {
+                provider, reset_at, ..
+            }) => {
+                assert_eq!(provider, "claude");
+                assert!(reset_at.is_some(), "tz-stamped refusal must parse a reset");
+            }
+            other => panic!("expected RateLimited, got {other:?} (err: {err:#})"),
+        }
+    }
+
+    /// #656 — a hung CLI becomes a typed Timeout instead of blocking the
+    /// pipeline forever. kill_on_drop reaps the child.
+    #[tokio::test]
+    async fn hung_cli_times_out_with_typed_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(&dir, "fake-claude-hang", "cat >/dev/null\nsleep 600\n");
+        std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
+        let reasoner = ClaudeCliReasoner { bin };
+        let started = std::time::Instant::now();
+        let err = reasoner.call(&dummy_opts(), "hi").await.expect_err("must time out");
+        std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "watchdog must fire promptly, took {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(
+            ReasonerError::find_in(&err),
+            Some(ReasonerError::Timeout { .. })
+        ));
+    }
+
+    /// A missing binary is a Local fault (never latched, never mistaken for
+    /// an outage), and an ordinary spawn failure classifies as Unavailable.
+    #[tokio::test]
+    async fn missing_claude_binary_classifies_as_local() {
+        let reasoner = ClaudeCliReasoner {
+            bin: "/nonexistent/claude-bin".into(),
+        };
+        let err = reasoner.call(&dummy_opts(), "hi").await.unwrap_err();
+        assert!(matches!(
+            ReasonerError::find_in(&err),
+            Some(ReasonerError::Local { .. })
+        ));
+    }
 }
