@@ -990,6 +990,17 @@ impl<L: crate::api::LinkedInApi + 'static, R: Reasoner + 'static> LinkedInFeedEn
 
 #[cfg(test)]
 mod tests {
+
+    /// Disable `gh issue create` for this test binary — channel tests build
+    /// the production channel (which wires GhCliIssueRunner), and without
+    /// this every `cargo test --workspace` files REAL postmortem issues on
+    /// the repo (#780: ~70 filed by test runs). Mirrors the email crate.
+    static GH_DISABLE_INIT: std::sync::Once = std::sync::Once::new();
+    fn disable_gh_for_tests() {
+        GH_DISABLE_INIT.call_once(|| {
+            std::env::set_var("AUGMENTAGENT_GH_DISABLE", "1");
+        });
+    }
     use super::*;
     use async_trait::async_trait;
     use augmentagent_approval_discord::{ApprovalBroker, ApprovalError};
@@ -1136,6 +1147,7 @@ mod tests {
             r#"{"decision":"flag","reason":"personal outreach"}"#,
         ]));
         let broker = Arc::new(RecordingBroker::default());
+        disable_gh_for_tests();
         let ch = LinkedInChannel::new(
             store,
             api,
@@ -1168,6 +1180,7 @@ mod tests {
             "Sure — Thursday 3pm works.",
         ]));
         let broker = Arc::new(RecordingBroker::default());
+        disable_gh_for_tests();
         let ch = LinkedInChannel::new(
             store.clone(),
             api,
@@ -1216,6 +1229,7 @@ mod tests {
         // it'll try to pop a response and we assert the queue stayed empty.
         let reasoner = Arc::new(ScriptedReasoner::new([]));
         let broker = Arc::new(RecordingBroker::default());
+        disable_gh_for_tests();
         let ch = LinkedInChannel::new(
             store.clone(),
             api,
@@ -1252,6 +1266,7 @@ mod tests {
         // let us assert reasoner was untouched via pop count.
         let reasoner = Arc::new(ScriptedReasoner::new([]));
         let broker = Arc::new(RecordingBroker::default());
+        disable_gh_for_tests();
         let ch = LinkedInChannel::new(
             store,
             api,
@@ -1315,6 +1330,7 @@ mod tests {
         let api = Arc::new(ExpiredApi);
         let reasoner = Arc::new(ScriptedReasoner::new([]));
         let broker = Arc::new(RecordingBroker::default());
+        disable_gh_for_tests();
         let ch = LinkedInChannel::new(
             store,
             api,
@@ -1347,6 +1363,7 @@ mod tests {
             "Sure — Thursday 3pm works.",
         ]));
         let broker = Arc::new(RecordingBroker::default());
+        disable_gh_for_tests();
         let ch = Arc::new(LinkedInChannel::new(
             store.clone(),
             api,
@@ -1390,6 +1407,7 @@ mod tests {
             r#"{"decision":"flag","reason":"personal outreach"}"#,
         ]));
         let broker = Arc::new(RecordingBroker::default());
+        disable_gh_for_tests();
         let ch = Arc::new(LinkedInChannel::new(
             store.clone(),
             api,
@@ -1425,6 +1443,7 @@ mod tests {
         let api = Arc::new(StubApi { dms: vec![] });
         let reasoner = Arc::new(ScriptedReasoner::new([]));
         let broker = Arc::new(RecordingBroker::default());
+        disable_gh_for_tests();
         let ch = Arc::new(LinkedInChannel::new(
             store,
             api,

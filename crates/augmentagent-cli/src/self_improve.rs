@@ -246,6 +246,11 @@ fn gate_env() -> Vec<(String, String)> {
     if !env.iter().any(|(k, _)| k == "CARGO_TARGET_DIR") {
         env.push(("CARGO_TARGET_DIR".into(), gate_target_dir()));
     }
+    // #780 — gate-run tests must NEVER file real GitHub issues. Channel
+    // tests that build the production channel reach GhCliIssueRunner; the
+    // per-crate test guards are the first line, this is the backstop.
+    env.retain(|(k, _)| k != "AUGMENTAGENT_GH_DISABLE");
+    env.push(("AUGMENTAGENT_GH_DISABLE".into(), "1".into()));
     env
 }
 
