@@ -180,9 +180,12 @@ impl GhIssueRunner for GhCliIssueRunner {
         // An exact-title open issue means this is a recurrence: leave a
         // comment there and return its number. Search failure degrades to
         // filing (previous behavior) — dedup is best-effort by design.
+        // Plain list + client-side exact match: `--search` mis-handles
+        // titles with backticks/brackets (#780 — the dedup silently missed
+        // and a test-run storm filed ~70 duplicates).
         let list = tokio::process::Command::new(&self.bin)
             .args([
-                "issue", "list", "--state", "open", "--search", title, "--json",
+                "issue", "list", "--state", "open", "--limit", "100", "--json",
                 "number,title",
             ])
             .output()
