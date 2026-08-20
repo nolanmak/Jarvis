@@ -173,6 +173,40 @@ impl GhIssueRunner for GhCliIssueRunner {
         if std::env::var("AUGMENTAGENT_GH_DISABLE").as_deref() == Ok("1") {
             anyhow::bail!("gh disabled via AUGMENTAGENT_GH_DISABLE=1 (test mode)");
         }
+        // #694 — dedup before filing: recurring failures (code-mode fence
+        // postmortems especially) re-file the identical issue on every
+        // event, and the #653 auto-PR picker is newest-first, so each
+        // duplicate resets the pipeline's attention and attempt counters.
+        // An exact-title open issue means this is a recurrence: leave a
+        // comment there and return its number. Search failure degrades to
+        // filing (previous behavior) — dedup is best-effort by design.
+        let list = tokio::process::Command::new(&self.bin)
+            .args([
+                "issue", "list", "--state", "open", "--search", title, "--json",
+                "number,title",
+            ])
+            .output()
+            .await;
+        if let Ok(out) = list {
+            if out.status.success() {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                    if let Some(existing) = find_exact_title(&v, title) {
+                        let _ = tokio::process::Command::new(&self.bin)
+                            .args([
+                                "issue",
+                                "comment",
+                                &existing.to_string(),
+                                "--body",
+                                "Recurred — deduplicated by the filer (#694); \
+                                 not opening a new issue.",
+                            ])
+                            .output()
+                            .await;
+                        return Ok(existing);
+                    }
+                }
+            }
+        }
         let mut cmd = tokio::process::Command::new(&self.bin);
         cmd.arg("issue").arg("create");
         cmd.arg("--title").arg(title);
@@ -195,6 +229,17 @@ impl GhIssueRunner for GhCliIssueRunner {
             .ok_or_else(|| anyhow::anyhow!("gh stdout has no issue number: {url:?}"))?;
         Ok(n)
     }
+}
+
+/// First open issue whose title EXACTLY matches `title`, from a
+/// `gh issue list --json number,title` payload (#694). Exact match only —
+/// gh's `--search` is fuzzy, and near-miss titles are distinct issues.
+fn find_exact_title(list_json: &serde_json::Value, title: &str) -> Option<u64> {
+    list_json.as_array()?.iter().find_map(|item| {
+        (item.get("title").and_then(|t| t.as_str()) == Some(title))
+            .then(|| item.get("number").and_then(|n| n.as_u64()))
+            .flatten()
+    })
 }
 
 /// Per-call context for [`handle_code_mode_failure`] and
@@ -618,6 +663,28 @@ mod tests {
 
     use augmentagent_approval_discord::{ApprovalBroker, ApprovalError, NoopBroker};
     use augmentagent_store::Email;
+
+    // ---- #694: exact-title dedup before filing ----
+
+    #[test]
+    fn find_exact_title_requires_an_exact_match() {
+        let list = serde_json::json!([
+            {"number": 679, "title": "[code-mode] no fenced ```ts block"},
+            {"number": 640, "title": "[code-mode] no fenced ```ts block (older variant)"}
+        ]);
+        assert_eq!(
+            find_exact_title(&list, "[code-mode] no fenced ```ts block"),
+            Some(679)
+        );
+        // Fuzzy/near-miss titles are distinct issues, not recurrences.
+        assert_eq!(find_exact_title(&list, "[code-mode] no fenced"), None);
+        // Error payloads and non-arrays never match.
+        assert_eq!(
+            find_exact_title(&serde_json::json!({"message": "boom"}), "x"),
+            None
+        );
+        assert_eq!(find_exact_title(&serde_json::json!([]), "x"), None);
+    }
 
     use crate::code_mode::manifest_v1;
     use crate::reasoner::ReasonerOpts;
