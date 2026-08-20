@@ -593,6 +593,8 @@ mod tests {
             message_id: message_id.into(),
             thread_id: Some(format!("th-{message_id}")),
             from: "peer@example.com".into(),
+            to: String::new(),
+            cc: String::new(),
             subject: "hello".into(),
             body: "body".into(),
             date: String::new(),
