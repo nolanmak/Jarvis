@@ -7748,6 +7748,13 @@ impl ReplyApprover {
                 message: "no draft body on action; cannot send".into(),
             };
         };
+        // #785 — the assumes marker is an approval-card carrier: it annotates
+        // what the draft is presuming and must never reach the recipient. The
+        // Gmail rail scrubs it when the email channel builds the Gmail draft;
+        // every other platform sends `actions.draftBody` verbatim, so each of
+        // those send paths scrubs here. No marker ⇒ unchanged bytes.
+        let owned = augmentagent_approval_discord::strip_assumes_for_send(body);
+        let body = owned.as_str();
 
         // Two LinkedIn dispatch shapes share this handler, distinguished by
         // the email row's `kind`:
@@ -7951,6 +7958,9 @@ impl ReplyApprover {
                 message: "no draft body on action; cannot send".into(),
             };
         };
+        // #785 — scrub the card-only assumes marker before it ships.
+        let owned = augmentagent_approval_discord::strip_assumes_for_send(body);
+        let body = owned.as_str();
         match discord.send_message(channel_id, body).await {
             Ok(_) => {
                 let _ = self.store.update_action_status(
@@ -8057,6 +8067,9 @@ impl ReplyApprover {
                 message: "no draft body on action; cannot send".into(),
             };
         };
+        // #785 — scrub the card-only assumes marker before it ships.
+        let owned = augmentagent_approval_discord::strip_assumes_for_send(body);
+        let body = owned.as_str();
         // Both comment-reply and DM-reply carry their send target on
         // `email.thread_id` (parent post id / conversation id respectively).
         let Some(target) = action.email.thread_id.as_deref() else {
@@ -8221,6 +8234,9 @@ impl ReplyApprover {
                 message: "no draft body on action; cannot send".into(),
             };
         };
+        // #785 — scrub the card-only assumes marker before it ships.
+        let owned = augmentagent_approval_discord::strip_assumes_for_send(body);
+        let body = owned.as_str();
         // `message_id` shape is "tg:<chat>:<msg_id>" — use it as the
         // reply_to target so the bot's response is threaded under the
         // original message in Telegram's UI.
@@ -8383,6 +8399,9 @@ impl ReplyApprover {
                 message: "no draft body on action; cannot send".into(),
             };
         };
+        // #785 — scrub the card-only assumes marker before it ships.
+        let owned = augmentagent_approval_discord::strip_assumes_for_send(body);
+        let body = owned.as_str();
         match slack.send_message(channel_id, body).await {
             Ok(ts) => {
                 let _ = self.store.update_action_status(
@@ -8482,6 +8501,9 @@ impl ReplyApprover {
                 message: "no draft body on action; cannot send".into(),
             };
         };
+        // #785 — scrub the card-only assumes marker before it ships.
+        let owned = augmentagent_approval_discord::strip_assumes_for_send(body);
+        let body = owned.as_str();
         match github
             .post_issue_comment(&locator.owner, &locator.repo, locator.number, body)
             .await
@@ -9010,13 +9032,14 @@ impl ReplyApprover {
                 message: "no accountEntityId on email; cannot revise".into(),
             };
         };
-        // Strip any #35 needs-input marker so the redraft model sees the
-        // clean reply text, not the `<!--aa:needs-input …-->` carrier. No
-        // marker ⇒ the draft is returned unchanged (pre-#35 behavior).
+        // Strip the #35 needs-input and #785 assumes markers so the redraft
+        // model sees the clean reply text, not the card-only carriers. No
+        // markers ⇒ the draft is returned unchanged (pre-#35 behavior).
         let previous_draft = augmentagent_approval_discord::split_needs_input(
             &action.action.draft_body.clone().unwrap_or_default(),
         )
         .0;
+        let previous_draft = augmentagent_approval_discord::split_assumes(&previous_draft).0;
 
         // 1. Generate revised draft via reasoner.
         let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
@@ -9056,13 +9079,18 @@ impl ReplyApprover {
         };
         let cc = envelope.as_ref().map(|env| split(&env.cc)).unwrap_or_default();
         let bcc = envelope.as_ref().map(|env| split(&env.bcc)).unwrap_or_default();
+        // The redraft runs the same system prompt as the first draft, so it
+        // may carry its own #785 assumes fence. Gmail gets the scrubbed body;
+        // the persisted one keeps the fence so the reposted card can render
+        // the warning against the NEW draft's assumptions.
+        let gmail_redraft = augmentagent_approval_discord::strip_assumes_for_send(&redraft);
         let new_draft_id = match self
             .gmail
             .create_draft_with_attachment(
                 entity_id,
                 &to,
                 &subject,
-                &redraft,
+                &gmail_redraft,
                 action.email.thread_id.as_deref(),
                 None,
                 &cc,

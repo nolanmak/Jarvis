@@ -1324,12 +1324,21 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             }
         };
 
-        // The Gmail draft must be the clean reply text — strip any #35
-        // needs-input marker (the marker is a Discord-card-only carrier; it
-        // lives in `actions.draftBody` so the card can render the field, but
-        // it must never reach Gmail). No marker ⇒ unchanged (pre-#35 bytes).
-        let (gmail_body, needs_input_asks) =
+        // The Gmail draft must be the clean reply text — strip the #35
+        // needs-input marker and the #785 assumes marker (both are
+        // Discord-card-only carriers; they live in `actions.draftBody` so the
+        // card can render their fields, but neither may reach Gmail). This is
+        // the single choke point for both draft rails: the code-mode body read
+        // back from the actions row and the classic draft alike. No markers ⇒
+        // unchanged bytes.
+        let (human_draft, needs_input_asks) =
             augmentagent_approval_discord::split_needs_input(&initial_draft);
+        let (human_draft, assumed_facts) =
+            augmentagent_approval_discord::split_assumes(&human_draft);
+        // `split_assumes` is tolerant by design — a malformed fence stays put
+        // so the card never renders half-parsed markup. A Gmail body has no
+        // such luxury, so it gets the strict scrub on top.
+        let gmail_body = augmentagent_approval_discord::strip_assumes_for_send(&human_draft);
         let draft_id = match existing_draft_id {
             Some(d) => d,
             None => match self
@@ -1371,14 +1380,19 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             initial_draft.clone()
         } else {
             let with_cc = format!("{gmail_body}\n\n[cc: {}]", cc.join(", "));
+            // Re-attach the card-only markers stripped above, needs-input
+            // last. `split_assumes` splices its fence out on render, so the
+            // cc marker survives regardless of which one sits where.
+            let with_assumes =
+                augmentagent_approval_discord::append_assumes_marker(&with_cc, &assumed_facts);
             if needs_input_asks.is_empty() {
-                with_cc
+                with_assumes
             } else {
                 let pairs: Vec<(String, String)> = needs_input_asks
                     .iter()
                     .map(|a| (a.kind.clone(), a.text.clone()))
                     .collect();
-                augmentagent_approval_discord::append_needs_input_marker(&with_cc, &pairs)
+                augmentagent_approval_discord::append_needs_input_marker(&with_assumes, &pairs)
             }
         };
         if let Err(e) = self
@@ -2316,6 +2330,7 @@ mod tests {
         thread: Vec<Email>,
         thread_fetch_fails: bool,
         recorded_cc: std::sync::Mutex<Option<(String, Vec<String>)>>,
+        recorded_body: std::sync::Mutex<Option<String>>,
     }
     #[async_trait]
     impl GmailApi for ThreadedGmail {
@@ -2364,10 +2379,11 @@ mod tests {
             to: &str,
             cc: &[String],
             _s: &str,
-            _b: &str,
+            b: &str,
             _th: Option<&str>,
         ) -> Result<String, crate::gmail::GmailError> {
             *self.recorded_cc.lock().unwrap() = Some((to.to_string(), cc.to_vec()));
+            *self.recorded_body.lock().unwrap() = Some(b.to_string());
             Ok("draft".into())
         }
         async fn send_draft(
@@ -2439,6 +2455,7 @@ mod tests {
             thread: vec![earlier, threaded_inbound()],
             thread_fetch_fails: false,
             recorded_cc: std::sync::Mutex::new(None),
+            recorded_body: std::sync::Mutex::new(None),
         });
         let reasoner = Arc::new(ScriptedReasoner::new([
             r#"{"decision":"reply","reason":"asked"}"#,
@@ -2508,6 +2525,7 @@ mod tests {
             thread: vec![threaded_inbound()],
             thread_fetch_fails: false,
             recorded_cc: std::sync::Mutex::new(None),
+            recorded_body: std::sync::Mutex::new(None),
         });
         let marked_draft = augmentagent_approval_discord::append_needs_input_marker(
             "Happy to — what time works?",
@@ -2544,6 +2562,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assumes_marker_reaches_the_card_but_never_the_gmail_body() {
+        // #785 — the drafter's assumed-facts fence is a card-only carrier: it
+        // must survive into `post_approval` (so the "⚠ Assumes" field renders)
+        // and be absent from the body handed to Gmail.
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(ThreadedGmail {
+            emails: vec![threaded_inbound()],
+            thread: vec![threaded_inbound()],
+            thread_fetch_fails: false,
+            recorded_cc: std::sync::Mutex::new(None),
+            recorded_body: std::sync::Mutex::new(None),
+        });
+        let draft = augmentagent_approval_discord::append_assumes_marker(
+            "The 14th works.",
+            &["you're free on the 14th - not verified against calendar".to_string()],
+        );
+        let broker = Arc::new(BodyRecordingBroker::default());
+        let ch = GmailChannel::new(
+            store,
+            gmail.clone(),
+            Arc::new(ScriptedReasoner::new([])),
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        let out = ch
+            .dispatch_reply("acc1", threaded_inbound(), draft, None)
+            .await
+            .unwrap();
+        assert!(matches!(out, Some(DispatchOutcome::AwaitingApproval)));
+
+        let sent = gmail.recorded_body.lock().unwrap().clone().unwrap();
+        assert_eq!(sent, "The 14th works.", "fence leaked into the Gmail body");
+
+        let bodies = broker.bodies.lock().unwrap();
+        let (human, _) = augmentagent_approval_discord::split_needs_input(&bodies[0]);
+        let (human, facts) = augmentagent_approval_discord::split_assumes(&human);
+        assert_eq!(facts.len(), 1, "assumed fact lost from card: {}", bodies[0]);
+        assert!(
+            human.contains("[cc: will@example.com"),
+            "cc marker lost from card body: {}",
+            bodies[0]
+        );
+    }
+
+    #[tokio::test]
     async fn reply_all_degrades_to_inbound_headers_when_thread_fetch_fails() {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(ThreadedGmail {
@@ -2551,6 +2618,7 @@ mod tests {
             thread: vec![],
             thread_fetch_fails: true,
             recorded_cc: std::sync::Mutex::new(None),
+            recorded_body: std::sync::Mutex::new(None),
         });
         let reasoner = Arc::new(ScriptedReasoner::new([
             r#"{"decision":"reply","reason":"asked"}"#,

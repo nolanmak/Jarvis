@@ -299,7 +299,7 @@ MessageId: {message_id}
 {body}
 </email>
 
-Return ONLY the reply text — no JSON, no quotes, no commentary, no subject line.
+Return ONLY the reply text — no JSON, no quotes, no commentary, no subject line, except the optional `<!--aa:assumes …-->` block described in your system prompt.
 "#,
         from = sanitize_untrusted(&email.from),
         subject = sanitize_untrusted(&email.subject),
@@ -346,6 +346,7 @@ Hard rules — the runner WILL reject programs that violate any of these:
 5. Only call `tools.*` (the API declared below) and standard JavaScript built-ins (`Date`, `Math`, `JSON`, `Array`, `String`, `Number`, `Promise`, `console.log`, etc.).
 6. Keep reasoning in comments above `main`. Keep the body of `main` tight — fetch what you need via `tools.*`, decide, then call `tools.draft` once.
 7. Every `tools.*` call MUST be `await`-ed. They return Promises; missing `await` is a bug.
+8. Insufficiency check. Before calling `tools.draft`, enumerate the material facts the reply depends on and classify each as grounded (established by the inbound email, the thread history, or context you actually fetched via `tools.*`) or ASSUMED. Never present an assumption as established, and prefer resolving a checkable fact with a tool over assuming it. If any material fact is still assumed, the body you pass to `tools.draft` MUST end with a blank line followed by an assumes block: the literal line `<!--aa:assumes`, then one short line per assumed fact (five maximum), then the literal line `-->`. Example body tail: `"...Best,\nNolan\n\n<!--aa:assumes\nyou're free on the 14th - not verified against calendar\n-->"`. The block is stripped before the reply is sent; it exists so the approver can see what the draft rests on. If every material fact is grounded, append nothing.
 
 The available tool surface is declared below as a TypeScript `.d.ts`. Treat every property's type signature as the source of truth.
 
@@ -543,7 +544,7 @@ pub fn code_mode_repair_user_message(
 /// Build the redraft prompt when the user clicks "Revise" in Discord.
 pub fn redraft_message(email: &Email, previous_draft: &str, feedback: &str) -> String {
     format!(
-        r#"You are a professional email draft editor. Revise the draft based on the user's feedback and return ONLY the revised email text — no JSON, no quotes, no commentary. Do not add To:, Cc:, Bcc:, or other recipient/header lines; recipients are managed separately from the email body.
+        r#"You are a professional email draft editor. Revise the draft based on the user's feedback and return ONLY the revised email text — no JSON, no quotes, no commentary, except the optional `<!--aa:assumes …-->` block described in your system prompt. Do not add To:, Cc:, Bcc:, or other recipient/header lines; recipients are managed separately from the email body.
 
 <original_email>
 From: {from}
@@ -606,6 +607,39 @@ mod tests {
         assert!(!got.contains("<draft_archetype"));
         assert!(!got.contains("<resolved_asks>"));
         assert!(got.contains("the inbound message"));
+    }
+
+    // --- Insufficiency check (#785) ---
+
+    #[test]
+    fn draft_tail_carves_out_the_assumes_block() {
+        // The "return ONLY the reply text" contract would otherwise forbid the
+        // marker the card renders as "⚠ Assumes".
+        let got = draft_user_message(&email(), "", "", "", "", "");
+        assert!(
+            got.contains(
+                "no subject line, except the optional `<!--aa:assumes …-->` block described in your system prompt."
+            ),
+            "draft tail lost the assumes carve-out:\n{got}"
+        );
+    }
+
+    #[test]
+    fn redraft_tail_carves_out_the_assumes_block() {
+        // Same system prompt as the first draft, so a v2 draft may re-emit
+        // the marker; the "no commentary" rule must not suppress it.
+        let got = redraft_message(&email(), "the previous draft", "make it shorter");
+        assert!(got.contains("`<!--aa:assumes …-->`"), "redraft tail:\n{got}");
+    }
+
+    #[test]
+    fn code_mode_system_states_the_insufficiency_rule() {
+        // Code-mode is the production rail and does NOT load SKILL.md, so the
+        // rule has to be self-contained in its system prompt.
+        let sys = code_mode_system(&crate::code_mode::manifest_v1());
+        assert!(sys.contains("8. Insufficiency check."), "missing rule 8:\n{sys}");
+        assert!(sys.contains("<!--aa:assumes"));
+        assert!(sys.contains("five maximum"));
     }
 
     #[test]

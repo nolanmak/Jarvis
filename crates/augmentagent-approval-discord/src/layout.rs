@@ -76,6 +76,104 @@ fn sanitize_marker_field(s: &str) -> String {
     s.replace(['|', '\n', '\r'], " ").trim().to_string()
 }
 
+/// Sentinel fencing the "assumed facts" payload the drafter appends when its
+/// reply rests on material facts neither the thread nor the resolved context
+/// established (#785). Same carrier discipline as the needs-input marker: an
+/// HTML comment so it can never reach a recipient, card-only, and absent by
+/// default — a draft with no fence renders byte-identically to pre-#785.
+///
+/// Body format (one assumed fact per line, between the fences):
+/// ```text
+/// <!--aa:assumes
+/// you're free on the 14th - not verified against calendar
+/// -->
+/// ```
+///
+/// The lines are model-authored, so an inbound email could in principle steer
+/// the drafter into emitting a bogus one. That is tolerable: the payload is a
+/// read-only caution on the approval card and drives no action, so the worst
+/// case is a warning the owner dismisses.
+const ASSUMES_OPEN: &str = "<!--aa:assumes\n";
+const ASSUMES_CLOSE: &str = "\n-->";
+/// [`ASSUMES_OPEN`] without its newline — lets [`strip_assumes_for_send`]
+/// catch a fence the model opened but never closed.
+const ASSUMES_OPEN_PREFIX: &str = "<!--aa:assumes";
+
+/// Cap on assumption lines carried by a card. Mirrors the limit stated in the
+/// draft prompt so a runaway model can't flood the embed field.
+const MAX_ASSUMES: usize = 5;
+
+/// Append the assumed-facts marker to a draft body. `facts` empty (or all
+/// blank) ⇒ the draft is returned unchanged, keeping the no-assumptions path
+/// byte-identical. Newlines are stripped from each fact so the frame stays a
+/// single block and round-trips through [`split_assumes`].
+pub fn append_assumes_marker(draft: &str, facts: &[String]) -> String {
+    let lines: Vec<String> = facts
+        .iter()
+        .map(|f| f.replace(['\n', '\r'], " ").trim().to_string())
+        .filter(|f| !f.is_empty())
+        .take(MAX_ASSUMES)
+        .collect();
+    if lines.is_empty() {
+        return draft.to_string();
+    }
+    let mut out = String::with_capacity(draft.len() + 32 + lines.len() * 48);
+    out.push_str(draft.trim_end());
+    out.push_str("\n\n");
+    out.push_str(ASSUMES_OPEN);
+    out.push_str(&lines.join("\n"));
+    out.push_str(ASSUMES_CLOSE);
+    out
+}
+
+/// Split a persisted draft into the human-facing draft and the assumed facts
+/// carried in its marker. No marker ⇒ `(draft, vec![])`. Tolerant: a malformed
+/// marker is treated as absent, so a half-parsed HTML comment is never
+/// rendered as a warning.
+///
+/// Unlike [`split_needs_input`], this SPLICES the fence out instead of
+/// truncating at it. The fence can legitimately have text after it — the #629
+/// `[to:]`/`[cc:]` envelope display markers and the needs-input marker are
+/// both appended later — and truncating would silently drop them from the card.
+pub fn split_assumes(draft: &str) -> (String, Vec<String>) {
+    let Some(open_at) = draft.rfind(ASSUMES_OPEN) else {
+        return (draft.to_string(), Vec::new());
+    };
+    let after_open = open_at + ASSUMES_OPEN.len();
+    let Some(rel_close) = draft[after_open..].find(ASSUMES_CLOSE) else {
+        return (draft.to_string(), Vec::new());
+    };
+    let facts: Vec<String> = draft[after_open..after_open + rel_close]
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .take(MAX_ASSUMES)
+        .collect();
+    if facts.is_empty() {
+        return (draft.to_string(), Vec::new());
+    }
+    let before = draft[..open_at].trim_end();
+    let after = draft[after_open + rel_close + ASSUMES_CLOSE.len()..].trim_start();
+    let human = if after.is_empty() {
+        before.to_string()
+    } else {
+        format!("{before}\n\n{after}")
+    };
+    (human, facts)
+}
+
+/// Scrub every trace of the assumes marker from a body bound for a real
+/// recipient. Stricter than [`split_assumes`], which deliberately leaves a
+/// malformed fence alone so the card never shows half-parsed markup: a Gmail
+/// body has no such luxury, so an unclosed `<!--aa:assumes` is truncated away.
+pub fn strip_assumes_for_send(body: &str) -> String {
+    let (clean, _) = split_assumes(body);
+    match clean.rfind(ASSUMES_OPEN_PREFIX) {
+        Some(at) => clean[..at].trim_end().to_string(),
+        None => clean,
+    }
+}
+
 /// Split a persisted draft into the human-facing draft and any needs-input
 /// asks carried in the trailing marker. No marker ⇒ `(draft, vec![])`, so
 /// every legacy / off-path draft is unaffected. Tolerant: a malformed marker
@@ -177,6 +275,9 @@ pub fn approval_message(
     // sees the raw `<!--aa:needs-input …-->` fence and the draft preview is
     // the real reply text. No marker ⇒ `human == draft`, byte-identical card.
     let (human_draft, needs) = split_needs_input(draft);
+    // #785 — then lift out the assumed facts, so the preview is the reply the
+    // recipient would get and the assumptions get their own field.
+    let (human_draft, assumes) = split_assumes(&human_draft);
     let at_cap = redraft_count >= MAX_REDRAFT_ITERATIONS;
     let footer = if redraft_count == 0 {
         "AugmentAgent approval".to_string()
@@ -199,6 +300,9 @@ pub fn approval_message(
             truncate(&format_needs_input(&needs), 1024),
             false,
         );
+    }
+    if !assumes.is_empty() {
+        embed = embed.field("⚠ Assumes", truncate(&format_assumes(&assumes), 1024), false);
     }
     let embed = embed.footer(CreateEmbedFooter::new(footer));
 
@@ -268,6 +372,20 @@ fn format_needs_input(needs: &[NeedsInput]) -> String {
         s.push('\n');
     }
     s.push_str("_Click **Provide missing info** to supply these; the draft re-renders with your values._");
+    s
+}
+
+/// One bullet per assumed fact for the card field (#785). The caption is what
+/// turns the list into an actionable choice: the approver either accepts the
+/// assumption or hits Revise.
+fn format_assumes(facts: &[String]) -> String {
+    let mut s = String::new();
+    for f in facts {
+        s.push_str("• ");
+        s.push_str(f);
+        s.push('\n');
+    }
+    s.push_str("_Not verified — Revise if any of these is wrong._");
     s
 }
 
@@ -631,6 +749,106 @@ mod tests {
         assert!(v.contains("aa:act-2:skip"));
         // The raw marker fence must NOT leak into the rendered card.
         assert!(!v.contains("aa:needs-input"));
+    }
+
+    // ---------------------------------------------------------------------
+    // #785: assumed-facts marker round-trip + card annotation.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn approval_card_surfaces_assumed_facts_and_hides_the_fence() {
+        let draft = "Hi,\n\nThe 14th works.\n\nBest,\nN\n\n<!--aa:assumes\nyou're free on the 14th - not verified against calendar\nthe kickoff is still scoped to Q4\n-->";
+        let v = json(&approval_message("act-a1", &email(), draft, 0));
+        assert!(v.contains("Assumes"), "missing assumes field: {v}");
+        assert!(v.contains("free on the 14th"));
+        assert!(v.contains("still scoped to Q4"));
+        // The raw fence must never reach the card.
+        assert!(!v.contains("aa:assumes"), "raw fence leaked: {v}");
+        // Row-1 verbs untouched — the annotation is display-only.
+        assert!(v.contains("aa:act-a1:approve"));
+        assert!(v.contains("aa:act-a1:revise"));
+    }
+
+    #[test]
+    fn assumes_marker_round_trips() {
+        let draft = "Hi,\n\nThe 14th works.\n\nBest,\nN";
+        let facts = vec![
+            "you're free on the 14th - not verified against calendar".to_string(),
+            "the kickoff is still scoped to Q4".to_string(),
+        ];
+        let marked = append_assumes_marker(draft, &facts);
+        let (human, got) = split_assumes(&marked);
+        assert_eq!(human, draft);
+        assert_eq!(got, facts);
+    }
+
+    #[test]
+    fn assumes_marker_with_no_facts_is_byte_identical() {
+        let draft = "Just a normal reply.";
+        assert_eq!(append_assumes_marker(draft, &[]), draft);
+        assert_eq!(append_assumes_marker(draft, &["  ".to_string()]), draft);
+        let (human, facts) = split_assumes(draft);
+        assert_eq!(human, draft);
+        assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn assumes_marker_caps_at_five_lines() {
+        let facts: Vec<String> = (0..9).map(|i| format!("fact {i}")).collect();
+        let (_, got) = split_assumes(&append_assumes_marker("body", &facts));
+        assert_eq!(got.len(), MAX_ASSUMES);
+    }
+
+    #[test]
+    fn malformed_assumes_fence_is_treated_as_absent() {
+        // Open fence, no close ⇒ raw text back, no field on the card.
+        let broken = format!("body\n\n{ASSUMES_OPEN}you're free on the 14th");
+        let (human, facts) = split_assumes(&broken);
+        assert_eq!(human, broken);
+        assert!(facts.is_empty());
+        let v = json(&approval_message("act-a2", &email(), &broken, 0));
+        assert!(!v.contains("Assumes\""), "half-parsed fence rendered a field: {v}");
+    }
+
+    #[test]
+    fn assumes_fence_is_spliced_so_later_markers_survive() {
+        // Production ordering is body → assumes → [cc:] → needs-input. Every
+        // one of them must still reach the card after both splitters run.
+        let with_assumes = append_assumes_marker(
+            "Hi,\n\nWorks for me.",
+            &["you're free on the 14th".to_string()],
+        );
+        let with_cc = format!("{with_assumes}\n\n[cc: will@example.com]");
+        let body = append_needs_input_marker(
+            &with_cc,
+            &[("share_doc".to_string(), "the pitch deck".to_string())],
+        );
+
+        let (human, needs) = split_needs_input(&body);
+        let (human, facts) = split_assumes(&human);
+        assert_eq!(needs.len(), 1);
+        assert_eq!(facts, vec!["you're free on the 14th".to_string()]);
+        assert!(human.contains("Works for me."));
+        assert!(human.contains("[cc: will@example.com]"), "cc marker spliced away: {human}");
+
+        let v = json(&approval_message("act-a3", &email(), &body, 0));
+        assert!(v.contains("Assumes"));
+        assert!(v.contains("free on the 14th"));
+        assert!(v.contains("Needs your input"));
+        assert!(v.contains("[cc: will@example.com]"));
+        assert!(!v.contains("aa:assumes"));
+        assert!(!v.contains("aa:needs-input"));
+    }
+
+    #[test]
+    fn strip_assumes_for_send_also_drops_an_unclosed_fence() {
+        // The tolerant splitter leaves a malformed fence in place; a body
+        // headed for a real inbox must be scrubbed anyway.
+        let closed = append_assumes_marker("Hello.", &["a guess".to_string()]);
+        assert_eq!(strip_assumes_for_send(&closed), "Hello.");
+        let unclosed = format!("Hello.\n\n{ASSUMES_OPEN}a guess");
+        assert_eq!(strip_assumes_for_send(&unclosed), "Hello.");
+        assert_eq!(strip_assumes_for_send("Hello."), "Hello.");
     }
 
     #[test]
