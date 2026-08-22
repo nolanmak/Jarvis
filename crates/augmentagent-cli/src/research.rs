@@ -35,6 +35,8 @@ const DEFAULT_SINCE_HOURS: u32 = 24;
 const DEFAULT_FETCH_BATCH: u32 = 100;
 const DEFAULT_MAX_PAPERS: usize = 15;
 const DEFAULT_MAX_ISSUES: u32 = 3;
+/// Label stamped on every issue this pipeline files (#787).
+const RESEARCH_LABEL: &str = "research";
 const DEFAULT_CATEGORIES: &str = "cs.AI,cs.MA,cs.CL,cs.LG";
 const DEFAULT_KEYWORDS: &str =
     "agent,tool use,multi-agent,rag,planning,reflection,memory,llm,reasoning";
@@ -744,6 +746,13 @@ async fn create_issue(cfg: &ResearchConfig, gap: &Gap) -> Result<u64> {
         .arg(&gap.title)
         .arg("--body")
         .arg(&body)
+        // #787 — label at filing time so these are filterable in the GitHub
+        // UI and distinguishable from human bug reports without parsing the
+        // body footer. The auto-PR picker keys on the footer (bodies are
+        // stable; labels can be edited), so this is for humans, not the
+        // pipeline.
+        .arg("--label")
+        .arg(RESEARCH_LABEL)
         .output()
         .await
         .context("spawning gh issue create")?;
