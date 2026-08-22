@@ -2213,6 +2213,29 @@ mod tests {
     }
 
     #[test]
+    fn assumes_fence_survives_a_card_re_render_with_every_other_marker() {
+        // #785 — a re-rendered card can carry all three carriers at once. The
+        // assumes fence is spliced (not truncated) on render, so the envelope
+        // markers appended after it must still reach the card.
+        let (s, id, _f) =
+            store_with_envelope(Some("a@example.com"), Some("cc@example.com"), None);
+        let body = crate::append_needs_input_marker(
+            &crate::append_assumes_marker("body", &["you're free on the 14th".to_string()]),
+            &[("scheduling".to_string(), "what time works?".to_string())],
+        );
+        let out = append_envelope_markers(body, Some(&s), &id, "a@example.com");
+        let (human, asks) = crate::split_needs_input(&out);
+        let (human, facts) = crate::split_assumes(&human);
+        assert_eq!(asks.len(), 1, "needs-input ask lost: {out}");
+        assert_eq!(facts, vec!["you're free on the 14th".to_string()]);
+        assert!(
+            human.contains("[cc: cc@example.com]"),
+            "cc marker lost from rendered card: {out}"
+        );
+        assert!(human.starts_with("body"), "draft text mangled: {human}");
+    }
+
+    #[test]
     fn no_envelope_or_no_store_passes_body_through() {
         let f = tempfile::NamedTempFile::new().unwrap();
         let s = augmentagent_store::Store::open(f.path()).unwrap();

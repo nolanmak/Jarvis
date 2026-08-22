@@ -33,6 +33,9 @@ pub use event_handler::{append_envelope_markers, chunk_for_discord};
 // persisted draft via this; the card decodes it on render. `NeedsInput` is
 // re-exported for the channel/test surface.
 pub use layout::{append_needs_input_marker, approval_message, split_needs_input, NeedsInput};
+// #785: the drafter emits the assumed-facts marker; the channel splits it off
+// the Gmail body and the card renders it as the "⚠ Assumes" field.
+pub use layout::{append_assumes_marker, split_assumes, strip_assumes_for_send};
 // #501 — scheduled-notice layout, for brokers/tests outside this crate.
 pub use layout::{scheduled_notice_message, schedule_modal, SCHEDULE_CUSTOM_VALUE};
 pub use loops::{
