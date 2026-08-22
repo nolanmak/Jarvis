@@ -133,6 +133,24 @@ pub struct Issue {
     /// run must require explicit owner approval before any host-side build
     /// or branch push.
     pub author_trusted: bool,
+    /// #787 — filed by the daily `augmentagent research` pipeline rather
+    /// than by a human. These are auto-filed with the owner's `gh` auth, so
+    /// they LOOK owner-authored to the trust gate; they are picked last and
+    /// never auto-merge.
+    pub research_filed: bool,
+}
+
+/// #787 — does this body carry the research pipeline's filing stamp?
+///
+/// The pipeline reads papers and proposes speculative adoptions, filing 3/day
+/// with the owner's `gh` credentials. Two consequences the picker must undo:
+/// newest-first ordering hands them the entire daily budget forever (3 filed
+/// per day vs. a cap of 3 runs), starving human bug reports outright; and the
+/// owner-authored auto-merge test cannot tell them from issues the owner
+/// actually wrote.
+pub fn is_research_filed(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    b.contains("auto-filed by the daily") || b.contains("`augmentagent research` pipeline")
 }
 
 /// One candidate issue as parsed from the REST `repos/*/issues` response
@@ -144,6 +162,7 @@ struct RestIssue {
     body: String,
     author: String,
     association: String,
+    research_filed: bool,
 }
 
 /// Map the REST issues array into pick candidates, dropping what can never
@@ -176,10 +195,12 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
                     .unwrap_or("")
                     .to_string()
             };
+            let body = s("body");
             Some(RestIssue {
                 number,
                 title: s("title"),
-                body: s("body"),
+                research_filed: is_research_filed(&body),
+                body,
                 author: iss
                     .pointer("/user/login")
                     .and_then(serde_json::Value::as_str)
@@ -440,13 +461,21 @@ async fn pick_issue(repo_root: &Path) -> Result<Option<Issue>> {
     let issues: serde_json::Value =
         serde_json::from_str(&stdout).context("parse gh api issues")?;
 
-    for iss in rest_issue_candidates(&issues) {
+    // #787 — human-filed issues first, newest-first within each group. The
+    // research pipeline files 3/day and the daily cap is 3, so strict
+    // newest-first would hand it the entire budget forever and human bug
+    // reports would never be reached.
+    let (human, research): (Vec<_>, Vec<_>) = rest_issue_candidates(&issues)
+        .into_iter()
+        .partition(|i| !i.research_filed);
+    for iss in human.into_iter().chain(research) {
         let RestIssue {
             number,
             title,
             body,
             author,
             association,
+            research_filed,
         } = iss;
         if is_blast_radius(&format!("{title} {body}")) {
             info!(issue = number, "skip: blast-radius keyword in issue");
@@ -473,6 +502,7 @@ async fn pick_issue(repo_root: &Path) -> Result<Option<Issue>> {
             body,
             author,
             author_trusted,
+            research_filed,
         }));
     }
     Ok(None)
@@ -1268,7 +1298,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         let enabled = automerge_enabled_value(
             std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
         );
-        if enabled && complexity.auto_mergeable() {
+        // #787 — research-filed issues never auto-merge: they are the
+        // daemon's own speculative proposals, auto-filed with the owner's gh
+        // auth (so they pass the owner-authored test), and they change core
+        // behaviour. They land as draft PRs for human review.
+        if enabled && complexity.auto_mergeable() && !issue.research_filed {
             let owner = std::env::var(GH_OWNER_ENV)
                 .ok()
                 .or(repo_owner_from_remote(repo_root).await);
@@ -1637,6 +1671,7 @@ async fn pick_issue_for_repo(
         return Ok(Some(Issue {
             number,
             title,
+            research_filed: is_research_filed(&body),
             body,
             author,
             author_trusted: false,
@@ -2436,6 +2471,7 @@ mod tests {
             body: "b".into(),
             author: "a".into(),
             author_trusted: true,
+            research_filed: false,
         };
         let with = build_fix_prompt(&issue, Some("the spec"));
         assert!(with.contains("the spec"));
@@ -2485,6 +2521,47 @@ mod tests {
         assert!(!status(&gate_sh("false 2>&1 | tail -1")));
         // Wrapped success still succeeds.
         assert!(status(&gate_sh("true 2>&1 | tail -1")));
+    }
+
+    // ---- #787: human-filed issues outrank research-filed ones ----
+
+    fn rest(n: u64, body: &str) -> serde_json::Value {
+        serde_json::json!({"number": n, "title": format!("t{n}"), "body": body,
+                           "user": {"login": "nolanmak"}, "author_association": "OWNER"})
+    }
+
+    #[test]
+    fn research_filing_stamp_is_detected() {
+        assert!(is_research_filed(
+            "Source: arXiv:1234\n\n_Auto-filed by the daily `augmentagent research` pipeline._"
+        ));
+        assert!(is_research_filed("AUTO-FILED BY THE DAILY pipeline"));
+        // A human issue that merely mentions research must not be caught.
+        assert!(!is_research_filed(
+            "The research loop keeps filing dupes; add dedup before filing."
+        ));
+        assert!(!is_research_filed(""));
+    }
+
+    #[test]
+    fn candidates_keep_order_and_carry_the_research_flag() {
+        let stamp = "_Auto-filed by the daily `augmentagent research` pipeline._";
+        let v = serde_json::json!([rest(9, stamp), rest(8, "real bug"), rest(7, stamp)]);
+        let got = rest_issue_candidates(&v);
+        assert_eq!(
+            got.iter().map(|i| (i.number, i.research_filed)).collect::<Vec<_>>(),
+            vec![(9, true), (8, false), (7, true)]
+        );
+        // The picker partitions this list human-first; verify the partition
+        // the picker performs keeps newest-first inside each group.
+        let (human, research): (Vec<_>, Vec<_>) =
+            got.into_iter().partition(|i| !i.research_filed);
+        let order: Vec<u64> = human.into_iter().chain(research).map(|i| i.number).collect();
+        assert_eq!(
+            order,
+            vec![8, 9, 7],
+            "human-filed #8 must outrank newer research-filed #9"
+        );
     }
 
     // ---- #676: REST issue-candidate parsing ----
