@@ -627,7 +627,33 @@ alternatives.\n\
 what tests to add/update, and what observable behaviour proves the fix.\n\
 Constraints: read-only — do NOT edit files. Stay inside the given working \
 directory. Do NOT plan changes to deploy/auth/secret/CI paths (systemd, \
-scripts/check-for-updates, .github/workflows, credentials/keyring/.env). \
+scripts/check-for-updates, .github/workflows, credentials/keyring/.env).\n\
+\n\
+Known repo facts — these are verified, and issue text often contradicts \
+them. Trust these over the issue:\n\
+- There is NO human-labelled triage corpus. Issues frequently cite \"the \
+13,685 labelled decisions\" as an acceptance gate. What exists is the \
+daemon's own past decisions in `data.db`, with no human ground truth, and \
+that file is gitignored — it is NOT in your working directory. If an \
+issue's acceptance criterion requires measuring accuracy against labelled \
+data, it is NOT-FIXABLE; say so rather than inventing fixtures. Shipping \
+the behaviour change while skipping its measurement gate inverts the \
+issue's intent and is never acceptable.\n\
+- `schema/*.md` prompts are compiled into the binary with `include_str!`, \
+and the auto-updater only rebuilds when `crates/` or `Cargo.*` change. A \
+schema-only change therefore merges, deploys, and does NOTHING. Never plan \
+a schema-only fix.\n\
+- `skills/**/*.md` are read from disk at runtime: editing one changes live \
+behaviour for ~250 emails/day on the next pull, with no rebuild and no \
+review. Grade ANY change to these files, or to triage/draft prompts, or to \
+the send path, as `hard` — regardless of how few lines it is.\n\
+- Changes to the self-improve pipeline's own gating logic are NOT-FIXABLE: \
+this pipeline must not modify the gate that decides whether its own work \
+merges.\n\
+\n\
+Grade complexity by BLAST RADIUS, not diff size. A 10-line prompt edit that \
+alters every outbound email is `hard`; a 300-line self-contained validator \
+with tests is `medium`.\n\
 Output ONLY the header and spec/reason, no preamble.";
 
 /// Complexity grade the scoping pass assigns (#653). Anything above
@@ -2521,6 +2547,28 @@ mod tests {
         assert!(!status(&gate_sh("false 2>&1 | tail -1")));
         // Wrapped success still succeeds.
         assert!(status(&gate_sh("true 2>&1 | tail -1")));
+    }
+
+    #[test]
+    fn scope_prompt_states_the_verified_repo_constraints() {
+        // #787 — the scoper repeatedly graded speculative research issues as
+        // buildable because their text asserts a labelled corpus exists and
+        // presents prompt edits as one-file changes. These facts are verified
+        // against the tree; losing any of them silently restores the bug.
+        for needle in [
+            "NO human-labelled triage corpus",
+            "gitignored",
+            "include_str!",
+            "merges, deploys, and does NOTHING",
+            "read from disk at runtime",
+            "BLAST RADIUS, not diff size",
+            "must not modify the gate",
+        ] {
+            assert!(
+                SCOPE_SYSTEM.contains(needle),
+                "scope prompt lost its {needle:?} constraint"
+            );
+        }
     }
 
     // ---- #787: human-filed issues outrank research-filed ones ----
