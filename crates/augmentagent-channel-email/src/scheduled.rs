@@ -786,7 +786,7 @@ mod tests {
         );
         assert_eq!(status_of(&store, &id), "error");
         let retryable = store
-            .list_retryable_replies(now_ms(), 86_400_000, 0, 5, 10)
+            .list_retryable_replies("gmail", now_ms(), 86_400_000, 0, 5, 10)
             .unwrap();
         assert!(retryable.iter().all(|r| r.action.id != id));
         let notices = broker.notices.lock().unwrap();

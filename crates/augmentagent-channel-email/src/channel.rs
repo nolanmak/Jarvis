@@ -206,6 +206,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
     pub async fn retry_once(&self) -> anyhow::Result<usize> {
         let now_ms = now_millis();
         let candidates: Vec<RetryableReply> = self.store.list_retryable_replies(
+            crate::inbound::PLATFORM,
             now_ms,
             self.config.retry_max_age.as_millis() as i64,
             self.config.retry_min_gap.as_millis() as i64,
@@ -2747,6 +2748,69 @@ mod tests {
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
         // Successful dispatch on the retry path marks the email processed.
         assert!(store.is_email_complete("m-retry").unwrap());
+    }
+
+    /// #670 REGRESSION — the retry queue used to be platform-blind, so the
+    /// GMAIL tick scooped up socialapi Error rows: the drafted one (a
+    /// post_approval failure) went straight to `dispatch_reply` and the
+    /// draftless one (a triage parse failure) was superseded and re-run through
+    /// the gmail pipeline. Neither row may be read, bumped or touched here.
+    #[tokio::test]
+    async fn retry_tick_ignores_socialapi_error_rows() {
+        let (store, _f) = tmp_store();
+        let mut action_ids = Vec::new();
+        for (message_id, draft) in [("m-sapi-draft", Some("sure, 3pm?")), ("m-sapi-bare", None)] {
+            let email = Email {
+                to: String::new(),
+                cc: String::new(),
+                message_id: message_id.into(),
+                thread_id: Some("conv-1".into()),
+                from: "jane <socialapi:jane>".into(),
+                subject: "[DM from jane]".into(),
+                body: "you around at 3?".into(),
+                date: "2026-08-21".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "socialapi".into(),
+                kind: "dm".into(),
+            };
+            store.upsert_email(&email).unwrap();
+            action_ids.push(
+                store
+                    .log_action(
+                        &email.message_id,
+                        email.thread_id.as_deref(),
+                        &email.from,
+                        &email.subject,
+                        Some(&email.body),
+                        draft,
+                        ActionStatus::Error,
+                    )
+                    .unwrap(),
+            );
+        }
+
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            Arc::new(StubGmail { emails: vec![] }),
+            // Unscripted: nothing in this tick should reach the reasoner.
+            Arc::new(ScriptedReasoner::new([])),
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                retry_min_gap: Duration::from_millis(0),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(ch.retry_once().await.unwrap(), 0);
+        assert!(broker.posts.lock().unwrap().is_empty());
+        for id in action_ids {
+            let row = store.get_action_with_email(&id).unwrap().unwrap();
+            assert_eq!(row.action.status, "error", "row {id} was re-triaged");
+            assert_eq!(row.retry_count, 0, "row {id} was counted as a gmail retry");
+        }
     }
 
     /// #451 REGRESSION — the bug that filled the queue with 102 empty cards.
