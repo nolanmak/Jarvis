@@ -6147,8 +6147,12 @@ impl Store {
     /// `true` the first time a `(conversation_id, message_id)` pair is seen and
     /// `false` on every subsequent call. Mirrors
     /// [`Store::record_seen_socialapi_comment`] but against the
-    /// `socialapi_seen_dms` ledger; the DM inbound poller calls this so each
-    /// inbound message surfaces a single WorkItem, ever, across restarts.
+    /// `socialapi_seen_dms` ledger.
+    ///
+    /// #671: this is written when a DM reaches a TERMINAL outcome (skipped,
+    /// carded, dry-run, already-actioned) rather than when it is emitted, so a
+    /// transient triage/draft failure leaves the DM unledgered and the next
+    /// poll re-feeds it. Read side: [`Store::is_socialapi_dm_seen`].
     pub fn record_seen_socialapi_dm(
         &self,
         conversation_id: &str,
@@ -6165,6 +6169,28 @@ impl Store {
             params![conversation_id, message_id, author, text, now],
         )?;
         Ok(n > 0)
+    }
+
+    /// True iff `(conversation_id, message_id)` is already in the
+    /// `socialapi_seen_dms` ledger. Read-only counterpart of
+    /// [`Store::record_seen_socialapi_dm`]: the DM source gates emission on
+    /// this so it no longer claims a message it hasn't carried to a terminal
+    /// outcome (#671).
+    pub fn is_socialapi_dm_seen(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM socialapi_seen_dms \
+                 WHERE conversation_id = ?1 AND message_id = ?2",
+                params![conversation_id, message_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(row.is_some())
     }
 
     /// Insert one inbound SocialAPI.ai webhook event (#249) idempotently,
@@ -8709,6 +8735,18 @@ mod tests {
         assert!(s
             .record_seen_socialapi_dm("conv_2", "msg_1", None, None)
             .unwrap());
+    }
+
+    #[test]
+    fn is_socialapi_dm_seen_reflects_ledger() {
+        let (s, _f) = fresh_store();
+        assert!(!s.is_socialapi_dm_seen("conv_1", "msg_1").unwrap());
+        s.record_seen_socialapi_dm("conv_1", "msg_1", Some("jane"), Some("hi!"))
+            .unwrap();
+        assert!(s.is_socialapi_dm_seen("conv_1", "msg_1").unwrap());
+        // Keyed on the pair, not either half alone.
+        assert!(!s.is_socialapi_dm_seen("conv_1", "msg_2").unwrap());
+        assert!(!s.is_socialapi_dm_seen("conv_2", "msg_1").unwrap());
     }
 
     #[test]
