@@ -16,12 +16,20 @@
 //! `approve_socialapi` (#244, merged). Every reply requires Discord approval;
 //! nothing here auto-replies.
 //!
+//! #671: the ledger is a *terminal-outcome* marker, written by the handler once
+//! a DM has been skipped, carded or dry-run — never by the source when it emits.
+//! The source only reads it. A transient reasoner failure therefore leaves the
+//! DM unledgered and the next poll re-feeds it, mirroring how gmail leaves a
+//! triage-stage error unread with `agentProcessedAt` NULL. Writing on emission
+//! turned any provider outage into a permanent silent drop of a human's DM.
+//!
 //! Wrap [`SocialApiDmSource`] in an
 //! [`InboundMessageTrigger`](augmentagent_channel_core::trigger::InboundMessageTrigger)
 //! and drive it through a
 //! [`ChannelRunner`](augmentagent_channel_core::trigger::ChannelRunner) with
 //! [`SocialApiDmChannel`] as the handler — the same shape Gmail/LinkedIn use.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -63,7 +71,10 @@ pub const DM_CONVERSATIONS_PER_POLL: usize = 10;
 /// Ignore unanswered inbound DMs older than this. First-run guard: the seen
 /// ledger starts empty, and without a horizon the first poll after connecting
 /// an account would draft replies to months-old, long-settled threads. Stale
-/// messages are still written to the ledger so they stay permanently skipped.
+/// messages are still written to the ledger so they stay permanently skipped —
+/// "never draft this" is a terminal decision the *source* is entitled to make.
+/// That also caps the #671 re-feed loop: a DM whose triage keeps failing ages
+/// out of the horizon after this many days instead of retrying forever.
 pub const DM_MAX_AGE_DAYS: i64 = 3;
 
 /// Normalized inbound-DM webhook event body (#249) as persisted by the Express
@@ -352,13 +363,26 @@ impl SocialApiDmSource {
 
     /// Fast-path drain of webhook-delivered DM events (#249). Reads up to
     /// `budget` unprocessed `socialapi_webhook_events` of kind `dm`, marks each
-    /// processed, and — for the ones not already in `socialapi_seen_dms` —
-    /// emits a `dm` WorkItem. Reusing the same dedup ledger as the poll path
+    /// processed, and — for the ones not already settled in `socialapi_seen_dms`
+    /// — emits a `dm` WorkItem. Reusing the same dedup ledger as the poll path
     /// means a webhook-delivered DM and a later poll of the same DM collapse to
     /// a single draft. Returns the emitted work items; the API poll runs after
     /// this with whatever budget remains. Best-effort: a malformed row is
     /// marked processed (so it doesn't wedge the queue) and skipped.
-    fn drain_webhook_events(&self, budget: u32) -> anyhow::Result<Vec<WorkItem>> {
+    ///
+    /// Every emitted `(conversation_id, message_id)` is recorded in `emitted`
+    /// because the ledger is now written by the handler, not here (#671): the
+    /// in-tick set is what stops this drain and the API poll from emitting the
+    /// same message twice in one tick. Conversely, a webhook row whose handler
+    /// then failed is already `processed` and can only come back via the API
+    /// poll — which reaches the top [`DM_CONVERSATIONS_PER_POLL`] conversations
+    /// per account, and an unanswered DM is by definition in a recently-active
+    /// thread.
+    fn drain_webhook_events(
+        &self,
+        budget: u32,
+        emitted: &mut HashSet<(String, String)>,
+    ) -> anyhow::Result<Vec<WorkItem>> {
         if budget == 0 {
             return Ok(Vec::new());
         }
@@ -377,8 +401,9 @@ impl SocialApiDmSource {
         let mut out = Vec::new();
         for ev in events {
             // Always mark processed first so a poison row can't be re-drained
-            // forever; the seen-ledger is the authoritative dedup if the same
-            // id later arrives via poll.
+            // forever; the seen-ledger is the authoritative dedup once the
+            // handler settles the DM, and the API poll is the fallback until
+            // then.
             if let Err(e) = self.store.mark_socialapi_webhook_event_processed(&ev.id) {
                 warn!(event = %ev.id, "socialapi dm webhook: mark processed failed: {e}");
             }
@@ -427,17 +452,15 @@ impl SocialApiDmSource {
                 );
                 continue;
             }
-            // Durable one-shot dedup keyed on (conversation_id, message_id) —
-            // the SAME ledger the poll path writes, so no double-draft.
-            let is_new = self.store.record_seen_socialapi_dm(
-                &payload.conversation_id,
-                &payload.message_id,
-                Some(payload.author.as_str()),
-                Some(payload.text.as_str()),
-            )?;
-            if !is_new {
+            // Durable dedup keyed on (conversation_id, message_id) — the SAME
+            // ledger the poll path reads, so no double-draft.
+            if self
+                .store
+                .is_socialapi_dm_seen(&payload.conversation_id, &payload.message_id)?
+            {
                 continue;
             }
+            emitted.insert((payload.conversation_id.clone(), payload.message_id.clone()));
             out.push(WorkItem {
                 platform: PLATFORM.into(),
                 kind: work_item_kind::DM.into(),
@@ -456,11 +479,17 @@ impl SocialApiDmSource {
 impl InboundSource for SocialApiDmSource {
     async fn fetch_new(&self) -> anyhow::Result<Vec<WorkItem>> {
         let mut budget = self.max_per_tick;
+        // What this tick has already emitted. The ledger is only written once
+        // the handler reaches a terminal outcome (#671), so it cannot be what
+        // keeps the webhook drain and the API poll below from both emitting the
+        // same message id within a single tick.
+        let mut emitted: HashSet<(String, String)> = HashSet::new();
         // #249 fast-path: drain webhook-delivered DM events AHEAD of the API
         // poll so near-real-time pushes don't wait for the next tick. Shares
         // the `socialapi_seen_dms` dedup ledger with the poll below, so a
-        // webhook item drained here is skipped when the poll later sees it.
-        let mut out = self.drain_webhook_events(budget)?;
+        // webhook item already settled by the handler is skipped when the poll
+        // later sees it.
+        let mut out = self.drain_webhook_events(budget, &mut emitted)?;
         budget = budget.saturating_sub(out.len() as u32);
 
         // Ownership backstop kept from #526: the messages endpoint states
@@ -541,17 +570,23 @@ impl InboundSource for SocialApiDmSource {
                     if msg.id.is_empty() || is_own_handle(&own_handles, &msg.sender_name) {
                         continue;
                     }
-                    // Durable one-shot dedup keyed on (conversation_id, message_id).
-                    let is_new = self.store.record_seen_socialapi_dm(
-                        &conv.id,
-                        &msg.id,
-                        Some(msg.sender_name.as_str()),
-                        Some(msg.text.as_str()),
-                    )?;
-                    if !is_new {
+                    // Durable dedup keyed on (conversation_id, message_id),
+                    // plus the in-tick set for whatever the webhook drain
+                    // already emitted this tick.
+                    let key = (conv.id.clone(), msg.id.clone());
+                    if emitted.contains(&key) || self.store.is_socialapi_dm_seen(&key.0, &key.1)? {
                         continue;
                     }
                     if !within_horizon(&msg.created_at, now) {
+                        // "Never draft this" is terminal, so the source records
+                        // it — unlike emission, which leaves the ledger to the
+                        // handler.
+                        self.store.record_seen_socialapi_dm(
+                            &conv.id,
+                            &msg.id,
+                            Some(msg.sender_name.as_str()),
+                            Some(msg.text.as_str()),
+                        )?;
                         debug!(
                             conversation = %conv.id,
                             message = %msg.id,
@@ -560,6 +595,7 @@ impl InboundSource for SocialApiDmSource {
                         );
                         continue;
                     }
+                    emitted.insert(key);
                     out.push(to_work_item(conv, msg));
                     budget -= 1;
                 }
@@ -617,12 +653,32 @@ pub struct SocialApiDmChannel<R: Reasoner> {
 }
 
 impl<R: Reasoner + 'static> SocialApiDmChannel<R> {
+    /// Write the `socialapi_seen_dms` ledger row for a DM that has reached a
+    /// terminal outcome (#671), so [`SocialApiDmSource`] stops re-feeding it.
+    /// `INSERT OR IGNORE`, so re-marking an already-recorded DM is harmless.
+    fn mark_seen(&self, dm: &SocialApiDmPayload) -> anyhow::Result<()> {
+        self.store.record_seen_socialapi_dm(
+            &dm.conversation_id,
+            &dm.message_id,
+            Some(dm.author.as_str()),
+            Some(dm.text.as_str()),
+        )?;
+        Ok(())
+    }
+
     /// Triage + draft + (unless dry-run) approval-card one inbound DM. Returns
     /// `true` when an approval card was posted.
     pub async fn handle_dm(&self, payload: SocialApiDmPayload) -> anyhow::Result<bool> {
+        // The ledger is keyed on (conversation, message) and `into_email`
+        // consumes the payload, so keep a copy for the terminal `mark_seen`.
+        let dm = payload.clone();
         let email = payload.into_email();
         self.store.upsert_email(&email)?;
         if self.store.is_message_processed(&email.message_id)? {
+            // An action row already exists (Pending/Error/Skipped/DryRun), so
+            // this DM is settled as far as triage goes. Marking it seen is what
+            // stops an errored message from being re-fed on every single poll.
+            self.mark_seen(&dm)?;
             return Ok(false);
         }
 
@@ -659,6 +715,7 @@ impl<R: Reasoner + 'static> SocialApiDmChannel<R> {
             )?;
             self.store
                 .mark_email_processed(&email.message_id, TriageResult::Skip)?;
+            self.mark_seen(&dm)?;
             return Ok(false);
         }
 
@@ -682,6 +739,8 @@ impl<R: Reasoner + 'static> SocialApiDmChannel<R> {
                 Ok(p) => Some(p),
                 Err(Denial::ApprovalRequired { .. }) => None,
                 Err(d) => {
+                    // Deliberately NOT marked seen: a deferral means "try
+                    // later", so the next poll must re-feed this DM.
                     info!(dm = %email.message_id, "socialapi dm reply deferred by governor: {d}");
                     return Ok(false);
                 }
@@ -719,6 +778,7 @@ impl<R: Reasoner + 'static> SocialApiDmChannel<R> {
             )?;
             self.store
                 .mark_email_processed(&email.message_id, TriageResult::Reply)?;
+            self.mark_seen(&dm)?;
             println!(
                 "[socialapi dm reply dry-run] {}\n--- reply ---\n{}\n--- /reply ---",
                 email.subject, draft
@@ -756,6 +816,7 @@ impl<R: Reasoner + 'static> SocialApiDmChannel<R> {
                 .record(p, augmentagent_channel_core::governor::Outcome::Ok)
                 .await;
         }
+        self.mark_seen(&dm)?;
         info!(action_id, dm = %email.message_id, "socialapi dm reply card posted");
         Ok(true)
     }
@@ -833,6 +894,33 @@ mod tests {
         }
     }
 
+    /// Stands in for a reasoner outage — a Claude quota refusal, a provider
+    /// 5xx, anything that surfaces as `Err` rather than as a bad decision.
+    struct FailingReasoner;
+    #[async_trait]
+    impl Reasoner for FailingReasoner {
+        async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+            Err(anyhow::anyhow!("quota refused"))
+        }
+    }
+
+    /// Succeeds for the first `fail_after` calls, then fails — so the failure
+    /// can be aimed at the DRAFT stage, past a successful triage.
+    struct FlakyReasoner {
+        fail_after: usize,
+        calls: std::sync::atomic::AtomicUsize,
+        inner: ScriptedReasoner,
+    }
+    #[async_trait]
+    impl Reasoner for FlakyReasoner {
+        async fn call(&self, opts: &ReasonerOpts, prompt: &str) -> anyhow::Result<String> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= self.fail_after {
+                return Err(anyhow::anyhow!("quota refused"));
+            }
+            self.inner.call(opts, prompt).await
+        }
+    }
+
     #[derive(Default)]
     struct RecordingBroker {
         posts: std::sync::Mutex<Vec<String>>,
@@ -883,12 +971,12 @@ mod tests {
         (Arc::new(store), file)
     }
 
-    fn channel(
+    fn channel<R: Reasoner>(
         store: Arc<Store>,
-        reasoner: Arc<ScriptedReasoner>,
+        reasoner: Arc<R>,
         broker: Arc<RecordingBroker>,
         dry_run: bool,
-    ) -> SocialApiDmChannel<ScriptedReasoner> {
+    ) -> SocialApiDmChannel<R> {
         SocialApiDmChannel {
             store,
             reasoner,
@@ -976,7 +1064,14 @@ mod tests {
         assert_eq!(first[0].kind, work_item_kind::DM);
         assert_eq!(first[0].platform, PLATFORM);
         assert_eq!(first[0].external_id, "m3");
-        // Second poll → already in socialapi_seen_dms → empty.
+        // Emitting does NOT ledger the message (#671) — that's the handler's
+        // job, at a terminal outcome.
+        assert!(!store.is_socialapi_dm_seen("conv_1", "m3").unwrap());
+        skip_channel(Arc::clone(&store))
+            .handle(first[0].clone())
+            .await
+            .unwrap();
+        // Second poll → now in socialapi_seen_dms → empty.
         let second = source.fetch_new().await.unwrap();
         assert!(second.is_empty());
     }
@@ -1072,9 +1167,12 @@ mod tests {
     }
 
     /// #249 fast-path: a webhook-delivered DM event drained from
-    /// `socialapi_webhook_events` surfaces as a `dm` WorkItem exactly once, is
-    /// marked processed, and a later API poll of the SAME message id (shared
-    /// `socialapi_seen_dms` ledger) produces no duplicate.
+    /// `socialapi_webhook_events` surfaces as a `dm` WorkItem exactly once —
+    /// the in-tick emitted set stops the API poll from re-emitting the same
+    /// message id in the same tick — and once the handler carries it to a
+    /// terminal outcome the shared `socialapi_seen_dms` ledger keeps every
+    /// later poll quiet. In between, the poll is the fallback for a webhook
+    /// item whose handler failed (#671).
     #[tokio::test]
     async fn drains_webhook_dm_event_once_and_dedups_against_poll() {
         let (store, _f) = tmp_store();
@@ -1119,16 +1217,189 @@ mod tests {
         let source = SocialApiDmSource::new(client(&server), Arc::clone(&store), 10);
 
         // First fetch: drains the webhook event → 1 work item (the poll sees m1
-        // but it's already in seen_dms from the drain, so no double).
+        // in the same tick, but the emitted set suppresses the double).
         let first = source.fetch_new().await.unwrap();
         assert_eq!(first.len(), 1, "webhook drain should surface m1 exactly once");
         assert_eq!(first[0].external_id, "m1");
         assert_eq!(first[0].kind, work_item_kind::DM);
 
-        // Webhook event is now processed → second fetch drains nothing and the
-        // poll re-sees m1 but it's deduped → empty.
+        // The webhook row is consumed, so with no terminal outcome recorded the
+        // API poll is the fallback — and it re-emits m1 exactly once.
         let second = source.fetch_new().await.unwrap();
-        assert!(second.is_empty(), "no duplicate from webhook+poll convergence");
+        assert_eq!(
+            second.len(),
+            1,
+            "an unhandled webhook DM must fall back to the poll"
+        );
+        assert_eq!(second[0].external_id, "m1");
+
+        // Once the handler settles it, every later poll is quiet.
+        skip_channel(Arc::clone(&store))
+            .handle(second[0].clone())
+            .await
+            .unwrap();
+        let third = source.fetch_new().await.unwrap();
+        assert!(third.is_empty(), "no duplicate from webhook+poll convergence");
+    }
+
+    /// One conversation carrying a single fresh incoming message, for tests
+    /// that poll the same inbox several times.
+    async fn mount_single_incoming(server: &MockServer) {
+        mount_conversations(
+            server,
+            serde_json::json!({"data": [{
+                "id": "conv_1", "account_id": "acc_1", "participant_name": "jane"
+            }]}),
+        )
+        .await;
+        mount_messages(
+            server,
+            "conv_1",
+            serde_json::json!({"data": [
+                {"id":"m1","direction":"incoming","sender_name":"jane","text":"you around?","created_at": rfc3339_ago(1)}
+            ]}),
+        )
+        .await;
+    }
+
+    fn skip_channel(store: Arc<Store>) -> SocialApiDmChannel<ScriptedReasoner> {
+        channel(
+            store,
+            Arc::new(ScriptedReasoner::new([
+                r#"{"decision":"skip","reason":"noise"}"#,
+            ])),
+            Arc::new(RecordingBroker::default()),
+            false,
+        )
+    }
+
+    /// #671: the seen-ledger is a TERMINAL-outcome marker, not an emission
+    /// receipt. A reasoner outage during triage must leave the DM unledgered so
+    /// the next poll re-feeds it — otherwise a transient quota refusal silently
+    /// drops a human's message forever.
+    #[tokio::test]
+    async fn reasoner_error_leaves_dm_unseen_so_next_poll_refeeds_it() {
+        let (store, _f) = tmp_store();
+        let server = MockServer::start().await;
+        mount_single_incoming(&server).await;
+        let source = SocialApiDmSource::new(client(&server), Arc::clone(&store), 10);
+
+        let first = source.fetch_new().await.unwrap();
+        assert_eq!(first.len(), 1);
+
+        let failing = channel(
+            Arc::clone(&store),
+            Arc::new(FailingReasoner),
+            Arc::new(RecordingBroker::default()),
+            false,
+        );
+        assert!(failing.handle(first[0].clone()).await.is_err());
+        assert!(!store.is_socialapi_dm_seen("conv_1", "m1").unwrap());
+        assert!(!store.is_message_processed("m1").unwrap());
+
+        // The next poll re-feeds the same message...
+        let second = source.fetch_new().await.unwrap();
+        assert_eq!(second.len(), 1, "a failed DM must be re-fed");
+        assert_eq!(second[0].external_id, "m1");
+
+        // ...and once the reasoner recovers, the terminal outcome ledgers it.
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = channel(
+            Arc::clone(&store),
+            Arc::new(ScriptedReasoner::new([
+                r#"{"decision":"reply","reason":"genuine question"}"#,
+                "Sure, how about Thursday?",
+            ])),
+            Arc::clone(&broker),
+            false,
+        );
+        ch.handle(second[0].clone()).await.unwrap();
+        assert_eq!(broker.posts.lock().unwrap().len(), 1);
+        assert!(store.is_socialapi_dm_seen("conv_1", "m1").unwrap());
+        assert!(source.fetch_new().await.unwrap().is_empty());
+    }
+
+    /// Same guarantee one stage later: triage succeeded, the draft call blew
+    /// up. No action row, no ledger row, re-fed on the next poll.
+    #[tokio::test]
+    async fn draft_stage_error_also_refeeds() {
+        let (store, _f) = tmp_store();
+        let server = MockServer::start().await;
+        mount_single_incoming(&server).await;
+        let source = SocialApiDmSource::new(client(&server), Arc::clone(&store), 10);
+        let first = source.fetch_new().await.unwrap();
+        assert_eq!(first.len(), 1);
+
+        let ch = channel(
+            Arc::clone(&store),
+            Arc::new(FlakyReasoner {
+                fail_after: 1,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                inner: ScriptedReasoner::new([r#"{"decision":"reply","reason":"genuine"}"#]),
+            }),
+            Arc::new(RecordingBroker::default()),
+            false,
+        );
+        assert!(ch.handle(first[0].clone()).await.is_err());
+        assert!(!store.is_socialapi_dm_seen("conv_1", "m1").unwrap());
+        assert!(!store.is_message_processed("m1").unwrap());
+
+        let second = source.fetch_new().await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].external_id, "m1");
+    }
+
+    /// A message that already carries an action row — an Error row from an
+    /// earlier parse failure, say — is settled as far as the handler is
+    /// concerned, so it must be ledgered. Without this the source re-feeds it
+    /// on every poll, forever.
+    #[tokio::test]
+    async fn already_processed_message_is_marked_seen() {
+        let (store, _f) = tmp_store();
+        store
+            .log_action(
+                "m1",
+                Some("conv_1"),
+                "jane <socialapi:jane>",
+                "[DM from jane]",
+                Some("you around?"),
+                None,
+                ActionStatus::Error,
+            )
+            .unwrap();
+        let ch = skip_channel(Arc::clone(&store));
+        let posted = ch
+            .handle_dm(SocialApiDmPayload {
+                attachment_url: None,
+                sub_platform: "instagram".into(),
+                conversation_id: "conv_1".into(),
+                account_id: "acc_1".into(),
+                with: "jane".into(),
+                message_id: "m1".into(),
+                author: "jane".into(),
+                text: "you around?".into(),
+                created_at: rfc3339_ago(1),
+            })
+            .await
+            .unwrap();
+        assert!(!posted);
+        assert!(store.is_socialapi_dm_seen("conv_1", "m1").unwrap());
+    }
+
+    /// A dry-run draft is a terminal outcome too — no card, but the DM is
+    /// handled and must not be re-fed.
+    #[tokio::test]
+    async fn dry_run_decision_marks_seen_without_a_card() {
+        let (store, _f) = tmp_store();
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"genuine question"}"#,
+            "Sure, how about Thursday?",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = channel(Arc::clone(&store), reasoner, Arc::clone(&broker), true);
+        assert!(!ch.handle_dm(dm_payload("instagram")).await.unwrap());
+        assert!(broker.posts.lock().unwrap().is_empty());
+        assert!(store.is_socialapi_dm_seen("c1", "m1").unwrap());
     }
 
     #[tokio::test]
@@ -1154,6 +1425,7 @@ mod tests {
         let posted = ch.handle_dm(payload).await.unwrap();
         assert!(posted);
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
+        assert!(store.is_socialapi_dm_seen("conv_1", "m1").unwrap());
     }
 
     #[tokio::test]
@@ -1178,6 +1450,7 @@ mod tests {
         let posted = ch.handle_dm(payload).await.unwrap();
         assert!(!posted);
         assert!(broker.posts.lock().unwrap().is_empty());
+        assert!(store.is_socialapi_dm_seen("conv_1", "spam1").unwrap());
     }
 
     fn seed_account(store: &Store, id: &str, handle: &str) {
