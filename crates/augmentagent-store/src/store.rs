@@ -3133,9 +3133,13 @@ impl Store {
     /// - `actions.createdAt` within `max_age_ms` (don't retry ancient errors forever)
     /// - `actions.updatedAt` older than `min_gap_ms` ago (space attempts out)
     /// - `actions.retryCount < max_attempts`
+    /// - `emails.platform` equals the caller's channel — each channel's retry
+    ///   tick only sees its own rows (#670); otherwise e.g. a socialapi Error
+    ///   row lands in the gmail tick and is dispatched through gmail plumbing
     /// - Joined with `emails` so the caller has the email body to retry with
     pub fn list_retryable_replies(
         &self,
+        platform: &str,
         now_ms: i64,
         max_age_ms: i64,
         min_gap_ms: i64,
@@ -3152,14 +3156,16 @@ impl Store {
              FROM actions a \
              JOIN emails e ON a.messageId = e.messageId \
              WHERE a.status = 'error' \
-               AND a.createdAt >= ?1 \
-               AND a.updatedAt <= ?2 \
-               AND COALESCE(a.retryCount, 0) < ?3 \
+               AND e.platform = ?1 \
+               AND a.createdAt >= ?2 \
+               AND a.updatedAt <= ?3 \
+               AND COALESCE(a.retryCount, 0) < ?4 \
              ORDER BY a.createdAt ASC \
-             LIMIT ?4",
+             LIMIT ?5",
         )?;
         let rows = stmt.query_map(
             params![
+                platform,
                 now_ms - max_age_ms,
                 now_ms - min_gap_ms,
                 max_attempts,
@@ -8183,11 +8189,57 @@ mod tests {
         // With retryCount at the cap the generic retry tick must skip it.
         let now = now_millis();
         let retryable = s
-            .list_retryable_replies(now, 86_400_000, 0, 5, 10)
+            .list_retryable_replies("gmail", now, 86_400_000, 0, 5, 10)
             .unwrap();
         assert!(
             retryable.iter().all(|r| r.action.id != id),
             "a capped scheduled-send failure must never re-enter dispatch_reply"
+        );
+    }
+
+    /// #670 REGRESSION — the retry queue is per-channel. A socialapi Error row
+    /// (logged by the DM handler's parse-failure / post_approval-failure paths)
+    /// must never surface to the gmail tick, whose recovery path dispatches
+    /// through gmail plumbing.
+    #[test]
+    fn list_retryable_replies_is_scoped_to_caller_platform() {
+        let (s, _f) = fresh_store();
+        let gmail_email = sample_email("m-plat-gmail");
+        let sapi_email = Email {
+            platform: "socialapi".into(),
+            ..sample_email("m-plat-sapi")
+        };
+        for e in [&gmail_email, &sapi_email] {
+            s.upsert_email(e).unwrap();
+            s.log_action(
+                &e.message_id,
+                None,
+                &e.from,
+                &e.subject,
+                Some(&e.body),
+                Some("draft"),
+                ActionStatus::Error,
+            )
+            .unwrap();
+        }
+
+        let now = now_millis();
+        let ids = |rows: Vec<RetryableReply>| {
+            rows.into_iter()
+                .map(|r| r.action.message_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(s
+                .list_retryable_replies("gmail", now, 86_400_000, 0, 5, 10)
+                .unwrap()),
+            ["m-plat-gmail"],
+        );
+        assert_eq!(
+            ids(s
+                .list_retryable_replies("socialapi", now, 86_400_000, 0, 5, 10)
+                .unwrap()),
+            ["m-plat-sapi"],
         );
     }
 
