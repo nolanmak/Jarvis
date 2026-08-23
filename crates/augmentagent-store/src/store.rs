@@ -1691,6 +1691,33 @@ impl Store {
         Ok(row.is_some())
     }
 
+    /// #795 — the newest action row for a message as
+    /// `(id, status, retry_count)`, or `None` when the message has never
+    /// been actioned. Callers need the *status* (not just existence) to tell
+    /// "a card is up / this is settled" from "triage errored with no card,
+    /// so this still needs another attempt".
+    pub fn latest_action_for_message(
+        &self,
+        message_id: &str,
+    ) -> StoreResult<Option<(String, String, i64)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let row = guard
+            .query_row(
+                "SELECT id, status, COALESCE(retryCount, 0) FROM actions \
+                 WHERE messageId = ?1 ORDER BY createdAt DESC LIMIT 1",
+                params![message_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// True iff there's already an in-flight action for this message —
     /// `pending` (awaiting Discord approval), `error` (will be picked up by
     /// the retry tick), or `scheduled`/`sending` (#500 — armed for a future
