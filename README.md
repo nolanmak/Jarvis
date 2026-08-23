@@ -64,6 +64,9 @@ Other top-level dirs: `schema/` (prompt + wiki schemas), `skills/`
 - Rust: `. $HOME/.cargo/env && cargo build --release` (binary at `./target/release/augmentagent`)
 - TypeScript: `npm run build`
 - Tests/lint: `cargo test --workspace` · `npm test`
+- Reasoner failover changes: exercise them with the fault-injection rig and
+  mint the PR-gate receipt from its transcript — see
+  [docs/REASONER-FAULT-INJECTION.md](docs/REASONER-FAULT-INJECTION.md)
 
 ## Process management
 

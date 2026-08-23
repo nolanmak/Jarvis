@@ -7068,14 +7068,17 @@ async fn run_reasoner_selftest(prompt: &str) -> Result<()> {
 
     let reasoner = build_reasoner();
     println!("chain: {}", reasoner.provider_names().join(" → "));
-    let latches = CooldownLatch::system().active();
-    if latches.is_empty() {
-        println!("cooldowns: none active");
-    } else {
-        for (provider, entry) in &latches {
-            println!("cooldowns: {provider} latched until {} ({})", entry.until, entry.reason);
+    let print_cooldowns = |label: &str| {
+        let latches = CooldownLatch::system().active();
+        if latches.is_empty() {
+            println!("{label}: none active");
+        } else {
+            for (provider, entry) in &latches {
+                println!("{label}: {provider} latched until {} ({})", entry.until, entry.reason);
+            }
         }
-    }
+    };
+    print_cooldowns("cooldowns");
 
     // Text-only opts (no tools) so every configured provider is eligible —
     // this is the widest possible probe of the chain. Quality tier keeps the
@@ -7098,7 +7101,12 @@ async fn run_reasoner_selftest(prompt: &str) -> Result<()> {
         audit_notifier: None,
         session_id: None,
     };
-    match reasoner.call(&opts, prompt).await {
+    let result = reasoner.call(&opts, prompt).await;
+    // The latches the call itself took are the observable half of a failover
+    // — without this line a fault-injection run (#666) can see WHICH
+    // provider answered but not that the failed one was actually latched.
+    print_cooldowns("cooldowns (after call)");
+    match result {
         Ok(text) => {
             println!("response: {text}");
             Ok(())
