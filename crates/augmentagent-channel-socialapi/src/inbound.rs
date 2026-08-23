@@ -77,6 +77,11 @@ pub const DM_CONVERSATIONS_PER_POLL: usize = 10;
 /// out of the horizon after this many days instead of retrying forever.
 pub const DM_MAX_AGE_DAYS: i64 = 3;
 
+/// #795 — how many times a DM whose triage/approval errored is re-fed for
+/// another attempt before it is flagged for the owner. Each attempt costs a
+/// full ~24k-token triage call, so this is the amplification bound (#448).
+const DM_MAX_TRIAGE_RETRIES: i64 = 3;
+
 /// Normalized inbound-DM webhook event body (#249) as persisted by the Express
 /// receiver into `socialapi_webhook_events.payload_json`. Mirrors the receiver's
 /// `normalizeSocialApiEvent` DM shape; everything the drain needs to rebuild a
@@ -292,8 +297,11 @@ fn unanswered_incoming_tail(msgs: &[DmMessage]) -> &[DmMessage] {
 }
 
 /// True iff `created_at` (RFC3339) is within [`DM_MAX_AGE_DAYS`] of `now`.
-/// Unparseable timestamps count as within — the seen-ledger still bounds
-/// re-emission to exactly once.
+/// Unparseable timestamps count as within, so a provider sending
+/// `created_at: null` never silently loses the DM. #795 note: re-emission
+/// is no longer bounded by the seen-ledger (an errored DM is deliberately
+/// left unseen), so the bound on repeated work is
+/// [`DM_MAX_TRIAGE_RETRIES`] in `handle_dm`, not this horizon.
 fn within_horizon(created_at: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
     match chrono::DateTime::parse_from_rfc3339(created_at) {
         Ok(t) => {
@@ -674,12 +682,51 @@ impl<R: Reasoner + 'static> SocialApiDmChannel<R> {
         let dm = payload.clone();
         let email = payload.into_email();
         self.store.upsert_email(&email)?;
-        if self.store.is_message_processed(&email.message_id)? {
-            // An action row already exists (Pending/Error/Skipped/DryRun), so
-            // this DM is settled as far as triage goes. Marking it seen is what
-            // stops an errored message from being re-fed on every single poll.
-            self.mark_seen(&dm)?;
-            return Ok(false);
+        // #795 — an `error` row is NOT settled: it means triage or the
+        // approval post failed with **no card posted**, and nothing retries
+        // socialapi error rows (`list_retryable_replies` is gmail-scoped
+        // since #670; the reconcile sweep only touches `pending`). Marking
+        // those seen dropped the DM permanently — never answered, never
+        // carded, never surfaced. Gmail deliberately keeps error rows open
+        // for its retry tick (channel.rs `has_open_action`); this mirrors
+        // that, bounded so a permanently-failing DM cannot re-spawn a ~24k
+        // token triage call on every poll forever (#448).
+        match self.store.latest_action_for_message(&email.message_id)? {
+            None => {}
+            Some((action_id, status, retries)) if status == ActionStatus::Error.as_str() => {
+                if retries >= DM_MAX_TRIAGE_RETRIES {
+                    // Out of attempts. Flag rather than drop: a flagged row
+                    // surfaces in the digest, a ledgered one is invisible.
+                    self.store.update_action_status(
+                        &action_id,
+                        ActionStatus::Flagged,
+                        None,
+                        Some(
+                            "socialapi DM triage failed repeatedly; needs attention \
+                             (auto-retries exhausted)",
+                        ),
+                    )?;
+                    self.mark_seen(&dm)?;
+                    warn!(
+                        message_id = %email.message_id,
+                        retries,
+                        "socialapi DM flagged after repeated triage failures"
+                    );
+                    return Ok(false);
+                }
+                // Leave the DM UNSEEN so the next poll re-triages it.
+                // `i64::MAX` because the bound is enforced above: the store
+                // helper's own threshold would flip the row to
+                // `permanent_error`, which is just as silent as the drop
+                // this fix removes.
+                self.store.increment_retry_count(&action_id, i64::MAX)?;
+                return Ok(false);
+            }
+            // Card is up, or the message reached a terminal outcome.
+            Some(_) => {
+                self.mark_seen(&dm)?;
+                return Ok(false);
+            }
         }
 
         let triage_opts = triage_opts(self.config.wiki_root.clone());
@@ -1353,9 +1400,76 @@ mod tests {
     /// earlier parse failure, say — is settled as far as the handler is
     /// concerned, so it must be ledgered. Without this the source re-feeds it
     /// on every poll, forever.
+    /// #795 — an `error` row means triage/approval failed with NO card
+    /// posted, and nothing retries socialapi error rows. Sealing it with
+    /// `mark_seen` dropped the DM forever; it must stay re-feedable until
+    /// the retry bound, then surface as flagged rather than vanish.
+    #[tokio::test]
+    async fn errored_dm_stays_refeedable_then_flags_instead_of_dropping() {
+        let (store, _f) = tmp_store();
+        let action = store
+            .log_action(
+                "m_e",
+                Some("conv_e"),
+                "jane <socialapi:jane>",
+                "[DM from jane]",
+                Some("you around?"),
+                None,
+                ActionStatus::Error,
+            )
+            .unwrap();
+        let ch = skip_channel(Arc::clone(&store));
+
+        // Under the bound: no card, no ledger write, retry counted.
+        for expected in 1..=DM_MAX_TRIAGE_RETRIES {
+            assert!(!ch.handle_dm(SocialApiDmPayload {
+                attachment_url: None,
+                sub_platform: "instagram".into(),
+                conversation_id: "conv_e".into(),
+                account_id: "acc_1".into(),
+                with: "jane".into(),
+                message_id: "m_e".into(),
+                author: "jane".into(),
+                text: "you around?".into(),
+                created_at: rfc3339_ago(1),
+            }).await.unwrap());
+            assert!(
+                !store.is_socialapi_dm_seen("conv_e", "m_e").unwrap(),
+                "errored DM must stay unseen so the next poll retries it"
+            );
+            let (_, status, retries) =
+                store.latest_action_for_message("m_e").unwrap().unwrap();
+            assert_eq!(status, ActionStatus::Error.as_str());
+            assert_eq!(retries, expected, "retry must be counted");
+        }
+
+        // Bound reached: flagged (visible in the digest) and ledgered.
+        assert!(!ch.handle_dm(SocialApiDmPayload {
+                attachment_url: None,
+                sub_platform: "instagram".into(),
+                conversation_id: "conv_e".into(),
+                account_id: "acc_1".into(),
+                with: "jane".into(),
+                message_id: "m_e".into(),
+                author: "jane".into(),
+                text: "you around?".into(),
+                created_at: rfc3339_ago(1),
+            }).await.unwrap());
+        let (id, status, _) = store.latest_action_for_message("m_e").unwrap().unwrap();
+        assert_eq!(id, action);
+        assert_eq!(
+            status,
+            ActionStatus::Flagged.as_str(),
+            "exhausted retries must FLAG, never silently drop"
+        );
+        assert!(store.is_socialapi_dm_seen("conv_e", "m_e").unwrap());
+    }
+
     #[tokio::test]
     async fn already_processed_message_is_marked_seen() {
         let (store, _f) = tmp_store();
+        // #795: a TERMINAL row (skipped) is genuinely settled. An `error`
+        // row is not — see errored_dm_stays_refeedable_then_flags_instead_of_dropping.
         store
             .log_action(
                 "m1",
@@ -1364,7 +1478,7 @@ mod tests {
                 "[DM from jane]",
                 Some("you around?"),
                 None,
-                ActionStatus::Error,
+                ActionStatus::Skipped,
             )
             .unwrap();
         let ch = skip_channel(Arc::clone(&store));
