@@ -1120,7 +1120,14 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     // Did anything change? A no-op run still burned a reasoner call, so it
     // counts as an attempt (#630) — otherwise the unattended loop silently
     // re-spends its daily cap on an issue the model can't act on.
-    let (_ok, diff, _) = run("git", &["diff", "--stat"], &worktree).await?;
+    // #793 — stage first: `git diff` is tracked-only, so every file the
+    // builder CREATED is invisible to it. Both guards below (blast radius,
+    // size cap) ran on that blind view, which meant a change of any size
+    // made of new files passed the 600-line cap, and a newly-created
+    // `.github/workflows/*.yml` or `scripts/deploy-*.sh` was never refused.
+    // Staging here is idempotent with the commit step's own `git add -A`.
+    let _ = run("git", &["add", "-A"], &worktree).await?;
+    let (_ok, diff, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
     if diff.trim().is_empty() {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
         let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
@@ -1149,7 +1156,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     // rollout MAY produce an acceptable diff, but after MAX_ATTEMPTS the
     // gave-up label pulls the issue from the pool — otherwise the unattended
     // loop would re-spend its whole daily cap on the same issue forever.
-    let (_ok, full_diff, _) = run("git", &["diff"], &worktree).await?;
+    let (_ok, full_diff, _) = run("git", &["diff", "--cached"], &worktree).await?;
     if is_blast_radius(&full_diff) {
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
         let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
@@ -1912,12 +1919,14 @@ async fn process_one_repo(
         }
     };
 
-    let (_ok, stat, _) = run("git", &["diff", "--stat"], &workspace).await?;
+    // #793 — same tracked-only blindness as the single-repo path.
+    let _ = run("git", &["add", "-A"], &workspace).await?;
+    let (_ok, stat, _) = run("git", &["diff", "--cached", "--stat"], &workspace).await?;
     if stat.trim().is_empty() {
         do_cleanup().await;
         return Ok(format!("issue #{}: reasoner made no changes", issue.number));
     }
-    let (_ok, full_diff, _) = run("git", &["diff"], &workspace).await?;
+    let (_ok, full_diff, _) = run("git", &["diff", "--cached"], &workspace).await?;
 
     // Blast-radius (global + per-repo) + per-repo size cap.
     if is_blast_radius_for_repo(&full_diff, repo) {
@@ -2569,6 +2578,49 @@ mod tests {
                 "scope prompt lost its {needle:?} constraint"
             );
         }
+    }
+
+    // ---- #793: guards must see newly-created files ----
+
+    /// The guards run `git diff --cached` after staging. This asserts the
+    /// distinction that broke them: plain `git diff` is blind to created
+    /// files, so a 900-line new file and a new `.github/workflows/*.yml`
+    /// both read as an empty diff (PR #792 self-reported 47 lines for a
+    /// 545-line change and auto-merged).
+    #[test]
+    fn staged_diff_sees_created_files_that_plain_diff_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q", "."]);
+        git(&["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q",
+              "--allow-empty", "-m", "init"]);
+        std::fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+        std::fs::write(repo.join(".github/workflows/x.yml"), "name: x
+").unwrap();
+        std::fs::write(repo.join("big.rs"), "line
+".repeat(900)).unwrap();
+
+        let plain = String::from_utf8(git(&["diff"]).stdout).unwrap();
+        assert_eq!(diff_line_count(&plain), 0, "precondition: plain diff is blind");
+        assert!(!is_blast_radius(&plain), "precondition: guard sees nothing");
+
+        git(&["add", "-A"]);
+        let staged = String::from_utf8(git(&["diff", "--cached"]).stdout).unwrap();
+        assert!(
+            diff_line_count(&staged) > MAX_DIFF_LINES,
+            "staged diff must expose the created lines so the cap applies"
+        );
+        assert!(
+            is_blast_radius(&staged),
+            "staged diff must expose a created .github/workflows path"
+        );
     }
 
     // ---- #787: human-filed issues outrank research-filed ones ----

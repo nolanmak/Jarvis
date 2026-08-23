@@ -68,6 +68,7 @@ is that receipt:
 ```bash
 cargo build --release
 mkdir -p .claude/agent-test-receipts
+set -o pipefail   # else `tee` masks a RED run and mints a GREEN receipt (#793)
 AUGMENTAGENT_E2E_BIN=./target/release/augmentagent \
   cargo test -p augmentagent-cli --test reasoner_failover_e2e -- --nocapture --test-threads=1 \
   | tee ".claude/agent-test-receipts/$(git rev-parse HEAD).txt"
