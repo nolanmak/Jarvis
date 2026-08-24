@@ -162,9 +162,10 @@ pub trait ApprovalBroker: Send + Sync {
         action_id: &str,
         email: &Email,
         sends_at_local: &str,
+        sends_at_ms: i64,
         to_display: &str,
     ) -> Result<Option<(u64, u64)>, ApprovalError> {
-        let _ = (action_id, email, sends_at_local, to_display);
+        let _ = (action_id, email, sends_at_local, sends_at_ms, to_display);
         Ok(None)
     }
 

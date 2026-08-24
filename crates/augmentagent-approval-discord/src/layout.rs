@@ -528,17 +528,26 @@ pub fn scheduled_notice_message(
     action_id: &str,
     email: &Email,
     sends_at_local: &str,
+    sends_at_ms: i64,
     to_display: &str,
 ) -> CreateMessage {
+    let sends_at_unix = sends_at_ms.div_euclid(1_000);
     let embed = CreateEmbed::new()
-        .title(truncate(&email.subject, 256))
+        .title(format!("Scheduled: {}", truncate(&email.subject, 245)))
+        .description("This email is armed and will send automatically.")
         .field("To", truncate(to_display, 256), true)
-        .field("Sends", truncate(sends_at_local, 256), true)
+        .field(
+            "Sends automatically",
+            format!(
+                "{sends_at_local}\n<t:{sends_at_unix}:F> · <t:{sends_at_unix}:R>"
+            ),
+            false,
+        )
         .footer(CreateEmbedFooter::new("AugmentAgent scheduled send"));
     let buttons = CreateActionRow::Buttons(vec![
         CreateButton::new(CustomId::new(action_id, Verb::SendNow).to_string())
-            .label("Send Now")
-            .style(ButtonStyle::Success),
+            .label("Send now instead")
+            .style(ButtonStyle::Secondary),
         CreateButton::new(CustomId::new(action_id, Verb::BackToQueue).to_string())
             .label("Back to queue")
             .style(ButtonStyle::Secondary),
@@ -983,6 +992,7 @@ mod tests {
             "act-s4",
             &email(),
             "Mon Sep 1, 9:00 AM",
+            1_756_716_000_000,
             &email().from,
         );
         let v: serde_json::Value =
@@ -990,7 +1000,7 @@ mod tests {
         let rows = v["components"].as_array().expect("components");
         assert_eq!(rows.len(), 1, "notice has ONE button row");
         let buttons = rows[0]["components"].as_array().expect("buttons");
-        assert_eq!(buttons.len(), 3, "exactly Send Now | Back to queue | Cancel");
+        assert_eq!(buttons.len(), 3, "exactly Send now instead | Back to queue | Cancel");
         let s = json(&msg);
         assert!(s.contains("aa:act-s4:send_now"));
         assert!(s.contains("aa:act-s4:back_to_queue"));
@@ -1001,6 +1011,10 @@ mod tests {
         assert!(!s.contains(":revise"));
         assert!(!s.contains(":skip"));
         assert!(s.contains("Mon Sep 1, 9:00 AM"));
+        assert!(s.contains("This email is armed and will send automatically."));
+        assert!(s.contains("<t:1756716000:F>"));
+        assert!(s.contains("<t:1756716000:R>"));
+        assert!(s.contains("Send now instead"));
     }
 
     #[test]
@@ -1008,7 +1022,7 @@ mod tests {
         // #473 routing override (#501 review): the notice must show the
         // ACTUAL recipient the caller resolved from the envelope, not the
         // card's From line.
-        let msg = scheduled_notice_message("act-s7", &email(), "t", "omer@example.com");
+        let msg = scheduled_notice_message("act-s7", &email(), "t", 1_700_000_000_000, "omer@example.com");
         let v = json(&msg);
         assert!(v.contains("omer@example.com"));
         assert!(!v.contains("peer@example.com"), "card From must not leak into To");
