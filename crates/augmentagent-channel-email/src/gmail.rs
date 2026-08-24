@@ -4,9 +4,11 @@
 //! depends on the `GmailApi` trait so Phase 1 tests can inject a fake.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::DateTime;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -22,6 +24,12 @@ pub enum GmailError {
     Decode(String),
     #[error("invalid input: {0}")]
     Invalid(String),
+    #[error("composio Gmail rate limit; retry after {retry_after} (composio log_id {log_id})")]
+    RateLimited {
+        retry_after_ms: i64,
+        retry_after: String,
+        log_id: String,
+    },
 }
 
 #[async_trait]
@@ -162,6 +170,7 @@ pub struct ComposioClient {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    rate_limit_store: Option<Arc<augmentagent_store::Store>>,
 }
 
 impl ComposioClient {
@@ -170,11 +179,18 @@ impl ComposioClient {
             http: reqwest::Client::new(),
             base_url: "https://backend.composio.dev".into(),
             api_key,
+            rate_limit_store: None,
         }
     }
 
     pub fn with_base_url(mut self, base_url: String) -> Self {
         self.base_url = base_url;
+        self
+    }
+
+    /// Shares one persisted cooldown across the daemon and separate CLI calls.
+    pub fn with_rate_limit_store(mut self, store: Arc<augmentagent_store::Store>) -> Self {
+        self.rate_limit_store = Some(store);
         self
     }
 
@@ -184,6 +200,9 @@ impl ComposioClient {
         entity_id: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, GmailError> {
+        if action == "GMAIL_FETCH_EMAILS" {
+            self.reject_if_cooling_down(entity_id)?;
+        }
         let url = format!("{}/api/v3/tools/execute/{}", self.base_url, action);
         let body = serde_json::json!({
             "user_id": entity_id,
@@ -207,7 +226,18 @@ impl ComposioClient {
                     let status = resp.status();
                     if status.is_success() {
                         let v = resp.json::<serde_json::Value>().await?;
-                        return check_envelope(action, v);
+                        let checked = check_envelope(action, v);
+                        match &checked {
+                            Err(GmailError::RateLimited { retry_after_ms, log_id, .. })
+                                if action == "GMAIL_FETCH_EMAILS" => {
+                                    self.record_cooldown(entity_id, *retry_after_ms, Some(log_id))?;
+                                }
+                            Ok(_) if action == "GMAIL_FETCH_EMAILS" => {
+                                self.clear_cooldown(entity_id)?;
+                            }
+                            _ => {}
+                        }
+                        return checked;
                     }
                     // Retry 5xx and 429; surface 4xx (other than 429) immediately.
                     let retryable = status.as_u16() == 429 || status.is_server_error();
@@ -232,6 +262,35 @@ impl ComposioClient {
                 Err(e) => return Err(GmailError::Http(e)),
             }
         }
+    }
+
+    fn reject_if_cooling_down(&self, entity_id: &str) -> Result<(), GmailError> {
+        let Some(store) = &self.rate_limit_store else {
+            return Ok(());
+        };
+        let retry_after_ms = store
+            .gmail_fetch_cooldown_until(entity_id, wallclock_ms())
+            .map_err(|e| GmailError::Composio { message: format!("read Gmail cooldown: {e}") })?;
+        if let Some(retry_after_ms) = retry_after_ms {
+            return Err(rate_limited_error(retry_after_ms, "cached"));
+        }
+        Ok(())
+    }
+
+    fn record_cooldown(&self, entity_id: &str, retry_after_ms: i64, log_id: Option<&str>) -> Result<(), GmailError> {
+        if let Some(store) = &self.rate_limit_store {
+            store.set_gmail_fetch_cooldown(entity_id, retry_after_ms, log_id)
+                .map_err(|e| GmailError::Composio { message: format!("persist Gmail cooldown: {e}") })?;
+        }
+        Ok(())
+    }
+
+    fn clear_cooldown(&self, entity_id: &str) -> Result<(), GmailError> {
+        if let Some(store) = &self.rate_limit_store {
+            store.clear_gmail_fetch_cooldown(entity_id)
+                .map_err(|e| GmailError::Composio { message: format!("clear Gmail cooldown: {e}") })?;
+        }
+        Ok(())
     }
 
     /// Resolve the Gmail address for a connected account via Composio's
@@ -780,6 +839,17 @@ mod tests {
         assert!(split_recipients(" , ").is_empty());
     }
 
+    #[test]
+    fn parses_composio_rate_limit_retry_timestamp() {
+        assert_eq!(
+            parse_rate_limit_retry_after(
+                "User-rate limit exceeded. Retry after 2099-01-01T00:00:00Z"
+            ),
+            Some((4_070_908_800_000, "2099-01-01T00:00:00Z".to_string()))
+        );
+        assert!(parse_rate_limit_retry_after("invalid credentials").is_none());
+    }
+
     // ---- #629: To/Cc recovery from the fetch payload ----
     //
     // Composio returns the full To list top-level and the Cc only inside
@@ -1105,6 +1175,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_limited_fetch_latches_entity_and_short_circuits_the_next_call() {
+        use std::sync::Arc;
+
+        let body = r#"{"successful":false,"error":"User-rate limit exceeded. Retry after 2099-01-01T00:00:00Z","log_id":"log_797"}"#;
+        let addr = spawn_one_shot_http(200, body).await;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(augmentagent_store::Store::open(db.path()).unwrap());
+        let client = ComposioClient::new("ak_fake".into())
+            .with_base_url(format!("http://{addr}"))
+            .with_rate_limit_store(Arc::clone(&store));
+
+        let first = client
+            .fetch_with_query("entity-limited", "anything", 1)
+            .await
+            .expect_err("provider rate limit must surface as an error");
+        assert!(matches!(first, GmailError::RateLimited { .. }), "got: {first}");
+
+        let second = client
+            .fetch_with_query("entity-limited", "anything", 1)
+            .await
+            .expect_err("known cooldown must be rejected locally before HTTP");
+        assert!(matches!(second, GmailError::RateLimited { .. }), "got: {second}");
+        assert_eq!(
+            store.gmail_fetch_cooldown_until("entity-limited", 0).unwrap(),
+            Some(4_070_908_800_000),
+            "the provider retry timestamp must be persisted for every caller"
+        );
+    }
+
+    #[tokio::test]
     async fn composio_401_propagates_status_and_message_to_error_display() {
         let body =
             r#"{"error":{"message":"Invalid API key: ak_637S7*","code":10401,"type":"auth"}}"#;
@@ -1364,12 +1464,57 @@ fn check_envelope(
         .get("log_id")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("-");
+    if action == "GMAIL_FETCH_EMAILS" {
+        if let Some((retry_after_ms, retry_after)) = parse_rate_limit_retry_after(err_text) {
+            return Err(GmailError::RateLimited {
+                retry_after_ms,
+                retry_after,
+                log_id: log_id.to_string(),
+            });
+        }
+    }
     Err(GmailError::Composio {
         message: format!(
             "{action} reported successful:false — {} (composio log_id {log_id})",
             err_text.trim()
         ),
     })
+}
+
+/// Composio reports Gmail user limits in a successful JSON envelope rather
+/// than a 429. The only reliable scheduling boundary it gives us is the
+/// RFC3339 timestamp following `Retry after`.
+fn parse_rate_limit_retry_after(error: &str) -> Option<(i64, String)> {
+    if !error.to_ascii_lowercase().contains("rate limit") {
+        return None;
+    }
+    let marker = "retry after";
+    let start = error.to_ascii_lowercase().find(marker)? + marker.len();
+    let retry_after = error[start..]
+        .trim_start()
+        .split_whitespace()
+        .next()?
+        .trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ')' | ']'));
+    let retry_after_ms = DateTime::parse_from_rfc3339(retry_after).ok()?.timestamp_millis();
+    Some((retry_after_ms, retry_after.to_string()))
+}
+
+fn rate_limited_error(retry_after_ms: i64, log_id: &str) -> GmailError {
+    let retry_after = DateTime::from_timestamp_millis(retry_after_ms)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| retry_after_ms.to_string());
+    GmailError::RateLimited {
+        retry_after_ms,
+        retry_after,
+        log_id: log_id.to_string(),
+    }
+}
+
+fn wallclock_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 /// Recursively search a JSON value for the first string-valued field whose
