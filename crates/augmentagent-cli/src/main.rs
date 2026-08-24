@@ -3689,7 +3689,7 @@ async fn run_gmail_search(
     account_filter: Option<String>,
 ) -> Result<()> {
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
-    let gmail = ComposioClient::new(api_key);
+    let gmail = ComposioClient::new(api_key).with_rate_limit_store(Arc::clone(&store));
     let mut accounts = store.get_active_gmail_accounts()?;
     if accounts.is_empty() {
         println!("(no active gmail accounts)");
@@ -5479,7 +5479,7 @@ async fn run_outbound_observer(
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n >= 30)
         .unwrap_or(300);
-    let gmail = Arc::new(ComposioClient::new(api_key));
+    let gmail = Arc::new(ComposioClient::new(api_key).with_rate_limit_store(Arc::clone(&store)));
     let observer = OutboundObserver::new(store, gmail, 200);
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     info!(interval_secs, "outbound observer started");
@@ -9618,7 +9618,7 @@ fn build_channel(
     interval_secs: u64,
 ) -> Result<GmailChannel<ComposioClient, FallbackReasoner>> {
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
-    let gmail = Arc::new(ComposioClient::new(api_key));
+    let gmail = Arc::new(ComposioClient::new(api_key).with_rate_limit_store(Arc::clone(&store)));
     let reasoner = build_reasoner();
 
     // Resolve wiki enable/disable and schema path.
@@ -13491,7 +13491,7 @@ async fn run_tone_backfill(
 
     let api_key = std::env::var("COMPOSIO_API_KEY")
         .context("COMPOSIO_API_KEY env var required for tone backfill")?;
-    let gmail = ComposioClient::new(api_key);
+    let gmail = ComposioClient::new(api_key).with_rate_limit_store(Arc::clone(&store));
 
     let accounts = match account {
         Some(a) => vec![a],
