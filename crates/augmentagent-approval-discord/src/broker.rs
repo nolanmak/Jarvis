@@ -212,13 +212,19 @@ impl ApprovalBroker for DiscordApprovalBroker {
         action_id: &str,
         email: &Email,
         sends_at_local: &str,
+        sends_at_ms: i64,
         to_display: &str,
     ) -> Result<Option<(u64, u64)>, ApprovalError> {
         // Same approval channel as the cards — the notice IS the card's
         // replacement in the carousel (#501). The returned ids are persisted
         // by the caller so the engine can retire the notice at fire time.
-        let message =
-            scheduled_notice_message(action_id, email, sends_at_local, to_display);
+        let message = scheduled_notice_message(
+            action_id,
+            email,
+            sends_at_local,
+            sends_at_ms,
+            to_display,
+        );
         let sent = self
             .channel_id
             .send_message(&*self.http, message)
