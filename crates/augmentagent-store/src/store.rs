@@ -825,6 +825,19 @@ impl Store {
             )?;
         }
 
+        // #797 — Composio returns Gmail user rate limits in an HTTP-success
+        // envelope. This is intentionally separate from account liveness: a
+        // cooling account remains connected and recovers automatically when
+        // the provider's window ends.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS gmail_fetch_cooldowns (\
+                 entityId TEXT PRIMARY KEY,\
+                 retryAfterMs INTEGER NOT NULL,\
+                 logId TEXT,\
+                 observedAtMs INTEGER NOT NULL\
+             );",
+        )?;
+
         // #81 — Proactive CRM signals + per-scan run cursor.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS proactive_signals (\
@@ -2081,6 +2094,56 @@ impl Store {
             "UPDATE gmail_accounts SET lastPolledAt = ?1, lastPollOk = ?2 \
              WHERE entityId = ?3",
             rusqlite::params![at_ms, if ok { 1 } else { 0 }, entity_id],
+        )?;
+        Ok(())
+    }
+
+    /// #797 — persist Composio's per-entity Gmail fetch cooldown so polling,
+    /// background observers, and one-shot CLI processes share one boundary.
+    pub fn set_gmail_fetch_cooldown(
+        &self,
+        entity_id: &str,
+        retry_after_ms: i64,
+        log_id: Option<&str>,
+    ) -> StoreResult<()> {
+        let observed_at_ms = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO gmail_fetch_cooldowns \
+                (entityId, retryAfterMs, logId, observedAtMs) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(entityId) DO UPDATE SET \
+                retryAfterMs = MAX(gmail_fetch_cooldowns.retryAfterMs, excluded.retryAfterMs), \
+                logId = COALESCE(excluded.logId, gmail_fetch_cooldowns.logId), \
+                observedAtMs = excluded.observedAtMs",
+            params![entity_id, retry_after_ms, log_id, observed_at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Returns only an active boundary; expired rows are harmless audit data.
+    pub fn gmail_fetch_cooldown_until(
+        &self,
+        entity_id: &str,
+        now_ms: i64,
+    ) -> StoreResult<Option<i64>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let retry_after_ms: Option<i64> = guard
+            .query_row(
+                "SELECT retryAfterMs FROM gmail_fetch_cooldowns \
+                 WHERE entityId = ?1 AND retryAfterMs > ?2",
+                params![entity_id, now_ms],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(retry_after_ms)
+    }
+
+    /// A successful fetch proves the provider accepted the request.
+    pub fn clear_gmail_fetch_cooldown(&self, entity_id: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "DELETE FROM gmail_fetch_cooldowns WHERE entityId = ?1",
+            params![entity_id],
         )?;
         Ok(())
     }
@@ -7022,6 +7085,35 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "expected table {tbl} to exist");
         }
+    }
+
+    #[test]
+    fn gmail_fetch_cooldown_is_persisted_per_entity_and_never_moves_backward() {
+        let (store, _file) = fresh_store();
+
+        store
+            .set_gmail_fetch_cooldown("rate-limited", 2_000, Some("log-first"))
+            .expect("record initial cooldown");
+        store
+            .set_gmail_fetch_cooldown("rate-limited", 1_500, Some("log-stale"))
+            .expect("an older provider timestamp cannot shorten a cooldown");
+        store
+            .set_gmail_fetch_cooldown("healthy", 3_000, None)
+            .expect("record another entity independently");
+
+        assert_eq!(
+            store.gmail_fetch_cooldown_until("rate-limited", 1_000).unwrap(),
+            Some(2_000)
+        );
+        assert_eq!(
+            store.gmail_fetch_cooldown_until("healthy", 1_000).unwrap(),
+            Some(3_000)
+        );
+        assert_eq!(
+            store.gmail_fetch_cooldown_until("rate-limited", 2_000).unwrap(),
+            None,
+            "expired cooldowns must stop blocking requests"
+        );
     }
 
     #[test]
