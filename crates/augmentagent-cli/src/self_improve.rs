@@ -951,10 +951,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     if !ok {
         bail!("not a git repo at {}", repo_root.display());
     }
-    if !status_out.trim().is_empty() {
+    let dirty_status = unmanaged_dirty_status(&status_out);
+    if !dirty_status.is_empty() {
         bail!(
             "refusing to self-improve from a dirty working tree \
-             (commit/stash first):\n{status_out}"
+             (commit/stash first):\n{dirty_status}"
         );
     }
 
@@ -1411,6 +1412,17 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         "issue #{}: PR auto-merged (owner-authored) — {pr_url}",
         issue.number
     ))
+}
+
+/// The pipeline owns this untracked worktree. It must not make the deploy
+/// appear dirty after a failed or interrupted attempt; every other porcelain
+/// entry remains a hard safety stop.
+fn unmanaged_dirty_status(status: &str) -> String {
+    status
+        .lines()
+        .filter(|line| !line.starts_with("?? .self-improve-worktrees/"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Bump an attempt counter encoded as a hidden marker comment, return the new
@@ -2763,5 +2775,19 @@ mod tests {
         assert_eq!(c.runs_today(101), 0);
         c.record(101);
         assert_eq!(c.runs_today(101), 1);
+    }
+
+    #[test]
+    fn managed_worktree_is_not_treated_as_user_dirt() {
+        assert_eq!(
+            unmanaged_dirty_status("?? .self-improve-worktrees/\n"),
+            ""
+        );
+        assert_eq!(
+            unmanaged_dirty_status(
+                "?? .self-improve-worktrees/\n M crates/augmentagent-cli/src/main.rs\n?? notes.txt\n"
+            ),
+            " M crates/augmentagent-cli/src/main.rs\n?? notes.txt"
+        );
     }
 }
