@@ -127,6 +127,34 @@ const BLAST_RADIUS_PATTERNS: &[&str] = &[
     "package-lock.json",
 ];
 
+/// #819 — the subset of [`BLAST_RADIUS_PATTERNS`] applied to issue *prose*.
+///
+/// The full list is written for diffs, where every entry is a path fragment
+/// out of `git diff`. Matched against an issue's title and body it also hits
+/// ordinary English: measured on 2026-08-27, bare `deploy` / `secret` /
+/// `.service` / `Cargo.lock` made **20 of 52** eligible open issues invisible
+/// to the picker — including plain bug reports, and including three reports
+/// about this pipeline that merely quoted the auto-updater's `systemctl`
+/// line. A guard that cannot tell "change the deploy path" from "explain what
+/// happens after a deploy" is not reading intent, it is reading vocabulary.
+///
+/// So the prose prefilter keeps only path-shaped tokens — a body containing
+/// one is naming a file, not using a word. The prose gate is a cost
+/// optimisation (it saves one Fable call); the real barriers are unchanged
+/// and all downstream: the scoper is told to return `not-fixable` for
+/// deploy/auth/secret/CI work, [`is_blast_radius`] still refuses the produced
+/// diff against the FULL list, and #300 means only trusted authors reach any
+/// of it unattended.
+const ISSUE_BLAST_RADIUS_PATTERNS: &[&str] = &[
+    "scripts/check-for-updates",
+    "scripts/vault-mount",
+    ".github/workflows",
+    "auth.rs",
+    "discord-creds",
+    "Cargo.lock",
+    "package-lock.json",
+];
+
 #[derive(Debug, Clone)]
 pub struct Issue {
     pub number: u64,
@@ -220,9 +248,19 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
 }
 
 /// True if any blast-radius pattern appears in `text` (case-insensitive).
+/// Applied to DIFFS — use [`is_issue_blast_radius`] for issue prose.
 pub fn is_blast_radius(text: &str) -> bool {
+    contains_any(text, BLAST_RADIUS_PATTERNS)
+}
+
+/// #819 — the prose variant, matching only [`ISSUE_BLAST_RADIUS_PATTERNS`].
+pub fn is_issue_blast_radius(text: &str) -> bool {
+    contains_any(text, ISSUE_BLAST_RADIUS_PATTERNS)
+}
+
+fn contains_any(text: &str, patterns: &[&str]) -> bool {
     let lower = text.to_ascii_lowercase();
-    BLAST_RADIUS_PATTERNS
+    patterns
         .iter()
         .any(|p| lower.contains(&p.to_ascii_lowercase()))
 }
@@ -484,8 +522,27 @@ async fn pick_issue(repo_root: &Path) -> Result<Option<Issue>> {
             association,
             research_filed,
         } = iss;
-        if is_blast_radius(&format!("{title} {body}")) {
-            info!(issue = number, "skip: blast-radius keyword in issue");
+        if is_issue_blast_radius(&format!("{title} {body}")) {
+            // #819 — every other refusal in this pipeline leaves a comment
+            // and/or a label. This one used to `continue` silently, so a
+            // matched issue stayed in the pool, was re-scanned on every tick
+            // forever, and told nobody. Label it out and say why. Neither
+            // call touches the reasoner, so this costs no daily budget.
+            info!(issue = number, "refusing: blast-radius path named in issue");
+            backoff_comment(
+                repo_root,
+                number,
+                &format!(
+                    "Auto-fix triage: this issue names a deploy/auth/secret \
+                     path, so the unattended pipeline will not pick it up — \
+                     that machinery only changes under human review. Remove \
+                     the `{GAVE_UP_LABEL}` label to re-triage it (for \
+                     example if the path is only mentioned as background)."
+                ),
+            )
+            .await
+            .ok();
+            label_gave_up(repo_root, number).await.ok();
             continue;
         }
         if has_open_agent_pr(repo_root, number).await? {
@@ -888,6 +945,9 @@ comment density. Comments only where the code can't speak for itself.\n\
 - Review your own diff (git diff) before finishing: no unrelated edits, no \
 drive-by refactors, no leftover debug output.\n\
 - Stay within the working directory you were given (a throwaway worktree).\n\
+- Clean up after yourself: delete any scratch script, scratch note, or dump \
+file you create. Everything still in the worktree when you finish is staged \
+and lands in the PR.\n\
 - Do NOT touch deploy/auth/secret/CI files (systemd units, scripts/check-for-updates, \
 .github/workflows, anything with credentials/keyring/.env).\n\
 - Keep the diff small and focused on the issue.\n\
@@ -904,6 +964,39 @@ the test that guards it.";
 /// stage. Caught live on the first real #653 pipeline run.
 fn gate_sh(cmd: &str) -> String {
     format!("set -o pipefail; {cmd}")
+}
+
+/// Paths whose change makes the Node build load-bearing (#820). `src/` is the
+/// TypeScript daemon + Express dashboard; the rest are what `npm run build`
+/// (`tailwind:build && tsc`) actually consumes.
+const NODE_GATE_PATHS: &[&str] = &[
+    "src/",
+    "views/",
+    "test/",
+    "sidecars/",
+    "public/",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "tailwind.config.js",
+    "tailwind.input.css",
+];
+
+/// True if `path` is one the Node build would compile.
+fn is_node_path(path: &str) -> bool {
+    NODE_GATE_PATHS
+        .iter()
+        .any(|p| if p.ends_with('/') { path.starts_with(p) } else { path == *p })
+}
+
+/// Does the staged diff reach Node? Unknowable ⇒ `true`: skipping the gate is
+/// the failure this replaces, so an unreadable diff must cost an install, not
+/// a missed build.
+async fn node_build_required(worktree: &Path) -> bool {
+    match run("git", &["diff", "--cached", "--name-only"], worktree).await {
+        Ok((true, out, _)) => out.lines().map(str::trim).any(is_node_path),
+        _ => true,
+    }
 }
 
 async fn verification_gate(worktree: &Path) -> Result<()> {
@@ -934,10 +1027,24 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     if !ok {
         bail!("cargo test failed:\n{o}{e}", o = _o.trim());
     }
-    // npm build is best-effort: only gate on it if a package.json + node_modules
-    // are present (prod has them; a bare CI checkout may not).
-    if worktree.join("package.json").exists() && worktree.join("node_modules").exists() {
-        info!("verification gate: npm run build (sandboxed env)");
+    // #820 — the Node half of the gate. It used to require `node_modules` to
+    // already exist in the worktree, which `git worktree add` can never
+    // produce (it is gitignored): `npm run build` had therefore run ZERO
+    // times since #103, while `src/` stayed fully editable by the builder.
+    // Install on demand instead, and only when the change actually reaches
+    // Node — a Rust-only fix, which is nearly all of them, still skips it.
+    if worktree.join("package.json").exists() && node_build_required(worktree).await {
+        info!("verification gate: npm ci + npm run build (sandboxed env)");
+        let (ok, _o, e) = run_sandboxed(
+            "bash",
+            &["-lc", &gate_sh("npm ci --no-audit --no-fund 2>&1 | tail -5")],
+            worktree,
+            &env,
+        )
+        .await?;
+        if !ok {
+            bail!("npm ci failed:\n{o}{e}", o = _o.trim());
+        }
         let (ok, _o, e) =
             run_sandboxed("bash", &["-lc", &gate_sh("npm run build 2>&1 | tail -5")], worktree, &env)
                 .await?;
@@ -945,9 +1052,51 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
             bail!("npm run build failed:\n{o}{e}", o = _o.trim());
         }
     } else {
-        info!("verification gate: npm build skipped (no node_modules)");
+        info!("verification gate: npm build not required (diff touches no Node paths)");
     }
     Ok(())
+}
+
+/// #817 — delete untracked files the builder left at the worktree ROOT,
+/// returning what was dropped.
+///
+/// Both `git add -A` calls in `run_once` sweep the whole worktree: whatever
+/// the builder leaves behind is staged, measured by the size cap, scanned by
+/// the blast-radius guard, and — if neither trips — committed, pushed, and
+/// (owner-authored, graded ≤medium) auto-merged to `main` and deployed.
+/// Observed live on the #811 run: the builder wrote `.aa811_check.txt` and
+/// `.aa811_fix.py` into the worktree root. It happened to clean up; nothing
+/// required it to, and `Write` + `Bash(npm *)` are both in its toolset.
+///
+/// Root depth is the discriminator, and a deliberately narrow one: scratch
+/// lands in the process cwd, which is the worktree root, while this repo's
+/// real source lives under `crates/`, `src/`, `scripts/`, `schema/`,
+/// `skills/`, `views/`. Nested files are never touched, so a legitimately
+/// created source file is safe. Every drop is logged — a fix that genuinely
+/// needed a new root-level file will say so in `stderr.log` rather than
+/// vanishing.
+async fn drop_root_scratch(worktree: &Path) -> Vec<String> {
+    let Ok((true, out, _)) = run(
+        "git",
+        &["ls-files", "--others", "--exclude-standard"],
+        worktree,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    let mut dropped = Vec::new();
+    for path in out.lines().map(str::trim).filter(|p| !p.is_empty()) {
+        // Nested paths are the builder's real work; only the root is scratch.
+        if path.contains('/') {
+            continue;
+        }
+        if tokio::fs::remove_file(worktree.join(path)).await.is_ok() {
+            warn!(file = %path, "dropped builder scratch left at the worktree root");
+            dropped.push(path.to_string());
+        }
+    }
+    dropped
 }
 
 /// Force the pipeline's fixed worktree path back to a usable state before a
@@ -1240,6 +1389,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     // made of new files passed the 600-line cap, and a newly-created
     // `.github/workflows/*.yml` or `scripts/deploy-*.sh` was never refused.
     // Staging here is idempotent with the commit step's own `git add -A`.
+    let dropped = drop_root_scratch(&worktree).await;
     let _ = run("git", &["add", "-A"], &worktree).await?;
     let (_ok, diff, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
     if diff.trim().is_empty() {
@@ -1492,12 +1642,24 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     } else {
         "Draft — a human must review and merge."
     };
+    // #817 — say so in the PR when the builder left scratch behind; a drop
+    // that is never reported is indistinguishable from one that never
+    // happened, and a fix that genuinely wanted a root-level file would
+    // otherwise look complete while missing it.
+    let scratch_note = if dropped.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n- dropped builder scratch at the worktree root: {}",
+            dropped.join(", ")
+        )
+    };
     let pr_body = format!(
         "Automated self-improvement for #{}.\n\n## Summary\n{}{plan_section}\n\n\
          ## QA review (approved)\n{}\n\n## Verification\n\
          - complexity (scoping pass): {}\n\
          - `cargo build --workspace`: pass\n- `cargo test --workspace`: pass\n\
-         - diff size: {lines} lines (cap {MAX_DIFF_LINES})\n\n\
+         - diff size: {lines} lines (cap {MAX_DIFF_LINES}){scratch_note}\n\n\
          {merge_note} Fixes #{}",
         issue.number,
         truncate(&summary, 1500),
@@ -3042,6 +3204,129 @@ mod tests {
         assert_eq!(c.runs_today(101), 0);
         c.record(101);
         assert_eq!(c.runs_today(101), 1);
+    }
+
+    // ---- #820: the Node half of the gate must be reachable ----
+
+    #[test]
+    fn node_gate_fires_on_node_paths_and_not_on_rust_only_diffs() {
+        assert!(is_node_path("src/index.ts"));
+        assert!(is_node_path("views/dashboard.ejs"));
+        assert!(is_node_path("package.json"));
+        assert!(is_node_path("tailwind.input.css"));
+
+        assert!(!is_node_path("crates/augmentagent-cli/src/self_improve.rs"));
+        assert!(!is_node_path("schema/triage.md"));
+        assert!(!is_node_path("Cargo.toml"));
+        // Prefix matching must be path-segment honest, not substring.
+        assert!(!is_node_path("crates/x/src/lib.rs"));
+        assert!(!is_node_path("package.json.bak"));
+    }
+
+    #[tokio::test]
+    async fn node_build_is_required_only_when_the_staged_diff_reaches_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q", "-b", "main", "."]);
+        git(&["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q",
+              "--allow-empty", "-m", "init"]);
+
+        // A Rust-only change: the common case, and it must stay fast.
+        std::fs::create_dir_all(repo.join("crates/x/src")).unwrap();
+        std::fs::write(repo.join("crates/x/src/lib.rs"), "pub fn f() {}\n").unwrap();
+        git(&["add", "-A"]);
+        assert!(!node_build_required(repo).await);
+
+        // Touch the TypeScript daemon and the gate becomes load-bearing.
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/index.ts"), "export const x = 1;\n").unwrap();
+        git(&["add", "-A"]);
+        assert!(node_build_required(repo).await);
+    }
+
+    // ---- #817: builder scratch must not reach the commit ----
+
+    #[tokio::test]
+    async fn root_scratch_is_dropped_but_nested_source_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(wt)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q", "-b", "main", "."]);
+        git(&["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q",
+              "--allow-empty", "-m", "init"]);
+
+        // What the builder left at the root on the live #811 run...
+        std::fs::write(wt.join(".aa811_fix.py"), "print(1)\n").unwrap();
+        std::fs::write(wt.join(".aa811_check.txt"), "notes\n").unwrap();
+        // ...next to a real new source file, which must survive.
+        std::fs::create_dir_all(wt.join("crates/x/src")).unwrap();
+        std::fs::write(wt.join("crates/x/src/new.rs"), "pub fn f() {}\n").unwrap();
+
+        let mut dropped = drop_root_scratch(wt).await;
+        dropped.sort();
+        assert_eq!(dropped, vec![".aa811_check.txt", ".aa811_fix.py"]);
+        assert!(!wt.join(".aa811_fix.py").exists());
+        assert!(
+            wt.join("crates/x/src/new.rs").exists(),
+            "a created source file is the builder's work, not scratch"
+        );
+
+        // And the staged set the guards + commit see is now only the source.
+        git(&["add", "-A"]);
+        let staged = String::from_utf8(git(&["diff", "--cached", "--name-only"]).stdout).unwrap();
+        assert_eq!(staged.trim(), "crates/x/src/new.rs");
+    }
+
+    // ---- #819: the prose prefilter must not eat the pool ----
+
+    #[test]
+    fn issue_prose_filter_keeps_paths_and_drops_english() {
+        // Real bodies from the open pool that the full list was blocking.
+        for prose in [
+            "an auto-merged PR makes the updater rebuild and deploy",
+            "the updater runs systemctl --user restart augmentagent.service",
+            "grep finds only Cargo.lock in the list",
+        ] {
+            assert!(
+                is_blast_radius(prose),
+                "precondition: the diff-level list matches this prose: {prose}"
+            );
+        }
+        // The first two are description, not intent, and must now be pickable.
+        assert!(!is_issue_blast_radius(
+            "an auto-merged PR makes the updater rebuild and deploy"
+        ));
+        assert!(!is_issue_blast_radius(
+            "the updater runs systemctl --user restart augmentagent.service"
+        ));
+
+        // Path-shaped tokens still refuse.
+        assert!(is_issue_blast_radius("patch scripts/check-for-updates.sh"));
+        assert!(is_issue_blast_radius("add a .github/workflows/ci.yml"));
+        assert!(is_issue_blast_radius("edit crates/augmentagent-auth/src/auth.rs"));
+        // `keyring` / `secret` / `credential` are prose, not paths: an issue
+        // that merely mentions where a token lives must still be pickable.
+        // The scoper is the component equipped to judge intent, and the
+        // diff-level guard still refuses whatever it produces.
+        assert!(!is_issue_blast_radius("the token is read from the keyring slot"));
+        assert!(is_blast_radius("the token is read from the keyring slot"));
+
+        // The diff-level guard is untouched — it still sees everything.
+        assert!(is_blast_radius("+++ b/deploy/release.sh"));
+        assert!(is_blast_radius("+++ b/crates/augmentagent-auth/src/auth.rs"));
     }
 
     // ---- #814: the daily cap must outlive the deploy restart ----
