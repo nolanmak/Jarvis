@@ -45,6 +45,11 @@ DASHBOARD_SYSTEMD_UNIT="augmentagent-dashboard.service"
 stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s [update] %s\n' "$(stamp)" "$*" >> "$LOG"; }
 
+# #826 — restart_unit / should_write_stamp. Sourced after log() so the
+# library's diagnostics land in update.log like everything else.
+# shellcheck source=lib/service-restart.sh
+. "$REPO_ROOT/scripts/lib/service-restart.sh"
+
 # Rebuild the side(s) flagged by NEEDS_REBUILD / NEEDS_DASHBOARD_REBUILD, then
 # restart the corresponding services. On Rust build failure we exit non-zero
 # WITHOUT restarting and WITHOUT advancing the stamp, so the daemon keeps
@@ -52,6 +57,8 @@ log() { printf '%s [update] %s\n' "$(stamp)" "$*" >> "$LOG"; }
 # stamp is advanced to $TARGET so a subsequent tick is a true no-op.
 apply_update() {
   local TARGET="$1"
+  # #826 — how many restarts that were REQUIRED did not verifiably happen.
+  local RESTART_FAILURES=0
 
   if [ "$NEEDS_REBUILD" -eq 1 ]; then
     log "rebuilding rust (changed files touched crates/ or Cargo)"
@@ -92,9 +99,11 @@ apply_update() {
       if [ "$NEEDS_REBUILD" -eq 1 ]; then
         if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
           log "restarting daemon via launchctl kickstart"
-          launchctl kickstart -k "gui/$(id -u)/$LABEL" >> "$LOG" 2>&1 || log "kickstart failed"
+          launchctl kickstart -k "gui/$(id -u)/$LABEL" >> "$LOG" 2>&1 \
+            || { log "kickstart failed"; RESTART_FAILURES=$((RESTART_FAILURES + 1)); }
         else
           log "daemon not registered under launchd ($LABEL) — run install-autostart.sh manually"
+          RESTART_FAILURES=$((RESTART_FAILURES + 1))
         fi
       fi
       if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
@@ -108,20 +117,19 @@ apply_update() {
       ;;
     Linux)
       if [ "$NEEDS_REBUILD" -eq 1 ]; then
-        if systemctl --user list-unit-files "$SYSTEMD_UNIT" 2>/dev/null | grep -q "$SYSTEMD_UNIT"; then
-          log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
-          systemctl --user restart "$SYSTEMD_UNIT" >> "$LOG" 2>&1 || log "systemctl restart failed"
-        else
-          log "daemon not registered under systemd ($SYSTEMD_UNIT) — run install-autostart.sh manually"
-        fi
+        log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
+        restart_unit "$SYSTEMD_UNIT" || RESTART_FAILURES=$((RESTART_FAILURES + 1))
       fi
       if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
-        if systemctl --user list-unit-files "$DASHBOARD_SYSTEMD_UNIT" 2>/dev/null | grep -q "$DASHBOARD_SYSTEMD_UNIT"; then
-          log "restarting dashboard via systemctl --user restart $DASHBOARD_SYSTEMD_UNIT"
-          systemctl --user restart "$DASHBOARD_SYSTEMD_UNIT" >> "$LOG" 2>&1 || log "systemctl dashboard restart failed"
-        else
-          log "dashboard not registered under systemd ($DASHBOARD_SYSTEMD_UNIT) — run install-dashboard.sh manually"
-        fi
+        # Dashboard failures stay non-fatal and do NOT block the stamp,
+        # matching the existing severity split (a dashboard BUILD failure is
+        # already log-only while a Rust build failure exits 1). It also must
+        # not latch: `auto_register` below is what first registers this unit
+        # on a fresh host, and it runs *after* apply_update — so an
+        # unregistered dashboard here is an expected transient, not a fault.
+        log "restarting dashboard via systemctl --user restart $DASHBOARD_SYSTEMD_UNIT"
+        restart_unit "$DASHBOARD_SYSTEMD_UNIT" \
+          || log "dashboard restart failed (non-fatal; UI stays on the previous build)"
       fi
       # Multi-tenant: tenant units run the same target/release/augmentagent
       # binary, so a Rust rebuild means they need a bounce too. Additive +
@@ -139,11 +147,25 @@ apply_update() {
       ;;
     *)
       log "no restart strategy for $(uname -s) — restart the daemon + dashboard manually"
+      [ "$NEEDS_REBUILD" -eq 1 ] && RESTART_FAILURES=$((RESTART_FAILURES + 1))
       ;;
   esac
 
   # Record what we successfully built from so the next tick is a true no-op
   # (and so an out-of-band checkout move is detected, not silently ignored).
+  #
+  # #826 — ONLY when the daemon verifiably came back on the new binary. The
+  # stamp is the updater's own staleness signal: advancing it after a skipped
+  # restart satisfies the `artifacts last built from '$BUILT'` guard forever,
+  # so the bounce is never retried and the daemon serves old code with every
+  # signal claiming it is current. Leaving the stamp behind makes the next
+  # tick take exactly that guard and try again.
+  if ! should_write_stamp "$RESTART_FAILURES"; then
+    log "NOT writing the build stamp: $RESTART_FAILURES required restart(s) could \
+not be verified. The daemon may still be on the previous binary; the next tick \
+will retry via the build-stamp mismatch path."
+    return 1
+  fi
   printf '%s\n' "$TARGET" > "$STAMP"
   log "update complete: now at $TARGET (build stamp written)"
 }
