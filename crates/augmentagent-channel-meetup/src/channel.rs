@@ -98,8 +98,10 @@ impl MeetupChannel {
                 .await
             {
                 Ok(e) => e,
-                Err(MeetupError::StalePersistedQuery) => {
-                    warn!(group = %sub.channel_id, "meetup hash stale — skipping (refresh via /intercept)");
+                // Both the GraphQL and the SSR reader came up empty — the
+                // client only surfaces this once the fallback has also failed.
+                Err(MeetupError::StalePersistedQuery(detail)) => {
+                    warn!(group = %sub.channel_id, %detail, "meetup hash stale and SSR fallback failed — skipping (refresh via /intercept)");
                     outcome.stale_hash_groups += 1;
                     continue;
                 }
