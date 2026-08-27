@@ -26,6 +26,7 @@
 //! This module shells out to `gh` and `git`; it does not depend on the
 //! GitHub channel crate (different concern — that's inbound notifications).
 
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -69,6 +70,12 @@ const IDLE_MSG: &str = "no eligible agent-fixable issues";
 /// honored so the owner doesn't have to enumerate every collaborator.
 const TRUSTED_AUTHORS_ENV: &str = "AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS";
 const GH_OWNER_ENV: &str = "AUGMENTAGENT_GH_OWNER";
+
+/// #816 — override for the single-flight lock file (tests).
+const LOCK_FILE_ENV: &str = "AUGMENTAGENT_SELFIMPROVE_LOCK";
+
+/// #814 — override for the persisted daily-run counter (tests).
+const COUNTER_FILE_ENV: &str = "AUGMENTAGENT_AUTOPR_COUNTER_FILE";
 
 /// Provider/API-key env vars stripped from the build/test gate's child
 /// process (#300). The gate compiles + tests attacker-influenceable code
@@ -943,18 +950,131 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Force the pipeline's fixed worktree path back to a usable state before a
+/// fresh `git worktree add`.
+///
+/// `git worktree remove` only acts on a *registered* worktree. A run killed
+/// mid-flight (daemon restart, OOM, `kill`) can leave the directory behind
+/// with a stale or absent `.git/worktrees` entry — `remove` then fails, and
+/// the `add` that follows refuses an existing path, so every later tick dies
+/// in the same place. Nothing here is recoverable state: the path is
+/// pipeline-owned and the branch is re-created from `origin/main`, so the
+/// unconditional `remove_dir_all` is safe and is what makes a crashed run
+/// self-healing instead of permanently wedging the loop.
+async fn reclaim_worktree(repo_root: &Path, worktree: &Path, branch: &str) {
+    let _ = run(
+        "git",
+        &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+        repo_root,
+    )
+    .await;
+    let _ = run("git", &["branch", "-D", branch], repo_root).await;
+    if worktree.exists() {
+        if let Err(e) = tokio::fs::remove_dir_all(worktree).await {
+            warn!(
+                path = %worktree.display(),
+                "could not reclaim stale self-improve worktree: {e}"
+            );
+        }
+    }
+    // Drop any registration left pointing at the path we just deleted;
+    // without this `worktree add` reports it as already checked out.
+    let _ = run("git", &["worktree", "prune"], repo_root).await;
+}
+
+/// #816 — process-wide single-flight guard for the pipeline.
+///
+/// The daemon's [`AutoPrLoop`] tick and a hand-run `augmentagent
+/// self-improve` share one fixed worktree path, and every run force-removes
+/// that path on entry. Concurrently, the second run deletes the first run's
+/// checkout mid-gate and the first can go on to commit and push whatever the
+/// second left there — with auto-merge on, straight to `main`. An advisory
+/// `flock` held for the whole run makes the loser skip its tick instead,
+/// which costs nothing: the next one is `AUGMENTAGENT_AUTOPR_INTERVAL_SECS`
+/// away.
+///
+/// Until now the accidental serializer was the dirty-tree preflight — a run
+/// in flight left `?? .self-improve-worktrees/` in `git status`, so the other
+/// run refused. Teaching that preflight to ignore the pipeline's own worktree
+/// is what makes a real lock necessary.
+struct RunLock {
+    /// Held only for its `Drop`: closing the fd releases the `flock`.
+    _file: std::fs::File,
+}
+
+impl RunLock {
+    /// Take the lock, or `Ok(None)` if another run already holds it.
+    fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("create lock dir {}", dir.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("open self-improve lock {}", path.display()))?;
+        // SAFETY: `file` owns the fd for the duration of the call, and
+        // `flock` neither reads nor writes through it.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Some(Self { _file: file }));
+        }
+        let err = std::io::Error::last_os_error();
+        // EWOULDBLOCK == EAGAIN on Linux; match both so this reads correctly
+        // wherever they differ.
+        if matches!(
+            err.raw_os_error(),
+            Some(e) if e == libc::EWOULDBLOCK || e == libc::EAGAIN
+        ) {
+            return Ok(None);
+        }
+        Err(err).context("flock self-improve lock")
+    }
+}
+
+/// Lock file path: `AUGMENTAGENT_SELFIMPROVE_LOCK` override (tests), else the
+/// daemon state dir alongside `reasoner-cooldowns.json`, else a cwd-relative
+/// fallback so a HOME-less environment still serializes.
+fn run_lock_path() -> PathBuf {
+    if let Ok(p) = std::env::var(LOCK_FILE_ENV) {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    std::env::var_os("HOME")
+        .map(|h| {
+            PathBuf::from(h)
+                .join(".local/state/augmentagent")
+                .join("self-improve.lock")
+        })
+        .unwrap_or_else(|| PathBuf::from(".self-improve.lock"))
+}
+
 /// Drive one self-improvement attempt. `dry_run` stops before opening the PR
 /// (prints what it would do) so the loop can be exercised safely.
 pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
+    // #816 — single-flight. Held for the whole run; dropped on every exit
+    // path. A losing run reports idle so it consumes no daily budget.
+    let _lock = match RunLock::try_acquire(&run_lock_path())? {
+        Some(l) => l,
+        None => {
+            info!("self-improve: another run holds the lock; skipping this tick");
+            return Ok(IDLE_MSG.to_string());
+        }
+    };
+
     // Refuse to run from a dirty tree / detached state — protects the deploy.
     let (ok, status_out, _) = run("git", &["status", "--porcelain"], repo_root).await?;
     if !ok {
         bail!("not a git repo at {}", repo_root.display());
     }
-    if !status_out.trim().is_empty() {
+    let dirty_status = unmanaged_dirty_status(&status_out);
+    if !dirty_status.is_empty() {
         bail!(
             "refusing to self-improve from a dirty working tree \
-             (commit/stash first):\n{status_out}"
+             (commit/stash first):\n{dirty_status}"
         );
     }
 
@@ -1014,13 +1134,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     let worktree = repo_root.join(".self-improve-worktrees").join("current");
 
     // Clean any stale worktree from a crashed prior run.
-    let _ = run(
-        "git",
-        &["worktree", "remove", "--force", &worktree.to_string_lossy()],
-        repo_root,
-    )
-    .await;
-    let _ = run("git", &["branch", "-D", &branch], repo_root).await;
+    reclaim_worktree(repo_root, &worktree, &branch).await;
 
     let (ok, _o, e) = run(
         "git",
@@ -1311,17 +1425,35 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     .await?;
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        bail!("git commit failed: {e}");
+        return Ok(record_hard_failure(repo_root, issue.number, "git commit failed", &e).await);
     }
-    let (ok, _o, e) = run(
-        "git",
-        &["push", "-u", "origin", &branch],
-        &worktree,
-    )
-    .await?;
+    // #815 — a run killed between the push and `gh pr create` leaves the
+    // remote branch behind with no PR. `has_open_agent_pr` only looks at
+    // PRs, so the issue is picked again, and this non-fast-forward push is
+    // where it dies — after three reasoner calls and a full workspace gate,
+    // every tick, forever. The `agent-fix/` namespace is pipeline-owned and
+    // this branch has already been shown to carry no open PR, so a fresh
+    // attempt is entitled to supersede the orphan. Force only in that
+    // narrow case, and say so in the log.
+    let (mut ok, _o, mut e) = run("git", &["push", "-u", "origin", &branch], &worktree).await?;
+    if !ok && remote_branch_exists(repo_root, &branch).await {
+        warn!(
+            issue = issue.number,
+            branch = %branch,
+            "orphaned remote branch from an interrupted run; superseding it"
+        );
+        let forced = run(
+            "git",
+            &["push", "--force", "-u", "origin", &branch],
+            &worktree,
+        )
+        .await?;
+        ok = forced.0;
+        e = forced.2;
+    }
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        bail!("git push failed: {e}");
+        return Ok(record_hard_failure(repo_root, issue.number, "git push failed", &e).await);
     }
 
     // Open the PR. Draft + human merge for everyone; owner-authored issues
@@ -1384,7 +1516,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     let (ok, stdout, e) = run(&gh, &args, &worktree).await?;
     cleanup(worktree, branch.clone(), repo_root.to_path_buf()).await;
     if !ok {
-        bail!("gh pr create failed: {e}");
+        // #815 — the branch is pushed but has no PR. Left as an `Err` this
+        // re-picks the same issue next tick and dies at the push above.
+        return Ok(record_hard_failure(repo_root, issue.number, "gh pr create failed", &e).await);
     }
     let pr_url = stdout.trim().to_string();
     if !automerge {
@@ -1411,6 +1545,68 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         "issue #{}: PR auto-merged (owner-authored) — {pr_url}",
         issue.number
     ))
+}
+
+/// The pipeline owns this untracked worktree. It must not make the deploy
+/// appear dirty after a failed or interrupted attempt; every other porcelain
+/// entry remains a hard safety stop.
+fn unmanaged_dirty_status(status: &str) -> String {
+    status
+        .lines()
+        .filter(|line| !line.starts_with("?? .self-improve-worktrees/"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Does `origin` already carry this branch? (#815)
+///
+/// Distinguishes "the push lost a race / auth broke" from "a previous run
+/// pushed this branch and then died before opening its PR".
+async fn remote_branch_exists(repo_root: &Path, branch: &str) -> bool {
+    let refspec = format!("refs/heads/{branch}");
+    match run(
+        "git",
+        &["ls-remote", "--heads", "origin", &refspec],
+        repo_root,
+    )
+    .await
+    {
+        Ok((true, out, _)) => !out.trim().is_empty(),
+        // A failed `ls-remote` says nothing; don't force-push on a guess.
+        _ => false,
+    }
+}
+
+/// #815 — record a post-gate failure as a *failed attempt* rather than an
+/// error, and return the loop's message for it.
+///
+/// `git commit` / `git push` / `gh pr create` failures reach this point
+/// having already spent three reasoner calls and a full workspace build+test.
+/// Returned as `Err` they bypass both `record_attempt` (so `MAX_ATTEMPTS`
+/// never accrues and the issue is never labeled out) and the loop's
+/// `DailyCounter::record` (so the spend is never counted) — which turns a
+/// sticky failure into an unbounded 30-minute retry of the most expensive
+/// path in the daemon. Counting them makes the loop give up like it does on
+/// a red gate or a rejected review.
+async fn record_hard_failure(repo_root: &Path, issue: u64, what: &str, err: &str) -> String {
+    let attempts = record_attempt(repo_root, issue).await.unwrap_or(1);
+    warn!(issue, attempts, "self-improve: {what}: {err}");
+    if attempts >= MAX_ATTEMPTS {
+        backoff_comment(
+            repo_root,
+            issue,
+            &format!(
+                "Self-improve gave up after {attempts} attempts: the fix built \
+                 and passed review, but publishing it kept failing \
+                 (`{what}`). Last error:\n```\n{}\n```",
+                truncate(err, 1000)
+            ),
+        )
+        .await
+        .ok();
+        label_gave_up(repo_root, issue).await.ok();
+    }
+    format!("issue #{issue}: {what} (attempt {attempts}); no PR opened")
 }
 
 /// Bump an attempt counter encoded as a hidden marker comment, return the new
@@ -1480,12 +1676,26 @@ async fn label_gave_up(repo_root: &Path, issue: u64) -> Result<()> {
     Ok(())
 }
 
+/// Clip `s` to a `max`-BYTE budget, appending an ellipsis.
+///
+/// #813 — `max` is a byte index, so the naive `&s[..max]` panics whenever the
+/// cut lands inside a multi-byte character. Every caller here feeds it either
+/// a GitHub issue body or raw model output, and the scoping/build/review
+/// system prompts are themselves full of em dashes, so a mid-character cut is
+/// a matter of when. The panic is not survivable where it happens: the loop
+/// runs in a `tokio::spawn`ed task whose handle is joined behind other
+/// never-terminating channel loops, so the task simply dies and the auto-PR
+/// loop stays dead until the next process restart. Walk back to the nearest
+/// char boundary instead.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
+        return s.to_string();
     }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 // =====================================================================
@@ -2153,8 +2363,9 @@ pub struct AutoPrLoop {
     daily_cap: u32,
 }
 
-/// Engaged-run counter with UTC-day rollover. Pure so it's testable.
-#[derive(Default)]
+/// Engaged-run counter with UTC-day rollover. Pure so it's testable;
+/// [`load`](Self::load) / [`save`](Self::save) add the durability.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct DailyCounter {
     day: u64,
     runs: u32,
@@ -2173,6 +2384,57 @@ impl DailyCounter {
         let _ = self.runs_today(day);
         self.runs += 1;
     }
+
+    /// #814 — read the counter back from disk, defaulting to a fresh one.
+    ///
+    /// The cap exists to bound how much of the owner's Claude subscription
+    /// the unattended loop spends per day, but it lived only in process
+    /// memory — and the loop's *success* path is exactly what destroys that
+    /// memory: an auto-merged PR touching `crates/` makes the auto-updater
+    /// rebuild and `systemctl restart augmentagent.service`, so the counter
+    /// resets to zero after every win. The cap therefore throttled failures
+    /// and nothing else. (`stderr.log` shows 19 `auto-PR loop started` lines
+    /// in the week to 2026-08-27 — 19 resets.)
+    fn load(path: &Path) -> Self {
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// Best-effort persist. A write failure must never abort a run — it only
+    /// costs the cap its memory, which is where we already were.
+    fn save(&self, path: &Path) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match serde_json::to_vec(self) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, bytes) {
+                    warn!(path = %path.display(), "could not persist auto-PR daily counter: {e}");
+                }
+            }
+            Err(e) => warn!("could not serialize auto-PR daily counter: {e}"),
+        }
+    }
+}
+
+/// Where the persisted counter lives: `AUGMENTAGENT_AUTOPR_COUNTER_FILE`
+/// override (tests), else the daemon state dir next to the reasoner
+/// cooldown latch.
+fn daily_counter_path() -> PathBuf {
+    if let Ok(p) = std::env::var(COUNTER_FILE_ENV) {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    std::env::var_os("HOME")
+        .map(|h| {
+            PathBuf::from(h)
+                .join(".local/state/augmentagent")
+                .join("autopr-daily-runs.json")
+        })
+        .unwrap_or_else(|| PathBuf::from("autopr-daily-runs.json"))
 }
 
 fn utc_day_now() -> u64 {
@@ -2239,7 +2501,8 @@ impl AutoPrLoop {
             dry_run = self.dry_run,
             "auto-PR loop started (#630/#653): polling open issues (self-triage, no label gate)"
         );
-        let mut counter = DailyCounter::default();
+        let counter_path = daily_counter_path();
+        let mut counter = DailyCounter::load(&counter_path);
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
@@ -2260,6 +2523,7 @@ impl AutoPrLoop {
                 Ok(msg) if msg == IDLE_MSG => {}
                 Ok(msg) => {
                     counter.record(today);
+                    counter.save(&counter_path);
                     info!(
                         runs_today = counter.runs_today(today),
                         daily_cap = self.daily_cap,
@@ -2349,6 +2613,21 @@ mod tests {
     fn truncate_is_byte_safe_for_ascii() {
         assert_eq!(truncate("hello", 3), "hel…");
         assert_eq!(truncate("hi", 10), "hi");
+    }
+
+    #[test]
+    fn truncate_never_splits_a_multibyte_char() {
+        // The em dash occupies bytes 9..12, so a byte-index cut at 10 or 11
+        // is exactly the panic the old implementation took.
+        let s = format!("{}—tail", "a".repeat(9));
+        assert_eq!(truncate(&s, 10), "aaaaaaaaa…");
+        assert_eq!(truncate(&s, 11), "aaaaaaaaa…");
+        // Landing exactly on a boundary keeps the whole character.
+        assert_eq!(truncate(&s, 12), "aaaaaaaaa—…");
+        // A cut before the first character yields just the ellipsis.
+        assert_eq!(truncate("—————", 2), "…");
+        // Multi-byte input that fits is returned untouched.
+        assert_eq!(truncate("café — ok", 64), "café — ok");
     }
 
     // --- #117 multi-repo helpers --------------------------------------
@@ -2763,5 +3042,162 @@ mod tests {
         assert_eq!(c.runs_today(101), 0);
         c.record(101);
         assert_eq!(c.runs_today(101), 1);
+    }
+
+    // ---- #814: the daily cap must outlive the deploy restart ----
+
+    #[test]
+    fn daily_counter_survives_a_restart_within_the_same_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/autopr-daily-runs.json");
+
+        let mut c = DailyCounter::load(&path);
+        c.record(100);
+        c.record(100);
+        c.save(&path);
+
+        // An auto-merged PR makes the updater restart the daemon. The cap
+        // must not start over, or success buys the loop a fresh budget.
+        let mut reloaded = DailyCounter::load(&path);
+        assert_eq!(reloaded.runs_today(100), 2);
+        // Rollover still zeroes it.
+        assert_eq!(reloaded.runs_today(101), 0);
+    }
+
+    #[test]
+    fn daily_counter_load_falls_back_to_zero_on_missing_or_corrupt_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.json");
+        assert_eq!(DailyCounter::load(&missing).runs_today(1), 0);
+
+        let junk = dir.path().join("junk.json");
+        std::fs::write(&junk, b"{ not json").unwrap();
+        assert_eq!(DailyCounter::load(&junk).runs_today(1), 0);
+    }
+
+    // ---- #815: an orphaned remote branch must be detectable ----
+
+    #[tokio::test]
+    async fn remote_branch_exists_sees_a_branch_pushed_by_an_interrupted_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("origin.git");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr));
+        };
+        git(dir.path(), &["init", "-q", "--bare", "origin.git"]);
+        git(&work, &["init", "-q", "-b", "main", "."]);
+        git(&work, &["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q",
+                     "--allow-empty", "-m", "init"]);
+        git(&work, &["remote", "add", "origin", &bare.to_string_lossy()]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        let branch = format!("{BRANCH_PREFIX}1");
+        assert!(
+            !remote_branch_exists(&work, &branch).await,
+            "a branch that was never pushed must not read as orphaned"
+        );
+
+        // Simulate a run that pushed and then died before `gh pr create`.
+        git(&work, &["branch", &branch]);
+        git(&work, &["push", "-q", "origin", &branch]);
+        assert!(
+            remote_branch_exists(&work, &branch).await,
+            "the orphaned branch must be detected, or the next attempt dies \
+             at a non-fast-forward push every tick forever"
+        );
+    }
+
+    // ---- #816: single-flight lock ----
+
+    #[test]
+    fn run_lock_is_exclusive_and_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/self-improve.lock");
+
+        let first = RunLock::try_acquire(&path).unwrap();
+        assert!(first.is_some(), "the first run must take the lock");
+        assert!(
+            RunLock::try_acquire(&path).unwrap().is_none(),
+            "a second run must be turned away, not wedged into the same worktree"
+        );
+
+        drop(first);
+        assert!(
+            RunLock::try_acquire(&path).unwrap().is_some(),
+            "the lock must be free again once the holding run finishes"
+        );
+    }
+
+    // ---- #812: a crashed run must not wedge the loop forever ----
+
+    #[tokio::test]
+    async fn reclaim_clears_an_unregistered_leftover_worktree_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q", "-b", "main", "."]);
+        git(&["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q",
+              "--allow-empty", "-m", "init"]);
+
+        // Simulate a run killed mid-flight: the directory survives with no
+        // `.git/worktrees` registration at all, so `git worktree remove`
+        // cannot clear it.
+        let worktree = repo.join(".self-improve-worktrees").join("current");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join("half-written.rs"), "fn main() {}\n").unwrap();
+        let add = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git")
+        };
+        assert!(
+            !add(&["worktree", "add", "-b", "agent-fix/issue-1",
+                   &worktree.to_string_lossy(), "main"])
+                .status
+                .success(),
+            "precondition: worktree add refuses the existing path"
+        );
+
+        reclaim_worktree(repo, &worktree, "agent-fix/issue-1").await;
+
+        assert!(!worktree.exists(), "the leftover directory must be gone");
+        assert!(
+            add(&["worktree", "add", "-b", "agent-fix/issue-1",
+                  &worktree.to_string_lossy(), "main"])
+                .status
+                .success(),
+            "after reclaim the pipeline must be able to create its worktree again"
+        );
+    }
+
+    #[test]
+    fn managed_worktree_is_not_treated_as_user_dirt() {
+        assert_eq!(
+            unmanaged_dirty_status("?? .self-improve-worktrees/\n"),
+            ""
+        );
+        assert_eq!(
+            unmanaged_dirty_status(
+                "?? .self-improve-worktrees/\n M crates/augmentagent-cli/src/main.rs\n?? notes.txt\n"
+            ),
+            " M crates/augmentagent-cli/src/main.rs\n?? notes.txt"
+        );
     }
 }
