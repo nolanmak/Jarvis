@@ -103,6 +103,7 @@ mod tests {
 
     fn email(from: &str, thread_id: Option<&str>) -> Email {
         Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: "m1".into(),

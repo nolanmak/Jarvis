@@ -590,6 +590,7 @@ mod tests {
         at_ms: i64,
     ) -> String {
         let email = Email {
+            attachments: Vec::new(),
             message_id: message_id.into(),
             thread_id: Some(format!("th-{message_id}")),
             from: "peer@example.com".into(),

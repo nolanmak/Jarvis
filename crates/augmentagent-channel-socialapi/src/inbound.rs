@@ -265,6 +265,7 @@ impl SocialApiDmPayload {
             None => self.text,
         };
         Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: self.message_id,

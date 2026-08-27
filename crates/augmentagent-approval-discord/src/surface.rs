@@ -148,6 +148,7 @@ mod tests {
 
     fn email() -> Email {
         Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: "m".into(),

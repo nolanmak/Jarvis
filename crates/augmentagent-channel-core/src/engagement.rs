@@ -235,6 +235,7 @@ impl ScheduledPostEngine {
                 .map_err(|e| anyhow::anyhow!("broker digest: {e}"))?;
         } else {
             let pseudo = Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: format!("sched:{}", post.id),
@@ -344,6 +345,7 @@ impl ScheduledPostEngine {
                 // Alert: a failed scheduled post is silent otherwise.
                 if !self.dry_run {
                     let pseudo = Email {
+                        attachments: Vec::new(),
                         to: String::new(),
                         cc: String::new(),
                         message_id: format!("sched-fail:{}", post.id),

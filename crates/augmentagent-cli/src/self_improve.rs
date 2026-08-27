@@ -2231,6 +2231,7 @@ async fn post_pr_prompt(
     summary: &str,
 ) {
     let synthetic = ApprovalEmail {
+        attachments: Vec::new(),
         message_id: format!("agent-pr-run:{run_id}"),
         to: String::new(),
         cc: String::new(),

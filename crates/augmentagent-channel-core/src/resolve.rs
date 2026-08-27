@@ -2010,6 +2010,7 @@ mod tests {
         assert!(out.unresolved.is_empty());
 
         let email = augmentagent_store::Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: "m1".into(),

@@ -134,6 +134,7 @@ pub trait ApprovalBroker: Send + Sync {
         // Fallback: synthesize a minimal Email + reason. Channels relying on
         // this must render it readably.
         let email = Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: format!("digest:{title}"),

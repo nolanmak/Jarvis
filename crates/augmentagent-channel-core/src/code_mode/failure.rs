@@ -493,6 +493,7 @@ pub async fn report_classic_fallback(
         "code-mode failure on action {classic_action_id}; filed issue {issue_str}; fell back to classic."
     );
     let notice_email = Email {
+        attachments: Vec::new(),
         to: String::new(),
         cc: String::new(),
         message_id: format!("code-mode-failure:{classic_action_id}"),
@@ -859,6 +860,7 @@ mod tests {
 
     fn sample_email() -> Email {
         Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: "msg-i7-test".into(),

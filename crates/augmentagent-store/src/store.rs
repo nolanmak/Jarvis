@@ -3018,6 +3018,7 @@ impl Store {
                         retry_count: r.get::<_, i64>(11)?,
                         draft_id: r.get::<_, Option<String>>(12)?,
                         email: Email {
+                            attachments: Vec::new(),
                             to: String::new(),
                             cc: String::new(),
                             message_id: r.get(1)?,
@@ -3278,6 +3279,7 @@ impl Store {
                     },
                     retry_count: r.get::<_, i64>(11)?,
                     email: Email {
+                        attachments: Vec::new(),
                         to: String::new(),
                         cc: String::new(),
                         message_id: r.get(1)?,
@@ -6886,6 +6888,7 @@ fn row_to_pending_nudge(r: &rusqlite::Row) -> rusqlite::Result<PendingNudge> {
             retry_count: r.get::<_, i64>(11)?,
             draft_id: r.get::<_, Option<String>>(12)?,
             email: Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: r.get(1)?,
@@ -7044,6 +7047,7 @@ mod tests {
 
     fn sample_email(message_id: &str) -> Email {
         Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: message_id.into(),

@@ -527,6 +527,7 @@ mod tests {
 
     fn mk_email(id: &str, thread: Option<&str>, account: &str) -> Email {
         Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: id.to_string(),

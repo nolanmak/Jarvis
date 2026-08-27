@@ -1773,6 +1773,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m1".into(),
@@ -1809,6 +1810,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m2".into(),
@@ -1928,6 +1930,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-flag".into(),
@@ -1975,6 +1978,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-skip".into(),
@@ -2019,6 +2023,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-bot".into(),
@@ -2083,6 +2088,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-event".into(),
@@ -2179,6 +2185,7 @@ mod tests {
             .unwrap();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-already".into(),
@@ -2240,6 +2247,7 @@ mod tests {
             .unwrap();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-fresh".into(),
@@ -2280,6 +2288,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m3".into(),
@@ -2426,6 +2435,7 @@ mod tests {
 
     fn threaded_inbound() -> Email {
         Email {
+            attachments: Vec::new(),
             message_id: "m-ra".into(),
             thread_id: Some("t-ra".into()),
             from: "Matt Elder <matt@example.com>".into(),
@@ -2700,6 +2710,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(FlakyGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-retry".into(),
@@ -2761,6 +2772,7 @@ mod tests {
         let mut action_ids = Vec::new();
         for (message_id, draft) in [("m-sapi-draft", Some("sure, 3pm?")), ("m-sapi-bare", None)] {
             let email = Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: message_id.into(),
@@ -2831,6 +2843,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-blast".into(),
@@ -2932,6 +2945,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-human".into(),
@@ -3084,6 +3098,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(CountingGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-broker-fail".into(),
@@ -3158,6 +3173,7 @@ mod tests {
         // the realistic display-name form also exercises extract_bare.
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-529".into(),
@@ -3334,6 +3350,7 @@ mod tests {
     async fn channel_runner_handler_reply_flow_matches_poll_once() {
         let (store, _f) = tmp_store();
         let email = Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: "cr-reply".into(),
@@ -3384,6 +3401,7 @@ mod tests {
     async fn channel_runner_handler_skip_and_flag_match_poll_once() {
         let (store, _f) = tmp_store();
         let skip_email = Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: "cr-skip".into(),
@@ -3397,6 +3415,7 @@ mod tests {
             kind: "dm".into(),
         };
         let flag_email = Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: "cr-flag".into(),
@@ -3521,6 +3540,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-cm-dryrun".into(),
@@ -3621,6 +3641,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-cm-fallback".into(),
@@ -3712,6 +3733,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-cm-repair-ok".into(),
@@ -3797,6 +3819,7 @@ mod tests {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: "m-cm-repair-fail".into(),
