@@ -127,6 +127,71 @@ const BLAST_RADIUS_PATTERNS: &[&str] = &[
     "package-lock.json",
 ];
 
+/// #823 — paths whose change demands a human before it ships, mirroring
+/// `scripts/agent-pr-verify-gate.sh`.
+///
+/// That script is a Claude Code **harness** hook: it fires on the harness's
+/// `Bash` tool and blocks `gh pr create` unless a real end-to-end receipt
+/// exists for the HEAD sha. This pipeline spawns `gh` itself, so the hook has
+/// never applied to it — and this pipeline is the only actor that can merge
+/// without review. The asymmetry runs the wrong way: the daemon has strictly
+/// less ability to verify live behaviour than the human the gate was written
+/// for. It cannot poll a real inbox or watch a card render, and its QA pass
+/// reads the diff rather than exercising it.
+///
+/// Matching here does NOT refuse the work — the pipeline may still propose
+/// these changes. It withholds auto-merge, exactly as `research_filed`
+/// already does, so a human sees the diff before it reaches `main` and
+/// deploys. Grading is advisory (`SCOPE_SYSTEM` asks for `hard`, nothing
+/// checks it against a diff that doesn't exist yet); this is a check.
+///
+/// Kept in sync with the shell script by
+/// `verify_gated_paths_match_the_pr_hook`.
+const VERIFY_GATED_PATHS: &[&str] = &[
+    "schema/*.md",
+    "skills/*/SKILL.md",
+    "skills/*/*.md",
+    "skills/*.md",
+    "crates/augmentagent-channel-core/src/reasoner.rs",
+    "crates/augmentagent-channel-email/src/channel.rs",
+    "crates/augmentagent-channel-email/src/outbound.rs",
+    "crates/augmentagent-channel-email/src/trigger.rs",
+    "crates/augmentagent-channel-core/src/trigger.rs",
+    "crates/augmentagent-channel-core/src/governor/*.rs",
+    "crates/augmentagent-channel-*/src/sigextract.rs",
+    "crates/augmentagent-channel-*/src/tone.rs",
+    "crates/augmentagent-approval-discord/src/event_handler.rs",
+    "crates/augmentagent-approval-discord/src/loops.rs",
+    "crates/augmentagent-approval-discord/src/process_loops.rs",
+];
+
+/// Match one path against one `VERIFY_GATED_PATHS` entry. The patterns come
+/// from shell `case` globs, where `*` does not cross `/`; mirror that so
+/// `crates/augmentagent-channel-*/src/tone.rs` stays one segment wide.
+fn glob_matches(pattern: &str, path: &str) -> bool {
+    let (pat_segs, path_segs): (Vec<_>, Vec<_>) =
+        (pattern.split('/').collect(), path.split('/').collect());
+    if pat_segs.len() != path_segs.len() {
+        return false;
+    }
+    pat_segs.iter().zip(path_segs).all(|(p, s)| match p.split_once('*') {
+        None => *p == s,
+        Some((pre, suf)) => s.len() >= pre.len() + suf.len()
+            && s.starts_with(pre)
+            && s.ends_with(suf),
+    })
+}
+
+/// Does this staged file list touch anything the PR-verify hook guards?
+fn touches_verify_gated_path(names: &str) -> Option<String> {
+    names
+        .lines()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .find(|f| VERIFY_GATED_PATHS.iter().any(|p| glob_matches(p, f)))
+        .map(str::to_string)
+}
+
 /// #819 — the subset of [`BLAST_RADIUS_PATTERNS`] applied to issue *prose*.
 ///
 /// The full list is written for diffs, where every entry is a path fragment
@@ -1440,6 +1505,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
             issue.number
         ));
     }
+    // #823 — does this diff touch a path the PR-verify hook guards? Computed
+    // next to the other diff-derived facts; it withholds auto-merge below
+    // rather than refusing the work.
+    let (_ok, staged_names, _) = run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
+    let gated = touches_verify_gated_path(&staged_names);
+
     let lines = diff_line_count(&full_diff);
     if lines > MAX_DIFF_LINES {
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
@@ -1617,7 +1688,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         // daemon's own speculative proposals, auto-filed with the owner's gh
         // auth (so they pass the owner-authored test), and they change core
         // behaviour. They land as draft PRs for human review.
-        if enabled && complexity.auto_mergeable() && !issue.research_filed {
+        if enabled && complexity.auto_mergeable() && !issue.research_filed && gated.is_none() {
             let owner = std::env::var(GH_OWNER_ENV)
                 .ok()
                 .or(repo_owner_from_remote(repo_root).await);
@@ -1637,10 +1708,20 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         .as_deref()
         .map(|p| format!("\n\n## Implementation spec (scoping pass)\n{}", truncate(p, 1500)))
         .unwrap_or_default();
-    let merge_note = if automerge {
-        "Auto-merged: owner-authored issue graded ≤medium, AUGMENTAGENT_AUTOPR_AUTOMERGE=1."
-    } else {
-        "Draft — a human must review and merge."
+    let merge_note = match (automerge, gated.as_deref()) {
+        (true, _) => "Auto-merged: owner-authored issue graded ≤medium, \
+                      AUGMENTAGENT_AUTOPR_AUTOMERGE=1."
+            .to_string(),
+        // #823 — name the file, so the reviewer knows why this is a draft
+        // even though the grade alone would have merged it.
+        (false, Some(f)) => format!(
+            "Draft — a human must review and merge. Auto-merge was withheld \
+             because `{f}` is covered by the PR-verify receipt gate \
+             (`scripts/agent-pr-verify-gate.sh`): changes there alter runtime \
+             behaviour the test suite cannot model, so they need a real \
+             exercise against the running daemon before they ship."
+        ),
+        (false, None) => "Draft — a human must review and merge.".to_string(),
     };
     // #817 — say so in the PR when the builder left scratch behind; a drop
     // that is never reported is indistinguishable from one that never
@@ -3204,6 +3285,80 @@ mod tests {
         assert_eq!(c.runs_today(101), 0);
         c.record(101);
         assert_eq!(c.runs_today(101), 1);
+    }
+
+    // ---- #823: the receipt gate must bind the daemon too ----
+
+    #[test]
+    fn verify_gated_paths_match_the_pr_hook() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/agent-pr-verify-gate.sh");
+        let src = std::fs::read_to_string(&script)
+            .unwrap_or_else(|e| panic!("read {}: {e}", script.display()));
+
+        let mut from_hook: Vec<&str> = Vec::new();
+        for line in src.lines() {
+            let line = line.trim();
+            if !line.contains("MATCHED+=") {
+                continue;
+            }
+            let Some((pats, _)) = line.split_once(')') else { continue };
+            from_hook.extend(pats.split('|').map(str::trim).filter(|p| !p.is_empty()));
+        }
+        assert!(
+            !from_hook.is_empty(),
+            "parsed no case patterns out of {} — this test's parser has drifted \
+             and is silently asserting nothing",
+            script.display()
+        );
+        for pat in from_hook {
+            assert!(
+                VERIFY_GATED_PATHS.contains(&pat),
+                "`{pat}` needs a verification receipt from a human, but the \
+                 auto-PR loop would still auto-merge it — add it to \
+                 VERIFY_GATED_PATHS"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_gated_paths_are_detected_in_a_staged_diff() {
+        // The real 2026-08-27T19:03Z unattended run on #800.
+        assert_eq!(
+            touches_verify_gated_path(
+                "crates/augmentagent-channel-core/src/reasoner.rs\nschema/wiki-ask.md\n"
+            )
+            .as_deref(),
+            Some("crates/augmentagent-channel-core/src/reasoner.rs")
+        );
+        assert_eq!(
+            touches_verify_gated_path("crates/augmentagent-channel-instagram/src/tone.rs")
+                .as_deref(),
+            Some("crates/augmentagent-channel-instagram/src/tone.rs")
+        );
+        // An ordinary Rust fix elsewhere still auto-merges as before.
+        assert!(touches_verify_gated_path(
+            "crates/augmentagent-cli/src/self_improve.rs\ncrates/augmentagent-store/src/store.rs"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn glob_matching_mirrors_shell_case_semantics() {
+        // `*` does not cross '/' in a shell `case` glob, so the Rust matcher
+        // must not widen the hook's list when mirroring it.
+        assert!(glob_matches("schema/*.md", "schema/wiki-ask.md"));
+        assert!(!glob_matches("schema/*.md", "schema/nested/x.md"));
+        assert!(!glob_matches("schema/*.md", "schema/notes.txt"));
+        assert!(glob_matches(
+            "crates/augmentagent-channel-*/src/tone.rs",
+            "crates/augmentagent-channel-slack/src/tone.rs"
+        ));
+        assert!(!glob_matches(
+            "crates/augmentagent-channel-*/src/tone.rs",
+            "crates/a/b/src/tone.rs"
+        ));
+        assert!(glob_matches("skills/*/SKILL.md", "skills/invoice/SKILL.md"));
     }
 
     // ---- #820: the Node half of the gate must be reachable ----
