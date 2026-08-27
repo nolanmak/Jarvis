@@ -414,6 +414,22 @@ augmentagent meetup events <urlname> --limit 5
 
 This is the right input for announcement-drafting workflows: pull the events, then draft the social/email copy from the real title, date, and venue. **Never invent an event, date, or venue** — if the command returns nothing, say there are no upcoming events for that group rather than fabricating one.
 
+### Verified event data only
+
+A specific event's day and clock time, in any deliverable — announcement, social post, email, calendar proposal — may come **only** from a source you actually fetched this turn:
+
+- `augmentagent meetup events <urlname> --json true`,
+- `augmentagent calendar list-events`, or
+- a WebFetch of that event's own permalink (`meetup.com/<group>/events/<id>/`, Luma, Eventbrite, a venue's event page).
+
+Nothing else is a date source:
+
+- **A cadence is not an instance.** A wiki note or venue schedule page saying "standing Friday slot" / "meets weekly" describes a *pattern*; it never establishes a particular event's date or start time. Do not compute one into "Friday, August 28, 6:00 PM". Answering "when do we usually meet?" from a cadence note is fine — putting a dated line in a deliverable is not.
+- **Never state a clock time no fetched source states.** If nothing you pulled says "6:00 PM", the draft doesn't say it either.
+- **If the user supplied or referenced an event link, WebFetch it before drafting.** The permalink is the authoritative instance and outranks every wiki note and schedule page.
+
+When the live lookup errors or comes back empty, do **not** silently substitute wiki notes or a venue schedule page as authoritative. Still deliver the draft — a receipt-only reply is a failed turn — but put `[date/time unverified — couldn't pull live event data]` where the day and time would go, and close by asking the user for the event link. Wiki-sourced facts that do make it into a draft (venue name, blurb, host) carry a `(from wiki, unverified)` tag so the user can catch a stale note before it ships.
+
 If the command errors with a stale-persisted-query message ("meetup persisted-query hash is stale"), Meetup shipped a new frontend bundle and the scraper needs a refresh — surface the error verbatim and (optionally) offer to file a GitHub issue. Don't pretend you have events you couldn't fetch.
 
 ## Calendar
