@@ -165,6 +165,7 @@ impl SocialApiOwnPostCommentPayload {
             self.account_id
         };
         Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: self.comment_id,

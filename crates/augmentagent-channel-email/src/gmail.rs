@@ -929,6 +929,110 @@ mod tests {
         }
     }
 
+    // #811: an attachment-only email (empty body, one PDF) drafted as "there is
+    // no attachment" because nothing in the fetch decode looked at attachment
+    // metadata. Composio's own `attachmentList` is the primary signal; the raw
+    // `Content-Type: multipart/mixed` header is the fallback for builds that
+    // omit it.
+
+    #[test]
+    fn fetch_message_surfaces_attachment_metadata() {
+        let v = serde_json::json!({
+            "messageId": "m1",
+            "sender": "matt@example.com",
+            "subject": "Resume",
+            "attachmentList": [
+                {"filename": "resume.pdf", "mimeType": "application/pdf", "attachmentId": "x"}
+            ]
+        });
+        let m: super::FetchMessage = serde_json::from_value(v).unwrap();
+        let e = m.into_email("acct").unwrap();
+        assert_eq!(e.attachments, vec!["resume.pdf (application/pdf)"]);
+    }
+
+    #[test]
+    fn fetch_message_falls_back_to_the_multipart_mixed_header() {
+        // No attachmentList, but the raw Content-Type says the message carries
+        // a non-inline part — enough to stop the drafter asserting absence.
+        let v = serde_json::json!({
+            "messageId": "m2",
+            "sender": "matt@example.com",
+            "payload": {"headers": [
+                {"name": "Content-Type", "value": "multipart/mixed; boundary=\"abc\""}
+            ]}
+        });
+        let m: super::FetchMessage = serde_json::from_value(v).unwrap();
+        let e = m.into_email("acct").unwrap();
+        assert_eq!(e.attachments, vec!["(attachment — filename unavailable)"]);
+    }
+
+    #[test]
+    fn fetch_message_reports_no_attachment_for_inline_and_plain_shapes() {
+        // multipart/related and multipart/alternative are inline-image / HTML
+        // shapes — claiming an attachment there would be a false positive.
+        for content_type in [
+            "multipart/related; boundary=\"x\"",
+            "multipart/alternative; boundary=\"x\"",
+            "text/plain; charset=UTF-8",
+        ] {
+            let v = serde_json::json!({
+                "messageId": "m3",
+                "sender": "a@example.com",
+                "payload": {"headers": [{"name": "Content-Type", "value": content_type}]}
+            });
+            let m: super::FetchMessage = serde_json::from_value(v).unwrap();
+            let e = m.into_email("acct").unwrap();
+            assert!(
+                e.attachments.is_empty(),
+                "{content_type} must not claim an attachment"
+            );
+        }
+
+        // No signal at all → empty, same as today.
+        let v = serde_json::json!({"messageId": "m4", "sender": "a@example.com"});
+        let m: super::FetchMessage = serde_json::from_value(v).unwrap();
+        assert!(m.into_email("acct").unwrap().attachments.is_empty());
+    }
+
+    #[test]
+    fn fetch_message_survives_a_shape_shifted_attachment_list() {
+        // #331 lesson again: a drifted `attachmentList` must degrade to "no
+        // attachments", never abort the decode of the whole page.
+        for bad in [
+            serde_json::json!("nope"),
+            serde_json::json!(42),
+            serde_json::json!([{"filename": 5}]),
+            serde_json::Value::Null,
+        ] {
+            let v = serde_json::json!({
+                "messageId": "m5",
+                "sender": "a@example.com",
+                "attachmentList": bad,
+            });
+            let m: super::FetchMessage =
+                serde_json::from_value(v).expect("lenient attachment list must not fail decode");
+            assert!(m.into_email("acct").unwrap().attachments.is_empty());
+        }
+    }
+
+    #[test]
+    fn fetch_message_labels_attachments_missing_a_filename_or_mime_type() {
+        let v = serde_json::json!({
+            "messageId": "m6",
+            "sender": "a@example.com",
+            "attachmentList": [
+                {"mimeType": "application/pdf"},
+                {"filename": "notes.txt"},
+            ]
+        });
+        let m: super::FetchMessage = serde_json::from_value(v).unwrap();
+        let e = m.into_email("acct").unwrap();
+        assert_eq!(
+            e.attachments,
+            vec!["(attachment — filename unavailable)", "notes.txt"]
+        );
+    }
+
     // ---- #164: tool-error propagation ----
     //
     // Regression test for the bug where the reasoner narrated a fabricated
@@ -1618,6 +1722,58 @@ struct FetchMessage {
         deserialize_with = "de_num_or_string"
     )]
     message_timestamp: Option<String>,
+    /// Attachment metadata Composio returns alongside the message (#811).
+    /// Without it the drafter had no signal an attachment existed and
+    /// confidently asserted its absence on attachment-only emails.
+    /// Deserialized leniently for the same #331 reason as `payload`.
+    #[serde(
+        default,
+        alias = "attachment_list",
+        deserialize_with = "de_lenient_attachments"
+    )]
+    attachment_list: Vec<FetchAttachment>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchAttachment {
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
+}
+
+/// Stand-in when an attachment is known to exist but Composio gave no filename.
+/// "Something is attached" is the signal that matters; the name is a bonus.
+const UNNAMED_ATTACHMENT: &str = "(attachment — filename unavailable)";
+
+impl FetchAttachment {
+    /// `resume.pdf (application/pdf)`, degrading gracefully as fields go
+    /// missing — both come back as `null` or `""` on some Composio builds.
+    fn label(&self) -> String {
+        let present = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        match (present(&self.filename), present(&self.mime_type)) {
+            (Some(name), Some(mime)) => format!("{name} ({mime})"),
+            (Some(name), None) => name,
+            (None, _) => UNNAMED_ATTACHMENT.to_string(),
+        }
+    }
+}
+
+/// Accept `attachmentList` in any shape: a well-formed array of objects parses,
+/// anything else (absent, null, a string, entries of the wrong type) yields an
+/// empty list rather than aborting the entire `FetchResp` decode.
+fn de_lenient_attachments<'de, D>(d: D) -> Result<Vec<FetchAttachment>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).unwrap_or_default())
 }
 
 /// Deserialize a field that Composio may send as either a JSON string
@@ -1680,6 +1836,29 @@ impl FetchMessage {
         })
     }
 
+    /// Human-readable attachment descriptors for the `Email` model (#811).
+    ///
+    /// Primary signal is Composio's `attachmentList`. When that is absent we
+    /// fall back to the raw `Content-Type` header: `multipart/mixed` is the
+    /// only multipart shape that implies a real attachment — `related` and
+    /// `alternative` are inline-image / HTML-body shapes, and claiming an
+    /// attachment there would be a false positive.
+    fn attachment_labels(&self) -> Vec<String> {
+        if !self.attachment_list.is_empty() {
+            return self
+                .attachment_list
+                .iter()
+                .map(FetchAttachment::label)
+                .collect();
+        }
+        match self.header("Content-Type") {
+            Some(ct) if ct.to_ascii_lowercase().starts_with("multipart/mixed") => {
+                vec![UNNAMED_ATTACHMENT.to_string()]
+            }
+            _ => Vec::new(),
+        }
+    }
+
     fn into_email(self, account: &str) -> Option<Email> {
         let to = self
             .to
@@ -1688,9 +1867,11 @@ impl FetchMessage {
             .or_else(|| self.header("To"))
             .unwrap_or_default();
         let cc = self.header("Cc").unwrap_or_default();
+        let attachments = self.attachment_labels();
         let message_id = self.message_id?;
         Some(Email {
             message_id,
+            attachments,
             thread_id: self.thread_id,
             from: self.from.or(self.sender).unwrap_or_default(),
             to,

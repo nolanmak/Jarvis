@@ -44,6 +44,7 @@ pub fn synthetic_memo_email(rec: &MemoRecord, chat_id: i64, source_id: i64) -> E
         body.push_str(&format!("\nTopics: {}", rec.topics.join(", ")));
     }
     Email {
+        attachments: Vec::new(),
         to: String::new(),
         cc: String::new(),
         message_id: format!("voice:{chat_id}:{source_id}"),

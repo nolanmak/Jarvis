@@ -343,6 +343,7 @@ impl DeftSubmission {
             DeftCommand::Query(q) => ("query".to_string(), q.clone()),
         };
         Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: self.dedup_id(),
@@ -465,6 +466,7 @@ impl DeftSubmission {
         }
 
         Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: self.dedup_id(),

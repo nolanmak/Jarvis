@@ -65,6 +65,7 @@ impl Tweet {
         let subject = format!("[X post by @{}]", self.author_handle);
         let date = ms_to_rfc3339(self.created_at_ms);
         Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: self.rest_id.clone(),
@@ -108,6 +109,7 @@ impl TwitterDm {
         let subject = format!("[X DM from @{}]", self.sender_handle);
         let date = ms_to_rfc3339(self.created_at_ms);
         Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: self.event_id,
@@ -221,6 +223,7 @@ mod tests {
     #[test]
     fn is_twitter_email_rejects_other_sources() {
         let email = Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: "m".into(),
