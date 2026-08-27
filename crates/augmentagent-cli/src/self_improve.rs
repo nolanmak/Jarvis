@@ -26,6 +26,7 @@
 //! This module shells out to `gh` and `git`; it does not depend on the
 //! GitHub channel crate (different concern — that's inbound notifications).
 
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -69,6 +70,9 @@ const IDLE_MSG: &str = "no eligible agent-fixable issues";
 /// honored so the owner doesn't have to enumerate every collaborator.
 const TRUSTED_AUTHORS_ENV: &str = "AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS";
 const GH_OWNER_ENV: &str = "AUGMENTAGENT_GH_OWNER";
+
+/// #816 — override for the single-flight lock file (tests).
+const LOCK_FILE_ENV: &str = "AUGMENTAGENT_SELFIMPROVE_LOCK";
 
 /// Provider/API-key env vars stripped from the build/test gate's child
 /// process (#300). The gate compiles + tests attacker-influenceable code
@@ -943,9 +947,121 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Force the pipeline's fixed worktree path back to a usable state before a
+/// fresh `git worktree add`.
+///
+/// `git worktree remove` only acts on a *registered* worktree. A run killed
+/// mid-flight (daemon restart, OOM, `kill`) can leave the directory behind
+/// with a stale or absent `.git/worktrees` entry — `remove` then fails, and
+/// the `add` that follows refuses an existing path, so every later tick dies
+/// in the same place. Nothing here is recoverable state: the path is
+/// pipeline-owned and the branch is re-created from `origin/main`, so the
+/// unconditional `remove_dir_all` is safe and is what makes a crashed run
+/// self-healing instead of permanently wedging the loop.
+async fn reclaim_worktree(repo_root: &Path, worktree: &Path, branch: &str) {
+    let _ = run(
+        "git",
+        &["worktree", "remove", "--force", &worktree.to_string_lossy()],
+        repo_root,
+    )
+    .await;
+    let _ = run("git", &["branch", "-D", branch], repo_root).await;
+    if worktree.exists() {
+        if let Err(e) = tokio::fs::remove_dir_all(worktree).await {
+            warn!(
+                path = %worktree.display(),
+                "could not reclaim stale self-improve worktree: {e}"
+            );
+        }
+    }
+    // Drop any registration left pointing at the path we just deleted;
+    // without this `worktree add` reports it as already checked out.
+    let _ = run("git", &["worktree", "prune"], repo_root).await;
+}
+
+/// #816 — process-wide single-flight guard for the pipeline.
+///
+/// The daemon's [`AutoPrLoop`] tick and a hand-run `augmentagent
+/// self-improve` share one fixed worktree path, and every run force-removes
+/// that path on entry. Concurrently, the second run deletes the first run's
+/// checkout mid-gate and the first can go on to commit and push whatever the
+/// second left there — with auto-merge on, straight to `main`. An advisory
+/// `flock` held for the whole run makes the loser skip its tick instead,
+/// which costs nothing: the next one is `AUGMENTAGENT_AUTOPR_INTERVAL_SECS`
+/// away.
+///
+/// Until now the accidental serializer was the dirty-tree preflight — a run
+/// in flight left `?? .self-improve-worktrees/` in `git status`, so the other
+/// run refused. Teaching that preflight to ignore the pipeline's own worktree
+/// is what makes a real lock necessary.
+struct RunLock {
+    /// Held only for its `Drop`: closing the fd releases the `flock`.
+    _file: std::fs::File,
+}
+
+impl RunLock {
+    /// Take the lock, or `Ok(None)` if another run already holds it.
+    fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("create lock dir {}", dir.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("open self-improve lock {}", path.display()))?;
+        // SAFETY: `file` owns the fd for the duration of the call, and
+        // `flock` neither reads nor writes through it.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Some(Self { _file: file }));
+        }
+        let err = std::io::Error::last_os_error();
+        // EWOULDBLOCK == EAGAIN on Linux; match both so this reads correctly
+        // wherever they differ.
+        if matches!(
+            err.raw_os_error(),
+            Some(e) if e == libc::EWOULDBLOCK || e == libc::EAGAIN
+        ) {
+            return Ok(None);
+        }
+        Err(err).context("flock self-improve lock")
+    }
+}
+
+/// Lock file path: `AUGMENTAGENT_SELFIMPROVE_LOCK` override (tests), else the
+/// daemon state dir alongside `reasoner-cooldowns.json`, else a cwd-relative
+/// fallback so a HOME-less environment still serializes.
+fn run_lock_path() -> PathBuf {
+    if let Ok(p) = std::env::var(LOCK_FILE_ENV) {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    std::env::var_os("HOME")
+        .map(|h| {
+            PathBuf::from(h)
+                .join(".local/state/augmentagent")
+                .join("self-improve.lock")
+        })
+        .unwrap_or_else(|| PathBuf::from(".self-improve.lock"))
+}
+
 /// Drive one self-improvement attempt. `dry_run` stops before opening the PR
 /// (prints what it would do) so the loop can be exercised safely.
 pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
+    // #816 — single-flight. Held for the whole run; dropped on every exit
+    // path. A losing run reports idle so it consumes no daily budget.
+    let _lock = match RunLock::try_acquire(&run_lock_path())? {
+        Some(l) => l,
+        None => {
+            info!("self-improve: another run holds the lock; skipping this tick");
+            return Ok(IDLE_MSG.to_string());
+        }
+    };
+
     // Refuse to run from a dirty tree / detached state — protects the deploy.
     let (ok, status_out, _) = run("git", &["status", "--porcelain"], repo_root).await?;
     if !ok {
@@ -1015,13 +1131,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     let worktree = repo_root.join(".self-improve-worktrees").join("current");
 
     // Clean any stale worktree from a crashed prior run.
-    let _ = run(
-        "git",
-        &["worktree", "remove", "--force", &worktree.to_string_lossy()],
-        repo_root,
-    )
-    .await;
-    let _ = run("git", &["branch", "-D", &branch], repo_root).await;
+    reclaim_worktree(repo_root, &worktree, &branch).await;
 
     let (ok, _o, e) = run(
         "git",
@@ -1492,12 +1602,26 @@ async fn label_gave_up(repo_root: &Path, issue: u64) -> Result<()> {
     Ok(())
 }
 
+/// Clip `s` to a `max`-BYTE budget, appending an ellipsis.
+///
+/// #813 — `max` is a byte index, so the naive `&s[..max]` panics whenever the
+/// cut lands inside a multi-byte character. Every caller here feeds it either
+/// a GitHub issue body or raw model output, and the scoping/build/review
+/// system prompts are themselves full of em dashes, so a mid-character cut is
+/// a matter of when. The panic is not survivable where it happens: the loop
+/// runs in a `tokio::spawn`ed task whose handle is joined behind other
+/// never-terminating channel loops, so the task simply dies and the auto-PR
+/// loop stays dead until the next process restart. Walk back to the nearest
+/// char boundary instead.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
+        return s.to_string();
     }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 // =====================================================================
@@ -2363,6 +2487,21 @@ mod tests {
         assert_eq!(truncate("hi", 10), "hi");
     }
 
+    #[test]
+    fn truncate_never_splits_a_multibyte_char() {
+        // The em dash occupies bytes 9..12, so a byte-index cut at 10 or 11
+        // is exactly the panic the old implementation took.
+        let s = format!("{}—tail", "a".repeat(9));
+        assert_eq!(truncate(&s, 10), "aaaaaaaaa…");
+        assert_eq!(truncate(&s, 11), "aaaaaaaaa…");
+        // Landing exactly on a boundary keeps the whole character.
+        assert_eq!(truncate(&s, 12), "aaaaaaaaa—…");
+        // A cut before the first character yields just the ellipsis.
+        assert_eq!(truncate("—————", 2), "…");
+        // Multi-byte input that fits is returned untouched.
+        assert_eq!(truncate("café — ok", 64), "café — ok");
+    }
+
     // --- #117 multi-repo helpers --------------------------------------
 
     fn repo_with_extra(extra: &str) -> AgentRepo {
@@ -2775,6 +2914,77 @@ mod tests {
         assert_eq!(c.runs_today(101), 0);
         c.record(101);
         assert_eq!(c.runs_today(101), 1);
+    }
+
+    // ---- #816: single-flight lock ----
+
+    #[test]
+    fn run_lock_is_exclusive_and_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/self-improve.lock");
+
+        let first = RunLock::try_acquire(&path).unwrap();
+        assert!(first.is_some(), "the first run must take the lock");
+        assert!(
+            RunLock::try_acquire(&path).unwrap().is_none(),
+            "a second run must be turned away, not wedged into the same worktree"
+        );
+
+        drop(first);
+        assert!(
+            RunLock::try_acquire(&path).unwrap().is_some(),
+            "the lock must be free again once the holding run finishes"
+        );
+    }
+
+    // ---- #812: a crashed run must not wedge the loop forever ----
+
+    #[tokio::test]
+    async fn reclaim_clears_an_unregistered_leftover_worktree_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q", "-b", "main", "."]);
+        git(&["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q",
+              "--allow-empty", "-m", "init"]);
+
+        // Simulate a run killed mid-flight: the directory survives with no
+        // `.git/worktrees` registration at all, so `git worktree remove`
+        // cannot clear it.
+        let worktree = repo.join(".self-improve-worktrees").join("current");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join("half-written.rs"), "fn main() {}\n").unwrap();
+        let add = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git")
+        };
+        assert!(
+            !add(&["worktree", "add", "-b", "agent-fix/issue-1",
+                   &worktree.to_string_lossy(), "main"])
+                .status
+                .success(),
+            "precondition: worktree add refuses the existing path"
+        );
+
+        reclaim_worktree(repo, &worktree, "agent-fix/issue-1").await;
+
+        assert!(!worktree.exists(), "the leftover directory must be gone");
+        assert!(
+            add(&["worktree", "add", "-b", "agent-fix/issue-1",
+                  &worktree.to_string_lossy(), "main"])
+                .status
+                .success(),
+            "after reclaim the pipeline must be able to create its worktree again"
+        );
     }
 
     #[test]
