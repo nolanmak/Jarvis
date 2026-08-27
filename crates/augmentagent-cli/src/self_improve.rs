@@ -74,6 +74,9 @@ const GH_OWNER_ENV: &str = "AUGMENTAGENT_GH_OWNER";
 /// #816 — override for the single-flight lock file (tests).
 const LOCK_FILE_ENV: &str = "AUGMENTAGENT_SELFIMPROVE_LOCK";
 
+/// #814 — override for the persisted daily-run counter (tests).
+const COUNTER_FILE_ENV: &str = "AUGMENTAGENT_AUTOPR_COUNTER_FILE";
+
 /// Provider/API-key env vars stripped from the build/test gate's child
 /// process (#300). The gate compiles + tests attacker-influenceable code
 /// (`build.rs`, proc-macros, `npm postinstall`); none of those need a
@@ -1422,17 +1425,35 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     .await?;
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        bail!("git commit failed: {e}");
+        return Ok(record_hard_failure(repo_root, issue.number, "git commit failed", &e).await);
     }
-    let (ok, _o, e) = run(
-        "git",
-        &["push", "-u", "origin", &branch],
-        &worktree,
-    )
-    .await?;
+    // #815 — a run killed between the push and `gh pr create` leaves the
+    // remote branch behind with no PR. `has_open_agent_pr` only looks at
+    // PRs, so the issue is picked again, and this non-fast-forward push is
+    // where it dies — after three reasoner calls and a full workspace gate,
+    // every tick, forever. The `agent-fix/` namespace is pipeline-owned and
+    // this branch has already been shown to carry no open PR, so a fresh
+    // attempt is entitled to supersede the orphan. Force only in that
+    // narrow case, and say so in the log.
+    let (mut ok, _o, mut e) = run("git", &["push", "-u", "origin", &branch], &worktree).await?;
+    if !ok && remote_branch_exists(repo_root, &branch).await {
+        warn!(
+            issue = issue.number,
+            branch = %branch,
+            "orphaned remote branch from an interrupted run; superseding it"
+        );
+        let forced = run(
+            "git",
+            &["push", "--force", "-u", "origin", &branch],
+            &worktree,
+        )
+        .await?;
+        ok = forced.0;
+        e = forced.2;
+    }
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        bail!("git push failed: {e}");
+        return Ok(record_hard_failure(repo_root, issue.number, "git push failed", &e).await);
     }
 
     // Open the PR. Draft + human merge for everyone; owner-authored issues
@@ -1495,7 +1516,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     let (ok, stdout, e) = run(&gh, &args, &worktree).await?;
     cleanup(worktree, branch.clone(), repo_root.to_path_buf()).await;
     if !ok {
-        bail!("gh pr create failed: {e}");
+        // #815 — the branch is pushed but has no PR. Left as an `Err` this
+        // re-picks the same issue next tick and dies at the push above.
+        return Ok(record_hard_failure(repo_root, issue.number, "gh pr create failed", &e).await);
     }
     let pr_url = stdout.trim().to_string();
     if !automerge {
@@ -1533,6 +1556,57 @@ fn unmanaged_dirty_status(status: &str) -> String {
         .filter(|line| !line.starts_with("?? .self-improve-worktrees/"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Does `origin` already carry this branch? (#815)
+///
+/// Distinguishes "the push lost a race / auth broke" from "a previous run
+/// pushed this branch and then died before opening its PR".
+async fn remote_branch_exists(repo_root: &Path, branch: &str) -> bool {
+    let refspec = format!("refs/heads/{branch}");
+    match run(
+        "git",
+        &["ls-remote", "--heads", "origin", &refspec],
+        repo_root,
+    )
+    .await
+    {
+        Ok((true, out, _)) => !out.trim().is_empty(),
+        // A failed `ls-remote` says nothing; don't force-push on a guess.
+        _ => false,
+    }
+}
+
+/// #815 — record a post-gate failure as a *failed attempt* rather than an
+/// error, and return the loop's message for it.
+///
+/// `git commit` / `git push` / `gh pr create` failures reach this point
+/// having already spent three reasoner calls and a full workspace build+test.
+/// Returned as `Err` they bypass both `record_attempt` (so `MAX_ATTEMPTS`
+/// never accrues and the issue is never labeled out) and the loop's
+/// `DailyCounter::record` (so the spend is never counted) — which turns a
+/// sticky failure into an unbounded 30-minute retry of the most expensive
+/// path in the daemon. Counting them makes the loop give up like it does on
+/// a red gate or a rejected review.
+async fn record_hard_failure(repo_root: &Path, issue: u64, what: &str, err: &str) -> String {
+    let attempts = record_attempt(repo_root, issue).await.unwrap_or(1);
+    warn!(issue, attempts, "self-improve: {what}: {err}");
+    if attempts >= MAX_ATTEMPTS {
+        backoff_comment(
+            repo_root,
+            issue,
+            &format!(
+                "Self-improve gave up after {attempts} attempts: the fix built \
+                 and passed review, but publishing it kept failing \
+                 (`{what}`). Last error:\n```\n{}\n```",
+                truncate(err, 1000)
+            ),
+        )
+        .await
+        .ok();
+        label_gave_up(repo_root, issue).await.ok();
+    }
+    format!("issue #{issue}: {what} (attempt {attempts}); no PR opened")
 }
 
 /// Bump an attempt counter encoded as a hidden marker comment, return the new
@@ -2289,8 +2363,9 @@ pub struct AutoPrLoop {
     daily_cap: u32,
 }
 
-/// Engaged-run counter with UTC-day rollover. Pure so it's testable.
-#[derive(Default)]
+/// Engaged-run counter with UTC-day rollover. Pure so it's testable;
+/// [`load`](Self::load) / [`save`](Self::save) add the durability.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct DailyCounter {
     day: u64,
     runs: u32,
@@ -2309,6 +2384,57 @@ impl DailyCounter {
         let _ = self.runs_today(day);
         self.runs += 1;
     }
+
+    /// #814 — read the counter back from disk, defaulting to a fresh one.
+    ///
+    /// The cap exists to bound how much of the owner's Claude subscription
+    /// the unattended loop spends per day, but it lived only in process
+    /// memory — and the loop's *success* path is exactly what destroys that
+    /// memory: an auto-merged PR touching `crates/` makes the auto-updater
+    /// rebuild and `systemctl restart augmentagent.service`, so the counter
+    /// resets to zero after every win. The cap therefore throttled failures
+    /// and nothing else. (`stderr.log` shows 19 `auto-PR loop started` lines
+    /// in the week to 2026-08-27 — 19 resets.)
+    fn load(path: &Path) -> Self {
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// Best-effort persist. A write failure must never abort a run — it only
+    /// costs the cap its memory, which is where we already were.
+    fn save(&self, path: &Path) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match serde_json::to_vec(self) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, bytes) {
+                    warn!(path = %path.display(), "could not persist auto-PR daily counter: {e}");
+                }
+            }
+            Err(e) => warn!("could not serialize auto-PR daily counter: {e}"),
+        }
+    }
+}
+
+/// Where the persisted counter lives: `AUGMENTAGENT_AUTOPR_COUNTER_FILE`
+/// override (tests), else the daemon state dir next to the reasoner
+/// cooldown latch.
+fn daily_counter_path() -> PathBuf {
+    if let Ok(p) = std::env::var(COUNTER_FILE_ENV) {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    std::env::var_os("HOME")
+        .map(|h| {
+            PathBuf::from(h)
+                .join(".local/state/augmentagent")
+                .join("autopr-daily-runs.json")
+        })
+        .unwrap_or_else(|| PathBuf::from("autopr-daily-runs.json"))
 }
 
 fn utc_day_now() -> u64 {
@@ -2375,7 +2501,8 @@ impl AutoPrLoop {
             dry_run = self.dry_run,
             "auto-PR loop started (#630/#653): polling open issues (self-triage, no label gate)"
         );
-        let mut counter = DailyCounter::default();
+        let counter_path = daily_counter_path();
+        let mut counter = DailyCounter::load(&counter_path);
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
@@ -2396,6 +2523,7 @@ impl AutoPrLoop {
                 Ok(msg) if msg == IDLE_MSG => {}
                 Ok(msg) => {
                     counter.record(today);
+                    counter.save(&counter_path);
                     info!(
                         runs_today = counter.runs_today(today),
                         daily_cap = self.daily_cap,
@@ -2914,6 +3042,78 @@ mod tests {
         assert_eq!(c.runs_today(101), 0);
         c.record(101);
         assert_eq!(c.runs_today(101), 1);
+    }
+
+    // ---- #814: the daily cap must outlive the deploy restart ----
+
+    #[test]
+    fn daily_counter_survives_a_restart_within_the_same_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/autopr-daily-runs.json");
+
+        let mut c = DailyCounter::load(&path);
+        c.record(100);
+        c.record(100);
+        c.save(&path);
+
+        // An auto-merged PR makes the updater restart the daemon. The cap
+        // must not start over, or success buys the loop a fresh budget.
+        let mut reloaded = DailyCounter::load(&path);
+        assert_eq!(reloaded.runs_today(100), 2);
+        // Rollover still zeroes it.
+        assert_eq!(reloaded.runs_today(101), 0);
+    }
+
+    #[test]
+    fn daily_counter_load_falls_back_to_zero_on_missing_or_corrupt_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.json");
+        assert_eq!(DailyCounter::load(&missing).runs_today(1), 0);
+
+        let junk = dir.path().join("junk.json");
+        std::fs::write(&junk, b"{ not json").unwrap();
+        assert_eq!(DailyCounter::load(&junk).runs_today(1), 0);
+    }
+
+    // ---- #815: an orphaned remote branch must be detectable ----
+
+    #[tokio::test]
+    async fn remote_branch_exists_sees_a_branch_pushed_by_an_interrupted_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("origin.git");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr));
+        };
+        git(dir.path(), &["init", "-q", "--bare", "origin.git"]);
+        git(&work, &["init", "-q", "-b", "main", "."]);
+        git(&work, &["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q",
+                     "--allow-empty", "-m", "init"]);
+        git(&work, &["remote", "add", "origin", &bare.to_string_lossy()]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        let branch = format!("{BRANCH_PREFIX}1");
+        assert!(
+            !remote_branch_exists(&work, &branch).await,
+            "a branch that was never pushed must not read as orphaned"
+        );
+
+        // Simulate a run that pushed and then died before `gh pr create`.
+        git(&work, &["branch", &branch]);
+        git(&work, &["push", "-q", "origin", &branch]);
+        assert!(
+            remote_branch_exists(&work, &branch).await,
+            "the orphaned branch must be detected, or the next attempt dies \
+             at a non-fast-forward push every tick forever"
+        );
     }
 
     // ---- #816: single-flight lock ----
