@@ -52,7 +52,7 @@ pub use memory_nudge::{default_cycles_root, CycleLogger, CycleSummary, CycleSurf
 pub use reasoner::{ClaudeCliReasoner, Reasoner, ReasonerError, ReasonerOpts};
 // #655 — multi-provider failover: one Reasoner seam, N provider adapters.
 pub use cooldown::CooldownLatch;
-pub use fallback::{build_reasoner, FallbackReasoner};
+pub use fallback::{build_pinned, build_reasoner, FallbackReasoner};
 pub use images::{extract_image_markers, image_marker_line, IMAGE_MARKER_PREFIX};
 pub use providers::{CapabilityClass, ModelTier, ProviderKind};
 pub use skills::{SkillEntry, SkillRegistry};

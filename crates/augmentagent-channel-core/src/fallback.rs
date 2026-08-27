@@ -85,61 +85,71 @@ pub struct FallbackReasoner {
 /// log line instead of erroring on every call. Claude is always eligible —
 /// it is the primary this daemon has run on since day one, and a missing
 /// `claude` binary should fail loudly per call, not silently vanish.
-pub fn build_reasoner() -> Arc<FallbackReasoner> {
-    let mut entries: Vec<Entry> = Vec::new();
-    for kind in chain_from_env() {
-        match kind {
-            ProviderKind::Claude => entries.push(Entry {
+/// Construct the entry for one provider, or `None` when it is not eligible
+/// (binary absent, no resolvable auth). Claude is always eligible — it is the
+/// primary this daemon has run on since day one, and a missing `claude`
+/// binary should fail loudly per call, not silently vanish.
+fn entry_for(kind: ProviderKind) -> Option<Entry> {
+    match kind {
+        ProviderKind::Claude => Some(Entry {
+            kind,
+            reasoner: Arc::new(ClaudeCliReasoner::new()),
+        }),
+        ProviderKind::Codex => {
+            let bin = crate::codex::codex_bin();
+            if !bin_resolves(&bin) {
+                info!("reasoner chain: codex skipped ({bin:?} not installed)");
+                return None;
+            }
+            if !crate::codex::codex_auth_available() {
+                info!(
+                    "reasoner chain: codex skipped (no CODEX_API_KEY and no \
+                     auth.json — run `codex login` or seed the key)"
+                );
+                return None;
+            }
+            Some(Entry {
                 kind,
-                reasoner: Arc::new(ClaudeCliReasoner::new()),
-            }),
-            ProviderKind::Codex => {
-                let bin = crate::codex::codex_bin();
-                if !bin_resolves(&bin) {
-                    info!("reasoner chain: codex skipped ({bin:?} not installed)");
-                    continue;
-                }
-                if !crate::codex::codex_auth_available() {
-                    info!(
-                        "reasoner chain: codex skipped (no CODEX_API_KEY and no \
-                         auth.json — run `codex login` or seed the key)"
-                    );
-                    continue;
-                }
-                entries.push(Entry {
-                    kind,
-                    reasoner: Arc::new(crate::codex::CodexCliReasoner::openai()),
-                });
+                reasoner: Arc::new(crate::codex::CodexCliReasoner::openai()),
+            })
+        }
+        ProviderKind::Gemini => {
+            let bin = crate::gemini::gemini_bin();
+            if !bin_resolves(&bin) {
+                info!("reasoner chain: gemini skipped ({bin:?} not installed)");
+                return None;
             }
-            ProviderKind::Gemini => {
-                let bin = crate::gemini::gemini_bin();
-                if !bin_resolves(&bin) {
-                    info!("reasoner chain: gemini skipped ({bin:?} not installed)");
-                    continue;
-                }
-                if crate::secret_loader::load_provider_key("GEMINI_API_KEY").is_none() {
-                    info!("reasoner chain: gemini skipped (no GEMINI_API_KEY in keyring/env)");
-                    continue;
-                }
-                entries.push(Entry {
-                    kind,
-                    reasoner: Arc::new(crate::gemini::GeminiCliReasoner::new()),
-                });
+            if crate::secret_loader::load_provider_key("GEMINI_API_KEY").is_none() {
+                info!("reasoner chain: gemini skipped (no GEMINI_API_KEY in keyring/env)");
+                return None;
             }
-            ProviderKind::Cerebras => {
-                // Thin chat-completions client (#663 plan B — codex ≥0.148
-                // removed wire_api=chat and Cerebras has no Responses API).
-                if crate::secret_loader::load_provider_key("CEREBRAS_API_KEY").is_none() {
-                    info!("reasoner chain: cerebras skipped (no CEREBRAS_API_KEY in keyring/env)");
-                    continue;
-                }
-                entries.push(Entry {
-                    kind,
-                    reasoner: Arc::new(crate::cerebras::CerebrasHttpReasoner::new()),
-                });
+            Some(Entry {
+                kind,
+                reasoner: Arc::new(crate::gemini::GeminiCliReasoner::new()),
+            })
+        }
+        ProviderKind::Cerebras => {
+            // Thin chat-completions client (#663 plan B — codex ≥0.148
+            // removed wire_api=chat and Cerebras has no Responses API).
+            if crate::secret_loader::load_provider_key("CEREBRAS_API_KEY").is_none() {
+                info!("reasoner chain: cerebras skipped (no CEREBRAS_API_KEY in keyring/env)");
+                return None;
             }
+            Some(Entry {
+                kind,
+                reasoner: Arc::new(crate::cerebras::CerebrasHttpReasoner::new()),
+            })
         }
     }
+}
+
+/// Build the production reasoner from `AUGMENTAGENT_REASONER_CHAIN`.
+///
+/// Eligibility is checked once per construction: a fallback CLI that is not
+/// installed (or has no resolvable auth) is dropped from the chain with one
+/// log line instead of erroring on every call.
+pub fn build_reasoner() -> Arc<FallbackReasoner> {
+    let mut entries: Vec<Entry> = chain_from_env().into_iter().filter_map(entry_for).collect();
     if entries.is_empty() {
         // Unreachable via chain_from_env (it always yields claude), but keep
         // the invariant explicit: the composite always has a primary.
@@ -155,6 +165,26 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
     Arc::new(FallbackReasoner {
         entries,
         latch: CooldownLatch::system(),
+    })
+}
+
+/// #828 — a reasoner pinned to exactly ONE provider, or `None` when that
+/// provider is not eligible.
+///
+/// This exists for the independent-review stage, where the whole value is
+/// that the reviewer is NOT the author. `build_reasoner` would hand back
+/// Claude (the head of the chain), so an independent review built on it
+/// would be Claude reviewing Claude while the PR claimed otherwise.
+///
+/// Deliberately returns `None` rather than falling back: a caller that
+/// cannot get the provider it asked for must be able to tell, and must fail
+/// closed. There is no chain here, so failover cannot silently occur either.
+pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
+    entry_for(kind).map(|entry| {
+        Arc::new(FallbackReasoner {
+            entries: vec![entry],
+            latch: CooldownLatch::system(),
+        })
     })
 }
 
@@ -333,6 +363,44 @@ impl Reasoner for FallbackReasoner {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ---- #828: single-provider pinning for the independent review ----
+
+    #[test]
+    fn build_pinned_yields_exactly_that_provider() {
+        let r = build_pinned(ProviderKind::Claude).expect("claude is always eligible");
+        assert_eq!(
+            r.provider_names(),
+            vec!["claude"],
+            "a pinned reasoner must carry one provider and no chain behind it"
+        );
+    }
+
+    #[test]
+    fn build_pinned_fails_closed_when_the_provider_is_ineligible() {
+        // The whole point of the independent review is that the reviewer is
+        // not the author. If codex cannot be built, the caller must be able
+        // to SEE that — a silent fall back to claude would mean Claude
+        // reviewing Claude while the PR claims an independent approval.
+        let _g = env_guard();
+        let prev = std::env::var("CODEX_CLI").ok();
+        std::env::set_var("CODEX_CLI", "/nonexistent/codex-binary-for-test");
+        let got = build_pinned(ProviderKind::Codex);
+        match prev {
+            Some(v) => std::env::set_var("CODEX_CLI", v),
+            None => std::env::remove_var("CODEX_CLI"),
+        }
+        assert!(
+            got.is_none(),
+            "an uninstalled provider must yield None, never a substitute"
+        );
+    }
+
+    /// Serialises the env-mutating tests in this module (#709).
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// Scripted provider double: returns a canned result and counts calls.
     struct Scripted {
