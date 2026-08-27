@@ -1497,16 +1497,56 @@ fn run_lock_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".self-improve.lock"))
 }
 
+/// What one `run_once` did, and whether it should cost daily budget.
+///
+/// The cap exists to bound spend against the owner's Claude subscription, and
+/// the expensive part of a run is the BUILD call (Opus, agentic, ~20 minutes).
+/// A run that stopped at triage — untrusted author, or a scoping pass that
+/// returned `not-fixable` — spent at most one cheap Fable call and finished in
+/// about thirty seconds. Billing those the same as a full build is what let a
+/// single day of refusals consume the entire budget: on 2026-08-27 the loop
+/// spent slot 2 of 3 labelling #828 out, a 30-second decision.
+///
+/// With 100 issues open and 50 already labelled `agent-gave-up`, a pool that
+/// is mostly refusal-bound would otherwise take weeks to drain at three
+/// refusals a day.
+pub struct RunReport {
+    pub message: String,
+    /// True when the builder ran. Only these consume daily budget.
+    pub billed: bool,
+}
+
+impl RunReport {
+    fn idle() -> Self {
+        Self { message: IDLE_MSG.to_string(), billed: false }
+    }
+    fn triage(message: String) -> Self {
+        Self { message, billed: false }
+    }
+    fn built(message: String) -> Self {
+        Self { message, billed: true }
+    }
+    fn is_idle(&self) -> bool {
+        self.message == IDLE_MSG
+    }
+}
+
+impl std::fmt::Display for RunReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Drive one self-improvement attempt. `dry_run` stops before opening the PR
 /// (prints what it would do) so the loop can be exercised safely.
-pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
+pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // #816 — single-flight. Held for the whole run; dropped on every exit
     // path. A losing run reports idle so it consumes no daily budget.
     let _lock = match RunLock::try_acquire(&run_lock_path())? {
         Some(l) => l,
         None => {
             info!("self-improve: another run holds the lock; skipping this tick");
-            return Ok(IDLE_MSG.to_string());
+            return Ok(RunReport::idle());
         }
     };
 
@@ -1524,7 +1564,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     }
 
     let Some(issue) = pick_issue(repo_root).await? else {
-        return Ok(IDLE_MSG.to_string());
+        return Ok(RunReport::idle());
     };
     info!(issue = issue.number, title = %issue.title, "selected issue");
 
@@ -1564,10 +1604,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         // unattended loop re-picks the same issue every tick: it head-of-line
         // blocks every other labeled issue and re-comments daily, forever.
         label_gave_up(repo_root, issue.number).await.ok();
-        return Ok(format!(
+        return Ok(RunReport::triage(format!(
             "issue #{}: refused — untrusted author '{}' (requires owner approval)",
             issue.number, issue.author
-        ));
+        )));
     }
 
     let branch = format!("{BRANCH_PREFIX}{}", issue.number);
@@ -1653,10 +1693,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
             .await
             .ok();
             label_gave_up(repo_root, issue.number).await.ok();
-            return Ok(format!(
+            return Ok(RunReport::triage(format!(
                 "issue #{}: scoped as not agent-fixable — labeled out",
                 issue.number
-            ));
+            )));
         }
     }
     let complexity = scope.as_ref().map(|s| s.complexity).unwrap_or(Complexity::Hard);
@@ -1705,10 +1745,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
             .ok();
             label_gave_up(repo_root, issue.number).await.ok();
         }
-        return Ok(format!(
+        return Ok(RunReport::built(format!(
             "issue #{}: reasoner made no changes; skipped (attempt {attempts})",
             issue.number
-        ));
+        )));
     }
 
     // Blast-radius + size guard on the actual diff. Each refusal burned a
@@ -1731,10 +1771,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         if attempts >= MAX_ATTEMPTS {
             label_gave_up(repo_root, issue.number).await.ok();
         }
-        return Ok(format!(
+        return Ok(RunReport::built(format!(
             "issue #{}: refused — diff hit blast-radius guard (attempt {attempts})",
             issue.number
-        ));
+        )));
     }
     // #823 — does this diff touch a path the PR-verify hook guards? Computed
     // next to the other diff-derived facts; it withholds auto-merge below
@@ -1759,10 +1799,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         if attempts >= MAX_ATTEMPTS {
             label_gave_up(repo_root, issue.number).await.ok();
         }
-        return Ok(format!(
+        return Ok(RunReport::built(format!(
             "issue #{}: refused — diff too large ({lines} lines, attempt {attempts})",
             issue.number
-        ));
+        )));
     }
 
     // Verification gate.
@@ -1784,10 +1824,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
             label_gave_up(repo_root, issue.number).await.ok();
         }
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        return Ok(format!(
+        return Ok(RunReport::built(format!(
             "issue #{}: verification gate failed (attempt {attempts}); no PR opened",
             issue.number
-        ));
+        )));
     }
 
     // Stage 3 (#653): QA review of the diff by the stronger tier. A reject
@@ -1830,10 +1870,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
             label_gave_up(repo_root, issue.number).await.ok();
         }
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        return Ok(format!(
+        return Ok(RunReport::built(format!(
             "issue #{}: QA review rejected the diff (attempt {attempts}); no PR opened",
             issue.number
-        ));
+        )));
     }
 
     // Stage 4 (#828): INDEPENDENT review by a different provider. Two passes
@@ -1858,13 +1898,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
 
     if dry_run {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        return Ok(format!(
+        return Ok(RunReport::built(format!(
             "issue #{}: DRY RUN — gate + QA review passed, {lines}-line diff \
              (complexity: {}), independent review: {}, would open PR",
             issue.number,
             complexity.as_str(),
             independent.status(),
-        ));
+        )));
     }
 
     // Commit via the configured git identity (env; no hardcoded personal
@@ -1898,7 +1938,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     .await?;
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        return Ok(record_hard_failure(repo_root, issue.number, "git commit failed", &e).await);
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e).await));
     }
     // #815 — a run killed between the push and `gh pr create` leaves the
     // remote branch behind with no PR. `has_open_agent_pr` only looks at
@@ -1926,7 +1966,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     }
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        return Ok(record_hard_failure(repo_root, issue.number, "git push failed", &e).await);
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e).await));
     }
 
     // Open the PR. Draft + human merge for everyone; owner-authored issues
@@ -2031,11 +2071,14 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     if !ok {
         // #815 — the branch is pushed but has no PR. Left as an `Err` this
         // re-picks the same issue next tick and dies at the push above.
-        return Ok(record_hard_failure(repo_root, issue.number, "gh pr create failed", &e).await);
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "gh pr create failed", &e).await));
     }
     let pr_url = stdout.trim().to_string();
     if !automerge {
-        return Ok(format!("issue #{}: draft PR opened — {pr_url}", issue.number));
+        return Ok(RunReport::built(format!(
+            "issue #{}: draft PR opened — {pr_url}",
+            issue.number
+        )));
     }
     // Merge immediately: the verification gate already passed, and `--auto`
     // needs branch protection this repo doesn't run. A merge failure (main
@@ -2049,15 +2092,15 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
     .await?;
     if !ok {
         warn!(issue = issue.number, "auto-merge failed; PR left open: {e}");
-        return Ok(format!(
+        return Ok(RunReport::built(format!(
             "issue #{}: PR opened but auto-merge FAILED (left open for review) — {pr_url}",
             issue.number
-        ));
+        )));
     }
-    Ok(format!(
+    Ok(RunReport::built(format!(
         "issue #{}: PR auto-merged (owner-authored) — {pr_url}",
         issue.number
-    ))
+    )))
 }
 
 /// The pipeline owns this untracked worktree. It must not make the deploy
@@ -2961,6 +3004,8 @@ fn utc_day_now() -> u64 {
 impl AutoPrLoop {
     const DEFAULT_INTERVAL_SECS: u64 = 1_800;
     const DEFAULT_DAILY_CAP: u32 = 3;
+    /// How many consecutive triage-only refusals one tick may clear.
+    const MAX_TRIAGE_PER_TICK: u32 = 5;
 
     /// Env-gated constructor: `None` unless `AUGMENTAGENT_AUTOPR=1|true`.
     /// `AUGMENTAGENT_AUTOPR_INTERVAL_SECS` (default 1800, floor 300 — the
@@ -3033,20 +3078,43 @@ impl AutoPrLoop {
                 );
                 continue;
             }
-            match run_once(&self.repo_root, self.dry_run).await {
-                Ok(msg) if msg == IDLE_MSG => {}
-                Ok(msg) => {
-                    counter.record(today);
-                    counter.save(&counter_path);
-                    info!(
-                        runs_today = counter.runs_today(today),
-                        daily_cap = self.daily_cap,
-                        "auto-PR: {msg}"
-                    );
+            // Triage-only outcomes are cheap and permanently label the
+            // issue out of the pool, so keep going within the SAME tick
+            // instead of spending a 30-minute interval on each one. Bounded
+            // so a pathological pool cannot spin; the pool shrinks with every
+            // refusal, so this burst is self-limiting.
+            let mut triaged = 0u32;
+            loop {
+                match run_once(&self.repo_root, self.dry_run).await {
+                    Ok(r) if r.is_idle() => break,
+                    Ok(r) if r.billed => {
+                        counter.record(today);
+                        counter.save(&counter_path);
+                        info!(
+                            runs_today = counter.runs_today(today),
+                            daily_cap = self.daily_cap,
+                            "auto-PR: {r}"
+                        );
+                        break;
+                    }
+                    Ok(r) => {
+                        triaged += 1;
+                        info!(triaged, "auto-PR (triage, unbilled): {r}");
+                        if triaged >= Self::MAX_TRIAGE_PER_TICK {
+                            info!(
+                                triaged,
+                                "auto-PR: triage burst limit reached; resuming next tick"
+                            );
+                            break;
+                        }
+                    }
+                    // Transient refusals (dirty deploy tree while a sibling
+                    // session works, gh/network hiccup) — try next tick.
+                    Err(e) => {
+                        warn!("auto-PR tick failed: {e:#}");
+                        break;
+                    }
                 }
-                // Transient refusals (e.g. dirty deploy tree while a sibling
-                // session works, gh/network hiccup) — log and try next tick.
-                Err(e) => warn!("auto-PR tick failed: {e:#}"),
             }
         }
     }
@@ -3556,6 +3624,37 @@ mod tests {
         assert_eq!(c.runs_today(101), 0);
         c.record(101);
         assert_eq!(c.runs_today(101), 1);
+    }
+
+    // ---- throughput: cheap triage must not cost a build's budget ----
+
+    #[test]
+    fn only_builds_are_billed_against_the_daily_cap() {
+        assert!(!RunReport::idle().billed);
+        assert!(RunReport::idle().is_idle());
+
+        // A scoping refusal is ~30s and one Fable call. Billing it the same
+        // as a 20-minute Opus build is what let three refusals consume a
+        // whole day's budget (observed 2026-08-27 on #828).
+        let t = RunReport::triage("issue #828: scoped as not agent-fixable".into());
+        assert!(!t.billed);
+        assert!(!t.is_idle(), "a refusal is an outcome, not an idle tick");
+
+        let b = RunReport::built("issue #799: PR auto-merged".into());
+        assert!(b.billed);
+        assert_eq!(b.to_string(), "issue #799: PR auto-merged");
+    }
+
+    #[test]
+    fn triage_burst_is_bounded() {
+        // The pool shrinks with every refusal (each one gets `agent-gave-up`),
+        // so the burst self-limits — but it still needs a hard stop so a
+        // pathological pool cannot spin a tick forever.
+        assert!(AutoPrLoop::MAX_TRIAGE_PER_TICK >= 1);
+        assert!(
+            AutoPrLoop::MAX_TRIAGE_PER_TICK <= 10,
+            "each triage still spends a scope call; keep the burst modest"
+        );
     }
 
     // ---- #828: independent codex review ----
