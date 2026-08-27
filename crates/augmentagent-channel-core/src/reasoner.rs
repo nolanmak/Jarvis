@@ -2290,6 +2290,29 @@ mod tests {
         );
     }
 
+    /// #800 — an announcement drafted while the Meetup scraper was down
+    /// carried a fabricated "Friday, 6:00 PM" pulled from a wiki cadence
+    /// note. `wiki-ask.md` must keep the guardrail that a specific event
+    /// date/time comes only from a fetched instance, and that an unverifiable
+    /// one is flagged rather than guessed.
+    #[test]
+    fn ask_opts_prompt_forbids_uncited_event_datetimes() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+
+        for needle in [
+            "A cadence is not an instance",
+            "[date/time unverified",
+            "(from wiki, unverified)",
+        ] {
+            assert!(
+                opts.system_prompt.contains(needle),
+                "wiki-ask.md lost the #800 event-date guardrail: {needle:?}"
+            );
+        }
+    }
+
     /// #317 — the reasoner routes `mcpServers` to `--mcp-config` and keeps
     /// the rest on `--settings`.
     #[test]
