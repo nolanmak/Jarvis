@@ -864,6 +864,7 @@ mod tests {
         });
         // Pre-stamp the email + a logged action so the gate trips.
         let prior_email = Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: "gh:600".into(),
@@ -941,6 +942,7 @@ mod tests {
     #[test]
     fn outbound_target_round_trips() {
         let email = Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: "gh:1".into(),

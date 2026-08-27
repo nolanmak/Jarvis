@@ -3758,6 +3758,11 @@ async fn run_gmail_search(
                     if !email.cc.is_empty() {
                         println!("     cc: {}", email.cc);
                     }
+                    // #811 — attachment metadata was invisible here, so an
+                    // attachment-only email looked like an empty message.
+                    if !email.attachments.is_empty() {
+                        println!("     attachments: {}", email.attachments.join(", "));
+                    }
                     if full {
                         println!("     body:\n{}\n", indent_body(&email.body, 7));
                     }
@@ -4619,6 +4624,7 @@ async fn post_reply_approval_card(
     // the row is purely synthetic (empty body, no thread): it exists so the
     // actions→emails join resolves and Approve can find the entity id.
     let inbound = StoreEmail {
+        attachments: Vec::new(),
         message_id: msg_id.to_string(),
         to: String::new(),
         cc: String::new(),
@@ -4783,6 +4789,7 @@ async fn post_social_approval_card(
         .context("DISCORD_CHANNEL_ID must be numeric")?;
 
     let inbound = StoreEmail {
+        attachments: Vec::new(),
         message_id: message_id.to_string(),
         to: String::new(),
         cc: String::new(),
@@ -13402,6 +13409,7 @@ async fn run_calendar_create_event(
     // exact machine payload approve_gcal will execute.
     let message_id = format!("gcal-create:{}", uuid::Uuid::new_v4());
     let inbound = augmentagent_store::Email {
+        attachments: Vec::new(),
         to: String::new(),
         cc: String::new(),
         message_id: message_id.clone(),
@@ -14079,6 +14087,7 @@ async fn run_compose_fan_out(
             let (broker, _) = build_broker(cli, Arc::clone(&store), dry_run).await?;
             for (v, card) in variants.iter().zip(cards.iter()) {
                 let pseudo = augmentagent_store::Email {
+                    attachments: Vec::new(),
                     to: String::new(),
                     cc: String::new(),
                     message_id: format!("compose:{}", v.platform.as_str()),
@@ -14181,6 +14190,7 @@ where
     // One approval surface for the whole family.
     let (broker, _) = build_broker(cli, Arc::clone(&store), dry_run).await?;
     let pseudo = augmentagent_store::Email {
+        attachments: Vec::new(),
         to: String::new(),
         cc: String::new(),
         message_id: "compose:socialapi-crosspost".into(),
@@ -14305,6 +14315,7 @@ mod auto_expire_sweep_tests {
 
     fn sample_email(message_id: &str) -> Email {
         Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: message_id.into(),
@@ -14508,6 +14519,7 @@ mod stale_reconcile_tests {
     ) -> String {
         store
             .upsert_email(&Email {
+                attachments: Vec::new(),
                 to: String::new(),
                 cc: String::new(),
                 message_id: msg.into(),

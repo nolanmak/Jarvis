@@ -15,6 +15,13 @@ pub struct Email {
     /// Raw `Cc:` header, same shape and caveats as `to`.
     #[serde(default)]
     pub cc: String,
+    /// Display labels for the message's attachments, e.g. `resume.pdf
+    /// (application/pdf)`. Same caveat as `to`/`cc`: the emails table doesn't
+    /// store it, so only live fetches populate it and DB round-trips yield
+    /// empty. #811 — triage/draft prompts read this so the drafter stops
+    /// asserting "no attachment" on attachment-bearing mail.
+    #[serde(default)]
+    pub attachments: Vec<String>,
     pub subject: String,
     pub body: String,
     pub date: String,
