@@ -920,6 +920,228 @@ fn parse_review_output(raw: &str) -> (bool, String) {
     (approved, raw.trim().to_string())
 }
 
+/// #828 — model for the independent codex reviews. Pinned per the #448 rule
+/// (no preset may inherit an interactive default); the codex adapter derives
+/// its own id from `model_for(Codex, tier_of(opts))`, and a non-`haiku` pin
+/// maps to the Quality tier.
+const AUTOPR_CODEX_MODEL: &str = "gpt-5.6-terra";
+
+fn codex_model() -> String {
+    resolve_model(
+        std::env::var("AUGMENTAGENT_AUTOPR_CODEX_MODEL").ok().as_deref(),
+        AUTOPR_CODEX_MODEL,
+    )
+}
+
+/// Read-only preset for the independent reviewer.
+///
+/// Deliberately `Read`/`Grep`/`Glob` and NOTHING else. That is not a
+/// convenience: `classify` returns `CapabilityClass::ReadTools` only when
+/// every tool is on that list, and codex is permitted that class (behind
+/// `AUGMENTAGENT_CODEX_READ_TOOLS`) precisely because it has no shell. Adding
+/// a single `Bash(...)` entry here would reclassify the preset as
+/// `FullAgentic`, which codex may not serve — the call would start failing
+/// closed instead of reviewing. It also gives the reviewer the thing that
+/// makes a system-level review possible at all: the whole worktree, not just
+/// the hunks.
+fn codex_review_opts(worktree: PathBuf, system_prompt: &str) -> augmentagent_channel_core::ReasonerOpts {
+    augmentagent_channel_core::ReasonerOpts {
+        system_prompt: system_prompt.to_string(),
+        model: Some(codex_model()),
+        allowed_tools: vec!["Read".into(), "Grep".into(), "Glob".into()],
+        add_dirs: vec![worktree.clone()],
+        permission_mode: "default".into(),
+        cwd: Some(worktree),
+        env: Vec::new(),
+        settings_json: None,
+        restrict_env: false,
+        audit_logger: None,
+        audit_notifier: None,
+        session_id: None,
+    }
+}
+
+const CODEX_DIFF_REVIEW_SYSTEM: &str = "You are an INDEPENDENT reviewer on a \
+staged autonomous fix pipeline. A different model wrote the change you are \
+about to read; its own QA pass already approved it. You are the second \
+opinion, and you were chosen because you do not share that model's blind \
+spots. Do not defer to it.\n\
+\n\
+This pass is the FOCUSED review: judge the diff itself. You have read-only \
+access to the whole repository (Read/Grep/Glob) — use it to check the diff \
+against how this codebase actually does things.\n\
+- Correctness: walk at least one concrete input through the changed lines.\n\
+- Best practices: error handling, naming, resource handling, edge cases, \
+input validation, concurrency, and anything that will bite in six months. \
+Flag it even when it merely matches bad surrounding code — say so if it does.\n\
+- Tests: is there a test that would FAIL without this change? A bug fix \
+without a regression test is `changes-requested` unless it is genuinely \
+untestable.\n\
+- Scope: no unrelated edits, no drive-by refactors, no leftover debug output, \
+no scratch files.\n\
+- Conventions: does it match the surrounding code's idiom and comment density?\n\
+\n\
+Your output MUST start with this line EXACTLY:\n\
+CODEX-REVIEW: lgtm | changes-requested\n\
+Then a blank line, then 3-8 sentences: for lgtm, what you verified and how; \
+for changes-requested, the concrete defects as file:line. Read-only — do NOT \
+edit anything. Output ONLY the verdict line and your notes.";
+
+const CODEX_SYSTEM_REVIEW_SYSTEM: &str = "You are an INDEPENDENT reviewer on a \
+staged autonomous fix pipeline, and this is the SYSTEM-INTERACTION pass. A \
+separate review already judged the diff on its own terms. Your job is the \
+question that one cannot answer from the hunks: what does this change do to \
+the rest of the system?\n\
+\n\
+You have read-only access to the entire repository (Read/Grep/Glob). USE IT — \
+a verdict that only looked at the diff is a failed review. Concretely:\n\
+- Find the CALLERS of every function, struct field, or behaviour the diff \
+touches (grep for the names) and check each one still holds.\n\
+- Invariants and contracts: does anything elsewhere assume what this change \
+just altered — ordering, nullability, a field always being populated, an \
+error being unreachable?\n\
+- Persistence and schema: if a struct/table/serialized shape changed, what \
+happens to rows or queued payloads written by the OLD code?\n\
+- Runtime and deploy: this daemon runs unattended against a live inbox. Does \
+this change behaviour for traffic nobody asked it to change? Is it hot-path?\n\
+- Failure modes: what breaks if this runs when a dependency is down, slow, or \
+returns something unexpected?\n\
+- Duplication: does this reimplement something the repo already has?\n\
+\n\
+Your output MUST start with this line EXACTLY:\n\
+CODEX-REVIEW: lgtm | changes-requested\n\
+Then a blank line, then 3-8 sentences naming the specific callers/invariants \
+you checked (file:line) and what you concluded. \"I read the diff and it looks \
+fine\" is not a system review — if you did not open anything outside the diff, \
+say `changes-requested`. Read-only — do NOT edit. Output ONLY the verdict and \
+notes.";
+
+/// Verdict of one codex pass. Unparseable or missing ⇒ not approved, matching
+/// `parse_review_output`'s default-reject: an approval here can flow into an
+/// auto-merge.
+fn parse_codex_review(raw: &str) -> (bool, String) {
+    let mut approved = false;
+    for (i, line) in raw.lines().enumerate() {
+        if i >= 5 {
+            break;
+        }
+        let l = line.trim().to_ascii_lowercase();
+        if l.starts_with("codex-review:") {
+            approved = l.contains("lgtm") && !l.contains("changes-requested");
+            break;
+        }
+    }
+    (approved, raw.trim().to_string())
+}
+
+/// Outcome of the independent stage (#828).
+struct IndependentReview {
+    /// False when codex could not be reached at all — NOT the same as a
+    /// rejection, and must never be treated as an approval.
+    available: bool,
+    diff_ok: bool,
+    system_ok: bool,
+    notes: String,
+}
+
+impl IndependentReview {
+    fn approved(&self) -> bool {
+        self.available && self.diff_ok && self.system_ok
+    }
+
+    /// One-line outcome for logs, the dry-run message, and the PR body.
+    fn status(&self) -> String {
+        if !self.available {
+            return "unavailable".into();
+        }
+        match (self.diff_ok, self.system_ok) {
+            (true, true) => "lgtm (diff + system)".into(),
+            (true, false) => "changes requested on system interaction".into(),
+            (false, true) => "changes requested on the diff".into(),
+            (false, false) => "changes requested (diff + system)".into(),
+        }
+    }
+
+    fn unavailable(reason: String) -> Self {
+        Self {
+            available: false,
+            diff_ok: false,
+            system_ok: false,
+            notes: format!("Independent review unavailable: {reason}"),
+        }
+    }
+}
+
+/// #828 — two independent codex passes: one focused on the diff, one on how
+/// the change lands in the rest of the system.
+///
+/// Pinned to codex via `build_pinned`, which returns `None` rather than
+/// falling back. That is the whole point: `build_reasoner` would hand back
+/// Claude, and an "independent" review served by the author's own model is
+/// worse than none, because the PR would claim a second opinion it never got.
+async fn independent_review(
+    issue: &Issue,
+    summary: &str,
+    diff: &str,
+    worktree: PathBuf,
+) -> IndependentReview {
+    let Some(reasoner) = augmentagent_channel_core::build_pinned(
+        augmentagent_channel_core::ProviderKind::Codex,
+    ) else {
+        return IndependentReview::unavailable(
+            "codex is not installed or not authenticated (`codex login`)".into(),
+        );
+    };
+
+    let context = format!(
+        "GitHub issue #{}: {}\n\n{}\n\nThe author model's own summary of its \
+         change:\n{}\n\nThe complete staged diff follows. The full repository \
+         is on disk at your working directory — read whatever you need.\n\n\
+         ```diff\n{}\n```",
+        issue.number,
+        issue.title,
+        truncate(&issue.body, 4000),
+        truncate(summary, 2000),
+        truncate(diff, 60_000),
+    );
+
+    let mut out = IndependentReview {
+        available: true,
+        diff_ok: false,
+        system_ok: false,
+        notes: String::new(),
+    };
+
+    let passes = [
+        ("focused diff review", CODEX_DIFF_REVIEW_SYSTEM),
+        ("system-interaction review", CODEX_SYSTEM_REVIEW_SYSTEM),
+    ];
+    let mut sections: Vec<String> = Vec::new();
+    for (label, system) in passes {
+        let opts = codex_review_opts(worktree.clone(), system);
+        match reasoner.call(&opts, &context).await {
+            Ok(raw) => {
+                let (ok, notes) = parse_codex_review(&raw);
+                info!(issue = issue.number, pass = label, approved = ok, "codex review");
+                if label.starts_with("focused") {
+                    out.diff_ok = ok;
+                } else {
+                    out.system_ok = ok;
+                }
+                sections.push(format!("### Codex — {label}\n{}", truncate(&notes, 1500)));
+            }
+            Err(e) => {
+                // Provider-side failure is "no independent review", never an
+                // approval and never a rejection of the diff.
+                warn!(issue = issue.number, pass = label, "codex review failed: {e:#}");
+                return IndependentReview::unavailable(format!("{label} failed: {e}"));
+            }
+        }
+    }
+    out.notes = sections.join("\n\n");
+    out
+}
+
 /// Build the stage-2 prompt: the issue plus (when the scoping pass produced
 /// one) the implementation spec.
 fn build_fix_prompt(issue: &Issue, plan: Option<&str>) -> String {
@@ -946,6 +1168,15 @@ fn build_fix_prompt(issue: &Issue, plan: Option<&str>) -> String {
 /// the auto-updater within minutes — that is exactly the behaviour the owner
 /// opted into for their own issues, and exactly why nobody else's issues
 /// qualify.
+/// #828 — does an independent LGTM also release the `hard` complexity band?
+/// Off by default: turning it on is the decision that lets high-blast-radius
+/// work merge with no human, on the strength of two independent reviews.
+fn codex_unlocks_hard() -> bool {
+    automerge_enabled_value(
+        std::env::var("AUGMENTAGENT_AUTOPR_CODEX_UNLOCKS_HARD").ok().as_deref(),
+    )
+}
+
 fn automerge_enabled_value(v: Option<&str>) -> bool {
     matches!(v.map(str::trim), Some(x) if x == "1" || x.eq_ignore_ascii_case("true"))
 }
@@ -1605,13 +1836,34 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         ));
     }
 
+    // Stage 4 (#828): INDEPENDENT review by a different provider. Two passes
+    // — one focused on the diff, one on how the change lands in the rest of
+    // the system — both with read-only access to the whole worktree. Runs
+    // before the dry-run exit so dry runs exercise the full pipeline.
+    //
+    // A rejection here does NOT discard the work: the diff built, passed the
+    // gate, and satisfied the author's own QA, so it opens as a draft PR
+    // carrying both verdicts for a human. It does count as a failed attempt,
+    // because a second opinion disagreeing is exactly what this stage is for.
+    let independent = independent_review(&issue, &summary, &full_diff, worktree.clone()).await;
+    if independent.available && !independent.approved() {
+        warn!(
+            issue = issue.number,
+            diff_ok = independent.diff_ok,
+            system_ok = independent.system_ok,
+            "independent review requested changes"
+        );
+        record_attempt(repo_root, issue.number).await.ok();
+    }
+
     if dry_run {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
         return Ok(format!(
             "issue #{}: DRY RUN — gate + QA review passed, {lines}-line diff \
-             (complexity: {}), would open PR",
+             (complexity: {}), independent review: {}, would open PR",
             issue.number,
-            complexity.as_str()
+            complexity.as_str(),
+            independent.status(),
         ));
     }
 
@@ -1688,7 +1940,16 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
         // daemon's own speculative proposals, auto-filed with the owner's gh
         // auth (so they pass the owner-authored test), and they change core
         // behaviour. They land as draft PRs for human review.
-        if enabled && complexity.auto_mergeable() && !issue.research_filed && gated.is_none() {
+        // #828 — an independent LGTM is REQUIRED for any auto-merge, and
+        // when `AUGMENTAGENT_AUTOPR_CODEX_UNLOCKS_HARD` is set it also
+        // releases the `hard` band: two independent reviewers is a real
+        // answer to blast radius, where one model grading its own family's
+        // work was not. Receipt-gated paths stay human-only either way —
+        // those change live behaviour no reviewer can verify by reading.
+        let complexity_ok = complexity.auto_mergeable() || codex_unlocks_hard();
+        if enabled && complexity_ok && independent.approved() && !issue.research_filed
+            && gated.is_none()
+        {
             let owner = std::env::var(GH_OWNER_ENV)
                 .ok()
                 .or(repo_owner_from_remote(repo_root).await);
@@ -1721,6 +1982,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
              behaviour the test suite cannot model, so they need a real \
              exercise against the running daemon before they ship."
         ),
+        (false, None) if !independent.approved() => format!(
+            "Draft — a human must review and merge. The independent codex \
+             review did not approve it ({}).",
+            independent.status()
+        ),
         (false, None) => "Draft — a human must review and merge.".to_string(),
     };
     // #817 — say so in the PR when the builder left scratch behind; a drop
@@ -1735,9 +2001,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<String> {
             dropped.join(", ")
         )
     };
+    let independent_section = format!(
+        "\n\n## Independent review (codex)\n{}\n",
+        truncate(&independent.notes, 3000)
+    );
     let pr_body = format!(
         "Automated self-improvement for #{}.\n\n## Summary\n{}{plan_section}\n\n\
-         ## QA review (approved)\n{}\n\n## Verification\n\
+         ## QA review (approved)\n{}{independent_section}\n## Verification\n\
          - complexity (scoping pass): {}\n\
          - `cargo build --workspace`: pass\n- `cargo test --workspace`: pass\n\
          - diff size: {lines} lines (cap {MAX_DIFF_LINES}){scratch_note}\n\n\
@@ -3286,6 +3556,114 @@ mod tests {
         assert_eq!(c.runs_today(101), 0);
         c.record(101);
         assert_eq!(c.runs_today(101), 1);
+    }
+
+    // ---- #828: independent codex review ----
+
+    #[test]
+    fn codex_review_preset_stays_in_the_read_tools_class() {
+        // Load-bearing: codex may serve ReadTools (behind the env flag)
+        // precisely because that class has no shell. One `Bash(...)` entry
+        // would reclassify this preset as FullAgentic, which codex may not
+        // serve — the stage would silently start failing closed.
+        let opts = codex_review_opts(PathBuf::from("/tmp/wt"), "sys");
+        for t in &opts.allowed_tools {
+            assert!(
+                matches!(t.as_str(), "Read" | "Grep" | "Glob" | "LS" | "WebSearch"),
+                "tool {t:?} would push the independent reviewer out of ReadTools"
+            );
+        }
+        assert!(opts.model.is_some(), "presets pin their model (#448)");
+        // It must see the whole worktree, not just the diff — a system-level
+        // review is impossible otherwise.
+        assert_eq!(opts.cwd, Some(PathBuf::from("/tmp/wt")));
+        assert!(opts.add_dirs.contains(&PathBuf::from("/tmp/wt")));
+    }
+
+    #[test]
+    fn codex_verdict_defaults_to_changes_requested() {
+        assert!(parse_codex_review("CODEX-REVIEW: lgtm
+
+checked the callers").0);
+        assert!(parse_codex_review("codex-review:  LGTM ").0);
+        assert!(!parse_codex_review("CODEX-REVIEW: changes-requested
+
+no test").0);
+        // Unparseable, empty, or a verdict buried past the header ⇒ reject.
+        assert!(!parse_codex_review("I think it looks fine to me").0);
+        assert!(!parse_codex_review("").0);
+        assert!(!parse_codex_review("
+
+
+
+
+
+CODEX-REVIEW: lgtm").0);
+        // A line that says both must not read as approval.
+        assert!(!parse_codex_review("CODEX-REVIEW: changes-requested (not lgtm)").0);
+    }
+
+    #[test]
+    fn independent_approval_requires_availability_and_both_passes() {
+        let mk = |available, diff_ok, system_ok| IndependentReview {
+            available,
+            diff_ok,
+            system_ok,
+            notes: String::new(),
+        };
+        assert!(mk(true, true, true).approved());
+        assert!(!mk(true, true, false).approved(), "system pass must count");
+        assert!(!mk(true, false, true).approved(), "diff pass must count");
+        // The one that matters: codex unreachable is NOT an approval.
+        assert!(
+            !mk(false, true, true).approved(),
+            "an unavailable reviewer must never read as an approval"
+        );
+        assert_eq!(mk(false, false, false).status(), "unavailable");
+        assert_eq!(mk(true, true, false).status(), "changes requested on system interaction");
+    }
+
+    #[test]
+    fn hard_band_stays_locked_unless_explicitly_opted_in() {
+        assert!(!automerge_enabled_value(None));
+        assert!(automerge_enabled_value(Some("1")));
+        // `hard` never auto-merges on complexity alone.
+        assert!(!Complexity::Hard.auto_mergeable());
+    }
+
+    /// Live probe (#828): actually spawns codex against the real review
+    /// preset. `#[ignore]`d so the verification gate never spends provider
+    /// quota — run it deliberately:
+    ///
+    /// ```text
+    /// AUGMENTAGENT_CODEX_READ_TOOLS=1 cargo test -p augmentagent-cli \
+    ///   --bins live_codex_review -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore]
+    async fn live_codex_review_returns_a_parseable_verdict() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repo root");
+        let reasoner = augmentagent_channel_core::build_pinned(
+            augmentagent_channel_core::ProviderKind::Codex,
+        )
+        .expect("codex must be installed and authenticated for this probe");
+        assert_eq!(reasoner.provider_names(), vec!["codex"]);
+
+        let opts = codex_review_opts(repo, CODEX_DIFF_REVIEW_SYSTEM);
+        let diff = "diff --git a/src/x.rs b/src/x.rs\n                    --- a/src/x.rs\n+++ b/src/x.rs\n                    @@ -1,3 +1,3 @@\n                    -fn total(v: &[u32]) -> u32 { v.iter().sum() }\n                    +fn total(v: &[u32]) -> u32 { v.iter().fold(0, |a, b| a + b) }\n";
+        let raw = reasoner
+            .call(&opts, &format!("Review this change.\n\n```diff\n{diff}\n```"))
+            .await
+            .expect("codex call");
+        println!("--- codex said ---\n{raw}\n---");
+        let (_ok, notes) = parse_codex_review(&raw);
+        assert!(
+            notes.to_ascii_lowercase().contains("codex-review:"),
+            "codex must emit the verdict header; got: {notes}"
+        );
     }
 
     // ---- #823: the receipt gate must bind the daemon too ----
