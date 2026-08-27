@@ -150,8 +150,6 @@ const ISSUE_BLAST_RADIUS_PATTERNS: &[&str] = &[
     "scripts/vault-mount",
     ".github/workflows",
     "auth.rs",
-    "keyring",
-    "keychain",
     "discord-creds",
     "Cargo.lock",
     "package-lock.json",
@@ -3318,7 +3316,13 @@ mod tests {
         // Path-shaped tokens still refuse.
         assert!(is_issue_blast_radius("patch scripts/check-for-updates.sh"));
         assert!(is_issue_blast_radius("add a .github/workflows/ci.yml"));
-        assert!(is_issue_blast_radius("rotate the keyring slot"));
+        assert!(is_issue_blast_radius("edit crates/augmentagent-auth/src/auth.rs"));
+        // `keyring` / `secret` / `credential` are prose, not paths: an issue
+        // that merely mentions where a token lives must still be pickable.
+        // The scoper is the component equipped to judge intent, and the
+        // diff-level guard still refuses whatever it produces.
+        assert!(!is_issue_blast_radius("the token is read from the keyring slot"));
+        assert!(is_blast_radius("the token is read from the keyring slot"));
 
         // The diff-level guard is untouched — it still sees everything.
         assert!(is_blast_radius("+++ b/deploy/release.sh"));
