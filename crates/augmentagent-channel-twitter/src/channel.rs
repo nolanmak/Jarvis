@@ -1233,6 +1233,7 @@ mod tests {
 
     fn tweet_email(message_id: &str) -> Email {
         Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: message_id.to_string(),

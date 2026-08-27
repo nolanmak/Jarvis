@@ -195,6 +195,7 @@ impl ProactiveRunner {
 
     async fn dispatch(&self, sig: &ProactiveSignal) -> anyhow::Result<()> {
         let pseudo = Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: format!("proactive:{}", sig.dedup_key),

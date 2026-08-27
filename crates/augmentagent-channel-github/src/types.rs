@@ -210,6 +210,7 @@ impl TriageCandidate {
         let thread_id = self.locator.as_ref().map(ThreadLocator::as_thread_id);
         let account_entity_id = format!("{ACCOUNT_ENTITY_ID_PREFIX}:{my_login}");
         Email {
+            attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
             message_id: format!("gh:{}", self.thread_id_u64),

@@ -892,6 +892,7 @@ pub(crate) fn message_to_email(
         SubscriptionMode::Digest | SubscriptionMode::StoreOnly => "digest_item",
     };
     Email {
+        attachments: Vec::new(),
         to: String::new(),
         cc: String::new(),
         message_id: msg.id.clone(),
