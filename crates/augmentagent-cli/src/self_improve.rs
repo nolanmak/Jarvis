@@ -968,6 +968,39 @@ fn gate_sh(cmd: &str) -> String {
     format!("set -o pipefail; {cmd}")
 }
 
+/// Paths whose change makes the Node build load-bearing (#820). `src/` is the
+/// TypeScript daemon + Express dashboard; the rest are what `npm run build`
+/// (`tailwind:build && tsc`) actually consumes.
+const NODE_GATE_PATHS: &[&str] = &[
+    "src/",
+    "views/",
+    "test/",
+    "sidecars/",
+    "public/",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json",
+    "tailwind.config.js",
+    "tailwind.input.css",
+];
+
+/// True if `path` is one the Node build would compile.
+fn is_node_path(path: &str) -> bool {
+    NODE_GATE_PATHS
+        .iter()
+        .any(|p| if p.ends_with('/') { path.starts_with(p) } else { path == *p })
+}
+
+/// Does the staged diff reach Node? Unknowable ⇒ `true`: skipping the gate is
+/// the failure this replaces, so an unreadable diff must cost an install, not
+/// a missed build.
+async fn node_build_required(worktree: &Path) -> bool {
+    match run("git", &["diff", "--cached", "--name-only"], worktree).await {
+        Ok((true, out, _)) => out.lines().map(str::trim).any(is_node_path),
+        _ => true,
+    }
+}
+
 async fn verification_gate(worktree: &Path) -> Result<()> {
     // #300 — Strip provider secrets from the gate's child env. `cargo
     // build`/`npm run build` execute `build.rs`/proc-macros/`npm
@@ -996,10 +1029,24 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     if !ok {
         bail!("cargo test failed:\n{o}{e}", o = _o.trim());
     }
-    // npm build is best-effort: only gate on it if a package.json + node_modules
-    // are present (prod has them; a bare CI checkout may not).
-    if worktree.join("package.json").exists() && worktree.join("node_modules").exists() {
-        info!("verification gate: npm run build (sandboxed env)");
+    // #820 — the Node half of the gate. It used to require `node_modules` to
+    // already exist in the worktree, which `git worktree add` can never
+    // produce (it is gitignored): `npm run build` had therefore run ZERO
+    // times since #103, while `src/` stayed fully editable by the builder.
+    // Install on demand instead, and only when the change actually reaches
+    // Node — a Rust-only fix, which is nearly all of them, still skips it.
+    if worktree.join("package.json").exists() && node_build_required(worktree).await {
+        info!("verification gate: npm ci + npm run build (sandboxed env)");
+        let (ok, _o, e) = run_sandboxed(
+            "bash",
+            &["-lc", &gate_sh("npm ci --no-audit --no-fund 2>&1 | tail -5")],
+            worktree,
+            &env,
+        )
+        .await?;
+        if !ok {
+            bail!("npm ci failed:\n{o}{e}", o = _o.trim());
+        }
         let (ok, _o, e) =
             run_sandboxed("bash", &["-lc", &gate_sh("npm run build 2>&1 | tail -5")], worktree, &env)
                 .await?;
@@ -1007,7 +1054,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
             bail!("npm run build failed:\n{o}{e}", o = _o.trim());
         }
     } else {
-        info!("verification gate: npm build skipped (no node_modules)");
+        info!("verification gate: npm build not required (diff touches no Node paths)");
     }
     Ok(())
 }
@@ -3159,6 +3206,51 @@ mod tests {
         assert_eq!(c.runs_today(101), 0);
         c.record(101);
         assert_eq!(c.runs_today(101), 1);
+    }
+
+    // ---- #820: the Node half of the gate must be reachable ----
+
+    #[test]
+    fn node_gate_fires_on_node_paths_and_not_on_rust_only_diffs() {
+        assert!(is_node_path("src/index.ts"));
+        assert!(is_node_path("views/dashboard.ejs"));
+        assert!(is_node_path("package.json"));
+        assert!(is_node_path("tailwind.input.css"));
+
+        assert!(!is_node_path("crates/augmentagent-cli/src/self_improve.rs"));
+        assert!(!is_node_path("schema/triage.md"));
+        assert!(!is_node_path("Cargo.toml"));
+        // Prefix matching must be path-segment honest, not substring.
+        assert!(!is_node_path("crates/x/src/lib.rs"));
+        assert!(!is_node_path("package.json.bak"));
+    }
+
+    #[tokio::test]
+    async fn node_build_is_required_only_when_the_staged_diff_reaches_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q", "-b", "main", "."]);
+        git(&["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q",
+              "--allow-empty", "-m", "init"]);
+
+        // A Rust-only change: the common case, and it must stay fast.
+        std::fs::create_dir_all(repo.join("crates/x/src")).unwrap();
+        std::fs::write(repo.join("crates/x/src/lib.rs"), "pub fn f() {}\n").unwrap();
+        git(&["add", "-A"]);
+        assert!(!node_build_required(repo).await);
+
+        // Touch the TypeScript daemon and the gate becomes load-bearing.
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/index.ts"), "export const x = 1;\n").unwrap();
+        git(&["add", "-A"]);
+        assert!(node_build_required(repo).await);
     }
 
     // ---- #817: builder scratch must not reach the commit ----
