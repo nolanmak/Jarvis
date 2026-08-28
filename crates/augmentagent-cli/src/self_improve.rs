@@ -318,37 +318,50 @@ pub fn is_blast_radius(text: &str) -> bool {
     blast_radius_hit(text).is_some()
 }
 
-/// The parts of a unified diff that represent the CHANGE: the paths it
-/// touches, and the lines it adds.
+/// The file paths a unified diff touches.
 ///
-/// `git diff` output is mostly CONTEXT — unchanged code printed so a human can
-/// read the hunk. Scanning it means a change is refused for what its
-/// neighbours happen to say, which is not a blast radius by any definition.
-/// Two live builds in a row (#831, #834) died on this guard after the
-/// expensive Opus stage, and #834 is a triage/calendar-invite fix that touches
-/// nothing deploy-shaped at all.
+/// The guard asks one question — "does this change modify a deploy/auth/secret
+/// PATH" — and every entry in [`BLAST_RADIUS_PATTERNS`] is a path fragment.
+/// Matching them against diff *content* is a category error, and an expensive
+/// one: it discards a completed agentic-Opus build.
 ///
-/// Paths still match, because "does this modify a guarded file" is the
-/// question the guard exists to answer. Added lines still match, so a diff
-/// that introduces a credential is still caught. Only context is dropped.
-fn diff_change_surface(diff: &str) -> String {
+/// Live evidence, #834 ("Triage should not draft replies to meeting/calendar
+/// invites"), a change touching nothing deploy-shaped:
+///
+/// ```text
+/// refused: diff hit the blast-radius guard pattern="deploy"
+///   line=+            "Quick question on the deploy",
+/// ```
+///
+/// That is a test fixture's fake email subject. Scanning context lines was the
+/// same failure one step earlier — a fix refused for what the code *around* it
+/// happened to say.
+///
+/// Dropping content scanning is not a weakening. A diff that creates a file
+/// under a guarded path still shows that path in its `diff --git` header, and
+/// secrets in content are the job of `scripts/check-no-personal-data.sh`,
+/// which runs as the `pre-commit` hook — linked worktrees share
+/// `.git/hooks`, so it covers the agent's commits too. Matching the literal
+/// word "secret" was never secret detection; real credentials do not announce
+/// themselves.
+fn diff_touched_paths(diff: &str) -> String {
     diff.lines()
         .filter(|l| {
             l.starts_with("diff --git ")
                 || l.starts_with("+++ ")
                 || l.starts_with("--- ")
                 || l.starts_with("rename ")
-                || (l.starts_with('+') && !l.starts_with("+++"))
+                || l.starts_with("copy ")
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// Blast-radius check scoped to a unified diff. Use this for diffs;
-/// [`blast_radius_hit`] stays the generic text matcher (issue prose, the
-/// multi-repo path).
+/// Blast-radius check scoped to the PATHS a unified diff touches. Use this for
+/// diffs; [`blast_radius_hit`] stays the generic text matcher (issue prose,
+/// the multi-repo path).
 pub fn blast_radius_hit_in_diff(diff: &str) -> Option<(&'static str, String)> {
-    blast_radius_hit(&diff_change_surface(diff))
+    blast_radius_hit(&diff_touched_paths(diff))
 }
 
 /// Which pattern tripped, and the line it tripped on.
@@ -3999,7 +4012,7 @@ CODEX-REVIEW: lgtm").0);
         assert_eq!(staged.trim(), "crates/x/src/new.rs");
     }
 
-    // ---- the diff guard must judge the CHANGE, not its neighbours ----
+    // ---- the diff guard judges PATHS, not prose ----
 
     /// Build a unified diff with no leading indentation. Written as joined
     /// lines rather than a `\`-continued literal on purpose: continuations
@@ -4011,59 +4024,79 @@ CODEX-REVIEW: lgtm").0);
     }
 
     #[test]
-    fn context_lines_do_not_trip_the_diff_guard() {
-        // A one-line fix that merely sits next to comments mentioning guarded
-        // words. Nothing here modifies anything deploy-shaped.
-        let diff = diff_of(&[
+    fn diff_content_does_not_trip_the_guard() {
+        // The real #834 refusal: a test fixture's fake email subject.
+        let fixture = diff_of(&[
             "diff --git a/crates/x/src/triage.rs b/crates/x/src/triage.rs",
-            "--- a/crates/x/src/triage.rs",
+            "+++ b/crates/x/src/triage.rs",
+            "+            \"Quick question on the deploy\",",
+        ]);
+        assert!(
+            blast_radius_hit(&fixture).is_some(),
+            "precondition: the unscoped matcher DOES trip on that fixture line"
+        );
+        assert!(
+            blast_radius_hit_in_diff(&fixture).is_none(),
+            "a fake email subject in a test must not discard a completed build"
+        );
+
+        // Context lines — the same failure one step earlier.
+        let context = diff_of(&[
+            "diff --git a/crates/x/src/triage.rs b/crates/x/src/triage.rs",
             "+++ b/crates/x/src/triage.rs",
             "@@ -10,7 +10,7 @@",
             "     // NOTE: the deploy path rebuilds this on every push.",
-            "     // Secrets are stripped before the gate runs.",
             "-    if is_invite(e) { draft(e) }",
             "+    if is_invite(e) { skip(e) }",
         ]);
-        assert!(
-            blast_radius_hit(&diff).is_some(),
-            "precondition: the unscoped matcher DOES trip on those context lines"
-        );
-        assert!(
-            blast_radius_hit_in_diff(&diff).is_none(),
-            "a fix must not be refused for what the surrounding code says"
-        );
+        assert!(blast_radius_hit_in_diff(&context).is_none());
     }
 
     #[test]
-    fn diff_guard_still_refuses_guarded_paths_and_added_secrets() {
-        // Touching a guarded file is exactly what the guard is for.
-        let path_diff = diff_of(&[
-            "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml",
-            "+++ b/.github/workflows/ci.yml",
-            "+  run: echo hi",
-        ]);
-        let (pat, _) =
-            blast_radius_hit_in_diff(&path_diff).expect("a guarded path must still refuse");
-        assert_eq!(pat, ".github/workflows");
+    fn diff_guard_still_refuses_guarded_paths() {
+        for (lines, want) in [
+            (
+                vec![
+                    "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml",
+                    "+++ b/.github/workflows/ci.yml",
+                    "+  run: echo hi",
+                ],
+                ".github/workflows",
+            ),
+            (
+                vec![
+                    "diff --git a/scripts/check-for-updates.sh b/scripts/check-for-updates.sh",
+                    "+++ b/scripts/check-for-updates.sh",
+                    "+echo hi",
+                ],
+                "scripts/check-for-updates",
+            ),
+            (
+                vec![
+                    "diff --git a/crates/augmentagent-auth/src/auth.rs b/crates/augmentagent-auth/src/auth.rs",
+                    "+++ b/crates/augmentagent-auth/src/auth.rs",
+                    "+fn f() {}",
+                ],
+                // `/auth` matches before `auth.rs` — both are in the list and
+                // either is a correct refusal; pin the one the order yields.
+                "/auth",
+            ),
+        ] {
+            let d = diff_of(&lines);
+            let (pat, _) = blast_radius_hit_in_diff(&d)
+                .unwrap_or_else(|| panic!("must refuse: {}", lines[0]));
+            assert_eq!(pat, want);
+        }
 
-        // So is introducing a credential, even in an innocuous file.
-        let added = diff_of(&[
-            "diff --git a/crates/x/src/a.rs b/crates/x/src/a.rs",
-            "+++ b/crates/x/src/a.rs",
-            "+const TOKEN: &str = \"put the real secret here\";",
+        // A newly CREATED file under a guarded path shows in the header, so
+        // dropping content scanning does not lose the #793 property.
+        let created = diff_of(&[
+            "diff --git a/systemd/augmentagent.service b/systemd/augmentagent.service",
+            "new file mode 100644",
+            "+++ b/systemd/augmentagent.service",
+            "+ExecStart=/usr/bin/augmentagent",
         ]);
-        assert!(
-            blast_radius_hit_in_diff(&added).is_some(),
-            "an ADDED line naming a secret must still refuse"
-        );
-
-        // Removing such a line is a cleanup, not a blast radius.
-        let removed = diff_of(&[
-            "diff --git a/crates/x/src/a.rs b/crates/x/src/a.rs",
-            "+++ b/crates/x/src/a.rs",
-            "-const TOKEN: &str = \"secret\";",
-        ]);
-        assert!(blast_radius_hit_in_diff(&removed).is_none());
+        assert!(blast_radius_hit_in_diff(&created).is_some());
     }
 
     #[test]
