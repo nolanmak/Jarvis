@@ -358,11 +358,26 @@ mod tests {
         assert_eq!(tier_of(&opts(vec![], None)), ModelTier::Quality);
 
         assert!(allowed_for(ProviderKind::Claude, CapabilityClass::FullAgentic));
-        // Codex is text-only until #664 probes: its sandbox cannot
-        // path-scope reads and its shell is always on.
+        // Codex is text-only by default. #828 lets a host opt into ReadTools
+        // via AUGMENTAGENT_CODEX_READ_TOOLS, so this must PIN the flag rather
+        // than read whatever the ambient environment happens to carry — on the
+        // production host it is set in `.env`, and the gate inherits it, which
+        // turned this into a red suite for every auto-PR run.
+        let _g = env_guard();
+        let prev = std::env::var("AUGMENTAGENT_CODEX_READ_TOOLS").ok();
+        std::env::remove_var("AUGMENTAGENT_CODEX_READ_TOOLS");
         assert!(allowed_for(ProviderKind::Codex, CapabilityClass::TextOnly));
         assert!(!allowed_for(ProviderKind::Codex, CapabilityClass::ReadTools));
+        // Never beyond read-tools, opted in or not — the shell is what the
+        // text-only rule was written against.
         assert!(!allowed_for(ProviderKind::Codex, CapabilityClass::WriteTools));
+        std::env::set_var("AUGMENTAGENT_CODEX_READ_TOOLS", "1");
+        assert!(!allowed_for(ProviderKind::Codex, CapabilityClass::WriteTools));
+        assert!(!allowed_for(ProviderKind::Codex, CapabilityClass::FullAgentic));
+        match prev {
+            Some(v) => std::env::set_var("AUGMENTAGENT_CODEX_READ_TOOLS", v),
+            None => std::env::remove_var("AUGMENTAGENT_CODEX_READ_TOOLS"),
+        }
         assert!(allowed_for(ProviderKind::Gemini, CapabilityClass::ReadTools));
         assert!(!allowed_for(ProviderKind::Gemini, CapabilityClass::FullAgentic));
         assert!(allowed_for(ProviderKind::Cerebras, CapabilityClass::TextOnly));
