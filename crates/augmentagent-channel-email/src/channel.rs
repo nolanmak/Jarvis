@@ -32,9 +32,9 @@ use augmentagent_channel_core::trigger::{WorkItem, WorkItemHandler};
 use augmentagent_channel_core::Reasoner;
 use augmentagent_store::{ActionStatus, RetryableReply, Store, TriageResult, NUDGE_INTERVAL_MS};
 
-use crate::gmail::{extract_bare_email, GmailApi};
+use crate::gmail::{extract_bare_email, split_recipients, GmailApi};
 use crate::outbound::parse_rfc2822_or_ms;
-use crate::sigextract::{is_event_blast, is_human_sender};
+use crate::sigextract::{is_cc_only_recipient, is_event_blast, is_human_sender};
 
 #[derive(Clone, Debug)]
 pub struct GmailChannelConfig {
@@ -668,6 +668,66 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                         IngestTrigger::Triaged,
                     );
                     return Ok(Some(DispatchOutcome::IngestOnly));
+                }
+
+                // --- 1a''. CC-ONLY BYSTANDER GUARD (#845). The drafter
+                // answered a message addressed to a venue owner ("Hi Gary!")
+                // on which the user was one of three Cc'd co-organizers, and
+                // opened the reply by correcting the sender about who they
+                // were writing to. When the user is only on Cc there is
+                // nothing to draft on their behalf — route to the Flag path
+                // so they still hear about it and can reply by hand if they
+                // want to. Sequenced AFTER the event-blast guard so blasts
+                // that Cc the user keep their silent ingest-only routing
+                // instead of starting to post flag notices.
+                let self_addrs: Vec<String> = match self.store.get_active_gmail_accounts() {
+                    Ok(accounts) => accounts.into_iter().map(|a| a.email).collect(),
+                    Err(e) => {
+                        // Never withhold a draft because of a store failure —
+                        // fall through and leave the call to the model, which
+                        // now sees the headers in its prompt.
+                        warn!("cc-only guard: could not list own accounts: {e}");
+                        Vec::new()
+                    }
+                };
+                if is_cc_only_recipient(&email.to, &email.cc, &self_addrs) {
+                    // Name the actual addressee so the Discord notice reads as
+                    // "this wasn't written to you"; a long To list is trimmed
+                    // to keep the card legible.
+                    let addressed: Vec<String> =
+                        split_recipients(&email.to).into_iter().take(3).collect();
+                    let reason = format!(
+                        "cc_only: addressed to {}; you are on Cc — no draft (reply only if you want to)",
+                        addressed.join(", ")
+                    );
+                    self.store.log_flagged_action(
+                        &email.message_id,
+                        email.thread_id.as_deref(),
+                        &email.from,
+                        &email.subject,
+                        Some(&email.body),
+                        &reason,
+                    )?;
+                    self.store
+                        .mark_email_processed(&email.message_id, TriageResult::Flag)?;
+                    println!(
+                        "[flag:cc-only] {} to={} from={}",
+                        email.message_id, email.to, email.from,
+                    );
+                    if let Err(e) = self.approvals.post_flag_notice(&email, &reason).await {
+                        warn!(
+                            message_id = %email.message_id,
+                            "post_flag_notice failed: {e}"
+                        );
+                    }
+                    self.maybe_ingest(
+                        &email,
+                        DecisionKind::Flag,
+                        Some(&reason),
+                        None,
+                        IngestTrigger::Triaged,
+                    );
+                    return Ok(Some(DispatchOutcome::Flagged));
                 }
 
                 // --- 1b. BACKPRESSURE (#99) — REMOVED in #450.
@@ -2281,6 +2341,128 @@ mod tests {
         assert_eq!(out.awaiting_approval, 1, "must draft when no thread match");
         assert_eq!(out.skipped, 0);
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
+    }
+
+    /// #845 — the message is addressed to someone else and the owner is only
+    /// on Cc ("I've CC'd our other organizers so we can coordinate"). Drafting
+    /// as the addressee produced a reply that opened by correcting the sender
+    /// about who they were writing to. The guard must route to Flag: notice,
+    /// no draft, no approval card.
+    #[tokio::test]
+    async fn reply_decision_flagged_when_owner_is_cc_only() {
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                attachments: Vec::new(),
+                to: "dana@example.com".into(),
+                cc: "Owner <me@x.com>, Casey <casey@example.com>".into(), // pii-ok: synthetic test fixture
+                message_id: "m-cc-only".into(),
+                thread_id: Some("T-cc-only".into()),
+                from: "Priya <priya@example.com>".into(),
+                subject: "Community Meetup – Venue Discussion".into(),
+                body: "Hi Dana! Wanted to talk about the space. \
+                       I've CC'd our other organizers so we can coordinate."
+                    .into(),
+                date: "Thu, 28 Aug 2026 12:00:00 +0000".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        // Triage says reply — the guard is what must intercept. The second
+        // scripted response (the "you've got the wrong person" draft) must
+        // never be consumed.
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"venue discussion"}"#,
+            "Hi Dana, I'm not Dana — I think there may have been a mix-up.",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.flagged, 1, "cc-only bystander must be flagged");
+        assert_eq!(out.awaiting_approval, 0, "no approval card");
+        assert_eq!(out.replied_dry_run, 0);
+        assert_eq!(broker.posts.lock().unwrap().len(), 0, "no draft posted");
+        let flags = broker.flag_posts.lock().unwrap();
+        assert_eq!(flags.len(), 1, "one flag notice");
+        assert!(
+            flags[0].1.contains("dana@example.com"),
+            "flag notice must name the actual addressee: {}",
+            flags[0].1
+        );
+        assert!(store.is_email_complete("m-cc-only").unwrap());
+    }
+
+    /// #845 negative pins — the guard fires ONLY when the owner is on Cc and
+    /// absent from a non-empty To. Everything else still drafts.
+    async fn drafts_with_headers(message_id: &str, to: &str, cc: &str) {
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                attachments: Vec::new(),
+                to: to.into(),
+                cc: cc.into(),
+                message_id: message_id.into(),
+                thread_id: Some("T-845".into()),
+                from: "client@example.com".into(), // pii-ok: synthetic test fixture
+                subject: "Quick question".into(),
+                body: "do you have a minute?".into(),
+                date: "Thu, 28 Aug 2026 12:00:00 +0000".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"actionable question"}"#,
+            "Sure — happy to help.",
+        ]));
+        let ch = GmailChannel::dry_run(
+            store,
+            gmail,
+            reasoner,
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(
+            out.replied_dry_run, 1,
+            "must still draft for to={to} cc={cc}"
+        );
+        assert_eq!(out.flagged, 0, "guard must not fire for to={to} cc={cc}");
+    }
+
+    #[tokio::test]
+    async fn cc_only_guard_skipped_when_owner_is_on_to() {
+        let owner_on_to = "Me <me@x.com>"; // pii-ok: synthetic test fixture
+        drafts_with_headers("m-845-to", owner_on_to, "other@example.com").await;
+    }
+
+    #[tokio::test]
+    async fn cc_only_guard_skipped_when_to_header_is_empty() {
+        // Pre-#629 rows, retry rehydration and non-Gmail platforms carry no
+        // headers at all — never withhold a draft on missing evidence.
+        let owner_on_cc = "me@x.com"; // pii-ok: synthetic test fixture
+        drafts_with_headers("m-845-noto", "", owner_on_cc).await;
+    }
+
+    #[tokio::test]
+    async fn cc_only_guard_skipped_when_owner_on_neither_header() {
+        // Bcc / group alias / forwarding: the owner isn't visible in either
+        // header, so the message may well be squarely addressed to them.
+        drafts_with_headers("m-845-alias", "team@example.com", "other@example.com").await;
     }
 
     #[tokio::test]

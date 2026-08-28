@@ -380,6 +380,47 @@ pub fn is_event_blast(from: &str, subject: &str, body: &str) -> bool {
     false
 }
 
+/// Heuristic: is the owner a Cc'd bystander on a message addressed to
+/// someone else? (#845)
+///
+/// The drafter answered a message whose `To:` was a venue owner and whose
+/// body opened "Hi Gary!" — the owner was one of three Cc'd co-organizers —
+/// and it opened the reply by correcting the sender about who they were
+/// writing to. `skills/email-triage/SKILL.md` already says "CC'd but not
+/// directly addressed → FLAG"; this is the deterministic form of that rule.
+///
+/// True only when ALL hold:
+/// 1. `to` is non-empty — a missing `To:` header is missing evidence (DB
+///    round-trips, retry rows, non-Gmail platforms), never grounds to
+///    withhold a draft.
+/// 2. No `self_addrs` entry appears in `to`.
+/// 3. At least one `self_addrs` entry appears in `cc`.
+///
+/// An owner absent from BOTH headers (Bcc, group alias, forwarding) is
+/// deliberately NOT cc-only: such a message may be squarely addressed to
+/// them, and the triage model now sees the headers to judge for itself.
+pub fn is_cc_only_recipient(to: &str, cc: &str, self_addrs: &[String]) -> bool {
+    let mine: Vec<String> = self_addrs
+        .iter()
+        .map(|a| a.trim().to_ascii_lowercase())
+        .filter(|a| !a.is_empty())
+        .collect();
+    if mine.is_empty() {
+        return false;
+    }
+    let lowered = |raw: &str| -> Vec<String> {
+        crate::gmail::split_recipients(raw)
+            .into_iter()
+            .map(|a| a.to_ascii_lowercase())
+            .collect()
+    };
+    let to_addrs = lowered(to);
+    if to_addrs.is_empty() || to_addrs.iter().any(|a| mine.contains(a)) {
+        return false;
+    }
+    lowered(cc).iter().any(|a| mine.contains(a))
+}
+
 /// Pull the bare `local@domain` from a raw `From:` header value that may
 /// include a display name (`"Foo" <foo@bar.com>` or `Foo <foo@bar.com>`). // pii-ok
 /// Falls back to the trimmed input if no angle-bracket pattern is found.
@@ -1126,6 +1167,62 @@ mod tests {
         assert!(is_human_sender(
             "jane.doe@employer.com", // pii-ok
             "Following up on yesterday's chat — Friday at 2 still works.",
+        ));
+    }
+
+    // ---- #845: Cc'd-bystander detection ----
+
+    /// pii-ok — synthetic test fixture standing in for the owner's account.
+    fn me() -> Vec<String> {
+        vec!["me@example.com".into()]
+    }
+
+    #[test]
+    fn cc_only_when_addressed_to_someone_else() {
+        // pii-ok — synthetic test fixtures.
+        assert!(is_cc_only_recipient(
+            "venue@example.com",
+            "Me <me@example.com>, Other <other@example.com>",
+            &me(),
+        ));
+    }
+
+    #[test]
+    fn cc_only_ignores_display_names_and_case() {
+        // A quoted comma in a display name must not split the To list.
+        assert!(is_cc_only_recipient(
+            r#""Doe, John" <john@example.com>"#,
+            "ME@EXAMPLE.COM",                // pii-ok: synthetic test fixture
+            &["Me@Example.com".to_string()], // pii-ok: synthetic test fixture
+        ));
+    }
+
+    #[test]
+    fn cc_only_false_when_owner_is_also_on_to() {
+        // pii-ok — synthetic test fixtures.
+        assert!(!is_cc_only_recipient(
+            "venue@example.com, me@example.com",
+            "me@example.com",
+            &me(),
+        ));
+    }
+
+    #[test]
+    fn cc_only_false_without_evidence() {
+        // pii-ok — synthetic test fixtures.
+        // Empty To (header never populated) → missing evidence, not a signal.
+        assert!(!is_cc_only_recipient("", "me@example.com", &me()));
+        // Owner on neither header (Bcc / group alias / forwarding).
+        assert!(!is_cc_only_recipient(
+            "venue@example.com",
+            "other@example.com",
+            &me(),
+        ));
+        // No usable self address to compare against.
+        assert!(!is_cc_only_recipient(
+            "venue@example.com",
+            "me@example.com",
+            &[String::new(), "  ".to_string()],
         ));
     }
 
