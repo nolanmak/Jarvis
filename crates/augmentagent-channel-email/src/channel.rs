@@ -34,7 +34,7 @@ use augmentagent_store::{ActionStatus, RetryableReply, Store, TriageResult, NUDG
 
 use crate::gmail::{extract_bare_email, GmailApi};
 use crate::outbound::parse_rfc2822_or_ms;
-use crate::sigextract::{is_event_blast, is_human_sender};
+use crate::sigextract::{is_event_blast, is_human_sender, is_meeting_invite};
 
 #[derive(Clone, Debug)]
 pub struct GmailChannelConfig {
@@ -260,8 +260,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             //      string, so the user gets a card with nothing in it.
             //   2. `dispatch_reply` starts AFTER triage, so it skips every
             //      triage guard: automated-sender (#217), already-replied
-            //      (#218), event-blast (#222). Newsletters that triage would
-            //      never have drafted sail straight into the queue.
+            //      (#218), event-blast (#222), meeting-invite (#834).
+            //      Newsletters that triage would never have drafted sail
+            //      straight into the queue.
             //
             // That is how the live queue reached 102 empty-draft cards from
             // Canva/Marshalls/BetaList — and, via the old backpressure cap,
@@ -668,6 +669,54 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                         IngestTrigger::Triaged,
                     );
                     return Ok(Some(DispatchOutcome::IngestOnly));
+                }
+
+                // --- 1a''. MEETING-INVITE GUARD (#834). Triage drafted a
+                // "happy to attend, could you share an agenda?" reply to a
+                // forwarded Microsoft Teams invite: the sender was human
+                // (so #217 passed) and the mail looked nothing like an
+                // event-platform blast (so #222 missed it). We never draft
+                // responses to meeting invites — the user's calendar, not
+                // the approval queue, is where these belong. Unlike the
+                // event-blast route above these are low-volume and
+                // personal, so we take the Flag path (Discord heads-up +
+                // wiki ingest, no draft) rather than going silent. Ordered
+                // after the event-blast gate so an event-platform invite
+                // keeps its quieter ingest-only route. See
+                // `sigextract.rs::is_meeting_invite` for the detection
+                // rules.
+                if is_meeting_invite(&email.subject, &email.body, &email.attachments) {
+                    let reason = "meeting invite (no draft)";
+                    self.store.log_flagged_action(
+                        &email.message_id,
+                        email.thread_id.as_deref(),
+                        &email.from,
+                        &email.subject,
+                        Some(&email.body),
+                        reason,
+                    )?;
+                    self.store
+                        .mark_email_processed(&email.message_id, TriageResult::Flag)?;
+                    println!(
+                        "[flag:meeting-invite] {} from={}",
+                        email.message_id, email.from,
+                    );
+                    // Best-effort heads-up, same as the Flag arm above: a
+                    // broker failure must not abort the flow.
+                    if let Err(e) = self.approvals.post_flag_notice(&email, reason).await {
+                        warn!(
+                            message_id = %email.message_id,
+                            "post_flag_notice failed: {e}"
+                        );
+                    }
+                    self.maybe_ingest(
+                        &email,
+                        DecisionKind::Flag,
+                        Some(reason),
+                        None,
+                        IngestTrigger::Triaged,
+                    );
+                    return Ok(Some(DispatchOutcome::Flagged));
                 }
 
                 // --- 1b. BACKPRESSURE (#99) — REMOVED in #450.
@@ -2158,6 +2207,81 @@ mod tests {
         assert_eq!(out2.ingest_only, 0);
         assert_eq!(broker.posts.lock().unwrap().len(), 0);
         assert_eq!(broker.flag_posts.lock().unwrap().len(), 0);
+    }
+
+    /// #834: a forwarded Microsoft Teams meeting invite from a human sender
+    /// where the triage model returns `reply` (the reported failure mode —
+    /// the draft asked the organizer to confirm attendance and share an
+    /// agenda). The meeting-invite gate must intercept and route to Flag:
+    /// no approval card, no Opus draft, but the invite IS surfaced on
+    /// Discord so the user can handle it on their calendar.
+    #[tokio::test]
+    async fn reply_decision_for_meeting_invite_routes_to_flag() {
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                attachments: Vec::new(),
+                to: String::new(),
+                cc: String::new(),
+                message_id: "m-invite".into(),
+                thread_id: Some("t-invite".into()),
+                // Human sender on a human domain — clears the #217 guard,
+                // and nothing here matches the #222 event-blast lists, so
+                // the new gate is provably what intercepts.
+                from: "Jeffrey Walters <jeff@example.com>".into(), // pii-ok: synthetic test fixture
+                subject: "FW: Updates Perry".into(),
+                body: "\
+Passing this along.
+
+________________________________________
+Microsoft Teams meeting
+Join on your computer, mobile app or room device
+Join the meeting now
+Meeting ID: 123 456 789
+When: Wednesday, September 2 1:00 PM-2:00 PM
+Where: Microsoft Teams
+"
+                .into(),
+                date: "2026-08-27".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        // Triage says `reply`. If the gate didn't fire, the second scripted
+        // response would be consumed by the draft phase and an approval
+        // card would post.
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"confirm attendance"}"#,
+            "Happy to attend — could you share an agenda?",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            gmail,
+            reasoner,
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                ..Default::default()
+            },
+        );
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.flagged, 1, "meeting invite must be flagged");
+        assert_eq!(out.awaiting_approval, 0, "no approval card for an invite");
+        assert_eq!(out.replied_dry_run, 0);
+        assert_eq!(out.skipped, 0);
+        assert_eq!(out.ingest_only, 0);
+        // No draft was generated — the approval rail is untouched.
+        assert_eq!(broker.posts.lock().unwrap().len(), 0);
+        // But the invite IS surfaced so the user can put it on the calendar.
+        let flags = broker.flag_posts.lock().unwrap();
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0].0, "m-invite");
+        assert!(flags[0].1.contains("meeting invite"));
+        // Terminally processed — the next tick must not re-spawn a draft.
+        assert!(store.is_email_complete("m-invite").unwrap());
     }
 
     /// #218 — when the outbound observer has already recorded a user reply
