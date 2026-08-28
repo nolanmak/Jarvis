@@ -315,12 +315,42 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
 /// True if any blast-radius pattern appears in `text` (case-insensitive).
 /// Applied to DIFFS — use [`is_issue_blast_radius`] for issue prose.
 pub fn is_blast_radius(text: &str) -> bool {
-    contains_any(text, BLAST_RADIUS_PATTERNS)
+    blast_radius_hit(text).is_some()
+}
+
+/// Which pattern tripped, and the line it tripped on.
+///
+/// The refusal used to read "the produced diff touches a deploy/auth/secret
+/// path" and name neither. That is a ~20-minute agentic Opus build discarded
+/// with nothing a human can act on — seen live on #831, where the answer
+/// ("Landlock code is security code") was only recoverable by re-deriving it
+/// by hand. The guard is right to refuse; it should say what it saw.
+pub fn blast_radius_hit(text: &str) -> Option<(&'static str, String)> {
+    let lower = text.to_ascii_lowercase();
+    let pattern = BLAST_RADIUS_PATTERNS
+        .iter()
+        .find(|p| lower.contains(&p.to_ascii_lowercase()))?;
+    let needle = pattern.to_ascii_lowercase();
+    let line = text
+        .lines()
+        .find(|l| l.to_ascii_lowercase().contains(&needle))
+        .unwrap_or("")
+        .trim();
+    Some((pattern, truncate(line, 200)))
 }
 
 /// #819 — the prose variant, matching only [`ISSUE_BLAST_RADIUS_PATTERNS`].
 pub fn is_issue_blast_radius(text: &str) -> bool {
-    contains_any(text, ISSUE_BLAST_RADIUS_PATTERNS)
+    issue_blast_radius_hit(text).is_some()
+}
+
+/// Prose variant of [`blast_radius_hit`].
+pub fn issue_blast_radius_hit(text: &str) -> Option<(&'static str, String)> {
+    let lower = text.to_ascii_lowercase();
+    let pattern = ISSUE_BLAST_RADIUS_PATTERNS
+        .iter()
+        .find(|p| lower.contains(&p.to_ascii_lowercase()))?;
+    Some((pattern, String::new()))
 }
 
 fn contains_any(text: &str, patterns: &[&str]) -> bool {
@@ -587,13 +617,13 @@ async fn pick_issue(repo_root: &Path) -> Result<Option<Issue>> {
             association,
             research_filed,
         } = iss;
-        if is_issue_blast_radius(&format!("{title} {body}")) {
+        if let Some((pattern, _)) = issue_blast_radius_hit(&format!("{title} {body}")) {
             // #819 — every other refusal in this pipeline leaves a comment
             // and/or a label. This one used to `continue` silently, so a
             // matched issue stayed in the pool, was re-scanned on every tick
             // forever, and told nobody. Label it out and say why. Neither
             // call touches the reasoner, so this costs no daily budget.
-            info!(issue = number, "refusing: blast-radius path named in issue");
+            info!(issue = number, pattern, "refusing: blast-radius path named in issue");
             backoff_comment(
                 repo_root,
                 number,
@@ -1757,14 +1787,27 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // gave-up label pulls the issue from the pool — otherwise the unattended
     // loop would re-spend its whole daily cap on the same issue forever.
     let (_ok, full_diff, _) = run("git", &["diff", "--cached"], &worktree).await?;
-    if is_blast_radius(&full_diff) {
+    if let Some((pattern, line)) = blast_radius_hit(&full_diff) {
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
         let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+        warn!(
+            issue = issue.number,
+            pattern, %line, "refused: diff hit the blast-radius guard"
+        );
         backoff_comment(
             repo_root,
             issue.number,
-            "Self-improve refused: the produced diff touches a \
-             deploy/auth/secret path (blast-radius guard).",
+            &format!(
+                "Self-improve refused: the produced diff touches a \
+                 deploy/auth/secret path (blast-radius guard).\n\n\
+                 Matched `{pattern}` on:\n```\n{line}\n```\n\n\
+                 The guard runs on the DIFF, so this only surfaces after the \
+                 build — the issue text itself named no such path. If the \
+                 match is incidental, reword the fix to avoid that path; if \
+                 the work is inherently deploy/auth/secret-shaped, it needs a \
+                 human and should carry `{GAVE_UP_LABEL}` rather than burning \
+                 the remaining attempts on the same refusal."
+            ),
         )
         .await
         .ok();
@@ -1772,7 +1815,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             label_gave_up(repo_root, issue.number).await.ok();
         }
         return Ok(RunReport::built(format!(
-            "issue #{}: refused — diff hit blast-radius guard (attempt {attempts})",
+            "issue #{}: refused — diff hit blast-radius guard on `{pattern}` (attempt {attempts})",
             issue.number
         )));
     }
@@ -3921,6 +3964,35 @@ CODEX-REVIEW: lgtm").0);
         git(&["add", "-A"]);
         let staged = String::from_utf8(git(&["diff", "--cached", "--name-only"]).stdout).unwrap();
         assert_eq!(staged.trim(), "crates/x/src/new.rs");
+    }
+
+    // ---- a refusal must say what it saw ----
+
+    #[test]
+    fn blast_radius_refusal_names_the_pattern_and_the_line() {
+        let diff = "diff --git a/src/ok.rs b/src/ok.rs\n                    +fn fine() {}\n                    diff --git a/systemd/augmentagent.service b/systemd/augmentagent.service\n                    +ExecStart=/usr/bin/augmentagent serve\n";
+        let (pattern, line) = blast_radius_hit(diff).expect("must trip");
+        assert!(
+            BLAST_RADIUS_PATTERNS.contains(&pattern),
+            "the reported pattern must be one the guard actually holds"
+        );
+        assert!(
+            line.contains("systemd"),
+            "the reported line must be the offending one, not the first line: {line}"
+        );
+        // Clean diffs stay clean.
+        assert!(blast_radius_hit("diff --git a/src/x.rs b/src/x.rs\n+fn f() {}").is_none());
+        // The bool wrapper keeps its old meaning for every existing caller.
+        assert!(is_blast_radius(diff));
+        assert!(!is_blast_radius("+fn f() {}"));
+    }
+
+    #[test]
+    fn issue_prose_refusal_names_its_pattern() {
+        let (pattern, _) =
+            issue_blast_radius_hit("please patch scripts/check-for-updates.sh").expect("trips");
+        assert_eq!(pattern, "scripts/check-for-updates");
+        assert!(issue_blast_radius_hit("an ordinary bug in the digest").is_none());
     }
 
     // ---- #819: the prose prefilter must not eat the pool ----
