@@ -117,8 +117,16 @@ apply_update() {
       ;;
     Linux)
       if [ "$NEEDS_REBUILD" -eq 1 ]; then
-        log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
-        restart_unit "$SYSTEMD_UNIT" || RESTART_FAILURES=$((RESTART_FAILURES + 1))
+        # #844 — an in-flight auto-PR build is ~20 min of agentic Opus; a
+        # restart kills it unrecorded. Deferring counts as a restart failure,
+        # so the stamp is withheld (#826) and the next tick retries — the
+        # binary is already built, so the retry is cheap.
+        if maybe_defer_restart; then
+          RESTART_FAILURES=$((RESTART_FAILURES + 1))
+        else
+          log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
+          restart_unit "$SYSTEMD_UNIT" || RESTART_FAILURES=$((RESTART_FAILURES + 1))
+        fi
       fi
       if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
         # Dashboard failures stay non-fatal and do NOT block the stamp,
