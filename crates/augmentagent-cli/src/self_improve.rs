@@ -657,10 +657,21 @@ async fn pick_issue(repo_root: &Path) -> Result<Option<Issue>> {
     // research pipeline files 3/day and the daily cap is 3, so strict
     // newest-first would hand it the entire budget forever and human bug
     // reports would never be reached.
+    let ledger = AttemptLedger::load(&attempt_ledger_path());
+    let today = utc_day_now();
+
     let (human, research): (Vec<_>, Vec<_>) = rest_issue_candidates(&issues)
         .into_iter()
         .partition(|i| !i.research_filed);
     for iss in human.into_iter().chain(research) {
+        // #851 — an issue already attempted today lost a build to a refusal;
+        // retrying it now would almost certainly lose another to the same
+        // one. Spend today's remaining budget on DIFFERENT issues; attempts
+        // still accumulate across days toward the gave-up label.
+        if ledger.attempted_today(today, iss.number) {
+            info!(issue = iss.number, "skip: already attempted today (#851 ledger)");
+            continue;
+        }
         let RestIssue {
             number,
             title,
@@ -1508,6 +1519,10 @@ and lands in the PR.\n\
 - Do NOT touch deploy/auth/secret/CI files (systemd units, scripts/check-for-updates, \
 .github/workflows, anything with credentials/keyring/.env).\n\
 - Keep the diff small and focused on the issue.\n\
+- Test fixtures must use INVENTED placeholder emails, names, and handles \
+(alice@example.com, not a real address quoted in the issue). A pre-commit \
+hook rejects real-looking personal data and the commit will fail after all \
+your work.\n\
 - Do NOT run git commit, git push, or gh. Just edit files.\n\
 When done, output a 2-4 sentence summary of what you changed and why, noting \
 the test that guards it.";
@@ -2198,7 +2213,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             system_ok = independent.system_ok,
             "independent review requested changes"
         );
-        record_attempt(repo_root, issue.number).await.ok();
+        // Not recorded as an attempt here: the run continues to open a draft
+        // PR, and dedup already keeps the issue out of the pool while that PR
+        // is open. Recording here AND in a later hard failure double-counted
+        // — the live #845 run consumed attempts 1 and 2 in one pass.
     }
 
     if dry_run {
@@ -2473,6 +2491,14 @@ async fn record_hard_failure(repo_root: &Path, issue: u64, what: &str, err: &str
 /// Bump an attempt counter encoded as a hidden marker comment, return the new
 /// count. (Lightweight; avoids needing extra labels per count.)
 async fn record_attempt(repo_root: &Path, issue: u64) -> Result<u32> {
+    // #851 — remember the attempt for the rest of the UTC day so the picker
+    // moves on instead of handing this issue straight back next tick.
+    {
+        let path = attempt_ledger_path();
+        let mut ledger = AttemptLedger::load(&path);
+        ledger.mark(utc_day_now(), issue);
+        ledger.save(&path);
+    }
     let gh = gh_bin();
     let (_ok, stdout, _) = run(
         &gh,
@@ -3281,6 +3307,82 @@ impl DailyCounter {
     }
 }
 
+/// #851 — which issues were already attempted today, so the picker never
+/// hands the same issue back after a refusal.
+///
+/// Without this, a post-build refusal was followed 30 minutes later by the
+/// SAME issue: `pick_issue` only excludes `agent-gave-up` labels and open
+/// agent PRs, and a refusal at attempt 1 or 2 is neither. When the refusal is
+/// deterministic — a guard refusal usually is — every retry burns a full
+/// agentic-Opus build reaching the identical conclusion. On 2026-08-28 that
+/// spent 2 of 3 daily slots on #658 and starved ~40 eligible issues for 16
+/// hours.
+///
+/// Keyed by UTC day, same rollover as [`DailyCounter`]: a flaky refusal gets
+/// a fresh chance tomorrow, while `record_attempt`'s markers still accumulate
+/// toward the permanent `agent-gave-up` label at [`MAX_ATTEMPTS`].
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct AttemptLedger {
+    day: u64,
+    issues: Vec<u64>,
+}
+
+impl AttemptLedger {
+    fn load(path: &Path) -> Self {
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn attempted_today(&self, day: u64, issue: u64) -> bool {
+        self.day == day && self.issues.contains(&issue)
+    }
+
+    fn mark(&mut self, day: u64, issue: u64) {
+        if self.day != day {
+            self.day = day;
+            self.issues.clear();
+        }
+        if !self.issues.contains(&issue) {
+            self.issues.push(issue);
+        }
+    }
+
+    /// Best-effort persist, mirroring [`DailyCounter::save`]: losing this
+    /// file only costs the day's skip memory, which is where we already were.
+    fn save(&self, path: &Path) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match serde_json::to_vec(self) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, bytes) {
+                    warn!(path = %path.display(), "could not persist attempt ledger: {e}");
+                }
+            }
+            Err(e) => warn!("could not serialize attempt ledger: {e}"),
+        }
+    }
+}
+
+/// Ledger path: `AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE` override (tests), else
+/// the daemon state dir next to the daily counter.
+fn attempt_ledger_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    std::env::var_os("HOME")
+        .map(|h| {
+            PathBuf::from(h)
+                .join(".local/state/augmentagent")
+                .join("autopr-attempted.json")
+        })
+        .unwrap_or_else(|| PathBuf::from("autopr-attempted.json"))
+}
+
 /// Where the persisted counter lives: `AUGMENTAGENT_AUTOPR_COUNTER_FILE`
 /// override (tests), else the daemon state dir next to the reasoner
 /// cooldown latch.
@@ -3400,7 +3502,14 @@ impl AutoPrLoop {
                             daily_cap = self.daily_cap,
                             "auto-PR: {r}"
                         );
-                        break;
+                        // #851 — with budget left, keep going in the SAME
+                        // tick. The attempt ledger guarantees the next pick
+                        // is a different issue, so remaining slots go to the
+                        // rest of the pool instead of idling 30 minutes —
+                        // or, worse, re-buying the refusal just recorded.
+                        if counter.runs_today(today) >= self.daily_cap {
+                            break;
+                        }
                     }
                     Ok(r) => {
                         triaged += 1;
@@ -4372,6 +4481,41 @@ CODEX-REVIEW: lgtm").0);
         git(&["add", "-A"]);
         let staged = String::from_utf8(git(&["diff", "--cached", "--name-only"]).stdout).unwrap();
         assert_eq!(staged.trim(), "crates/x/src/new.rs");
+    }
+
+    // ---- #851: never hand a refused issue straight back ----
+
+    #[test]
+    fn attempt_ledger_skips_within_the_day_and_resets_on_rollover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/attempted.json");
+
+        let mut l = AttemptLedger::load(&path);
+        assert!(!l.attempted_today(100, 658));
+        l.mark(100, 658);
+        l.save(&path);
+
+        // Reload (daemon restart mid-day) — the memory must survive, or one
+        // deploy re-exposes the whole pool to the same refusal.
+        let l2 = AttemptLedger::load(&path);
+        assert!(l2.attempted_today(100, 658));
+        assert!(!l2.attempted_today(100, 667), "other issues stay eligible");
+        // Tomorrow the issue gets a fresh chance; gave-up handles permanence.
+        assert!(!l2.attempted_today(101, 658));
+
+        // Marking on a new day clears yesterday's entries.
+        let mut l3 = l2;
+        l3.mark(101, 700);
+        assert!(!l3.attempted_today(101, 658));
+        assert!(l3.attempted_today(101, 700));
+    }
+
+    #[test]
+    fn attempt_ledger_survives_corrupt_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk.json");
+        std::fs::write(&junk, b"{ nope").unwrap();
+        assert!(!AttemptLedger::load(&junk).attempted_today(1, 1));
     }
 
     // ---- #843: the scoper's predictions are binding, pre-build ----
