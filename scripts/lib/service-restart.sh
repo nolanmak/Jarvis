@@ -95,3 +95,55 @@ restart_unit() {
 should_write_stamp() {
   [ "${1:-0}" -eq 0 ]
 }
+
+# --- #844: don't kill an in-flight self-improve run -------------------------
+#
+# The auto-PR loop's build stage is ~20 minutes of agentic Opus on the owner's
+# Claude subscription. The updater restarting augmentagent.service kills it
+# mid-flight, silently: the process dies before `record_attempt`, so the spend
+# is not even recorded, and the issue is re-picked to burn another build.
+# Observed live 2026-08-28: a run selected #667 at 01:45:31 and the 01:49:12
+# deploy restart destroyed it. Worse, an auto-merged PR *triggers* a rebuild +
+# restart by design — the loop's own success can kill its next run.
+#
+# run_once holds an exclusive flock on the self-improve lock for the whole run
+# (#816), which makes "a run is in flight" observable from outside the
+# process. Defer the restart while it is held — bounded, because a stale
+# binary is worse than one lost build.
+
+SELF_IMPROVE_LOCK="${AUGMENTAGENT_SELFIMPROVE_LOCK:-$HOME/.local/state/augmentagent/self-improve.lock}"
+RESTART_DEFER_STAMP="${AUGMENTAGENT_RESTART_DEFER_STAMP:-${LOG_DIR:-$HOME/.local/state/augmentagent}/restart-deferred-since}"
+RESTART_DEFER_MAX_SECS="${AUGMENTAGENT_RESTART_DEFER_MAX_SECS:-2400}"
+
+# Is a self-improve run holding the lock right now?
+self_improve_run_in_flight() {
+  [ -e "$SELF_IMPROVE_LOCK" ] || return 1
+  ! flock -n "$SELF_IMPROVE_LOCK" -c true 2>/dev/null
+}
+
+# Should this restart be deferred? 0 = defer (a run is in flight and the
+# deferral budget is not exhausted); 1 = proceed. Clears its own state on
+# every proceed so one long-past deferral cannot poison a later deploy.
+maybe_defer_restart() {
+  if ! self_improve_run_in_flight; then
+    rm -f "$RESTART_DEFER_STAMP"
+    return 1
+  fi
+  local now since
+  now=$(date +%s)
+  since=$(cat "$RESTART_DEFER_STAMP" 2>/dev/null || true)
+  case "$since" in
+    ''|*[!0-9]*)
+      printf '%s\n' "$now" > "$RESTART_DEFER_STAMP"
+      _sr_log "self-improve run in flight; deferring restart (retry next tick)"
+      return 0
+      ;;
+  esac
+  if [ $((now - since)) -lt "$RESTART_DEFER_MAX_SECS" ]; then
+    _sr_log "self-improve run still in flight ($((now - since))s); deferring restart"
+    return 0
+  fi
+  _sr_log "self-improve run in flight for $((now - since))s (> ${RESTART_DEFER_MAX_SECS}s); restarting anyway — a stale binary is worse than one lost build"
+  rm -f "$RESTART_DEFER_STAMP"
+  return 1
+}
