@@ -996,6 +996,108 @@ fn parse_review_output(raw: &str) -> (bool, String) {
     (approved, raw.trim().to_string())
 }
 
+/// Identifiers a diff introduces or changes, for caller lookup (#840).
+///
+/// Deliberately crude: scan ADDED lines for Rust item keywords and take the
+/// name that follows. A missed symbol costs the reviewer one piece of
+/// evidence; a wrong one costs a cheap `git grep` that finds nothing.
+fn changed_symbols(diff: &str) -> Vec<String> {
+    const KEYWORDS: &[&str] = &["fn ", "struct ", "enum ", "trait ", "const ", "static ", "type "];
+    let mut out: Vec<String> = Vec::new();
+    for line in diff.lines() {
+        if !line.starts_with('+') || line.starts_with("+++") {
+            continue;
+        }
+        let body = line[1..].trim_start();
+        for kw in KEYWORDS {
+            let Some(rest) = body.split(kw).nth(1) else { continue };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            // Single letters are generics (`fn f<T>`), not call sites worth
+            // grepping for.
+            if name.len() > 2 && !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Paths a unified diff touches, as repo-relative strings (#840).
+fn changed_files(diff: &str) -> Vec<String> {
+    diff.lines()
+        .filter_map(|l| l.strip_prefix("+++ b/"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// #840 — pre-computed system context for the independent reviewer.
+///
+/// Codex cannot run commands on this host: its `-s read-only` sandbox is
+/// bubblewrap, and AppArmor blocks unprivileged user namespaces
+/// (`apparmor_restrict_unprivileged_userns=1`), so every command dies with
+/// `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`. A reviewer
+/// told to "find the callers" therefore finds nothing and, honestly, says so.
+///
+/// The daemon has no such restriction. So it does the lookup itself and hands
+/// the reviewer the evidence: for every identifier the diff introduces, where
+/// else in the repo that name appears, excluding the changed files themselves.
+/// That is the part of "read the whole system" a text-only model can actually
+/// use — it cannot chase an arbitrary hunch, and the prompt says so rather
+/// than letting the model imply coverage it does not have.
+async fn caller_evidence(worktree: &Path, diff: &str) -> String {
+    const MAX_SYMBOLS: usize = 12;
+    const MAX_HITS_PER_SYMBOL: usize = 8;
+
+    let touched = changed_files(diff);
+    let symbols = changed_symbols(diff);
+    if symbols.is_empty() {
+        return "No new named items in this diff, so there are no call sites to \
+                look up."
+            .into();
+    }
+
+    let mut sections: Vec<String> = Vec::new();
+    for sym in symbols.iter().take(MAX_SYMBOLS) {
+        let Ok((true, out, _)) = run(
+            "git",
+            &["grep", "-n", "--fixed-strings", "--", sym],
+            worktree,
+        )
+        .await
+        else {
+            continue;
+        };
+        let hits: Vec<&str> = out
+            .lines()
+            .filter(|l| {
+                // A definition inside the diff's own files is not a caller.
+                !touched.iter().any(|f| l.starts_with(&format!("{f}:")))
+            })
+            .take(MAX_HITS_PER_SYMBOL)
+            .collect();
+        if hits.is_empty() {
+            sections.push(format!(
+                "`{sym}` — no references outside the changed files. Either it \
+                 is genuinely new, or nothing calls it yet."
+            ));
+        } else {
+            sections.push(format!("`{sym}` is referenced at:\n{}", hits.join("\n")));
+        }
+    }
+
+    if sections.is_empty() {
+        return "Caller lookup produced no results.".into();
+    }
+    format!(
+        "Call sites for the identifiers this diff introduces, pre-computed \
+         (up to {MAX_SYMBOLS} symbols, {MAX_HITS_PER_SYMBOL} hits each):\n\n{}",
+        sections.join("\n\n")
+    )
+}
+
 /// #828 — model for the independent codex reviews. Pinned per the #448 rule
 /// (no preset may inherit an interactive default); the codex adapter derives
 /// its own id from `model_for(Codex, tier_of(opts))`, and a non-`haiku` pin
@@ -1009,22 +1111,28 @@ fn codex_model() -> String {
     )
 }
 
-/// Read-only preset for the independent reviewer.
+/// Text-only preset for the independent reviewer (#840).
 ///
-/// Deliberately `Read`/`Grep`/`Glob` and NOTHING else. That is not a
-/// convenience: `classify` returns `CapabilityClass::ReadTools` only when
-/// every tool is on that list, and codex is permitted that class (behind
-/// `AUGMENTAGENT_CODEX_READ_TOOLS`) precisely because it has no shell. Adding
-/// a single `Bash(...)` entry here would reclassify the preset as
-/// `FullAgentic`, which codex may not serve — the call would start failing
-/// closed instead of reviewing. It also gives the reviewer the thing that
-/// makes a system-level review possible at all: the whole worktree, not just
-/// the hunks.
+/// It carries no tools on purpose. Codex has no `Read`/`Grep`/`Glob` — those
+/// are Claude Code tool names, and `allowed_tools` is never passed to the
+/// codex adapter at all; codex's only tool is a shell governed by `-s`. On
+/// this host that shell cannot start, so granting tools would be capability
+/// theatre. The reviewer is given the diff and pre-computed call sites as
+/// text instead, which is what it can actually act on.
+///
+/// `cwd` is still pinned to the worktree: it costs nothing and keeps the
+/// spawn's working directory off the deploy checkout.
 fn codex_review_opts(worktree: PathBuf, system_prompt: &str) -> augmentagent_channel_core::ReasonerOpts {
     augmentagent_channel_core::ReasonerOpts {
         system_prompt: system_prompt.to_string(),
         model: Some(codex_model()),
-        allowed_tools: vec!["Read".into(), "Grep".into(), "Glob".into()],
+        // #840 — NO tools. Codex cannot execute anything on this host (its
+        // read-only sandbox is bubblewrap; AppArmor blocks unprivileged user
+        // namespaces), so tools would be surface with no capability behind
+        // it. Everything the reviewer needs is supplied as text, including
+        // pre-computed caller evidence. This keeps the preset TextOnly, which
+        // codex is cleared for with no policy widening.
+        allowed_tools: vec![],
         add_dirs: vec![worktree.clone()],
         permission_mode: "default".into(),
         cwd: Some(worktree),
@@ -1043,9 +1151,9 @@ about to read; its own QA pass already approved it. You are the second \
 opinion, and you were chosen because you do not share that model's blind \
 spots. Do not defer to it.\n\
 \n\
-This pass is the FOCUSED review: judge the diff itself. You have read-only \
-access to the whole repository (Read/Grep/Glob) — use it to check the diff \
-against how this codebase actually does things.\n\
+This pass is the FOCUSED review: judge the diff itself, from what is in this \
+message. You have no tools, so reason from the diff as given and say \
+`changes-requested` if a decisive fact is missing rather than assuming it.\n\
 - Correctness: walk at least one concrete input through the changed lines.\n\
 - Best practices: error handling, naming, resource handling, edge cases, \
 input validation, concurrency, and anything that will bite in six months. \
@@ -1069,10 +1177,13 @@ separate review already judged the diff on its own terms. Your job is the \
 question that one cannot answer from the hunks: what does this change do to \
 the rest of the system?\n\
 \n\
-You have read-only access to the entire repository (Read/Grep/Glob). USE IT — \
-a verdict that only looked at the diff is a failed review. Concretely:\n\
-- Find the CALLERS of every function, struct field, or behaviour the diff \
-touches (grep for the names) and check each one still holds.\n\
+You have NO tools. Everything you get is in this message: the diff, and a \
+pre-computed list of call sites for the identifiers it introduces. Reason from \
+that evidence. Do not claim to have inspected anything you were not given, and \
+if the decisive fact is genuinely absent, say `changes-requested` and name \
+exactly what you would need. Concretely:\n\
+- Work through the supplied CALL SITES: for each, does the change still hold \
+there?\n\
 - Invariants and contracts: does anything elsewhere assume what this change \
 just altered — ordering, nullability, a field always being populated, an \
 error being unreachable?\n\
@@ -1087,10 +1198,9 @@ returns something unexpected?\n\
 Your output MUST start with this line EXACTLY:\n\
 CODEX-REVIEW: lgtm | changes-requested\n\
 Then a blank line, then 3-8 sentences naming the specific callers/invariants \
-you checked (file:line) and what you concluded. \"I read the diff and it looks \
-fine\" is not a system review — if you did not open anything outside the diff, \
-say `changes-requested`. Read-only — do NOT edit. Output ONLY the verdict and \
-notes.";
+you checked (file:line, from the supplied evidence) and what you concluded. \
+\"I read the diff and it looks fine\" is not a system review. Output ONLY the \
+verdict and notes.";
 
 /// Verdict of one codex pass. Unparseable or missing ⇒ not approved, matching
 /// `parse_review_output`'s default-reject: an approval here can flow into an
@@ -1172,7 +1282,7 @@ async fn independent_review(
     let context = format!(
         "GitHub issue #{}: {}\n\n{}\n\nThe author model's own summary of its \
          change:\n{}\n\nThe complete staged diff follows. The full repository \
-         is on disk at your working directory — read whatever you need.\n\n\
+         is NOT browsable from here — work from what is quoted below.\n\n\
          ```diff\n{}\n```",
         issue.number,
         issue.title,
@@ -1188,14 +1298,19 @@ async fn independent_review(
         notes: String::new(),
     };
 
+    let evidence = caller_evidence(&worktree, diff).await;
+    let system_context = format!(
+        "{context}\n\n## Pre-computed call sites\n{evidence}"
+    );
+
     let passes = [
-        ("focused diff review", CODEX_DIFF_REVIEW_SYSTEM),
-        ("system-interaction review", CODEX_SYSTEM_REVIEW_SYSTEM),
+        ("focused diff review", CODEX_DIFF_REVIEW_SYSTEM, &context),
+        ("system-interaction review", CODEX_SYSTEM_REVIEW_SYSTEM, &system_context),
     ];
     let mut sections: Vec<String> = Vec::new();
-    for (label, system) in passes {
+    for (label, system, prompt) in passes {
         let opts = codex_review_opts(worktree.clone(), system);
-        match reasoner.call(&opts, &context).await {
+        match reasoner.call(&opts, prompt).await {
             Ok(raw) => {
                 let (ok, notes) = parse_codex_review(&raw);
                 info!(issue = issue.number, pass = label, approved = ok, "codex review");
@@ -3743,6 +3858,97 @@ mod tests {
         assert!(
             AutoPrLoop::MAX_TRIAGE_PER_TICK <= 10,
             "each triage still spends a scope call; keep the burst modest"
+        );
+    }
+
+    // ---- #840: system context the reviewer can actually use ----
+
+    #[test]
+    fn changed_symbols_finds_new_items_and_ignores_noise() {
+        let d = diff_of(&[
+            "diff --git a/crates/x/src/a.rs b/crates/x/src/a.rs",
+            "+++ b/crates/x/src/a.rs",
+            "+pub fn is_calendar_invite(e: &Email) -> bool {",
+            "+struct InviteShape {",
+            "+    // fn mentioned in a comment should still be harmless",
+            "+const MAX_TRIES: u32 = 3;",
+            "-fn removed_thing() {}",
+            "     fn context_thing() {}",
+        ]);
+        let got = changed_symbols(&d);
+        assert!(got.contains(&"is_calendar_invite".to_string()));
+        assert!(got.contains(&"InviteShape".to_string()));
+        assert!(got.contains(&"MAX_TRIES".to_string()));
+        // Removed and context lines are not what this diff introduces.
+        assert!(!got.contains(&"removed_thing".to_string()));
+        assert!(!got.contains(&"context_thing".to_string()));
+    }
+
+    #[test]
+    fn changed_files_reads_the_b_side_paths() {
+        let d = diff_of(&[
+            "diff --git a/crates/x/src/a.rs b/crates/x/src/a.rs",
+            "--- a/crates/x/src/a.rs",
+            "+++ b/crates/x/src/a.rs",
+            "+fn f() {}",
+        ]);
+        assert_eq!(changed_files(&d), vec!["crates/x/src/a.rs".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn caller_evidence_finds_call_sites_outside_the_changed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q", "-b", "main", "."]);
+        std::fs::create_dir_all(repo.join("crates/x/src")).unwrap();
+        // The definition lives in the changed file...
+        std::fs::write(repo.join("crates/x/src/a.rs"), "pub fn is_invite() -> bool { true }\n")
+            .unwrap();
+        // ...and a caller lives elsewhere. That caller is the whole point.
+        std::fs::write(
+            repo.join("crates/x/src/caller.rs"),
+            "fn go() { if is_invite() { return; } }\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q", "-m", "init"]);
+
+        let d = diff_of(&[
+            "diff --git a/crates/x/src/a.rs b/crates/x/src/a.rs",
+            "+++ b/crates/x/src/a.rs",
+            "+pub fn is_invite() -> bool { true }",
+        ]);
+        let ev = caller_evidence(repo, &d).await;
+        assert!(
+            ev.contains("crates/x/src/caller.rs"),
+            "the caller outside the diff must be surfaced: {ev}"
+        );
+        assert!(
+            !ev.contains("crates/x/src/a.rs:"),
+            "the definition inside the changed file is not a caller: {ev}"
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_evidence_says_so_when_there_is_nothing_to_look_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = diff_of(&[
+            "diff --git a/README.md b/README.md",
+            "+++ b/README.md",
+            "+just prose, no new items",
+        ]);
+        let ev = caller_evidence(dir.path(), &d).await;
+        assert!(
+            ev.to_lowercase().contains("no new named items"),
+            "must state the absence rather than returning something that reads \
+             like evidence: {ev}"
         );
     }
 
