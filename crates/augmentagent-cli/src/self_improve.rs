@@ -4060,6 +4060,61 @@ CODEX-REVIEW: lgtm").0);
         );
     }
 
+    /// Live probe (#840): the SYSTEM-interaction pass, end to end — real
+    /// `git grep` evidence over this repo, then a real codex call. Guards the
+    /// regression that motivated #840, where the pass reported
+    /// "the read-only command environment failed before executing any
+    /// command" and reviewed nothing.
+    ///
+    /// ```text
+    /// cargo test -p augmentagent-cli --bins live_codex_system_pass -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore]
+    async fn live_codex_system_pass_reasons_from_supplied_evidence() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("repo root");
+
+        // A diff over a symbol this repo really calls from more than one file.
+        let diff = diff_of(&[
+            "diff --git a/crates/augmentagent-cli/src/self_improve.rs b/crates/augmentagent-cli/src/self_improve.rs",
+            "+++ b/crates/augmentagent-cli/src/self_improve.rs",
+            "+pub fn is_blast_radius(text: &str) -> bool { false }",
+        ]);
+
+        let evidence = caller_evidence(&repo, &diff).await;
+        println!("--- evidence ---\n{evidence}\n");
+        assert!(
+            evidence.contains("is_blast_radius"),
+            "the daemon must find real call sites: {evidence}"
+        );
+
+        let reasoner = augmentagent_channel_core::build_pinned(
+            augmentagent_channel_core::ProviderKind::Codex,
+        )
+        .expect("codex must be installed and authenticated");
+        let opts = codex_review_opts(repo, CODEX_SYSTEM_REVIEW_SYSTEM);
+        let raw = reasoner
+            .call(
+                &opts,
+                &format!("```diff\n{diff}\n```\n\n## Pre-computed call sites\n{evidence}"),
+            )
+            .await
+            .expect("codex call");
+        println!("--- codex system pass ---\n{raw}\n---");
+
+        assert!(
+            raw.to_ascii_lowercase().contains("codex-review:"),
+            "must emit the verdict header: {raw}"
+        );
+        assert!(
+            !raw.to_ascii_lowercase().contains("failed before executing any command"),
+            "the #840 regression is back — the pass is trying to run commands: {raw}"
+        );
+    }
+
     // ---- #823: the receipt gate must bind the daemon too ----
 
     #[test]
