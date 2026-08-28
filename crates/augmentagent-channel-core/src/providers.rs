@@ -147,50 +147,22 @@ pub fn allowed_for(kind: ProviderKind, class: CapabilityClass) -> bool {
             class,
             CapabilityClass::TextOnly | CapabilityClass::ReadTools
         ),
-        ProviderKind::Codex => {
+        // #840 — codex stays TEXT-ONLY. #828 briefly widened this to
+        // ReadTools on the reasoning that the class "structurally excludes
+        // the shell". That was Claude-shaped: `Read`/`Grep`/`Glob` are Claude
+        // Code tool names, `allowed_tools` is never passed to the codex
+        // adapter, and codex's only tool IS a shell. The classifier said
+        // "no shell" about a provider that has nothing else.
+        //
+        // It also bought nothing: codex cannot execute any command on this
+        // host, because its `-s read-only` sandbox is bubblewrap and AppArmor
+        // blocks unprivileged user namespaces. The independent reviewer now
+        // receives its context as pre-computed text instead (#840), which
+        // needs no widening at all.
+        ProviderKind::Codex | ProviderKind::Cerebras => {
             matches!(class, CapabilityClass::TextOnly)
-                || (codex_read_tools_enabled() && matches!(class, CapabilityClass::ReadTools))
         }
-        ProviderKind::Cerebras => matches!(class, CapabilityClass::TextOnly),
     }
-}
-
-/// #828 — opt-in widening of codex to READ-TOOLS presets.
-///
-/// The blanket text-only rule above is written against the *shell*: "the
-/// model's shell can read any file on disk (`.env`,
-/// `~/.claude/.credentials.json`, `~/.ssh`)". `CapabilityClass::ReadTools`
-/// structurally excludes that — `classify` only returns it when EVERY
-/// allowed tool is `Read`/`Grep`/`Glob`/`LS`/`WebSearch`, so a preset in this
-/// class has no `Bash` and therefore no shell at all. The rationale for the
-/// ban does not reach this class.
-///
-/// It is still a widening, so it is off by default and opted into per host:
-/// codex's file tools are not proven cwd-confined the way gemini's are, so a
-/// prompt-injected run could still `Read` an absolute path outside the
-/// worktree. What bounds the damage on the auto-PR review path that motivated
-/// this:
-///
-/// - **Inputs are inside the trust boundary.** The reviewer sees an
-///   owner-authored issue (#300 gate) and a diff Claude wrote — not the
-///   untrusted inbound email that the original text-only rule was defending
-///   against.
-/// - **No secrets in reach of the obvious paths.** The review runs in a fresh
-///   `git worktree`, which carries no `.env` (gitignored) and no credentials;
-///   the codex adapter already spawns with `env_clear()` plus an allowlist.
-/// - **No network egress from tool calls** — codex's Landlock sandbox blocks
-///   it, so the only output channel is the review text itself, which lands on
-///   the owner's own private PR.
-///
-/// Kernel-level read confinement (Landlock on the spawn, or `bwrap` once
-/// unprivileged user namespaces are permitted — AppArmor blocks them on this
-/// host today) is the real fix and is tracked separately. Until then this
-/// flag is the explicit, auditable place where the trade-off is made.
-pub fn codex_read_tools_enabled() -> bool {
-    matches!(
-        std::env::var("AUGMENTAGENT_CODEX_READ_TOOLS").ok().as_deref().map(str::trim),
-        Some("1") | Some("true") | Some("TRUE")
-    )
 }
 
 /// Default tier→model map per provider. Every cell is overridable without a
@@ -270,37 +242,6 @@ pub fn bin_resolves(bin: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    // ---- #828: codex read-tools is opt-in, never on by accident ----
-
-    #[test]
-    fn codex_read_tools_is_off_unless_explicitly_enabled() {
-        let _g = crate::providers::tests::env_guard();
-        let prev = std::env::var("AUGMENTAGENT_CODEX_READ_TOOLS").ok();
-        std::env::remove_var("AUGMENTAGENT_CODEX_READ_TOOLS");
-        assert!(
-            !allowed_for(ProviderKind::Codex, CapabilityClass::ReadTools),
-            "the widening must be opt-in; a bare checkout keeps codex text-only"
-        );
-        assert!(allowed_for(ProviderKind::Codex, CapabilityClass::TextOnly));
-
-        std::env::set_var("AUGMENTAGENT_CODEX_READ_TOOLS", "1");
-        assert!(allowed_for(ProviderKind::Codex, CapabilityClass::ReadTools));
-        // Never beyond read-tools: FullAgentic keeps the shell, which is what
-        // the text-only rule was actually written against.
-        assert!(!allowed_for(ProviderKind::Codex, CapabilityClass::FullAgentic));
-        // And it must not leak to another provider.
-        assert!(!allowed_for(ProviderKind::Cerebras, CapabilityClass::ReadTools));
-
-        match prev {
-            Some(v) => std::env::set_var("AUGMENTAGENT_CODEX_READ_TOOLS", v),
-            None => std::env::remove_var("AUGMENTAGENT_CODEX_READ_TOOLS"),
-        }
-    }
-
-    pub(crate) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     use super::*;
 
@@ -358,26 +299,14 @@ mod tests {
         assert_eq!(tier_of(&opts(vec![], None)), ModelTier::Quality);
 
         assert!(allowed_for(ProviderKind::Claude, CapabilityClass::FullAgentic));
-        // Codex is text-only by default. #828 lets a host opt into ReadTools
-        // via AUGMENTAGENT_CODEX_READ_TOOLS, so this must PIN the flag rather
-        // than read whatever the ambient environment happens to carry — on the
-        // production host it is set in `.env`, and the gate inherits it, which
-        // turned this into a red suite for every auto-PR run.
-        let _g = env_guard();
-        let prev = std::env::var("AUGMENTAGENT_CODEX_READ_TOOLS").ok();
-        std::env::remove_var("AUGMENTAGENT_CODEX_READ_TOOLS");
+        // Codex is text-only: its sandbox cannot path-scope reads, its only
+        // tool is a shell, and on this host that shell cannot even start
+        // (#840 reverted the #828 read-tools widening). No env dependence —
+        // reading ambient state here turned the whole gate red once already.
         assert!(allowed_for(ProviderKind::Codex, CapabilityClass::TextOnly));
         assert!(!allowed_for(ProviderKind::Codex, CapabilityClass::ReadTools));
-        // Never beyond read-tools, opted in or not — the shell is what the
-        // text-only rule was written against.
-        assert!(!allowed_for(ProviderKind::Codex, CapabilityClass::WriteTools));
-        std::env::set_var("AUGMENTAGENT_CODEX_READ_TOOLS", "1");
         assert!(!allowed_for(ProviderKind::Codex, CapabilityClass::WriteTools));
         assert!(!allowed_for(ProviderKind::Codex, CapabilityClass::FullAgentic));
-        match prev {
-            Some(v) => std::env::set_var("AUGMENTAGENT_CODEX_READ_TOOLS", v),
-            None => std::env::remove_var("AUGMENTAGENT_CODEX_READ_TOOLS"),
-        }
         assert!(allowed_for(ProviderKind::Gemini, CapabilityClass::ReadTools));
         assert!(!allowed_for(ProviderKind::Gemini, CapabilityClass::FullAgentic));
         assert!(allowed_for(ProviderKind::Cerebras, CapabilityClass::TextOnly));
