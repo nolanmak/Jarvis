@@ -353,6 +353,12 @@ fn diff_touched_paths(diff: &str) -> String {
                 || l.starts_with("rename ")
                 || l.starts_with("copy ")
         })
+        // The pattern list is substrings, so `.env` also matches
+        // `.env.example` — a tracked, secret-free documentation file that
+        // issues legitimately ask to update ("document every knob in
+        // .env.example"). Two live builds on #658 were destroyed by exactly
+        // that match. Exempt it by basename; the real `.env` still trips.
+        .filter(|l| !l.trim_end().ends_with(".env.example"))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -803,9 +809,11 @@ vague, under-specified, or not actually fixable by a coding agent at all \
 relevant code first, then judge it and — when fixable — produce an \
 implementation spec for a second, separate agent that will write the code.\n\
 \n\
-Your output MUST start with these two lines EXACTLY (then a blank line):\n\
+Your output MUST start with these four lines EXACTLY (then a blank line):\n\
 VERDICT: fixable | not-fixable\n\
 COMPLEXITY: simple | medium | hard\n\
+EST-DIFF-LINES: <your honest estimate of added+removed lines>\n\
+GUARDED-PATHS: yes | no\n\
 \n\
 Verdict guide: 'fixable' means a competent engineer could ship it from the \
 issue text plus the code, as a focused diff under 600 changed lines, \
@@ -856,6 +864,17 @@ the send path, as `hard` — regardless of how few lines it is.\n\
 this pipeline must not modify the gate that decides whether its own work \
 merges.\n\
 \n\
+EST-DIFF-LINES and GUARDED-PATHS are binding, not advisory. The pipeline \
+refuses any diff over 600 changed lines and any diff touching \
+deploy/auth/secret/CI paths (systemd units, scripts/check-for-updates, \
+.github/workflows, Cargo.lock — i.e. new dependencies, credentials/keyring, \
+.env) — AFTER the expensive build. Your two headers are the cheap check that \
+runs BEFORE it: if your honest estimate exceeds ~600 lines, or the work \
+cannot be done without touching a guarded path, say so and the pipeline \
+stops here instead of burning a 20-minute build to learn the same thing. \
+(.env.example is exempt — documenting knobs there is fine.) Estimating \
+implementation + tests to an order of magnitude is enough.\n\
+\n\
 Grade complexity by BLAST RADIUS, not diff size. A 10-line prompt edit that \
 alters every outbound email is `hard`; a 300-line self-contained validator \
 with tests is `medium`.\n\
@@ -890,6 +909,13 @@ impl Complexity {
 struct ScopeOutcome {
     fixable: bool,
     complexity: Complexity,
+    /// #843 — the scoper's own size estimate. `None` when the header was
+    /// missing or unparseable (older prompt, formatting glitch): absence must
+    /// not refuse work, only an explicit over-cap estimate may.
+    est_diff_lines: Option<usize>,
+    /// #843 — the scoper's answer to "would the diff touch a guarded path?".
+    /// Defaults to `false` for the same reason.
+    guarded_paths: bool,
     /// The spec (fixable) or the refusal reason (not-fixable) — the raw text
     /// with the header lines removed.
     body: String,
@@ -903,12 +929,27 @@ struct ScopeOutcome {
 fn parse_scope_output(raw: &str) -> ScopeOutcome {
     let mut fixable = true;
     let mut complexity = Complexity::Hard;
+    let mut est_diff_lines: Option<usize> = None;
+    let mut guarded_paths = false;
     let mut body_lines: Vec<&str> = Vec::new();
     for (i, line) in raw.lines().enumerate() {
         let l = line.trim().to_ascii_lowercase();
         let is_header_zone = i < 10;
         if is_header_zone && l.starts_with("verdict:") {
             fixable = !l.contains("not-fixable") && !l.contains("not fixable");
+            continue;
+        }
+        if is_header_zone && l.starts_with("est-diff-lines:") {
+            est_diff_lines = l["est-diff-lines:".len()..]
+                .trim()
+                .trim_start_matches('~')
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|n| n.parse().ok());
+            continue;
+        }
+        if is_header_zone && l.starts_with("guarded-paths:") {
+            guarded_paths = l.contains("yes");
             continue;
         }
         if is_header_zone && l.starts_with("complexity:") {
@@ -926,7 +967,36 @@ fn parse_scope_output(raw: &str) -> ScopeOutcome {
     ScopeOutcome {
         fixable,
         complexity,
+        est_diff_lines,
+        guarded_paths,
         body: body_lines.join("\n").trim().to_string(),
+    }
+}
+
+/// #843 — should this scoped issue be refused BEFORE the build?
+///
+/// Three of six live runs (2026-08-27/28) spent a ~20-minute agentic-Opus
+/// build producing a diff a post-build guard then discarded: #831 and #658
+/// hit the blast-radius guard, #667 came in at 2203 lines against the 600
+/// cap. In every case the scoper had the information — its own prompt states
+/// both constraints — but nothing made them binding. This does. The margin
+/// (1.5x) tolerates honest underestimates; a scoper predicting ~900+ lines is
+/// predicting a refusal, not a rounding error.
+fn scope_predicts_refusal(s: &ScopeOutcome) -> Option<String> {
+    if s.guarded_paths {
+        return Some(
+            "the scoping pass judged the fix cannot avoid a deploy/auth/secret \
+             path, which the blast-radius guard would refuse after the build"
+                .into(),
+        );
+    }
+    match s.est_diff_lines {
+        Some(n) if n > MAX_DIFF_LINES * 3 / 2 => Some(format!(
+            "the scoping pass estimates a ~{n}-line diff against a \
+             {MAX_DIFF_LINES}-line cap; the size guard would refuse it after \
+             the build"
+        )),
+        _ => None,
     }
 }
 
@@ -1890,6 +1960,37 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             )));
         }
     }
+    // #843 — the scoper's own predictions, made binding. A refusal here has
+    // spent one cheap Fable call and ~30 seconds; the same refusal after the
+    // build costs a ~20-minute agentic-Opus run. Three of six live runs paid
+    // the expensive version of this exact conclusion.
+    if let Some(sc) = &scope {
+        if let Some(reason) = scope_predicts_refusal(sc) {
+            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+            backoff_comment(
+                repo_root,
+                issue.number,
+                &format!(
+                    "Auto-fix triage: refused before building — {reason}.\n\n\
+                     The work itself may be sound; it does not fit the \
+                     unattended pipeline's bounds (focused diff ≤ 600 lines, \
+                     no deploy/auth/secret/CI paths). Splitting it into \
+                     smaller issues usually resolves the size case. Remove \
+                     the `{GAVE_UP_LABEL}` label to re-triage.\n\n\
+                     Scoping spec, for whoever picks this up:\n\n{}",
+                    truncate(&sc.body, 1500)
+                ),
+            )
+            .await
+            .ok();
+            label_gave_up(repo_root, issue.number).await.ok();
+            return Ok(RunReport::triage(format!(
+                "issue #{}: refused pre-build ({reason}) — labeled out",
+                issue.number
+            )));
+        }
+    }
+
     let complexity = scope.as_ref().map(|s| s.complexity).unwrap_or(Complexity::Hard);
     let plan = scope
         .as_ref()
@@ -4271,6 +4372,78 @@ CODEX-REVIEW: lgtm").0);
         git(&["add", "-A"]);
         let staged = String::from_utf8(git(&["diff", "--cached", "--name-only"]).stdout).unwrap();
         assert_eq!(staged.trim(), "crates/x/src/new.rs");
+    }
+
+    // ---- #843: the scoper's predictions are binding, pre-build ----
+
+    #[test]
+    fn scope_headers_carry_size_and_guarded_path_predictions() {
+        let o = parse_scope_output(
+            "VERDICT: fixable\nCOMPLEXITY: medium\nEST-DIFF-LINES: ~2200\nGUARDED-PATHS: no\n\nspec",
+        );
+        assert!(o.fixable);
+        assert_eq!(o.est_diff_lines, Some(2200));
+        assert!(!o.guarded_paths);
+
+        let o = parse_scope_output(
+            "VERDICT: fixable\nCOMPLEXITY: simple\nEST-DIFF-LINES: 120\nGUARDED-PATHS: yes\n\nspec",
+        );
+        assert_eq!(o.est_diff_lines, Some(120));
+        assert!(o.guarded_paths);
+
+        // Missing headers (older prompt, glitch) must not invent predictions.
+        let o = parse_scope_output("VERDICT: fixable\nCOMPLEXITY: simple\n\nspec");
+        assert_eq!(o.est_diff_lines, None);
+        assert!(!o.guarded_paths);
+    }
+
+    #[test]
+    fn scope_predictions_refuse_before_the_build_only_when_explicit() {
+        let base = parse_scope_output("VERDICT: fixable\nCOMPLEXITY: simple\n\nspec");
+        // No headers -> no refusal: absence is not evidence.
+        assert!(scope_predicts_refusal(&base).is_none());
+
+        // #667's shape: ~2200 lines against a 600 cap.
+        let big = parse_scope_output(
+            "VERDICT: fixable\nCOMPLEXITY: medium\nEST-DIFF-LINES: 2200\nGUARDED-PATHS: no\n\nspec",
+        );
+        let reason = scope_predicts_refusal(&big).expect("must refuse pre-build");
+        assert!(reason.contains("2200"), "{reason}");
+
+        // An honest near-cap estimate proceeds — the margin absorbs it.
+        let near = parse_scope_output(
+            "VERDICT: fixable\nCOMPLEXITY: medium\nEST-DIFF-LINES: 700\nGUARDED-PATHS: no\n\nspec",
+        );
+        assert!(scope_predicts_refusal(&near).is_none());
+
+        // #831's shape: the work cannot avoid guarded paths.
+        let guarded = parse_scope_output(
+            "VERDICT: fixable\nCOMPLEXITY: simple\nEST-DIFF-LINES: 50\nGUARDED-PATHS: yes\n\nspec",
+        );
+        assert!(scope_predicts_refusal(&guarded).is_some());
+    }
+
+    #[test]
+    fn env_example_is_exempt_from_the_path_guard() {
+        // #658 burned two builds on this: `.env` substring-matched
+        // `.env.example`, a tracked documentation file the issue itself asked
+        // to update.
+        let docs = diff_of(&[
+            "diff --git a/.env.example b/.env.example",
+            "+++ b/.env.example",
+            "+AUGMENTAGENT_MODEL_CODEX_QUALITY=gpt-5.6-terra",
+        ]);
+        assert!(
+            blast_radius_hit_in_diff(&docs).is_none(),
+            "documenting a knob in .env.example must not cost a build"
+        );
+        // The real .env is still refused.
+        let real = diff_of(&[
+            "diff --git a/.env b/.env",
+            "+++ b/.env",
+            "+SECRET=x",
+        ]);
+        assert!(blast_radius_hit_in_diff(&real).is_some());
     }
 
     // ---- the diff guard judges PATHS, not prose ----
