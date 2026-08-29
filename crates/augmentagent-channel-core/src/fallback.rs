@@ -78,69 +78,63 @@ pub struct FallbackReasoner {
     latch: CooldownLatch,
 }
 
-/// Build the production reasoner from `AUGMENTAGENT_REASONER_CHAIN`.
-///
-/// Eligibility is checked once per construction: a fallback CLI that is not
-/// installed (or has no resolvable auth) is dropped from the chain with one
-/// log line instead of erroring on every call. Claude is always eligible —
-/// it is the primary this daemon has run on since day one, and a missing
-/// `claude` binary should fail loudly per call, not silently vanish.
-/// Construct the entry for one provider, or `None` when it is not eligible
-/// (binary absent, no resolvable auth). Claude is always eligible — it is the
+/// Why `kind` cannot serve calls on this box (binary absent, no resolvable
+/// auth), or `None` when it is usable. Claude is always eligible — it is the
 /// primary this daemon has run on since day one, and a missing `claude`
 /// binary should fail loudly per call, not silently vanish.
-fn entry_for(kind: ProviderKind) -> Option<Entry> {
+///
+/// Public so `doctor` (#658) reports the same verdict the chain builder
+/// reaches, instead of a second opinion that can drift from it.
+pub fn ineligible_reason(kind: ProviderKind) -> Option<String> {
     match kind {
-        ProviderKind::Claude => Some(Entry {
-            kind,
-            reasoner: Arc::new(ClaudeCliReasoner::new()),
-        }),
+        ProviderKind::Claude => None,
         ProviderKind::Codex => {
             let bin = crate::codex::codex_bin();
             if !bin_resolves(&bin) {
-                info!("reasoner chain: codex skipped ({bin:?} not installed)");
-                return None;
+                return Some(format!("{bin:?} not installed"));
             }
             if !crate::codex::codex_auth_available() {
-                info!(
-                    "reasoner chain: codex skipped (no CODEX_API_KEY and no \
-                     auth.json — run `codex login` or seed the key)"
+                return Some(
+                    "no CODEX_API_KEY and no auth.json — run `codex login` or seed the key"
+                        .to_string(),
                 );
-                return None;
             }
-            Some(Entry {
-                kind,
-                reasoner: Arc::new(crate::codex::CodexCliReasoner::openai()),
-            })
+            None
         }
         ProviderKind::Gemini => {
             let bin = crate::gemini::gemini_bin();
             if !bin_resolves(&bin) {
-                info!("reasoner chain: gemini skipped ({bin:?} not installed)");
-                return None;
+                return Some(format!("{bin:?} not installed"));
             }
             if crate::secret_loader::load_provider_key("GEMINI_API_KEY").is_none() {
-                info!("reasoner chain: gemini skipped (no GEMINI_API_KEY in keyring/env)");
-                return None;
+                return Some("no GEMINI_API_KEY in keyring/env".to_string());
             }
-            Some(Entry {
-                kind,
-                reasoner: Arc::new(crate::gemini::GeminiCliReasoner::new()),
-            })
+            None
         }
         ProviderKind::Cerebras => {
-            // Thin chat-completions client (#663 plan B — codex ≥0.148
-            // removed wire_api=chat and Cerebras has no Responses API).
             if crate::secret_loader::load_provider_key("CEREBRAS_API_KEY").is_none() {
-                info!("reasoner chain: cerebras skipped (no CEREBRAS_API_KEY in keyring/env)");
-                return None;
+                return Some("no CEREBRAS_API_KEY in keyring/env".to_string());
             }
-            Some(Entry {
-                kind,
-                reasoner: Arc::new(crate::cerebras::CerebrasHttpReasoner::new()),
-            })
+            None
         }
     }
+}
+
+/// Construct the entry for one provider, or `None` when it is not eligible.
+fn entry_for(kind: ProviderKind) -> Option<Entry> {
+    if let Some(reason) = ineligible_reason(kind) {
+        info!("reasoner chain: {} skipped ({reason})", kind.name());
+        return None;
+    }
+    let reasoner: Arc<dyn Reasoner> = match kind {
+        ProviderKind::Claude => Arc::new(ClaudeCliReasoner::new()),
+        ProviderKind::Codex => Arc::new(crate::codex::CodexCliReasoner::openai()),
+        ProviderKind::Gemini => Arc::new(crate::gemini::GeminiCliReasoner::new()),
+        // Thin chat-completions client (#663 plan B — codex ≥0.148 removed
+        // wire_api=chat and Cerebras has no Responses API).
+        ProviderKind::Cerebras => Arc::new(crate::cerebras::CerebrasHttpReasoner::new()),
+    };
+    Some(Entry { kind, reasoner })
 }
 
 /// Build the production reasoner from `AUGMENTAGENT_REASONER_CHAIN`.

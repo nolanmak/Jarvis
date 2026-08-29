@@ -34,6 +34,55 @@ pub fn cerebras_base_url() -> String {
         .unwrap_or_else(|| "https://api.cerebras.ai/v1".into())
 }
 
+/// The provider's public model catalog (OpenAI-compatible `GET /v1/models`).
+///
+/// `doctor --deep` (#658) uses this to flag a pin that has been deprecated
+/// out from under us: Cerebras retired five model families in twelve months,
+/// and a fallback pinned to a dead id fails every call it is asked to serve.
+/// The key is passed as a bearer header and never appears in an error string.
+pub async fn list_models(
+    client: &reqwest::Client,
+    base: &str,
+    key: &str,
+) -> Result<Vec<String>, String> {
+    let url = format!("{}/models", base.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .bearer_auth(key)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err(format!("auth rejected (HTTP {status}) — check the key"));
+    }
+    if !status.is_success() {
+        let detail: String = text.chars().take(300).collect();
+        return Err(format!("HTTP {status}: {detail}"));
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("unparseable catalog body: {e}"))?;
+    let ids: Vec<String> = parsed
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if ids.is_empty() {
+        // An empty catalog is never real; treat it as an unusable answer
+        // rather than "every pin is gone".
+        return Err("catalog listed no models".into());
+    }
+    Ok(ids)
+}
+
 pub struct CerebrasHttpReasoner {
     client: reqwest::Client,
     /// Test override; production resolves [`cerebras_base_url`] per call.
@@ -248,6 +297,32 @@ mod tests {
                 "{status} must map to RateLimited, got: {err:#}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn list_models_parses_catalog_ids() {
+        let base = one_shot_server(
+            "200 OK",
+            r#"{"object":"list","data":[{"id":"gpt-oss-120b"},{"id":"gemma-4-31b"}]}"#,
+        )
+        .await;
+        let got = list_models(&reqwest::Client::new(), &base, "test-key")
+            .await
+            .unwrap();
+        assert_eq!(got, vec!["gpt-oss-120b".to_string(), "gemma-4-31b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_models_reports_auth_failure_without_leaking_the_key() {
+        let base = one_shot_server("401 Unauthorized", r#"{"message":"wrong api key"}"#).await;
+        let err = list_models(&reqwest::Client::new(), &base, "sk-not-a-real-key")
+            .await
+            .unwrap_err();
+        assert!(err.contains("auth"), "401 must read as an auth failure: {err}");
+        assert!(
+            !err.contains("sk-not-a-real-key"),
+            "the key must never reach a doctor finding: {err}"
+        );
     }
 
     #[tokio::test]
