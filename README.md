@@ -88,6 +88,14 @@ Runtime secrets and integration tokens live in environment variables
 `keyring` crate. This is a Linux-only deployment; there is no macOS
 counterpart.
 
+Which model answers a given call is config, not code: the "Reasoner provider
+chain & model tiers" block in `.env.example` documents the provider chain
+(`AUGMENTAGENT_REASONER_CHAIN`, claude-only by default) and the per-provider
+Quality/Fast model map (`AUGMENTAGENT_MODEL_<PROVIDER>_<TIER>`). Check a chain
+end to end with `augmentagent reasoner-selftest`; `augmentagent doctor --deep`
+reports the resolved models and flags a pinned model that has left its
+provider's catalog.
+
 ## Contributing
 
 Branch + PR only — never push to `main` (the auto-updater watches it).
