@@ -4305,6 +4305,23 @@ fn revise_subject(original: &str, thread_id: Option<&str>) -> String {
     format!("Re: {original}")
 }
 
+/// #652 — the subject a recreated draft carries after a Revise. A subject
+/// asked for in THIS revise wins and is used verbatim (no forced `Re:` — the
+/// user asked for those words); otherwise an override from an earlier round
+/// still stands, so "make it shorter" can't silently undo it; otherwise the
+/// subject derived from the inbound mail, which is the pre-#652 behavior.
+fn revised_subject(
+    asked_for: Option<&str>,
+    persisted: Option<&str>,
+    original: &str,
+    thread_id: Option<&str>,
+) -> String {
+    asked_for
+        .or(persisted)
+        .map(str::to_string)
+        .unwrap_or_else(|| revise_subject(original, thread_id))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_gmail_compose(
     store: Arc<Store>,
@@ -7426,8 +7443,8 @@ mod unescape_body_tests {
 #[cfg(test)]
 mod approval_body_tests {
     use super::{
-        compose_pending_disposition, revise_subject, strip_approval_envelope_markers,
-        ComposePendingDisposition,
+        compose_pending_disposition, revise_subject, revised_subject,
+        strip_approval_envelope_markers, ComposePendingDisposition,
     };
 
     #[test]
@@ -7490,6 +7507,39 @@ mod approval_body_tests {
     #[test]
     fn a_user_written_re_subject_survives_on_a_new_email_card() {
         assert_eq!(revise_subject("Re: hi", None), "Re: hi");
+    }
+
+    #[test]
+    fn a_subject_asked_for_during_revise_reaches_the_draft_verbatim() {
+        // #652 — the redraft's `Subject:` line beats both the persisted
+        // override and the derived reply subject, with no forced `Re:`: the
+        // user asked for those exact words.
+        assert_eq!(
+            revised_subject(
+                Some("Invoice for July"),
+                Some("Older override"),
+                "Ship Systems x EFS",
+                Some("t1"),
+            ),
+            "Invoice for July"
+        );
+    }
+
+    #[test]
+    fn a_later_revise_keeps_the_subject_an_earlier_one_set() {
+        // "make it shorter" must not silently undo the subject change.
+        assert_eq!(
+            revised_subject(None, Some("Invoice for July"), "Ship Systems x EFS", Some("t1")),
+            "Invoice for July"
+        );
+    }
+
+    #[test]
+    fn an_untouched_subject_still_derives_from_the_inbound_mail() {
+        assert_eq!(
+            revised_subject(None, None, "Ship Systems x EFS", Some("t1")),
+            "Re: Ship Systems x EFS"
+        );
     }
 }
 
@@ -9068,9 +9118,14 @@ impl ReplyApprover {
                 };
             }
         };
+        // #652 — a requested subject change comes back as a leading
+        // `Subject:` line. Split it off before anything persists or sends the
+        // text, so the header never lands in the body (#650) and the next
+        // round's previous_draft stays clean.
+        let (new_subject, redraft) =
+            augmentagent_channel_core::prompt::split_redraft_subject(&redraft);
 
         // 2. Create a fresh Gmail draft with the revised body.
-        let subject = revise_subject(&action.email.subject, action.email.thread_id.as_deref());
         // #473 — recreate the draft with the envelope the card was composed
         // with, when one was recorded. Pre-#473 behavior (To = emails.from,
         // no cc/bcc) silently dropped an overridden To and every cc/bcc on
@@ -9083,6 +9138,14 @@ impl ReplyApprover {
                 tracing::warn!(action_id, "revise: envelope lookup failed: {e}");
                 None
             });
+        // The thread id is kept whichever subject wins — this is still the
+        // same reply, just with the header the user asked for.
+        let subject = revised_subject(
+            new_subject.as_deref(),
+            envelope.as_ref().and_then(|env| env.subject.as_deref()),
+            &action.email.subject,
+            action.email.thread_id.as_deref(),
+        );
         let to = envelope
             .as_ref()
             .and_then(|env| env.to.clone())
@@ -9151,6 +9214,11 @@ impl ReplyApprover {
         let _ = self
             .store
             .set_action_draft_id(action_id, &new_draft_id);
+        // Only after the CAS wins: a lost race must not leave the subject of
+        // a draft nobody will send behind on the row (#652).
+        if new_subject.is_some() {
+            let _ = self.store.set_action_subject(action_id, Some(&subject));
+        }
         let _ = self.store.reset_nudge_schedule(action_id);
 
         // 4. Delete the now-stale old draft best-effort — the row already
@@ -9161,6 +9229,9 @@ impl ReplyApprover {
             }
         }
 
+        if new_subject.is_some() {
+            tracing::info!(action_id, subject = %subject, "revise: applied a new subject");
+        }
         tracing::info!(action_id, new_draft_id, "revise: new draft posted");
         ApprovalActionOutcome::Revised {
             email: action.email,

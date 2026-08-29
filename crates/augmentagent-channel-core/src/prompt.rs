@@ -563,9 +563,20 @@ pub fn code_mode_repair_user_message(
 }
 
 /// Build the redraft prompt when the user clicks "Revise" in Discord.
+///
+/// Email cards get one extra clause (#652): a `Subject:` first line is the
+/// only channel the model has to act on "change the subject to X", and
+/// [`split_redraft_subject`] parses it back out. Chat platforms (discord,
+/// slack, telegram, …) share this prompt and have no subject at all, so they
+/// keep the pre-#652 bytes.
 pub fn redraft_message(email: &Email, previous_draft: &str, feedback: &str) -> String {
+    let subject_clause = if email.platform == "gmail" {
+        " If — and only if — the user's feedback asks for a different subject line, put the new subject on the very first line as `Subject: <new subject>`, followed by one blank line, then the body. Otherwise never include a Subject line."
+    } else {
+        ""
+    };
     format!(
-        r#"You are a professional email draft editor. Revise the draft based on the user's feedback and return ONLY the revised email text — no JSON, no quotes, no commentary, except the optional `<!--aa:assumes …-->` block described in your system prompt. Do not add To:, Cc:, Bcc:, or other recipient/header lines; recipients are managed separately from the email body.
+        r#"You are a professional email draft editor. Revise the draft based on the user's feedback and return ONLY the revised email text — no JSON, no quotes, no commentary, except the optional `<!--aa:assumes …-->` block described in your system prompt. Do not add To:, Cc:, Bcc:, or other recipient/header lines; recipients are managed separately from the email body.{subject_clause}
 
 <original_email>
 From: {from}
@@ -588,6 +599,34 @@ Write the revised draft now.
         subject = sanitize_untrusted(&email.subject),
         body = sanitize_untrusted(&email.body),
     )
+}
+
+/// #652 — split a `Subject: …` override off the front of a redraft, returning
+/// `(subject, body)`. This is both the channel [`redraft_message`] asks for
+/// and the shape a model leaks unprompted when told to change the subject
+/// (#650), so parsing it here applies the change AND keeps the header out of
+/// the sent body. Only the first non-blank line counts: a `Subject:` deeper in
+/// the text is prose and stays put, and a draft without one comes back
+/// byte-identical.
+pub fn split_redraft_subject(redraft: &str) -> (Option<String>, String) {
+    let Some(first_char) = redraft.find(|c: char| !c.is_whitespace()) else {
+        return (None, redraft.to_string());
+    };
+    let line_start = redraft[..first_char].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let (first_line, rest) = match redraft[line_start..].split_once('\n') {
+        Some((line, rest)) => (line, rest),
+        None => (&redraft[line_start..], ""),
+    };
+    let first_line = first_line.trim();
+    if !first_line
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("subject:"))
+    {
+        return (None, redraft.to_string());
+    }
+    let subject = first_line[8..].trim();
+    let subject = (!subject.is_empty()).then(|| subject.to_string());
+    (subject, rest.trim_start().to_string())
 }
 
 #[cfg(test)]
@@ -724,6 +763,54 @@ mod tests {
         // the marker; the "no commentary" rule must not suppress it.
         let got = redraft_message(&email(), "the previous draft", "make it shorter");
         assert!(got.contains("`<!--aa:assumes …-->`"), "redraft tail:\n{got}");
+    }
+
+    #[test]
+    fn redraft_offers_a_subject_channel_on_gmail_only() {
+        // #652 — without this clause the model has nowhere to put a requested
+        // subject change, so it either drops it or writes it into the body.
+        let got = redraft_message(&email(), "the previous draft", "call it Invoice for July");
+        assert!(
+            got.contains("`Subject: <new subject>`"),
+            "gmail redraft lost the subject channel:\n{got}"
+        );
+        let mut chat = email();
+        chat.platform = "slack".into();
+        let got = redraft_message(&chat, "the previous draft", "call it Invoice for July");
+        assert!(
+            !got.contains("Subject: <new subject>"),
+            "chat redraft must not talk about subject lines:\n{got}"
+        );
+    }
+
+    #[test]
+    fn split_redraft_subject_pulls_a_leading_header() {
+        let (subject, body) =
+            split_redraft_subject("Subject: Invoice for July\n\nHi Alice,\nthanks.");
+        assert_eq!(subject.as_deref(), Some("Invoice for July"));
+        assert_eq!(body, "Hi Alice,\nthanks.");
+
+        // Lower-case and leading blank lines are accepted too.
+        let (subject, body) = split_redraft_subject("\n  subject:  Invoice  \nHi Alice,");
+        assert_eq!(subject.as_deref(), Some("Invoice"));
+        assert_eq!(body, "Hi Alice,");
+    }
+
+    #[test]
+    fn split_redraft_subject_leaves_a_plain_draft_byte_identical() {
+        let draft = "Hi Alice,\n\nSubject: not a header, just prose.\n\n— N";
+        let (subject, body) = split_redraft_subject(draft);
+        assert_eq!(subject, None);
+        assert_eq!(body, draft);
+    }
+
+    #[test]
+    fn split_redraft_subject_drops_an_empty_header() {
+        // An empty value is not an override, but the line still must not
+        // reach the sent body.
+        let (subject, body) = split_redraft_subject("Subject:   \n\nHi Alice,");
+        assert_eq!(subject, None);
+        assert_eq!(body, "Hi Alice,");
     }
 
     #[test]

@@ -1122,7 +1122,8 @@ async fn delete_notice_message(
 
 /// #473 — append the stored compose envelope to a reposted card body as the
 /// same display markers the original card carried (`[to: …]`/`[cc: …]`/
-/// `[bcc: …]`). `[to:]` is shown only when it differs from `card_from` (the
+/// `[bcc: …]`), plus `[subject: …]` when a Revise overrode the header
+/// (#652). `[to:]` is shown only when it differs from `card_from` (the
 /// card's From line), matching compose-time behavior. No store or no
 /// recorded envelope (auto-triage replies, non-gmail platforms) → the body
 /// passes through unchanged. Public since #501: the Back-to-queue repost in
@@ -1147,6 +1148,11 @@ pub fn append_envelope_markers(
     }
     if let Some(bcc) = env.bcc.as_deref() {
         markers.push_str(&format!("\n[bcc: {bcc}]"));
+    }
+    // #652 — a Revise that changed the subject is otherwise invisible: the
+    // card title still renders the inbound subject.
+    if let Some(subject) = env.subject.as_deref() {
+        markers.push_str(&format!("\n[subject: {subject}]"));
     }
     if markers.is_empty() {
         return body;
@@ -2178,6 +2184,24 @@ mod tests {
         assert!(out.contains("[to: omer@y.com]"), "missing to marker: {out}");
         assert!(out.contains("[bcc: josh@x.com]"), "missing bcc marker: {out}");
         assert!(out.starts_with("body"), "body must lead: {out}");
+    }
+
+    #[test]
+    fn envelope_markers_show_a_revised_subject() {
+        // #652 — the reposted card is the only place the operator can see
+        // that Revise actually applied the subject they asked for.
+        let (s, id, _f) = store_with_envelope(None, None, None);
+        s.set_action_subject(&id, Some("Invoice for July")).unwrap();
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "alice@example.com");
+        assert!(
+            out.contains("[subject: Invoice for July]"),
+            "missing subject marker: {out}"
+        );
+
+        // Untouched subject → no marker, even with an envelope recorded.
+        let (s, id, _f) = store_with_envelope(None, Some("cc@example.com"), None);
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "alice@example.com");
+        assert!(!out.contains("[subject:"), "spurious subject marker: {out}");
     }
 
     #[test]
