@@ -192,6 +192,8 @@ augmentagent gmail compose \
   --body "Hi Jeremy,\n\n…"
 ```
 
+The body is the message text only — never start it with a `Subject:` line; the subject goes in `--subject` (#650: compose drops a leading one and warns, and refuses a body that is nothing else).
+
 For multi-line or long bodies, write the body to a tempfile and pass `--body-file /path/to/body.txt` (or `--body-file -` to read stdin). Inline `--body` values interpret `\n` and `\t` escapes as real newlines/tabs (write `\\n` for a literal backslash-n), so short multi-paragraph bodies work inline too. Returns a `draft_id` and a Gmail URL the user can open to review/send.
 
 **Multiple recipients (#439):** `--to` takes several addresses — repeat the flag (`--to a@x.com --to b@y.com`) or pass one comma-separated value (`--to 'a@x.com, b@y.com'`). `--cc` and `--bcc` work the same way and exist on `compose`, `send-now`, and `update-draft`. When the user says "respond to Bo and his assistant" or "reply all", put EVERY named person on `--to`/`--cc` — do not address one person and merely mention the other in the body. The approval card shows `[to: …]`/`[cc: …]`/`[bcc: …]` lines under the draft; card **Revise** re-creates the draft with that same envelope (#473), so recipients survive revision — but attachments still don't (re-pass `--attach` via `update-draft`). `update-draft` only carries what you re-pass, so repeat `--cc`/`--bcc` there too.

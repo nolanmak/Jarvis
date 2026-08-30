@@ -4265,6 +4265,62 @@ fn strip_approval_envelope_markers(body: &str) -> String {
         .to_string()
 }
 
+/// #650 — drop a leading `Subject: …` line from a body that is about to become
+/// a Gmail message. The subject belongs in the header; a body that opens with
+/// one ships a visible duplicate subject to the recipient, which is what a
+/// threaded reply carrying a differing `--subject` did. Returns the remainder
+/// (a verbatim slice, so CRLF endings and the trailing newline survive) plus
+/// the dropped value, or the body unchanged when the first non-blank line is
+/// not a subject header — a `Subject:` inside quoted or forwarded text further
+/// down is real message content.
+fn strip_leading_subject_line(body: &str) -> (String, Option<String>) {
+    const HEADER: &str = "subject:";
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            offset += line.len();
+            continue;
+        }
+        let Some((header, value)) = trimmed.get(..HEADER.len()).zip(trimmed.get(HEADER.len()..))
+        else {
+            return (body.to_string(), None);
+        };
+        if !header.eq_ignore_ascii_case(HEADER) {
+            return (body.to_string(), None);
+        }
+        offset += line.len();
+        for after in body[offset..].split_inclusive('\n') {
+            if !after.trim().is_empty() {
+                break;
+            }
+            offset += after.len();
+        }
+        return (body[offset..].to_string(), Some(value.trim().to_string()));
+    }
+    (body.to_string(), None)
+}
+
+/// Sanitize a `--body`/`--body-file` value before any Gmail write. A body that
+/// is nothing but its own `Subject:` header is a mistake we can only fail on —
+/// and it fails here, before a draft exists, so there is no orphan to clean up
+/// (#412).
+fn body_without_leaked_subject(body: String, subject: &str) -> Result<String> {
+    let (rest, Some(dropped)) = strip_leading_subject_line(&body) else {
+        return Ok(body);
+    };
+    anyhow::ensure!(
+        !rest.trim().is_empty(),
+        "the body contains only a 'Subject:' line; the subject goes in \
+         --subject and the message text in --body"
+    );
+    eprintln!(
+        "note: dropped leading \"Subject: {dropped}\" line from the body; \
+         the subject header is --subject ({subject})"
+    );
+    Ok(rest)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ComposePendingDisposition {
     Create,
@@ -4361,7 +4417,7 @@ async fn run_gmail_compose(
     let to = to.join(", ");
     let cc = normalize_recipients("--cc", &cc)?;
     let bcc = normalize_recipients("--bcc", &bcc)?;
-    let body_str = read_body(body, body_file)?;
+    let body_str = body_without_leaked_subject(read_body(body, body_file)?, &subject)?;
     // Validate the --post flag pairing BEFORE any Gmail write, so a usage
     // error can't strand an orphan draft in the mailbox (#412).
     if post
@@ -5212,7 +5268,7 @@ async fn run_gmail_update_draft(
     let to = to.join(", ");
     let cc = normalize_recipients("--cc", &cc)?;
     let bcc = normalize_recipients("--bcc", &bcc)?;
-    let body_str = read_body(body, body_file)?;
+    let body_str = body_without_leaked_subject(read_body(body, body_file)?, &subject)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     // #500 — refuse while a send of exactly this draft is in flight: update
     // is create-replacement + DELETE-old, which would yank the draft out
@@ -5384,7 +5440,7 @@ async fn run_gmail_send_now(
     let to = to.join(", ");
     let cc = normalize_recipients("--cc", &cc)?;
     let bcc = normalize_recipients("--bcc", &bcc)?;
-    let body_str = read_body(body, body_file)?;
+    let body_str = body_without_leaked_subject(read_body(body, body_file)?, &subject)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
@@ -7426,8 +7482,8 @@ mod unescape_body_tests {
 #[cfg(test)]
 mod approval_body_tests {
     use super::{
-        compose_pending_disposition, revise_subject, strip_approval_envelope_markers,
-        ComposePendingDisposition,
+        body_without_leaked_subject, compose_pending_disposition, revise_subject,
+        strip_approval_envelope_markers, strip_leading_subject_line, ComposePendingDisposition,
     };
 
     #[test]
@@ -7467,6 +7523,64 @@ mod approval_body_tests {
     fn keeps_normal_prose_and_non_email_colons() {
         let body = "Hi,\n\nCC: means carbon copy in this sentence.\nTo: the team";
         assert_eq!(strip_approval_envelope_markers(body), body);
+    }
+
+    #[test]
+    fn leading_subject_line_is_dropped() {
+        assert_eq!(
+            strip_leading_subject_line("Subject: Hosting a PTE event\n\nHey Casey,\n\nThanks."),
+            (
+                "Hey Casey,\n\nThanks.".to_string(),
+                Some("Hosting a PTE event".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn subject_match_is_case_and_whitespace_insensitive() {
+        assert_eq!(
+            strip_leading_subject_line("\n  SUBJECT:  venue question \nHi"),
+            ("Hi".to_string(), Some("venue question".to_string()))
+        );
+    }
+
+    #[test]
+    fn mid_body_subject_line_survives() {
+        let body = "Hi,\n\n> Subject: old thread\nbye";
+        assert_eq!(strip_leading_subject_line(body), (body.to_string(), None));
+    }
+
+    #[test]
+    fn subject_only_body_yields_empty_remainder() {
+        assert_eq!(
+            strip_leading_subject_line("Subject: venue question\n"),
+            (String::new(), Some("venue question".to_string()))
+        );
+    }
+
+    #[test]
+    fn remainder_is_preserved_verbatim_including_crlf() {
+        assert_eq!(
+            strip_leading_subject_line("Subject: x\r\n\r\nHi\r\nBye\r\n"),
+            ("Hi\r\nBye\r\n".to_string(), Some("x".to_string()))
+        );
+    }
+
+    #[test]
+    fn body_without_subject_is_untouched() {
+        let body = "Hey Casey,\n\nThanks.";
+        assert_eq!(strip_leading_subject_line(body), (body.to_string(), None));
+    }
+
+    #[test]
+    fn a_subject_only_body_fails_before_any_gmail_write() {
+        let only_header = "Subject: venue question\n".to_string();
+        assert!(body_without_leaked_subject(only_header, "Re: venue").is_err());
+        let with_text = "Subject: venue question\n\nHi".to_string();
+        assert_eq!(
+            body_without_leaked_subject(with_text, "Re: venue").unwrap(),
+            "Hi"
+        );
     }
 
     #[test]
@@ -9067,6 +9181,18 @@ impl ReplyApprover {
                     message: format!("redraft call failed: {e}"),
                 };
             }
+        };
+        // #650 — the redraft prompt shows the model a `Subject:` header block
+        // it sometimes echoes back as the first body line. Drop it here, before
+        // the Gmail draft and the reposted card, so both carry the same
+        // subject-free text. A redraft that is nothing BUT that line is kept
+        // untouched: a daemon-side revise has no way to fail usefully.
+        let redraft = match strip_leading_subject_line(&redraft) {
+            (rest, Some(_)) if !rest.trim().is_empty() => {
+                tracing::warn!(action_id, "revise: dropped leading Subject: line from redraft");
+                rest
+            }
+            _ => redraft,
         };
 
         // 2. Create a fresh Gmail draft with the revised body.
