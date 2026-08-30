@@ -596,6 +596,26 @@ impl ComposioClient {
         Ok(new_id)
     }
 
+    /// Every non-empty subject on a thread, oldest-first (#651).
+    ///
+    /// Gmail sends a reply under the THREAD's subject and discards the one
+    /// supplied alongside `thread_id`, so a compose that threads must first
+    /// check that its `--subject` is one the thread already carries. All
+    /// messages are returned (`max = 0`) because a subject can change
+    /// mid-thread and any of them is a legitimate match.
+    pub async fn fetch_thread_subjects(
+        &self,
+        entity_id: &str,
+        thread_id: &str,
+    ) -> Result<Vec<String>, GmailError> {
+        let messages = self.fetch_thread_messages(entity_id, thread_id, 0).await?;
+        Ok(messages
+            .into_iter()
+            .map(|m| m.subject)
+            .filter(|s| !s.trim().is_empty())
+            .collect())
+    }
+
     /// Shared paginated fetch for `GMAIL_FETCH_EMAILS`. Walks pages up to
     /// `max_total` messages (in `PAGE_SIZE` chunks), deduping by `message_id`
     /// and guarding against a non-advancing pagination cursor.
@@ -779,6 +799,29 @@ pub fn split_recipients(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Canonical form of a subject for comparison (#651). Strips leading
+/// `Re:`/`Fwd:`/`Fw:` prefixes — mail clients stack them — then folds case
+/// and collapses whitespace runs. The colon is required, so "Regarding x"
+/// keeps its first word.
+pub fn normalize_subject(raw: &str) -> String {
+    const PREFIXES: [&str; 3] = ["re:", "fwd:", "fw:"];
+    let mut rest = raw.trim();
+    'strip: loop {
+        let lower = rest.to_ascii_lowercase();
+        for p in PREFIXES {
+            if lower.starts_with(p) {
+                rest = rest[p.len()..].trim_start();
+                continue 'strip;
+            }
+        }
+        break;
+    }
+    rest.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,6 +880,24 @@ mod tests {
         assert_eq!(split_recipients("a@x.com,, b@y.com,"), vec!["a@x.com", "b@y.com"]);
         assert!(split_recipients("").is_empty());
         assert!(split_recipients(" , ").is_empty());
+    }
+
+    // ---- #651: subject comparison across a thread ----
+
+    #[test]
+    fn normalize_subject_strips_stacked_reply_prefixes() {
+        assert_eq!(
+            normalize_subject("RE:  Re: Fwd: Hello  world"),
+            "hello world"
+        );
+        assert_eq!(normalize_subject("Fw: Ground Floor?"), "ground floor?");
+        assert_eq!(normalize_subject("  Hello world  "), "hello world");
+    }
+
+    #[test]
+    fn normalize_subject_keeps_words_that_merely_start_with_re() {
+        assert_eq!(normalize_subject("Regarding x"), "regarding x");
+        assert_eq!(normalize_subject("Reply to this"), "reply to this");
     }
 
     #[test]
@@ -1362,6 +1423,41 @@ mod tests {
             .await
             .expect("message id should resolve");
         assert_eq!(t, "THREAD1");
+    }
+
+    // ---- #651: the subjects a threaded compose must agree with ----
+
+    #[tokio::test]
+    async fn fetch_thread_subjects_returns_every_subject_on_the_thread() {
+        let body = r#"{"successful":true,"data":{"messages":[
+            {"id":"M1","threadId":"T1","subject":"Ground Floor as a venue?","from":"bo@example.com"},
+            {"id":"M2","threadId":"T1","subject":"Re: Ground Floor as a venue?","from":"alice@example.com"},
+            {"id":"M3","threadId":"T1","subject":"","from":"bo@example.com"}
+        ]}}"#;
+        let addr = spawn_one_shot_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let subjects = client
+            .fetch_thread_subjects("entity-x", "T1")
+            .await
+            .expect("thread subjects should fetch");
+        assert_eq!(
+            subjects,
+            vec!["Ground Floor as a venue?", "Re: Ground Floor as a venue?"]
+        );
+    }
+
+    // A failed lookup must surface as an error so the caller can fail closed
+    // rather than send under an unverified subject.
+    #[tokio::test]
+    async fn fetch_thread_subjects_surfaces_provider_failure() {
+        let addr = spawn_one_shot_http(500, r#"{"error":"upstream exploded"}"#).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        client
+            .fetch_thread_subjects("entity-x", "T1")
+            .await
+            .expect_err("a provider failure must not look like an empty thread");
     }
 
     // An id that is neither a message nor a thread in this mailbox (the
