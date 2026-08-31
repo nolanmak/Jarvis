@@ -1749,6 +1749,77 @@ async fn node_build_required(worktree: &Path) -> bool {
     }
 }
 
+/// The workspace crates a change set touches, as `-p`-able package names —
+/// or `None` when anything falls outside `crates/`, which means only the
+/// full gate can vouch for it (Node sources, schema, scripts).
+///
+/// Crate directory names ARE the package names in this workspace
+/// (`crates/augmentagent-cli` ⇒ package `augmentagent-cli`).
+fn changed_crates(paths: &str) -> Option<Vec<String>> {
+    let mut crates: Vec<String> = Vec::new();
+    for path in paths.lines().map(str::trim).filter(|p| !p.is_empty()) {
+        let mut segs = path.split('/');
+        match (segs.next(), segs.next(), segs.next()) {
+            (Some("crates"), Some(dir), Some(_)) => {
+                if !crates.iter().any(|c| c == dir) {
+                    crates.push(dir.to_string());
+                }
+            }
+            // Workspace manifests change dependency resolution everywhere.
+            _ => return None,
+        }
+    }
+    (!crates.is_empty()).then_some(crates)
+}
+
+/// Build + test ONLY the given crates (#870). Used between revision rounds,
+/// where the full single-threaded workspace suite (~5 min) was re-verifying
+/// 30+ untouched crates after every round — ~20 of the 49 minutes of a
+/// three-round run. The FULL gate still runs exactly once before anything is
+/// pushed or merged; this trims the redundancy, not the bar.
+async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Result<()> {
+    let env = gate_env();
+    let pkgs: String = crates
+        .iter()
+        .map(|c| format!("-p {c}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    info!(%pkgs, "verification gate (targeted): cargo build");
+    let (ok, _o, e) = run_sandboxed(
+        "bash",
+        &["-lc", &gate_sh(&format!(". $HOME/.cargo/env && cargo build {pkgs} 2>&1 | tail -5"))],
+        worktree,
+        &env,
+    )
+    .await?;
+    if !ok {
+        bail!("targeted cargo build failed:\n{o}{e}", o = _o.trim());
+    }
+    info!(%pkgs, "verification gate (targeted): cargo test");
+    let (ok, _o, e) = run_sandboxed(
+        "bash",
+        &["-lc", &gate_sh(&format!(
+            ". $HOME/.cargo/env && cargo test {pkgs} -- --test-threads=1 2>&1 | tail -8"
+        ))],
+        worktree,
+        &env,
+    )
+    .await?;
+    if !ok {
+        bail!("targeted cargo test failed:\n{o}{e}", o = _o.trim());
+    }
+    Ok(())
+}
+
+/// Gate for an intermediate revision round: targeted when the diff stays
+/// inside `crates/`, full otherwise.
+async fn gate_for_round(worktree: &Path, changed_paths: &str) -> Result<()> {
+    match changed_crates(changed_paths) {
+        Some(crates) => verification_gate_targeted(worktree, &crates).await,
+        None => verification_gate(worktree).await,
+    }
+}
+
 async fn verification_gate(worktree: &Path) -> Result<()> {
     // #300 — Strip provider secrets from the gate's child env. `cargo
     // build`/`npm run build` execute `build.rs`/proc-macros/`npm
@@ -2040,7 +2111,17 @@ async fn resume_draft_pr(
                 }
             }
         }
-        if let Err(gate_err) = verification_gate(&worktree).await {
+        // Round 0 earns the FULL suite (first verification of an old branch
+        // against today's main); later rounds verify the changed crates
+        // (#870) — the full gate runs once more before any merge.
+        let gate_result = if rounds_done == 0 {
+            verification_gate(&worktree).await
+        } else {
+            let (_ok, names, _) =
+                run("git", &["diff", "--name-only", "origin/main...HEAD"], &worktree).await?;
+            gate_for_round(&worktree, &names).await
+        };
+        if let Err(gate_err) = gate_result {
             cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
             let _ = run(
                 &gh,
@@ -2060,6 +2141,26 @@ async fn resume_draft_pr(
             independent.status()
         ));
         if independent.approved() {
+            if rounds_done > 0 {
+                // Revisions were verified crate-targeted; nothing merges
+                // without the full suite passing once (#870).
+                if let Err(gate_err) = verification_gate(&worktree).await {
+                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                    let _ = run(
+                        &gh,
+                        &["pr", "comment", &pr.to_string(), "--body",
+                          &format!("Auto-resume: double LGTM, but the final \
+                                    full-workspace gate failed:\n```\n{}\n```",
+                                   truncate(&gate_err.to_string(), 1200))],
+                        repo_root,
+                    )
+                    .await;
+                    record_attempt(repo_root, issue.number).await.ok();
+                    return Ok(RunReport::built(format!(
+                        "PR #{pr}: LGTM but final full gate failed"
+                    )));
+                }
+            }
             if dry_run {
                 cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
@@ -2122,7 +2223,9 @@ async fn resume_draft_pr(
                 &gh,
                 &["pr", "comment", &pr.to_string(), "--body",
                   &format!("Auto-resume: no double LGTM after {rounds_done} revision \
-                            round(s) ({}). Latest findings:\n\n{}",
+                            round(s) ({}). Revisions were verified against the \
+                            changed crates' tests; the full workspace suite \
+                            runs before any merge. Latest findings:\n\n{}",
                            notes_log.join("; "),
                            truncate(&independent.notes, 2500))],
                 repo_root,
@@ -2829,7 +2932,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         issue.number
                     )));
                 }
-                if let Err(gate_err) = verification_gate(&worktree).await {
+                let (_ok, names2, _) =
+                    run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
+                if let Err(gate_err) = gate_for_round(&worktree, &names2).await {
                     warn!(issue = issue.number, "post-revision gate failed: {gate_err:#}");
                     let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
                     if attempts >= MAX_ATTEMPTS {
@@ -2853,8 +2958,6 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     )));
                 }
                 // The revised diff may touch different files.
-                let (_ok, names2, _) =
-                    run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
                 gated = touches_verify_gated_path(&names2);
                 lines = lines2;
                 independent = independent_review(&issue, &rev_summary, &diff2, worktree.clone()).await;
@@ -2875,6 +2978,32 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             approved = independent.approved(),
             "iterative review finished"
         );
+        // Intermediate rounds ran the targeted gate (#870); everything that
+        // ships — or even lands as a PR claiming workspace-pass — gets the
+        // FULL suite exactly once here.
+        if let Err(gate_err) = verification_gate(&worktree).await {
+            warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
+            let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+            if attempts >= MAX_ATTEMPTS {
+                backoff_comment(
+                    repo_root,
+                    issue.number,
+                    &format!(
+                        "Self-improve gave up after {attempts} attempts. Final \
+                         full-workspace gate failure after revisions:\n```\n{}\n```",
+                        truncate(&gate_err.to_string(), 1500)
+                    ),
+                )
+                .await
+                .ok();
+                label_gave_up(repo_root, issue.number).await.ok();
+            }
+            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+            return Ok(RunReport::built(format!(
+                "issue #{}: final full gate failed after {round} revision round(s)",
+                issue.number
+            )));
+        }
     }
 
     if dry_run {
@@ -5184,6 +5313,31 @@ CODEX-REVIEW: lgtm").0);
             complexity_from_pr_body("- complexity (scoping pass): who knows"),
             Complexity::Hard
         );
+    }
+
+    // ---- #870: targeted gate between rounds ----
+
+    #[test]
+    fn changed_crates_targets_inside_crates_and_bails_outside() {
+        assert_eq!(
+            changed_crates("crates/augmentagent-cli/src/self_improve.rs\ncrates/augmentagent-store/src/store.rs"),
+            Some(vec!["augmentagent-cli".into(), "augmentagent-store".into()])
+        );
+        // Duplicates collapse.
+        assert_eq!(
+            changed_crates("crates/x/src/a.rs\ncrates/x/src/b.rs"),
+            Some(vec!["x".into()])
+        );
+        // Anything outside crates/ means only the full gate can vouch for it.
+        assert_eq!(changed_crates("src/index.ts"), None);
+        assert_eq!(changed_crates("crates/x/src/a.rs\nCargo.toml"), None);
+        assert_eq!(changed_crates("schema/triage.md"), None);
+        // A bare `crates/<dir>` line (no file) is not a crate change we can
+        // name — full gate.
+        assert_eq!(changed_crates("crates/x"), None);
+        // Empty set: nothing to target.
+        assert_eq!(changed_crates(""), None);
+        assert_eq!(changed_crates("\n\n"), None);
     }
 
     // ---- revise loop + receipt override ----
