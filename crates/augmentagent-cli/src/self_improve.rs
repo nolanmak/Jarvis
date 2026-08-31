@@ -1310,7 +1310,7 @@ fn parse_codex_review(raw: &str) -> (bool, String) {
 /// drafts accumulated over three days with nobody (human or model) acting
 /// on a single finding. One bounded revision converts "codex found issues"
 /// into "merged PR" without widening any gate.
-fn build_revise_prompt(issue: &Issue, review_notes: &str) -> String {
+fn build_revise_prompt(issue: &Issue, review_notes: &str, current_lines: usize) -> String {
     format!(
         "You previously implemented a fix for GitHub issue #{} ({}) in this \
          worktree. An independent reviewer examined your diff and requested \
@@ -1318,11 +1318,29 @@ fn build_revise_prompt(issue: &Issue, review_notes: &str) -> String {
          real (with a regression test where the finding is bug-shaped), and \
          where a finding is mistaken, add a brief code comment at the \
          relevant site explaining why the behaviour is correct. Keep the \
-         diff focused; do not start over or refactor unrelated code. When \
+         diff focused; do not start over or refactor unrelated code.\n\
+         HARD BUDGET: the total diff may not exceed {MAX_DIFF_LINES} changed \
+         lines and is currently at {current_lines}. A revision that grows \
+         past the cap is rejected wholesale, discarding all of this work — \
+         if you are near the cap, trim (drop non-essential refactors, tighten \
+         verbose tests) while keeping the fix and its regression tests. When \
          done, summarize what you changed per finding.",
         issue.number,
         issue.title,
         truncate(review_notes, 4000),
+    )
+}
+
+/// Synthetic "findings" for a shrink round: the revision overgrew the cap,
+/// and the next round's job is to cut it down, not to add more.
+fn shrink_findings(lines: usize) -> String {
+    format!(
+        "Your last revision grew the diff to {lines} changed lines, over the \
+         hard {MAX_DIFF_LINES}-line cap — it cannot ship at this size. Reduce \
+         the diff below the cap without losing the fix or its regression \
+         tests: drop non-essential refactors, collapse duplicated test \
+         scaffolding, and prefer editing existing tests over adding parallel \
+         ones."
     )
 }
 
@@ -1959,16 +1977,58 @@ async fn resume_draft_pr(
                 "PR #{pr}: resume refused — blast radius on `{pattern}`"
             )));
         }
-        if diff_line_count(&diff) > MAX_DIFF_LINES {
-            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-            let _ = run(
-                &gh,
-                &["pr", "comment", &pr.to_string(), "--body",
-                  &format!("Auto-resume refused: diff exceeds the {MAX_DIFF_LINES}-line cap.")],
-                repo_root,
-            )
-            .await;
-            return Ok(RunReport::built(format!("PR #{pr}: resume refused — oversized")));
+        let lines_now = diff_line_count(&diff);
+        if lines_now > MAX_DIFF_LINES {
+            // A revision that grew past the cap gets a SHRINK round while
+            // budget remains — refusing outright here discarded every round
+            // of paid work on the live #839 resume. Codex is not consulted
+            // on an oversized diff; the next round's only job is to cut.
+            if rounds_done >= revise_rounds() {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                let _ = run(
+                    &gh,
+                    &["pr", "comment", &pr.to_string(), "--body",
+                      &format!("Auto-resume refused: diff is {lines_now} lines \
+                                (cap {MAX_DIFF_LINES}) and the revision budget \
+                                is exhausted.")],
+                    repo_root,
+                )
+                .await;
+                record_attempt(repo_root, issue.number).await.ok();
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: resume refused — oversized after revisions"
+                )));
+            }
+            rounds_done += 1;
+            info!(pr, issue = issue.number, round = rounds_done, lines_now, "resume: shrink round");
+            match reasoner
+                .call(
+                    &fix_opts(worktree.clone()),
+                    &build_revise_prompt(&issue, &shrink_findings(lines_now), lines_now),
+                )
+                .await
+            {
+                Ok(rs) => {
+                    let _ = drop_root_scratch(&worktree).await;
+                    let _ = run("git", &["add", "-A"], &worktree).await?;
+                    let msg = format!("review round {rounds_done}: reduce diff below the size cap");
+                    let _ = run(
+                        "git",
+                        &["-c", &name_arg, "-c", &email_arg, "commit", "--allow-empty", "-m", &msg],
+                        &worktree,
+                    )
+                    .await?;
+                    summary = format!("{summary}\nRound {rounds_done} (shrink): {}", truncate(&rs, 200));
+                    continue;
+                }
+                Err(e) => {
+                    warn!(pr, "resume shrink round failed: {e:#}");
+                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                    return Ok(RunReport::built(format!(
+                        "PR #{pr}: resume refused — oversized, shrink errored"
+                    )));
+                }
+            }
         }
         if let Err(gate_err) = verification_gate(&worktree).await {
             cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
@@ -2073,7 +2133,10 @@ async fn resume_draft_pr(
         rounds_done += 1;
         info!(pr, issue = issue.number, round = rounds_done, "resume: revising against findings");
         let rev_summary = match reasoner
-            .call(&fix_opts(worktree.clone()), &build_revise_prompt(&issue, &independent.notes))
+            .call(
+                &fix_opts(worktree.clone()),
+                &build_revise_prompt(&issue, &independent.notes, lines_now),
+            )
             .await
         {
             Ok(rs) => rs,
@@ -2664,12 +2727,22 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // a revised diff earns its verdict, it does not inherit one.
     let max_rounds = revise_rounds();
     let mut round = 0u32;
+    // Set when a round overgrew the size cap: the next round revises against
+    // a shrink instruction instead of codex notes, and codex is not consulted
+    // on a diff that cannot ship anyway.
+    let mut findings_override: Option<String> = None;
     while independent.available && !independent.approved() && round < max_rounds {
         round += 1;
+        let findings = findings_override
+            .take()
+            .unwrap_or_else(|| independent.notes.clone());
         info!(issue = issue.number, round, max_rounds, "revising against the independent findings");
         let round1 = independent.status();
         match reasoner
-            .call(&fix_opts(worktree.clone()), &build_revise_prompt(&issue, &independent.notes))
+            .call(
+                &fix_opts(worktree.clone()),
+                &build_revise_prompt(&issue, &findings, lines),
+            )
             .await
         {
             Err(e) => {
@@ -2709,13 +2782,30 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 }
                 let lines2 = diff_line_count(&diff2);
                 if lines2 > MAX_DIFF_LINES {
+                    // Shrink round while budget remains — a terminal refusal
+                    // here discards every round of paid work (seen live on
+                    // the #839 resume). Terminal only when rounds are spent.
+                    if round < max_rounds {
+                        warn!(
+                            issue = issue.number,
+                            round, lines2, "revision overgrew the cap; scheduling a shrink round"
+                        );
+                        findings_override = Some(shrink_findings(lines2));
+                        lines = lines2;
+                        revision_note.push_str(&format!(
+                            "\n### Revision round {round}: overgrew the cap \
+                             ({lines2} lines); next round shrinks\n"
+                        ));
+                        continue;
+                    }
                     let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
                     backoff_comment(
                         repo_root,
                         issue.number,
                         &format!(
                             "Self-improve refused after revision: diff grew to \
-                             {lines2} lines (cap {MAX_DIFF_LINES})."
+                             {lines2} lines (cap {MAX_DIFF_LINES}) and the \
+                             revision budget is exhausted."
                         ),
                     )
                     .await
@@ -5098,7 +5188,7 @@ CODEX-REVIEW: lgtm").0);
             author_trusted: true,
             research_filed: false,
         };
-        let p = build_revise_prompt(&issue, "rfind(',') splits quoted display names");
+        let p = build_revise_prompt(&issue, "rfind(',') splits quoted display names", 373);
         assert!(p.contains("rfind"), "the reviewer's findings must reach the builder");
         assert!(p.contains("#845"));
         assert!(
@@ -5109,6 +5199,21 @@ CODEX-REVIEW: lgtm").0);
             p.contains("mistaken"),
             "the builder must be allowed to rebut a wrong finding rather than \
              blindly comply with it"
+        );
+        // The budget must be stated every round — the live #839 resume blew
+        // the cap on round 2 because the builder was never told it existed.
+        assert!(p.contains("373"), "current size must be in the prompt");
+        assert!(p.contains("600"), "the cap must be in the prompt");
+    }
+
+    #[test]
+    fn shrink_findings_name_the_size_and_forbid_losing_the_fix() {
+        let f = shrink_findings(812);
+        assert!(f.contains("812"));
+        assert!(f.contains("600"));
+        assert!(
+            f.contains("without losing the fix"),
+            "a shrink round must cut scaffolding, not the fix or its tests"
         );
     }
 
