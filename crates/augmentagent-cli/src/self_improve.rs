@@ -1254,11 +1254,27 @@ untestable.\n\
 no scratch files.\n\
 - Conventions: does it match the surrounding code's idiom and comment density?\n\
 \n\
+MATERIALITY (#889): request changes ONLY for findings that would cause \
+incorrect behaviour in a case a user could realistically hit, lose data, \
+create a security hole, or leave the issue's own reported case without a \
+regression test. Style preferences, theoretical edge cases needing exotic \
+preconditions, and nice-to-have hardening are NOT blockers — put them in \
+your notes prefixed `non-blocking:` and still approve. Ask yourself: would \
+you block a colleague's merge over this? A reviewer that always finds one \
+more thing is not a bar, it is an unreachable asymptote.\n\
+CONVERGENCE: when the message includes your PRIOR findings, your PRIMARY job \
+is judging whether they were addressed (fixed, or rebutted in a code comment \
+with a sound argument). Do not re-litigate a rebutted finding without new \
+evidence. A NEW finding on a revision round must clear the materiality bar \
+with room to spare — each round of fresh eyes will always find something \
+smaller, and that ratchet is a process failure, not rigor.\n\
+\n\
 Your output MUST start with this line EXACTLY:\n\
 CODEX-REVIEW: lgtm | changes-requested\n\
-Then a blank line, then 3-8 sentences: for lgtm, what you verified and how; \
-for changes-requested, the concrete defects as file:line. Read-only — do NOT \
-edit anything. Output ONLY the verdict line and your notes.";
+Then a blank line, then 3-8 sentences: for lgtm, what you verified and how \
+(non-blocking notes welcome); for changes-requested, the concrete defects as \
+file:line and why each is material. Read-only — do NOT edit anything. Output \
+ONLY the verdict line and your notes.";
 
 const CODEX_SYSTEM_REVIEW_SYSTEM: &str = "You are an INDEPENDENT reviewer on a \
 staged autonomous fix pipeline, and this is the SYSTEM-INTERACTION pass. A \
@@ -1558,6 +1574,7 @@ async fn independent_review(
     summary: &str,
     diff: &str,
     worktree: PathBuf,
+    prior_findings: Option<&str>,
 ) -> IndependentReview {
     let Some(reasoner) = augmentagent_channel_core::build_pinned(
         augmentagent_channel_core::ProviderKind::Codex,
@@ -1567,6 +1584,20 @@ async fn independent_review(
         );
     };
 
+    // #889 — on revision rounds the reviewer sees its own prior findings, so
+    // it can converge (were they addressed?) instead of re-scoping from
+    // scratch and finding one smaller thing per round forever.
+    let prior_section = prior_findings
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| {
+            format!(
+                "\n\n## Your prior findings on the previous revision\n\
+                 The builder revised specifically against these. Judge \
+                 whether each was addressed or soundly rebutted.\n{}",
+                truncate(p, 3000)
+            )
+        })
+        .unwrap_or_default();
     let context = format!(
         "GitHub issue #{}: {}\n\n{}\n\nThe author model's own summary of its \
          change:\n{}\n\nThe complete staged diff follows. The full repository \
@@ -1578,6 +1609,7 @@ async fn independent_review(
         truncate(summary, 2000),
         truncate(diff, 60_000),
     );
+    let context = format!("{context}{prior_section}");
 
     let mut out = IndependentReview {
         available: true,
@@ -2102,6 +2134,9 @@ async fn resume_draft_pr(
 
     let mut rounds_done = 0u32;
     let mut notes_log: Vec<String> = Vec::new();
+    // #889 — the reviewer's previous round's findings, fed back so it judges
+    // convergence instead of re-scoping every round.
+    let mut prior_notes: Option<String> = None;
     let mut summary = format!("Resumed sitting draft PR #{pr}.");
     loop {
         // The PR's actual contribution, freshly computed each round.
@@ -2243,7 +2278,10 @@ async fn resume_draft_pr(
             )));
         }
 
-        let independent = independent_review(&issue, &summary, &diff, worktree.clone()).await;
+        let independent =
+            independent_review(&issue, &summary, &diff, worktree.clone(), prior_notes.as_deref())
+                .await;
+        prior_notes = Some(independent.notes.clone());
         notes_log.push(format!(
             "round {rounds_done}: {}",
             independent.status()
@@ -3022,7 +3060,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // gate, and satisfied the author's own QA, so it opens as a draft PR
     // carrying both verdicts for a human. It does count as a failed attempt,
     // because a second opinion disagreeing is exactly what this stage is for.
-    let mut independent = independent_review(&issue, &summary, &full_diff, worktree.clone()).await;
+    let mut independent =
+        independent_review(&issue, &summary, &full_diff, worktree.clone(), None).await;
     let mut revision_note = String::new();
     if independent.available && !independent.approved() {
         warn!(
@@ -3177,7 +3216,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 // The revised diff may touch different files.
                 gated = touches_verify_gated_path(&names2);
                 lines = lines2;
-                independent = independent_review(&issue, &rev_summary, &diff2, worktree.clone()).await;
+                let prior = independent.notes.clone();
+                independent =
+                    independent_review(&issue, &rev_summary, &diff2, worktree.clone(), Some(&prior))
+                        .await;
                 revision_note.push_str(&format!(
                     "\n### Revision round {round} (prior verdict: {round1})\n{}\n\n\
                      Verdict after round {round}: {}\n",
@@ -5248,6 +5290,25 @@ mod tests {
         // review is impossible otherwise.
         assert_eq!(opts.cwd, Some(PathBuf::from("/tmp/wt")));
         assert!(opts.add_dirs.contains(&PathBuf::from("/tmp/wt")));
+    }
+
+    #[test]
+    fn focused_prompt_carries_materiality_and_convergence_rules() {
+        // #889 — 0 focused-pass approvals in ~20 live reviews: each round of
+        // fresh eyes found one smaller thing, forever. The prompt must state
+        // a materiality bar and a convergence rule or the bar is an
+        // unreachable asymptote and nothing ever merges.
+        assert!(CODEX_DIFF_REVIEW_SYSTEM.contains("MATERIALITY"));
+        assert!(CODEX_DIFF_REVIEW_SYSTEM.contains("non-blocking:"));
+        assert!(
+            CODEX_DIFF_REVIEW_SYSTEM.contains("would you block a colleague"),
+            "the human-review calibration question is the operative test"
+        );
+        assert!(CODEX_DIFF_REVIEW_SYSTEM.contains("CONVERGENCE"));
+        assert!(
+            CODEX_DIFF_REVIEW_SYSTEM.contains("Do not re-litigate a rebutted finding"),
+            "a sound rebuttal must settle a finding"
+        );
     }
 
     #[test]
