@@ -1301,6 +1301,69 @@ fn parse_codex_review(raw: &str) -> (bool, String) {
     (approved, raw.trim().to_string())
 }
 
+/// Build the one-shot revision prompt: the reviewer's concrete findings,
+/// handed back to the builder that wrote the diff.
+///
+/// This is the loop's missing last mile. Codex requests changes on most
+/// first attempts — that is a reviewer doing its job — but until now the
+/// pipeline just parked a draft PR and the findings went nowhere: seven
+/// drafts accumulated over three days with nobody (human or model) acting
+/// on a single finding. One bounded revision converts "codex found issues"
+/// into "merged PR" without widening any gate.
+fn build_revise_prompt(issue: &Issue, review_notes: &str) -> String {
+    format!(
+        "You previously implemented a fix for GitHub issue #{} ({}) in this \
+         worktree. An independent reviewer examined your diff and requested \
+         changes. Its findings:\n\n{}\n\nAddress each finding: fix what is \
+         real (with a regression test where the finding is bug-shaped), and \
+         where a finding is mistaken, add a brief code comment at the \
+         relevant site explaining why the behaviour is correct. Keep the \
+         diff focused; do not start over or refactor unrelated code. When \
+         done, summarize what you changed per finding.",
+        issue.number,
+        issue.title,
+        truncate(review_notes, 4000),
+    )
+}
+
+/// #851-follow-up — may this PR auto-merge despite touching a receipt-gated
+/// path? Owner policy (2026-08-31): a DOUBLE codex LGTM overrides the
+/// receipt gate when `AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT=1`.
+///
+/// The receipt gate exists because diffs that read clean can still break
+/// live email behaviour (#209/#211/#213); codex reads diffs and cannot
+/// exercise an inbox, so this trades that protection for throughput. The
+/// owner made that call explicitly; the env flag keeps it one line to
+/// revert, and OFF is the safe default for any other deployment.
+fn automerge_receipt_ok(gated: Option<&str>, independent_approved: bool, flag: Option<&str>) -> bool {
+    match gated {
+        None => true,
+        Some(_) => independent_approved && automerge_enabled_value(flag),
+    }
+}
+
+/// Post a short notice to the owner's Discord webhook, best-effort (#851
+/// visibility gap: draft PRs sat unseen for three days). A webhook failure
+/// must never fail the run — the PR already exists.
+async fn notify_discord(text: &str) {
+    let Ok(url) = std::env::var("DISCORD_WEBHOOK_URL") else { return };
+    if url.trim().is_empty() {
+        return;
+    }
+    let body = serde_json::json!({ "content": truncate(text, 1800) });
+    match reqwest::Client::new()
+        .post(url.trim())
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => warn!(status = %r.status(), "draft-PR discord notice rejected"),
+        Err(e) => warn!("draft-PR discord notice failed: {e}"),
+    }
+}
+
 /// Outcome of the independent stage (#828).
 struct IndependentReview {
     /// False when codex could not be reached at all — NOT the same as a
@@ -1443,6 +1506,14 @@ fn build_fix_prompt(issue: &Issue, plan: Option<&str>) -> String {
 /// #828 — does an independent LGTM also release the `hard` complexity band?
 /// Off by default: turning it on is the decision that lets high-blast-radius
 /// work merge with no human, on the strength of two independent reviews.
+/// One revision pass against codex findings — default ON, `=0` disables.
+fn revise_enabled() -> bool {
+    !matches!(
+        std::env::var("AUGMENTAGENT_AUTOPR_REVISE").ok().as_deref().map(str::trim),
+        Some("0") | Some("false") | Some("FALSE")
+    )
+}
+
 fn codex_unlocks_hard() -> bool {
     automerge_enabled_value(
         std::env::var("AUGMENTAGENT_AUTOPR_CODEX_UNLOCKS_HARD").ok().as_deref(),
@@ -2015,7 +2086,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
     let opts = fix_opts(worktree.clone());
     let prompt = build_fix_prompt(&issue, plan.as_deref());
-    let summary = match reasoner.call(&opts, &prompt).await {
+    let mut summary = match reasoner.call(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
@@ -2032,7 +2103,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // made of new files passed the 600-line cap, and a newly-created
     // `.github/workflows/*.yml` or `scripts/deploy-*.sh` was never refused.
     // Staging here is idempotent with the commit step's own `git add -A`.
-    let dropped = drop_root_scratch(&worktree).await;
+    let mut dropped = drop_root_scratch(&worktree).await;
     let _ = run("git", &["add", "-A"], &worktree).await?;
     let (_ok, diff, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
     if diff.trim().is_empty() {
@@ -2100,9 +2171,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // next to the other diff-derived facts; it withholds auto-merge below
     // rather than refusing the work.
     let (_ok, staged_names, _) = run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
-    let gated = touches_verify_gated_path(&staged_names);
+    let mut gated = touches_verify_gated_path(&staged_names);
 
-    let lines = diff_line_count(&full_diff);
+    let mut lines = diff_line_count(&full_diff);
     if lines > MAX_DIFF_LINES {
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
         let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
@@ -2205,7 +2276,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // gate, and satisfied the author's own QA, so it opens as a draft PR
     // carrying both verdicts for a human. It does count as a failed attempt,
     // because a second opinion disagreeing is exactly what this stage is for.
-    let independent = independent_review(&issue, &summary, &full_diff, worktree.clone()).await;
+    let mut independent = independent_review(&issue, &summary, &full_diff, worktree.clone()).await;
+    let mut revision_note = String::new();
     if independent.available && !independent.approved() {
         warn!(
             issue = issue.number,
@@ -2213,10 +2285,115 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             system_ok = independent.system_ok,
             "independent review requested changes"
         );
-        // Not recorded as an attempt here: the run continues to open a draft
-        // PR, and dedup already keeps the issue out of the pool while that PR
-        // is open. Recording here AND in a later hard failure double-counted
-        // — the live #845 run consumed attempts 1 and 2 in one pass.
+        // Not recorded as an attempt: the run continues either to a revision
+        // or to a draft PR, and dedup keeps the issue out of the pool while
+        // that PR is open (recording here double-counted — see #852).
+    }
+
+    // One bounded revision against the reviewer's findings (default ON,
+    // AUGMENTAGENT_AUTOPR_REVISE=0 disables). Seven drafts accumulated over
+    // three days because a codex rejection just parked the work with nobody
+    // acting on the findings; this is the loop that turns findings into
+    // merges. Everything downstream of the edit re-runs: scratch sweep,
+    // blast/size guards, the full verification gate, and BOTH codex passes —
+    // the revised diff earns its verdict, it does not inherit one.
+    if independent.available && !independent.approved() && revise_enabled() {
+        info!(issue = issue.number, "revising once against the independent findings");
+        let round1 = independent.status();
+        match reasoner
+            .call(&fix_opts(worktree.clone()), &build_revise_prompt(&issue, &independent.notes))
+            .await
+        {
+            Err(e) => warn!(
+                issue = issue.number,
+                "revision pass failed; keeping the round-1 outcome: {e:#}"
+            ),
+            Ok(rev_summary) => {
+                dropped.extend(drop_root_scratch(&worktree).await);
+                let _ = run("git", &["add", "-A"], &worktree).await?;
+                let (_ok, diff2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+                if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff2) {
+                    warn!(issue = issue.number, pattern, %line, "revision hit the blast-radius guard");
+                    let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+                    backoff_comment(
+                        repo_root,
+                        issue.number,
+                        &format!(
+                            "Self-improve refused after revision: the revised diff \
+                             touches `{pattern}`:\n```\n{line}\n```"
+                        ),
+                    )
+                    .await
+                    .ok();
+                    if attempts >= MAX_ATTEMPTS {
+                        label_gave_up(repo_root, issue.number).await.ok();
+                    }
+                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                    return Ok(RunReport::built(format!(
+                        "issue #{}: revision hit blast-radius guard on `{pattern}` (attempt {attempts})",
+                        issue.number
+                    )));
+                }
+                let lines2 = diff_line_count(&diff2);
+                if lines2 > MAX_DIFF_LINES {
+                    let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+                    backoff_comment(
+                        repo_root,
+                        issue.number,
+                        &format!(
+                            "Self-improve refused after revision: diff grew to \
+                             {lines2} lines (cap {MAX_DIFF_LINES})."
+                        ),
+                    )
+                    .await
+                    .ok();
+                    if attempts >= MAX_ATTEMPTS {
+                        label_gave_up(repo_root, issue.number).await.ok();
+                    }
+                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                    return Ok(RunReport::built(format!(
+                        "issue #{}: revision oversized ({lines2} lines, attempt {attempts})",
+                        issue.number
+                    )));
+                }
+                if let Err(gate_err) = verification_gate(&worktree).await {
+                    warn!(issue = issue.number, "post-revision gate failed: {gate_err:#}");
+                    let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+                    if attempts >= MAX_ATTEMPTS {
+                        backoff_comment(
+                            repo_root,
+                            issue.number,
+                            &format!(
+                                "Self-improve gave up after {attempts} attempts. \
+                                 Post-revision gate failure:\n```\n{}\n```",
+                                truncate(&gate_err.to_string(), 1500)
+                            ),
+                        )
+                        .await
+                        .ok();
+                        label_gave_up(repo_root, issue.number).await.ok();
+                    }
+                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                    return Ok(RunReport::built(format!(
+                        "issue #{}: post-revision gate failed (attempt {attempts}); no PR opened",
+                        issue.number
+                    )));
+                }
+                // The revised diff may touch different files.
+                let (_ok, names2, _) =
+                    run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
+                gated = touches_verify_gated_path(&names2);
+                lines = lines2;
+                independent = independent_review(&issue, &rev_summary, &diff2, worktree.clone()).await;
+                revision_note = format!(
+                    "\n### Revision (round 1 verdict: {round1})\n{}\n\n\
+                     Final verdict after revision: {}\n",
+                    truncate(&rev_summary, 1200),
+                    independent.status()
+                );
+                summary = format!("{summary}\n\nRevision: {}", truncate(&rev_summary, 400));
+            }
+        }
     }
 
     if dry_run {
@@ -2310,8 +2487,15 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // work was not. Receipt-gated paths stay human-only either way —
         // those change live behaviour no reviewer can verify by reading.
         let complexity_ok = complexity.auto_mergeable() || codex_unlocks_hard();
+        // Owner policy 2026-08-31: a double codex LGTM may override the
+        // receipt gate (env-gated; see `automerge_receipt_ok`).
+        let receipt_ok = automerge_receipt_ok(
+            gated.as_deref(),
+            independent.approved(),
+            std::env::var("AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT").ok().as_deref(),
+        );
         if enabled && complexity_ok && independent.approved() && !issue.research_filed
-            && gated.is_none()
+            && receipt_ok
         {
             let owner = std::env::var(GH_OWNER_ENV)
                 .ok()
@@ -2365,7 +2549,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         )
     };
     let independent_section = format!(
-        "\n\n## Independent review (codex)\n{}\n",
+        "\n\n## Independent review (codex)\n{}{revision_note}\n",
         truncate(&independent.notes, 3000)
     );
     let pr_body = format!(
@@ -2398,6 +2582,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }
     let pr_url = stdout.trim().to_string();
     if !automerge {
+        // Visibility (#851): drafts sat unseen for three days. Tell the owner.
+        notify_discord(&format!(
+            "📝 auto-PR needs review: {} — {pr_url}\n{}",
+            issue.title,
+            truncate(&merge_note, 300)
+        ))
+        .await;
         return Ok(RunReport::built(format!(
             "issue #{}: draft PR opened — {pr_url}",
             issue.number
@@ -2420,6 +2611,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             issue.number
         )));
     }
+    notify_discord(&format!("✅ auto-PR merged: {} — {pr_url}", issue.title)).await;
     Ok(RunReport::built(format!(
         "issue #{}: PR auto-merged (owner-authored) — {pr_url}",
         issue.number
@@ -4481,6 +4673,69 @@ CODEX-REVIEW: lgtm").0);
         git(&["add", "-A"]);
         let staged = String::from_utf8(git(&["diff", "--cached", "--name-only"]).stdout).unwrap();
         assert_eq!(staged.trim(), "crates/x/src/new.rs");
+    }
+
+    // ---- revise loop + receipt override ----
+
+    #[test]
+    fn revise_prompt_carries_the_findings_and_forbids_a_rewrite() {
+        let issue = Issue {
+            number: 845,
+            title: "To/CC bug".into(),
+            body: "b".into(),
+            author: "a".into(),
+            author_trusted: true,
+            research_filed: false,
+        };
+        let p = build_revise_prompt(&issue, "rfind(',') splits quoted display names");
+        assert!(p.contains("rfind"), "the reviewer's findings must reach the builder");
+        assert!(p.contains("#845"));
+        assert!(
+            p.contains("do not start over"),
+            "a revision must stay a revision, not a second attempt from scratch"
+        );
+        assert!(
+            p.contains("mistaken"),
+            "the builder must be allowed to rebut a wrong finding rather than \
+             blindly comply with it"
+        );
+    }
+
+    #[test]
+    fn receipt_override_requires_double_lgtm_and_the_explicit_flag() {
+        // Ungated work merges as before, reviewer or not.
+        assert!(automerge_receipt_ok(None, true, None));
+        assert!(automerge_receipt_ok(None, false, None));
+
+        let gated = Some("crates/augmentagent-channel-email/src/channel.rs");
+        // Gated + no flag: held, even with a double LGTM — safe default for
+        // any deployment that has not made the owner's call.
+        assert!(!automerge_receipt_ok(gated, true, None));
+        // Gated + flag + double LGTM: the owner's 2026-08-31 policy.
+        assert!(automerge_receipt_ok(gated, true, Some("1")));
+        // Gated + flag but codex did NOT approve: still held. The override
+        // is "LGTM overrides the receipt", never "the flag overrides codex".
+        assert!(!automerge_receipt_ok(gated, false, Some("1")));
+    }
+
+    #[test]
+    fn revise_is_on_by_default_and_disableable() {
+        // Pin the env either way (#838's lesson: never read ambient state).
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AUGMENTAGENT_AUTOPR_REVISE").ok();
+
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE");
+        assert!(revise_enabled(), "revision is the default");
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", "0");
+        assert!(!revise_enabled());
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", "1");
+        assert!(revise_enabled());
+
+        match prev {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE"),
+        }
     }
 
     // ---- #851: never hand a refused issue straight back ----
