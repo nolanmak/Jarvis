@@ -4253,13 +4253,8 @@ async fn upload_attach_if_given(
 /// mailbox — the raw Gmail 404 ("Requested entity was not found") gave the
 /// caller nothing to act on.
 ///
-/// #650 — also refuses a `--subject` the thread will not honor. A message
-/// written into a thread goes out under the THREAD's subject; the `subject`
-/// argument is only what threads it. So a differing `--subject` is a request
-/// Gmail silently drops, and the caller — having seen its subject vanish —
-/// starts writing it into the body instead, where it reaches the recipient as
-/// literal text. Refusing here, before `create_draft`, keeps #412 discipline:
-/// no draft exists yet, so there is no orphan to clean up.
+/// #650 — also refuses a `--subject` the thread will not honor, see
+/// [`ensure_subject_fits_thread`].
 async fn resolve_compose_thread_id(
     gmail: &ComposioClient,
     entity_id: &str,
@@ -4278,36 +4273,88 @@ async fn resolve_compose_thread_id(
              don't exist in another."
         )
     })?;
-    if let Some(thread_subject) = read_thread_subject(gmail, entity_id, &resolved).await {
-        anyhow::ensure!(
-            subjects_agree(subject, &thread_subject),
-            "--subject {subject:?} is not thread {resolved}'s subject ({thread_subject:?}), \
-             and a threaded reply goes out under the thread's subject — yours would be \
-             dropped without a trace. Reply with --subject {thread_subject:?}, or drop \
-             --thread-id to start a new thread under {subject:?}."
-        );
-    }
+    ensure_subject_fits_thread(gmail, entity_id, &resolved, subject).await?;
     Ok(Some(resolved))
 }
 
-/// The subject a message written into `thread_id` will actually carry, when
-/// Gmail will tell us. `None` on a lookup failure or a subjectless thread:
-/// not knowing is not evidence of a conflict, so the write goes ahead.
-async fn read_thread_subject(
+/// #650 — refuse a write into `thread_id` carrying a subject the thread will
+/// not honor. A message written into a thread goes out under the THREAD's
+/// subject; `subject` is only what threads it. So a differing subject is a
+/// request Gmail silently drops, and the caller — having seen its subject
+/// vanish — starts writing it into the body instead, where it reaches the
+/// recipient as literal text. Every threaded write passes through here,
+/// whether the thread came from `--thread-id` or from the draft being
+/// replaced. Checking before `create_draft` keeps #412 discipline: no draft
+/// exists yet, so there is no orphan to clean up.
+///
+/// A thread whose subject cannot be read fails the write rather than passing
+/// unchecked: an unverified threaded write is exactly the silent mismatch
+/// this guards against, and reaching here means a Composio thread lookup
+/// already succeeded, so a failure now is an outage — not routine.
+async fn ensure_subject_fits_thread(
     gmail: &ComposioClient,
     entity_id: &str,
     thread_id: &str,
-) -> Option<String> {
-    match gmail.fetch_thread_messages(entity_id, thread_id, 1).await {
-        Ok(messages) => messages
-            .last()
-            .map(|m| m.subject.trim().to_string())
-            .filter(|s| !s.is_empty()),
+    subject: &str,
+) -> Result<()> {
+    let messages = gmail
+        .fetch_thread_messages(entity_id, thread_id, 1)
+        .await
+        .with_context(|| {
+            format!(
+                "could not read thread {thread_id}'s subject, so --subject {subject:?} \
+                 could not be checked against it — a mismatch would go out under the \
+                 thread's subject. Retry, or start a new thread instead."
+            )
+        })?;
+    let thread_subject = messages
+        .last()
+        .map(|m| m.subject.trim().to_string())
+        .with_context(|| format!("thread {thread_id} has no messages to take a subject from"))?;
+    anyhow::ensure!(
+        subjects_agree(subject, &thread_subject),
+        "--subject {subject:?} is not thread {thread_id}'s subject ({thread_subject:?}), \
+         and a threaded write goes out under the thread's subject — yours would be \
+         dropped without a trace. Use --subject {thread_subject:?}, or start a new \
+         thread (compose without --thread-id) to keep {subject:?}."
+    );
+    Ok(())
+}
+
+/// Pick the thread an `update-draft` replacement joins (update = create
+/// replacement + delete old, #382): the explicit `--thread-id` when given,
+/// otherwise the thread the old draft already sits in. Detection is
+/// best-effort — a lookup failure downgrades to an unthreaded draft rather
+/// than blocking the update — but once a thread IS known the #650 subject
+/// check applies either way. The replacement goes out under that thread's
+/// subject whether the caller named the thread or the draft did, so an
+/// inherited thread silently drops a new `--subject` just as an explicit one
+/// would.
+async fn resolve_update_draft_thread_id(
+    gmail: &ComposioClient,
+    entity_id: &str,
+    account_email: &str,
+    draft_id: &str,
+    thread_id: Option<String>,
+    subject: &str,
+) -> Result<Option<String>> {
+    if let Some(t) = thread_id.filter(|t| !t.is_empty()) {
+        return resolve_compose_thread_id(gmail, entity_id, account_email, Some(t), subject).await;
+    }
+    let inherited = match gmail.get_draft_thread_id(entity_id, draft_id).await {
+        Ok(t) => t,
         Err(e) => {
-            tracing::warn!(thread_id, "could not read thread subject: {e}");
+            eprintln!(
+                "warning: could not determine draft {draft_id}'s thread ({e}); \
+                 the replacement draft will start a new thread"
+            );
             None
         }
+    };
+    if let Some(t) = &inherited {
+        ensure_subject_fits_thread(gmail, entity_id, t, subject).await?;
     }
+    Ok(inherited)
 }
 
 /// #439 — flatten repeated `--to`/`--cc`/`--bcc` values (each possibly a
@@ -4421,9 +4468,8 @@ fn subjects_agree(a: &str, b: &str) -> bool {
 /// DIFFERENT one is a subject the author meant to set, and no body can supply
 /// a header, so silently dropping it would send a message under a subject
 /// nobody asked for. Say so instead and let the caller put it where it
-/// belongs — which for a threaded write means dropping `--thread-id`, since
-/// [`resolve_compose_thread_id`] enforces that a reply keeps its thread's
-/// subject.
+/// belongs — which for a threaded write means starting a new thread, since
+/// [`ensure_subject_fits_thread`] holds a reply to its thread's subject.
 fn body_without_leaked_subject(
     body: &str,
     outgoing_subject: &str,
@@ -5429,28 +5475,9 @@ async fn run_gmail_update_draft(
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
     let attachment = upload_attach_if_given(&gmail, attach).await?;
-    // Update = create replacement + delete old (#382). Keep the reply
-    // threaded: use the explicit --thread-id when given, otherwise detect
-    // the old draft's thread. Detection is best-effort — a lookup failure
-    // downgrades to an unthreaded draft rather than blocking the update, so
-    // the #650 subject check rides on the explicit branch only: the caller
-    // asked to thread there, and refusing is the honest answer. Failing an
-    // update over a thread nobody asked for would contradict best-effort.
-    let thread_id = match thread_id.filter(|t| !t.is_empty()) {
-        Some(t) => {
-            resolve_compose_thread_id(&gmail, &entity_id, &email, Some(t), &subject).await?
-        }
-        None => match gmail.get_draft_thread_id(&entity_id, &draft_id).await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!(
-                    "warning: could not determine draft {draft_id}'s thread ({e}); \
-                     the replacement draft will start a new thread"
-                );
-                None
-            }
-        },
-    };
+    let thread_id =
+        resolve_update_draft_thread_id(&gmail, &entity_id, &email, &draft_id, thread_id, &subject)
+            .await?;
     let new_id = gmail
         .update_draft_with_attachment(
             &entity_id,
@@ -7704,14 +7731,6 @@ mod approval_body_tests {
     }
 
     #[test]
-    fn subject_only_body_yields_empty_remainder() {
-        assert_eq!(
-            strip_leading_subject_line("Subject: venue question\n"),
-            (String::new(), Some("venue question".to_string()))
-        );
-    }
-
-    #[test]
     fn remainder_is_preserved_verbatim_including_crlf() {
         assert_eq!(
             strip_leading_subject_line("Subject: x\r\n\r\nHi\r\nBye\r\n"),
@@ -7792,47 +7811,60 @@ mod approval_body_tests {
     }
 }
 
-/// #650 — the threaded half of the leak: a reply carries its THREAD's subject,
-/// so a `--subject` naming anything else is dropped by Gmail without a word,
-/// which is what pushed the intended subject into the body in the first place.
-/// These drive `resolve_compose_thread_id` — the gate every `--thread-id`
-/// write (`compose`, `update-draft`, `send-now`) passes through before
-/// `create_draft` — against a stubbed Composio.
+/// #650 — the threaded half of the leak: a message written into a thread goes
+/// out under its THREAD's subject, so a `--subject` naming anything else is
+/// dropped by Gmail without a word, which is what pushed the intended subject
+/// into the body in the first place. These drive both gates a threaded write
+/// passes before `create_draft` — `resolve_compose_thread_id` for `compose`
+/// and `send-now`, `resolve_update_draft_thread_id` for `update-draft` —
+/// against a stubbed Composio.
 #[cfg(test)]
 mod compose_thread_subject_tests {
-    use super::{resolve_compose_thread_id, ComposioClient};
+    use super::{resolve_compose_thread_id, resolve_update_draft_thread_id, ComposioClient};
 
-    /// Stub the two lookups `resolve_compose_thread_id` makes: id → thread,
-    /// then thread → its messages (whose subject is the one Gmail will send).
-    /// The returned mocks must stay alive — mockito unregisters on drop.
-    async fn stub_thread(server: &mut mockito::Server, thread_subject: &str) -> Vec<mockito::Mock> {
-        let responses = [
-            (
-                "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID",
-                serde_json::json!({"successful": true, "data": {"id": "m1", "threadId": "THREAD1"}}),
-            ),
-            (
-                "GMAIL_FETCH_MESSAGE_BY_THREAD_ID",
-                serde_json::json!({"successful": true, "data": {"messages": [{
-                    "messageId": "m1",
-                    "threadId": "THREAD1",
-                    "from": "casey@example.com",
-                    "subject": thread_subject,
-                }]}}),
-            ),
-        ];
-        let mut mocks = Vec::new();
-        for (action, body) in responses {
-            mocks.push(
-                server
-                    .mock("POST", format!("/api/v3/tools/execute/{action}").as_str())
-                    .with_header("content-type", "application/json")
-                    .with_body(body.to_string())
-                    .create_async()
-                    .await,
-            );
-        }
-        mocks
+    /// Stub one Composio action. The mock must outlive the call under test —
+    /// mockito unregisters it on drop.
+    async fn stub(
+        server: &mut mockito::Server,
+        action: &str,
+        body: serde_json::Value,
+    ) -> mockito::Mock {
+        server
+            .mock("POST", format!("/api/v3/tools/execute/{action}").as_str())
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .create_async()
+            .await
+    }
+
+    /// The id → THREAD1 lookup `compose`/`send-now` do first.
+    async fn stub_thread_lookup(server: &mut mockito::Server) -> mockito::Mock {
+        let body =
+            serde_json::json!({"successful": true, "data": {"id": "m1", "threadId": "THREAD1"}});
+        stub(server, "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID", body).await
+    }
+
+    /// The draft → THREAD1 lookup `update-draft` does without a `--thread-id`.
+    async fn stub_draft_lookup(server: &mut mockito::Server) -> mockito::Mock {
+        let body = serde_json::json!({"successful": true, "data": {"drafts": [
+            {"id": "d1", "message": {"id": "m1", "threadId": "THREAD1"}}
+        ]}});
+        stub(server, "GMAIL_LIST_DRAFTS", body).await
+    }
+
+    /// THREAD1's own subject — the one Gmail will actually send under.
+    async fn stub_thread_subject(server: &mut mockito::Server, subject: &str) -> mockito::Mock {
+        let body = serde_json::json!({"successful": true, "data": {"messages": [{
+            "messageId": "m1",
+            "threadId": "THREAD1",
+            "from": "casey@example.com",
+            "subject": subject,
+        }]}});
+        stub(server, "GMAIL_FETCH_MESSAGE_BY_THREAD_ID", body).await
+    }
+
+    fn client(server: &mockito::Server) -> ComposioClient {
+        ComposioClient::new("ak_fake".into()).with_base_url(server.url())
     }
 
     /// The reported case: the agent wanted "Hosting a PTE event" on a reply
@@ -7842,11 +7874,11 @@ mod compose_thread_subject_tests {
     #[tokio::test]
     async fn a_subject_the_thread_will_not_carry_is_refused_before_any_draft() {
         let mut server = mockito::Server::new_async().await;
-        let _mocks = stub_thread(&mut server, "Re: Ground Floor availability").await;
-        let gmail = ComposioClient::new("ak_fake".into()).with_base_url(server.url());
+        let _id = stub_thread_lookup(&mut server).await;
+        let _thread = stub_thread_subject(&mut server, "Re: Ground Floor availability").await;
 
         let err = resolve_compose_thread_id(
-            &gmail,
+            &client(&server),
             "entity-x",
             "owner@example.com",
             Some("THREAD1".into()),
@@ -7858,18 +7890,18 @@ mod compose_thread_subject_tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("Hosting a PTE event"), "{msg}");
         assert!(msg.contains("Ground Floor availability"), "{msg}");
-        assert!(msg.contains("drop --thread-id"), "{msg}");
+        assert!(msg.contains("new thread"), "{msg}");
     }
 
     /// A real reply — same subject, `Re:` prefix and all — still threads.
     #[tokio::test]
     async fn replying_under_the_threads_own_subject_still_resolves() {
         let mut server = mockito::Server::new_async().await;
-        let _mocks = stub_thread(&mut server, "Ground Floor availability").await;
-        let gmail = ComposioClient::new("ak_fake".into()).with_base_url(server.url());
+        let _id = stub_thread_lookup(&mut server).await;
+        let _thread = stub_thread_subject(&mut server, "Ground Floor availability").await;
 
         let resolved = resolve_compose_thread_id(
-            &gmail,
+            &client(&server),
             "entity-x",
             "owner@example.com",
             Some("THREAD1".into()),
@@ -7880,24 +7912,104 @@ mod compose_thread_subject_tests {
         assert_eq!(resolved.as_deref(), Some("THREAD1"));
     }
 
-    /// A thread whose subject can't be read is not evidence of a conflict:
-    /// the write proceeds rather than blocking on a Composio hiccup.
+    /// A thread whose subject Composio won't hand over is not a licence to
+    /// thread anyway: an unchecked write is the silent mismatch itself, so the
+    /// outage is reported instead of assumed harmless.
     #[tokio::test]
-    async fn an_unreadable_thread_subject_does_not_block_the_write() {
+    async fn an_unreadable_thread_subject_refuses_the_write() {
         let mut server = mockito::Server::new_async().await;
-        let _mocks = stub_thread(&mut server, "").await;
-        let gmail = ComposioClient::new("ak_fake".into()).with_base_url(server.url());
+        let _id = stub_thread_lookup(&mut server).await;
+        let _down = stub(
+            &mut server,
+            "GMAIL_FETCH_MESSAGE_BY_THREAD_ID",
+            serde_json::json!({"successful": false, "error": "upstream unavailable"}),
+        )
+        .await;
 
-        let resolved = resolve_compose_thread_id(
-            &gmail,
+        let err = resolve_compose_thread_id(
+            &client(&server),
             "entity-x",
             "owner@example.com",
             Some("THREAD1".into()),
             "Hosting a PTE event",
         )
         .await
-        .expect("an unknown thread subject must not fail the write");
+        .expect_err("an unverifiable subject must not be threaded blind");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("could not read thread THREAD1's subject"), "{msg}");
+    }
+
+    /// The same leak through `update-draft`, which needs no `--thread-id` at
+    /// all: the draft it replaces is already in "Ground Floor availability",
+    /// so a re-`--subject` to "Hosting a PTE event" would be dropped exactly
+    /// as on `compose`. The inherited thread gets the same check.
+    #[tokio::test]
+    async fn a_subject_the_inherited_draft_thread_will_not_carry_is_refused() {
+        let mut server = mockito::Server::new_async().await;
+        let _drafts = stub_draft_lookup(&mut server).await;
+        let _thread = stub_thread_subject(&mut server, "Ground Floor availability").await;
+
+        let err = resolve_update_draft_thread_id(
+            &client(&server),
+            "entity-x",
+            "owner@example.com",
+            "d1",
+            None,
+            "Hosting a PTE event",
+        )
+        .await
+        .expect_err("an inherited thread drops a new --subject just as an explicit one does");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Hosting a PTE event"), "{msg}");
+        assert!(msg.contains("Ground Floor availability"), "{msg}");
+    }
+
+    /// Revising the body of a reply — the ordinary update — still inherits
+    /// the draft's thread.
+    #[tokio::test]
+    async fn an_update_keeping_the_threads_subject_stays_threaded() {
+        let mut server = mockito::Server::new_async().await;
+        let _drafts = stub_draft_lookup(&mut server).await;
+        let _thread = stub_thread_subject(&mut server, "Ground Floor availability").await;
+
+        let resolved = resolve_update_draft_thread_id(
+            &client(&server),
+            "entity-x",
+            "owner@example.com",
+            "d1",
+            None,
+            "Re: Ground Floor availability",
+        )
+        .await
+        .expect("an update under the thread's own subject must be allowed");
         assert_eq!(resolved.as_deref(), Some("THREAD1"));
+    }
+
+    /// Thread DETECTION stays best-effort (#382): when the draft's thread
+    /// can't be looked up there is no thread to check a subject against, so
+    /// the update downgrades to unthreaded instead of failing.
+    #[tokio::test]
+    async fn an_undetectable_draft_thread_still_downgrades_to_unthreaded() {
+        let mut server = mockito::Server::new_async().await;
+        let _drafts = stub(
+            &mut server,
+            "GMAIL_LIST_DRAFTS",
+            serde_json::json!({"successful": false, "error": "upstream unavailable"}),
+        )
+        .await;
+
+        let resolved = resolve_update_draft_thread_id(
+            &client(&server),
+            "entity-x",
+            "owner@example.com",
+            "d1",
+            None,
+            "Hosting a PTE event",
+        )
+        .await
+        .expect("a draft-thread lookup failure must not block the update");
+        assert_eq!(resolved, None);
     }
 }
 
