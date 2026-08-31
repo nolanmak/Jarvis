@@ -1460,6 +1460,39 @@ async fn find_resumable_draft(repo_root: &Path) -> Option<(u64, u64, String)> {
         return None;
     }
     let prs: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+
+    // #880 — a PR whose issue carries the gave-up label is NOT resumable.
+    // Without this, the daily ledger reset made a never-converging PR an
+    // annuity: #853 burned two full resume cycles (7 revision rounds, 8
+    // focused rejections) in one day, and nothing would have stopped a third
+    // tomorrow. The gave-up label is the existing "needs a human" bit — the
+    // resume path just never read it.
+    let (ok, labeled, _) = run(
+        &gh,
+        &[
+            "issue", "list", "--state", "open", "--label", GAVE_UP_LABEL,
+            "--limit", "200", "--json", "number",
+        ],
+        repo_root,
+    )
+    .await
+    .ok()?;
+    let gave_up: std::collections::HashSet<u64> = if ok {
+        serde_json::from_str::<serde_json::Value>(&labeled)
+            .ok()
+            .and_then(|v| {
+                v.as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|i| i.get("number")?.as_u64())
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    } else {
+        // Can't tell — resume nothing rather than resume a labeled-out PR.
+        return None;
+    };
+
     let ledger = AttemptLedger::load(&attempt_ledger_path());
     let today = utc_day_now();
     prs.as_array()?
@@ -1469,7 +1502,7 @@ async fn find_resumable_draft(repo_root: &Path) -> Option<(u64, u64, String)> {
             let number = pr.get("number")?.as_u64()?;
             let branch = pr.get("headRefName")?.as_str()?;
             let issue = issue_from_branch(branch)?;
-            (draft && !ledger.attempted_today(today, issue))
+            (draft && !ledger.attempted_today(today, issue) && !gave_up.contains(&issue))
                 .then(|| (number, issue, branch.to_string()))
         })
         .min_by_key(|(number, _, _)| *number)
@@ -2201,8 +2234,13 @@ async fn resume_draft_pr(
                 repo_root,
             )
             .await;
-            record_attempt(repo_root, issue.number).await.ok();
-            return Ok(RunReport::built(format!("PR #{pr}: resume gate failed")));
+            let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+            if attempts >= MAX_ATTEMPTS {
+                label_gave_up(repo_root, issue.number).await.ok();
+            }
+            return Ok(RunReport::built(format!(
+                "PR #{pr}: resume gate failed (attempt {attempts})"
+            )));
         }
 
         let independent = independent_review(&issue, &summary, &diff, worktree.clone()).await;
@@ -2302,7 +2340,12 @@ async fn resume_draft_pr(
             )
             .await;
             cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-            record_attempt(repo_root, issue.number).await.ok();
+            let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+            if attempts >= MAX_ATTEMPTS {
+                // Every future resume would replay the same disagreement;
+                // the label hands it to a human with the exchange attached.
+                label_gave_up(repo_root, issue.number).await.ok();
+            }
             notify_discord(&format!(
                 "📝 resumed draft still needs review after {rounds_done} rounds: {} — PR #{pr}",
                 issue.title
