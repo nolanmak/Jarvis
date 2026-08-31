@@ -4361,50 +4361,46 @@ fn revise_subject(original: &str, thread_id: Option<&str>) -> String {
 }
 
 /// Refuse a threaded compose whose `--subject` disagrees with the thread
-/// (#651). Gmail sends a reply under the THREAD's subject and drops the one
-/// passed alongside `thread_id`, so such a message goes out under a header
-/// that has nothing to do with its content — as three recipients saw.
+/// (#651). Gmail sends a reply under the thread's ORIGINAL subject and drops
+/// the one passed alongside `thread_id`, so such a message goes out under a
+/// header that has nothing to do with its content — as three recipients saw.
+/// `thread_subject` is therefore the subject recipients will actually see: a
+/// different subject introduced later in the thread is not a match, because
+/// sending under it is exactly the mismatch this guard exists to stop.
 /// Returns the refusal text, or `None` when there is nothing to compare
-/// (empty subject, subject-less thread) or the subject is one the thread
-/// already carries.
-fn thread_subject_conflict(subject: &str, thread_subjects: &[String]) -> Option<String> {
+/// (empty `--subject`, subject-less thread).
+fn thread_subject_conflict(subject: &str, thread_subject: Option<&str>) -> Option<String> {
     let wanted = normalize_subject(subject);
-    if wanted.is_empty() {
-        return None;
-    }
-    let known: Vec<&str> = thread_subjects
-        .iter()
-        .map(String::as_str)
-        .filter(|s| !normalize_subject(s).is_empty())
-        .collect();
-    let first = known.first()?;
-    if known.iter().any(|s| normalize_subject(s) == wanted) {
+    let actual = thread_subject?;
+    let sent_as = normalize_subject(actual);
+    if wanted.is_empty() || sent_as.is_empty() || sent_as == wanted {
         return None;
     }
     Some(format!(
-        "--subject {subject:?} does not match the thread's subject {first:?}. A reply on \
+        "--subject {subject:?} does not match the thread's subject {actual:?}. A reply on \
          --thread-id is sent under the thread's subject, so this message would go out with a \
-         header that doesn't match its content. Either pass --subject \"Re: {first}\" to reply \
+         header that doesn't match its content. Either pass --subject \"Re: {actual}\" to reply \
          in-thread, or drop --thread-id to start a new thread under {subject:?}."
     ))
 }
 
 /// Fail-closed guard for [`thread_subject_conflict`], run before any draft is
-/// created so a refusal never strands an orphan draft (#412 discipline).
+/// created — and before any attachment upload — so a refusal never strands
+/// orphan work (#412 discipline).
 async fn ensure_subject_matches_thread(
     gmail: &ComposioClient,
     entity_id: &str,
     thread_id: &str,
     subject: &str,
 ) -> Result<()> {
-    let thread_subjects = gmail
-        .fetch_thread_subjects(entity_id, thread_id)
+    let thread_subject = gmail
+        .fetch_thread_subject(entity_id, thread_id)
         .await
         .context(
             "could not verify the thread's subject before drafting; retry, or drop --thread-id \
              to start a new thread",
         )?;
-    if let Some(conflict) = thread_subject_conflict(subject, &thread_subjects) {
+    if let Some(conflict) = thread_subject_conflict(subject, thread_subject.as_deref()) {
         anyhow::bail!(conflict);
     }
     Ok(())
@@ -4519,11 +4515,11 @@ async fn run_gmail_compose(
     };
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
-    let attachment = upload_attach_if_given(&gmail, attach).await?;
     let thread_id = resolve_compose_thread_id(&gmail, &entity_id, &email, thread_id).await?;
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
+    let attachment = upload_attach_if_given(&gmail, attach).await?;
     let draft_id = gmail
         .create_draft_with_attachment(
             &entity_id,
@@ -5334,7 +5330,6 @@ async fn run_gmail_update_draft(
     }
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
-    let attachment = upload_attach_if_given(&gmail, attach).await?;
     // Update = create replacement + delete old (#382). Keep the reply
     // threaded: use the explicit --thread-id when given, otherwise detect
     // the old draft's thread. Detection is best-effort — a lookup failure
@@ -5355,6 +5350,7 @@ async fn run_gmail_update_draft(
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
+    let attachment = upload_attach_if_given(&gmail, attach).await?;
     let new_id = gmail
         .update_draft_with_attachment(
             &entity_id,
@@ -5499,11 +5495,11 @@ async fn run_gmail_send_now(
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
-    let attachment = upload_attach_if_given(&gmail, attach).await?;
     let thread_id = resolve_compose_thread_id(&gmail, &entity_id, &email, thread_id).await?;
     if let Some(t) = thread_id.as_deref() {
         ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
     }
+    let attachment = upload_attach_if_given(&gmail, attach).await?;
     let draft_id = gmail
         .create_draft_with_attachment(
             &entity_id,
@@ -7603,16 +7599,11 @@ mod approval_body_tests {
 
     // ---- #651: a --subject that disagrees with the thread it replies on ----
 
-    fn thread() -> Vec<String> {
-        vec![
-            "Ground Floor as a venue?".into(),
-            "Re: Ground Floor as a venue?".into(),
-        ]
-    }
+    const THREAD: Option<&str> = Some("Ground Floor as a venue?");
 
     #[test]
     fn conflicting_subject_on_a_thread_is_refused_naming_both_subjects() {
-        let msg = thread_subject_conflict("Hosting an event at Tactic?", &thread())
+        let msg = thread_subject_conflict("Hosting an event at Tactic?", THREAD)
             .expect("a subject unrelated to the thread must be refused");
         assert!(
             msg.contains("Hosting an event at Tactic?"),
@@ -7631,31 +7622,32 @@ mod approval_body_tests {
     #[test]
     fn subject_matching_the_thread_is_allowed_ignoring_prefix_and_case() {
         assert_eq!(
-            thread_subject_conflict("Re: Ground Floor as a venue?", &thread()),
+            thread_subject_conflict("Re: Ground Floor as a venue?", THREAD),
             None
         );
         assert_eq!(
-            thread_subject_conflict("ground floor as a venue?", &thread()),
+            thread_subject_conflict("ground floor as a venue?", THREAD),
             None
         );
-        // A subject introduced later in the thread counts as a match too.
-        assert_eq!(
-            thread_subject_conflict(
-                "Renamed mid-thread",
-                &["Original".into(), "Renamed mid-thread".into()]
-            ),
-            None
+    }
+
+    // A subject someone introduced later in the thread is NOT a pass: Gmail
+    // still sends under the original, so allowing it re-opens #651.
+    #[test]
+    fn subject_renamed_mid_thread_is_refused_against_the_original() {
+        let msg = thread_subject_conflict("Renamed mid-thread", Some("Original"))
+            .expect("only the thread's original subject may be replied under");
+        assert!(
+            msg.contains("Original"),
+            "refusal must quote the subject Gmail will send under: {msg}"
         );
     }
 
     #[test]
     fn nothing_to_compare_never_refuses() {
-        assert_eq!(thread_subject_conflict("Anything", &[]), None);
-        assert_eq!(
-            thread_subject_conflict("Anything", &["".into(), "  ".into()]),
-            None
-        );
-        assert_eq!(thread_subject_conflict("   ", &thread()), None);
+        assert_eq!(thread_subject_conflict("Anything", None), None);
+        assert_eq!(thread_subject_conflict("Anything", Some("  ")), None);
+        assert_eq!(thread_subject_conflict("   ", THREAD), None);
     }
 
     #[test]

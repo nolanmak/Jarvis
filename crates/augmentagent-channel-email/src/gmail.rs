@@ -596,24 +596,24 @@ impl ComposioClient {
         Ok(new_id)
     }
 
-    /// Every non-empty subject on a thread, oldest-first (#651).
+    /// The subject a reply on this thread will actually be sent under (#651),
+    /// or `None` for a thread that carries no subject at all.
     ///
-    /// Gmail sends a reply under the THREAD's subject and discards the one
-    /// supplied alongside `thread_id`, so a compose that threads must first
-    /// check that its `--subject` is one the thread already carries. All
-    /// messages are returned (`max = 0`) because a subject can change
-    /// mid-thread and any of them is a legitimate match.
-    pub async fn fetch_thread_subjects(
+    /// Gmail sends a threaded message under the thread's ORIGINAL subject and
+    /// discards the one supplied alongside `thread_id`, so this — not any
+    /// subject that happens to appear later in the thread — is what a compose
+    /// must agree with. `max = 0` keeps the whole thread so the oldest message
+    /// is the one we read.
+    pub async fn fetch_thread_subject(
         &self,
         entity_id: &str,
         thread_id: &str,
-    ) -> Result<Vec<String>, GmailError> {
+    ) -> Result<Option<String>, GmailError> {
         let messages = self.fetch_thread_messages(entity_id, thread_id, 0).await?;
         Ok(messages
             .into_iter()
             .map(|m| m.subject)
-            .filter(|s| !s.trim().is_empty())
-            .collect())
+            .find(|s| !s.trim().is_empty()))
     }
 
     /// Shared paginated fetch for `GMAIL_FETCH_EMAILS`. Walks pages up to
@@ -1425,37 +1425,35 @@ mod tests {
         assert_eq!(t, "THREAD1");
     }
 
-    // ---- #651: the subjects a threaded compose must agree with ----
+    // ---- #651: the subject a threaded compose must agree with ----
 
+    // A rename part-way down the thread does NOT change what Gmail sends
+    // under, so the oldest subject is the one we report.
     #[tokio::test]
-    async fn fetch_thread_subjects_returns_every_subject_on_the_thread() {
+    async fn fetch_thread_subject_returns_the_original_not_a_later_rename() {
         let body = r#"{"successful":true,"data":{"messages":[
             {"id":"M1","threadId":"T1","subject":"Ground Floor as a venue?","from":"bo@example.com"},
-            {"id":"M2","threadId":"T1","subject":"Re: Ground Floor as a venue?","from":"alice@example.com"},
-            {"id":"M3","threadId":"T1","subject":"","from":"bo@example.com"}
+            {"id":"M2","threadId":"T1","subject":"Renamed mid-thread","from":"alice@example.com"}
         ]}}"#;
         let addr = spawn_one_shot_http(200, body).await;
         let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
 
-        let subjects = client
-            .fetch_thread_subjects("entity-x", "T1")
+        let subject = client
+            .fetch_thread_subject("entity-x", "T1")
             .await
-            .expect("thread subjects should fetch");
-        assert_eq!(
-            subjects,
-            vec!["Ground Floor as a venue?", "Re: Ground Floor as a venue?"]
-        );
+            .expect("thread subject should fetch");
+        assert_eq!(subject.as_deref(), Some("Ground Floor as a venue?"));
     }
 
     // A failed lookup must surface as an error so the caller can fail closed
     // rather than send under an unverified subject.
     #[tokio::test]
-    async fn fetch_thread_subjects_surfaces_provider_failure() {
+    async fn fetch_thread_subject_surfaces_provider_failure() {
         let addr = spawn_one_shot_http(500, r#"{"error":"upstream exploded"}"#).await;
         let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
 
         client
-            .fetch_thread_subjects("entity-x", "T1")
+            .fetch_thread_subject("entity-x", "T1")
             .await
             .expect_err("a provider failure must not look like an empty thread");
     }
