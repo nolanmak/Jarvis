@@ -1364,6 +1364,66 @@ async fn notify_discord(text: &str) {
     }
 }
 
+/// Issue number encoded in an agent branch name (`agent-fix/issue-845` → 845).
+fn issue_from_branch(branch: &str) -> Option<u64> {
+    branch.strip_prefix(BRANCH_PREFIX)?.parse().ok()
+}
+
+/// `complexity (scoping pass): <grade>` as written into every agent PR body.
+/// Unparseable defaults to Hard — the conservative direction, exactly like
+/// `parse_scope_output`.
+fn complexity_from_pr_body(body: &str) -> Complexity {
+    for line in body.lines() {
+        let l = line.trim().to_ascii_lowercase();
+        if let Some(rest) = l.strip_prefix("- complexity (scoping pass):") {
+            return if rest.contains("simple") {
+                Complexity::Simple
+            } else if rest.contains("medium") {
+                Complexity::Medium
+            } else {
+                Complexity::Hard
+            };
+        }
+    }
+    Complexity::Hard
+}
+
+/// A sitting draft the loop should pick up: the OLDEST open draft agent PR
+/// whose issue has not already been attempted today.
+///
+/// Until now these were invisible: `has_open_agent_pr` deduplicates the
+/// issue out of the pool, so a draft that nobody merged sat forever — seven
+/// of them, three days, while the loop only ever started new work. Owner
+/// directive 2026-08-31: sitting PRs are picked up too, and since they are
+/// mostly-finished work they outrank new issues.
+async fn find_resumable_draft(repo_root: &Path) -> Option<(u64, u64, String)> {
+    let gh = gh_bin();
+    let (ok, stdout, _) = run(
+        &gh,
+        &["pr", "list", "--state", "open", "--json", "number,isDraft,headRefName"],
+        repo_root,
+    )
+    .await
+    .ok()?;
+    if !ok {
+        return None;
+    }
+    let prs: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+    let ledger = AttemptLedger::load(&attempt_ledger_path());
+    let today = utc_day_now();
+    prs.as_array()?
+        .iter()
+        .filter_map(|pr| {
+            let draft = pr.get("isDraft")?.as_bool()?;
+            let number = pr.get("number")?.as_u64()?;
+            let branch = pr.get("headRefName")?.as_str()?;
+            let issue = issue_from_branch(branch)?;
+            (draft && !ledger.attempted_today(today, issue))
+                .then(|| (number, issue, branch.to_string()))
+        })
+        .min_by_key(|(number, _, _)| *number)
+}
+
 /// Outcome of the independent stage (#828).
 struct IndependentReview {
     /// False when codex could not be reached at all — NOT the same as a
@@ -1761,6 +1821,283 @@ async fn drop_root_scratch(worktree: &Path) -> Vec<String> {
     dropped
 }
 
+/// Resume a sitting draft PR (#866): re-review it against today's `main`,
+/// revise against fresh findings, and merge on a double LGTM.
+///
+/// Deliberately re-reviews rather than trusting anything recorded on the PR:
+/// `main` has moved since the draft opened, the guards have changed, and the
+/// findings that held it may be stale. Round 0 costs two codex calls and no
+/// build — a draft that is already good merges without spending the builder
+/// at all.
+async fn resume_draft_pr(
+    repo_root: &Path,
+    reasoner: &Arc<FallbackReasoner>,
+    pr: u64,
+    issue_no: u64,
+    branch: &str,
+    dry_run: bool,
+) -> Result<RunReport> {
+    let gh = gh_bin();
+    info!(pr, issue = issue_no, %branch, "resuming sitting draft PR");
+
+    // Whatever happens next counts as today's attempt on this issue, so a
+    // failing resume moves on to other work instead of re-running every tick.
+    {
+        let path = attempt_ledger_path();
+        let mut ledger = AttemptLedger::load(&path);
+        ledger.mark(utc_day_now(), issue_no);
+        ledger.save(&path);
+    }
+
+    // The issue, for trust + prompts. Refuse untrusted authors exactly like
+    // the fresh path (#300) — the PR was created from this issue's text.
+    let (ok, ibody, _) = run(
+        &gh,
+        &["api", &format!("repos/{{owner}}/{{repo}}/issues/{issue_no}")],
+        repo_root,
+    )
+    .await?;
+    if !ok {
+        bail!("resume: could not fetch issue #{issue_no}");
+    }
+    let iv: serde_json::Value = serde_json::from_str(&ibody).context("parse issue")?;
+    let author = iv.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let association = iv.get("author_association").and_then(|v| v.as_str()).unwrap_or("");
+    let allowlist = trusted_authors(repo_root).await;
+    if !author_is_trusted(&author, association, &allowlist) {
+        warn!(pr, issue = issue_no, %author, "resume refused: untrusted issue author");
+        return Ok(RunReport::triage(format!(
+            "PR #{pr}: resume refused — untrusted author '{author}'"
+        )));
+    }
+    let issue = Issue {
+        number: issue_no,
+        title: iv.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        body: iv.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        author,
+        author_trusted: true,
+        research_filed: is_research_filed(
+            iv.get("body").and_then(|v| v.as_str()).unwrap_or(""),
+        ),
+    };
+    let (_ok, prbody_raw, _) = run(
+        &gh,
+        &["pr", "view", &pr.to_string(), "--json", "body"],
+        repo_root,
+    )
+    .await?;
+    let complexity = serde_json::from_str::<serde_json::Value>(&prbody_raw)
+        .ok()
+        .and_then(|v| v.get("body").and_then(|b| b.as_str()).map(complexity_from_pr_body))
+        .unwrap_or(Complexity::Hard);
+
+    // Worktree from the PR's branch, brought up to date with main. A merge
+    // conflict is a human's job — say so on the PR and move on.
+    let worktree = repo_root.join(".self-improve-worktrees").join("current");
+    reclaim_worktree(repo_root, &worktree, branch).await;
+    let _ = run("git", &["fetch", "origin", branch], repo_root).await?;
+    let (ok, _o, e) = run(
+        "git",
+        &[
+            "worktree", "add", "-b", branch,
+            &worktree.to_string_lossy(),
+            &format!("origin/{branch}"),
+        ],
+        repo_root,
+    )
+    .await?;
+    if !ok {
+        bail!("resume: worktree add from origin/{branch} failed: {e}");
+    }
+    let cleanup = |wt: PathBuf, br: String, root: PathBuf| async move {
+        let _ = run("git", &["worktree", "remove", "--force", &wt.to_string_lossy()], &root).await;
+        let _ = run("git", &["branch", "-D", &br], &root).await;
+    };
+    let (ok, _o, _e) = run("git", &["merge", "--no-edit", "origin/main"], &worktree).await?;
+    if !ok {
+        let _ = run("git", &["merge", "--abort"], &worktree).await;
+        cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+        let _ = run(
+            &gh,
+            &["pr", "comment", &pr.to_string(), "--body",
+              "Auto-resume: this branch no longer merges cleanly with `main`; \
+               it needs a human rebase before the loop can pick it up again."],
+            repo_root,
+        )
+        .await;
+        return Ok(RunReport::triage(format!(
+            "PR #{pr}: resume skipped — merge conflict with main"
+        )));
+    }
+
+    let git_name = std::env::var("AUGMENTAGENT_GIT_AUTHOR_NAME")
+        .unwrap_or_else(|_| "AugmentAgent".to_string());
+    let git_email = std::env::var("AUGMENTAGENT_GIT_AUTHOR_EMAIL")
+        .unwrap_or_else(|_| "augmentagent@localhost".to_string());
+    let name_arg = format!("user.name={git_name}");
+    let email_arg = format!("user.email={git_email}");
+
+    let mut rounds_done = 0u32;
+    let mut notes_log: Vec<String> = Vec::new();
+    let mut summary = format!("Resumed sitting draft PR #{pr}.");
+    loop {
+        // The PR's actual contribution, freshly computed each round.
+        let (_ok, diff, _) =
+            run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
+        // Guards re-run every round — the rules have changed since the draft
+        // opened, and a revision can add lines or touch new paths.
+        if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff) {
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            let _ = run(
+                &gh,
+                &["pr", "comment", &pr.to_string(), "--body",
+                  &format!("Auto-resume refused: the diff touches `{pattern}`:\n```\n{line}\n```")],
+                repo_root,
+            )
+            .await;
+            return Ok(RunReport::built(format!(
+                "PR #{pr}: resume refused — blast radius on `{pattern}`"
+            )));
+        }
+        if diff_line_count(&diff) > MAX_DIFF_LINES {
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            let _ = run(
+                &gh,
+                &["pr", "comment", &pr.to_string(), "--body",
+                  &format!("Auto-resume refused: diff exceeds the {MAX_DIFF_LINES}-line cap.")],
+                repo_root,
+            )
+            .await;
+            return Ok(RunReport::built(format!("PR #{pr}: resume refused — oversized")));
+        }
+        if let Err(gate_err) = verification_gate(&worktree).await {
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            let _ = run(
+                &gh,
+                &["pr", "comment", &pr.to_string(), "--body",
+                  &format!("Auto-resume: verification gate failed against current \
+                            `main`:\n```\n{}\n```", truncate(&gate_err.to_string(), 1200))],
+                repo_root,
+            )
+            .await;
+            record_attempt(repo_root, issue.number).await.ok();
+            return Ok(RunReport::built(format!("PR #{pr}: resume gate failed")));
+        }
+
+        let independent = independent_review(&issue, &summary, &diff, worktree.clone()).await;
+        notes_log.push(format!(
+            "round {rounds_done}: {}",
+            independent.status()
+        ));
+        if independent.approved() {
+            if dry_run {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: DRY RUN — double LGTM after {rounds_done} revision round(s), would merge"
+                )));
+            }
+            // Push whatever the rounds committed (the merge-with-main commit
+            // included), surface the verdicts, and merge per policy.
+            let (ok, _o, e) = run("git", &["push", "origin", branch], &worktree).await?;
+            if !ok {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                bail!("resume: push failed: {e}");
+            }
+            let _ = run(
+                &gh,
+                &["pr", "comment", &pr.to_string(), "--body",
+                  &format!("Auto-resume: double codex LGTM after {rounds_done} \
+                            revision round(s) against current `main`.\n\n{}",
+                           truncate(&independent.notes, 2500))],
+                repo_root,
+            )
+            .await;
+            let enabled = automerge_enabled_value(
+                std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
+            );
+            let complexity_ok = complexity.auto_mergeable() || codex_unlocks_hard();
+            if !(enabled && complexity_ok && !issue.research_filed) {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                notify_discord(&format!(
+                    "📝 resumed draft has double LGTM but needs a human merge: {} — PR #{pr}",
+                    issue.title
+                ))
+                .await;
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: double LGTM, left for human merge (policy)"
+                )));
+            }
+            let _ = run(&gh, &["pr", "ready", &pr.to_string()], repo_root).await;
+            let (ok, _o, e) = run(
+                &gh,
+                &["pr", "merge", &pr.to_string(), "--squash", "--delete-branch"],
+                repo_root,
+            )
+            .await?;
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            if !ok {
+                warn!(pr, "resume auto-merge failed; PR left ready: {e}");
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: double LGTM but merge FAILED (left open)"
+                )));
+            }
+            notify_discord(&format!("✅ resumed draft merged: {} — PR #{pr}", issue.title)).await;
+            return Ok(RunReport::built(format!("PR #{pr}: resumed and MERGED")));
+        }
+
+        if rounds_done >= revise_rounds() {
+            // Out of rounds: publish the improved state + verdicts, stay draft.
+            let _ = run("git", &["push", "origin", branch], &worktree).await;
+            let _ = run(
+                &gh,
+                &["pr", "comment", &pr.to_string(), "--body",
+                  &format!("Auto-resume: no double LGTM after {rounds_done} revision \
+                            round(s) ({}). Latest findings:\n\n{}",
+                           notes_log.join("; "),
+                           truncate(&independent.notes, 2500))],
+                repo_root,
+            )
+            .await;
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            record_attempt(repo_root, issue.number).await.ok();
+            notify_discord(&format!(
+                "📝 resumed draft still needs review after {rounds_done} rounds: {} — PR #{pr}",
+                issue.title
+            ))
+            .await;
+            return Ok(RunReport::built(format!(
+                "PR #{pr}: resumed, no LGTM after {rounds_done} rounds; still draft"
+            )));
+        }
+
+        rounds_done += 1;
+        info!(pr, issue = issue.number, round = rounds_done, "resume: revising against findings");
+        let rev_summary = match reasoner
+            .call(&fix_opts(worktree.clone()), &build_revise_prompt(&issue, &independent.notes))
+            .await
+        {
+            Ok(rs) => rs,
+            Err(e) => {
+                warn!(pr, "resume revision failed; leaving draft as-is: {e:#}");
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: resume revision errored; draft unchanged"
+                )));
+            }
+        };
+        let _ = drop_root_scratch(&worktree).await;
+        let _ = run("git", &["add", "-A"], &worktree).await?;
+        let msg = format!("review round {rounds_done}: address independent findings");
+        let _ = run(
+            "git",
+            &["-c", &name_arg, "-c", &email_arg, "commit", "--allow-empty", "-m", &msg],
+            &worktree,
+        )
+        .await?;
+        summary = format!("{summary}\nRound {rounds_done}: {}", truncate(&rev_summary, 300));
+    }
+}
+
 /// Force the pipeline's fixed worktree path back to a usable state before a
 /// fresh `git worktree add`.
 ///
@@ -1927,6 +2264,15 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             "refusing to self-improve from a dirty working tree \
              (commit/stash first):\n{dirty_status}"
         );
+    }
+
+    // #866 — sitting draft PRs outrank new work: they are mostly-finished
+    // diffs that only lack an approving review, and until now the dedup guard
+    // made them permanently invisible (seven drafts, three days, zero
+    // merges). Resume the oldest one not yet attempted today.
+    if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root).await {
+        let reasoner = build_reasoner();
+        return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run).await;
     }
 
     let Some(issue) = pick_issue(repo_root).await? else {
@@ -4708,6 +5054,36 @@ CODEX-REVIEW: lgtm").0);
         git(&["add", "-A"]);
         let staged = String::from_utf8(git(&["diff", "--cached", "--name-only"]).stdout).unwrap();
         assert_eq!(staged.trim(), "crates/x/src/new.rs");
+    }
+
+    // ---- #866: sitting drafts are picked up, not orphaned ----
+
+    #[test]
+    fn issue_number_parses_from_agent_branch_names() {
+        assert_eq!(issue_from_branch("agent-fix/issue-845"), Some(845));
+        assert_eq!(issue_from_branch("agent-fix/issue-0"), Some(0));
+        // Non-agent branches must never be resumed.
+        assert_eq!(issue_from_branch("fix/845-something"), None);
+        assert_eq!(issue_from_branch("agent-fix/issue-"), None);
+        assert_eq!(issue_from_branch("agent-fix/issue-12x"), None);
+    }
+
+    #[test]
+    fn complexity_recovers_from_a_pr_body_and_defaults_hard() {
+        assert_eq!(
+            complexity_from_pr_body("## Verification\n- complexity (scoping pass): medium\n- diff"),
+            Complexity::Medium
+        );
+        assert_eq!(
+            complexity_from_pr_body("- complexity (scoping pass): simple"),
+            Complexity::Simple
+        );
+        // Old or hand-written bodies without the line stay conservative.
+        assert_eq!(complexity_from_pr_body("no such line"), Complexity::Hard);
+        assert_eq!(
+            complexity_from_pr_body("- complexity (scoping pass): who knows"),
+            Complexity::Hard
+        );
     }
 
     // ---- revise loop + receipt override ----
