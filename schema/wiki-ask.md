@@ -192,7 +192,7 @@ augmentagent gmail compose \
   --body "Hi Jeremy,\n\n…"
 ```
 
-The body is the message text only — never start it with a `Subject:` line; the subject goes in `--subject` (#650: compose drops a leading one and warns, and refuses a body that is nothing else).
+The body is the message text only — never start it with a `Subject:` line; the subject goes in `--subject`, which is what lands in the real header on `compose`, `update-draft` and `send-now` (threaded replies included). A leading `Subject:` line that repeats `--subject` is dropped with a note; one that names a *different* subject — or a body that is nothing but that line — is refused before any Gmail write, so pass the subject you want as `--subject` (#650).
 
 For multi-line or long bodies, write the body to a tempfile and pass `--body-file /path/to/body.txt` (or `--body-file -` to read stdin). Inline `--body` values interpret `\n` and `\t` escapes as real newlines/tabs (write `\\n` for a literal backslash-n), so short multi-paragraph bodies work inline too. Returns a `draft_id` and a Gmail URL the user can open to review/send.
 
