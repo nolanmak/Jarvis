@@ -7032,13 +7032,21 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
+    use tempfile::TempDir;
     use serde_json;
 
-    fn fresh_store() -> (Store, NamedTempFile) {
-        let file = NamedTempFile::new().unwrap();
+    /// Store on a tempdir-backed file, NOT a `NamedTempFile` (#877).
+    ///
+    /// `NamedTempFile` deletes only its own file on drop; SQLite in WAL mode
+    /// creates `-wal`/`-shm` SIDECARS next to it that nothing removes. With
+    /// the verification gate running this suite on every pipeline round,
+    /// /tmp accumulated 22,006 leaked files (19 GB) in three days. A tempdir
+    /// removes everything under it, sidecars included.
+    fn fresh_store() -> (Store, TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("store-test.db");
         {
-            let conn = Connection::open(file.path()).unwrap();
+            let conn = Connection::open(&db).unwrap();
             conn.execute_batch(
                 r#"
                 CREATE TABLE actions (
@@ -7081,7 +7089,7 @@ mod tests {
             )
             .unwrap();
         }
-        (Store::open(file.path()).unwrap(), file)
+        (Store::open(&db).unwrap(), dir)
     }
 
     fn sample_email(message_id: &str) -> Email {
@@ -7319,7 +7327,7 @@ mod tests {
             .log_action("m1", None, "a@b.com", "s", None, Some("draft"), ActionStatus::Pending)
             .unwrap();
         // Next nudge is roughly 6h out — query directly to verify.
-        let conn = Connection::open(_f.path()).unwrap();
+        let conn = Connection::open(_f.path().join("store-test.db")).unwrap();
         let next: Option<i64> = conn
             .query_row(
                 "SELECT nextNudgeAtMs FROM actions WHERE id = ?1",
@@ -7345,7 +7353,7 @@ mod tests {
         let id = s
             .log_action("m1", None, "a@b.com", "s", None, None, ActionStatus::DryRun)
             .unwrap();
-        let conn = Connection::open(_f.path()).unwrap();
+        let conn = Connection::open(_f.path().join("store-test.db")).unwrap();
         let next: Option<i64> = conn
             .query_row(
                 "SELECT nextNudgeAtMs FROM actions WHERE id = ?1",
@@ -7458,7 +7466,7 @@ mod tests {
         let now = now_millis();
         s.record_nudge(&id, now + NUDGE_INTERVAL_MS).unwrap();
         s.record_nudge(&id, now + 2 * NUDGE_INTERVAL_MS).unwrap();
-        let conn = Connection::open(_f.path()).unwrap();
+        let conn = Connection::open(_f.path().join("store-test.db")).unwrap();
         let (count, next): (i64, i64) = conn
             .query_row(
                 "SELECT nudgeCount, nextNudgeAtMs FROM actions WHERE id = ?1",
@@ -7482,7 +7490,7 @@ mod tests {
         s.record_nudge(&id, now_millis()).unwrap();
         // Revise: defer timer 6h, KEEP count (card stays the active one).
         s.reset_nudge_schedule(&id).unwrap();
-        let conn = Connection::open(_f.path()).unwrap();
+        let conn = Connection::open(_f.path().join("store-test.db")).unwrap();
         let (count, next): (i64, i64) = conn
             .query_row(
                 "SELECT nudgeCount, nextNudgeAtMs FROM actions WHERE id = ?1",
@@ -8597,13 +8605,14 @@ mod tests {
 
     #[test]
     fn migration_is_idempotent_for_scheduled_columns() {
-        let file = NamedTempFile::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("store-test.db");
         {
-            let s1 = Store::open(file.path()).unwrap();
+            let s1 = Store::open(&db).unwrap();
             drop(s1);
         }
         // Second open re-runs migrate() over the already-altered schema.
-        let s2 = Store::open(file.path()).unwrap();
+        let s2 = Store::open(&db).unwrap();
         let guard = s2.conn.lock().unwrap();
         let n: i64 = guard
             .query_row(
@@ -9149,7 +9158,7 @@ mod tests {
                 ActionStatus::Pending,
             )
             .unwrap();
-        let conn = Connection::open(f.path()).unwrap();
+        let conn = Connection::open(f.path().join("store-test.db")).unwrap();
         let (mode, source, trace): (String, Option<String>, Option<String>) = conn
             .query_row(
                 "SELECT mode, generatedSource, toolCallTrace FROM actions WHERE id = ?1",
@@ -9166,9 +9175,10 @@ mod tests {
     fn migration_is_idempotent() {
         // Opening Store twice must not error on the second run — every
         // ALTER TABLE is guarded by `column_exists`.
-        let file = NamedTempFile::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("store-test.db");
         {
-            let conn = Connection::open(file.path()).unwrap();
+            let conn = Connection::open(&db).unwrap();
             conn.execute_batch(
                 r#"
                 CREATE TABLE actions (
@@ -9211,8 +9221,8 @@ mod tests {
             )
             .unwrap();
         }
-        let _s1 = Store::open(file.path()).unwrap();
-        let _s2 = Store::open(file.path()).unwrap();
+        let _s1 = Store::open(&db).unwrap();
+        let _s2 = Store::open(&db).unwrap();
     }
 
     #[test]
@@ -9360,9 +9370,10 @@ mod tests {
     /// must create every Node-owned base table itself.
     #[test]
     fn store_open_creates_all_node_owned_tables() {
-        let file = NamedTempFile::new().unwrap();
-        let _store = Store::open(file.path()).expect("open on empty file should succeed");
-        let conn = Connection::open(file.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("store-test.db");
+        let _store = Store::open(&db).expect("open on empty file should succeed");
+        let conn = Connection::open(&db).unwrap();
         let tables = table_names(&conn);
         for t in NODE_OWNED_TABLES {
             assert!(
@@ -9376,9 +9387,10 @@ mod tests {
     /// otherwise-empty tempfile.
     #[test]
     fn store_open_creates_all_required_indexes() {
-        let file = NamedTempFile::new().unwrap();
-        let _store = Store::open(file.path()).expect("open on empty file should succeed");
-        let conn = Connection::open(file.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("store-test.db");
+        let _store = Store::open(&db).expect("open on empty file should succeed");
+        let conn = Connection::open(&db).unwrap();
         let indexes = index_names(&conn);
         for i in NODE_OWNED_INDEXES {
             assert!(
@@ -9394,9 +9406,10 @@ mod tests {
     /// base tables with the minimal Node shape, then open Store.
     #[test]
     fn store_open_is_idempotent_against_node_initialized_db() {
-        let file = NamedTempFile::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("store-test.db");
         {
-            let conn = Connection::open(file.path()).unwrap();
+            let conn = Connection::open(&db).unwrap();
             // Pre-seed actions exactly as Node's initDb would (older shape:
             // no recipientEmail yet — that's what the ALTER guards exist for).
             conn.execute_batch(
@@ -9416,11 +9429,11 @@ mod tests {
             )
             .unwrap();
         }
-        let _store = Store::open(file.path())
+        let _store = Store::open(&db)
             .expect("open against Node-style pre-seeded db should succeed");
         // And re-opening must be safe (steady-state autostart case).
-        let _store2 = Store::open(file.path()).expect("re-open should be a no-op");
-        let conn = Connection::open(file.path()).unwrap();
+        let _store2 = Store::open(&db).expect("re-open should be a no-op");
+        let conn = Connection::open(&db).unwrap();
         let tables = table_names(&conn);
         for t in NODE_OWNED_TABLES {
             assert!(
@@ -9459,7 +9472,7 @@ mod tests {
         assert_eq!(got, want, "only T1's pending rows return");
 
         // Status side-effect check.
-        let conn = Connection::open(_f.path()).unwrap();
+        let conn = Connection::open(_f.path().join("store-test.db")).unwrap();
         let status_of = |id: &str| -> (String, Option<String>) {
             conn.query_row(
                 "SELECT status, errorMessage FROM actions WHERE id = ?1",
@@ -9514,7 +9527,7 @@ mod tests {
             .unwrap();
         assert_eq!(affected, vec![id_pending.clone()]);
 
-        let conn = Connection::open(_f.path()).unwrap();
+        let conn = Connection::open(_f.path().join("store-test.db")).unwrap();
         let st = |id: &str| -> String {
             conn.query_row(
                 "SELECT status FROM actions WHERE id = ?1",
