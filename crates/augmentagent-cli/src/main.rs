@@ -16,7 +16,9 @@ use augmentagent_approval_discord::{
 };
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{build_reasoner, FallbackReasoner, Reasoner};
-use augmentagent_channel_email::gmail::{normalize_subject, Attachment, ComposioClient, GmailApi};
+use augmentagent_channel_email::gmail::{
+    normalize_subject, Attachment, ComposioClient, GmailApi, ThreadSubject,
+};
 use augmentagent_channel_email::sigextract::{
     detect_signature_block, is_human_sender, signature_patch, strip_quoted_reply,
     SignatureExtractor,
@@ -4364,43 +4366,62 @@ fn revise_subject(original: &str, thread_id: Option<&str>) -> String {
 /// (#651). Gmail sends a reply under the thread's ORIGINAL subject and drops
 /// the one passed alongside `thread_id`, so such a message goes out under a
 /// header that has nothing to do with its content — as three recipients saw.
-/// `thread_subject` is therefore the subject recipients will actually see: a
-/// different subject introduced later in the thread is not a match, because
-/// sending under it is exactly the mismatch this guard exists to stop.
-/// Returns the refusal text, or `None` when there is nothing to compare
-/// (empty `--subject`, subject-less thread).
-fn thread_subject_conflict(subject: &str, thread_subject: Option<&str>) -> Option<String> {
+/// Only that original counts as a match: a subject introduced later in the
+/// thread, or a `Fwd:` of it, is still not what recipients would see.
+/// Returns the refusal text, or `None` when there is nothing to compare (no
+/// `--subject`, subject-less thread).
+fn thread_subject_conflict(subject: &str, thread: &ThreadSubject) -> Option<String> {
     let wanted = normalize_subject(subject);
-    let actual = thread_subject?;
-    let sent_as = normalize_subject(actual);
-    if wanted.is_empty() || sent_as.is_empty() || sent_as == wanted {
+    if wanted.is_empty() {
         return None;
     }
-    Some(format!(
-        "--subject {subject:?} does not match the thread's subject {actual:?}. A reply on \
-         --thread-id is sent under the thread's subject, so this message would go out with a \
-         header that doesn't match its content. Either pass --subject \"Re: {actual}\" to reply \
-         in-thread, or drop --thread-id to start a new thread under {subject:?}."
-    ))
+    match thread {
+        // Every message on the thread came back untitled: there is no header
+        // to contradict, and refusing would block replying to it at all.
+        ThreadSubject::Missing => None,
+        // Unknowable ⇒ unverifiable. Sending anyway is the gamble that put
+        // the wrong header in three inboxes, so refuse and name the way out.
+        ThreadSubject::Undetermined => Some(format!(
+            "could not tell which subject this thread was started under: it carries more than one \
+             and the provider returned no timestamps to order them by. A reply on --thread-id is \
+             sent under the thread's original subject, so {subject:?} cannot be verified. Drop \
+             --thread-id to start a new thread under {subject:?}, or send the reply from Gmail."
+        )),
+        ThreadSubject::Original(actual) => {
+            let sent_as = normalize_subject(actual);
+            if sent_as.is_empty() || sent_as == wanted {
+                return None;
+            }
+            Some(format!(
+                "--subject {subject:?} does not match the thread's subject {actual:?}. A reply on \
+                 --thread-id is sent under the thread's subject, so this message would go out \
+                 with a header that doesn't match its content. Either pass --subject \
+                 \"Re: {actual}\" to reply in-thread, or drop --thread-id to start a new thread \
+                 under {subject:?}."
+            ))
+        }
+    }
 }
 
 /// Fail-closed guard for [`thread_subject_conflict`], run before any draft is
 /// created — and before any attachment upload — so a refusal never strands
-/// orphan work (#412 discipline).
+/// orphan work (#412 discipline). Costs one extra thread fetch per threaded
+/// compose; a provider failure refuses rather than sends, because an
+/// unverified subject is exactly what #651 put in front of recipients.
 async fn ensure_subject_matches_thread(
     gmail: &ComposioClient,
     entity_id: &str,
     thread_id: &str,
     subject: &str,
 ) -> Result<()> {
-    let thread_subject = gmail
+    let thread = gmail
         .fetch_thread_subject(entity_id, thread_id)
         .await
         .context(
             "could not verify the thread's subject before drafting; retry, or drop --thread-id \
              to start a new thread",
         )?;
-    if let Some(conflict) = thread_subject_conflict(subject, thread_subject.as_deref()) {
+    if let Some(conflict) = thread_subject_conflict(subject, &thread) {
         anyhow::bail!(conflict);
     }
     Ok(())
@@ -7537,7 +7558,7 @@ mod unescape_body_tests {
 mod approval_body_tests {
     use super::{
         compose_pending_disposition, revise_subject, strip_approval_envelope_markers,
-        thread_subject_conflict, ComposePendingDisposition,
+        thread_subject_conflict, ComposePendingDisposition, ThreadSubject,
     };
 
     #[test]
@@ -7599,11 +7620,13 @@ mod approval_body_tests {
 
     // ---- #651: a --subject that disagrees with the thread it replies on ----
 
-    const THREAD: Option<&str> = Some("Ground Floor as a venue?");
+    fn thread() -> ThreadSubject {
+        ThreadSubject::Original("Ground Floor as a venue?".into())
+    }
 
     #[test]
     fn conflicting_subject_on_a_thread_is_refused_naming_both_subjects() {
-        let msg = thread_subject_conflict("Hosting an event at Tactic?", THREAD)
+        let msg = thread_subject_conflict("Hosting an event at Tactic?", &thread())
             .expect("a subject unrelated to the thread must be refused");
         assert!(
             msg.contains("Hosting an event at Tactic?"),
@@ -7622,11 +7645,11 @@ mod approval_body_tests {
     #[test]
     fn subject_matching_the_thread_is_allowed_ignoring_prefix_and_case() {
         assert_eq!(
-            thread_subject_conflict("Re: Ground Floor as a venue?", THREAD),
+            thread_subject_conflict("Re: Ground Floor as a venue?", &thread()),
             None
         );
         assert_eq!(
-            thread_subject_conflict("ground floor as a venue?", THREAD),
+            thread_subject_conflict("ground floor as a venue?", &thread()),
             None
         );
     }
@@ -7635,19 +7658,65 @@ mod approval_body_tests {
     // still sends under the original, so allowing it re-opens #651.
     #[test]
     fn subject_renamed_mid_thread_is_refused_against_the_original() {
-        let msg = thread_subject_conflict("Renamed mid-thread", Some("Original"))
-            .expect("only the thread's original subject may be replied under");
+        let msg = thread_subject_conflict(
+            "Renamed mid-thread",
+            &ThreadSubject::Original("Original".into()),
+        )
+        .expect("only the thread's original subject may be replied under");
         assert!(
             msg.contains("Original"),
             "refusal must quote the subject Gmail will send under: {msg}"
         );
     }
 
+    // A forward is a different subject line: Gmail would still send it under
+    // the thread's own subject, so "Fwd: X" on a thread titled "X" is the
+    // same header/intent mismatch as any other rename.
+    #[test]
+    fn forwarding_subject_on_a_thread_is_refused() {
+        assert!(
+            thread_subject_conflict("Fwd: Original", &ThreadSubject::Original("Original".into()))
+                .is_some(),
+            "a forward would go out under the plain thread subject"
+        );
+        // Replying to a thread that IS a forward still matches.
+        assert_eq!(
+            thread_subject_conflict(
+                "Re: Fwd: Original",
+                &ThreadSubject::Original("Fwd: Original".into())
+            ),
+            None
+        );
+    }
+
+    // Can't tell what Gmail will send under ⇒ can't verify ⇒ refuse.
+    #[test]
+    fn an_unknowable_thread_subject_is_refused() {
+        let msg =
+            thread_subject_conflict("Hosting an event at Tactic?", &ThreadSubject::Undetermined)
+                .expect("an unverifiable thread subject must not be drafted against");
+        assert!(
+            msg.contains("--thread-id"),
+            "refusal must name the way out: {msg}"
+        );
+    }
+
     #[test]
     fn nothing_to_compare_never_refuses() {
-        assert_eq!(thread_subject_conflict("Anything", None), None);
-        assert_eq!(thread_subject_conflict("Anything", Some("  ")), None);
-        assert_eq!(thread_subject_conflict("   ", THREAD), None);
+        assert_eq!(
+            thread_subject_conflict("Anything", &ThreadSubject::Missing),
+            None
+        );
+        assert_eq!(
+            thread_subject_conflict("Anything", &ThreadSubject::Original("  ".into())),
+            None
+        );
+        assert_eq!(thread_subject_conflict("   ", &thread()), None);
+        // No subject stated ⇒ no intent to contradict, even unverifiably.
+        assert_eq!(
+            thread_subject_conflict("", &ThreadSubject::Undetermined),
+            None
+        );
     }
 
     #[test]
