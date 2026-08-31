@@ -192,7 +192,9 @@ augmentagent gmail compose \
   --body "Hi Jeremy,\n\n…"
 ```
 
-The body is the message text only — never start it with a `Subject:` line; the subject goes in `--subject`, which is what lands in the real header on `compose`, `update-draft` and `send-now` (threaded replies included). A leading `Subject:` line that repeats `--subject` is dropped with a note; one that names a *different* subject — or a body that is nothing but that line — is refused before any Gmail write, so pass the subject you want as `--subject` (#650).
+**Subjects live in `--subject`, never in the body (#650).** The body is the message text only — never start it with a `Subject:` line, which is delivered to the recipient as visible text. A leading `Subject:` line that repeats `--subject` is dropped with a note; one that names a *different* subject — or a body that is nothing but that line — is refused before any Gmail write.
+
+A `--thread-id` reply goes out under **the thread's** subject; `--subject` only threads it. So `compose`, `update-draft` and `send-now` refuse a `--thread-id` write whose `--subject` isn't the thread's (a `Re:`/`Fwd:` prefix is fine) rather than sending under a subject you didn't ask for. To change the subject, drop `--thread-id` and start a new thread.
 
 For multi-line or long bodies, write the body to a tempfile and pass `--body-file /path/to/body.txt` (or `--body-file -` to read stdin). Inline `--body` values interpret `\n` and `\t` escapes as real newlines/tabs (write `\\n` for a literal backslash-n), so short multi-paragraph bodies work inline too. Returns a `draft_id` and a Gmail URL the user can open to review/send.
 
