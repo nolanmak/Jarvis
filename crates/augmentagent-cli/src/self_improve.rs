@@ -1613,6 +1613,17 @@ fn revise_rounds() -> u32 {
         .min(5)
 }
 
+/// Should sitting draft PRs be resumed before new issues? Default ON (#866).
+/// `AUGMENTAGENT_AUTOPR_RESUME_FIRST=0` flips a run to new-issues-first — the
+/// owner's "pick up new issues right now" lever, exported per-invocation for
+/// a manual run without changing the daemon's default.
+fn resume_first_enabled() -> bool {
+    !matches!(
+        std::env::var("AUGMENTAGENT_AUTOPR_RESUME_FIRST").ok().as_deref().map(str::trim),
+        Some("0") | Some("false") | Some("FALSE")
+    )
+}
+
 /// One revision pass against codex findings — default ON, `=0` disables.
 fn revise_enabled() -> bool {
     !matches!(
@@ -1941,12 +1952,7 @@ async fn resume_draft_pr(
 
     // Whatever happens next counts as today's attempt on this issue, so a
     // failing resume moves on to other work instead of re-running every tick.
-    {
-        let path = attempt_ledger_path();
-        let mut ledger = AttemptLedger::load(&path);
-        ledger.mark(utc_day_now(), issue_no);
-        ledger.save(&path);
-    }
+    AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue_no);
 
     // The issue, for trust + prompts. Refuse untrusted authors exactly like
     // the fresh path (#300) — the PR was created from this issue's text.
@@ -1992,7 +1998,9 @@ async fn resume_draft_pr(
 
     // Worktree from the PR's branch, brought up to date with main. A merge
     // conflict is a human's job — say so on the PR and move on.
-    let worktree = repo_root.join(".self-improve-worktrees").join("current");
+    let worktree = repo_root
+        .join(".self-improve-worktrees")
+        .join(lane_from_env().worktree_name());
     reclaim_worktree(repo_root, &worktree, branch).await;
     let _ = run("git", &["fetch", "origin", branch], repo_root).await?;
     let (ok, _o, e) = run(
@@ -2358,6 +2366,64 @@ impl RunLock {
     }
 }
 
+/// Which half of the pipeline this invocation runs (#871).
+///
+/// The owner has a PR backlog AND an issue backlog, and one serialized
+/// pipeline forces them to queue behind each other. Lanes let a REVIEW
+/// process (resume sitting drafts) and a BUILD process (new issues) run
+/// concurrently: each lane has its own flock and its own worktree path, so
+/// the #816 mutual-destruction hazard cannot occur between them, while two
+/// runs of the SAME lane still exclude each other.
+///
+/// Cross-lane overlap is safe by construction: the resume lane only touches
+/// issues that HAVE an open agent PR, the build lane's `pick_issue` skips
+/// exactly those (dedup), and the attempt ledger writes are flocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// Default: resume a sitting draft if one exists, else build new work.
+    Combined,
+    /// Only resume sitting draft PRs; idle when none are eligible.
+    Resume,
+    /// Only build new issues; never resumes.
+    Build,
+}
+
+/// `AUGMENTAGENT_AUTOPR_LANE` = `resume` | `build`; anything else (and the
+/// daemon default) is [`Lane::Combined`].
+fn lane_from_env() -> Lane {
+    match std::env::var("AUGMENTAGENT_AUTOPR_LANE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("resume") => Lane::Resume,
+        Some("build") => Lane::Build,
+        _ => Lane::Combined,
+    }
+}
+
+impl Lane {
+    /// Worktree directory name under `.self-improve-worktrees/`.
+    fn worktree_name(self) -> &'static str {
+        match self {
+            // Combined and Build share a name deliberately: they also share
+            // a lock, so they can never run concurrently.
+            Lane::Combined | Lane::Build => "current",
+            Lane::Resume => "resume",
+        }
+    }
+
+    /// Suffix distinguishing this lane's lock file.
+    fn lock_suffix(self) -> &'static str {
+        match self {
+            Lane::Combined | Lane::Build => "",
+            Lane::Resume => "-resume",
+        }
+    }
+}
+
 /// Lock file path: `AUGMENTAGENT_SELFIMPROVE_LOCK` override (tests), else the
 /// daemon state dir alongside `reasoner-cooldowns.json`, else a cwd-relative
 /// fallback so a HOME-less environment still serializes.
@@ -2367,13 +2433,10 @@ fn run_lock_path() -> PathBuf {
             return PathBuf::from(p);
         }
     }
+    let name = format!("self-improve{}.lock", lane_from_env().lock_suffix());
     std::env::var_os("HOME")
-        .map(|h| {
-            PathBuf::from(h)
-                .join(".local/state/augmentagent")
-                .join("self-improve.lock")
-        })
-        .unwrap_or_else(|| PathBuf::from(".self-improve.lock"))
+        .map(|h| PathBuf::from(h).join(".local/state/augmentagent").join(&name))
+        .unwrap_or_else(|| PathBuf::from(format!(".{name}")))
 }
 
 /// What one `run_once` did, and whether it should cost daily budget.
@@ -2446,9 +2509,19 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // diffs that only lack an approving review, and until now the dedup guard
     // made them permanently invisible (seven drafts, three days, zero
     // merges). Resume the oldest one not yet attempted today.
-    if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root).await {
-        let reasoner = build_reasoner();
-        return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run).await;
+    // #871 — lanes: the resume lane does ONLY this (idling when no draft is
+    // eligible), the build lane skips it entirely, and the default combined
+    // lane keeps resume-first (still flippable via the knob).
+    let lane = lane_from_env();
+    if lane != Lane::Build && resume_first_enabled() {
+        if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root).await {
+            let reasoner = build_reasoner();
+            return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run)
+                .await;
+        }
+    }
+    if lane == Lane::Resume {
+        return Ok(RunReport::idle());
     }
 
     let Some(issue) = pick_issue(repo_root).await? else {
@@ -2504,7 +2577,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // time; with the shared gate target cache, binaries compiled under a
     // deleted per-issue path get reused from later runs and panic reading
     // fixtures. A stable path keeps every baked path resolvable.
-    let worktree = repo_root.join(".self-improve-worktrees").join("current");
+    let worktree = repo_root
+        .join(".self-improve-worktrees")
+        .join(lane_from_env().worktree_name());
 
     // Clean any stale worktree from a crashed prior run.
     reclaim_worktree(repo_root, &worktree, &branch).await;
@@ -3295,12 +3370,7 @@ async fn record_hard_failure(repo_root: &Path, issue: u64, what: &str, err: &str
 async fn record_attempt(repo_root: &Path, issue: u64) -> Result<u32> {
     // #851 — remember the attempt for the rest of the UTC day so the picker
     // moves on instead of handing this issue straight back next tick.
-    {
-        let path = attempt_ledger_path();
-        let mut ledger = AttemptLedger::load(&path);
-        ledger.mark(utc_day_now(), issue);
-        ledger.save(&path);
-    }
+    AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue);
     let gh = gh_bin();
     let (_ok, stdout, _) = run(
         &gh,
@@ -4149,6 +4219,41 @@ impl AttemptLedger {
         if !self.issues.contains(&issue) {
             self.issues.push(issue);
         }
+    }
+
+    /// Atomically read-modify-write a mark under an exclusive flock (#871).
+    /// With the resume and build lanes running in parallel, two unlocked
+    /// read-modify-write cycles could drop one lane's mark — which would
+    /// re-expose an already-attempted issue to the picker the same day.
+    fn mark_persist(path: &Path, day: u64, issue: u64) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(path = %path.display(), "attempt ledger open failed: {e}");
+                return;
+            }
+        };
+        // SAFETY: `file` owns the fd; flock neither reads nor writes it.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            warn!("attempt ledger flock failed; marking without it");
+        }
+        let mut ledger = std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+            .unwrap_or_default();
+        ledger.mark(day, issue);
+        ledger.save(path);
+        // Lock released when `file` drops.
     }
 
     /// Best-effort persist, mirroring [`DailyCounter::save`]: losing this
@@ -5440,6 +5545,88 @@ CODEX-REVIEW: lgtm").0);
         match prev_e {
             Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", v),
             None => std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE"),
+        }
+    }
+
+    #[test]
+    fn lanes_have_disjoint_locks_and_worktrees() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AUGMENTAGENT_AUTOPR_LANE").ok();
+
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_LANE");
+        assert_eq!(lane_from_env(), Lane::Combined);
+        std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", "resume");
+        assert_eq!(lane_from_env(), Lane::Resume);
+        std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", "build");
+        assert_eq!(lane_from_env(), Lane::Build);
+        // Unknown values must not invent a third lane.
+        std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", "yolo");
+        assert_eq!(lane_from_env(), Lane::Combined);
+
+        // The whole point: resume and build can run CONCURRENTLY, so they
+        // must never share a lock or a worktree...
+        assert_ne!(Lane::Resume.lock_suffix(), Lane::Build.lock_suffix());
+        assert_ne!(Lane::Resume.worktree_name(), Lane::Build.worktree_name());
+        // ...while combined and build must EXCLUDE each other (the daemon
+        // runs combined), so they share both.
+        assert_eq!(Lane::Combined.lock_suffix(), Lane::Build.lock_suffix());
+        assert_eq!(Lane::Combined.worktree_name(), Lane::Build.worktree_name());
+
+        std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", "resume");
+        assert!(run_lock_path().to_string_lossy().contains("self-improve-resume.lock"));
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_LANE");
+        assert!(run_lock_path().to_string_lossy().ends_with("self-improve.lock"));
+
+        match prev {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_LANE"),
+        }
+    }
+
+    #[test]
+    fn ledger_mark_persist_survives_concurrent_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attempted.json");
+        // Two lanes marking different issues at once must both land — an
+        // unlocked read-modify-write drops one.
+        let p1 = path.clone();
+        let p2 = path.clone();
+        let t1 = std::thread::spawn(move || {
+            for i in 0..50u64 {
+                AttemptLedger::mark_persist(&p1, 100, 1000 + i);
+            }
+        });
+        let t2 = std::thread::spawn(move || {
+            for i in 0..50u64 {
+                AttemptLedger::mark_persist(&p2, 100, 2000 + i);
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let l = AttemptLedger::load(&path);
+        for i in 0..50u64 {
+            assert!(l.attempted_today(100, 1000 + i), "lane-1 mark {} lost", 1000 + i);
+            assert!(l.attempted_today(100, 2000 + i), "lane-2 mark {} lost", 2000 + i);
+        }
+    }
+
+    #[test]
+    fn resume_first_is_default_and_flippable_per_run() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AUGMENTAGENT_AUTOPR_RESUME_FIRST").ok();
+
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST");
+        assert!(resume_first_enabled(), "draining sitting drafts stays the default");
+        std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST", "0");
+        assert!(!resume_first_enabled(), "the owner's new-issues-now lever");
+        std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST", "1");
+        assert!(resume_first_enabled());
+
+        match prev {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST"),
         }
     }
 
