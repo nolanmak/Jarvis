@@ -1317,8 +1317,18 @@ fn build_revise_prompt(issue: &Issue, review_notes: &str, current_lines: usize) 
          changes. Its findings:\n\n{}\n\nAddress each finding: fix what is \
          real (with a regression test where the finding is bug-shaped), and \
          where a finding is mistaken, add a brief code comment at the \
-         relevant site explaining why the behaviour is correct. Keep the \
-         diff focused; do not start over or refactor unrelated code.\n\
+         relevant site explaining why the behaviour is correct.\n\
+         IF THE FINDING IS ARCHITECTURAL — the reviewer shows your APPROACH \
+         cannot handle the reported case, not just a detail of it — replace \
+         the approach with the smallest correct alternative instead of \
+         patching around it. Take a reviewer-proposed alternative seriously; \
+         it has repeatedly been the fix. Patching a structurally wrong \
+         approach for another round wastes the whole run. Otherwise keep the \
+         diff focused; never refactor unrelated code.\n\
+         Always add a regression test that reproduces the ORIGINAL reported \
+         case verbatim (the exact inputs from the issue, placeholder \
+         identities) — if that test cannot pass under your approach, the \
+         approach is wrong.\n\
          HARD BUDGET: the total diff may not exceed {MAX_DIFF_LINES} changed \
          lines and is currently at {current_lines}. A revision that grows \
          past the cap is rejected wholesale, discarding all of this work — \
@@ -5191,9 +5201,23 @@ CODEX-REVIEW: lgtm").0);
         let p = build_revise_prompt(&issue, "rfind(',') splits quoted display names", 373);
         assert!(p.contains("rfind"), "the reviewer's findings must reach the builder");
         assert!(p.contains("#845"));
+        // The live #853 resume burned four rounds because "do not start
+        // over" entrenched a structurally wrong approach: the guard matched
+        // greeting names against address tokens ("Gary" vs "glozoff"), codex
+        // showed the reported case could never pass, and the builder kept
+        // patching details around the hole. Revisions must be allowed to
+        // pivot when the finding is architectural.
         assert!(
-            p.contains("do not start over"),
-            "a revision must stay a revision, not a second attempt from scratch"
+            p.contains("IF THE FINDING IS ARCHITECTURAL"),
+            "an architectural finding must permit replacing the approach"
+        );
+        assert!(
+            p.contains("reviewer-proposed alternative"),
+            "the reviewer's prescription is signal, not noise"
+        );
+        assert!(
+            p.contains("ORIGINAL reported case verbatim"),
+            "the issue's own repro is the acceptance test that catches a non-fix"
         );
         assert!(
             p.contains("mistaken"),
