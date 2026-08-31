@@ -397,6 +397,12 @@ const GREETING_OPENERS: &[&str] = &[
 const COLLECTIVE_GREETINGS: &[&str] =
     &["there", "all", "team", "folks", "everyone", "both", "guys"];
 
+/// Punctuation a greeting may put between the opener and the name — "Hi, Gary!"
+/// and "Hello: Gary" are as common as the bare-space form.
+fn is_greeting_sep(c: char) -> bool {
+    c.is_whitespace() || c == ',' || c == ':'
+}
+
 /// The name in the body's opening salutation, lowercased ("Hi Gary!" → `gary`).
 /// `None` when the first line is not a salutation, or greets a group.
 fn salutation_name(body: &str) -> Option<String> {
@@ -405,10 +411,10 @@ fn salutation_name(body: &str) -> Option<String> {
     let rest = GREETING_OPENERS.iter().find_map(|g| {
         lowered
             .strip_prefix(g)
-            .filter(|r| r.starts_with(char::is_whitespace))
+            .filter(|r| r.starts_with(is_greeting_sep))
     })?;
     let name: String = rest
-        .trim_start()
+        .trim_start_matches(is_greeting_sep)
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '\'')
         .collect();
@@ -1260,6 +1266,19 @@ mod tests {
             &["Me@Example.com".to_string()],    // pii-ok: synthetic test fixture
             "Dear Dana, following up on the quote.",
         ));
+    }
+
+    #[test]
+    fn cc_only_survives_punctuated_greetings() {
+        // "Hi, Gary!" is at least as common as "Hi Gary!" — punctuation after
+        // the opener must not decide whether the guard fires. pii-ok —
+        // synthetic test fixtures.
+        for body in ["Hi Gary!", "Hi, Gary!", "Hello: Gary,", "Dear, Gary"] {
+            assert!(
+                is_cc_only_bystander("gary@example.com", "Me <me@example.com>", &me(), body),
+                "missed greeting: {body}"
+            );
+        }
     }
 
     #[test]

@@ -66,9 +66,10 @@ const RECIPIENT_HEADER_CHAR_CAP: usize = 2_000;
 /// Render one `To:`/`Cc:` line, or `String::new()` when the header is empty.
 ///
 /// Headers are attacker-controlled inbound data, so they go through
-/// [`sanitize_untrusted`] like every other untrusted field. Over the cap we
-/// cut at the last address boundary that fits and report how many were
-/// dropped, so the model never sees half an address.
+/// [`sanitize_untrusted`] like every other untrusted field. Over the cap only
+/// whole addresses survive — if not even the first one fits, none are shown —
+/// and the rest are reported as a count, so the model never sees half an
+/// address.
 fn recipient_header(label: &str, raw: &str) -> String {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -84,11 +85,10 @@ fn recipient_header(label: &str, raw: &str) -> String {
         .rev()
         .find(|i| safe.is_char_boundary(*i))
         .unwrap_or(0);
-    let head = match safe[..cut].rfind(',') {
-        Some(i) => &safe[..i],
-        None => &safe[..cut],
-    };
-    let dropped = safe[head.len()..].matches(',').count().max(1);
+    // No comma inside the cap means the first address alone overruns it; drop
+    // it too rather than render a fragment that reads like a real recipient.
+    let head = safe[..cut].rfind(',').map_or("", |i| &safe[..i]);
+    let dropped = safe[head.len()..].matches(',').count() + usize::from(head.is_empty());
     format!("\n{label}: {head}… (+{dropped} more)")
 }
 
@@ -854,6 +854,10 @@ mod tests {
         // Never a truncated half-address, always a dropped-count suffix.
         assert!(line.contains("@example.com… (+"), "cut mid-address: {line}");
         assert!(line.ends_with(" more)"), "no dropped-count suffix: {line}");
+        // A lone address longer than the cap has no boundary to cut at, so it
+        // is dropped whole rather than rendered as a plausible-looking stub.
+        let long = format!("{}@example.com", "a".repeat(RECIPIENT_HEADER_CHAR_CAP));
+        assert_eq!(to_line(&long), "To: … (+1 more)");
         // `&` renders as `&amp;`: capping before escaping would let this header
         // reach ~5x the cap in the prompt the model actually sees.
         let amp = to_line(&vec!["&&&&&&&&&&@example.com"; 300].join(", "));
