@@ -1341,6 +1341,21 @@ fn build_revise_prompt(issue: &Issue, review_notes: &str, current_lines: usize) 
     )
 }
 
+/// Synthetic "findings" for a gate-repair round (#873): the last change went
+/// RED — a compile error or failing test — and the next round's job is to
+/// make it green again. This is the red→fix half of TDD; treating a red gate
+/// as terminal discarded ~40-minute runs twice in one evening (#854's
+/// calendar doctest, #855's revision that did not compile), when a compile
+/// error is precisely the easiest failure to iterate on.
+fn gate_findings(err: &str) -> String {
+    format!(
+        "Your last change FAILED the verification gate — it does not build or \
+         its tests fail. Fix exactly this failure; change nothing unrelated. \
+         Gate output:\n\n```\n{}\n```",
+        truncate(err, 3000)
+    )
+}
+
 /// Synthetic "findings" for a shrink round: the revision overgrew the cap,
 /// and the next round's job is to cut it down, not to add more.
 fn shrink_findings(lines: usize) -> String {
@@ -2130,12 +2145,51 @@ async fn resume_draft_pr(
             gate_for_round(&worktree, &names).await
         };
         if let Err(gate_err) = gate_result {
+            // #873 — a red gate gets a repair round while budget remains.
+            // Round 0 red means the draft rotted against today's main; a
+            // later red means the revision broke it. Both are exactly the
+            // failure a builder can iterate on (it sees the compiler/test
+            // output verbatim), and terminal-refusing here discarded two
+            // ~40-minute runs in one evening.
+            if rounds_done < revise_rounds() {
+                rounds_done += 1;
+                info!(pr, issue = issue.number, round = rounds_done, "resume: gate-repair round");
+                match reasoner
+                    .call(
+                        &fix_opts(worktree.clone()),
+                        &build_revise_prompt(&issue, &gate_findings(&gate_err.to_string()), lines_now),
+                    )
+                    .await
+                {
+                    Ok(rs) => {
+                        let _ = drop_root_scratch(&worktree).await;
+                        let _ = run("git", &["add", "-A"], &worktree).await?;
+                        let msg =
+                            format!("review round {rounds_done}: repair the verification gate");
+                        let _ = run(
+                            "git",
+                            &["-c", &name_arg, "-c", &email_arg, "commit", "--allow-empty", "-m", &msg],
+                            &worktree,
+                        )
+                        .await?;
+                        summary = format!(
+                            "{summary}\nRound {rounds_done} (gate repair): {}",
+                            truncate(&rs, 200)
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(pr, "gate-repair round failed: {e:#}");
+                    }
+                }
+            }
             cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
             let _ = run(
                 &gh,
                 &["pr", "comment", &pr.to_string(), "--body",
                   &format!("Auto-resume: verification gate failed against current \
-                            `main`:\n```\n{}\n```", truncate(&gate_err.to_string(), 1200))],
+                            `main` and the repair budget is exhausted:\n```\n{}\n```",
+                           truncate(&gate_err.to_string(), 1200))],
                 repo_root,
             )
             .await;
@@ -3011,6 +3065,18 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
                 if let Err(gate_err) = gate_for_round(&worktree, &names2).await {
                     warn!(issue = issue.number, "post-revision gate failed: {gate_err:#}");
+                    // #873 — a red gate gets a repair round while budget
+                    // remains: red→fix is the other half of TDD, and a
+                    // compile error is the easiest failure to iterate on.
+                    // Codex is not consulted on a diff that does not build.
+                    if round < max_rounds {
+                        findings_override = Some(gate_findings(&gate_err.to_string()));
+                        revision_note.push_str(&format!(
+                            "\n### Revision round {round}: failed the gate; \
+                             next round repairs\n"
+                        ));
+                        continue;
+                    }
                     let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
                     if attempts >= MAX_ATTEMPTS {
                         backoff_comment(
@@ -5487,6 +5553,17 @@ CODEX-REVIEW: lgtm").0);
         // the cap on round 2 because the builder was never told it existed.
         assert!(p.contains("373"), "current size must be in the prompt");
         assert!(p.contains("600"), "the cap must be in the prompt");
+    }
+
+    #[test]
+    fn gate_findings_carry_the_error_and_forbid_unrelated_changes() {
+        let f = gate_findings("error[E0308]: mismatched types\n --> src/x.rs:9");
+        assert!(f.contains("E0308"), "the builder must see the compiler's own words");
+        assert!(f.contains("FAILED the verification gate"));
+        assert!(
+            f.contains("change nothing unrelated"),
+            "a repair round repairs; it must not become a rewrite"
+        );
     }
 
     #[test]
