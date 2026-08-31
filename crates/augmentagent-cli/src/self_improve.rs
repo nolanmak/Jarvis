@@ -2844,6 +2844,31 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let mut gated = touches_verify_gated_path(&staged_names);
 
     let mut lines = diff_line_count(&full_diff);
+    if lines > MAX_DIFF_LINES && revise_enabled() {
+        // #875 — the FIRST diff gets one shrink attempt too. #868 added
+        // shrink rounds inside the revise loop, but the initial size check
+        // stayed terminal — and promptly discarded a completed build at 652
+        // lines against a 600 cap, the exactly-marginal overage that trims
+        // trivially. One build-tier call risks nothing: still over after the
+        // shrink ⇒ the refusal below proceeds unchanged.
+        info!(issue = issue.number, lines, "initial diff over cap; one shrink attempt");
+        if let Ok(rs) = reasoner
+            .call(
+                &fix_opts(worktree.clone()),
+                &build_revise_prompt(&issue, &shrink_findings(lines), lines),
+            )
+            .await
+        {
+            let _ = drop_root_scratch(&worktree).await;
+            let _ = run("git", &["add", "-A"], &worktree).await?;
+            let (_ok, d2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+            // Shrinking must not smuggle in a guarded path.
+            if blast_radius_hit_in_diff(&d2).is_none() {
+                lines = diff_line_count(&d2);
+                summary = format!("{summary}\n\nShrink: {}", truncate(&rs, 200));
+            }
+        }
+    }
     if lines > MAX_DIFF_LINES {
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
         let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
@@ -2851,8 +2876,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             repo_root,
             issue.number,
             &format!(
-                "Self-improve refused: diff is {lines} lines (cap {MAX_DIFF_LINES}). \
-                 Needs a human."
+                "Self-improve refused: diff is {lines} lines (cap {MAX_DIFF_LINES}) \
+                 after a shrink attempt. Needs a human (or a split issue)."
             ),
         )
         .await
