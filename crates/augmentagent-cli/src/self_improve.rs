@@ -1506,6 +1506,25 @@ fn build_fix_prompt(issue: &Issue, plan: Option<&str>) -> String {
 /// #828 — does an independent LGTM also release the `hard` complexity band?
 /// Off by default: turning it on is the decision that lets high-blast-radius
 /// work merge with no human, on the strength of two independent reviews.
+/// Max revision rounds per run (owner directive 2026-08-31: iterate until
+/// LGTM). Default 3; `AUGMENTAGENT_AUTOPR_REVISE_ROUNDS` tunes it, clamped
+/// to 5 — each round costs a build-tier call, a full gate run, and two codex
+/// calls, and a reviewer/builder pair that has not converged in five rounds
+/// is disagreeing, not iterating. `AUGMENTAGENT_AUTOPR_REVISE=0` still
+/// disables outright. Exhausted rounds land as a draft carrying every
+/// round's verdict, so the disagreement is legible to the human who inherits
+/// it.
+fn revise_rounds() -> u32 {
+    if !revise_enabled() {
+        return 0;
+    }
+    std::env::var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(3)
+        .min(5)
+}
+
 /// One revision pass against codex findings — default ON, `=0` disables.
 fn revise_enabled() -> bool {
     !matches!(
@@ -2290,24 +2309,32 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // that PR is open (recording here double-counted — see #852).
     }
 
-    // One bounded revision against the reviewer's findings (default ON,
-    // AUGMENTAGENT_AUTOPR_REVISE=0 disables). Seven drafts accumulated over
+    // Iterate revisions until the reviewer approves (owner directive
+    // 2026-08-31), bounded by `revise_rounds`. Seven drafts accumulated over
     // three days because a codex rejection just parked the work with nobody
-    // acting on the findings; this is the loop that turns findings into
-    // merges. Everything downstream of the edit re-runs: scratch sweep,
+    // acting on the findings; this loop is what turns findings into merges.
+    // Every round re-runs everything downstream of the edit: scratch sweep,
     // blast/size guards, the full verification gate, and BOTH codex passes —
-    // the revised diff earns its verdict, it does not inherit one.
-    if independent.available && !independent.approved() && revise_enabled() {
-        info!(issue = issue.number, "revising once against the independent findings");
+    // a revised diff earns its verdict, it does not inherit one.
+    let max_rounds = revise_rounds();
+    let mut round = 0u32;
+    while independent.available && !independent.approved() && round < max_rounds {
+        round += 1;
+        info!(issue = issue.number, round, max_rounds, "revising against the independent findings");
         let round1 = independent.status();
         match reasoner
             .call(&fix_opts(worktree.clone()), &build_revise_prompt(&issue, &independent.notes))
             .await
         {
-            Err(e) => warn!(
-                issue = issue.number,
-                "revision pass failed; keeping the round-1 outcome: {e:#}"
-            ),
+            Err(e) => {
+                // Provider trouble, not a verdict — keep the last outcome and
+                // stop iterating rather than burning rounds on a flaky call.
+                warn!(
+                    issue = issue.number,
+                    round, "revision pass failed; keeping the prior outcome: {e:#}"
+                );
+                break;
+            }
             Ok(rev_summary) => {
                 dropped.extend(drop_root_scratch(&worktree).await);
                 let _ = run("git", &["add", "-A"], &worktree).await?;
@@ -2385,15 +2412,23 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 gated = touches_verify_gated_path(&names2);
                 lines = lines2;
                 independent = independent_review(&issue, &rev_summary, &diff2, worktree.clone()).await;
-                revision_note = format!(
-                    "\n### Revision (round 1 verdict: {round1})\n{}\n\n\
-                     Final verdict after revision: {}\n",
-                    truncate(&rev_summary, 1200),
+                revision_note.push_str(&format!(
+                    "\n### Revision round {round} (prior verdict: {round1})\n{}\n\n\
+                     Verdict after round {round}: {}\n",
+                    truncate(&rev_summary, 1000),
                     independent.status()
-                );
-                summary = format!("{summary}\n\nRevision: {}", truncate(&rev_summary, 400));
+                ));
+                summary = format!("{summary}\n\nRevision {round}: {}", truncate(&rev_summary, 300));
             }
         }
+    }
+    if round > 0 {
+        info!(
+            issue = issue.number,
+            rounds = round,
+            approved = independent.approved(),
+            "iterative review finished"
+        );
     }
 
     if dry_run {
@@ -4716,6 +4751,37 @@ CODEX-REVIEW: lgtm").0);
         // Gated + flag but codex did NOT approve: still held. The override
         // is "LGTM overrides the receipt", never "the flag overrides codex".
         assert!(!automerge_receipt_ok(gated, false, Some("1")));
+    }
+
+    #[test]
+    fn revise_rounds_defaults_bounded_and_respects_the_kill_switch() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_r = std::env::var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS").ok();
+        let prev_e = std::env::var("AUGMENTAGENT_AUTOPR_REVISE").ok();
+
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS");
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE");
+        assert_eq!(revise_rounds(), 3, "iterate-until-LGTM defaults to 3 rounds");
+
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS", "10");
+        assert_eq!(revise_rounds(), 5, "each round is paid work; the ceiling holds");
+
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS", "1");
+        assert_eq!(revise_rounds(), 1);
+
+        // The kill switch beats the round count.
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", "0");
+        assert_eq!(revise_rounds(), 0);
+
+        match prev_r {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS"),
+        }
+        match prev_e {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE"),
+        }
     }
 
     #[test]
