@@ -459,6 +459,14 @@ fn gate_env() -> Vec<(String, String)> {
     if !env.iter().any(|(k, _)| k == "CARGO_TARGET_DIR") {
         env.push(("CARGO_TARGET_DIR".into(), gate_target_dir()));
     }
+    // #877 — contain the gate's temp files. The workspace suite leaked
+    // 22,006 SQLite files (19 GB) into system /tmp in three days: WAL/SHM
+    // sidecars outliving NamedTempFile, plus whole tempdirs when a gate run
+    // is killed mid-flight (destructors never run). Pointing TMPDIR into the
+    // gate cache bounds the damage — every gate sweeps it before running, so
+    // even kill-leaked files live only until the next gate, in a dir we own.
+    env.retain(|(k, _)| k != "TMPDIR");
+    env.push(("TMPDIR".into(), format!("{}/tmp", gate_target_dir())));
     // #780 — gate-run tests must NEVER file real GitHub issues. Channel
     // tests that build the production channel reach GhCliIssueRunner; the
     // per-crate test guards are the first line, this is the backstop.
@@ -1813,7 +1821,7 @@ async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Resul
     info!(%pkgs, "verification gate (targeted): cargo build");
     let (ok, _o, e) = run_sandboxed(
         "bash",
-        &["-lc", &gate_sh(&format!(". $HOME/.cargo/env && cargo build {pkgs} 2>&1 | tail -5"))],
+        &["-lc", &gate_sh(&format!("rm -rf \"$TMPDIR\" && mkdir -p \"$TMPDIR\" && . $HOME/.cargo/env && cargo build {pkgs} 2>&1 | tail -5"))],
         worktree,
         &env,
     )
@@ -1855,7 +1863,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     info!("verification gate: cargo build (sandboxed env)");
     let (ok, _o, e) = run_sandboxed(
         "bash",
-        &["-lc", &gate_sh(". $HOME/.cargo/env && cargo build --workspace 2>&1 | tail -5")],
+        &["-lc", &gate_sh("rm -rf \"$TMPDIR\" && mkdir -p \"$TMPDIR\" && . $HOME/.cargo/env && cargo build --workspace 2>&1 | tail -5")],
         worktree,
         &env,
     )
@@ -4790,6 +4798,23 @@ mod tests {
     }
 
     // ---- #692: shared gate target cache + stable worktree path ----
+
+    #[test]
+    fn gate_env_contains_temp_files_inside_the_gate_cache() {
+        // #877 — 19 GB of leaked SQLite temp files in system /tmp. The gate
+        // must point TMPDIR at a dir it owns and sweeps.
+        let env = gate_env();
+        let tmp = env.iter().find(|(k, _)| k == "TMPDIR").expect("TMPDIR pinned");
+        // Compare against the gate cache itself, not the env's
+        // CARGO_TARGET_DIR — a parent env (like this test harness) may pin
+        // that elsewhere, and the invariant is about where temp files LAND.
+        assert!(
+            tmp.1.starts_with(&gate_target_dir()),
+            "gate TMPDIR must live under the gate cache, not system /tmp: {}",
+            tmp.1
+        );
+        assert!(!tmp.1.trim_end_matches('/').eq("/tmp"));
+    }
 
     #[test]
     fn gate_env_provides_a_shared_cargo_target_dir() {
