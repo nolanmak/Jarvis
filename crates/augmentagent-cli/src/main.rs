@@ -236,6 +236,12 @@ enum Cmd {
         #[command(subcommand)]
         op: CalendarOp,
     },
+    /// ShadowNote journal → wiki ingest (#427). Opt-in: inert unless the
+    /// SHADOWNOTE_* config is present in keyring/env (see epic #425).
+    Journal {
+        #[command(subcommand)]
+        op: JournalOp,
+    },
     /// Voice memo capture: drop-folder watcher + Whisper transcription ->
     /// wiki ingest. All ops stubs in foundation/swarm-v1.
     Voice {
@@ -926,6 +932,17 @@ enum CalendarOp {
         days: i64,
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum JournalOp {
+    /// Run one ShadowNote sync pass and exit. Default --dry-run true:
+    /// decrypt + count without firing wiki ingest or advancing the sync
+    /// watermark — this is the verify-gate exercise path.
+    PollOnce {
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
     },
 }
 
@@ -2476,6 +2493,38 @@ async fn main() -> Result<()> {
                 }
                 None => info!("auto-PR loop disabled: AUGMENTAGENT_AUTOPR not set"),
             }
+            // #427 — ShadowNote journal → wiki ingest. Self-gates on the
+            // SHADOWNOTE_* keyring/env config (plus AWS creds via the SDK
+            // default chain); an unconfigured box logs and moves on, same
+            // as the reddit/github gates.
+            match augmentagent_channel_journal::JournalRuntime::from_env().await {
+                Ok(Some(runtime)) => {
+                    let jc = augmentagent_channel_journal::JournalChannel::new(
+                        Arc::clone(&store),
+                        Arc::clone(&runtime.client),
+                        runtime.dek.clone(),
+                        build_reasoner(),
+                        augmentagent_channel_journal::JournalChannelConfig {
+                            owner_id: runtime.config.owner_id.clone(),
+                            dry_run,
+                            wiki_root: cli.wiki_dir.clone(),
+                            wiki_schema_path: cli
+                                .wiki_dir
+                                .as_ref()
+                                .map(|_| PathBuf::from("schema/wiki-skill.md")),
+                            poll_interval: augmentagent_channel_journal::DEFAULT_POLL_INTERVAL,
+                        },
+                    );
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move { jc.run(sd).await }));
+                }
+                Ok(None) => {
+                    info!("shadownote journal channel disabled: SHADOWNOTE_* config not present");
+                }
+                Err(e) => {
+                    warn!("shadownote journal channel disabled: {e:#}");
+                }
+            }
             // #48 — Reddit channel. Self-gates on having completed the
             // dashboard OAuth bootstrap (refresh token in keyring); prod
             // without it never spawns this, exactly like github/meetup gate.
@@ -2968,6 +3017,12 @@ async fn main() -> Result<()> {
             | WhatsappOp::DenyInbound { .. }
             | WhatsappOp::PollOnce { .. } => {
                 unimplemented!("see issue #74 (whatsapp feature PR)")
+            }
+        },
+        Cmd::Journal { op } => match op {
+            JournalOp::PollOnce { dry_run } => {
+                run_journal_poll_once(cli.wiki_dir.clone(), store, dry_run).await?;
+                Ok(())
             }
         },
         Cmd::Calendar { op } => match op {
@@ -13046,6 +13101,46 @@ fn load_any_github_auth() -> Result<augmentagent_channel_github::GithubAuth> {
 // ---------------------------------------------------------------------------
 // Calendar (archived AugmentAgent#82) — Phase 1 CLI helpers.
 // ---------------------------------------------------------------------------
+
+/// #427 — one ShadowNote journal sync pass. Self-gates on SHADOWNOTE_*
+/// config exactly like the serve spawn; without it this prints why and
+/// exits 0 so the subcommand is safe to probe on an unconfigured box.
+async fn run_journal_poll_once(
+    wiki_dir: Option<PathBuf>,
+    store: Arc<Store>,
+    dry_run: bool,
+) -> Result<()> {
+    use augmentagent_channel_journal::{JournalChannel, JournalChannelConfig, JournalRuntime};
+
+    let Some(runtime) = JournalRuntime::from_env().await? else {
+        println!(
+            "shadownote journal not configured (SHADOWNOTE_APPSYNC_URL / \
+             SHADOWNOTE_OWNER_ID missing from keyring/env); nothing to do"
+        );
+        return Ok(());
+    };
+    let wiki_schema_path = wiki_dir
+        .as_ref()
+        .map(|_| PathBuf::from("schema/wiki-skill.md"));
+    let config = JournalChannelConfig {
+        owner_id: runtime.config.owner_id.clone(),
+        dry_run,
+        wiki_root: wiki_dir,
+        wiki_schema_path,
+        poll_interval: augmentagent_channel_journal::DEFAULT_POLL_INTERVAL,
+    };
+    let reasoner = build_reasoner();
+    let channel = JournalChannel::new(
+        store,
+        Arc::clone(&runtime.client),
+        runtime.dek.clone(),
+        reasoner,
+        config,
+    );
+    let outcome = channel.poll_once().await?;
+    println!("{outcome:#?}");
+    Ok(())
+}
 
 async fn run_calendar_poll_once(
     wiki_dir: Option<PathBuf>,

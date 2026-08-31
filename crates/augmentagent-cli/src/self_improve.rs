@@ -459,6 +459,14 @@ fn gate_env() -> Vec<(String, String)> {
     if !env.iter().any(|(k, _)| k == "CARGO_TARGET_DIR") {
         env.push(("CARGO_TARGET_DIR".into(), gate_target_dir()));
     }
+    // #877 — contain the gate's temp files. The workspace suite leaked
+    // 22,006 SQLite files (19 GB) into system /tmp in three days: WAL/SHM
+    // sidecars outliving NamedTempFile, plus whole tempdirs when a gate run
+    // is killed mid-flight (destructors never run). Pointing TMPDIR into the
+    // gate cache bounds the damage — every gate sweeps it before running, so
+    // even kill-leaked files live only until the next gate, in a dir we own.
+    env.retain(|(k, _)| k != "TMPDIR");
+    env.push(("TMPDIR".into(), format!("{}/tmp", gate_target_dir())));
     // #780 — gate-run tests must NEVER file real GitHub issues. Channel
     // tests that build the production channel reach GhCliIssueRunner; the
     // per-crate test guards are the first line, this is the backstop.
@@ -1301,6 +1309,172 @@ fn parse_codex_review(raw: &str) -> (bool, String) {
     (approved, raw.trim().to_string())
 }
 
+/// Build the one-shot revision prompt: the reviewer's concrete findings,
+/// handed back to the builder that wrote the diff.
+///
+/// This is the loop's missing last mile. Codex requests changes on most
+/// first attempts — that is a reviewer doing its job — but until now the
+/// pipeline just parked a draft PR and the findings went nowhere: seven
+/// drafts accumulated over three days with nobody (human or model) acting
+/// on a single finding. One bounded revision converts "codex found issues"
+/// into "merged PR" without widening any gate.
+fn build_revise_prompt(issue: &Issue, review_notes: &str, current_lines: usize) -> String {
+    format!(
+        "You previously implemented a fix for GitHub issue #{} ({}) in this \
+         worktree. An independent reviewer examined your diff and requested \
+         changes. Its findings:\n\n{}\n\nAddress each finding: fix what is \
+         real (with a regression test where the finding is bug-shaped), and \
+         where a finding is mistaken, add a brief code comment at the \
+         relevant site explaining why the behaviour is correct.\n\
+         IF THE FINDING IS ARCHITECTURAL — the reviewer shows your APPROACH \
+         cannot handle the reported case, not just a detail of it — replace \
+         the approach with the smallest correct alternative instead of \
+         patching around it. Take a reviewer-proposed alternative seriously; \
+         it has repeatedly been the fix. Patching a structurally wrong \
+         approach for another round wastes the whole run. Otherwise keep the \
+         diff focused; never refactor unrelated code.\n\
+         Always add a regression test that reproduces the ORIGINAL reported \
+         case verbatim (the exact inputs from the issue, placeholder \
+         identities) — if that test cannot pass under your approach, the \
+         approach is wrong.\n\
+         HARD BUDGET: the total diff may not exceed {MAX_DIFF_LINES} changed \
+         lines and is currently at {current_lines}. A revision that grows \
+         past the cap is rejected wholesale, discarding all of this work — \
+         if you are near the cap, trim (drop non-essential refactors, tighten \
+         verbose tests) while keeping the fix and its regression tests. When \
+         done, summarize what you changed per finding.",
+        issue.number,
+        issue.title,
+        truncate(review_notes, 4000),
+    )
+}
+
+/// Synthetic "findings" for a gate-repair round (#873): the last change went
+/// RED — a compile error or failing test — and the next round's job is to
+/// make it green again. This is the red→fix half of TDD; treating a red gate
+/// as terminal discarded ~40-minute runs twice in one evening (#854's
+/// calendar doctest, #855's revision that did not compile), when a compile
+/// error is precisely the easiest failure to iterate on.
+fn gate_findings(err: &str) -> String {
+    format!(
+        "Your last change FAILED the verification gate — it does not build or \
+         its tests fail. Fix exactly this failure; change nothing unrelated. \
+         Gate output:\n\n```\n{}\n```",
+        truncate(err, 3000)
+    )
+}
+
+/// Synthetic "findings" for a shrink round: the revision overgrew the cap,
+/// and the next round's job is to cut it down, not to add more.
+fn shrink_findings(lines: usize) -> String {
+    format!(
+        "Your last revision grew the diff to {lines} changed lines, over the \
+         hard {MAX_DIFF_LINES}-line cap — it cannot ship at this size. Reduce \
+         the diff below the cap without losing the fix or its regression \
+         tests: drop non-essential refactors, collapse duplicated test \
+         scaffolding, and prefer editing existing tests over adding parallel \
+         ones."
+    )
+}
+
+/// #851-follow-up — may this PR auto-merge despite touching a receipt-gated
+/// path? Owner policy (2026-08-31): a DOUBLE codex LGTM overrides the
+/// receipt gate when `AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT=1`.
+///
+/// The receipt gate exists because diffs that read clean can still break
+/// live email behaviour (#209/#211/#213); codex reads diffs and cannot
+/// exercise an inbox, so this trades that protection for throughput. The
+/// owner made that call explicitly; the env flag keeps it one line to
+/// revert, and OFF is the safe default for any other deployment.
+fn automerge_receipt_ok(gated: Option<&str>, independent_approved: bool, flag: Option<&str>) -> bool {
+    match gated {
+        None => true,
+        Some(_) => independent_approved && automerge_enabled_value(flag),
+    }
+}
+
+/// Post a short notice to the owner's Discord webhook, best-effort (#851
+/// visibility gap: draft PRs sat unseen for three days). A webhook failure
+/// must never fail the run — the PR already exists.
+async fn notify_discord(text: &str) {
+    let Ok(url) = std::env::var("DISCORD_WEBHOOK_URL") else { return };
+    if url.trim().is_empty() {
+        return;
+    }
+    let body = serde_json::json!({ "content": truncate(text, 1800) });
+    match reqwest::Client::new()
+        .post(url.trim())
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => warn!(status = %r.status(), "draft-PR discord notice rejected"),
+        Err(e) => warn!("draft-PR discord notice failed: {e}"),
+    }
+}
+
+/// Issue number encoded in an agent branch name (`agent-fix/issue-845` → 845).
+fn issue_from_branch(branch: &str) -> Option<u64> {
+    branch.strip_prefix(BRANCH_PREFIX)?.parse().ok()
+}
+
+/// `complexity (scoping pass): <grade>` as written into every agent PR body.
+/// Unparseable defaults to Hard — the conservative direction, exactly like
+/// `parse_scope_output`.
+fn complexity_from_pr_body(body: &str) -> Complexity {
+    for line in body.lines() {
+        let l = line.trim().to_ascii_lowercase();
+        if let Some(rest) = l.strip_prefix("- complexity (scoping pass):") {
+            return if rest.contains("simple") {
+                Complexity::Simple
+            } else if rest.contains("medium") {
+                Complexity::Medium
+            } else {
+                Complexity::Hard
+            };
+        }
+    }
+    Complexity::Hard
+}
+
+/// A sitting draft the loop should pick up: the OLDEST open draft agent PR
+/// whose issue has not already been attempted today.
+///
+/// Until now these were invisible: `has_open_agent_pr` deduplicates the
+/// issue out of the pool, so a draft that nobody merged sat forever — seven
+/// of them, three days, while the loop only ever started new work. Owner
+/// directive 2026-08-31: sitting PRs are picked up too, and since they are
+/// mostly-finished work they outrank new issues.
+async fn find_resumable_draft(repo_root: &Path) -> Option<(u64, u64, String)> {
+    let gh = gh_bin();
+    let (ok, stdout, _) = run(
+        &gh,
+        &["pr", "list", "--state", "open", "--json", "number,isDraft,headRefName"],
+        repo_root,
+    )
+    .await
+    .ok()?;
+    if !ok {
+        return None;
+    }
+    let prs: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+    let ledger = AttemptLedger::load(&attempt_ledger_path());
+    let today = utc_day_now();
+    prs.as_array()?
+        .iter()
+        .filter_map(|pr| {
+            let draft = pr.get("isDraft")?.as_bool()?;
+            let number = pr.get("number")?.as_u64()?;
+            let branch = pr.get("headRefName")?.as_str()?;
+            let issue = issue_from_branch(branch)?;
+            (draft && !ledger.attempted_today(today, issue))
+                .then(|| (number, issue, branch.to_string()))
+        })
+        .min_by_key(|(number, _, _)| *number)
+}
+
 /// Outcome of the independent stage (#828).
 struct IndependentReview {
     /// False when codex could not be reached at all — NOT the same as a
@@ -1443,6 +1617,44 @@ fn build_fix_prompt(issue: &Issue, plan: Option<&str>) -> String {
 /// #828 — does an independent LGTM also release the `hard` complexity band?
 /// Off by default: turning it on is the decision that lets high-blast-radius
 /// work merge with no human, on the strength of two independent reviews.
+/// Max revision rounds per run (owner directive 2026-08-31: iterate until
+/// LGTM). Default 3; `AUGMENTAGENT_AUTOPR_REVISE_ROUNDS` tunes it, clamped
+/// to 5 — each round costs a build-tier call, a full gate run, and two codex
+/// calls, and a reviewer/builder pair that has not converged in five rounds
+/// is disagreeing, not iterating. `AUGMENTAGENT_AUTOPR_REVISE=0` still
+/// disables outright. Exhausted rounds land as a draft carrying every
+/// round's verdict, so the disagreement is legible to the human who inherits
+/// it.
+fn revise_rounds() -> u32 {
+    if !revise_enabled() {
+        return 0;
+    }
+    std::env::var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(3)
+        .min(5)
+}
+
+/// Should sitting draft PRs be resumed before new issues? Default ON (#866).
+/// `AUGMENTAGENT_AUTOPR_RESUME_FIRST=0` flips a run to new-issues-first — the
+/// owner's "pick up new issues right now" lever, exported per-invocation for
+/// a manual run without changing the daemon's default.
+fn resume_first_enabled() -> bool {
+    !matches!(
+        std::env::var("AUGMENTAGENT_AUTOPR_RESUME_FIRST").ok().as_deref().map(str::trim),
+        Some("0") | Some("false") | Some("FALSE")
+    )
+}
+
+/// One revision pass against codex findings — default ON, `=0` disables.
+fn revise_enabled() -> bool {
+    !matches!(
+        std::env::var("AUGMENTAGENT_AUTOPR_REVISE").ok().as_deref().map(str::trim),
+        Some("0") | Some("false") | Some("FALSE")
+    )
+}
+
 fn codex_unlocks_hard() -> bool {
     automerge_enabled_value(
         std::env::var("AUGMENTAGENT_AUTOPR_CODEX_UNLOCKS_HARD").ok().as_deref(),
@@ -1571,6 +1783,77 @@ async fn node_build_required(worktree: &Path) -> bool {
     }
 }
 
+/// The workspace crates a change set touches, as `-p`-able package names —
+/// or `None` when anything falls outside `crates/`, which means only the
+/// full gate can vouch for it (Node sources, schema, scripts).
+///
+/// Crate directory names ARE the package names in this workspace
+/// (`crates/augmentagent-cli` ⇒ package `augmentagent-cli`).
+fn changed_crates(paths: &str) -> Option<Vec<String>> {
+    let mut crates: Vec<String> = Vec::new();
+    for path in paths.lines().map(str::trim).filter(|p| !p.is_empty()) {
+        let mut segs = path.split('/');
+        match (segs.next(), segs.next(), segs.next()) {
+            (Some("crates"), Some(dir), Some(_)) => {
+                if !crates.iter().any(|c| c == dir) {
+                    crates.push(dir.to_string());
+                }
+            }
+            // Workspace manifests change dependency resolution everywhere.
+            _ => return None,
+        }
+    }
+    (!crates.is_empty()).then_some(crates)
+}
+
+/// Build + test ONLY the given crates (#870). Used between revision rounds,
+/// where the full single-threaded workspace suite (~5 min) was re-verifying
+/// 30+ untouched crates after every round — ~20 of the 49 minutes of a
+/// three-round run. The FULL gate still runs exactly once before anything is
+/// pushed or merged; this trims the redundancy, not the bar.
+async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Result<()> {
+    let env = gate_env();
+    let pkgs: String = crates
+        .iter()
+        .map(|c| format!("-p {c}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    info!(%pkgs, "verification gate (targeted): cargo build");
+    let (ok, _o, e) = run_sandboxed(
+        "bash",
+        &["-lc", &gate_sh(&format!("rm -rf \"$TMPDIR\" && mkdir -p \"$TMPDIR\" && . $HOME/.cargo/env && cargo build {pkgs} 2>&1 | tail -5"))],
+        worktree,
+        &env,
+    )
+    .await?;
+    if !ok {
+        bail!("targeted cargo build failed:\n{o}{e}", o = _o.trim());
+    }
+    info!(%pkgs, "verification gate (targeted): cargo test");
+    let (ok, _o, e) = run_sandboxed(
+        "bash",
+        &["-lc", &gate_sh(&format!(
+            ". $HOME/.cargo/env && cargo test {pkgs} -- --test-threads=1 2>&1 | tail -8"
+        ))],
+        worktree,
+        &env,
+    )
+    .await?;
+    if !ok {
+        bail!("targeted cargo test failed:\n{o}{e}", o = _o.trim());
+    }
+    Ok(())
+}
+
+/// Gate for an intermediate revision round: targeted when the diff stays
+/// inside `crates/`, full otherwise.
+async fn gate_for_round(worktree: &Path, changed_paths: &str) -> Result<()> {
+    match changed_crates(changed_paths) {
+        Some(crates) => verification_gate_targeted(worktree, &crates).await,
+        None => verification_gate(worktree).await,
+    }
+}
+
 async fn verification_gate(worktree: &Path) -> Result<()> {
     // #300 — Strip provider secrets from the gate's child env. `cargo
     // build`/`npm run build` execute `build.rs`/proc-macros/`npm
@@ -1580,7 +1863,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     info!("verification gate: cargo build (sandboxed env)");
     let (ok, _o, e) = run_sandboxed(
         "bash",
-        &["-lc", &gate_sh(". $HOME/.cargo/env && cargo build --workspace 2>&1 | tail -5")],
+        &["-lc", &gate_sh("rm -rf \"$TMPDIR\" && mkdir -p \"$TMPDIR\" && . $HOME/.cargo/env && cargo build --workspace 2>&1 | tail -5")],
         worktree,
         &env,
     )
@@ -1671,6 +1954,396 @@ async fn drop_root_scratch(worktree: &Path) -> Vec<String> {
     dropped
 }
 
+/// Resume a sitting draft PR (#866): re-review it against today's `main`,
+/// revise against fresh findings, and merge on a double LGTM.
+///
+/// Deliberately re-reviews rather than trusting anything recorded on the PR:
+/// `main` has moved since the draft opened, the guards have changed, and the
+/// findings that held it may be stale. Round 0 costs two codex calls and no
+/// build — a draft that is already good merges without spending the builder
+/// at all.
+async fn resume_draft_pr(
+    repo_root: &Path,
+    reasoner: &Arc<FallbackReasoner>,
+    pr: u64,
+    issue_no: u64,
+    branch: &str,
+    dry_run: bool,
+) -> Result<RunReport> {
+    let gh = gh_bin();
+    info!(pr, issue = issue_no, %branch, "resuming sitting draft PR");
+
+    // Whatever happens next counts as today's attempt on this issue, so a
+    // failing resume moves on to other work instead of re-running every tick.
+    AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue_no);
+
+    // The issue, for trust + prompts. Refuse untrusted authors exactly like
+    // the fresh path (#300) — the PR was created from this issue's text.
+    let (ok, ibody, _) = run(
+        &gh,
+        &["api", &format!("repos/{{owner}}/{{repo}}/issues/{issue_no}")],
+        repo_root,
+    )
+    .await?;
+    if !ok {
+        bail!("resume: could not fetch issue #{issue_no}");
+    }
+    let iv: serde_json::Value = serde_json::from_str(&ibody).context("parse issue")?;
+    let author = iv.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let association = iv.get("author_association").and_then(|v| v.as_str()).unwrap_or("");
+    let allowlist = trusted_authors(repo_root).await;
+    if !author_is_trusted(&author, association, &allowlist) {
+        warn!(pr, issue = issue_no, %author, "resume refused: untrusted issue author");
+        return Ok(RunReport::triage(format!(
+            "PR #{pr}: resume refused — untrusted author '{author}'"
+        )));
+    }
+    let issue = Issue {
+        number: issue_no,
+        title: iv.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        body: iv.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        author,
+        author_trusted: true,
+        research_filed: is_research_filed(
+            iv.get("body").and_then(|v| v.as_str()).unwrap_or(""),
+        ),
+    };
+    let (_ok, prbody_raw, _) = run(
+        &gh,
+        &["pr", "view", &pr.to_string(), "--json", "body"],
+        repo_root,
+    )
+    .await?;
+    let complexity = serde_json::from_str::<serde_json::Value>(&prbody_raw)
+        .ok()
+        .and_then(|v| v.get("body").and_then(|b| b.as_str()).map(complexity_from_pr_body))
+        .unwrap_or(Complexity::Hard);
+
+    // Worktree from the PR's branch, brought up to date with main. A merge
+    // conflict is a human's job — say so on the PR and move on.
+    let worktree = repo_root
+        .join(".self-improve-worktrees")
+        .join(lane_from_env().worktree_name());
+    reclaim_worktree(repo_root, &worktree, branch).await;
+    let _ = run("git", &["fetch", "origin", branch], repo_root).await?;
+    let (ok, _o, e) = run(
+        "git",
+        &[
+            "worktree", "add", "-b", branch,
+            &worktree.to_string_lossy(),
+            &format!("origin/{branch}"),
+        ],
+        repo_root,
+    )
+    .await?;
+    if !ok {
+        bail!("resume: worktree add from origin/{branch} failed: {e}");
+    }
+    let cleanup = |wt: PathBuf, br: String, root: PathBuf| async move {
+        let _ = run("git", &["worktree", "remove", "--force", &wt.to_string_lossy()], &root).await;
+        let _ = run("git", &["branch", "-D", &br], &root).await;
+    };
+    let (ok, _o, _e) = run("git", &["merge", "--no-edit", "origin/main"], &worktree).await?;
+    if !ok {
+        let _ = run("git", &["merge", "--abort"], &worktree).await;
+        cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+        let _ = run(
+            &gh,
+            &["pr", "comment", &pr.to_string(), "--body",
+              "Auto-resume: this branch no longer merges cleanly with `main`; \
+               it needs a human rebase before the loop can pick it up again."],
+            repo_root,
+        )
+        .await;
+        return Ok(RunReport::triage(format!(
+            "PR #{pr}: resume skipped — merge conflict with main"
+        )));
+    }
+
+    let git_name = std::env::var("AUGMENTAGENT_GIT_AUTHOR_NAME")
+        .unwrap_or_else(|_| "AugmentAgent".to_string());
+    let git_email = std::env::var("AUGMENTAGENT_GIT_AUTHOR_EMAIL")
+        .unwrap_or_else(|_| "augmentagent@localhost".to_string());
+    let name_arg = format!("user.name={git_name}");
+    let email_arg = format!("user.email={git_email}");
+
+    let mut rounds_done = 0u32;
+    let mut notes_log: Vec<String> = Vec::new();
+    let mut summary = format!("Resumed sitting draft PR #{pr}.");
+    loop {
+        // The PR's actual contribution, freshly computed each round.
+        let (_ok, diff, _) =
+            run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
+        // Guards re-run every round — the rules have changed since the draft
+        // opened, and a revision can add lines or touch new paths.
+        if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff) {
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            let _ = run(
+                &gh,
+                &["pr", "comment", &pr.to_string(), "--body",
+                  &format!("Auto-resume refused: the diff touches `{pattern}`:\n```\n{line}\n```")],
+                repo_root,
+            )
+            .await;
+            return Ok(RunReport::built(format!(
+                "PR #{pr}: resume refused — blast radius on `{pattern}`"
+            )));
+        }
+        let lines_now = diff_line_count(&diff);
+        if lines_now > MAX_DIFF_LINES {
+            // A revision that grew past the cap gets a SHRINK round while
+            // budget remains — refusing outright here discarded every round
+            // of paid work on the live #839 resume. Codex is not consulted
+            // on an oversized diff; the next round's only job is to cut.
+            if rounds_done >= revise_rounds() {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                let _ = run(
+                    &gh,
+                    &["pr", "comment", &pr.to_string(), "--body",
+                      &format!("Auto-resume refused: diff is {lines_now} lines \
+                                (cap {MAX_DIFF_LINES}) and the revision budget \
+                                is exhausted.")],
+                    repo_root,
+                )
+                .await;
+                record_attempt(repo_root, issue.number).await.ok();
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: resume refused — oversized after revisions"
+                )));
+            }
+            rounds_done += 1;
+            info!(pr, issue = issue.number, round = rounds_done, lines_now, "resume: shrink round");
+            match reasoner
+                .call(
+                    &fix_opts(worktree.clone()),
+                    &build_revise_prompt(&issue, &shrink_findings(lines_now), lines_now),
+                )
+                .await
+            {
+                Ok(rs) => {
+                    let _ = drop_root_scratch(&worktree).await;
+                    let _ = run("git", &["add", "-A"], &worktree).await?;
+                    let msg = format!("review round {rounds_done}: reduce diff below the size cap");
+                    let _ = run(
+                        "git",
+                        &["-c", &name_arg, "-c", &email_arg, "commit", "--allow-empty", "-m", &msg],
+                        &worktree,
+                    )
+                    .await?;
+                    summary = format!("{summary}\nRound {rounds_done} (shrink): {}", truncate(&rs, 200));
+                    continue;
+                }
+                Err(e) => {
+                    warn!(pr, "resume shrink round failed: {e:#}");
+                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                    return Ok(RunReport::built(format!(
+                        "PR #{pr}: resume refused — oversized, shrink errored"
+                    )));
+                }
+            }
+        }
+        // Round 0 earns the FULL suite (first verification of an old branch
+        // against today's main); later rounds verify the changed crates
+        // (#870) — the full gate runs once more before any merge.
+        let gate_result = if rounds_done == 0 {
+            verification_gate(&worktree).await
+        } else {
+            let (_ok, names, _) =
+                run("git", &["diff", "--name-only", "origin/main...HEAD"], &worktree).await?;
+            gate_for_round(&worktree, &names).await
+        };
+        if let Err(gate_err) = gate_result {
+            // #873 — a red gate gets a repair round while budget remains.
+            // Round 0 red means the draft rotted against today's main; a
+            // later red means the revision broke it. Both are exactly the
+            // failure a builder can iterate on (it sees the compiler/test
+            // output verbatim), and terminal-refusing here discarded two
+            // ~40-minute runs in one evening.
+            if rounds_done < revise_rounds() {
+                rounds_done += 1;
+                info!(pr, issue = issue.number, round = rounds_done, "resume: gate-repair round");
+                match reasoner
+                    .call(
+                        &fix_opts(worktree.clone()),
+                        &build_revise_prompt(&issue, &gate_findings(&gate_err.to_string()), lines_now),
+                    )
+                    .await
+                {
+                    Ok(rs) => {
+                        let _ = drop_root_scratch(&worktree).await;
+                        let _ = run("git", &["add", "-A"], &worktree).await?;
+                        let msg =
+                            format!("review round {rounds_done}: repair the verification gate");
+                        let _ = run(
+                            "git",
+                            &["-c", &name_arg, "-c", &email_arg, "commit", "--allow-empty", "-m", &msg],
+                            &worktree,
+                        )
+                        .await?;
+                        summary = format!(
+                            "{summary}\nRound {rounds_done} (gate repair): {}",
+                            truncate(&rs, 200)
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(pr, "gate-repair round failed: {e:#}");
+                    }
+                }
+            }
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            let _ = run(
+                &gh,
+                &["pr", "comment", &pr.to_string(), "--body",
+                  &format!("Auto-resume: verification gate failed against current \
+                            `main` and the repair budget is exhausted:\n```\n{}\n```",
+                           truncate(&gate_err.to_string(), 1200))],
+                repo_root,
+            )
+            .await;
+            record_attempt(repo_root, issue.number).await.ok();
+            return Ok(RunReport::built(format!("PR #{pr}: resume gate failed")));
+        }
+
+        let independent = independent_review(&issue, &summary, &diff, worktree.clone()).await;
+        notes_log.push(format!(
+            "round {rounds_done}: {}",
+            independent.status()
+        ));
+        if independent.approved() {
+            if rounds_done > 0 {
+                // Revisions were verified crate-targeted; nothing merges
+                // without the full suite passing once (#870).
+                if let Err(gate_err) = verification_gate(&worktree).await {
+                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                    let _ = run(
+                        &gh,
+                        &["pr", "comment", &pr.to_string(), "--body",
+                          &format!("Auto-resume: double LGTM, but the final \
+                                    full-workspace gate failed:\n```\n{}\n```",
+                                   truncate(&gate_err.to_string(), 1200))],
+                        repo_root,
+                    )
+                    .await;
+                    record_attempt(repo_root, issue.number).await.ok();
+                    return Ok(RunReport::built(format!(
+                        "PR #{pr}: LGTM but final full gate failed"
+                    )));
+                }
+            }
+            if dry_run {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: DRY RUN — double LGTM after {rounds_done} revision round(s), would merge"
+                )));
+            }
+            // Push whatever the rounds committed (the merge-with-main commit
+            // included), surface the verdicts, and merge per policy.
+            let (ok, _o, e) = run("git", &["push", "origin", branch], &worktree).await?;
+            if !ok {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                bail!("resume: push failed: {e}");
+            }
+            let _ = run(
+                &gh,
+                &["pr", "comment", &pr.to_string(), "--body",
+                  &format!("Auto-resume: double codex LGTM after {rounds_done} \
+                            revision round(s) against current `main`.\n\n{}",
+                           truncate(&independent.notes, 2500))],
+                repo_root,
+            )
+            .await;
+            let enabled = automerge_enabled_value(
+                std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
+            );
+            let complexity_ok = complexity.auto_mergeable() || codex_unlocks_hard();
+            if !(enabled && complexity_ok && !issue.research_filed) {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                notify_discord(&format!(
+                    "📝 resumed draft has double LGTM but needs a human merge: {} — PR #{pr}",
+                    issue.title
+                ))
+                .await;
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: double LGTM, left for human merge (policy)"
+                )));
+            }
+            let _ = run(&gh, &["pr", "ready", &pr.to_string()], repo_root).await;
+            let (ok, _o, e) = run(
+                &gh,
+                &["pr", "merge", &pr.to_string(), "--squash", "--delete-branch"],
+                repo_root,
+            )
+            .await?;
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            if !ok {
+                warn!(pr, "resume auto-merge failed; PR left ready: {e}");
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: double LGTM but merge FAILED (left open)"
+                )));
+            }
+            notify_discord(&format!("✅ resumed draft merged: {} — PR #{pr}", issue.title)).await;
+            return Ok(RunReport::built(format!("PR #{pr}: resumed and MERGED")));
+        }
+
+        if rounds_done >= revise_rounds() {
+            // Out of rounds: publish the improved state + verdicts, stay draft.
+            let _ = run("git", &["push", "origin", branch], &worktree).await;
+            let _ = run(
+                &gh,
+                &["pr", "comment", &pr.to_string(), "--body",
+                  &format!("Auto-resume: no double LGTM after {rounds_done} revision \
+                            round(s) ({}). Revisions were verified against the \
+                            changed crates' tests; the full workspace suite \
+                            runs before any merge. Latest findings:\n\n{}",
+                           notes_log.join("; "),
+                           truncate(&independent.notes, 2500))],
+                repo_root,
+            )
+            .await;
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            record_attempt(repo_root, issue.number).await.ok();
+            notify_discord(&format!(
+                "📝 resumed draft still needs review after {rounds_done} rounds: {} — PR #{pr}",
+                issue.title
+            ))
+            .await;
+            return Ok(RunReport::built(format!(
+                "PR #{pr}: resumed, no LGTM after {rounds_done} rounds; still draft"
+            )));
+        }
+
+        rounds_done += 1;
+        info!(pr, issue = issue.number, round = rounds_done, "resume: revising against findings");
+        let rev_summary = match reasoner
+            .call(
+                &fix_opts(worktree.clone()),
+                &build_revise_prompt(&issue, &independent.notes, lines_now),
+            )
+            .await
+        {
+            Ok(rs) => rs,
+            Err(e) => {
+                warn!(pr, "resume revision failed; leaving draft as-is: {e:#}");
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: resume revision errored; draft unchanged"
+                )));
+            }
+        };
+        let _ = drop_root_scratch(&worktree).await;
+        let _ = run("git", &["add", "-A"], &worktree).await?;
+        let msg = format!("review round {rounds_done}: address independent findings");
+        let _ = run(
+            "git",
+            &["-c", &name_arg, "-c", &email_arg, "commit", "--allow-empty", "-m", &msg],
+            &worktree,
+        )
+        .await?;
+        summary = format!("{summary}\nRound {rounds_done}: {}", truncate(&rev_summary, 300));
+    }
+}
+
 /// Force the pipeline's fixed worktree path back to a usable state before a
 /// fresh `git worktree add`.
 ///
@@ -1755,6 +2428,64 @@ impl RunLock {
     }
 }
 
+/// Which half of the pipeline this invocation runs (#871).
+///
+/// The owner has a PR backlog AND an issue backlog, and one serialized
+/// pipeline forces them to queue behind each other. Lanes let a REVIEW
+/// process (resume sitting drafts) and a BUILD process (new issues) run
+/// concurrently: each lane has its own flock and its own worktree path, so
+/// the #816 mutual-destruction hazard cannot occur between them, while two
+/// runs of the SAME lane still exclude each other.
+///
+/// Cross-lane overlap is safe by construction: the resume lane only touches
+/// issues that HAVE an open agent PR, the build lane's `pick_issue` skips
+/// exactly those (dedup), and the attempt ledger writes are flocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// Default: resume a sitting draft if one exists, else build new work.
+    Combined,
+    /// Only resume sitting draft PRs; idle when none are eligible.
+    Resume,
+    /// Only build new issues; never resumes.
+    Build,
+}
+
+/// `AUGMENTAGENT_AUTOPR_LANE` = `resume` | `build`; anything else (and the
+/// daemon default) is [`Lane::Combined`].
+fn lane_from_env() -> Lane {
+    match std::env::var("AUGMENTAGENT_AUTOPR_LANE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("resume") => Lane::Resume,
+        Some("build") => Lane::Build,
+        _ => Lane::Combined,
+    }
+}
+
+impl Lane {
+    /// Worktree directory name under `.self-improve-worktrees/`.
+    fn worktree_name(self) -> &'static str {
+        match self {
+            // Combined and Build share a name deliberately: they also share
+            // a lock, so they can never run concurrently.
+            Lane::Combined | Lane::Build => "current",
+            Lane::Resume => "resume",
+        }
+    }
+
+    /// Suffix distinguishing this lane's lock file.
+    fn lock_suffix(self) -> &'static str {
+        match self {
+            Lane::Combined | Lane::Build => "",
+            Lane::Resume => "-resume",
+        }
+    }
+}
+
 /// Lock file path: `AUGMENTAGENT_SELFIMPROVE_LOCK` override (tests), else the
 /// daemon state dir alongside `reasoner-cooldowns.json`, else a cwd-relative
 /// fallback so a HOME-less environment still serializes.
@@ -1764,13 +2495,10 @@ fn run_lock_path() -> PathBuf {
             return PathBuf::from(p);
         }
     }
+    let name = format!("self-improve{}.lock", lane_from_env().lock_suffix());
     std::env::var_os("HOME")
-        .map(|h| {
-            PathBuf::from(h)
-                .join(".local/state/augmentagent")
-                .join("self-improve.lock")
-        })
-        .unwrap_or_else(|| PathBuf::from(".self-improve.lock"))
+        .map(|h| PathBuf::from(h).join(".local/state/augmentagent").join(&name))
+        .unwrap_or_else(|| PathBuf::from(format!(".{name}")))
 }
 
 /// What one `run_once` did, and whether it should cost daily budget.
@@ -1839,6 +2567,25 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         );
     }
 
+    // #866 — sitting draft PRs outrank new work: they are mostly-finished
+    // diffs that only lack an approving review, and until now the dedup guard
+    // made them permanently invisible (seven drafts, three days, zero
+    // merges). Resume the oldest one not yet attempted today.
+    // #871 — lanes: the resume lane does ONLY this (idling when no draft is
+    // eligible), the build lane skips it entirely, and the default combined
+    // lane keeps resume-first (still flippable via the knob).
+    let lane = lane_from_env();
+    if lane != Lane::Build && resume_first_enabled() {
+        if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root).await {
+            let reasoner = build_reasoner();
+            return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run)
+                .await;
+        }
+    }
+    if lane == Lane::Resume {
+        return Ok(RunReport::idle());
+    }
+
     let Some(issue) = pick_issue(repo_root).await? else {
         return Ok(RunReport::idle());
     };
@@ -1892,7 +2639,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // time; with the shared gate target cache, binaries compiled under a
     // deleted per-issue path get reused from later runs and panic reading
     // fixtures. A stable path keeps every baked path resolvable.
-    let worktree = repo_root.join(".self-improve-worktrees").join("current");
+    let worktree = repo_root
+        .join(".self-improve-worktrees")
+        .join(lane_from_env().worktree_name());
 
     // Clean any stale worktree from a crashed prior run.
     reclaim_worktree(repo_root, &worktree, &branch).await;
@@ -2015,7 +2764,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
     let opts = fix_opts(worktree.clone());
     let prompt = build_fix_prompt(&issue, plan.as_deref());
-    let summary = match reasoner.call(&opts, &prompt).await {
+    let mut summary = match reasoner.call(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
@@ -2032,7 +2781,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // made of new files passed the 600-line cap, and a newly-created
     // `.github/workflows/*.yml` or `scripts/deploy-*.sh` was never refused.
     // Staging here is idempotent with the commit step's own `git add -A`.
-    let dropped = drop_root_scratch(&worktree).await;
+    let mut dropped = drop_root_scratch(&worktree).await;
     let _ = run("git", &["add", "-A"], &worktree).await?;
     let (_ok, diff, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
     if diff.trim().is_empty() {
@@ -2100,9 +2849,34 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // next to the other diff-derived facts; it withholds auto-merge below
     // rather than refusing the work.
     let (_ok, staged_names, _) = run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
-    let gated = touches_verify_gated_path(&staged_names);
+    let mut gated = touches_verify_gated_path(&staged_names);
 
-    let lines = diff_line_count(&full_diff);
+    let mut lines = diff_line_count(&full_diff);
+    if lines > MAX_DIFF_LINES && revise_enabled() {
+        // #875 — the FIRST diff gets one shrink attempt too. #868 added
+        // shrink rounds inside the revise loop, but the initial size check
+        // stayed terminal — and promptly discarded a completed build at 652
+        // lines against a 600 cap, the exactly-marginal overage that trims
+        // trivially. One build-tier call risks nothing: still over after the
+        // shrink ⇒ the refusal below proceeds unchanged.
+        info!(issue = issue.number, lines, "initial diff over cap; one shrink attempt");
+        if let Ok(rs) = reasoner
+            .call(
+                &fix_opts(worktree.clone()),
+                &build_revise_prompt(&issue, &shrink_findings(lines), lines),
+            )
+            .await
+        {
+            let _ = drop_root_scratch(&worktree).await;
+            let _ = run("git", &["add", "-A"], &worktree).await?;
+            let (_ok, d2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+            // Shrinking must not smuggle in a guarded path.
+            if blast_radius_hit_in_diff(&d2).is_none() {
+                lines = diff_line_count(&d2);
+                summary = format!("{summary}\n\nShrink: {}", truncate(&rs, 200));
+            }
+        }
+    }
     if lines > MAX_DIFF_LINES {
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
         let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
@@ -2110,8 +2884,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             repo_root,
             issue.number,
             &format!(
-                "Self-improve refused: diff is {lines} lines (cap {MAX_DIFF_LINES}). \
-                 Needs a human."
+                "Self-improve refused: diff is {lines} lines (cap {MAX_DIFF_LINES}) \
+                 after a shrink attempt. Needs a human (or a split issue)."
             ),
         )
         .await
@@ -2205,7 +2979,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // gate, and satisfied the author's own QA, so it opens as a draft PR
     // carrying both verdicts for a human. It does count as a failed attempt,
     // because a second opinion disagreeing is exactly what this stage is for.
-    let independent = independent_review(&issue, &summary, &full_diff, worktree.clone()).await;
+    let mut independent = independent_review(&issue, &summary, &full_diff, worktree.clone()).await;
+    let mut revision_note = String::new();
     if independent.available && !independent.approved() {
         warn!(
             issue = issue.number,
@@ -2213,10 +2988,196 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             system_ok = independent.system_ok,
             "independent review requested changes"
         );
-        // Not recorded as an attempt here: the run continues to open a draft
-        // PR, and dedup already keeps the issue out of the pool while that PR
-        // is open. Recording here AND in a later hard failure double-counted
-        // — the live #845 run consumed attempts 1 and 2 in one pass.
+        // Not recorded as an attempt: the run continues either to a revision
+        // or to a draft PR, and dedup keeps the issue out of the pool while
+        // that PR is open (recording here double-counted — see #852).
+    }
+
+    // Iterate revisions until the reviewer approves (owner directive
+    // 2026-08-31), bounded by `revise_rounds`. Seven drafts accumulated over
+    // three days because a codex rejection just parked the work with nobody
+    // acting on the findings; this loop is what turns findings into merges.
+    // Every round re-runs everything downstream of the edit: scratch sweep,
+    // blast/size guards, the full verification gate, and BOTH codex passes —
+    // a revised diff earns its verdict, it does not inherit one.
+    let max_rounds = revise_rounds();
+    let mut round = 0u32;
+    // Set when a round overgrew the size cap: the next round revises against
+    // a shrink instruction instead of codex notes, and codex is not consulted
+    // on a diff that cannot ship anyway.
+    let mut findings_override: Option<String> = None;
+    while independent.available && !independent.approved() && round < max_rounds {
+        round += 1;
+        let findings = findings_override
+            .take()
+            .unwrap_or_else(|| independent.notes.clone());
+        info!(issue = issue.number, round, max_rounds, "revising against the independent findings");
+        let round1 = independent.status();
+        match reasoner
+            .call(
+                &fix_opts(worktree.clone()),
+                &build_revise_prompt(&issue, &findings, lines),
+            )
+            .await
+        {
+            Err(e) => {
+                // Provider trouble, not a verdict — keep the last outcome and
+                // stop iterating rather than burning rounds on a flaky call.
+                warn!(
+                    issue = issue.number,
+                    round, "revision pass failed; keeping the prior outcome: {e:#}"
+                );
+                break;
+            }
+            Ok(rev_summary) => {
+                dropped.extend(drop_root_scratch(&worktree).await);
+                let _ = run("git", &["add", "-A"], &worktree).await?;
+                let (_ok, diff2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+                if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff2) {
+                    warn!(issue = issue.number, pattern, %line, "revision hit the blast-radius guard");
+                    let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+                    backoff_comment(
+                        repo_root,
+                        issue.number,
+                        &format!(
+                            "Self-improve refused after revision: the revised diff \
+                             touches `{pattern}`:\n```\n{line}\n```"
+                        ),
+                    )
+                    .await
+                    .ok();
+                    if attempts >= MAX_ATTEMPTS {
+                        label_gave_up(repo_root, issue.number).await.ok();
+                    }
+                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                    return Ok(RunReport::built(format!(
+                        "issue #{}: revision hit blast-radius guard on `{pattern}` (attempt {attempts})",
+                        issue.number
+                    )));
+                }
+                let lines2 = diff_line_count(&diff2);
+                if lines2 > MAX_DIFF_LINES {
+                    // Shrink round while budget remains — a terminal refusal
+                    // here discards every round of paid work (seen live on
+                    // the #839 resume). Terminal only when rounds are spent.
+                    if round < max_rounds {
+                        warn!(
+                            issue = issue.number,
+                            round, lines2, "revision overgrew the cap; scheduling a shrink round"
+                        );
+                        findings_override = Some(shrink_findings(lines2));
+                        lines = lines2;
+                        revision_note.push_str(&format!(
+                            "\n### Revision round {round}: overgrew the cap \
+                             ({lines2} lines); next round shrinks\n"
+                        ));
+                        continue;
+                    }
+                    let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+                    backoff_comment(
+                        repo_root,
+                        issue.number,
+                        &format!(
+                            "Self-improve refused after revision: diff grew to \
+                             {lines2} lines (cap {MAX_DIFF_LINES}) and the \
+                             revision budget is exhausted."
+                        ),
+                    )
+                    .await
+                    .ok();
+                    if attempts >= MAX_ATTEMPTS {
+                        label_gave_up(repo_root, issue.number).await.ok();
+                    }
+                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                    return Ok(RunReport::built(format!(
+                        "issue #{}: revision oversized ({lines2} lines, attempt {attempts})",
+                        issue.number
+                    )));
+                }
+                let (_ok, names2, _) =
+                    run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
+                if let Err(gate_err) = gate_for_round(&worktree, &names2).await {
+                    warn!(issue = issue.number, "post-revision gate failed: {gate_err:#}");
+                    // #873 — a red gate gets a repair round while budget
+                    // remains: red→fix is the other half of TDD, and a
+                    // compile error is the easiest failure to iterate on.
+                    // Codex is not consulted on a diff that does not build.
+                    if round < max_rounds {
+                        findings_override = Some(gate_findings(&gate_err.to_string()));
+                        revision_note.push_str(&format!(
+                            "\n### Revision round {round}: failed the gate; \
+                             next round repairs\n"
+                        ));
+                        continue;
+                    }
+                    let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+                    if attempts >= MAX_ATTEMPTS {
+                        backoff_comment(
+                            repo_root,
+                            issue.number,
+                            &format!(
+                                "Self-improve gave up after {attempts} attempts. \
+                                 Post-revision gate failure:\n```\n{}\n```",
+                                truncate(&gate_err.to_string(), 1500)
+                            ),
+                        )
+                        .await
+                        .ok();
+                        label_gave_up(repo_root, issue.number).await.ok();
+                    }
+                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                    return Ok(RunReport::built(format!(
+                        "issue #{}: post-revision gate failed (attempt {attempts}); no PR opened",
+                        issue.number
+                    )));
+                }
+                // The revised diff may touch different files.
+                gated = touches_verify_gated_path(&names2);
+                lines = lines2;
+                independent = independent_review(&issue, &rev_summary, &diff2, worktree.clone()).await;
+                revision_note.push_str(&format!(
+                    "\n### Revision round {round} (prior verdict: {round1})\n{}\n\n\
+                     Verdict after round {round}: {}\n",
+                    truncate(&rev_summary, 1000),
+                    independent.status()
+                ));
+                summary = format!("{summary}\n\nRevision {round}: {}", truncate(&rev_summary, 300));
+            }
+        }
+    }
+    if round > 0 {
+        info!(
+            issue = issue.number,
+            rounds = round,
+            approved = independent.approved(),
+            "iterative review finished"
+        );
+        // Intermediate rounds ran the targeted gate (#870); everything that
+        // ships — or even lands as a PR claiming workspace-pass — gets the
+        // FULL suite exactly once here.
+        if let Err(gate_err) = verification_gate(&worktree).await {
+            warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
+            let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+            if attempts >= MAX_ATTEMPTS {
+                backoff_comment(
+                    repo_root,
+                    issue.number,
+                    &format!(
+                        "Self-improve gave up after {attempts} attempts. Final \
+                         full-workspace gate failure after revisions:\n```\n{}\n```",
+                        truncate(&gate_err.to_string(), 1500)
+                    ),
+                )
+                .await
+                .ok();
+                label_gave_up(repo_root, issue.number).await.ok();
+            }
+            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+            return Ok(RunReport::built(format!(
+                "issue #{}: final full gate failed after {round} revision round(s)",
+                issue.number
+            )));
+        }
     }
 
     if dry_run {
@@ -2310,8 +3271,15 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // work was not. Receipt-gated paths stay human-only either way —
         // those change live behaviour no reviewer can verify by reading.
         let complexity_ok = complexity.auto_mergeable() || codex_unlocks_hard();
+        // Owner policy 2026-08-31: a double codex LGTM may override the
+        // receipt gate (env-gated; see `automerge_receipt_ok`).
+        let receipt_ok = automerge_receipt_ok(
+            gated.as_deref(),
+            independent.approved(),
+            std::env::var("AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT").ok().as_deref(),
+        );
         if enabled && complexity_ok && independent.approved() && !issue.research_filed
-            && gated.is_none()
+            && receipt_ok
         {
             let owner = std::env::var(GH_OWNER_ENV)
                 .ok()
@@ -2365,7 +3333,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         )
     };
     let independent_section = format!(
-        "\n\n## Independent review (codex)\n{}\n",
+        "\n\n## Independent review (codex)\n{}{revision_note}\n",
         truncate(&independent.notes, 3000)
     );
     let pr_body = format!(
@@ -2398,6 +3366,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }
     let pr_url = stdout.trim().to_string();
     if !automerge {
+        // Visibility (#851): drafts sat unseen for three days. Tell the owner.
+        notify_discord(&format!(
+            "📝 auto-PR needs review: {} — {pr_url}\n{}",
+            issue.title,
+            truncate(&merge_note, 300)
+        ))
+        .await;
         return Ok(RunReport::built(format!(
             "issue #{}: draft PR opened — {pr_url}",
             issue.number
@@ -2420,6 +3395,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             issue.number
         )));
     }
+    notify_discord(&format!("✅ auto-PR merged: {} — {pr_url}", issue.title)).await;
     Ok(RunReport::built(format!(
         "issue #{}: PR auto-merged (owner-authored) — {pr_url}",
         issue.number
@@ -2493,12 +3469,7 @@ async fn record_hard_failure(repo_root: &Path, issue: u64, what: &str, err: &str
 async fn record_attempt(repo_root: &Path, issue: u64) -> Result<u32> {
     // #851 — remember the attempt for the rest of the UTC day so the picker
     // moves on instead of handing this issue straight back next tick.
-    {
-        let path = attempt_ledger_path();
-        let mut ledger = AttemptLedger::load(&path);
-        ledger.mark(utc_day_now(), issue);
-        ledger.save(&path);
-    }
+    AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue);
     let gh = gh_bin();
     let (_ok, stdout, _) = run(
         &gh,
@@ -3349,6 +4320,41 @@ impl AttemptLedger {
         }
     }
 
+    /// Atomically read-modify-write a mark under an exclusive flock (#871).
+    /// With the resume and build lanes running in parallel, two unlocked
+    /// read-modify-write cycles could drop one lane's mark — which would
+    /// re-expose an already-attempted issue to the picker the same day.
+    fn mark_persist(path: &Path, day: u64, issue: u64) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(path = %path.display(), "attempt ledger open failed: {e}");
+                return;
+            }
+        };
+        // SAFETY: `file` owns the fd; flock neither reads nor writes it.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            warn!("attempt ledger flock failed; marking without it");
+        }
+        let mut ledger = std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+            .unwrap_or_default();
+        ledger.mark(day, issue);
+        ledger.save(path);
+        // Lock released when `file` drops.
+    }
+
     /// Best-effort persist, mirroring [`DailyCounter::save`]: losing this
     /// file only costs the day's skip memory, which is where we already were.
     fn save(&self, path: &Path) {
@@ -3792,6 +4798,23 @@ mod tests {
     }
 
     // ---- #692: shared gate target cache + stable worktree path ----
+
+    #[test]
+    fn gate_env_contains_temp_files_inside_the_gate_cache() {
+        // #877 — 19 GB of leaked SQLite temp files in system /tmp. The gate
+        // must point TMPDIR at a dir it owns and sweeps.
+        let env = gate_env();
+        let tmp = env.iter().find(|(k, _)| k == "TMPDIR").expect("TMPDIR pinned");
+        // Compare against the gate cache itself, not the env's
+        // CARGO_TARGET_DIR — a parent env (like this test harness) may pin
+        // that elsewhere, and the invariant is about where temp files LAND.
+        assert!(
+            tmp.1.starts_with(&gate_target_dir()),
+            "gate TMPDIR must live under the gate cache, not system /tmp: {}",
+            tmp.1
+        );
+        assert!(!tmp.1.trim_end_matches('/').eq("/tmp"));
+    }
 
     #[test]
     fn gate_env_provides_a_shared_cargo_target_dir() {
@@ -4481,6 +5504,277 @@ CODEX-REVIEW: lgtm").0);
         git(&["add", "-A"]);
         let staged = String::from_utf8(git(&["diff", "--cached", "--name-only"]).stdout).unwrap();
         assert_eq!(staged.trim(), "crates/x/src/new.rs");
+    }
+
+    // ---- #866: sitting drafts are picked up, not orphaned ----
+
+    #[test]
+    fn issue_number_parses_from_agent_branch_names() {
+        assert_eq!(issue_from_branch("agent-fix/issue-845"), Some(845));
+        assert_eq!(issue_from_branch("agent-fix/issue-0"), Some(0));
+        // Non-agent branches must never be resumed.
+        assert_eq!(issue_from_branch("fix/845-something"), None);
+        assert_eq!(issue_from_branch("agent-fix/issue-"), None);
+        assert_eq!(issue_from_branch("agent-fix/issue-12x"), None);
+    }
+
+    #[test]
+    fn complexity_recovers_from_a_pr_body_and_defaults_hard() {
+        assert_eq!(
+            complexity_from_pr_body("## Verification\n- complexity (scoping pass): medium\n- diff"),
+            Complexity::Medium
+        );
+        assert_eq!(
+            complexity_from_pr_body("- complexity (scoping pass): simple"),
+            Complexity::Simple
+        );
+        // Old or hand-written bodies without the line stay conservative.
+        assert_eq!(complexity_from_pr_body("no such line"), Complexity::Hard);
+        assert_eq!(
+            complexity_from_pr_body("- complexity (scoping pass): who knows"),
+            Complexity::Hard
+        );
+    }
+
+    // ---- #870: targeted gate between rounds ----
+
+    #[test]
+    fn changed_crates_targets_inside_crates_and_bails_outside() {
+        assert_eq!(
+            changed_crates("crates/augmentagent-cli/src/self_improve.rs\ncrates/augmentagent-store/src/store.rs"),
+            Some(vec!["augmentagent-cli".into(), "augmentagent-store".into()])
+        );
+        // Duplicates collapse.
+        assert_eq!(
+            changed_crates("crates/x/src/a.rs\ncrates/x/src/b.rs"),
+            Some(vec!["x".into()])
+        );
+        // Anything outside crates/ means only the full gate can vouch for it.
+        assert_eq!(changed_crates("src/index.ts"), None);
+        assert_eq!(changed_crates("crates/x/src/a.rs\nCargo.toml"), None);
+        assert_eq!(changed_crates("schema/triage.md"), None);
+        // A bare `crates/<dir>` line (no file) is not a crate change we can
+        // name — full gate.
+        assert_eq!(changed_crates("crates/x"), None);
+        // Empty set: nothing to target.
+        assert_eq!(changed_crates(""), None);
+        assert_eq!(changed_crates("\n\n"), None);
+    }
+
+    // ---- revise loop + receipt override ----
+
+    #[test]
+    fn revise_prompt_carries_the_findings_and_forbids_a_rewrite() {
+        let issue = Issue {
+            number: 845,
+            title: "To/CC bug".into(),
+            body: "b".into(),
+            author: "a".into(),
+            author_trusted: true,
+            research_filed: false,
+        };
+        let p = build_revise_prompt(&issue, "rfind(',') splits quoted display names", 373);
+        assert!(p.contains("rfind"), "the reviewer's findings must reach the builder");
+        assert!(p.contains("#845"));
+        // The live #853 resume burned four rounds because "do not start
+        // over" entrenched a structurally wrong approach: the guard matched
+        // greeting names against address tokens ("Gary" vs "glozoff"), codex
+        // showed the reported case could never pass, and the builder kept
+        // patching details around the hole. Revisions must be allowed to
+        // pivot when the finding is architectural.
+        assert!(
+            p.contains("IF THE FINDING IS ARCHITECTURAL"),
+            "an architectural finding must permit replacing the approach"
+        );
+        assert!(
+            p.contains("reviewer-proposed alternative"),
+            "the reviewer's prescription is signal, not noise"
+        );
+        assert!(
+            p.contains("ORIGINAL reported case verbatim"),
+            "the issue's own repro is the acceptance test that catches a non-fix"
+        );
+        assert!(
+            p.contains("mistaken"),
+            "the builder must be allowed to rebut a wrong finding rather than \
+             blindly comply with it"
+        );
+        // The budget must be stated every round — the live #839 resume blew
+        // the cap on round 2 because the builder was never told it existed.
+        assert!(p.contains("373"), "current size must be in the prompt");
+        assert!(p.contains("600"), "the cap must be in the prompt");
+    }
+
+    #[test]
+    fn gate_findings_carry_the_error_and_forbid_unrelated_changes() {
+        let f = gate_findings("error[E0308]: mismatched types\n --> src/x.rs:9");
+        assert!(f.contains("E0308"), "the builder must see the compiler's own words");
+        assert!(f.contains("FAILED the verification gate"));
+        assert!(
+            f.contains("change nothing unrelated"),
+            "a repair round repairs; it must not become a rewrite"
+        );
+    }
+
+    #[test]
+    fn shrink_findings_name_the_size_and_forbid_losing_the_fix() {
+        let f = shrink_findings(812);
+        assert!(f.contains("812"));
+        assert!(f.contains("600"));
+        assert!(
+            f.contains("without losing the fix"),
+            "a shrink round must cut scaffolding, not the fix or its tests"
+        );
+    }
+
+    #[test]
+    fn receipt_override_requires_double_lgtm_and_the_explicit_flag() {
+        // Ungated work merges as before, reviewer or not.
+        assert!(automerge_receipt_ok(None, true, None));
+        assert!(automerge_receipt_ok(None, false, None));
+
+        let gated = Some("crates/augmentagent-channel-email/src/channel.rs");
+        // Gated + no flag: held, even with a double LGTM — safe default for
+        // any deployment that has not made the owner's call.
+        assert!(!automerge_receipt_ok(gated, true, None));
+        // Gated + flag + double LGTM: the owner's 2026-08-31 policy.
+        assert!(automerge_receipt_ok(gated, true, Some("1")));
+        // Gated + flag but codex did NOT approve: still held. The override
+        // is "LGTM overrides the receipt", never "the flag overrides codex".
+        assert!(!automerge_receipt_ok(gated, false, Some("1")));
+    }
+
+    #[test]
+    fn revise_rounds_defaults_bounded_and_respects_the_kill_switch() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_r = std::env::var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS").ok();
+        let prev_e = std::env::var("AUGMENTAGENT_AUTOPR_REVISE").ok();
+
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS");
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE");
+        assert_eq!(revise_rounds(), 3, "iterate-until-LGTM defaults to 3 rounds");
+
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS", "10");
+        assert_eq!(revise_rounds(), 5, "each round is paid work; the ceiling holds");
+
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS", "1");
+        assert_eq!(revise_rounds(), 1);
+
+        // The kill switch beats the round count.
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", "0");
+        assert_eq!(revise_rounds(), 0);
+
+        match prev_r {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS"),
+        }
+        match prev_e {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE"),
+        }
+    }
+
+    #[test]
+    fn lanes_have_disjoint_locks_and_worktrees() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AUGMENTAGENT_AUTOPR_LANE").ok();
+
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_LANE");
+        assert_eq!(lane_from_env(), Lane::Combined);
+        std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", "resume");
+        assert_eq!(lane_from_env(), Lane::Resume);
+        std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", "build");
+        assert_eq!(lane_from_env(), Lane::Build);
+        // Unknown values must not invent a third lane.
+        std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", "yolo");
+        assert_eq!(lane_from_env(), Lane::Combined);
+
+        // The whole point: resume and build can run CONCURRENTLY, so they
+        // must never share a lock or a worktree...
+        assert_ne!(Lane::Resume.lock_suffix(), Lane::Build.lock_suffix());
+        assert_ne!(Lane::Resume.worktree_name(), Lane::Build.worktree_name());
+        // ...while combined and build must EXCLUDE each other (the daemon
+        // runs combined), so they share both.
+        assert_eq!(Lane::Combined.lock_suffix(), Lane::Build.lock_suffix());
+        assert_eq!(Lane::Combined.worktree_name(), Lane::Build.worktree_name());
+
+        std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", "resume");
+        assert!(run_lock_path().to_string_lossy().contains("self-improve-resume.lock"));
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_LANE");
+        assert!(run_lock_path().to_string_lossy().ends_with("self-improve.lock"));
+
+        match prev {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_LANE"),
+        }
+    }
+
+    #[test]
+    fn ledger_mark_persist_survives_concurrent_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attempted.json");
+        // Two lanes marking different issues at once must both land — an
+        // unlocked read-modify-write drops one.
+        let p1 = path.clone();
+        let p2 = path.clone();
+        let t1 = std::thread::spawn(move || {
+            for i in 0..50u64 {
+                AttemptLedger::mark_persist(&p1, 100, 1000 + i);
+            }
+        });
+        let t2 = std::thread::spawn(move || {
+            for i in 0..50u64 {
+                AttemptLedger::mark_persist(&p2, 100, 2000 + i);
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let l = AttemptLedger::load(&path);
+        for i in 0..50u64 {
+            assert!(l.attempted_today(100, 1000 + i), "lane-1 mark {} lost", 1000 + i);
+            assert!(l.attempted_today(100, 2000 + i), "lane-2 mark {} lost", 2000 + i);
+        }
+    }
+
+    #[test]
+    fn resume_first_is_default_and_flippable_per_run() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AUGMENTAGENT_AUTOPR_RESUME_FIRST").ok();
+
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST");
+        assert!(resume_first_enabled(), "draining sitting drafts stays the default");
+        std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST", "0");
+        assert!(!resume_first_enabled(), "the owner's new-issues-now lever");
+        std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST", "1");
+        assert!(resume_first_enabled());
+
+        match prev {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST"),
+        }
+    }
+
+    #[test]
+    fn revise_is_on_by_default_and_disableable() {
+        // Pin the env either way (#838's lesson: never read ambient state).
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AUGMENTAGENT_AUTOPR_REVISE").ok();
+
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE");
+        assert!(revise_enabled(), "revision is the default");
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", "0");
+        assert!(!revise_enabled());
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", "1");
+        assert!(revise_enabled());
+
+        match prev {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE"),
+        }
     }
 
     // ---- #851: never hand a refused issue straight back ----
