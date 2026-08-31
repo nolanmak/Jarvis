@@ -1301,6 +1301,147 @@ fn parse_codex_review(raw: &str) -> (bool, String) {
     (approved, raw.trim().to_string())
 }
 
+/// Build the one-shot revision prompt: the reviewer's concrete findings,
+/// handed back to the builder that wrote the diff.
+///
+/// This is the loop's missing last mile. Codex requests changes on most
+/// first attempts — that is a reviewer doing its job — but until now the
+/// pipeline just parked a draft PR and the findings went nowhere: seven
+/// drafts accumulated over three days with nobody (human or model) acting
+/// on a single finding. One bounded revision converts "codex found issues"
+/// into "merged PR" without widening any gate.
+fn build_revise_prompt(issue: &Issue, review_notes: &str, current_lines: usize) -> String {
+    format!(
+        "You previously implemented a fix for GitHub issue #{} ({}) in this \
+         worktree. An independent reviewer examined your diff and requested \
+         changes. Its findings:\n\n{}\n\nAddress each finding: fix what is \
+         real (with a regression test where the finding is bug-shaped), and \
+         where a finding is mistaken, add a brief code comment at the \
+         relevant site explaining why the behaviour is correct. Keep the \
+         diff focused; do not start over or refactor unrelated code.\n\
+         HARD BUDGET: the total diff may not exceed {MAX_DIFF_LINES} changed \
+         lines and is currently at {current_lines}. A revision that grows \
+         past the cap is rejected wholesale, discarding all of this work — \
+         if you are near the cap, trim (drop non-essential refactors, tighten \
+         verbose tests) while keeping the fix and its regression tests. When \
+         done, summarize what you changed per finding.",
+        issue.number,
+        issue.title,
+        truncate(review_notes, 4000),
+    )
+}
+
+/// Synthetic "findings" for a shrink round: the revision overgrew the cap,
+/// and the next round's job is to cut it down, not to add more.
+fn shrink_findings(lines: usize) -> String {
+    format!(
+        "Your last revision grew the diff to {lines} changed lines, over the \
+         hard {MAX_DIFF_LINES}-line cap — it cannot ship at this size. Reduce \
+         the diff below the cap without losing the fix or its regression \
+         tests: drop non-essential refactors, collapse duplicated test \
+         scaffolding, and prefer editing existing tests over adding parallel \
+         ones."
+    )
+}
+
+/// #851-follow-up — may this PR auto-merge despite touching a receipt-gated
+/// path? Owner policy (2026-08-31): a DOUBLE codex LGTM overrides the
+/// receipt gate when `AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT=1`.
+///
+/// The receipt gate exists because diffs that read clean can still break
+/// live email behaviour (#209/#211/#213); codex reads diffs and cannot
+/// exercise an inbox, so this trades that protection for throughput. The
+/// owner made that call explicitly; the env flag keeps it one line to
+/// revert, and OFF is the safe default for any other deployment.
+fn automerge_receipt_ok(gated: Option<&str>, independent_approved: bool, flag: Option<&str>) -> bool {
+    match gated {
+        None => true,
+        Some(_) => independent_approved && automerge_enabled_value(flag),
+    }
+}
+
+/// Post a short notice to the owner's Discord webhook, best-effort (#851
+/// visibility gap: draft PRs sat unseen for three days). A webhook failure
+/// must never fail the run — the PR already exists.
+async fn notify_discord(text: &str) {
+    let Ok(url) = std::env::var("DISCORD_WEBHOOK_URL") else { return };
+    if url.trim().is_empty() {
+        return;
+    }
+    let body = serde_json::json!({ "content": truncate(text, 1800) });
+    match reqwest::Client::new()
+        .post(url.trim())
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {}
+        Ok(r) => warn!(status = %r.status(), "draft-PR discord notice rejected"),
+        Err(e) => warn!("draft-PR discord notice failed: {e}"),
+    }
+}
+
+/// Issue number encoded in an agent branch name (`agent-fix/issue-845` → 845).
+fn issue_from_branch(branch: &str) -> Option<u64> {
+    branch.strip_prefix(BRANCH_PREFIX)?.parse().ok()
+}
+
+/// `complexity (scoping pass): <grade>` as written into every agent PR body.
+/// Unparseable defaults to Hard — the conservative direction, exactly like
+/// `parse_scope_output`.
+fn complexity_from_pr_body(body: &str) -> Complexity {
+    for line in body.lines() {
+        let l = line.trim().to_ascii_lowercase();
+        if let Some(rest) = l.strip_prefix("- complexity (scoping pass):") {
+            return if rest.contains("simple") {
+                Complexity::Simple
+            } else if rest.contains("medium") {
+                Complexity::Medium
+            } else {
+                Complexity::Hard
+            };
+        }
+    }
+    Complexity::Hard
+}
+
+/// A sitting draft the loop should pick up: the OLDEST open draft agent PR
+/// whose issue has not already been attempted today.
+///
+/// Until now these were invisible: `has_open_agent_pr` deduplicates the
+/// issue out of the pool, so a draft that nobody merged sat forever — seven
+/// of them, three days, while the loop only ever started new work. Owner
+/// directive 2026-08-31: sitting PRs are picked up too, and since they are
+/// mostly-finished work they outrank new issues.
+async fn find_resumable_draft(repo_root: &Path) -> Option<(u64, u64, String)> {
+    let gh = gh_bin();
+    let (ok, stdout, _) = run(
+        &gh,
+        &["pr", "list", "--state", "open", "--json", "number,isDraft,headRefName"],
+        repo_root,
+    )
+    .await
+    .ok()?;
+    if !ok {
+        return None;
+    }
+    let prs: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+    let ledger = AttemptLedger::load(&attempt_ledger_path());
+    let today = utc_day_now();
+    prs.as_array()?
+        .iter()
+        .filter_map(|pr| {
+            let draft = pr.get("isDraft")?.as_bool()?;
+            let number = pr.get("number")?.as_u64()?;
+            let branch = pr.get("headRefName")?.as_str()?;
+            let issue = issue_from_branch(branch)?;
+            (draft && !ledger.attempted_today(today, issue))
+                .then(|| (number, issue, branch.to_string()))
+        })
+        .min_by_key(|(number, _, _)| *number)
+}
+
 /// Outcome of the independent stage (#828).
 struct IndependentReview {
     /// False when codex could not be reached at all — NOT the same as a
@@ -1443,6 +1584,33 @@ fn build_fix_prompt(issue: &Issue, plan: Option<&str>) -> String {
 /// #828 — does an independent LGTM also release the `hard` complexity band?
 /// Off by default: turning it on is the decision that lets high-blast-radius
 /// work merge with no human, on the strength of two independent reviews.
+/// Max revision rounds per run (owner directive 2026-08-31: iterate until
+/// LGTM). Default 3; `AUGMENTAGENT_AUTOPR_REVISE_ROUNDS` tunes it, clamped
+/// to 5 — each round costs a build-tier call, a full gate run, and two codex
+/// calls, and a reviewer/builder pair that has not converged in five rounds
+/// is disagreeing, not iterating. `AUGMENTAGENT_AUTOPR_REVISE=0` still
+/// disables outright. Exhausted rounds land as a draft carrying every
+/// round's verdict, so the disagreement is legible to the human who inherits
+/// it.
+fn revise_rounds() -> u32 {
+    if !revise_enabled() {
+        return 0;
+    }
+    std::env::var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(3)
+        .min(5)
+}
+
+/// One revision pass against codex findings — default ON, `=0` disables.
+fn revise_enabled() -> bool {
+    !matches!(
+        std::env::var("AUGMENTAGENT_AUTOPR_REVISE").ok().as_deref().map(str::trim),
+        Some("0") | Some("false") | Some("FALSE")
+    )
+}
+
 fn codex_unlocks_hard() -> bool {
     automerge_enabled_value(
         std::env::var("AUGMENTAGENT_AUTOPR_CODEX_UNLOCKS_HARD").ok().as_deref(),
@@ -1671,6 +1839,328 @@ async fn drop_root_scratch(worktree: &Path) -> Vec<String> {
     dropped
 }
 
+/// Resume a sitting draft PR (#866): re-review it against today's `main`,
+/// revise against fresh findings, and merge on a double LGTM.
+///
+/// Deliberately re-reviews rather than trusting anything recorded on the PR:
+/// `main` has moved since the draft opened, the guards have changed, and the
+/// findings that held it may be stale. Round 0 costs two codex calls and no
+/// build — a draft that is already good merges without spending the builder
+/// at all.
+async fn resume_draft_pr(
+    repo_root: &Path,
+    reasoner: &Arc<FallbackReasoner>,
+    pr: u64,
+    issue_no: u64,
+    branch: &str,
+    dry_run: bool,
+) -> Result<RunReport> {
+    let gh = gh_bin();
+    info!(pr, issue = issue_no, %branch, "resuming sitting draft PR");
+
+    // Whatever happens next counts as today's attempt on this issue, so a
+    // failing resume moves on to other work instead of re-running every tick.
+    {
+        let path = attempt_ledger_path();
+        let mut ledger = AttemptLedger::load(&path);
+        ledger.mark(utc_day_now(), issue_no);
+        ledger.save(&path);
+    }
+
+    // The issue, for trust + prompts. Refuse untrusted authors exactly like
+    // the fresh path (#300) — the PR was created from this issue's text.
+    let (ok, ibody, _) = run(
+        &gh,
+        &["api", &format!("repos/{{owner}}/{{repo}}/issues/{issue_no}")],
+        repo_root,
+    )
+    .await?;
+    if !ok {
+        bail!("resume: could not fetch issue #{issue_no}");
+    }
+    let iv: serde_json::Value = serde_json::from_str(&ibody).context("parse issue")?;
+    let author = iv.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let association = iv.get("author_association").and_then(|v| v.as_str()).unwrap_or("");
+    let allowlist = trusted_authors(repo_root).await;
+    if !author_is_trusted(&author, association, &allowlist) {
+        warn!(pr, issue = issue_no, %author, "resume refused: untrusted issue author");
+        return Ok(RunReport::triage(format!(
+            "PR #{pr}: resume refused — untrusted author '{author}'"
+        )));
+    }
+    let issue = Issue {
+        number: issue_no,
+        title: iv.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        body: iv.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        author,
+        author_trusted: true,
+        research_filed: is_research_filed(
+            iv.get("body").and_then(|v| v.as_str()).unwrap_or(""),
+        ),
+    };
+    let (_ok, prbody_raw, _) = run(
+        &gh,
+        &["pr", "view", &pr.to_string(), "--json", "body"],
+        repo_root,
+    )
+    .await?;
+    let complexity = serde_json::from_str::<serde_json::Value>(&prbody_raw)
+        .ok()
+        .and_then(|v| v.get("body").and_then(|b| b.as_str()).map(complexity_from_pr_body))
+        .unwrap_or(Complexity::Hard);
+
+    // Worktree from the PR's branch, brought up to date with main. A merge
+    // conflict is a human's job — say so on the PR and move on.
+    let worktree = repo_root.join(".self-improve-worktrees").join("current");
+    reclaim_worktree(repo_root, &worktree, branch).await;
+    let _ = run("git", &["fetch", "origin", branch], repo_root).await?;
+    let (ok, _o, e) = run(
+        "git",
+        &[
+            "worktree", "add", "-b", branch,
+            &worktree.to_string_lossy(),
+            &format!("origin/{branch}"),
+        ],
+        repo_root,
+    )
+    .await?;
+    if !ok {
+        bail!("resume: worktree add from origin/{branch} failed: {e}");
+    }
+    let cleanup = |wt: PathBuf, br: String, root: PathBuf| async move {
+        let _ = run("git", &["worktree", "remove", "--force", &wt.to_string_lossy()], &root).await;
+        let _ = run("git", &["branch", "-D", &br], &root).await;
+    };
+    let (ok, _o, _e) = run("git", &["merge", "--no-edit", "origin/main"], &worktree).await?;
+    if !ok {
+        let _ = run("git", &["merge", "--abort"], &worktree).await;
+        cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+        let _ = run(
+            &gh,
+            &["pr", "comment", &pr.to_string(), "--body",
+              "Auto-resume: this branch no longer merges cleanly with `main`; \
+               it needs a human rebase before the loop can pick it up again."],
+            repo_root,
+        )
+        .await;
+        return Ok(RunReport::triage(format!(
+            "PR #{pr}: resume skipped — merge conflict with main"
+        )));
+    }
+
+    let git_name = std::env::var("AUGMENTAGENT_GIT_AUTHOR_NAME")
+        .unwrap_or_else(|_| "AugmentAgent".to_string());
+    let git_email = std::env::var("AUGMENTAGENT_GIT_AUTHOR_EMAIL")
+        .unwrap_or_else(|_| "augmentagent@localhost".to_string());
+    let name_arg = format!("user.name={git_name}");
+    let email_arg = format!("user.email={git_email}");
+
+    let mut rounds_done = 0u32;
+    let mut notes_log: Vec<String> = Vec::new();
+    let mut summary = format!("Resumed sitting draft PR #{pr}.");
+    loop {
+        // The PR's actual contribution, freshly computed each round.
+        let (_ok, diff, _) =
+            run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
+        // Guards re-run every round — the rules have changed since the draft
+        // opened, and a revision can add lines or touch new paths.
+        if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff) {
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            let _ = run(
+                &gh,
+                &["pr", "comment", &pr.to_string(), "--body",
+                  &format!("Auto-resume refused: the diff touches `{pattern}`:\n```\n{line}\n```")],
+                repo_root,
+            )
+            .await;
+            return Ok(RunReport::built(format!(
+                "PR #{pr}: resume refused — blast radius on `{pattern}`"
+            )));
+        }
+        let lines_now = diff_line_count(&diff);
+        if lines_now > MAX_DIFF_LINES {
+            // A revision that grew past the cap gets a SHRINK round while
+            // budget remains — refusing outright here discarded every round
+            // of paid work on the live #839 resume. Codex is not consulted
+            // on an oversized diff; the next round's only job is to cut.
+            if rounds_done >= revise_rounds() {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                let _ = run(
+                    &gh,
+                    &["pr", "comment", &pr.to_string(), "--body",
+                      &format!("Auto-resume refused: diff is {lines_now} lines \
+                                (cap {MAX_DIFF_LINES}) and the revision budget \
+                                is exhausted.")],
+                    repo_root,
+                )
+                .await;
+                record_attempt(repo_root, issue.number).await.ok();
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: resume refused — oversized after revisions"
+                )));
+            }
+            rounds_done += 1;
+            info!(pr, issue = issue.number, round = rounds_done, lines_now, "resume: shrink round");
+            match reasoner
+                .call(
+                    &fix_opts(worktree.clone()),
+                    &build_revise_prompt(&issue, &shrink_findings(lines_now), lines_now),
+                )
+                .await
+            {
+                Ok(rs) => {
+                    let _ = drop_root_scratch(&worktree).await;
+                    let _ = run("git", &["add", "-A"], &worktree).await?;
+                    let msg = format!("review round {rounds_done}: reduce diff below the size cap");
+                    let _ = run(
+                        "git",
+                        &["-c", &name_arg, "-c", &email_arg, "commit", "--allow-empty", "-m", &msg],
+                        &worktree,
+                    )
+                    .await?;
+                    summary = format!("{summary}\nRound {rounds_done} (shrink): {}", truncate(&rs, 200));
+                    continue;
+                }
+                Err(e) => {
+                    warn!(pr, "resume shrink round failed: {e:#}");
+                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                    return Ok(RunReport::built(format!(
+                        "PR #{pr}: resume refused — oversized, shrink errored"
+                    )));
+                }
+            }
+        }
+        if let Err(gate_err) = verification_gate(&worktree).await {
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            let _ = run(
+                &gh,
+                &["pr", "comment", &pr.to_string(), "--body",
+                  &format!("Auto-resume: verification gate failed against current \
+                            `main`:\n```\n{}\n```", truncate(&gate_err.to_string(), 1200))],
+                repo_root,
+            )
+            .await;
+            record_attempt(repo_root, issue.number).await.ok();
+            return Ok(RunReport::built(format!("PR #{pr}: resume gate failed")));
+        }
+
+        let independent = independent_review(&issue, &summary, &diff, worktree.clone()).await;
+        notes_log.push(format!(
+            "round {rounds_done}: {}",
+            independent.status()
+        ));
+        if independent.approved() {
+            if dry_run {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: DRY RUN — double LGTM after {rounds_done} revision round(s), would merge"
+                )));
+            }
+            // Push whatever the rounds committed (the merge-with-main commit
+            // included), surface the verdicts, and merge per policy.
+            let (ok, _o, e) = run("git", &["push", "origin", branch], &worktree).await?;
+            if !ok {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                bail!("resume: push failed: {e}");
+            }
+            let _ = run(
+                &gh,
+                &["pr", "comment", &pr.to_string(), "--body",
+                  &format!("Auto-resume: double codex LGTM after {rounds_done} \
+                            revision round(s) against current `main`.\n\n{}",
+                           truncate(&independent.notes, 2500))],
+                repo_root,
+            )
+            .await;
+            let enabled = automerge_enabled_value(
+                std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
+            );
+            let complexity_ok = complexity.auto_mergeable() || codex_unlocks_hard();
+            if !(enabled && complexity_ok && !issue.research_filed) {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                notify_discord(&format!(
+                    "📝 resumed draft has double LGTM but needs a human merge: {} — PR #{pr}",
+                    issue.title
+                ))
+                .await;
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: double LGTM, left for human merge (policy)"
+                )));
+            }
+            let _ = run(&gh, &["pr", "ready", &pr.to_string()], repo_root).await;
+            let (ok, _o, e) = run(
+                &gh,
+                &["pr", "merge", &pr.to_string(), "--squash", "--delete-branch"],
+                repo_root,
+            )
+            .await?;
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            if !ok {
+                warn!(pr, "resume auto-merge failed; PR left ready: {e}");
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: double LGTM but merge FAILED (left open)"
+                )));
+            }
+            notify_discord(&format!("✅ resumed draft merged: {} — PR #{pr}", issue.title)).await;
+            return Ok(RunReport::built(format!("PR #{pr}: resumed and MERGED")));
+        }
+
+        if rounds_done >= revise_rounds() {
+            // Out of rounds: publish the improved state + verdicts, stay draft.
+            let _ = run("git", &["push", "origin", branch], &worktree).await;
+            let _ = run(
+                &gh,
+                &["pr", "comment", &pr.to_string(), "--body",
+                  &format!("Auto-resume: no double LGTM after {rounds_done} revision \
+                            round(s) ({}). Latest findings:\n\n{}",
+                           notes_log.join("; "),
+                           truncate(&independent.notes, 2500))],
+                repo_root,
+            )
+            .await;
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            record_attempt(repo_root, issue.number).await.ok();
+            notify_discord(&format!(
+                "📝 resumed draft still needs review after {rounds_done} rounds: {} — PR #{pr}",
+                issue.title
+            ))
+            .await;
+            return Ok(RunReport::built(format!(
+                "PR #{pr}: resumed, no LGTM after {rounds_done} rounds; still draft"
+            )));
+        }
+
+        rounds_done += 1;
+        info!(pr, issue = issue.number, round = rounds_done, "resume: revising against findings");
+        let rev_summary = match reasoner
+            .call(
+                &fix_opts(worktree.clone()),
+                &build_revise_prompt(&issue, &independent.notes, lines_now),
+            )
+            .await
+        {
+            Ok(rs) => rs,
+            Err(e) => {
+                warn!(pr, "resume revision failed; leaving draft as-is: {e:#}");
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                return Ok(RunReport::built(format!(
+                    "PR #{pr}: resume revision errored; draft unchanged"
+                )));
+            }
+        };
+        let _ = drop_root_scratch(&worktree).await;
+        let _ = run("git", &["add", "-A"], &worktree).await?;
+        let msg = format!("review round {rounds_done}: address independent findings");
+        let _ = run(
+            "git",
+            &["-c", &name_arg, "-c", &email_arg, "commit", "--allow-empty", "-m", &msg],
+            &worktree,
+        )
+        .await?;
+        summary = format!("{summary}\nRound {rounds_done}: {}", truncate(&rev_summary, 300));
+    }
+}
+
 /// Force the pipeline's fixed worktree path back to a usable state before a
 /// fresh `git worktree add`.
 ///
@@ -1837,6 +2327,15 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             "refusing to self-improve from a dirty working tree \
              (commit/stash first):\n{dirty_status}"
         );
+    }
+
+    // #866 — sitting draft PRs outrank new work: they are mostly-finished
+    // diffs that only lack an approving review, and until now the dedup guard
+    // made them permanently invisible (seven drafts, three days, zero
+    // merges). Resume the oldest one not yet attempted today.
+    if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root).await {
+        let reasoner = build_reasoner();
+        return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run).await;
     }
 
     let Some(issue) = pick_issue(repo_root).await? else {
@@ -2015,7 +2514,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
     let opts = fix_opts(worktree.clone());
     let prompt = build_fix_prompt(&issue, plan.as_deref());
-    let summary = match reasoner.call(&opts, &prompt).await {
+    let mut summary = match reasoner.call(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
@@ -2032,7 +2531,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // made of new files passed the 600-line cap, and a newly-created
     // `.github/workflows/*.yml` or `scripts/deploy-*.sh` was never refused.
     // Staging here is idempotent with the commit step's own `git add -A`.
-    let dropped = drop_root_scratch(&worktree).await;
+    let mut dropped = drop_root_scratch(&worktree).await;
     let _ = run("git", &["add", "-A"], &worktree).await?;
     let (_ok, diff, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
     if diff.trim().is_empty() {
@@ -2100,9 +2599,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // next to the other diff-derived facts; it withholds auto-merge below
     // rather than refusing the work.
     let (_ok, staged_names, _) = run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
-    let gated = touches_verify_gated_path(&staged_names);
+    let mut gated = touches_verify_gated_path(&staged_names);
 
-    let lines = diff_line_count(&full_diff);
+    let mut lines = diff_line_count(&full_diff);
     if lines > MAX_DIFF_LINES {
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
         let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
@@ -2205,7 +2704,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // gate, and satisfied the author's own QA, so it opens as a draft PR
     // carrying both verdicts for a human. It does count as a failed attempt,
     // because a second opinion disagreeing is exactly what this stage is for.
-    let independent = independent_review(&issue, &summary, &full_diff, worktree.clone()).await;
+    let mut independent = independent_review(&issue, &summary, &full_diff, worktree.clone()).await;
+    let mut revision_note = String::new();
     if independent.available && !independent.approved() {
         warn!(
             issue = issue.number,
@@ -2213,10 +2713,158 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             system_ok = independent.system_ok,
             "independent review requested changes"
         );
-        // Not recorded as an attempt here: the run continues to open a draft
-        // PR, and dedup already keeps the issue out of the pool while that PR
-        // is open. Recording here AND in a later hard failure double-counted
-        // — the live #845 run consumed attempts 1 and 2 in one pass.
+        // Not recorded as an attempt: the run continues either to a revision
+        // or to a draft PR, and dedup keeps the issue out of the pool while
+        // that PR is open (recording here double-counted — see #852).
+    }
+
+    // Iterate revisions until the reviewer approves (owner directive
+    // 2026-08-31), bounded by `revise_rounds`. Seven drafts accumulated over
+    // three days because a codex rejection just parked the work with nobody
+    // acting on the findings; this loop is what turns findings into merges.
+    // Every round re-runs everything downstream of the edit: scratch sweep,
+    // blast/size guards, the full verification gate, and BOTH codex passes —
+    // a revised diff earns its verdict, it does not inherit one.
+    let max_rounds = revise_rounds();
+    let mut round = 0u32;
+    // Set when a round overgrew the size cap: the next round revises against
+    // a shrink instruction instead of codex notes, and codex is not consulted
+    // on a diff that cannot ship anyway.
+    let mut findings_override: Option<String> = None;
+    while independent.available && !independent.approved() && round < max_rounds {
+        round += 1;
+        let findings = findings_override
+            .take()
+            .unwrap_or_else(|| independent.notes.clone());
+        info!(issue = issue.number, round, max_rounds, "revising against the independent findings");
+        let round1 = independent.status();
+        match reasoner
+            .call(
+                &fix_opts(worktree.clone()),
+                &build_revise_prompt(&issue, &findings, lines),
+            )
+            .await
+        {
+            Err(e) => {
+                // Provider trouble, not a verdict — keep the last outcome and
+                // stop iterating rather than burning rounds on a flaky call.
+                warn!(
+                    issue = issue.number,
+                    round, "revision pass failed; keeping the prior outcome: {e:#}"
+                );
+                break;
+            }
+            Ok(rev_summary) => {
+                dropped.extend(drop_root_scratch(&worktree).await);
+                let _ = run("git", &["add", "-A"], &worktree).await?;
+                let (_ok, diff2, _) = run("git", &["diff", "--cached"], &worktree).await?;
+                if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff2) {
+                    warn!(issue = issue.number, pattern, %line, "revision hit the blast-radius guard");
+                    let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+                    backoff_comment(
+                        repo_root,
+                        issue.number,
+                        &format!(
+                            "Self-improve refused after revision: the revised diff \
+                             touches `{pattern}`:\n```\n{line}\n```"
+                        ),
+                    )
+                    .await
+                    .ok();
+                    if attempts >= MAX_ATTEMPTS {
+                        label_gave_up(repo_root, issue.number).await.ok();
+                    }
+                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                    return Ok(RunReport::built(format!(
+                        "issue #{}: revision hit blast-radius guard on `{pattern}` (attempt {attempts})",
+                        issue.number
+                    )));
+                }
+                let lines2 = diff_line_count(&diff2);
+                if lines2 > MAX_DIFF_LINES {
+                    // Shrink round while budget remains — a terminal refusal
+                    // here discards every round of paid work (seen live on
+                    // the #839 resume). Terminal only when rounds are spent.
+                    if round < max_rounds {
+                        warn!(
+                            issue = issue.number,
+                            round, lines2, "revision overgrew the cap; scheduling a shrink round"
+                        );
+                        findings_override = Some(shrink_findings(lines2));
+                        lines = lines2;
+                        revision_note.push_str(&format!(
+                            "\n### Revision round {round}: overgrew the cap \
+                             ({lines2} lines); next round shrinks\n"
+                        ));
+                        continue;
+                    }
+                    let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+                    backoff_comment(
+                        repo_root,
+                        issue.number,
+                        &format!(
+                            "Self-improve refused after revision: diff grew to \
+                             {lines2} lines (cap {MAX_DIFF_LINES}) and the \
+                             revision budget is exhausted."
+                        ),
+                    )
+                    .await
+                    .ok();
+                    if attempts >= MAX_ATTEMPTS {
+                        label_gave_up(repo_root, issue.number).await.ok();
+                    }
+                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                    return Ok(RunReport::built(format!(
+                        "issue #{}: revision oversized ({lines2} lines, attempt {attempts})",
+                        issue.number
+                    )));
+                }
+                if let Err(gate_err) = verification_gate(&worktree).await {
+                    warn!(issue = issue.number, "post-revision gate failed: {gate_err:#}");
+                    let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+                    if attempts >= MAX_ATTEMPTS {
+                        backoff_comment(
+                            repo_root,
+                            issue.number,
+                            &format!(
+                                "Self-improve gave up after {attempts} attempts. \
+                                 Post-revision gate failure:\n```\n{}\n```",
+                                truncate(&gate_err.to_string(), 1500)
+                            ),
+                        )
+                        .await
+                        .ok();
+                        label_gave_up(repo_root, issue.number).await.ok();
+                    }
+                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                    return Ok(RunReport::built(format!(
+                        "issue #{}: post-revision gate failed (attempt {attempts}); no PR opened",
+                        issue.number
+                    )));
+                }
+                // The revised diff may touch different files.
+                let (_ok, names2, _) =
+                    run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
+                gated = touches_verify_gated_path(&names2);
+                lines = lines2;
+                independent = independent_review(&issue, &rev_summary, &diff2, worktree.clone()).await;
+                revision_note.push_str(&format!(
+                    "\n### Revision round {round} (prior verdict: {round1})\n{}\n\n\
+                     Verdict after round {round}: {}\n",
+                    truncate(&rev_summary, 1000),
+                    independent.status()
+                ));
+                summary = format!("{summary}\n\nRevision {round}: {}", truncate(&rev_summary, 300));
+            }
+        }
+    }
+    if round > 0 {
+        info!(
+            issue = issue.number,
+            rounds = round,
+            approved = independent.approved(),
+            "iterative review finished"
+        );
     }
 
     if dry_run {
@@ -2310,8 +2958,15 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // work was not. Receipt-gated paths stay human-only either way —
         // those change live behaviour no reviewer can verify by reading.
         let complexity_ok = complexity.auto_mergeable() || codex_unlocks_hard();
+        // Owner policy 2026-08-31: a double codex LGTM may override the
+        // receipt gate (env-gated; see `automerge_receipt_ok`).
+        let receipt_ok = automerge_receipt_ok(
+            gated.as_deref(),
+            independent.approved(),
+            std::env::var("AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT").ok().as_deref(),
+        );
         if enabled && complexity_ok && independent.approved() && !issue.research_filed
-            && gated.is_none()
+            && receipt_ok
         {
             let owner = std::env::var(GH_OWNER_ENV)
                 .ok()
@@ -2365,7 +3020,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         )
     };
     let independent_section = format!(
-        "\n\n## Independent review (codex)\n{}\n",
+        "\n\n## Independent review (codex)\n{}{revision_note}\n",
         truncate(&independent.notes, 3000)
     );
     let pr_body = format!(
@@ -2398,6 +3053,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }
     let pr_url = stdout.trim().to_string();
     if !automerge {
+        // Visibility (#851): drafts sat unseen for three days. Tell the owner.
+        notify_discord(&format!(
+            "📝 auto-PR needs review: {} — {pr_url}\n{}",
+            issue.title,
+            truncate(&merge_note, 300)
+        ))
+        .await;
         return Ok(RunReport::built(format!(
             "issue #{}: draft PR opened — {pr_url}",
             issue.number
@@ -2420,6 +3082,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             issue.number
         )));
     }
+    notify_discord(&format!("✅ auto-PR merged: {} — {pr_url}", issue.title)).await;
     Ok(RunReport::built(format!(
         "issue #{}: PR auto-merged (owner-authored) — {pr_url}",
         issue.number
@@ -4481,6 +5144,145 @@ CODEX-REVIEW: lgtm").0);
         git(&["add", "-A"]);
         let staged = String::from_utf8(git(&["diff", "--cached", "--name-only"]).stdout).unwrap();
         assert_eq!(staged.trim(), "crates/x/src/new.rs");
+    }
+
+    // ---- #866: sitting drafts are picked up, not orphaned ----
+
+    #[test]
+    fn issue_number_parses_from_agent_branch_names() {
+        assert_eq!(issue_from_branch("agent-fix/issue-845"), Some(845));
+        assert_eq!(issue_from_branch("agent-fix/issue-0"), Some(0));
+        // Non-agent branches must never be resumed.
+        assert_eq!(issue_from_branch("fix/845-something"), None);
+        assert_eq!(issue_from_branch("agent-fix/issue-"), None);
+        assert_eq!(issue_from_branch("agent-fix/issue-12x"), None);
+    }
+
+    #[test]
+    fn complexity_recovers_from_a_pr_body_and_defaults_hard() {
+        assert_eq!(
+            complexity_from_pr_body("## Verification\n- complexity (scoping pass): medium\n- diff"),
+            Complexity::Medium
+        );
+        assert_eq!(
+            complexity_from_pr_body("- complexity (scoping pass): simple"),
+            Complexity::Simple
+        );
+        // Old or hand-written bodies without the line stay conservative.
+        assert_eq!(complexity_from_pr_body("no such line"), Complexity::Hard);
+        assert_eq!(
+            complexity_from_pr_body("- complexity (scoping pass): who knows"),
+            Complexity::Hard
+        );
+    }
+
+    // ---- revise loop + receipt override ----
+
+    #[test]
+    fn revise_prompt_carries_the_findings_and_forbids_a_rewrite() {
+        let issue = Issue {
+            number: 845,
+            title: "To/CC bug".into(),
+            body: "b".into(),
+            author: "a".into(),
+            author_trusted: true,
+            research_filed: false,
+        };
+        let p = build_revise_prompt(&issue, "rfind(',') splits quoted display names", 373);
+        assert!(p.contains("rfind"), "the reviewer's findings must reach the builder");
+        assert!(p.contains("#845"));
+        assert!(
+            p.contains("do not start over"),
+            "a revision must stay a revision, not a second attempt from scratch"
+        );
+        assert!(
+            p.contains("mistaken"),
+            "the builder must be allowed to rebut a wrong finding rather than \
+             blindly comply with it"
+        );
+        // The budget must be stated every round — the live #839 resume blew
+        // the cap on round 2 because the builder was never told it existed.
+        assert!(p.contains("373"), "current size must be in the prompt");
+        assert!(p.contains("600"), "the cap must be in the prompt");
+    }
+
+    #[test]
+    fn shrink_findings_name_the_size_and_forbid_losing_the_fix() {
+        let f = shrink_findings(812);
+        assert!(f.contains("812"));
+        assert!(f.contains("600"));
+        assert!(
+            f.contains("without losing the fix"),
+            "a shrink round must cut scaffolding, not the fix or its tests"
+        );
+    }
+
+    #[test]
+    fn receipt_override_requires_double_lgtm_and_the_explicit_flag() {
+        // Ungated work merges as before, reviewer or not.
+        assert!(automerge_receipt_ok(None, true, None));
+        assert!(automerge_receipt_ok(None, false, None));
+
+        let gated = Some("crates/augmentagent-channel-email/src/channel.rs");
+        // Gated + no flag: held, even with a double LGTM — safe default for
+        // any deployment that has not made the owner's call.
+        assert!(!automerge_receipt_ok(gated, true, None));
+        // Gated + flag + double LGTM: the owner's 2026-08-31 policy.
+        assert!(automerge_receipt_ok(gated, true, Some("1")));
+        // Gated + flag but codex did NOT approve: still held. The override
+        // is "LGTM overrides the receipt", never "the flag overrides codex".
+        assert!(!automerge_receipt_ok(gated, false, Some("1")));
+    }
+
+    #[test]
+    fn revise_rounds_defaults_bounded_and_respects_the_kill_switch() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_r = std::env::var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS").ok();
+        let prev_e = std::env::var("AUGMENTAGENT_AUTOPR_REVISE").ok();
+
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS");
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE");
+        assert_eq!(revise_rounds(), 3, "iterate-until-LGTM defaults to 3 rounds");
+
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS", "10");
+        assert_eq!(revise_rounds(), 5, "each round is paid work; the ceiling holds");
+
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS", "1");
+        assert_eq!(revise_rounds(), 1);
+
+        // The kill switch beats the round count.
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", "0");
+        assert_eq!(revise_rounds(), 0);
+
+        match prev_r {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE_ROUNDS"),
+        }
+        match prev_e {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE"),
+        }
+    }
+
+    #[test]
+    fn revise_is_on_by_default_and_disableable() {
+        // Pin the env either way (#838's lesson: never read ambient state).
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AUGMENTAGENT_AUTOPR_REVISE").ok();
+
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE");
+        assert!(revise_enabled(), "revision is the default");
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", "0");
+        assert!(!revise_enabled());
+        std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", "1");
+        assert!(revise_enabled());
+
+        match prev {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE"),
+        }
     }
 
     // ---- #851: never hand a refused issue straight back ----
