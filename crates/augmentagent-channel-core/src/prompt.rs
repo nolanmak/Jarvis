@@ -74,19 +74,27 @@ fn recipient_header(label: &str, raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
-    if raw.len() <= RECIPIENT_HEADER_CHAR_CAP {
-        return format!("\n{label}: {}", sanitize_untrusted(raw));
+    // Escape first, then cap: `<` and `&` expand 4-5x, so a cap applied to the
+    // raw header would let a `&&&&…` blast render far past it.
+    let safe = sanitize_untrusted(raw);
+    if safe.len() <= RECIPIENT_HEADER_CHAR_CAP {
+        return format!("\n{label}: {safe}");
     }
     let cut = (0..=RECIPIENT_HEADER_CHAR_CAP)
         .rev()
-        .find(|i| raw.is_char_boundary(*i))
+        .find(|i| safe.is_char_boundary(*i))
         .unwrap_or(0);
-    let head = match raw[..cut].rfind(',') {
-        Some(i) => &raw[..i],
-        None => &raw[..cut],
+    let head = match safe[..cut].rfind(',') {
+        Some(i) => &safe[..i],
+        // One address longer than the whole cap: back off past any half-cut
+        // `&amp;` so the line can't end in a mangled entity.
+        None => match safe[..cut].rfind('&') {
+            Some(i) if !safe[i..cut].contains(';') => &safe[..i],
+            _ => &safe[..cut],
+        },
     };
-    let dropped = raw[head.len()..].matches(',').count().max(1);
-    format!("\n{label}: {}… (+{dropped} more)", sanitize_untrusted(head))
+    let dropped = safe[head.len()..].matches(',').count().max(1);
+    format!("\n{label}: {head}… (+{dropped} more)")
 }
 
 /// Render the optional `To:` / `Cc:` lines that sit inside the `<email>`
@@ -857,6 +865,20 @@ mod tests {
         assert!(line.ends_with(" more)"), "no dropped-count suffix: {line}");
         // Never a truncated half-address.
         assert!(line.contains("@example.com… (+"), "cut mid-address: {line}");
+    }
+
+    #[test]
+    fn recipient_header_cap_counts_escaped_length() {
+        // `&` renders as `&amp;`: a cap applied before escaping would let this
+        // header reach ~5x the cap in the prompt the model actually sees.
+        let blast = vec!["&&&&&&&&&&@example.com"; 300].join(", ");
+        let got = triage_user_message(&email_with_recipients(&blast, ""), "", "");
+        let line = got.lines().find(|l| l.starts_with("To: ")).unwrap();
+        assert!(
+            line.len() < RECIPIENT_HEADER_CHAR_CAP + 64,
+            "rendered {} chars, cap {RECIPIENT_HEADER_CHAR_CAP}",
+            line.len()
+        );
     }
 
     // --- Insufficiency check (#785) ---

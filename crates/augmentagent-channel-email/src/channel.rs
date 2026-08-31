@@ -34,7 +34,7 @@ use augmentagent_store::{ActionStatus, RetryableReply, Store, TriageResult, NUDG
 
 use crate::gmail::{extract_bare_email, split_recipients, GmailApi};
 use crate::outbound::parse_rfc2822_or_ms;
-use crate::sigextract::{is_cc_only_recipient, is_event_blast, is_human_sender};
+use crate::sigextract::{is_cc_only_bystander, is_event_blast, is_human_sender};
 
 #[derive(Clone, Debug)]
 pub struct GmailChannelConfig {
@@ -674,12 +674,15 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 // answered a message addressed to a venue owner ("Hi Gary!")
                 // on which the user was one of three Cc'd co-organizers, and
                 // opened the reply by correcting the sender about who they
-                // were writing to. When the user is only on Cc there is
-                // nothing to draft on their behalf — route to the Flag path
-                // so they still hear about it and can reply by hand if they
-                // want to. Sequenced AFTER the event-blast guard so blasts
-                // that Cc the user keep their silent ingest-only routing
-                // instead of starting to post flag notices.
+                // were writing to. When the greeting names a To: recipient
+                // and the user is only on Cc there is nothing to draft on
+                // their behalf — route to the Flag path so they still hear
+                // about it and can reply by hand if they want to. Cc
+                // placement alone is NOT enough (see is_cc_only_bystander): a
+                // message that greets the user, or greets nobody, stays on
+                // the drafting path. Sequenced AFTER the event-blast guard so
+                // blasts that Cc the user keep their silent ingest-only
+                // routing instead of starting to post flag notices.
                 let self_addrs: Vec<String> = match self.store.get_active_gmail_accounts() {
                     Ok(accounts) => accounts.into_iter().map(|a| a.email).collect(),
                     Err(e) => {
@@ -690,7 +693,7 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                         Vec::new()
                     }
                 };
-                if is_cc_only_recipient(&email.to, &email.cc, &self_addrs) {
+                if is_cc_only_bystander(&email.to, &email.cc, &self_addrs, &email.body) {
                     // Name the actual addressee so the Discord notice reads as
                     // "this wasn't written to you"; a long To list is trimmed
                     // to keep the card legible.
@@ -2403,9 +2406,10 @@ mod tests {
         assert!(store.is_email_complete("m-cc-only").unwrap());
     }
 
-    /// #845 negative pins — the guard fires ONLY when the owner is on Cc and
-    /// absent from a non-empty To. Everything else still drafts.
-    async fn drafts_with_headers(message_id: &str, to: &str, cc: &str) {
+    /// #845 negative pins — the guard fires ONLY when the owner is on Cc,
+    /// absent from a non-empty To, AND the body greets a To recipient.
+    /// Everything else still drafts.
+    async fn drafts_with_headers(message_id: &str, to: &str, cc: &str, body: &str) {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
@@ -2416,7 +2420,7 @@ mod tests {
                 thread_id: Some("T-845".into()),
                 from: "client@example.com".into(), // pii-ok: synthetic test fixture
                 subject: "Quick question".into(),
-                body: "do you have a minute?".into(),
+                body: body.into(),
                 date: "Thu, 28 Aug 2026 12:00:00 +0000".into(),
                 account_entity_id: Some("acc1".into()),
                 platform: "gmail".into(),
@@ -2447,7 +2451,7 @@ mod tests {
     #[tokio::test]
     async fn cc_only_guard_skipped_when_owner_is_on_to() {
         let owner_on_to = "Me <me@x.com>"; // pii-ok: synthetic test fixture
-        drafts_with_headers("m-845-to", owner_on_to, "other@example.com").await;
+        drafts_with_headers("m-845-to", owner_on_to, "other@example.com", "Hi Dana!").await;
     }
 
     #[tokio::test]
@@ -2455,14 +2459,30 @@ mod tests {
         // Pre-#629 rows, retry rehydration and non-Gmail platforms carry no
         // headers at all — never withhold a draft on missing evidence.
         let owner_on_cc = "me@x.com"; // pii-ok: synthetic test fixture
-        drafts_with_headers("m-845-noto", "", owner_on_cc).await;
+        drafts_with_headers("m-845-noto", "", owner_on_cc, "Hi Dana!").await;
     }
 
     #[tokio::test]
     async fn cc_only_guard_skipped_when_owner_on_neither_header() {
         // Bcc / group alias / forwarding: the owner isn't visible in either
         // header, so the message may well be squarely addressed to them.
-        drafts_with_headers("m-845-alias", "team@example.com", "other@example.com").await;
+        let owner_hidden = "sam@example.com"; // pii-ok: synthetic test fixture
+        drafts_with_headers("m-845-bcc", "dana@example.com", owner_hidden, "Hi Dana!").await;
+    }
+
+    #[tokio::test]
+    async fn cc_only_guard_skipped_when_owner_is_greeted_by_name() {
+        // The Cc line is where a sender puts someone they still expect an
+        // answer from. "Hi Robin, can you confirm?" with Robin only on Cc is
+        // squarely addressed to the owner, so it must still get a draft.
+        let owner_on_cc = "Robin <me@x.com>"; // pii-ok: synthetic test fixture
+        drafts_with_headers(
+            "m-845-greeted",
+            "dana@example.com",
+            owner_on_cc,
+            "Hi Robin, can you confirm the deposit went out?",
+        )
+        .await;
     }
 
     #[tokio::test]

@@ -380,8 +380,55 @@ pub fn is_event_blast(from: &str, subject: &str, body: &str) -> bool {
     false
 }
 
-/// Heuristic: is the owner a Cc'd bystander on a message addressed to
-/// someone else? (#845)
+/// Greeting openers that introduce the addressee by name.
+const GREETING_OPENERS: &[&str] = &[
+    "hi",
+    "hey",
+    "hello",
+    "dear",
+    "good morning",
+    "good afternoon",
+    "good evening",
+];
+
+/// Salutations that address a group rather than one person.
+const COLLECTIVE_GREETINGS: &[&str] =
+    &["there", "all", "team", "folks", "everyone", "both", "guys"];
+
+/// The name in the body's opening salutation, lowercased ("Hi Gary!" → `gary`).
+/// `None` when the first line is not a salutation, or greets a group.
+fn salutation_name(body: &str) -> Option<String> {
+    let first = body.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let lowered = first.to_ascii_lowercase();
+    let rest = GREETING_OPENERS.iter().find_map(|g| {
+        lowered
+            .strip_prefix(g)
+            .filter(|r| r.starts_with(char::is_whitespace))
+    })?;
+    let name: String = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '\'')
+        .collect();
+    (name.chars().count() > 1 && !COLLECTIVE_GREETINGS.contains(&name.as_str())).then_some(name)
+}
+
+/// Does the opening salutation name one of the `To:` recipients? Each
+/// recipient contributes its display-name words and local-part tokens
+/// (`"Gary Smith" <g.smith@example.com>` → gary, smith, g); domains are
+/// dropped, since a shared domain says nothing about who was addressed.
+fn greets_a_to_recipient(to: &str, body: &str) -> bool {
+    let Some(name) = salutation_name(body) else {
+        return false;
+    };
+    to.split(',')
+        .filter_map(|part| part.split('@').next())
+        .flat_map(|label| label.split(|c: char| !c.is_alphanumeric()))
+        .any(|tok| tok.eq_ignore_ascii_case(&name))
+}
+
+/// Heuristic: is the owner a Cc'd bystander on a message that greets someone
+/// else by name? (#845)
 ///
 /// The drafter answered a message whose `To:` was a venue owner and whose
 /// body opened "Hi Gary!" — the owner was one of three Cc'd co-organizers —
@@ -395,11 +442,15 @@ pub fn is_event_blast(from: &str, subject: &str, body: &str) -> bool {
 ///    withhold a draft.
 /// 2. No `self_addrs` entry appears in `to`.
 /// 3. At least one `self_addrs` entry appears in `cc`.
+/// 4. The body opens by greeting a `To:` recipient.
 ///
-/// An owner absent from BOTH headers (Bcc, group alias, forwarding) is
-/// deliberately NOT cc-only: such a message may be squarely addressed to
-/// them, and the triage model now sees the headers to judge for itself.
-pub fn is_cc_only_recipient(to: &str, cc: &str, self_addrs: &[String]) -> bool {
+/// Condition 4 is the "not directly addressed" half of the rule, and it is
+/// what keeps "Hi Robin, can you confirm?" on the drafting path: Cc placement
+/// alone is not evidence that the owner isn't the intended responder, so a
+/// message that greets the owner — or greets nobody — is left to the triage
+/// model, which now sees both headers in its prompt. An owner absent from
+/// BOTH headers (Bcc, group alias, forwarding) is likewise not cc-only.
+pub fn is_cc_only_bystander(to: &str, cc: &str, self_addrs: &[String], body: &str) -> bool {
     let mine: Vec<String> = self_addrs
         .iter()
         .map(|a| a.trim().to_ascii_lowercase())
@@ -418,7 +469,7 @@ pub fn is_cc_only_recipient(to: &str, cc: &str, self_addrs: &[String]) -> bool {
     if to_addrs.is_empty() || to_addrs.iter().any(|a| mine.contains(a)) {
         return false;
     }
-    lowered(cc).iter().any(|a| mine.contains(a))
+    lowered(cc).iter().any(|a| mine.contains(a)) && greets_a_to_recipient(to, body)
 }
 
 /// Pull the bare `local@domain` from a raw `From:` header value that may
@@ -1178,51 +1229,63 @@ mod tests {
     }
 
     #[test]
-    fn cc_only_when_addressed_to_someone_else() {
+    fn cc_only_when_greeting_names_the_to_recipient() {
         // pii-ok — synthetic test fixtures.
-        assert!(is_cc_only_recipient(
-            "venue@example.com",
+        assert!(is_cc_only_bystander(
+            "dana@example.com",
             "Me <me@example.com>, Other <other@example.com>",
             &me(),
+            "Hi Dana!\n\nWanted to talk about the space.",
         ));
-    }
-
-    #[test]
-    fn cc_only_ignores_display_names_and_case() {
-        // A quoted comma in a display name must not split the To list.
-        assert!(is_cc_only_recipient(
-            r#""Doe, John" <john@example.com>"#,
+        // A display-name match counts too, and a quoted comma in one must not
+        // split the To list.
+        assert!(is_cc_only_bystander(
+            r#""Doe, Dana" <frontdesk@example.com>"#,
             "ME@EXAMPLE.COM",                // pii-ok: synthetic test fixture
             &["Me@Example.com".to_string()], // pii-ok: synthetic test fixture
+            "Dear Dana, following up on the quote.",
         ));
     }
 
     #[test]
-    fn cc_only_false_when_owner_is_also_on_to() {
-        // pii-ok — synthetic test fixtures.
-        assert!(!is_cc_only_recipient(
-            "venue@example.com, me@example.com",
+    fn cc_only_false_when_owner_is_not_the_greeted_party() {
+        // Why the guard reads the salutation at all: Cc placement alone must
+        // not withhold a draft from a message written to the owner. pii-ok —
+        // synthetic test fixtures.
+        let (to, cc) = ("dana@example.com", "me@example.com");
+        // Owner greeted by name from the Cc line.
+        assert!(!is_cc_only_bystander(to, cc, &me(), "Hi Robin, confirm?"));
+        // No salutation at all — no evidence either way.
+        assert!(!is_cc_only_bystander(to, cc, &me(), "Deposit went out."));
+        // A collective greeting addresses the thread, owner included.
+        assert!(!is_cc_only_bystander(
+            "team@example.com",
             "me@example.com",
             &me(),
+            "Hi team — agenda for Thursday attached.",
         ));
     }
 
     #[test]
-    fn cc_only_false_without_evidence() {
-        // pii-ok — synthetic test fixtures.
-        // Empty To (header never populated) → missing evidence, not a signal.
-        assert!(!is_cc_only_recipient("", "me@example.com", &me()));
-        // Owner on neither header (Bcc / group alias / forwarding).
-        assert!(!is_cc_only_recipient(
-            "venue@example.com",
-            "other@example.com",
-            &me(),
+    fn cc_only_false_without_header_evidence() {
+        // pii-ok — synthetic test fixtures. Every case greets the To
+        // recipient, so only the headers decide.
+        let headers = |to, cc| is_cc_only_bystander(to, cc, &me(), "Hi Dana!");
+        // Owner is on To as well.
+        assert!(!headers(
+            "dana@example.com, me@example.com",
+            "me@example.com"
         ));
+        // Empty To (header never populated) → missing evidence, not a signal.
+        assert!(!headers("", "me@example.com"));
+        // Owner on neither header (Bcc / group alias / forwarding).
+        assert!(!headers("dana@example.com", "other@example.com"));
         // No usable self address to compare against.
-        assert!(!is_cc_only_recipient(
-            "venue@example.com",
+        assert!(!is_cc_only_bystander(
+            "dana@example.com",
             "me@example.com",
             &[String::new(), "  ".to_string()],
+            "Hi Dana!",
         ));
     }
 
