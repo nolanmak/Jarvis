@@ -27,13 +27,19 @@
 //!    enabled on the API; raw DynamoDB writes would corrupt `_version`
 //!    sync metadata for the app.
 
+pub mod channel;
 pub mod client;
 pub mod config;
 pub mod crypto;
+pub mod html;
 
+pub use channel::{
+    JournalChannel, JournalChannelConfig, JournalRuntime, PollOutcome, DEFAULT_POLL_INTERVAL,
+};
 pub use client::{Entry, EntryPage, JournalApi, JournalError, NewEntry, ShadowNoteClient};
 pub use config::JournalConfig;
 pub use crypto::{
     decrypt_entry_content, encrypt_entry_content, CryptoError, DekProvider, EnvelopeCiphertext,
     GeneratedDek, KmsDekProvider,
 };
+pub use html::html_to_text;

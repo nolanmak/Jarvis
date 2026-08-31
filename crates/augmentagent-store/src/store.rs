@@ -1105,6 +1105,19 @@ impl Store {
             [],
         )?;
 
+        // #427 — ShadowNote journal DataStore delta-sync watermark. One row
+        // per ownerId; stores the `startedAt` epoch-ms the last completed
+        // sync returned, passed back as `lastSync` so a restart only
+        // re-ingests entries changed since the previous full pass.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS journal_sync_state (\
+                 owner_id      TEXT PRIMARY KEY,\
+                 last_sync_ms  INTEGER NOT NULL,\
+                 updated_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
         // #80 — voice-capture Telegram long-poll cursor. Single-row table
         // keyed by a logical capture-bot id; stores the last acked update_id
         // so a daemon restart never re-ingests an already-transcribed memo.
@@ -2238,6 +2251,32 @@ impl Store {
              ON CONFLICT(entity_id) DO UPDATE SET \
                  page_token = excluded.page_token, updated_at_ms = excluded.updated_at_ms",
             params![entity_id, page_token, now_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// ShadowNote journal delta-sync watermark (#427). `None` = never
+    /// synced — caller runs a base sync (full backfill).
+    pub fn get_journal_sync_state(&self, owner_id: &str) -> StoreResult<Option<i64>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let ms: Option<i64> = guard
+            .query_row(
+                "SELECT last_sync_ms FROM journal_sync_state WHERE owner_id = ?1",
+                params![owner_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(ms)
+    }
+
+    pub fn set_journal_sync_state(&self, owner_id: &str, last_sync_ms: i64) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO journal_sync_state (owner_id, last_sync_ms, updated_at_ms) \
+                 VALUES (?1, ?2, ?3) \
+             ON CONFLICT(owner_id) DO UPDATE SET \
+                 last_sync_ms = excluded.last_sync_ms, updated_at_ms = excluded.updated_at_ms",
+            params![owner_id, last_sync_ms, now_millis()],
         )?;
         Ok(())
     }
