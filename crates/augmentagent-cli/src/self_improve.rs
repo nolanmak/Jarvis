@@ -1317,8 +1317,18 @@ fn build_revise_prompt(issue: &Issue, review_notes: &str, current_lines: usize) 
          changes. Its findings:\n\n{}\n\nAddress each finding: fix what is \
          real (with a regression test where the finding is bug-shaped), and \
          where a finding is mistaken, add a brief code comment at the \
-         relevant site explaining why the behaviour is correct. Keep the \
-         diff focused; do not start over or refactor unrelated code.\n\
+         relevant site explaining why the behaviour is correct.\n\
+         IF THE FINDING IS ARCHITECTURAL — the reviewer shows your APPROACH \
+         cannot handle the reported case, not just a detail of it — replace \
+         the approach with the smallest correct alternative instead of \
+         patching around it. Take a reviewer-proposed alternative seriously; \
+         it has repeatedly been the fix. Patching a structurally wrong \
+         approach for another round wastes the whole run. Otherwise keep the \
+         diff focused; never refactor unrelated code.\n\
+         Always add a regression test that reproduces the ORIGINAL reported \
+         case verbatim (the exact inputs from the issue, placeholder \
+         identities) — if that test cannot pass under your approach, the \
+         approach is wrong.\n\
          HARD BUDGET: the total diff may not exceed {MAX_DIFF_LINES} changed \
          lines and is currently at {current_lines}. A revision that grows \
          past the cap is rejected wholesale, discarding all of this work — \
@@ -1328,6 +1338,21 @@ fn build_revise_prompt(issue: &Issue, review_notes: &str, current_lines: usize) 
         issue.number,
         issue.title,
         truncate(review_notes, 4000),
+    )
+}
+
+/// Synthetic "findings" for a gate-repair round (#873): the last change went
+/// RED — a compile error or failing test — and the next round's job is to
+/// make it green again. This is the red→fix half of TDD; treating a red gate
+/// as terminal discarded ~40-minute runs twice in one evening (#854's
+/// calendar doctest, #855's revision that did not compile), when a compile
+/// error is precisely the easiest failure to iterate on.
+fn gate_findings(err: &str) -> String {
+    format!(
+        "Your last change FAILED the verification gate — it does not build or \
+         its tests fail. Fix exactly this failure; change nothing unrelated. \
+         Gate output:\n\n```\n{}\n```",
+        truncate(err, 3000)
     )
 }
 
@@ -1603,6 +1628,17 @@ fn revise_rounds() -> u32 {
         .min(5)
 }
 
+/// Should sitting draft PRs be resumed before new issues? Default ON (#866).
+/// `AUGMENTAGENT_AUTOPR_RESUME_FIRST=0` flips a run to new-issues-first — the
+/// owner's "pick up new issues right now" lever, exported per-invocation for
+/// a manual run without changing the daemon's default.
+fn resume_first_enabled() -> bool {
+    !matches!(
+        std::env::var("AUGMENTAGENT_AUTOPR_RESUME_FIRST").ok().as_deref().map(str::trim),
+        Some("0") | Some("false") | Some("FALSE")
+    )
+}
+
 /// One revision pass against codex findings — default ON, `=0` disables.
 fn revise_enabled() -> bool {
     !matches!(
@@ -1739,6 +1775,77 @@ async fn node_build_required(worktree: &Path) -> bool {
     }
 }
 
+/// The workspace crates a change set touches, as `-p`-able package names —
+/// or `None` when anything falls outside `crates/`, which means only the
+/// full gate can vouch for it (Node sources, schema, scripts).
+///
+/// Crate directory names ARE the package names in this workspace
+/// (`crates/augmentagent-cli` ⇒ package `augmentagent-cli`).
+fn changed_crates(paths: &str) -> Option<Vec<String>> {
+    let mut crates: Vec<String> = Vec::new();
+    for path in paths.lines().map(str::trim).filter(|p| !p.is_empty()) {
+        let mut segs = path.split('/');
+        match (segs.next(), segs.next(), segs.next()) {
+            (Some("crates"), Some(dir), Some(_)) => {
+                if !crates.iter().any(|c| c == dir) {
+                    crates.push(dir.to_string());
+                }
+            }
+            // Workspace manifests change dependency resolution everywhere.
+            _ => return None,
+        }
+    }
+    (!crates.is_empty()).then_some(crates)
+}
+
+/// Build + test ONLY the given crates (#870). Used between revision rounds,
+/// where the full single-threaded workspace suite (~5 min) was re-verifying
+/// 30+ untouched crates after every round — ~20 of the 49 minutes of a
+/// three-round run. The FULL gate still runs exactly once before anything is
+/// pushed or merged; this trims the redundancy, not the bar.
+async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Result<()> {
+    let env = gate_env();
+    let pkgs: String = crates
+        .iter()
+        .map(|c| format!("-p {c}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    info!(%pkgs, "verification gate (targeted): cargo build");
+    let (ok, _o, e) = run_sandboxed(
+        "bash",
+        &["-lc", &gate_sh(&format!(". $HOME/.cargo/env && cargo build {pkgs} 2>&1 | tail -5"))],
+        worktree,
+        &env,
+    )
+    .await?;
+    if !ok {
+        bail!("targeted cargo build failed:\n{o}{e}", o = _o.trim());
+    }
+    info!(%pkgs, "verification gate (targeted): cargo test");
+    let (ok, _o, e) = run_sandboxed(
+        "bash",
+        &["-lc", &gate_sh(&format!(
+            ". $HOME/.cargo/env && cargo test {pkgs} -- --test-threads=1 2>&1 | tail -8"
+        ))],
+        worktree,
+        &env,
+    )
+    .await?;
+    if !ok {
+        bail!("targeted cargo test failed:\n{o}{e}", o = _o.trim());
+    }
+    Ok(())
+}
+
+/// Gate for an intermediate revision round: targeted when the diff stays
+/// inside `crates/`, full otherwise.
+async fn gate_for_round(worktree: &Path, changed_paths: &str) -> Result<()> {
+    match changed_crates(changed_paths) {
+        Some(crates) => verification_gate_targeted(worktree, &crates).await,
+        None => verification_gate(worktree).await,
+    }
+}
+
 async fn verification_gate(worktree: &Path) -> Result<()> {
     // #300 — Strip provider secrets from the gate's child env. `cargo
     // build`/`npm run build` execute `build.rs`/proc-macros/`npm
@@ -1860,12 +1967,7 @@ async fn resume_draft_pr(
 
     // Whatever happens next counts as today's attempt on this issue, so a
     // failing resume moves on to other work instead of re-running every tick.
-    {
-        let path = attempt_ledger_path();
-        let mut ledger = AttemptLedger::load(&path);
-        ledger.mark(utc_day_now(), issue_no);
-        ledger.save(&path);
-    }
+    AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue_no);
 
     // The issue, for trust + prompts. Refuse untrusted authors exactly like
     // the fresh path (#300) — the PR was created from this issue's text.
@@ -1911,7 +2013,9 @@ async fn resume_draft_pr(
 
     // Worktree from the PR's branch, brought up to date with main. A merge
     // conflict is a human's job — say so on the PR and move on.
-    let worktree = repo_root.join(".self-improve-worktrees").join("current");
+    let worktree = repo_root
+        .join(".self-improve-worktrees")
+        .join(lane_from_env().worktree_name());
     reclaim_worktree(repo_root, &worktree, branch).await;
     let _ = run("git", &["fetch", "origin", branch], repo_root).await?;
     let (ok, _o, e) = run(
@@ -2030,13 +2134,62 @@ async fn resume_draft_pr(
                 }
             }
         }
-        if let Err(gate_err) = verification_gate(&worktree).await {
+        // Round 0 earns the FULL suite (first verification of an old branch
+        // against today's main); later rounds verify the changed crates
+        // (#870) — the full gate runs once more before any merge.
+        let gate_result = if rounds_done == 0 {
+            verification_gate(&worktree).await
+        } else {
+            let (_ok, names, _) =
+                run("git", &["diff", "--name-only", "origin/main...HEAD"], &worktree).await?;
+            gate_for_round(&worktree, &names).await
+        };
+        if let Err(gate_err) = gate_result {
+            // #873 — a red gate gets a repair round while budget remains.
+            // Round 0 red means the draft rotted against today's main; a
+            // later red means the revision broke it. Both are exactly the
+            // failure a builder can iterate on (it sees the compiler/test
+            // output verbatim), and terminal-refusing here discarded two
+            // ~40-minute runs in one evening.
+            if rounds_done < revise_rounds() {
+                rounds_done += 1;
+                info!(pr, issue = issue.number, round = rounds_done, "resume: gate-repair round");
+                match reasoner
+                    .call(
+                        &fix_opts(worktree.clone()),
+                        &build_revise_prompt(&issue, &gate_findings(&gate_err.to_string()), lines_now),
+                    )
+                    .await
+                {
+                    Ok(rs) => {
+                        let _ = drop_root_scratch(&worktree).await;
+                        let _ = run("git", &["add", "-A"], &worktree).await?;
+                        let msg =
+                            format!("review round {rounds_done}: repair the verification gate");
+                        let _ = run(
+                            "git",
+                            &["-c", &name_arg, "-c", &email_arg, "commit", "--allow-empty", "-m", &msg],
+                            &worktree,
+                        )
+                        .await?;
+                        summary = format!(
+                            "{summary}\nRound {rounds_done} (gate repair): {}",
+                            truncate(&rs, 200)
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(pr, "gate-repair round failed: {e:#}");
+                    }
+                }
+            }
             cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
             let _ = run(
                 &gh,
                 &["pr", "comment", &pr.to_string(), "--body",
                   &format!("Auto-resume: verification gate failed against current \
-                            `main`:\n```\n{}\n```", truncate(&gate_err.to_string(), 1200))],
+                            `main` and the repair budget is exhausted:\n```\n{}\n```",
+                           truncate(&gate_err.to_string(), 1200))],
                 repo_root,
             )
             .await;
@@ -2050,6 +2203,26 @@ async fn resume_draft_pr(
             independent.status()
         ));
         if independent.approved() {
+            if rounds_done > 0 {
+                // Revisions were verified crate-targeted; nothing merges
+                // without the full suite passing once (#870).
+                if let Err(gate_err) = verification_gate(&worktree).await {
+                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                    let _ = run(
+                        &gh,
+                        &["pr", "comment", &pr.to_string(), "--body",
+                          &format!("Auto-resume: double LGTM, but the final \
+                                    full-workspace gate failed:\n```\n{}\n```",
+                                   truncate(&gate_err.to_string(), 1200))],
+                        repo_root,
+                    )
+                    .await;
+                    record_attempt(repo_root, issue.number).await.ok();
+                    return Ok(RunReport::built(format!(
+                        "PR #{pr}: LGTM but final full gate failed"
+                    )));
+                }
+            }
             if dry_run {
                 cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
@@ -2112,7 +2285,9 @@ async fn resume_draft_pr(
                 &gh,
                 &["pr", "comment", &pr.to_string(), "--body",
                   &format!("Auto-resume: no double LGTM after {rounds_done} revision \
-                            round(s) ({}). Latest findings:\n\n{}",
+                            round(s) ({}). Revisions were verified against the \
+                            changed crates' tests; the full workspace suite \
+                            runs before any merge. Latest findings:\n\n{}",
                            notes_log.join("; "),
                            truncate(&independent.notes, 2500))],
                 repo_root,
@@ -2245,6 +2420,64 @@ impl RunLock {
     }
 }
 
+/// Which half of the pipeline this invocation runs (#871).
+///
+/// The owner has a PR backlog AND an issue backlog, and one serialized
+/// pipeline forces them to queue behind each other. Lanes let a REVIEW
+/// process (resume sitting drafts) and a BUILD process (new issues) run
+/// concurrently: each lane has its own flock and its own worktree path, so
+/// the #816 mutual-destruction hazard cannot occur between them, while two
+/// runs of the SAME lane still exclude each other.
+///
+/// Cross-lane overlap is safe by construction: the resume lane only touches
+/// issues that HAVE an open agent PR, the build lane's `pick_issue` skips
+/// exactly those (dedup), and the attempt ledger writes are flocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// Default: resume a sitting draft if one exists, else build new work.
+    Combined,
+    /// Only resume sitting draft PRs; idle when none are eligible.
+    Resume,
+    /// Only build new issues; never resumes.
+    Build,
+}
+
+/// `AUGMENTAGENT_AUTOPR_LANE` = `resume` | `build`; anything else (and the
+/// daemon default) is [`Lane::Combined`].
+fn lane_from_env() -> Lane {
+    match std::env::var("AUGMENTAGENT_AUTOPR_LANE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("resume") => Lane::Resume,
+        Some("build") => Lane::Build,
+        _ => Lane::Combined,
+    }
+}
+
+impl Lane {
+    /// Worktree directory name under `.self-improve-worktrees/`.
+    fn worktree_name(self) -> &'static str {
+        match self {
+            // Combined and Build share a name deliberately: they also share
+            // a lock, so they can never run concurrently.
+            Lane::Combined | Lane::Build => "current",
+            Lane::Resume => "resume",
+        }
+    }
+
+    /// Suffix distinguishing this lane's lock file.
+    fn lock_suffix(self) -> &'static str {
+        match self {
+            Lane::Combined | Lane::Build => "",
+            Lane::Resume => "-resume",
+        }
+    }
+}
+
 /// Lock file path: `AUGMENTAGENT_SELFIMPROVE_LOCK` override (tests), else the
 /// daemon state dir alongside `reasoner-cooldowns.json`, else a cwd-relative
 /// fallback so a HOME-less environment still serializes.
@@ -2254,13 +2487,10 @@ fn run_lock_path() -> PathBuf {
             return PathBuf::from(p);
         }
     }
+    let name = format!("self-improve{}.lock", lane_from_env().lock_suffix());
     std::env::var_os("HOME")
-        .map(|h| {
-            PathBuf::from(h)
-                .join(".local/state/augmentagent")
-                .join("self-improve.lock")
-        })
-        .unwrap_or_else(|| PathBuf::from(".self-improve.lock"))
+        .map(|h| PathBuf::from(h).join(".local/state/augmentagent").join(&name))
+        .unwrap_or_else(|| PathBuf::from(format!(".{name}")))
 }
 
 /// What one `run_once` did, and whether it should cost daily budget.
@@ -2333,9 +2563,19 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // diffs that only lack an approving review, and until now the dedup guard
     // made them permanently invisible (seven drafts, three days, zero
     // merges). Resume the oldest one not yet attempted today.
-    if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root).await {
-        let reasoner = build_reasoner();
-        return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run).await;
+    // #871 — lanes: the resume lane does ONLY this (idling when no draft is
+    // eligible), the build lane skips it entirely, and the default combined
+    // lane keeps resume-first (still flippable via the knob).
+    let lane = lane_from_env();
+    if lane != Lane::Build && resume_first_enabled() {
+        if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root).await {
+            let reasoner = build_reasoner();
+            return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run)
+                .await;
+        }
+    }
+    if lane == Lane::Resume {
+        return Ok(RunReport::idle());
     }
 
     let Some(issue) = pick_issue(repo_root).await? else {
@@ -2391,7 +2631,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // time; with the shared gate target cache, binaries compiled under a
     // deleted per-issue path get reused from later runs and panic reading
     // fixtures. A stable path keeps every baked path resolvable.
-    let worktree = repo_root.join(".self-improve-worktrees").join("current");
+    let worktree = repo_root
+        .join(".self-improve-worktrees")
+        .join(lane_from_env().worktree_name());
 
     // Clean any stale worktree from a crashed prior run.
     reclaim_worktree(repo_root, &worktree, &branch).await;
@@ -2819,8 +3061,22 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         issue.number
                     )));
                 }
-                if let Err(gate_err) = verification_gate(&worktree).await {
+                let (_ok, names2, _) =
+                    run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
+                if let Err(gate_err) = gate_for_round(&worktree, &names2).await {
                     warn!(issue = issue.number, "post-revision gate failed: {gate_err:#}");
+                    // #873 — a red gate gets a repair round while budget
+                    // remains: red→fix is the other half of TDD, and a
+                    // compile error is the easiest failure to iterate on.
+                    // Codex is not consulted on a diff that does not build.
+                    if round < max_rounds {
+                        findings_override = Some(gate_findings(&gate_err.to_string()));
+                        revision_note.push_str(&format!(
+                            "\n### Revision round {round}: failed the gate; \
+                             next round repairs\n"
+                        ));
+                        continue;
+                    }
                     let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
                     if attempts >= MAX_ATTEMPTS {
                         backoff_comment(
@@ -2843,8 +3099,6 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                     )));
                 }
                 // The revised diff may touch different files.
-                let (_ok, names2, _) =
-                    run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
                 gated = touches_verify_gated_path(&names2);
                 lines = lines2;
                 independent = independent_review(&issue, &rev_summary, &diff2, worktree.clone()).await;
@@ -2865,6 +3119,32 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             approved = independent.approved(),
             "iterative review finished"
         );
+        // Intermediate rounds ran the targeted gate (#870); everything that
+        // ships — or even lands as a PR claiming workspace-pass — gets the
+        // FULL suite exactly once here.
+        if let Err(gate_err) = verification_gate(&worktree).await {
+            warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
+            let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+            if attempts >= MAX_ATTEMPTS {
+                backoff_comment(
+                    repo_root,
+                    issue.number,
+                    &format!(
+                        "Self-improve gave up after {attempts} attempts. Final \
+                         full-workspace gate failure after revisions:\n```\n{}\n```",
+                        truncate(&gate_err.to_string(), 1500)
+                    ),
+                )
+                .await
+                .ok();
+                label_gave_up(repo_root, issue.number).await.ok();
+            }
+            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+            return Ok(RunReport::built(format!(
+                "issue #{}: final full gate failed after {round} revision round(s)",
+                issue.number
+            )));
+        }
     }
 
     if dry_run {
@@ -3156,12 +3436,7 @@ async fn record_hard_failure(repo_root: &Path, issue: u64, what: &str, err: &str
 async fn record_attempt(repo_root: &Path, issue: u64) -> Result<u32> {
     // #851 — remember the attempt for the rest of the UTC day so the picker
     // moves on instead of handing this issue straight back next tick.
-    {
-        let path = attempt_ledger_path();
-        let mut ledger = AttemptLedger::load(&path);
-        ledger.mark(utc_day_now(), issue);
-        ledger.save(&path);
-    }
+    AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue);
     let gh = gh_bin();
     let (_ok, stdout, _) = run(
         &gh,
@@ -4010,6 +4285,41 @@ impl AttemptLedger {
         if !self.issues.contains(&issue) {
             self.issues.push(issue);
         }
+    }
+
+    /// Atomically read-modify-write a mark under an exclusive flock (#871).
+    /// With the resume and build lanes running in parallel, two unlocked
+    /// read-modify-write cycles could drop one lane's mark — which would
+    /// re-expose an already-attempted issue to the picker the same day.
+    fn mark_persist(path: &Path, day: u64, issue: u64) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(path = %path.display(), "attempt ledger open failed: {e}");
+                return;
+            }
+        };
+        // SAFETY: `file` owns the fd; flock neither reads nor writes it.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            warn!("attempt ledger flock failed; marking without it");
+        }
+        let mut ledger = std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+            .unwrap_or_default();
+        ledger.mark(day, issue);
+        ledger.save(path);
+        // Lock released when `file` drops.
     }
 
     /// Best-effort persist, mirroring [`DailyCounter::save`]: losing this
@@ -5176,6 +5486,31 @@ CODEX-REVIEW: lgtm").0);
         );
     }
 
+    // ---- #870: targeted gate between rounds ----
+
+    #[test]
+    fn changed_crates_targets_inside_crates_and_bails_outside() {
+        assert_eq!(
+            changed_crates("crates/augmentagent-cli/src/self_improve.rs\ncrates/augmentagent-store/src/store.rs"),
+            Some(vec!["augmentagent-cli".into(), "augmentagent-store".into()])
+        );
+        // Duplicates collapse.
+        assert_eq!(
+            changed_crates("crates/x/src/a.rs\ncrates/x/src/b.rs"),
+            Some(vec!["x".into()])
+        );
+        // Anything outside crates/ means only the full gate can vouch for it.
+        assert_eq!(changed_crates("src/index.ts"), None);
+        assert_eq!(changed_crates("crates/x/src/a.rs\nCargo.toml"), None);
+        assert_eq!(changed_crates("schema/triage.md"), None);
+        // A bare `crates/<dir>` line (no file) is not a crate change we can
+        // name — full gate.
+        assert_eq!(changed_crates("crates/x"), None);
+        // Empty set: nothing to target.
+        assert_eq!(changed_crates(""), None);
+        assert_eq!(changed_crates("\n\n"), None);
+    }
+
     // ---- revise loop + receipt override ----
 
     #[test]
@@ -5191,9 +5526,23 @@ CODEX-REVIEW: lgtm").0);
         let p = build_revise_prompt(&issue, "rfind(',') splits quoted display names", 373);
         assert!(p.contains("rfind"), "the reviewer's findings must reach the builder");
         assert!(p.contains("#845"));
+        // The live #853 resume burned four rounds because "do not start
+        // over" entrenched a structurally wrong approach: the guard matched
+        // greeting names against address tokens ("Gary" vs "glozoff"), codex
+        // showed the reported case could never pass, and the builder kept
+        // patching details around the hole. Revisions must be allowed to
+        // pivot when the finding is architectural.
         assert!(
-            p.contains("do not start over"),
-            "a revision must stay a revision, not a second attempt from scratch"
+            p.contains("IF THE FINDING IS ARCHITECTURAL"),
+            "an architectural finding must permit replacing the approach"
+        );
+        assert!(
+            p.contains("reviewer-proposed alternative"),
+            "the reviewer's prescription is signal, not noise"
+        );
+        assert!(
+            p.contains("ORIGINAL reported case verbatim"),
+            "the issue's own repro is the acceptance test that catches a non-fix"
         );
         assert!(
             p.contains("mistaken"),
@@ -5204,6 +5553,17 @@ CODEX-REVIEW: lgtm").0);
         // the cap on round 2 because the builder was never told it existed.
         assert!(p.contains("373"), "current size must be in the prompt");
         assert!(p.contains("600"), "the cap must be in the prompt");
+    }
+
+    #[test]
+    fn gate_findings_carry_the_error_and_forbid_unrelated_changes() {
+        let f = gate_findings("error[E0308]: mismatched types\n --> src/x.rs:9");
+        assert!(f.contains("E0308"), "the builder must see the compiler's own words");
+        assert!(f.contains("FAILED the verification gate"));
+        assert!(
+            f.contains("change nothing unrelated"),
+            "a repair round repairs; it must not become a rewrite"
+        );
     }
 
     #[test]
@@ -5262,6 +5622,88 @@ CODEX-REVIEW: lgtm").0);
         match prev_e {
             Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_REVISE", v),
             None => std::env::remove_var("AUGMENTAGENT_AUTOPR_REVISE"),
+        }
+    }
+
+    #[test]
+    fn lanes_have_disjoint_locks_and_worktrees() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AUGMENTAGENT_AUTOPR_LANE").ok();
+
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_LANE");
+        assert_eq!(lane_from_env(), Lane::Combined);
+        std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", "resume");
+        assert_eq!(lane_from_env(), Lane::Resume);
+        std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", "build");
+        assert_eq!(lane_from_env(), Lane::Build);
+        // Unknown values must not invent a third lane.
+        std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", "yolo");
+        assert_eq!(lane_from_env(), Lane::Combined);
+
+        // The whole point: resume and build can run CONCURRENTLY, so they
+        // must never share a lock or a worktree...
+        assert_ne!(Lane::Resume.lock_suffix(), Lane::Build.lock_suffix());
+        assert_ne!(Lane::Resume.worktree_name(), Lane::Build.worktree_name());
+        // ...while combined and build must EXCLUDE each other (the daemon
+        // runs combined), so they share both.
+        assert_eq!(Lane::Combined.lock_suffix(), Lane::Build.lock_suffix());
+        assert_eq!(Lane::Combined.worktree_name(), Lane::Build.worktree_name());
+
+        std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", "resume");
+        assert!(run_lock_path().to_string_lossy().contains("self-improve-resume.lock"));
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_LANE");
+        assert!(run_lock_path().to_string_lossy().ends_with("self-improve.lock"));
+
+        match prev {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_LANE", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_LANE"),
+        }
+    }
+
+    #[test]
+    fn ledger_mark_persist_survives_concurrent_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attempted.json");
+        // Two lanes marking different issues at once must both land — an
+        // unlocked read-modify-write drops one.
+        let p1 = path.clone();
+        let p2 = path.clone();
+        let t1 = std::thread::spawn(move || {
+            for i in 0..50u64 {
+                AttemptLedger::mark_persist(&p1, 100, 1000 + i);
+            }
+        });
+        let t2 = std::thread::spawn(move || {
+            for i in 0..50u64 {
+                AttemptLedger::mark_persist(&p2, 100, 2000 + i);
+            }
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+        let l = AttemptLedger::load(&path);
+        for i in 0..50u64 {
+            assert!(l.attempted_today(100, 1000 + i), "lane-1 mark {} lost", 1000 + i);
+            assert!(l.attempted_today(100, 2000 + i), "lane-2 mark {} lost", 2000 + i);
+        }
+    }
+
+    #[test]
+    fn resume_first_is_default_and_flippable_per_run() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AUGMENTAGENT_AUTOPR_RESUME_FIRST").ok();
+
+        std::env::remove_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST");
+        assert!(resume_first_enabled(), "draining sitting drafts stays the default");
+        std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST", "0");
+        assert!(!resume_first_enabled(), "the owner's new-issues-now lever");
+        std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST", "1");
+        assert!(resume_first_enabled());
+
+        match prev {
+            Some(v) => std::env::set_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST", v),
+            None => std::env::remove_var("AUGMENTAGENT_AUTOPR_RESUME_FIRST"),
         }
     }
 
