@@ -86,12 +86,7 @@ fn recipient_header(label: &str, raw: &str) -> String {
         .unwrap_or(0);
     let head = match safe[..cut].rfind(',') {
         Some(i) => &safe[..i],
-        // One address longer than the whole cap: back off past any half-cut
-        // `&amp;` so the line can't end in a mangled entity.
-        None => match safe[..cut].rfind('&') {
-            Some(i) if !safe[i..cut].contains(';') => &safe[..i],
-            _ => &safe[..cut],
-        },
+        None => &safe[..cut],
     };
     let dropped = safe[head.len()..].matches(',').count().max(1);
     format!("\n{label}: {head}… (+{dropped} more)")
@@ -765,9 +760,7 @@ mod tests {
     //
     // A message addressed to a third party, with the user only on Cc, was
     // drafted as though the user were the addressee — no prompt carried the
-    // To/Cc headers, so neither triage nor the drafter could tell. When the
-    // headers are empty (non-Gmail platforms, pre-#629 rows) the output must
-    // stay byte-identical, guarded by the empty-block tests above.
+    // To/Cc headers, so neither triage nor the drafter could tell.
 
     fn email_with_recipients(to: &str, cc: &str) -> Email {
         Email {
@@ -817,14 +810,7 @@ mod tests {
             assert!(!got.contains("\nCc: "), "spurious Cc line:\n{got}");
         }
         // A Cc without a To still renders the Cc alone.
-        let got = draft_user_message(
-            &email_with_recipients("", "x@example.com"),
-            "",
-            "",
-            "",
-            "",
-            "",
-        );
+        let got = triage_user_message(&email_with_recipients("", "x@example.com"), "", "");
         assert!(!got.contains("\nTo: "));
         assert!(got.contains("\nCc: x@example.com\n"));
     }
@@ -843,16 +829,19 @@ mod tests {
 
     #[test]
     fn oversized_recipient_header_is_capped() {
+        let to_line = |raw: &str| {
+            triage_user_message(&email_with_recipients(raw, ""), "", "")
+                .lines()
+                .find(|l| l.starts_with("To: "))
+                .expect("To line present")
+                .to_string()
+        };
         // A 300-address blast must not crowd out the body.
         let blast = (0..300)
             .map(|i| format!("person{i}@example.com"))
             .collect::<Vec<_>>()
             .join(", ");
-        let got = triage_user_message(&email_with_recipients(&blast, ""), "", "");
-        let line = got
-            .lines()
-            .find(|l| l.starts_with("To: "))
-            .expect("To line present");
+        let line = to_line(&blast);
         assert!(
             line.len() < RECIPIENT_HEADER_CHAR_CAP + 64,
             "cap ignored: {line}"
@@ -862,22 +851,16 @@ mod tests {
             "kept the first addresses"
         );
         assert!(!line.contains("person299@example.com"), "kept the tail");
-        assert!(line.ends_with(" more)"), "no dropped-count suffix: {line}");
-        // Never a truncated half-address.
+        // Never a truncated half-address, always a dropped-count suffix.
         assert!(line.contains("@example.com… (+"), "cut mid-address: {line}");
-    }
-
-    #[test]
-    fn recipient_header_cap_counts_escaped_length() {
-        // `&` renders as `&amp;`: a cap applied before escaping would let this
-        // header reach ~5x the cap in the prompt the model actually sees.
-        let blast = vec!["&&&&&&&&&&@example.com"; 300].join(", ");
-        let got = triage_user_message(&email_with_recipients(&blast, ""), "", "");
-        let line = got.lines().find(|l| l.starts_with("To: ")).unwrap();
+        assert!(line.ends_with(" more)"), "no dropped-count suffix: {line}");
+        // `&` renders as `&amp;`: capping before escaping would let this header
+        // reach ~5x the cap in the prompt the model actually sees.
+        let amp = to_line(&vec!["&&&&&&&&&&@example.com"; 300].join(", "));
         assert!(
-            line.len() < RECIPIENT_HEADER_CHAR_CAP + 64,
+            amp.len() < RECIPIENT_HEADER_CHAR_CAP + 64,
             "rendered {} chars, cap {RECIPIENT_HEADER_CHAR_CAP}",
-            line.len()
+            amp.len()
         );
     }
 

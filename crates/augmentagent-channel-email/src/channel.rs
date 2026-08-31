@@ -674,21 +674,20 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 // answered a message addressed to a venue owner ("Hi Gary!")
                 // on which the user was one of three Cc'd co-organizers, and
                 // opened the reply by correcting the sender about who they
-                // were writing to. When the greeting names a To: recipient
-                // and the user is only on Cc there is nothing to draft on
-                // their behalf — route to the Flag path so they still hear
-                // about it and can reply by hand if they want to. Cc
-                // placement alone is NOT enough (see is_cc_only_bystander): a
-                // message that greets the user, or greets nobody, stays on
-                // the drafting path. Sequenced AFTER the event-blast guard so
-                // blasts that Cc the user keep their silent ingest-only
-                // routing instead of starting to post flag notices.
+                // were writing to. When the greeting names someone who is not
+                // the user and the user is only on Cc there is nothing to
+                // draft on their behalf — route to the Flag path so they still
+                // hear about it and can reply by hand. Cc placement alone is
+                // NOT enough (see is_cc_only_bystander). Sequenced AFTER the
+                // event-blast guard so blasts that Cc the user keep their
+                // silent ingest-only routing instead of posting flag notices.
                 let self_addrs: Vec<String> = match self.store.get_active_gmail_accounts() {
                     Ok(accounts) => accounts.into_iter().map(|a| a.email).collect(),
                     Err(e) => {
-                        // Never withhold a draft because of a store failure —
-                        // fall through and leave the call to the model, which
-                        // now sees the headers in its prompt.
+                        // Like the thread-reply lookup above: a store failure
+                        // must not withhold a draft. Fall through with no
+                        // addresses (the guard then can't fire) and leave the
+                        // call to the model, which now sees both headers.
                         warn!("cc-only guard: could not list own accounts: {e}");
                         Vec::new()
                     }
@@ -2346,9 +2345,10 @@ mod tests {
         assert_eq!(broker.posts.lock().unwrap().len(), 1);
     }
 
-    /// #845 — the message is addressed to someone else and the owner is only
-    /// on Cc ("I've CC'd our other organizers so we can coordinate"). Drafting
-    /// as the addressee produced a reply that opened by correcting the sender
+    /// #845 verbatim (invented addresses): the message is addressed to a venue
+    /// owner greeted as "Hi Gary!" — a name that appears nowhere in the To
+    /// header — and the owner is one of three Cc'd co-organizers. Drafting as
+    /// the addressee produced a reply that opened by correcting the sender
     /// about who they were writing to. The guard must route to Flag: notice,
     /// no draft, no approval card.
     #[tokio::test]
@@ -2357,13 +2357,13 @@ mod tests {
         let gmail = Arc::new(StubGmail {
             emails: vec![Email {
                 attachments: Vec::new(),
-                to: "dana@example.com".into(),
-                cc: "Owner <me@x.com>, Casey <casey@example.com>".into(), // pii-ok: synthetic test fixture
+                to: "gwhitaker@example.com".into(),
+                cc: "Me <me@x.com>, Casey <casey@example.com>, Sam <sam@example.com>".into(), // pii-ok: synthetic test fixture
                 message_id: "m-cc-only".into(),
                 thread_id: Some("T-cc-only".into()),
                 from: "Priya <priya@example.com>".into(),
                 subject: "Community Meetup – Venue Discussion".into(),
-                body: "Hi Dana! Wanted to talk about the space. \
+                body: "Hi Gary! We'd love to host our meetup at your space. \
                        I've CC'd our other organizers so we can coordinate."
                     .into(),
                 date: "Thu, 28 Aug 2026 12:00:00 +0000".into(),
@@ -2377,7 +2377,7 @@ mod tests {
         // never be consumed.
         let reasoner = Arc::new(ScriptedReasoner::new([
             r#"{"decision":"reply","reason":"venue discussion"}"#,
-            "Hi Dana, I'm not Dana — I think there may have been a mix-up.",
+            "Hi Priya — I think you have the wrong person; I'm not Gary.",
         ]));
         let broker = Arc::new(RecordingBroker::default());
         let ch = GmailChannel::new(
@@ -2399,7 +2399,7 @@ mod tests {
         let flags = broker.flag_posts.lock().unwrap();
         assert_eq!(flags.len(), 1, "one flag notice");
         assert!(
-            flags[0].1.contains("dana@example.com"),
+            flags[0].1.contains("gwhitaker@example.com"),
             "flag notice must name the actual addressee: {}",
             flags[0].1
         );
@@ -2407,8 +2407,8 @@ mod tests {
     }
 
     /// #845 negative pins — the guard fires ONLY when the owner is on Cc,
-    /// absent from a non-empty To, AND the body greets a To recipient.
-    /// Everything else still drafts.
+    /// absent from a non-empty To, AND the body greets someone who is not the
+    /// owner. Everything else still drafts.
     async fn drafts_with_headers(message_id: &str, to: &str, cc: &str, body: &str) {
         let (store, _f) = tmp_store();
         let gmail = Arc::new(StubGmail {
@@ -2449,37 +2449,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cc_only_guard_skipped_when_owner_is_on_to() {
-        let owner_on_to = "Me <me@x.com>"; // pii-ok: synthetic test fixture
-        drafts_with_headers("m-845-to", owner_on_to, "other@example.com", "Hi Dana!").await;
-    }
-
-    #[tokio::test]
-    async fn cc_only_guard_skipped_when_to_header_is_empty() {
-        // Pre-#629 rows, retry rehydration and non-Gmail platforms carry no
-        // headers at all — never withhold a draft on missing evidence.
-        let owner_on_cc = "me@x.com"; // pii-ok: synthetic test fixture
-        drafts_with_headers("m-845-noto", "", owner_on_cc, "Hi Dana!").await;
-    }
-
-    #[tokio::test]
-    async fn cc_only_guard_skipped_when_owner_on_neither_header() {
-        // Bcc / group alias / forwarding: the owner isn't visible in either
-        // header, so the message may well be squarely addressed to them.
-        let owner_hidden = "sam@example.com"; // pii-ok: synthetic test fixture
-        drafts_with_headers("m-845-bcc", "dana@example.com", owner_hidden, "Hi Dana!").await;
-    }
-
-    #[tokio::test]
-    async fn cc_only_guard_skipped_when_owner_is_greeted_by_name() {
-        // The Cc line is where a sender puts someone they still expect an
-        // answer from. "Hi Robin, can you confirm?" with Robin only on Cc is
-        // squarely addressed to the owner, so it must still get a draft.
-        let owner_on_cc = "Robin <me@x.com>"; // pii-ok: synthetic test fixture
+    async fn cc_only_guard_leaves_everything_else_on_the_drafting_path() {
+        // Ordinary addressed mail: owner on To, headers populated, guard
+        // silent. The owner's address is the one tmp_store seeds.
+        let owner = "Me <me@x.com>"; // pii-ok: synthetic test fixture
+        drafts_with_headers("m-845-to", owner, "other@example.com", "Hi Gary!").await;
+        // The Cc line is also where a sender puts someone they still expect an
+        // answer from: "Hi Robin, …" with Robin only on Cc is addressed to the
+        // owner. (The remaining header shapes — empty To, owner on neither
+        // header — are pinned in sigextract::tests.)
+        let owner_cc = "Robin <me@x.com>"; // pii-ok: synthetic test fixture
         drafts_with_headers(
             "m-845-greeted",
-            "dana@example.com",
-            owner_on_cc,
+            "gwhitaker@example.com",
+            owner_cc,
             "Hi Robin, can you confirm the deposit went out?",
         )
         .await;
