@@ -14,6 +14,8 @@ use thiserror::Error;
 
 use augmentagent_store::Email;
 
+use crate::outbound::parse_rfc2822_or_ms;
+
 #[derive(Debug, Error)]
 pub enum GmailError {
     #[error("http: {0}")]
@@ -74,10 +76,13 @@ pub trait GmailApi: Send + Sync {
     /// Fetch the last `max` messages of a Gmail thread, oldest-first, for
     /// thread-aware drafting (#32).
     ///
-    /// Wraps Gmail `users.threads.get`. Implementations SHOULD return the
-    /// chronologically-ordered messages and leave token/char budgeting to the
-    /// caller. The default impl returns an empty Vec so test fakes that don't
-    /// model threads still compile; `ComposioClient` overrides it with a real
+    /// Wraps Gmail `users.threads.get`. `max = 0` means no trim — the whole
+    /// thread. Implementations SHOULD return the chronologically-ordered
+    /// messages and leave token/char budgeting to the caller, but that is a
+    /// preference, not a guarantee the provider makes: callers that depend on
+    /// which message is oldest must order by `Email::date` themselves (#651).
+    /// The default impl returns an empty Vec so test fakes that don't model
+    /// threads still compile; `ComposioClient` overrides it with a real
     /// `GMAIL_FETCH_MESSAGE_BY_THREAD_ID` call.
     async fn fetch_thread_messages(
         &self,
@@ -602,18 +607,16 @@ impl ComposioClient {
     /// Gmail sends a threaded message under the thread's ORIGINAL subject and
     /// discards the one supplied alongside `thread_id`, so this — not any
     /// subject that happens to appear later in the thread — is what a compose
-    /// must agree with. `max = 0` keeps the whole thread so the oldest message
-    /// is the one we read.
+    /// must agree with. `max = 0` skips the trim in `fetch_thread_messages`,
+    /// keeping the whole thread; [`oldest_subject`] then picks the original
+    /// out of it without trusting the order Composio returned.
     pub async fn fetch_thread_subject(
         &self,
         entity_id: &str,
         thread_id: &str,
     ) -> Result<Option<String>, GmailError> {
         let messages = self.fetch_thread_messages(entity_id, thread_id, 0).await?;
-        Ok(messages
-            .into_iter()
-            .map(|m| m.subject)
-            .find(|s| !s.trim().is_empty()))
+        Ok(oldest_subject(&messages))
     }
 
     /// Shared paginated fetch for `GMAIL_FETCH_EMAILS`. Walks pages up to
@@ -820,6 +823,30 @@ pub fn normalize_subject(raw: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+/// Subject of the thread's OLDEST message — the one Gmail sends a threaded
+/// reply under (#651) — picked from each message's own timestamp rather than
+/// the order Composio returned them in.
+///
+/// `GMAIL_FETCH_MESSAGE_BY_THREAD_ID` documents no ordering guarantee, and we
+/// have seen Composio reshuffle and re-serve pages before (#331); a
+/// newest-first payload would otherwise let a subject someone introduced
+/// mid-thread pass for the original and re-open the reported bug. Undated
+/// messages sort behind every dated one, so a dated original still wins over
+/// an undated rename, and ties keep the provider's order — the best signal
+/// left when nothing carries a timestamp. Blank subjects are skipped: Gmail
+/// threads under the first real one.
+fn oldest_subject(messages: &[Email]) -> Option<String> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| !m.subject.trim().is_empty())
+        .min_by_key(|(i, m)| match parse_rfc2822_or_ms(&m.date) {
+            0 => (i64::MAX, *i),
+            ms => (ms, *i),
+        })
+        .map(|(_, m)| m.subject.clone())
 }
 
 #[cfg(test)]
@@ -1428,12 +1455,34 @@ mod tests {
     // ---- #651: the subject a threaded compose must agree with ----
 
     // A rename part-way down the thread does NOT change what Gmail sends
-    // under, so the oldest subject is the one we report.
+    // under, so the oldest subject is the one we report — and we must reach
+    // it from the timestamps, not from the position Composio put it in.
+    // Served newest-first here: reading the first message would report the
+    // rename and re-open #651.
     #[tokio::test]
-    async fn fetch_thread_subject_returns_the_original_not_a_later_rename() {
+    async fn fetch_thread_subject_returns_the_original_in_any_provider_order() {
         let body = r#"{"successful":true,"data":{"messages":[
-            {"id":"M1","threadId":"T1","subject":"Ground Floor as a venue?","from":"bo@example.com"},
-            {"id":"M2","threadId":"T1","subject":"Renamed mid-thread","from":"alice@example.com"}
+            {"id":"M2","threadId":"T1","subject":"Renamed mid-thread","from":"alice@example.com","messageTimestamp":"2026-08-14T09:30:00Z"},
+            {"id":"M1","threadId":"T1","subject":"Ground Floor as a venue?","from":"bob@example.com","messageTimestamp":"2026-08-12T17:02:00Z"}
+        ]}}"#;
+        let addr = spawn_one_shot_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let subject = client
+            .fetch_thread_subject("entity-x", "T1")
+            .await
+            .expect("thread subject should fetch");
+        assert_eq!(subject.as_deref(), Some("Ground Floor as a venue?"));
+    }
+
+    // Nothing to sort on: fall back to the order Composio served, skipping
+    // the subject-less message Gmail would not have threaded under.
+    #[tokio::test]
+    async fn fetch_thread_subject_falls_back_to_provider_order_when_undated() {
+        let body = r#"{"successful":true,"data":{"messages":[
+            {"id":"M1","threadId":"T1","subject":"","from":"bob@example.com"},
+            {"id":"M2","threadId":"T1","subject":"Ground Floor as a venue?","from":"bob@example.com"},
+            {"id":"M3","threadId":"T1","subject":"Renamed mid-thread","from":"alice@example.com"}
         ]}}"#;
         let addr = spawn_one_shot_http(200, body).await;
         let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
