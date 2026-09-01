@@ -15,16 +15,17 @@ pub fn bump_updated(page: &str, date: &str) -> Option<String> {
     let end = rest.find("\n---\n")?;
     let fm = &rest[..end];
 
-    for line in fm.lines() {
-        if let Some(existing) = line.strip_prefix("updated:") {
+    let mut lines: Vec<String> = fm.lines().map(str::to_string).collect();
+    for i in 0..lines.len() {
+        if let Some(existing) = lines[i].strip_prefix("updated:") {
             let existing = existing.trim().trim_matches('\'').trim_matches('"');
             if existing >= date {
                 return None; // ISO dates compare lexicographically
             }
-            let old_line = line;
-            let new_line = format!("updated: {date}");
-            let new_fm = fm.replacen(old_line, &new_line, 1);
-            return Some(format!("---\n{new_fm}{}", &rest[end..]));
+            // Rebuild by line index — a substring replace would hit a
+            // lookalike key (`last-updated:`) that sorts earlier in the file.
+            lines[i] = format!("updated: {date}");
+            return Some(format!("---\n{}{}", lines.join("\n"), &rest[end..]));
         }
     }
     // No updated: field — insert one at the end of the frontmatter.
@@ -62,5 +63,23 @@ mod tests {
     #[test]
     fn no_frontmatter_is_untouched() {
         assert!(bump_updated("# John\n", "2026-08-26").is_none());
+    }
+
+    #[test]
+    fn only_the_updated_line_is_rewritten_despite_lookalike_keys() {
+        // `last-updated:` contains the substring "updated: 2026-05-01" — a
+        // substring-based replace corrupts it and leaves the real field
+        // untouched (repeating every sync). Caught in review.
+        let page =
+            "---\nkind: person\nlast-updated: 2026-05-01\nupdated: 2026-05-01\n---\n\n# John\n";
+        let out = bump_updated(page, "2026-08-26").unwrap();
+        assert!(
+            out.contains("last-updated: 2026-05-01"),
+            "unrelated field must survive:\n{out}"
+        );
+        assert!(
+            out.contains("\nupdated: 2026-08-26\n"),
+            "real field must advance:\n{out}"
+        );
     }
 }
