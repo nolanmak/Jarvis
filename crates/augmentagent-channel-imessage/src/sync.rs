@@ -28,6 +28,9 @@ pub struct ImessageReport {
     pub noop: usize,
     pub skipped: usize,
     pub phones_indexed: usize,
+    /// DMs whose page was found by full-name match rather than by phone or
+    /// identity index (see `ImessageSyncer::resolve_by_name`).
+    pub resolved_by_name: usize,
     pub applied: bool,
     pub diffs: Vec<ImessageDiff>,
 }
@@ -81,6 +84,7 @@ impl ImessageSyncer<'_> {
                 .cloned()
                 .unwrap_or_else(|| conv.identifier.clone());
 
+            let title = clean_title(&conv.title);
             let (slug, existing_path) = match self.resolve(&index, &handle) {
                 Some(hit) => hit,
                 None => {
@@ -98,15 +102,26 @@ impl ImessageSyncer<'_> {
                         });
                         continue;
                     }
-                    let slug = slug_from_email(&format!("{}@contact", conv.title));
-                    let path = self.layout.people_dir().join(format!("{slug}.md"));
-                    (slug, path)
+                    // No phone/identity hit, but the wiki may already hold
+                    // this person under the LLM-ingest slug (kebab full name,
+                    // `chris-crimi.md`). At first backfill only 3 of ~1,350
+                    // people pages carried a phone, so without this step
+                    // every texter with an email-only page got a duplicate
+                    // `<name>_at_contact.md` stub.
+                    if let Some(hit) = self.resolve_by_name(&title) {
+                        report.resolved_by_name += 1;
+                        hit
+                    } else {
+                        let slug = slug_from_email(&format!("{title}@contact"));
+                        let path = self.layout.people_dir().join(format!("{slug}.md"));
+                        (slug, path)
+                    }
                 }
             };
 
             let existing = std::fs::read_to_string(&existing_path).ok();
             let mut patch = PersonPatch::new()
-                .with_display_name(conv.title.clone())
+                .with_display_name(title.clone())
                 .identity("imessage", &handle)
                 .source(format!(
                     "iMessage history: {} messages through {} ({})",
@@ -152,7 +167,7 @@ impl ImessageSyncer<'_> {
                     self.store.upsert_phone_identity(&PhoneIdentity {
                         phone: handle.clone(),
                         person_slug: slug.clone(),
-                        display_name: Some(conv.title.clone()),
+                        display_name: Some(title.clone()),
                         source: "imessage".into(),
                     })?;
                     report.phones_indexed += 1;
@@ -162,7 +177,7 @@ impl ImessageSyncer<'_> {
             }
 
             report.diffs.push(ImessageDiff {
-                title: conv.title.clone(),
+                title,
                 slug: Some(slug),
                 action: action.into(),
                 last_message: last_date.map(str::to_string),
@@ -227,6 +242,56 @@ impl ImessageSyncer<'_> {
             .lookup("imessage", handle)
             .map(|p| (p.slug.clone(), p.path.clone()))
     }
+
+    /// Last resort for DMs: an existing `people/<kebab-full-name>.md` page.
+    /// Conservative on purpose — `name_slug` refuses single-token names, and
+    /// the file must already exist. A miss here means a fresh stub, never a
+    /// guess.
+    fn resolve_by_name(&self, title: &str) -> Option<(String, PathBuf)> {
+        let slug = name_slug(title)?;
+        let path = self.layout.people_dir().join(format!("{slug}.md"));
+        path.is_file().then_some((slug, path))
+    }
+}
+
+/// Contact display names sometimes arrive with the surname doubled
+/// ("Derek Meegan Meegan") when the Contacts card's first-name field already
+/// holds the full name. Collapse an immediately repeated trailing token when
+/// there are at least three tokens; two-token names ("Sirhan Sirhan") are
+/// left alone. Whitespace is normalized either way.
+pub(crate) fn clean_title(title: &str) -> String {
+    let toks: Vec<&str> = title.split_whitespace().collect();
+    let n = toks.len();
+    if n >= 3 && toks[n - 1].eq_ignore_ascii_case(toks[n - 2]) {
+        return toks[..n - 1].join(" ");
+    }
+    toks.join(" ")
+}
+
+/// The `people/<slug>.md` convention LLM ingest uses: lowercase ASCII kebab
+/// of the full name. `None` unless at least two alphabetic segments survive —
+/// "Chase", "Pop" or "📫" are not enough evidence to claim an existing page.
+/// Non-ASCII letters are dropped rather than transliterated, so an accented
+/// name yields a slug that will not match anything and falls through to a
+/// stub (a miss, never a false positive).
+pub(crate) fn name_slug(title: &str) -> Option<String> {
+    let mut out = String::with_capacity(title.len());
+    let mut last_dash = true;
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    let alpha_segments = out
+        .split('-')
+        .filter(|seg| seg.chars().any(|c| c.is_ascii_alphabetic()))
+        .count();
+    (alpha_segments >= 2).then_some(out)
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -464,6 +529,99 @@ mod tests {
         assert!(page.contains("imessage:"), "identity appended:\n{page}");
         // page was touched more recently than the last text — keep it
         assert!(page.contains("updated: 2026-12-01"), "page:\n{page}");
+    }
+
+    #[test]
+    fn backfill_resolves_existing_page_by_full_name_instead_of_stubbing() {
+        // Email-only page (the common case: 1,348 of ~1,350 pages had no
+        // phone at first backfill). Title carries the doubled-surname
+        // artifact too.
+        let (dir, layout, store) = fresh_env();
+        std::fs::write(
+            layout.people_dir().join("derek-meegan.md"),
+            "---\nkind: person\nkey: derek-meegan\nupdated: 2026-05-01\nidentities:\n  email: [derek@example.com]\n---\n\n# Derek Meegan\n\n## Profile\n\n## Source\n",
+        )
+        .unwrap();
+        let bundle = fixture_bundle(
+            dir.path(),
+            &[("+14155550123", "Derek_Meegan", "Derek Meegan Meegan", DM_MD)],
+        );
+        let syncer = ImessageSyncer {
+            bundle: &bundle,
+            layout: &layout,
+            store: &store,
+            apply: true,
+        };
+        let report = syncer.run().unwrap();
+        assert_eq!(report.pages_created, 0, "must not stub a duplicate");
+        assert_eq!(report.resolved_by_name, 1);
+        assert_eq!(report.diffs[0].slug.as_deref(), Some("derek-meegan"));
+        assert_eq!(report.diffs[0].title, "Derek Meegan", "surname collapsed");
+        assert!(!layout
+            .people_dir()
+            .join("derek_meegan_meegan_at_contact.md")
+            .exists());
+        let page = std::fs::read_to_string(layout.people_dir().join("derek-meegan.md")).unwrap();
+        assert!(page.contains("imessage:"), "identity appended:\n{page}");
+        assert!(page.contains("updated: 2026-08-26"), "bumped to last text:\n{page}");
+        // phone reverse index now points at the canonical page
+        assert_eq!(
+            store
+                .lookup_person_by_phone("+14155550123")
+                .unwrap()
+                .unwrap()
+                .person_slug,
+            "derek-meegan"
+        );
+    }
+
+    #[test]
+    fn single_token_title_never_claims_an_existing_page() {
+        let (dir, layout, store) = fresh_env();
+        std::fs::write(
+            layout.people_dir().join("chase.md"),
+            "---\nkind: person\nkey: chase\n---\n\n# Chase (bank)\n",
+        )
+        .unwrap();
+        let md = "---\ntitle: 'Chase'\n---\n\n### [2026-08-26T11:00:00-04:00] +14155550777\nhey\n";
+        let bundle = fixture_bundle(dir.path(), &[("+14155550777", "Chase", "Chase", md)]);
+        let syncer = ImessageSyncer {
+            bundle: &bundle,
+            layout: &layout,
+            store: &store,
+            apply: true,
+        };
+        let report = syncer.run().unwrap();
+        assert_eq!(report.resolved_by_name, 0);
+        assert_eq!(report.pages_created, 1);
+        assert!(layout.people_dir().join("chase_at_contact.md").exists());
+        let untouched = std::fs::read_to_string(layout.people_dir().join("chase.md")).unwrap();
+        assert!(!untouched.contains("imessage"), "existing page must be left alone");
+    }
+
+    #[test]
+    fn clean_title_collapses_doubled_surname_only() {
+        assert_eq!(clean_title("Derek Meegan Meegan"), "Derek Meegan");
+        assert_eq!(clean_title("Aunt Laurie laurie"), "Aunt Laurie");
+        assert_eq!(clean_title("Sirhan Sirhan"), "Sirhan Sirhan");
+        assert_eq!(clean_title("Kevin Mckenna Netrality"), "Kevin Mckenna Netrality");
+        assert_eq!(clean_title("  Chris   Crimi "), "Chris Crimi");
+        assert_eq!(clean_title("+14155550123"), "+14155550123");
+    }
+
+    #[test]
+    fn name_slug_requires_two_alphabetic_segments() {
+        assert_eq!(name_slug("Chris Crimi").as_deref(), Some("chris-crimi"));
+        assert_eq!(
+            name_slug("Emmett Madden-Prado").as_deref(),
+            Some("emmett-madden-prado")
+        );
+        assert_eq!(name_slug("Taylor Yates 💚🩵").as_deref(), Some("taylor-yates"));
+        assert_eq!(name_slug("lasya tarini").as_deref(), Some("lasya-tarini"));
+        assert_eq!(name_slug("Chase"), None);
+        assert_eq!(name_slug("📫"), None);
+        assert_eq!(name_slug("+14155550123"), None);
+        assert_eq!(name_slug("KP 2"), None, "digits are not a name segment");
     }
 
     #[test]
