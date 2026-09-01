@@ -110,6 +110,56 @@ restart_unit augmentagent.service >/dev/null 2>&1
 check "succeeds when the process actually bounced" "$?" "0"
 teardown_stub
 
+echo "maybe_defer_restart (#844):"
+
+DEFER_DIR=$(mktemp -d)
+export AUGMENTAGENT_SELFIMPROVE_LOCK="$DEFER_DIR/self-improve.lock"
+export AUGMENTAGENT_RESTART_DEFER_STAMP="$DEFER_DIR/deferred-since"
+export AUGMENTAGENT_RESTART_DEFER_MAX_SECS=2400
+# Re-read the config now that the overrides exist.
+SELF_IMPROVE_LOCK="$AUGMENTAGENT_SELFIMPROVE_LOCK"
+RESTART_DEFER_STAMP="$AUGMENTAGENT_RESTART_DEFER_STAMP"
+RESTART_DEFER_MAX_SECS="$AUGMENTAGENT_RESTART_DEFER_MAX_SECS"
+
+# No lock file at all -> proceed.
+maybe_defer_restart >/dev/null 2>&1
+check "proceeds when no run has ever taken the lock" "$?" "1"
+
+# Lock file present but NOT held -> proceed (a finished run leaves the file).
+touch "$AUGMENTAGENT_SELFIMPROVE_LOCK"
+maybe_defer_restart >/dev/null 2>&1
+check "proceeds when the lock file exists but nothing holds it" "$?" "1"
+
+# Held lock -> defer, and record when the deferral started.
+flock -x "$AUGMENTAGENT_SELFIMPROVE_LOCK" -c 'sleep 30' &
+HOLDER=$!
+sleep 0.3
+maybe_defer_restart >/dev/null 2>&1
+check "defers while a run holds the lock" "$?" "0"
+[ -s "$AUGMENTAGENT_RESTART_DEFER_STAMP" ] \
+  && ok "records when the deferral began" \
+  || bad "records when the deferral began" "stamp file empty/absent"
+
+# Still held but the budget is exhausted -> proceed anyway.
+printf '%s\n' "$(( $(date +%s) - 3000 ))" > "$AUGMENTAGENT_RESTART_DEFER_STAMP"
+maybe_defer_restart >/dev/null 2>&1
+check "restarts anyway once the deferral budget is exhausted" "$?" "1"
+[ -e "$AUGMENTAGENT_RESTART_DEFER_STAMP" ] \
+  && bad "clears its state after a forced proceed" "stamp survived" \
+  || ok "clears its state after a forced proceed"
+
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+
+# Lock released -> proceed and clear any leftover stamp.
+printf '9\n' > "$AUGMENTAGENT_RESTART_DEFER_STAMP"
+maybe_defer_restart >/dev/null 2>&1
+check "proceeds again once the run has finished" "$?" "1"
+[ -e "$AUGMENTAGENT_RESTART_DEFER_STAMP" ] \
+  && bad "clears stale deferral state when the lock is free" "stamp survived" \
+  || ok "clears stale deferral state when the lock is free"
+rm -rf "$DEFER_DIR"
+unset AUGMENTAGENT_SELFIMPROVE_LOCK AUGMENTAGENT_RESTART_DEFER_STAMP
+
 echo "should_write_stamp:"
 should_write_stamp 0; check "writes the stamp when nothing failed" "$?" "0"
 should_write_stamp 1; check "withholds the stamp when a required restart failed" "$?" "1"
