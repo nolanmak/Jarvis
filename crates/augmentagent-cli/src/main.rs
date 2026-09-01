@@ -244,6 +244,12 @@ enum Cmd {
         #[command(subcommand)]
         op: JournalOp,
     },
+    /// iMessage history bundle → KB (#882). Opt-in: inert unless
+    /// AUGMENTAGENT_IMESSAGE_REPO_DIR points at the bundle repo.
+    Imessage {
+        #[command(subcommand)]
+        op: ImessageOp,
+    },
     /// Voice memo capture: drop-folder watcher + Whisper transcription ->
     /// wiki ingest. All ops stubs in foundation/swarm-v1.
     Voice {
@@ -962,6 +968,22 @@ enum JournalOp {
     SkipToNow,
     /// #900 — print the persisted watermark and in-progress cursor.
     Status,
+}
+
+#[derive(Subcommand)]
+enum ImessageOp {
+    /// Backfill conversation history into person pages (#885). Dry-run
+    /// JSON report by default; pass `--apply` to write fill-blanks pages,
+    /// stamp `updated:` with last-message dates, and index phones.
+    Sync {
+        /// Write wiki pages + phone index (default: dry-run only).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Run one incremental poll pass and exit (#886): persist new bundle
+    /// entries as `emails` rows and advance the per-conversation cursor.
+    /// Does not fire wiki ingest — that's the daemon loop's job.
+    PollOnce,
 }
 
 #[derive(Subcommand)]
@@ -2550,6 +2572,27 @@ async fn main() -> Result<()> {
                     warn!("shadownote journal channel disabled: {e:#}");
                 }
             }
+            // #886 — iMessage bundle → emails + wiki ingest. Self-gates on
+            // AUGMENTAGENT_IMESSAGE_REPO_DIR; an unconfigured box logs and
+            // moves on, same as the journal gate above.
+            match augmentagent_channel_imessage::ImessageConfig::load() {
+                Some(imcfg) => {
+                    let store_c = Arc::clone(&store);
+                    let reasoner = build_reasoner();
+                    let wiki_root = cli.wiki_dir.clone();
+                    let wiki_schema = wiki_root
+                        .as_ref()
+                        .and_then(|_| std::fs::read_to_string("schema/wiki-skill.md").ok());
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        imessage_poll_loop(imcfg, store_c, reasoner, wiki_root, wiki_schema, sd)
+                            .await
+                    }));
+                }
+                None => {
+                    info!("imessage channel disabled: AUGMENTAGENT_IMESSAGE_REPO_DIR not set");
+                }
+            }
             // #48 — Reddit channel. Self-gates on having completed the
             // dashboard OAuth bootstrap (refresh token in keyring); prod
             // without it never spawns this, exactly like github/meetup gate.
@@ -3069,6 +3112,16 @@ async fn main() -> Result<()> {
             }
             JournalOp::Status => {
                 run_journal_status(store).await?;
+                Ok(())
+            }
+        },
+        Cmd::Imessage { ref op } => match op {
+            ImessageOp::Sync { apply } => {
+                run_imessage_sync(&cli, store, *apply)?;
+                Ok(())
+            }
+            ImessageOp::PollOnce => {
+                run_imessage_poll_once(store)?;
                 Ok(())
             }
         },
@@ -10562,6 +10615,121 @@ async fn run_linkedin_connections_sync(
 /// `carddav` (env-configured). Dry-run JSON by default; `--apply` writes
 /// fill-blanks wiki pages, indexes phones, persists the sync cursor, and
 /// posts a Discord summary.
+/// #885 — iMessage history → person pages. Dry-run prints the JSON report
+/// and writes nothing; `--apply` writes fill-blanks pages and indexes phones.
+fn run_imessage_sync(cli: &Cli, store: Arc<Store>, apply: bool) -> Result<()> {
+    let config = augmentagent_channel_imessage::ImessageConfig::load()
+        .context("AUGMENTAGENT_IMESSAGE_REPO_DIR is required for imessage sync")?;
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for imessage sync")?;
+    let layout = augmentagent_wiki::WikiLayout::new(wiki_root);
+    layout.bootstrap().context("wiki bootstrap")?;
+
+    let bundle = augmentagent_channel_imessage::Bundle::open(&config.repo_dir);
+    let syncer = augmentagent_channel_imessage::ImessageSyncer {
+        bundle: &bundle,
+        layout: &layout,
+        store: &store,
+        apply,
+    };
+    info!(repo = %config.repo_dir.display(), apply, "starting imessage sync");
+    let report = syncer.run().context("imessage sync run")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// #886 — one incremental poll pass: new bundle entries → `emails` rows,
+/// cursor advanced. Wiki ingest is deliberately not fired here (daemon-only).
+fn run_imessage_poll_once(store: Arc<Store>) -> Result<()> {
+    let config = augmentagent_channel_imessage::ImessageConfig::load()
+        .context("AUGMENTAGENT_IMESSAGE_REPO_DIR is required for imessage poll")?;
+    let bundle = augmentagent_channel_imessage::Bundle::open(&config.repo_dir);
+    let (stats, deltas) = augmentagent_channel_imessage::poll_once(&bundle, &store)
+        .context("imessage poll")?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "conversations_with_new": stats.conversations_with_new,
+            "emails_inserted": stats.emails_inserted,
+            "first_run_conversations": deltas.iter().filter(|d| d.first_run).count(),
+        })
+    );
+    Ok(())
+}
+
+/// #886 — daemon loop: refresh the bundle repo, poll for new entries, and
+/// fan fresh (non-first-run) conversation deltas into `Capture` wiki ingest.
+async fn imessage_poll_loop(
+    config: augmentagent_channel_imessage::ImessageConfig,
+    store: Arc<Store>,
+    reasoner: Arc<FallbackReasoner>,
+    wiki_root: Option<PathBuf>,
+    wiki_schema: Option<String>,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    const POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
+    let mut tick = tokio::time::interval(POLL_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = tick.tick() => {}
+        }
+        // The bundle repo is kept current by the operator's own sync job;
+        // a pull failure (offline, not a git repo) degrades to reading
+        // whatever is on disk.
+        let pull = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&config.repo_dir)
+            .args(["pull", "--ff-only", "--quiet"])
+            .output()
+            .await;
+        if let Ok(out) = &pull {
+            if !out.status.success() {
+                warn!(
+                    stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                    "imessage bundle git pull failed; reading on-disk state"
+                );
+            }
+        }
+
+        let bundle = augmentagent_channel_imessage::Bundle::open(&config.repo_dir);
+        let (stats, deltas) = match augmentagent_channel_imessage::poll_once(&bundle, &store) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("imessage poll failed: {e:#}");
+                continue;
+            }
+        };
+        if stats.emails_inserted > 0 {
+            info!(
+                conversations = stats.conversations_with_new,
+                emails = stats.emails_inserted,
+                "imessage poll ingested new messages"
+            );
+        }
+        let (Some(root), Some(schema)) = (&wiki_root, &wiki_schema) else {
+            continue;
+        };
+        for delta in deltas.iter().filter(|d| !d.first_run) {
+            augmentagent_channel_core::ingest::spawn_ingest(
+                Arc::clone(&reasoner),
+                root.clone(),
+                schema.clone(),
+                augmentagent_channel_imessage::batched_delta_email(delta),
+                augmentagent_channel_core::decision::DecisionKind::Capture,
+                Some("imessage history sync".to_string()),
+                None,
+                augmentagent_channel_core::ingest::IngestTrigger::ImessageHistory,
+            );
+        }
+    }
+}
+
 async fn run_contacts_sync(
     cli: &Cli,
     store: Arc<Store>,

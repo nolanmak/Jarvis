@@ -17,4 +17,6 @@ pub use bundle::{
 };
 pub use config::ImessageConfig;
 pub use page::bump_updated;
-pub use sync::{ImessageReport, ImessageSyncer};
+pub use sync::{
+    batched_delta_email, poll_once, ImessageReport, ImessageSyncer, PollDelta, PollStats,
+};

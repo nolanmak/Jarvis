@@ -56,6 +56,9 @@ pub enum IngestTrigger {
     /// ShadowNote journal entry synced into the wiki (#427). Pairs with
     /// `DecisionKind::Capture`, like voice memos.
     Journal,
+    /// New iMessage bundle entries synced into the wiki (#886). Pairs with
+    /// `DecisionKind::Capture`; never fired on a first full-history pass.
+    ImessageHistory,
 }
 
 impl IngestTrigger {
@@ -69,6 +72,7 @@ impl IngestTrigger {
             Self::VoiceMemo => "voice-memo",
             Self::Meeting => "meeting",
             Self::Journal => "journal",
+            Self::ImessageHistory => "imessage-history",
         }
     }
 }
