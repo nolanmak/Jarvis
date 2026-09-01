@@ -1497,6 +1497,27 @@ mod tests {
 
     // ---- #651: the subject a threaded compose must agree with ----
 
+    // `fetch_thread_subject` asks for `max = 0` meaning "no trim". Were that
+    // ever read as "keep zero messages" it would report a subject-less thread
+    // and wave every conflicting --subject straight through the guard, so pin
+    // the contract here rather than in a doc comment alone.
+    #[tokio::test]
+    async fn fetch_thread_messages_keeps_the_whole_thread_when_max_is_zero() {
+        let body = r#"{"successful":true,"data":{"messages":[
+            {"id":"M1","threadId":"T1","subject":"Ground Floor as a venue?","from":"bob@example.com","messageTimestamp":"2026-08-12T17:02:00Z"},
+            {"id":"M2","threadId":"T1","subject":"Re: Ground Floor as a venue?","from":"alice@example.com","messageTimestamp":"2026-08-14T09:30:00Z"}
+        ]}}"#;
+        let addr = spawn_one_shot_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let msgs = client
+            .fetch_thread_messages("entity-x", "T1", 0)
+            .await
+            .expect("thread should fetch");
+        let ids: Vec<&str> = msgs.iter().map(|m| m.message_id.as_str()).collect();
+        assert_eq!(ids, vec!["M1", "M2"], "max = 0 must not trim the thread");
+    }
+
     // A rename part-way down the thread does NOT change what Gmail sends
     // under, so the oldest subject is the one we report — and we must reach
     // it from the timestamps, not from the position Composio put it in.
@@ -2182,6 +2203,8 @@ impl GmailApi for ComposioClient {
             .filter_map(|m| m.into_email(entity_id))
             .collect();
         // Keep only the last `max` messages, preserving chronological order.
+        // `max == 0` means no trim, not "keep none": `fetch_thread_subject`
+        // relies on it to see the message the thread was started under (#651).
         if max > 0 && msgs.len() > max as usize {
             let drop = msgs.len() - max as usize;
             msgs.drain(0..drop);
