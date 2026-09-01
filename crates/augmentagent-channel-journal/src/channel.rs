@@ -28,6 +28,11 @@
 //!   watermark is left alone, and the operator chooses between
 //!   `augmentagent journal backfill` (import deliberately, capped) and
 //!   `augmentagent journal skip-to-now` (follow new entries only).
+//! - **Cannot hang (#901).** Every request has connect/request timeouts
+//!   (see `client`), a poll may not outlive half the tick interval, and
+//!   pagination stops after `max_pages_per_poll` pages. A hung or looping
+//!   upstream therefore surfaces as a logged failure and the next tick
+//!   still fires; the persisted cursor resumes whatever was left.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -63,6 +68,9 @@ pub struct JournalChannelConfig {
     pub base_sync_threshold: usize,
     /// #900 — operator opt-in for a deliberate full import.
     pub allow_base_sync: bool,
+    /// #901 — pages fetched per `poll_once` before it yields with the
+    /// cursor persisted; a bound on a server that never stops paginating.
+    pub max_pages_per_poll: usize,
 }
 
 /// #900 — AppSync DataStore's delta-sync TTL defaults to 30 minutes; polling
@@ -75,6 +83,9 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub const DEFAULT_MAX_ENTRIES_PER_POLL: usize = 50;
 /// #900 — rows a delta poll may return before it is called a base sync.
 pub const DEFAULT_BASE_SYNC_THRESHOLD: usize = 500;
+/// #901 — pages per poll. 50 × PAGE_LIMIT(100) rows is far beyond any
+/// legitimate delta; the cursor carries the rest to the next tick.
+pub const DEFAULT_MAX_PAGES_PER_POLL: usize = 50;
 
 #[derive(Debug, Default)]
 pub struct PollOutcome {
@@ -142,6 +153,10 @@ where
 
     pub async fn run(&self, shutdown: CancellationToken) -> anyhow::Result<()> {
         let mut tick = tokio::time::interval(self.config.poll_interval);
+        // #901 — a poll may never outlive half the interval. Dropping the
+        // future mid-pass is safe: the cursor is persisted per page (#900),
+        // so the next tick resumes rather than replays.
+        let deadline = (self.config.poll_interval / 2).max(Duration::from_millis(50));
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
@@ -149,14 +164,18 @@ where
                     return Ok(());
                 }
                 _ = tick.tick() => {
-                    match self.poll_once().await {
-                        Ok(outcome) if outcome.refused => warn!(
+                    match tokio::time::timeout(deadline, self.poll_once()).await {
+                        Ok(Ok(outcome)) if outcome.refused => warn!(
                             ?outcome,
                             "journal poll refused (base-sync fallback) — \
                              `augmentagent journal backfill` or `journal skip-to-now`"
                         ),
-                        Ok(outcome) => info!(?outcome, "journal poll complete"),
-                        Err(e) => error!("journal poll failed: {e:#}"),
+                        Ok(Ok(outcome)) => info!(?outcome, "journal poll complete"),
+                        Ok(Err(e)) => error!("journal poll failed: {e:#}"),
+                        Err(_) => error!(
+                            deadline_secs = deadline.as_secs_f64(),
+                            "journal poll timed out; the persisted cursor resumes next tick"
+                        ),
                     }
                 }
             }
@@ -205,6 +224,8 @@ where
         };
         outcome.resumed = cursor.is_some();
 
+        let max_pages = self.config.max_pages_per_poll.max(1);
+
         // Phase A — base-sync detection for a fresh delta pass: buffer pages
         // (no side effects) until the pass ends or the threshold is crossed.
         let mut pending: VecDeque<(Option<String>, EntryPage)> = VecDeque::new();
@@ -218,7 +239,10 @@ where
                 seen += page.items.len();
                 next_token = page.next_token.clone();
                 pending.push_back((token_used, page));
-                if next_token.is_none() || seen >= self.config.base_sync_threshold {
+                if next_token.is_none()
+                    || seen >= self.config.base_sync_threshold
+                    || outcome.pages >= max_pages
+                {
                     break;
                 }
             }
@@ -246,6 +270,11 @@ where
                 let (token_used, page) = match pending.pop_front() {
                     Some(p) => p,
                     None => {
+                        if outcome.pages >= max_pages {
+                            // #901 — the cursor for the next page was
+                            // persisted when the previous one completed.
+                            return Ok(false);
+                        }
                         let token_used = next_token.clone();
                         let page = self
                             .fetch_page(
@@ -517,6 +546,9 @@ mod tests {
         pages: Vec<EntryPage>,
         calls: Mutex<Vec<(Option<i64>, Option<String>)>>,
         fail_once_at: Mutex<Option<usize>>,
+        /// #901 — when set, every fetch records the call and then never
+        /// answers (a request with no timeout against a dead upstream).
+        hang: Mutex<bool>,
     }
     #[async_trait]
     impl JournalApi for FakeApi {
@@ -529,6 +561,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((last_sync, next_token.clone()));
+            if *self.hang.lock().unwrap() {
+                std::future::pending::<()>().await;
+            }
             let idx = next_token
                 .as_deref()
                 .and_then(|t| t.parse::<usize>().ok())
@@ -594,12 +629,16 @@ mod tests {
         cap: usize,
         threshold: usize,
         allow_base_sync: bool,
+        interval: Duration,
+        max_pages: usize,
     }
     const LIVE: Opts = Opts {
         dry_run: false,
         cap: 1_000,
         threshold: 500,
         allow_base_sync: false,
+        interval: DEFAULT_POLL_INTERVAL,
+        max_pages: DEFAULT_MAX_PAGES_PER_POLL,
     };
     const DRY: Opts = Opts {
         dry_run: true,
@@ -623,16 +662,18 @@ mod tests {
             pages,
             calls: Mutex::new(Vec::new()),
             fail_once_at: Mutex::new(None),
+            hang: Mutex::new(false),
         });
         let config = JournalChannelConfig {
             owner_id: "owner-1".into(),
             dry_run: opts.dry_run,
             wiki_root: None,
             wiki_schema_path: None,
-            poll_interval: DEFAULT_POLL_INTERVAL,
+            poll_interval: opts.interval,
             max_entries_per_poll: opts.cap,
             base_sync_threshold: opts.threshold,
             allow_base_sync: opts.allow_base_sync,
+            max_pages_per_poll: opts.max_pages,
         };
         JournalChannel::new(store, api, Arc::new(FixedDek), Arc::new(NoopReasoner), config)
     }
@@ -884,6 +925,43 @@ mod tests {
         assert!(!p2.resumed);
         assert_eq!(p2.processed, 50);
         assert_eq!(p2.skipped_already_ingested, 0);
+    }
+
+    // ---- #901: a hung request must not freeze the channel loop ----
+
+    #[tokio::test]
+    async fn hung_page_fetch_does_not_block_the_loop() {
+        // 200 ms interval → 100 ms poll deadline. Every fetch hangs; the
+        // loop must time each poll out and keep ticking, not park forever
+        // inside the first `poll_once` (which is what froze the watermark
+        // on 2026-08-31).
+        let opts = Opts {
+            interval: Duration::from_millis(200),
+            ..LIVE
+        };
+        let (ch, _store, _d) = channel(vec![page("e", 1, None, 10)], opts);
+        *ch.api.hang.lock().unwrap() = true;
+        let shutdown = CancellationToken::new();
+        tokio::select! {
+            r = ch.run(shutdown.clone()) => r.unwrap(),
+            _ = tokio::time::sleep(Duration::from_millis(700)) => shutdown.cancel(),
+        }
+        let attempts = calls(&ch).len();
+        assert!(attempts >= 2, "loop parked after the first hung poll: {attempts} attempt(s)");
+    }
+
+    #[tokio::test]
+    async fn pagination_is_bounded_per_poll() {
+        // A server that always hands back a next token must not spin the
+        // poller forever: stop at `max_pages_per_poll` with the cursor
+        // persisted so the next tick continues from there.
+        let looping = page("e", 1, Some("0"), 10);
+        let opts = Opts { max_pages: 7, ..LIVE };
+        let (ch, store, _d) = channel(vec![looping], opts);
+        let out = ch.poll_once().await.unwrap();
+        assert_eq!(out.pages, 7);
+        assert_eq!(out.watermark_ms, None, "pass is not complete");
+        assert!(store.get_journal_sync_cursor("owner-1").unwrap().is_some());
     }
 
     #[test]

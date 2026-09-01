@@ -2536,6 +2536,8 @@ async fn main() -> Result<()> {
                             base_sync_threshold:
                                 augmentagent_channel_journal::DEFAULT_BASE_SYNC_THRESHOLD,
                             allow_base_sync: false,
+                            max_pages_per_poll:
+                                augmentagent_channel_journal::DEFAULT_MAX_PAGES_PER_POLL,
                         },
                     );
                     let sd = shutdown.clone();
@@ -13222,7 +13224,7 @@ async fn run_journal_poll_once(
 ) -> Result<()> {
     use augmentagent_channel_journal::{
         JournalChannel, JournalChannelConfig, JournalRuntime, DEFAULT_BASE_SYNC_THRESHOLD,
-        DEFAULT_MAX_ENTRIES_PER_POLL,
+        DEFAULT_MAX_ENTRIES_PER_POLL, DEFAULT_MAX_PAGES_PER_POLL,
     };
 
     let Some(runtime) = JournalRuntime::from_env().await? else {
@@ -13244,6 +13246,7 @@ async fn run_journal_poll_once(
         max_entries_per_poll: max_entries.unwrap_or(DEFAULT_MAX_ENTRIES_PER_POLL),
         base_sync_threshold: DEFAULT_BASE_SYNC_THRESHOLD,
         allow_base_sync,
+        max_pages_per_poll: DEFAULT_MAX_PAGES_PER_POLL,
     };
     let reasoner = build_reasoner();
     let channel = JournalChannel::new(

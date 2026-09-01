@@ -155,10 +155,37 @@ pub struct ShadowNoteClient {
     credentials: SharedCredentialsProvider,
 }
 
+/// #901 — no request may hang the poller. On 2026-08-31 a sync pass sat
+/// inside an unbounded request for hours, which froze the watermark and
+/// turned every restart into a full replay. Connect and whole-request
+/// bounds; the latter is overridable with `SHADOWNOTE_HTTP_TIMEOUT_SECS`.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn http_client(connect: Duration, request: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .timeout(request)
+        .build()
+        .unwrap_or_else(|e| {
+            warn!("reqwest client builder failed ({e}); falling back to the default client");
+            reqwest::Client::new()
+        })
+}
+
+fn request_timeout_from_env() -> Duration {
+    std::env::var("SHADOWNOTE_HTTP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+}
+
 impl ShadowNoteClient {
     pub fn new(config: &JournalConfig, credentials: SharedCredentialsProvider) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: http_client(DEFAULT_CONNECT_TIMEOUT, request_timeout_from_env()),
             url: config.appsync_url.clone(),
             region: config.region.clone(),
             owner_id: config.owner_id.clone(),
@@ -184,6 +211,12 @@ impl ShadowNoteClient {
     /// Point at a mock server in tests.
     pub fn with_base_url(mut self, url: String) -> Self {
         self.url = url;
+        self
+    }
+
+    /// #901 — override the connect / whole-request bounds (tests, ops tuning).
+    pub fn with_timeouts(mut self, connect: Duration, request: Duration) -> Self {
+        self.http = http_client(connect, request);
         self
     }
 
@@ -484,6 +517,37 @@ mod tests {
             .unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].title.as_deref(), Some("mine"));
+    }
+
+    /// #901 — the poller froze for hours on 2026-08-31 because nothing
+    /// bounded a request. A server that accepts and never answers must
+    /// surface as a timeout error, quickly.
+    #[tokio::test]
+    async fn request_times_out_against_a_silent_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((sock, _)) = listener.accept().await {
+                    held.push(sock);
+                }
+            }
+        });
+        let client = test_client(&format!("http://{addr}"))
+            .with_timeouts(Duration::from_millis(200), Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let err = client.sync_entries(None, None).await.unwrap_err();
+        assert!(
+            matches!(&err, JournalError::Http(e) if e.is_timeout()),
+            "expected a timeout, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        hold.abort();
     }
 
     #[tokio::test]
