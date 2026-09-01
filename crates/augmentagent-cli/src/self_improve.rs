@@ -2057,6 +2057,59 @@ async fn pr_is_merged(repo_root: &Path, pr: u64) -> bool {
     merge_succeeded(false, pr_state(repo_root, pr).await.as_deref())
 }
 
+/// #895 — make a revision round visible on the PR: push the round's commit
+/// and post the findings it addressed plus the pushed SHA as a PR comment, so
+/// the PR timeline reads findings → revision → findings → … → LGTM instead of
+/// going silent for the whole run. Also makes each round durable: a run
+/// killed mid-loop no longer loses its revisions.
+///
+/// Best-effort — a failed push or comment never aborts the round; the final
+/// push at the end of the run still covers the commit.
+async fn publish_round(
+    worktree: &Path,
+    branch: &str,
+    repo_root: &Path,
+    pr: u64,
+    round: u32,
+    kind: &str,
+    findings: &str,
+    dry_run: bool,
+) {
+    if dry_run {
+        info!(pr, round, kind, "DRY RUN — would push the round and comment its findings");
+        return;
+    }
+    match run("git", &["push", "origin", branch], worktree).await {
+        Ok((true, _, _)) => {}
+        Ok((false, _, e)) => {
+            warn!(pr, round, "round push failed (final push will retry): {}", truncate(&e, 300))
+        }
+        Err(e) => warn!(pr, round, "round push errored: {e:#}"),
+    }
+    let sha = match run("git", &["rev-parse", "--short", "HEAD"], worktree).await {
+        Ok((true, out, _)) => out.trim().to_string(),
+        _ => "unknown".to_string(),
+    };
+    let body = round_comment(round, kind, findings, &sha);
+    let gh = gh_bin();
+    match run(&gh, &["pr", "comment", &pr.to_string(), "--body", &body], repo_root).await {
+        Ok((true, _, _)) => {}
+        Ok((false, _, e)) => warn!(pr, round, "round comment failed: {}", truncate(&e, 300)),
+        Err(e) => warn!(pr, round, "round comment errored: {e:#}"),
+    }
+}
+
+/// Body of the per-round PR comment (#895). Findings are capped so a verbose
+/// reviewer can't blow past GitHub's comment limit.
+fn round_comment(round: u32, kind: &str, findings: &str, sha: &str) -> String {
+    format!(
+        "Auto-resume — review round {round} ({kind}).\n\n\
+         **Findings addressed by this revision:**\n{}\n\n\
+         Revision pushed as `{sha}`; codex re-reviews this commit next.",
+        truncate(findings, 2500)
+    )
+}
+
 /// Resume a sitting draft PR (#866): re-review it against today's `main`,
 /// revise against fresh findings, and merge on a double LGTM.
 ///
@@ -2236,6 +2289,7 @@ async fn resume_draft_pr(
                         &worktree,
                     )
                     .await?;
+                    publish_round(&worktree, branch, repo_root, pr, rounds_done, "shrink", &shrink_findings(lines_now), dry_run).await;
                     summary = format!("{summary}\nRound {rounds_done} (shrink): {}", truncate(&rs, 200));
                     continue;
                 }
@@ -2286,6 +2340,7 @@ async fn resume_draft_pr(
                             &worktree,
                         )
                         .await?;
+                        publish_round(&worktree, branch, repo_root, pr, rounds_done, "gate repair", &gate_findings(&gate_err.to_string()), dry_run).await;
                         summary = format!(
                             "{summary}\nRound {rounds_done} (gate repair): {}",
                             truncate(&rs, 200)
@@ -2466,6 +2521,7 @@ async fn resume_draft_pr(
             &worktree,
         )
         .await?;
+        publish_round(&worktree, branch, repo_root, pr, rounds_done, "independent findings", &independent.notes, dry_run).await;
         summary = format!("{summary}\nRound {rounds_done}: {}", truncate(&rev_summary, 300));
     }
 }
@@ -6404,5 +6460,32 @@ CODEX-REVIEW: lgtm").0);
             between.contains("cleanup(worktree, branch.to_string()"),
             "resume_draft_pr must release the worktree between `gh pr ready` and `gh pr merge --delete-branch`"
         );
+    }
+
+    // #895 — every revision round must be pushed + commented on the PR.
+    #[test]
+    fn round_comment_names_round_kind_findings_and_sha() {
+        let c = round_comment(2, "independent findings", "rfind(',') splits quoted display names", "abc1234");
+        assert!(c.contains("review round 2"));
+        assert!(c.contains("(independent findings)"));
+        assert!(c.contains("rfind(',') splits quoted display names"));
+        assert!(c.contains("`abc1234`"));
+        // verbose reviewers are capped well under GitHub's comment limit
+        let long = "x".repeat(20_000);
+        assert!(round_comment(1, "shrink", &long, "deadbee").len() < 3_000);
+    }
+
+    // Structural: in resume_draft_pr, each round commit (shrink, gate repair,
+    // revise) is followed by a publish_round call. Red before #895 (0 of 3).
+    #[test]
+    fn resume_publishes_every_round_commit() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = src[start..].find("\n}\n").expect("fn end") + start;
+        let body = &src[start..end];
+        let commits = body.matches(r#""commit", "--allow-empty", "-m", &msg"#).count();
+        let publishes = body.matches("publish_round(").count();
+        assert_eq!(commits, 3, "expected the shrink, gate-repair and revise commits");
+        assert_eq!(publishes, commits, "every round commit must be pushed + commented (#895)");
     }
 }
