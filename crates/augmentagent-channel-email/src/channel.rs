@@ -258,11 +258,13 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             //
             //   1. It publishes an approval card whose draft is the empty
             //      string, so the user gets a card with nothing in it.
-            //   2. `dispatch_reply` starts AFTER triage, so it skips every
-            //      triage guard: automated-sender (#217), already-replied
-            //      (#218), event-blast (#222), meeting-invite (#834).
-            //      Newsletters that triage would never have drafted sail
-            //      straight into the queue.
+            //   2. `dispatch_reply` starts AFTER triage, so it skips the
+            //      triage guards: automated-sender (#217), already-replied
+            //      (#218), event-blast (#222). Newsletters that triage would
+            //      never have drafted sail straight into the queue.
+            //      (Meeting-invite (#834) is the exception: it also runs as
+            //      a backstop inside `dispatch_reply`, so it holds on the
+            //      has-a-draft retry path below too.)
             //
             // That is how the live queue reached 102 empty-draft cards from
             // Canva/Marshalls/BetaList — and, via the old backpressure cap,
@@ -682,41 +684,13 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 // personal, so we take the Flag path (Discord heads-up +
                 // wiki ingest, no draft) rather than going silent. Ordered
                 // after the event-blast gate so an event-platform invite
-                // keeps its quieter ingest-only route. See
+                // keeps its quieter ingest-only route. Catching it HERE,
+                // rather than only at the `dispatch_reply` backstop below,
+                // is what saves the draft-model call. See
                 // `sigextract.rs::is_meeting_invite` for the detection
                 // rules.
                 if is_meeting_invite(&email.subject, &email.body, &email.attachments) {
-                    let reason = "meeting invite (no draft)";
-                    self.store.log_flagged_action(
-                        &email.message_id,
-                        email.thread_id.as_deref(),
-                        &email.from,
-                        &email.subject,
-                        Some(&email.body),
-                        reason,
-                    )?;
-                    self.store
-                        .mark_email_processed(&email.message_id, TriageResult::Flag)?;
-                    println!(
-                        "[flag:meeting-invite] {} from={}",
-                        email.message_id, email.from,
-                    );
-                    // Best-effort heads-up, same as the Flag arm above: a
-                    // broker failure must not abort the flow.
-                    if let Err(e) = self.approvals.post_flag_notice(&email, reason).await {
-                        warn!(
-                            message_id = %email.message_id,
-                            "post_flag_notice failed: {e}"
-                        );
-                    }
-                    self.maybe_ingest(
-                        &email,
-                        DecisionKind::Flag,
-                        Some(reason),
-                        None,
-                        IngestTrigger::Triaged,
-                    );
-                    return Ok(Some(DispatchOutcome::Flagged));
+                    return Ok(Some(self.suppress_meeting_invite(&email, None).await?));
                 }
 
                 // --- 1b. BACKPRESSURE (#99) — REMOVED in #450.
@@ -1296,6 +1270,67 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         out
     }
 
+    /// Route a meeting / calendar invite off the reply rail (#834): retire the
+    /// action row, mark the email terminally processed as `Flag`, post the
+    /// Discord heads-up, ingest. No draft, no approval card.
+    ///
+    /// `existing_action_id` is `Some` when a row already exists for this
+    /// message — the retry tick's errored row, or the code-mode / classic row
+    /// pre-created before dispatch. Those move to `Superseded` instead of
+    /// gaining a second row, which is what makes the suppression terminal:
+    /// `list_retryable_replies` only selects `status='error'`, so the retry
+    /// tick stops handing the invite back, and any Discord card already
+    /// showing for that id is dead on its next sqlite lookup.
+    async fn suppress_meeting_invite(
+        &self,
+        email: &augmentagent_store::Email,
+        existing_action_id: Option<&str>,
+    ) -> anyhow::Result<DispatchOutcome> {
+        let reason = "meeting invite (no draft)";
+        match existing_action_id {
+            Some(id) => {
+                self.store.update_action_status(
+                    id,
+                    ActionStatus::Superseded,
+                    None,
+                    Some(reason),
+                )?;
+            }
+            None => {
+                self.store.log_flagged_action(
+                    &email.message_id,
+                    email.thread_id.as_deref(),
+                    &email.from,
+                    &email.subject,
+                    Some(&email.body),
+                    reason,
+                )?;
+            }
+        }
+        self.store
+            .mark_email_processed(&email.message_id, TriageResult::Flag)?;
+        println!(
+            "[flag:meeting-invite] {} from={}",
+            email.message_id, email.from,
+        );
+        // Best-effort heads-up, same as the Flag arm in `process_email`: a
+        // broker failure must not abort the flow.
+        if let Err(e) = self.approvals.post_flag_notice(email, reason).await {
+            warn!(
+                message_id = %email.message_id,
+                "post_flag_notice failed: {e}"
+            );
+        }
+        self.maybe_ingest(
+            email,
+            DecisionKind::Flag,
+            Some(reason),
+            None,
+            IngestTrigger::Triaged,
+        );
+        Ok(DispatchOutcome::Flagged)
+    }
+
     /// Non-blocking reply dispatch: create Gmail draft, log/update the action,
     /// post the approval card, return. The subsequent Approve / Revise / Skip
     /// is handled by the Discord event handler against the sqlite row.
@@ -1310,6 +1345,26 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
         initial_draft: String,
         existing_action_id: Option<String>,
     ) -> anyhow::Result<Option<DispatchOutcome>> {
+        // MEETING-INVITE BACKSTOP (#834). `retry_once` reaches here without
+        // ever re-running triage whenever the errored action still carries a
+        // draft body — the #451 re-triage detour only covers empty drafts —
+        // so the triage-side gate above cannot see that traffic. Any invite
+        // draft queued before this fix, or drafted and then stranded by a
+        // `post_approval` failure, would otherwise be re-drafted and carded
+        // by the very next retry tick. Checking at the single choke point
+        // every reply passes through closes that hole for good.
+        //
+        // Only subject + body are consulted, because that is all the retry
+        // path has: `list_retryable_replies` rehydrates `Email` from sqlite
+        // with `attachments` empty. The reported Teams forward is caught on
+        // its body alone, so the persisted shape is covered.
+        if is_meeting_invite(&email.subject, &email.body, &email.attachments) {
+            return Ok(Some(
+                self.suppress_meeting_invite(&email, existing_action_id.as_deref())
+                    .await?,
+            ));
+        }
+
         let (action_id, existing_draft_id) = match existing_action_id {
             Some(id) => {
                 self.store.update_action_status(
@@ -2209,6 +2264,20 @@ mod tests {
         assert_eq!(broker.flag_posts.lock().unwrap().len(), 0);
     }
 
+    /// The forwarded Microsoft Teams invite reported in #834, with invented
+    /// identities. Shared by both #834 channel tests.
+    const TEAMS_INVITE_BODY: &str = "\
+Passing this along.
+
+________________________________________
+Microsoft Teams meeting
+Join on your computer, mobile app or room device
+Join the meeting now
+Meeting ID: 123 456 789
+When: Wednesday, September 2 1:00 PM-2:00 PM
+Where: Microsoft Teams
+";
+
     /// #834: a forwarded Microsoft Teams meeting invite from a human sender
     /// where the triage model returns `reply` (the reported failure mode —
     /// the draft asked the organizer to confirm attendance and share an
@@ -2230,18 +2299,7 @@ mod tests {
                 // the new gate is provably what intercepts.
                 from: "Jeffrey Walters <jeff@example.com>".into(), // pii-ok: synthetic test fixture
                 subject: "FW: Updates Perry".into(),
-                body: "\
-Passing this along.
-
-________________________________________
-Microsoft Teams meeting
-Join on your computer, mobile app or room device
-Join the meeting now
-Meeting ID: 123 456 789
-When: Wednesday, September 2 1:00 PM-2:00 PM
-Where: Microsoft Teams
-"
-                .into(),
+                body: TEAMS_INVITE_BODY.into(),
                 date: "2026-08-27".into(),
                 account_entity_id: Some("acc1".into()),
                 platform: "gmail".into(),
@@ -2282,6 +2340,81 @@ Where: Microsoft Teams
         assert!(flags[0].1.contains("meeting invite"));
         // Terminally processed — the next tick must not re-spawn a draft.
         assert!(store.is_email_complete("m-invite").unwrap());
+    }
+
+    /// #834 REGRESSION (queued/retried traffic). `dispatch_reply` runs AFTER
+    /// triage, so the triage-side gate cannot see an invite draft that is
+    /// already in the queue: an errored action WITH a draft body is exactly
+    /// the shape #451's re-triage detour does NOT cover, so `retry_once`
+    /// hands it straight to `dispatch_reply`. Seeded here as an invite draft
+    /// queued before the guard existed. The backstop must suppress it
+    /// terminally — no card, and never offered to the retry tick again.
+    #[tokio::test]
+    async fn retry_of_queued_meeting_invite_draft_is_suppressed() {
+        let (store, _f) = tmp_store();
+        let email = Email {
+            // Empty, as `list_retryable_replies` rehydrates it: subject and
+            // body are all the backstop gets on this path.
+            attachments: Vec::new(),
+            to: String::new(),
+            cc: String::new(),
+            message_id: "m-invite-queued".into(),
+            thread_id: Some("t-invite".into()),
+            from: "Jeffrey Walters <jeff@example.com>".into(), // pii-ok: synthetic test fixture
+            subject: "FW: Updates Perry".into(),
+            body: TEAMS_INVITE_BODY.into(),
+            date: "2026-08-27".into(),
+            account_entity_id: Some("acc1".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        };
+        store.upsert_email(&email).unwrap();
+        let action_id = store
+            .log_action(
+                &email.message_id,
+                email.thread_id.as_deref(),
+                &email.from,
+                &email.subject,
+                Some(&email.body),
+                Some("Happy to attend — could you share an agenda?"),
+                ActionStatus::Error,
+            )
+            .unwrap();
+
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = GmailChannel::new(
+            store.clone(),
+            Arc::new(StubGmail { emails: vec![] }),
+            // Unscripted: suppression must never consult the model.
+            Arc::new(ScriptedReasoner::new([])),
+            broker.clone(),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
+                dry_run: false,
+                retry_min_gap: Duration::from_millis(0),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(ch.retry_once().await.unwrap(), 1);
+        // Before the backstop this posted the invite draft as a card.
+        assert!(broker.posts.lock().unwrap().is_empty());
+        {
+            let flags = broker.flag_posts.lock().unwrap();
+            assert_eq!(flags.len(), 1);
+            assert!(flags[0].1.contains("meeting invite"));
+        }
+        // Terminal on both rails: the row leaves 'error' so
+        // `list_retryable_replies` can't return it, and the email is marked
+        // processed so the poll loop won't re-triage it either.
+        let row = store.get_action_with_email(&action_id).unwrap().unwrap();
+        assert_eq!(row.action.status, "superseded");
+        assert!(store.is_email_complete("m-invite-queued").unwrap());
+        assert_eq!(
+            ch.retry_once().await.unwrap(),
+            0,
+            "suppressed invite was re-queued"
+        );
     }
 
     /// #218 — when the outbound observer has already recorded a user reply
