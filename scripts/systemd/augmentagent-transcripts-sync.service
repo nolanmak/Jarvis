@@ -1,0 +1,14 @@
+[Unit]
+Description=AugmentAgent — pull the FlyOnTheWall transcript repo and ingest new meetings
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/AugmentAgent
+EnvironmentFile=-%h/AugmentAgent/.env
+# Read-only against the transcript repo; dedup is the emails table, so a
+# re-run is free and a missed run costs nothing but latency.
+ExecStart=%h/AugmentAgent/target/release/augmentagent --wiki-dir ./wiki transcripts sync
+StandardOutput=append:%h/.local/state/augmentagent/transcripts-sync.log
+StandardError=append:%h/.local/state/augmentagent/transcripts-sync.log

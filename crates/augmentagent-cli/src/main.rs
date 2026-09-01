@@ -156,6 +156,11 @@ enum Cmd {
         #[command(subcommand)]
         op: WikiOp,
     },
+    /// FlyOnTheWall meeting transcripts (#915).
+    Transcripts {
+        #[command(subcommand)]
+        op: TranscriptsOp,
+    },
     /// Compose a morning digest of recent inbox activity.
     Digest {
         /// Window size in hours. Defaults to 24.
@@ -1850,6 +1855,27 @@ enum ResumeOp {
     },
 }
 
+/// FlyOnTheWall transcript-repo operations (#915).
+#[derive(Subcommand, Debug)]
+enum TranscriptsOp {
+    /// Fast-forward the transcript clone, then ingest any new meetings.
+    ///
+    /// Read-only against that repo: FlyOnTheWall owns it and re-pushes retitled
+    /// meetings to the same path, so this side never commits, merges or pushes.
+    /// Dedup is the `emails` table (`fotw:<id>`), so a rescan is free.
+    Sync {
+        /// Scan and report without pulling or ingesting.
+        #[arg(long)]
+        dry_run: bool,
+        /// Ingest what is already on disk; skip the git pull.
+        #[arg(long)]
+        no_pull: bool,
+        /// Ingest only meetings whose export recorded disclosure (§11).
+        #[arg(long, default_value_t = false)]
+        require_disclosed: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum WikiOp {
     /// Health-check the wiki: contradictions, orphans, stale claims, missing cross-refs.
@@ -2756,6 +2782,22 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Transcripts { ref op } => match op {
+            TranscriptsOp::Sync {
+                dry_run,
+                no_pull,
+                require_disclosed,
+            } => {
+                run_transcripts_sync(
+                    &cli,
+                    Arc::clone(&store),
+                    *dry_run,
+                    *no_pull,
+                    *require_disclosed,
+                )
+                .await
+            }
+        },
         Cmd::Wiki { ref op } => match op {
             WikiOp::Lint { out } => run_wiki_lint(&cli, Arc::clone(&store), out.clone()).await,
             WikiOp::Ask { question, post } => run_wiki_ask(&cli, question.clone(), *post).await,
@@ -7146,6 +7188,145 @@ mod wiki_sync_validation_tests {
 /// `wiki sync` — reconcile the local knowledge base with its private
 /// GitHub mirror. Two-way: commit local page changes, pull owner edits
 /// (owner-wins), push. Reuses the ambient `gh` credential. See epic #474.
+/// `augmentagent transcripts sync` (#915).
+///
+/// Fast-forward the FlyOnTheWall transcript clone, then hand any meeting the
+/// `emails` table has not seen to the wiki ingest funnel. Read-only against
+/// that repo throughout: FlyOnTheWall owns it.
+///
+/// The calendar roster comes from rows the gcal channel already wrote — see
+/// `augmentagent_channel_fotw::calendar` — so this needs no Google credentials
+/// of its own, and degrades to name-based linking when a recording has no
+/// matching invite.
+async fn run_transcripts_sync(
+    cli: &Cli,
+    store: Arc<Store>,
+    dry_run: bool,
+    no_pull: bool,
+    require_disclosed: bool,
+) -> Result<()> {
+    use augmentagent_channel_fotw::calendar::{rosters_from_rows, GcalRow};
+    use augmentagent_channel_fotw::distill::RosterMember;
+    use augmentagent_channel_fotw::match_event::{match_event, EventWindow, Match};
+    use augmentagent_channel_fotw::runner::{scan, ScanOpts, SeenLog};
+
+    let repo = std::env::var("AUGMENTAGENT_TRANSCRIPTS_DIR")
+        .map(PathBuf::from)
+        .context("set AUGMENTAGENT_TRANSCRIPTS_DIR to the transcript repo clone")?;
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for transcripts sync")?;
+    let my_email = std::env::var("AUGMENTAGENT_MY_EMAIL").unwrap_or_default();
+
+    if !no_pull && !dry_run {
+        match augmentagent_channel_fotw::sync::sync(&repo) {
+            Ok(0) => println!("[transcripts] already up to date"),
+            Ok(n) => println!("[transcripts] pulled {n} commit(s)"),
+            Err(e) => anyhow::bail!("transcripts sync: {e}"),
+        }
+    }
+
+    // The roster index, built once per run: a few hundred rows, consulted per
+    // meeting by the closure below.
+    let events = rosters_from_rows(
+        &store
+            .gcal_attendee_rows()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(message_id, from, received_at)| GcalRow {
+                message_id,
+                from,
+                received_at,
+            })
+            .collect::<Vec<_>>(),
+    );
+    let windows: Vec<EventWindow> = events.iter().map(|e| e.window.clone()).collect();
+    let resolve = |doc: &augmentagent_channel_fotw::parse::MeetingDoc| {
+        let m = match_event(doc.started_at_ms, doc.duration_ms, &windows);
+        // Only a single match names anyone; ambiguity is reported, never resolved.
+        let roster: Vec<RosterMember> = match &m {
+            Match::Single(w) => events
+                .iter()
+                .find(|e| e.window.event_id == w.event_id)
+                .map(|e| e.roster.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        (m, roster)
+    };
+
+    struct StoreLog(Arc<Store>);
+    impl SeenLog for StoreLog {
+        fn record(&self, email: &augmentagent_store::Email) -> Result<bool> {
+            Ok(self.0.upsert_email(email)?)
+        }
+    }
+    /// A dry run must not write the dedup row, or the real run that follows
+    /// would find every meeting already seen and ingest nothing.
+    struct DryLog;
+    impl SeenLog for DryLog {
+        fn record(&self, _: &augmentagent_store::Email) -> Result<bool> {
+            Ok(true)
+        }
+    }
+    let log: Box<dyn SeenLog> = if dry_run {
+        Box::new(DryLog)
+    } else {
+        Box::new(StoreLog(Arc::clone(&store)))
+    };
+
+    let meetings_dir = repo.join("meetings");
+    let opts = ScanOpts {
+        dir: &meetings_dir,
+        require_disclosed,
+        my_email: &my_email,
+    };
+    let (report, emails) = scan(&opts, log.as_ref(), &resolve)?;
+
+    println!(
+        "[transcripts] {} new, {} duplicate, {} skipped, {} unreadable",
+        report.ingested.len(),
+        report.duplicates,
+        report.skipped.len(),
+        report.unreadable.len()
+    );
+    for (id, why) in &report.skipped {
+        println!("[transcripts] skipped {id}: {why:?}");
+    }
+    if dry_run {
+        for e in &emails {
+            println!("\n--- would ingest {} ---\n{}", e.message_id, e.body);
+        }
+        return Ok(());
+    }
+
+    let reasoner = build_reasoner();
+    let schema = resolve_wiki_schema(cli)
+        .context("wiki schema not found; transcripts ingest needs schema/wiki-skill.md")?;
+    for email in emails {
+        let id = email.message_id.clone();
+        augmentagent_channel_core::ingest::spawn_ingest(
+            Arc::clone(&reasoner),
+            wiki_root.clone(),
+            // The relevance gate rides on the schema for this platform only: a
+            // recorded meeting is not a message addressed to anyone, and a
+            // personal capture should leave no trace.
+            format!(
+                "{schema}\n{}",
+                augmentagent_channel_fotw::distill::RELEVANCE_GATE
+            ),
+            email,
+            augmentagent_channel_core::decision::DecisionKind::Meeting,
+            Some("meeting transcript".to_string()),
+            None,
+            augmentagent_channel_core::ingest::IngestTrigger::Meeting,
+        );
+        println!("[transcripts] ingesting {id}");
+    }
+    Ok(())
+}
+
 async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
     let wiki_root = cli
         .wiki_dir

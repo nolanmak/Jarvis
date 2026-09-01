@@ -1,0 +1,14 @@
+[Unit]
+Description=AugmentAgent transcripts sync (every 10 minutes)
+
+[Timer]
+# Wall-clock schedule rather than OnUnitActiveSec: a monotonic timer stops
+# firing after a re-login, which is how the wiki-sync timer wedged (#909).
+OnBootSec=4min
+OnCalendar=*:0/10
+Persistent=true
+AccuracySec=30s
+Unit=augmentagent-transcripts-sync.service
+
+[Install]
+WantedBy=timers.target

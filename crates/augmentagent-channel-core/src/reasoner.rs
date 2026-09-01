@@ -1637,7 +1637,22 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             "Bash(aa-gh issue view *)".to_string(),
             "Bash(aa-gh issue comment *)".to_string(),
         ],
-        add_dirs: vec![wiki_root.clone()],
+        add_dirs: {
+            // #915: the wiki holds the distilled, cited facts about a meeting;
+            // the transcript clone holds what was actually said. Grepping the
+            // words is the only way to answer "what exactly did we agree", and
+            // the clone is read-only to this daemon, so opening it costs
+            // nothing but the path. Absent variable, absent directory —
+            // unchanged behaviour.
+            let mut dirs = vec![wiki_root.clone()];
+            if let Some(t) = std::env::var_os("AUGMENTAGENT_TRANSCRIPTS_DIR") {
+                let t = PathBuf::from(t);
+                if t.is_dir() {
+                    dirs.push(t);
+                }
+            }
+            dirs
+        },
         permission_mode: "acceptEdits".into(),
         // Pin cwd to the wiki so Write/Edit cannot touch the source tree.
         cwd: Some(wiki_root.clone()),
@@ -3465,5 +3480,31 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
             ReasonerError::find_in(&err),
             Some(ReasonerError::Local { .. })
         ));
+    }
+
+    /// #915: the ask agent can read the transcript clone when one is
+    /// configured, and nothing changes when it is not.
+    #[test]
+    fn ask_opts_add_the_transcript_clone_only_when_it_exists() {
+        let wiki = std::env::temp_dir().join("aa-ask-wiki-test");
+        std::fs::create_dir_all(&wiki).unwrap();
+        let repo = std::env::temp_dir();
+
+        // SAFETY: single-threaded test; the var is read once inside the call.
+        unsafe { std::env::remove_var("AUGMENTAGENT_TRANSCRIPTS_DIR") };
+        assert_eq!(ask_opts(wiki.clone(), repo.clone()).add_dirs.len(), 1);
+
+        let t = std::env::temp_dir().join("aa-ask-transcripts-test");
+        std::fs::create_dir_all(&t).unwrap();
+        unsafe { std::env::set_var("AUGMENTAGENT_TRANSCRIPTS_DIR", &t) };
+        assert_eq!(
+            ask_opts(wiki.clone(), repo.clone()).add_dirs.len(),
+            2,
+            "the clone must be readable"
+        );
+
+        unsafe { std::env::set_var("AUGMENTAGENT_TRANSCRIPTS_DIR", "/nonexistent/aa-x") };
+        assert_eq!(ask_opts(wiki, repo).add_dirs.len(), 1);
+        unsafe { std::env::remove_var("AUGMENTAGENT_TRANSCRIPTS_DIR") };
     }
 }
