@@ -91,7 +91,11 @@ impl ImessageSyncer<'_> {
                     // The bundle resolves contact names itself: a title equal
                     // to the raw identifier means "not in the operator's
                     // contacts" — short codes, delivery bots. Never page those.
-                    if conv.title == conv.identifier {
+                    // Same for a title with nothing slug-able in it (an emoji
+                    // contact) — it would collapse to `at_contact.md`.
+                    if conv.title == conv.identifier
+                        || !title.chars().any(|c| c.is_ascii_alphanumeric())
+                    {
                         report.skipped += 1;
                         report.diffs.push(ImessageDiff {
                             title: conv.title.clone(),
@@ -465,10 +469,14 @@ mod tests {
         assert_eq!(report.pages_created, 1);
         let page =
             std::fs::read_to_string(layout.people_dir().join("john_smith_at_contact.md")).unwrap();
+        // list-valued per schema/wiki-skill.md — a scalar here is unreadable
+        // by the identity index (see crm::MULTI_VALUED)
         assert!(
-            page.contains("imessage: \"+14155550123\"")
-                || page.contains("imessage: '+14155550123'")
-                || page.contains("imessage: +14155550123"),
+            page.contains("  imessage:\n    - \"+14155550123\"\n"),
+            "page:\n{page}"
+        );
+        assert!(
+            page.contains("  phone:\n    - \"+14155550123\"\n"),
             "page:\n{page}"
         );
         // CRM rule: updated == last message date, never today
@@ -597,6 +605,23 @@ mod tests {
         assert!(layout.people_dir().join("chase_at_contact.md").exists());
         let untouched = std::fs::read_to_string(layout.people_dir().join("chase.md")).unwrap();
         assert!(!untouched.contains("imessage"), "existing page must be left alone");
+    }
+
+    #[test]
+    fn backfill_skips_titles_with_nothing_to_slug() {
+        let (dir, layout, store) = fresh_env();
+        let md = "---\ntitle: '📫'\n---\n\n### [2026-08-26T11:00:00-04:00] +14155550555\nhi\n";
+        let bundle = fixture_bundle(dir.path(), &[("+14155550555", "mailbox", "📫", md)]);
+        let syncer = ImessageSyncer {
+            bundle: &bundle,
+            layout: &layout,
+            store: &store,
+            apply: true,
+        };
+        let report = syncer.run().unwrap();
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.pages_created, 0);
+        assert!(!layout.people_dir().join("at_contact.md").exists());
     }
 
     #[test]

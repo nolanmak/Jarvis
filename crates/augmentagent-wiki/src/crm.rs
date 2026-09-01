@@ -137,8 +137,8 @@ fn create_stub(patch: &PersonPatch) -> MergeResult {
     if !patch.identities.is_empty() {
         fm.push_str("identities:\n");
         for (plat, id) in collapse_identities(&patch.identities) {
-            if plat == "email" {
-                fm.push_str("  email:\n");
+            if is_multi_valued(&plat) {
+                fm.push_str(&format!("  {plat}:\n"));
                 for e in id.split('\u{1f}') {
                     fm.push_str(&format!("    - {}\n", yaml_scalar(e)));
                 }
@@ -199,10 +199,22 @@ fn merge_into_existing(src: &str, patch: &PersonPatch) -> MergeResult {
     }
 }
 
-/// Collapse a `Vec<(platform,id)>` into ordered unique platforms. For `email`
-/// we keep every distinct value joined by US (`\u{1f}`) — an in-band
-/// separator that can't appear in an address — so the caller renders a YAML
-/// list. All other platforms keep first-seen value (single-valued).
+/// Identity platforms that are YAML lists in `schema/wiki-skill.md`
+/// (`email: [..]`, `phone: [..]`, `imessage: [..]`). Everything else is a
+/// scalar. Writer and reader (`identity::Identities`) must agree on this
+/// set — a scalar written under a list key makes the whole page unparseable
+/// and silently drops it from the identity index.
+const MULTI_VALUED: &[&str] = &["email", "phone", "imessage"];
+
+fn is_multi_valued(platform: &str) -> bool {
+    MULTI_VALUED.contains(&platform)
+}
+
+/// Collapse a `Vec<(platform,id)>` into ordered unique platforms. For the
+/// multi-valued platforms we keep every distinct value joined by US
+/// (`\u{1f}`) — an in-band separator that can't appear in an address or
+/// phone — so the caller renders a YAML list. All other platforms keep the
+/// first-seen value (single-valued).
 fn collapse_identities(pairs: &[(String, String)]) -> Vec<(String, String)> {
     let mut order: Vec<String> = Vec::new();
     let mut map: BTreeMap<String, String> = BTreeMap::new();
@@ -211,7 +223,7 @@ fn collapse_identities(pairs: &[(String, String)]) -> Vec<(String, String)> {
         if id.is_empty() {
             continue;
         }
-        if plat == "email" {
+        if is_multi_valued(plat) {
             let entry = map.entry(plat.clone()).or_default();
             let already = entry.split('\u{1f}').any(|e| e.eq_ignore_ascii_case(id));
             if !already {
@@ -257,8 +269,8 @@ fn merge_frontmatter_identities(
         let mut fm = String::from("---\nkind: person\nidentities:\n");
         let mut added = Vec::new();
         for (plat, id) in &collapsed {
-            if plat == "email" {
-                fm.push_str("  email:\n");
+            if is_multi_valued(plat) {
+                fm.push_str(&format!("  {plat}:\n"));
                 for e in id.split('\u{1f}') {
                     fm.push_str(&format!("    - {}\n", yaml_scalar(e)));
                 }
@@ -279,61 +291,131 @@ fn merge_frontmatter_identities(
         .lines()
         .any(|l| l.trim_end() == "identities:" || l.starts_with("identities:"));
 
+    // List-valued keys already on the page are extended *in place* (a legacy
+    // scalar, a flow list or a block list — whichever shape is there), so a
+    // new value never lands after an unrelated key where it would be invalid
+    // YAML. Absent keys and scalar keys are appended before the closing `---`.
+    let mut fm_new = fm_inner.clone();
     for (plat, id) in &collapsed {
-        if plat == "email" {
-            let existing = extract_email_values(&fm_inner);
-            for e in id.split('\u{1f}') {
-                if !existing.iter().any(|x| x.eq_ignore_ascii_case(e)) {
-                    new_lines.push(format!("    - {}", yaml_scalar(e)));
-                    if !added.contains(&"email".to_string()) {
-                        added.push("email".to_string());
-                    }
-                }
+        if is_multi_valued(plat) {
+            let existing = extract_list_values(&fm_new, plat);
+            let fresh: Vec<String> = id
+                .split('\u{1f}')
+                .filter(|v| !existing.iter().any(|x| x.eq_ignore_ascii_case(v)))
+                .map(str::to_string)
+                .collect();
+            if fresh.is_empty() {
+                continue;
             }
-        } else if !identity_key_present(&fm_inner, plat) {
+            match extend_list_key(&fm_new, plat, &fresh) {
+                Some(rewritten) => fm_new = rewritten,
+                None => new_lines.push(format!("  {plat}: {}", flow_list(&fresh))),
+            }
+            added.push(plat.clone());
+        } else if !identity_key_present(&fm_new, plat) {
             new_lines.push(format!("  {plat}: {}", yaml_scalar(id)));
             added.push(plat.clone());
         }
     }
 
-    if new_lines.is_empty() {
+    if fm_new == fm_inner && new_lines.is_empty() {
         return (src.to_string(), Vec::new());
     }
 
-    // Splice strategy: keep existing frontmatter byte-for-byte; insert the
-    // new identity lines just before the closing `---`. If there was no
-    // `identities:` key we add the header line first.
     let mut insert = String::new();
-    if !has_identities_key {
+    if !has_identities_key && !new_lines.is_empty() {
         insert.push_str("identities:\n");
     }
-    // When appending email entries to an existing `email:` list we need the
-    // `email:` parent to already exist; if it doesn't (only non-email keys
-    // present) the entries we generated start with 4-space indent which is
-    // still valid as a fresh list only when preceded by `  email:`.
-    let needs_email_header = collapsed.iter().any(|(p, _)| p == "email")
-        && !fm_inner.lines().any(|l| {
-            let t = l.trim_start();
-            t == "email:" || t.starts_with("email:")
-        });
-    if needs_email_header
-        && new_lines.iter().any(|l| l.starts_with("    - "))
-    {
-        // Insert `  email:` header right before the first email entry.
-        let first_email = new_lines
-            .iter()
-            .position(|l| l.starts_with("    - "))
-            .unwrap();
-        new_lines.insert(first_email, "  email:".to_string());
+    if !new_lines.is_empty() {
+        insert.push_str(&new_lines.join("\n"));
+        insert.push('\n');
     }
-    insert.push_str(&new_lines.join("\n"));
-    insert.push('\n');
 
-    let mut out = String::with_capacity(src.len() + insert.len());
-    out.push_str(&src[..close_off]);
+    let mut out = String::with_capacity(src.len() + insert.len() + 16);
+    out.push_str("---\n");
+    out.push_str(&fm_new);
     out.push_str(&insert);
     out.push_str(&src[close_off..]);
     (out, added)
+}
+
+/// `[a, b]` with each value YAML-quoted only when needed.
+fn flow_list(values: &[String]) -> String {
+    let items: Vec<String> = values.iter().map(|v| yaml_scalar(v)).collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Add `fresh` values to the existing `key:` entry inside `fm_inner`,
+/// touching only that key's lines. Handles every shape found on disk:
+///
+/// - block list (`key:` + `  - v` items) — items appended after the last one
+/// - flow list (`key: [a, b]`) — rewritten as one flow list
+/// - legacy scalar (`key: "+1…"`) — promoted to a flow list `[old, new]`
+///
+/// `None` when the key is absent; the caller appends a fresh list. The
+/// trailing-newline state of `fm_inner` is preserved.
+fn extend_list_key(fm_inner: &str, key: &str, fresh: &[String]) -> Option<String> {
+    let lines: Vec<&str> = fm_inner.lines().collect();
+    let head_idx = lines.iter().position(|l| {
+        let t = l.trim_start();
+        t == format!("{key}:") || t.starts_with(&format!("{key}: "))
+    })?;
+    let head = lines[head_idx];
+    let indent = &head[..head.len() - head.trim_start().len()];
+    let rest = head.trim_start()[key.len() + 1..].trim();
+
+    let mut out: Vec<String> = lines[..head_idx].iter().map(|l| l.to_string()).collect();
+    let mut resume = head_idx + 1;
+    if rest.is_empty() {
+        // Block list: keep the header and existing items, append after them.
+        out.push(head.to_string());
+        let mut item_indent = format!("{indent}  ");
+        while resume < lines.len() {
+            let l = lines[resume];
+            let lead = &l[..l.len() - l.trim_start().len()];
+            if lead.len() > indent.len() && l.trim_start().starts_with("- ") {
+                item_indent = lead.to_string();
+                out.push(l.to_string());
+                resume += 1;
+            } else {
+                break;
+            }
+        }
+        for v in fresh {
+            out.push(format!("{item_indent}- {}", yaml_scalar(v)));
+        }
+    } else {
+        let mut all: Vec<String> = if rest.starts_with('[') {
+            split_flow_list(rest)
+        } else {
+            vec![unquote(rest).to_string()]
+        };
+        all.extend(fresh.iter().cloned());
+        out.push(format!("{indent}{key}: {}", flow_list(&all)));
+    }
+    out.extend(lines[resume..].iter().map(|l| l.to_string()));
+
+    let mut joined = out.join("\n");
+    if fm_inner.ends_with('\n') {
+        joined.push('\n');
+    }
+    Some(joined)
+}
+
+fn unquote(v: &str) -> &str {
+    let v = v.trim();
+    v.strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .or_else(|| v.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
+        .unwrap_or(v)
+}
+
+fn split_flow_list(rest: &str) -> Vec<String> {
+    rest.trim_matches(|c| c == '[' || c == ']')
+        .split(',')
+        .map(|part| unquote(part).to_string())
+        .filter(|v| !v.is_empty())
+        .collect()
 }
 
 /// Split into `(frontmatter_inner, byte_offset_of_closing_delim)`.
@@ -361,35 +443,38 @@ fn identity_key_present(fm_inner: &str, key: &str) -> bool {
     })
 }
 
-/// Pull existing `email:` list entries (`    - x@y` or inline `email: [a, b]`).
-fn extract_email_values(fm_inner: &str) -> Vec<String> {
+/// Pull the existing values of a list-valued `key:` — block items
+/// (`    - v`), an inline flow list (`key: [a, b]`) or a legacy bare scalar
+/// (`key: "v"`, written before the key became a list).
+fn extract_list_values(fm_inner: &str, key: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut in_email = false;
+    let mut in_block = false;
+    let prefix = format!("{key}:");
     for line in fm_inner.lines() {
         let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("email:") {
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            if !rest.is_empty() && !rest.starts_with(' ') {
+                // `keyword:` is a prefix of a longer key (`phone_home:`)
+                in_block = false;
+                continue;
+            }
             let rest = rest.trim();
             if rest.starts_with('[') {
-                // inline flow list
-                for part in rest.trim_matches(|c| c == '[' || c == ']').split(',') {
-                    let v = part.trim().trim_matches('"').trim();
-                    if !v.is_empty() {
-                        out.push(v.to_string());
-                    }
-                }
-                in_email = false;
+                out.extend(split_flow_list(rest));
+                in_block = false;
+            } else if rest.is_empty() {
+                in_block = true;
             } else {
-                in_email = true;
+                out.push(unquote(rest).to_string());
+                in_block = false;
             }
             continue;
         }
-        if in_email {
+        if in_block {
             if let Some(item) = trimmed.strip_prefix("- ") {
-                out.push(item.trim().trim_matches('"').to_string());
-            } else if !trimmed.is_empty() && !line.starts_with(' ') {
-                in_email = false;
-            } else if !trimmed.starts_with('-') && !trimmed.is_empty() {
-                in_email = false;
+                out.push(unquote(item).to_string());
+            } else if !trimmed.is_empty() {
+                in_block = false;
             }
         }
     }
@@ -591,6 +676,8 @@ fn join_preserving_trailing_nl(original: &str, lines: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::IdentityIndex;
+    use crate::layout::WikiLayout;
 
     #[test]
     fn creates_stub_with_sections_and_identities() {
@@ -662,8 +749,8 @@ mod tests {
         // linkedin already present → untouched.
         assert!(r.content.contains("linkedin: old-handle"));
         assert!(!r.content.contains("new-handle"));
-        // phone was blank → added.
-        assert!(r.content.contains("phone: \"+14155550100\""));
+        // phone was blank → added, as a list (schema/wiki-skill.md).
+        assert!(r.content.contains("  phone: [\"+14155550100\"]\n"), "{}", r.content);
     }
 
     #[test]
@@ -730,9 +817,82 @@ mod tests {
     }
 
     #[test]
+    fn phone_and_imessage_stubs_are_lists_the_identity_index_can_read() {
+        // Regression: the writer emitted `phone: "+1…"` while the reader
+        // declares `Vec<String>`, so every page the iMessage backfill wrote
+        // was skipped by the identity index with "expected a sequence".
+        let patch = PersonPatch::new()
+            .with_display_name("Nav")
+            .identity("imessage", "+12012757410")
+            .identity("phone", "+12012757410");
+        let out = merge_person_page(None, &patch);
+        assert!(
+            out.content.contains("  imessage:\n    - \"+12012757410\"\n"),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("  phone:\n    - \"+12012757410\"\n"),
+            "{}",
+            out.content
+        );
+        let dir = tempfile::TempDir::new().unwrap();
+        let layout = WikiLayout::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(layout.people_dir()).unwrap();
+        std::fs::write(layout.people_dir().join("nav.md"), &out.content).unwrap();
+        let index = IdentityIndex::build(&layout).unwrap();
+        assert_eq!(index.len(), 1, "page must parse");
+        assert!(index.lookup("imessage", "+12012757410").is_some());
+        assert!(index.lookup("phone", "+12012757410").is_some());
+    }
+
+    #[test]
+    fn list_keys_are_extended_in_place_whatever_their_shape() {
+        // flow list not last in the block, legacy scalar phone, block email
+        let page = "---\nkind: person\nidentities:\n  email: [a@example.com]\n  phone: \"+15550001\"\n  linkedin: urn:li:1\n---\n\n# P\n";
+        let patch = PersonPatch::new()
+            .identity("email", "b@example.com")
+            .identity("phone", "+15550002")
+            .identity("imessage", "+15550002");
+        let out = merge_person_page(Some(page), &patch);
+        assert!(out.changed);
+        assert!(out.content.contains("  email: [a@example.com, b@example.com]\n"), "{}", out.content);
+        assert!(
+            out.content.contains("  phone: [\"+15550001\", \"+15550002\"]\n"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("  linkedin: urn:li:1\n"), "{}", out.content);
+        assert!(
+            out.content.contains("  imessage: [\"+15550002\"]\n---\n"),
+            "{}",
+            out.content
+        );
+        // still valid YAML for the strict reader, and idempotent
+        let dir = tempfile::TempDir::new().unwrap();
+        let layout = WikiLayout::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(layout.people_dir()).unwrap();
+        std::fs::write(layout.people_dir().join("p.md"), &out.content).unwrap();
+        let index = IdentityIndex::build(&layout).unwrap();
+        let hit = index.lookup("phone", "+15550001").expect("old phone kept");
+        assert_eq!(hit.identities.phone, vec!["+15550001", "+15550002"]);
+        assert_eq!(hit.identities.email, vec!["a@example.com", "b@example.com"]);
+        let again = merge_person_page(Some(&out.content), &patch);
+        assert!(!again.changed, "second merge must be a no-op:\n{}", again.content);
+    }
+
+    #[test]
+    fn block_list_gets_items_appended_after_the_last_existing_item() {
+        let page = "---\nkind: person\nidentities:\n  email:\n    - a@example.com\n  linkedin: urn:li:1\n---\n";
+        let out = merge_person_page(Some(page), &PersonPatch::new().identity("email", "b@example.com"));
+        assert_eq!(
+            out.content,
+            "---\nkind: person\nidentities:\n  email:\n    - a@example.com\n    - b@example.com\n  linkedin: urn:li:1\n---\n"
+        );
+    }
+
+    #[test]
     fn identity_index_resolves_created_stub() {
-        use crate::identity::IdentityIndex;
-        use crate::layout::WikiLayout;
         let dir = tempfile::TempDir::new().unwrap();
         let layout = WikiLayout::new(dir.path().to_path_buf());
         std::fs::create_dir_all(layout.people_dir()).unwrap();
