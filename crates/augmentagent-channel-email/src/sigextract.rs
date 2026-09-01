@@ -422,8 +422,10 @@ const TEAMS_JOIN_MARKERS: &[&str] = &[
 ///
 /// Returns true if **any** of:
 ///   1. An attachment label names a calendar artifact (`text/calendar` MIME
-///      or a `.ics` filename). Note `attachments` is empty on DB
-///      round-trips, so this is a bonus signal, never the only one.
+///      or a `.ics` filename — matched at a token end so it reads as an
+///      extension, not any substring of a longer label). Bonus signal only:
+///      `list_retryable_replies` rehydrates `Email` with no attachments, so
+///      the body/subject rules below carry the persisted path on their own.
 ///   2. The body is a Teams invite: "Microsoft Teams meeting" AND a join
 ///      marker. Conjunctive on purpose — "let's do a Teams meeting" must
 ///      still get a draft.
@@ -439,7 +441,9 @@ pub fn is_meeting_invite(subject: &str, body: &str, attachments: &[String]) -> b
     // 1. Calendar attachment labels (e.g. `invite.ics (text/calendar)`).
     for att in attachments {
         let att_lower = att.to_ascii_lowercase();
-        if att_lower.contains("text/calendar") || att_lower.contains(".ics") {
+        if att_lower.contains("text/calendar")
+            || att_lower.split_whitespace().any(|t| t.ends_with(".ics"))
+        {
             return true;
         }
     }
@@ -1421,6 +1425,12 @@ Where: Microsoft Teams
             "Quick question on the deploy",
             "Did the migration land yet? Need to plan around it.",
             &["proposal.pdf (application/pdf)".to_string()],
+        ));
+        // `.ics` must read as a filename extension, not any substring.
+        assert!(!is_meeting_invite(
+            "Numbers for Q3",
+            "Export attached.",
+            &["metrics.icsv (text/csv)".to_string()],
         ));
         assert!(!is_meeting_invite("", "", &[]));
     }
