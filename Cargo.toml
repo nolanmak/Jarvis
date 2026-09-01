@@ -24,6 +24,7 @@ members = [
     "crates/augmentagent-channel-partiful",
     "crates/augmentagent-channel-gdrive",
     "crates/augmentagent-channel-journal",
+    "crates/augmentagent-channel-imessage",
     "crates/augmentagent-channel-contacts",
     "crates/augmentagent-channel-deft",
     "crates/augmentagent-content-adapter",

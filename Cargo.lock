@@ -518,6 +518,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-channel-imessage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "augmentagent-wiki",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "augmentagent-channel-instagram"
 version = "0.1.0"
 dependencies = [
