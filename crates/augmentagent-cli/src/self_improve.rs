@@ -467,6 +467,7 @@ fn gate_env() -> Vec<(String, String)> {
     // even kill-leaked files live only until the next gate, in a dir we own.
     env.retain(|(k, _)| k != "TMPDIR");
     env.push(("TMPDIR".into(), format!("{}/tmp", gate_target_dir())));
+
     // #780 — gate-run tests must NEVER file real GitHub issues. Channel
     // tests that build the production channel reach GhCliIssueRunner; the
     // per-crate test guards are the first line, this is the backstop.
@@ -1750,7 +1751,13 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
         model: Some(build_model()),
         // #692 — the builder's own `cargo check/test -p` self-verification
         // reuses the shared gate cache instead of cold-building per issue.
-        env: vec![("CARGO_TARGET_DIR".into(), gate_target_dir())],
+        // #891 — and its test temp files land in the gate's swept TMPDIR, not
+        // system /tmp: the gate was contained (#878) but the builder's own
+        // test runs re-leaked 4 GB / 4,500 files within two hours.
+        env: vec![
+            ("CARGO_TARGET_DIR".into(), gate_target_dir()),
+            ("TMPDIR".into(), format!("{}/tmp", gate_target_dir())),
+        ],
         allowed_tools: vec![
             "Read".into(),
             "Grep".into(),
@@ -4883,6 +4890,15 @@ mod tests {
     }
 
     // ---- #692: shared gate target cache + stable worktree path ----
+
+    #[test]
+    fn builder_env_contains_temp_files_inside_the_gate_cache() {
+        // #891 — the builder runs `cargo test -p` itself; without this its
+        // SQLite temp files went to system /tmp even after the gate was fixed.
+        let opts = fix_opts(PathBuf::from("/tmp/wt"));
+        let tmp = opts.env.iter().find(|(k, _)| k == "TMPDIR").expect("builder TMPDIR pinned");
+        assert!(tmp.1.starts_with(&gate_target_dir()), "{}", tmp.1);
+    }
 
     #[test]
     fn gate_env_contains_temp_files_inside_the_gate_cache() {
