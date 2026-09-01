@@ -91,9 +91,8 @@ counterpart.
 Which model answers a given call is config, not code: the "Reasoner provider
 chain & model tiers" block in `.env.example` documents the provider chain
 (`AUGMENTAGENT_REASONER_CHAIN`, claude-only by default) and the per-provider
-Quality/Fast model map (`AUGMENTAGENT_MODEL_<PROVIDER>_<TIER>`). Check a chain
-end to end with `augmentagent reasoner-selftest`; `augmentagent doctor --deep`
-reports the resolved models and flags a pinned model that has left its
+Quality/Fast map (`AUGMENTAGENT_MODEL_<PROVIDER>_<TIER>`). `augmentagent
+doctor` reports both; `--deep` also flags a Cerebras pin that has left the
 provider's catalog.
 
 ## Contributing

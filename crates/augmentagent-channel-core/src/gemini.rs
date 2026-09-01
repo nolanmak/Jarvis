@@ -311,6 +311,7 @@ impl Reasoner for GeminiCliReasoner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ModelTier;
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
 
@@ -367,6 +368,40 @@ echo '{{"response":"a fine summary","stats":{{}}}}'
         assert!(rec.contains("SYSTEM_MD=set"), "system prompt must travel via GEMINI_SYSTEM_MD");
         assert!(rec.contains("SETTINGS=set"), "per-spawn settings must be pinned");
         assert!(!rec.contains("\nauto\n"), "-m must never be left on gemini's floating default");
+    }
+
+    /// #658 — the argv end of the tier map: `-m` carries exactly what
+    /// `model_for` resolved, on BOTH tiers, never the floating `auto` default.
+    #[tokio::test]
+    async fn spawn_pins_the_resolved_model_on_both_tiers() {
+        for (preset_model, tier) in [
+            ("claude-opus-4-8", ModelTier::Quality),
+            ("claude-haiku-4-5-20251001", ModelTier::Fast),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let record = dir.path().join("argv.txt");
+            let bin = stub(
+                &dir,
+                "fake-gemini",
+                &format!(
+                    "cat >/dev/null\nprintf '%s\\n' \"$@\" >{}\necho '{{\"response\":\"ok\"}}'\n",
+                    record.display()
+                ),
+            );
+            let mut o = opts(vec![]);
+            o.model = Some(preset_model.into());
+            GeminiCliReasoner { bin }.call(&o, "hi").await.unwrap();
+            let argv: Vec<String> = std::fs::read_to_string(&record)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            let want = model_for(ProviderKind::Gemini, tier);
+            assert!(
+                argv.windows(2).any(|w| w[0] == "-m" && w[1] == want),
+                "gemini must spawn with `-m {want}`, got {argv:?}"
+            );
+        }
     }
 
     #[tokio::test]

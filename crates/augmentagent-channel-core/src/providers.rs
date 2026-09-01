@@ -202,10 +202,9 @@ pub fn model_for(kind: ProviderKind, tier: ModelTier) -> String {
     }
 }
 
-/// A parsed `AUGMENTAGENT_REASONER_CHAIN`: the providers in configured
-/// order, plus the tokens that named nothing. The daemon only wants the
-/// former; `doctor` (#658) reports the latter, because a silently shortened
-/// chain looks exactly like a chain nobody configured.
+/// A parsed `AUGMENTAGENT_REASONER_CHAIN`: providers in configured order,
+/// plus the tokens that named nothing. `doctor` (#658) reports the latter —
+/// a silently shortened chain looks like a chain nobody configured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedChain {
     pub providers: Vec<ProviderKind>,
@@ -335,7 +334,9 @@ mod tests {
 
     /// #448's invariant extended to every provider (#658): the model each
     /// fallback provider runs is explicit — a filled map cell or an explicit
-    /// env override — never an inherited interactive default.
+    /// env override — never an inherited interactive default. A cell only
+    /// binds if an adapter spawns with it, which each adapter's own
+    /// `spawn_pins_the_resolved_model_on_both_tiers` guards (#658).
     #[test]
     fn no_fallback_preset_inherits_an_interactive_model() {
         for kind in [
@@ -357,64 +358,14 @@ mod tests {
 
     #[test]
     fn parse_chain_reports_unknown_tokens() {
-        // Same input as `chain_env_parses_and_defaults`, minus the env: a
-        // typo is skipped, not fatal, but it must be NAMED so `doctor` can
-        // show the owner why their chain came up short.
-        let parsed = parse_chain("claude, codex,nope,gemini,claude");
+        // A typo is skipped, not fatal — but it must be NAMED, so `doctor`
+        // can show the owner why their chain came up short.
+        let parsed = parse_chain("claude,nope,gemini");
         assert_eq!(
             parsed.providers,
-            vec![ProviderKind::Claude, ProviderKind::Codex, ProviderKind::Gemini]
+            vec![ProviderKind::Claude, ProviderKind::Gemini]
         );
         assert_eq!(parsed.unknown, vec!["nope".to_string()]);
-
-        let empty = parse_chain("");
-        assert_eq!(empty.providers, vec![ProviderKind::Claude]);
-        assert!(empty.unknown.is_empty());
-    }
-
-    /// #448's no-inheritance invariant taken across the whole matrix (#658):
-    /// every production preset, on every provider, resolves to a concrete
-    /// pinned model — never empty, never gemini's floating `auto`, never the
-    /// owner's `[1m]` context alias.
-    #[test]
-    fn every_preset_resolves_an_explicit_model_on_every_provider() {
-        use crate::reasoner::{
-            archetype_pick_opts, ask_opts, digest_opts, draft_opts, ingest_opts, lint_opts,
-            loop_parse_opts, resume_opts, social_adapter_opts, tone_summarize_opts, triage_opts,
-            wiki_migrate_opts,
-        };
-        let wiki = std::path::PathBuf::from("/tmp/wiki");
-        let repo = std::path::PathBuf::from("/tmp/repo");
-        let presets: Vec<(&str, ReasonerOpts)> = vec![
-            ("triage", triage_opts(Some(wiki.clone()))),
-            ("draft", draft_opts("sys".into(), Some(wiki.clone()))),
-            ("lint", lint_opts("sys".into(), wiki.clone())),
-            ("ask", ask_opts(wiki.clone(), repo.clone())),
-            ("digest", digest_opts(Some(wiki.clone()))),
-            ("social_adapter", social_adapter_opts("sys".into())),
-            ("resume", resume_opts(wiki.clone())),
-            ("tone_summarize", tone_summarize_opts()),
-            ("loop_parse", loop_parse_opts()),
-            ("archetype_pick", archetype_pick_opts()),
-            ("ingest", ingest_opts("sys".into(), wiki.clone())),
-            ("wiki_migrate", wiki_migrate_opts("sys".into(), wiki.clone())),
-        ];
-        for (name, opts) in presets {
-            let tier = tier_of(&opts);
-            for kind in [
-                ProviderKind::Claude,
-                ProviderKind::Codex,
-                ProviderKind::Gemini,
-                ProviderKind::Cerebras,
-            ] {
-                let m = model_for(kind, tier);
-                assert!(
-                    !m.trim().is_empty() && m != "auto" && !m.contains("[1m]"),
-                    "{name}_opts on {} resolved to a floating model: {m:?}",
-                    kind.name()
-                );
-            }
-        }
     }
 
     #[test]
