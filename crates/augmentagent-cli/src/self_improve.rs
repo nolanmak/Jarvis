@@ -467,6 +467,7 @@ fn gate_env() -> Vec<(String, String)> {
     // even kill-leaked files live only until the next gate, in a dir we own.
     env.retain(|(k, _)| k != "TMPDIR");
     env.push(("TMPDIR".into(), format!("{}/tmp", gate_target_dir())));
+
     // #780 — gate-run tests must NEVER file real GitHub issues. Channel
     // tests that build the production channel reach GhCliIssueRunner; the
     // per-crate test guards are the first line, this is the backstop.
@@ -1254,11 +1255,27 @@ untestable.\n\
 no scratch files.\n\
 - Conventions: does it match the surrounding code's idiom and comment density?\n\
 \n\
+MATERIALITY (#889): request changes ONLY for findings that would cause \
+incorrect behaviour in a case a user could realistically hit, lose data, \
+create a security hole, or leave the issue's own reported case without a \
+regression test. Style preferences, theoretical edge cases needing exotic \
+preconditions, and nice-to-have hardening are NOT blockers — put them in \
+your notes prefixed `non-blocking:` and still approve. Ask yourself: would \
+you block a colleague's merge over this? A reviewer that always finds one \
+more thing is not a bar, it is an unreachable asymptote.\n\
+CONVERGENCE: when the message includes your PRIOR findings, your PRIMARY job \
+is judging whether they were addressed (fixed, or rebutted in a code comment \
+with a sound argument). Do not re-litigate a rebutted finding without new \
+evidence. A NEW finding on a revision round must clear the materiality bar \
+with room to spare — each round of fresh eyes will always find something \
+smaller, and that ratchet is a process failure, not rigor.\n\
+\n\
 Your output MUST start with this line EXACTLY:\n\
 CODEX-REVIEW: lgtm | changes-requested\n\
-Then a blank line, then 3-8 sentences: for lgtm, what you verified and how; \
-for changes-requested, the concrete defects as file:line. Read-only — do NOT \
-edit anything. Output ONLY the verdict line and your notes.";
+Then a blank line, then 3-8 sentences: for lgtm, what you verified and how \
+(non-blocking notes welcome); for changes-requested, the concrete defects as \
+file:line and why each is material. Read-only — do NOT edit anything. Output \
+ONLY the verdict line and your notes.";
 
 const CODEX_SYSTEM_REVIEW_SYSTEM: &str = "You are an INDEPENDENT reviewer on a \
 staged autonomous fix pipeline, and this is the SYSTEM-INTERACTION pass. A \
@@ -1460,6 +1477,39 @@ async fn find_resumable_draft(repo_root: &Path) -> Option<(u64, u64, String)> {
         return None;
     }
     let prs: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+
+    // #880 — a PR whose issue carries the gave-up label is NOT resumable.
+    // Without this, the daily ledger reset made a never-converging PR an
+    // annuity: #853 burned two full resume cycles (7 revision rounds, 8
+    // focused rejections) in one day, and nothing would have stopped a third
+    // tomorrow. The gave-up label is the existing "needs a human" bit — the
+    // resume path just never read it.
+    let (ok, labeled, _) = run(
+        &gh,
+        &[
+            "issue", "list", "--state", "open", "--label", GAVE_UP_LABEL,
+            "--limit", "200", "--json", "number",
+        ],
+        repo_root,
+    )
+    .await
+    .ok()?;
+    let gave_up: std::collections::HashSet<u64> = if ok {
+        serde_json::from_str::<serde_json::Value>(&labeled)
+            .ok()
+            .and_then(|v| {
+                v.as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|i| i.get("number")?.as_u64())
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    } else {
+        // Can't tell — resume nothing rather than resume a labeled-out PR.
+        return None;
+    };
+
     let ledger = AttemptLedger::load(&attempt_ledger_path());
     let today = utc_day_now();
     prs.as_array()?
@@ -1469,7 +1519,7 @@ async fn find_resumable_draft(repo_root: &Path) -> Option<(u64, u64, String)> {
             let number = pr.get("number")?.as_u64()?;
             let branch = pr.get("headRefName")?.as_str()?;
             let issue = issue_from_branch(branch)?;
-            (draft && !ledger.attempted_today(today, issue))
+            (draft && !ledger.attempted_today(today, issue) && !gave_up.contains(&issue))
                 .then(|| (number, issue, branch.to_string()))
         })
         .min_by_key(|(number, _, _)| *number)
@@ -1525,6 +1575,7 @@ async fn independent_review(
     summary: &str,
     diff: &str,
     worktree: PathBuf,
+    prior_findings: Option<&str>,
 ) -> IndependentReview {
     let Some(reasoner) = augmentagent_channel_core::build_pinned(
         augmentagent_channel_core::ProviderKind::Codex,
@@ -1534,6 +1585,20 @@ async fn independent_review(
         );
     };
 
+    // #889 — on revision rounds the reviewer sees its own prior findings, so
+    // it can converge (were they addressed?) instead of re-scoping from
+    // scratch and finding one smaller thing per round forever.
+    let prior_section = prior_findings
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| {
+            format!(
+                "\n\n## Your prior findings on the previous revision\n\
+                 The builder revised specifically against these. Judge \
+                 whether each was addressed or soundly rebutted.\n{}",
+                truncate(p, 3000)
+            )
+        })
+        .unwrap_or_default();
     let context = format!(
         "GitHub issue #{}: {}\n\n{}\n\nThe author model's own summary of its \
          change:\n{}\n\nThe complete staged diff follows. The full repository \
@@ -1545,6 +1610,7 @@ async fn independent_review(
         truncate(summary, 2000),
         truncate(diff, 60_000),
     );
+    let context = format!("{context}{prior_section}");
 
     let mut out = IndependentReview {
         available: true,
@@ -1685,7 +1751,13 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
         model: Some(build_model()),
         // #692 — the builder's own `cargo check/test -p` self-verification
         // reuses the shared gate cache instead of cold-building per issue.
-        env: vec![("CARGO_TARGET_DIR".into(), gate_target_dir())],
+        // #891 — and its test temp files land in the gate's swept TMPDIR, not
+        // system /tmp: the gate was contained (#878) but the builder's own
+        // test runs re-leaked 4 GB / 4,500 files within two hours.
+        env: vec![
+            ("CARGO_TARGET_DIR".into(), gate_target_dir()),
+            ("TMPDIR".into(), format!("{}/tmp", gate_target_dir())),
+        ],
         allowed_tools: vec![
             "Read".into(),
             "Grep".into(),
@@ -1954,6 +2026,90 @@ async fn drop_root_scratch(worktree: &Path) -> Vec<String> {
     dropped
 }
 
+/// Is this PR merged on GitHub? (#893)
+///
+/// `gh pr merge --squash --delete-branch` merges, deletes the REMOTE branch,
+/// then tries to delete the LOCAL branch — and exits non-zero if that last
+/// step fails, e.g. because a worktree still holds it. PR #839 was reported
+/// "merge FAILED (left open)" while sitting on main as MERGED. Never infer
+/// merge failure from gh's exit code alone; ask GitHub.
+/// Did the merge succeed? gh's exit code is only half the evidence (#893):
+/// a non-zero exit with the PR in state `MERGED` on GitHub is a success whose
+/// local-branch-delete step tripped, not a failed merge.
+fn merge_succeeded(gh_exit_ok: bool, pr_state: Option<&str>) -> bool {
+    gh_exit_ok
+        || pr_state
+            .map(|st| st.trim().eq_ignore_ascii_case("MERGED"))
+            .unwrap_or(false)
+}
+
+async fn pr_state(repo_root: &Path, pr: u64) -> Option<String> {
+    let gh = gh_bin();
+    match run(&gh, &["pr", "view", &pr.to_string(), "--json", "state", "--jq", ".state"], repo_root)
+        .await
+    {
+        Ok((true, out, _)) => Some(out.trim().to_string()),
+        _ => None,
+    }
+}
+
+async fn pr_is_merged(repo_root: &Path, pr: u64) -> bool {
+    merge_succeeded(false, pr_state(repo_root, pr).await.as_deref())
+}
+
+/// #895 — make a revision round visible on the PR: push the round's commit
+/// and post the findings it addressed plus the pushed SHA as a PR comment, so
+/// the PR timeline reads findings → revision → findings → … → LGTM instead of
+/// going silent for the whole run. Also makes each round durable: a run
+/// killed mid-loop no longer loses its revisions.
+///
+/// Best-effort — a failed push or comment never aborts the round; the final
+/// push at the end of the run still covers the commit.
+async fn publish_round(
+    worktree: &Path,
+    branch: &str,
+    repo_root: &Path,
+    pr: u64,
+    round: u32,
+    kind: &str,
+    findings: &str,
+    dry_run: bool,
+) {
+    if dry_run {
+        info!(pr, round, kind, "DRY RUN — would push the round and comment its findings");
+        return;
+    }
+    match run("git", &["push", "origin", branch], worktree).await {
+        Ok((true, _, _)) => {}
+        Ok((false, _, e)) => {
+            warn!(pr, round, "round push failed (final push will retry): {}", truncate(&e, 300))
+        }
+        Err(e) => warn!(pr, round, "round push errored: {e:#}"),
+    }
+    let sha = match run("git", &["rev-parse", "--short", "HEAD"], worktree).await {
+        Ok((true, out, _)) => out.trim().to_string(),
+        _ => "unknown".to_string(),
+    };
+    let body = round_comment(round, kind, findings, &sha);
+    let gh = gh_bin();
+    match run(&gh, &["pr", "comment", &pr.to_string(), "--body", &body], repo_root).await {
+        Ok((true, _, _)) => {}
+        Ok((false, _, e)) => warn!(pr, round, "round comment failed: {}", truncate(&e, 300)),
+        Err(e) => warn!(pr, round, "round comment errored: {e:#}"),
+    }
+}
+
+/// Body of the per-round PR comment (#895). Findings are capped so a verbose
+/// reviewer can't blow past GitHub's comment limit.
+fn round_comment(round: u32, kind: &str, findings: &str, sha: &str) -> String {
+    format!(
+        "Auto-resume — review round {round} ({kind}).\n\n\
+         **Findings addressed by this revision:**\n{}\n\n\
+         Revision pushed as `{sha}`; codex re-reviews this commit next.",
+        truncate(findings, 2500)
+    )
+}
+
 /// Resume a sitting draft PR (#866): re-review it against today's `main`,
 /// revise against fresh findings, and merge on a double LGTM.
 ///
@@ -2069,6 +2225,9 @@ async fn resume_draft_pr(
 
     let mut rounds_done = 0u32;
     let mut notes_log: Vec<String> = Vec::new();
+    // #889 — the reviewer's previous round's findings, fed back so it judges
+    // convergence instead of re-scoping every round.
+    let mut prior_notes: Option<String> = None;
     let mut summary = format!("Resumed sitting draft PR #{pr}.");
     loop {
         // The PR's actual contribution, freshly computed each round.
@@ -2130,6 +2289,7 @@ async fn resume_draft_pr(
                         &worktree,
                     )
                     .await?;
+                    publish_round(&worktree, branch, repo_root, pr, rounds_done, "shrink", &shrink_findings(lines_now), dry_run).await;
                     summary = format!("{summary}\nRound {rounds_done} (shrink): {}", truncate(&rs, 200));
                     continue;
                 }
@@ -2180,6 +2340,7 @@ async fn resume_draft_pr(
                             &worktree,
                         )
                         .await?;
+                        publish_round(&worktree, branch, repo_root, pr, rounds_done, "gate repair", &gate_findings(&gate_err.to_string()), dry_run).await;
                         summary = format!(
                             "{summary}\nRound {rounds_done} (gate repair): {}",
                             truncate(&rs, 200)
@@ -2201,11 +2362,19 @@ async fn resume_draft_pr(
                 repo_root,
             )
             .await;
-            record_attempt(repo_root, issue.number).await.ok();
-            return Ok(RunReport::built(format!("PR #{pr}: resume gate failed")));
+            let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+            if attempts >= MAX_ATTEMPTS {
+                label_gave_up(repo_root, issue.number).await.ok();
+            }
+            return Ok(RunReport::built(format!(
+                "PR #{pr}: resume gate failed (attempt {attempts})"
+            )));
         }
 
-        let independent = independent_review(&issue, &summary, &diff, worktree.clone()).await;
+        let independent =
+            independent_review(&issue, &summary, &diff, worktree.clone(), prior_notes.as_deref())
+                .await;
+        prior_notes = Some(independent.notes.clone());
         notes_log.push(format!(
             "round {rounds_done}: {}",
             independent.status()
@@ -2269,18 +2438,25 @@ async fn resume_draft_pr(
                 )));
             }
             let _ = run(&gh, &["pr", "ready", &pr.to_string()], repo_root).await;
+            // #893 — release the worktree BEFORE merging: gh's --delete-branch
+            // also deletes the local branch, which fails while a worktree
+            // holds it and turns a successful merge into a reported failure.
+            // Everything is pushed; nothing local is needed past this point.
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
             let (ok, _o, e) = run(
                 &gh,
                 &["pr", "merge", &pr.to_string(), "--squash", "--delete-branch"],
                 repo_root,
             )
             .await?;
-            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-            if !ok {
+            if !ok && !pr_is_merged(repo_root, pr).await {
                 warn!(pr, "resume auto-merge failed; PR left ready: {e}");
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: double LGTM but merge FAILED (left open)"
                 )));
+            }
+            if !ok {
+                warn!(pr, "gh pr merge exited non-zero but the PR is MERGED; treating as success: {e}");
             }
             notify_discord(&format!("✅ resumed draft merged: {} — PR #{pr}", issue.title)).await;
             return Ok(RunReport::built(format!("PR #{pr}: resumed and MERGED")));
@@ -2302,7 +2478,12 @@ async fn resume_draft_pr(
             )
             .await;
             cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-            record_attempt(repo_root, issue.number).await.ok();
+            let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+            if attempts >= MAX_ATTEMPTS {
+                // Every future resume would replay the same disagreement;
+                // the label hands it to a human with the exchange attached.
+                label_gave_up(repo_root, issue.number).await.ok();
+            }
             notify_discord(&format!(
                 "📝 resumed draft still needs review after {rounds_done} rounds: {} — PR #{pr}",
                 issue.title
@@ -2340,6 +2521,7 @@ async fn resume_draft_pr(
             &worktree,
         )
         .await?;
+        publish_round(&worktree, branch, repo_root, pr, rounds_done, "independent findings", &independent.notes, dry_run).await;
         summary = format!("{summary}\nRound {rounds_done}: {}", truncate(&rev_summary, 300));
     }
 }
@@ -2979,7 +3161,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // gate, and satisfied the author's own QA, so it opens as a draft PR
     // carrying both verdicts for a human. It does count as a failed attempt,
     // because a second opinion disagreeing is exactly what this stage is for.
-    let mut independent = independent_review(&issue, &summary, &full_diff, worktree.clone()).await;
+    let mut independent =
+        independent_review(&issue, &summary, &full_diff, worktree.clone(), None).await;
     let mut revision_note = String::new();
     if independent.available && !independent.approved() {
         warn!(
@@ -3134,7 +3317,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 // The revised diff may touch different files.
                 gated = touches_verify_gated_path(&names2);
                 lines = lines2;
-                independent = independent_review(&issue, &rev_summary, &diff2, worktree.clone()).await;
+                let prior = independent.notes.clone();
+                independent =
+                    independent_review(&issue, &rev_summary, &diff2, worktree.clone(), Some(&prior))
+                        .await;
                 revision_note.push_str(&format!(
                     "\n### Revision round {round} (prior verdict: {round1})\n{}\n\n\
                      Verdict after round {round}: {}\n",
@@ -3388,7 +3574,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         repo_root,
     )
     .await?;
-    if !ok {
+    let pr_number = pr_url.rsplit('/').next().and_then(|n| n.parse::<u64>().ok());
+    let merged_anyway = match pr_number {
+        Some(n) if !ok => pr_is_merged(repo_root, n).await,
+        _ => false,
+    };
+    if !ok && !merged_anyway {
         warn!(issue = issue.number, "auto-merge failed; PR left open: {e}");
         return Ok(RunReport::built(format!(
             "issue #{}: PR opened but auto-merge FAILED (left open for review) — {pr_url}",
@@ -4800,6 +4991,15 @@ mod tests {
     // ---- #692: shared gate target cache + stable worktree path ----
 
     #[test]
+    fn builder_env_contains_temp_files_inside_the_gate_cache() {
+        // #891 — the builder runs `cargo test -p` itself; without this its
+        // SQLite temp files went to system /tmp even after the gate was fixed.
+        let opts = fix_opts(PathBuf::from("/tmp/wt"));
+        let tmp = opts.env.iter().find(|(k, _)| k == "TMPDIR").expect("builder TMPDIR pinned");
+        assert!(tmp.1.starts_with(&gate_target_dir()), "{}", tmp.1);
+    }
+
+    #[test]
     fn gate_env_contains_temp_files_inside_the_gate_cache() {
         // #877 — 19 GB of leaked SQLite temp files in system /tmp. The gate
         // must point TMPDIR at a dir it owns and sweeps.
@@ -5205,6 +5405,25 @@ mod tests {
         // review is impossible otherwise.
         assert_eq!(opts.cwd, Some(PathBuf::from("/tmp/wt")));
         assert!(opts.add_dirs.contains(&PathBuf::from("/tmp/wt")));
+    }
+
+    #[test]
+    fn focused_prompt_carries_materiality_and_convergence_rules() {
+        // #889 — 0 focused-pass approvals in ~20 live reviews: each round of
+        // fresh eyes found one smaller thing, forever. The prompt must state
+        // a materiality bar and a convergence rule or the bar is an
+        // unreachable asymptote and nothing ever merges.
+        assert!(CODEX_DIFF_REVIEW_SYSTEM.contains("MATERIALITY"));
+        assert!(CODEX_DIFF_REVIEW_SYSTEM.contains("non-blocking:"));
+        assert!(
+            CODEX_DIFF_REVIEW_SYSTEM.contains("would you block a colleague"),
+            "the human-review calibration question is the operative test"
+        );
+        assert!(CODEX_DIFF_REVIEW_SYSTEM.contains("CONVERGENCE"));
+        assert!(
+            CODEX_DIFF_REVIEW_SYSTEM.contains("Do not re-litigate a rebutted finding"),
+            "a sound rebuttal must settle a finding"
+        );
     }
 
     #[test]
@@ -6202,5 +6421,71 @@ CODEX-REVIEW: lgtm").0);
             ),
             " M crates/augmentagent-cli/src/main.rs\n?? notes.txt"
         );
+    }
+
+    // #893 — PR #839 merged on GitHub but gh exited non-zero because the
+    // local branch was still held by the resume worktree; we reported FAILED.
+    #[test]
+    fn merge_reported_by_github_state_not_gh_exit_code() {
+        // gh succeeded → merged, whatever state says (or doesn't).
+        assert!(merge_succeeded(true, None));
+        assert!(merge_succeeded(true, Some("OPEN")));
+        // gh failed but GitHub says MERGED → the merge happened.
+        assert!(merge_succeeded(false, Some("MERGED")));
+        assert!(merge_succeeded(false, Some(" merged\n")));
+        // gh failed and the PR is still open/closed/unknown → real failure.
+        assert!(!merge_succeeded(false, Some("OPEN")));
+        assert!(!merge_succeeded(false, Some("CLOSED")));
+        assert!(!merge_succeeded(false, Some("")));
+        assert!(!merge_succeeded(false, None));
+    }
+
+    // Structural guard for the ordering half of #893: the resume path must
+    // release the worktree BEFORE `gh pr merge --delete-branch`, or the
+    // local-branch deletion fails while a worktree holds the branch.
+    #[test]
+    fn resume_cleans_up_worktree_before_merging() {
+        // Earlier failure paths also call cleanup, so anchor on the merge
+        // section: between `gh pr ready` and `gh pr merge` there must be one.
+        let src = include_str!("self_improve.rs");
+        let resume_start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let body = &src[resume_start..];
+        let ready_at = body.find(r#"["pr", "ready", &pr.to_string()]"#).expect("gh pr ready call");
+        let merge_at = body
+            .find(r#""pr", "merge", &pr.to_string(), "--squash", "--delete-branch""#)
+            .expect("merge call");
+        assert!(ready_at < merge_at, "ready must precede merge");
+        let between = &body[ready_at..merge_at];
+        assert!(
+            between.contains("cleanup(worktree, branch.to_string()"),
+            "resume_draft_pr must release the worktree between `gh pr ready` and `gh pr merge --delete-branch`"
+        );
+    }
+
+    // #895 — every revision round must be pushed + commented on the PR.
+    #[test]
+    fn round_comment_names_round_kind_findings_and_sha() {
+        let c = round_comment(2, "independent findings", "rfind(',') splits quoted display names", "abc1234");
+        assert!(c.contains("review round 2"));
+        assert!(c.contains("(independent findings)"));
+        assert!(c.contains("rfind(',') splits quoted display names"));
+        assert!(c.contains("`abc1234`"));
+        // verbose reviewers are capped well under GitHub's comment limit
+        let long = "x".repeat(20_000);
+        assert!(round_comment(1, "shrink", &long, "deadbee").len() < 3_000);
+    }
+
+    // Structural: in resume_draft_pr, each round commit (shrink, gate repair,
+    // revise) is followed by a publish_round call. Red before #895 (0 of 3).
+    #[test]
+    fn resume_publishes_every_round_commit() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = src[start..].find("\n}\n").expect("fn end") + start;
+        let body = &src[start..end];
+        let commits = body.matches(r#""commit", "--allow-empty", "-m", &msg"#).count();
+        let publishes = body.matches("publish_round(").count();
+        assert_eq!(commits, 3, "expected the shrink, gate-repair and revise commits");
+        assert_eq!(publishes, commits, "every round commit must be pushed + commented (#895)");
     }
 }

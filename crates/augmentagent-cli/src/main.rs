@@ -418,8 +418,8 @@ enum Cmd {
         /// stdout is piped, table on a tty.
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         json: Option<bool>,
-        /// Add slower probes (Composio whoami ping; per-channel validate
-        /// summaries sourced from `status`).
+        /// Add slower probes (Composio whoami ping; Cerebras model-catalog
+        /// check; per-channel validate summaries sourced from `status`).
         #[arg(long, default_value_t = false)]
         deep: bool,
     },
