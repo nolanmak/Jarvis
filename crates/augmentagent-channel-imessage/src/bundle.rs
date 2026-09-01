@@ -74,10 +74,10 @@ impl Bundle {
     /// deterministic iteration.
     pub fn conversations(&self) -> Result<Vec<Conversation>> {
         let path = self.root.join("conversations").join("index.json");
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let map: BTreeMap<String, Conversation> = serde_json::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let map: BTreeMap<String, Conversation> =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         Ok(map.into_values().collect())
     }
 
@@ -88,8 +88,8 @@ impl Bundle {
             .join("conversations")
             .join(&conv.dir)
             .join("messages.md");
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         Ok(parse_entries(&raw))
     }
 }
@@ -123,7 +123,9 @@ pub fn parse_entries(md: &str) -> Vec<MessageEntry> {
             current.attachments.push(line.to_string());
         } else {
             // un-escape body lines that collide with the header pattern
-            let unescaped = line.strip_prefix('\\').filter(|r| r.starts_with(HEADER_PREFIX));
+            let unescaped = line
+                .strip_prefix('\\')
+                .filter(|r| r.starts_with(HEADER_PREFIX));
             let text = unescaped.unwrap_or(line);
             if !current.body.is_empty() {
                 current.body.push('\n');
@@ -181,7 +183,10 @@ pub fn entry_date(timestamp: &str) -> Option<&str> {
     let ok = date.len() == 10
         && date.as_bytes()[4] == b'-'
         && date.as_bytes()[7] == b'-'
-        && date.chars().enumerate().all(|(i, c)| matches!(i, 4 | 7) || c.is_ascii_digit());
+        && date
+            .chars()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 4 | 7) || c.is_ascii_digit());
     ok.then_some(date)
 }
 

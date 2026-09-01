@@ -53,7 +53,10 @@ pub struct ImessageSyncer<'a> {
 impl ImessageSyncer<'_> {
     pub fn run(&self) -> Result<ImessageReport> {
         let index = IdentityIndex::build(self.layout)?;
-        let mut report = ImessageReport { applied: self.apply, ..Default::default() };
+        let mut report = ImessageReport {
+            applied: self.apply,
+            ..Default::default()
+        };
 
         for conv in self.bundle.conversations()? {
             report.conversations_seen += 1;
@@ -213,7 +216,10 @@ impl ImessageSyncer<'_> {
     fn resolve(&self, index: &IdentityIndex, handle: &str) -> Option<(String, PathBuf)> {
         if handle.starts_with('+') {
             if let Ok(Some(hit)) = self.store.lookup_person_by_phone(handle) {
-                let path = self.layout.people_dir().join(format!("{}.md", hit.person_slug));
+                let path = self
+                    .layout
+                    .people_dir()
+                    .join(format!("{}.md", hit.person_slug));
                 return Some((hit.person_slug, path));
             }
         }
@@ -271,9 +277,63 @@ pub fn poll_once(bundle: &Bundle, store: &Store) -> Result<(PollStats, Vec<PollD
         }
         store.set_imessage_entries_seen(&conv.identifier, entries.len() as i64)?;
         stats.conversations_with_new += 1;
-        deltas.push(PollDelta { conversation: conv, new_entries, first_run: seen == 0 });
+        deltas.push(PollDelta {
+            conversation: conv,
+            new_entries,
+            first_run: seen == 0,
+        });
     }
     Ok((stats, deltas))
+}
+
+/// One synthetic `Email` for a whole conversation delta — the wiki ingest
+/// runs once per conversation per poll, not once per message. Body is the
+/// new entries in their on-disk header format, capped to keep the ingest
+/// prompt bounded (oldest entries drop first; the `emails` rows already
+/// hold everything).
+pub fn batched_delta_email(delta: &PollDelta) -> augmentagent_store::Email {
+    const MAX_CHARS: usize = 8_000;
+    let conv = &delta.conversation;
+    let mut sections: Vec<String> = delta
+        .new_entries
+        .iter()
+        .map(|(_, e)| {
+            let mut s = format!("### [{}] {}\n{}", e.timestamp, e.sender, e.body);
+            for a in &e.attachments {
+                s.push('\n');
+                s.push_str(a);
+            }
+            s
+        })
+        .collect();
+    let mut total: usize = sections.iter().map(|s| s.len() + 2).sum();
+    while sections.len() > 1 && total > MAX_CHARS {
+        let dropped = sections.remove(0);
+        total -= dropped.len() + 2;
+    }
+    let last_idx = delta.new_entries.last().map(|(i, _)| *i).unwrap_or(0);
+    augmentagent_store::Email {
+        message_id: format!("imessage:{}:batch:{}", conv.identifier, last_idx),
+        thread_id: Some(format!("imessage:{}", conv.identifier)),
+        from: conv
+            .participants
+            .first()
+            .cloned()
+            .unwrap_or_else(|| conv.identifier.clone()),
+        to: String::new(),
+        cc: String::new(),
+        attachments: Vec::new(),
+        subject: format!("iMessage: {} ({} new)", conv.title, delta.new_entries.len()),
+        body: sections.join("\n\n"),
+        date: delta
+            .new_entries
+            .last()
+            .map(|(_, e)| e.timestamp.clone())
+            .unwrap_or_default(),
+        account_entity_id: Some("imessage".into()),
+        platform: "imessage".into(),
+        kind: "dm".into(),
+    }
 }
 
 #[cfg(test)]
@@ -326,19 +386,33 @@ mod tests {
     #[test]
     fn backfill_creates_page_with_last_message_date() {
         let (dir, layout, store) = fresh_env();
-        let bundle = fixture_bundle(dir.path(), &[("+14155550123", "John_Smith", "John Smith", DM_MD)]);
-        let syncer = ImessageSyncer { bundle: &bundle, layout: &layout, store: &store, apply: true };
+        let bundle = fixture_bundle(
+            dir.path(),
+            &[("+14155550123", "John_Smith", "John Smith", DM_MD)],
+        );
+        let syncer = ImessageSyncer {
+            bundle: &bundle,
+            layout: &layout,
+            store: &store,
+            apply: true,
+        };
         let report = syncer.run().unwrap();
         assert_eq!(report.pages_created, 1);
-        let page = std::fs::read_to_string(
-            layout.people_dir().join("john_smith_at_contact.md"),
-        )
-        .unwrap();
-        assert!(page.contains("imessage: \"+14155550123\"") || page.contains("imessage: '+14155550123'") || page.contains("imessage: +14155550123"), "page:\n{page}");
+        let page =
+            std::fs::read_to_string(layout.people_dir().join("john_smith_at_contact.md")).unwrap();
+        assert!(
+            page.contains("imessage: \"+14155550123\"")
+                || page.contains("imessage: '+14155550123'")
+                || page.contains("imessage: +14155550123"),
+            "page:\n{page}"
+        );
         // CRM rule: updated == last message date, never today
         assert!(page.contains("updated: 2026-08-26"), "page:\n{page}");
         // phone reverse index written
-        assert!(store.lookup_person_by_phone("+14155550123").unwrap().is_some());
+        assert!(store
+            .lookup_person_by_phone("+14155550123")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -346,7 +420,12 @@ mod tests {
         let (dir, layout, store) = fresh_env();
         let md = "---\n---\n\n### [2026-08-26T11:00:00-04:00] 72849\nreply Y to subscribe\n";
         let bundle = fixture_bundle(dir.path(), &[("72849", "72849", "72849", md)]);
-        let syncer = ImessageSyncer { bundle: &bundle, layout: &layout, store: &store, apply: true };
+        let syncer = ImessageSyncer {
+            bundle: &bundle,
+            layout: &layout,
+            store: &store,
+            apply: true,
+        };
         let report = syncer.run().unwrap();
         assert_eq!(report.skipped, 1);
         assert_eq!(report.pages_created, 0);
@@ -369,8 +448,16 @@ mod tests {
                 source: "google_people".into(),
             })
             .unwrap();
-        let bundle = fixture_bundle(dir.path(), &[("+14155550123", "John_Smith", "John Smith", DM_MD)]);
-        let syncer = ImessageSyncer { bundle: &bundle, layout: &layout, store: &store, apply: true };
+        let bundle = fixture_bundle(
+            dir.path(),
+            &[("+14155550123", "John_Smith", "John Smith", DM_MD)],
+        );
+        let syncer = ImessageSyncer {
+            bundle: &bundle,
+            layout: &layout,
+            store: &store,
+            apply: true,
+        };
         let report = syncer.run().unwrap();
         assert_eq!(report.pages_created, 0, "must reuse the phone-indexed page");
         let page = std::fs::read_to_string(layout.people_dir().join("john_smith.md")).unwrap();
@@ -382,13 +469,24 @@ mod tests {
     #[test]
     fn backfill_dry_run_writes_nothing() {
         let (dir, layout, store) = fresh_env();
-        let bundle = fixture_bundle(dir.path(), &[("+14155550123", "John_Smith", "John Smith", DM_MD)]);
-        let syncer = ImessageSyncer { bundle: &bundle, layout: &layout, store: &store, apply: false };
+        let bundle = fixture_bundle(
+            dir.path(),
+            &[("+14155550123", "John_Smith", "John Smith", DM_MD)],
+        );
+        let syncer = ImessageSyncer {
+            bundle: &bundle,
+            layout: &layout,
+            store: &store,
+            apply: false,
+        };
         let report = syncer.run().unwrap();
         assert_eq!(report.pages_created, 1); // reported…
         assert!(!report.applied);
         assert_eq!(std::fs::read_dir(layout.people_dir()).unwrap().count(), 0); // …not written
-        assert!(store.lookup_person_by_phone("+14155550123").unwrap().is_none());
+        assert!(store
+            .lookup_person_by_phone("+14155550123")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -401,7 +499,12 @@ mod tests {
         .unwrap();
         let md = "---\n---\n\n### [2026-08-26T11:00:00-04:00] +14155550999\nski this weekend?\n";
         let bundle = fixture_bundle(dir.path(), &[("chat0001", "chat0001", "Ski Trip", md)]);
-        let syncer = ImessageSyncer { bundle: &bundle, layout: &layout, store: &store, apply: true };
+        let syncer = ImessageSyncer {
+            bundle: &bundle,
+            layout: &layout,
+            store: &store,
+            apply: true,
+        };
         let report = syncer.run().unwrap();
         assert_eq!(report.pages_created, 0);
         assert_eq!(report.pages_updated, 1);
@@ -412,16 +515,24 @@ mod tests {
     #[test]
     fn poll_inserts_tail_and_advances_cursor() {
         let (dir, _layout, store) = fresh_env();
-        let bundle = fixture_bundle(dir.path(), &[("+14155550123", "John_Smith", "John Smith", DM_MD)]);
+        let bundle = fixture_bundle(
+            dir.path(),
+            &[("+14155550123", "John_Smith", "John Smith", DM_MD)],
+        );
         let (stats, deltas) = poll_once(&bundle, &store).unwrap();
         assert_eq!(stats.emails_inserted, 2);
         assert_eq!(deltas.len(), 1);
         assert!(deltas[0].first_run);
         // historical firstSeenAt from the message timestamp
-        let first_seen = store.email_first_seen_at("imessage:+14155550123:0").unwrap().unwrap();
+        let first_seen = store
+            .email_first_seen_at("imessage:+14155550123:0")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             first_seen,
-            DateTime::parse_from_rfc3339("2026-08-20T10:00:00-04:00").unwrap().timestamp_millis()
+            DateTime::parse_from_rfc3339("2026-08-20T10:00:00-04:00")
+                .unwrap()
+                .timestamp_millis()
         );
         // second poll: nothing new
         let (stats2, deltas2) = poll_once(&bundle, &store).unwrap();
@@ -430,9 +541,55 @@ mod tests {
     }
 
     #[test]
+    fn batched_delta_email_joins_entries_and_caps_size() {
+        let conv = Conversation {
+            identifier: "+14155550123".into(),
+            dir: "John_Smith".into(),
+            title: "John Smith".into(),
+            participants: vec!["+14155550123".into()],
+            service: "iMessage".into(),
+        };
+        let entry = |i: usize, body: &str| {
+            (
+                i,
+                MessageEntry {
+                    timestamp: format!("2026-08-26T11:{:02}:00-04:00", i),
+                    sender: "me".into(),
+                    body: body.into(),
+                    attachments: Vec::new(),
+                },
+            )
+        };
+        let delta = PollDelta {
+            conversation: conv.clone(),
+            new_entries: vec![entry(5, "first"), entry(6, "second")],
+            first_run: false,
+        };
+        let email = batched_delta_email(&delta);
+        assert_eq!(email.message_id, "imessage:+14155550123:batch:6");
+        assert!(email.body.contains("first") && email.body.contains("second"));
+        assert_eq!(email.date, "2026-08-26T11:06:00-04:00");
+        assert_eq!(email.platform, "imessage");
+
+        // oversized deltas drop oldest entries but keep the newest
+        let big = "x".repeat(3_000);
+        let delta = PollDelta {
+            conversation: conv,
+            new_entries: (0..5).map(|i| entry(i, &big)).collect(),
+            first_run: false,
+        };
+        let email = batched_delta_email(&delta);
+        assert!(email.body.len() <= 9_000);
+        assert!(email.body.contains("2026-08-26T11:04"), "newest entry kept");
+    }
+
+    #[test]
     fn poll_delta_after_append_is_not_first_run() {
         let (dir, _layout, store) = fresh_env();
-        let bundle = fixture_bundle(dir.path(), &[("+14155550123", "John_Smith", "John Smith", DM_MD)]);
+        let bundle = fixture_bundle(
+            dir.path(),
+            &[("+14155550123", "John_Smith", "John Smith", DM_MD)],
+        );
         poll_once(&bundle, &store).unwrap();
         // append one entry to the conversation file
         let md_path = dir
