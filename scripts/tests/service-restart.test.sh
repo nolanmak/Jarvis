@@ -160,6 +160,40 @@ check "proceeds again once the run has finished" "$?" "1"
 rm -rf "$DEFER_DIR"
 unset AUGMENTAGENT_SELFIMPROVE_LOCK AUGMENTAGENT_RESTART_DEFER_STAMP
 
+echo "trim_gate_cache_if_idle (#891):"
+CACHE_DIR=$(mktemp -d)
+export AUGMENTAGENT_GATE_TARGET_DIR="$CACHE_DIR/gate"
+export AUGMENTAGENT_GATE_CACHE_MAX_MB=1
+export AUGMENTAGENT_SELFIMPROVE_LOCK="$CACHE_DIR/self-improve.lock"
+GATE_CACHE_DIR="$AUGMENTAGENT_GATE_TARGET_DIR"; GATE_CACHE_MAX_MB=1
+SELF_IMPROVE_LOCK="$AUGMENTAGENT_SELFIMPROVE_LOCK"
+RESUME_LANE_LOCK="$CACHE_DIR/self-improve-resume.lock"
+mkdir -p "$GATE_CACHE_DIR/debug"; dd if=/dev/zero of="$GATE_CACHE_DIR/debug/blob" bs=1M count=3 status=none
+
+# A lane mid-build (holding either lock) must block the trim.
+touch "$RESUME_LANE_LOCK"
+# Short hold, then WAIT for it: `flock -c` hands the locked fd to its child,
+# so killing the flock pid does not release the lock.
+flock -x "$RESUME_LANE_LOCK" -c 'sleep 3' & HOLDER=$!
+sleep 0.3
+trim_gate_cache_if_idle >/dev/null 2>&1
+check "leaves the cache alone while a lane holds its lock" "$?" "1"
+[ -d "$GATE_CACHE_DIR/debug" ] && ok "debug/ survives while a build may be using it" \
+  || bad "debug/ survives while a build may be using it" "it was deleted under a live build"
+wait "$HOLDER" 2>/dev/null
+
+# Idle + over cap -> trimmed.
+trim_gate_cache_if_idle >/dev/null 2>&1
+check "trims when over cap and every lane is idle" "$?" "0"
+[ -d "$GATE_CACHE_DIR/debug" ] && bad "drops debug/ on trim" "still present" || ok "drops debug/ on trim"
+
+# Under cap -> untouched.
+mkdir -p "$GATE_CACHE_DIR/debug"; GATE_CACHE_MAX_MB=100000
+trim_gate_cache_if_idle >/dev/null 2>&1
+check "leaves a cache under the cap alone" "$?" "1"
+rm -rf "$CACHE_DIR"
+unset AUGMENTAGENT_GATE_TARGET_DIR AUGMENTAGENT_GATE_CACHE_MAX_MB AUGMENTAGENT_SELFIMPROVE_LOCK
+
 echo "should_write_stamp:"
 should_write_stamp 0; check "writes the stamp when nothing failed" "$?" "0"
 should_write_stamp 1; check "withholds the stamp when a required restart failed" "$?" "1"

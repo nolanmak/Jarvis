@@ -147,3 +147,38 @@ maybe_defer_restart() {
   rm -f "$RESTART_DEFER_STAMP"
   return 1
 }
+
+# --- #891: cap the shared gate cache, only when NO lane is building ---------
+#
+# Parallel lanes key cargo debug artifacts by worktree path, so the shared
+# gate cache doubled to 26 GB in one evening. Dropping `debug/` from inside a
+# gate run would race the other lane's build; the updater runs every few
+# minutes and can see both lane locks, so it is the safe place to trim.
+GATE_CACHE_DIR="${AUGMENTAGENT_GATE_TARGET_DIR:-$HOME/.cache/augmentagent-gate-target}"
+GATE_CACHE_MAX_MB="${AUGMENTAGENT_GATE_CACHE_MAX_MB:-20000}"
+RESUME_LANE_LOCK="${AUGMENTAGENT_SELFIMPROVE_LOCK:-$HOME/.local/state/augmentagent/self-improve.lock}"
+RESUME_LANE_LOCK="${RESUME_LANE_LOCK%.lock}-resume.lock"
+
+any_lane_building() {
+  for l in "$SELF_IMPROVE_LOCK" "$RESUME_LANE_LOCK"; do
+    [ -e "$l" ] || continue
+    flock -n "$l" -c true 2>/dev/null || return 0
+  done
+  return 1
+}
+
+# Trim the gate cache's debug/ when it is over the cap and every lane is idle.
+# 0 = trimmed, 1 = left alone (under cap, or a lane is mid-build).
+trim_gate_cache_if_idle() {
+  [ -d "$GATE_CACHE_DIR/debug" ] || return 1
+  local sz
+  sz=$(du -sm "$GATE_CACHE_DIR" 2>/dev/null | cut -f1)
+  [ "${sz:-0}" -gt "$GATE_CACHE_MAX_MB" ] || return 1
+  if any_lane_building; then
+    _sr_log "gate cache ${sz}MB over cap but a lane is building; trimming later"
+    return 1
+  fi
+  _sr_log "gate cache ${sz}MB over ${GATE_CACHE_MAX_MB}MB cap and lanes idle; dropping debug/ (next gate cold-rebuilds once)"
+  rm -rf "$GATE_CACHE_DIR/debug"
+  return 0
+}
