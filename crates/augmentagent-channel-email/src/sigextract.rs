@@ -409,6 +409,34 @@ const TEAMS_JOIN_MARKERS: &[&str] = &[
     "meeting id:",
 ];
 
+/// Conferencing join URLs, matched anywhere in the body. Provider-agnostic
+/// so a forwarded Zoom / Meet / Webex invite is caught on the same footing
+/// as the Teams one that was reported.
+const JOIN_LINK_MARKERS: &[&str] = &[
+    "zoom.us/j/",
+    "zoom.us/my/",
+    "meet.google.com/",
+    "teams.microsoft.com/l/meetup-join",
+    "teams.live.com/meet/",
+    ".webex.com/",
+    "whereby.com/",
+    "chime.aws/",
+    "meet.jit.si/",
+];
+
+/// Line-anchored headers that calendar clients print as a block above a
+/// forwarded invite. Any TWO distinct ones mean an invite; one alone (a
+/// stray "Where: the usual spot" in prose) does not.
+const INVITE_HEADER_PREFIXES: &[&str] = &[
+    "when:",
+    "where:",
+    "organizer:",
+    "attendees:",
+    "required attendees:",
+    "optional attendees:",
+    "invitees:",
+];
+
 /// Heuristic: is this `(subject, body, attachments)` a meeting / calendar
 /// invite rather than something to reply to?
 ///
@@ -429,11 +457,18 @@ const TEAMS_JOIN_MARKERS: &[&str] = &[
 ///   2. The body is a Teams invite: "Microsoft Teams meeting" AND a join
 ///      marker. Conjunctive on purpose — "let's do a Teams meeting" must
 ///      still get a draft.
-///   3. The body has line-anchored `When:` and `Where:` lines — the
-///      forwarded Outlook/Teams invite shape. Anchored per-line so a
-///      mid-sentence "when:" can't trip it.
-///   4. The body carries Google Calendar's invitation boilerplate.
-///   5. The subject, after stripping stacked `Fw:`/`Fwd:`/`Re:` prefixes,
+///   3. The body pairs a line-anchored `Join ...` lead-in with a
+///      conferencing join URL — the provider-agnostic online-invite shape
+///      ("Join Zoom Meeting" over a `zoom.us/j/` link, "Join with Google
+///      Meet" over a `meet.google.com/` link). Conjunctive so prose that
+///      merely pastes a standing room link still gets a draft.
+///   4. The body carries two distinct line-anchored invite headers
+///      (`When:` / `Where:` / `Organizer:` / `Attendees:` / …) — the
+///      forwarded Outlook/Teams shape, including the online-meeting variant
+///      that drops `Where:`. Anchored per-line so a mid-sentence "when:"
+///      can't trip it, and paired so one stray header can't either.
+///   5. The body carries Google Calendar's invitation boilerplate.
+///   6. The subject, after stripping stacked `Fw:`/`Fwd:`/`Re:` prefixes,
 ///      starts with a calendar-client invite marker.
 ///
 /// All comparisons are case-insensitive plain string ops; no regex crate.
@@ -458,25 +493,37 @@ pub fn is_meeting_invite(subject: &str, body: &str, attachments: &[String]) -> b
             return true;
         }
 
-        // 3. Line-anchored `When:` + `Where:` pair.
-        let mut has_when = false;
-        let mut has_where = false;
-        for line in body_lower.lines() {
-            let line = line.trim_start();
-            has_when |= line.starts_with("when:");
-            has_where |= line.starts_with("where:");
-        }
-        if has_when && has_where {
+        // 3. Generic online invite — a `Join ...` line AND a provider URL.
+        if body_lower
+            .lines()
+            .any(|l| l.trim_start().starts_with("join "))
+            && JOIN_LINK_MARKERS.iter().any(|m| body_lower.contains(m))
+        {
             return true;
         }
 
-        // 4. Google Calendar boilerplate.
+        // 4. Two distinct line-anchored invite headers.
+        let mut seen_headers = 0u32;
+        for line in body_lower.lines() {
+            let line = line.trim_start();
+            if let Some(i) = INVITE_HEADER_PREFIXES
+                .iter()
+                .position(|h| line.starts_with(h))
+            {
+                seen_headers |= 1 << i;
+            }
+        }
+        if seen_headers.count_ones() >= 2 {
+            return true;
+        }
+
+        // 5. Google Calendar boilerplate.
         if body_lower.contains("invitation from google calendar") {
             return true;
         }
     }
 
-    // 5. Subject markers, with stacked forward prefixes stripped.
+    // 6. Subject markers, with stacked forward prefixes stripped.
     let mut subject_lower = subject.trim().to_ascii_lowercase();
     loop {
         let stripped = SUBJECT_FORWARD_PREFIXES
@@ -1394,6 +1441,34 @@ Where: Microsoft Teams
         assert!(is_meeting_invite("Declined: coffee chat", "", &[]));
     }
 
+    /// A forward strips the `.ics` part, and only Teams bodies carry the
+    /// "Microsoft Teams meeting" literal — so for every other client the
+    /// join link and the organizer/attendee header block are the only
+    /// signals left. Each is asserted on its own here.
+    #[test]
+    fn meeting_invite_matches_generic_join_links_and_headers() {
+        // pii-ok — synthetic forwarded-invite fixtures.
+        assert!(is_meeting_invite(
+            "FW: Project sync",
+            "Join Zoom Meeting\nhttps://zoom.us/j/1234567890?pwd=abcdef\n",
+            &[],
+        ));
+        assert!(is_meeting_invite(
+            "Fwd: Project sync",
+            "Join with Google Meet\nhttps://meet.google.com/abc-defg-hij\n",
+            &[],
+        ));
+        // Header block alone — no join link, and an online meeting so the
+        // Outlook forward carries no `Where:` line.
+        assert!(is_meeting_invite(
+            "FW: Project sync",
+            "When: Wednesday, September 2 1:00 PM\n\
+             Organizer: Alice Example <alice@example.com>\n\
+             Required Attendees: bob@example.com\n",
+            &[],
+        ));
+    }
+
     #[test]
     fn meeting_invite_matches_google_calendar_body() {
         // pii-ok — synthetic Google Calendar boilerplate fixture.
@@ -1414,10 +1489,22 @@ Where: Microsoft Teams
             "Let's do a Teams meeting sometime next week — does Thursday work?",
             &[],
         ));
-        // Mid-sentence "when:" with no line-anchored When:/Where: pair.
+        // Mid-sentence "when:" with no line-anchored invite headers.
         assert!(!is_meeting_invite(
             "Re: timeline",
             "Still unclear when: the vendor keeps moving the date.",
+            &[],
+        ));
+        // A single stray invite header is not a header block.
+        assert!(!is_meeting_invite(
+            "Re: lunch",
+            "Where: the usual spot. Works for you?",
+            &[],
+        ));
+        // A standing room link pasted in prose, with no `Join ...` line.
+        assert!(!is_meeting_invite(
+            "Re: thursday",
+            "Easier on my room if you'd rather: https://zoom.us/j/1234567890",
             &[],
         ));
         // Plain reply-worthy mail with an ordinary attachment.
