@@ -25,7 +25,7 @@ pub use scheduled::{
     SEND_DRAFT_TIMEOUT,
 };
 pub use sigextract::{
-    detect_signature_block, is_human_sender, signature_patch, ExtractedFields,
+    detect_signature_block, is_human_sender, is_meeting_invite, signature_patch, ExtractedFields,
     SignatureBlock, SignatureExtractor, SigError,
 };
 
