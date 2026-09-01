@@ -1157,6 +1157,19 @@ impl Store {
             [],
         )?;
 
+        // #886 — iMessage bundle incremental cursor. One row per
+        // conversation identifier; stores how many entries of that
+        // conversation's append-only messages.md have been ingested, so a
+        // poll only processes the tail.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS imessage_sync_state (\
+                 conversation  TEXT PRIMARY KEY,\
+                 entries_seen  INTEGER NOT NULL,\
+                 updated_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
         // #80 — voice-capture Telegram long-poll cursor. Single-row table
         // keyed by a logical capture-bot id; stores the last acked update_id
         // so a daemon restart never re-ingests an already-transcribed memo.
@@ -1703,6 +1716,56 @@ impl Store {
                     email.date,
                     email.account_entity_id,
                     now,
+                    email.platform,
+                    email.kind,
+                ],
+            )?;
+            Ok(true)
+        }
+    }
+
+    /// [`upsert_email`] variant for historical imports (#886): a *new* row's
+    /// `firstSeenAt` is the caller-supplied message timestamp rather than
+    /// now, so downstream freshness rendering ("facts as of …") reflects
+    /// when the message was actually sent. Existing rows update like
+    /// [`upsert_email`] and keep their original `firstSeenAt`.
+    pub fn upsert_email_backfill(&self, email: &Email, first_seen_ms: i64) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let existed: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM emails WHERE messageId = ?1",
+                params![email.message_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let body_masked = redact::mask(&email.body);
+        let body_param: &str = &body_masked;
+        if existed.is_some() {
+            guard.execute(
+                "UPDATE emails SET threadId = ?2, fromEmail = ?3, subject = ?4, body = ?5, receivedAt = ?6 WHERE messageId = ?1",
+                params![
+                    email.message_id,
+                    email.thread_id,
+                    email.from,
+                    email.subject,
+                    body_param,
+                    email.date,
+                ],
+            )?;
+            Ok(false)
+        } else {
+            guard.execute(
+                "INSERT INTO emails (messageId, threadId, fromEmail, subject, body, receivedAt, accountEntityId, firstSeenAt, platform, kind) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    email.message_id,
+                    email.thread_id,
+                    email.from,
+                    email.subject,
+                    body_param,
+                    email.date,
+                    email.account_entity_id,
+                    first_seen_ms,
                     email.platform,
                     email.kind,
                 ],
@@ -2415,6 +2478,35 @@ impl Store {
             params![owner_id, entry_id, version, now_millis()],
         )?;
         Ok(inserted > 0)
+    }
+
+    // ---------------------------------------------------------------
+    // #886 — iMessage bundle incremental cursor.
+    // ---------------------------------------------------------------
+
+    /// Entries of this conversation already ingested. 0 = never synced.
+    pub fn get_imessage_entries_seen(&self, conversation: &str) -> StoreResult<i64> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: Option<i64> = guard
+            .query_row(
+                "SELECT entries_seen FROM imessage_sync_state WHERE conversation = ?1",
+                params![conversation],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(n.unwrap_or(0))
+    }
+
+    pub fn set_imessage_entries_seen(&self, conversation: &str, entries_seen: i64) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO imessage_sync_state (conversation, entries_seen, updated_at_ms) \
+                 VALUES (?1, ?2, ?3) \
+             ON CONFLICT(conversation) DO UPDATE SET \
+                 entries_seen = excluded.entries_seen, updated_at_ms = excluded.updated_at_ms",
+            params![conversation, entries_seen, now_millis()],
+        )?;
+        Ok(())
     }
 
     // ---------------------------------------------------------------
@@ -7251,6 +7343,36 @@ mod tests {
         let e = sample_email("m1");
         assert!(s.upsert_email(&e).unwrap());
         assert!(!s.upsert_email(&e).unwrap());
+    }
+
+    #[test]
+    fn imessage_entries_seen_roundtrip() {
+        let (store, _d) = fresh_store();
+        // never-synced conversation reads as 0, not an error
+        assert_eq!(store.get_imessage_entries_seen("+14155550123").unwrap(), 0);
+        store.set_imessage_entries_seen("+14155550123", 42).unwrap();
+        assert_eq!(store.get_imessage_entries_seen("+14155550123").unwrap(), 42);
+        store.set_imessage_entries_seen("+14155550123", 57).unwrap();
+        assert_eq!(store.get_imessage_entries_seen("+14155550123").unwrap(), 57);
+    }
+
+    #[test]
+    fn upsert_email_backfill_preserves_historical_first_seen() {
+        let (store, _d) = fresh_store();
+        let email = sample_email("imessage:+14155550123:0");
+        // historical import: firstSeenAt is the message timestamp, so the
+        // wiki index renders honest "facts as of" dates (#886)
+        assert!(store.upsert_email_backfill(&email, 1_600_000_000_000).unwrap());
+        assert_eq!(
+            store.email_first_seen_at("imessage:+14155550123:0").unwrap(),
+            Some(1_600_000_000_000)
+        );
+        // re-import is an update, and never rewrites firstSeenAt
+        assert!(!store.upsert_email_backfill(&email, 1_700_000_000_000).unwrap());
+        assert_eq!(
+            store.email_first_seen_at("imessage:+14155550123:0").unwrap(),
+            Some(1_600_000_000_000)
+        );
     }
 
     #[test]
