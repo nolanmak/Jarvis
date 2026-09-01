@@ -34,6 +34,8 @@ identities:                    # person pages only; optional, omit block if empt
   slack: <workspace-user-id>
   whatsapp: "<phone>"
   instagram: <handle>
+  phone: ["<E.164>", ...]      # array — mobile + work line is common
+  imessage: ["<E.164 or apple-id email>", ...]  # array; phone-shaped handles also match `phone`
 ---
 ```
 

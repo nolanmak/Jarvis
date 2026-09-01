@@ -45,6 +45,12 @@ pub struct Identities {
     /// ingestion only fills it when blank.
     #[serde(default)]
     pub address: Option<String>,
+    /// iMessage handles (#883): E.164 phone numbers or Apple-ID email
+    /// addresses. Multi-valued — a person can text from both. Lookup also
+    /// falls back to `phone`, so Contacts-imported people resolve without
+    /// duplicating numbers here.
+    #[serde(default)]
+    pub imessage: Vec<String>,
 }
 
 impl Identities {
@@ -67,6 +73,19 @@ impl Identities {
             "phone" => {
                 // E.164 ids compared verbatim (already normalized upstream).
                 self.phone.iter().any(|p| p == id)
+            }
+            "imessage" => {
+                // Handles are E.164 phones (verbatim) or Apple-ID emails
+                // (case-insensitive). Phone-shaped handles also match the
+                // `phone` array — most texters arrive via Contacts import.
+                let email_like = id.contains('@');
+                self.imessage.iter().any(|h| {
+                    if email_like && h.contains('@') {
+                        h.eq_ignore_ascii_case(id)
+                    } else {
+                        h == id
+                    }
+                }) || (!email_like && self.phone.iter().any(|p| p == id))
             }
             "address" => self.address.as_deref() == Some(id),
             _ => false,
@@ -329,6 +348,35 @@ mod tests {
         )]);
         let index = IdentityIndex::build(&layout).unwrap();
         assert!(index.lookup("signal", "999").is_none());
+    }
+
+    #[test]
+    fn lookup_by_imessage_handle_matches_declared_handles() {
+        let (_d, layout) = layout_with_pages(&[(
+            "jane",
+            "kind: person\nkey: jane\nidentities:\n  imessage: [\"+14155550123\", \"Jane@iCloud.com\"]",
+        )]);
+        let index = IdentityIndex::build(&layout).unwrap();
+        // E.164 handles compare verbatim (normalized upstream)
+        assert!(index.lookup("imessage", "+14155550123").is_some());
+        // Apple-ID email handles are case-insensitive like email
+        assert!(index.lookup("imessage", "jane@icloud.com").is_some());
+        assert!(index.lookup("imessage", "+10000000000").is_none());
+    }
+
+    #[test]
+    fn imessage_lookup_falls_back_to_phone_identities() {
+        // most iMessage handles are plain phone numbers; a person imported
+        // from Contacts with only `phone:` must resolve without duplicate
+        // bookkeeping in `imessage:`
+        let (_d, layout) = layout_with_pages(&[(
+            "bob",
+            "kind: person\nkey: bob\nidentities:\n  phone: [\"+14155550999\"]",
+        )]);
+        let index = IdentityIndex::build(&layout).unwrap();
+        assert!(index.lookup("imessage", "+14155550999").is_some());
+        // but not the reverse: an imessage email handle is not a phone
+        assert!(index.lookup("phone", "bob@icloud.com").is_none());
     }
 
     #[test]
