@@ -17,6 +17,7 @@ pub use models::{
     ToneProfile, TriageResult, UserLoop, WhatsappDevice,
 };
 pub use store::{
+    JournalSyncCursor,
     ActionCodeModeFields, ActionWithEmail, PendingActionRow, PendingNudge, RetryableReply,
     RevisionRecord, Store,
     StoreError, StoreResult, NUDGE_INTERVAL_MS,
