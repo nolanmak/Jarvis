@@ -944,6 +944,22 @@ enum JournalOp {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
     },
+    /// #900 — deliberately import a full-journal (base-sync) page set that
+    /// a normal poll refuses. Capped per run and resumable: re-run, or let
+    /// the daemon's ticks continue from the persisted cursor, until
+    /// `watermark_ms` is reported.
+    Backfill {
+        #[arg(long, default_value_t = 200)]
+        max_entries: usize,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+    /// #900 — accept the journal as-is: set the sync watermark to now and
+    /// drop any in-progress cursor, so only entries changed from now on
+    /// are ingested.
+    SkipToNow,
+    /// #900 — print the persisted watermark and in-progress cursor.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -2513,6 +2529,11 @@ async fn main() -> Result<()> {
                                 .as_ref()
                                 .map(|_| PathBuf::from("schema/wiki-skill.md")),
                             poll_interval: augmentagent_channel_journal::DEFAULT_POLL_INTERVAL,
+                            max_entries_per_poll:
+                                augmentagent_channel_journal::DEFAULT_MAX_ENTRIES_PER_POLL,
+                            base_sync_threshold:
+                                augmentagent_channel_journal::DEFAULT_BASE_SYNC_THRESHOLD,
+                            allow_base_sync: false,
                         },
                     );
                     let sd = shutdown.clone();
@@ -3021,7 +3042,29 @@ async fn main() -> Result<()> {
         },
         Cmd::Journal { op } => match op {
             JournalOp::PollOnce { dry_run } => {
-                run_journal_poll_once(cli.wiki_dir.clone(), store, dry_run).await?;
+                run_journal_poll_once(cli.wiki_dir.clone(), store, dry_run, None, false).await?;
+                Ok(())
+            }
+            JournalOp::Backfill {
+                max_entries,
+                dry_run,
+            } => {
+                run_journal_poll_once(
+                    cli.wiki_dir.clone(),
+                    store,
+                    dry_run,
+                    Some(max_entries),
+                    true,
+                )
+                .await?;
+                Ok(())
+            }
+            JournalOp::SkipToNow => {
+                run_journal_skip_to_now(store).await?;
+                Ok(())
+            }
+            JournalOp::Status => {
+                run_journal_status(store).await?;
                 Ok(())
             }
         },
@@ -12989,12 +13032,21 @@ fn load_any_github_auth() -> Result<augmentagent_channel_github::GithubAuth> {
 /// #427 — one ShadowNote journal sync pass. Self-gates on SHADOWNOTE_*
 /// config exactly like the serve spawn; without it this prints why and
 /// exits 0 so the subcommand is safe to probe on an unconfigured box.
+///
+/// #900 — `max_entries` overrides the per-pass ingest cap and
+/// `allow_base_sync` is the operator opt-in that lets a full-journal
+/// (base-sync) page set through; a normal poll refuses one.
 async fn run_journal_poll_once(
     wiki_dir: Option<PathBuf>,
     store: Arc<Store>,
     dry_run: bool,
+    max_entries: Option<usize>,
+    allow_base_sync: bool,
 ) -> Result<()> {
-    use augmentagent_channel_journal::{JournalChannel, JournalChannelConfig, JournalRuntime};
+    use augmentagent_channel_journal::{
+        JournalChannel, JournalChannelConfig, JournalRuntime, DEFAULT_BASE_SYNC_THRESHOLD,
+        DEFAULT_MAX_ENTRIES_PER_POLL,
+    };
 
     let Some(runtime) = JournalRuntime::from_env().await? else {
         println!(
@@ -13012,6 +13064,9 @@ async fn run_journal_poll_once(
         wiki_root: wiki_dir,
         wiki_schema_path,
         poll_interval: augmentagent_channel_journal::DEFAULT_POLL_INTERVAL,
+        max_entries_per_poll: max_entries.unwrap_or(DEFAULT_MAX_ENTRIES_PER_POLL),
+        base_sync_threshold: DEFAULT_BASE_SYNC_THRESHOLD,
+        allow_base_sync,
     };
     let reasoner = build_reasoner();
     let channel = JournalChannel::new(
@@ -13023,6 +13078,59 @@ async fn run_journal_poll_once(
     );
     let outcome = channel.poll_once().await?;
     println!("{outcome:#?}");
+    if outcome.refused {
+        println!(
+            "refused: the delta sync returned a full-journal page set. \
+             `augmentagent journal backfill` imports it deliberately (capped, resumable); \
+             `augmentagent journal skip-to-now` follows new entries only."
+        );
+    } else if outcome.watermark_ms.is_none() {
+        println!(
+            "pass incomplete ({} deferred): the cursor is persisted; re-run (or wait for the \
+             daemon's next tick) to continue.",
+            outcome.deferred
+        );
+    }
+    Ok(())
+}
+
+/// #900 — operator recovery: accept the journal as-is and only follow
+/// entries changed from now on. Clears any in-progress cursor.
+async fn run_journal_skip_to_now(store: Arc<Store>) -> Result<()> {
+    use augmentagent_channel_journal::JournalRuntime;
+
+    let Some(runtime) = JournalRuntime::from_env().await? else {
+        println!("shadownote journal not configured; nothing to do");
+        return Ok(());
+    };
+    let owner = runtime.config.owner_id.as_str();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    store.clear_journal_sync_cursor(owner)?;
+    store.set_journal_sync_state(owner, now)?;
+    println!(
+        "journal watermark for owner {owner} set to {now} and the in-progress cursor cleared; \
+         only entries changed after now will be ingested"
+    );
+    Ok(())
+}
+
+/// #900 — show the persisted watermark and any in-progress cursor.
+async fn run_journal_status(store: Arc<Store>) -> Result<()> {
+    use augmentagent_channel_journal::JournalRuntime;
+
+    let Some(runtime) = JournalRuntime::from_env().await? else {
+        println!("shadownote journal not configured");
+        return Ok(());
+    };
+    let owner = runtime.config.owner_id.as_str();
+    let watermark = store.get_journal_sync_state(owner)?;
+    let cursor = store.get_journal_sync_cursor(owner)?;
+    println!("owner:     {owner}");
+    println!("watermark: {watermark:?}");
+    println!("cursor:    {cursor:?}");
     Ok(())
 }
 
