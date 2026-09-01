@@ -56,11 +56,16 @@ pub fn gemini_bin() -> String {
 
 pub struct GeminiCliReasoner {
     bin: String,
+    /// #898 — shared cap on concurrent CLI children.
+    gate: std::sync::Arc<crate::cli_gate::CliGate>,
 }
 
 impl Default for GeminiCliReasoner {
     fn default() -> Self {
-        Self { bin: gemini_bin() }
+        Self {
+            bin: gemini_bin(),
+            gate: crate::cli_gate::CliGate::global(),
+        }
     }
 }
 
@@ -75,6 +80,8 @@ impl GeminiCliReasoner {
         user_message: &str,
     ) -> anyhow::Result<String> {
         let dur = reasoner_timeout();
+        // #898 — CLI slot taken before the watchdog starts (see cli_gate).
+        let _permit = self.gate.acquire("gemini").await;
         match tokio::time::timeout(dur, self.call_once(opts, user_message)).await {
             // Post-classify untyped failures (stdin EPIPE, read/wait IO) as
             // provider-side Unavailable (#655 review) so they fail over
@@ -360,7 +367,10 @@ echo '{{"response":"a fine summary","stats":{{}}}}'
                 record = record.display()
             ),
         );
-        let r = GeminiCliReasoner { bin };
+        let r = GeminiCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        };
         let got = r.call(&opts(vec![]), "summarize this").await.unwrap();
         assert_eq!(got, "a fine summary");
         let rec = std::fs::read_to_string(&record).unwrap();
@@ -390,7 +400,10 @@ echo '{{"response":"a fine summary","stats":{{}}}}'
             );
             let mut o = opts(vec![]);
             o.model = Some(preset_model.into());
-            GeminiCliReasoner { bin }.call(&o, "hi").await.unwrap();
+            GeminiCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        }.call(&o, "hi").await.unwrap();
             let argv: Vec<String> = std::fs::read_to_string(&record)
                 .unwrap()
                 .lines()
@@ -416,7 +429,10 @@ echo '{"error":{"type":"ApiError","message":"429 RESOURCE_EXHAUSTED: rateLimitEx
 exit 1
 "#,
         );
-        let r = GeminiCliReasoner { bin };
+        let r = GeminiCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        };
         let err = r.call(&opts(vec![]), "hi").await.unwrap_err();
         match ReasonerError::find_in(&err) {
             Some(ReasonerError::RateLimited { provider, .. }) => assert_eq!(provider, "gemini"),
@@ -439,7 +455,10 @@ echo "Attempt 1 failed: quota exhausted, retrying..." >&2
 echo '{"response":"recovered fine"}'
 "#,
         );
-        let r = GeminiCliReasoner { bin };
+        let r = GeminiCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        };
         assert_eq!(r.call(&opts(vec![]), "hi").await.unwrap(), "recovered fine");
     }
 }
