@@ -38,6 +38,13 @@ LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent-tenant-${TENANT}"
 ENV_FILE="$DATA_DIR/tenant.env"
 SERVICE_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 NODE_BIN="$(command -v node 2>/dev/null || echo /usr/bin/node)"
+# #902 — same cgroup + rlimit ceilings as the prod unit (see
+# install-autostart.sh header); a tenant is the same binary with the same
+# fan-out paths. Overridable per host at install time.
+MEMORY_HIGH="${AUGMENTAGENT_UNIT_MEMORY_HIGH:-5G}"
+MEMORY_MAX="${AUGMENTAGENT_UNIT_MEMORY_MAX:-6G}"
+TASKS_MAX="${AUGMENTAGENT_UNIT_TASKS_MAX:-512}"
+NOFILE="${AUGMENTAGENT_UNIT_NOFILE:-4096}"
 
 mkdir -p "$UNIT_DIR" "$DATA_DIR" "$LOG_DIR" "$DATA_DIR/wiki"
 
@@ -84,6 +91,13 @@ Environment=PATH=$SERVICE_PATH
 ExecStart=$BIN --db $DATA_DIR/data.db --wiki-dir $DATA_DIR/wiki serve --no-email true --dry-run false --interval-secs 120
 Restart=on-failure
 RestartSec=10
+# #902 — die alone: killed inside this cgroup, never the desktop session.
+MemoryHigh=$MEMORY_HIGH
+MemoryMax=$MEMORY_MAX
+MemorySwapMax=0
+TasksMax=$TASKS_MAX
+LimitNOFILE=$NOFILE
+OOMPolicy=kill
 StandardOutput=append:$LOG_DIR/stdout.log
 StandardError=append:$LOG_DIR/stderr.log
 

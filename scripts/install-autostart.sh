@@ -8,6 +8,17 @@
 # on Linux. Idempotent — re-running reloads with the current config.
 #
 # Usage: ./scripts/install-autostart.sh
+#
+# Resource limits (#902, from the 2026-08-31 OOM post-mortem #897): the Linux
+# unit carries MemoryHigh/MemoryMax/MemorySwapMax/TasksMax/LimitNOFILE/
+# OOMPolicy so a runaway daemon is killed INSIDE its own cgroup instead of the
+# kernel's global OOM killer taking the desktop session down with it (that is
+# what happened when ~300 `claude -p` children fanned out at once). MemoryHigh
+# throttles the in-cgroup `cargo build` (self-improve gate) before MemoryMax
+# kills the daemon — that ordering is intended. Defaults suit a 15 GB laptop;
+# override per host at install time:
+#   AUGMENTAGENT_UNIT_MEMORY_HIGH (5G)  AUGMENTAGENT_UNIT_MEMORY_MAX (6G)
+#   AUGMENTAGENT_UNIT_TASKS_MAX (512)   AUGMENTAGENT_UNIT_NOFILE (4096)
 
 set -euo pipefail
 
@@ -123,6 +134,12 @@ install_linux() {
   # spots so cargo/node/etc are findable from the script.
   local SERVICE_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 
+  # #902 — cgroup + rlimit ceilings (see the header). Overridable per host.
+  local MEMORY_HIGH="${AUGMENTAGENT_UNIT_MEMORY_HIGH:-5G}"
+  local MEMORY_MAX="${AUGMENTAGENT_UNIT_MEMORY_MAX:-6G}"
+  local TASKS_MAX="${AUGMENTAGENT_UNIT_TASKS_MAX:-512}"
+  local NOFILE="${AUGMENTAGENT_UNIT_NOFILE:-4096}"
+
   log "Writing unit: $UNIT"
   cat > "$UNIT" <<UNIT_EOF
 [Unit]
@@ -140,6 +157,14 @@ Environment=RUST_LOG=info
 Environment=AUGMENTAGENT_DEFT_ENABLED=1
 Restart=on-failure
 RestartSec=10
+# #902 — die alone: a fan-out is killed inside this cgroup, not by the
+# kernel's global OOM killer picking off the desktop session.
+MemoryHigh=$MEMORY_HIGH
+MemoryMax=$MEMORY_MAX
+MemorySwapMax=0
+TasksMax=$TASKS_MAX
+LimitNOFILE=$NOFILE
+OOMPolicy=kill
 StandardOutput=append:$LOG_DIR/stdout.log
 StandardError=append:$LOG_DIR/stderr.log
 
