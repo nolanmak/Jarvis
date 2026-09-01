@@ -45,7 +45,7 @@ has_line() { grep -qx -- "$2" "$1"; }
 
 expect_directives() {
   local unit="$1" label="$2"
-  for d in "MemoryHigh=5G" "MemoryMax=6G" "MemorySwapMax=0" "TasksMax=512" "LimitNOFILE=4096" "OOMPolicy=kill"; do
+  for d in "MemoryHigh=8G" "MemoryMax=10G" "MemorySwapMax=0" "TasksMax=2048" "LimitNOFILE=4096" "OOMPolicy=continue"; do
     if has_line "$unit" "$d"; then ok "$label renders $d"; else bad "$label renders $d" "missing from $unit"; fi
   done
 }
@@ -87,7 +87,7 @@ make_case
 for d in "MemoryHigh=9G" "MemoryMax=12G" "TasksMax=1024" "LimitNOFILE=8192"; do
   has_line "$UNIT" "$d" && ok "override renders $d" || bad "override renders $d" "not found in $UNIT"
 done
-has_line "$UNIT" "MemoryMax=6G" && bad "override replaces the default (no duplicate MemoryMax)" "default still present" \
+has_line "$UNIT" "MemoryMax=10G" && bad "override replaces the default (no duplicate MemoryMax)" "default still present" \
   || ok "override replaces the default (no duplicate MemoryMax)"
 rm -rf "$TMP"
 

@@ -41,9 +41,9 @@ NODE_BIN="$(command -v node 2>/dev/null || echo /usr/bin/node)"
 # #902 — same cgroup + rlimit ceilings as the prod unit (see
 # install-autostart.sh header); a tenant is the same binary with the same
 # fan-out paths. Overridable per host at install time.
-MEMORY_HIGH="${AUGMENTAGENT_UNIT_MEMORY_HIGH:-5G}"
-MEMORY_MAX="${AUGMENTAGENT_UNIT_MEMORY_MAX:-6G}"
-TASKS_MAX="${AUGMENTAGENT_UNIT_TASKS_MAX:-512}"
+MEMORY_HIGH="${AUGMENTAGENT_UNIT_MEMORY_HIGH:-8G}"
+MEMORY_MAX="${AUGMENTAGENT_UNIT_MEMORY_MAX:-10G}"
+TASKS_MAX="${AUGMENTAGENT_UNIT_TASKS_MAX:-2048}"
 NOFILE="${AUGMENTAGENT_UNIT_NOFILE:-4096}"
 
 mkdir -p "$UNIT_DIR" "$DATA_DIR" "$LOG_DIR" "$DATA_DIR/wiki"
@@ -97,7 +97,7 @@ MemoryMax=$MEMORY_MAX
 MemorySwapMax=0
 TasksMax=$TASKS_MAX
 LimitNOFILE=$NOFILE
-OOMPolicy=kill
+OOMPolicy=continue
 StandardOutput=append:$LOG_DIR/stdout.log
 StandardError=append:$LOG_DIR/stderr.log
 

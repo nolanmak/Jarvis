@@ -11,14 +11,17 @@
 #
 # Resource limits (#902, from the 2026-08-31 OOM post-mortem #897): the Linux
 # unit carries MemoryHigh/MemoryMax/MemorySwapMax/TasksMax/LimitNOFILE/
-# OOMPolicy so a runaway daemon is killed INSIDE its own cgroup instead of the
-# kernel's global OOM killer taking the desktop session down with it (that is
-# what happened when ~300 `claude -p` children fanned out at once). MemoryHigh
-# throttles the in-cgroup `cargo build` (self-improve gate) before MemoryMax
-# kills the daemon — that ordering is intended. Defaults suit a 15 GB laptop;
-# override per host at install time:
-#   AUGMENTAGENT_UNIT_MEMORY_HIGH (5G)  AUGMENTAGENT_UNIT_MEMORY_MAX (6G)
-#   AUGMENTAGENT_UNIT_TASKS_MAX (512)   AUGMENTAGENT_UNIT_NOFILE (4096)
+# OOMPolicy so a runaway fan-out is contained INSIDE its own cgroup instead of
+# the kernel's global OOM killer taking the desktop session down with it (that
+# is what happened when ~300 `claude -p` children fanned out at once). With
+# OOMPolicy=continue the kernel kills the offending child and the daemon keeps
+# running — `kill` would turn one OOM'd child into a full daemon restart, the
+# very restart storm #903 exists to prevent. MemoryHigh throttles the
+# in-cgroup `cargo build` (self-improve gate) before MemoryMax bites; the
+# ceilings leave a release build room (it peaks at several GB) while still
+# leaving the desktop ~5 GB on a 15 GB laptop. Override per host at install:
+#   AUGMENTAGENT_UNIT_MEMORY_HIGH (8G)  AUGMENTAGENT_UNIT_MEMORY_MAX (10G)
+#   AUGMENTAGENT_UNIT_TASKS_MAX (2048)  AUGMENTAGENT_UNIT_NOFILE (4096)
 
 set -euo pipefail
 
@@ -135,9 +138,9 @@ install_linux() {
   local SERVICE_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 
   # #902 — cgroup + rlimit ceilings (see the header). Overridable per host.
-  local MEMORY_HIGH="${AUGMENTAGENT_UNIT_MEMORY_HIGH:-5G}"
-  local MEMORY_MAX="${AUGMENTAGENT_UNIT_MEMORY_MAX:-6G}"
-  local TASKS_MAX="${AUGMENTAGENT_UNIT_TASKS_MAX:-512}"
+  local MEMORY_HIGH="${AUGMENTAGENT_UNIT_MEMORY_HIGH:-8G}"
+  local MEMORY_MAX="${AUGMENTAGENT_UNIT_MEMORY_MAX:-10G}"
+  local TASKS_MAX="${AUGMENTAGENT_UNIT_TASKS_MAX:-2048}"
   local NOFILE="${AUGMENTAGENT_UNIT_NOFILE:-4096}"
 
   log "Writing unit: $UNIT"
@@ -164,7 +167,7 @@ MemoryMax=$MEMORY_MAX
 MemorySwapMax=0
 TasksMax=$TASKS_MAX
 LimitNOFILE=$NOFILE
-OOMPolicy=kill
+OOMPolicy=continue
 StandardOutput=append:$LOG_DIR/stdout.log
 StandardError=append:$LOG_DIR/stderr.log
 
