@@ -2,10 +2,17 @@
 Description=Periodic AugmentAgent knowledge-base mirror sync
 
 [Timer]
-# First run shortly after boot, then every 10 minutes. Persistent so a
-# missed window (host asleep) fires on next wake.
+# Wall-clock schedule (every 10 minutes) rather than OnUnitActiveSec: a
+# monotonic interval only re-arms from the service's last activation as
+# tracked by the current user manager, and after a timer restart or a
+# logout/login it can sit at NextElapse=infinity forever (observed
+# 2026-09-01: last trigger 21:35 the night before, nothing since). Persistent
+# only applies to OnCalendar, so a missed window (host asleep) now really
+# does fire on the next wake. OnBootSec/OnStartupSec give a first run shortly
+# after boot or a user-manager restart (#909).
 OnBootSec=3min
-OnUnitActiveSec=10min
+OnStartupSec=3min
+OnCalendar=*:0/10
 Persistent=true
 Unit=augmentagent-wiki-sync.service
 
