@@ -179,6 +179,8 @@ will retry via the build-stamp mismatch path."
 }
 
 log "checking for updates"
+# #891 — housekeeping that must never run under a live build.
+trim_gate_cache_if_idle || true
 
 git fetch origin main --quiet || {
   log "fetch failed"
