@@ -11,7 +11,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer};
+use serde_yaml_ng::Value;
 use tracing::warn;
 
 use crate::layout::WikiLayout;
@@ -23,7 +25,7 @@ use crate::layout::WikiLayout;
 /// normal case; upgrade to `Vec` only if that changes.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct Identities {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub email: Vec<String>,
     #[serde(default)]
     pub linkedin: Option<String>,
@@ -39,7 +41,7 @@ pub struct Identities {
     pub instagram: Option<String>,
     /// E.164-normalized phone (#62). Multi-valued — a person commonly has a
     /// mobile + a work line; CRM ingestion union-merges them.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub phone: Vec<String>,
     /// Free-form mailing address (#62). Single-valued in practice; CRM
     /// ingestion only fills it when blank.
@@ -49,8 +51,31 @@ pub struct Identities {
     /// addresses. Multi-valued — a person can text from both. Lookup also
     /// falls back to `phone`, so Contacts-imported people resolve without
     /// duplicating numbers here.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "one_or_many")]
     pub imessage: Vec<String>,
+}
+
+/// List-valued identity fields also accept a bare scalar. Pages written by
+/// the CRM merge before it rendered lists (`phone: "+1…"`), hand edits on
+/// GitHub and an unquoted numeric short code (`imessage: 29694`) all occur
+/// on disk, and one such page must not silently vanish from the index —
+/// `IdentityIndex::build` skips anything that fails to parse.
+fn one_or_many<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    fn scalar(v: &Value) -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        }
+    }
+    match Value::deserialize(d)? {
+        Value::Null => Ok(Vec::new()),
+        Value::Sequence(items) => Ok(items.iter().filter_map(scalar).collect()),
+        other => scalar(&other)
+            .map(|s| vec![s])
+            .ok_or_else(|| D::Error::custom("expected a string or a list of strings")),
+    }
 }
 
 impl Identities {
@@ -377,6 +402,24 @@ mod tests {
         assert!(index.lookup("imessage", "+14155550999").is_some());
         // but not the reverse: an imessage email handle is not a phone
         assert!(index.lookup("phone", "bob@icloud.com").is_none());
+    }
+
+    #[test]
+    fn list_identity_fields_accept_legacy_scalars() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let layout = WikiLayout::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(layout.people_dir()).unwrap();
+        std::fs::write(
+            layout.people_dir().join("legacy.md"),
+            "---\nkind: person\nidentities:\n  email: a@example.com\n  phone: \"+15550001\"\n  imessage: 29694\n---\n",
+        )
+        .unwrap();
+        let index = IdentityIndex::build(&layout).unwrap();
+        assert_eq!(index.len(), 1, "scalar-shaped page must still index");
+        let p = index.lookup("phone", "+15550001").expect("scalar phone");
+        assert_eq!(p.identities.email, vec!["a@example.com"]);
+        assert_eq!(p.identities.imessage, vec!["29694"], "number stringified");
+        assert!(index.lookup("imessage", "29694").is_some());
     }
 
     #[test]
