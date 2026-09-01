@@ -81,10 +81,9 @@ pub struct FallbackReasoner {
 /// Why `kind` cannot serve calls on this box (binary absent, no resolvable
 /// auth), or `None` when it is usable. Claude is always eligible — it is the
 /// primary this daemon has run on since day one, and a missing `claude`
-/// binary should fail loudly per call, not silently vanish.
-///
-/// Public so `doctor` (#658) reports the same verdict the chain builder
-/// reaches, instead of a second opinion that can drift from it.
+/// binary should fail loudly per call, not silently vanish. Public so
+/// `doctor` (#658) reports the same verdict the chain builder reaches,
+/// instead of a second opinion that can drift from it.
 pub fn ineligible_reason(kind: ProviderKind) -> Option<String> {
     match kind {
         ProviderKind::Claude => None,

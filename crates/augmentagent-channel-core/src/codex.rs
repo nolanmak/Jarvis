@@ -402,6 +402,7 @@ impl Reasoner for CodexCliReasoner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ModelTier;
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
 
@@ -471,6 +472,40 @@ exit 1
         match ReasonerError::find_in(&err) {
             Some(ReasonerError::RateLimited { provider, .. }) => assert_eq!(provider, "codex"),
             other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    /// #658 — the argv end of the tier map: `-m` carries exactly what
+    /// `model_for` resolved, on BOTH tiers, never codex's own default.
+    #[tokio::test]
+    async fn spawn_pins_the_resolved_model_on_both_tiers() {
+        for (preset_model, tier) in [
+            ("claude-opus-4-8", ModelTier::Quality),
+            ("claude-haiku-4-5-20251001", ModelTier::Fast),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let record = dir.path().join("argv.txt");
+            let bin = stub(
+                &dir,
+                "fake-codex",
+                &format!(
+                    "cat >/dev/null\nprintf '%s\\n' \"$@\" >{}\necho '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"ok\"}}}}'\n",
+                    record.display()
+                ),
+            );
+            let mut o = opts();
+            o.model = Some(preset_model.into());
+            CodexCliReasoner { bin }.call(&o, "hi").await.unwrap();
+            let argv: Vec<String> = std::fs::read_to_string(&record)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            let want = model_for(ProviderKind::Codex, tier);
+            assert!(
+                argv.windows(2).any(|w| w[0] == "-m" && w[1] == want),
+                "codex must spawn with `-m {want}`, got {argv:?}"
+            );
         }
     }
 
