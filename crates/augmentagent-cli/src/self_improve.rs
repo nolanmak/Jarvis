@@ -2026,6 +2026,37 @@ async fn drop_root_scratch(worktree: &Path) -> Vec<String> {
     dropped
 }
 
+/// Is this PR merged on GitHub? (#893)
+///
+/// `gh pr merge --squash --delete-branch` merges, deletes the REMOTE branch,
+/// then tries to delete the LOCAL branch — and exits non-zero if that last
+/// step fails, e.g. because a worktree still holds it. PR #839 was reported
+/// "merge FAILED (left open)" while sitting on main as MERGED. Never infer
+/// merge failure from gh's exit code alone; ask GitHub.
+/// Did the merge succeed? gh's exit code is only half the evidence (#893):
+/// a non-zero exit with the PR in state `MERGED` on GitHub is a success whose
+/// local-branch-delete step tripped, not a failed merge.
+fn merge_succeeded(gh_exit_ok: bool, pr_state: Option<&str>) -> bool {
+    gh_exit_ok
+        || pr_state
+            .map(|st| st.trim().eq_ignore_ascii_case("MERGED"))
+            .unwrap_or(false)
+}
+
+async fn pr_state(repo_root: &Path, pr: u64) -> Option<String> {
+    let gh = gh_bin();
+    match run(&gh, &["pr", "view", &pr.to_string(), "--json", "state", "--jq", ".state"], repo_root)
+        .await
+    {
+        Ok((true, out, _)) => Some(out.trim().to_string()),
+        _ => None,
+    }
+}
+
+async fn pr_is_merged(repo_root: &Path, pr: u64) -> bool {
+    merge_succeeded(false, pr_state(repo_root, pr).await.as_deref())
+}
+
 /// Resume a sitting draft PR (#866): re-review it against today's `main`,
 /// revise against fresh findings, and merge on a double LGTM.
 ///
@@ -2352,18 +2383,25 @@ async fn resume_draft_pr(
                 )));
             }
             let _ = run(&gh, &["pr", "ready", &pr.to_string()], repo_root).await;
+            // #893 — release the worktree BEFORE merging: gh's --delete-branch
+            // also deletes the local branch, which fails while a worktree
+            // holds it and turns a successful merge into a reported failure.
+            // Everything is pushed; nothing local is needed past this point.
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
             let (ok, _o, e) = run(
                 &gh,
                 &["pr", "merge", &pr.to_string(), "--squash", "--delete-branch"],
                 repo_root,
             )
             .await?;
-            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-            if !ok {
+            if !ok && !pr_is_merged(repo_root, pr).await {
                 warn!(pr, "resume auto-merge failed; PR left ready: {e}");
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: double LGTM but merge FAILED (left open)"
                 )));
+            }
+            if !ok {
+                warn!(pr, "gh pr merge exited non-zero but the PR is MERGED; treating as success: {e}");
             }
             notify_discord(&format!("✅ resumed draft merged: {} — PR #{pr}", issue.title)).await;
             return Ok(RunReport::built(format!("PR #{pr}: resumed and MERGED")));
@@ -3480,7 +3518,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         repo_root,
     )
     .await?;
-    if !ok {
+    let pr_number = pr_url.rsplit('/').next().and_then(|n| n.parse::<u64>().ok());
+    let merged_anyway = match pr_number {
+        Some(n) if !ok => pr_is_merged(repo_root, n).await,
+        _ => false,
+    };
+    if !ok && !merged_anyway {
         warn!(issue = issue.number, "auto-merge failed; PR left open: {e}");
         return Ok(RunReport::built(format!(
             "issue #{}: PR opened but auto-merge FAILED (left open for review) — {pr_url}",
@@ -6321,6 +6364,45 @@ CODEX-REVIEW: lgtm").0);
                 "?? .self-improve-worktrees/\n M crates/augmentagent-cli/src/main.rs\n?? notes.txt\n"
             ),
             " M crates/augmentagent-cli/src/main.rs\n?? notes.txt"
+        );
+    }
+
+    // #893 — PR #839 merged on GitHub but gh exited non-zero because the
+    // local branch was still held by the resume worktree; we reported FAILED.
+    #[test]
+    fn merge_reported_by_github_state_not_gh_exit_code() {
+        // gh succeeded → merged, whatever state says (or doesn't).
+        assert!(merge_succeeded(true, None));
+        assert!(merge_succeeded(true, Some("OPEN")));
+        // gh failed but GitHub says MERGED → the merge happened.
+        assert!(merge_succeeded(false, Some("MERGED")));
+        assert!(merge_succeeded(false, Some(" merged\n")));
+        // gh failed and the PR is still open/closed/unknown → real failure.
+        assert!(!merge_succeeded(false, Some("OPEN")));
+        assert!(!merge_succeeded(false, Some("CLOSED")));
+        assert!(!merge_succeeded(false, Some("")));
+        assert!(!merge_succeeded(false, None));
+    }
+
+    // Structural guard for the ordering half of #893: the resume path must
+    // release the worktree BEFORE `gh pr merge --delete-branch`, or the
+    // local-branch deletion fails while a worktree holds the branch.
+    #[test]
+    fn resume_cleans_up_worktree_before_merging() {
+        // Earlier failure paths also call cleanup, so anchor on the merge
+        // section: between `gh pr ready` and `gh pr merge` there must be one.
+        let src = include_str!("self_improve.rs");
+        let resume_start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let body = &src[resume_start..];
+        let ready_at = body.find(r#"["pr", "ready", &pr.to_string()]"#).expect("gh pr ready call");
+        let merge_at = body
+            .find(r#""pr", "merge", &pr.to_string(), "--squash", "--delete-branch""#)
+            .expect("merge call");
+        assert!(ready_at < merge_at, "ready must precede merge");
+        let between = &body[ready_at..merge_at];
+        assert!(
+            between.contains("cleanup(worktree, branch.to_string()"),
+            "resume_draft_pr must release the worktree between `gh pr ready` and `gh pr merge --delete-branch`"
         );
     }
 }
