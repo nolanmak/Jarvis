@@ -9,6 +9,8 @@
 //!
 //! `--deep` adds slower probes:
 //!   * `composio_api`        — whoami-style ping against Composio (5s timeout)
+//!   * `cerebras_models`     — is the pinned Cerebras model still in the
+//!                              catalog? Only when cerebras is in the chain.
 //!   * `per_channel_validate` — one finding per configured channel, sourced
 //!                              from `status::collect` (read-only).
 //!
@@ -28,6 +30,7 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::time::timeout;
 
+use augmentagent_channel_core::providers::{model_for, parse_chain, ModelTier, ProviderKind};
 use augmentagent_store::{rusqlite, Store};
 
 use crate::status;
@@ -171,10 +174,13 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
     findings.push(check_socialapi(&store));
     // 12. calendar — configured (Composio + gmail entities) but unscheduled? (#376)
     findings.push(check_calendar_scheduled(&store));
+    // 13. reasoner chain — configured providers + the model each tier runs (#658)
+    findings.push(check_reasoner_chain());
 
     // --- Deep checks (off by default).
     if deep {
         findings.push(check_composio_api().await);
+        findings.push(check_cerebras_models().await);
         findings.extend(check_per_channel_validate(&status_doc));
     }
 
@@ -682,6 +688,57 @@ fn check_calendar_scheduled(store: &Store) -> Finding {
     }
 }
 
+/// #658 — what the reasoner will actually run: the configured provider chain
+/// and the model each tier resolves to. Both are env-driven and swappable
+/// without a rebuild, so a typo or a dark provider surfaces here rather than
+/// in a failed call hours later.
+fn check_reasoner_chain() -> Finding {
+    let raw = std::env::var("AUGMENTAGENT_REASONER_CHAIN").unwrap_or_default();
+    let ineligible: Vec<(ProviderKind, String)> = parse_chain(&raw)
+        .providers
+        .into_iter()
+        .filter_map(|k| augmentagent_channel_core::ineligible_reason(k).map(|why| (k, why)))
+        .collect();
+    reasoner_chain_finding(&raw, &ineligible)
+}
+
+fn reasoner_chain_finding(raw: &str, ineligible: &[(ProviderKind, String)]) -> Finding {
+    let parsed = parse_chain(raw);
+    let chain = if raw.trim().is_empty() {
+        "claude (default; failover off)".to_string()
+    } else {
+        parsed.providers.iter().map(|k| k.name()).collect::<Vec<_>>().join(" -> ")
+    };
+    let models = parsed
+        .providers
+        .iter()
+        .map(|k| {
+            let (q, f) = (model_for(*k, ModelTier::Quality), model_for(*k, ModelTier::Fast));
+            format!("{}: quality={q} fast={f}", k.name())
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let mut problems: Vec<String> = parsed
+        .unknown
+        .iter()
+        .map(|t| format!("unknown provider skipped: {t}"))
+        .collect();
+    for (kind, why) in ineligible {
+        problems.push(format!("{} configured but ineligible ({why})", kind.name()));
+    }
+
+    if problems.is_empty() {
+        Finding::ok("reasoner_chain", format!("{chain} [{models}]"))
+    } else {
+        Finding::warn(
+            "reasoner_chain",
+            format!("{chain} [{models}] — {}", problems.join("; ")),
+            Some("AUGMENTAGENT_REASONER_CHAIN=claude,codex,gemini,cerebras"),
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `--deep` checks.
 // ---------------------------------------------------------------------------
@@ -741,6 +798,95 @@ async fn check_composio_api() -> Finding {
             None,
         ),
     }
+}
+
+/// #658 — is the pinned Cerebras model still in the catalog? Cerebras retired
+/// five model families in twelve months (zai-glm-4.7 on 2026-08-17), so a pin
+/// fine at deploy time can become a fallback that 404s every call it serves.
+/// Chain membership gates the network call, not just its severity: a box that
+/// merely retains an unused CEREBRAS_API_KEY must not pay a round trip — or
+/// inherit a 401 warning — from an otherwise unrelated deep run.
+async fn check_cerebras_models() -> Finding {
+    let raw = std::env::var("AUGMENTAGENT_REASONER_CHAIN").unwrap_or_default();
+    if !parse_chain(&raw).providers.contains(&ProviderKind::Cerebras) {
+        return Finding::ok(
+            "cerebras_models",
+            "cerebras is not in AUGMENTAGENT_REASONER_CHAIN — skipped".to_string(),
+        );
+    }
+    let Some(key) = augmentagent_channel_core::secret_loader::load_provider_key("CEREBRAS_API_KEY")
+    else {
+        return Finding::ok(
+            "cerebras_models",
+            "no CEREBRAS_API_KEY in keyring or env — skipped".to_string(),
+        );
+    };
+    // Read through `model_for` so an `AUGMENTAGENT_MODEL_CEREBRAS_*` override
+    // is what gets validated — that is the pin most likely to name a model
+    // nobody checked.
+    let pinned = [ModelTier::Quality, ModelTier::Fast]
+        .map(|t| (t, model_for(ProviderKind::Cerebras, t)))
+        .to_vec();
+    let catalog = augmentagent_channel_core::cerebras::list_models(
+        &reqwest::Client::new(),
+        &augmentagent_channel_core::cerebras::cerebras_base_url(),
+        &key,
+    )
+    .await;
+    cerebras_models_finding(&pinned, catalog)
+}
+
+/// Only reached with cerebras in the chain, so a dead pin is an error: every
+/// call that fails over to it will 404.
+fn cerebras_models_finding(
+    pinned: &[(ModelTier, String)],
+    catalog: Result<Vec<String>, String>,
+) -> Finding {
+    let catalog = match catalog {
+        Ok(c) => c,
+        // Never an error: an offline box must not fail `doctor`.
+        Err(e) => {
+            return Finding::warn(
+                "cerebras_models",
+                format!("could not list the Cerebras catalog: {e}"),
+                None,
+            );
+        }
+    };
+    let missing: Vec<&(ModelTier, String)> = pinned
+        .iter()
+        .filter(|(_, model)| !catalog.contains(model))
+        .collect();
+    let Some((tier, _)) = missing.first() else {
+        return Finding::ok(
+            "cerebras_models",
+            format!(
+                "pinned models present in the catalog: {}",
+                pinned
+                    .iter()
+                    .map(|(_, m)| m.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+    };
+    let names = missing
+        .iter()
+        .map(|(_, m)| m.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let env_key = match tier {
+        ModelTier::Quality => "AUGMENTAGENT_MODEL_CEREBRAS_QUALITY",
+        ModelTier::Fast => "AUGMENTAGENT_MODEL_CEREBRAS_FAST",
+    };
+    Finding::error(
+        "cerebras_models",
+        format!(
+            "pinned Cerebras model(s) no longer in the catalog: {names} — every call \
+             that falls over to cerebras will fail"
+        ),
+        Some(&format!("{env_key}=<one of: {}>", catalog.join(", "))),
+    )
 }
 
 /// One finding per configured channel. Read-only — we just lift the
@@ -868,6 +1014,84 @@ mod tests {
         }
         assert_eq!(f.severity, Severity::Warn);
         assert_eq!(f.name, "env_file_present");
+    }
+
+    /// A pin that has left the catalog is a fallback that fails every call
+    /// it serves — Cerebras dropped zai-glm-4.7 on 2026-08-17 with the model
+    /// still named in a config somewhere.
+    #[test]
+    fn cerebras_models_finding_flags_a_missing_pin() {
+        let catalog = || Ok(vec!["gpt-oss-120b".to_string(), "gemma-4-31b".to_string()]);
+        let dead = cerebras_models_finding(&[(ModelTier::Fast, "zai-glm-4.7".into())], catalog());
+        assert_eq!(dead.severity, Severity::Error);
+        assert!(dead.message.contains("zai-glm-4.7"), "{}", dead.message);
+        assert!(dead
+            .suggested_cmd
+            .as_deref()
+            .unwrap_or_default()
+            .contains("AUGMENTAGENT_MODEL_CEREBRAS_FAST="));
+
+        let live = vec![
+            (ModelTier::Quality, "gpt-oss-120b".to_string()),
+            (ModelTier::Fast, "gemma-4-31b".to_string()),
+        ];
+        assert_eq!(cerebras_models_finding(&live, catalog()).severity, Severity::Ok);
+
+        // An unreachable catalog is a network fact, not a config fault — an
+        // offline box must not fail `doctor`.
+        assert_eq!(
+            cerebras_models_finding(&live, Err("request failed: timeout".into())).severity,
+            Severity::Warn
+        );
+    }
+
+    /// A box that merely keeps an unused CEREBRAS_API_KEY must get no live
+    /// catalog request out of `doctor --deep`. The base URL below points at a
+    /// closed port: any attempt surfaces as the "could not list" warning.
+    #[tokio::test]
+    async fn cerebras_models_skips_the_call_when_cerebras_is_not_in_the_chain() {
+        std::env::set_var("AUGMENTAGENT_REASONER_CHAIN", "claude,gemini");
+        std::env::set_var("AUGMENTAGENT_CEREBRAS_BASE_URL", "http://127.0.0.1:1/v1");
+        let f = check_cerebras_models().await;
+        std::env::remove_var("AUGMENTAGENT_REASONER_CHAIN");
+        std::env::remove_var("AUGMENTAGENT_CEREBRAS_BASE_URL");
+        assert_eq!(f.severity, Severity::Ok);
+        assert!(
+            f.message.contains("not in AUGMENTAGENT_REASONER_CHAIN"),
+            "{}",
+            f.message
+        );
+    }
+
+    #[test]
+    fn reasoner_chain_finding_names_unknown_tokens() {
+        let typo = reasoner_chain_finding("claude,openai", &[]);
+        assert_eq!(typo.severity, Severity::Warn);
+        assert!(typo.message.contains("openai"), "{}", typo.message);
+        assert!(typo
+            .suggested_cmd
+            .as_deref()
+            .unwrap_or_default()
+            .contains("AUGMENTAGENT_REASONER_CHAIN="));
+
+        // The resolved models are the point of the check — read the
+        // expectation through `model_for` so a developer with an
+        // `AUGMENTAGENT_MODEL_*` override in their shell still passes.
+        let default = reasoner_chain_finding("", &[]);
+        assert_eq!(default.severity, Severity::Ok);
+        let want = model_for(ProviderKind::Claude, ModelTier::Quality);
+        assert!(
+            default.message.contains("failover off") && default.message.contains(&want),
+            "{}",
+            default.message
+        );
+
+        let dark = reasoner_chain_finding(
+            "claude,codex",
+            &[(ProviderKind::Codex, "no CODEX_API_KEY and no auth.json".to_string())],
+        );
+        assert_eq!(dark.severity, Severity::Warn);
+        assert!(dark.message.contains("codex"), "{}", dark.message);
     }
 
     #[test]
