@@ -77,11 +77,16 @@ pub fn codex_auth_available() -> bool {
 
 pub struct CodexCliReasoner {
     bin: String,
+    /// #898 — shared cap on concurrent CLI children.
+    gate: std::sync::Arc<crate::cli_gate::CliGate>,
 }
 
 impl CodexCliReasoner {
     pub fn openai() -> Self {
-        Self { bin: codex_bin() }
+        Self {
+            bin: codex_bin(),
+            gate: crate::cli_gate::CliGate::global(),
+        }
     }
 
     fn provider_name(&self) -> &'static str {
@@ -96,6 +101,8 @@ impl CodexCliReasoner {
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
         let dur = reasoner_timeout();
+        // #898 — CLI slot taken before the watchdog starts (see cli_gate).
+        let _permit = self.gate.acquire("codex").await;
         match tokio::time::timeout(dur, self.call_once(opts, user_message, all_blocks)).await {
             // Post-classify any untyped failure (stdin EPIPE, read/wait IO)
             // as provider-side Unavailable (#655 review) — an untyped error
@@ -448,7 +455,10 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"{\"decisio
 echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
 "#,
         );
-        let r = CodexCliReasoner { bin };
+        let r = CodexCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        };
         let got = r.call(&opts(), "classify this").await.unwrap();
         assert_eq!(got, "{\"decision\":\"reply\"}", "LastBlock keeps the final message");
         let all = r.call_transcript(&opts(), "classify this").await.unwrap();
@@ -467,7 +477,10 @@ echo '{"type":"turn.failed","error":{"message":"You'\''ve hit your usage limit. 
 exit 1
 "#,
         );
-        let r = CodexCliReasoner { bin };
+        let r = CodexCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        };
         let err = r.call(&opts(), "hi").await.unwrap_err();
         match ReasonerError::find_in(&err) {
             Some(ReasonerError::RateLimited { provider, .. }) => assert_eq!(provider, "codex"),
@@ -495,7 +508,10 @@ exit 1
             );
             let mut o = opts();
             o.model = Some(preset_model.into());
-            CodexCliReasoner { bin }.call(&o, "hi").await.unwrap();
+            CodexCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        }.call(&o, "hi").await.unwrap();
             let argv: Vec<String> = std::fs::read_to_string(&record)
                 .unwrap()
                 .lines()
@@ -530,7 +546,10 @@ echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"a red sq
                 record = record.display()
             ),
         );
-        let r = CodexCliReasoner { bin };
+        let r = CodexCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        };
         let msg = format!("what is in this image?\nIMAGE: {}", img.display());
         let got = r.call(&opts(), &msg).await.unwrap();
         assert_eq!(got, "a red square");
@@ -548,6 +567,7 @@ echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"a red sq
     async fn missing_binary_is_local_not_failoverable_noise() {
         let r = CodexCliReasoner {
             bin: "/nonexistent/codex-bin".into(),
+            gate: crate::cli_gate::CliGate::global(),
         };
         let err = r.call(&opts(), "hi").await.unwrap_err();
         assert!(matches!(
