@@ -9,6 +9,7 @@
 
 pub mod archetype;
 pub mod cerebras;
+pub mod cli_gate;
 pub mod code_mode;
 pub mod codex;
 pub mod cooldown;
