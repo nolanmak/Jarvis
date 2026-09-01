@@ -12,9 +12,7 @@ pub fn bump_updated(page: &str, date: &str) -> Option<String> {
     let Some(rest) = page.strip_prefix("---\n") else {
         return None; // no frontmatter — nothing safe to edit
     };
-    let Some(end) = rest.find("\n---\n") else {
-        return None;
-    };
+    let end = rest.find("\n---\n")?;
     let fm = &rest[..end];
 
     for line in fm.lines() {
