@@ -50,6 +50,7 @@ use async_trait::async_trait;
 
 mod channel_router;
 mod code_mode;
+mod doc_cmd;
 mod doctor;
 mod env_cfg;
 mod installers;
@@ -195,6 +196,13 @@ enum Cmd {
     Gmail {
         #[command(subcommand)]
         op: GmailOp,
+    },
+    /// Document text extraction (#939): pdftotext/pandoc first, then Mistral
+    /// OCR for scanned (image-only) PDFs when MISTRAL_API_KEY is set. Same
+    /// pipeline the Discord attachment handler and `gmail get-attachment` use.
+    Doc {
+        #[command(subcommand)]
+        op: DocOp,
     },
     /// Resume ingestion — one-shot seed of the wiki from the user's CV.
     Resume {
@@ -1493,6 +1501,29 @@ enum DiscordOp {
     PollOnce {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocOp {
+    /// Extract text from a PDF / DOCX / DOC. Writes `<file>.txt` beside the
+    /// input unless `--out` is given (`--out -` prints the text to stdout after
+    /// the receipt line) and reports whether the OCR stage ran.
+    Extract {
+        /// Path to the document.
+        file: PathBuf,
+        /// Output path for the text; `-` prints to stdout.
+        #[arg(long)]
+        out: Option<String>,
+        /// Force the kind (pdf|docx|doc) when the filename doesn't tell.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Skip the OCR stage even when MISTRAL_API_KEY is configured.
+        #[arg(long, default_value_t = false)]
+        no_ocr: bool,
+        /// Print a JSON receipt instead of the human line.
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        json: bool,
     },
 }
 
@@ -2975,6 +3006,12 @@ async fn main() -> Result<()> {
                     attach.clone(),
                 )
                 .await
+            }
+        },
+        Cmd::Doc { ref op } => match op {
+            DocOp::Extract { file, out, kind, no_ocr, json } => {
+                doc_cmd::run_doc_extract(file.clone(), out.clone(), kind.clone(), *no_ocr, *json)
+                    .await
             }
         },
         Cmd::Resume { ref op } => match op {
