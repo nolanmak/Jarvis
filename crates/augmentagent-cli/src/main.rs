@@ -53,6 +53,7 @@ mod code_mode;
 mod doc_cmd;
 mod doctor;
 mod env_cfg;
+mod gmail_attach;
 mod installers;
 mod logs;
 mod loop_cmd;
@@ -1552,6 +1553,47 @@ enum GmailOp {
         #[arg(long)]
         account: Option<String>,
     },
+    /// List a message's attachments (#937): index, filename, MIME type, and
+    /// the attachmentId that `get-attachment` needs. Message ids come from
+    /// `gmail search`.
+    ListAttachments {
+        /// Email address or Composio entity_id. Required when more than one
+        /// account is connected (message ids are per-mailbox).
+        #[arg(long)]
+        account: Option<String>,
+        /// Gmail messageId (from `gmail search`).
+        #[arg(long)]
+        message_id: String,
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Download one attachment (#937) to `/tmp/aa-doc-<id>-<idx>.<ext>` — a
+    /// path the ask agent's Read tool may open — and, for PDF/DOCX/DOC,
+    /// extract its text to the sibling `.txt`, running Mistral OCR when a PDF
+    /// has no text layer and MISTRAL_API_KEY is set (#939).
+    GetAttachment {
+        /// Email address or Composio entity_id. Required when more than one
+        /// account is connected.
+        #[arg(long)]
+        account: Option<String>,
+        /// Gmail messageId (from `gmail search`).
+        #[arg(long)]
+        message_id: String,
+        /// Select by attachmentId (from `list-attachments`)…
+        #[arg(long)]
+        attachment_id: Option<String>,
+        /// …or by filename, case-insensitive, as printed by `gmail search`.
+        #[arg(long)]
+        name: Option<String>,
+        /// Override the download path (the default is what the ask agent can Read).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Extract text for document kinds (default true).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        extract: bool,
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        json: bool,
+    },
     /// List active Gmail accounts (so the chat agent can pick `--account`).
     Accounts {
         #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
@@ -2938,6 +2980,30 @@ async fn main() -> Result<()> {
                 run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await
             }
             GmailOp::Accounts { json } => run_gmail_accounts(store, *json).await,
+            GmailOp::ListAttachments { account, message_id, json } => {
+                gmail_attach::run_gmail_list_attachments(
+                    store,
+                    account.clone(),
+                    message_id.clone(),
+                    *json,
+                )
+                .await
+            }
+            GmailOp::GetAttachment {
+                account, message_id, attachment_id, name, out, extract, json,
+            } => {
+                gmail_attach::run_gmail_get_attachment(
+                    store,
+                    account.clone(),
+                    message_id.clone(),
+                    attachment_id.clone(),
+                    name.clone(),
+                    out.clone(),
+                    *extract,
+                    *json,
+                )
+                .await
+            }
             GmailOp::Compose {
                 account, to, cc, bcc, subject, body, body_file, thread_id, json,
                 post, allow_duplicate, attach, reply_to_message_id, reply_to_from,
