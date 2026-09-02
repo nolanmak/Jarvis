@@ -5282,9 +5282,6 @@ async fn record_hard_failure(
 /// attempt's prompts can say what this one hit, and its kind/stage/first
 /// line go into the marker comment. `None` = a site that does not say.
 async fn record_attempt(repo_root: &Path, issue: u64, rec: Option<AttemptRecord>) -> Result<u32> {
-    // #851 — remember the attempt for the rest of the UTC day so the picker
-    // moves on instead of handing this issue straight back next tick.
-    AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue);
     let rec = rec.unwrap_or_else(AttemptRecord::unspecified);
     {
         let path = attempt_history_path();
@@ -5307,6 +5304,12 @@ async fn record_attempt(repo_root: &Path, issue: u64, rec: Option<AttemptRecord>
         warn!(issue, kind = rec.kind.as_str(), stage = %rec.stage, "attempt not charged (harness failure)");
         return Ok(prior);
     }
+    // #851 — a model failure is remembered for the rest of the UTC day so
+    // the picker moves on instead of handing this issue straight back next
+    // tick (a deterministic refusal would only be re-bought). Harness
+    // failures skip this on purpose: they retry next tick, and the daily cap
+    // bounds the spend.
+    AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue);
     let n = prior + 1;
     let _ = run(
         &gh,
@@ -9579,5 +9582,20 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(
             body.contains("build_fix_prompt(&issue, plan.as_deref(), prior_attempts.as_deref())")
         );
+    }
+
+    // Structural: a harness failure must stay retryable next tick — the
+    // daily-ledger mark comes after the countability check, never before.
+    #[test]
+    fn harness_failures_are_not_parked_for_the_day() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn record_attempt(").expect("record_attempt");
+        let end = start + src[start..].find("\n}\n").expect("end");
+        let body = &src[start..end];
+        let check = body.find("if !rec.kind.counts_toward_max_attempts()").expect("harness check");
+        let ledger = body.find("AttemptLedger::mark_persist(").expect("ledger mark");
+        assert!(check < ledger, "ledger mark must follow the harness check");
+        assert!(body[check..ledger].contains("return Ok(prior)"), "harness failures return before the mark");
+        assert_eq!(body.matches("AttemptLedger::mark_persist(").count(), 1);
     }
 }
