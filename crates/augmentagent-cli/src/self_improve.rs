@@ -4856,7 +4856,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 let (_ok, diff2, _) = run("git", &["diff", "--cached"], &worktree).await?;
                 if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff2) {
                     warn!(issue = issue.number, pattern, %line, "revision hit the blast-radius guard");
-                    let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:blast-radius", &format!("matched `{pattern}` on: {line}"), &diff, lines))).await.unwrap_or(1);
+                    let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:blast-radius", &format!("matched `{pattern}` on: {line}"), &diff_touched_paths(&diff2), diff_line_count(&diff2)))).await.unwrap_or(1);
                     backoff_comment(
                         repo_root,
                         issue.number,
@@ -4894,7 +4894,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         ));
                         continue;
                     }
-                    let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:size", &format!("diff is {lines2} lines (cap {MAX_DIFF_LINES})"), &diff, lines2))).await.unwrap_or(1);
+                    let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:size", &format!("diff is {lines2} lines (cap {MAX_DIFF_LINES})"), &diff_touched_paths(&diff2), lines2))).await.unwrap_or(1);
                     backoff_comment(
                         repo_root,
                         issue.number,
@@ -4931,7 +4931,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         ));
                         continue;
                     }
-                    let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:gate", &detail, &diff, lines) })).await.unwrap_or(1);
+                    let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:gate", &detail, &diff_touched_paths(&diff2), lines2) })).await.unwrap_or(1);
                     if attempts >= MAX_ATTEMPTS {
                         backoff_comment(
                             repo_root,
@@ -4981,7 +4981,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // FULL suite exactly once here.
         if let Err(gate_err) = verification_gate(&worktree).await {
             warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
-            let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:final-gate", &detail, &diff, lines) })).await.unwrap_or(1);
+            // The record must describe the diff that failed — the revised
+            // one, not the pre-revision snapshot.
+            let (_ok, final_diff, _) = run("git", &["diff", "--cached"], &worktree).await?;
+            let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:final-gate", &detail, &diff_touched_paths(&final_diff), diff_line_count(&final_diff)) })).await.unwrap_or(1);
             if attempts >= MAX_ATTEMPTS {
                 backoff_comment(
                     repo_root,
@@ -9770,5 +9773,27 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let body = &src[start..start + 4000];
         assert!(body.contains("Ok(r) if r.billed => {"), "billed reports are what the cap counts");
         assert!(body.contains("counter.record(today);"));
+    }
+
+    // Structural (codex on #859): a revision-round failure is recorded with
+    // the REVISED diff (`diff2` / a fresh final diff), never the pre-revision
+    // snapshot — that context is what the next attempt is told.
+    #[test]
+    fn revision_failures_record_the_revised_diff() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let end = start + src[start..].find("\n}\n").expect("end");
+        let body = &src[start..end];
+        let revise = body.find("revision hit the blast-radius guard").expect("revision loop");
+        let tail = &body[revise..];
+        assert!(!tail.contains("&diff, lines"), "a revision-round record still uses the original diff");
+        for stage in ["revise:blast-radius", "revise:size", "revise:gate", "revise:final-gate"] {
+            let at = tail.find(stage).expect(stage);
+            let call = &tail[at..at + 200];
+            assert!(
+                call.contains("diff2") || call.contains("final_diff"),
+                "{stage} must record the revised diff: {call}"
+            );
+        }
     }
 }

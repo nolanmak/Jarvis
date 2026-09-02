@@ -222,17 +222,21 @@ impl FallbackReasoner {
         self.entries.iter().map(|e| e.kind.name()).collect()
     }
 
-    fn note(&self, name: &'static str, ok: bool) {
+    /// One more call dispatched to `name` (before the provider runs).
+    fn note_call(&self, name: &'static str) {
         let mut u = self.usage.lock().unwrap_or_else(|e| e.into_inner());
         match u.iter_mut().find(|(n, _, _)| *n == name) {
-            Some(row) => {
-                if ok {
-                    row.2 += 1;
-                } else {
-                    row.1 += 1;
-                }
-            }
-            None => u.push((name, u32::from(!ok), u32::from(ok))),
+            Some(row) => row.1 += 1,
+            None => u.push((name, 1, 0)),
+        }
+    }
+
+    /// The call just dispatched to `name` returned Ok.
+    fn note_ok(&self, name: &'static str) {
+        let mut u = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        match u.iter_mut().find(|(n, _, _)| *n == name) {
+            Some(row) => row.2 += 1,
+            None => u.push((name, 1, 1)),
         }
     }
 
@@ -282,7 +286,7 @@ impl FallbackReasoner {
                 tracing::debug!(provider = name, %until, "provider latched; skipping");
                 continue;
             }
-            self.note(name, false);
+            self.note_call(name);
             let res = if transcript {
                 entry.reasoner.call_transcript(opts, user_message).await
             } else {
@@ -290,7 +294,7 @@ impl FallbackReasoner {
             };
             match res {
                 Ok(text) => {
-                    self.note(name, true);
+                    self.note_ok(name);
                     if Some(entry.kind) != primary {
                         info!(
                             provider = name,
@@ -418,9 +422,19 @@ mod tests {
         let opts = text_only_opts();
         fb.call(&opts, "hi").await.unwrap();
         fb.call(&opts, "again").await.unwrap();
-        assert_eq!(fb.calls(), 2);
-        assert_eq!(fb.usage(), vec![("claude", 2, 2)]);
+        assert_eq!(fb.calls(), 2, "two calls attempted");
+        assert_eq!(fb.usage(), vec![("claude", 2, 2)], "(provider, attempted, served)");
         assert_eq!(fb.usage_summary(), "claude 2/2");
+        // A provider that errors counts an attempt and no serve.
+        let dir2 = tempfile::tempdir().unwrap();
+        let bad = Scripted::err(|| anyhow::anyhow!("boom"));
+        let fb2 = FallbackReasoner::for_tests(
+            vec![(ProviderKind::Claude, bad.clone() as Arc<dyn Reasoner>)],
+            latch_in(&dir2),
+        );
+        let _ = fb2.call(&opts, "hi").await;
+        assert_eq!(fb2.usage(), vec![("claude", 1, 0)]);
+        assert_eq!(fb2.usage_summary(), "claude 0/1");
     }
 
     #[test]
