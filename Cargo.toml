@@ -37,6 +37,7 @@ members = [
     "crates/augmentagent-wiki",
     "crates/augmentagent-cli",
     "crates/augmentagent-loops",
+    "crates/augmentagent-docs",
     "crates/augmentagent-tools",
     "crates/augmentagent-mcp-memory",
 ]

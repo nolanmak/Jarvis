@@ -11,6 +11,9 @@ augmentagent-store = { path = "../augmentagent-store" }
 # #176 — `!loops` Discord command reuses the shared /proc walker + signal
 # primitive that backs `augmentagent loops` (#175).
 augmentagent-loops = { path = "../augmentagent-loops" }
+# #939 — shared PDF/DOCX → text pipeline (pdftotext, then Mistral OCR for
+# scanned PDFs) so Discord drops and the CLI extract identically.
+augmentagent-docs = { path = "../augmentagent-docs" }
 
 tokio = { workspace = true }
 tokio-util = { workspace = true }
