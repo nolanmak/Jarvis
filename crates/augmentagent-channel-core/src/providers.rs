@@ -202,27 +202,46 @@ pub fn model_for(kind: ProviderKind, tier: ModelTier) -> String {
     }
 }
 
-/// Parse the configured chain. Default is `claude` alone — failover is
-/// opt-in via `.env` so a bare checkout behaves exactly as before #655.
-/// Unknown entries are logged-and-skipped rather than fatal so a typo can't
-/// take the reasoner down; duplicates are dropped.
-pub fn chain_from_env() -> Vec<ProviderKind> {
-    let raw = std::env::var("AUGMENTAGENT_REASONER_CHAIN").unwrap_or_default();
-    let mut chain: Vec<ProviderKind> = Vec::new();
+/// A parsed `AUGMENTAGENT_REASONER_CHAIN`: providers in configured order,
+/// plus the tokens that named nothing. `doctor` (#658) reports the latter —
+/// a silently shortened chain looks like a chain nobody configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedChain {
+    pub providers: Vec<ProviderKind>,
+    pub unknown: Vec<String>,
+}
+
+/// Parse a chain string. Default is `claude` alone — failover is opt-in via
+/// `.env` so a bare checkout behaves exactly as before #655. Unknown entries
+/// are skipped rather than fatal so a typo can't take the reasoner down;
+/// duplicates are dropped.
+pub fn parse_chain(raw: &str) -> ParsedChain {
+    let mut providers: Vec<ProviderKind> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
     for tok in raw.split(',') {
         if tok.trim().is_empty() {
             continue;
         }
         match ProviderKind::parse(tok) {
-            Some(k) if !chain.contains(&k) => chain.push(k),
+            Some(k) if !providers.contains(&k) => providers.push(k),
             Some(_) => {}
-            None => tracing::warn!("AUGMENTAGENT_REASONER_CHAIN: unknown provider {tok:?} skipped"),
+            None => unknown.push(tok.trim().to_string()),
         }
     }
-    if chain.is_empty() {
-        chain.push(ProviderKind::Claude);
+    if providers.is_empty() {
+        providers.push(ProviderKind::Claude);
     }
-    chain
+    ParsedChain { providers, unknown }
+}
+
+/// The configured chain, as the daemon builds it at startup.
+pub fn chain_from_env() -> Vec<ProviderKind> {
+    let raw = std::env::var("AUGMENTAGENT_REASONER_CHAIN").unwrap_or_default();
+    let parsed = parse_chain(&raw);
+    for tok in &parsed.unknown {
+        tracing::warn!("AUGMENTAGENT_REASONER_CHAIN: unknown provider {tok:?} skipped");
+    }
+    parsed.providers
 }
 
 /// Does `bin` resolve to an executable? Absolute/relative paths are checked
@@ -315,7 +334,9 @@ mod tests {
 
     /// #448's invariant extended to every provider (#658): the model each
     /// fallback provider runs is explicit — a filled map cell or an explicit
-    /// env override — never an inherited interactive default.
+    /// env override — never an inherited interactive default. A cell only
+    /// binds if an adapter spawns with it, which each adapter's own
+    /// `spawn_pins_the_resolved_model_on_both_tiers` guards (#658).
     #[test]
     fn no_fallback_preset_inherits_an_interactive_model() {
         for kind in [
@@ -333,6 +354,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parse_chain_reports_unknown_tokens() {
+        // A typo is skipped, not fatal — but it must be NAMED, so `doctor`
+        // can show the owner why their chain came up short.
+        let parsed = parse_chain("claude,nope,gemini");
+        assert_eq!(
+            parsed.providers,
+            vec![ProviderKind::Claude, ProviderKind::Gemini]
+        );
+        assert_eq!(parsed.unknown, vec!["nope".to_string()]);
     }
 
     #[test]

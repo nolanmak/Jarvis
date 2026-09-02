@@ -160,6 +160,99 @@ check "proceeds again once the run has finished" "$?" "1"
 rm -rf "$DEFER_DIR"
 unset AUGMENTAGENT_SELFIMPROVE_LOCK AUGMENTAGENT_RESTART_DEFER_STAMP
 
+echo "trim_gate_cache_if_idle (#891):"
+CACHE_DIR=$(mktemp -d)
+export AUGMENTAGENT_GATE_TARGET_DIR="$CACHE_DIR/gate"
+export AUGMENTAGENT_GATE_CACHE_MAX_MB=1
+export AUGMENTAGENT_SELFIMPROVE_LOCK="$CACHE_DIR/self-improve.lock"
+GATE_CACHE_DIR="$AUGMENTAGENT_GATE_TARGET_DIR"; GATE_CACHE_MAX_MB=1
+SELF_IMPROVE_LOCK="$AUGMENTAGENT_SELFIMPROVE_LOCK"
+RESUME_LANE_LOCK="$CACHE_DIR/self-improve-resume.lock"
+mkdir -p "$GATE_CACHE_DIR/debug"; dd if=/dev/zero of="$GATE_CACHE_DIR/debug/blob" bs=1M count=3 status=none
+
+# A lane mid-build (holding either lock) must block the trim.
+touch "$RESUME_LANE_LOCK"
+# Short hold, then WAIT for it: `flock -c` hands the locked fd to its child,
+# so killing the flock pid does not release the lock.
+flock -x "$RESUME_LANE_LOCK" -c 'sleep 3' & HOLDER=$!
+sleep 0.3
+trim_gate_cache_if_idle >/dev/null 2>&1
+check "leaves the cache alone while a lane holds its lock" "$?" "1"
+[ -d "$GATE_CACHE_DIR/debug" ] && ok "debug/ survives while a build may be using it" \
+  || bad "debug/ survives while a build may be using it" "it was deleted under a live build"
+wait "$HOLDER" 2>/dev/null
+
+# Idle + over cap -> trimmed.
+trim_gate_cache_if_idle >/dev/null 2>&1
+check "trims when over cap and every lane is idle" "$?" "0"
+[ -d "$GATE_CACHE_DIR/debug" ] && bad "drops debug/ on trim" "still present" || ok "drops debug/ on trim"
+
+# Under cap -> untouched.
+mkdir -p "$GATE_CACHE_DIR/debug"; GATE_CACHE_MAX_MB=100000
+trim_gate_cache_if_idle >/dev/null 2>&1
+check "leaves a cache under the cap alone" "$?" "1"
+rm -rf "$CACHE_DIR"
+unset AUGMENTAGENT_GATE_TARGET_DIR AUGMENTAGENT_GATE_CACHE_MAX_MB AUGMENTAGENT_SELFIMPROVE_LOCK
+
+echo "memory_pressure_ok / restart_budget_ok (#903):"
+HYG_DIR=$(mktemp -d)
+MEMINFO_PATH="$HYG_DIR/meminfo"
+RESTART_MIN_AVAIL_MB=3072
+RESTART_HISTORY="$HYG_DIR/restart-history"
+RESTARTS_PER_HOUR=3
+unset AUGMENTAGENT_RESTART_FORCE
+
+printf 'MemTotal:       16000000 kB\nMemAvailable:    8000000 kB\n' > "$MEMINFO_PATH"
+memory_pressure_ok >/dev/null 2>&1
+check "memory: proceeds with plenty of MemAvailable" "$?" "0"
+
+printf 'MemTotal:       16000000 kB\nMemAvailable:    1048576 kB\n' > "$MEMINFO_PATH"
+HYG_LOG=$(memory_pressure_ok 2>&1); rc=$?
+check "memory: defers when MemAvailable is under the floor" "$rc" "1"
+case "$HYG_LOG" in
+  *"restart deferred"*"MemAvailable"*) ok "memory: says why (restart deferred: MemAvailable=…)" ;;
+  *) bad "memory: says why (restart deferred: MemAvailable=…)" "log was: $HYG_LOG" ;;
+esac
+
+rm -f "$MEMINFO_PATH"
+memory_pressure_ok >/dev/null 2>&1
+check "memory: fails open when meminfo is unreadable (macOS/containers)" "$?" "0"
+
+printf 'MemAvailable:    1048576 kB\n' > "$MEMINFO_PATH"
+AUGMENTAGENT_RESTART_FORCE=1 memory_pressure_ok >/dev/null 2>&1
+check "memory: AUGMENTAGENT_RESTART_FORCE=1 overrides" "$?" "0"
+
+restart_budget_ok >/dev/null 2>&1
+check "budget: proceeds with no history" "$?" "0"
+
+HYG_NOW=$(date +%s)
+printf '%s\n%s\n%s\n' "$((HYG_NOW-600))" "$((HYG_NOW-1200))" "$((HYG_NOW-1800))" > "$RESTART_HISTORY"
+HYG_LOG=$(restart_budget_ok 2>&1); rc=$?
+check "budget: defers after 3 restarts inside the hour" "$rc" "1"
+case "$HYG_LOG" in
+  *"restart deferred"*) ok "budget: says why (restart deferred: …)" ;;
+  *) bad "budget: says why (restart deferred: …)" "log was: $HYG_LOG" ;;
+esac
+
+printf '%s\n%s\n%s\n' "$((HYG_NOW-4000))" "$((HYG_NOW-5000))" "$((HYG_NOW-6000))" > "$RESTART_HISTORY"
+restart_budget_ok >/dev/null 2>&1
+check "budget: restarts older than an hour do not count" "$?" "0"
+
+printf '%s\n%s\n%s\n' "$((HYG_NOW-600))" "$((HYG_NOW-1200))" "$((HYG_NOW-1800))" > "$RESTART_HISTORY"
+AUGMENTAGENT_RESTART_FORCE=1 restart_budget_ok >/dev/null 2>&1
+check "budget: AUGMENTAGENT_RESTART_FORCE=1 overrides" "$?" "0"
+
+printf '%s\n%s\n' "$((HYG_NOW-9000))" "$((HYG_NOW-100))" > "$RESTART_HISTORY"
+record_restart >/dev/null 2>&1
+check "record_restart: returns 0" "$?" "0"
+if [ "$(grep -c . "$RESTART_HISTORY")" = "2" ] && ! grep -q "^$((HYG_NOW-9000))$" "$RESTART_HISTORY" \
+   && grep -q "^$((HYG_NOW-100))$" "$RESTART_HISTORY"; then
+  ok "record_restart: appends now and prunes entries older than an hour"
+else
+  bad "record_restart: appends now and prunes entries older than an hour" "history: $(tr '\n' ' ' < "$RESTART_HISTORY")"
+fi
+rm -rf "$HYG_DIR"
+
 echo "should_write_stamp:"
 should_write_stamp 0; check "writes the stamp when nothing failed" "$?" "0"
 should_write_stamp 1; check "withholds the stamp when a required restart failed" "$?" "1"
