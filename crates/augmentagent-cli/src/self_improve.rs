@@ -2792,6 +2792,95 @@ fn round_comment(round: u32, kind: &str, findings: &str, sha: &str) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// #933 — auto-rebase: a sitting draft's merge conflict is the builder's job.
+//
+// `resume_draft_pr` used to abort the merge, comment "needs a human rebase",
+// and move on — every eligible tick, forever (#855/#857/#859). A conflict
+// between a ≤600-line agent diff and today's `main` is exactly the mechanical
+// edit the builder already makes in revision rounds, so it gets one attempt
+// per resume; the normal round loop (guards → gate → reviews) judges the
+// result. Blast-radius paths stay a human's job.
+// ---------------------------------------------------------------------------
+
+/// Paths `git status --porcelain` reports as unmerged (any `U` in the XY
+/// columns, plus `AA`/`DD`).
+fn conflicted_files(porcelain: &str) -> Vec<String> {
+    porcelain
+        .lines()
+        .filter_map(|l| {
+            let (xy, path) = l.split_at_checked(2)?;
+            let path = path.strip_prefix(' ')?;
+            let unmerged = xy.contains('U') || xy == "AA" || xy == "DD";
+            (unmerged && !path.is_empty()).then(|| path.to_string())
+        })
+        .collect()
+}
+
+/// A line that IS a git conflict marker: `<<<<<<< `, `=======`, `>>>>>>> `
+/// (or diff3's `||||||| `) at column 0. Indented look-alikes and markers
+/// inside a string or a doc-comment table are not markers.
+fn has_conflict_markers(text: &str) -> bool {
+    text.lines().any(|l| {
+        l == "======="
+            || l.starts_with("<<<<<<< ")
+            || l.starts_with(">>>>>>> ")
+            || l.starts_with("||||||| ")
+    })
+}
+
+/// What to do with a set of conflicted paths.
+enum ConflictPlan {
+    /// A human's job — the reason names the path.
+    Refuse(String),
+    /// Ask the builder.
+    Resolve,
+}
+
+fn conflict_plan(files: &[String]) -> ConflictPlan {
+    if files.is_empty() {
+        return ConflictPlan::Refuse("git reported no unmerged paths".into());
+    }
+    match files.iter().find(|f| is_blast_radius(f)) {
+        Some(f) => ConflictPlan::Refuse(format!("`{f}` is a deploy/auth/secret path")),
+        None => ConflictPlan::Resolve,
+    }
+}
+
+/// The builder's brief for a conflict: the issue, the PR's own description,
+/// the conflicted files, and the `git diff` hunks carrying the markers.
+fn build_conflict_prompt(
+    issue: &Issue,
+    pr_body: &str,
+    files: &[String],
+    both_sides_diff: &str,
+) -> String {
+    let list = files
+        .iter()
+        .map(|f| format!("- {f}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "You previously implemented a fix for GitHub issue #{} ({}) on this \
+         branch. `main` has moved since, and `git merge origin/main` stopped \
+         with conflicts in exactly these files:\n{}\n\n\
+         The PR's description of the fix:\n{}\n\n\
+         The conflict hunks (`git diff`; `<<<<<<<` is this branch, `>>>>>>>` \
+         is `main`):\n```\n{}\n```\n\n\
+         Resolve every conflict in those files: keep `main`'s behaviour AND \
+         this branch's intent — where both sides changed the same thing, \
+         integrate them rather than picking a side. Edit nothing else. Leave \
+         no conflict markers: no line may start with `<<<<<<<`, `=======` or \
+         `>>>>>>>`. Do not run git commands; only edit the files. When done, \
+         summarize what you kept from each side, per file.",
+        issue.number,
+        issue.title,
+        list,
+        truncate(pr_body, 1500),
+        truncate(both_sides_diff, 8000),
+    )
+}
+
 /// Resume a sitting draft PR (#866): re-review it against today's `main`,
 /// revise against fresh findings, and merge on a double LGTM.
 ///
@@ -2852,10 +2941,15 @@ async fn resume_draft_pr(
         repo_root,
     )
     .await?;
-    let complexity = serde_json::from_str::<serde_json::Value>(&prbody_raw)
+    let pr_body: String = serde_json::from_str::<serde_json::Value>(&prbody_raw)
         .ok()
-        .and_then(|v| v.get("body").and_then(|b| b.as_str()).map(complexity_from_pr_body))
-        .unwrap_or(Complexity::Hard);
+        .and_then(|v| v.get("body").and_then(|b| b.as_str()).map(str::to_string))
+        .unwrap_or_default();
+    let complexity = if pr_body.is_empty() {
+        Complexity::Hard
+    } else {
+        complexity_from_pr_body(&pr_body)
+    };
 
     // Worktree from the PR's branch, brought up to date with main. A merge
     // conflict is a human's job — say so on the PR and move on.
@@ -2881,23 +2975,6 @@ async fn resume_draft_pr(
         let _ = run("git", &["worktree", "remove", "--force", &wt.to_string_lossy()], &root).await;
         let _ = run("git", &["branch", "-D", &br], &root).await;
     };
-    let (ok, _o, _e) = run("git", &["merge", "--no-edit", "origin/main"], &worktree).await?;
-    if !ok {
-        let _ = run("git", &["merge", "--abort"], &worktree).await;
-        cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-        let _ = run(
-            &gh,
-            &["pr", "comment", &pr.to_string(), "--body",
-              "Auto-resume: this branch no longer merges cleanly with `main`; \
-               it needs a human rebase before the loop can pick it up again."],
-            repo_root,
-        )
-        .await;
-        return Ok(RunReport::triage(format!(
-            "PR #{pr}: resume skipped — merge conflict with main"
-        )));
-    }
-
     let git_name = std::env::var("AUGMENTAGENT_GIT_AUTHOR_NAME")
         .unwrap_or_else(|_| "AugmentAgent".to_string());
     let git_email = std::env::var("AUGMENTAGENT_GIT_AUTHOR_EMAIL")
@@ -2905,12 +2982,132 @@ async fn resume_draft_pr(
     let name_arg = format!("user.name={git_name}");
     let email_arg = format!("user.email={git_email}");
 
+    let (ok, _o, _e) = run("git", &["merge", "--no-edit", "origin/main"], &worktree).await?;
+    let mut conflict_note: Option<String> = None;
+    if !ok {
+        // #933 — a conflict with today's main is the builder's job before it
+        // is a human's: resolve the markers, verify none remain, commit the
+        // merge, and let the round loop below (guards → gate → reviews)
+        // judge the result. One attempt per resume; the ledger bounds days.
+        let (_ok, porcelain, _) = run("git", &["status", "--porcelain"], &worktree).await?;
+        let files = conflicted_files(&porcelain);
+        info!(pr, files = %files.join(", "), "resume: merge conflict with main; resolving");
+        let mut builder_ran = false;
+        let resolved: std::result::Result<String, String> = match conflict_plan(&files) {
+            ConflictPlan::Refuse(why) => Err(why),
+            ConflictPlan::Resolve => {
+                let (_ok, hunks, _) = run("git", &["diff"], &worktree).await?;
+                builder_ran = true;
+                match reasoner
+                    .call(
+                        &fix_opts(worktree.clone()),
+                        &build_conflict_prompt(&issue, &pr_body, &files, &hunks),
+                    )
+                    .await
+                {
+                    Ok(rs) => {
+                        let _ = drop_root_scratch(&worktree).await;
+                        let mut leftover: Option<String> = None;
+                        for f in &files {
+                            if let Ok(text) = tokio::fs::read_to_string(worktree.join(f)).await {
+                                if has_conflict_markers(&text) {
+                                    leftover = Some(f.clone());
+                                    break;
+                                }
+                            }
+                        }
+                        match leftover {
+                            Some(f) => Err(format!("conflict markers remain in `{f}`")),
+                            None => {
+                                let _ = run("git", &["add", "-A"], &worktree).await?;
+                                let (_ok, after, _) =
+                                    run("git", &["status", "--porcelain"], &worktree).await?;
+                                let still = conflicted_files(&after);
+                                if still.is_empty() {
+                                    Ok(rs)
+                                } else {
+                                    Err(format!("still unmerged: {}", still.join(", ")))
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => Err(format!("builder call failed: {e:#}")),
+                }
+            }
+        };
+        match resolved {
+            Ok(rs) => {
+                let msg =
+                    "auto-resume: merge origin/main (conflicts resolved by builder)".to_string();
+                let _ = run(
+                    "git",
+                    &["-c", &name_arg, "-c", &email_arg, "commit", "--allow-empty", "-m", &msg],
+                    &worktree,
+                )
+                .await?;
+                let findings = format!(
+                    "Merge conflict with `main` resolved by the builder in: {}\n\n{}",
+                    files.join(", "),
+                    truncate(&rs, 600)
+                );
+                publish_round(
+                    &worktree,
+                    branch,
+                    repo_root,
+                    pr,
+                    0,
+                    "conflict resolution",
+                    &findings,
+                    dry_run,
+                )
+                .await;
+                conflict_note = Some(format!("Conflict resolution: {}", truncate(&rs, 200)));
+            }
+            Err(why) => {
+                let _ = run("git", &["merge", "--abort"], &worktree).await;
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                let _ = run(
+                    &gh,
+                    &[
+                        "pr",
+                        "comment",
+                        &pr.to_string(),
+                        "--body",
+                        &format!(
+                            "Auto-resume: this branch no longer merges cleanly with \
+                                `main` and the loop could not resolve it ({why}); it \
+                                needs a human rebase before the loop can pick it up \
+                                again."
+                        ),
+                    ],
+                    repo_root,
+                )
+                .await;
+                let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+                if attempts >= MAX_ATTEMPTS {
+                    label_gave_up(repo_root, issue.number).await.ok();
+                }
+                let message = format!(
+                    "PR #{pr}: merge conflict with main not resolved ({why}); attempt {attempts}"
+                );
+                return Ok(if builder_ran {
+                    RunReport::built(message)
+                } else {
+                    RunReport::triage(message)
+                });
+            }
+        }
+    }
+
     let mut rounds_done = 0u32;
     let mut notes_log: Vec<String> = Vec::new();
     // #889 — the reviewer's previous round's findings, fed back so it judges
     // convergence instead of re-scoping every round.
     let mut prior_notes: Option<String> = None;
-    let mut summary = format!("Resumed sitting draft PR #{pr}.");
+    let mut summary = match conflict_note {
+        Some(note) => format!("Resumed sitting draft PR #{pr}.\n{note}"),
+        None => format!("Resumed sitting draft PR #{pr}."),
+    };
     loop {
         // The PR's actual contribution, freshly computed each round.
         let (_ok, diff, _) =
@@ -7304,8 +7501,8 @@ CODEX-REVIEW: lgtm").0);
             .count();
         let publishes = body.matches("publish_round(").count();
         assert_eq!(
-            commits, 3,
-            "expected the shrink, gate-repair and revise commits"
+            commits, 4,
+            "expected the conflict-resolution (#933), shrink, gate-repair and revise commits"
         );
         assert_eq!(
             publishes, commits,
@@ -7735,5 +7932,157 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // The daily ledger still applies to the pinned draft.
         ledger.mark(100, 11);
         assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(11)), None);
+    }
+
+    // --- #933 auto-rebase: the builder resolves a draft's merge conflict ---
+
+    #[test]
+    fn conflicted_files_parses_unmerged_porcelain_entries() {
+        let porcelain = "UU crates/a/src/lib.rs\nAA b.rs\n M c.rs\n?? d\nDU e.rs\nUD f.rs\nAU g.rs\nUA h.rs\nA  i.rs\n";
+        assert_eq!(
+            conflicted_files(porcelain),
+            vec![
+                "crates/a/src/lib.rs".to_string(),
+                "b.rs".into(),
+                "e.rs".into(),
+                "f.rs".into(),
+                "g.rs".into(),
+                "h.rs".into(),
+            ]
+        );
+        assert!(conflicted_files(" M c.rs\n?? d\n").is_empty());
+        assert!(conflicted_files("").is_empty());
+    }
+
+    #[test]
+    fn has_conflict_markers_detects_all_three_kinds_only_at_line_start() {
+        assert!(has_conflict_markers("a\n<<<<<<< HEAD\nb\n"));
+        assert!(has_conflict_markers("a\n=======\nb\n"));
+        assert!(has_conflict_markers("a\n>>>>>>> origin/main\nb\n"));
+        assert!(has_conflict_markers(
+            "<<<<<<< ours\n=======\n>>>>>>> theirs\n"
+        ));
+        // A doc-comment table rule and a `>>>` in code are not markers.
+        assert!(!has_conflict_markers(
+            "/// | a | b |\n/// |=======|\nlet x = a >>> b;\n"
+        ));
+        assert!(!has_conflict_markers(
+            "    ======= indented is not a marker\n"
+        ));
+        assert!(!has_conflict_markers(
+            "let s = \"<<<<<<< not at line start\";\n"
+        ));
+        assert!(!has_conflict_markers(""));
+    }
+
+    #[test]
+    fn conflict_prompt_names_files_issue_and_forbids_markers() {
+        let issue = Issue {
+            number: 650,
+            title: "gmail compose leaks --subject into the body".into(),
+            body: "## Why\nthe subject line ends up in the body".into(),
+            author: "nolanmak".into(),
+            author_trusted: true,
+            research_filed: false,
+        };
+        let files = vec![
+            "crates/a/src/lib.rs".to_string(),
+            "crates/a/src/x.rs".to_string(),
+        ];
+        let diff = "diff --cc crates/a/src/lib.rs\n++<<<<<<< HEAD\n+a\n++=======\n+b\n++>>>>>>> origin/main\n";
+        let p = build_conflict_prompt(&issue, "PR body: fixes the leak", &files, diff);
+        assert!(p.contains("#650") && p.contains("gmail compose leaks --subject"));
+        for f in &files {
+            assert!(p.contains(f), "prompt must name {f}");
+        }
+        assert!(p.contains("PR body: fixes the leak"));
+        assert!(
+            p.contains("++<<<<<<< HEAD"),
+            "the conflict hunks are the input"
+        );
+        assert!(p.contains("no conflict markers"), "{p}");
+        assert!(p.contains("Edit nothing else"), "{p}");
+        // A 100 kB diff is cut, not forwarded whole.
+        let huge = "x".repeat(100_000);
+        assert!(build_conflict_prompt(&issue, "", &files, &huge).len() < 12_000);
+    }
+
+    #[test]
+    fn blast_radius_conflict_is_refused_without_a_builder_call() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(matches!(
+            conflict_plan(&s(&["crates/a/src/lib.rs", "scripts/check-for-updates.sh"])),
+            ConflictPlan::Refuse(ref why) if why.contains("scripts/check-for-updates.sh")
+        ));
+        assert!(matches!(
+            conflict_plan(&s(&[".github/workflows/ci.yml"])),
+            ConflictPlan::Refuse(_)
+        ));
+        assert!(matches!(
+            conflict_plan(&s(&["crates/a/src/lib.rs", "README.md"])),
+            ConflictPlan::Resolve
+        ));
+        // Nothing conflicted is not a plan — the caller never gets here, but
+        // the safe answer is still "nothing to resolve".
+        assert!(matches!(conflict_plan(&[]), ConflictPlan::Refuse(_)));
+    }
+
+    // Structural: between the merge and its abort, resume_draft_pr calls the
+    // builder and scans for leftover markers — it no longer gives up on the
+    // first conflict.
+    #[test]
+    fn resume_tries_resolution_before_aborting_the_merge() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let body = &src[start..];
+        let merge = body
+            .find(r#""merge", "--no-edit", "origin/main""#)
+            .expect("merge call");
+        let abort = body.find(r#""merge", "--abort""#).expect("abort call");
+        assert!(merge < abort);
+        let between = &body[merge..abort];
+        assert!(
+            between.contains("fix_opts("),
+            "builder must be asked to resolve the conflict"
+        );
+        assert!(
+            between.contains("has_conflict_markers("),
+            "leftover markers must be scanned before commit"
+        );
+        assert!(
+            between.contains("conflict_plan("),
+            "blast-radius paths must be refused first"
+        );
+        assert!(
+            between.contains("publish_round("),
+            "the merge commit must be pushed + commented"
+        );
+    }
+
+    // Structural: an unresolved conflict (refused or failed) records an
+    // attempt, so the draft is not retried every tick until gave-up.
+    #[test]
+    fn unresolved_conflict_is_recorded_as_an_attempt() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let body = &src[start..];
+        let abort = body.find(r#""merge", "--abort""#).expect("abort call");
+        let after = &body[abort..];
+        let ret = after
+            .find("return Ok(RunReport::")
+            .expect("return after abort");
+        let arm = &after[..ret];
+        assert!(
+            arm.contains("record_attempt("),
+            "conflict failure must count as an attempt"
+        );
+        assert!(
+            arm.contains("label_gave_up("),
+            "and reach gave-up at MAX_ATTEMPTS"
+        );
+        assert!(
+            arm.contains("needs a human rebase"),
+            "and still tell the human"
+        );
     }
 }
