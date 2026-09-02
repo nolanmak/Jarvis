@@ -1,0 +1,30 @@
+[package]
+name = "augmentagent-docs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# #939 — shared document → text pipeline: stage 1 is the local converter
+# (pdftotext / pandoc), stage 2 is Mistral OCR for scanned (image-only) PDFs.
+# Lives in its own leaf crate because BOTH the Discord attachment handler
+# (approval-discord) and the CLI (`gmail get-attachment`, `doc extract`) need
+# it, and channel-core depends on approval-discord — so the pipeline can't
+# live in core without a cycle.
+
+[dependencies]
+# Keyring-first `MISTRAL_API_KEY` lookup (#128 pattern), env fallback.
+augmentagent-auth = { path = "../augmentagent-auth" }
+
+anyhow = { workspace = true }
+base64 = "0.22"
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tempfile = "3"

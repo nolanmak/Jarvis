@@ -34,9 +34,13 @@ pub mod crypto;
 pub mod html;
 
 pub use channel::{
-    JournalChannel, JournalChannelConfig, JournalRuntime, PollOutcome, DEFAULT_POLL_INTERVAL,
+    JournalChannel, JournalChannelConfig, JournalRuntime, PollOutcome, DEFAULT_BASE_SYNC_THRESHOLD,
+    DEFAULT_MAX_ENTRIES_PER_POLL, DEFAULT_MAX_PAGES_PER_POLL, DEFAULT_POLL_INTERVAL,
 };
-pub use client::{Entry, EntryPage, JournalApi, JournalError, NewEntry, ShadowNoteClient};
+pub use client::{
+    Entry, EntryPage, JournalApi, JournalError, NewEntry, ShadowNoteClient,
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT,
+};
 pub use config::JournalConfig;
 pub use crypto::{
     decrypt_entry_content, encrypt_entry_content, CryptoError, DekProvider, EnvelopeCiphertext,

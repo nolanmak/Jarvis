@@ -8,6 +8,20 @@
 # on Linux. Idempotent — re-running reloads with the current config.
 #
 # Usage: ./scripts/install-autostart.sh
+#
+# Resource limits (#902, from the 2026-08-31 OOM post-mortem #897): the Linux
+# unit carries MemoryHigh/MemoryMax/MemorySwapMax/TasksMax/LimitNOFILE/
+# OOMPolicy so a runaway fan-out is contained INSIDE its own cgroup instead of
+# the kernel's global OOM killer taking the desktop session down with it (that
+# is what happened when ~300 `claude -p` children fanned out at once). With
+# OOMPolicy=continue the kernel kills the offending child and the daemon keeps
+# running — `kill` would turn one OOM'd child into a full daemon restart, the
+# very restart storm #903 exists to prevent. MemoryHigh throttles the
+# in-cgroup `cargo build` (self-improve gate) before MemoryMax bites; the
+# ceilings leave a release build room (it peaks at several GB) while still
+# leaving the desktop ~5 GB on a 15 GB laptop. Override per host at install:
+#   AUGMENTAGENT_UNIT_MEMORY_HIGH (8G)  AUGMENTAGENT_UNIT_MEMORY_MAX (10G)
+#   AUGMENTAGENT_UNIT_TASKS_MAX (2048)  AUGMENTAGENT_UNIT_NOFILE (4096)
 
 set -euo pipefail
 
@@ -123,6 +137,12 @@ install_linux() {
   # spots so cargo/node/etc are findable from the script.
   local SERVICE_PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 
+  # #902 — cgroup + rlimit ceilings (see the header). Overridable per host.
+  local MEMORY_HIGH="${AUGMENTAGENT_UNIT_MEMORY_HIGH:-8G}"
+  local MEMORY_MAX="${AUGMENTAGENT_UNIT_MEMORY_MAX:-10G}"
+  local TASKS_MAX="${AUGMENTAGENT_UNIT_TASKS_MAX:-2048}"
+  local NOFILE="${AUGMENTAGENT_UNIT_NOFILE:-4096}"
+
   log "Writing unit: $UNIT"
   cat > "$UNIT" <<UNIT_EOF
 [Unit]
@@ -140,6 +160,14 @@ Environment=RUST_LOG=info
 Environment=AUGMENTAGENT_DEFT_ENABLED=1
 Restart=on-failure
 RestartSec=10
+# #902 — die alone: a fan-out is killed inside this cgroup, not by the
+# kernel's global OOM killer picking off the desktop session.
+MemoryHigh=$MEMORY_HIGH
+MemoryMax=$MEMORY_MAX
+MemorySwapMax=0
+TasksMax=$TASKS_MAX
+LimitNOFILE=$NOFILE
+OOMPolicy=continue
 StandardOutput=append:$LOG_DIR/stdout.log
 StandardError=append:$LOG_DIR/stderr.log
 

@@ -16,7 +16,9 @@ use augmentagent_approval_discord::{
 };
 use augmentagent_channel_core::reasoner::{ask_opts, digest_opts, draft_opts};
 use augmentagent_channel_core::{build_reasoner, FallbackReasoner, Reasoner};
-use augmentagent_channel_email::gmail::{Attachment, ComposioClient, GmailApi};
+use augmentagent_channel_email::gmail::{
+    normalize_subject, Attachment, ComposioClient, GmailApi, ThreadSubject,
+};
 use augmentagent_channel_email::sigextract::{
     detect_signature_block, is_human_sender, signature_patch, strip_quoted_reply,
     SignatureExtractor,
@@ -48,6 +50,7 @@ use async_trait::async_trait;
 
 mod channel_router;
 mod code_mode;
+mod doc_cmd;
 mod doctor;
 mod env_cfg;
 mod installers;
@@ -154,6 +157,11 @@ enum Cmd {
         #[command(subcommand)]
         op: WikiOp,
     },
+    /// FlyOnTheWall meeting transcripts (#915).
+    Transcripts {
+        #[command(subcommand)]
+        op: TranscriptsOp,
+    },
     /// Compose a morning digest of recent inbox activity.
     Digest {
         /// Window size in hours. Defaults to 24.
@@ -188,6 +196,13 @@ enum Cmd {
     Gmail {
         #[command(subcommand)]
         op: GmailOp,
+    },
+    /// Document text extraction (#939): pdftotext/pandoc first, then Mistral
+    /// OCR for scanned (image-only) PDFs when MISTRAL_API_KEY is set. Same
+    /// pipeline the Discord attachment handler and `gmail get-attachment` use.
+    Doc {
+        #[command(subcommand)]
+        op: DocOp,
     },
     /// Resume ingestion — one-shot seed of the wiki from the user's CV.
     Resume {
@@ -241,6 +256,17 @@ enum Cmd {
     Journal {
         #[command(subcommand)]
         op: JournalOp,
+    },
+    /// iMessage history bundle → KB (#882). Opt-in: inert unless
+    /// AUGMENTAGENT_IMESSAGE_REPO_DIR points at the bundle repo.
+    Imessage {
+        #[command(subcommand)]
+        op: ImessageOp,
+    },
+    /// Person-page maintenance (identity-merge groundwork).
+    Person {
+        #[command(subcommand)]
+        op: PersonOp,
     },
     /// Voice memo capture: drop-folder watcher + Whisper transcription ->
     /// wiki ingest. All ops stubs in foundation/swarm-v1.
@@ -416,8 +442,8 @@ enum Cmd {
         /// stdout is piped, table on a tty.
         #[arg(long, num_args = 0..=1, default_missing_value = "true")]
         json: Option<bool>,
-        /// Add slower probes (Composio whoami ping; per-channel validate
-        /// summaries sourced from `status`).
+        /// Add slower probes (Composio whoami ping; Cerebras model-catalog
+        /// check; per-channel validate summaries sourced from `status`).
         #[arg(long, default_value_t = false)]
         deep: bool,
     },
@@ -944,6 +970,56 @@ enum JournalOp {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
     },
+    /// #900 — deliberately import a full-journal (base-sync) page set that
+    /// a normal poll refuses. Capped per run and resumable: re-run, or let
+    /// the daemon's ticks continue from the persisted cursor, until
+    /// `watermark_ms` is reported.
+    Backfill {
+        #[arg(long, default_value_t = 200)]
+        max_entries: usize,
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
+    /// #900 — accept the journal as-is: set the sync watermark to now and
+    /// drop any in-progress cursor, so only entries changed from now on
+    /// are ingested.
+    SkipToNow,
+    /// #900 — print the persisted watermark and in-progress cursor.
+    Status,
+}
+
+#[derive(Subcommand)]
+enum PersonOp {
+    /// Fold an auto-created contact stub (`*_at_contact.md`) into a canonical
+    /// person page: move its identities + `## Source` lines (fill-blanks via
+    /// `merge_person_page`), delete the stub, and repoint `identity_phone`
+    /// rows so future syncs resolve to the surviving page. Dry-run JSON
+    /// report by default; `--apply` writes.
+    Merge {
+        /// Slug of the stub to fold in (must end in `_at_contact`).
+        from: String,
+        /// Slug of the surviving canonical page.
+        into: String,
+        /// Write the target page, delete the stub, repoint the phone index.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImessageOp {
+    /// Backfill conversation history into person pages (#885). Dry-run
+    /// JSON report by default; pass `--apply` to write fill-blanks pages,
+    /// stamp `updated:` with last-message dates, and index phones.
+    Sync {
+        /// Write wiki pages + phone index (default: dry-run only).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Run one incremental poll pass and exit (#886): persist new bundle
+    /// entries as `emails` rows and advance the per-conversation cursor.
+    /// Does not fire wiki ingest — that's the daemon loop's job.
+    PollOnce,
 }
 
 #[derive(Subcommand)]
@@ -1429,6 +1505,29 @@ enum DiscordOp {
 }
 
 #[derive(Subcommand)]
+enum DocOp {
+    /// Extract text from a PDF / DOCX / DOC. Writes `<file>.txt` beside the
+    /// input unless `--out` is given (`--out -` prints the text to stdout after
+    /// the receipt line) and reports whether the OCR stage ran.
+    Extract {
+        /// Path to the document.
+        file: PathBuf,
+        /// Output path for the text; `-` prints to stdout.
+        #[arg(long)]
+        out: Option<String>,
+        /// Force the kind (pdf|docx|doc) when the filename doesn't tell.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Skip the OCR stage even when MISTRAL_API_KEY is configured.
+        #[arg(long, default_value_t = false)]
+        no_ocr: bool,
+        /// Print a JSON receipt instead of the human line.
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum GmailOp {
     /// Search all connected Gmail accounts with a Gmail query string
     /// (e.g. `from:jeremy@acme.com`, `subject:deadline after:2026/04/01`).
@@ -1808,6 +1907,73 @@ enum ResumeOp {
         #[arg(long)]
         file: PathBuf,
     },
+}
+
+/// FlyOnTheWall transcript-repo operations (#915).
+#[derive(Subcommand, Debug)]
+enum TranscriptsOp {
+    /// Fast-forward the transcript clone, then ingest any new meetings.
+    ///
+    /// Read-only against that repo: FlyOnTheWall owns it and re-pushes retitled
+    /// meetings to the same path, so this side never commits, merges or pushes.
+    /// Dedup is the `emails` table (`fotw:<id>`), so a rescan is free.
+    Sync {
+        /// Scan and report without pulling or ingesting. Defaults to true —
+        /// pass `--dry-run false` for a live run (PR #922: same safe default
+        /// as every other channel's bare command).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+        /// Ingest what is already on disk; skip the git pull.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        no_pull: bool,
+        /// Ingest only meetings whose export recorded disclosure (§11).
+        #[arg(long, default_value_t = false)]
+        require_disclosed: bool,
+    },
+}
+
+#[cfg(test)]
+mod transcripts_cli_args_tests {
+    use super::*;
+
+    fn sync_args(argv: &[&str]) -> (bool, bool, bool) {
+        let cli = Cli::try_parse_from(argv).expect("argv must parse");
+        match cli.cmd {
+            Cmd::Transcripts {
+                op:
+                    TranscriptsOp::Sync {
+                        dry_run,
+                        no_pull,
+                        require_disclosed,
+                    },
+            } => (dry_run, no_pull, require_disclosed),
+            _ => panic!("expected transcripts sync"),
+        }
+    }
+
+    /// PR #922 review — every other channel's bare command is a dry run
+    /// (`default_value_t = true, ArgAction::Set`); a bare `transcripts sync`
+    /// doing a live pull + ingest breaks that convention exactly where an
+    /// operator is most likely to type it.
+    #[test]
+    fn bare_transcripts_sync_is_a_dry_run() {
+        let (dry_run, no_pull, require_disclosed) =
+            sync_args(&["augmentagent", "transcripts", "sync"]);
+        assert!(dry_run, "bare `transcripts sync` must default to a dry run");
+        assert!(!no_pull, "the pull itself stays on by default");
+        assert!(!require_disclosed);
+    }
+
+    /// A live run is an explicit opt-in, same shape as the other channels.
+    #[test]
+    fn a_live_run_is_an_explicit_opt_in() {
+        let (dry_run, ..) =
+            sync_args(&["augmentagent", "transcripts", "sync", "--dry-run", "false"]);
+        assert!(!dry_run);
+        let (_, no_pull, _) =
+            sync_args(&["augmentagent", "transcripts", "sync", "--no-pull", "true"]);
+        assert!(no_pull);
+    }
 }
 
 #[derive(Subcommand)]
@@ -2513,6 +2679,13 @@ async fn main() -> Result<()> {
                                 .as_ref()
                                 .map(|_| PathBuf::from("schema/wiki-skill.md")),
                             poll_interval: augmentagent_channel_journal::DEFAULT_POLL_INTERVAL,
+                            max_entries_per_poll:
+                                augmentagent_channel_journal::DEFAULT_MAX_ENTRIES_PER_POLL,
+                            base_sync_threshold:
+                                augmentagent_channel_journal::DEFAULT_BASE_SYNC_THRESHOLD,
+                            allow_base_sync: false,
+                            max_pages_per_poll:
+                                augmentagent_channel_journal::DEFAULT_MAX_PAGES_PER_POLL,
                         },
                     );
                     let sd = shutdown.clone();
@@ -2523,6 +2696,27 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => {
                     warn!("shadownote journal channel disabled: {e:#}");
+                }
+            }
+            // #886 — iMessage bundle → emails + wiki ingest. Self-gates on
+            // AUGMENTAGENT_IMESSAGE_REPO_DIR; an unconfigured box logs and
+            // moves on, same as the journal gate above.
+            match augmentagent_channel_imessage::ImessageConfig::load() {
+                Some(imcfg) => {
+                    let store_c = Arc::clone(&store);
+                    let reasoner = build_reasoner();
+                    let wiki_root = cli.wiki_dir.clone();
+                    let wiki_schema = wiki_root
+                        .as_ref()
+                        .and_then(|_| std::fs::read_to_string("schema/wiki-skill.md").ok());
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        imessage_poll_loop(imcfg, store_c, reasoner, wiki_root, wiki_schema, sd)
+                            .await
+                    }));
+                }
+                None => {
+                    info!("imessage channel disabled: AUGMENTAGENT_IMESSAGE_REPO_DIR not set");
                 }
             }
             // #48 — Reddit channel. Self-gates on having completed the
@@ -2688,6 +2882,22 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Transcripts { ref op } => match op {
+            TranscriptsOp::Sync {
+                dry_run,
+                no_pull,
+                require_disclosed,
+            } => {
+                run_transcripts_sync(
+                    &cli,
+                    Arc::clone(&store),
+                    *dry_run,
+                    *no_pull,
+                    *require_disclosed,
+                )
+                .await
+            }
+        },
         Cmd::Wiki { ref op } => match op {
             WikiOp::Lint { out } => run_wiki_lint(&cli, Arc::clone(&store), out.clone()).await,
             WikiOp::Ask { question, post } => run_wiki_ask(&cli, question.clone(), *post).await,
@@ -2796,6 +3006,12 @@ async fn main() -> Result<()> {
                     attach.clone(),
                 )
                 .await
+            }
+        },
+        Cmd::Doc { ref op } => match op {
+            DocOp::Extract { file, out, kind, no_ocr, json } => {
+                doc_cmd::run_doc_extract(file.clone(), out.clone(), kind.clone(), *no_ocr, *json)
+                    .await
             }
         },
         Cmd::Resume { ref op } => match op {
@@ -3021,7 +3237,45 @@ async fn main() -> Result<()> {
         },
         Cmd::Journal { op } => match op {
             JournalOp::PollOnce { dry_run } => {
-                run_journal_poll_once(cli.wiki_dir.clone(), store, dry_run).await?;
+                run_journal_poll_once(cli.wiki_dir.clone(), store, dry_run, None, false).await?;
+                Ok(())
+            }
+            JournalOp::Backfill {
+                max_entries,
+                dry_run,
+            } => {
+                run_journal_poll_once(
+                    cli.wiki_dir.clone(),
+                    store,
+                    dry_run,
+                    Some(max_entries),
+                    true,
+                )
+                .await?;
+                Ok(())
+            }
+            JournalOp::SkipToNow => {
+                run_journal_skip_to_now(store).await?;
+                Ok(())
+            }
+            JournalOp::Status => {
+                run_journal_status(store).await?;
+                Ok(())
+            }
+        },
+        Cmd::Person { ref op } => match op {
+            PersonOp::Merge { from, into, apply } => {
+                run_person_merge(&cli, store, from, into, *apply)?;
+                Ok(())
+            }
+        },
+        Cmd::Imessage { ref op } => match op {
+            ImessageOp::Sync { apply } => {
+                run_imessage_sync(&cli, store, *apply)?;
+                Ok(())
+            }
+            ImessageOp::PollOnce => {
+                run_imessage_poll_once(store)?;
                 Ok(())
             }
         },
@@ -4252,15 +4506,11 @@ async fn upload_attach_if_given(
 /// fails with an actionable message when the id isn't in `account_email`'s
 /// mailbox — the raw Gmail 404 ("Requested entity was not found") gave the
 /// caller nothing to act on.
-///
-/// #650 — also refuses a `--subject` the thread will not honor, see
-/// [`ensure_subject_fits_thread`].
 async fn resolve_compose_thread_id(
     gmail: &ComposioClient,
     entity_id: &str,
     account_email: &str,
     thread_id: Option<String>,
-    subject: &str,
 ) -> Result<Option<String>> {
     let Some(t) = thread_id.filter(|t| !t.is_empty()) else {
         return Ok(None);
@@ -4273,88 +4523,7 @@ async fn resolve_compose_thread_id(
              don't exist in another."
         )
     })?;
-    ensure_subject_fits_thread(gmail, entity_id, &resolved, subject).await?;
     Ok(Some(resolved))
-}
-
-/// #650 — refuse a write into `thread_id` carrying a subject the thread will
-/// not honor. A message written into a thread goes out under the THREAD's
-/// subject; `subject` is only what threads it. So a differing subject is a
-/// request Gmail silently drops, and the caller — having seen its subject
-/// vanish — starts writing it into the body instead, where it reaches the
-/// recipient as literal text. Every threaded write passes through here,
-/// whether the thread came from `--thread-id` or from the draft being
-/// replaced. Checking before `create_draft` keeps #412 discipline: no draft
-/// exists yet, so there is no orphan to clean up.
-///
-/// A thread whose subject cannot be read fails the write rather than passing
-/// unchecked: an unverified threaded write is exactly the silent mismatch
-/// this guards against, and reaching here means a Composio thread lookup
-/// already succeeded, so a failure now is an outage — not routine.
-async fn ensure_subject_fits_thread(
-    gmail: &ComposioClient,
-    entity_id: &str,
-    thread_id: &str,
-    subject: &str,
-) -> Result<()> {
-    let messages = gmail
-        .fetch_thread_messages(entity_id, thread_id, 1)
-        .await
-        .with_context(|| {
-            format!(
-                "could not read thread {thread_id}'s subject, so --subject {subject:?} \
-                 could not be checked against it — a mismatch would go out under the \
-                 thread's subject. Retry, or start a new thread instead."
-            )
-        })?;
-    let thread_subject = messages
-        .last()
-        .map(|m| m.subject.trim().to_string())
-        .with_context(|| format!("thread {thread_id} has no messages to take a subject from"))?;
-    anyhow::ensure!(
-        subjects_agree(subject, &thread_subject),
-        "--subject {subject:?} is not thread {thread_id}'s subject ({thread_subject:?}), \
-         and a threaded write goes out under the thread's subject — yours would be \
-         dropped without a trace. Use --subject {thread_subject:?}, or start a new \
-         thread (compose without --thread-id) to keep {subject:?}."
-    );
-    Ok(())
-}
-
-/// Pick the thread an `update-draft` replacement joins (update = create
-/// replacement + delete old, #382): the explicit `--thread-id` when given,
-/// otherwise the thread the old draft already sits in. Detection is
-/// best-effort — a lookup failure downgrades to an unthreaded draft rather
-/// than blocking the update — but once a thread IS known the #650 subject
-/// check applies either way. The replacement goes out under that thread's
-/// subject whether the caller named the thread or the draft did, so an
-/// inherited thread silently drops a new `--subject` just as an explicit one
-/// would.
-async fn resolve_update_draft_thread_id(
-    gmail: &ComposioClient,
-    entity_id: &str,
-    account_email: &str,
-    draft_id: &str,
-    thread_id: Option<String>,
-    subject: &str,
-) -> Result<Option<String>> {
-    if let Some(t) = thread_id.filter(|t| !t.is_empty()) {
-        return resolve_compose_thread_id(gmail, entity_id, account_email, Some(t), subject).await;
-    }
-    let inherited = match gmail.get_draft_thread_id(entity_id, draft_id).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!(
-                "warning: could not determine draft {draft_id}'s thread ({e}); \
-                 the replacement draft will start a new thread"
-            );
-            None
-        }
-    };
-    if let Some(t) = &inherited {
-        ensure_subject_fits_thread(gmail, entity_id, t, subject).await?;
-    }
-    Ok(inherited)
 }
 
 /// #439 — flatten repeated `--to`/`--cc`/`--bcc` values (each possibly a
@@ -4469,7 +4638,7 @@ fn subjects_agree(a: &str, b: &str) -> bool {
 /// a header, so silently dropping it would send a message under a subject
 /// nobody asked for. Say so instead and let the caller put it where it
 /// belongs — which for a threaded write means starting a new thread, since
-/// [`ensure_subject_fits_thread`] holds a reply to its thread's subject.
+/// [`ensure_subject_matches_thread`] (#651) holds a reply to its thread's subject.
 fn body_without_leaked_subject(
     body: &str,
     outgoing_subject: &str,
@@ -4550,6 +4719,71 @@ fn revise_subject(original: &str, thread_id: Option<&str>) -> String {
         return original.to_string();
     }
     format!("Re: {original}")
+}
+
+/// Refuse a threaded compose whose `--subject` disagrees with the thread
+/// (#651). Gmail sends a reply under the thread's ORIGINAL subject and drops
+/// the one passed alongside `thread_id`, so such a message goes out under a
+/// header that has nothing to do with its content — as three recipients saw.
+/// Only that original counts as a match: a subject introduced later in the
+/// thread, or a `Fwd:` of it, is still not what recipients would see.
+/// Returns the refusal text, or `None` when there is nothing to compare (no
+/// `--subject`, subject-less thread).
+fn thread_subject_conflict(subject: &str, thread: &ThreadSubject) -> Option<String> {
+    let wanted = normalize_subject(subject);
+    if wanted.is_empty() {
+        return None;
+    }
+    match thread {
+        // Every message on the thread came back untitled: there is no header
+        // to contradict, and refusing would block replying to it at all.
+        ThreadSubject::Missing => None,
+        // Unknowable ⇒ unverifiable. Sending anyway is the gamble that put
+        // the wrong header in three inboxes, so refuse and name the way out.
+        ThreadSubject::Undetermined => Some(format!(
+            "could not tell which subject this thread was started under: it carries more than one \
+             and the provider returned no timestamps to order them by. A reply on --thread-id is \
+             sent under the thread's original subject, so {subject:?} cannot be verified. Drop \
+             --thread-id to start a new thread under {subject:?}, or send the reply from Gmail."
+        )),
+        ThreadSubject::Original(actual) => {
+            let sent_as = normalize_subject(actual);
+            if sent_as.is_empty() || sent_as == wanted {
+                return None;
+            }
+            Some(format!(
+                "--subject {subject:?} does not match the thread's subject {actual:?}. A reply on \
+                 --thread-id is sent under the thread's subject, so this message would go out \
+                 with a header that doesn't match its content. Either pass --subject \
+                 \"Re: {actual}\" to reply in-thread, or drop --thread-id to start a new thread \
+                 under {subject:?}."
+            ))
+        }
+    }
+}
+
+/// Fail-closed guard for [`thread_subject_conflict`], run before any draft is
+/// created — and before any attachment upload — so a refusal never strands
+/// orphan work (#412 discipline). Costs one extra thread fetch per threaded
+/// compose; a provider failure refuses rather than sends, because an
+/// unverified subject is exactly what #651 put in front of recipients.
+async fn ensure_subject_matches_thread(
+    gmail: &ComposioClient,
+    entity_id: &str,
+    thread_id: &str,
+    subject: &str,
+) -> Result<()> {
+    let thread = gmail
+        .fetch_thread_subject(entity_id, thread_id)
+        .await
+        .context(
+            "could not verify the thread's subject before drafting; retry, or drop --thread-id \
+             to start a new thread",
+        )?;
+    if let Some(conflict) = thread_subject_conflict(subject, &thread) {
+        anyhow::bail!(conflict);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4661,9 +4895,11 @@ async fn run_gmail_compose(
     };
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
+    let thread_id = resolve_compose_thread_id(&gmail, &entity_id, &email, thread_id).await?;
+    if let Some(t) = thread_id.as_deref() {
+        ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
+    }
     let attachment = upload_attach_if_given(&gmail, attach).await?;
-    let thread_id =
-        resolve_compose_thread_id(&gmail, &entity_id, &email, thread_id, &subject).await?;
     let draft_id = gmail
         .create_draft_with_attachment(
             &entity_id,
@@ -5474,10 +5710,27 @@ async fn run_gmail_update_draft(
     }
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
+    // Update = create replacement + delete old (#382). Keep the reply
+    // threaded: use the explicit --thread-id when given, otherwise detect
+    // the old draft's thread. Detection is best-effort — a lookup failure
+    // downgrades to an unthreaded draft rather than blocking the update.
+    let thread_id = match thread_id.filter(|t| !t.is_empty()) {
+        Some(t) => resolve_compose_thread_id(&gmail, &entity_id, &email, Some(t)).await?,
+        None => match gmail.get_draft_thread_id(&entity_id, &draft_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "warning: could not determine draft {draft_id}'s thread ({e}); \
+                     the replacement draft will start a new thread"
+                );
+                None
+            }
+        },
+    };
+    if let Some(t) = thread_id.as_deref() {
+        ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
+    }
     let attachment = upload_attach_if_given(&gmail, attach).await?;
-    let thread_id =
-        resolve_update_draft_thread_id(&gmail, &entity_id, &email, &draft_id, thread_id, &subject)
-            .await?;
     let new_id = gmail
         .update_draft_with_attachment(
             &entity_id,
@@ -5622,9 +5875,11 @@ async fn run_gmail_send_now(
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
+    let thread_id = resolve_compose_thread_id(&gmail, &entity_id, &email, thread_id).await?;
+    if let Some(t) = thread_id.as_deref() {
+        ensure_subject_matches_thread(&gmail, &entity_id, t, &subject).await?;
+    }
     let attachment = upload_attach_if_given(&gmail, attach).await?;
-    let thread_id =
-        resolve_compose_thread_id(&gmail, &entity_id, &email, thread_id, &subject).await?;
     let draft_id = gmail
         .create_draft_with_attachment(
             &entity_id,
@@ -7152,6 +7407,232 @@ mod wiki_sync_validation_tests {
 /// `wiki sync` — reconcile the local knowledge base with its private
 /// GitHub mirror. Two-way: commit local page changes, pull owner edits
 /// (owner-wins), push. Reuses the ambient `gh` credential. See epic #474.
+/// The `emails` table as transcript dedup: `record` returns true for a first
+/// sighting (and remembers it), false for a re-push of the same meeting.
+struct TranscriptSeenLog(Arc<Store>);
+impl augmentagent_channel_fotw::runner::SeenLog for TranscriptSeenLog {
+    fn record(&self, email: &augmentagent_store::Email) -> Result<bool> {
+        Ok(self.0.upsert_email(email)?)
+    }
+}
+
+/// A dry run must not write the dedup row, or the real run that follows
+/// would find every meeting already seen and ingest nothing — but it must
+/// still *read* the table, or it reports every already-ingested meeting as
+/// new and prints its body under "would ingest" (PR #922 review).
+struct TranscriptDryLog(Arc<Store>);
+impl augmentagent_channel_fotw::runner::SeenLog for TranscriptDryLog {
+    fn record(&self, email: &augmentagent_store::Email) -> Result<bool> {
+        Ok(self.0.email_first_seen_at(&email.message_id)?.is_none())
+    }
+}
+
+#[cfg(test)]
+mod transcript_seen_log_tests {
+    use super::*;
+    use augmentagent_channel_fotw::runner::SeenLog;
+
+    fn test_email(id: &str) -> augmentagent_store::Email {
+        augmentagent_store::Email {
+            message_id: id.into(),
+            thread_id: None,
+            from: "sender".into(),
+            subject: "subject".into(),
+            body: "body".into(),
+            date: "2026-09-01T00:00:00Z".into(),
+            to: String::new(),
+            cc: String::new(),
+            attachments: Vec::new(),
+            account_entity_id: None,
+            platform: "fotw".into(),
+            kind: "email".into(),
+        }
+    }
+
+    /// PR #922 review — a dry run must report what a live run would do:
+    /// read-only duplicate detection, still writing nothing. It used to call
+    /// every already-ingested meeting "new" and print its full body under
+    /// "would ingest".
+    #[test]
+    fn a_dry_run_sees_duplicates_without_writing() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(Store::open(dir.path().join("t.db")).expect("open store"));
+        let live = TranscriptSeenLog(Arc::clone(&store));
+        let dry = TranscriptDryLog(Arc::clone(&store));
+
+        assert!(
+            dry.record(&test_email("fotw:m1")).unwrap(),
+            "an unseen meeting reads as new"
+        );
+        assert_eq!(
+            store.email_first_seen_at("fotw:m1").unwrap(),
+            None,
+            "a dry run writes no dedup row"
+        );
+
+        assert!(live.record(&test_email("fotw:m1")).unwrap());
+        assert!(
+            !dry.record(&test_email("fotw:m1")).unwrap(),
+            "a recorded meeting reads as a duplicate in a dry run"
+        );
+    }
+}
+
+/// `augmentagent transcripts sync` (#915).
+///
+/// Fast-forward the FlyOnTheWall transcript clone, then hand any meeting the
+/// `emails` table has not seen to the wiki ingest funnel. Read-only against
+/// that repo throughout: FlyOnTheWall owns it.
+///
+/// The calendar roster comes from rows the gcal channel already wrote — see
+/// `augmentagent_channel_fotw::calendar` — so this needs no Google credentials
+/// of its own, and degrades to name-based linking when a recording has no
+/// matching invite.
+async fn run_transcripts_sync(
+    cli: &Cli,
+    store: Arc<Store>,
+    dry_run: bool,
+    no_pull: bool,
+    require_disclosed: bool,
+) -> Result<()> {
+    use augmentagent_channel_fotw::calendar::{rosters_from_rows, GcalRow};
+    use augmentagent_channel_fotw::distill::RosterMember;
+    use augmentagent_channel_fotw::match_event::{match_event, EventWindow, Match};
+    use augmentagent_channel_fotw::runner::{scan, ScanOpts, SeenLog};
+
+    let repo = std::env::var("AUGMENTAGENT_TRANSCRIPTS_DIR")
+        .map(PathBuf::from)
+        .context("set AUGMENTAGENT_TRANSCRIPTS_DIR to the transcript repo clone")?;
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for transcripts sync")?;
+    let my_email = std::env::var("AUGMENTAGENT_MY_EMAIL").unwrap_or_default();
+
+    if !no_pull && !dry_run {
+        match augmentagent_channel_fotw::sync::sync(&repo) {
+            Ok(0) => println!("[transcripts] already up to date"),
+            Ok(n) => println!("[transcripts] pulled {n} commit(s)"),
+            Err(e) => anyhow::bail!("transcripts sync: {e}"),
+        }
+    }
+
+    // The roster index, built once per run: a few hundred rows, consulted per
+    // meeting by the closure below.
+    let events = rosters_from_rows(
+        &store
+            .gcal_attendee_rows()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(message_id, from, received_at)| GcalRow {
+                message_id,
+                from,
+                received_at,
+            })
+            .collect::<Vec<_>>(),
+    );
+    let windows: Vec<EventWindow> = events.iter().map(|e| e.window.clone()).collect();
+    let resolve = |doc: &augmentagent_channel_fotw::parse::MeetingDoc| {
+        let m = match_event(doc.started_at_ms, doc.duration_ms, &windows);
+        // Only a single match names anyone; ambiguity is reported, never resolved.
+        let roster: Vec<RosterMember> = match &m {
+            Match::Single(w) => events
+                .iter()
+                .find(|e| e.window.event_id == w.event_id)
+                .map(|e| e.roster.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        (m, roster)
+    };
+
+    let log: Box<dyn SeenLog> = if dry_run {
+        Box::new(TranscriptDryLog(Arc::clone(&store)))
+    } else {
+        Box::new(TranscriptSeenLog(Arc::clone(&store)))
+    };
+
+    let meetings_dir = repo.join("meetings");
+    let opts = ScanOpts {
+        dir: &meetings_dir,
+        require_disclosed,
+        my_email: &my_email,
+    };
+    let (report, emails) = scan(&opts, log.as_ref(), &resolve)?;
+
+    println!(
+        "[transcripts] {} new, {} duplicate, {} skipped, {} unreadable",
+        report.ingested.len(),
+        report.duplicates,
+        report.skipped.len(),
+        report.unreadable.len()
+    );
+    for (id, why) in &report.skipped {
+        println!("[transcripts] skipped {id}: {why:?}");
+    }
+    if dry_run {
+        for e in &emails {
+            println!("\n--- would ingest {} ---\n{}", e.message_id, e.body);
+        }
+        return Ok(());
+    }
+
+    let spawned = emails.len();
+    let reasoner = build_reasoner();
+    let schema = resolve_wiki_schema(cli)
+        .context("wiki schema not found; transcripts ingest needs schema/wiki-skill.md")?;
+    for email in emails {
+        let id = email.message_id.clone();
+        augmentagent_channel_core::ingest::spawn_ingest(
+            Arc::clone(&reasoner),
+            wiki_root.clone(),
+            // The relevance gate rides on the schema for this platform only: a
+            // recorded meeting is not a message addressed to anyone, and a
+            // personal capture should leave no trace.
+            format!(
+                "{schema}\n{}",
+                augmentagent_channel_fotw::distill::RELEVANCE_GATE
+            ),
+            email,
+            augmentagent_channel_core::decision::DecisionKind::Meeting,
+            Some("meeting transcript".to_string()),
+            None,
+            augmentagent_channel_core::ingest::IngestTrigger::Meeting,
+        );
+        println!("[transcripts] ingesting {id}");
+    }
+    if spawned == 0 {
+        return Ok(());
+    }
+    // PR #922 — this is a one-shot process: returning while jobs are queued
+    // would drop the tokio runtime and kill them mid-ingest, after the dedup
+    // row already marked each meeting seen — never to be retried. Hold the
+    // process open until the pool drains. The pool itself (#899) keeps
+    // concurrency at its worker cap (2), so this cannot re-create the
+    // 2026-08-31 `claude -p` burst; it only makes the process live as long
+    // as its own jobs.
+    let pool = augmentagent_channel_core::ingest::IngestPool::global();
+    println!("[transcripts] waiting for {spawned} ingest job(s)…");
+    let drained = pool
+        .wait_idle(std::time::Duration::from_secs(15 * 60))
+        .await;
+    let stats = pool.stats();
+    if !drained {
+        anyhow::bail!(
+            "transcripts ingest did not drain in 15m ({} queued, {} in flight) — \
+             the recorded meetings will read as duplicates on the next run; \
+             delete their fotw:<id> rows from `emails` to retry",
+            stats.queued,
+            stats.in_flight
+        );
+    }
+    println!(
+        "[transcripts] ingest finished ({} completed, {} dropped)",
+        stats.completed, stats.dropped
+    );
+    Ok(())
+}
+
 async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
     let wiki_root = cli
         .wiki_dir
@@ -7663,7 +8144,7 @@ mod approval_body_tests {
     use super::{
         body_without_leaked_subject, compose_pending_disposition, revise_subject,
         strip_approval_envelope_markers, strip_leading_subject_line, subjects_agree,
-        ComposePendingDisposition,
+        thread_subject_conflict, ComposePendingDisposition, ThreadSubject,
     };
 
     #[test]
@@ -7805,211 +8286,110 @@ mod approval_body_tests {
         assert_eq!(revise_subject("RE: hi", Some("t1")), "RE: hi");
     }
 
+    // ---- #651: a --subject that disagrees with the thread it replies on ----
+
+    fn thread() -> ThreadSubject {
+        ThreadSubject::Original("Ground Floor as a venue?".into())
+    }
+
+    #[test]
+    fn conflicting_subject_on_a_thread_is_refused_naming_both_subjects() {
+        let msg = thread_subject_conflict("Hosting an event at Tactic?", &thread())
+            .expect("a subject unrelated to the thread must be refused");
+        assert!(
+            msg.contains("Hosting an event at Tactic?"),
+            "refusal must quote the given subject: {msg}"
+        );
+        assert!(
+            msg.contains("Ground Floor as a venue?"),
+            "refusal must quote the thread's subject: {msg}"
+        );
+        assert!(
+            msg.contains("--thread-id"),
+            "refusal must name both ways out: {msg}"
+        );
+    }
+
+    #[test]
+    fn subject_matching_the_thread_is_allowed_ignoring_prefix_and_case() {
+        assert_eq!(
+            thread_subject_conflict("Re: Ground Floor as a venue?", &thread()),
+            None
+        );
+        assert_eq!(
+            thread_subject_conflict("ground floor as a venue?", &thread()),
+            None
+        );
+    }
+
+    // A subject someone introduced later in the thread is NOT a pass: Gmail
+    // still sends under the original, so allowing it re-opens #651.
+    #[test]
+    fn subject_renamed_mid_thread_is_refused_against_the_original() {
+        let msg = thread_subject_conflict(
+            "Renamed mid-thread",
+            &ThreadSubject::Original("Original".into()),
+        )
+        .expect("only the thread's original subject may be replied under");
+        assert!(
+            msg.contains("Original"),
+            "refusal must quote the subject Gmail will send under: {msg}"
+        );
+    }
+
+    // A forward is a different subject line: Gmail would still send it under
+    // the thread's own subject, so "Fwd: X" on a thread titled "X" is the
+    // same header/intent mismatch as any other rename.
+    #[test]
+    fn forwarding_subject_on_a_thread_is_refused() {
+        assert!(
+            thread_subject_conflict("Fwd: Original", &ThreadSubject::Original("Original".into()))
+                .is_some(),
+            "a forward would go out under the plain thread subject"
+        );
+        // Replying to a thread that IS a forward still matches.
+        assert_eq!(
+            thread_subject_conflict(
+                "Re: Fwd: Original",
+                &ThreadSubject::Original("Fwd: Original".into())
+            ),
+            None
+        );
+    }
+
+    // Can't tell what Gmail will send under ⇒ can't verify ⇒ refuse.
+    #[test]
+    fn an_unknowable_thread_subject_is_refused() {
+        let msg =
+            thread_subject_conflict("Hosting an event at Tactic?", &ThreadSubject::Undetermined)
+                .expect("an unverifiable thread subject must not be drafted against");
+        assert!(
+            msg.contains("--thread-id"),
+            "refusal must name the way out: {msg}"
+        );
+    }
+
+    #[test]
+    fn nothing_to_compare_never_refuses() {
+        assert_eq!(
+            thread_subject_conflict("Anything", &ThreadSubject::Missing),
+            None
+        );
+        assert_eq!(
+            thread_subject_conflict("Anything", &ThreadSubject::Original("  ".into())),
+            None
+        );
+        assert_eq!(thread_subject_conflict("   ", &thread()), None);
+        // No subject stated ⇒ no intent to contradict, even unverifiably.
+        assert_eq!(
+            thread_subject_conflict("", &ThreadSubject::Undetermined),
+            None
+        );
+    }
+
     #[test]
     fn a_user_written_re_subject_survives_on_a_new_email_card() {
         assert_eq!(revise_subject("Re: hi", None), "Re: hi");
-    }
-}
-
-/// #650 — the threaded half of the leak: a message written into a thread goes
-/// out under its THREAD's subject, so a `--subject` naming anything else is
-/// dropped by Gmail without a word, which is what pushed the intended subject
-/// into the body in the first place. These drive both gates a threaded write
-/// passes before `create_draft` — `resolve_compose_thread_id` for `compose`
-/// and `send-now`, `resolve_update_draft_thread_id` for `update-draft` —
-/// against a stubbed Composio.
-#[cfg(test)]
-mod compose_thread_subject_tests {
-    use super::{resolve_compose_thread_id, resolve_update_draft_thread_id, ComposioClient};
-
-    /// Stub one Composio action. The mock must outlive the call under test —
-    /// mockito unregisters it on drop.
-    async fn stub(
-        server: &mut mockito::Server,
-        action: &str,
-        body: serde_json::Value,
-    ) -> mockito::Mock {
-        server
-            .mock("POST", format!("/api/v3/tools/execute/{action}").as_str())
-            .with_header("content-type", "application/json")
-            .with_body(body.to_string())
-            .create_async()
-            .await
-    }
-
-    /// The id → THREAD1 lookup `compose`/`send-now` do first.
-    async fn stub_thread_lookup(server: &mut mockito::Server) -> mockito::Mock {
-        let body =
-            serde_json::json!({"successful": true, "data": {"id": "m1", "threadId": "THREAD1"}});
-        stub(server, "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID", body).await
-    }
-
-    /// The draft → THREAD1 lookup `update-draft` does without a `--thread-id`.
-    async fn stub_draft_lookup(server: &mut mockito::Server) -> mockito::Mock {
-        let body = serde_json::json!({"successful": true, "data": {"drafts": [
-            {"id": "d1", "message": {"id": "m1", "threadId": "THREAD1"}}
-        ]}});
-        stub(server, "GMAIL_LIST_DRAFTS", body).await
-    }
-
-    /// THREAD1's own subject — the one Gmail will actually send under.
-    async fn stub_thread_subject(server: &mut mockito::Server, subject: &str) -> mockito::Mock {
-        let body = serde_json::json!({"successful": true, "data": {"messages": [{
-            "messageId": "m1",
-            "threadId": "THREAD1",
-            "from": "casey@example.com",
-            "subject": subject,
-        }]}});
-        stub(server, "GMAIL_FETCH_MESSAGE_BY_THREAD_ID", body).await
-    }
-
-    fn client(server: &mockito::Server) -> ComposioClient {
-        ComposioClient::new("ak_fake".into()).with_base_url(server.url())
-    }
-
-    /// The reported case: the agent wanted "Hosting a PTE event" on a reply
-    /// inside the "Ground Floor availability" thread. Gmail would have sent it
-    /// under the thread's subject regardless, so the write is refused with
-    /// both subjects named — no draft, nothing to clean up (#412).
-    #[tokio::test]
-    async fn a_subject_the_thread_will_not_carry_is_refused_before_any_draft() {
-        let mut server = mockito::Server::new_async().await;
-        let _id = stub_thread_lookup(&mut server).await;
-        let _thread = stub_thread_subject(&mut server, "Re: Ground Floor availability").await;
-
-        let err = resolve_compose_thread_id(
-            &client(&server),
-            "entity-x",
-            "owner@example.com",
-            Some("THREAD1".into()),
-            "Hosting a PTE event",
-        )
-        .await
-        .expect_err("a subject Gmail would silently drop must not reach create_draft");
-
-        let msg = format!("{err:#}");
-        assert!(msg.contains("Hosting a PTE event"), "{msg}");
-        assert!(msg.contains("Ground Floor availability"), "{msg}");
-        assert!(msg.contains("new thread"), "{msg}");
-    }
-
-    /// A real reply — same subject, `Re:` prefix and all — still threads.
-    #[tokio::test]
-    async fn replying_under_the_threads_own_subject_still_resolves() {
-        let mut server = mockito::Server::new_async().await;
-        let _id = stub_thread_lookup(&mut server).await;
-        let _thread = stub_thread_subject(&mut server, "Ground Floor availability").await;
-
-        let resolved = resolve_compose_thread_id(
-            &client(&server),
-            "entity-x",
-            "owner@example.com",
-            Some("THREAD1".into()),
-            "Re: Ground Floor availability",
-        )
-        .await
-        .expect("a reply keeping the thread's subject must be allowed");
-        assert_eq!(resolved.as_deref(), Some("THREAD1"));
-    }
-
-    /// A thread whose subject Composio won't hand over is not a licence to
-    /// thread anyway: an unchecked write is the silent mismatch itself, so the
-    /// outage is reported instead of assumed harmless.
-    #[tokio::test]
-    async fn an_unreadable_thread_subject_refuses_the_write() {
-        let mut server = mockito::Server::new_async().await;
-        let _id = stub_thread_lookup(&mut server).await;
-        let _down = stub(
-            &mut server,
-            "GMAIL_FETCH_MESSAGE_BY_THREAD_ID",
-            serde_json::json!({"successful": false, "error": "upstream unavailable"}),
-        )
-        .await;
-
-        let err = resolve_compose_thread_id(
-            &client(&server),
-            "entity-x",
-            "owner@example.com",
-            Some("THREAD1".into()),
-            "Hosting a PTE event",
-        )
-        .await
-        .expect_err("an unverifiable subject must not be threaded blind");
-        let msg = format!("{err:#}");
-        assert!(msg.contains("could not read thread THREAD1's subject"), "{msg}");
-    }
-
-    /// The same leak through `update-draft`, which needs no `--thread-id` at
-    /// all: the draft it replaces is already in "Ground Floor availability",
-    /// so a re-`--subject` to "Hosting a PTE event" would be dropped exactly
-    /// as on `compose`. The inherited thread gets the same check.
-    #[tokio::test]
-    async fn a_subject_the_inherited_draft_thread_will_not_carry_is_refused() {
-        let mut server = mockito::Server::new_async().await;
-        let _drafts = stub_draft_lookup(&mut server).await;
-        let _thread = stub_thread_subject(&mut server, "Ground Floor availability").await;
-
-        let err = resolve_update_draft_thread_id(
-            &client(&server),
-            "entity-x",
-            "owner@example.com",
-            "d1",
-            None,
-            "Hosting a PTE event",
-        )
-        .await
-        .expect_err("an inherited thread drops a new --subject just as an explicit one does");
-
-        let msg = format!("{err:#}");
-        assert!(msg.contains("Hosting a PTE event"), "{msg}");
-        assert!(msg.contains("Ground Floor availability"), "{msg}");
-    }
-
-    /// Revising the body of a reply — the ordinary update — still inherits
-    /// the draft's thread.
-    #[tokio::test]
-    async fn an_update_keeping_the_threads_subject_stays_threaded() {
-        let mut server = mockito::Server::new_async().await;
-        let _drafts = stub_draft_lookup(&mut server).await;
-        let _thread = stub_thread_subject(&mut server, "Ground Floor availability").await;
-
-        let resolved = resolve_update_draft_thread_id(
-            &client(&server),
-            "entity-x",
-            "owner@example.com",
-            "d1",
-            None,
-            "Re: Ground Floor availability",
-        )
-        .await
-        .expect("an update under the thread's own subject must be allowed");
-        assert_eq!(resolved.as_deref(), Some("THREAD1"));
-    }
-
-    /// Thread DETECTION stays best-effort (#382): when the draft's thread
-    /// can't be looked up there is no thread to check a subject against, so
-    /// the update downgrades to unthreaded instead of failing.
-    #[tokio::test]
-    async fn an_undetectable_draft_thread_still_downgrades_to_unthreaded() {
-        let mut server = mockito::Server::new_async().await;
-        let _drafts = stub(
-            &mut server,
-            "GMAIL_LIST_DRAFTS",
-            serde_json::json!({"successful": false, "error": "upstream unavailable"}),
-        )
-        .await;
-
-        let resolved = resolve_update_draft_thread_id(
-            &client(&server),
-            "entity-x",
-            "owner@example.com",
-            "d1",
-            None,
-            "Hosting a PTE event",
-        )
-        .await
-        .expect("a draft-thread lookup failure must not block the update");
-        assert_eq!(resolved, None);
     }
 }
 
@@ -10828,6 +11208,196 @@ async fn run_linkedin_connections_sync(
 /// `carddav` (env-configured). Dry-run JSON by default; `--apply` writes
 /// fill-blanks wiki pages, indexes phones, persists the sync cursor, and
 /// posts a Discord summary.
+/// Owner-approved stub merge: the deterministic executor the identity-merge
+/// approval flow calls (and a standalone CLI for manual merges). The string
+/// transform lives in `augmentagent_wiki::crm::merge_stub_into`; this owns
+/// the guards, file IO, `updated:` carry-forward, and the `identity_phone`
+/// repoint that keeps future syncs from resurrecting the deleted stub.
+fn run_person_merge(
+    cli: &Cli,
+    store: Arc<Store>,
+    from: &str,
+    into: &str,
+    apply: bool,
+) -> Result<()> {
+    let ok_slug =
+        |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    anyhow::ensure!(ok_slug(from) && ok_slug(into), "slugs must be [A-Za-z0-9_-]+");
+    anyhow::ensure!(from != into, "--from and --into are the same page");
+    anyhow::ensure!(
+        from.ends_with("_at_contact"),
+        "refusing to merge '{from}': only auto-created *_at_contact stubs can be folded \
+         (canonical pages may hold human-written content a blind merge would bury)"
+    );
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for person merge")?;
+    let layout = augmentagent_wiki::WikiLayout::new(wiki_root);
+    let from_path = layout.people_dir().join(format!("{from}.md"));
+    let into_path = layout.people_dir().join(format!("{into}.md"));
+    let stub_src = std::fs::read_to_string(&from_path)
+        .with_context(|| format!("stub not found: {}", from_path.display()))?;
+    let target_src = std::fs::read_to_string(&into_path)
+        .with_context(|| format!("target not found: {}", into_path.display()))?;
+
+    let merged = augmentagent_wiki::crm::merge_stub_into(&target_src, &stub_src, from);
+
+    // Carry the stub's `updated:` forward when it is newer — the stub's date
+    // is the person's last text, and the stale-contact engine reads it.
+    let stub_updated = stub_src
+        .split("\n---\n")
+        .next()
+        .and_then(|fm| fm.lines().find_map(|l| l.strip_prefix("updated:")))
+        .map(|v| v.trim().trim_matches('\'').trim_matches('"').to_string());
+    let mut content = merged.content.clone();
+    let mut bumped = false;
+    if let Some(date) = &stub_updated {
+        if let Some(newer) = augmentagent_channel_imessage::bump_updated(&content, date) {
+            content = newer;
+            bumped = true;
+        }
+    }
+
+    let mut repointed = 0usize;
+    if apply {
+        if merged.changed || bumped {
+            std::fs::write(&into_path, &content)?;
+        }
+        std::fs::remove_file(&from_path)
+            .with_context(|| format!("removing stub {}", from_path.display()))?;
+        repointed = store.repoint_phone_identity(from, into)?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "from": from,
+            "into": into,
+            "applied": apply,
+            "changed": merged.changed,
+            "updated_bumped": bumped,
+            "moved": merged.moved,
+            "phone_rows_repointed": repointed,
+        }))?
+    );
+    Ok(())
+}
+
+/// #885 — iMessage history → person pages. Dry-run prints the JSON report
+/// and writes nothing; `--apply` writes fill-blanks pages and indexes phones.
+fn run_imessage_sync(cli: &Cli, store: Arc<Store>, apply: bool) -> Result<()> {
+    let config = augmentagent_channel_imessage::ImessageConfig::load()
+        .context("AUGMENTAGENT_IMESSAGE_REPO_DIR is required for imessage sync")?;
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for imessage sync")?;
+    let layout = augmentagent_wiki::WikiLayout::new(wiki_root);
+    layout.bootstrap().context("wiki bootstrap")?;
+
+    let bundle = augmentagent_channel_imessage::Bundle::open(&config.repo_dir);
+    let syncer = augmentagent_channel_imessage::ImessageSyncer {
+        bundle: &bundle,
+        layout: &layout,
+        store: &store,
+        apply,
+    };
+    info!(repo = %config.repo_dir.display(), apply, "starting imessage sync");
+    let report = syncer.run().context("imessage sync run")?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// #886 — one incremental poll pass: new bundle entries → `emails` rows,
+/// cursor advanced. Wiki ingest is deliberately not fired here (daemon-only).
+fn run_imessage_poll_once(store: Arc<Store>) -> Result<()> {
+    let config = augmentagent_channel_imessage::ImessageConfig::load()
+        .context("AUGMENTAGENT_IMESSAGE_REPO_DIR is required for imessage poll")?;
+    let bundle = augmentagent_channel_imessage::Bundle::open(&config.repo_dir);
+    let (stats, deltas) = augmentagent_channel_imessage::poll_once(&bundle, &store)
+        .context("imessage poll")?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "conversations_with_new": stats.conversations_with_new,
+            "emails_inserted": stats.emails_inserted,
+            "first_run_conversations": deltas.iter().filter(|d| d.first_run).count(),
+        })
+    );
+    Ok(())
+}
+
+/// #886 — daemon loop: refresh the bundle repo, poll for new entries, and
+/// fan fresh (non-first-run) conversation deltas into `Capture` wiki ingest.
+async fn imessage_poll_loop(
+    config: augmentagent_channel_imessage::ImessageConfig,
+    store: Arc<Store>,
+    reasoner: Arc<FallbackReasoner>,
+    wiki_root: Option<PathBuf>,
+    wiki_schema: Option<String>,
+    shutdown: CancellationToken,
+) -> anyhow::Result<()> {
+    const POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
+    let mut tick = tokio::time::interval(POLL_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = tick.tick() => {}
+        }
+        // The bundle repo is kept current by the operator's own sync job;
+        // a pull failure (offline, not a git repo) degrades to reading
+        // whatever is on disk.
+        let pull = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(&config.repo_dir)
+            .args(["pull", "--ff-only", "--quiet"])
+            .output()
+            .await;
+        if let Ok(out) = &pull {
+            if !out.status.success() {
+                warn!(
+                    stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                    "imessage bundle git pull failed; reading on-disk state"
+                );
+            }
+        }
+
+        let bundle = augmentagent_channel_imessage::Bundle::open(&config.repo_dir);
+        let (stats, deltas) = match augmentagent_channel_imessage::poll_once(&bundle, &store) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("imessage poll failed: {e:#}");
+                continue;
+            }
+        };
+        if stats.emails_inserted > 0 {
+            info!(
+                conversations = stats.conversations_with_new,
+                emails = stats.emails_inserted,
+                "imessage poll ingested new messages"
+            );
+        }
+        let (Some(root), Some(schema)) = (&wiki_root, &wiki_schema) else {
+            continue;
+        };
+        for delta in deltas.iter().filter(|d| !d.first_run) {
+            augmentagent_channel_core::ingest::spawn_ingest(
+                Arc::clone(&reasoner),
+                root.clone(),
+                schema.clone(),
+                augmentagent_channel_imessage::batched_delta_email(delta),
+                augmentagent_channel_core::decision::DecisionKind::Capture,
+                Some("imessage history sync".to_string()),
+                None,
+                augmentagent_channel_core::ingest::IngestTrigger::ImessageHistory,
+            );
+        }
+    }
+}
+
 async fn run_contacts_sync(
     cli: &Cli,
     store: Arc<Store>,
@@ -13477,12 +14047,21 @@ fn load_any_github_auth() -> Result<augmentagent_channel_github::GithubAuth> {
 /// #427 — one ShadowNote journal sync pass. Self-gates on SHADOWNOTE_*
 /// config exactly like the serve spawn; without it this prints why and
 /// exits 0 so the subcommand is safe to probe on an unconfigured box.
+///
+/// #900 — `max_entries` overrides the per-pass ingest cap and
+/// `allow_base_sync` is the operator opt-in that lets a full-journal
+/// (base-sync) page set through; a normal poll refuses one.
 async fn run_journal_poll_once(
     wiki_dir: Option<PathBuf>,
     store: Arc<Store>,
     dry_run: bool,
+    max_entries: Option<usize>,
+    allow_base_sync: bool,
 ) -> Result<()> {
-    use augmentagent_channel_journal::{JournalChannel, JournalChannelConfig, JournalRuntime};
+    use augmentagent_channel_journal::{
+        JournalChannel, JournalChannelConfig, JournalRuntime, DEFAULT_BASE_SYNC_THRESHOLD,
+        DEFAULT_MAX_ENTRIES_PER_POLL, DEFAULT_MAX_PAGES_PER_POLL,
+    };
 
     let Some(runtime) = JournalRuntime::from_env().await? else {
         println!(
@@ -13500,6 +14079,10 @@ async fn run_journal_poll_once(
         wiki_root: wiki_dir,
         wiki_schema_path,
         poll_interval: augmentagent_channel_journal::DEFAULT_POLL_INTERVAL,
+        max_entries_per_poll: max_entries.unwrap_or(DEFAULT_MAX_ENTRIES_PER_POLL),
+        base_sync_threshold: DEFAULT_BASE_SYNC_THRESHOLD,
+        allow_base_sync,
+        max_pages_per_poll: DEFAULT_MAX_PAGES_PER_POLL,
     };
     let reasoner = build_reasoner();
     let channel = JournalChannel::new(
@@ -13511,6 +14094,59 @@ async fn run_journal_poll_once(
     );
     let outcome = channel.poll_once().await?;
     println!("{outcome:#?}");
+    if outcome.refused {
+        println!(
+            "refused: the delta sync returned a full-journal page set. \
+             `augmentagent journal backfill` imports it deliberately (capped, resumable); \
+             `augmentagent journal skip-to-now` follows new entries only."
+        );
+    } else if outcome.watermark_ms.is_none() {
+        println!(
+            "pass incomplete ({} deferred): the cursor is persisted; re-run (or wait for the \
+             daemon's next tick) to continue.",
+            outcome.deferred
+        );
+    }
+    Ok(())
+}
+
+/// #900 — operator recovery: accept the journal as-is and only follow
+/// entries changed from now on. Clears any in-progress cursor.
+async fn run_journal_skip_to_now(store: Arc<Store>) -> Result<()> {
+    use augmentagent_channel_journal::JournalRuntime;
+
+    let Some(runtime) = JournalRuntime::from_env().await? else {
+        println!("shadownote journal not configured; nothing to do");
+        return Ok(());
+    };
+    let owner = runtime.config.owner_id.as_str();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    store.clear_journal_sync_cursor(owner)?;
+    store.set_journal_sync_state(owner, now)?;
+    println!(
+        "journal watermark for owner {owner} set to {now} and the in-progress cursor cleared; \
+         only entries changed after now will be ingested"
+    );
+    Ok(())
+}
+
+/// #900 — show the persisted watermark and any in-progress cursor.
+async fn run_journal_status(store: Arc<Store>) -> Result<()> {
+    use augmentagent_channel_journal::JournalRuntime;
+
+    let Some(runtime) = JournalRuntime::from_env().await? else {
+        println!("shadownote journal not configured");
+        return Ok(());
+    };
+    let owner = runtime.config.owner_id.as_str();
+    let watermark = store.get_journal_sync_state(owner)?;
+    let cursor = store.get_journal_sync_cursor(owner)?;
+    println!("owner:     {owner}");
+    println!("watermark: {watermark:?}");
+    println!("cursor:    {cursor:?}");
     Ok(())
 }
 

@@ -147,3 +147,112 @@ maybe_defer_restart() {
   rm -f "$RESTART_DEFER_STAMP"
   return 1
 }
+
+# --- #903: restart hygiene — host memory pressure + restart-rate budget ------
+#
+# The updater restarted augmentagent.service 12 times on 2026-08-31, one per
+# merged PR, the last into a host already under memory pressure (#897). Each
+# restart re-runs every channel's first tick — exactly when the journal replay
+# fired — and a `cargo build --release` is the second-largest memory user on
+# the box. Neither the build nor the bounce should happen when the host is
+# struggling, and a busy auto-ship day should not turn the daemon's life into
+# a chain of start-up bursts.
+#
+# Both checks defer exactly like maybe_defer_restart (#844): the caller logs
+# `restart deferred: …`, withholds the build stamp (#826), and the next tick
+# retries through the stamp-mismatch path. AUGMENTAGENT_RESTART_FORCE=1
+# bypasses both for a manual deploy.
+
+MEMINFO_PATH="${AUGMENTAGENT_MEMINFO_PATH:-/proc/meminfo}"
+RESTART_MIN_AVAIL_MB="${AUGMENTAGENT_RESTART_MIN_AVAIL_MB:-3072}"
+RESTART_HISTORY="${AUGMENTAGENT_RESTART_HISTORY:-${LOG_DIR:-$HOME/.local/state/augmentagent}/restart-history}"
+RESTARTS_PER_HOUR="${AUGMENTAGENT_RESTARTS_PER_HOUR:-3}"
+RESTART_WINDOW_SECS=3600
+
+# MemAvailable in MB, or -1 when it cannot be read (macOS, some containers).
+mem_available_mb() {
+  awk '/^MemAvailable:/ { printf "%d", $2 / 1024; found = 1 } END { if (!found) print -1 }' \
+    "$MEMINFO_PATH" 2>/dev/null || printf '%s' -1
+}
+
+# 0 = enough headroom to build and bounce; 1 = under pressure, defer.
+memory_pressure_ok() {
+  [ "${AUGMENTAGENT_RESTART_FORCE:-0}" = 1 ] && return 0
+  local avail
+  avail=$(mem_available_mb)
+  case "$avail" in ''|*[!0-9-]*) avail=-1 ;; esac
+  # Unreadable meminfo must not block deploys forever: fail open.
+  [ "$avail" -lt 0 ] && return 0
+  if [ "$avail" -lt "$RESTART_MIN_AVAIL_MB" ]; then
+    _sr_log "restart deferred: MemAvailable=${avail}MB < ${RESTART_MIN_AVAIL_MB}MB (retry next tick; AUGMENTAGENT_RESTART_FORCE=1 overrides)"
+    return 1
+  fi
+  return 0
+}
+
+# Restarts recorded inside the sliding window.
+_restarts_in_window() {
+  awk -v now="$(date +%s)" -v win="$RESTART_WINDOW_SECS" \
+    '$1 ~ /^[0-9]+$/ && now - $1 < win { n++ } END { print n + 0 }' "$RESTART_HISTORY" 2>/dev/null \
+    || printf '%s' 0
+}
+
+# 0 = within budget; 1 = too many recent restarts, defer.
+restart_budget_ok() {
+  [ "${AUGMENTAGENT_RESTART_FORCE:-0}" = 1 ] && return 0
+  local n
+  n=$(_restarts_in_window)
+  if [ "${n:-0}" -ge "$RESTARTS_PER_HOUR" ]; then
+    _sr_log "restart deferred: $n restart(s) in the last hour (budget ${RESTARTS_PER_HOUR}/h; retry next tick; AUGMENTAGENT_RESTART_FORCE=1 overrides)"
+    return 1
+  fi
+  return 0
+}
+
+# Record a verified bounce and prune everything outside the window.
+record_restart() {
+  local now tmp
+  now=$(date +%s)
+  mkdir -p "$(dirname "$RESTART_HISTORY")" 2>/dev/null || true
+  tmp="$RESTART_HISTORY.tmp.$$"
+  {
+    awk -v now="$now" -v win="$RESTART_WINDOW_SECS" \
+      '$1 ~ /^[0-9]+$/ && now - $1 < win' "$RESTART_HISTORY" 2>/dev/null
+    printf '%s\n' "$now"
+  } > "$tmp" && mv "$tmp" "$RESTART_HISTORY"
+}
+
+# --- #891: cap the shared gate cache, only when NO lane is building ---------
+#
+# Parallel lanes key cargo debug artifacts by worktree path, so the shared
+# gate cache doubled to 26 GB in one evening. Dropping `debug/` from inside a
+# gate run would race the other lane's build; the updater runs every few
+# minutes and can see both lane locks, so it is the safe place to trim.
+GATE_CACHE_DIR="${AUGMENTAGENT_GATE_TARGET_DIR:-$HOME/.cache/augmentagent-gate-target}"
+GATE_CACHE_MAX_MB="${AUGMENTAGENT_GATE_CACHE_MAX_MB:-20000}"
+RESUME_LANE_LOCK="${AUGMENTAGENT_SELFIMPROVE_LOCK:-$HOME/.local/state/augmentagent/self-improve.lock}"
+RESUME_LANE_LOCK="${RESUME_LANE_LOCK%.lock}-resume.lock"
+
+any_lane_building() {
+  for l in "$SELF_IMPROVE_LOCK" "$RESUME_LANE_LOCK"; do
+    [ -e "$l" ] || continue
+    flock -n "$l" -c true 2>/dev/null || return 0
+  done
+  return 1
+}
+
+# Trim the gate cache's debug/ when it is over the cap and every lane is idle.
+# 0 = trimmed, 1 = left alone (under cap, or a lane is mid-build).
+trim_gate_cache_if_idle() {
+  [ -d "$GATE_CACHE_DIR/debug" ] || return 1
+  local sz
+  sz=$(du -sm "$GATE_CACHE_DIR" 2>/dev/null | cut -f1)
+  [ "${sz:-0}" -gt "$GATE_CACHE_MAX_MB" ] || return 1
+  if any_lane_building; then
+    _sr_log "gate cache ${sz}MB over cap but a lane is building; trimming later"
+    return 1
+  fi
+  _sr_log "gate cache ${sz}MB over ${GATE_CACHE_MAX_MB}MB cap and lanes idle; dropping debug/ (next gate cold-rebuilds once)"
+  rm -rf "$GATE_CACHE_DIR/debug"
+  return 0
+}

@@ -33,6 +33,7 @@ augmentagent-channel-deft = { path = "../augmentagent-channel-deft" }
 augmentagent-channel-telegram-bot = { path = "../augmentagent-channel-telegram-bot" }
 augmentagent-channel-calendar = { path = "../augmentagent-channel-calendar" }
 augmentagent-channel-journal = { path = "../augmentagent-channel-journal" }
+augmentagent-channel-imessage = { path = "../augmentagent-channel-imessage" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-auth = { path = "../augmentagent-auth" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }
@@ -40,10 +41,13 @@ augmentagent-browser-client = { path = "../augmentagent-browser-client" }
 augmentagent-renderer-client = { path = "../augmentagent-renderer-client" }
 augmentagent-proactive = { path = "../augmentagent-proactive" }
 augmentagent-channel-voice = { path = "../augmentagent-channel-voice" }
+augmentagent-channel-fotw = { path = "../augmentagent-channel-fotw" }
 augmentagent-content-adapter = { path = "../augmentagent-content-adapter" }
 # #176 — shared /proc walker + signal primitive consumed by both `loops`
 # and the Discord `!loops` command (avoids a circular dep through the cli bin).
 augmentagent-loops = { path = "../augmentagent-loops" }
+# #939 — `augmentagent doc extract` + `gmail get-attachment --extract`.
+augmentagent-docs = { path = "../augmentagent-docs" }
 
 async-trait = { workspace = true }
 serenity = { workspace = true }

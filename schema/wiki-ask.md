@@ -194,7 +194,7 @@ augmentagent gmail compose \
 
 **Subjects live in `--subject`, never in the body (#650).** The body is the message text only — never start it with a `Subject:` line, which is delivered to the recipient as visible text. A leading `Subject:` line that repeats `--subject` is dropped with a note; one that names a *different* subject — or a body that is nothing but that line — is refused before any Gmail write.
 
-A threaded write goes out under **the thread's** subject; `--subject` only threads it. So `compose`, `update-draft` and `send-now` refuse a threaded write whose `--subject` isn't that thread's (a `Re:`/`Fwd:` prefix is fine) rather than sending under a subject you didn't ask for — including an `update-draft` whose thread came from the draft itself rather than `--thread-id`. To change the subject, compose without `--thread-id` and start a new thread.
+A threaded write goes out under **the thread's** subject; `--subject` only threads it. So `compose`, `update-draft` and `send-now` refuse a threaded write whose `--subject` isn't the thread's original subject (#651; a `Re:`/`Fwd:` prefix is fine) rather than sending under a header you didn't ask for — including an `update-draft` whose thread came from the draft itself. To change the subject, compose without `--thread-id` and start a new thread.
 
 For multi-line or long bodies, write the body to a tempfile and pass `--body-file /path/to/body.txt` (or `--body-file -` to read stdin). Inline `--body` values interpret `\n` and `\t` escapes as real newlines/tabs (write `\\n` for a literal backslash-n), so short multi-paragraph bodies work inline too. Returns a `draft_id` and a Gmail URL the user can open to review/send.
 
@@ -533,3 +533,27 @@ What does **not** count:
 - Questions about the user's calendar, contacts, projects, or third-party tools. Those are wiki/web/gmail questions, not issues.
 - One-off chit-chat or clarifying questions.
 - Anything where the user explicitly says "don't file this" / "just FYI".
+
+## Meeting transcripts
+
+`~/transcripts/meetings/*.md` (when `AUGMENTAGENT_TRANSCRIPTS_DIR` is set) holds
+what was actually **said** in recorded meetings — full timestamped transcripts
+exported by FlyOnTheWall, one file per meeting, plus an OKF `index.md` and
+`log.md`.
+
+The split matters:
+
+- **The wiki** holds the distilled, cited facts — who committed to what, which
+  project moved. Those pages cite `fotw:<meeting-id>` in `sources:`.
+- **The transcript clone** holds the words. Grep it when the question is *what
+  exactly was said*, who said it, or in what order — the kind of question a
+  summary cannot answer.
+
+This is different from the wiki's own Meeting log, which records gcal
+attendance and RSVP only and is structurally stripped of event content. These
+files are the content.
+
+The clone is read-only, and the scope guard enforces exactly that: `Read`,
+`Grep` and `Glob` are allowed under the transcript directory, while `Write`
+and `Edit` stay wiki-only. Never write there: FlyOnTheWall owns that repo and
+re-pushes meetings to the same paths.

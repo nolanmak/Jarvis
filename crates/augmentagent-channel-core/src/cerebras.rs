@@ -34,6 +34,53 @@ pub fn cerebras_base_url() -> String {
         .unwrap_or_else(|| "https://api.cerebras.ai/v1".into())
 }
 
+/// The provider's public model catalog (OpenAI-compatible `GET /v1/models`).
+/// `doctor --deep` (#658) uses it to flag a pin deprecated out from under us:
+/// Cerebras retired five model families in twelve months, and a fallback
+/// pinned to a dead id fails every call it serves. The key rides a bearer
+/// header and never appears in an error string.
+pub async fn list_models(
+    client: &reqwest::Client,
+    base: &str,
+    key: &str,
+) -> Result<Vec<String>, String> {
+    let url = format!("{}/models", base.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .bearer_auth(key)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err(format!("auth rejected (HTTP {status}) — check the key"));
+    }
+    if !status.is_success() {
+        let detail: String = text.chars().take(300).collect();
+        return Err(format!("HTTP {status}: {detail}"));
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("unparseable catalog body: {e}"))?;
+    let ids: Vec<String> = parsed
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if ids.is_empty() {
+        // Never real — an unusable answer, not "every pin is gone".
+        return Err("catalog listed no models".into());
+    }
+    Ok(ids)
+}
+
 pub struct CerebrasHttpReasoner {
     client: reqwest::Client,
     /// Test override; production resolves [`cerebras_base_url`] per call.
@@ -173,27 +220,33 @@ impl Reasoner for CerebrasHttpReasoner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ModelTier;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// Minimal one-shot HTTP server: accept one connection, read the
     /// request, respond with `status` + `body`, exit. Enough to exercise the
-    /// adapter without an http-server dev-dependency.
-    async fn one_shot_server(status: &'static str, body: &'static str) -> String {
+    /// adapter without an http-server dev-dependency. Returns the base URL
+    /// plus a handle yielding the raw request the adapter sent.
+    async fn one_shot_server(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        let seen = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; 65536];
             // Read until the end of headers + body enough for the test.
-            let _ = sock.read(&mut buf).await;
+            let n = sock.read(&mut buf).await.unwrap_or(0);
             let resp = format!(
                 "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = sock.write_all(resp.as_bytes()).await;
             let _ = sock.shutdown().await;
+            String::from_utf8_lossy(&buf[..n]).into_owned()
         });
-        format!("http://{addr}/v1")
+        (format!("http://{addr}/v1"), seen)
     }
 
     fn opts() -> ReasonerOpts {
@@ -220,7 +273,7 @@ mod tests {
     #[tokio::test]
     async fn parses_chat_completion_content() {
         std::env::set_var("CEREBRAS_API_KEY", "test-key");
-        let base = one_shot_server(
+        let (base, _seen) = one_shot_server(
             "200 OK",
             r#"{"choices":[{"message":{"role":"assistant","content":"{\"interval_secs\":300}"}}]}"#,
         )
@@ -230,6 +283,29 @@ mod tests {
         assert_eq!(got, "{\"interval_secs\":300}");
     }
 
+    /// #658 — the wire end of the tier map: the posted body carries exactly
+    /// the model `model_for` resolved, on BOTH tiers.
+    #[tokio::test]
+    async fn request_body_pins_the_resolved_model_on_both_tiers() {
+        std::env::set_var("CEREBRAS_API_KEY", "test-key");
+        for (preset_model, tier) in [
+            ("claude-opus-4-8", ModelTier::Quality),
+            ("claude-haiku-4-5-20251001", ModelTier::Fast),
+        ] {
+            let (base, seen) =
+                one_shot_server("200 OK", r#"{"choices":[{"message":{"content":"ok"}}]}"#).await;
+            let mut o = opts();
+            o.model = Some(preset_model.into());
+            let r = CerebrasHttpReasoner::with_base(base);
+            r.call(&o, "hi").await.unwrap();
+            let want = model_for(ProviderKind::Cerebras, tier);
+            assert!(
+                seen.await.unwrap().contains(&format!(r#""model":"{want}""#)),
+                "cerebras must post model {want}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn http_429_maps_to_rate_limited_and_402_too() {
         std::env::set_var("CEREBRAS_API_KEY", "test-key");
@@ -237,7 +313,7 @@ mod tests {
             ("429 Too Many Requests", r#"{"message":"tokens per minute exceeded"}"#),
             ("402 Payment Required", r#"{"message":"insufficient credits"}"#),
         ] {
-            let base = one_shot_server(status, body).await;
+            let (base, _seen) = one_shot_server(status, body).await;
             let r = CerebrasHttpReasoner::with_base(base);
             let err = r.call(&opts(), "hi").await.unwrap_err();
             assert!(
@@ -251,9 +327,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_models_parses_catalog_ids() {
+        let (base, _seen) = one_shot_server(
+            "200 OK",
+            r#"{"object":"list","data":[{"id":"gpt-oss-120b"},{"id":"gemma-4-31b"}]}"#,
+        )
+        .await;
+        let got = list_models(&reqwest::Client::new(), &base, "test-key")
+            .await
+            .unwrap();
+        assert_eq!(got, vec!["gpt-oss-120b".to_string(), "gemma-4-31b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_models_reports_auth_failure_without_leaking_the_key() {
+        let (base, _seen) =
+            one_shot_server("401 Unauthorized", r#"{"message":"wrong api key"}"#).await;
+        let err = list_models(&reqwest::Client::new(), &base, "sk-not-a-real-key")
+            .await
+            .unwrap_err();
+        assert!(err.contains("auth"), "401 must read as an auth failure: {err}");
+        assert!(
+            !err.contains("sk-not-a-real-key"),
+            "the key must never reach a doctor finding: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn server_error_maps_to_unavailable() {
         std::env::set_var("CEREBRAS_API_KEY", "test-key");
-        let base = one_shot_server("503 Service Unavailable", r#"{"message":"overloaded"}"#).await;
+        let (base, _seen) =
+            one_shot_server("503 Service Unavailable", r#"{"message":"overloaded"}"#).await;
         let r = CerebrasHttpReasoner::with_base(base);
         let err = r.call(&opts(), "hi").await.unwrap_err();
         assert!(matches!(
