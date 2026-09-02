@@ -836,11 +836,10 @@ pub fn extract_bare_email(raw: &str) -> String {
     raw.trim().to_string()
 }
 
-/// Split an RFC 5322-style recipient list into bare addresses (#439).
-/// Commas inside double quotes (`"Doe, John" <j@x.com>`) or angle brackets
-/// don't split; each part is then reduced via [`extract_bare_email`] and
-/// empty parts are dropped.
-pub fn split_recipients(raw: &str) -> Vec<String> {
+/// Split an RFC 5322-style recipient list into raw entries, display names
+/// intact (`"Doe, John" <j@example.com>` stays one entry). Commas inside
+/// double quotes or angle brackets don't split.
+pub fn split_recipient_entries(raw: &str) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut in_quotes = false;
@@ -865,6 +864,13 @@ pub fn split_recipients(raw: &str) -> Vec<String> {
     }
     parts.push(cur);
     parts
+}
+
+/// Split an RFC 5322-style recipient list into bare addresses (#439). Each
+/// entry from [`split_recipient_entries`] is reduced via [`extract_bare_email`]
+/// and empty parts are dropped.
+pub fn split_recipients(raw: &str) -> Vec<String> {
+    split_recipient_entries(raw)
         .iter()
         .map(|p| extract_bare_email(p))
         .filter(|p| !p.is_empty())
