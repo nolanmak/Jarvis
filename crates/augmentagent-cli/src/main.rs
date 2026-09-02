@@ -4574,6 +4574,113 @@ fn strip_approval_envelope_markers(body: &str) -> String {
         .to_string()
 }
 
+/// #650 — split a leading `Subject: …` line off a body that is about to become
+/// a Gmail message. The subject belongs in the header; a body that opens with
+/// one ships that line to the recipient as visible text. Returns the remainder
+/// (a verbatim slice, so CRLF endings and the trailing newline survive) plus
+/// the dropped value, or the body unchanged when the first non-blank line is
+/// not a subject header — a `Subject:` inside quoted or forwarded text further
+/// down is real message content.
+fn strip_leading_subject_line(body: &str) -> (String, Option<String>) {
+    const HEADER: &str = "subject:";
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            offset += line.len();
+            continue;
+        }
+        let Some((header, value)) = trimmed.get(..HEADER.len()).zip(trimmed.get(HEADER.len()..))
+        else {
+            return (body.to_string(), None);
+        };
+        if !header.eq_ignore_ascii_case(HEADER) {
+            return (body.to_string(), None);
+        }
+        offset += line.len();
+        for after in body[offset..].split_inclusive('\n') {
+            if !after.trim().is_empty() {
+                break;
+            }
+            offset += after.len();
+        }
+        return (body[offset..].to_string(), Some(value.trim().to_string()));
+    }
+    (body.to_string(), None)
+}
+
+/// Do two subjects say the same thing? Reply/forward prefixes and case are
+/// noise here: a reply's header is `Re: venue question` while the body echoes
+/// back the bare `venue question`, and both name one subject.
+fn subjects_agree(a: &str, b: &str) -> bool {
+    const PREFIXES: [&str; 3] = ["re:", "fwd:", "fw:"];
+    fn core(s: &str) -> String {
+        let mut s = s.trim();
+        loop {
+            let lower = s.to_ascii_lowercase();
+            match PREFIXES.iter().find(|p| lower.starts_with(**p)) {
+                Some(p) => s = s[p.len()..].trim_start(),
+                None => return lower,
+            }
+        }
+    }
+    core(a) == core(b)
+}
+
+/// #650 — reconcile a body that opens with its own `Subject:` header against
+/// the subject the Gmail write is actually going to send. Returns the body to
+/// send plus the dropped line's value, or the reason the write must not
+/// happen. Refusing here (rather than at the API) keeps #412 discipline: no
+/// draft exists yet, so there is no orphan to clean up.
+///
+/// Dropping the line is only safe when it repeats the outgoing subject. A
+/// DIFFERENT one is a subject the author meant to set, and no body can supply
+/// a header, so silently dropping it would send a message under a subject
+/// nobody asked for. Say so instead and let the caller put it where it
+/// belongs — which for a threaded write means starting a new thread, since
+/// [`ensure_subject_matches_thread`] (#651) holds a reply to its thread's subject.
+fn body_without_leaked_subject(
+    body: &str,
+    outgoing_subject: &str,
+) -> Result<(String, Option<String>), String> {
+    let (rest, Some(dropped)) = strip_leading_subject_line(body) else {
+        return Ok((body.to_string(), None));
+    };
+    if !subjects_agree(&dropped, outgoing_subject) {
+        return Err(format!(
+            "the body opens with \"Subject: {dropped}\" but the message goes out as \
+             \"{outgoing_subject}\" — a Subject line in the body is delivered as \
+             visible text, never as the header"
+        ));
+    }
+    if rest.trim().is_empty() {
+        return Err(
+            "the body is nothing but its own \"Subject:\" line — the subject is \
+             already on the message, the body needs the message text"
+                .into(),
+        );
+    }
+    Ok((rest, Some(dropped)))
+}
+
+/// CLI adapter for [`body_without_leaked_subject`]: a body-level `Subject:`
+/// naming something other than `--subject` is a usage error, and one that
+/// merely repeats `--subject` is dropped with a note.
+fn body_for_gmail_write(body: String, subject: &str) -> Result<String> {
+    match body_without_leaked_subject(&body, subject) {
+        Ok((clean, dropped)) => {
+            if let Some(dropped) = dropped {
+                eprintln!(
+                    "note: dropped leading \"Subject: {dropped}\" line from the body; \
+                     the subject header is --subject ({subject})"
+                );
+            }
+            Ok(clean)
+        }
+        Err(e) => anyhow::bail!("{e}; pass the intended subject as --subject"),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ComposePendingDisposition {
     Create,
@@ -4735,7 +4842,7 @@ async fn run_gmail_compose(
     let to = to.join(", ");
     let cc = normalize_recipients("--cc", &cc)?;
     let bcc = normalize_recipients("--bcc", &bcc)?;
-    let body_str = read_body(body, body_file)?;
+    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject)?;
     // Validate the --post flag pairing BEFORE any Gmail write, so a usage
     // error can't strand an orphan draft in the mailbox (#412).
     if post
@@ -5589,7 +5696,7 @@ async fn run_gmail_update_draft(
     let to = to.join(", ");
     let cc = normalize_recipients("--cc", &cc)?;
     let bcc = normalize_recipients("--bcc", &bcc)?;
-    let body_str = read_body(body, body_file)?;
+    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     // #500 — refuse while a send of exactly this draft is in flight: update
     // is create-replacement + DELETE-old, which would yank the draft out
@@ -5764,7 +5871,7 @@ async fn run_gmail_send_now(
     let to = to.join(", ");
     let cc = normalize_recipients("--cc", &cc)?;
     let bcc = normalize_recipients("--bcc", &bcc)?;
-    let body_str = read_body(body, body_file)?;
+    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
@@ -8068,7 +8175,8 @@ mod unescape_body_tests {
 #[cfg(test)]
 mod approval_body_tests {
     use super::{
-        compose_pending_disposition, revise_subject, strip_approval_envelope_markers,
+        body_without_leaked_subject, compose_pending_disposition, revise_subject,
+        strip_approval_envelope_markers, strip_leading_subject_line, subjects_agree,
         thread_subject_conflict, ComposePendingDisposition, ThreadSubject,
     };
 
@@ -8109,6 +8217,107 @@ mod approval_body_tests {
     fn keeps_normal_prose_and_non_email_colons() {
         let body = "Hi,\n\nCC: means carbon copy in this sentence.\nTo: the team";
         assert_eq!(strip_approval_envelope_markers(body), body);
+    }
+
+    #[test]
+    fn leading_subject_line_is_dropped() {
+        assert_eq!(
+            strip_leading_subject_line("Subject: Hosting a PTE event\n\nHey Casey,\n\nThanks."),
+            (
+                "Hey Casey,\n\nThanks.".to_string(),
+                Some("Hosting a PTE event".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn subject_match_is_case_and_whitespace_insensitive() {
+        assert_eq!(
+            strip_leading_subject_line("\n  SUBJECT:  venue question \nHi"),
+            ("Hi".to_string(), Some("venue question".to_string()))
+        );
+    }
+
+    #[test]
+    fn mid_body_subject_line_survives() {
+        let body = "Hi,\n\n> Subject: old thread\nbye";
+        assert_eq!(strip_leading_subject_line(body), (body.to_string(), None));
+    }
+
+    #[test]
+    fn remainder_is_preserved_verbatim_including_crlf() {
+        assert_eq!(
+            strip_leading_subject_line("Subject: x\r\n\r\nHi\r\nBye\r\n"),
+            ("Hi\r\nBye\r\n".to_string(), Some("x".to_string()))
+        );
+    }
+
+    #[test]
+    fn body_without_subject_is_untouched() {
+        let body = "Hey Casey,\n\nThanks.";
+        assert_eq!(strip_leading_subject_line(body), (body.to_string(), None));
+    }
+
+    /// #650 verbatim: the reply body the agent handed to `gmail compose`
+    /// opened with the subject it meant for the header, so the recipient saw
+    /// a literal "Subject:" line above the greeting.
+    #[test]
+    fn the_reported_subject_line_never_reaches_the_recipient() {
+        assert_eq!(
+            body_without_leaked_subject(
+                "Subject: Hosting a PTE event\n\nHey Casey,\n\nWe'd love to host it.",
+                "Re: Hosting a PTE event"
+            ),
+            Ok((
+                "Hey Casey,\n\nWe'd love to host it.".to_string(),
+                Some("Hosting a PTE event".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn a_body_subject_that_disagrees_with_the_header_is_refused() {
+        let err = body_without_leaked_subject(
+            "Subject: Hosting a PTE event\n\nHey Casey,",
+            "Re: Thursday's venue",
+        )
+        .unwrap_err();
+        assert!(err.contains("Hosting a PTE event"), "{err}");
+        assert!(err.contains("Thursday's venue"), "{err}");
+    }
+
+    #[test]
+    fn a_subject_only_body_is_refused_before_any_gmail_write() {
+        assert!(
+            body_without_leaked_subject("Subject: Hosting a PTE event\n", "Hosting a PTE event")
+                .is_err()
+        );
+    }
+
+    /// #650/#651 discipline (codex on #857): every Gmail write path checks
+    /// the body's own `Subject:` line and the thread's subject BEFORE it
+    /// uploads an attachment or creates a draft, so a refusal never strands
+    /// an orphan upload. Pinned structurally on the three CLI paths.
+    #[test]
+    fn refusals_run_before_any_attachment_upload_on_every_write_path() {
+        let src = include_str!("main.rs");
+        for f in ["async fn run_gmail_compose(", "async fn run_gmail_update_draft(", "async fn run_gmail_send_now("] {
+            let start = src.find(f).expect(f);
+            let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+            let body_gate = body.find("body_for_gmail_write(").expect("body subject gate");
+            let thread_gate = body.find("ensure_subject_matches_thread(").expect("thread subject gate (#651)");
+            let upload = body.find("upload_attach_if_given(").expect("attachment upload");
+            let draft = body.find("create_draft_with_attachment(").or_else(|| body.find("update_draft_with_attachment(")).expect("draft write");
+            assert!(body_gate < upload && thread_gate < upload, "{f}: a refusal must precede the upload");
+            assert!(upload < draft, "{f}: upload precedes the draft write");
+        }
+    }
+
+    #[test]
+    fn reply_and_forward_prefixes_do_not_make_two_subjects_disagree() {
+        assert!(subjects_agree("Hosting a PTE event", "RE: hosting a PTE event"));
+        assert!(subjects_agree("Fwd: Re: venue", "venue"));
+        assert!(!subjects_agree("venue", "venue tomorrow"));
     }
 
     #[test]
@@ -9925,6 +10134,29 @@ impl ReplyApprover {
 
         // 2. Create a fresh Gmail draft with the revised body.
         let subject = revise_subject(&action.email.subject, action.email.thread_id.as_deref());
+        // #650 — the redraft prompt shows the model a `Subject:` header block
+        // it sometimes echoes back as the first body line, which then ships to
+        // the recipient as visible text. Drop it here, before the Gmail draft
+        // and the reposted card, so both carry the same subject-free text.
+        // Nothing in a redraft can change the outgoing subject — it is the
+        // thread's — so a line naming a DIFFERENT one, or a redraft that is
+        // nothing but that line, fails the revise instead of creating a draft
+        // that leaks it. The card stays pending and Revise can run again.
+        let redraft = match body_without_leaked_subject(&redraft, &subject) {
+            Ok((clean, dropped)) => {
+                if dropped.is_some() {
+                    tracing::warn!(action_id, "revise: dropped leading Subject: line from redraft");
+                }
+                clean
+            }
+            Err(message) => {
+                tracing::warn!(action_id, "revise: rejected redraft: {message}");
+                return ApprovalActionOutcome::Failed {
+                    message: format!("redraft carries its own subject line: {message}"),
+                };
+            }
+        };
+
         // #473 — recreate the draft with the envelope the card was composed
         // with, when one was recorded. Pre-#473 behavior (To = emails.from,
         // no cc/bcc) silently dropped an overridden To and every cc/bcc on

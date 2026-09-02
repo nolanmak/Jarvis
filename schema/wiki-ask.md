@@ -192,6 +192,10 @@ augmentagent gmail compose \
   --body "Hi Jeremy,\n\n…"
 ```
 
+**Subjects live in `--subject`, never in the body (#650).** The body is the message text only — never start it with a `Subject:` line, which is delivered to the recipient as visible text. A leading `Subject:` line that repeats `--subject` is dropped with a note; one that names a *different* subject — or a body that is nothing but that line — is refused before any Gmail write.
+
+A threaded write goes out under **the thread's** subject; `--subject` only threads it. So `compose`, `update-draft` and `send-now` refuse a threaded write whose `--subject` isn't the thread's original subject (#651; a `Re:`/`Fwd:` prefix is fine) rather than sending under a header you didn't ask for — including an `update-draft` whose thread came from the draft itself. To change the subject, compose without `--thread-id` and start a new thread.
+
 For multi-line or long bodies, write the body to a tempfile and pass `--body-file /path/to/body.txt` (or `--body-file -` to read stdin). Inline `--body` values interpret `\n` and `\t` escapes as real newlines/tabs (write `\\n` for a literal backslash-n), so short multi-paragraph bodies work inline too. Returns a `draft_id` and a Gmail URL the user can open to review/send.
 
 **Multiple recipients (#439):** `--to` takes several addresses — repeat the flag (`--to a@x.com --to b@y.com`) or pass one comma-separated value (`--to 'a@x.com, b@y.com'`). `--cc` and `--bcc` work the same way and exist on `compose`, `send-now`, and `update-draft`. When the user says "respond to Bo and his assistant" or "reply all", put EVERY named person on `--to`/`--cc` — do not address one person and merely mention the other in the body. The approval card shows `[to: …]`/`[cc: …]`/`[bcc: …]` lines under the draft; card **Revise** re-creates the draft with that same envelope (#473), so recipients survive revision — but attachments still don't (re-pass `--attach` via `update-draft`). `update-draft` only carries what you re-pass, so repeat `--cc`/`--bcc` there too.
