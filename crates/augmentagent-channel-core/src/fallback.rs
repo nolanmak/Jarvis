@@ -76,6 +76,11 @@ struct Entry {
 pub struct FallbackReasoner {
     entries: Vec<Entry>,
     latch: CooldownLatch,
+    /// #803 — resource accounting for this instance: `(provider, calls
+    /// attempted, calls that returned Ok)`, in chain order of first use. The
+    /// auto-PR loop builds one reasoner per attempt, so this IS the attempt's
+    /// spend and the record of which provider actually served it.
+    usage: std::sync::Mutex<Vec<(&'static str, u32, u32)>>,
 }
 
 /// Why `kind` cannot serve calls on this box (binary absent, no resolvable
@@ -158,6 +163,7 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
     Arc::new(FallbackReasoner {
         entries,
         latch: CooldownLatch::system(),
+        usage: std::sync::Mutex::new(Vec::new()),
     })
 }
 
@@ -177,6 +183,7 @@ pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
         Arc::new(FallbackReasoner {
             entries: vec![entry],
             latch: CooldownLatch::system(),
+            usage: std::sync::Mutex::new(Vec::new()),
         })
     })
 }
@@ -191,6 +198,7 @@ impl FallbackReasoner {
                 reasoner: Arc::new(ClaudeCliReasoner::new()),
             }],
             latch: CooldownLatch::system(),
+            usage: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -205,12 +213,47 @@ impl FallbackReasoner {
                 .map(|(kind, reasoner)| Entry { kind, reasoner })
                 .collect(),
             latch,
+            usage: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     /// Providers currently configured (for status surfaces).
     pub fn provider_names(&self) -> Vec<&'static str> {
         self.entries.iter().map(|e| e.kind.name()).collect()
+    }
+
+    fn note(&self, name: &'static str, ok: bool) {
+        let mut u = self.usage.lock().unwrap_or_else(|e| e.into_inner());
+        match u.iter_mut().find(|(n, _, _)| *n == name) {
+            Some(row) => {
+                if ok {
+                    row.2 += 1;
+                } else {
+                    row.1 += 1;
+                }
+            }
+            None => u.push((name, u32::from(!ok), u32::from(ok))),
+        }
+    }
+
+    /// #803 — `(provider, calls attempted, calls served)` for this instance.
+    pub fn usage(&self) -> Vec<(&'static str, u32, u32)> {
+        self.usage.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Calls attempted across every provider on this instance.
+    pub fn calls(&self) -> u32 {
+        self.usage().iter().map(|(_, c, _)| c).sum()
+    }
+
+    /// `"claude 3/3, codex 1/2"` — served/attempted per provider; empty when
+    /// nothing was called.
+    pub fn usage_summary(&self) -> String {
+        self.usage()
+            .iter()
+            .map(|(n, c, ok)| format!("{n} {ok}/{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     async fn dispatch(
@@ -239,6 +282,7 @@ impl FallbackReasoner {
                 tracing::debug!(provider = name, %until, "provider latched; skipping");
                 continue;
             }
+            self.note(name, false);
             let res = if transcript {
                 entry.reasoner.call_transcript(opts, user_message).await
             } else {
@@ -246,6 +290,7 @@ impl FallbackReasoner {
             };
             match res {
                 Ok(text) => {
+                    self.note(name, true);
                     if Some(entry.kind) != primary {
                         info!(
                             provider = name,
@@ -358,6 +403,25 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ---- #828: single-provider pinning for the independent review ----
+
+    // #803 — the loop reads this per attempt for its resource accounting.
+    #[tokio::test]
+    async fn usage_counts_calls_and_successes_per_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Scripted::ok("answer");
+        let fb = FallbackReasoner::for_tests(
+            vec![(ProviderKind::Claude, a.clone() as Arc<dyn Reasoner>)],
+            latch_in(&dir),
+        );
+        assert_eq!(fb.calls(), 0);
+        assert_eq!(fb.usage_summary(), "");
+        let opts = text_only_opts();
+        fb.call(&opts, "hi").await.unwrap();
+        fb.call(&opts, "again").await.unwrap();
+        assert_eq!(fb.calls(), 2);
+        assert_eq!(fb.usage(), vec![("claude", 2, 2)]);
+        assert_eq!(fb.usage_summary(), "claude 2/2");
+    }
 
     #[test]
     fn build_pinned_yields_exactly_that_provider() {
