@@ -2666,6 +2666,20 @@ impl Store {
         Ok(())
     }
 
+    /// Repoint every phone-index row from one person slug to another — the
+    /// store half of an owner-approved page merge (`person merge`). Without
+    /// this, a deleted stub's rows keep resolving future syncs to a missing
+    /// page. Returns the number of rows moved.
+    pub fn repoint_phone_identity(&self, from_slug: &str, to_slug: &str) -> StoreResult<usize> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE identity_phone SET person_slug = ?2, updated_at_ms = ?3 \
+             WHERE person_slug = ?1",
+            params![from_slug, to_slug, now_millis()],
+        )?;
+        Ok(n)
+    }
+
     /// Backfill the human-readable Gmail address for a connected account.
     /// The OAuth connect flow never captured it (Composio doesn't return it
     /// on the connection), so the dashboard + entity picker show opaque IDs

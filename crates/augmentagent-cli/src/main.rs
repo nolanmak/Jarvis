@@ -250,6 +250,11 @@ enum Cmd {
         #[command(subcommand)]
         op: ImessageOp,
     },
+    /// Person-page maintenance (identity-merge groundwork).
+    Person {
+        #[command(subcommand)]
+        op: PersonOp,
+    },
     /// Voice memo capture: drop-folder watcher + Whisper transcription ->
     /// wiki ingest. All ops stubs in foundation/swarm-v1.
     Voice {
@@ -968,6 +973,24 @@ enum JournalOp {
     SkipToNow,
     /// #900 — print the persisted watermark and in-progress cursor.
     Status,
+}
+
+#[derive(Subcommand)]
+enum PersonOp {
+    /// Fold an auto-created contact stub (`*_at_contact.md`) into a canonical
+    /// person page: move its identities + `## Source` lines (fill-blanks via
+    /// `merge_person_page`), delete the stub, and repoint `identity_phone`
+    /// rows so future syncs resolve to the surviving page. Dry-run JSON
+    /// report by default; `--apply` writes.
+    Merge {
+        /// Slug of the stub to fold in (must end in `_at_contact`).
+        from: String,
+        /// Slug of the surviving canonical page.
+        into: String,
+        /// Write the target page, delete the stub, repoint the phone index.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3112,6 +3135,12 @@ async fn main() -> Result<()> {
             }
             JournalOp::Status => {
                 run_journal_status(store).await?;
+                Ok(())
+            }
+        },
+        Cmd::Person { ref op } => match op {
+            PersonOp::Merge { from, into, apply } => {
+                run_person_merge(&cli, store, from, into, *apply)?;
                 Ok(())
             }
         },
@@ -10615,6 +10644,81 @@ async fn run_linkedin_connections_sync(
 /// `carddav` (env-configured). Dry-run JSON by default; `--apply` writes
 /// fill-blanks wiki pages, indexes phones, persists the sync cursor, and
 /// posts a Discord summary.
+/// Owner-approved stub merge: the deterministic executor the identity-merge
+/// approval flow calls (and a standalone CLI for manual merges). The string
+/// transform lives in `augmentagent_wiki::crm::merge_stub_into`; this owns
+/// the guards, file IO, `updated:` carry-forward, and the `identity_phone`
+/// repoint that keeps future syncs from resurrecting the deleted stub.
+fn run_person_merge(
+    cli: &Cli,
+    store: Arc<Store>,
+    from: &str,
+    into: &str,
+    apply: bool,
+) -> Result<()> {
+    let ok_slug =
+        |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    anyhow::ensure!(ok_slug(from) && ok_slug(into), "slugs must be [A-Za-z0-9_-]+");
+    anyhow::ensure!(from != into, "--from and --into are the same page");
+    anyhow::ensure!(
+        from.ends_with("_at_contact"),
+        "refusing to merge '{from}': only auto-created *_at_contact stubs can be folded \
+         (canonical pages may hold human-written content a blind merge would bury)"
+    );
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for person merge")?;
+    let layout = augmentagent_wiki::WikiLayout::new(wiki_root);
+    let from_path = layout.people_dir().join(format!("{from}.md"));
+    let into_path = layout.people_dir().join(format!("{into}.md"));
+    let stub_src = std::fs::read_to_string(&from_path)
+        .with_context(|| format!("stub not found: {}", from_path.display()))?;
+    let target_src = std::fs::read_to_string(&into_path)
+        .with_context(|| format!("target not found: {}", into_path.display()))?;
+
+    let merged = augmentagent_wiki::crm::merge_stub_into(&target_src, &stub_src, from);
+
+    // Carry the stub's `updated:` forward when it is newer — the stub's date
+    // is the person's last text, and the stale-contact engine reads it.
+    let stub_updated = stub_src
+        .split("\n---\n")
+        .next()
+        .and_then(|fm| fm.lines().find_map(|l| l.strip_prefix("updated:")))
+        .map(|v| v.trim().trim_matches('\'').trim_matches('"').to_string());
+    let mut content = merged.content.clone();
+    let mut bumped = false;
+    if let Some(date) = &stub_updated {
+        if let Some(newer) = augmentagent_channel_imessage::bump_updated(&content, date) {
+            content = newer;
+            bumped = true;
+        }
+    }
+
+    let mut repointed = 0usize;
+    if apply {
+        if merged.changed || bumped {
+            std::fs::write(&into_path, &content)?;
+        }
+        std::fs::remove_file(&from_path)
+            .with_context(|| format!("removing stub {}", from_path.display()))?;
+        repointed = store.repoint_phone_identity(from, into)?;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "from": from,
+            "into": into,
+            "applied": apply,
+            "changed": merged.changed,
+            "updated_bumped": bumped,
+            "moved": merged.moved,
+            "phone_rows_repointed": repointed,
+        }))?
+    );
+    Ok(())
+}
+
 /// #885 — iMessage history → person pages. Dry-run prints the JSON report
 /// and writes nothing; `--apply` writes fill-blanks pages and indexes phones.
 fn run_imessage_sync(cli: &Cli, store: Arc<Store>, apply: bool) -> Result<()> {
