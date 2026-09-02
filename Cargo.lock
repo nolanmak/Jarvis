@@ -271,6 +271,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "augmentagent-docs",
  "augmentagent-loops",
  "augmentagent-store",
  "chrono",
@@ -903,6 +904,7 @@ dependencies = [
  "augmentagent-channel-twitter",
  "augmentagent-channel-voice",
  "augmentagent-content-adapter",
+ "augmentagent-docs",
  "augmentagent-loops",
  "augmentagent-proactive",
  "augmentagent-renderer-client",
@@ -946,6 +948,22 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "augmentagent-docs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "augmentagent-auth",
+ "base64",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]

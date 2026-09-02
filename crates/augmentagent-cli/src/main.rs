@@ -50,8 +50,10 @@ use async_trait::async_trait;
 
 mod channel_router;
 mod code_mode;
+mod doc_cmd;
 mod doctor;
 mod env_cfg;
+mod gmail_attach;
 mod installers;
 mod logs;
 mod loop_cmd;
@@ -195,6 +197,13 @@ enum Cmd {
     Gmail {
         #[command(subcommand)]
         op: GmailOp,
+    },
+    /// Document text extraction (#939): pdftotext/pandoc first, then Mistral
+    /// OCR for scanned (image-only) PDFs when MISTRAL_API_KEY is set. Same
+    /// pipeline the Discord attachment handler and `gmail get-attachment` use.
+    Doc {
+        #[command(subcommand)]
+        op: DocOp,
     },
     /// Resume ingestion — one-shot seed of the wiki from the user's CV.
     Resume {
@@ -1497,6 +1506,29 @@ enum DiscordOp {
 }
 
 #[derive(Subcommand)]
+enum DocOp {
+    /// Extract text from a PDF / DOCX / DOC. Writes `<file>.txt` beside the
+    /// input unless `--out` is given (`--out -` prints the text to stdout after
+    /// the receipt line) and reports whether the OCR stage ran.
+    Extract {
+        /// Path to the document.
+        file: PathBuf,
+        /// Output path for the text; `-` prints to stdout.
+        #[arg(long)]
+        out: Option<String>,
+        /// Force the kind (pdf|docx|doc) when the filename doesn't tell.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Skip the OCR stage even when MISTRAL_API_KEY is configured.
+        #[arg(long, default_value_t = false)]
+        no_ocr: bool,
+        /// Print a JSON receipt instead of the human line.
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum GmailOp {
     /// Search all connected Gmail accounts with a Gmail query string
     /// (e.g. `from:jeremy@acme.com`, `subject:deadline after:2026/04/01`).
@@ -1520,6 +1552,47 @@ enum GmailOp {
         /// throttled account.
         #[arg(long)]
         account: Option<String>,
+    },
+    /// List a message's attachments (#937): index, filename, MIME type, and
+    /// the attachmentId that `get-attachment` needs. Message ids come from
+    /// `gmail search`.
+    ListAttachments {
+        /// Email address or Composio entity_id. Required when more than one
+        /// account is connected (message ids are per-mailbox).
+        #[arg(long)]
+        account: Option<String>,
+        /// Gmail messageId (from `gmail search`).
+        #[arg(long)]
+        message_id: String,
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        json: bool,
+    },
+    /// Download one attachment (#937) to `/tmp/aa-doc-<id>-<idx>.<ext>` — a
+    /// path the ask agent's Read tool may open — and, for PDF/DOCX/DOC,
+    /// extract its text to the sibling `.txt`, running Mistral OCR when a PDF
+    /// has no text layer and MISTRAL_API_KEY is set (#939).
+    GetAttachment {
+        /// Email address or Composio entity_id. Required when more than one
+        /// account is connected.
+        #[arg(long)]
+        account: Option<String>,
+        /// Gmail messageId (from `gmail search`).
+        #[arg(long)]
+        message_id: String,
+        /// Select by attachmentId (from `list-attachments`)…
+        #[arg(long)]
+        attachment_id: Option<String>,
+        /// …or by filename, case-insensitive, as printed by `gmail search`.
+        #[arg(long)]
+        name: Option<String>,
+        /// Override the download path (the default is what the ask agent can Read).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Extract text for document kinds (default true).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        extract: bool,
+        #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        json: bool,
     },
     /// List active Gmail accounts (so the chat agent can pick `--account`).
     Accounts {
@@ -2907,6 +2980,30 @@ async fn main() -> Result<()> {
                 run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await
             }
             GmailOp::Accounts { json } => run_gmail_accounts(store, *json).await,
+            GmailOp::ListAttachments { account, message_id, json } => {
+                gmail_attach::run_gmail_list_attachments(
+                    store,
+                    account.clone(),
+                    message_id.clone(),
+                    *json,
+                )
+                .await
+            }
+            GmailOp::GetAttachment {
+                account, message_id, attachment_id, name, out, extract, json,
+            } => {
+                gmail_attach::run_gmail_get_attachment(
+                    store,
+                    account.clone(),
+                    message_id.clone(),
+                    attachment_id.clone(),
+                    name.clone(),
+                    out.clone(),
+                    *extract,
+                    *json,
+                )
+                .await
+            }
             GmailOp::Compose {
                 account, to, cc, bcc, subject, body, body_file, thread_id, json,
                 post, allow_duplicate, attach, reply_to_message_id, reply_to_from,
@@ -2975,6 +3072,12 @@ async fn main() -> Result<()> {
                     attach.clone(),
                 )
                 .await
+            }
+        },
+        Cmd::Doc { ref op } => match op {
+            DocOp::Extract { file, out, kind, no_ocr, json } => {
+                doc_cmd::run_doc_extract(file.clone(), out.clone(), kind.clone(), *no_ocr, *json)
+                    .await
             }
         },
         Cmd::Resume { ref op } => match op {
@@ -4547,6 +4650,113 @@ fn strip_approval_envelope_markers(body: &str) -> String {
         .to_string()
 }
 
+/// #650 — split a leading `Subject: …` line off a body that is about to become
+/// a Gmail message. The subject belongs in the header; a body that opens with
+/// one ships that line to the recipient as visible text. Returns the remainder
+/// (a verbatim slice, so CRLF endings and the trailing newline survive) plus
+/// the dropped value, or the body unchanged when the first non-blank line is
+/// not a subject header — a `Subject:` inside quoted or forwarded text further
+/// down is real message content.
+fn strip_leading_subject_line(body: &str) -> (String, Option<String>) {
+    const HEADER: &str = "subject:";
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            offset += line.len();
+            continue;
+        }
+        let Some((header, value)) = trimmed.get(..HEADER.len()).zip(trimmed.get(HEADER.len()..))
+        else {
+            return (body.to_string(), None);
+        };
+        if !header.eq_ignore_ascii_case(HEADER) {
+            return (body.to_string(), None);
+        }
+        offset += line.len();
+        for after in body[offset..].split_inclusive('\n') {
+            if !after.trim().is_empty() {
+                break;
+            }
+            offset += after.len();
+        }
+        return (body[offset..].to_string(), Some(value.trim().to_string()));
+    }
+    (body.to_string(), None)
+}
+
+/// Do two subjects say the same thing? Reply/forward prefixes and case are
+/// noise here: a reply's header is `Re: venue question` while the body echoes
+/// back the bare `venue question`, and both name one subject.
+fn subjects_agree(a: &str, b: &str) -> bool {
+    const PREFIXES: [&str; 3] = ["re:", "fwd:", "fw:"];
+    fn core(s: &str) -> String {
+        let mut s = s.trim();
+        loop {
+            let lower = s.to_ascii_lowercase();
+            match PREFIXES.iter().find(|p| lower.starts_with(**p)) {
+                Some(p) => s = s[p.len()..].trim_start(),
+                None => return lower,
+            }
+        }
+    }
+    core(a) == core(b)
+}
+
+/// #650 — reconcile a body that opens with its own `Subject:` header against
+/// the subject the Gmail write is actually going to send. Returns the body to
+/// send plus the dropped line's value, or the reason the write must not
+/// happen. Refusing here (rather than at the API) keeps #412 discipline: no
+/// draft exists yet, so there is no orphan to clean up.
+///
+/// Dropping the line is only safe when it repeats the outgoing subject. A
+/// DIFFERENT one is a subject the author meant to set, and no body can supply
+/// a header, so silently dropping it would send a message under a subject
+/// nobody asked for. Say so instead and let the caller put it where it
+/// belongs — which for a threaded write means starting a new thread, since
+/// [`ensure_subject_matches_thread`] (#651) holds a reply to its thread's subject.
+fn body_without_leaked_subject(
+    body: &str,
+    outgoing_subject: &str,
+) -> Result<(String, Option<String>), String> {
+    let (rest, Some(dropped)) = strip_leading_subject_line(body) else {
+        return Ok((body.to_string(), None));
+    };
+    if !subjects_agree(&dropped, outgoing_subject) {
+        return Err(format!(
+            "the body opens with \"Subject: {dropped}\" but the message goes out as \
+             \"{outgoing_subject}\" — a Subject line in the body is delivered as \
+             visible text, never as the header"
+        ));
+    }
+    if rest.trim().is_empty() {
+        return Err(
+            "the body is nothing but its own \"Subject:\" line — the subject is \
+             already on the message, the body needs the message text"
+                .into(),
+        );
+    }
+    Ok((rest, Some(dropped)))
+}
+
+/// CLI adapter for [`body_without_leaked_subject`]: a body-level `Subject:`
+/// naming something other than `--subject` is a usage error, and one that
+/// merely repeats `--subject` is dropped with a note.
+fn body_for_gmail_write(body: String, subject: &str) -> Result<String> {
+    match body_without_leaked_subject(&body, subject) {
+        Ok((clean, dropped)) => {
+            if let Some(dropped) = dropped {
+                eprintln!(
+                    "note: dropped leading \"Subject: {dropped}\" line from the body; \
+                     the subject header is --subject ({subject})"
+                );
+            }
+            Ok(clean)
+        }
+        Err(e) => anyhow::bail!("{e}; pass the intended subject as --subject"),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ComposePendingDisposition {
     Create,
@@ -4747,7 +4957,7 @@ async fn run_gmail_compose(
     let to = to.join(", ");
     let cc = normalize_recipients("--cc", &cc)?;
     let bcc = normalize_recipients("--bcc", &bcc)?;
-    let body_str = read_body(body, body_file)?;
+    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject)?;
     // Validate the --post flag pairing BEFORE any Gmail write, so a usage
     // error can't strand an orphan draft in the mailbox (#412).
     if post
@@ -5601,7 +5811,7 @@ async fn run_gmail_update_draft(
     let to = to.join(", ");
     let cc = normalize_recipients("--cc", &cc)?;
     let bcc = normalize_recipients("--bcc", &bcc)?;
-    let body_str = read_body(body, body_file)?;
+    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     // #500 — refuse while a send of exactly this draft is in flight: update
     // is create-replacement + DELETE-old, which would yank the draft out
@@ -5776,7 +5986,7 @@ async fn run_gmail_send_now(
     let to = to.join(", ");
     let cc = normalize_recipients("--cc", &cc)?;
     let bcc = normalize_recipients("--bcc", &bcc)?;
-    let body_str = read_body(body, body_file)?;
+    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
@@ -7312,6 +7522,39 @@ mod wiki_sync_validation_tests {
 /// `wiki sync` — reconcile the local knowledge base with its private
 /// GitHub mirror. Two-way: commit local page changes, pull owner edits
 /// (owner-wins), push. Reuses the ambient `gh` credential. See epic #474.
+/// `AUGMENTAGENT_MY_EMAIL` — a comma-separated list of the operator's own
+/// addresses (personal gmail, work domain, export account). Every one of them
+/// is "me" for meeting-roster self-exclusion (#922 follow-up).
+fn parse_my_emails(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(test)]
+mod my_email_parse_tests {
+    use super::parse_my_emails;
+
+    /// #922 follow-up — AUGMENTAGENT_MY_EMAIL is a comma-separated list of
+    /// the operator's own addresses. Whitespace and empty entries are noise,
+    /// not addresses.
+    #[test]
+    fn a_comma_separated_list_parses_to_clean_addresses() {
+        assert_eq!(
+            parse_my_emails(" a@example.com, B2@example.com ,,"),
+            vec!["a@example.com".to_string(), "B2@example.com".to_string()]
+        );
+        assert_eq!(
+            parse_my_emails("solo@example.com"),
+            vec!["solo@example.com".to_string()]
+        );
+        assert!(parse_my_emails("").is_empty());
+        assert!(parse_my_emails(" , ").is_empty());
+    }
+}
+
 /// The `emails` table as transcript dedup: `record` returns true for a first
 /// sighting (and remembers it), false for a re-push of the same meeting.
 struct TranscriptSeenLog(Arc<Store>);
@@ -7412,7 +7655,7 @@ async fn run_transcripts_sync(
         .wiki_dir
         .clone()
         .context("--wiki-dir is required for transcripts sync")?;
-    let my_email = std::env::var("AUGMENTAGENT_MY_EMAIL").unwrap_or_default();
+    let my_emails = parse_my_emails(&std::env::var("AUGMENTAGENT_MY_EMAIL").unwrap_or_default());
 
     if !no_pull && !dry_run {
         match augmentagent_channel_fotw::sync::sync(&repo) {
@@ -7461,7 +7704,7 @@ async fn run_transcripts_sync(
     let opts = ScanOpts {
         dir: &meetings_dir,
         require_disclosed,
-        my_email: &my_email,
+        my_emails: &my_emails,
     };
     let (report, emails) = scan(&opts, log.as_ref(), &resolve)?;
 
@@ -8047,9 +8290,10 @@ mod unescape_body_tests {
 #[cfg(test)]
 mod approval_body_tests {
     use super::{
-        compose_pending_disposition, revise_subject, revised_subject,
-        strip_approval_envelope_markers, thread_for_revised_subject, thread_subject_conflict,
-        ComposePendingDisposition, ThreadSubject,
+        body_without_leaked_subject, compose_pending_disposition, revise_subject, revised_subject,
+        strip_approval_envelope_markers, strip_leading_subject_line, subjects_agree,
+        thread_for_revised_subject, thread_subject_conflict, ComposePendingDisposition,
+        ThreadSubject,
     };
 
     #[test]
@@ -8100,6 +8344,107 @@ mod approval_body_tests {
             strip_approval_envelope_markers("Subject: not a marker\nHi"),
             "Subject: not a marker\nHi"
         );
+    }
+
+    #[test]
+    fn leading_subject_line_is_dropped() {
+        assert_eq!(
+            strip_leading_subject_line("Subject: Hosting a PTE event\n\nHey Casey,\n\nThanks."),
+            (
+                "Hey Casey,\n\nThanks.".to_string(),
+                Some("Hosting a PTE event".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn subject_match_is_case_and_whitespace_insensitive() {
+        assert_eq!(
+            strip_leading_subject_line("\n  SUBJECT:  venue question \nHi"),
+            ("Hi".to_string(), Some("venue question".to_string()))
+        );
+    }
+
+    #[test]
+    fn mid_body_subject_line_survives() {
+        let body = "Hi,\n\n> Subject: old thread\nbye";
+        assert_eq!(strip_leading_subject_line(body), (body.to_string(), None));
+    }
+
+    #[test]
+    fn remainder_is_preserved_verbatim_including_crlf() {
+        assert_eq!(
+            strip_leading_subject_line("Subject: x\r\n\r\nHi\r\nBye\r\n"),
+            ("Hi\r\nBye\r\n".to_string(), Some("x".to_string()))
+        );
+    }
+
+    #[test]
+    fn body_without_subject_is_untouched() {
+        let body = "Hey Casey,\n\nThanks.";
+        assert_eq!(strip_leading_subject_line(body), (body.to_string(), None));
+    }
+
+    /// #650 verbatim: the reply body the agent handed to `gmail compose`
+    /// opened with the subject it meant for the header, so the recipient saw
+    /// a literal "Subject:" line above the greeting.
+    #[test]
+    fn the_reported_subject_line_never_reaches_the_recipient() {
+        assert_eq!(
+            body_without_leaked_subject(
+                "Subject: Hosting a PTE event\n\nHey Casey,\n\nWe'd love to host it.",
+                "Re: Hosting a PTE event"
+            ),
+            Ok((
+                "Hey Casey,\n\nWe'd love to host it.".to_string(),
+                Some("Hosting a PTE event".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn a_body_subject_that_disagrees_with_the_header_is_refused() {
+        let err = body_without_leaked_subject(
+            "Subject: Hosting a PTE event\n\nHey Casey,",
+            "Re: Thursday's venue",
+        )
+        .unwrap_err();
+        assert!(err.contains("Hosting a PTE event"), "{err}");
+        assert!(err.contains("Thursday's venue"), "{err}");
+    }
+
+    #[test]
+    fn a_subject_only_body_is_refused_before_any_gmail_write() {
+        assert!(
+            body_without_leaked_subject("Subject: Hosting a PTE event\n", "Hosting a PTE event")
+                .is_err()
+        );
+    }
+
+    /// #650/#651 discipline (codex on #857): every Gmail write path checks
+    /// the body's own `Subject:` line and the thread's subject BEFORE it
+    /// uploads an attachment or creates a draft, so a refusal never strands
+    /// an orphan upload. Pinned structurally on the three CLI paths.
+    #[test]
+    fn refusals_run_before_any_attachment_upload_on_every_write_path() {
+        let src = include_str!("main.rs");
+        for f in ["async fn run_gmail_compose(", "async fn run_gmail_update_draft(", "async fn run_gmail_send_now("] {
+            let start = src.find(f).expect(f);
+            let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+            let body_gate = body.find("body_for_gmail_write(").expect("body subject gate");
+            let thread_gate = body.find("ensure_subject_matches_thread(").expect("thread subject gate (#651)");
+            let upload = body.find("upload_attach_if_given(").expect("attachment upload");
+            let draft = body.find("create_draft_with_attachment(").or_else(|| body.find("update_draft_with_attachment(")).expect("draft write");
+            assert!(body_gate < upload && thread_gate < upload, "{f}: a refusal must precede the upload");
+            assert!(upload < draft, "{f}: upload precedes the draft write");
+        }
+    }
+
+    #[test]
+    fn reply_and_forward_prefixes_do_not_make_two_subjects_disagree() {
+        assert!(subjects_agree("Hosting a PTE event", "RE: hosting a PTE event"));
+        assert!(subjects_agree("Fwd: Re: venue", "venue"));
+        assert!(!subjects_agree("venue", "venue tomorrow"));
     }
 
     #[test]
@@ -8429,6 +8774,117 @@ impl LoopPoster for DiscordLoopPoster {
                 .context("discord send_message (loop result)")?;
         }
         Ok(())
+    }
+}
+
+/// #428 — bridge implementing the discord crate's `JournalOps` trait:
+/// `!journal` text → paragraph HTML → KMS envelope encrypt → AppSync
+/// `createEntry` (shows up in the ShadowNote app), plus an immediate wiki
+/// ingest so wiki-ask sees the entry before the next poller pass. Every
+/// failure reply carries the entry text back so nothing is silently lost.
+struct CliJournalOps {
+    runtime: augmentagent_channel_journal::JournalRuntime,
+    reasoner: Arc<FallbackReasoner>,
+    wiki_root: Option<PathBuf>,
+    wiki_schema: Option<String>,
+}
+
+impl CliJournalOps {
+    async fn save_html(&self, title: Option<String>, html: &str) -> Result<String, String> {
+        use augmentagent_channel_core::decision::DecisionKind;
+        use augmentagent_channel_journal as journal;
+        use augmentagent_channel_journal::JournalApi as _;
+
+        let text_for_replies = journal::html_to_text(html);
+        let Some(kms_arn) = self.runtime.config.kms_key_arn.as_deref() else {
+            return Err(format!(
+                "SHADOWNOTE_KMS_KEY_ARN isn't set, so I can't encrypt — entry NOT saved. \
+                 Your text (safe to retry):\n{text_for_replies}"
+            ));
+        };
+        let content = journal::encrypt_entry_content(html, kms_arn, self.runtime.dek.as_ref())
+            .await
+            .map_err(|e| {
+                format!(
+                    "encrypt failed ({e}) — entry NOT saved. Your text (safe to retry):\n{text_for_replies}"
+                )
+            })?;
+        let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let entry = self
+            .runtime
+            .client
+            .create_entry(journal::NewEntry {
+                created_at,
+                content,
+                // Both title sources (composer model, `!journal done <title>`)
+                // converge here; neither may carry markup into the app.
+                title: title.as_deref().and_then(journal::compose::sanitize_title),
+                topic: Some("Journal".into()),
+            })
+            .await
+            .map_err(|e| {
+                format!(
+                    "ShadowNote save failed ({e}) — entry NOT saved. Your text (safe to retry):\n{text_for_replies}"
+                )
+            })?;
+        // Immediate wiki ingest — the syncEntries poller would pick it up
+        // within a cycle anyway; this just closes the gap to "ask about it
+        // right now".
+        if let (Some(root), Some(schema)) = (&self.wiki_root, &self.wiki_schema) {
+            augmentagent_channel_core::ingest::spawn_ingest(
+                Arc::clone(&self.reasoner),
+                root.clone(),
+                schema.clone(),
+                journal::channel::synthetic_journal_email(&entry, &text_for_replies),
+                DecisionKind::Capture,
+                Some("discord journaling session".to_string()),
+                None,
+                augmentagent_channel_core::ingest::IngestTrigger::Journal,
+            );
+        }
+        Ok(format!(
+            "📓 Saved to ShadowNote — “{}” ({})",
+            entry.title.as_deref().unwrap_or("Journal entry"),
+            entry.created_at
+        ))
+    }
+}
+
+#[async_trait]
+impl augmentagent_approval_discord::JournalOps for CliJournalOps {
+    async fn save_text(&self, title: Option<String>, text: &str) -> Result<String, String> {
+        let html = augmentagent_channel_journal::compose::text_to_paragraphs(text);
+        if html.is_empty() {
+            return Err("that message was empty after trimming — nothing saved".to_string());
+        }
+        self.save_html(title, &html).await
+    }
+
+    async fn compose_and_save(
+        &self,
+        history: &str,
+        title_override: Option<String>,
+    ) -> Result<String, String> {
+        use augmentagent_channel_journal::compose;
+
+        let raw = self
+            .reasoner
+            .call(&compose::compose_opts(), &compose::compose_user_message(history))
+            .await
+            .map_err(|e| {
+                format!(
+                    "compose failed ({e:#}) — nothing saved. You can save directly with \
+                     `!journal <text>`."
+                )
+            })?;
+        let (composed_title, html) = compose::parse_composed_entry(&raw);
+        if html.is_empty() {
+            return Err(
+                "the composer returned an empty entry — nothing saved. Try `!journal <text>`."
+                    .to_string(),
+            );
+        }
+        self.save_html(title_override.or(composed_title), &html).await
     }
 }
 
@@ -9895,6 +10351,25 @@ impl ReplyApprover {
             &action.email.subject,
             action.email.thread_id.as_deref(),
         );
+        // #650 — a leading `Subject:` line the split above did not claim (an
+        // empty one, or one the model echoed after the split point) must not
+        // ship as body text: drop it when it repeats the outgoing subject,
+        // fail the revise when it names a different one. The card stays
+        // pending and Revise can run again.
+        let redraft = match body_without_leaked_subject(&redraft, &subject) {
+            Ok((clean, dropped)) => {
+                if dropped.is_some() {
+                    tracing::warn!(action_id, "revise: dropped leading Subject: line from redraft");
+                }
+                clean
+            }
+            Err(message) => {
+                tracing::warn!(action_id, "revise: rejected redraft: {message}");
+                return ApprovalActionOutcome::Failed {
+                    message: format!("redraft carries its own subject line: {message}"),
+                };
+            }
+        };
         let to = envelope
             .as_ref()
             .and_then(|env| env.to.clone())
@@ -10407,6 +10882,32 @@ async fn build_broker(
     // Keep handles for the broker before `store` is moved into the approver:
     // the #37 Revise-triple capture.
     let store_for_broker = Arc::clone(&store);
+    // #428 — `!journal` write-back bridge. Present iff SHADOWNOTE_* config
+    // exists (keyring/env); without it the command replies with the
+    // not-configured notice and the daemon is otherwise unaffected.
+    let journal_ops: Option<Arc<dyn augmentagent_approval_discord::JournalOps>> =
+        match augmentagent_channel_journal::JournalRuntime::from_env().await {
+            Ok(Some(runtime)) => {
+                let wiki_schema = cli
+                    .wiki_dir
+                    .as_ref()
+                    .and_then(|_| std::fs::read_to_string("schema/wiki-skill.md").ok());
+                Some(Arc::new(CliJournalOps {
+                    runtime,
+                    reasoner: Arc::clone(&reasoner),
+                    wiki_root: cli.wiki_dir.clone(),
+                    wiki_schema,
+                }))
+            }
+            Ok(None) => {
+                info!("!journal write-back disabled: SHADOWNOTE_* config not present");
+                None
+            }
+            Err(e) => {
+                warn!("!journal write-back disabled: {e:#}");
+                None
+            }
+        };
     let approver = Arc::new(ReplyApprover {
         store,
         gmail,
@@ -10440,6 +10941,7 @@ async fn build_broker(
         store: Some(store_for_broker),
         loop_parser,
         wiki_root: cli.wiki_dir.clone(),
+        journal_ops,
     })
     .await
     .context("start discord broker")?;

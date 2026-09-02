@@ -29,6 +29,7 @@
 
 pub mod channel;
 pub mod client;
+pub mod compose;
 pub mod config;
 pub mod crypto;
 pub mod html;

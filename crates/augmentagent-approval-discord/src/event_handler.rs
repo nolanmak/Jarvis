@@ -18,6 +18,10 @@ use serenity::all::{
 };
 use tracing::{debug, info, warn};
 
+// #939 — shared PDF/DOCX → text pipeline (pdftotext, then Mistral OCR for
+// scanned PDFs). Lives in a leaf crate so this crate stays below channel-core.
+use augmentagent_docs::{extract_text, DocKind, OcrClient};
+
 use crate::broker::BrokerState;
 use crate::custom_id::{CustomId, Verb};
 use crate::layout::{
@@ -113,6 +117,59 @@ impl EventHandler for Handler {
                     warn!("failed to post rejection footer: {e}");
                 }
             }
+            return;
+        }
+
+        // `!journal` — ShadowNote journaling write-back (#428).
+        // Handled inline, never routed to wiki-ask. The slow
+        // path (compose LLM call + KMS + AppSync) runs off the event loop.
+        if let Some(cmd) = crate::journal_cmd::parse_journal_command(&user_text) {
+            use crate::journal_cmd::{JournalCmd, JOURNAL_NOT_CONFIGURED, JOURNAL_USAGE};
+            let ops = self.state.journal_ops.clone();
+            let ctx_for_history = ctx.clone();
+            let http = ctx.http.clone();
+            let channel_id = msg.channel_id;
+            let msg_id = msg.id;
+            let bot_user_id = self.state.bot_user_id.get().copied();
+            let allowed_user_id = self.state.allowed_user_id;
+            tokio::spawn(async move {
+                let reply = match (ops, cmd) {
+                    (_, JournalCmd::Usage) => JOURNAL_USAGE.to_string(),
+                    (None, _) => JOURNAL_NOT_CONFIGURED.to_string(),
+                    (Some(ops), JournalCmd::Text(text)) => ops
+                        .save_text(None, &text)
+                        .await
+                        .unwrap_or_else(|user_facing_err| user_facing_err),
+                    (Some(ops), JournalCmd::Done { title }) => {
+                        let history = fetch_conversation_context(
+                            &ctx_for_history,
+                            channel_id,
+                            msg_id,
+                            bot_user_id,
+                            allowed_user_id,
+                        )
+                        .await;
+                        if history.trim().is_empty() {
+                            "I couldn't read any recent conversation to compose from — \
+                             write the entry directly with `!journal <text>`."
+                                .to_string()
+                        } else {
+                            ops.compose_and_save(&history, title)
+                                .await
+                                .unwrap_or_else(|user_facing_err| user_facing_err)
+                        }
+                    }
+                };
+                send_chunks_reply_chain(
+                    &http,
+                    channel_id,
+                    msg_id,
+                    chunk_for_discord(&reply),
+                    Vec::new(),
+                    "journal command reply",
+                )
+                .await;
+            });
             return;
         }
 
@@ -1359,63 +1416,13 @@ const TEXT_EXT_ALLOWLIST: &[&str] = &[
 /// These are formats that commonly contain credentials.
 const TEXT_EXT_DENYLIST: &[&str] = &["env", "pem", "key", "p12", "pfx"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DocKind {
-    Pdf,
-    Docx,
-    Doc,
-}
-
 /// Identify the doc kind from an attachment's content_type and/or filename
-/// extension. Returns `None` for everything else — non-docs flow through the
-/// regular text-file / image / rejected branches.
+/// extension. Delegates to the shared pipeline crate (#939) so Discord drops,
+/// `gmail get-attachment`, and `doc extract` agree on what counts as a doc.
+/// Returns `None` for everything else — non-docs flow through the regular
+/// text-file / image / rejected branches.
 fn doc_kind_for(att: &Attachment) -> Option<DocKind> {
-    let ext = std::path::Path::new(&att.filename)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_lowercase());
-    let ct = att.content_type.as_deref();
-    match (ct, ext.as_deref()) {
-        (Some("application/pdf"), _) | (_, Some("pdf")) => Some(DocKind::Pdf),
-        (
-            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-            _,
-        )
-        | (_, Some("docx")) => Some(DocKind::Docx),
-        (Some("application/msword"), _) | (_, Some("doc")) => Some(DocKind::Doc),
-        _ => None,
-    }
-}
-
-/// Pure helper that picks the converter binary + args for a doc kind.
-/// Extracted so the dispatch is unit-testable without the binaries installed.
-fn doc_command_for(kind: DocKind, in_path: &std::path::Path) -> (&'static str, Vec<String>) {
-    let in_arg = in_path.to_string_lossy().into_owned();
-    match kind {
-        // `-` writes to stdout; `-layout` preserves columns/whitespace better
-        // for log-like dumps.
-        DocKind::Pdf => ("pdftotext", vec!["-layout".into(), in_arg, "-".into()]),
-        // pandoc handles both .docx and legacy .doc.
-        DocKind::Docx | DocKind::Doc => ("pandoc", vec!["--to=plain".into(), in_arg]),
-    }
-}
-
-/// Shell out to the appropriate converter and return the extracted text.
-/// Errors include: binary missing, non-zero exit, invalid UTF-8 in stdout.
-async fn convert_doc_to_text(kind: DocKind, in_path: &std::path::Path) -> anyhow::Result<String> {
-    let (program, args) = doc_command_for(kind, in_path);
-    let output = tokio::process::Command::new(program)
-        .args(&args)
-        .output()
-        .await?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "{program} exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    augmentagent_docs::doc_kind_for(&att.filename, att.content_type.as_deref())
 }
 
 /// Mirror of the image filter for text files. Accepts attachments whose
@@ -1681,6 +1688,12 @@ struct DownloadedTextFile {
     path: PathBuf,
     truncated: bool,
     original_size: u32,
+    /// #939 — what the OCR stage did for a converted doc (recovered text /
+    /// unavailable because MISTRAL_API_KEY is unset / failed). Surfaced in
+    /// the prompt so the reasoner never mistakes a scanned PDF's empty
+    /// extraction for an empty document. `None` for plain text files and
+    /// docs whose text layer was fine.
+    note: Option<String>,
 }
 
 /// Pure slicing helper for the truncation logic. Extracted so the cap behavior
@@ -1719,6 +1732,7 @@ async fn download_text_files(
                             path,
                             truncated,
                             original_size: att.size,
+                            note: None,
                         }),
                         Err(e) => warn!("write text tempfile {} failed: {e}", path.display()),
                     }
@@ -1731,9 +1745,14 @@ async fn download_text_files(
     out
 }
 
-/// Download PDF / DOCX / DOC attachments, shell out to the appropriate
-/// converter (pdftotext / pandoc), truncate the extracted text to
+/// Download PDF / DOCX / DOC attachments, run the shared two-stage pipeline
+/// (pdftotext / pandoc, then Mistral OCR when a PDF has no text layer and
+/// `MISTRAL_API_KEY` is configured — #939), truncate the extracted text to
 /// `MAX_TEXT_BYTES`, and write the result to `/tmp/aa-doc-<msg_id>-<idx>.txt`.
+///
+/// A scanned PDF with no OCR key still lands (empty) — with a `note` telling
+/// the reasoner why, per the owner rule that a missing key degrades to a
+/// clear signal rather than a silent blank.
 ///
 /// Returns `DownloadedTextFile`s so the converted output flows through the
 /// same prompt-builder annotation as a regular text attachment. The original
@@ -1747,6 +1766,12 @@ async fn extract_doc_attachments(
     msg_id: u64,
 ) -> Vec<DownloadedTextFile> {
     let mut out = Vec::with_capacity(attachments.len());
+    // One key lookup per message, not per attachment. `None` ⇒ OCR skipped.
+    let ocr = if attachments.iter().any(|a| doc_kind_for(a).is_some()) {
+        OcrClient::from_env()
+    } else {
+        None
+    };
     for (idx, att) in attachments.iter().enumerate() {
         let Some(kind) = doc_kind_for(att) else {
             continue;
@@ -1777,8 +1802,13 @@ async fn extract_doc_attachments(
         };
 
         if download_ok {
-            match convert_doc_to_text(kind, &in_path).await {
-                Ok(text) => {
+            match extract_text(kind, &in_path, ocr.as_ref()).await {
+                Ok(extracted) => {
+                    let text = extracted.text;
+                    let note = extracted.ocr.note();
+                    if let Some(n) = &note {
+                        info!(file = %att.filename, "{n}");
+                    }
                     let (to_write, truncated) = truncate_text_bytes(text.as_bytes());
                     let extracted_len = text.len().min(u32::MAX as usize) as u32;
                     match tokio::fs::write(&out_path, to_write).await {
@@ -1786,6 +1816,7 @@ async fn extract_doc_attachments(
                             path: out_path,
                             truncated,
                             original_size: extracted_len,
+                            note,
                         }),
                         Err(e) => {
                             warn!("write doc text tempfile {} failed: {e}", out_path.display())
@@ -1852,6 +1883,11 @@ fn build_prompt(
                     format_size(MAX_TEXT_BYTES),
                     format_size(f.original_size),
                 ));
+            }
+            // #939 — OCR outcome for converted docs (recovered / unavailable /
+            // failed). Nothing is appended when the text layer was fine.
+            if let Some(note) = &f.note {
+                s.push_str(&format!("  ({note})"));
             }
             s.push('\n');
         }
@@ -2137,6 +2173,7 @@ fn hard_split(s: &str, max: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use augmentagent_docs::doc_command_for;
 
     // ---- #303: fail-closed owner-allowlist check ----
 
@@ -2533,6 +2570,7 @@ mod tests {
             path: PathBuf::from(path),
             truncated: false,
             original_size: 1,
+            note: None,
         }
     }
 
@@ -2561,6 +2599,46 @@ mod tests {
         assert!(prompt.contains("/tmp/aa-txt-1-0.md"));
     }
 
+    // ---- #939: OCR outcome flows into the prompt as an honest annotation ----
+
+    #[test]
+    fn build_prompt_annotates_ocr_notes() {
+        let txts = vec![
+            DownloadedTextFile {
+                path: PathBuf::from("/tmp/aa-doc-9-0.txt"),
+                truncated: false,
+                original_size: 0,
+                note: augmentagent_docs::OcrOutcome::Unavailable.note(),
+            },
+            DownloadedTextFile {
+                path: PathBuf::from("/tmp/aa-doc-9-1.txt"),
+                truncated: false,
+                original_size: 4200,
+                note: augmentagent_docs::OcrOutcome::Applied { pages: 3 }.note(),
+            },
+            fresh_txt("/tmp/aa-doc-9-2.txt"),
+        ];
+        let prompt = build_prompt("review the report", &[], &txts);
+        let line = |needle: &str| {
+            prompt
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("no line for {needle}"))
+                .to_string()
+        };
+        // Owner rule: no key ⇒ a CLEAR signal naming the env var, never a
+        // silent blank the agent would mistake for an empty document.
+        let unavailable = line("aa-doc-9-0.txt");
+        assert!(unavailable.contains("OCR unavailable"), "{unavailable}");
+        assert!(unavailable.contains("MISTRAL_API_KEY"), "{unavailable}");
+        let applied = line("aa-doc-9-1.txt");
+        assert!(applied.contains("OCR"), "{applied}");
+        assert!(applied.contains("3 pages"), "{applied}");
+        // A digital PDF (text layer fine) gets no OCR chatter.
+        let plain = line("aa-doc-9-2.txt");
+        assert!(!plain.contains("OCR"), "{plain}");
+    }
+
     #[test]
     fn build_prompt_annotates_truncated_files() {
         let txts = vec![
@@ -2568,6 +2646,7 @@ mod tests {
                 path: PathBuf::from("/tmp/aa-txt-3-0.log"),
                 truncated: true,
                 original_size: 4 * 1_048_576 + 700_000, // ~4.7 MB
+                note: None,
             },
             fresh_txt("/tmp/aa-txt-3-1.md"),
         ];
