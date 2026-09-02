@@ -182,10 +182,10 @@ augmentagent gmail accounts --json true
 
 ### Read an email attachment (#937, #939)
 
-`gmail search` prints `attachments: <name> (<mime>)` on each message that has any. To read one, download it by name:
+`gmail search` prints `attachments: <name> (<mime>)` on each message that has any. To read one, download it by name — pass the `<name>` part verbatim (including any odd spacing before the extension); the ` (<mime>)` suffix is tolerated but not needed:
 
 ```
-augmentagent gmail get-attachment --account <email> --message-id <messageId> --name "<filename exactly as printed>"
+augmentagent gmail get-attachment --account <email> --message-id <messageId> --name "<name as printed, without the (mime) suffix>"
 ```
 
 That saves the file to `/tmp/aa-doc-<id>-<n>.<ext>` and, for PDF / DOCX / DOC, extracts the text to the sibling `.txt` — then **Read the `.txt`** (your Read carve-out admits both paths). The command prints:

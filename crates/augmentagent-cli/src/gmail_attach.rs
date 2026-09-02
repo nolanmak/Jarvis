@@ -72,6 +72,37 @@ pub fn list_json_rows(metas: &[AttachmentMeta]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Write `bytes` at `path` without ever following a symlink planted there
+/// (CWE-59 — the `/tmp/aa-doc-*` path is predictable). `create_new` opens
+/// with O_EXCL, which refuses to follow links; when something already sits at
+/// the path (a previous download, or a planted link) it is unlinked AS A PATH
+/// ENTRY — `remove_file` on a symlink removes the link, never its target — and
+/// the exclusive create is retried once. A link re-planted in between makes
+/// the retry fail loudly rather than write through it.
+async fn write_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut removed_once = false;
+    loop {
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .await
+        {
+            Ok(mut f) => {
+                f.write_all(bytes).await?;
+                f.flush().await?;
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && !removed_once => {
+                tokio::fs::remove_file(path).await?;
+                removed_once = true;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn composio_client(store: &Arc<Store>) -> Result<ComposioClient> {
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     Ok(ComposioClient::new(api_key).with_rate_limit_store(Arc::clone(store)))
@@ -171,7 +202,7 @@ pub async fn run_gmail_get_attachment(
     .to_string();
 
     let path = out.unwrap_or_else(|| tmp_doc_path(&message_id, idx, &filename));
-    tokio::fs::write(&path, &bytes)
+    write_no_follow(&path, &bytes)
         .await
         .with_context(|| format!("write {}", path.display()))?;
 
@@ -185,7 +216,7 @@ pub async fn run_gmail_get_attachment(
             match extract_text(kind, &path, ocr.as_ref()).await {
                 Ok(ex) => {
                     let txt = crate::doc_cmd::default_out_path(&path);
-                    tokio::fs::write(&txt, ex.text.as_bytes())
+                    write_no_follow(&txt, ex.text.as_bytes())
                         .await
                         .with_context(|| format!("write {}", txt.display()))?;
                     extracted = Some((txt, ex.text.chars().count(), ex.ocr));
@@ -279,6 +310,42 @@ mod tests {
         assert!(tmp_doc_path("ff", 0, "x.")
             .to_string_lossy()
             .ends_with("-0.bin"));
+    }
+
+    // CodeRabbit on #946 (CWE-59): the /tmp/aa-doc-* path is predictable, so
+    // a plain `fs::write` would follow a symlink planted there. The helper
+    // must overwrite a regular file, refuse to follow a symlink (replacing
+    // the link itself, never touching its target), and never leave the
+    // download at a path it didn't create.
+    #[tokio::test]
+    async fn write_no_follow_overwrites_regular_files_but_never_follows_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("aa-doc-1-0.pdf");
+
+        // Fresh path → created.
+        write_no_follow(&target, b"one").await.unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"one");
+        // Existing regular file → overwritten (repeat downloads are normal).
+        write_no_follow(&target, b"two").await.unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"two");
+
+        // Symlink planted at the path → the victim must stay untouched.
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"precious").unwrap();
+        std::fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(&victim, &target).unwrap();
+        write_no_follow(&target, b"payload").await.unwrap();
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"precious",
+            "symlink was followed"
+        );
+        let meta = std::fs::symlink_metadata(&target).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "path must now be a regular file, not a link"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload");
     }
 
     #[test]

@@ -374,7 +374,15 @@ impl ComposioClient {
     /// GET a presigned URL (no Composio auth header — the signature IS the
     /// auth). Returns the bytes and the `Content-Type` the store reported.
     pub async fn download_url(&self, url: &str) -> Result<(Vec<u8>, Option<String>), GmailError> {
-        let resp = self.http.get(url).send().await?;
+        // `reqwest::Client::new()` has no default timeout; a stalled peer
+        // would otherwise hang `bytes()` forever. Per-request timeout covers
+        // the body read too (CodeRabbit on #946).
+        let resp = self
+            .http
+            .get(url)
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -1151,6 +1159,11 @@ mod tests {
         // snake_case alias + missing mime degrade gracefully.
         assert_eq!(metas[1].attachment_id.as_deref(), Some("second"));
         assert_eq!(metas[1].label(), "notes.docx");
+        // mime_type snake_case alias (CodeRabbit on #946).
+        let v = serde_json::json!({"data": {"attachmentList": [
+            {"attachmentId": "x", "filename": "a.pdf", "mime_type": "application/pdf"}
+        ]}});
+        assert_eq!(super::attachments_from_fetch(&v)[0].mime_type.as_deref(), Some("application/pdf"));
     }
 
     #[test]
@@ -1196,6 +1209,18 @@ mod tests {
         assert!(err.to_string().contains("PCT REPORTS .pdf"), "{err}");
         let err = super::pick_attachment(&metas, None, Some("missing.pdf")).unwrap_err();
         assert!(err.to_string().contains("invoice.pdf"), "{err}");
+        // CodeRabbit on #946: `gmail search` prints `name (mime)`; an agent
+        // that pastes that whole string must still land on the file.
+        let (idx, _) = super::pick_attachment(&metas, None, Some("PCT REPORTS .pdf (application/pdf)")).unwrap();
+        assert_eq!(idx, 0);
+        // …but a literal filename that happens to end in a parenthetical wins
+        // over the stripped form.
+        let paren = super::attachments_from_fetch(&serde_json::json!({"data": {"attachmentList": [
+            {"attachmentId": "P1", "filename": "plan (final).pdf"},
+            {"attachmentId": "P2", "filename": "plan"}
+        ]}}));
+        let (idx, _) = super::pick_attachment(&paren, None, Some("plan (final).pdf")).unwrap();
+        assert_eq!(idx, 0);
         // Neither selector → error.
         assert!(super::pick_attachment(&metas, None, None).is_err());
         // Empty list → error.
@@ -2230,7 +2255,7 @@ struct FetchMessage {
 pub struct AttachmentMeta {
     #[serde(default)]
     pub filename: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "mime_type")]
     pub mime_type: Option<String>,
     #[serde(default, alias = "attachment_id", alias = "id")]
     pub attachment_id: Option<String>,
@@ -2330,28 +2355,46 @@ pub fn pick_attachment<'a>(
             )));
     }
     if let Some(name) = name.map(str::trim).filter(|s| !s.is_empty()) {
-        let wanted = name.to_lowercase();
-        let hits: Vec<(usize, &AttachmentMeta)> = metas
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| {
-                m.filename
-                    .as_deref()
-                    .map(|f| f.trim().to_lowercase() == wanted)
-                    .unwrap_or(false)
-            })
-            .collect();
-        return match hits.len() {
-            1 => Ok(hits[0]),
-            0 => Err(GmailError::Invalid(format!(
-                "no attachment named {name:?}; available: {}",
-                listing()
-            ))),
-            n => Err(GmailError::Invalid(format!(
-                "attachment name {name:?} is ambiguous ({n} matches); pass --attachment-id instead: {}",
-                listing()
-            ))),
-        };
+        // `gmail search` prints `name (mime)`; an agent that pastes the whole
+        // string must still land on the file, so after the verbatim name we
+        // also try it with a trailing ` (…)` stripped. Verbatim wins, so a
+        // filename that genuinely ends in a parenthetical is still reachable.
+        let verbatim = name.to_lowercase();
+        let mut candidates = vec![verbatim.clone()];
+        if verbatim.ends_with(')') {
+            if let Some(i) = verbatim.rfind(" (") {
+                let stripped = verbatim[..i].trim().to_string();
+                if !stripped.is_empty() {
+                    candidates.push(stripped);
+                }
+            }
+        }
+        for wanted in &candidates {
+            let hits: Vec<(usize, &AttachmentMeta)> = metas
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| {
+                    m.filename
+                        .as_deref()
+                        .map(|f| f.trim().to_lowercase() == *wanted)
+                        .unwrap_or(false)
+                })
+                .collect();
+            match hits.len() {
+                0 => continue,
+                1 => return Ok(hits[0]),
+                n => {
+                    return Err(GmailError::Invalid(format!(
+                        "attachment name {name:?} is ambiguous ({n} matches); pass --attachment-id instead: {}",
+                        listing()
+                    )))
+                }
+            }
+        }
+        return Err(GmailError::Invalid(format!(
+            "no attachment named {name:?}; available: {}",
+            listing()
+        )));
     }
     Err(GmailError::Invalid(format!(
         "pass --attachment-id or --name; available: {}",
