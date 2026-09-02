@@ -4659,6 +4659,27 @@ async fn ensure_subject_matches_thread(
     Ok(())
 }
 
+/// #652 × #651 — which thread the recreated draft joins. Gmail sends a
+/// threaded message under the THREAD's subject and drops any other, so a
+/// subject the user asked for during Revise can only take effect on a new
+/// thread. Keep the thread while the outgoing subject still names the
+/// inbound one (a `Re:`/`Fwd:` prefix is fine — that is every ordinary
+/// reply); start a new thread the moment it says something else. Never
+/// accept a subject change and then let Gmail discard it.
+fn thread_for_revised_subject<'a>(
+    outgoing_subject: &str,
+    inbound_subject: &str,
+    thread_id: Option<&'a str>,
+) -> Option<&'a str> {
+    let thread_id = thread_id?;
+    let inbound = normalize_subject(inbound_subject);
+    if inbound.is_empty() || normalize_subject(outgoing_subject) == inbound {
+        Some(thread_id)
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_gmail_compose(
     store: Arc<Store>,
@@ -8016,8 +8037,8 @@ mod unescape_body_tests {
 mod approval_body_tests {
     use super::{
         compose_pending_disposition, revise_subject, revised_subject,
-        strip_approval_envelope_markers, thread_subject_conflict, ComposePendingDisposition,
-        ThreadSubject,
+        strip_approval_envelope_markers, thread_for_revised_subject, thread_subject_conflict,
+        ComposePendingDisposition, ThreadSubject,
     };
 
     #[test]
@@ -8206,6 +8227,36 @@ mod approval_body_tests {
             revised_subject(None, Some("Invoice for July"), "Ship Systems x EFS", Some("t1")),
             "Invoice for July"
         );
+    }
+
+    // #652 × #651 (codex on #855): Gmail sends a threaded reply under the
+    // thread's subject, so a revised subject only takes effect off-thread.
+    #[test]
+    fn a_new_subject_leaves_the_thread_but_a_reply_subject_keeps_it() {
+        // The reported case: "Invoice for July" asked for on a reply in the
+        // "Ship Systems x EFS" thread ⇒ new thread, never a silently-dropped header.
+        assert_eq!(
+            thread_for_revised_subject("Invoice for July", "Ship Systems x EFS", Some("t1")),
+            None
+        );
+        // Ordinary replies (derived or user-written `Re:`) stay threaded.
+        assert_eq!(
+            thread_for_revised_subject("Re: Ship Systems x EFS", "Ship Systems x EFS", Some("t1")),
+            Some("t1")
+        );
+        assert_eq!(
+            thread_for_revised_subject("re: RE: ship systems x efs", "Re: Ship Systems x EFS", Some("t1")),
+            Some("t1")
+        );
+        // A forward is a different message to recipients (#651's rule), so it
+        // leaves the thread too.
+        assert_eq!(
+            thread_for_revised_subject("Fwd: Ship Systems x EFS", "Ship Systems x EFS", Some("t1")),
+            None
+        );
+        // No thread to begin with, or an untitled inbound: nothing to leave.
+        assert_eq!(thread_for_revised_subject("Invoice for July", "Ship Systems x EFS", None), None);
+        assert_eq!(thread_for_revised_subject("Invoice for July", "", Some("t1")), Some("t1"));
     }
 
     #[test]
@@ -9836,6 +9887,21 @@ impl ReplyApprover {
         // the persisted one keeps the fence so the reposted card can render
         // the warning against the NEW draft's assumptions.
         let gmail_redraft = augmentagent_approval_discord::strip_assumes_for_send(&redraft);
+        // A subject that no longer names the inbound one cannot ride the
+        // thread (Gmail would send under the thread's subject, #651): it
+        // starts a new thread instead, which is what the user asked for.
+        let draft_thread_id = thread_for_revised_subject(
+            &subject,
+            &action.email.subject,
+            action.email.thread_id.as_deref(),
+        );
+        if action.email.thread_id.is_some() && draft_thread_id.is_none() {
+            tracing::info!(
+                action_id,
+                subject = %subject,
+                "revise: new subject starts a new thread (Gmail keeps a thread's subject)"
+            );
+        }
         let new_draft_id = match self
             .gmail
             .create_draft_with_attachment(
@@ -9843,7 +9909,7 @@ impl ReplyApprover {
                 &to,
                 &subject,
                 &gmail_redraft,
-                action.email.thread_id.as_deref(),
+                draft_thread_id,
                 None,
                 &cc,
                 &bcc,
