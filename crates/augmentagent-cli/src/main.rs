@@ -8345,7 +8345,9 @@ impl CliJournalOps {
             .create_entry(journal::NewEntry {
                 created_at,
                 content,
-                title: title.clone(),
+                // Both title sources (composer model, `!journal done <title>`)
+                // converge here; neither may carry markup into the app.
+                title: title.as_deref().and_then(journal::compose::sanitize_title),
                 topic: Some("Journal".into()),
             })
             .await

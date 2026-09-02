@@ -126,6 +126,27 @@ pub fn sanitize_paragraph_html(body: &str) -> String {
     out
 }
 
+/// Entry titles come from two untrusted sources — the composer model and the
+/// user's own `!journal done <title>` — and ShadowNote's title rendering
+/// contract is not ours to rely on. Make markup impossible rather than
+/// escaping it: drop `<`/`>` and control characters, collapse whitespace, cap
+/// the length (char-boundary safe). `None` when nothing is left.
+pub const MAX_TITLE_CHARS: usize = 120;
+
+pub fn sanitize_title(title: &str) -> Option<String> {
+    let cleaned: String = title
+        .chars()
+        .filter(|c| !matches!(c, '<' | '>'))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let capped: String = cleaned.chars().take(MAX_TITLE_CHARS).collect();
+    let capped = capped.trim().to_string();
+    (!capped.is_empty()).then_some(capped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +201,25 @@ mod tests {
         assert_eq!(
             sanitize_paragraph_html("<script>alert(1)</script>"),
             "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>"
+        );
+    }
+
+    #[test]
+    fn titles_cannot_carry_markup_and_are_capped() {
+        assert_eq!(
+            sanitize_title("Friday <img src=x onerror=alert(1)> review").as_deref(),
+            Some("Friday img src=x onerror=alert(1) review")
+        );
+        assert_eq!(sanitize_title("  <script>  ").as_deref(), Some("script"));
+        assert_eq!(sanitize_title("<>"), None);
+        assert_eq!(
+            sanitize_title("tabs\tand\nnewlines").as_deref(),
+            Some("tabs and newlines")
+        );
+        let long = "é".repeat(500);
+        assert_eq!(
+            sanitize_title(&long).unwrap().chars().count(),
+            MAX_TITLE_CHARS
         );
     }
 
