@@ -4979,6 +4979,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // Intermediate rounds ran the targeted gate (#870); everything that
         // ships — or even lands as a PR claiming workspace-pass — gets the
         // FULL suite exactly once here.
+        // Revisions changed the worktree: refresh what the publish records
+        // below describe.
+        let (_ok, diff, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
+        let (_ok, full_after, _) = run("git", &["diff", "--cached"], &worktree).await?;
+        let lines = diff_line_count(&full_after);
         if let Err(gate_err) = verification_gate(&worktree).await {
             warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
             // The record must describe the diff that failed — the revised
@@ -6364,19 +6369,45 @@ fn infra_failure_reason(text: &str) -> Option<&'static str> {
         .map(|(_, why)| *why)
 }
 
+/// The LAST `max` bytes of `s` (char-boundary safe), with a leading ellipsis
+/// when something was dropped. Gate and publish output put the actionable
+/// line — the failing test, the compiler error, the rejected push — at the
+/// end, so a head-truncated record would carry the setup noise and lose
+/// the reason the attempt failed.
+fn truncate_tail(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut start = s.len() - max;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &s[start..])
+}
+
+/// Room left for the diagnostic tail after the `infra (…): ` prefix.
+const TAIL_BUDGET: usize = MAX_DETAIL_BYTES - 64;
+
 /// A red gate, attributed: `Infra` with the reason up front, else `GateRed`.
+/// Either way the text kept is the tail, where cargo puts the failure.
 fn gate_outcome(gate_text: &str) -> (FailureKind, String) {
     match infra_failure_reason(gate_text) {
-        Some(why) => (FailureKind::Infra, format!("infra ({why}): {gate_text}")),
-        None => (FailureKind::GateRed, gate_text.to_string()),
+        Some(why) => (
+            FailureKind::Infra,
+            format!("infra ({why}): {}", truncate_tail(gate_text, TAIL_BUDGET)),
+        ),
+        None => (FailureKind::GateRed, truncate_tail(gate_text, TAIL_BUDGET)),
     }
 }
 
 /// A failed commit/push/PR creation, attributed the same way.
 fn publish_outcome(err: &str) -> (FailureKind, String) {
     match infra_failure_reason(err) {
-        Some(why) => (FailureKind::Infra, format!("infra ({why}): {err}")),
-        None => (FailureKind::PublishFailed, err.to_string()),
+        Some(why) => (
+            FailureKind::Infra,
+            format!("infra ({why}): {}", truncate_tail(err, TAIL_BUDGET)),
+        ),
+        None => (FailureKind::PublishFailed, truncate_tail(err, TAIL_BUDGET)),
     }
 }
 
@@ -9785,8 +9816,12 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let end = start + src[start..].find("\n}\n").expect("end");
         let body = &src[start..end];
         let revise = body.find("revision hit the blast-radius guard").expect("revision loop");
+        let loop_end = revise + body[revise..].find("final full gate failed after revisions").expect("final gate");
+        assert!(!body[revise..loop_end].contains("&diff, lines"), "a revision-round record still uses the original diff");
+        // After the loop the publish records describe the refreshed diff.
+        let refreshed = body[revise..].find("let (_ok, diff, _) = run(\"git\", &[\"diff\", \"--cached\", \"--stat\"], &worktree).await?;").expect("refreshed stat");
+        assert!(revise + refreshed < body.len());
         let tail = &body[revise..];
-        assert!(!tail.contains("&diff, lines"), "a revision-round record still uses the original diff");
         for stage in ["revise:blast-radius", "revise:size", "revise:gate", "revise:final-gate"] {
             let at = tail.find(stage).expect(stage);
             let call = &tail[at..at + 200];
@@ -9795,5 +9830,32 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
                 "{stage} must record the revised diff: {call}"
             );
         }
+    }
+
+    // Codex on #859: cargo puts the failing test / compiler error at the END
+    // of its output; the record keeps that tail, not the setup noise.
+    #[test]
+    fn gate_and_publish_records_keep_the_diagnostic_tail() {
+        let filler = "   Compiling something v0.1.0 (/x)\n".repeat(120); // ~4 kB
+        let text = format!("{filler}failures:\n    store::tests::round_trip\n\ntest result: FAILED. 1 failed");
+        let (kind, detail) = gate_outcome(&text);
+        assert_eq!(kind, FailureKind::GateRed);
+        assert!(detail.len() <= MAX_DETAIL_BYTES, "{}", detail.len());
+        assert!(detail.starts_with('…'), "a cut tail is marked");
+        assert!(detail.contains("store::tests::round_trip") && detail.ends_with("1 failed"), "{detail}");
+        assert!(!detail.contains(&"   Compiling something v0.1.0 (/x)\n".repeat(60)), "leading filler dropped");
+        // The infra prefix survives a long body too.
+        let infra = format!("{filler}error: No space left on device");
+        let (kind, detail) = gate_outcome(&infra);
+        assert_eq!(kind, FailureKind::Infra);
+        assert!(detail.starts_with("infra (disk full): …"), "{}", &detail[..40]);
+        assert!(detail.ends_with("No space left on device"));
+        // Publish errors likewise; short ones are untouched.
+        assert_eq!(publish_outcome("rejected: hook").1, "rejected: hook");
+        let (_, d) = publish_outcome(&format!("{filler}! [remote rejected] main -> main (protected)"));
+        assert!(d.ends_with("(protected)") && d.len() <= MAX_DETAIL_BYTES);
+        // Multibyte input never panics at the cut.
+        let wide = "—".repeat(3_000);
+        assert!(truncate_tail(&wide, 100).len() <= 100 + '…'.len_utf8() + 3);
     }
 }
