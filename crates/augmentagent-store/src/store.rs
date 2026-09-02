@@ -1778,6 +1778,29 @@ impl Store {
     /// dry-run reply, successful send, or an explicit rejection/timeout from
     /// the approver. Transient errors leave `agentProcessedAt = NULL`, which
     /// makes them retryable.
+    /// Every per-attendee row the calendar channel wrote, as
+    /// `(messageId, fromEmail, receivedAt)`.
+    ///
+    /// Those rows are keyed `gcal:{event_id}:{attendee_email}` and carry the
+    /// event start in `receivedAt`, which makes them a complete record of who
+    /// was invited to what — recoverable with no Google API call. #915's
+    /// transcript bridge reads this to attach a roster to a recorded meeting.
+    ///
+    /// # Errors
+    ///
+    /// Whatever sqlite failed with.
+    pub fn gcal_attendee_rows(&self) -> StoreResult<Vec<(String, String, String)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT messageId, fromEmail, COALESCE(receivedAt, '') FROM emails \
+             WHERE platform = 'gcal' AND messageId LIKE 'gcal:%'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn is_email_complete(&self, message_id: &str) -> StoreResult<bool> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let row: Option<Option<i64>> = guard

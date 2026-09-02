@@ -1,0 +1,25 @@
+[Unit]
+Description=AugmentAgent — pull the FlyOnTheWall transcript repo and ingest new meetings
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/AugmentAgent
+EnvironmentFile=-%h/AugmentAgent/.env
+# Read-only against the transcript repo; dedup is the emails table, so a
+# re-run is free and a missed run costs nothing but latency. `--dry-run
+# false` is the explicit live-run opt-in (PR #922: the bare command is a
+# dry run, like every other channel).
+ExecStart=%h/AugmentAgent/target/release/augmentagent --wiki-dir ./wiki transcripts sync --dry-run false
+# Ingestion shells out to the `claude` CLI (~/.local/bin) — same PATH note
+# as augmentagent-wiki-sync.service.
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=RUST_LOG=info
+# systemd opens the append: targets below BEFORE ExecStart and does not
+# create parent directories; on a fresh host the unit would fail before
+# the binary ever ran. StateDirectory has the user manager create
+# %h/.local/state/augmentagent first (PR #922 review).
+StateDirectory=augmentagent
+StandardOutput=append:%h/.local/state/augmentagent/transcripts-sync.log
+StandardError=append:%h/.local/state/augmentagent/transcripts-sync.log

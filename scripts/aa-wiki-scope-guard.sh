@@ -12,6 +12,9 @@
 #   2 — hook itself failed (treated as block by Claude Code)
 #
 # Required env: WIKI_ROOT (absolute path to the wiki directory)
+# Optional env: AUGMENTAGENT_TRANSCRIPTS_DIR — the FlyOnTheWall transcript
+#   clone (#915). Read/Glob/Grep are additionally allowed under it;
+#   Write/Edit stay wiki-only because FlyOnTheWall owns that repo.
 #
 # Issue: #127 — Read/Write/Glob/Grep ignored the wiki-root scope claim
 # in `schema/wiki-ask.md`. Only the Bash allowlist was actually enforced.
@@ -90,6 +93,21 @@ fi
 # to avoid `/wiki-evil` matching when WIKI_ROOT is `/wiki`.
 if [[ "$ABS" == "$WIKI_ROOT_ABS" || "$ABS" == "$WIKI_ROOT_ABS"/* ]]; then
   exit 0
+fi
+
+# PR #922 — #915 hands the transcript clone to the ask session via
+# `--add-dir`, but this guard used to reject every Read/Grep/Glob on it,
+# so "grep the words actually said" was dead on arrival. Allow the READ
+# tools under AUGMENTAGENT_TRANSCRIPTS_DIR when it resolves (readlink -f
+# requires the directory to exist, so a bogus value grants nothing).
+# Write/Edit are deliberately absent: FlyOnTheWall owns that repo and
+# this side never writes there.
+if [[ "$TOOL" =~ ^(Read|Glob|Grep)$ && -n "${AUGMENTAGENT_TRANSCRIPTS_DIR:-}" ]]; then
+  if TRANSCRIPTS_ABS=$(readlink -f -- "$AUGMENTAGENT_TRANSCRIPTS_DIR" 2>/dev/null); then
+    if [[ "$ABS" == "$TRANSCRIPTS_ABS" || "$ABS" == "$TRANSCRIPTS_ABS"/* ]]; then
+      exit 0
+    fi
+  fi
 fi
 
 # Allow Read on Discord-attachment tempfiles. The discord crate

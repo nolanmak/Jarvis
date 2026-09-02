@@ -1,0 +1,19 @@
+[package]
+name = "augmentagent-channel-fotw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+augmentagent-store = { path = "../augmentagent-store" }
+augmentagent-channel-core = { path = "../augmentagent-channel-core" }
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

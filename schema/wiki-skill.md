@@ -212,3 +212,13 @@ write the corresponding field on the person page. When in doubt, omit. The
 v1 sections (`## Identity`, `## Relationship`, `## Recent threads`,
 `## Commitments`, `## Tone`) remain the primary surface for everything that
 doesn't fit a structured v2 field.
+
+### The `fotw:` source namespace
+
+A fact learned from a recorded meeting cites `fotw:<meeting-id>` in `sources:`,
+where the id is the meeting's frontmatter `id`. It is stable across re-exports,
+so a retitled meeting keeps the same citation.
+
+Meeting ingests carry the summary and the action items, never the transcript.
+If you need the words, they are in the transcript clone — but a wiki page
+records the durable fact, not the dialogue.

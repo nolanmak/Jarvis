@@ -13,6 +13,7 @@ members = [
     "crates/augmentagent-channel-whatsapp",
     "crates/augmentagent-channel-calendar",
     "crates/augmentagent-channel-voice",
+    "crates/augmentagent-channel-fotw",
     "crates/augmentagent-channel-github",
     "crates/augmentagent-channel-linear",
     "crates/augmentagent-channel-notion",

@@ -263,6 +263,26 @@ impl IngestPool {
         }
     }
 
+    /// Wait until nothing is queued or in flight (index rebuilds excluded),
+    /// polling until `timeout`; true when the pool drained. A one-shot
+    /// process (`transcripts sync`, PR #922) must hold `main` open on this:
+    /// returning early drops the tokio runtime and kills fire-and-forget
+    /// jobs mid-ingest — after the dedup row already marked their meetings
+    /// seen, never to be retried.
+    pub async fn wait_idle(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let s = self.stats();
+            if s.queued == 0 && s.in_flight == 0 {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Synchronous admission so the cap holds even for a tight submit loop.
     fn admit(&self, message_id: &str) -> Admission {
         let mut ids = self.active_ids.lock().expect("ingest pool ids mutex poisoned");
@@ -599,6 +619,38 @@ mod tests {
         submit(&pool, &reasoner, dir.path(), "same-id");
         drain(&pool).await;
         assert_eq!(reasoner.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// PR #922 review — a one-shot process (`transcripts sync`) must be able
+    /// to wait for its fire-and-forget jobs: `main` returning while jobs are
+    /// queued drops the tokio runtime and kills them mid-ingest, after the
+    /// dedup row has already marked each meeting seen.
+    #[tokio::test]
+    async fn wait_idle_blocks_until_the_pool_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool(8, 2, 10);
+        let reasoner = slow(Duration::from_millis(40));
+        for i in 0..5 {
+            submit(&pool, &reasoner, dir.path(), &format!("w{i}"));
+        }
+        assert!(
+            pool.wait_idle(Duration::from_secs(10)).await,
+            "pool must report drained: {:?}",
+            pool.stats()
+        );
+        assert_eq!(pool.stats().completed, 5);
+
+        // An already-empty pool is idle immediately.
+        assert!(pool.wait_idle(Duration::from_millis(10)).await);
+    }
+
+    #[tokio::test]
+    async fn wait_idle_times_out_rather_than_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool(8, 1, 10);
+        let reasoner = slow(Duration::from_secs(5));
+        submit(&pool, &reasoner, dir.path(), "slowpoke");
+        assert!(!pool.wait_idle(Duration::from_millis(80)).await);
     }
 
     #[tokio::test]
