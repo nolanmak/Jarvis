@@ -367,7 +367,7 @@ mod tests {
             .join(format!("{}.md", contact_slug(&card("Jane Doe", "", "jane@x.com"))));
         assert!(page.is_file());
         let body = std::fs::read_to_string(&page).unwrap();
-        assert!(body.contains("phone: \"+14155552671\""));
+        assert!(body.contains("  phone:\n    - \"+14155552671\"\n"), "{body}");
         assert!(body.contains("- **Phone:** +14155552671"));
 
         // Reverse index resolves.
