@@ -4510,15 +4510,25 @@ fn normalize_recipients(flag: &str, values: &[String]) -> Result<Vec<String>> {
 /// Remove recipient metadata that is rendered on approval cards but must
 /// never become part of the Gmail message body. Older cards could feed their
 /// display-only `CC:`/`[cc: ...]` line back through the revise prompt, after
-/// which the model occasionally returned it as email text.
+/// which the model occasionally returned it as email text. The #652
+/// `[subject: …]` marker is display-only in the same way — but ONLY in its
+/// bracketed form: a bare `Subject: …` line is real prose (#650 handles the
+/// leading-header case separately).
 fn strip_approval_envelope_markers(body: &str) -> String {
     body.lines()
         .filter(|line| {
             let trimmed = line.trim();
-            let marker = trimmed
+            let bracketed = trimmed
                 .strip_prefix('[')
-                .and_then(|s| s.strip_suffix(']'))
-                .unwrap_or(trimmed);
+                .and_then(|s| s.strip_suffix(']'));
+            if let Some(inner) = bracketed {
+                if let Some((name, _)) = inner.split_once(':') {
+                    if name.trim().eq_ignore_ascii_case("subject") {
+                        return false;
+                    }
+                }
+            }
+            let marker = bracketed.unwrap_or(trimmed);
             let Some((name, value)) = marker.split_once(':') else {
                 return true;
             };
@@ -4672,8 +4682,9 @@ fn thread_for_revised_subject<'a>(
     thread_id: Option<&'a str>,
 ) -> Option<&'a str> {
     let thread_id = thread_id?;
-    let inbound = normalize_subject(inbound_subject);
-    if inbound.is_empty() || normalize_subject(outgoing_subject) == inbound {
+    // An untitled inbound is a subject too: a Revise that gives it one is a
+    // change Gmail would drop on-thread just the same.
+    if normalize_subject(outgoing_subject) == normalize_subject(inbound_subject) {
         Some(thread_id)
     } else {
         None
@@ -8078,6 +8089,17 @@ mod approval_body_tests {
     fn keeps_normal_prose_and_non_email_colons() {
         let body = "Hi,\n\nCC: means carbon copy in this sentence.\nTo: the team";
         assert_eq!(strip_approval_envelope_markers(body), body);
+        // #652 (codex on #855): the reposted card's `[subject: …]` marker is
+        // display-only and must never reach a sent body; a bare `Subject:`
+        // line is prose and stays.
+        assert_eq!(
+            strip_approval_envelope_markers("[subject: Invoice for July]\nHi Alice,\n[to: a@example.com]"),
+            "Hi Alice,"
+        );
+        assert_eq!(
+            strip_approval_envelope_markers("Subject: not a marker\nHi"),
+            "Subject: not a marker\nHi"
+        );
     }
 
     #[test]
@@ -8256,7 +8278,9 @@ mod approval_body_tests {
         );
         // No thread to begin with, or an untitled inbound: nothing to leave.
         assert_eq!(thread_for_revised_subject("Invoice for July", "Ship Systems x EFS", None), None);
-        assert_eq!(thread_for_revised_subject("Invoice for July", "", Some("t1")), Some("t1"));
+        // An untitled inbound thread: a new subject leaves it, staying untitled keeps it.
+        assert_eq!(thread_for_revised_subject("Invoice for July", "", Some("t1")), None);
+        assert_eq!(thread_for_revised_subject("Re: ", "", Some("t1")), Some("t1"));
     }
 
     #[test]
