@@ -156,6 +156,11 @@ enum Cmd {
         #[command(subcommand)]
         op: WikiOp,
     },
+    /// FlyOnTheWall meeting transcripts (#915).
+    Transcripts {
+        #[command(subcommand)]
+        op: TranscriptsOp,
+    },
     /// Compose a morning digest of recent inbox activity.
     Digest {
         /// Window size in hours. Defaults to 24.
@@ -1873,6 +1878,73 @@ enum ResumeOp {
     },
 }
 
+/// FlyOnTheWall transcript-repo operations (#915).
+#[derive(Subcommand, Debug)]
+enum TranscriptsOp {
+    /// Fast-forward the transcript clone, then ingest any new meetings.
+    ///
+    /// Read-only against that repo: FlyOnTheWall owns it and re-pushes retitled
+    /// meetings to the same path, so this side never commits, merges or pushes.
+    /// Dedup is the `emails` table (`fotw:<id>`), so a rescan is free.
+    Sync {
+        /// Scan and report without pulling or ingesting. Defaults to true —
+        /// pass `--dry-run false` for a live run (PR #922: same safe default
+        /// as every other channel's bare command).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+        /// Ingest what is already on disk; skip the git pull.
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+        no_pull: bool,
+        /// Ingest only meetings whose export recorded disclosure (§11).
+        #[arg(long, default_value_t = false)]
+        require_disclosed: bool,
+    },
+}
+
+#[cfg(test)]
+mod transcripts_cli_args_tests {
+    use super::*;
+
+    fn sync_args(argv: &[&str]) -> (bool, bool, bool) {
+        let cli = Cli::try_parse_from(argv).expect("argv must parse");
+        match cli.cmd {
+            Cmd::Transcripts {
+                op:
+                    TranscriptsOp::Sync {
+                        dry_run,
+                        no_pull,
+                        require_disclosed,
+                    },
+            } => (dry_run, no_pull, require_disclosed),
+            _ => panic!("expected transcripts sync"),
+        }
+    }
+
+    /// PR #922 review — every other channel's bare command is a dry run
+    /// (`default_value_t = true, ArgAction::Set`); a bare `transcripts sync`
+    /// doing a live pull + ingest breaks that convention exactly where an
+    /// operator is most likely to type it.
+    #[test]
+    fn bare_transcripts_sync_is_a_dry_run() {
+        let (dry_run, no_pull, require_disclosed) =
+            sync_args(&["augmentagent", "transcripts", "sync"]);
+        assert!(dry_run, "bare `transcripts sync` must default to a dry run");
+        assert!(!no_pull, "the pull itself stays on by default");
+        assert!(!require_disclosed);
+    }
+
+    /// A live run is an explicit opt-in, same shape as the other channels.
+    #[test]
+    fn a_live_run_is_an_explicit_opt_in() {
+        let (dry_run, ..) =
+            sync_args(&["augmentagent", "transcripts", "sync", "--dry-run", "false"]);
+        assert!(!dry_run);
+        let (_, no_pull, _) =
+            sync_args(&["augmentagent", "transcripts", "sync", "--no-pull", "true"]);
+        assert!(no_pull);
+    }
+}
+
 #[derive(Subcommand)]
 enum WikiOp {
     /// Health-check the wiki: contradictions, orphans, stale claims, missing cross-refs.
@@ -2779,6 +2851,22 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Transcripts { ref op } => match op {
+            TranscriptsOp::Sync {
+                dry_run,
+                no_pull,
+                require_disclosed,
+            } => {
+                run_transcripts_sync(
+                    &cli,
+                    Arc::clone(&store),
+                    *dry_run,
+                    *no_pull,
+                    *require_disclosed,
+                )
+                .await
+            }
+        },
         Cmd::Wiki { ref op } => match op {
             WikiOp::Lint { out } => run_wiki_lint(&cli, Arc::clone(&store), out.clone()).await,
             WikiOp::Ask { question, post } => run_wiki_ask(&cli, question.clone(), *post).await,
@@ -7175,6 +7263,232 @@ mod wiki_sync_validation_tests {
 /// `wiki sync` — reconcile the local knowledge base with its private
 /// GitHub mirror. Two-way: commit local page changes, pull owner edits
 /// (owner-wins), push. Reuses the ambient `gh` credential. See epic #474.
+/// The `emails` table as transcript dedup: `record` returns true for a first
+/// sighting (and remembers it), false for a re-push of the same meeting.
+struct TranscriptSeenLog(Arc<Store>);
+impl augmentagent_channel_fotw::runner::SeenLog for TranscriptSeenLog {
+    fn record(&self, email: &augmentagent_store::Email) -> Result<bool> {
+        Ok(self.0.upsert_email(email)?)
+    }
+}
+
+/// A dry run must not write the dedup row, or the real run that follows
+/// would find every meeting already seen and ingest nothing — but it must
+/// still *read* the table, or it reports every already-ingested meeting as
+/// new and prints its body under "would ingest" (PR #922 review).
+struct TranscriptDryLog(Arc<Store>);
+impl augmentagent_channel_fotw::runner::SeenLog for TranscriptDryLog {
+    fn record(&self, email: &augmentagent_store::Email) -> Result<bool> {
+        Ok(self.0.email_first_seen_at(&email.message_id)?.is_none())
+    }
+}
+
+#[cfg(test)]
+mod transcript_seen_log_tests {
+    use super::*;
+    use augmentagent_channel_fotw::runner::SeenLog;
+
+    fn test_email(id: &str) -> augmentagent_store::Email {
+        augmentagent_store::Email {
+            message_id: id.into(),
+            thread_id: None,
+            from: "sender".into(),
+            subject: "subject".into(),
+            body: "body".into(),
+            date: "2026-09-01T00:00:00Z".into(),
+            to: String::new(),
+            cc: String::new(),
+            attachments: Vec::new(),
+            account_entity_id: None,
+            platform: "fotw".into(),
+            kind: "email".into(),
+        }
+    }
+
+    /// PR #922 review — a dry run must report what a live run would do:
+    /// read-only duplicate detection, still writing nothing. It used to call
+    /// every already-ingested meeting "new" and print its full body under
+    /// "would ingest".
+    #[test]
+    fn a_dry_run_sees_duplicates_without_writing() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(Store::open(dir.path().join("t.db")).expect("open store"));
+        let live = TranscriptSeenLog(Arc::clone(&store));
+        let dry = TranscriptDryLog(Arc::clone(&store));
+
+        assert!(
+            dry.record(&test_email("fotw:m1")).unwrap(),
+            "an unseen meeting reads as new"
+        );
+        assert_eq!(
+            store.email_first_seen_at("fotw:m1").unwrap(),
+            None,
+            "a dry run writes no dedup row"
+        );
+
+        assert!(live.record(&test_email("fotw:m1")).unwrap());
+        assert!(
+            !dry.record(&test_email("fotw:m1")).unwrap(),
+            "a recorded meeting reads as a duplicate in a dry run"
+        );
+    }
+}
+
+/// `augmentagent transcripts sync` (#915).
+///
+/// Fast-forward the FlyOnTheWall transcript clone, then hand any meeting the
+/// `emails` table has not seen to the wiki ingest funnel. Read-only against
+/// that repo throughout: FlyOnTheWall owns it.
+///
+/// The calendar roster comes from rows the gcal channel already wrote — see
+/// `augmentagent_channel_fotw::calendar` — so this needs no Google credentials
+/// of its own, and degrades to name-based linking when a recording has no
+/// matching invite.
+async fn run_transcripts_sync(
+    cli: &Cli,
+    store: Arc<Store>,
+    dry_run: bool,
+    no_pull: bool,
+    require_disclosed: bool,
+) -> Result<()> {
+    use augmentagent_channel_fotw::calendar::{rosters_from_rows, GcalRow};
+    use augmentagent_channel_fotw::distill::RosterMember;
+    use augmentagent_channel_fotw::match_event::{match_event, EventWindow, Match};
+    use augmentagent_channel_fotw::runner::{scan, ScanOpts, SeenLog};
+
+    let repo = std::env::var("AUGMENTAGENT_TRANSCRIPTS_DIR")
+        .map(PathBuf::from)
+        .context("set AUGMENTAGENT_TRANSCRIPTS_DIR to the transcript repo clone")?;
+    let wiki_root = cli
+        .wiki_dir
+        .clone()
+        .context("--wiki-dir is required for transcripts sync")?;
+    let my_email = std::env::var("AUGMENTAGENT_MY_EMAIL").unwrap_or_default();
+
+    if !no_pull && !dry_run {
+        match augmentagent_channel_fotw::sync::sync(&repo) {
+            Ok(0) => println!("[transcripts] already up to date"),
+            Ok(n) => println!("[transcripts] pulled {n} commit(s)"),
+            Err(e) => anyhow::bail!("transcripts sync: {e}"),
+        }
+    }
+
+    // The roster index, built once per run: a few hundred rows, consulted per
+    // meeting by the closure below.
+    let events = rosters_from_rows(
+        &store
+            .gcal_attendee_rows()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(message_id, from, received_at)| GcalRow {
+                message_id,
+                from,
+                received_at,
+            })
+            .collect::<Vec<_>>(),
+    );
+    let windows: Vec<EventWindow> = events.iter().map(|e| e.window.clone()).collect();
+    let resolve = |doc: &augmentagent_channel_fotw::parse::MeetingDoc| {
+        let m = match_event(doc.started_at_ms, doc.duration_ms, &windows);
+        // Only a single match names anyone; ambiguity is reported, never resolved.
+        let roster: Vec<RosterMember> = match &m {
+            Match::Single(w) => events
+                .iter()
+                .find(|e| e.window.event_id == w.event_id)
+                .map(|e| e.roster.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        (m, roster)
+    };
+
+    let log: Box<dyn SeenLog> = if dry_run {
+        Box::new(TranscriptDryLog(Arc::clone(&store)))
+    } else {
+        Box::new(TranscriptSeenLog(Arc::clone(&store)))
+    };
+
+    let meetings_dir = repo.join("meetings");
+    let opts = ScanOpts {
+        dir: &meetings_dir,
+        require_disclosed,
+        my_email: &my_email,
+    };
+    let (report, emails) = scan(&opts, log.as_ref(), &resolve)?;
+
+    println!(
+        "[transcripts] {} new, {} duplicate, {} skipped, {} unreadable",
+        report.ingested.len(),
+        report.duplicates,
+        report.skipped.len(),
+        report.unreadable.len()
+    );
+    for (id, why) in &report.skipped {
+        println!("[transcripts] skipped {id}: {why:?}");
+    }
+    if dry_run {
+        for e in &emails {
+            println!("\n--- would ingest {} ---\n{}", e.message_id, e.body);
+        }
+        return Ok(());
+    }
+
+    let spawned = emails.len();
+    let reasoner = build_reasoner();
+    let schema = resolve_wiki_schema(cli)
+        .context("wiki schema not found; transcripts ingest needs schema/wiki-skill.md")?;
+    for email in emails {
+        let id = email.message_id.clone();
+        augmentagent_channel_core::ingest::spawn_ingest(
+            Arc::clone(&reasoner),
+            wiki_root.clone(),
+            // The relevance gate rides on the schema for this platform only: a
+            // recorded meeting is not a message addressed to anyone, and a
+            // personal capture should leave no trace.
+            format!(
+                "{schema}\n{}",
+                augmentagent_channel_fotw::distill::RELEVANCE_GATE
+            ),
+            email,
+            augmentagent_channel_core::decision::DecisionKind::Meeting,
+            Some("meeting transcript".to_string()),
+            None,
+            augmentagent_channel_core::ingest::IngestTrigger::Meeting,
+        );
+        println!("[transcripts] ingesting {id}");
+    }
+    if spawned == 0 {
+        return Ok(());
+    }
+    // PR #922 — this is a one-shot process: returning while jobs are queued
+    // would drop the tokio runtime and kill them mid-ingest, after the dedup
+    // row already marked each meeting seen — never to be retried. Hold the
+    // process open until the pool drains. The pool itself (#899) keeps
+    // concurrency at its worker cap (2), so this cannot re-create the
+    // 2026-08-31 `claude -p` burst; it only makes the process live as long
+    // as its own jobs.
+    let pool = augmentagent_channel_core::ingest::IngestPool::global();
+    println!("[transcripts] waiting for {spawned} ingest job(s)…");
+    let drained = pool
+        .wait_idle(std::time::Duration::from_secs(15 * 60))
+        .await;
+    let stats = pool.stats();
+    if !drained {
+        anyhow::bail!(
+            "transcripts ingest did not drain in 15m ({} queued, {} in flight) — \
+             the recorded meetings will read as duplicates on the next run; \
+             delete their fotw:<id> rows from `emails` to retry",
+            stats.queued,
+            stats.in_flight
+        );
+    }
+    println!(
+        "[transcripts] ingest finished ({} completed, {} dropped)",
+        stats.completed, stats.dropped
+    );
+    Ok(())
+}
+
 async fn run_wiki_sync(cli: &Cli, dry_run: bool, no_pull: bool) -> Result<()> {
     let wiki_root = cli
         .wiki_dir
