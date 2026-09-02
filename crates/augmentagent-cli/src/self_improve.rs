@@ -898,6 +898,10 @@ implementation + tests to an order of magnitude is enough.\n\
 Grade complexity by BLAST RADIUS, not diff size. A 10-line prompt edit that \
 alters every outbound email is `hard`; a 300-line self-contained validator \
 with tests is `medium`.\n\
+If the issue carries a 'Prior attempts on this issue' section, treat it as \
+ground truth about what did not work: your spec must address each stated \
+cause, and repeated failures on the same cause are evidence the issue is \
+not-fixable as written.\n\
 Output ONLY the header and spec/reason, no preamble.";
 
 /// Complexity grade the scoping pass assigns (#653). Anything above
@@ -1701,20 +1705,22 @@ async fn independent_review(
 
 /// Build the stage-2 prompt: the issue plus (when the scoping pass produced
 /// one) the implementation spec.
-fn build_fix_prompt(issue: &Issue, plan: Option<&str>) -> String {
-    let mut prompt = match plan {
+fn build_fix_prompt(issue: &Issue, plan: Option<&str>, prior: Option<&str>) -> String {
+    let spec = match plan {
         Some(p) => format!(
-            "GitHub issue #{}: {}\n\n{}\n\n\
-             ## Implementation spec (from a read-only scoping pass on a \
+            "\n\n## Implementation spec (from a read-only scoping pass on a \
              stronger model — follow it unless the code contradicts it, and \
-             say so in your summary if it does)\n{}\n\nImplement the fix now.",
-            issue.number, issue.title, issue.body, p
+             say so in your summary if it does)\n{p}"
         ),
-        None => format!(
-            "GitHub issue #{}: {}\n\n{}\n\nImplement the fix now.",
-            issue.number, issue.title, issue.body
-        ),
+        None => String::new(),
     };
+    let mut prompt = format!(
+        "GitHub issue #{}: {}\n\n{}{spec}{}\n\nImplement the fix now.",
+        issue.number,
+        issue.title,
+        issue.body,
+        prior_attempts_section(prior)
+    );
     if is_red_main_issue(&issue.body) {
         // #932 — the one way a red-main fix can be worse than the outage.
         prompt.push_str(
@@ -1725,6 +1731,31 @@ fn build_fix_prompt(issue: &Issue, plan: Option<&str>) -> String {
         );
     }
     prompt
+}
+
+/// Build the stage-1 scoping prompt. Prior failures go in (#803) so the
+/// scoper re-plans around the dead end instead of reproducing the spec that
+/// already failed.
+fn build_scope_prompt(issue: &Issue, prior: Option<&str>) -> String {
+    format!(
+        "GitHub issue #{}: {}\n\n{}{}\n\nProduce the verdict header and (if \
+         fixable) the implementation spec now.",
+        issue.number,
+        issue.title,
+        issue.body,
+        prior_attempts_section(prior)
+    )
+}
+
+fn prior_attempts_section(prior: Option<&str>) -> String {
+    match prior {
+        Some(p) => format!(
+            "\n\n## Prior attempts on this issue (each of these already \
+             failed — address the stated cause explicitly and say in your \
+             summary how this attempt differs)\n{p}"
+        ),
+        None => String::new(),
+    }
 }
 
 /// #630 — auto-merge policy. Off unless `AUGMENTAGENT_AUTOPR_AUTOMERGE=1|true`,
@@ -1863,6 +1894,9 @@ and lands in the PR.\n\
 hook rejects real-looking personal data and the commit will fail after all \
 your work.\n\
 - Do NOT run git commit, git push, or gh. Just edit files.\n\
+- If the prompt carries a 'Prior attempts on this issue' section, treat it as \
+ground truth about what did not work: do not re-run those dead ends, fix the \
+stated cause, and say in your summary how this attempt differs.\n\
 When done, output a 2-4 sentence summary of what you changed and why, noting \
 the test that guards it.";
 
@@ -3538,7 +3572,7 @@ async fn resume_draft_pr(
                     repo_root,
                 )
                 .await;
-                let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+                let attempts = record_attempt(repo_root, issue.number, Some(failure_record(FailureKind::GuardRefusal, "resume:conflict", &why))).await.unwrap_or(1);
                 if attempts >= MAX_ATTEMPTS {
                     label_gave_up(repo_root, issue.number).await.ok();
                     close_gave_up_pr(repo_root, pr, issue.number, attempts, &why).await;
@@ -3600,7 +3634,7 @@ async fn resume_draft_pr(
                     repo_root,
                 )
                 .await;
-                record_attempt(repo_root, issue.number).await.ok();
+                record_attempt(repo_root, issue.number, Some(failure_record(FailureKind::GuardRefusal, "resume:size", &format!("diff is {lines_now} lines (cap {MAX_DIFF_LINES})")))).await.ok();
                 return Ok(RunReport::built(format!(
                     "PR #{pr}: resume refused — oversized after revisions"
                 )));
@@ -3723,7 +3757,7 @@ async fn resume_draft_pr(
                 repo_root,
             )
             .await;
-            let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+            let attempts = record_attempt(repo_root, issue.number, Some(failure_record(FailureKind::GateRed, "resume:gate", &format!("{gate_err:#}")))).await.unwrap_or(1);
             if attempts >= MAX_ATTEMPTS {
                 label_gave_up(repo_root, issue.number).await.ok();
                 close_gave_up_pr(repo_root, pr, issue.number, attempts, &format!("{gate_err:#}")).await;
@@ -3775,7 +3809,7 @@ async fn resume_draft_pr(
                         repo_root,
                     )
                     .await;
-                    record_attempt(repo_root, issue.number).await.ok();
+                    record_attempt(repo_root, issue.number, Some(failure_record(FailureKind::GateRed, "resume:final-gate", &format!("{gate_err:#}")))).await.ok();
                     return Ok(RunReport::built(format!(
                         "PR #{pr}: LGTM but final full gate failed"
                     )));
@@ -3862,7 +3896,7 @@ async fn resume_draft_pr(
             )
             .await;
             cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-            let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+            let attempts = record_attempt(repo_root, issue.number, Some(failure_record(FailureKind::ReviewReject, "resume:review", &independent.notes))).await.unwrap_or(1);
             if attempts >= MAX_ATTEMPTS {
                 // Every future resume would replay the same disagreement;
                 // the label hands it to a human with the exchange attached.
@@ -4256,6 +4290,23 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     };
     info!(issue = issue.number, title = %issue.title, "selected issue");
 
+    // #803 — what earlier attempts on this issue already failed on, and the
+    // wall-clock this attempt spends, so a hard issue's cost is attributable
+    // to capability or to harness friction.
+    let started = std::time::Instant::now();
+    let prior_attempts = AttemptHistory::load(&attempt_history_path()).digest(issue.number);
+    let rec = |kind: FailureKind, stage: &str, detail: &str, diffstat: &str, lines: usize| {
+        AttemptRecord {
+            at: unix_now(),
+            kind,
+            stage: stage.to_string(),
+            detail: truncate(detail, MAX_DETAIL_BYTES),
+            diffstat: truncate(diffstat, MAX_DIFFSTAT_BYTES),
+            diff_lines: lines,
+            wall_secs: started.elapsed().as_secs(),
+        }
+    };
+
     // #300 — Trust gate. If the issue author is not trusted (not the owner /
     // a write-access collaborator / an allowlisted login), the body is
     // attacker-controllable. Refuse to run the unattended build/push pipeline
@@ -4345,11 +4396,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // (which gates auto-merge), and expands the ask into an implementation
     // spec before the builder edits anything. Scoping failure degrades to
     // the single-stage behaviour with complexity defaulting to hard.
-    let scope_prompt = format!(
-        "GitHub issue #{}: {}\n\n{}\n\nProduce the verdict header and (if \
-         fixable) the implementation spec now.",
-        issue.number, issue.title, issue.body
-    );
+    let scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
     let scope = match reasoner
         .call(&scope_opts(worktree.clone()), &scope_prompt)
         .await
@@ -4359,6 +4406,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             warn!(
                 issue = issue.number,
                 "scoping pass failed; building without a spec: {e:#}"
+            );
+            record_reasoner_error(
+                issue.number,
+                rec(FailureKind::ReasonerError, "scope", &format!("{e:#}"), "", 0),
             );
             None
         }
@@ -4430,10 +4481,14 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
 
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
     let opts = fix_opts(worktree.clone());
-    let prompt = build_fix_prompt(&issue, plan.as_deref());
+    let prompt = build_fix_prompt(&issue, plan.as_deref(), prior_attempts.as_deref());
     let mut summary = match reasoner.call(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
+            record_reasoner_error(
+                issue.number,
+                rec(FailureKind::ReasonerError, "build", &format!("{err:#}"), "", 0),
+            );
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             return Err(err).context("reasoner failed during self-improve");
         }
@@ -4453,7 +4508,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let (_ok, diff, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
     if diff.trim().is_empty() {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+        let attempts = record_attempt(
+            repo_root,
+            issue.number,
+            Some(rec(FailureKind::NoChanges, "build", &truncate(&summary, 800), "", 0)),
+        )
+        .await
+        .unwrap_or(1);
         if attempts >= MAX_ATTEMPTS {
             backoff_comment(
                 repo_root,
@@ -4482,7 +4543,19 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let (_ok, full_diff, _) = run("git", &["diff", "--cached"], &worktree).await?;
     if let Some((pattern, line)) = blast_radius_hit_in_diff(&full_diff) {
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
-        let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+        let attempts = record_attempt(
+            repo_root,
+            issue.number,
+            Some(rec(
+                FailureKind::GuardRefusal,
+                "guard:blast-radius",
+                &format!("matched `{pattern}` on: {line}"),
+                &diff,
+                diff_line_count(&full_diff),
+            )),
+        )
+        .await
+        .unwrap_or(1);
         warn!(
             issue = issue.number,
             pattern, %line, "refused: diff hit the blast-radius guard"
@@ -4546,7 +4619,19 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }
     if lines > MAX_DIFF_LINES {
         cleanup(worktree.clone(), branch.clone(), repo_root.to_path_buf()).await;
-        let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+        let attempts = record_attempt(
+            repo_root,
+            issue.number,
+            Some(rec(
+                FailureKind::GuardRefusal,
+                "guard:size",
+                &format!("diff is {lines} lines (cap {MAX_DIFF_LINES})"),
+                &diff,
+                lines,
+            )),
+        )
+        .await
+        .unwrap_or(1);
         backoff_comment(
             repo_root,
             issue.number,
@@ -4589,7 +4674,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 )));
             }
         }
-        let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+        let attempts = record_attempt(
+            repo_root,
+            issue.number,
+            Some(rec(FailureKind::GateRed, "gate", &format!("{gate_err:#}"), &diff, lines)),
+        )
+        .await
+        .unwrap_or(1);
         if attempts >= MAX_ATTEMPTS {
             backoff_comment(
                 repo_root,
@@ -4630,13 +4721,23 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         Err(e) => {
             // Transient reviewer failure (session limit etc.) — don't burn an
             // attempt on infrastructure noise; the next tick retries whole.
+            record_reasoner_error(
+                issue.number,
+                rec(FailureKind::ReasonerError, "qa-review", &format!("{e:#}"), &diff, lines),
+            );
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
             return Err(e).context("QA review pass failed during self-improve");
         }
     };
     if !review_ok {
         warn!(issue = issue.number, "QA review rejected the diff");
-        let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+        let attempts = record_attempt(
+            repo_root,
+            issue.number,
+            Some(rec(FailureKind::ReviewReject, "qa-review", &review_notes, &diff, lines)),
+        )
+        .await
+        .unwrap_or(1);
         backoff_comment(
             repo_root,
             issue.number,
@@ -4723,7 +4824,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 let (_ok, diff2, _) = run("git", &["diff", "--cached"], &worktree).await?;
                 if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff2) {
                     warn!(issue = issue.number, pattern, %line, "revision hit the blast-radius guard");
-                    let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+                    let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:blast-radius", &format!("matched `{pattern}` on: {line}"), &diff, lines))).await.unwrap_or(1);
                     backoff_comment(
                         repo_root,
                         issue.number,
@@ -4761,7 +4862,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         ));
                         continue;
                     }
-                    let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+                    let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GuardRefusal, "revise:size", &format!("diff is {lines2} lines (cap {MAX_DIFF_LINES})"), &diff, lines2))).await.unwrap_or(1);
                     backoff_comment(
                         repo_root,
                         issue.number,
@@ -4798,7 +4899,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         ));
                         continue;
                     }
-                    let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+                    let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GateRed, "revise:gate", &format!("{gate_err:#}"), &diff, lines))).await.unwrap_or(1);
                     if attempts >= MAX_ATTEMPTS {
                         backoff_comment(
                             repo_root,
@@ -4848,7 +4949,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // FULL suite exactly once here.
         if let Err(gate_err) = verification_gate(&worktree).await {
             warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
-            let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
+            let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GateRed, "revise:final-gate", &format!("{gate_err:#}"), &diff, lines))).await.unwrap_or(1);
             if attempts >= MAX_ATTEMPTS {
                 backoff_comment(
                     repo_root,
@@ -4913,7 +5014,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     .await?;
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e).await));
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e, rec(FailureKind::PublishFailed, "publish:git commit", &e, &diff, lines)).await));
     }
     // #815 — a run killed between the push and `gh pr create` leaves the
     // remote branch behind with no PR. `has_open_agent_pr` only looks at
@@ -4941,7 +5042,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e).await));
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e, rec(FailureKind::PublishFailed, "publish:git push", &e, &diff, lines)).await));
     }
 
     // Open the PR. Draft + human merge for everyone; owner-authored issues
@@ -5062,7 +5163,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     if !ok {
         // #815 — the branch is pushed but has no PR. Left as an `Err` this
         // re-picks the same issue next tick and dies at the push above.
-        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "gh pr create failed", &e).await));
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "gh pr create failed", &e, rec(FailureKind::PublishFailed, "publish:gh pr create", &e, &diff, lines)).await));
     }
     let pr_url = stdout.trim().to_string();
     if !automerge {
@@ -5148,8 +5249,14 @@ async fn remote_branch_exists(repo_root: &Path, branch: &str) -> bool {
 /// sticky failure into an unbounded 30-minute retry of the most expensive
 /// path in the daemon. Counting them makes the loop give up like it does on
 /// a red gate or a rejected review.
-async fn record_hard_failure(repo_root: &Path, issue: u64, what: &str, err: &str) -> String {
-    let attempts = record_attempt(repo_root, issue).await.unwrap_or(1);
+async fn record_hard_failure(
+    repo_root: &Path,
+    issue: u64,
+    what: &str,
+    err: &str,
+    rec: AttemptRecord,
+) -> String {
+    let attempts = record_attempt(repo_root, issue, Some(rec)).await.unwrap_or(1);
     warn!(issue, attempts, "self-improve: {what}: {err}");
     if attempts >= MAX_ATTEMPTS {
         backoff_comment(
@@ -5171,10 +5278,20 @@ async fn record_hard_failure(repo_root: &Path, issue: u64, what: &str, err: &str
 
 /// Bump an attempt counter encoded as a hidden marker comment, return the new
 /// count. (Lightweight; avoids needing extra labels per count.)
-async fn record_attempt(repo_root: &Path, issue: u64) -> Result<u32> {
+/// `rec` (#803) is persisted to the local [`AttemptHistory`] so the next
+/// attempt's prompts can say what this one hit, and its kind/stage/first
+/// line go into the marker comment. `None` = a site that does not say.
+async fn record_attempt(repo_root: &Path, issue: u64, rec: Option<AttemptRecord>) -> Result<u32> {
     // #851 — remember the attempt for the rest of the UTC day so the picker
     // moves on instead of handing this issue straight back next tick.
     AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue);
+    let rec = rec.unwrap_or_else(AttemptRecord::unspecified);
+    {
+        let path = attempt_history_path();
+        let mut history = AttemptHistory::load(&path);
+        history.push(issue, rec.clone());
+        history.save(&path);
+    }
     let gh = gh_bin();
     let (_ok, stdout, _) = run(
         &gh,
@@ -5197,10 +5314,7 @@ async fn record_attempt(repo_root: &Path, issue: u64) -> Result<u32> {
             "comment",
             &issue.to_string(),
             "--body",
-            &format!(
-                "<!-- self-improve-attempt --> attempt {n} did not produce an \
-                 acceptable PR (gate failure, refused diff, or no changes)."
-            ),
+            &attempt_marker_body(n, &rec),
         ],
         repo_root,
     )
@@ -6094,6 +6208,218 @@ fn attempt_ledger_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("autopr-attempted.json"))
 }
 
+// ---------------------------------------------------------------------------
+// #803 — Continual Harness: what earlier attempts on an issue failed on is
+// carried into the next attempt's prompts, and harness failures (a reasoner
+// error) are recorded separately from model failures instead of collapsing
+// into one anonymous "attempt N did not produce an acceptable PR" marker.
+// ---------------------------------------------------------------------------
+
+/// Why an attempt ended without an acceptable PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum FailureKind {
+    NoChanges,
+    GuardRefusal,
+    GateRed,
+    ReviewReject,
+    PublishFailed,
+    /// The reasoner itself failed (quota, timeout, provider down) — a harness
+    /// failure, recorded for the record but never charged as an attempt.
+    ReasonerError,
+    /// A caller that did not say — legacy sites; still an attempt.
+    Other,
+}
+
+impl FailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoChanges => "no-changes",
+            Self::GuardRefusal => "guard-refusal",
+            Self::GateRed => "gate-red",
+            Self::ReviewReject => "review-reject",
+            Self::PublishFailed => "publish-failed",
+            Self::ReasonerError => "reasoner-error",
+            Self::Other => "unspecified",
+        }
+    }
+
+    fn counts_toward_max_attempts(self) -> bool {
+        !matches!(self, Self::ReasonerError)
+    }
+}
+
+/// One attempt's outcome, as much of it as the next attempt needs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AttemptRecord {
+    at: u64,
+    kind: FailureKind,
+    stage: String,
+    detail: String,
+    diffstat: String,
+    diff_lines: usize,
+    wall_secs: u64,
+}
+
+impl AttemptRecord {
+    fn unspecified() -> Self {
+        Self {
+            at: unix_now(),
+            kind: FailureKind::Other,
+            stage: "unspecified".into(),
+            detail: String::new(),
+            diffstat: String::new(),
+            diff_lines: 0,
+            wall_secs: 0,
+        }
+    }
+}
+
+const MAX_HISTORY_PER_ISSUE: usize = 8;
+const MAX_DETAIL_BYTES: usize = 2_000;
+const MAX_DIFFSTAT_BYTES: usize = 600;
+const MAX_DIGEST_DETAIL_BYTES: usize = 1_200;
+const MAX_DIGEST_BYTES: usize = 6_000;
+
+/// Per-issue attempt records, newest last, bounded per issue. Local state:
+/// the gave-up COUNT still comes from the GitHub marker comments, so losing
+/// this file costs context, never the back-off.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct AttemptHistory {
+    issues: std::collections::BTreeMap<u64, Vec<AttemptRecord>>,
+}
+
+impl AttemptHistory {
+    fn load(path: &Path) -> Self {
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+            .unwrap_or_default()
+    }
+
+    fn push(&mut self, issue: u64, rec: AttemptRecord) {
+        let recs = self.issues.entry(issue).or_default();
+        recs.push(rec);
+        let overflow = recs.len().saturating_sub(MAX_HISTORY_PER_ISSUE);
+        recs.drain(..overflow);
+    }
+
+    fn save(&self, path: &Path) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match serde_json::to_vec(self) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, bytes) {
+                    warn!(path = %path.display(), "could not persist attempt history: {e}");
+                }
+            }
+            Err(e) => warn!("could not serialize attempt history: {e}"),
+        }
+    }
+
+    /// The "Prior attempts" digest for `issue`, or `None` when there are none.
+    fn digest(&self, issue: u64) -> Option<String> {
+        let recs = self.issues.get(&issue).filter(|r| !r.is_empty())?;
+        let body = recs.iter().map(digest_entry).collect::<Vec<_>>().join("\n");
+        Some(truncate(&body, MAX_DIGEST_BYTES))
+    }
+}
+
+fn digest_entry(rec: &AttemptRecord) -> String {
+    let when = chrono::DateTime::from_timestamp(rec.at as i64, 0)
+        .map(|t| t.format("%Y-%m-%d %H:%MZ").to_string())
+        .unwrap_or_else(|| rec.at.to_string());
+    let attribution = if rec.kind.counts_toward_max_attempts() {
+        ""
+    } else {
+        " (harness, not counted)"
+    };
+    let diff = if rec.diffstat.trim().is_empty() {
+        String::new()
+    } else {
+        let stat = rec.diffstat.replace('\n', "; ");
+        format!(", {}-line diff ({})", rec.diff_lines, stat.trim())
+    };
+    let detail = truncate(&rec.detail, MAX_DIGEST_DETAIL_BYTES)
+        .lines()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let head = format!(
+        "- {when} · {}{attribution} at stage {} after {}s{diff}",
+        rec.kind.as_str(),
+        rec.stage,
+        rec.wall_secs
+    );
+    if detail.trim().is_empty() {
+        head
+    } else {
+        format!("{head}\n{detail}")
+    }
+}
+
+/// `AUGMENTAGENT_AUTOPR_HISTORY_FILE` override (tests), else the daemon
+/// state dir next to the attempt ledger.
+fn attempt_history_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AUGMENTAGENT_AUTOPR_HISTORY_FILE") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    std::env::var_os("HOME")
+        .map(|h| {
+            PathBuf::from(h)
+                .join(".local/state/augmentagent")
+                .join("autopr-attempt-history.json")
+        })
+        .unwrap_or_else(|| PathBuf::from("autopr-attempt-history.json"))
+}
+
+/// A harness failure: remembered for the next attempt's context, never
+/// charged as an attempt.
+fn record_reasoner_error(issue: u64, rec: AttemptRecord) {
+    let path = attempt_history_path();
+    let mut history = AttemptHistory::load(&path);
+    history.push(issue, rec);
+    history.save(&path);
+}
+
+/// The hidden marker comment keeps its `<!-- self-improve-attempt -->` prefix
+/// (the count is derived from it) and now says what happened.
+fn attempt_marker_body(n: u32, rec: &AttemptRecord) -> String {
+    let head = format!(
+        "<!-- self-improve-attempt --> attempt {n} — {} at {} after {}s",
+        rec.kind.as_str(),
+        rec.stage,
+        rec.wall_secs
+    );
+    match rec.detail.lines().find(|l| !l.trim().is_empty()) {
+        Some(first) => format!("{head}: {}", truncate(first, 300)),
+        None => head,
+    }
+}
+
+/// A record for sites that have no diff or wall-clock in scope (resume path).
+fn failure_record(kind: FailureKind, stage: &str, detail: &str) -> AttemptRecord {
+    AttemptRecord {
+        at: unix_now(),
+        kind,
+        stage: stage.to_string(),
+        detail: truncate(detail, MAX_DETAIL_BYTES),
+        diffstat: String::new(),
+        diff_lines: 0,
+        wall_secs: 0,
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Where the persisted counter lives: `AUGMENTAGENT_AUTOPR_COUNTER_FILE`
 /// override (tests), else the daemon state dir next to the reasoner
 /// cooldown latch.
@@ -6494,10 +6820,10 @@ mod tests {
             author_trusted: true,
             research_filed: false,
         };
-        let with = build_fix_prompt(&issue, Some("the spec"));
+        let with = build_fix_prompt(&issue, Some("the spec"), None);
         assert!(with.contains("the spec"));
         assert!(with.contains("Implementation spec"));
-        let without = build_fix_prompt(&issue, None);
+        let without = build_fix_prompt(&issue, None, None);
         assert!(!without.contains("Implementation spec"));
         assert!(without.contains("Implement the fix now."));
     }
@@ -8324,7 +8650,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             author_trusted: true,
             research_filed: false,
         };
-        let p = build_fix_prompt(&issue, None);
+        let p = build_fix_prompt(&issue, None, None);
         assert!(p.contains("source::tests::apply_writes_indexes_and_is_idempotent"));
         assert!(
             p.contains("Never weaken, loosen, or delete an assertion"),
@@ -8336,7 +8662,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             body: "## Why\nfix the thing".into(),
             ..issue
         };
-        assert!(!build_fix_prompt(&plain, None).contains("Never weaken"));
+        assert!(!build_fix_prompt(&plain, None, None).contains("Never weaken"));
     }
 
     #[test]
@@ -8945,5 +9271,198 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             Some(9)
         );
         assert_eq!(rabbit_rate_limit_minutes("Walkthrough"), None);
+    }
+
+    // --- #803 Continual Harness: prior attempts reach the next attempt ------
+
+    fn test_issue_803() -> Issue {
+        Issue {
+            number: 7,
+            title: "t".into(),
+            body: "b".into(),
+            author: "a".into(),
+            author_trusted: true,
+            research_filed: false,
+        }
+    }
+
+    fn test_record(kind: FailureKind, stage: &str, detail: &str) -> AttemptRecord {
+        AttemptRecord {
+            at: 1_756_000_000,
+            kind,
+            stage: stage.into(),
+            detail: detail.into(),
+            diffstat: "crates/augmentagent-store/src/lib.rs | 12 ++--".into(),
+            diff_lines: 212,
+            wall_secs: 840,
+        }
+    }
+
+    #[test]
+    fn attempt_history_digest_reaches_scope_and_fix_prompts() {
+        let mut h = AttemptHistory::default();
+        h.push(
+            7,
+            test_record(
+                FailureKind::GateRed,
+                "gate",
+                "cargo test failed:\n… test store::x … FAILED",
+            ),
+        );
+        h.push(
+            7,
+            test_record(FailureKind::ReviewReject, "qa-review", "no regression test"),
+        );
+        h.push(
+            7,
+            test_record(FailureKind::ReasonerError, "build", "claude rate limit"),
+        );
+
+        let digest = h.digest(7).expect("records exist for #7");
+        for needle in [
+            "gate-red",
+            "FAILED",
+            "review-reject",
+            "no regression test",
+            "not counted",
+        ] {
+            assert!(digest.contains(needle), "digest lost {needle:?}: {digest}");
+        }
+        assert!(h.digest(8).is_none());
+
+        let issue = test_issue_803();
+        let fix = build_fix_prompt(&issue, Some("the spec"), Some(digest.as_str()));
+        assert!(fix.contains("the spec"));
+        assert!(fix.contains("Prior attempts"));
+        assert!(fix.contains("FAILED"));
+        assert!(build_scope_prompt(&issue, Some(digest.as_str())).contains("Prior attempts"));
+
+        assert!(!build_fix_prompt(&issue, None, None).contains("Prior attempts"));
+        assert!(!build_scope_prompt(&issue, None).contains("Prior attempts"));
+        // The section sits after the issue body and before the closing ask.
+        let body_at = fix.find("\n\nb").unwrap();
+        let prior_at = fix.find("Prior attempts").unwrap();
+        let ask_at = fix.find("Implement the fix now.").unwrap();
+        assert!(body_at < prior_at && prior_at < ask_at);
+    }
+
+    #[test]
+    fn attempt_history_round_trips_and_survives_corrupt_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/history.json");
+        let mut h = AttemptHistory::load(&path);
+        assert!(h.digest(7).is_none());
+        h.push(7, test_record(FailureKind::GateRed, "gate", "boom"));
+        h.save(&path);
+        let reloaded = AttemptHistory::load(&path);
+        assert_eq!(reloaded.digest(7), h.digest(7));
+        let junk = dir.path().join("junk.json");
+        std::fs::write(&junk, b"{ nope").unwrap();
+        assert!(AttemptHistory::load(&junk).digest(7).is_none());
+    }
+
+    #[test]
+    fn attempt_history_caps_records_per_issue() {
+        let mut h = AttemptHistory::default();
+        for i in 0..12 {
+            h.push(
+                7,
+                test_record(FailureKind::GateRed, "gate", &format!("failure {i}")),
+            );
+        }
+        assert_eq!(h.issues[&7].len(), MAX_HISTORY_PER_ISSUE);
+        let digest = h.digest(7).unwrap();
+        assert!(digest.contains("failure 11"), "newest record must survive");
+        assert!(
+            !digest.contains("failure 3"),
+            "oldest records must be dropped"
+        );
+    }
+
+    #[test]
+    fn attempt_digest_is_byte_bounded_and_multibyte_safe() {
+        let mut h = AttemptHistory::default();
+        for i in 0..MAX_HISTORY_PER_ISSUE {
+            h.push(
+                7,
+                test_record(
+                    FailureKind::GateRed,
+                    "gate",
+                    &format!("{i}{}", "—".repeat(50_000)),
+                ),
+            );
+        }
+        let digest = h.digest(7).unwrap();
+        let bound = MAX_DIGEST_BYTES + '…'.len_utf8();
+        assert!(digest.len() <= bound, "digest was {} bytes", digest.len());
+    }
+
+    #[test]
+    fn attempt_marker_keeps_legacy_prefix_and_names_the_kind() {
+        let rec = test_record(FailureKind::GateRed, "gate", "cargo test failed");
+        let body = attempt_marker_body(2, &rec);
+        assert!(
+            body.starts_with("<!-- self-improve-attempt -->"),
+            "the count is parsed from this prefix"
+        );
+        assert!(body.contains("attempt 2"));
+        assert!(
+            body.contains("gate-red")
+                && body.contains("gate")
+                && body.contains("cargo test failed")
+        );
+        // A site that did not say still produces a countable marker.
+        let plain = attempt_marker_body(3, &AttemptRecord::unspecified());
+        assert!(plain.starts_with("<!-- self-improve-attempt --> attempt 3"));
+    }
+
+    #[test]
+    fn failure_kind_counting_rule_is_unchanged() {
+        assert!(!FailureKind::ReasonerError.counts_toward_max_attempts());
+        for kind in [
+            FailureKind::NoChanges,
+            FailureKind::GuardRefusal,
+            FailureKind::GateRed,
+            FailureKind::ReviewReject,
+            FailureKind::PublishFailed,
+            FailureKind::Other,
+        ] {
+            assert!(
+                kind.counts_toward_max_attempts(),
+                "{} must keep counting",
+                kind.as_str()
+            );
+        }
+    }
+
+    // Structural: every terminal failure in run_once that charges an attempt
+    // says what kind it was; a reasoner error is remembered but not charged.
+    #[test]
+    fn run_once_failure_sites_carry_typed_records() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let end = start + src[start..].find("\n}\n").expect("end");
+        let body = &src[start..end];
+        for kind in [
+            "FailureKind::NoChanges",
+            "FailureKind::GuardRefusal",
+            "FailureKind::GateRed",
+            "FailureKind::ReviewReject",
+            "FailureKind::PublishFailed",
+        ] {
+            assert!(body.contains(kind), "run_once must record {kind}");
+        }
+        assert!(
+            body.matches("record_reasoner_error(").count() >= 3,
+            "scope, build and qa-review reasoner errors are harness failures"
+        );
+        assert!(
+            !body.contains("record_attempt(repo_root, issue.number, None)"),
+            "no anonymous attempt in run_once"
+        );
+        assert!(body.contains("build_scope_prompt(&issue, prior_attempts.as_deref())"));
+        assert!(
+            body.contains("build_fix_prompt(&issue, plan.as_deref(), prior_attempts.as_deref())")
+        );
     }
 }
