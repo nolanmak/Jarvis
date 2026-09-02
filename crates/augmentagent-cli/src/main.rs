@@ -7263,6 +7263,39 @@ mod wiki_sync_validation_tests {
 /// `wiki sync` — reconcile the local knowledge base with its private
 /// GitHub mirror. Two-way: commit local page changes, pull owner edits
 /// (owner-wins), push. Reuses the ambient `gh` credential. See epic #474.
+/// `AUGMENTAGENT_MY_EMAIL` — a comma-separated list of the operator's own
+/// addresses (personal gmail, work domain, export account). Every one of them
+/// is "me" for meeting-roster self-exclusion (#922 follow-up).
+fn parse_my_emails(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(test)]
+mod my_email_parse_tests {
+    use super::parse_my_emails;
+
+    /// #922 follow-up — AUGMENTAGENT_MY_EMAIL is a comma-separated list of
+    /// the operator's own addresses. Whitespace and empty entries are noise,
+    /// not addresses.
+    #[test]
+    fn a_comma_separated_list_parses_to_clean_addresses() {
+        assert_eq!(
+            parse_my_emails(" a@example.com, B2@example.com ,,"),
+            vec!["a@example.com".to_string(), "B2@example.com".to_string()]
+        );
+        assert_eq!(
+            parse_my_emails("solo@example.com"),
+            vec!["solo@example.com".to_string()]
+        );
+        assert!(parse_my_emails("").is_empty());
+        assert!(parse_my_emails(" , ").is_empty());
+    }
+}
+
 /// The `emails` table as transcript dedup: `record` returns true for a first
 /// sighting (and remembers it), false for a re-push of the same meeting.
 struct TranscriptSeenLog(Arc<Store>);
@@ -7363,7 +7396,7 @@ async fn run_transcripts_sync(
         .wiki_dir
         .clone()
         .context("--wiki-dir is required for transcripts sync")?;
-    let my_email = std::env::var("AUGMENTAGENT_MY_EMAIL").unwrap_or_default();
+    let my_emails = parse_my_emails(&std::env::var("AUGMENTAGENT_MY_EMAIL").unwrap_or_default());
 
     if !no_pull && !dry_run {
         match augmentagent_channel_fotw::sync::sync(&repo) {
@@ -7412,7 +7445,7 @@ async fn run_transcripts_sync(
     let opts = ScanOpts {
         dir: &meetings_dir,
         require_disclosed,
-        my_email: &my_email,
+        my_emails: &my_emails,
     };
     let (report, emails) = scan(&opts, log.as_ref(), &resolve)?;
 
