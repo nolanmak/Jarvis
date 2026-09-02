@@ -1464,11 +1464,22 @@ fn complexity_from_pr_body(body: &str) -> Complexity {
 /// of them, three days, while the loop only ever started new work. Owner
 /// directive 2026-08-31: sitting PRs are picked up too, and since they are
 /// mostly-finished work they outrank new issues.
-async fn find_resumable_draft(repo_root: &Path, only: Option<u64>) -> Option<(u64, u64, String)> {
+async fn find_resumable_draft(
+    repo_root: &Path,
+    only: Option<u64>,
+    dry_run: bool,
+) -> Option<(u64, u64, String)> {
     let gh = gh_bin();
     let (ok, stdout, _) = run(
         &gh,
-        &["pr", "list", "--state", "open", "--json", "number,isDraft,headRefName"],
+        &[
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--json",
+            "number,isDraft,headRefName",
+        ],
         repo_root,
     )
     .await
@@ -1487,8 +1498,16 @@ async fn find_resumable_draft(repo_root: &Path, only: Option<u64>) -> Option<(u6
     let (ok, labeled, _) = run(
         &gh,
         &[
-            "issue", "list", "--state", "open", "--label", GAVE_UP_LABEL,
-            "--limit", "200", "--json", "number",
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--label",
+            GAVE_UP_LABEL,
+            "--limit",
+            "200",
+            "--json",
+            "number",
         ],
         repo_root,
     )
@@ -1498,17 +1517,30 @@ async fn find_resumable_draft(repo_root: &Path, only: Option<u64>) -> Option<(u6
         serde_json::from_str::<serde_json::Value>(&labeled)
             .ok()
             .and_then(|v| {
-                v.as_array().map(|a| {
-                    a.iter()
-                        .filter_map(|i| i.get("number")?.as_u64())
-                        .collect()
-                })
+                v.as_array()
+                    .map(|a| a.iter().filter_map(|i| i.get("number")?.as_u64()).collect())
             })
             .unwrap_or_default()
     } else {
         // Can't tell — resume nothing rather than resume a labeled-out PR.
         return None;
     };
+
+    // #934 — a draft whose issue already gave up is closed on sight (branch
+    // kept, revival instructions in the comment) so `gh pr list` shows only
+    // work that is actually in play.
+    if !dry_run {
+        for (pr, issue) in drafts_to_close(&prs, &gave_up) {
+            close_gave_up_pr(
+                repo_root,
+                pr,
+                issue,
+                MAX_ATTEMPTS,
+                "see the attempt comments on the issue",
+            )
+            .await;
+        }
+    }
 
     let ledger = AttemptLedger::load(&attempt_ledger_path());
     resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only)
@@ -2886,6 +2918,71 @@ fn build_conflict_prompt(
     )
 }
 
+// ---------------------------------------------------------------------------
+// #934 — close-or-escalate: a draft whose issue gave up is closed, not left
+// open forever. `label_gave_up` marks the ISSUE and #880 stops the resume
+// lane from touching the draft again — but the PR itself sat open (#853 for
+// days), noise in `gh pr list` that made "what needs a human" unreadable.
+// The branch is kept; the close comment says how to revive it.
+// ---------------------------------------------------------------------------
+
+fn gave_up_close_comment(pr: u64, issue: u64, attempts: u32, last_failure: &str) -> String {
+    format!(
+        "Auto-resume: closing draft #{pr} — the loop gave up on #{issue} after {attempts} \
+         attempts (issue labelled `{GAVE_UP_LABEL}`). Last failure:\n```\n{}\n```\n\n\
+         The branch is kept. To revive: push a fix to the branch (or fix the failure \
+         another way), remove the `{GAVE_UP_LABEL}` label from #{issue}, and reopen this \
+         PR — the loop resumes it on its next tick.",
+        truncate(last_failure, 1500)
+    )
+}
+
+/// `gh pr close --comment`, never `--delete-branch`. Best-effort like the
+/// label call: a failure here must not abort the run that already gave up.
+async fn close_gave_up_pr(
+    repo_root: &Path,
+    pr: u64,
+    issue: u64,
+    attempts: u32,
+    last_failure: &str,
+) {
+    let gh = gh_bin();
+    let body = gave_up_close_comment(pr, issue, attempts, last_failure);
+    match run(
+        &gh,
+        &["pr", "close", &pr.to_string(), "--comment", &body],
+        repo_root,
+    )
+    .await
+    {
+        Ok((true, _, _)) => info!(pr, issue, "closed gave-up draft (branch kept)"),
+        Ok((false, _, e)) => warn!(pr, "could not close gave-up draft: {}", truncate(&e, 300)),
+        Err(e) => warn!(pr, "close gave-up draft errored: {e:#}"),
+    }
+}
+
+/// Open DRAFTS on agent branches whose issue already carries the gave-up
+/// label: `(pr, issue)`. A ready PR is a human's decision now; a human
+/// branch is never ours.
+fn drafts_to_close(
+    prs: &serde_json::Value,
+    gave_up: &std::collections::HashSet<u64>,
+) -> Vec<(u64, u64)> {
+    prs.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|pr| {
+                    let draft = pr.get("isDraft")?.as_bool()?;
+                    let number = pr.get("number")?.as_u64()?;
+                    let branch = pr.get("headRefName")?.as_str()?;
+                    let issue = issue_from_branch(branch)?;
+                    (draft && gave_up.contains(&issue)).then_some((number, issue))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Resume a sitting draft PR (#866): re-review it against today's `main`,
 /// revise against fresh findings, and merge on a double LGTM.
 ///
@@ -3102,6 +3199,7 @@ async fn resume_draft_pr(
                 let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
                 if attempts >= MAX_ATTEMPTS {
                     label_gave_up(repo_root, issue.number).await.ok();
+                    close_gave_up_pr(repo_root, pr, issue.number, attempts, &why).await;
                 }
                 let message = format!(
                     "PR #{pr}: merge conflict with main not resolved ({why}); attempt {attempts}"
@@ -3286,6 +3384,7 @@ async fn resume_draft_pr(
             let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
             if attempts >= MAX_ATTEMPTS {
                 label_gave_up(repo_root, issue.number).await.ok();
+                close_gave_up_pr(repo_root, pr, issue.number, attempts, &format!("{gate_err:#}")).await;
             }
             return Ok(RunReport::built(format!(
                 "PR #{pr}: resume gate failed (attempt {attempts})"
@@ -3404,6 +3503,7 @@ async fn resume_draft_pr(
                 // Every future resume would replay the same disagreement;
                 // the label hands it to a human with the exchange attached.
                 label_gave_up(repo_root, issue.number).await.ok();
+                close_gave_up_pr(repo_root, pr, issue.number, attempts, &independent.notes).await;
             }
             notify_discord(&format!(
                 "📝 resumed draft still needs review after {rounds_done} rounds: {} — PR #{pr}",
@@ -3722,7 +3822,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 RedMainPlan::Resume(n) => {
                     if lane != Lane::Build {
                         if let Some((pr, issue_no, resume_branch)) =
-                            find_resumable_draft(repo_root, Some(n)).await
+                            find_resumable_draft(repo_root, Some(n), dry_run).await
                         {
                             info!(sha = %short, pr, issue = issue_no, "main is red; resuming its fix PR first");
                             let reasoner = build_reasoner();
@@ -3759,7 +3859,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // eligible), the build lane skips it entirely, and the default combined
     // lane keeps resume-first (still flippable via the knob).
     if red_main_issue.is_none() && lane != Lane::Build && resume_first_enabled() {
-        if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root, None).await {
+        if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root, None, dry_run).await {
             let reasoner = build_reasoner();
             return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run)
                 .await;
@@ -8129,5 +8229,102 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             arm.contains("needs a human rebase"),
             "and still tell the human"
         );
+    }
+
+    // --- #934 close-or-escalate: gave-up drafts are closed, not left open --
+
+    #[test]
+    fn gave_up_close_comment_names_issue_attempts_and_revival() {
+        let c = gave_up_close_comment(859, 803, 3, "cargo test failed:\nfailures:\n    a::b");
+        assert!(c.contains("#803"), "{c}");
+        assert!(c.contains("after 3 attempts"), "{c}");
+        assert!(
+            c.contains("failures:\n    a::b"),
+            "the last failure is quoted"
+        );
+        assert!(c.contains("remove the `agent-gave-up` label"), "{c}");
+        assert!(c.contains("reopen"), "{c}");
+        assert!(c.contains("branch is kept"), "{c}");
+        // A 20 kB failure is cut well under GitHub's comment limit.
+        let long = "x".repeat(20_000);
+        assert!(gave_up_close_comment(1, 2, 3, &long).len() < 3_000);
+    }
+
+    #[test]
+    fn drafts_to_close_are_open_drafts_of_gave_up_issues() {
+        let prs: serde_json::Value = serde_json::json!([
+            {"number": 853, "isDraft": true, "headRefName": "agent-fix/issue-845"},
+            {"number": 855, "isDraft": true, "headRefName": "agent-fix/issue-652"},
+            {"number": 900, "isDraft": false, "headRefName": "agent-fix/issue-700"},
+            {"number": 901, "isDraft": true, "headRefName": "feature/human"},
+        ]);
+        let gave_up: std::collections::HashSet<u64> = [845u64, 700].into_iter().collect();
+        // Only DRAFTS on agent branches whose issue gave up; a ready PR (900)
+        // is a human's decision now, a human branch (901) is never ours.
+        assert_eq!(drafts_to_close(&prs, &gave_up), vec![(853u64, 845u64)]);
+        assert!(drafts_to_close(&prs, &std::collections::HashSet::new()).is_empty());
+    }
+
+    // Structural: every gave-up in resume_draft_pr closes the PR (branch
+    // kept), and close_gave_up_pr never deletes the branch.
+    #[test]
+    fn gave_up_in_resume_closes_the_pr_but_keeps_the_branch() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = start + src[start..].find("\n}\n").expect("fn end");
+        let body = &src[start..end];
+        let mut sites = 0;
+        let mut from = 0;
+        while let Some(at) = body[from..].find("label_gave_up(") {
+            let abs = from + at;
+            let ret = abs
+                + body[abs..]
+                    .find("return Ok(RunReport::")
+                    .expect("return after gave-up");
+            assert!(
+                body[abs..ret].contains("close_gave_up_pr("),
+                "gave-up site {} must close the PR before returning",
+                sites + 1
+            );
+            sites += 1;
+            from = abs + 1;
+        }
+        assert_eq!(
+            sites, 3,
+            "conflict-exhausted, gate-exhausted, review-exhausted"
+        );
+        let cstart = src.find("async fn close_gave_up_pr(").expect("close fn");
+        let cend = cstart + src[cstart..].find("\n}\n").expect("close fn end");
+        let close = &src[cstart..cend];
+        assert!(close.contains(r#""pr", "close""#));
+        assert!(
+            !close.contains("--delete-branch"),
+            "the branch stays for a human"
+        );
+    }
+
+    // Structural: run_once has no PR yet at its gave-up sites — nothing to close.
+    #[test]
+    fn run_once_gave_up_does_not_close_anything() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let end = start + src[start..].find("\n}\n").expect("end of run_once");
+        let body = &src[start..end];
+        assert!(!body.contains("close_gave_up_pr("));
+        assert!(!body.contains(r#""pr", "close""#));
+    }
+
+    // Structural: the finder sweeps drafts that already gave up (the one-off
+    // for #853-style leftovers) before choosing what to resume.
+    #[test]
+    fn find_resumable_draft_sweeps_gave_up_drafts() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn find_resumable_draft(").expect("finder");
+        let end = start + src[start..].find("\n}\n").expect("finder end");
+        let body = &src[start..end];
+        let sweep = body.find("drafts_to_close(").expect("sweep");
+        let close = body.find("close_gave_up_pr(").expect("close in sweep");
+        let choose = body.find("resumable_from(").expect("choice");
+        assert!(sweep < close && close < choose, "sweep, close, then choose");
     }
 }
