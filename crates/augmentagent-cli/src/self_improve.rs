@@ -6425,11 +6425,30 @@ struct AttemptHistory {
 }
 
 impl AttemptHistory {
+    /// The live file, else the `.bak` left by the previous [`save`](Self::save)
+    /// — a daemon killed mid-write must not cost every issue its context.
     fn load(path: &Path) -> Self {
-        std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+        let parse = |p: &Path| {
+            std::fs::read(p)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+        };
+        parse(path)
+            .or_else(|| {
+                let bak = Self::bak_path(path);
+                let recovered = parse(&bak);
+                if recovered.is_some() {
+                    warn!(path = %path.display(), "attempt history unreadable; recovered from .bak");
+                }
+                recovered
+            })
             .unwrap_or_default()
+    }
+
+    fn bak_path(path: &Path) -> PathBuf {
+        let mut p = path.as_os_str().to_owned();
+        p.push(".bak");
+        PathBuf::from(p)
     }
 
     fn push(&mut self, issue: u64, rec: AttemptRecord) {
@@ -6439,17 +6458,35 @@ impl AttemptHistory {
         recs.drain(..overflow);
     }
 
+    /// Atomic replace: serialize to `<path>.tmp`, keep the previous file as
+    /// `<path>.bak`, then rename the temp over the live file. A crash at any
+    /// point leaves either the old or the new file readable, never a torn one.
+    /// Best-effort like [`DailyCounter::save`]: a failure costs context, not
+    /// the run.
     fn save(&self, path: &Path) {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        match serde_json::to_vec(self) {
-            Ok(bytes) => {
-                if let Err(e) = std::fs::write(path, bytes) {
-                    warn!(path = %path.display(), "could not persist attempt history: {e}");
-                }
+        let bytes = match serde_json::to_vec(self) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("could not serialize attempt history: {e}");
+                return;
             }
-            Err(e) => warn!("could not serialize attempt history: {e}"),
+        };
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        if let Err(e) = std::fs::write(&tmp, bytes) {
+            warn!(path = %tmp.display(), "could not write attempt history: {e}");
+            return;
+        }
+        if path.exists() {
+            let _ = std::fs::copy(path, Self::bak_path(path));
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            warn!(path = %path.display(), "could not replace attempt history: {e}");
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
@@ -9893,5 +9930,31 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // Multibyte input never panics at the cut.
         let wide = "—".repeat(3_000);
         assert!(truncate_tail(&wide, 100).len() <= 100 + '…'.len_utf8() + 3);
+    }
+
+    // Codex on #859: the history is written atomically (temp + rename) and a
+    // torn or corrupt live file falls back to the previous good one.
+    #[test]
+    fn attempt_history_save_is_atomic_and_recovers_from_bak() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state/history.json");
+        let mut h = AttemptHistory::default();
+        h.push(7, test_record(FailureKind::GateRed, "gate", "first"));
+        h.save(&path);
+        assert!(path.exists());
+        assert!(!dir.path().join("state/history.json.tmp").exists(), "no temp file left behind");
+        h.push(7, test_record(FailureKind::ReviewReject, "qa-review", "second"));
+        h.save(&path);
+        let bak = dir.path().join("state/history.json.bak");
+        assert!(bak.exists(), "previous file kept as .bak");
+        // Simulate a crash that tore the live file: recovery yields the
+        // previous good state, not an empty history.
+        std::fs::write(&path, b"{\"issues\":{\"7\":[{\"at\":1,\"ki").unwrap();
+        let recovered = AttemptHistory::load(&path);
+        let digest = recovered.digest(7).expect("recovered from .bak");
+        assert!(digest.contains("first") && !digest.contains("second"));
+        // A stale temp file is ignored by load.
+        std::fs::write(dir.path().join("state/history.json.tmp"), b"garbage").unwrap();
+        assert!(AttemptHistory::load(&path).digest(7).is_some());
     }
 }
