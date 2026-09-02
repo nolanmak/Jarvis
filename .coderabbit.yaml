@@ -1,0 +1,11 @@
+# CodeRabbit configuration (https://docs.coderabbit.ai/reference/configuration).
+#
+# The auto-PR loop opens every agent PR as a DRAFT and only marks it ready
+# seconds before merging, so with the default (drafts are not reviewed)
+# CodeRabbit never saw an agent PR (#936). Reviewing drafts lets the loop
+# treat CodeRabbit as its third reviewer: revise on actionable findings,
+# merge only when it has none on the final head.
+reviews:
+  auto_review:
+    enabled: true
+    drafts: true
