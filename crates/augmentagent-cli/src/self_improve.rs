@@ -4537,7 +4537,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // Staging here is idempotent with the commit step's own `git add -A`.
     let mut dropped = drop_root_scratch(&worktree).await;
     let _ = run("git", &["add", "-A"], &worktree).await?;
-    let (_ok, diff, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
+    let (_ok, mut diff, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
     if diff.trim().is_empty() {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
         let attempts = record_attempt(
@@ -4979,17 +4979,16 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // Intermediate rounds ran the targeted gate (#870); everything that
         // ships — or even lands as a PR claiming workspace-pass — gets the
         // FULL suite exactly once here.
-        // Revisions changed the worktree: refresh what the publish records
-        // below describe.
-        let (_ok, diff, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
+        // Revisions changed the worktree: refresh what the final-gate and
+        // publish records below describe (the outer `diff`/`lines` are the
+        // pre-revision snapshot).
+        let (_ok, stat_after, _) = run("git", &["diff", "--cached", "--stat"], &worktree).await?;
         let (_ok, full_after, _) = run("git", &["diff", "--cached"], &worktree).await?;
-        let lines = diff_line_count(&full_after);
+        diff = stat_after;
+        lines = diff_line_count(&full_after);
         if let Err(gate_err) = verification_gate(&worktree).await {
             warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
-            // The record must describe the diff that failed — the revised
-            // one, not the pre-revision snapshot.
-            let (_ok, final_diff, _) = run("git", &["diff", "--cached"], &worktree).await?;
-            let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:final-gate", &detail, &diff_touched_paths(&final_diff), diff_line_count(&final_diff)) })).await.unwrap_or(1);
+            let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:final-gate", &detail, &diff_touched_paths(&full_after), lines) })).await.unwrap_or(1);
             if attempts >= MAX_ATTEMPTS {
                 backoff_comment(
                     repo_root,
@@ -9818,15 +9817,15 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let revise = body.find("revision hit the blast-radius guard").expect("revision loop");
         let loop_end = revise + body[revise..].find("final full gate failed after revisions").expect("final gate");
         assert!(!body[revise..loop_end].contains("&diff, lines"), "a revision-round record still uses the original diff");
-        // After the loop the publish records describe the refreshed diff.
-        let refreshed = body[revise..].find("let (_ok, diff, _) = run(\"git\", &[\"diff\", \"--cached\", \"--stat\"], &worktree).await?;").expect("refreshed stat");
-        assert!(revise + refreshed < body.len());
+        // After the loop the outer diff/lines are refreshed, so the publish
+        // records describe what was actually pushed.
         let tail = &body[revise..];
+        assert!(tail.contains("diff = stat_after;") && tail.contains("lines = diff_line_count(&full_after);"), "publish records must see the revised diff");
         for stage in ["revise:blast-radius", "revise:size", "revise:gate", "revise:final-gate"] {
             let at = tail.find(stage).expect(stage);
             let call = &tail[at..at + 200];
             assert!(
-                call.contains("diff2") || call.contains("final_diff"),
+                call.contains("diff2") || call.contains("full_after"),
                 "{stage} must record the revised diff: {call}"
             );
         }
