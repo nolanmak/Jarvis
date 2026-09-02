@@ -8261,6 +8261,25 @@ mod approval_body_tests {
         );
     }
 
+    /// #650/#651 discipline (codex on #857): every Gmail write path checks
+    /// the body's own `Subject:` line and the thread's subject BEFORE it
+    /// uploads an attachment or creates a draft, so a refusal never strands
+    /// an orphan upload. Pinned structurally on the three CLI paths.
+    #[test]
+    fn refusals_run_before_any_attachment_upload_on_every_write_path() {
+        let src = include_str!("main.rs");
+        for f in ["async fn run_gmail_compose(", "async fn run_gmail_update_draft(", "async fn run_gmail_send_now("] {
+            let start = src.find(f).expect(f);
+            let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+            let body_gate = body.find("body_for_gmail_write(").expect("body subject gate");
+            let thread_gate = body.find("ensure_subject_matches_thread(").expect("thread subject gate (#651)");
+            let upload = body.find("upload_attach_if_given(").expect("attachment upload");
+            let draft = body.find("create_draft_with_attachment(").or_else(|| body.find("update_draft_with_attachment(")).expect("draft write");
+            assert!(body_gate < upload && thread_gate < upload, "{f}: a refusal must precede the upload");
+            assert!(upload < draft, "{f}: upload precedes the draft write");
+        }
+    }
+
     #[test]
     fn reply_and_forward_prefixes_do_not_make_two_subjects_disagree() {
         assert!(subjects_agree("Hosting a PTE event", "RE: hosting a PTE event"));
