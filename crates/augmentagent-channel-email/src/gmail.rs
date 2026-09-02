@@ -331,6 +331,74 @@ impl ComposioClient {
     ///
     /// Both failing means the id isn't in THIS account's mailbox at all —
     /// commonly the thread lives in a different connected account.
+    /// Enumerate a message's attachments (#937) via
+    /// `GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID` format=full — the only fetch shape
+    /// that carries `attachmentList` with `attachmentId`s.
+    pub async fn list_attachments(
+        &self,
+        entity_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<AttachmentMeta>, GmailError> {
+        // No inline `user_id` (see resolve_thread_id): account routing is the
+        // execute() envelope's job.
+        let args = serde_json::json!({
+            "message_id": message_id,
+            "format": "full",
+        });
+        let v = self
+            .execute("GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID", entity_id, args)
+            .await?;
+        Ok(attachments_from_fetch(&v))
+    }
+
+    /// Stage one attachment for download (#937) via `GMAIL_GET_ATTACHMENT`.
+    /// Returns the presigned URL envelope; fetch the bytes with
+    /// [`Self::download_url`]. `file_name` is required by Composio (it names
+    /// the staged object) — pass the attachment's own filename.
+    pub async fn get_attachment_file(
+        &self,
+        entity_id: &str,
+        message_id: &str,
+        attachment_id: &str,
+        file_name: &str,
+    ) -> Result<AttachmentFile, GmailError> {
+        let args = serde_json::json!({
+            "message_id": message_id,
+            "attachment_id": attachment_id,
+            "file_name": file_name,
+        });
+        let v = self.execute("GMAIL_GET_ATTACHMENT", entity_id, args).await?;
+        parse_attachment_file(&v)
+    }
+
+    /// GET a presigned URL (no Composio auth header — the signature IS the
+    /// auth). Returns the bytes and the `Content-Type` the store reported.
+    pub async fn download_url(&self, url: &str) -> Result<(Vec<u8>, Option<String>), GmailError> {
+        // `reqwest::Client::new()` has no default timeout; a stalled peer
+        // would otherwise hang `bytes()` forever. Per-request timeout covers
+        // the body read too (CodeRabbit on #946).
+        let resp = self
+            .http
+            .get(url)
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(GmailError::Composio {
+                message: format!("attachment download → {status}: {}", text.trim()),
+            });
+        }
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let bytes = resp.bytes().await?.to_vec();
+        Ok((bytes, content_type))
+    }
+
     pub async fn resolve_thread_id(
         &self,
         entity_id: &str,
@@ -1066,6 +1134,121 @@ mod tests {
     // `Content-Type: multipart/mixed` header is the fallback for builds that
     // omit it.
 
+    // ---- #937: attachment enumeration + download plumbing ----
+
+    #[test]
+    fn attachments_from_fetch_parses_the_live_composio_shape() {
+        // Probed live 2026-09-02 against GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID
+        // format=full: entries carry attachmentId / filename / mimeType.
+        let v = serde_json::json!({
+            "successful": true,
+            "data": {
+                "messageId": "1a05eed77b9f2074",
+                "attachmentList": [
+                    {"attachmentId": "ANGjdJ_abc", "filename": "PCT REPORTS .pdf", "mimeType": "application/pdf"},
+                    {"attachment_id": "second", "filename": "notes.docx"}
+                ]
+            }
+        });
+        let metas = super::attachments_from_fetch(&v);
+        assert_eq!(metas.len(), 2);
+        assert_eq!(metas[0].attachment_id.as_deref(), Some("ANGjdJ_abc"));
+        assert_eq!(metas[0].filename.as_deref(), Some("PCT REPORTS .pdf"));
+        assert_eq!(metas[0].mime_type.as_deref(), Some("application/pdf"));
+        assert_eq!(metas[0].label(), "PCT REPORTS .pdf (application/pdf)");
+        // snake_case alias + missing mime degrade gracefully.
+        assert_eq!(metas[1].attachment_id.as_deref(), Some("second"));
+        assert_eq!(metas[1].label(), "notes.docx");
+        // mime_type snake_case alias (CodeRabbit on #946).
+        let v = serde_json::json!({"data": {"attachmentList": [
+            {"attachmentId": "x", "filename": "a.pdf", "mime_type": "application/pdf"}
+        ]}});
+        assert_eq!(super::attachments_from_fetch(&v)[0].mime_type.as_deref(), Some("application/pdf"));
+    }
+
+    #[test]
+    fn attachments_from_fetch_is_lenient_about_shape_drift() {
+        // #331 lesson: never abort on a drifted list — degrade to empty.
+        for bad in [
+            serde_json::json!({"data": {"attachmentList": "nope"}}),
+            serde_json::json!({"data": {"attachmentList": null}}),
+            serde_json::json!({"data": {}}),
+            serde_json::json!({"data": {"attachmentList": [42, "x"]}}),
+            serde_json::json!("not an object"),
+        ] {
+            assert!(super::attachments_from_fetch(&bad).is_empty(), "{bad}");
+        }
+        // Mixed: bad entries are dropped, good ones kept.
+        let v = serde_json::json!({"data": {"attachmentList": [
+            {"attachmentId": "ok", "filename": "a.pdf"}, 7
+        ]}});
+        assert_eq!(super::attachments_from_fetch(&v).len(), 1);
+    }
+
+    #[test]
+    fn pick_attachment_by_id_or_case_insensitive_name() {
+        let metas = super::attachments_from_fetch(&serde_json::json!({"data": {"attachmentList": [
+            {"attachmentId": "ID1", "filename": "PCT REPORTS .pdf", "mimeType": "application/pdf"},
+            {"attachmentId": "ID2", "filename": "invoice.pdf", "mimeType": "application/pdf"},
+            {"attachmentId": "ID3", "filename": "invoice.pdf", "mimeType": "application/pdf"}
+        ]}}));
+        // Exact id.
+        let (idx, m) = super::pick_attachment(&metas, Some("ID2"), None).unwrap();
+        assert_eq!((idx, m.attachment_id.as_deref()), (1, Some("ID2")));
+        // Name: case-insensitive, whitespace-trimmed (the real filename has a
+        // trailing space before the extension).
+        let (idx, m) = super::pick_attachment(&metas, None, Some("pct reports .PDF")).unwrap();
+        assert_eq!((idx, m.attachment_id.as_deref()), (0, Some("ID1")));
+        let (idx, _) = super::pick_attachment(&metas, None, Some("  PCT REPORTS .pdf  ")).unwrap();
+        assert_eq!(idx, 0);
+        // Ambiguous name → error that says so.
+        let err = super::pick_attachment(&metas, None, Some("invoice.pdf")).unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        // Unknown id / name → error listing what IS there.
+        let err = super::pick_attachment(&metas, Some("nope"), None).unwrap_err();
+        assert!(err.to_string().contains("PCT REPORTS .pdf"), "{err}");
+        let err = super::pick_attachment(&metas, None, Some("missing.pdf")).unwrap_err();
+        assert!(err.to_string().contains("invoice.pdf"), "{err}");
+        // CodeRabbit on #946: `gmail search` prints `name (mime)`; an agent
+        // that pastes that whole string must still land on the file.
+        let (idx, _) = super::pick_attachment(&metas, None, Some("PCT REPORTS .pdf (application/pdf)")).unwrap();
+        assert_eq!(idx, 0);
+        // …but a literal filename that happens to end in a parenthetical wins
+        // over the stripped form.
+        let paren = super::attachments_from_fetch(&serde_json::json!({"data": {"attachmentList": [
+            {"attachmentId": "P1", "filename": "plan (final).pdf"},
+            {"attachmentId": "P2", "filename": "plan"}
+        ]}}));
+        let (idx, _) = super::pick_attachment(&paren, None, Some("plan (final).pdf")).unwrap();
+        assert_eq!(idx, 0);
+        // Neither selector → error.
+        assert!(super::pick_attachment(&metas, None, None).is_err());
+        // Empty list → error.
+        assert!(super::pick_attachment(&[], Some("ID1"), None).is_err());
+    }
+
+    #[test]
+    fn parse_attachment_file_reads_data_file_from_get_attachment() {
+        // Probed live 2026-09-02: GMAIL_GET_ATTACHMENT → data.file{name,mimetype,s3url}
+        // where s3url is a presigned (Cloudflare R2) URL.
+        let v = serde_json::json!({
+            "successful": true,
+            "data": {"file": {
+                "name": "PCT REPORTS .pdf",
+                "mimetype": "application/pdf",
+                "s3url": "https://temp.example.r2.cloudflarestorage.com/x?sig=1"
+            }}
+        });
+        let f = super::parse_attachment_file(&v).unwrap();
+        assert_eq!(f.name, "PCT REPORTS .pdf");
+        assert_eq!(f.mimetype, "application/pdf");
+        assert!(f.s3url.starts_with("https://temp.example"));
+
+        // No file / no s3url → decode error naming the field.
+        let err = super::parse_attachment_file(&serde_json::json!({"data": {}})).unwrap_err();
+        assert!(err.to_string().contains("s3url"), "{err}");
+    }
+
     #[test]
     fn fetch_message_surfaces_attachment_metadata() {
         let v = serde_json::json!({
@@ -1285,6 +1468,100 @@ mod tests {
 
     // ---- #439: multi-recipient / cc / bcc land as the array params Composio
     // actually accepts, not a comma-joined `recipient_email` string ----
+
+    // ---- #937: list_attachments / get_attachment_file / download_url ----
+
+    #[tokio::test]
+    async fn list_attachments_fetches_the_message_in_full_format() {
+        let resp = r#"{"successful":true,"data":{"messageId":"m1","attachmentList":[{"attachmentId":"A1","filename":"r.pdf","mimeType":"application/pdf"}]}}"#;
+        let (addr, captured) = spawn_capturing_http(resp).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let metas = client.list_attachments("entity-x", "m1").await.expect("list ok");
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].attachment_id.as_deref(), Some("A1"));
+
+        let raw = captured.await.expect("request captured");
+        assert!(raw.contains("/api/v3/tools/execute/GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID"), "{raw}");
+        let body = raw.split("\r\n\r\n").nth(1).expect("body");
+        let json: serde_json::Value = serde_json::from_str(body).expect("json body");
+        assert_eq!(json["user_id"], "entity-x");
+        assert_eq!(json["arguments"]["message_id"], "m1");
+        assert_eq!(json["arguments"]["format"], "full");
+        // No inline user_id in arguments — a Composio entity id there 403s.
+        assert!(json["arguments"].get("user_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_attachment_file_sends_the_three_required_params() {
+        let resp = r#"{"successful":true,"data":{"file":{"name":"r.pdf","mimetype":"application/pdf","s3url":"https://files.example/r.pdf"}}}"#;
+        let (addr, captured) = spawn_capturing_http(resp).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let f = client
+            .get_attachment_file("entity-x", "m1", "A1", "r.pdf")
+            .await
+            .expect("get ok");
+        assert_eq!(f.s3url, "https://files.example/r.pdf");
+
+        let raw = captured.await.expect("request captured");
+        assert!(raw.contains("/api/v3/tools/execute/GMAIL_GET_ATTACHMENT"), "{raw}");
+        let body = raw.split("\r\n\r\n").nth(1).expect("body");
+        let json: serde_json::Value = serde_json::from_str(body).expect("json body");
+        assert_eq!(json["arguments"]["message_id"], "m1");
+        assert_eq!(json["arguments"]["attachment_id"], "A1");
+        assert_eq!(json["arguments"]["file_name"], "r.pdf");
+    }
+
+    #[tokio::test]
+    async fn get_attachment_file_surfaces_an_unsuccessful_envelope() {
+        let resp = r#"{"successful":false,"error":"Requested entity was not found.","log_id":"lg1"}"#;
+        let addr = spawn_repeating_http(200, resp).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+        let err = client
+            .get_attachment_file("entity-x", "m1", "A1", "r.pdf")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn download_url_returns_the_bytes_and_content_type() {
+        // Presigned-URL GET: plain bytes, not a Composio envelope.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = b"%PDF-1.4 fake";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/pdf\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body).await;
+            let _ = socket.shutdown().await;
+        });
+        let client = ComposioClient::new("ak_fake".into());
+        let (bytes, ct) = client
+            .download_url(&format!("http://{addr}/r.pdf"))
+            .await
+            .expect("download ok");
+        assert_eq!(bytes, b"%PDF-1.4 fake");
+        assert_eq!(ct.as_deref(), Some("application/pdf"));
+    }
+
+    #[tokio::test]
+    async fn download_url_rejects_non_2xx() {
+        let addr = spawn_one_shot_http(403, "denied").await;
+        let client = ComposioClient::new("ak_fake".into());
+        let err = client
+            .download_url(&format!("http://{addr}/r.pdf"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("403"), "{err}");
+    }
 
     #[tokio::test]
     async fn create_draft_splits_to_into_recipient_email_and_extra_recipients() {
@@ -1965,26 +2242,33 @@ struct FetchMessage {
         alias = "attachment_list",
         deserialize_with = "de_lenient_attachments"
     )]
-    attachment_list: Vec<FetchAttachment>,
+    attachment_list: Vec<AttachmentMeta>,
 }
 
-#[derive(Debug, Deserialize)]
+/// One entry of Composio's `attachmentList` (#811 labels, #937 download).
+/// Shape probed live 2026-09-02 on `GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID`
+/// format=full: `{attachmentId, filename, mimeType}`. Every field is optional
+/// because Composio builds have been seen returning `null`/`""` for any of
+/// them; `attachment_id` is what `GMAIL_GET_ATTACHMENT` needs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct FetchAttachment {
+pub struct AttachmentMeta {
     #[serde(default)]
-    filename: Option<String>,
-    #[serde(default)]
-    mime_type: Option<String>,
+    pub filename: Option<String>,
+    #[serde(default, alias = "mime_type")]
+    pub mime_type: Option<String>,
+    #[serde(default, alias = "attachment_id", alias = "id")]
+    pub attachment_id: Option<String>,
 }
 
 /// Stand-in when an attachment is known to exist but Composio gave no filename.
 /// "Something is attached" is the signal that matters; the name is a bonus.
 const UNNAMED_ATTACHMENT: &str = "(attachment — filename unavailable)";
 
-impl FetchAttachment {
+impl AttachmentMeta {
     /// `resume.pdf (application/pdf)`, degrading gracefully as fields go
     /// missing — both come back as `null` or `""` on some Composio builds.
-    fn label(&self) -> String {
+    pub fn label(&self) -> String {
         let present = |v: &Option<String>| {
             v.as_deref()
                 .map(str::trim)
@@ -2002,12 +2286,149 @@ impl FetchAttachment {
 /// Accept `attachmentList` in any shape: a well-formed array of objects parses,
 /// anything else (absent, null, a string, entries of the wrong type) yields an
 /// empty list rather than aborting the entire `FetchResp` decode.
-fn de_lenient_attachments<'de, D>(d: D) -> Result<Vec<FetchAttachment>, D::Error>
+fn de_lenient_attachments<'de, D>(d: D) -> Result<Vec<AttachmentMeta>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let v = serde_json::Value::deserialize(d)?;
-    Ok(serde_json::from_value(v).unwrap_or_default())
+    Ok(lenient_attachment_list(&v))
+}
+
+/// Per-entry lenient decode of an `attachmentList` value: a non-array yields
+/// nothing, malformed entries are dropped, well-formed ones survive. Losing
+/// every attachment over one odd entry is the #331 failure mode.
+fn lenient_attachment_list(v: &serde_json::Value) -> Vec<AttachmentMeta> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| serde_json::from_value::<AttachmentMeta>(e.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Attachment metadata from a `GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID` envelope
+/// (#937). Looks for `attachmentList` / `attachment_list` anywhere under the
+/// response (Composio nests under `data`, sometimes `data.response_data`).
+pub fn attachments_from_fetch(v: &serde_json::Value) -> Vec<AttachmentMeta> {
+    fn find_list(v: &serde_json::Value) -> Option<&serde_json::Value> {
+        let map = v.as_object()?;
+        for key in ["attachmentList", "attachment_list"] {
+            if let Some(l) = map.get(key) {
+                return Some(l);
+            }
+        }
+        map.values().find_map(find_list)
+    }
+    find_list(v).map(lenient_attachment_list).unwrap_or_default()
+}
+
+/// Select one attachment by exact `attachment_id` or by filename
+/// (case-insensitive, whitespace-trimmed — the real report's name carries a
+/// trailing space before `.pdf`). Returns the list index alongside the entry
+/// so callers can derive a stable tempfile slot. Errors name what IS there.
+pub fn pick_attachment<'a>(
+    metas: &'a [AttachmentMeta],
+    attachment_id: Option<&str>,
+    name: Option<&str>,
+) -> Result<(usize, &'a AttachmentMeta), GmailError> {
+    let listing = || -> String {
+        if metas.is_empty() {
+            "(message has no attachments)".to_string()
+        } else {
+            metas
+                .iter()
+                .enumerate()
+                .map(|(i, m)| format!("[{i}] {}", m.label()))
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+    };
+    if let Some(id) = attachment_id.map(str::trim).filter(|s| !s.is_empty()) {
+        return metas
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m.attachment_id.as_deref() == Some(id))
+            .ok_or_else(|| GmailError::Invalid(format!(
+                "no attachment with id {id:?}; available: {}",
+                listing()
+            )));
+    }
+    if let Some(name) = name.map(str::trim).filter(|s| !s.is_empty()) {
+        // `gmail search` prints `name (mime)`; an agent that pastes the whole
+        // string must still land on the file, so after the verbatim name we
+        // also try it with a trailing ` (…)` stripped. Verbatim wins, so a
+        // filename that genuinely ends in a parenthetical is still reachable.
+        let verbatim = name.to_lowercase();
+        let mut candidates = vec![verbatim.clone()];
+        if verbatim.ends_with(')') {
+            if let Some(i) = verbatim.rfind(" (") {
+                let stripped = verbatim[..i].trim().to_string();
+                if !stripped.is_empty() {
+                    candidates.push(stripped);
+                }
+            }
+        }
+        for wanted in &candidates {
+            let hits: Vec<(usize, &AttachmentMeta)> = metas
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| {
+                    m.filename
+                        .as_deref()
+                        .map(|f| f.trim().to_lowercase() == *wanted)
+                        .unwrap_or(false)
+                })
+                .collect();
+            match hits.len() {
+                0 => continue,
+                1 => return Ok(hits[0]),
+                n => {
+                    return Err(GmailError::Invalid(format!(
+                        "attachment name {name:?} is ambiguous ({n} matches); pass --attachment-id instead: {}",
+                        listing()
+                    )))
+                }
+            }
+        }
+        return Err(GmailError::Invalid(format!(
+            "no attachment named {name:?}; available: {}",
+            listing()
+        )));
+    }
+    Err(GmailError::Invalid(format!(
+        "pass --attachment-id or --name; available: {}",
+        listing()
+    )))
+}
+
+/// `data.file` of a `GMAIL_GET_ATTACHMENT` envelope (#937): the attachment
+/// staged behind a presigned URL. Probed live 2026-09-02.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AttachmentFile {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub mimetype: String,
+    pub s3url: String,
+}
+
+pub fn parse_attachment_file(v: &serde_json::Value) -> Result<AttachmentFile, GmailError> {
+    fn find_file(v: &serde_json::Value) -> Option<&serde_json::Value> {
+        let map = v.as_object()?;
+        if map.contains_key("s3url") {
+            return Some(v);
+        }
+        map.values().find_map(find_file)
+    }
+    let file = find_file(v).ok_or_else(|| {
+        GmailError::Decode(format!(
+            "GMAIL_GET_ATTACHMENT response has no data.file.s3url: {}",
+            serde_json::to_string(v).unwrap_or_default()
+        ))
+    })?;
+    serde_json::from_value(file.clone())
+        .map_err(|e| GmailError::Decode(format!("GMAIL_GET_ATTACHMENT data.file: {e}")))
 }
 
 /// Deserialize a field that Composio may send as either a JSON string
@@ -2082,7 +2503,7 @@ impl FetchMessage {
             return self
                 .attachment_list
                 .iter()
-                .map(FetchAttachment::label)
+                .map(AttachmentMeta::label)
                 .collect();
         }
         match self.header("Content-Type") {
