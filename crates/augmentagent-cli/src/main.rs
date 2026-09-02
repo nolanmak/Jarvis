@@ -8343,6 +8343,117 @@ impl LoopPoster for DiscordLoopPoster {
     }
 }
 
+/// #428 — bridge implementing the discord crate's `JournalOps` trait:
+/// `!journal` text → paragraph HTML → KMS envelope encrypt → AppSync
+/// `createEntry` (shows up in the ShadowNote app), plus an immediate wiki
+/// ingest so wiki-ask sees the entry before the next poller pass. Every
+/// failure reply carries the entry text back so nothing is silently lost.
+struct CliJournalOps {
+    runtime: augmentagent_channel_journal::JournalRuntime,
+    reasoner: Arc<FallbackReasoner>,
+    wiki_root: Option<PathBuf>,
+    wiki_schema: Option<String>,
+}
+
+impl CliJournalOps {
+    async fn save_html(&self, title: Option<String>, html: &str) -> Result<String, String> {
+        use augmentagent_channel_core::decision::DecisionKind;
+        use augmentagent_channel_journal as journal;
+        use augmentagent_channel_journal::JournalApi as _;
+
+        let text_for_replies = journal::html_to_text(html);
+        let Some(kms_arn) = self.runtime.config.kms_key_arn.as_deref() else {
+            return Err(format!(
+                "SHADOWNOTE_KMS_KEY_ARN isn't set, so I can't encrypt — entry NOT saved. \
+                 Your text (safe to retry):\n{text_for_replies}"
+            ));
+        };
+        let content = journal::encrypt_entry_content(html, kms_arn, self.runtime.dek.as_ref())
+            .await
+            .map_err(|e| {
+                format!(
+                    "encrypt failed ({e}) — entry NOT saved. Your text (safe to retry):\n{text_for_replies}"
+                )
+            })?;
+        let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let entry = self
+            .runtime
+            .client
+            .create_entry(journal::NewEntry {
+                created_at,
+                content,
+                // Both title sources (composer model, `!journal done <title>`)
+                // converge here; neither may carry markup into the app.
+                title: title.as_deref().and_then(journal::compose::sanitize_title),
+                topic: Some("Journal".into()),
+            })
+            .await
+            .map_err(|e| {
+                format!(
+                    "ShadowNote save failed ({e}) — entry NOT saved. Your text (safe to retry):\n{text_for_replies}"
+                )
+            })?;
+        // Immediate wiki ingest — the syncEntries poller would pick it up
+        // within a cycle anyway; this just closes the gap to "ask about it
+        // right now".
+        if let (Some(root), Some(schema)) = (&self.wiki_root, &self.wiki_schema) {
+            augmentagent_channel_core::ingest::spawn_ingest(
+                Arc::clone(&self.reasoner),
+                root.clone(),
+                schema.clone(),
+                journal::channel::synthetic_journal_email(&entry, &text_for_replies),
+                DecisionKind::Capture,
+                Some("discord journaling session".to_string()),
+                None,
+                augmentagent_channel_core::ingest::IngestTrigger::Journal,
+            );
+        }
+        Ok(format!(
+            "📓 Saved to ShadowNote — “{}” ({})",
+            entry.title.as_deref().unwrap_or("Journal entry"),
+            entry.created_at
+        ))
+    }
+}
+
+#[async_trait]
+impl augmentagent_approval_discord::JournalOps for CliJournalOps {
+    async fn save_text(&self, title: Option<String>, text: &str) -> Result<String, String> {
+        let html = augmentagent_channel_journal::compose::text_to_paragraphs(text);
+        if html.is_empty() {
+            return Err("that message was empty after trimming — nothing saved".to_string());
+        }
+        self.save_html(title, &html).await
+    }
+
+    async fn compose_and_save(
+        &self,
+        history: &str,
+        title_override: Option<String>,
+    ) -> Result<String, String> {
+        use augmentagent_channel_journal::compose;
+
+        let raw = self
+            .reasoner
+            .call(&compose::compose_opts(), &compose::compose_user_message(history))
+            .await
+            .map_err(|e| {
+                format!(
+                    "compose failed ({e:#}) — nothing saved. You can save directly with \
+                     `!journal <text>`."
+                )
+            })?;
+        let (composed_title, html) = compose::parse_composed_entry(&raw);
+        if html.is_empty() {
+            return Err(
+                "the composer returned an empty entry — nothing saved. Try `!journal <text>`."
+                    .to_string(),
+            );
+        }
+        self.save_html(title_override.or(composed_title), &html).await
+    }
+}
+
 /// Executes Approve / Revise / Skip clicks against sqlite + Composio +
 /// reasoner. Backed entirely by the persistent action row — no in-memory
 /// state — so cards remain valid across daemon restarts and indefinitely.
@@ -10282,6 +10393,32 @@ async fn build_broker(
     // Keep handles for the broker before `store` is moved into the approver:
     // the #37 Revise-triple capture.
     let store_for_broker = Arc::clone(&store);
+    // #428 — `!journal` write-back bridge. Present iff SHADOWNOTE_* config
+    // exists (keyring/env); without it the command replies with the
+    // not-configured notice and the daemon is otherwise unaffected.
+    let journal_ops: Option<Arc<dyn augmentagent_approval_discord::JournalOps>> =
+        match augmentagent_channel_journal::JournalRuntime::from_env().await {
+            Ok(Some(runtime)) => {
+                let wiki_schema = cli
+                    .wiki_dir
+                    .as_ref()
+                    .and_then(|_| std::fs::read_to_string("schema/wiki-skill.md").ok());
+                Some(Arc::new(CliJournalOps {
+                    runtime,
+                    reasoner: Arc::clone(&reasoner),
+                    wiki_root: cli.wiki_dir.clone(),
+                    wiki_schema,
+                }))
+            }
+            Ok(None) => {
+                info!("!journal write-back disabled: SHADOWNOTE_* config not present");
+                None
+            }
+            Err(e) => {
+                warn!("!journal write-back disabled: {e:#}");
+                None
+            }
+        };
     let approver = Arc::new(ReplyApprover {
         store,
         gmail,
@@ -10315,6 +10452,7 @@ async fn build_broker(
         store: Some(store_for_broker),
         loop_parser,
         wiki_root: cli.wiki_dir.clone(),
+        journal_ops,
     })
     .await
     .context("start discord broker")?;
