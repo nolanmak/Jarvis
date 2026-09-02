@@ -4613,15 +4613,25 @@ fn normalize_recipients(flag: &str, values: &[String]) -> Result<Vec<String>> {
 /// Remove recipient metadata that is rendered on approval cards but must
 /// never become part of the Gmail message body. Older cards could feed their
 /// display-only `CC:`/`[cc: ...]` line back through the revise prompt, after
-/// which the model occasionally returned it as email text.
+/// which the model occasionally returned it as email text. The #652
+/// `[subject: …]` marker is display-only in the same way — but ONLY in its
+/// bracketed form: a bare `Subject: …` line is real prose (#650 handles the
+/// leading-header case separately).
 fn strip_approval_envelope_markers(body: &str) -> String {
     body.lines()
         .filter(|line| {
             let trimmed = line.trim();
-            let marker = trimmed
+            let bracketed = trimmed
                 .strip_prefix('[')
-                .and_then(|s| s.strip_suffix(']'))
-                .unwrap_or(trimmed);
+                .and_then(|s| s.strip_suffix(']'));
+            if let Some(inner) = bracketed {
+                if let Some((name, _)) = inner.split_once(':') {
+                    if name.trim().eq_ignore_ascii_case("subject") {
+                        return false;
+                    }
+                }
+            }
+            let marker = bracketed.unwrap_or(trimmed);
             let Some((name, value)) = marker.split_once(':') else {
                 return true;
             };
@@ -4787,6 +4797,23 @@ fn revise_subject(original: &str, thread_id: Option<&str>) -> String {
     format!("Re: {original}")
 }
 
+/// #652 — the subject a recreated draft carries after a Revise. A subject
+/// asked for in THIS revise wins and is used verbatim (no forced `Re:` — the
+/// user asked for those words); otherwise an override from an earlier round
+/// still stands, so "make it shorter" can't silently undo it; otherwise the
+/// subject derived from the inbound mail, which is the pre-#652 behavior.
+fn revised_subject(
+    asked_for: Option<&str>,
+    persisted: Option<&str>,
+    original: &str,
+    thread_id: Option<&str>,
+) -> String {
+    asked_for
+        .or(persisted)
+        .map(str::to_string)
+        .unwrap_or_else(|| revise_subject(original, thread_id))
+}
+
 /// Refuse a threaded compose whose `--subject` disagrees with the thread
 /// (#651). Gmail sends a reply under the thread's ORIGINAL subject and drops
 /// the one passed alongside `thread_id`, so such a message goes out under a
@@ -4850,6 +4877,28 @@ async fn ensure_subject_matches_thread(
         anyhow::bail!(conflict);
     }
     Ok(())
+}
+
+/// #652 × #651 — which thread the recreated draft joins. Gmail sends a
+/// threaded message under the THREAD's subject and drops any other, so a
+/// subject the user asked for during Revise can only take effect on a new
+/// thread. Keep the thread while the outgoing subject still names the
+/// inbound one (a `Re:`/`Fwd:` prefix is fine — that is every ordinary
+/// reply); start a new thread the moment it says something else. Never
+/// accept a subject change and then let Gmail discard it.
+fn thread_for_revised_subject<'a>(
+    outgoing_subject: &str,
+    inbound_subject: &str,
+    thread_id: Option<&'a str>,
+) -> Option<&'a str> {
+    let thread_id = thread_id?;
+    // An untitled inbound is a subject too: a Revise that gives it one is a
+    // change Gmail would drop on-thread just the same.
+    if normalize_subject(outgoing_subject) == normalize_subject(inbound_subject) {
+        Some(thread_id)
+    } else {
+        None
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8241,9 +8290,10 @@ mod unescape_body_tests {
 #[cfg(test)]
 mod approval_body_tests {
     use super::{
-        body_without_leaked_subject, compose_pending_disposition, revise_subject,
+        body_without_leaked_subject, compose_pending_disposition, revise_subject, revised_subject,
         strip_approval_envelope_markers, strip_leading_subject_line, subjects_agree,
-        thread_subject_conflict, ComposePendingDisposition, ThreadSubject,
+        thread_for_revised_subject, thread_subject_conflict, ComposePendingDisposition,
+        ThreadSubject,
     };
 
     #[test]
@@ -8283,6 +8333,17 @@ mod approval_body_tests {
     fn keeps_normal_prose_and_non_email_colons() {
         let body = "Hi,\n\nCC: means carbon copy in this sentence.\nTo: the team";
         assert_eq!(strip_approval_envelope_markers(body), body);
+        // #652 (codex on #855): the reposted card's `[subject: …]` marker is
+        // display-only and must never reach a sent body; a bare `Subject:`
+        // line is prose and stays.
+        assert_eq!(
+            strip_approval_envelope_markers("[subject: Invoice for July]\nHi Alice,\n[to: a@example.com]"),
+            "Hi Alice,"
+        );
+        assert_eq!(
+            strip_approval_envelope_markers("Subject: not a marker\nHi"),
+            "Subject: not a marker\nHi"
+        );
     }
 
     #[test]
@@ -8508,6 +8569,85 @@ mod approval_body_tests {
     #[test]
     fn a_user_written_re_subject_survives_on_a_new_email_card() {
         assert_eq!(revise_subject("Re: hi", None), "Re: hi");
+    }
+
+    #[test]
+    fn a_subject_asked_for_during_revise_reaches_the_draft_verbatim() {
+        // #652 — the redraft's `Subject:` line beats both the persisted
+        // override and the derived reply subject, with no forced `Re:`: the
+        // user asked for those exact words.
+        assert_eq!(
+            revised_subject(
+                Some("Invoice for July"),
+                Some("Older override"),
+                "Ship Systems x EFS",
+                Some("t1"),
+            ),
+            "Invoice for July"
+        );
+    }
+
+    #[test]
+    fn a_later_revise_keeps_the_subject_an_earlier_one_set() {
+        // "make it shorter" must not silently undo the subject change.
+        assert_eq!(
+            revised_subject(None, Some("Invoice for July"), "Ship Systems x EFS", Some("t1")),
+            "Invoice for July"
+        );
+    }
+
+    // #652 × #651 (codex on #855): Gmail sends a threaded reply under the
+    // thread's subject, so a revised subject only takes effect off-thread.
+    #[test]
+    fn a_new_subject_leaves_the_thread_but_a_reply_subject_keeps_it() {
+        // The reported case: "Invoice for July" asked for on a reply in the
+        // "Ship Systems x EFS" thread ⇒ new thread, never a silently-dropped header.
+        assert_eq!(
+            thread_for_revised_subject("Invoice for July", "Ship Systems x EFS", Some("t1")),
+            None
+        );
+        // Ordinary replies (derived or user-written `Re:`) stay threaded.
+        assert_eq!(
+            thread_for_revised_subject("Re: Ship Systems x EFS", "Ship Systems x EFS", Some("t1")),
+            Some("t1")
+        );
+        assert_eq!(
+            thread_for_revised_subject("re: RE: ship systems x efs", "Re: Ship Systems x EFS", Some("t1")),
+            Some("t1")
+        );
+        // A forward is a different message to recipients (#651's rule), so it
+        // leaves the thread too.
+        assert_eq!(
+            thread_for_revised_subject("Fwd: Ship Systems x EFS", "Ship Systems x EFS", Some("t1")),
+            None
+        );
+        // No thread to begin with, or an untitled inbound: nothing to leave.
+        assert_eq!(thread_for_revised_subject("Invoice for July", "Ship Systems x EFS", None), None);
+        // An untitled inbound thread: a new subject leaves it, staying untitled keeps it.
+        assert_eq!(thread_for_revised_subject("Invoice for July", "", Some("t1")), None);
+        assert_eq!(thread_for_revised_subject("Re: ", "", Some("t1")), Some("t1"));
+    }
+
+    // Structural (codex on #855): the subject override is written only
+    // inside the success arm of the draft-id write, after the CAS.
+    #[test]
+    fn revise_persists_the_subject_only_with_its_draft_id() {
+        let src = include_str!("main.rs");
+        let start = src.find("match self.store.refresh_pending_draft(action_id, &redraft)").expect("CAS");
+        let body = &src[start..start + 4000];
+        let id_write = body.find("match self.store.set_action_draft_id(action_id, &new_draft_id)").expect("gated id write");
+        let ok_arm = body[id_write..].find("Ok(()) =>").expect("success arm") + id_write;
+        let subject_write = body[id_write..].find("set_action_subject(action_id, Some(&subject))").expect("subject write") + id_write;
+        let err_arm = body[id_write..].find("Err(e) => tracing::warn!").expect("failure arm") + id_write;
+        assert!(ok_arm < subject_write && subject_write < err_arm, "subject write must sit in the Ok arm");
+    }
+
+    #[test]
+    fn an_untouched_subject_still_derives_from_the_inbound_mail() {
+        assert_eq!(
+            revised_subject(None, None, "Ship Systems x EFS", Some("t1")),
+            "Re: Ship Systems x EFS"
+        );
     }
 }
 
@@ -10197,17 +10337,39 @@ impl ReplyApprover {
                 };
             }
         };
+        // #652 — a requested subject change comes back as a leading
+        // `Subject:` line. Split it off before anything persists or sends the
+        // text, so the header never lands in the body (#650) and the next
+        // round's previous_draft stays clean.
+        let (new_subject, redraft) =
+            augmentagent_channel_core::prompt::split_redraft_subject(&redraft);
 
         // 2. Create a fresh Gmail draft with the revised body.
-        let subject = revise_subject(&action.email.subject, action.email.thread_id.as_deref());
-        // #650 — the redraft prompt shows the model a `Subject:` header block
-        // it sometimes echoes back as the first body line, which then ships to
-        // the recipient as visible text. Drop it here, before the Gmail draft
-        // and the reposted card, so both carry the same subject-free text.
-        // Nothing in a redraft can change the outgoing subject — it is the
-        // thread's — so a line naming a DIFFERENT one, or a redraft that is
-        // nothing but that line, fails the revise instead of creating a draft
-        // that leaks it. The card stays pending and Revise can run again.
+        // #473 — recreate the draft with the envelope the card was composed
+        // with, when one was recorded. Pre-#473 behavior (To = emails.from,
+        // no cc/bcc) silently dropped an overridden To and every cc/bcc on
+        // reply cards: the intro pattern ("moving you to BCC") lost its BCC
+        // — and its actual recipient — the moment the user hit Revise.
+        let envelope = self
+            .store
+            .get_action_envelope(action_id)
+            .unwrap_or_else(|e| {
+                tracing::warn!(action_id, "revise: envelope lookup failed: {e}");
+                None
+            });
+        // The thread id is kept whichever subject wins — this is still the
+        // same reply, just with the header the user asked for.
+        let subject = revised_subject(
+            new_subject.as_deref(),
+            envelope.as_ref().and_then(|env| env.subject.as_deref()),
+            &action.email.subject,
+            action.email.thread_id.as_deref(),
+        );
+        // #650 — a leading `Subject:` line the split above did not claim (an
+        // empty one, or one the model echoed after the split point) must not
+        // ship as body text: drop it when it repeats the outgoing subject,
+        // fail the revise when it names a different one. The card stays
+        // pending and Revise can run again.
         let redraft = match body_without_leaked_subject(&redraft, &subject) {
             Ok((clean, dropped)) => {
                 if dropped.is_some() {
@@ -10222,19 +10384,6 @@ impl ReplyApprover {
                 };
             }
         };
-
-        // #473 — recreate the draft with the envelope the card was composed
-        // with, when one was recorded. Pre-#473 behavior (To = emails.from,
-        // no cc/bcc) silently dropped an overridden To and every cc/bcc on
-        // reply cards: the intro pattern ("moving you to BCC") lost its BCC
-        // — and its actual recipient — the moment the user hit Revise.
-        let envelope = self
-            .store
-            .get_action_envelope(action_id)
-            .unwrap_or_else(|e| {
-                tracing::warn!(action_id, "revise: envelope lookup failed: {e}");
-                None
-            });
         let to = envelope
             .as_ref()
             .and_then(|env| env.to.clone())
@@ -10251,6 +10400,21 @@ impl ReplyApprover {
         // the persisted one keeps the fence so the reposted card can render
         // the warning against the NEW draft's assumptions.
         let gmail_redraft = augmentagent_approval_discord::strip_assumes_for_send(&redraft);
+        // A subject that no longer names the inbound one cannot ride the
+        // thread (Gmail would send under the thread's subject, #651): it
+        // starts a new thread instead, which is what the user asked for.
+        let draft_thread_id = thread_for_revised_subject(
+            &subject,
+            &action.email.subject,
+            action.email.thread_id.as_deref(),
+        );
+        if action.email.thread_id.is_some() && draft_thread_id.is_none() {
+            tracing::info!(
+                action_id,
+                subject = %subject,
+                "revise: new subject starts a new thread (Gmail keeps a thread's subject)"
+            );
+        }
         let new_draft_id = match self
             .gmail
             .create_draft_with_attachment(
@@ -10258,7 +10422,7 @@ impl ReplyApprover {
                 &to,
                 &subject,
                 &gmail_redraft,
-                action.email.thread_id.as_deref(),
+                draft_thread_id,
                 None,
                 &cc,
                 &bcc,
@@ -10300,9 +10464,24 @@ impl ReplyApprover {
                 return ApprovalActionOutcome::AlreadyResolved { status };
             }
         }
-        let _ = self
-            .store
-            .set_action_draft_id(action_id, &new_draft_id);
+        // The subject override is only meaningful next to the draft id it
+        // belongs to (#652): it is written after the CAS above won AND the
+        // draft id landed, so a failed id write can never leave the row
+        // carrying a subject for a draft it does not point at.
+        match self.store.set_action_draft_id(action_id, &new_draft_id) {
+            Ok(()) => {
+                if new_subject.is_some() {
+                    if let Err(e) = self.store.set_action_subject(action_id, Some(&subject)) {
+                        tracing::warn!(action_id, "revise: could not persist the new subject: {e}");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                action_id,
+                new_draft_id,
+                "revise: could not record the new draft id; subject override not persisted: {e}"
+            ),
+        }
         let _ = self.store.reset_nudge_schedule(action_id);
 
         // 4. Delete the now-stale old draft best-effort — the row already
@@ -10313,6 +10492,9 @@ impl ReplyApprover {
             }
         }
 
+        if new_subject.is_some() {
+            tracing::info!(action_id, subject = %subject, "revise: applied a new subject");
+        }
         tracing::info!(action_id, new_draft_id, "revise: new draft posted");
         ApprovalActionOutcome::Revised {
             email: action.email,
