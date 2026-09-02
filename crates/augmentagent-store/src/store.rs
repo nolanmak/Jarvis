@@ -384,6 +384,12 @@ impl Store {
         if !column_exists(conn, "actions", "bccEmails")? {
             conn.execute("ALTER TABLE actions ADD COLUMN bccEmails TEXT", [])?;
         }
+        // #652: the subject the outgoing draft actually carries, once a Revise
+        // has changed it. NULL = never overridden, which keeps the derived
+        // `Re: <inbound subject>` behavior.
+        if !column_exists(conn, "actions", "envelopeSubject")? {
+            conn.execute("ALTER TABLE actions ADD COLUMN envelopeSubject TEXT", [])?;
+        }
         if !column_exists(conn, "actions", "nextNudgeAtMs")? {
             conn.execute("ALTER TABLE actions ADD COLUMN nextNudgeAtMs INTEGER", [])?;
             // One-shot backfill: rows still in 'pending' from before the
@@ -3377,9 +3383,24 @@ impl Store {
         Ok(())
     }
 
-    /// #473 — the envelope recorded by [`set_action_envelope`], or `None`
-    /// when the row doesn't exist or no field was ever set (pre-#473 rows,
-    /// auto-triage replies): callers then fall back to `emails.from`.
+    /// #652 — persist the subject the outgoing draft now carries, after a
+    /// Revise changed it. Kept separate from [`set_action_envelope`] so a
+    /// later recipient write can't clobber it (and vice versa).
+    pub fn set_action_subject(&self, action_id: &str, subject: Option<&str>) -> StoreResult<()> {
+        let subject = subject.filter(|s| !s.trim().is_empty());
+        let now = now_millis();
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "UPDATE actions SET envelopeSubject = ?2, updatedAt = ?3 WHERE id = ?1",
+            params![action_id, subject, now],
+        )?;
+        Ok(())
+    }
+
+    /// #473 — the envelope recorded by [`set_action_envelope`] (and the #652
+    /// subject override), or `None` when the row doesn't exist or no field was
+    /// ever set (pre-#473 rows, auto-triage replies): callers then fall back
+    /// to `emails.from` and the derived reply subject.
     pub fn get_action_envelope(
         &self,
         action_id: &str,
@@ -3387,18 +3408,21 @@ impl Store {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let row = guard
             .query_row(
-                "SELECT toEmails, ccEmails, bccEmails FROM actions WHERE id = ?1",
+                "SELECT toEmails, ccEmails, bccEmails, envelopeSubject FROM actions WHERE id = ?1",
                 params![action_id],
                 |r| {
                     Ok(ActionEnvelope {
                         to: r.get::<_, Option<String>>(0)?,
                         cc: r.get::<_, Option<String>>(1)?,
                         bcc: r.get::<_, Option<String>>(2)?,
+                        subject: r.get::<_, Option<String>>(3)?,
                     })
                 },
             )
             .optional()?;
-        Ok(row.filter(|e| e.to.is_some() || e.cc.is_some() || e.bcc.is_some()))
+        Ok(row.filter(|e| {
+            e.to.is_some() || e.cc.is_some() || e.bcc.is_some() || e.subject.is_some()
+        }))
     }
 
     /// #419 duplicate guard — the newest open (pending or #500 scheduled)
@@ -7212,13 +7236,16 @@ fn row_to_pending_nudge(r: &rusqlite::Row) -> rusqlite::Result<PendingNudge> {
 }
 
 /// #473 — the outbound envelope a compose-originated card was created with.
-/// Each field is a comma-joined bare-address list as passed at compose time;
-/// `None` = never set (fall back to `emails.from`, the pre-#473 behavior).
+/// The recipient fields are comma-joined bare-address lists as passed at
+/// compose time; `None` = never set (fall back to `emails.from`, the pre-#473
+/// behavior). `subject` (#652) is the header a Revise overrode, `None` when
+/// the derived reply subject still applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionEnvelope {
     pub to: Option<String>,
     pub cc: Option<String>,
     pub bcc: Option<String>,
+    pub subject: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -7549,6 +7576,42 @@ mod tests {
 
         // Unknown action id → None, not an error.
         assert_eq!(s.get_action_envelope("nope").unwrap(), None);
+    }
+
+    // --- #652: subject override survives Revise ---
+
+    #[test]
+    fn action_subject_round_trips_independently_of_the_recipients() {
+        let (s, _f) = fresh_store();
+        let id = s
+            .log_action(
+                "m1",
+                None,
+                "alice@example.com",
+                "intro",
+                None,
+                Some("v0"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+
+        // Subject-only override: the envelope must become visible, or the
+        // redraft and the reposted card never see the new subject.
+        s.set_action_subject(&id, Some("Invoice for July")).unwrap();
+        let env = s.get_action_envelope(&id).unwrap().expect("envelope set");
+        assert_eq!(env.subject.as_deref(), Some("Invoice for July"));
+        assert_eq!(env.to, None);
+
+        // A later recipient write must not clobber the subject.
+        s.set_action_envelope(&id, Some("bob@example.com"), None, None)
+            .unwrap();
+        let env = s.get_action_envelope(&id).unwrap().expect("envelope set");
+        assert_eq!(env.subject.as_deref(), Some("Invoice for July"));
+        assert_eq!(env.to.as_deref(), Some("bob@example.com"));
+
+        // Blank normalizes to NULL, same as the recipient fields.
+        s.set_action_subject(&id, Some("  ")).unwrap();
+        assert_eq!(s.get_action_envelope(&id).unwrap().unwrap().subject, None);
     }
 
     // --- #419: duplicate guard + card-sync queries ---
