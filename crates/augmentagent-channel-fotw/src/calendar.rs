@@ -61,10 +61,11 @@ fn display_name(from: &str) -> Option<String> {
 
 /// RFC3339 → epoch milliseconds, without a date library.
 ///
-/// Deliberately strict: anything it cannot read is dropped rather than guessed,
-/// because a mis-parsed timestamp is a wrong match, and a wrong match cites the
-/// wrong people. Handles `Z` and `±HH:MM` offsets, which is everything
-/// `DateTime<Utc>::to_rfc3339` emits.
+/// Deliberately strict: anything it cannot read — an impossible civil date,
+/// an out-of-range or wrong-shaped offset, trailing junk — is dropped rather
+/// than guessed, because a mis-parsed timestamp is a wrong match, and a wrong
+/// match cites the wrong people. Handles `Z` and `±HH:MM` offsets, which is
+/// everything `DateTime<Utc>::to_rfc3339` emits.
 pub fn rfc3339_to_ms(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || (b[10] != b'T' && b[10] != b't') {
@@ -73,7 +74,19 @@ pub fn rfc3339_to_ms(s: &str) -> Option<i64> {
     let num = |a: usize, z: usize| s.get(a..z)?.parse::<i64>().ok();
     let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    // A day the month does not have is dropped, not normalized into the
+    // next month — 2026-02-31 is not March 3rd (PR #922 review).
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days_in_month = match mo {
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 31,
+    };
+    if !(1..=days_in_month).contains(&d) {
         return None;
     }
     // Days since the Unix epoch (Howard Hinnant's civil-from-days).
@@ -86,17 +99,35 @@ pub fn rfc3339_to_ms(s: &str) -> Option<i64> {
     let days = era * 146_097 + doe - 719_468;
     let mut ms = ((days * 86_400) + h * 3600 + mi * 60 + sec) * 1000;
 
-    // Trailing offset, if any.
-    let tail = &s[19..];
-    let tail = tail.split(['+', '-']).next().unwrap_or("");
-    let off_start = 19 + tail.len();
-    if let Some(sign) = s.as_bytes().get(off_start) {
-        if *sign == b'+' || *sign == b'-' {
-            let oh = s.get(off_start + 1..off_start + 3)?.parse::<i64>().ok()?;
-            let om = s.get(off_start + 4..off_start + 6)?.parse::<i64>().ok()?;
+    // Tail: optional fractional seconds, then exactly `Z` or `±HH:MM`.
+    // Anything else — trailing junk, `+0500`, an out-of-range `+99:99` that
+    // would shift the event by days — is dropped rather than guessed
+    // (PR #922 review).
+    let mut tail = &s[19..];
+    if let Some(frac) = tail.strip_prefix('.') {
+        let digits = frac.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        tail = &frac[digits..];
+    }
+    match tail.as_bytes() {
+        [b'Z' | b'z'] => {}
+        [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2]
+            if h1.is_ascii_digit()
+                && h2.is_ascii_digit()
+                && m1.is_ascii_digit()
+                && m2.is_ascii_digit() =>
+        {
+            let oh = i64::from((*h1 - b'0') * 10 + (*h2 - b'0'));
+            let om = i64::from((*m1 - b'0') * 10 + (*m2 - b'0'));
+            if oh > 23 || om > 59 {
+                return None;
+            }
             let offset = (oh * 3600 + om * 60) * 1000;
             ms += if *sign == b'+' { -offset } else { offset };
         }
+        _ => return None,
     }
     Some(ms)
 }
@@ -206,6 +237,50 @@ mod tests {
         ] {
             assert_eq!(rfc3339_to_ms(bad), None, "{bad} must not parse");
         }
+    }
+
+    /// PR #922 review — a day the month does not have must be dropped, not
+    /// normalized into the next month (2026-02-31 used to parse as March 3rd
+    /// and could attach a roster from three days away).
+    #[test]
+    fn impossible_civil_dates_are_rejected() {
+        for bad in [
+            "2026-02-31T10:00:00Z",
+            "2026-02-29T10:00:00Z", // 2026 is not a leap year
+            "2026-04-31T10:00:00Z",
+            "2026-00-10T10:00:00Z",
+            "2026-01-00T10:00:00Z",
+            "2100-02-29T10:00:00Z", // a century year is not a leap year
+        ] {
+            assert_eq!(rfc3339_to_ms(bad), None, "{bad} must not parse");
+        }
+        // The leap day itself stays valid.
+        assert!(rfc3339_to_ms("2024-02-29T10:00:00Z").is_some());
+        assert!(rfc3339_to_ms("2000-02-29T10:00:00Z").is_some());
+    }
+
+    /// PR #922 review — the tail must be exactly `Z` (with optional
+    /// fractional seconds) or `±HH:MM` with real hours and minutes. `+99:99`
+    /// used to shift a meeting by days and silently attach the wrong roster;
+    /// trailing junk was accepted outright.
+    #[test]
+    fn malformed_offsets_are_rejected_not_applied() {
+        for bad in [
+            "2026-09-01T14:00:00+99:99",
+            "2026-09-01T14:00:00+05-00",
+            "2026-09-01T14:00:00+24:00",
+            "2026-09-01T14:00:00+05:60",
+            "2026-09-01T14:00:00Zjunk",
+            "2026-09-01T14:00:00junk",
+            "2026-09-01T14:00:00.Z",
+        ] {
+            assert_eq!(rfc3339_to_ms(bad), None, "{bad} must not parse");
+        }
+        // What the channel actually writes still parses.
+        assert_eq!(
+            rfc3339_to_ms("2026-09-01T14:00:00+00:00"),
+            rfc3339_to_ms("2026-09-01T14:00:00Z")
+        );
     }
 
     #[test]

@@ -64,16 +64,34 @@ fn unquote(raw: &str) -> String {
     }
 }
 
-/// `HH:MM:SS` → milliseconds. Saturating and lenient: a malformed duration is
+/// `HH:MM:SS` → milliseconds. Exactly three non-negative numeric fields,
+/// with saturating arithmetic: a wrong-shaped or unparseable duration is
 /// zero, never a parse failure, because duration is not load-bearing for
 /// ingestion — only for the calendar window, which tolerates a zero span.
+/// Guessing at `01:05` (1h05m? 1m05s?) would manufacture a wrong window
+/// instead (PR #922 review).
 fn hms_to_ms(raw: &str) -> i64 {
     let s = unquote(raw);
-    let mut parts = s.split(':').map(|p| p.trim().parse::<i64>().unwrap_or(0));
-    let h = parts.next().unwrap_or(0);
-    let m = parts.next().unwrap_or(0);
-    let sec = parts.next().unwrap_or(0);
-    ((h * 3600) + (m * 60) + sec).max(0) * 1000
+    let mut fields = [0i64; 3];
+    let mut n = 0;
+    for part in s.split(':') {
+        if n == 3 {
+            return 0; // four or more fields is not HH:MM:SS
+        }
+        match part.trim().parse::<i64>() {
+            Ok(v) if v >= 0 => fields[n] = v,
+            _ => return 0,
+        }
+        n += 1;
+    }
+    if n != 3 {
+        return 0;
+    }
+    let [h, m, sec] = fields;
+    h.saturating_mul(3600)
+        .saturating_add(m.saturating_mul(60))
+        .saturating_add(sec)
+        .saturating_mul(1000)
 }
 
 /// Split `---\n…\n---\n` off the front. Returns (frontmatter, body).
@@ -388,5 +406,24 @@ The team agreed to move the batch workloads off Azure VMs.
         assert_eq!(hms_to_ms("\"garbage\""), 0);
         assert_eq!(hms_to_ms("\"00:00:00\""), 0);
         assert_eq!(hms_to_ms("\"99:59:59\""), 359_999_000);
+    }
+
+    /// PR #922 review — `01:05` is not `HH:MM:SS`. Guessing which two fields
+    /// it holds (1h05m? 1m05s?) manufactures a wrong calendar window, so a
+    /// wrong-shaped duration is zero like any other malformed one.
+    #[test]
+    fn a_two_field_duration_is_malformed_not_guessed() {
+        assert_eq!(hms_to_ms("\"01:05\""), 0);
+        assert_eq!(hms_to_ms("01:05"), 0);
+        assert_eq!(hms_to_ms("\"01:05:02:99\""), 0);
+    }
+
+    /// PR #922 review — an absurd hour must not overflow the millisecond
+    /// arithmetic (debug builds panic on overflow; release wraps into a
+    /// nonsense window), and a negative field is malformed, not arithmetic.
+    #[test]
+    fn an_oversized_hour_saturates_instead_of_overflowing() {
+        assert_eq!(hms_to_ms("\"9223372036854775807:00:00\""), i64::MAX);
+        assert_eq!(hms_to_ms("\"01:-05:00\""), 0);
     }
 }

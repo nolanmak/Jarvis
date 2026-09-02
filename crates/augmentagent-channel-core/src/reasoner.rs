@@ -1526,6 +1526,20 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             repo_root.to_string_lossy().into_owned(),
         ),
     ];
+    // #915/#922 — the scope guard allows the READ tools under the transcript
+    // clone, but only if it can see the same variable the daemon used to
+    // open the dir (`add_dirs` below); `restrict_env` means nothing is
+    // inherited, so forward it explicitly. Same condition as add_dirs:
+    // absent variable or absent directory, absent env.
+    if let Some(t) = std::env::var_os("AUGMENTAGENT_TRANSCRIPTS_DIR") {
+        let t = PathBuf::from(t);
+        if t.is_dir() {
+            env.push((
+                "AUGMENTAGENT_TRANSCRIPTS_DIR".into(),
+                t.to_string_lossy().into_owned(),
+            ));
+        }
+    }
     // #214 — Prepend the release bin's dir to PATH so the agent's bare
     // `augmentagent <subcommand>` invocations actually resolve to OUR
     // binary. Without this, the bare-command allowlist patterns above
@@ -2515,6 +2529,48 @@ mod tests {
         assert!(
             !wiki_env.contains("rel-wiki-xyz/rel-wiki-xyz"),
             "relative wiki dir must not be doubled into <wiki>/wiki; got {wiki_env}"
+        );
+    }
+
+    /// PR #922 review — #915 opens the transcript clone via `--add-dir`, but
+    /// the #127 scope guard only allowed WIKI_ROOT, so every Read/Grep/Glob
+    /// on a transcript was denied. The guard now honors
+    /// AUGMENTAGENT_TRANSCRIPTS_DIR — which only works if `ask_opts` forwards
+    /// it into the spawned CLI's restricted (#128) env.
+    #[test]
+    fn ask_opts_forwards_transcripts_dir_to_the_scope_guard() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        let transcripts = tempfile::tempdir().expect("transcripts tmpdir");
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        // One EnvGuard only — it holds the global env lock, so a second
+        // would self-deadlock. AUGMENTAGENT_DB is cleared by hand under it.
+        let _t = EnvGuard::set(
+            "AUGMENTAGENT_TRANSCRIPTS_DIR",
+            transcripts.path().to_str().unwrap(),
+        );
+        let prior_db = std::env::var("AUGMENTAGENT_DB").ok();
+        std::env::remove_var("AUGMENTAGENT_DB");
+
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+
+        if let Some(v) = prior_db {
+            std::env::set_var("AUGMENTAGENT_DB", v);
+        }
+        let fwd = opts
+            .env
+            .iter()
+            .find(|(k, _)| k == "AUGMENTAGENT_TRANSCRIPTS_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("AUGMENTAGENT_TRANSCRIPTS_DIR must reach the guard's env");
+        assert_eq!(fwd, transcripts.path().to_string_lossy());
+        // And the clone itself is opened for the session (#915 behaviour,
+        // pinned so the env forwarding cannot drift from add_dirs).
+        assert!(
+            opts.add_dirs
+                .iter()
+                .any(|d| d.as_path() == transcripts.path()),
+            "transcript clone must be in add_dirs"
         );
     }
 

@@ -549,5 +549,7 @@ This is different from the wiki's own Meeting log, which records gcal
 attendance and RSVP only and is structurally stripped of event content. These
 files are the content.
 
-The clone is read-only. Never write there: FlyOnTheWall owns that repo and
+The clone is read-only, and the scope guard enforces exactly that: `Read`,
+`Grep` and `Glob` are allowed under the transcript directory, while `Write`
+and `Edit` stay wiki-only. Never write there: FlyOnTheWall owns that repo and
 re-pushes meetings to the same paths.

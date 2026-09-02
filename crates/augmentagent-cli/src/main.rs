@@ -1864,16 +1864,62 @@ enum TranscriptsOp {
     /// meetings to the same path, so this side never commits, merges or pushes.
     /// Dedup is the `emails` table (`fotw:<id>`), so a rescan is free.
     Sync {
-        /// Scan and report without pulling or ingesting.
-        #[arg(long)]
+        /// Scan and report without pulling or ingesting. Defaults to true —
+        /// pass `--dry-run false` for a live run (PR #922: same safe default
+        /// as every other channel's bare command).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
         /// Ingest what is already on disk; skip the git pull.
-        #[arg(long)]
+        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         no_pull: bool,
         /// Ingest only meetings whose export recorded disclosure (§11).
         #[arg(long, default_value_t = false)]
         require_disclosed: bool,
     },
+}
+
+#[cfg(test)]
+mod transcripts_cli_args_tests {
+    use super::*;
+
+    fn sync_args(argv: &[&str]) -> (bool, bool, bool) {
+        let cli = Cli::try_parse_from(argv).expect("argv must parse");
+        match cli.cmd {
+            Cmd::Transcripts {
+                op:
+                    TranscriptsOp::Sync {
+                        dry_run,
+                        no_pull,
+                        require_disclosed,
+                    },
+            } => (dry_run, no_pull, require_disclosed),
+            _ => panic!("expected transcripts sync"),
+        }
+    }
+
+    /// PR #922 review — every other channel's bare command is a dry run
+    /// (`default_value_t = true, ArgAction::Set`); a bare `transcripts sync`
+    /// doing a live pull + ingest breaks that convention exactly where an
+    /// operator is most likely to type it.
+    #[test]
+    fn bare_transcripts_sync_is_a_dry_run() {
+        let (dry_run, no_pull, require_disclosed) =
+            sync_args(&["augmentagent", "transcripts", "sync"]);
+        assert!(dry_run, "bare `transcripts sync` must default to a dry run");
+        assert!(!no_pull, "the pull itself stays on by default");
+        assert!(!require_disclosed);
+    }
+
+    /// A live run is an explicit opt-in, same shape as the other channels.
+    #[test]
+    fn a_live_run_is_an_explicit_opt_in() {
+        let (dry_run, ..) =
+            sync_args(&["augmentagent", "transcripts", "sync", "--dry-run", "false"]);
+        assert!(!dry_run);
+        let (_, no_pull, _) =
+            sync_args(&["augmentagent", "transcripts", "sync", "--no-pull", "true"]);
+        assert!(no_pull);
+    }
 }
 
 #[derive(Subcommand)]
@@ -7188,6 +7234,77 @@ mod wiki_sync_validation_tests {
 /// `wiki sync` — reconcile the local knowledge base with its private
 /// GitHub mirror. Two-way: commit local page changes, pull owner edits
 /// (owner-wins), push. Reuses the ambient `gh` credential. See epic #474.
+/// The `emails` table as transcript dedup: `record` returns true for a first
+/// sighting (and remembers it), false for a re-push of the same meeting.
+struct TranscriptSeenLog(Arc<Store>);
+impl augmentagent_channel_fotw::runner::SeenLog for TranscriptSeenLog {
+    fn record(&self, email: &augmentagent_store::Email) -> Result<bool> {
+        Ok(self.0.upsert_email(email)?)
+    }
+}
+
+/// A dry run must not write the dedup row, or the real run that follows
+/// would find every meeting already seen and ingest nothing — but it must
+/// still *read* the table, or it reports every already-ingested meeting as
+/// new and prints its body under "would ingest" (PR #922 review).
+struct TranscriptDryLog(Arc<Store>);
+impl augmentagent_channel_fotw::runner::SeenLog for TranscriptDryLog {
+    fn record(&self, email: &augmentagent_store::Email) -> Result<bool> {
+        Ok(self.0.email_first_seen_at(&email.message_id)?.is_none())
+    }
+}
+
+#[cfg(test)]
+mod transcript_seen_log_tests {
+    use super::*;
+    use augmentagent_channel_fotw::runner::SeenLog;
+
+    fn test_email(id: &str) -> augmentagent_store::Email {
+        augmentagent_store::Email {
+            message_id: id.into(),
+            thread_id: None,
+            from: "sender".into(),
+            subject: "subject".into(),
+            body: "body".into(),
+            date: "2026-09-01T00:00:00Z".into(),
+            to: String::new(),
+            cc: String::new(),
+            attachments: Vec::new(),
+            account_entity_id: None,
+            platform: "fotw".into(),
+            kind: "email".into(),
+        }
+    }
+
+    /// PR #922 review — a dry run must report what a live run would do:
+    /// read-only duplicate detection, still writing nothing. It used to call
+    /// every already-ingested meeting "new" and print its full body under
+    /// "would ingest".
+    #[test]
+    fn a_dry_run_sees_duplicates_without_writing() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = Arc::new(Store::open(dir.path().join("t.db")).expect("open store"));
+        let live = TranscriptSeenLog(Arc::clone(&store));
+        let dry = TranscriptDryLog(Arc::clone(&store));
+
+        assert!(
+            dry.record(&test_email("fotw:m1")).unwrap(),
+            "an unseen meeting reads as new"
+        );
+        assert_eq!(
+            store.email_first_seen_at("fotw:m1").unwrap(),
+            None,
+            "a dry run writes no dedup row"
+        );
+
+        assert!(live.record(&test_email("fotw:m1")).unwrap());
+        assert!(
+            !dry.record(&test_email("fotw:m1")).unwrap(),
+            "a recorded meeting reads as a duplicate in a dry run"
+        );
+    }
+}
+
 /// `augmentagent transcripts sync` (#915).
 ///
 /// Fast-forward the FlyOnTheWall transcript clone, then hand any meeting the
@@ -7256,24 +7373,10 @@ async fn run_transcripts_sync(
         (m, roster)
     };
 
-    struct StoreLog(Arc<Store>);
-    impl SeenLog for StoreLog {
-        fn record(&self, email: &augmentagent_store::Email) -> Result<bool> {
-            Ok(self.0.upsert_email(email)?)
-        }
-    }
-    /// A dry run must not write the dedup row, or the real run that follows
-    /// would find every meeting already seen and ingest nothing.
-    struct DryLog;
-    impl SeenLog for DryLog {
-        fn record(&self, _: &augmentagent_store::Email) -> Result<bool> {
-            Ok(true)
-        }
-    }
     let log: Box<dyn SeenLog> = if dry_run {
-        Box::new(DryLog)
+        Box::new(TranscriptDryLog(Arc::clone(&store)))
     } else {
-        Box::new(StoreLog(Arc::clone(&store)))
+        Box::new(TranscriptSeenLog(Arc::clone(&store)))
     };
 
     let meetings_dir = repo.join("meetings");
@@ -7301,6 +7404,7 @@ async fn run_transcripts_sync(
         return Ok(());
     }
 
+    let spawned = emails.len();
     let reasoner = build_reasoner();
     let schema = resolve_wiki_schema(cli)
         .context("wiki schema not found; transcripts ingest needs schema/wiki-skill.md")?;
@@ -7324,6 +7428,35 @@ async fn run_transcripts_sync(
         );
         println!("[transcripts] ingesting {id}");
     }
+    if spawned == 0 {
+        return Ok(());
+    }
+    // PR #922 — this is a one-shot process: returning while jobs are queued
+    // would drop the tokio runtime and kill them mid-ingest, after the dedup
+    // row already marked each meeting seen — never to be retried. Hold the
+    // process open until the pool drains. The pool itself (#899) keeps
+    // concurrency at its worker cap (2), so this cannot re-create the
+    // 2026-08-31 `claude -p` burst; it only makes the process live as long
+    // as its own jobs.
+    let pool = augmentagent_channel_core::ingest::IngestPool::global();
+    println!("[transcripts] waiting for {spawned} ingest job(s)…");
+    let drained = pool
+        .wait_idle(std::time::Duration::from_secs(15 * 60))
+        .await;
+    let stats = pool.stats();
+    if !drained {
+        anyhow::bail!(
+            "transcripts ingest did not drain in 15m ({} queued, {} in flight) — \
+             the recorded meetings will read as duplicates on the next run; \
+             delete their fotw:<id> rows from `emails` to retry",
+            stats.queued,
+            stats.in_flight
+        );
+    }
+    println!(
+        "[transcripts] ingest finished ({} completed, {} dropped)",
+        stats.completed, stats.dropped
+    );
     Ok(())
 }
 
