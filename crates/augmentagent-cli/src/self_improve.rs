@@ -6588,6 +6588,15 @@ fn attempt_history_path() -> PathBuf {
 
 /// A harness failure: remembered for the next attempt's context, never
 /// charged as an attempt.
+///
+/// Why this is not an unbounded retry of the expensive path: the callers
+/// return `Err` and the loop's tick ends (`AutoPrLoop::run` breaks on `Err`),
+/// so an outage costs at most one failed call per `interval_secs` (30 min).
+/// A provider that refuses (quota, down) fails at the FIRST call of the
+/// attempt — the scoping pass — before any build spend, and the #655
+/// fallback chain latches that provider (`reasoner-cooldowns.json`) so the
+/// next tick is served by the next provider or fails fast again. When every
+/// provider is down there is nothing to bound: no builder runs.
 fn record_reasoner_error(issue: u64, rec: AttemptRecord) {
     let path = attempt_history_path();
     let mut history = AttemptHistory::load(&path);
