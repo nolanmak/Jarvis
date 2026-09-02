@@ -1905,7 +1905,7 @@ async fn verification_gate_targeted(worktree: &Path, crates: &[String]) -> Resul
     let (ok, _o, e) = run_sandboxed(
         "bash",
         &["-lc", &gate_sh(&format!(
-            ". $HOME/.cargo/env && cargo test {pkgs} -- --test-threads=1 2>&1 | tail -8"
+            ". $HOME/.cargo/env && cargo test {pkgs} -- --test-threads=1 2>&1 | tail -40"
         ))],
         worktree,
         &env,
@@ -1946,7 +1946,7 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
     info!("verification gate: cargo test (sandboxed env)");
     let (ok, _o, e) = run_sandboxed(
         "bash",
-        &["-lc", &gate_sh(". $HOME/.cargo/env && cargo test --workspace -- --test-threads=1 2>&1 | tail -8")],
+        &["-lc", &gate_sh(". $HOME/.cargo/env && cargo test --workspace -- --test-threads=1 2>&1 | tail -40")],
         worktree,
         &env,
     )
@@ -1982,6 +1982,314 @@ async fn verification_gate(worktree: &Path) -> Result<()> {
         info!("verification gate: npm build not required (diff touches no Node paths)");
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// #931 — baseline check: a red `main` is not the builder's failure.
+//
+// The gate runs the workspace suite inside the issue worktree, so a test
+// that is already red on `main` fails every run identically. On 2026-09-02
+// that cost #921, #917 and #916 an attempt and a daily-cap slot each for a
+// contacts test none of them touched, and the loop then idled 22 hours. Now
+// the failing tests are re-run on a clean `origin/main` worktree (once per
+// main SHA, cached), a failure main already has leaves the run unbilled and
+// unrecorded, and a known-red main holds the loop before it spends anything.
+// ---------------------------------------------------------------------------
+
+/// The test names cargo lists under the summary `failures:` block. Only
+/// Rust-path characters are accepted, so a name can be handed straight to
+/// `cargo test -- <filter>` without quoting. Empty for green output AND for
+/// a compile error — callers must not read "nothing failed" into it.
+fn failing_tests(cargo_output: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_block = false;
+    for line in cargo_output.lines() {
+        if line.trim_end() == "failures:" {
+            in_block = true;
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        let name = line.trim();
+        // The first `failures:` block is followed by a blank line and the
+        // per-test `---- name stdout ----` sections; the summary list is
+        // the indented one that ends at the blank line before `test result`.
+        if name.is_empty() || !line.starts_with("    ") || name.starts_with("----") {
+            in_block = false;
+            continue;
+        }
+        let rust_path = name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':');
+        if rust_path && !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// Packages named by cargo's ``to rerun pass `-p <pkg> …` `` hints, deduped.
+fn failing_packages(cargo_output: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in cargo_output.lines() {
+        let Some(rest) = line.split("to rerun pass `-p ").nth(1) else {
+            continue;
+        };
+        let pkg: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if !pkg.is_empty() && !out.iter().any(|p| p == &pkg) {
+            out.push(pkg);
+        }
+    }
+    out
+}
+
+/// How a red gate splits once `main` has been consulted.
+struct BaselineVerdict {
+    /// Red in the worktree AND on `main` — not this diff's doing.
+    preexisting: Vec<String>,
+    /// Red in the worktree only — the diff broke it.
+    introduced: Vec<String>,
+}
+
+fn classify_gate_failure(worktree: &[String], main: &[String]) -> BaselineVerdict {
+    let (preexisting, introduced): (Vec<String>, Vec<String>) = worktree
+        .iter()
+        .cloned()
+        .partition(|t| main.iter().any(|m| m == t));
+    BaselineVerdict {
+        preexisting,
+        introduced,
+    }
+}
+
+/// Which tests were already checked against which `main`, and which of them
+/// were red there. One SHA at a time: a new `main` commit invalidates all of
+/// it, so the check runs once per main commit rather than once per issue.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct BaselineCache {
+    sha: String,
+    checked: Vec<String>,
+    failing: Vec<String>,
+}
+
+impl BaselineCache {
+    fn load(path: &Path) -> Self {
+        std::fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// Best-effort persist, like [`DailyCounter::save`]: a write failure
+    /// costs a repeat check, never a run.
+    fn save(&self, path: &Path) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match serde_json::to_vec(self) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(path, bytes) {
+                    warn!(path = %path.display(), "could not persist baseline cache: {e}");
+                }
+            }
+            Err(e) => warn!("could not serialize baseline cache: {e}"),
+        }
+    }
+
+    /// The subset of `tests` not yet run against `sha`.
+    fn unchecked(&self, sha: &str, tests: &[String]) -> Vec<String> {
+        if self.sha != sha {
+            return tests.to_vec();
+        }
+        tests
+            .iter()
+            .filter(|t| !self.checked.iter().any(|c| c == *t))
+            .cloned()
+            .collect()
+    }
+
+    fn failing_for(&self, sha: &str) -> &[String] {
+        if self.sha == sha {
+            &self.failing
+        } else {
+            &[]
+        }
+    }
+
+    fn is_red(&self, sha: &str) -> bool {
+        !self.failing_for(sha).is_empty()
+    }
+
+    fn record(&mut self, sha: &str, checked: &[String], failing: &[String]) {
+        if self.sha != sha {
+            self.sha = sha.to_string();
+            self.checked.clear();
+            self.failing.clear();
+        }
+        for t in checked {
+            if !self.checked.iter().any(|c| c == t) {
+                self.checked.push(t.clone());
+            }
+        }
+        for t in failing {
+            if !self.failing.iter().any(|c| c == t) {
+                self.failing.push(t.clone());
+            }
+        }
+    }
+}
+
+/// `AUGMENTAGENT_AUTOPR_BASELINE_FILE` override (tests), else the daemon
+/// state dir next to the daily counter and the attempt ledger.
+fn baseline_cache_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AUGMENTAGENT_AUTOPR_BASELINE_FILE") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    std::env::var_os("HOME")
+        .map(|h| {
+            PathBuf::from(h)
+                .join(".local/state/augmentagent")
+                .join("autopr-baseline.json")
+        })
+        .unwrap_or_else(|| PathBuf::from("autopr-baseline.json"))
+}
+
+/// Current `origin/main` after a fetch (a stale ref would keep the latch
+/// closed after a human fixed main). Falls back to the local ref offline.
+async fn origin_main_sha(repo_root: &Path) -> Option<String> {
+    let _ = run("git", &["fetch", "-q", "origin", "main"], repo_root).await;
+    let (ok, out, _) = run("git", &["rev-parse", "origin/main"], repo_root)
+        .await
+        .ok()?;
+    let sha = out.trim().to_string();
+    (ok && sha.len() >= 7).then_some(sha)
+}
+
+/// Run exactly `tests` (targeted to `pkgs`) on a clean `origin/main`
+/// worktree and return the ones that fail there. Uses the gate's sandboxed
+/// env and shared target dir, so it is a warm targeted build, not a
+/// workspace one. Errors — no package to target, main does not build — mean
+/// "unknowable", and the caller keeps today's behaviour (charge the run).
+async fn baseline_failures(
+    repo_root: &Path,
+    pkgs: &[String],
+    tests: &[String],
+) -> Result<Vec<String>> {
+    if pkgs.is_empty() || tests.is_empty() {
+        bail!("baseline: no package or test names to target");
+    }
+    let lane = lane_from_env().worktree_name();
+    let worktree = repo_root
+        .join(".self-improve-worktrees")
+        .join(format!("{lane}-baseline"));
+    let branch = format!("agent-baseline/{lane}");
+    reclaim_worktree(repo_root, &worktree, &branch).await;
+    let (ok, _o, e) = run(
+        "git",
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &worktree.to_string_lossy(),
+            "origin/main",
+        ],
+        repo_root,
+    )
+    .await?;
+    if !ok {
+        bail!("baseline: worktree add from origin/main failed: {e}");
+    }
+    let pkg_args = pkgs
+        .iter()
+        .map(|p| format!("-p {p}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // Names were validated to Rust-path characters by `failing_tests`.
+    let filters = tests.join(" ");
+    info!(%pkg_args, %filters, "baseline check: cargo test on origin/main (sandboxed env)");
+    let env = gate_env();
+    let result = run_sandboxed(
+        "bash",
+        &["-lc", &gate_sh(&format!(
+            ". $HOME/.cargo/env && cargo test {pkg_args} --no-fail-fast -- --test-threads=1 {filters} 2>&1 | tail -60"
+        ))],
+        &worktree,
+        &env,
+    )
+    .await;
+    reclaim_worktree(repo_root, &worktree, &branch).await;
+    let (_ok, out, err) = result?;
+    let text = format!("{out}{err}");
+    if text.contains("could not compile") || text.contains("error: package ID specification") {
+        bail!(
+            "baseline: origin/main did not build the targeted crates:\n{}",
+            truncate(&text, 1500)
+        );
+    }
+    Ok(failing_tests(&text))
+}
+
+/// Split a red gate into what `main` already fails and what this diff broke.
+/// `None` when there is nothing to compare (compile error, unparsable
+/// output, no `origin/main`, baseline could not run) — the caller then
+/// treats the failure as the diff's, exactly as before #931.
+async fn preexisting_on_main(repo_root: &Path, gate_err: &str) -> Option<BaselineVerdict> {
+    let worktree_red = failing_tests(gate_err);
+    if worktree_red.is_empty() {
+        return None;
+    }
+    let pkgs = failing_packages(gate_err);
+    let sha = origin_main_sha(repo_root).await?;
+    let path = baseline_cache_path();
+    let mut cache = BaselineCache::load(&path);
+    let missing = cache.unchecked(&sha, &worktree_red);
+    if !missing.is_empty() {
+        match baseline_failures(repo_root, &pkgs, &missing).await {
+            Ok(red) => {
+                cache.record(&sha, &missing, &red);
+                cache.save(&path);
+            }
+            Err(e) => {
+                warn!("baseline check unavailable; charging the run as before: {e:#}");
+                return None;
+            }
+        }
+    }
+    let verdict = classify_gate_failure(&worktree_red, cache.failing_for(&sha));
+    if !verdict.preexisting.is_empty() {
+        warn!(
+            sha = %sha,
+            preexisting = %verdict.preexisting.join(", "),
+            introduced = %verdict.introduced.join(", "),
+            "gate failure is (partly) already red on main"
+        );
+    }
+    Some(verdict)
+}
+
+/// A `main` the cache already knows is red.
+struct RedMain {
+    sha: String,
+    failing: Vec<String>,
+}
+
+/// One `git rev-parse` against the cache: while `origin/main` is a SHA the
+/// last check found red, every gate would fail the same way, so the tick
+/// ends before resume or pick spends a builder run. Releases by itself the
+/// moment main moves.
+async fn main_red_latch(repo_root: &Path) -> Option<RedMain> {
+    let sha = origin_main_sha(repo_root).await?;
+    let cache = BaselineCache::load(&baseline_cache_path());
+    cache.is_red(&sha).then(|| RedMain {
+        failing: cache.failing_for(&sha).to_vec(),
+        sha,
+    })
 }
 
 /// #817 — delete untracked files the builder left at the worktree ROOT,
@@ -2313,6 +2621,27 @@ async fn resume_draft_pr(
             gate_for_round(&worktree, &names).await
         };
         if let Err(gate_err) = gate_result {
+            // #931 — a failure `main` already has is not this draft's; do
+            // not spend a repair round on it or count an attempt. The
+            // ledger mark at the top of this fn already moves the picker on.
+            let verdict = preexisting_on_main(repo_root, &gate_err.to_string()).await;
+            if let Some(v) = verdict.as_ref().filter(|v| v.introduced.is_empty()) {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                return Ok(RunReport::triage(format!(
+                    "PR #{pr}: gate red on main too ({}); not charged",
+                    v.preexisting.join(", ")
+                )));
+            }
+            // What the repair round is told: only the failures this draft
+            // introduced are its job.
+            let gate_text = match verdict.as_ref() {
+                Some(v) if !v.preexisting.is_empty() => format!(
+                    "{gate_err:#}\n\nAlready failing on `main` before this PR — NOT yours, \
+                     ignore: {}",
+                    v.preexisting.join(", ")
+                ),
+                _ => gate_err.to_string(),
+            };
             // #873 — a red gate gets a repair round while budget remains.
             // Round 0 red means the draft rotted against today's main; a
             // later red means the revision broke it. Both are exactly the
@@ -2321,11 +2650,16 @@ async fn resume_draft_pr(
             // ~40-minute runs in one evening.
             if rounds_done < revise_rounds() {
                 rounds_done += 1;
-                info!(pr, issue = issue.number, round = rounds_done, "resume: gate-repair round");
+                info!(
+                    pr,
+                    issue = issue.number,
+                    round = rounds_done,
+                    "resume: gate-repair round"
+                );
                 match reasoner
                     .call(
                         &fix_opts(worktree.clone()),
-                        &build_revise_prompt(&issue, &gate_findings(&gate_err.to_string()), lines_now),
+                        &build_revise_prompt(&issue, &gate_findings(&gate_text), lines_now),
                     )
                     .await
                 {
@@ -2340,7 +2674,7 @@ async fn resume_draft_pr(
                             &worktree,
                         )
                         .await?;
-                        publish_round(&worktree, branch, repo_root, pr, rounds_done, "gate repair", &gate_findings(&gate_err.to_string()), dry_run).await;
+                        publish_round(&worktree, branch, repo_root, pr, rounds_done, "gate repair", &gate_findings(&gate_text), dry_run).await;
                         summary = format!(
                             "{summary}\nRound {rounds_done} (gate repair): {}",
                             truncate(&rs, 200)
@@ -2700,20 +3034,44 @@ pub struct RunReport {
     pub message: String,
     /// True when the builder ran. Only these consume daily budget.
     pub billed: bool,
+    /// #931 — idle-class with a reason: the tick ends here, unbilled, and
+    /// the loop does not spin through its triage burst.
+    held: bool,
 }
 
 impl RunReport {
     fn idle() -> Self {
-        Self { message: IDLE_MSG.to_string(), billed: false }
+        Self {
+            message: IDLE_MSG.to_string(),
+            billed: false,
+            held: true,
+        }
     }
     fn triage(message: String) -> Self {
-        Self { message, billed: false }
+        Self {
+            message,
+            billed: false,
+            held: false,
+        }
     }
     fn built(message: String) -> Self {
-        Self { message, billed: true }
+        Self {
+            message,
+            billed: true,
+            held: false,
+        }
+    }
+    /// Nothing was spent and nothing more should be this tick — `main` is
+    /// known-red (#931). Idle-class, but the message says why.
+    fn held(message: String) -> Self {
+        Self {
+            message,
+            billed: false,
+            held: true,
+        }
     }
     fn is_idle(&self) -> bool {
-        self.message == IDLE_MSG
+        self.held || self.message == IDLE_MSG
     }
 }
 
@@ -2747,6 +3105,21 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             "refusing to self-improve from a dirty working tree \
              (commit/stash first):\n{dirty_status}"
         );
+    }
+
+    // #931 — a known-red `main` fails every gate identically; hold the tick
+    // (unbilled) until it moves instead of buying a doomed build.
+    if let Some(red) = main_red_latch(repo_root).await {
+        let short = red.sha.get(..7).unwrap_or(&red.sha);
+        info!(
+            sha = short,
+            failing = %red.failing.join(", "),
+            "self-improve: main is red; holding until it changes"
+        );
+        return Ok(RunReport::held(format!(
+            "main is red at {short} ({}); holding until it changes",
+            red.failing.join(", ")
+        )));
     }
 
     // #866 — sitting draft PRs outrank new work: they are mostly-finished
@@ -3083,7 +3456,24 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
 
     // Verification gate.
     if let Err(gate_err) = verification_gate(&worktree).await {
-        warn!(issue = issue.number, "verification gate failed: {gate_err:#}");
+        warn!(
+            issue = issue.number,
+            "verification gate failed: {gate_err:#}"
+        );
+        // #931 — a failure `main` already has is not this diff's. Leave
+        // unbilled and unrecorded (no attempt, no comment); the ledger mark
+        // alone keeps the picker from re-buying the same build this tick.
+        if let Some(verdict) = preexisting_on_main(repo_root, &gate_err.to_string()).await {
+            if verdict.introduced.is_empty() {
+                AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue.number);
+                cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                return Ok(RunReport::triage(format!(
+                    "issue #{}: gate red on main too ({}); not charged",
+                    issue.number,
+                    verdict.preexisting.join(", ")
+                )));
+            }
+        }
         let attempts = record_attempt(repo_root, issue.number).await.unwrap_or(1);
         if attempts >= MAX_ATTEMPTS {
             backoff_comment(
@@ -6483,9 +6873,235 @@ CODEX-REVIEW: lgtm").0);
         let start = src.find("async fn resume_draft_pr(").expect("resume fn");
         let end = src[start..].find("\n}\n").expect("fn end") + start;
         let body = &src[start..end];
-        let commits = body.matches(r#""commit", "--allow-empty", "-m", &msg"#).count();
+        let commits = body
+            .matches(r#""commit", "--allow-empty", "-m", &msg"#)
+            .count();
         let publishes = body.matches("publish_round(").count();
-        assert_eq!(commits, 3, "expected the shrink, gate-repair and revise commits");
-        assert_eq!(publishes, commits, "every round commit must be pushed + commented (#895)");
+        assert_eq!(
+            commits, 3,
+            "expected the shrink, gate-repair and revise commits"
+        );
+        assert_eq!(
+            publishes, commits,
+            "every round commit must be pushed + commented (#895)"
+        );
+    }
+
+    // --- #931 baseline check: a red `main` is not the builder's failure ----
+
+    const CARGO_RED: &str = "\
+running 28 tests
+test phone::tests::rejects_garbage ... ok
+test source::tests::apply_writes_indexes_and_is_idempotent ... FAILED
+test source::tests::slug_prefers_email_for_shared_space ... FAILED
+
+failures:
+
+---- source::tests::apply_writes_indexes_and_is_idempotent stdout ----
+
+thread 'source::tests::apply_writes_indexes_and_is_idempotent' panicked at crates/x/src/source.rs:370:9:
+assertion failed: body.contains(\"phone\")
+
+
+failures:
+    source::tests::apply_writes_indexes_and_is_idempotent
+    source::tests::slug_prefers_email_for_shared_space
+
+test result: FAILED. 26 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.34s
+
+error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
+error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
+";
+
+    #[test]
+    fn failing_tests_parses_cargo_failures_block() {
+        let got = failing_tests(CARGO_RED);
+        assert_eq!(
+            got,
+            vec![
+                "source::tests::apply_writes_indexes_and_is_idempotent".to_string(),
+                "source::tests::slug_prefers_email_for_shared_space".to_string(),
+            ]
+        );
+        // Green output has no `failures:` block.
+        let green = "running 3 tests\ntest a::b ... ok\n\ntest result: ok. 3 passed; 0 failed\n";
+        assert!(failing_tests(green).is_empty());
+        // A compile error is not a test failure — the caller must not treat
+        // an empty list as "nothing is wrong with the diff".
+        let compile = "error[E0308]: mismatched types\nerror: could not compile `x`\n";
+        assert!(failing_tests(compile).is_empty());
+        // Names are shell-safe by construction: anything outside a Rust path
+        // is dropped rather than passed to `cargo test -- <filter>`.
+        let hostile = "failures:\n    a::b\n    evil; rm -rf /\n\ntest result: FAILED.\n";
+        assert_eq!(failing_tests(hostile), vec!["a::b".to_string()]);
+    }
+
+    #[test]
+    fn failing_packages_parses_rerun_hint() {
+        assert_eq!(
+            failing_packages(CARGO_RED),
+            vec!["augmentagent-channel-contacts".to_string()],
+            "repeated hints dedup"
+        );
+        let two = "error: test failed, to rerun pass `-p a-crate --lib`\n\
+                   error: test failed, to rerun pass `-p b_crate --test it`\n";
+        assert_eq!(
+            failing_packages(two),
+            vec!["a-crate".to_string(), "b_crate".to_string()]
+        );
+        assert!(failing_packages("test result: ok.").is_empty());
+    }
+
+    #[test]
+    fn classify_gate_failure_splits_preexisting_from_introduced() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let v = classify_gate_failure(&s(&["b", "c"]), &s(&["a", "b"]));
+        assert_eq!(v.preexisting, s(&["b"]));
+        assert_eq!(v.introduced, s(&["c"]));
+        // Everything the worktree fails, main fails too ⇒ nothing introduced.
+        let v = classify_gate_failure(&s(&["b"]), &s(&["a", "b"]));
+        assert!(v.introduced.is_empty());
+        assert_eq!(v.preexisting, s(&["b"]));
+        // Green main ⇒ everything is the diff's fault.
+        let v = classify_gate_failure(&s(&["b"]), &[]);
+        assert_eq!(v.introduced, s(&["b"]));
+        assert!(v.preexisting.is_empty());
+    }
+
+    // Structural: in run_once's gate-failure arm the baseline comparison
+    // runs BEFORE the attempt is recorded, and a purely pre-existing failure
+    // leaves through the unbilled triage report.
+    #[test]
+    fn preexisting_only_gate_failure_is_unbilled_and_unrecorded() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let end = start + src[start..].find("\n}\n").expect("end of run_once");
+        let body = &src[start..end];
+        let gate_at = body
+            .find("if let Err(gate_err) = verification_gate(&worktree).await {")
+            .expect("gate-failure arm");
+        let arm = &body[gate_at..];
+        let pre = arm
+            .find("preexisting_on_main(")
+            .expect("baseline check in the gate arm");
+        let rec = arm
+            .find("record_attempt(")
+            .expect("record_attempt in the gate arm");
+        assert!(pre < rec, "baseline check must precede record_attempt");
+        let between = &arm[pre..rec];
+        assert!(
+            between.contains("introduced.is_empty()"),
+            "must branch on `introduced`"
+        );
+        assert!(
+            between.contains("RunReport::triage("),
+            "a pre-existing failure must leave unbilled (triage), not built"
+        );
+        // The issue is still marked attempted-today so the picker moves on —
+        // otherwise the same tick re-buys the identical build up to
+        // MAX_TRIAGE_PER_TICK times.
+        assert!(between.contains("AttemptLedger::mark_persist("));
+    }
+
+    // Structural: the same arm in resume_draft_pr.
+    #[test]
+    fn resume_gate_failure_checks_baseline_before_repairing() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let body = &src[start..];
+        let gate_at = body
+            .find("if let Err(gate_err) = gate_result {")
+            .expect("resume gate arm");
+        let arm = &body[gate_at..];
+        let pre = arm
+            .find("preexisting_on_main(")
+            .expect("baseline check in resume gate arm");
+        let repair = arm.find("gate-repair round").expect("repair round");
+        assert!(pre < repair, "baseline check must precede the repair round");
+        assert!(arm[pre..repair].contains("RunReport::triage("));
+    }
+
+    #[test]
+    fn baseline_cache_is_keyed_by_main_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/autopr-baseline.json");
+        let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut c = BaselineCache::load(&path);
+        assert_eq!(
+            c.unchecked("sha1", &t(&["a", "b"])),
+            t(&["a", "b"]),
+            "empty cache: all unchecked"
+        );
+        c.record("sha1", &t(&["a", "b"]), &t(&["b"]));
+        c.save(&path);
+        let c = BaselineCache::load(&path);
+        assert_eq!(c.failing_for("sha1"), &t(&["b"])[..]);
+        assert!(
+            c.unchecked("sha1", &t(&["a", "b"])).is_empty(),
+            "both checked on sha1"
+        );
+        assert_eq!(
+            c.unchecked("sha1", &t(&["a", "z"])),
+            t(&["z"]),
+            "only the new one"
+        );
+        // A new main SHA invalidates everything.
+        assert!(c.failing_for("sha2").is_empty());
+        assert_eq!(c.unchecked("sha2", &t(&["a"])), t(&["a"]));
+        assert!(c.is_red("sha1"));
+        assert!(!c.is_red("sha2"));
+        // Junk on disk ⇒ empty cache, never a panic (mirrors DailyCounter).
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(BaselineCache::load(&path).unchecked("sha1", &t(&["a"])) == t(&["a"]));
+        assert!(BaselineCache::load(&dir.path().join("missing.json"))
+            .failing_for("sha1")
+            .is_empty());
+    }
+
+    #[test]
+    fn baseline_red_report_is_not_billed() {
+        let r = RunReport::triage("issue #1: gate red on main too (a::b); not charged".into());
+        assert!(!r.billed);
+        assert!(
+            !r.is_idle(),
+            "triage keeps the tick going so the latch can engage"
+        );
+        // The latch report is idle-class: the tick ends without spending
+        // anything, and the loop does not spin through MAX_TRIAGE_PER_TICK.
+        let h = RunReport::held("main is red at abc1234 (a::b); holding".into());
+        assert!(!h.billed);
+        assert!(h.is_idle());
+        assert_ne!(h.message, IDLE_MSG, "the hold names its reason");
+    }
+
+    // Structural: the latch is the first thing run_once does after the
+    // preflight — before resume and before pick — so a known-red main costs
+    // one `git rev-parse`, not a builder run.
+    #[test]
+    fn red_main_latch_precedes_resume_and_pick() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let body = &src[start..];
+        let latch = body.find("main_red_latch(").expect("latch in run_once");
+        let resume = body.find("find_resumable_draft(").expect("resume");
+        let pick = body.find("pick_issue(").expect("pick");
+        assert!(latch < resume && latch < pick);
+        assert!(body[latch..resume].contains("RunReport::held("));
+    }
+
+    #[test]
+    fn gate_tail_keeps_the_failures_block() {
+        // `tail -8` could not fit a `failures:` list of more than two names
+        // plus the trailer, so the baseline parser saw nothing to compare.
+        let src = include_str!("self_improve.rs");
+        for cmd in [
+            "cargo test --workspace -- --test-threads=1 2>&1 | tail -40",
+            "cargo test {pkgs} -- --test-threads=1 2>&1 | tail -40",
+        ] {
+            assert!(
+                src.contains(cmd),
+                "gate must keep ≥40 lines of cargo test output: {cmd}"
+            );
+        }
     }
 }
