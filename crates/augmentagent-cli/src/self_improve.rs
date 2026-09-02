@@ -3757,7 +3757,7 @@ async fn resume_draft_pr(
                 repo_root,
             )
             .await;
-            let attempts = record_attempt(repo_root, issue.number, Some(failure_record(FailureKind::GateRed, "resume:gate", &format!("{gate_err:#}")))).await.unwrap_or(1);
+            let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); failure_record(kind, "resume:gate", &detail) })).await.unwrap_or(1);
             if attempts >= MAX_ATTEMPTS {
                 label_gave_up(repo_root, issue.number).await.ok();
                 close_gave_up_pr(repo_root, pr, issue.number, attempts, &format!("{gate_err:#}")).await;
@@ -3809,7 +3809,7 @@ async fn resume_draft_pr(
                         repo_root,
                     )
                     .await;
-                    record_attempt(repo_root, issue.number, Some(failure_record(FailureKind::GateRed, "resume:final-gate", &format!("{gate_err:#}")))).await.ok();
+                    record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); failure_record(kind, "resume:final-gate", &detail) })).await.ok();
                     return Ok(RunReport::built(format!(
                         "PR #{pr}: LGTM but final full gate failed"
                     )));
@@ -4677,7 +4677,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         let attempts = record_attempt(
             repo_root,
             issue.number,
-            Some(rec(FailureKind::GateRed, "gate", &format!("{gate_err:#}"), &diff, lines)),
+            Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "gate", &detail, &diff, lines) }),
         )
         .await
         .unwrap_or(1);
@@ -4899,7 +4899,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                         ));
                         continue;
                     }
-                    let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GateRed, "revise:gate", &format!("{gate_err:#}"), &diff, lines))).await.unwrap_or(1);
+                    let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:gate", &detail, &diff, lines) })).await.unwrap_or(1);
                     if attempts >= MAX_ATTEMPTS {
                         backoff_comment(
                             repo_root,
@@ -4949,7 +4949,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // FULL suite exactly once here.
         if let Err(gate_err) = verification_gate(&worktree).await {
             warn!(issue = issue.number, "final full gate failed after revisions: {gate_err:#}");
-            let attempts = record_attempt(repo_root, issue.number, Some(rec(FailureKind::GateRed, "revise:final-gate", &format!("{gate_err:#}"), &diff, lines))).await.unwrap_or(1);
+            let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); rec(kind, "revise:final-gate", &detail, &diff, lines) })).await.unwrap_or(1);
             if attempts >= MAX_ATTEMPTS {
                 backoff_comment(
                     repo_root,
@@ -5014,7 +5014,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     .await?;
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e, rec(FailureKind::PublishFailed, "publish:git commit", &e, &diff, lines)).await));
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git commit", &detail, &diff, lines) }).await));
     }
     // #815 — a run killed between the push and `gh pr create` leaves the
     // remote branch behind with no PR. `has_open_agent_pr` only looks at
@@ -5042,7 +5042,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e, rec(FailureKind::PublishFailed, "publish:git push", &e, &diff, lines)).await));
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git push", &detail, &diff, lines) }).await));
     }
 
     // Open the PR. Draft + human merge for everyone; owner-authored issues
@@ -5163,7 +5163,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     if !ok {
         // #815 — the branch is pushed but has no PR. Left as an `Err` this
         // re-picks the same issue next tick and dies at the push above.
-        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "gh pr create failed", &e, rec(FailureKind::PublishFailed, "publish:gh pr create", &e, &diff, lines)).await));
+        return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "gh pr create failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:gh pr create", &detail, &diff, lines) }).await));
     }
     let pr_url = stdout.trim().to_string();
     if !automerge {
@@ -5295,17 +5295,18 @@ async fn record_attempt(repo_root: &Path, issue: u64, rec: Option<AttemptRecord>
     let gh = gh_bin();
     let (_ok, stdout, _) = run(
         &gh,
-        &[
-            "issue",
-            "view",
-            &issue.to_string(),
-            "--json",
-            "comments",
-        ],
+        &["issue", "view", &issue.to_string(), "--json", "comments"],
         repo_root,
     )
     .await?;
     let prior = stdout.matches("<!-- self-improve-attempt -->").count() as u32;
+    // #803 — a harness failure is remembered (above) but never charged: no
+    // marker, so the GitHub-derived count and the gave-up decision stay
+    // untouched. The caller sees the unchanged count.
+    if !rec.kind.counts_toward_max_attempts() {
+        warn!(issue, kind = rec.kind.as_str(), stage = %rec.stage, "attempt not charged (harness failure)");
+        return Ok(prior);
+    }
     let n = prior + 1;
     let _ = run(
         &gh,
@@ -6227,6 +6228,9 @@ enum FailureKind {
     /// The reasoner itself failed (quota, timeout, provider down) — a harness
     /// failure, recorded for the record but never charged as an attempt.
     ReasonerError,
+    /// The box failed the gate or the publish, not the diff: disk full,
+    /// OOM/kill, cargo lock contention, network. Recorded, never charged.
+    Infra,
     /// A caller that did not say — legacy sites; still an attempt.
     Other,
 }
@@ -6240,12 +6244,17 @@ impl FailureKind {
             Self::ReviewReject => "review-reject",
             Self::PublishFailed => "publish-failed",
             Self::ReasonerError => "reasoner-error",
+            Self::Infra => "infra",
             Self::Other => "unspecified",
         }
     }
 
+    /// Model-attributable kinds count toward `MAX_ATTEMPTS`; harness kinds
+    /// (a reasoner error, an infrastructure failure) are remembered but
+    /// never charged — #803's "harness failures must not become model
+    /// failures".
     fn counts_toward_max_attempts(self) -> bool {
-        !matches!(self, Self::ReasonerError)
+        !matches!(self, Self::ReasonerError | Self::Infra)
     }
 }
 
@@ -6272,6 +6281,50 @@ impl AttemptRecord {
             diff_lines: 0,
             wall_secs: 0,
         }
+    }
+}
+
+/// Harness signatures in a gate or publish failure — the box, not the diff.
+/// Deliberately specific (disk, OOM/kill, cargo lock, network phrasing):
+/// a false "infra" under-charges a real failure, a false "model" is what
+/// happened before #803. Flaky tests are not text-classifiable and stay
+/// charged; a failure `main` already has is handled by #931 instead.
+fn infra_failure_reason(text: &str) -> Option<&'static str> {
+    const SIGNS: &[(&str, &str)] = &[
+        ("no space left on device", "disk full"),
+        ("out of memory", "out of memory"),
+        ("memory allocation of", "out of memory"),
+        ("signal: 9", "killed (SIGKILL)"),
+        ("sigkill", "killed (SIGKILL)"),
+        ("blocking waiting for file lock", "cargo lock contention"),
+        ("failed to download", "network"),
+        ("could not resolve host", "network"),
+        ("connection refused", "network"),
+        ("connection reset", "network"),
+        ("spurious network error", "network"),
+        ("operation timed out", "network"),
+        ("too many open files", "fd exhaustion"),
+    ];
+    let lower = text.to_ascii_lowercase();
+    SIGNS
+        .iter()
+        .find(|(sign, _)| lower.contains(sign))
+        .map(|(_, why)| *why)
+}
+
+/// A red gate, attributed: `Infra` with the reason up front, else `GateRed`.
+fn gate_outcome(gate_text: &str) -> (FailureKind, String) {
+    match infra_failure_reason(gate_text) {
+        Some(why) => (FailureKind::Infra, format!("infra ({why}): {gate_text}")),
+        None => (FailureKind::GateRed, gate_text.to_string()),
+    }
+}
+
+/// A failed commit/push/PR creation, attributed the same way.
+fn publish_outcome(err: &str) -> (FailureKind, String) {
+    match infra_failure_reason(err) {
+        Some(why) => (FailureKind::Infra, format!("infra ({why}): {err}")),
+        None => (FailureKind::PublishFailed, err.to_string()),
     }
 }
 
@@ -9417,8 +9470,63 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     }
 
     #[test]
-    fn failure_kind_counting_rule_is_unchanged() {
+    fn infra_signatures_are_harness_failures_and_stay_uncharged() {
+        for text in [
+            "error: could not compile `x`\n... No space left on device (os error 28)",
+            "process didn't exit successfully: (signal: 9, SIGKILL: kill)",
+            "    Blocking waiting for file lock on package cache",
+            "warning: spurious network error (3 tries remaining)",
+            "failed to download from `https://crates.io/...`: Could not resolve host",
+        ] {
+            let (kind, detail) = gate_outcome(text);
+            assert_eq!(kind, FailureKind::Infra, "{text}");
+            assert!(detail.starts_with("infra ("), "{detail}");
+            assert!(!kind.counts_toward_max_attempts());
+        }
+        for text in [
+            "assertion `left == right` failed\n  left: 1\n right: 2",
+            "test result: FAILED. 27 passed; 1 failed",
+            "error[E0308]: mismatched types",
+        ] {
+            let (kind, detail) = gate_outcome(text);
+            assert_eq!(kind, FailureKind::GateRed, "{text}");
+            assert_eq!(detail, text);
+        }
+        assert_eq!(
+            publish_outcome("fatal: unable to access: Connection refused").0,
+            FailureKind::Infra
+        );
+        assert_eq!(
+            publish_outcome("pre-commit hook rejected the commit").0,
+            FailureKind::PublishFailed
+        );
+    }
+
+    // Structural: record_attempt posts the GitHub marker (the count) only for
+    // kinds that count; a harness failure returns the unchanged count.
+    #[test]
+    fn harness_failures_post_no_attempt_marker() {
+        let src = include_str!("self_improve.rs");
+        let start = src
+            .find("async fn record_attempt(")
+            .expect("record_attempt");
+        let end = start + src[start..].find("\n}\n").expect("end");
+        let body = &src[start..end];
+        let gate = body
+            .find("if !rec.kind.counts_toward_max_attempts()")
+            .expect("harness check");
+        let marker = body.find(r#""comment","#).expect("marker comment");
+        assert!(
+            gate < marker,
+            "the harness check must precede the marker comment"
+        );
+        assert!(body[gate..marker].contains("return Ok(prior)"));
+    }
+
+    #[test]
+    fn failure_kinds_split_harness_from_model() {
         assert!(!FailureKind::ReasonerError.counts_toward_max_attempts());
+        assert!(!FailureKind::Infra.counts_toward_max_attempts());
         for kind in [
             FailureKind::NoChanges,
             FailureKind::GuardRefusal,
@@ -9446,12 +9554,19 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         for kind in [
             "FailureKind::NoChanges",
             "FailureKind::GuardRefusal",
-            "FailureKind::GateRed",
             "FailureKind::ReviewReject",
-            "FailureKind::PublishFailed",
         ] {
             assert!(body.contains(kind), "run_once must record {kind}");
         }
+        // Gate and publish failures are attributed (infra vs model) at every site.
+        assert!(
+            body.matches("gate_outcome(").count() >= 3,
+            "gate, revise gate, final gate"
+        );
+        assert!(
+            body.matches("publish_outcome(").count() >= 3,
+            "commit, push, pr create"
+        );
         assert!(
             body.matches("record_reasoner_error(").count() >= 3,
             "scope, build and qa-review reasoner errors are harness failures"
