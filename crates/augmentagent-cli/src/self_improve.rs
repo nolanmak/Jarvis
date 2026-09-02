@@ -6454,10 +6454,27 @@ impl AttemptHistory {
     }
 
     /// The "Prior attempts" digest for `issue`, or `None` when there are none.
+    /// Bounded by dropping the OLDEST whole entries: the newest failure is
+    /// what the next attempt most needs, so it always survives (tail-bounded
+    /// on its own if it alone exceeds the budget).
     fn digest(&self, issue: u64) -> Option<String> {
         let recs = self.issues.get(&issue).filter(|r| !r.is_empty())?;
-        let body = recs.iter().map(digest_entry).collect::<Vec<_>>().join("\n");
-        Some(truncate(&body, MAX_DIGEST_BYTES))
+        let mut kept: Vec<String> = Vec::new();
+        let mut used = 0usize;
+        for rec in recs.iter().rev() {
+            let entry = digest_entry(rec);
+            let cost = entry.len() + usize::from(!kept.is_empty());
+            if used + cost > MAX_DIGEST_BYTES {
+                if kept.is_empty() {
+                    kept.push(truncate_tail(&entry, MAX_DIGEST_BYTES));
+                }
+                break;
+            }
+            used += cost;
+            kept.push(entry);
+        }
+        kept.reverse();
+        Some(kept.join("\n"))
     }
 }
 
@@ -9553,18 +9570,38 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     fn attempt_digest_is_byte_bounded_and_multibyte_safe() {
         let mut h = AttemptHistory::default();
         for i in 0..MAX_HISTORY_PER_ISSUE {
-            h.push(
-                7,
-                test_record(
-                    FailureKind::GateRed,
-                    "gate",
-                    &format!("{i}{}", "—".repeat(50_000)),
-                ),
-            );
+            h.push(7, test_record(FailureKind::GateRed, "gate", &format!("{i}{}", "—".repeat(50_000))));
         }
         let digest = h.digest(7).unwrap();
         let bound = MAX_DIGEST_BYTES + '…'.len_utf8();
         assert!(digest.len() <= bound, "digest was {} bytes", digest.len());
+        // Each entry's detail is itself bounded (MAX_DIGEST_DETAIL_BYTES), so
+        // several fit; what must hold is that the NEWEST is among them and
+        // the oldest is what fell off.
+        let newest = MAX_HISTORY_PER_ISSUE - 1;
+        assert!(digest.contains(&format!("  {newest}—")), "newest record must survive");
+        assert!(!digest.contains("  0—"), "oldest record is dropped first");
+    }
+
+    // Codex on #859: eight ~1.2 kB details exceed the 6 kB digest budget;
+    // the NEWEST failures must survive, the oldest are what gets dropped.
+    #[test]
+    fn attempt_digest_keeps_the_newest_records_when_over_budget() {
+        let mut h = AttemptHistory::default();
+        for i in 0..MAX_HISTORY_PER_ISSUE {
+            let detail = format!("attempt-{i} {}", "x".repeat(1_150));
+            h.push(7, test_record(FailureKind::ReviewReject, "qa-review", &detail));
+        }
+        let digest = h.digest(7).unwrap();
+        assert!(digest.len() <= MAX_DIGEST_BYTES, "{}", digest.len());
+        let newest = MAX_HISTORY_PER_ISSUE - 1;
+        assert!(digest.contains(&format!("attempt-{newest} ")), "newest record must survive");
+        assert!(digest.contains(&format!("attempt-{} ", newest - 1)), "second newest too");
+        assert!(!digest.contains("attempt-0 "), "the oldest is what gets dropped");
+        // Chronological order is preserved among the kept entries.
+        let a = digest.find(&format!("attempt-{} ", newest - 1)).unwrap();
+        let b = digest.find(&format!("attempt-{newest} ")).unwrap();
+        assert!(a < b);
     }
 
     #[test]
