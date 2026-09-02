@@ -3,13 +3,36 @@
 //! After each triage (and optional draft) completes, we fire a Haiku call that
 //! reads/writes the wiki. The call is best-effort — failures log a warning
 //! and do not affect triage/draft correctness.
+//!
+//! #899 — every `spawn_ingest` used to be an unbounded `tokio::spawn` whose
+//! task immediately launched a CLI subprocess and then queued on the single
+//! `index.md` page lock. On 2026-08-31 the journal poller called it 1,694
+//! times in two minutes: ~300 concurrent `claude -p` children (the kernel
+//! OOM killer took the desktop with them, #897) and 1,396 "index rebuild
+//! failed: lock not acquired" warnings. Ingest now runs through a
+//! process-wide [`IngestPool`]:
+//!
+//! - **Bounded.** `workers` jobs run at once; up to `queue_capacity` more
+//!   wait. Beyond that a job is *dropped* — counted, logged (throttled) —
+//!   never parked and never blocking the caller. Ingest is best-effort; a
+//!   dropped journal entry returns when its `_version` bumps or via the
+//!   explicit backfill, and email triage must never stall on wiki writes.
+//! - **Deduplicated.** A `message_id` already queued or running is dropped
+//!   silently (counted), which makes a replayed batch idempotent in-process.
+//! - **Coalesced index rebuild.** Completions set a per-root dirty flag; one
+//!   debounced task rebuilds `index.md` at most once per
+//!   `index_rebuild_debounce` instead of once per job.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use augmentagent_store::Email;
 use augmentagent_wiki::with_page_lock;
-use tracing::{debug, warn};
+use tokio::sync::Semaphore;
+use tracing::{debug, info, warn};
 
 use crate::decision::DecisionKind;
 use crate::prompt::sanitize_untrusted;
@@ -33,6 +56,9 @@ pub enum IngestTrigger {
     /// ShadowNote journal entry synced into the wiki (#427). Pairs with
     /// `DecisionKind::Capture`, like voice memos.
     Journal,
+    /// New iMessage bundle entries synced into the wiki (#886). Pairs with
+    /// `DecisionKind::Capture`; never fired on a first full-history pass.
+    ImessageHistory,
 }
 
 impl IngestTrigger {
@@ -46,6 +72,7 @@ impl IngestTrigger {
             Self::VoiceMemo => "voice-memo",
             Self::Meeting => "meeting",
             Self::Journal => "journal",
+            Self::ImessageHistory => "imessage-history",
         }
     }
 }
@@ -106,8 +133,261 @@ fn resolve_first_seen(id: &str) -> Option<i64> {
     FIRST_SEEN_RESOLVER.get().and_then(|f| f(id))
 }
 
-/// Fire-and-forget ingest. Spawns a background tokio task; never errors to
-/// the caller. Returns immediately.
+/// #899 — sizing for the process-wide ingest pool. `Default` reads
+/// `AUGMENTAGENT_INGEST_WORKERS` (2), `AUGMENTAGENT_INGEST_QUEUE` (256) and
+/// `AUGMENTAGENT_INDEX_REBUILD_DEBOUNCE_MS` (5000).
+#[derive(Debug, Clone)]
+pub struct IngestPoolConfig {
+    /// Jobs allowed to wait for a worker. Beyond `queue_capacity + workers`
+    /// admitted-but-unfinished jobs, new ones are dropped.
+    pub queue_capacity: usize,
+    /// Jobs running at once (each is a CLI subprocess; the reasoner's own
+    /// gate, #898, bounds those process-wide as well).
+    pub workers: usize,
+    /// Quiet period after a completion before `index.md` is regenerated.
+    pub index_rebuild_debounce: Duration,
+}
+
+pub const DEFAULT_INGEST_WORKERS: usize = 2;
+pub const DEFAULT_INGEST_QUEUE: usize = 256;
+pub const DEFAULT_INDEX_REBUILD_DEBOUNCE: Duration = Duration::from_secs(5);
+
+impl Default for IngestPoolConfig {
+    fn default() -> Self {
+        fn env_usize(var: &str, default: usize) -> usize {
+            std::env::var(var)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(default)
+        }
+        Self {
+            queue_capacity: env_usize("AUGMENTAGENT_INGEST_QUEUE", DEFAULT_INGEST_QUEUE),
+            workers: env_usize("AUGMENTAGENT_INGEST_WORKERS", DEFAULT_INGEST_WORKERS).max(1),
+            index_rebuild_debounce: Duration::from_millis(env_usize(
+                "AUGMENTAGENT_INDEX_REBUILD_DEBOUNCE_MS",
+                DEFAULT_INDEX_REBUILD_DEBOUNCE.as_millis() as usize,
+            ) as u64),
+        }
+    }
+}
+
+/// Snapshot of the pool's counters (dashboard / tests).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IngestStats {
+    /// Admitted, waiting for a worker.
+    pub queued: usize,
+    /// Running right now.
+    pub in_flight: usize,
+    /// Refused because the pool was full (lifetime).
+    pub dropped: usize,
+    /// Refused because the same `message_id` was already queued/running.
+    pub deduped: usize,
+    /// Finished (ok or failed) — lifetime.
+    pub completed: usize,
+    /// `index.md` regenerations actually run — lifetime.
+    pub index_rebuilds: usize,
+}
+
+/// #899 — see the module docs. One instance per process in production
+/// ([`IngestPool::global`]); tests build their own.
+pub struct IngestPool {
+    config: IngestPoolConfig,
+    workers: Arc<Semaphore>,
+    queued: AtomicUsize,
+    in_flight: AtomicUsize,
+    dropped: AtomicUsize,
+    deduped: AtomicUsize,
+    completed: AtomicUsize,
+    index_rebuilds: AtomicUsize,
+    /// `message_id`s admitted and not yet finished.
+    active_ids: Mutex<HashSet<String>>,
+    /// Wiki roots with a debounced rebuild already scheduled.
+    rebuild_scheduled: Mutex<HashSet<PathBuf>>,
+    last_drop_warn_ms: AtomicU64,
+}
+
+enum Admission {
+    Admitted,
+    Duplicate,
+    Full,
+}
+
+/// A full pool warns at most once per this interval.
+const DROP_WARN_EVERY: Duration = Duration::from_secs(60);
+
+impl IngestPool {
+    pub fn new(config: IngestPoolConfig) -> Self {
+        let workers = config.workers.max(1);
+        Self {
+            workers: Arc::new(Semaphore::new(workers)),
+            config: IngestPoolConfig { workers, ..config },
+            queued: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
+            deduped: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
+            index_rebuilds: AtomicUsize::new(0),
+            active_ids: Mutex::new(HashSet::new()),
+            rebuild_scheduled: Mutex::new(HashSet::new()),
+            last_drop_warn_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// The process-wide pool every channel's `spawn_ingest` goes through.
+    pub fn global() -> Arc<IngestPool> {
+        static GLOBAL: OnceLock<Arc<IngestPool>> = OnceLock::new();
+        Arc::clone(GLOBAL.get_or_init(|| {
+            let config = IngestPoolConfig::default();
+            info!(
+                workers = config.workers,
+                queue = config.queue_capacity,
+                debounce_ms = config.index_rebuild_debounce.as_millis() as u64,
+                "ingest pool armed (#899)"
+            );
+            Arc::new(IngestPool::new(config))
+        }))
+    }
+
+    pub fn config(&self) -> &IngestPoolConfig {
+        &self.config
+    }
+
+    pub fn stats(&self) -> IngestStats {
+        IngestStats {
+            queued: self.queued.load(Ordering::SeqCst),
+            in_flight: self.in_flight.load(Ordering::SeqCst),
+            dropped: self.dropped.load(Ordering::SeqCst),
+            deduped: self.deduped.load(Ordering::SeqCst),
+            completed: self.completed.load(Ordering::SeqCst),
+            index_rebuilds: self.index_rebuilds.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Wait until nothing is queued or in flight (index rebuilds excluded),
+    /// polling until `timeout`; true when the pool drained. A one-shot
+    /// process (`transcripts sync`, PR #922) must hold `main` open on this:
+    /// returning early drops the tokio runtime and kills fire-and-forget
+    /// jobs mid-ingest — after the dedup row already marked their meetings
+    /// seen, never to be retried.
+    pub async fn wait_idle(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let s = self.stats();
+            if s.queued == 0 && s.in_flight == 0 {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Synchronous admission so the cap holds even for a tight submit loop.
+    fn admit(&self, message_id: &str) -> Admission {
+        let mut ids = self.active_ids.lock().expect("ingest pool ids mutex poisoned");
+        if ids.contains(message_id) {
+            self.deduped.fetch_add(1, Ordering::SeqCst);
+            return Admission::Duplicate;
+        }
+        let unfinished =
+            self.queued.load(Ordering::SeqCst) + self.in_flight.load(Ordering::SeqCst);
+        if unfinished >= self.config.queue_capacity + self.config.workers {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+            return Admission::Full;
+        }
+        ids.insert(message_id.to_string());
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        Admission::Admitted
+    }
+
+    fn started(&self) {
+        self.queued.fetch_sub(1, Ordering::SeqCst);
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn finished(&self, message_id: &str) {
+        self.active_ids
+            .lock()
+            .expect("ingest pool ids mutex poisoned")
+            .remove(message_id);
+        self.completed.fetch_add(1, Ordering::SeqCst);
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn warn_dropped(&self, message_id: &str, trigger: &IngestTrigger) {
+        let now = now_ms();
+        let last = self.last_drop_warn_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= DROP_WARN_EVERY.as_millis() as u64
+            && self
+                .last_drop_warn_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let s = self.stats();
+            warn!(
+                message_id,
+                trigger = trigger.label(),
+                queued = s.queued,
+                in_flight = s.in_flight,
+                dropped_total = s.dropped,
+                capacity = self.config.queue_capacity,
+                "ingest queue full; dropping (best-effort ingest — see AUGMENTAGENT_INGEST_QUEUE)"
+            );
+        }
+    }
+
+    /// index.md is derived (#642): regenerate it after ingests so a page the
+    /// model just created (or failed to catalog) can't drift out of the
+    /// index. Coalesced (#899): the first completion for a root schedules
+    /// one rebuild after the debounce; later completions inside the window
+    /// ride along. Runs even when the ingest call errored — the model may
+    /// have written pages before failing, and the rebuild is idempotent.
+    fn schedule_index_rebuild(self: &Arc<Self>, wiki_root: PathBuf) {
+        {
+            let mut scheduled = self
+                .rebuild_scheduled
+                .lock()
+                .expect("ingest pool rebuild mutex poisoned");
+            if !scheduled.insert(wiki_root.clone()) {
+                return;
+            }
+        }
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(pool.config.index_rebuild_debounce).await;
+            pool.rebuild_scheduled
+                .lock()
+                .expect("ingest pool rebuild mutex poisoned")
+                .remove(&wiki_root);
+            pool.index_rebuilds.fetch_add(1, Ordering::SeqCst);
+            let index_path = wiki_root.join("index.md");
+            let rebuilt = with_page_lock(&index_path, || async {
+                let root = wiki_root.clone();
+                tokio::task::spawn_blocking(move || {
+                    augmentagent_wiki::index::rebuild_index(&root, &resolve_first_seen)
+                })
+                .await
+                .map_err(anyhow::Error::from)?
+            })
+            .await;
+            match rebuilt {
+                Ok(stats) => debug!(pages = stats.total(), "wiki index rebuilt"),
+                Err(e) => warn!("wiki index rebuild failed: {e:#}"),
+            }
+        });
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Fire-and-forget ingest through the process-wide [`IngestPool`]; never
+/// errors and never blocks the caller. Returns immediately.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_ingest<R>(
     reasoner: Arc<R>,
@@ -121,7 +401,55 @@ pub fn spawn_ingest<R>(
 ) where
     R: Reasoner + 'static,
 {
+    spawn_ingest_on(
+        IngestPool::global(),
+        reasoner,
+        wiki_root,
+        schema,
+        email,
+        decision,
+        reason,
+        draft,
+        trigger,
+    );
+}
+
+/// [`spawn_ingest`] on a specific pool (tests, embedders).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_ingest_on<R>(
+    pool: Arc<IngestPool>,
+    reasoner: Arc<R>,
+    wiki_root: PathBuf,
+    schema: String,
+    email: Email,
+    decision: DecisionKind,
+    reason: Option<String>,
+    draft: Option<String>,
+    trigger: IngestTrigger,
+) where
+    R: Reasoner + 'static,
+{
+    match pool.admit(&email.message_id) {
+        Admission::Admitted => {}
+        Admission::Duplicate => {
+            debug!(
+                message_id = %email.message_id,
+                trigger = trigger.label(),
+                "wiki ingest already queued/running; skipped"
+            );
+            return;
+        }
+        Admission::Full => {
+            pool.warn_dropped(&email.message_id, &trigger);
+            return;
+        }
+    }
     tokio::spawn(async move {
+        let _worker = Arc::clone(&pool.workers)
+            .acquire_owned()
+            .await
+            .expect("ingest pool semaphore is never closed");
+        pool.started();
         let opts = ingest_opts(schema, wiki_root.clone());
         let user_msg = ingest_user_message(
             &email,
@@ -148,32 +476,204 @@ pub fn spawn_ingest<R>(
                 );
             }
         }
-        // index.md is derived (#642): regenerate it after every ingest so a
-        // page the model just created (or failed to catalog) can't drift out
-        // of the index. Runs even when the ingest call errored — the model
-        // may have written pages before failing, and the rebuild is
-        // idempotent. Page lock serializes concurrent ingest tails in this
-        // process; the write itself is atomic (temp + rename, no lockfile).
-        let index_path = wiki_root.join("index.md");
-        let rebuilt = with_page_lock(&index_path, || async {
-            let root = wiki_root.clone();
-            tokio::task::spawn_blocking(move || {
-                augmentagent_wiki::index::rebuild_index(&root, &resolve_first_seen)
-            })
-            .await
-            .map_err(anyhow::Error::from)?
-        })
-        .await;
-        match rebuilt {
-            Ok(stats) => debug!(
-                pages = stats.total(),
-                message_id = %email.message_id,
-                "wiki index rebuilt"
-            ),
-            Err(e) => warn!(
-                message_id = %email.message_id,
-                "wiki index rebuild failed: {e:#}"
-            ),
-        }
+        pool.finished(&email.message_id);
+        pool.schedule_index_rebuild(wiki_root);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reasoner::ReasonerOpts;
+    use async_trait::async_trait;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Counts calls and how many run at once; completes after `delay`.
+    struct SlowReasoner {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        calls: AtomicUsize,
+        delay: Duration,
+    }
+    #[async_trait]
+    impl Reasoner for SlowReasoner {
+        async fn call(&self, _opts: &ReasonerOpts, _msg: &str) -> anyhow::Result<String> {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(now, Ordering::SeqCst);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok("ok".into())
+        }
+    }
+
+    fn slow(delay: Duration) -> Arc<SlowReasoner> {
+        Arc::new(SlowReasoner {
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            delay,
+        })
+    }
+
+    fn email(id: &str) -> Email {
+        Email {
+            message_id: id.into(),
+            thread_id: None,
+            from: "sender".into(),
+            subject: "subject".into(),
+            body: "body".into(),
+            date: "2026-09-01T00:00:00Z".into(),
+            to: String::new(),
+            cc: String::new(),
+            attachments: Vec::new(),
+            account_entity_id: None,
+            platform: "test".into(),
+            kind: "email".into(),
+        }
+    }
+
+    fn pool(queue_capacity: usize, workers: usize, debounce_ms: u64) -> Arc<IngestPool> {
+        Arc::new(IngestPool::new(IngestPoolConfig {
+            queue_capacity,
+            workers,
+            index_rebuild_debounce: Duration::from_millis(debounce_ms),
+        }))
+    }
+
+    fn submit(pool: &Arc<IngestPool>, reasoner: &Arc<SlowReasoner>, root: &Path, id: &str) {
+        spawn_ingest_on(
+            Arc::clone(pool),
+            Arc::clone(reasoner),
+            root.to_path_buf(),
+            "schema".into(),
+            email(id),
+            DecisionKind::Skip,
+            None,
+            None,
+            IngestTrigger::Triaged,
+        );
+    }
+
+    /// Wait until nothing is queued or running (index rebuilds excluded).
+    async fn drain(pool: &IngestPool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let s = pool.stats();
+            if s.queued == 0 && s.in_flight == 0 {
+                return;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "pool did not drain: {s:?}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn burst_is_bounded_and_dropped_not_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool(8, 2, 10);
+        let reasoner = slow(Duration::from_millis(50));
+
+        let started = std::time::Instant::now();
+        for i in 0..200 {
+            submit(&pool, &reasoner, dir.path(), &format!("m{i}"));
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "spawn_ingest must never block the caller ({:?})",
+            started.elapsed()
+        );
+
+        drain(&pool).await;
+        let s = pool.stats();
+        assert!(
+            reasoner.max_active.load(Ordering::SeqCst) <= 2,
+            "workers leaked: {} concurrent calls",
+            reasoner.max_active.load(Ordering::SeqCst)
+        );
+        // 2 running + 8 queued are admitted; the other 190 are dropped
+        // (counted, logged) rather than parked or blocking the caller.
+        assert_eq!(s.completed, 10, "{s:?}");
+        assert_eq!(s.dropped, 190, "{s:?}");
+        assert_eq!(s.completed + s.dropped, 200);
+    }
+
+    #[tokio::test]
+    async fn duplicate_message_ids_are_deduped() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool(64, 2, 10);
+        let reasoner = slow(Duration::from_millis(30));
+        for _ in 0..50 {
+            submit(&pool, &reasoner, dir.path(), "same-id");
+        }
+        drain(&pool).await;
+        let s = pool.stats();
+        assert_eq!(reasoner.calls.load(Ordering::SeqCst), 1, "{s:?}");
+        assert_eq!(s.completed, 1, "{s:?}");
+        assert_eq!(s.deduped, 49, "{s:?}");
+        assert_eq!(s.dropped, 0, "{s:?}");
+
+        // Once it has finished, the same id is a fresh observation again.
+        submit(&pool, &reasoner, dir.path(), "same-id");
+        drain(&pool).await;
+        assert_eq!(reasoner.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// PR #922 review — a one-shot process (`transcripts sync`) must be able
+    /// to wait for its fire-and-forget jobs: `main` returning while jobs are
+    /// queued drops the tokio runtime and kills them mid-ingest, after the
+    /// dedup row has already marked each meeting seen.
+    #[tokio::test]
+    async fn wait_idle_blocks_until_the_pool_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool(8, 2, 10);
+        let reasoner = slow(Duration::from_millis(40));
+        for i in 0..5 {
+            submit(&pool, &reasoner, dir.path(), &format!("w{i}"));
+        }
+        assert!(
+            pool.wait_idle(Duration::from_secs(10)).await,
+            "pool must report drained: {:?}",
+            pool.stats()
+        );
+        assert_eq!(pool.stats().completed, 5);
+
+        // An already-empty pool is idle immediately.
+        assert!(pool.wait_idle(Duration::from_millis(10)).await);
+    }
+
+    #[tokio::test]
+    async fn wait_idle_times_out_rather_than_hanging() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool(8, 1, 10);
+        let reasoner = slow(Duration::from_secs(5));
+        submit(&pool, &reasoner, dir.path(), "slowpoke");
+        assert!(!pool.wait_idle(Duration::from_millis(80)).await);
+    }
+
+    #[tokio::test]
+    async fn index_rebuild_is_coalesced() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool(64, 4, 100);
+        let reasoner = slow(Duration::ZERO);
+        for i in 0..20 {
+            submit(&pool, &reasoner, dir.path(), &format!("m{i}"));
+        }
+        drain(&pool).await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let s = pool.stats();
+        assert_eq!(s.completed, 20, "{s:?}");
+        assert_eq!(
+            s.index_rebuilds, 1,
+            "20 completions inside one debounce window must rebuild once: {s:?}"
+        );
+
+        // A completion after the window schedules exactly one more.
+        submit(&pool, &reasoner, dir.path(), "late");
+        drain(&pool).await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(pool.stats().index_rebuilds, 2);
+    }
 }

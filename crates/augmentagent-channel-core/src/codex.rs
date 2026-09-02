@@ -77,11 +77,16 @@ pub fn codex_auth_available() -> bool {
 
 pub struct CodexCliReasoner {
     bin: String,
+    /// #898 — shared cap on concurrent CLI children.
+    gate: std::sync::Arc<crate::cli_gate::CliGate>,
 }
 
 impl CodexCliReasoner {
     pub fn openai() -> Self {
-        Self { bin: codex_bin() }
+        Self {
+            bin: codex_bin(),
+            gate: crate::cli_gate::CliGate::global(),
+        }
     }
 
     fn provider_name(&self) -> &'static str {
@@ -96,6 +101,8 @@ impl CodexCliReasoner {
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
         let dur = reasoner_timeout();
+        // #898 — CLI slot taken before the watchdog starts (see cli_gate).
+        let _permit = self.gate.acquire("codex").await;
         match tokio::time::timeout(dur, self.call_once(opts, user_message, all_blocks)).await {
             // Post-classify any untyped failure (stdin EPIPE, read/wait IO)
             // as provider-side Unavailable (#655 review) — an untyped error
@@ -402,6 +409,7 @@ impl Reasoner for CodexCliReasoner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ModelTier;
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
 
@@ -447,7 +455,10 @@ echo '{"type":"item.completed","item":{"type":"agent_message","text":"{\"decisio
 echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
 "#,
         );
-        let r = CodexCliReasoner { bin };
+        let r = CodexCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        };
         let got = r.call(&opts(), "classify this").await.unwrap();
         assert_eq!(got, "{\"decision\":\"reply\"}", "LastBlock keeps the final message");
         let all = r.call_transcript(&opts(), "classify this").await.unwrap();
@@ -466,11 +477,51 @@ echo '{"type":"turn.failed","error":{"message":"You'\''ve hit your usage limit. 
 exit 1
 "#,
         );
-        let r = CodexCliReasoner { bin };
+        let r = CodexCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        };
         let err = r.call(&opts(), "hi").await.unwrap_err();
         match ReasonerError::find_in(&err) {
             Some(ReasonerError::RateLimited { provider, .. }) => assert_eq!(provider, "codex"),
             other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    /// #658 — the argv end of the tier map: `-m` carries exactly what
+    /// `model_for` resolved, on BOTH tiers, never codex's own default.
+    #[tokio::test]
+    async fn spawn_pins_the_resolved_model_on_both_tiers() {
+        for (preset_model, tier) in [
+            ("claude-opus-4-8", ModelTier::Quality),
+            ("claude-haiku-4-5-20251001", ModelTier::Fast),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let record = dir.path().join("argv.txt");
+            let bin = stub(
+                &dir,
+                "fake-codex",
+                &format!(
+                    "cat >/dev/null\nprintf '%s\\n' \"$@\" >{}\necho '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"ok\"}}}}'\n",
+                    record.display()
+                ),
+            );
+            let mut o = opts();
+            o.model = Some(preset_model.into());
+            CodexCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        }.call(&o, "hi").await.unwrap();
+            let argv: Vec<String> = std::fs::read_to_string(&record)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            let want = model_for(ProviderKind::Codex, tier);
+            assert!(
+                argv.windows(2).any(|w| w[0] == "-m" && w[1] == want),
+                "codex must spawn with `-m {want}`, got {argv:?}"
+            );
         }
     }
 
@@ -495,7 +546,10 @@ echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"a red sq
                 record = record.display()
             ),
         );
-        let r = CodexCliReasoner { bin };
+        let r = CodexCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        };
         let msg = format!("what is in this image?\nIMAGE: {}", img.display());
         let got = r.call(&opts(), &msg).await.unwrap();
         assert_eq!(got, "a red square");
@@ -513,6 +567,7 @@ echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"a red sq
     async fn missing_binary_is_local_not_failoverable_noise() {
         let r = CodexCliReasoner {
             bin: "/nonexistent/codex-bin".into(),
+            gate: crate::cli_gate::CliGate::global(),
         };
         let err = r.call(&opts(), "hi").await.unwrap_err();
         assert!(matches!(

@@ -474,6 +474,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "augmentagent-channel-fotw"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "augmentagent-channel-gdrive"
 version = "0.1.0"
 dependencies = [
@@ -515,6 +528,23 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "augmentagent-channel-imessage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "augmentagent-channel-core",
+ "augmentagent-store",
+ "augmentagent-wiki",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -859,8 +889,10 @@ dependencies = [
  "augmentagent-channel-deft",
  "augmentagent-channel-discord-dm",
  "augmentagent-channel-email",
+ "augmentagent-channel-fotw",
  "augmentagent-channel-gdrive",
  "augmentagent-channel-github",
+ "augmentagent-channel-imessage",
  "augmentagent-channel-journal",
  "augmentagent-channel-linkedin",
  "augmentagent-channel-meetup",

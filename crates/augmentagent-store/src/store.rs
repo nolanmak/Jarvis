@@ -29,6 +29,21 @@ pub enum StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
+/// #900 — an interrupted ShadowNote sync pass, persisted after every page so
+/// a restart resumes pagination instead of replaying the whole batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalSyncCursor {
+    /// The `lastSync` the in-progress query was issued with (`None` = base
+    /// sync). A resumed query must reuse it — AppSync page tokens belong to
+    /// that query.
+    pub last_sync_ms: Option<i64>,
+    /// The server's `startedAt` for this pass; becomes the watermark when
+    /// the pass completes.
+    pub started_at_ms: i64,
+    /// Token of the next unprocessed page (`None` = start from the first).
+    pub next_token: Option<String>,
+}
+
 /// The only `kind` values `socialapi_webhook_events` accepts (#529). Kept as a
 /// constant so the runtime guard, the sqlite CHECK, and the drain's filter
 /// can't drift apart — a row whose kind matches none of these is never
@@ -1118,6 +1133,43 @@ impl Store {
             [],
         )?;
 
+        // #900 — in-progress journal sync pass (resumable pagination cursor)
+        // and the per-(entry, _version) ingest ledger that makes a replayed
+        // page set idempotent. Both keyed by ownerId like journal_sync_state.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS journal_sync_cursor (\
+                 owner_id      TEXT PRIMARY KEY,\
+                 last_sync_ms  INTEGER,\
+                 started_at_ms INTEGER NOT NULL,\
+                 next_token    TEXT,\
+                 updated_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS journal_ingested (\
+                 owner_id       TEXT NOT NULL,\
+                 entry_id       TEXT NOT NULL,\
+                 version        INTEGER NOT NULL,\
+                 ingested_at_ms INTEGER NOT NULL,\
+                 PRIMARY KEY (owner_id, entry_id, version)\
+             )",
+            [],
+        )?;
+
+        // #886 — iMessage bundle incremental cursor. One row per
+        // conversation identifier; stores how many entries of that
+        // conversation's append-only messages.md have been ingested, so a
+        // poll only processes the tail.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS imessage_sync_state (\
+                 conversation  TEXT PRIMARY KEY,\
+                 entries_seen  INTEGER NOT NULL,\
+                 updated_at_ms INTEGER NOT NULL\
+             )",
+            [],
+        )?;
+
         // #80 — voice-capture Telegram long-poll cursor. Single-row table
         // keyed by a logical capture-bot id; stores the last acked update_id
         // so a daemon restart never re-ingests an already-transcribed memo.
@@ -1672,10 +1724,83 @@ impl Store {
         }
     }
 
+    /// [`upsert_email`] variant for historical imports (#886): a *new* row's
+    /// `firstSeenAt` is the caller-supplied message timestamp rather than
+    /// now, so downstream freshness rendering ("facts as of …") reflects
+    /// when the message was actually sent. Existing rows update like
+    /// [`upsert_email`] and keep their original `firstSeenAt`.
+    pub fn upsert_email_backfill(&self, email: &Email, first_seen_ms: i64) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let existed: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM emails WHERE messageId = ?1",
+                params![email.message_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let body_masked = redact::mask(&email.body);
+        let body_param: &str = &body_masked;
+        if existed.is_some() {
+            guard.execute(
+                "UPDATE emails SET threadId = ?2, fromEmail = ?3, subject = ?4, body = ?5, receivedAt = ?6 WHERE messageId = ?1",
+                params![
+                    email.message_id,
+                    email.thread_id,
+                    email.from,
+                    email.subject,
+                    body_param,
+                    email.date,
+                ],
+            )?;
+            Ok(false)
+        } else {
+            guard.execute(
+                "INSERT INTO emails (messageId, threadId, fromEmail, subject, body, receivedAt, accountEntityId, firstSeenAt, platform, kind) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    email.message_id,
+                    email.thread_id,
+                    email.from,
+                    email.subject,
+                    body_param,
+                    email.date,
+                    email.account_entity_id,
+                    first_seen_ms,
+                    email.platform,
+                    email.kind,
+                ],
+            )?;
+            Ok(true)
+        }
+    }
+
     /// True iff the email has been carried to a terminal outcome — skip, flag,
     /// dry-run reply, successful send, or an explicit rejection/timeout from
     /// the approver. Transient errors leave `agentProcessedAt = NULL`, which
     /// makes them retryable.
+    /// Every per-attendee row the calendar channel wrote, as
+    /// `(messageId, fromEmail, receivedAt)`.
+    ///
+    /// Those rows are keyed `gcal:{event_id}:{attendee_email}` and carry the
+    /// event start in `receivedAt`, which makes them a complete record of who
+    /// was invited to what — recoverable with no Google API call. #915's
+    /// transcript bridge reads this to attach a roster to a recorded meeting.
+    ///
+    /// # Errors
+    ///
+    /// Whatever sqlite failed with.
+    pub fn gcal_attendee_rows(&self) -> StoreResult<Vec<(String, String, String)>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = guard.prepare(
+            "SELECT messageId, fromEmail, COALESCE(receivedAt, '') FROM emails \
+             WHERE platform = 'gcal' AND messageId LIKE 'gcal:%'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn is_email_complete(&self, message_id: &str) -> StoreResult<bool> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let row: Option<Option<i64>> = guard
@@ -2281,6 +2406,132 @@ impl Store {
         Ok(())
     }
 
+    /// #900 — the interrupted sync pass for `owner_id`, if any (crash,
+    /// restart, budget exhausted, page-fetch error).
+    pub fn get_journal_sync_cursor(
+        &self,
+        owner_id: &str,
+    ) -> StoreResult<Option<JournalSyncCursor>> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let cursor = guard
+            .query_row(
+                "SELECT last_sync_ms, started_at_ms, next_token \
+                   FROM journal_sync_cursor WHERE owner_id = ?1",
+                params![owner_id],
+                |r| {
+                    Ok(JournalSyncCursor {
+                        last_sync_ms: r.get(0)?,
+                        started_at_ms: r.get(1)?,
+                        next_token: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(cursor)
+    }
+
+    /// #900 — persist the in-progress pass after a page is processed.
+    pub fn set_journal_sync_cursor(
+        &self,
+        owner_id: &str,
+        cursor: &JournalSyncCursor,
+    ) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO journal_sync_cursor \
+                 (owner_id, last_sync_ms, started_at_ms, next_token, updated_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(owner_id) DO UPDATE SET \
+                 last_sync_ms = excluded.last_sync_ms, \
+                 started_at_ms = excluded.started_at_ms, \
+                 next_token = excluded.next_token, \
+                 updated_at_ms = excluded.updated_at_ms",
+            params![
+                owner_id,
+                cursor.last_sync_ms,
+                cursor.started_at_ms,
+                cursor.next_token,
+                now_millis()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// #900 — the pass completed (or was abandoned); no cursor to resume.
+    pub fn clear_journal_sync_cursor(&self, owner_id: &str) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "DELETE FROM journal_sync_cursor WHERE owner_id = ?1",
+            params![owner_id],
+        )?;
+        Ok(())
+    }
+
+    /// #900 — has this `(entry, _version)` already been handed to ingest?
+    pub fn journal_entry_ingested(
+        &self,
+        owner_id: &str,
+        entry_id: &str,
+        version: i64,
+    ) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let hit: Option<i64> = guard
+            .query_row(
+                "SELECT 1 FROM journal_ingested \
+                  WHERE owner_id = ?1 AND entry_id = ?2 AND version = ?3",
+                params![owner_id, entry_id, version],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(hit.is_some())
+    }
+
+    /// #900 — record an `(entry, _version)` as handed to ingest. Returns
+    /// `true` when the row is new, `false` when it was already recorded.
+    pub fn mark_journal_ingested(
+        &self,
+        owner_id: &str,
+        entry_id: &str,
+        version: i64,
+    ) -> StoreResult<bool> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let inserted = guard.execute(
+            "INSERT OR IGNORE INTO journal_ingested \
+                 (owner_id, entry_id, version, ingested_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![owner_id, entry_id, version, now_millis()],
+        )?;
+        Ok(inserted > 0)
+    }
+
+    // ---------------------------------------------------------------
+    // #886 — iMessage bundle incremental cursor.
+    // ---------------------------------------------------------------
+
+    /// Entries of this conversation already ingested. 0 = never synced.
+    pub fn get_imessage_entries_seen(&self, conversation: &str) -> StoreResult<i64> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n: Option<i64> = guard
+            .query_row(
+                "SELECT entries_seen FROM imessage_sync_state WHERE conversation = ?1",
+                params![conversation],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(n.unwrap_or(0))
+    }
+
+    pub fn set_imessage_entries_seen(&self, conversation: &str, entries_seen: i64) -> StoreResult<()> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        guard.execute(
+            "INSERT INTO imessage_sync_state (conversation, entries_seen, updated_at_ms) \
+                 VALUES (?1, ?2, ?3) \
+             ON CONFLICT(conversation) DO UPDATE SET \
+                 entries_seen = excluded.entries_seen, updated_at_ms = excluded.updated_at_ms",
+            params![conversation, entries_seen, now_millis()],
+        )?;
+        Ok(())
+    }
+
     // ---------------------------------------------------------------
     // #61 — LinkedIn connection-sync cursor.
     // ---------------------------------------------------------------
@@ -2436,6 +2687,20 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Repoint every phone-index row from one person slug to another — the
+    /// store half of an owner-approved page merge (`person merge`). Without
+    /// this, a deleted stub's rows keep resolving future syncs to a missing
+    /// page. Returns the number of rows moved.
+    pub fn repoint_phone_identity(&self, from_slug: &str, to_slug: &str) -> StoreResult<usize> {
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let n = guard.execute(
+            "UPDATE identity_phone SET person_slug = ?2, updated_at_ms = ?3 \
+             WHERE person_slug = ?1",
+            params![from_slug, to_slug, now_millis()],
+        )?;
+        Ok(n)
     }
 
     /// Backfill the human-readable Gmail address for a connected account.
@@ -7118,6 +7383,36 @@ mod tests {
     }
 
     #[test]
+    fn imessage_entries_seen_roundtrip() {
+        let (store, _d) = fresh_store();
+        // never-synced conversation reads as 0, not an error
+        assert_eq!(store.get_imessage_entries_seen("+14155550123").unwrap(), 0);
+        store.set_imessage_entries_seen("+14155550123", 42).unwrap();
+        assert_eq!(store.get_imessage_entries_seen("+14155550123").unwrap(), 42);
+        store.set_imessage_entries_seen("+14155550123", 57).unwrap();
+        assert_eq!(store.get_imessage_entries_seen("+14155550123").unwrap(), 57);
+    }
+
+    #[test]
+    fn upsert_email_backfill_preserves_historical_first_seen() {
+        let (store, _d) = fresh_store();
+        let email = sample_email("imessage:+14155550123:0");
+        // historical import: firstSeenAt is the message timestamp, so the
+        // wiki index renders honest "facts as of" dates (#886)
+        assert!(store.upsert_email_backfill(&email, 1_600_000_000_000).unwrap());
+        assert_eq!(
+            store.email_first_seen_at("imessage:+14155550123:0").unwrap(),
+            Some(1_600_000_000_000)
+        );
+        // re-import is an update, and never rewrites firstSeenAt
+        assert!(!store.upsert_email_backfill(&email, 1_700_000_000_000).unwrap());
+        assert_eq!(
+            store.email_first_seen_at("imessage:+14155550123:0").unwrap(),
+            Some(1_600_000_000_000)
+        );
+    }
+
+    #[test]
     fn socialapi_tables_exist_after_migrate() {
         let (s, _f) = fresh_store();
         let guard = s.conn.lock().unwrap();
@@ -9701,5 +9996,41 @@ mod tests {
         assert!(!s
             .insert_socialapi_webhook_event("ev_2", "dm", None, "{}")
             .unwrap());
+    }
+    #[test]
+    fn journal_sync_cursor_roundtrip_and_ingested_marks() {
+        let (store, _dir) = fresh_store();
+        assert_eq!(store.get_journal_sync_cursor("o").unwrap(), None);
+        let cur = JournalSyncCursor {
+            last_sync_ms: Some(5),
+            started_at_ms: 10,
+            next_token: Some("2".into()),
+        };
+        store.set_journal_sync_cursor("o", &cur).unwrap();
+        assert_eq!(store.get_journal_sync_cursor("o").unwrap(), Some(cur.clone()));
+        let cur2 = JournalSyncCursor {
+            next_token: None,
+            ..cur
+        };
+        store.set_journal_sync_cursor("o", &cur2).unwrap();
+        assert_eq!(store.get_journal_sync_cursor("o").unwrap(), Some(cur2));
+        store.clear_journal_sync_cursor("o").unwrap();
+        assert_eq!(store.get_journal_sync_cursor("o").unwrap(), None);
+
+        assert!(!store.journal_entry_ingested("o", "e1", 3).unwrap());
+        assert!(store.mark_journal_ingested("o", "e1", 3).unwrap());
+        assert!(
+            !store.mark_journal_ingested("o", "e1", 3).unwrap(),
+            "second mark is a no-op"
+        );
+        assert!(store.journal_entry_ingested("o", "e1", 3).unwrap());
+        assert!(
+            !store.journal_entry_ingested("o", "e1", 4).unwrap(),
+            "a bumped _version is unseen"
+        );
+        assert!(
+            !store.journal_entry_ingested("other", "e1", 3).unwrap(),
+            "scoped per owner"
+        );
     }
 }

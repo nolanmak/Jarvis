@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
+use crate::cli_gate::CliGate;
+
 use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -545,12 +547,16 @@ pub trait Reasoner: Send + Sync {
 
 pub struct ClaudeCliReasoner {
     bin: String,
+    /// #898 — shared cap on concurrent CLI children; the global gate in
+    /// production, a private one in tests.
+    gate: Arc<CliGate>,
 }
 
 impl Default for ClaudeCliReasoner {
     fn default() -> Self {
         Self {
             bin: std::env::var("CLAUDE_CLI").unwrap_or_else(|_| "claude".into()),
+            gate: CliGate::global(),
         }
     }
 }
@@ -558,6 +564,12 @@ impl Default for ClaudeCliReasoner {
 impl ClaudeCliReasoner {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// #898 — use a specific gate instead of the process-global one.
+    pub fn with_gate(mut self, gate: Arc<CliGate>) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Legacy convenience: pin a model for callers that don't build a full
@@ -659,6 +671,11 @@ impl ClaudeCliReasoner {
         capture: TextCapture,
     ) -> Result<String, CallError> {
         let dur = reasoner_timeout_for(opts);
+        // #898 — take the CLI slot *before* the watchdog starts: time spent
+        // queued behind other children must not count against this call.
+        // The permit lives to the end of this scope — past the child on
+        // every path, including the watchdog dropping `call_once`.
+        let _permit = self.gate.acquire("claude").await;
         match tokio::time::timeout(dur, self.call_once(opts, user_message, capture)).await {
             Ok(r) => r,
             Err(_) => {
@@ -1509,6 +1526,20 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             repo_root.to_string_lossy().into_owned(),
         ),
     ];
+    // #915/#922 — the scope guard allows the READ tools under the transcript
+    // clone, but only if it can see the same variable the daemon used to
+    // open the dir (`add_dirs` below); `restrict_env` means nothing is
+    // inherited, so forward it explicitly. Same condition as add_dirs:
+    // absent variable or absent directory, absent env.
+    if let Some(t) = std::env::var_os("AUGMENTAGENT_TRANSCRIPTS_DIR") {
+        let t = PathBuf::from(t);
+        if t.is_dir() {
+            env.push((
+                "AUGMENTAGENT_TRANSCRIPTS_DIR".into(),
+                t.to_string_lossy().into_owned(),
+            ));
+        }
+    }
     // #214 — Prepend the release bin's dir to PATH so the agent's bare
     // `augmentagent <subcommand>` invocations actually resolve to OUR
     // binary. Without this, the bare-command allowlist patterns above
@@ -1620,7 +1651,22 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             "Bash(aa-gh issue view *)".to_string(),
             "Bash(aa-gh issue comment *)".to_string(),
         ],
-        add_dirs: vec![wiki_root.clone()],
+        add_dirs: {
+            // #915: the wiki holds the distilled, cited facts about a meeting;
+            // the transcript clone holds what was actually said. Grepping the
+            // words is the only way to answer "what exactly did we agree", and
+            // the clone is read-only to this daemon, so opening it costs
+            // nothing but the path. Absent variable, absent directory —
+            // unchanged behaviour.
+            let mut dirs = vec![wiki_root.clone()];
+            if let Some(t) = std::env::var_os("AUGMENTAGENT_TRANSCRIPTS_DIR") {
+                let t = PathBuf::from(t);
+                if t.is_dir() {
+                    dirs.push(t);
+                }
+            }
+            dirs
+        },
         permission_mode: "acceptEdits".into(),
         // Pin cwd to the wiki so Write/Edit cannot touch the source tree.
         cwd: Some(wiki_root.clone()),
@@ -2486,6 +2532,48 @@ mod tests {
         );
     }
 
+    /// PR #922 review — #915 opens the transcript clone via `--add-dir`, but
+    /// the #127 scope guard only allowed WIKI_ROOT, so every Read/Grep/Glob
+    /// on a transcript was denied. The guard now honors
+    /// AUGMENTAGENT_TRANSCRIPTS_DIR — which only works if `ask_opts` forwards
+    /// it into the spawned CLI's restricted (#128) env.
+    #[test]
+    fn ask_opts_forwards_transcripts_dir_to_the_scope_guard() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        let transcripts = tempfile::tempdir().expect("transcripts tmpdir");
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        // One EnvGuard only — it holds the global env lock, so a second
+        // would self-deadlock. AUGMENTAGENT_DB is cleared by hand under it.
+        let _t = EnvGuard::set(
+            "AUGMENTAGENT_TRANSCRIPTS_DIR",
+            transcripts.path().to_str().unwrap(),
+        );
+        let prior_db = std::env::var("AUGMENTAGENT_DB").ok();
+        std::env::remove_var("AUGMENTAGENT_DB");
+
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+
+        if let Some(v) = prior_db {
+            std::env::set_var("AUGMENTAGENT_DB", v);
+        }
+        let fwd = opts
+            .env
+            .iter()
+            .find(|(k, _)| k == "AUGMENTAGENT_TRANSCRIPTS_DIR")
+            .map(|(_, v)| v.clone())
+            .expect("AUGMENTAGENT_TRANSCRIPTS_DIR must reach the guard's env");
+        assert_eq!(fwd, transcripts.path().to_string_lossy());
+        // And the clone itself is opened for the session (#915 behaviour,
+        // pinned so the env forwarding cannot drift from add_dirs).
+        assert!(
+            opts.add_dirs
+                .iter()
+                .any(|d| d.as_path() == transcripts.path()),
+            "transcript clone must be in add_dirs"
+        );
+    }
+
     /// Regression test for the PR #199 follow-up: `aa-gh` must be
     /// reachable both as bare `aa-gh ...` and by absolute path, and
     /// `<repo>/scripts/` must be on PATH so the bare form actually
@@ -3263,6 +3351,113 @@ mod failover_error_tests {
         path.to_string_lossy().into_owned()
     }
 
+    // ---- #898: process-global cap on concurrent CLI subprocesses ----
+
+    const RESULT_OK: &str = r#"echo '{"type":"result","result":"ok"}'"#;
+
+    /// 40 concurrent calls through a stub that sleeps must never have more
+    /// than the gate's capacity of children alive at once — and must all
+    /// still complete (callers queue, nothing is dropped).
+    #[tokio::test]
+    async fn in_flight_never_exceeds_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(
+            &dir,
+            "fake-claude-slow",
+            &format!("cat >/dev/null
+sleep 0.15
+{RESULT_OK}
+"),
+        );
+        let gate = Arc::new(CliGate::new(3));
+        let reasoner = Arc::new(ClaudeCliReasoner {
+            bin,
+            gate: Arc::clone(&gate),
+        });
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let sampler = {
+            let gate = Arc::clone(&gate);
+            let max_seen = Arc::clone(&max_seen);
+            tokio::spawn(async move {
+                loop {
+                    max_seen.fetch_max(gate.in_flight(), Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(3)).await;
+                }
+            })
+        };
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..40 {
+            let r = Arc::clone(&reasoner);
+            set.spawn(async move { r.call(&dummy_opts(), "hi").await });
+        }
+        let mut ok = 0usize;
+        while let Some(joined) = set.join_next().await {
+            let out = joined.unwrap().expect("every queued call completes");
+            assert_eq!(out, "ok");
+            ok += 1;
+        }
+        sampler.abort();
+        assert_eq!(ok, 40);
+        let max = max_seen.load(Ordering::SeqCst);
+        assert!(max <= 3, "gate leaked: {max} children in flight at once");
+        assert!(max >= 2, "gate should still allow concurrency, saw {max}");
+        assert_eq!(gate.in_flight(), 0);
+        assert_eq!(gate.waiting(), 0);
+    }
+
+    /// A permit must go back on every exit path: non-zero exit, and the
+    /// caller's future being dropped (the #656 watchdog / a shutdown), so a
+    /// capacity-1 gate never starves the next call.
+    #[tokio::test]
+    async fn permit_released_on_failure_and_on_cancel() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new(CliGate::new(1));
+
+        let failing = stub_cli(&dir, "fake-claude-fail", "cat >/dev/null
+echo boom >&2
+exit 1
+");
+        let fail = ClaudeCliReasoner {
+            bin: failing,
+            gate: Arc::clone(&gate),
+        };
+        assert!(fail.call(&dummy_opts(), "x").await.is_err());
+        assert_eq!(gate.in_flight(), 0, "failed call must release its permit");
+
+        let slow = stub_cli(
+            &dir,
+            "fake-claude-hang",
+            &format!("cat >/dev/null
+sleep 5
+{RESULT_OK}
+"),
+        );
+        let hang = ClaudeCliReasoner {
+            bin: slow,
+            gate: Arc::clone(&gate),
+        };
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(200), hang.call(&dummy_opts(), "x")).await;
+        assert!(cancelled.is_err(), "the slow call should have been cancelled");
+        assert_eq!(gate.in_flight(), 0, "a cancelled call must release its permit");
+
+        let ok_bin = stub_cli(&dir, "fake-claude-ok", &format!("cat >/dev/null
+{RESULT_OK}
+"));
+        let ok = ClaudeCliReasoner {
+            bin: ok_bin,
+            gate: Arc::clone(&gate),
+        };
+        let out = tokio::time::timeout(Duration::from_secs(5), ok.call(&dummy_opts(), "x"))
+            .await
+            .expect("next call must not be starved")
+            .unwrap();
+        assert_eq!(out, "ok");
+    }
+
     /// #448's refusal arrives as a SUCCESSFUL completion; post-#656 it must
     /// surface as a downcastable `ReasonerError::RateLimited` with the reset
     /// hint parsed — that's what the fallback chain latches from.
@@ -3278,7 +3473,10 @@ echo '{"type":"assistant","message":{"content":[{"type":"text","text":"You'\''ve
 echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30am (America/New_York)"}'
 "#,
         );
-        let reasoner = ClaudeCliReasoner { bin };
+        let reasoner = ClaudeCliReasoner {
+            bin,
+            gate: CliGate::global(),
+        };
         let err = reasoner
             .call(&dummy_opts(), "triage this")
             .await
@@ -3307,7 +3505,10 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
         let dir = tempfile::tempdir().unwrap();
         let bin = stub_cli(&dir, "fake-claude-hang", "cat >/dev/null\nsleep 600\n");
         std::env::set_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS", "1");
-        let reasoner = ClaudeCliReasoner { bin };
+        let reasoner = ClaudeCliReasoner {
+            bin,
+            gate: CliGate::global(),
+        };
         let started = std::time::Instant::now();
         let err = reasoner.call(&dummy_opts(), "hi").await.expect_err("must time out");
         std::env::remove_var("AUGMENTAGENT_REASONER_TIMEOUT_SECS");
@@ -3328,11 +3529,38 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
     async fn missing_claude_binary_classifies_as_local() {
         let reasoner = ClaudeCliReasoner {
             bin: "/nonexistent/claude-bin".into(),
+            gate: CliGate::global(),
         };
         let err = reasoner.call(&dummy_opts(), "hi").await.unwrap_err();
         assert!(matches!(
             ReasonerError::find_in(&err),
             Some(ReasonerError::Local { .. })
         ));
+    }
+
+    /// #915: the ask agent can read the transcript clone when one is
+    /// configured, and nothing changes when it is not.
+    #[test]
+    fn ask_opts_add_the_transcript_clone_only_when_it_exists() {
+        let wiki = std::env::temp_dir().join("aa-ask-wiki-test");
+        std::fs::create_dir_all(&wiki).unwrap();
+        let repo = std::env::temp_dir();
+
+        // SAFETY: single-threaded test; the var is read once inside the call.
+        unsafe { std::env::remove_var("AUGMENTAGENT_TRANSCRIPTS_DIR") };
+        assert_eq!(ask_opts(wiki.clone(), repo.clone()).add_dirs.len(), 1);
+
+        let t = std::env::temp_dir().join("aa-ask-transcripts-test");
+        std::fs::create_dir_all(&t).unwrap();
+        unsafe { std::env::set_var("AUGMENTAGENT_TRANSCRIPTS_DIR", &t) };
+        assert_eq!(
+            ask_opts(wiki.clone(), repo.clone()).add_dirs.len(),
+            2,
+            "the clone must be readable"
+        );
+
+        unsafe { std::env::set_var("AUGMENTAGENT_TRANSCRIPTS_DIR", "/nonexistent/aa-x") };
+        assert_eq!(ask_opts(wiki, repo).add_dirs.len(), 1);
+        unsafe { std::env::remove_var("AUGMENTAGENT_TRANSCRIPTS_DIR") };
     }
 }
