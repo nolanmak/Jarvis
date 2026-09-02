@@ -1339,8 +1339,13 @@ fn parse_codex_review(raw: &str) -> (bool, String) {
 /// drafts accumulated over three days with nobody (human or model) acting
 /// on a single finding. One bounded revision converts "codex found issues"
 /// into "merged PR" without widening any gate.
-fn build_revise_prompt(issue: &Issue, review_notes: &str, current_lines: usize) -> String {
-    format!(
+fn build_revise_prompt(
+    issue: &Issue,
+    review_notes: &str,
+    current_lines: usize,
+    prior: Option<&str>,
+) -> String {
+    let base = format!(
         "You previously implemented a fix for GitHub issue #{} ({}) in this \
          worktree. An independent reviewer examined your diff and requested \
          changes. Its findings:\n\n{}\n\nAddress each finding: fix what is \
@@ -1367,7 +1372,10 @@ fn build_revise_prompt(issue: &Issue, review_notes: &str, current_lines: usize) 
         issue.number,
         issue.title,
         truncate(review_notes, 4000),
-    )
+    );
+    // #803 — what earlier attempts on this issue already failed on, so a
+    // revision round does not repeat a dead end the last attempt hit.
+    format!("{base}{}", prior_attempts_section(prior))
 }
 
 /// Synthetic "findings" for a gate-repair round (#873): the last change went
@@ -3413,6 +3421,9 @@ async fn resume_draft_pr(
             iv.get("body").and_then(|v| v.as_str()).unwrap_or(""),
         ),
     };
+    // #803 — the resume path revises against fresh findings; every revision
+    // prompt also carries what earlier attempts on this issue failed on.
+    let prior_attempts = AttemptHistory::load(&attempt_history_path()).digest(issue.number);
     let (_ok, prbody_raw, _) = run(
         &gh,
         &["pr", "view", &pr.to_string(), "--json", "body"],
@@ -3644,7 +3655,7 @@ async fn resume_draft_pr(
             match reasoner
                 .call(
                     &fix_opts(worktree.clone()),
-                    &build_revise_prompt(&issue, &shrink_findings(lines_now), lines_now),
+                    &build_revise_prompt(&issue, &shrink_findings(lines_now), lines_now, prior_attempts.as_deref()),
                 )
                 .await
             {
@@ -3720,7 +3731,7 @@ async fn resume_draft_pr(
                 match reasoner
                     .call(
                         &fix_opts(worktree.clone()),
-                        &build_revise_prompt(&issue, &gate_findings(&gate_text), lines_now),
+                        &build_revise_prompt(&issue, &gate_findings(&gate_text), lines_now, prior_attempts.as_deref()),
                     )
                     .await
                 {
@@ -3930,7 +3941,7 @@ async fn resume_draft_pr(
         let rev_summary = match reasoner
             .call(
                 &fix_opts(worktree.clone()),
-                &build_revise_prompt(&issue, &findings, lines_now),
+                &build_revise_prompt(&issue, &findings, lines_now, prior_attempts.as_deref()),
             )
             .await
         {
@@ -4603,7 +4614,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         if let Ok(rs) = reasoner
             .call(
                 &fix_opts(worktree.clone()),
-                &build_revise_prompt(&issue, &shrink_findings(lines), lines),
+                &build_revise_prompt(&issue, &shrink_findings(lines), lines, prior_attempts.as_deref()),
             )
             .await
         {
@@ -4805,7 +4816,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         match reasoner
             .call(
                 &fix_opts(worktree.clone()),
-                &build_revise_prompt(&issue, &findings, lines),
+                &build_revise_prompt(&issue, &findings, lines, prior_attempts.as_deref()),
             )
             .await
         {
@@ -7688,7 +7699,7 @@ CODEX-REVIEW: lgtm").0);
             author_trusted: true,
             research_filed: false,
         };
-        let p = build_revise_prompt(&issue, "rfind(',') splits quoted display names", 373);
+        let p = build_revise_prompt(&issue, "rfind(',') splits quoted display names", 373, None);
         assert!(p.contains("rfind"), "the reviewer's findings must reach the builder");
         assert!(p.contains("#845"));
         // The live #853 resume burned four rounds because "do not start
@@ -9597,5 +9608,34 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(check < ledger, "ledger mark must follow the harness check");
         assert!(body[check..ledger].contains("return Ok(prior)"), "harness failures return before the mark");
         assert_eq!(body.matches("AttemptLedger::mark_persist(").count(), 1);
+    }
+
+    #[test]
+    fn revise_prompt_carries_prior_attempts() {
+        let issue = test_issue_803();
+        let with = build_revise_prompt(&issue, "the findings", 120, Some("- 2026-09-02 · gate-red at stage gate after 40s\n  cargo test failed"));
+        assert!(with.contains("the findings"));
+        assert!(with.contains("Prior attempts on this issue"));
+        assert!(with.contains("gate-red at stage gate"));
+        assert!(with.contains("HARD BUDGET"), "the revise contract is intact");
+        assert!(!build_revise_prompt(&issue, "the findings", 120, None).contains("Prior attempts"));
+    }
+
+    // Structural: resume_draft_pr loads the digest once the issue is known and
+    // every revision prompt it builds (shrink, gate repair, revise) gets it.
+    #[test]
+    fn resume_revisions_see_prior_attempts() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = start + src[start..].find("\n}\n").expect("end");
+        let body = &src[start..end];
+        let load = body.find("AttemptHistory::load(&attempt_history_path()).digest(issue.number)").expect("digest load");
+        let calls: Vec<usize> = body.match_indices("build_revise_prompt(").map(|(i, _)| i).collect();
+        assert_eq!(calls.len(), 3, "shrink, gate repair, revise");
+        for at in calls {
+            assert!(load < at, "digest must be loaded before the prompt is built");
+            let call = &body[at..at + body[at..].find(')').unwrap() + 1];
+            assert!(call.contains("prior_attempts.as_deref()"), "revision prompt without history: {call}");
+        }
     }
 }
