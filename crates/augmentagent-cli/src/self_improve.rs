@@ -1464,7 +1464,7 @@ fn complexity_from_pr_body(body: &str) -> Complexity {
 /// of them, three days, while the loop only ever started new work. Owner
 /// directive 2026-08-31: sitting PRs are picked up too, and since they are
 /// mostly-finished work they outrank new issues.
-async fn find_resumable_draft(repo_root: &Path) -> Option<(u64, u64, String)> {
+async fn find_resumable_draft(repo_root: &Path, only: Option<u64>) -> Option<(u64, u64, String)> {
     let gh = gh_bin();
     let (ok, stdout, _) = run(
         &gh,
@@ -1511,7 +1511,19 @@ async fn find_resumable_draft(repo_root: &Path) -> Option<(u64, u64, String)> {
     };
 
     let ledger = AttemptLedger::load(&attempt_ledger_path());
-    let today = utc_day_now();
+    resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only)
+}
+
+/// The oldest eligible draft `(pr, issue, branch)` — or, with `only`, that
+/// issue's draft and nothing else (#932: a red main's fix PR outranks every
+/// other draft, and must never fall back to "some other PR").
+fn resumable_from(
+    prs: &serde_json::Value,
+    ledger: &AttemptLedger,
+    today: u64,
+    gave_up: &std::collections::HashSet<u64>,
+    only: Option<u64>,
+) -> Option<(u64, u64, String)> {
     prs.as_array()?
         .iter()
         .filter_map(|pr| {
@@ -1519,7 +1531,8 @@ async fn find_resumable_draft(repo_root: &Path) -> Option<(u64, u64, String)> {
             let number = pr.get("number")?.as_u64()?;
             let branch = pr.get("headRefName")?.as_str()?;
             let issue = issue_from_branch(branch)?;
-            (draft && !ledger.attempted_today(today, issue) && !gave_up.contains(&issue))
+            let wanted = only.is_none_or(|o| o == issue);
+            (draft && wanted && !ledger.attempted_today(today, issue) && !gave_up.contains(&issue))
                 .then(|| (number, issue, branch.to_string()))
         })
         .min_by_key(|(number, _, _)| *number)
@@ -1657,7 +1670,7 @@ async fn independent_review(
 /// Build the stage-2 prompt: the issue plus (when the scoping pass produced
 /// one) the implementation spec.
 fn build_fix_prompt(issue: &Issue, plan: Option<&str>) -> String {
-    match plan {
+    let mut prompt = match plan {
         Some(p) => format!(
             "GitHub issue #{}: {}\n\n{}\n\n\
              ## Implementation spec (from a read-only scoping pass on a \
@@ -1669,7 +1682,17 @@ fn build_fix_prompt(issue: &Issue, plan: Option<&str>) -> String {
             "GitHub issue #{}: {}\n\n{}\n\nImplement the fix now.",
             issue.number, issue.title, issue.body
         ),
+    };
+    if is_red_main_issue(&issue.body) {
+        // #932 — the one way a red-main fix can be worse than the outage.
+        prompt.push_str(
+            "\n\nThis failure is on `main`, not in your diff. Decide from the recent \
+             commits listed in the issue whether the TEST or the CODE went stale, and \
+             fix the smaller side. Never weaken, loosen, or delete an assertion to make \
+             a test pass; if the test is right, fix the code it tests.",
+        );
     }
+    prompt
 }
 
 /// #630 — auto-merge policy. Off unless `AUGMENTAGENT_AUTOPR_AUTOMERGE=1|true`,
@@ -2074,6 +2097,14 @@ struct BaselineCache {
     sha: String,
     checked: Vec<String>,
     failing: Vec<String>,
+    /// #932 — the FULL workspace gate ran on `sha`, so `failing` is complete
+    /// (a #931 targeted check only vouches for the names it was asked about).
+    #[serde(default)]
+    full_checked: bool,
+    /// #932 — the gate's error text whenever `sha` was red; the only record
+    /// of a `main` that does not build (no test names to keep).
+    #[serde(default)]
+    gate_err: Option<String>,
 }
 
 impl BaselineCache {
@@ -2121,15 +2152,43 @@ impl BaselineCache {
     }
 
     fn is_red(&self, sha: &str) -> bool {
-        !self.failing_for(sha).is_empty()
+        !self.failing_for(sha).is_empty() || self.gate_err_for(sha).is_some()
     }
 
-    fn record(&mut self, sha: &str, checked: &[String], failing: &[String]) {
+    fn gate_err_for(&self, sha: &str) -> Option<&String> {
+        if self.sha == sha {
+            self.gate_err.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// #932 — has the full gate still to run on `sha`?
+    fn needs_full_check(&self, sha: &str) -> bool {
+        self.sha != sha || !self.full_checked
+    }
+
+    /// #932 — the full gate ran on `sha`: `failing` is now the whole story,
+    /// and `gate_err` is `Some` exactly when the gate was red.
+    fn record_full(&mut self, sha: &str, failing: &[String], gate_err: Option<String>) {
+        self.reset_if_moved(sha);
+        self.record(sha, failing, failing);
+        self.full_checked = true;
+        self.gate_err = gate_err;
+    }
+
+    fn reset_if_moved(&mut self, sha: &str) {
         if self.sha != sha {
             self.sha = sha.to_string();
             self.checked.clear();
             self.failing.clear();
+            self.full_checked = false;
+            self.gate_err = None;
         }
+    }
+
+    fn record(&mut self, sha: &str, checked: &[String], failing: &[String]) {
+        self.reset_if_moved(sha);
         for t in checked {
             if !self.checked.iter().any(|c| c == t) {
                 self.checked.push(t.clone());
@@ -2273,22 +2332,337 @@ async fn preexisting_on_main(repo_root: &Path, gate_err: &str) -> Option<Baselin
     Some(verdict)
 }
 
-/// A `main` the cache already knows is red.
+/// A red `main`, as the cache knows it.
 struct RedMain {
     sha: String,
+    /// Test names red on `main`; empty when `main` does not build.
     failing: Vec<String>,
+    /// Packages cargo named in its rerun hints, for `-p` and `git log` paths.
+    packages: Vec<String>,
+    /// The gate's error text (present whenever red).
+    gate_err: Option<String>,
 }
 
-/// One `git rev-parse` against the cache: while `origin/main` is a SHA the
-/// last check found red, every gate would fail the same way, so the tick
-/// ends before resume or pick spends a builder run. Releases by itself the
-/// moment main moves.
-async fn main_red_latch(repo_root: &Path) -> Option<RedMain> {
+/// #932 — is `origin/main` red? The full verification gate runs once per
+/// main SHA on a clean detached worktree (sandboxed env, shared target dir)
+/// and the answer is cached; every later tick costs one `git rev-parse`.
+/// `None` also when the gate itself could not run (worktree/fetch failure)
+/// — the loop then proceeds exactly as before #932.
+async fn main_is_red(repo_root: &Path) -> Option<RedMain> {
     let sha = origin_main_sha(repo_root).await?;
-    let cache = BaselineCache::load(&baseline_cache_path());
-    cache.is_red(&sha).then(|| RedMain {
+    let path = baseline_cache_path();
+    let mut cache = BaselineCache::load(&path);
+    if cache.needs_full_check(&sha) {
+        let short = sha.get(..7).unwrap_or(&sha);
+        info!(
+            sha = short,
+            "self-improve: full gate on origin/main (once per main commit)"
+        );
+        match full_gate_on_main(repo_root).await {
+            Ok(Ok(())) => cache.record_full(&sha, &[], None),
+            Ok(Err(gate_err)) => {
+                let text = format!("{gate_err:#}");
+                let failing = failing_tests(&text);
+                warn!(
+                    sha = short,
+                    failing = %failing.join(", "),
+                    "origin/main is RED: {}",
+                    truncate(&text, 600)
+                );
+                cache.record_full(&sha, &failing, Some(truncate(&text, 4000)));
+            }
+            Err(e) => {
+                warn!("could not run the full gate on origin/main; proceeding as before: {e:#}");
+                return None;
+            }
+        }
+        cache.save(&path);
+    }
+    if !cache.is_red(&sha) {
+        return None;
+    }
+    let gate_err = cache.gate_err_for(&sha).cloned();
+    let packages = gate_err
+        .as_deref()
+        .map(failing_packages)
+        .unwrap_or_default();
+    Some(RedMain {
         failing: cache.failing_for(&sha).to_vec(),
+        packages,
+        gate_err,
         sha,
+    })
+}
+
+/// Run [`verification_gate`] on a clean detached checkout of `origin/main`.
+/// Outer `Err` = could not even try; inner `Err` = the gate is red.
+async fn full_gate_on_main(repo_root: &Path) -> Result<Result<()>> {
+    let lane = lane_from_env().worktree_name();
+    let worktree = repo_root
+        .join(".self-improve-worktrees")
+        .join(format!("{lane}-baseline"));
+    let branch = format!("agent-baseline/{lane}");
+    reclaim_worktree(repo_root, &worktree, &branch).await;
+    let (ok, _o, e) = run(
+        "git",
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &worktree.to_string_lossy(),
+            "origin/main",
+        ],
+        repo_root,
+    )
+    .await?;
+    if !ok {
+        bail!("baseline: worktree add from origin/main failed: {e}");
+    }
+    let verdict = verification_gate(&worktree).await;
+    reclaim_worktree(repo_root, &worktree, &branch).await;
+    Ok(verdict)
+}
+
+/// Marker the loop puts in the issues it files for a red `main`, so the
+/// pipeline can recognise its own work (fixability bypass, prompt clause).
+const RED_MAIN_MARKER: &str = "<!-- red-main -->";
+
+fn is_red_main_issue(body: &str) -> bool {
+    body.contains(RED_MAIN_MARKER)
+}
+
+/// Deterministic per SHA — it is the dedup key against open issues.
+fn red_main_title(red: &RedMain) -> String {
+    let short = red.sha.get(..7).unwrap_or(&red.sha);
+    if red.failing.is_empty() {
+        return format!("main is red at {short}: workspace does not build");
+    }
+    const SHOWN: usize = 3;
+    let shown = red
+        .failing
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if red.failing.len() > SHOWN {
+        format!(
+            "main is red at {short}: {shown} (+{} more)",
+            red.failing.len() - SHOWN
+        )
+    } else {
+        format!("main is red at {short}: {shown}")
+    }
+}
+
+fn red_main_body(red: &RedMain, recent_commits: &str) -> String {
+    let mut b = format!(
+        "{RED_MAIN_MARKER}\nAuto-filed by the auto-PR loop: `origin/main` at `{}` fails its \
+         own verification gate, so every issue's gate is red until this is fixed. \
+         This issue outranks all other work.\n\n",
+        red.sha
+    );
+    if red.failing.is_empty() {
+        b.push_str("## `main` does not build\n\n```\n");
+        b.push_str(&truncate(red.gate_err.as_deref().unwrap_or(""), 2500));
+        b.push_str("\n```\n\n");
+    } else {
+        b.push_str("## Failing on `main`\n\n");
+        for t in &red.failing {
+            b.push_str(&format!("- `{t}`\n"));
+        }
+        b.push('\n');
+    }
+    if !red.packages.is_empty() {
+        b.push_str("Packages: ");
+        b.push_str(
+            &red.packages
+                .iter()
+                .map(|p| format!("`-p {p}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        b.push_str("\n\n");
+    }
+    b.push_str("## Recent commits touching those crates\n\n```\n");
+    b.push_str(recent_commits.trim());
+    b.push_str(
+        "\n```\n\n## What to do\n\nDecide from those commits whether the TEST or the CODE went \
+                stale and fix the smaller side. Never weaken or delete an assertion to make a \
+                test pass; if the test is right, fix the code. Keep the diff minimal — this PR \
+                exists only to make `main` green again.\n",
+    );
+    b
+}
+
+/// Find the open issue with exactly `title` in a REST `issues` listing:
+/// `(number, carries the gave-up label)`. Pull requests share the endpoint
+/// and never match.
+fn red_main_issue_lookup(issues: &serde_json::Value, title: &str) -> Option<(u64, bool)> {
+    issues.as_array()?.iter().find_map(|iss| {
+        if iss.get("pull_request").is_some() {
+            return None;
+        }
+        if iss.get("title").and_then(serde_json::Value::as_str) != Some(title) {
+            return None;
+        }
+        let number = iss.get("number").and_then(serde_json::Value::as_u64)?;
+        let gave_up = iss
+            .get("labels")
+            .and_then(serde_json::Value::as_array)
+            .map(|ls| {
+                ls.iter()
+                    .any(|l| l.get("name").and_then(|n| n.as_str()) == Some(GAVE_UP_LABEL))
+            })
+            .unwrap_or(false);
+        Some((number, gave_up))
+    })
+}
+
+/// `git log` for the crates cargo blamed (all of `main` when it named none).
+async fn red_main_recent_commits(repo_root: &Path, packages: &[String]) -> String {
+    let mut args: Vec<String> = vec![
+        "log".into(),
+        "-5".into(),
+        "--format=%h %s".into(),
+        "origin/main".into(),
+    ];
+    if !packages.is_empty() {
+        args.push("--".into());
+        for p in packages {
+            args.push(format!("crates/{p}"));
+        }
+    }
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run("git", &argv, repo_root).await {
+        Ok((true, out, _)) => out,
+        _ => String::new(),
+    }
+}
+
+/// `gh issue create` for a red main; the number parsed from the URL gh
+/// prints. Labels are best-effort: a repo without them still gets the issue.
+async fn file_red_main_issue(repo_root: &Path, title: &str, body: &str) -> Result<u64> {
+    let gh = gh_bin();
+    let labelled = [
+        "issue",
+        "create",
+        "--title",
+        title,
+        "--body",
+        body,
+        "--label",
+        "bug",
+        "--label",
+        FIXABLE_LABEL,
+        "--label",
+        "automation/proposed",
+    ];
+    let plain = ["issue", "create", "--title", title, "--body", body];
+    let (mut ok, mut out, mut err) = run(&gh, &labelled, repo_root).await?;
+    if !ok {
+        warn!(
+            "gh issue create with labels failed ({}); retrying without labels",
+            err.trim()
+        );
+        (ok, out, err) = run(&gh, &plain, repo_root).await?;
+    }
+    if !ok {
+        bail!("gh issue create failed: {err}");
+    }
+    out.trim()
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.parse::<u64>().ok())
+        .ok_or_else(|| anyhow::anyhow!("could not parse issue number from `{}`", out.trim()))
+}
+
+/// What run_once does about a red main this tick.
+enum RedMainPlan {
+    /// Run the ordinary pipeline on this (found or freshly filed) issue.
+    Build(Issue),
+    /// A fix PR is already open for this issue; resume that one.
+    Resume(u64),
+    /// Nothing the loop can do right now; end the tick unbilled.
+    Hold(String),
+}
+
+async fn red_main_plan(repo_root: &Path, red: &RedMain) -> RedMainPlan {
+    let title = red_main_title(red);
+    let gh = gh_bin();
+    let listing = run(
+        &gh,
+        &[
+            "api",
+            "repos/{owner}/{repo}/issues?state=open&per_page=100&sort=created&direction=desc",
+        ],
+        repo_root,
+    )
+    .await;
+    let json: serde_json::Value = match listing {
+        Ok((true, out, _)) => serde_json::from_str(&out).unwrap_or(serde_json::Value::Null),
+        _ => return RedMainPlan::Hold("could not list open issues".into()),
+    };
+    let number = match red_main_issue_lookup(&json, &title) {
+        Some((n, true)) => {
+            return RedMainPlan::Hold(format!(
+                "issue #{n} carries `{GAVE_UP_LABEL}`; a human has to fix main"
+            ))
+        }
+        Some((n, false)) => n,
+        None => {
+            let commits = red_main_recent_commits(repo_root, &red.packages).await;
+            match file_red_main_issue(repo_root, &title, &red_main_body(red, &commits)).await {
+                Ok(n) => {
+                    info!(issue = n, %title, "filed a red-main issue");
+                    n
+                }
+                Err(e) => return RedMainPlan::Hold(format!("could not file the issue: {e:#}")),
+            }
+        }
+    };
+    if AttemptLedger::load(&attempt_ledger_path()).attempted_today(utc_day_now(), number) {
+        return RedMainPlan::Hold(format!("issue #{number} already attempted today"));
+    }
+    if has_open_agent_pr(repo_root, number).await.unwrap_or(true) {
+        return RedMainPlan::Resume(number);
+    }
+    // Build the Issue the same way pick_issue does, trust gate included —
+    // the daemon files with the owner's gh login, but nothing here assumes it.
+    let (ok, out, _) = match run(
+        &gh,
+        &["api", &format!("repos/{{owner}}/{{repo}}/issues/{number}")],
+        repo_root,
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return RedMainPlan::Hold(format!("could not read issue #{number}: {e:#}")),
+    };
+    if !ok {
+        return RedMainPlan::Hold(format!("could not read issue #{number}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
+    let s = |k: &str| {
+        v.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let author = v
+        .pointer("/user/login")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let allowlist = trusted_authors(repo_root).await;
+    let author_trusted = author_is_trusted(&author, &s("author_association"), &allowlist);
+    RedMainPlan::Build(Issue {
+        number,
+        title,
+        body: s("body"),
+        author,
+        author_trusted,
+        research_filed: false,
     })
 }
 
@@ -3107,20 +3481,62 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         );
     }
 
-    // #931 — a known-red `main` fails every gate identically; hold the tick
-    // (unbilled) until it moves instead of buying a doomed build.
-    if let Some(red) = main_red_latch(repo_root).await {
-        let short = red.sha.get(..7).unwrap_or(&red.sha);
-        info!(
-            sha = short,
-            failing = %red.failing.join(", "),
-            "self-improve: main is red; holding until it changes"
-        );
-        return Ok(RunReport::held(format!(
-            "main is red at {short} ({}); holding until it changes",
-            red.failing.join(", ")
-        )));
-    }
+    // #931/#932 — a red `main` fails every gate identically, so it is the
+    // loop's first issue: file it (once per SHA), run the ordinary pipeline
+    // on it, or resume its fix PR — and when none of that is possible, end
+    // the tick unbilled rather than buy a doomed build.
+    let lane = lane_from_env();
+    let red_main_issue: Option<Issue> = match main_is_red(repo_root).await {
+        None => None,
+        Some(red) => {
+            let short = red.sha.get(..7).unwrap_or(&red.sha).to_string();
+            let what = if red.failing.is_empty() {
+                "workspace does not build".to_string()
+            } else {
+                red.failing.join(", ")
+            };
+            match red_main_plan(repo_root, &red).await {
+                RedMainPlan::Build(issue) if lane != Lane::Resume => {
+                    info!(sha = %short, issue = issue.number, "main is red; building its fix first");
+                    Some(issue)
+                }
+                RedMainPlan::Build(issue) => {
+                    return Ok(RunReport::held(format!(
+                        "main is red at {short} ({what}); fix issue #{} is the build lane's",
+                        issue.number
+                    )));
+                }
+                RedMainPlan::Resume(n) => {
+                    if lane != Lane::Build {
+                        if let Some((pr, issue_no, resume_branch)) =
+                            find_resumable_draft(repo_root, Some(n)).await
+                        {
+                            info!(sha = %short, pr, issue = issue_no, "main is red; resuming its fix PR first");
+                            let reasoner = build_reasoner();
+                            return resume_draft_pr(
+                                repo_root,
+                                &reasoner,
+                                pr,
+                                issue_no,
+                                &resume_branch,
+                                dry_run,
+                            )
+                            .await;
+                        }
+                    }
+                    return Ok(RunReport::held(format!(
+                        "main is red at {short} ({what}); fix PR for #{n} is open but not resumable now"
+                    )));
+                }
+                RedMainPlan::Hold(reason) => {
+                    info!(sha = %short, %reason, "main is red; holding this tick");
+                    return Ok(RunReport::held(format!(
+                        "main is red at {short} ({what}); {reason}"
+                    )));
+                }
+            }
+        }
+    };
 
     // #866 — sitting draft PRs outrank new work: they are mostly-finished
     // diffs that only lack an approving review, and until now the dedup guard
@@ -3129,9 +3545,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // #871 — lanes: the resume lane does ONLY this (idling when no draft is
     // eligible), the build lane skips it entirely, and the default combined
     // lane keeps resume-first (still flippable via the knob).
-    let lane = lane_from_env();
-    if lane != Lane::Build && resume_first_enabled() {
-        if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root).await {
+    if red_main_issue.is_none() && lane != Lane::Build && resume_first_enabled() {
+        if let Some((pr, issue_no, resume_branch)) = find_resumable_draft(repo_root, None).await {
             let reasoner = build_reasoner();
             return resume_draft_pr(repo_root, &reasoner, pr, issue_no, &resume_branch, dry_run)
                 .await;
@@ -3141,8 +3556,14 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         return Ok(RunReport::idle());
     }
 
-    let Some(issue) = pick_issue(repo_root).await? else {
-        return Ok(RunReport::idle());
+    let issue = match red_main_issue {
+        Some(issue) => issue,
+        None => {
+            let Some(issue) = pick_issue(repo_root).await? else {
+                return Ok(RunReport::idle());
+            };
+            issue
+        }
     };
     info!(issue = issue.number, title = %issue.title, "selected issue");
 
@@ -3254,7 +3675,9 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
     };
     if let Some(s) = &scope {
-        if !s.fixable {
+        // #932 — a red-main issue is never labelled out: that would hold the
+        // loop until a human notices, which is the outage this exists to end.
+        if !s.fixable && !is_red_main_issue(&issue.body) {
             // #653 — the scoper judged this not agent-fixable (research ask,
             // epic, owner decision, …). Label it out so it is scoped at most
             // once, and leave the reason on the issue.
@@ -3464,7 +3887,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // unbilled and unrecorded (no attempt, no comment); the ledger mark
         // alone keeps the picker from re-buying the same build this tick.
         if let Some(verdict) = preexisting_on_main(repo_root, &gate_err.to_string()).await {
-            if verdict.introduced.is_empty() {
+            // #932 — except for the red-main issue itself: those failures
+            // ARE its job, so a still-red gate is a real attempt that must
+            // accumulate toward gave-up instead of retrying daily forever.
+            if verdict.introduced.is_empty() && !is_red_main_issue(&issue.body) {
                 AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue.number);
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
                 return Ok(RunReport::triage(format!(
@@ -7074,19 +7500,19 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert_ne!(h.message, IDLE_MSG, "the hold names its reason");
     }
 
-    // Structural: the latch is the first thing run_once does after the
-    // preflight — before resume and before pick — so a known-red main costs
-    // one `git rev-parse`, not a builder run.
+    // Structural (#931 → #932): the red-main check is the first thing
+    // run_once does after the preflight — before resume and before pick — and
+    // a red main it cannot act on ends the tick unbilled.
     #[test]
-    fn red_main_latch_precedes_resume_and_pick() {
+    fn red_main_check_precedes_resume_and_pick() {
         let src = include_str!("self_improve.rs");
         let start = src.find("pub async fn run_once(").expect("run_once");
         let body = &src[start..];
-        let latch = body.find("main_red_latch(").expect("latch in run_once");
+        let red = body.find("main_is_red(").expect("main_is_red in run_once");
         let resume = body.find("find_resumable_draft(").expect("resume");
         let pick = body.find("pick_issue(").expect("pick");
-        assert!(latch < resume && latch < pick);
-        assert!(body[latch..resume].contains("RunReport::held("));
+        assert!(red < resume && red < pick);
+        assert!(body[red..resume].contains("RunReport::held("));
     }
 
     #[test]
@@ -7103,5 +7529,211 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
                 "gate must keep ≥40 lines of cargo test output: {cmd}"
             );
         }
+    }
+
+    // --- #932 self-heal: a red main becomes the loop's first issue ---------
+
+    fn red_fixture() -> RedMain {
+        RedMain {
+            sha: "abc1234def5678".into(),
+            failing: vec!["source::tests::apply_writes_indexes_and_is_idempotent".into()],
+            packages: vec!["augmentagent-channel-contacts".into()],
+            gate_err: None,
+        }
+    }
+
+    #[test]
+    fn red_main_issue_title_is_stable_per_sha_and_names_tests() {
+        let red = red_fixture();
+        let t = red_main_title(&red);
+        assert!(t.starts_with("main is red at abc1234: "), "{t}");
+        assert!(t.contains("source::tests::apply_writes_indexes_and_is_idempotent"));
+        assert_eq!(
+            t,
+            red_main_title(&red),
+            "title is the dedup key — must be deterministic"
+        );
+        // A main that does not build has no test names to show.
+        let broken = RedMain {
+            failing: vec![],
+            gate_err: Some("cargo build failed:\nerror[E0308]".into()),
+            ..red_fixture()
+        };
+        assert_eq!(
+            red_main_title(&broken),
+            "main is red at abc1234: workspace does not build"
+        );
+        // Many failures: the title stays one line, the body has the rest.
+        let many = RedMain {
+            failing: (0..12).map(|i| format!("m::t{i}")).collect(),
+            ..red_fixture()
+        };
+        let t = red_main_title(&many);
+        assert!(t.len() < 200, "{t}");
+        assert!(t.contains("m::t0") && t.contains("+9 more"), "{t}");
+    }
+
+    #[test]
+    fn red_main_issue_body_carries_recent_commits_and_packages() {
+        let red = red_fixture();
+        let body = red_main_body(&red, "d05d7f0 Write phone/imessage identities as lists\n");
+        assert!(is_red_main_issue(&body), "body carries the red-main marker");
+        assert!(!is_red_main_issue("## Why\nplain issue"));
+        assert!(body.contains("d05d7f0 Write phone/imessage identities as lists"));
+        assert!(body.contains("-p augmentagent-channel-contacts"));
+        assert!(body.contains("source::tests::apply_writes_indexes_and_is_idempotent"));
+        assert!(body.contains("abc1234def5678"), "full SHA for the human");
+        // A build failure carries the gate tail instead of test names.
+        let broken = RedMain {
+            failing: vec![],
+            gate_err: Some("cargo build failed:\nerror[E0308]: mismatched types".into()),
+            ..red_fixture()
+        };
+        assert!(red_main_body(&broken, "").contains("error[E0308]"));
+    }
+
+    #[test]
+    fn red_main_issue_is_deduped_by_open_title() {
+        let title = red_main_title(&red_fixture());
+        let json: serde_json::Value = serde_json::json!([
+            {"number": 5, "title": title, "labels": []},
+            {"number": 6, "title": "other", "labels": [{"name": GAVE_UP_LABEL}]},
+            {"number": 7, "title": "main is red at 0000000: x", "labels": [{"name": GAVE_UP_LABEL}]},
+            {"number": 8, "title": title, "labels": [], "pull_request": {"url": "x"}},
+        ]);
+        assert_eq!(red_main_issue_lookup(&json, &title), Some((5, false)));
+        // A gave-up red-main issue is found (so it is not re-filed) but flagged.
+        assert_eq!(
+            red_main_issue_lookup(&json, "main is red at 0000000: x"),
+            Some((7, true))
+        );
+        assert_eq!(red_main_issue_lookup(&json, "nope"), None);
+        // Pull requests share the issues endpoint; never match one.
+        let prs_only: serde_json::Value = serde_json::json!([
+            {"number": 8, "title": title, "labels": [], "pull_request": {"url": "x"}},
+        ]);
+        assert_eq!(red_main_issue_lookup(&prs_only, &title), None);
+    }
+
+    #[test]
+    fn red_main_prompt_forbids_assertion_weakening() {
+        let red = red_fixture();
+        let issue = Issue {
+            number: 99,
+            title: red_main_title(&red),
+            body: red_main_body(&red, "d05d7f0 lists\n"),
+            author: "nolanmak".into(),
+            author_trusted: true,
+            research_filed: false,
+        };
+        let p = build_fix_prompt(&issue, None);
+        assert!(p.contains("source::tests::apply_writes_indexes_and_is_idempotent"));
+        assert!(
+            p.contains("Never weaken, loosen, or delete an assertion"),
+            "red-main prompt must forbid assertion weakening:\n{p}"
+        );
+        assert!(p.contains("not in your diff"), "{p}");
+        // Ordinary issues do not get the clause.
+        let plain = Issue {
+            body: "## Why\nfix the thing".into(),
+            ..issue
+        };
+        assert!(!build_fix_prompt(&plain, None).contains("Never weaken"));
+    }
+
+    #[test]
+    fn baseline_gate_runs_once_per_main_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("autopr-baseline.json");
+        let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut c = BaselineCache::load(&path);
+        assert!(c.needs_full_check("s1"), "nothing checked yet");
+        // A targeted (#931) check does NOT count as a full one.
+        c.record("s1", &t(&["a"]), &[]);
+        assert!(c.needs_full_check("s1"));
+        c.record_full("s1", &t(&["b"]), None);
+        assert!(!c.needs_full_check("s1"), "full gate ran once for s1");
+        assert!(c.is_red("s1"));
+        assert_eq!(c.failing_for("s1"), &t(&["b"])[..]);
+        c.save(&path);
+        let c2 = BaselineCache::load(&path);
+        assert!(
+            !c2.needs_full_check("s1"),
+            "full-check bit survives a restart"
+        );
+        // A new main SHA needs its own full gate.
+        assert!(c2.needs_full_check("s2"));
+        let mut c3 = c2;
+        c3.record_full("s2", &[], Some("cargo build failed:\nerror[E0308]".into()));
+        assert!(
+            c3.is_red("s2"),
+            "a main that does not build is red with no test names"
+        );
+        assert!(c3.failing_for("s2").is_empty());
+        assert!(c3.gate_err_for("s2").is_some());
+        c3.record_full("s3", &[], None);
+        assert!(
+            !c3.is_red("s3") && !c3.needs_full_check("s3"),
+            "green main is remembered too"
+        );
+    }
+
+    // Structural: the scoper's "not agent-fixable" verdict never labels a
+    // red-main issue out — that would hold the loop until a human notices,
+    // which is the outage this feature exists to end.
+    #[test]
+    fn red_main_issue_bypasses_the_fixability_verdict() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let body = &src[start..];
+        let at = body.find("if !s.fixable").expect("fixability branch");
+        let line = &body[at..at + 80];
+        assert!(
+            line.contains("!is_red_main_issue(&issue.body)"),
+            "fixability refusal must exempt red-main issues: {line}"
+        );
+    }
+
+    // Structural: the #931 "not charged" exit does not apply to the red-main
+    // issue itself — its failing tests are the job, so a red gate there is a
+    // real attempt.
+    #[test]
+    fn red_main_issue_gate_failure_is_a_real_attempt() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let end = start + src[start..].find("\n}\n").expect("end of run_once");
+        let body = &src[start..end];
+        let at = body.find("if verdict.introduced.is_empty()").expect("not-charged branch");
+        let line = &body[at..at + 80];
+        assert!(line.contains("&& !is_red_main_issue(&issue.body)"), "{line}");
+    }
+
+    #[test]
+    fn resumable_draft_can_be_pinned_to_one_issue() {
+        let prs: serde_json::Value = serde_json::json!([
+            {"number": 101, "isDraft": true, "headRefName": "agent-fix/issue-11"},
+            {"number": 100, "isDraft": true, "headRefName": "agent-fix/issue-10"},
+            {"number": 102, "isDraft": false, "headRefName": "agent-fix/issue-12"},
+            {"number": 103, "isDraft": true, "headRefName": "feature/human"},
+        ]);
+        let mut ledger = AttemptLedger::default();
+        let gave_up: std::collections::HashSet<u64> = [12u64].into_iter().collect();
+        // Unpinned: oldest eligible draft.
+        assert_eq!(
+            resumable_from(&prs, &ledger, 100, &gave_up, None),
+            Some((100, 10, "agent-fix/issue-10".to_string()))
+        );
+        // Pinned to the red-main issue: that draft even though it is newer.
+        assert_eq!(
+            resumable_from(&prs, &ledger, 100, &gave_up, Some(11)),
+            Some((101, 11, "agent-fix/issue-11".to_string()))
+        );
+        // Pinned to an issue without an eligible draft: nothing, never a
+        // fallback to some other PR.
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(12)), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(99)), None);
+        // The daily ledger still applies to the pinned draft.
+        ledger.mark(100, 11);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(11)), None);
     }
 }
