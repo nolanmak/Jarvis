@@ -12,6 +12,7 @@ pub mod attachments;
 mod broker;
 mod custom_id;
 mod event_handler;
+mod journal_cmd;
 mod layout;
 mod loops;
 mod nudge;
@@ -29,6 +30,7 @@ pub use broker::{DiscordApprovalBroker, DiscordConfig};
 // #501 — `append_envelope_markers` is shared with the CLI's Back-to-queue
 // repost so it renders the same To/cc/bcc decoration as the Revise repost.
 pub use event_handler::{append_envelope_markers, chunk_for_discord};
+pub use journal_cmd::{parse_journal_command, JournalCmd, JOURNAL_NOT_CONFIGURED, JOURNAL_USAGE};
 // #35 Phase 5: the email channel appends the needs-input marker to the
 // persisted draft via this; the card decodes it on render. `NeedsInput` is
 // re-exported for the channel/test surface.
@@ -224,6 +226,29 @@ impl ApprovalBroker for NoopBroker {
     ) -> Result<(), ApprovalError> {
         Ok(())
     }
+}
+
+/// Bridge into the ShadowNote journaling flow (#428):
+/// this crate owns the `!journal` grammar + dispatch, the
+/// cli implements the encrypt/AppSync/wiki-ingest plumbing, no circular
+/// dep and no AWS dependencies here.
+///
+/// Both methods return the user-facing reply line. The `Err` string is
+/// ALSO user-facing and must carry enough of the entry text that a failed
+/// save never silently loses what the user wrote.
+#[async_trait]
+pub trait JournalOps: Send + Sync {
+    /// `!journal <text>` — save the raw message text as an entry (the
+    /// impl wraps it into the app's paragraph HTML).
+    async fn save_text(&self, title: Option<String>, text: &str) -> Result<String, String>;
+
+    /// `!journal done [title]` — compose an entry from the conversation
+    /// excerpt and save it. `title_override` wins over the composed title.
+    async fn compose_and_save(
+        &self,
+        history: &str,
+        title_override: Option<String>,
+    ) -> Result<String, String>;
 }
 
 /// Executes the user's button click against the product side (gmail send /
