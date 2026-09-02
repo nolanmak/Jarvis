@@ -180,6 +180,28 @@ Most users have multiple connected Gmail accounts. Use `--account <email>` (pref
 augmentagent gmail accounts --json true
 ```
 
+### Read an email attachment (#937, #939)
+
+`gmail search` prints `attachments: <name> (<mime>)` on each message that has any. To read one, download it by name:
+
+```
+augmentagent gmail get-attachment --account <email> --message-id <messageId> --name "<filename exactly as printed>"
+```
+
+That saves the file to `/tmp/aa-doc-<id>-<n>.<ext>` and, for PDF / DOCX / DOC, extracts the text to the sibling `.txt` — then **Read the `.txt`** (your Read carve-out admits both paths). The command prints:
+
+- `saved: <path> (<bytes> bytes, <mime>, "<name>")`
+- `extracted: <path>.txt (<chars> chars, ocr: applied (N pages) | not-needed | unavailable | failed: …)` and a `note:` line whenever OCR mattered.
+
+Read the `ocr:` field before you rely on the text:
+
+- `not-needed` — a digital PDF; the text layer was used.
+- `applied (N pages)` — the PDF was a scan with no text layer and Mistral OCR recovered the text. Treat it as OCR output (small character errors are possible) and say so if you quote it verbatim.
+- `unavailable` — a scan, and `MISTRAL_API_KEY` is not configured: the `.txt` is EMPTY. Tell the user the attachment is a scanned image you can't read yet and ask for screenshots of the pages (or to configure the key). **Never describe an empty extraction as an empty document.**
+- `failed: …` — a scan, and the OCR call failed; report the reason and ask for screenshots.
+
+If two attachments share a name, run `augmentagent gmail list-attachments --account <email> --message-id <id>` and pass `--attachment-id` instead of `--name`. Attachments over ~25 MB arrive as Google Drive links in the message body, not as attachments. Files the user drops in Discord already arrive extracted at a `/tmp/aa-doc-…txt` path with the same `ocr` note in the prompt.
+
 ### Compose a draft
 
 Default path. Saves to Gmail/Drafts; doesn't send.
