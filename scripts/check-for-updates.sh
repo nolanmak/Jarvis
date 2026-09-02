@@ -61,6 +61,13 @@ apply_update() {
   local RESTART_FAILURES=0
 
   if [ "$NEEDS_REBUILD" -eq 1 ]; then
+    # #903 — a release build is the second-largest memory user on the box;
+    # under pressure it would tip a host that is already struggling. Not a
+    # build failure: withhold the stamp so the next tick retries (#826).
+    if ! memory_pressure_ok; then
+      log "skipping rebuild + restart under memory pressure; stamp withheld, retry next tick"
+      return 1
+    fi
     log "rebuilding rust (changed files touched crates/ or Cargo)"
     # Build BOTH production binaries. `augmentagent-mcp-memory` is a separate
     # package that the daemon spawns as a stdio MCP server — ask_opts points
@@ -123,9 +130,17 @@ apply_update() {
         # binary is already built, so the retry is cheap.
         if maybe_defer_restart; then
           RESTART_FAILURES=$((RESTART_FAILURES + 1))
+        elif ! memory_pressure_ok || ! restart_budget_ok; then
+          # #903 — same deferral semantics as #844: counts as a restart
+          # failure so the stamp is withheld and the next tick retries.
+          RESTART_FAILURES=$((RESTART_FAILURES + 1))
         else
           log "restarting daemon via systemctl --user restart $SYSTEMD_UNIT"
-          restart_unit "$SYSTEMD_UNIT" || RESTART_FAILURES=$((RESTART_FAILURES + 1))
+          if restart_unit "$SYSTEMD_UNIT"; then
+            record_restart
+          else
+            RESTART_FAILURES=$((RESTART_FAILURES + 1))
+          fi
         fi
       fi
       if [ "$NEEDS_DASHBOARD_REBUILD" -eq 1 ]; then
@@ -179,6 +194,8 @@ will retry via the build-stamp mismatch path."
 }
 
 log "checking for updates"
+# #891 — housekeeping that must never run under a live build.
+trim_gate_cache_if_idle || true
 
 git fetch origin main --quiet || {
   log "fetch failed"

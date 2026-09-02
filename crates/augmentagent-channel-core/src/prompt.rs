@@ -75,21 +75,57 @@ fn recipient_header(label: &str, raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
-    // Escape first, then cap: `<` and `&` expand 4-5x, so a cap applied to the
-    // raw header would let a `&&&&…` blast render far past it.
-    let safe = sanitize_untrusted(raw);
-    if safe.len() <= RECIPIENT_HEADER_CHAR_CAP {
-        return format!("\n{label}: {safe}");
+    // Entry by entry, so a quoted display name (`"Doe, John" <j@x>`) is never
+    // split at its comma and nothing shorter than a whole entry is shown.
+    // Escape before measuring: `<` and `&` expand 4-5x, so a cap applied to
+    // the raw header would let a `&&&&…` blast render far past it.
+    let entries: Vec<String> = recipient_entries(raw)
+        .into_iter()
+        .map(|e| sanitize_untrusted(&e))
+        .collect();
+    let mut shown: Vec<&str> = Vec::new();
+    let mut len = 0usize;
+    for e in &entries {
+        let extra = e.len() + usize::from(!shown.is_empty()) * 2;
+        if len + extra > RECIPIENT_HEADER_CHAR_CAP {
+            break;
+        }
+        len += extra;
+        shown.push(e);
     }
-    let cut = (0..=RECIPIENT_HEADER_CHAR_CAP)
-        .rev()
-        .find(|i| safe.is_char_boundary(*i))
-        .unwrap_or(0);
-    // No comma inside the cap means the first address alone overruns it; drop
-    // it too rather than render a fragment that reads like a real recipient.
-    let head = safe[..cut].rfind(',').map_or("", |i| &safe[..i]);
-    let dropped = safe[head.len()..].matches(',').count() + usize::from(head.is_empty());
-    format!("\n{label}: {head}… (+{dropped} more)")
+    let dropped = entries.len() - shown.len();
+    if dropped == 0 {
+        return format!("\n{label}: {}", shown.join(", "));
+    }
+    format!("\n{label}: {}… (+{dropped} more)", shown.join(", "))
+}
+
+/// Split a recipient header into entries, display names intact: commas inside
+/// double quotes or angle brackets don't split. (Same rule as the email
+/// crate's `split_recipient_entries`, which this crate cannot depend on.)
+fn recipient_entries(raw: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let (mut in_quotes, mut depth) = (false, 0usize);
+    for c in raw.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '<' if !in_quotes => depth += 1,
+            '>' if !in_quotes => depth = depth.saturating_sub(1),
+            ',' if !in_quotes && depth == 0 => {
+                parts.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    parts.push(cur);
+    parts
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 /// Render the optional `To:` / `Cc:` lines that sit inside the `<email>`
@@ -858,6 +894,20 @@ mod tests {
         // is dropped whole rather than rendered as a plausible-looking stub.
         let long = format!("{}@example.com", "a".repeat(RECIPIENT_HEADER_CHAR_CAP));
         assert_eq!(to_line(&long), "To: … (+1 more)");
+        // A quoted display name with a comma is one entry (codex on #853):
+        // when it does not fit, the whole entry goes — never a `"Doe` stub.
+        let quoted = format!(
+            "\"Doe, {}\" <doe@example.com>, next@example.com",
+            "x".repeat(RECIPIENT_HEADER_CHAR_CAP)
+        );
+        let line = to_line(&quoted);
+        assert!(!line.contains("\"Doe"), "cut inside a quoted name: {line}");
+        assert_eq!(line, "To: … (+2 more)");
+        // And when it fits, it stays whole with its comma.
+        assert_eq!(
+            to_line("\"Doe, John\" <j@example.com>, k@example.com"),
+            "To: \"Doe, John\" &lt;j@example.com&gt;, k@example.com"
+        );
         // `&` renders as `&amp;`: capping before escaping would let this header
         // reach ~5x the cap in the prompt the model actually sees.
         let amp = to_line(&vec!["&&&&&&&&&&@example.com"; 300].join(", "));

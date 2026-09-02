@@ -56,11 +56,16 @@ pub fn gemini_bin() -> String {
 
 pub struct GeminiCliReasoner {
     bin: String,
+    /// #898 — shared cap on concurrent CLI children.
+    gate: std::sync::Arc<crate::cli_gate::CliGate>,
 }
 
 impl Default for GeminiCliReasoner {
     fn default() -> Self {
-        Self { bin: gemini_bin() }
+        Self {
+            bin: gemini_bin(),
+            gate: crate::cli_gate::CliGate::global(),
+        }
     }
 }
 
@@ -75,6 +80,8 @@ impl GeminiCliReasoner {
         user_message: &str,
     ) -> anyhow::Result<String> {
         let dur = reasoner_timeout();
+        // #898 — CLI slot taken before the watchdog starts (see cli_gate).
+        let _permit = self.gate.acquire("gemini").await;
         match tokio::time::timeout(dur, self.call_once(opts, user_message)).await {
             // Post-classify untyped failures (stdin EPIPE, read/wait IO) as
             // provider-side Unavailable (#655 review) so they fail over
@@ -311,6 +318,7 @@ impl Reasoner for GeminiCliReasoner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ModelTier;
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt;
 
@@ -359,7 +367,10 @@ echo '{{"response":"a fine summary","stats":{{}}}}'
                 record = record.display()
             ),
         );
-        let r = GeminiCliReasoner { bin };
+        let r = GeminiCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        };
         let got = r.call(&opts(vec![]), "summarize this").await.unwrap();
         assert_eq!(got, "a fine summary");
         let rec = std::fs::read_to_string(&record).unwrap();
@@ -367,6 +378,43 @@ echo '{{"response":"a fine summary","stats":{{}}}}'
         assert!(rec.contains("SYSTEM_MD=set"), "system prompt must travel via GEMINI_SYSTEM_MD");
         assert!(rec.contains("SETTINGS=set"), "per-spawn settings must be pinned");
         assert!(!rec.contains("\nauto\n"), "-m must never be left on gemini's floating default");
+    }
+
+    /// #658 — the argv end of the tier map: `-m` carries exactly what
+    /// `model_for` resolved, on BOTH tiers, never the floating `auto` default.
+    #[tokio::test]
+    async fn spawn_pins_the_resolved_model_on_both_tiers() {
+        for (preset_model, tier) in [
+            ("claude-opus-4-8", ModelTier::Quality),
+            ("claude-haiku-4-5-20251001", ModelTier::Fast),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let record = dir.path().join("argv.txt");
+            let bin = stub(
+                &dir,
+                "fake-gemini",
+                &format!(
+                    "cat >/dev/null\nprintf '%s\\n' \"$@\" >{}\necho '{{\"response\":\"ok\"}}'\n",
+                    record.display()
+                ),
+            );
+            let mut o = opts(vec![]);
+            o.model = Some(preset_model.into());
+            GeminiCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        }.call(&o, "hi").await.unwrap();
+            let argv: Vec<String> = std::fs::read_to_string(&record)
+                .unwrap()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            let want = model_for(ProviderKind::Gemini, tier);
+            assert!(
+                argv.windows(2).any(|w| w[0] == "-m" && w[1] == want),
+                "gemini must spawn with `-m {want}`, got {argv:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -381,7 +429,10 @@ echo '{"error":{"type":"ApiError","message":"429 RESOURCE_EXHAUSTED: rateLimitEx
 exit 1
 "#,
         );
-        let r = GeminiCliReasoner { bin };
+        let r = GeminiCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        };
         let err = r.call(&opts(vec![]), "hi").await.unwrap_err();
         match ReasonerError::find_in(&err) {
             Some(ReasonerError::RateLimited { provider, .. }) => assert_eq!(provider, "gemini"),
@@ -404,7 +455,10 @@ echo "Attempt 1 failed: quota exhausted, retrying..." >&2
 echo '{"response":"recovered fine"}'
 "#,
         );
-        let r = GeminiCliReasoner { bin };
+        let r = GeminiCliReasoner {
+            bin,
+            gate: crate::cli_gate::CliGate::global(),
+        };
         assert_eq!(r.call(&opts(vec![]), "hi").await.unwrap(), "recovered fine");
     }
 }

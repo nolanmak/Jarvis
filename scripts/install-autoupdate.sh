@@ -124,6 +124,7 @@ Description=Run AugmentAgent auto-updater every ${INTERVAL_SECS}s
 
 [Timer]
 OnBootSec=2min
+OnStartupSec=2min
 OnUnitActiveSec=${INTERVAL_SECS}s
 Unit=$SERVICE_NAME
 Persistent=true

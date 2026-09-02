@@ -529,3 +529,27 @@ What does **not** count:
 - Questions about the user's calendar, contacts, projects, or third-party tools. Those are wiki/web/gmail questions, not issues.
 - One-off chit-chat or clarifying questions.
 - Anything where the user explicitly says "don't file this" / "just FYI".
+
+## Meeting transcripts
+
+`~/transcripts/meetings/*.md` (when `AUGMENTAGENT_TRANSCRIPTS_DIR` is set) holds
+what was actually **said** in recorded meetings — full timestamped transcripts
+exported by FlyOnTheWall, one file per meeting, plus an OKF `index.md` and
+`log.md`.
+
+The split matters:
+
+- **The wiki** holds the distilled, cited facts — who committed to what, which
+  project moved. Those pages cite `fotw:<meeting-id>` in `sources:`.
+- **The transcript clone** holds the words. Grep it when the question is *what
+  exactly was said*, who said it, or in what order — the kind of question a
+  summary cannot answer.
+
+This is different from the wiki's own Meeting log, which records gcal
+attendance and RSVP only and is structurally stripped of event content. These
+files are the content.
+
+The clone is read-only, and the scope guard enforces exactly that: `Read`,
+`Grep` and `Glob` are allowed under the transcript directory, while `Write`
+and `Edit` stay wiki-only. Never write there: FlyOnTheWall owns that repo and
+re-pushes meetings to the same paths.

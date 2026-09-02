@@ -14,6 +14,8 @@ use thiserror::Error;
 
 use augmentagent_store::Email;
 
+use crate::outbound::parse_rfc2822_or_ms;
+
 #[derive(Debug, Error)]
 pub enum GmailError {
     #[error("http: {0}")]
@@ -74,10 +76,13 @@ pub trait GmailApi: Send + Sync {
     /// Fetch the last `max` messages of a Gmail thread, oldest-first, for
     /// thread-aware drafting (#32).
     ///
-    /// Wraps Gmail `users.threads.get`. Implementations SHOULD return the
-    /// chronologically-ordered messages and leave token/char budgeting to the
-    /// caller. The default impl returns an empty Vec so test fakes that don't
-    /// model threads still compile; `ComposioClient` overrides it with a real
+    /// Wraps Gmail `users.threads.get`. `max = 0` means no trim — the whole
+    /// thread. Implementations SHOULD return the chronologically-ordered
+    /// messages and leave token/char budgeting to the caller, but that is a
+    /// preference, not a guarantee the provider makes: callers that depend on
+    /// which message is oldest must order by `Email::date` themselves (#651).
+    /// The default impl returns an empty Vec so test fakes that don't model
+    /// threads still compile; `ComposioClient` overrides it with a real
     /// `GMAIL_FETCH_MESSAGE_BY_THREAD_ID` call.
     async fn fetch_thread_messages(
         &self,
@@ -596,6 +601,25 @@ impl ComposioClient {
         Ok(new_id)
     }
 
+    /// The subject a message on this thread will actually be sent under
+    /// (#651).
+    ///
+    /// Gmail sends a threaded message under the thread's ORIGINAL subject and
+    /// discards the one supplied alongside `thread_id`, so this — not any
+    /// subject that happens to appear later in the thread — is what a compose
+    /// must agree with. `max = 0` skips the trim in `fetch_thread_messages`,
+    /// keeping the whole thread; [`thread_subject`] then picks the original
+    /// out of it without trusting the order Composio returned, or reports
+    /// [`ThreadSubject::Undetermined`] when the payload cannot say.
+    pub async fn fetch_thread_subject(
+        &self,
+        entity_id: &str,
+        thread_id: &str,
+    ) -> Result<ThreadSubject, GmailError> {
+        let messages = self.fetch_thread_messages(entity_id, thread_id, 0).await?;
+        Ok(thread_subject(&messages))
+    }
+
     /// Shared paginated fetch for `GMAIL_FETCH_EMAILS`. Walks pages up to
     /// `max_total` messages (in `PAGE_SIZE` chunks), deduping by `message_id`
     /// and guarding against a non-advancing pagination cursor.
@@ -785,6 +809,80 @@ pub fn split_recipients(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Canonical form of a subject for comparison (#651). Strips leading `Re:`
+/// prefixes — mail clients stack them, and a reply is sent under the subject
+/// it replies to — then folds case and collapses whitespace runs. The colon
+/// is required, so "Regarding x" keeps its first word.
+///
+/// `Fwd:`/`Fw:` are deliberately NOT stripped. A forward is a different
+/// subject line, and Gmail would still send it under the thread's own
+/// subject, so `--subject "Fwd: X"` on a thread titled "X" is precisely the
+/// header/intent mismatch this comparison exists to catch.
+pub fn normalize_subject(raw: &str) -> String {
+    const REPLY: &str = "re:";
+    let mut rest = raw.trim();
+    while rest
+        .get(..REPLY.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(REPLY))
+    {
+        rest = rest[REPLY.len()..].trim_start();
+    }
+    rest.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// What Gmail will send a threaded message under (#651).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadSubject {
+    /// The thread's original subject — the header recipients will see.
+    Original(String),
+    /// The thread carries more than one subject and the provider gave us no
+    /// timestamps to order them by, so which one Gmail will use is unknowable
+    /// from this payload.
+    Undetermined,
+    /// No message on the thread carries a subject: nothing to compare.
+    Missing,
+}
+
+/// Which subject a threaded message goes out under: the one on the thread's
+/// OLDEST message, decided from each message's own timestamp rather than the
+/// order Composio returned them in.
+///
+/// `GMAIL_FETCH_MESSAGE_BY_THREAD_ID` documents no ordering guarantee, and we
+/// have seen Composio reshuffle and re-serve pages before (#331), so a
+/// newest-first payload must not let a subject someone introduced mid-thread
+/// pass for the original. Where the thread carries a single subject the order
+/// cannot change the answer; where it carries several and any of them is
+/// undated we refuse to guess ([`ThreadSubject::Undetermined`]) rather than
+/// verify a compose against a subject that may not be the one sent. Blank
+/// subjects are ignored: Gmail threads under the first real one.
+fn thread_subject(messages: &[Email]) -> ThreadSubject {
+    let titled: Vec<&Email> = messages
+        .iter()
+        .filter(|m| !m.subject.trim().is_empty())
+        .collect();
+    let Some(first) = titled.first().copied() else {
+        return ThreadSubject::Missing;
+    };
+    let renamed = titled
+        .iter()
+        .any(|m| normalize_subject(&m.subject) != normalize_subject(&first.subject));
+    if renamed && titled.iter().any(|m| parse_rfc2822_or_ms(&m.date) == 0) {
+        return ThreadSubject::Undetermined;
+    }
+    let oldest = titled
+        .iter()
+        .min_by_key(|m| match parse_rfc2822_or_ms(&m.date) {
+            0 => i64::MAX,
+            ms => ms,
+        })
+        .copied()
+        .unwrap_or(first);
+    ThreadSubject::Original(oldest.subject.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,6 +941,39 @@ mod tests {
         assert_eq!(split_recipients("a@x.com,, b@y.com,"), vec!["a@x.com", "b@y.com"]);
         assert!(split_recipients("").is_empty());
         assert!(split_recipients(" , ").is_empty());
+    }
+
+    // ---- #651: subject comparison across a thread ----
+
+    #[test]
+    fn normalize_subject_strips_stacked_reply_prefixes() {
+        assert_eq!(normalize_subject("RE:  Re: Hello  world"), "hello world");
+        assert_eq!(normalize_subject("  Hello world  "), "hello world");
+    }
+
+    // A forward is a different subject line, not a prefix to fold away: a
+    // thread titled "X" does not send "Fwd: X" (#651).
+    #[test]
+    fn normalize_subject_keeps_forward_prefixes() {
+        assert_ne!(
+            normalize_subject("Fwd: Ground Floor?"),
+            normalize_subject("Ground Floor?")
+        );
+        assert_ne!(
+            normalize_subject("Fw: Ground Floor?"),
+            normalize_subject("Ground Floor?")
+        );
+        // ...but replying to a forwarded thread still matches it.
+        assert_eq!(
+            normalize_subject("Re: Fwd: Ground Floor?"),
+            normalize_subject("Fwd: Ground Floor?")
+        );
+    }
+
+    #[test]
+    fn normalize_subject_keeps_words_that_merely_start_with_re() {
+        assert_eq!(normalize_subject("Regarding x"), "regarding x");
+        assert_eq!(normalize_subject("Reply to this"), "reply to this");
     }
 
     #[test]
@@ -1368,6 +1499,109 @@ mod tests {
             .await
             .expect("message id should resolve");
         assert_eq!(t, "THREAD1");
+    }
+
+    // ---- #651: the subject a threaded compose must agree with ----
+
+    // `fetch_thread_subject` asks for `max = 0` meaning "no trim". Were that
+    // ever read as "keep zero messages" it would report a subject-less thread
+    // and wave every conflicting --subject straight through the guard, so pin
+    // the contract here rather than in a doc comment alone.
+    #[tokio::test]
+    async fn fetch_thread_messages_keeps_the_whole_thread_when_max_is_zero() {
+        let body = r#"{"successful":true,"data":{"messages":[
+            {"id":"M1","threadId":"T1","subject":"Ground Floor as a venue?","from":"bob@example.com","messageTimestamp":"2026-08-12T17:02:00Z"},
+            {"id":"M2","threadId":"T1","subject":"Re: Ground Floor as a venue?","from":"alice@example.com","messageTimestamp":"2026-08-14T09:30:00Z"}
+        ]}}"#;
+        let addr = spawn_one_shot_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let msgs = client
+            .fetch_thread_messages("entity-x", "T1", 0)
+            .await
+            .expect("thread should fetch");
+        let ids: Vec<&str> = msgs.iter().map(|m| m.message_id.as_str()).collect();
+        assert_eq!(ids, vec!["M1", "M2"], "max = 0 must not trim the thread");
+    }
+
+    // A rename part-way down the thread does NOT change what Gmail sends
+    // under, so the oldest subject is the one we report — and we must reach
+    // it from the timestamps, not from the position Composio put it in.
+    // Served newest-first here: reading the first message would report the
+    // rename and re-open #651.
+    #[tokio::test]
+    async fn fetch_thread_subject_returns_the_original_in_any_provider_order() {
+        let body = r#"{"successful":true,"data":{"messages":[
+            {"id":"M2","threadId":"T1","subject":"Renamed mid-thread","from":"alice@example.com","messageTimestamp":"2026-08-14T09:30:00Z"},
+            {"id":"M1","threadId":"T1","subject":"Ground Floor as a venue?","from":"bob@example.com","messageTimestamp":"2026-08-12T17:02:00Z"}
+        ]}}"#;
+        let addr = spawn_one_shot_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let subject = client
+            .fetch_thread_subject("entity-x", "T1")
+            .await
+            .expect("thread subject should fetch");
+        assert_eq!(
+            subject,
+            ThreadSubject::Original("Ground Floor as a venue?".into())
+        );
+    }
+
+    // Renamed mid-thread AND undated: nothing in the payload says which
+    // subject came first, so we must not name one — verifying a compose
+    // against a guess is how #651 reached recipients in the first place.
+    #[tokio::test]
+    async fn fetch_thread_subject_is_undetermined_when_a_renamed_thread_is_undated() {
+        let body = r#"{"successful":true,"data":{"messages":[
+            {"id":"M1","threadId":"T1","subject":"Ground Floor as a venue?","from":"bob@example.com"},
+            {"id":"M2","threadId":"T1","subject":"Renamed mid-thread","from":"alice@example.com"}
+        ]}}"#;
+        let addr = spawn_one_shot_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let subject = client
+            .fetch_thread_subject("entity-x", "T1")
+            .await
+            .expect("thread subject should fetch");
+        assert_eq!(subject, ThreadSubject::Undetermined);
+    }
+
+    // One subject on the whole thread (bare and `Re:`-prefixed are the same
+    // subject): no ordering is needed to know what Gmail sends under, so an
+    // undated payload is still answerable. The subject-less message is
+    // skipped — Gmail would not have threaded under it.
+    #[tokio::test]
+    async fn fetch_thread_subject_reads_an_undated_single_subject_thread() {
+        let body = r#"{"successful":true,"data":{"messages":[
+            {"id":"M1","threadId":"T1","subject":"","from":"bob@example.com"},
+            {"id":"M2","threadId":"T1","subject":"Ground Floor as a venue?","from":"bob@example.com"},
+            {"id":"M3","threadId":"T1","subject":"Re: Ground Floor as a venue?","from":"alice@example.com"}
+        ]}}"#;
+        let addr = spawn_one_shot_http(200, body).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        let subject = client
+            .fetch_thread_subject("entity-x", "T1")
+            .await
+            .expect("thread subject should fetch");
+        assert_eq!(
+            subject,
+            ThreadSubject::Original("Ground Floor as a venue?".into())
+        );
+    }
+
+    // A failed lookup must surface as an error so the caller can fail closed
+    // rather than send under an unverified subject.
+    #[tokio::test]
+    async fn fetch_thread_subject_surfaces_provider_failure() {
+        let addr = spawn_one_shot_http(500, r#"{"error":"upstream exploded"}"#).await;
+        let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
+
+        client
+            .fetch_thread_subject("entity-x", "T1")
+            .await
+            .expect_err("a provider failure must not look like an empty thread");
     }
 
     // An id that is neither a message nor a thread in this mailbox (the
@@ -1975,6 +2209,8 @@ impl GmailApi for ComposioClient {
             .filter_map(|m| m.into_email(entity_id))
             .collect();
         // Keep only the last `max` messages, preserving chronological order.
+        // `max == 0` means no trim, not "keep none": `fetch_thread_subject`
+        // relies on it to see the message the thread was started under (#651).
         if max > 0 && msgs.len() > max as usize {
             let drop = msgs.len() - max as usize;
             msgs.drain(0..drop);

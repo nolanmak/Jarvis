@@ -490,6 +490,165 @@ pub fn is_cc_only_bystander(to: &str, cc: &str, self_addrs: &[String], body: &st
     !mine_on_cc.is_empty() && !mine_on_cc.iter().any(|e| goes_by(e, &name))
 }
 
+/// Subject prefixes stripped (repeatedly, since forwards stack) before the
+/// invite-subject markers are matched. Lowercase; compared against the
+/// lowercased, trimmed subject.
+const SUBJECT_FORWARD_PREFIXES: &[&str] = &["fw:", "fwd:", "re:"];
+
+/// Subject markers (lowercase) that calendar clients — Google Calendar,
+/// Outlook, Teams — put at the START of an invite / update / RSVP subject.
+/// Matched with `starts_with` after forward prefixes are stripped, so an
+/// ordinary mail merely mentioning "invitation" mid-subject won't match.
+const MEETING_INVITE_SUBJECT_PREFIXES: &[&str] = &[
+    "invitation:",
+    "updated invitation:",
+    "canceled event:",
+    "accepted:",
+    "tentatively accepted:",
+    "declined:",
+    "meeting canceled:",
+    "meeting updated:",
+];
+
+/// Teams join markers. Any one of these, *combined with* the literal
+/// "microsoft teams meeting", identifies a real invite body — prose that
+/// merely proposes a Teams call carries neither.
+const TEAMS_JOIN_MARKERS: &[&str] = &[
+    "join the meeting now",
+    "teams.microsoft.com/l/meetup-join",
+    "meeting id:",
+];
+
+/// Conferencing join URLs, matched anywhere in the body. Provider-agnostic
+/// so a forwarded Zoom / Meet / Webex invite is caught on the same footing
+/// as the Teams one that was reported.
+const JOIN_LINK_MARKERS: &[&str] = &[
+    "zoom.us/j/",
+    "zoom.us/my/",
+    "meet.google.com/",
+    "teams.microsoft.com/l/meetup-join",
+    "teams.live.com/meet/",
+    ".webex.com/",
+    "whereby.com/",
+    "chime.aws/",
+    "meet.jit.si/",
+];
+
+/// Line-anchored headers that calendar clients print as a block above a
+/// forwarded invite. Any TWO distinct ones mean an invite; one alone (a
+/// stray "Where: the usual spot" in prose) does not.
+const INVITE_HEADER_PREFIXES: &[&str] = &[
+    "when:",
+    "where:",
+    "organizer:",
+    "attendees:",
+    "required attendees:",
+    "optional attendees:",
+    "invitees:",
+];
+
+/// Heuristic: is this `(subject, body, attachments)` a meeting / calendar
+/// invite rather than something to reply to?
+///
+/// Issue #834: triage drafted a full "can you confirm attendance, and could
+/// you share an agenda?" reply to a forwarded Microsoft Teams invite. The
+/// sender was human (so #217's `is_human_sender` passed) and the mail was
+/// nothing like an event-platform blast (so #222's `is_event_blast` missed
+/// it) — the user's position is that we never draft responses to meeting
+/// invites at all. Callers route a match to the Flag path: the invite is
+/// still surfaced for calendar handling, but no draft is generated.
+///
+/// Returns true if **any** of:
+///   1. An attachment label names a calendar artifact (`text/calendar` MIME
+///      or a `.ics` filename — matched at a token end so it reads as an
+///      extension, not any substring of a longer label). Bonus signal only:
+///      `list_retryable_replies` rehydrates `Email` with no attachments, so
+///      the body/subject rules below carry the persisted path on their own.
+///   2. The body is a Teams invite: "Microsoft Teams meeting" AND a join
+///      marker. Conjunctive on purpose — "let's do a Teams meeting" must
+///      still get a draft.
+///   3. The body pairs a line-anchored `Join ...` lead-in with a
+///      conferencing join URL — the provider-agnostic online-invite shape
+///      ("Join Zoom Meeting" over a `zoom.us/j/` link, "Join with Google
+///      Meet" over a `meet.google.com/` link). Conjunctive so prose that
+///      merely pastes a standing room link still gets a draft.
+///   4. The body carries two distinct line-anchored invite headers
+///      (`When:` / `Where:` / `Organizer:` / `Attendees:` / …) — the
+///      forwarded Outlook/Teams shape, including the online-meeting variant
+///      that drops `Where:`. Anchored per-line so a mid-sentence "when:"
+///      can't trip it, and paired so one stray header can't either.
+///   5. The body carries Google Calendar's invitation boilerplate.
+///   6. The subject, after stripping stacked `Fw:`/`Fwd:`/`Re:` prefixes,
+///      starts with a calendar-client invite marker.
+///
+/// All comparisons are case-insensitive plain string ops; no regex crate.
+pub fn is_meeting_invite(subject: &str, body: &str, attachments: &[String]) -> bool {
+    // 1. Calendar attachment labels (e.g. `invite.ics (text/calendar)`).
+    for att in attachments {
+        let att_lower = att.to_ascii_lowercase();
+        if att_lower.contains("text/calendar")
+            || att_lower.split_whitespace().any(|t| t.ends_with(".ics"))
+        {
+            return true;
+        }
+    }
+
+    if !body.is_empty() {
+        let body_lower = body.to_ascii_lowercase();
+
+        // 2. Teams invite body — product name AND a join marker.
+        if body_lower.contains("microsoft teams meeting")
+            && TEAMS_JOIN_MARKERS.iter().any(|m| body_lower.contains(m))
+        {
+            return true;
+        }
+
+        // 3. Generic online invite — a `Join ...` line AND a provider URL.
+        if body_lower
+            .lines()
+            .any(|l| l.trim_start().starts_with("join "))
+            && JOIN_LINK_MARKERS.iter().any(|m| body_lower.contains(m))
+        {
+            return true;
+        }
+
+        // 4. Two distinct line-anchored invite headers.
+        let mut seen_headers = 0u32;
+        for line in body_lower.lines() {
+            let line = line.trim_start();
+            if let Some(i) = INVITE_HEADER_PREFIXES
+                .iter()
+                .position(|h| line.starts_with(h))
+            {
+                seen_headers |= 1 << i;
+            }
+        }
+        if seen_headers.count_ones() >= 2 {
+            return true;
+        }
+
+        // 5. Google Calendar boilerplate.
+        if body_lower.contains("invitation from google calendar") {
+            return true;
+        }
+    }
+
+    // 6. Subject markers, with stacked forward prefixes stripped.
+    let mut subject_lower = subject.trim().to_ascii_lowercase();
+    loop {
+        let stripped = SUBJECT_FORWARD_PREFIXES
+            .iter()
+            .find_map(|p| subject_lower.strip_prefix(p));
+        match stripped {
+            Some(rest) => subject_lower = rest.trim_start().to_string(),
+            None => break,
+        }
+    }
+    MEETING_INVITE_SUBJECT_PREFIXES
+        .iter()
+        .any(|m| subject_lower.starts_with(m))
+}
+
 /// Pull the bare `local@domain` from a raw `From:` header value that may
 /// include a display name (`"Foo" <foo@bar.com>` or `Foo <foo@bar.com>`). // pii-ok
 /// Falls back to the trimmed input if no angle-bracket pattern is found.
@@ -1437,6 +1596,132 @@ mod tests {
             "Quick question on the deploy",                      // pii-ok
             "Hey — did the migration land yet? Need to plan around it.", // pii-ok
         ));
+    }
+
+    /// #834 — the exact shape that slipped through: a forwarded Microsoft
+    /// Teams invite from a human sender that triage marked `reply`.
+    #[test]
+    fn meeting_invite_matches_forwarded_teams_invite() {
+        // pii-ok — synthetic forwarded-Teams-invite fixture.
+        let body = "\
+________________________________________
+Microsoft Teams meeting
+Join on your computer, mobile app or room device
+Join the meeting now
+Meeting ID: 123 456 789
+When: Wednesday, September 2 1:00 PM-2:00 PM
+Where: Microsoft Teams
+";
+        assert!(is_meeting_invite("FW: Q3 Sync", body, &[]));
+    }
+
+    #[test]
+    fn meeting_invite_matches_calendar_attachment_labels() {
+        // pii-ok — synthetic attachment-label fixtures.
+        assert!(is_meeting_invite(
+            "Q3 Sync",
+            "See attached.",
+            &["invite.ics (text/calendar)".to_string()],
+        ));
+        assert!(is_meeting_invite(
+            "Q3 Sync",
+            "See attached.",
+            &["Meeting.ICS".to_string()],
+        ));
+    }
+
+    #[test]
+    fn meeting_invite_matches_invitation_subjects() {
+        // pii-ok — synthetic calendar-client subject fixtures.
+        assert!(is_meeting_invite("Invitation: standup @ Tue", "", &[]));
+        assert!(is_meeting_invite(
+            "Fwd: Fw: Updated invitation: Perry sync",
+            "",
+            &[],
+        ));
+        assert!(is_meeting_invite("Canceled event: design review", "", &[]));
+        assert!(is_meeting_invite("Declined: coffee chat", "", &[]));
+    }
+
+    /// A forward strips the `.ics` part, and only Teams bodies carry the
+    /// "Microsoft Teams meeting" literal — so for every other client the
+    /// join link and the organizer/attendee header block are the only
+    /// signals left. Each is asserted on its own here.
+    #[test]
+    fn meeting_invite_matches_generic_join_links_and_headers() {
+        // pii-ok — synthetic forwarded-invite fixtures.
+        assert!(is_meeting_invite(
+            "FW: Project sync",
+            "Join Zoom Meeting\nhttps://zoom.us/j/1234567890?pwd=abcdef\n",
+            &[],
+        ));
+        assert!(is_meeting_invite(
+            "Fwd: Project sync",
+            "Join with Google Meet\nhttps://meet.google.com/abc-defg-hij\n",
+            &[],
+        ));
+        // Header block alone — no join link, and an online meeting so the
+        // Outlook forward carries no `Where:` line.
+        assert!(is_meeting_invite(
+            "FW: Project sync",
+            "When: Wednesday, September 2 1:00 PM\n\
+             Organizer: Alice Example <alice@example.com>\n\
+             Required Attendees: bob@example.com\n",
+            &[],
+        ));
+    }
+
+    #[test]
+    fn meeting_invite_matches_google_calendar_body() {
+        // pii-ok — synthetic Google Calendar boilerplate fixture.
+        assert!(is_meeting_invite(
+            "Re: sync",
+            "Invitation from Google Calendar\n\nYou are receiving this email...",
+            &[],
+        ));
+    }
+
+    #[test]
+    fn meeting_invite_passes_through_ordinary_mail() {
+        // pii-ok — synthetic negatives. Each of these would lose a draft if
+        // the detection were loosened.
+        // Teams named in prose without any join markers.
+        assert!(!is_meeting_invite(
+            "Re: next steps",
+            "Let's do a Teams meeting sometime next week — does Thursday work?",
+            &[],
+        ));
+        // Mid-sentence "when:" with no line-anchored invite headers.
+        assert!(!is_meeting_invite(
+            "Re: timeline",
+            "Still unclear when: the vendor keeps moving the date.",
+            &[],
+        ));
+        // A single stray invite header is not a header block.
+        assert!(!is_meeting_invite(
+            "Re: lunch",
+            "Where: the usual spot. Works for you?",
+            &[],
+        ));
+        // A standing room link pasted in prose, with no `Join ...` line.
+        assert!(!is_meeting_invite(
+            "Re: thursday",
+            "Easier on my room if you'd rather: https://zoom.us/j/1234567890",
+            &[],
+        ));
+        // Plain reply-worthy mail with an ordinary attachment.
+        assert!(!is_meeting_invite(
+            "Quick question on the deploy",
+            "Did the migration land yet? Need to plan around it.",
+            &["proposal.pdf (application/pdf)".to_string()],
+        ));
+        // `.ics` must read as a filename extension, not any substring.
+        assert!(!is_meeting_invite(
+            "Numbers for Q3",
+            "Export attached.",
+            &["metrics.icsv (text/csv)".to_string()],
+        ));
+        assert!(!is_meeting_invite("", "", &[]));
     }
 
     #[tokio::test]
