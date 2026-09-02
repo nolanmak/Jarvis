@@ -239,7 +239,13 @@ impl ImessageSyncer<'_> {
                     .layout
                     .people_dir()
                     .join(format!("{}.md", hit.person_slug));
-                return Some((hit.person_slug, path));
+                if path.is_file() {
+                    return Some((hit.person_slug, path));
+                }
+                // The indexed page is gone — the owner merged or deleted it.
+                // Fall through to the identity index / name match / stub path
+                // instead of resurrecting the dead slug (`person merge`
+                // repoints these rows, but hand deletion happens too).
             }
         }
         index
@@ -605,6 +611,52 @@ mod tests {
         assert!(layout.people_dir().join("chase_at_contact.md").exists());
         let untouched = std::fs::read_to_string(layout.people_dir().join("chase.md")).unwrap();
         assert!(!untouched.contains("imessage"), "existing page must be left alone");
+    }
+
+    #[test]
+    fn stale_phone_index_row_falls_through_instead_of_resurrecting_the_stub() {
+        // identity_phone points at a page that no longer exists (owner
+        // deleted/merged it) while a canonical page matches by name.
+        let (dir, layout, store) = fresh_env();
+        store
+            .upsert_phone_identity(&PhoneIdentity {
+                phone: "+14155550123".into(),
+                person_slug: "john_smith_at_contact".into(),
+                display_name: Some("John Smith".into()),
+                source: "imessage".into(),
+            })
+            .unwrap();
+        std::fs::write(
+            layout.people_dir().join("john-smith.md"),
+            "---\nkind: person\nkey: john-smith\n---\n\n# John Smith\n\n## Source\n",
+        )
+        .unwrap();
+        let bundle = fixture_bundle(
+            dir.path(),
+            &[("+14155550123", "John_Smith", "John Smith", DM_MD)],
+        );
+        let syncer = ImessageSyncer {
+            bundle: &bundle,
+            layout: &layout,
+            store: &store,
+            apply: true,
+        };
+        let report = syncer.run().unwrap();
+        assert_eq!(report.pages_created, 0, "no resurrection of the dead slug");
+        assert_eq!(report.resolved_by_name, 1);
+        assert!(!layout
+            .people_dir()
+            .join("john_smith_at_contact.md")
+            .exists());
+        // the phone index is healed to the surviving page
+        assert_eq!(
+            store
+                .lookup_person_by_phone("+14155550123")
+                .unwrap()
+                .unwrap()
+                .person_slug,
+            "john-smith"
+        );
     }
 
     #[test]

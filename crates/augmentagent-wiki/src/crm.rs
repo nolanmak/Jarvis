@@ -481,6 +481,68 @@ fn extract_list_values(fm_inner: &str, key: &str) -> Vec<String> {
     out
 }
 
+/// Result of [`merge_stub_into`]: the rewritten target page plus what moved.
+#[derive(Debug)]
+pub struct StubMergeResult {
+    pub content: String,
+    pub changed: bool,
+    /// Platforms / sections the merge actually filled on the target.
+    pub moved: Vec<String>,
+}
+
+/// Fold an auto-created contact stub (`<name>_at_contact.md`, produced by the
+/// contacts / iMessage backfills) into a canonical person page, as one pure
+/// string transform. Moves the stub's list-valued identities (the only kind a
+/// stub ever carries — see `MULTI_VALUED`) and its `## Source` provenance
+/// lines into the target via the same fill-blanks `merge_person_page` path,
+/// and appends a `Merged from …` provenance line. Deleting the stub file and
+/// repointing `identity_phone` are the caller's IO (`person merge` in the
+/// CLI) — this module never touches disk.
+///
+/// Idempotent: applying twice reports `changed == false` the second time.
+pub fn merge_stub_into(target_src: &str, stub_src: &str, stub_slug: &str) -> StubMergeResult {
+    let mut patch = PersonPatch::new();
+    if let Some((fm_inner, _)) = split_frontmatter(stub_src) {
+        for plat in MULTI_VALUED {
+            for v in extract_list_values(fm_inner, plat) {
+                patch = patch.identity(*plat, v);
+            }
+        }
+    }
+    for line in source_lines(stub_src) {
+        patch = patch.source(line);
+    }
+    patch = patch.source(format!("Merged from {stub_slug}.md (owner-approved)"));
+    let r = merge_person_page(Some(target_src), &patch);
+    StubMergeResult {
+        content: r.content,
+        changed: r.changed,
+        moved: r.filled,
+    }
+}
+
+/// The `- …` items of a page's `## Source` section, without the bullet.
+fn source_lines(page: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_source = false;
+    for line in page.lines() {
+        let t = line.trim();
+        if t == "## Source" {
+            in_source = true;
+            continue;
+        }
+        if in_source {
+            if t.starts_with("## ") {
+                break;
+            }
+            if let Some(item) = t.strip_prefix("- ") {
+                out.push(item.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// YAML-quote a scalar only when it could be misparsed (`:` `#` leading `-`,
 /// etc). Emails / urns / phone are safe bare in practice but we quote
 /// defensively when in doubt.
@@ -889,6 +951,31 @@ mod tests {
             out.content,
             "---\nkind: person\nidentities:\n  email:\n    - a@example.com\n    - b@example.com\n  linkedin: urn:li:1\n---\n"
         );
+    }
+
+    #[test]
+    fn stub_merge_moves_identities_and_sources_and_is_idempotent() {
+        let target = "---\nkind: person\nkey: centra\nupdated: 2026-06-01\nidentities:\n  email: [org@example.com]\n---\n\n# Centra\n\n## Profile\n\n## Source\n\n- email thread\n";
+        let stub = "---\nkind: person\nidentities:\n  imessage: [\"+12067598450\"]\n  phone: [\"+12067598450\"]\nupdated: 2026-08-25\n---\n\n# Landlord\n\n## Profile\n\n## Source\n\n- iMessage history: 23 messages through 2026-08-25 (SMS)\n";
+        let r = merge_stub_into(target, stub, "landlord_at_contact");
+        assert!(r.changed);
+        assert!(r.content.contains("  imessage: [\"+12067598450\"]"), "{}", r.content);
+        assert!(r.content.contains("  phone: [\"+12067598450\"]"), "{}", r.content);
+        assert!(r.content.contains("email: [org@example.com]"), "target identity kept");
+        assert!(r.content.contains("- iMessage history: 23 messages through 2026-08-25 (SMS)"));
+        assert!(r.content.contains("- Merged from landlord_at_contact.md (owner-approved)"));
+        assert!(r.content.contains("- email thread"), "target sources kept");
+        // second application is a no-op
+        let again = merge_stub_into(&r.content, stub, "landlord_at_contact");
+        assert!(!again.changed, "must be idempotent:\n{}", again.content);
+    }
+
+    #[test]
+    fn stub_merge_unions_into_existing_phone_list() {
+        let target = "---\nkind: person\nidentities:\n  phone: [\"+15550001\"]\n---\n\n# P\n\n## Source\n";
+        let stub = "---\nkind: person\nidentities:\n  phone: [\"+15550002\"]\n---\n\n# Q\n\n## Source\n";
+        let r = merge_stub_into(target, stub, "q_at_contact");
+        assert!(r.content.contains("  phone: [\"+15550001\", \"+15550002\"]"), "{}", r.content);
     }
 
     #[test]
