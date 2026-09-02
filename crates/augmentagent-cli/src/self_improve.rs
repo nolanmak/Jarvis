@@ -6360,6 +6360,20 @@ fn infra_failure_reason(text: &str) -> Option<&'static str> {
         ("spurious network error", "network"),
         ("operation timed out", "network"),
         ("too many open files", "fd exhaustion"),
+        // GitHub / API side (gh push, pr create, issue comment): an outage or
+        // a throttle is the harness, not the diff.
+        ("http 500", "github 5xx"),
+        ("http 502", "github 5xx"),
+        ("http 503", "github 5xx"),
+        ("http 504", "github 5xx"),
+        ("502 bad gateway", "github 5xx"),
+        ("503 service unavailable", "github 5xx"),
+        ("504 gateway", "github 5xx"),
+        ("rate limit", "github rate limit"),
+        ("abuse detection", "github rate limit"),
+        ("error connecting to api.github.com", "network"),
+        ("could not connect to server", "network"),
+        ("the remote end hung up unexpectedly", "network"),
     ];
     let lower = text.to_ascii_lowercase();
     SIGNS
@@ -9956,5 +9970,28 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // A stale temp file is ignored by load.
         std::fs::write(dir.path().join("state/history.json.tmp"), b"garbage").unwrap();
         assert!(AttemptHistory::load(&path).digest(7).is_some());
+    }
+
+    // Codex on #859: GitHub outages and throttles at publish time are the
+    // harness too — remembered, uncharged, retried next tick.
+    #[test]
+    fn github_outages_and_throttles_are_harness_failures() {
+        for text in [
+            "GraphQL: HTTP 503 Service Unavailable",
+            "HTTP 502: Bad Gateway (https://api.github.com/repos/x/y/pulls)",
+            "API rate limit exceeded for user ID 1 (HTTP 403)",
+            "You have triggered an abuse detection mechanism",
+            "error connecting to api.github.com",
+            "fatal: the remote end hung up unexpectedly",
+        ] {
+            let (kind, detail) = publish_outcome(text);
+            assert_eq!(kind, FailureKind::Infra, "{text}");
+            assert!(detail.starts_with("infra ("), "{detail}");
+            assert!(!kind.counts_toward_max_attempts());
+        }
+        // A genuine rejection still counts.
+        let (kind, _) = publish_outcome("! [remote rejected] main -> main (protected branch hook declined)");
+        assert_eq!(kind, FailureKind::PublishFailed);
+        assert!(kind.counts_toward_max_attempts());
     }
 }
