@@ -8628,6 +8628,20 @@ mod approval_body_tests {
         assert_eq!(thread_for_revised_subject("Re: ", "", Some("t1")), Some("t1"));
     }
 
+    // Structural (codex on #855): the subject override is written only
+    // inside the success arm of the draft-id write, after the CAS.
+    #[test]
+    fn revise_persists_the_subject_only_with_its_draft_id() {
+        let src = include_str!("main.rs");
+        let start = src.find("match self.store.refresh_pending_draft(action_id, &redraft)").expect("CAS");
+        let body = &src[start..start + 4000];
+        let id_write = body.find("match self.store.set_action_draft_id(action_id, &new_draft_id)").expect("gated id write");
+        let ok_arm = body[id_write..].find("Ok(()) =>").expect("success arm") + id_write;
+        let subject_write = body[id_write..].find("set_action_subject(action_id, Some(&subject))").expect("subject write") + id_write;
+        let err_arm = body[id_write..].find("Err(e) => tracing::warn!").expect("failure arm") + id_write;
+        assert!(ok_arm < subject_write && subject_write < err_arm, "subject write must sit in the Ok arm");
+    }
+
     #[test]
     fn an_untouched_subject_still_derives_from_the_inbound_mail() {
         assert_eq!(
@@ -10450,13 +10464,23 @@ impl ReplyApprover {
                 return ApprovalActionOutcome::AlreadyResolved { status };
             }
         }
-        let _ = self
-            .store
-            .set_action_draft_id(action_id, &new_draft_id);
-        // Only after the CAS wins: a lost race must not leave the subject of
-        // a draft nobody will send behind on the row (#652).
-        if new_subject.is_some() {
-            let _ = self.store.set_action_subject(action_id, Some(&subject));
+        // The subject override is only meaningful next to the draft id it
+        // belongs to (#652): it is written after the CAS above won AND the
+        // draft id landed, so a failed id write can never leave the row
+        // carrying a subject for a draft it does not point at.
+        match self.store.set_action_draft_id(action_id, &new_draft_id) {
+            Ok(()) => {
+                if new_subject.is_some() {
+                    if let Err(e) = self.store.set_action_subject(action_id, Some(&subject)) {
+                        tracing::warn!(action_id, "revise: could not persist the new subject: {e}");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(
+                action_id,
+                new_draft_id,
+                "revise: could not record the new draft id; subject override not persisted: {e}"
+            ),
         }
         let _ = self.store.reset_nudge_schedule(action_id);
 
