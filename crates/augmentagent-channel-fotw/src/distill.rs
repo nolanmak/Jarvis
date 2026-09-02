@@ -73,13 +73,18 @@ pub fn admit(doc: &MeetingDoc, require_disclosed: bool) -> Result<(), Skip> {
     Ok(())
 }
 
-/// Render the roster as body lines, self excluded.
-fn roster_block(roster: &[RosterMember], my_email: &str) -> String {
+/// Render the roster as body lines, self excluded. "Self" is any of the
+/// operator's configured addresses (#922 follow-up): the gcal channel already
+/// drops the connected account via the API's `is_self`, but the operator can
+/// be invited under other addresses (work domain, personal gmail) that only
+/// this list knows about.
+fn roster_block(roster: &[RosterMember], my_emails: &[String]) -> String {
     let mut out = String::new();
-    for m in roster
-        .iter()
-        .filter(|m| !m.email.eq_ignore_ascii_case(my_email))
-    {
+    for m in roster.iter().filter(|m| {
+        !my_emails
+            .iter()
+            .any(|me| m.email.eq_ignore_ascii_case(me))
+    }) {
         let name = m.display_name.as_deref().unwrap_or("");
         let rsvp = m
             .response_status
@@ -100,7 +105,7 @@ pub fn synthetic_meeting_email(
     doc: &MeetingDoc,
     event: &Match,
     roster: &[RosterMember],
-    my_email: &str,
+    my_emails: &[String],
 ) -> Email {
     let title = if doc.title.trim().is_empty() {
         "Untitled meeting".to_string()
@@ -118,7 +123,7 @@ pub fn synthetic_meeting_email(
     match event {
         Match::Single(ev) => {
             body.push_str(&format!("Calendar event: {}\n", ev.event_id));
-            let block = roster_block(roster, my_email);
+            let block = roster_block(roster, my_emails);
             if block.is_empty() {
                 body.push_str("Invited: (only me)\n");
             } else {
@@ -230,9 +235,13 @@ The team agreed to move the batch workloads off Azure VMs.
         parse_meeting_file(REAL).unwrap()
     }
 
+    fn me() -> Vec<String> {
+        vec!["me@example.com".to_string()]
+    }
+
     #[test]
     fn the_body_carries_the_summary_and_the_action_items() {
-        let e = synthetic_meeting_email(&doc(), &Match::None, &[], "me@example.com");
+        let e = synthetic_meeting_email(&doc(), &Match::None, &[], &me());
         assert!(e.body.contains("move the batch workloads off Azure"));
         assert!(e.body.contains("Priya to price out the reserved instances"));
         assert!(e.body.contains("Azure cost reduction"));
@@ -258,7 +267,7 @@ The team agreed to move the batch workloads off Azure VMs.
                 end_ms: 1,
             }),
         ] {
-            let e = synthetic_meeting_email(&d, &event, &[], "me@example.com");
+            let e = synthetic_meeting_email(&d, &event, &[], &me());
             assert!(
                 !e.body.contains("the bill came in"),
                 "transcript speech reached the body via {event:?}"
@@ -276,7 +285,7 @@ The team agreed to move the batch workloads off Azure VMs.
 
     #[test]
     fn the_operators_own_notes_do_not_flow() {
-        let e = synthetic_meeting_email(&doc(), &Match::None, &[], "me@example.com");
+        let e = synthetic_meeting_email(&doc(), &Match::None, &[], &me());
         assert!(
             !e.body.contains("ask Priya about the reserved instances"),
             "`## Notes` are the operator's own words and stay theirs"
@@ -285,7 +294,7 @@ The team agreed to move the batch workloads off Azure VMs.
 
     #[test]
     fn the_envelope_dedups_on_the_meeting_id() {
-        let e = synthetic_meeting_email(&doc(), &Match::None, &[], "me@example.com");
+        let e = synthetic_meeting_email(&doc(), &Match::None, &[], &me());
         assert_eq!(e.message_id, "fotw:01a05b42");
         assert_eq!(e.platform, PLATFORM);
         assert_eq!(e.kind, KIND);
@@ -311,13 +320,64 @@ The team agreed to move the batch workloads off Azure VMs.
             start_ms: 0,
             end_ms: 1,
         });
-        let e = synthetic_meeting_email(&doc(), &ev, &roster, "me@example.com");
+        let e = synthetic_meeting_email(&doc(), &ev, &roster, &me());
         assert!(e.body.contains("priya@example.com"));
         assert!(e.body.contains("Priya Raman"));
         assert!(e.body.contains("evt-1"));
         assert!(
             !e.body.contains("me@example.com"),
             "the operator is not an attendee of their own meeting"
+        );
+    }
+
+    /// #922 follow-up — the operator has several addresses (personal gmail,
+    /// work domain, the export account); every one of them is "me". A roster
+    /// member matching ANY configured own address is excluded,
+    /// case-insensitively, and an empty list excludes nobody.
+    #[test]
+    fn every_own_address_is_excluded_from_the_roster() {
+        let mine = [
+            "me.personal@example.com".to_string(),
+            "me.work@example.com".to_string(),
+        ];
+        let roster = vec![
+            RosterMember {
+                email: "ME.PERSONAL@example.com".into(), // mine, case-shifted
+                display_name: Some("Me".into()),
+                response_status: None,
+            },
+            RosterMember {
+                email: "me.work@example.com".into(), // mine, second address
+                display_name: None,
+                response_status: None,
+            },
+            RosterMember {
+                email: "guest@example.com".into(),
+                display_name: Some("Guest".into()),
+                response_status: None,
+            },
+        ];
+        let ev = Match::Single(EventWindow {
+            event_id: "evt-multi".into(),
+            start_ms: 0,
+            end_ms: 1,
+        });
+        let e = synthetic_meeting_email(&doc(), &ev, &roster, &mine);
+        assert!(e.body.contains("guest@example.com"));
+        assert!(
+            !e.body.to_lowercase().contains("me.personal@example.com"),
+            "first own address must be excluded whatever its case"
+        );
+        assert!(
+            !e.body.contains("me.work@example.com"),
+            "second own address must be excluded too"
+        );
+
+        let nobody: [String; 0] = [];
+        let e = synthetic_meeting_email(&doc(), &ev, &roster, &nobody);
+        assert!(
+            e.body.contains("me.work@example.com"),
+            "with no configured addresses, nobody is excluded"
         );
     }
 
@@ -332,7 +392,7 @@ The team agreed to move the batch workloads off Azure VMs.
             &doc(),
             &Match::Ambiguous(vec!["a".into(), "b".into()]),
             &roster,
-            "me@example.com",
+            &me(),
         );
         assert!(amb.body.contains("2 candidate events"));
         assert!(
@@ -340,7 +400,7 @@ The team agreed to move the batch workloads off Azure VMs.
             "an unchosen roster must never be attached"
         );
 
-        let none = synthetic_meeting_email(&doc(), &Match::None, &roster, "me@example.com");
+        let none = synthetic_meeting_email(&doc(), &Match::None, &roster, &me());
         assert!(none.body.contains("ad-hoc recording"));
         assert!(!none.body.contains("priya@example.com"));
     }
@@ -351,7 +411,7 @@ The team agreed to move the batch workloads off Azure VMs.
             "---\ntype: meeting-transcript\nid: \"x\"\ntitle: \"Untitled recording\"\ndate: \"2026-08-27\"\nduration: \"00:00:40\"\ndisclosed: true\n---\n\n# Untitled recording\n\n## Transcript\n\n- [00:00:01] S0: testing\n",
         )
         .unwrap();
-        let e = synthetic_meeting_email(&thin, &Match::None, &[], "me@example.com");
+        let e = synthetic_meeting_email(&thin, &Match::None, &[], &me());
         assert!(e.body.contains("none was generated"));
         assert!(!e.body.contains("testing"));
     }

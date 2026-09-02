@@ -51,7 +51,9 @@ pub struct ScanOpts<'a> {
     /// Refuse a meeting whose export did not record disclosure.
     pub require_disclosed: bool,
     /// The operator's own address, excluded from any roster.
-    pub my_email: &'a str,
+    /// The operator's own addresses, comma-split upstream; any roster member
+    /// matching one of them is excluded as "me" (#922 follow-up).
+    pub my_emails: &'a [String],
 }
 
 /// Read every meeting file in `dir`, newest filename first.
@@ -113,7 +115,7 @@ pub fn scan(
         }
 
         let (event, roster) = resolve_event(&doc);
-        let email = synthetic_meeting_email(&doc, &event, &roster, opts.my_email);
+        let email = synthetic_meeting_email(&doc, &event, &roster, opts.my_emails);
 
         match seen.record(&email) {
             Ok(true) => {
@@ -177,7 +179,7 @@ mod tests {
         ScanOpts {
             dir: d.path(),
             require_disclosed: false,
-            my_email: "me@example.com",
+            my_emails: &[],
         }
     }
 
@@ -292,7 +294,7 @@ mod tests {
         let o = ScanOpts {
             dir: &missing,
             require_disclosed: false,
-            my_email: "me@example.com",
+            my_emails: &[],
         };
         assert!(scan(&o, &FakeLog::default(), &no_calendar).is_err());
     }
