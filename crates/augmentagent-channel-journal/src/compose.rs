@@ -82,12 +82,48 @@ pub fn parse_composed_entry(raw: &str) -> (Option<String>, String) {
         },
         None => (None, trimmed),
     };
-    let html = if body.contains("<p") {
-        body.to_string()
-    } else {
-        text_to_paragraphs(body)
-    };
-    (title, html)
+    (title, sanitize_paragraph_html(body))
+}
+
+/// The composer is told "one `<p>…</p>` per paragraph, no other tags", but a
+/// model's formatting instruction is not a security boundary: whatever it
+/// emits is encrypted, persisted, and later rendered by the ShadowNote
+/// editor. Keep only bare `<p>`, `</p>` and `<br>`/`<br />`; every other tag
+/// (attributes included — `<p onclick=…>`) is escaped into visible text, so a
+/// stray `<img onerror=…>` can never become markup. Plain text is wrapped.
+pub fn sanitize_paragraph_html(body: &str) -> String {
+    if !body.contains("<p") && !body.contains("<P") {
+        return text_to_paragraphs(body);
+    }
+    fn escape_text(s: &str) -> String {
+        s.replace('<', "&lt;").replace('>', "&gt;")
+    }
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&escape_text(&rest[..i]));
+        let from_tag = &rest[i..];
+        let Some(j) = from_tag.find('>') else {
+            out.push_str(&escape_text(from_tag));
+            rest = "";
+            break;
+        };
+        let tag = &from_tag[..=j];
+        let norm: String = tag
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        match norm.as_str() {
+            "<p>" => out.push_str("<p>"),
+            "</p>" => out.push_str("</p>"),
+            "<br>" | "<br/>" => out.push_str("<br />"),
+            _ => out.push_str(&escape_text(tag)),
+        }
+        rest = &from_tag[j + 1..];
+    }
+    out.push_str(&escape_text(rest));
+    out
 }
 
 #[cfg(test)]
@@ -120,6 +156,31 @@ mod tests {
         let (title, html) = parse_composed_entry("TITLE: T\n\njust text");
         assert_eq!(title.as_deref(), Some("T"));
         assert_eq!(html, "<p>just text</p>");
+    }
+
+    #[test]
+    fn hostile_html_is_neutralized_not_persisted() {
+        // Stored-XSS shape from the #438 codex review: a paragraph followed
+        // by an event-handler tag.
+        let (_, html) = parse_composed_entry("<p>entry</p><img src=x onerror=alert(1)>");
+        assert_eq!(html, "<p>entry</p>&lt;img src=x onerror=alert(1)&gt;");
+        // Attributes on an allowed tag are not allowed either.
+        assert_eq!(
+            sanitize_paragraph_html("<p onclick=x>hi</p>"),
+            "&lt;p onclick=x&gt;hi</p>"
+        );
+        // Case and self-closing forms of the allowed tags are normalized.
+        assert_eq!(
+            sanitize_paragraph_html("<P>Up</P><BR/>a<br>b"),
+            "<p>Up</p><br />a<br />b"
+        );
+        // An unclosed tag cannot leak past the end of the body.
+        assert_eq!(sanitize_paragraph_html("<p>a<b"), "<p>a&lt;b");
+        // No paragraphs at all: still plain text, still escaped.
+        assert_eq!(
+            sanitize_paragraph_html("<script>alert(1)</script>"),
+            "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>"
+        );
     }
 
     #[test]

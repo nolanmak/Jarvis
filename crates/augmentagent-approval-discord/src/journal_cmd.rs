@@ -36,10 +36,12 @@ pub fn parse_journal_command(text: &str) -> Option<JournalCmd> {
         JournalCmd::Usage
     } else if arg.eq_ignore_ascii_case("done") {
         JournalCmd::Done { title: None }
-    } else if let Some(title) = arg
-        .strip_prefix("done ")
-        .or_else(|| arg.strip_prefix("Done "))
+    } else if let Some((_, title)) = arg
+        .split_once(char::is_whitespace)
+        .filter(|(word, _)| word.eq_ignore_ascii_case("done"))
     {
+        // The keyword is case-insensitive in every form: `DONE Friday` is a
+        // titled done, not an entry whose text starts with "DONE".
         JournalCmd::Done {
             title: Some(title.trim().to_string()).filter(|t| !t.is_empty()),
         }
@@ -72,6 +74,23 @@ mod tests {
             Some(JournalCmd::Done {
                 title: Some("Friday review".into())
             })
+        );
+        // Keyword case never matters (#438 codex review).
+        assert_eq!(
+            parse_journal_command("!journal DONE Friday"),
+            Some(JournalCmd::Done {
+                title: Some("Friday".into())
+            })
+        );
+        assert_eq!(
+            parse_journal_command("!journal Done\tweekly"),
+            Some(JournalCmd::Done {
+                title: Some("weekly".into())
+            })
+        );
+        assert_eq!(
+            parse_journal_command("!journal DONE"),
+            Some(JournalCmd::Done { title: None })
         );
     }
 
