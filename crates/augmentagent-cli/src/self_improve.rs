@@ -2841,7 +2841,12 @@ fn conflict_plan(files: &[String]) -> ConflictPlan {
     if files.is_empty() {
         return ConflictPlan::Refuse("git reported no unmerged paths".into());
     }
-    match files.iter().find(|f| is_blast_radius(f)) {
+    // `.env.example` is the documented template the diff guard also exempts;
+    // the `.env` pattern would otherwise refuse it.
+    match files
+        .iter()
+        .find(|f| !f.ends_with(".env.example") && is_blast_radius(f))
+    {
         Some(f) => ConflictPlan::Refuse(format!("`{f}` is a deploy/auth/secret path")),
         None => ConflictPlan::Resolve,
     }
@@ -3007,27 +3012,46 @@ async fn resume_draft_pr(
                 {
                     Ok(rs) => {
                         let _ = drop_root_scratch(&worktree).await;
+                        let _ = run("git", &["add", "-A"], &worktree).await?;
+                        // Scan EVERY staged file, not only the initially
+                        // unmerged ones: the builder may leave a marker in a
+                        // file it merely touched, and `git add -A` has just
+                        // cleared the unmerged index entries that would have
+                        // caught it.
+                        let (_ok, staged, _) =
+                            run("git", &["diff", "--cached", "--name-only"], &worktree).await?;
                         let mut leftover: Option<String> = None;
-                        for f in &files {
+                        for f in staged.lines().map(str::trim).filter(|f| !f.is_empty()) {
                             if let Ok(text) = tokio::fs::read_to_string(worktree.join(f)).await {
                                 if has_conflict_markers(&text) {
-                                    leftover = Some(f.clone());
+                                    leftover = Some(f.to_string());
                                     break;
                                 }
                             }
                         }
-                        match leftover {
-                            Some(f) => Err(format!("conflict markers remain in `{f}`")),
-                            None => {
-                                let _ = run("git", &["add", "-A"], &worktree).await?;
-                                let (_ok, after, _) =
-                                    run("git", &["status", "--porcelain"], &worktree).await?;
-                                let still = conflicted_files(&after);
-                                if still.is_empty() {
-                                    Ok(rs)
-                                } else {
-                                    Err(format!("still unmerged: {}", still.join(", ")))
-                                }
+                        let (_ok, after, _) =
+                            run("git", &["status", "--porcelain"], &worktree).await?;
+                        let still = conflicted_files(&after);
+                        if let Some(f) = leftover {
+                            Err(format!("conflict markers remain in `{f}`"))
+                        } else if !still.is_empty() {
+                            Err(format!("still unmerged: {}", still.join(", ")))
+                        } else {
+                            // The merge commit must land before anything is
+                            // published: a hook rejecting it would otherwise
+                            // leave the resolution only in the worktree.
+                            let msg = "auto-resume: merge origin/main (conflicts resolved by builder)"
+                                .to_string();
+                            let (ok, _o, e) = run(
+                                "git",
+                                &["-c", &name_arg, "-c", &email_arg, "commit", "--allow-empty", "-m", &msg],
+                                &worktree,
+                            )
+                            .await?;
+                            if ok {
+                                Ok(rs)
+                            } else {
+                                Err(format!("merge commit failed: {}", truncate(&e, 300)))
                             }
                         }
                     }
@@ -3037,14 +3061,6 @@ async fn resume_draft_pr(
         };
         match resolved {
             Ok(rs) => {
-                let msg =
-                    "auto-resume: merge origin/main (conflicts resolved by builder)".to_string();
-                let _ = run(
-                    "git",
-                    &["-c", &name_arg, "-c", &email_arg, "commit", "--allow-empty", "-m", &msg],
-                    &worktree,
-                )
-                .await?;
                 let findings = format!(
                     "Merge conflict with `main` resolved by the builder in: {}\n\n{}",
                     files.join(", "),
@@ -8022,6 +8038,15 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             conflict_plan(&s(&["crates/a/src/lib.rs", "README.md"])),
             ConflictPlan::Resolve
         ));
+        // The documented env template is exempt, exactly like the diff guard.
+        assert!(matches!(
+            conflict_plan(&s(&[".env.example", "crates/a/src/lib.rs"])),
+            ConflictPlan::Resolve
+        ));
+        assert!(matches!(
+            conflict_plan(&s(&[".env"])),
+            ConflictPlan::Refuse(_)
+        ));
         // Nothing conflicted is not a plan — the caller never gets here, but
         // the safe answer is still "nothing to resolve".
         assert!(matches!(conflict_plan(&[]), ConflictPlan::Refuse(_)));
@@ -8057,6 +8082,26 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             between.contains("publish_round("),
             "the merge commit must be pushed + commented"
         );
+    }
+
+    // Structural (CodeRabbit on #941): after staging, EVERY staged file is
+    // scanned for markers — not only the initially unmerged ones — and the
+    // merge commit's exit status gates publishing.
+    #[test]
+    fn conflict_resolution_scans_every_staged_file_and_checks_the_commit() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let body = &src[start..];
+        let merge = body.find(r#""merge", "--no-edit", "origin/main""#).expect("merge call");
+        let publish = merge + body[merge..].find("publish_round(").expect("publish");
+        let arm = &body[merge..publish];
+        let add = arm.find(r#""add", "-A""#).expect("git add -A");
+        let staged = arm.find(r#""diff", "--cached", "--name-only""#).expect("staged file list");
+        let scan = arm.rfind("has_conflict_markers(").expect("marker scan");
+        assert!(add < staged && staged < scan, "stage, list every staged file, then scan them all");
+        let commit = arm.find(r#""commit", "--allow-empty", "-m", &msg"#).expect("merge commit");
+        assert!(scan < commit, "scan before committing");
+        assert!(arm[commit..].contains("merge commit failed"), "a rejected commit must fail the resolution");
     }
 
     // Structural: an unresolved conflict (refused or failed) records an
