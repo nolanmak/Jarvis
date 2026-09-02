@@ -2989,9 +2989,13 @@ fn drafts_to_close(
 // The `coderabbitai[bot]` GitHub app reviews this repo's human PRs but had
 // never seen an agent PR: the loop opens drafts (skipped by default) and
 // `gh pr ready` + merge happen within seconds. With `.coderabbit.yaml`
-// reviewing drafts, the resume lane now waits for CodeRabbit's verdict on
-// the pushed head, revises on actionable findings exactly like codex
-// findings, and merges only when codex AND CodeRabbit have nothing left.
+// reviewing drafts, the resume lane looks for CodeRabbit's verdict on the
+// pushed head, revises on actionable findings exactly like codex findings,
+// and merges only when neither codex nor CodeRabbit has anything left.
+//
+// CodeRabbit is ADVISORY (owner directive 2026-09-02): a review that exists
+// gates the merge; one that is rate-limited or has not arrived is never
+// waited for beyond a short poll — the loop proceeds on the double LGTM.
 // ---------------------------------------------------------------------------
 
 const RABBIT_LOGIN: &str = "coderabbitai[bot]";
@@ -3014,9 +3018,15 @@ struct RabbitReview {
 }
 
 impl RabbitReview {
-    /// Unavailable is NOT approval; skipped (not configured) is.
+    /// A review of the head exists and has actionable findings.
+    fn blocks(&self) -> bool {
+        self.available && self.actionable > 0
+    }
+
+    /// Advisory: only an existing review with findings withholds the merge.
+    /// Absent (rate-limited, not yet reviewed, not installed) never blocks.
     fn approved(&self) -> bool {
-        self.skipped || (self.available && self.actionable == 0)
+        !self.blocks()
     }
 
     fn unavailable(reason: &str) -> Self {
@@ -3186,12 +3196,47 @@ fn coderabbit_configured(repo_root: &Path) -> bool {
     repo_root.join(".coderabbit.yaml").exists() || repo_root.join(".coderabbit.yml").exists()
 }
 
+/// How long to poll for a review that is on its way (default 5 min; `0`
+/// = consider only what is already there).
 fn rabbit_wait_secs() -> u64 {
     std::env::var("AUGMENTAGENT_AUTOPR_RABBIT_WAIT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(900)
-        .clamp(60, 1800)
+        .unwrap_or(300)
+        .min(900)
+}
+
+enum RabbitWait {
+    /// Give up on a verdict for this head; the reason is logged.
+    Stop(String),
+    /// Poll again shortly.
+    Poll,
+    /// Ask once (`@coderabbitai review`) — an old draft it explicitly skipped.
+    Ask,
+}
+
+/// What to do while no review of the head exists, given CodeRabbit's newest
+/// comment on the PR. Rate-limited ⇒ stop at once, never wait it out.
+fn rabbit_wait_decision(
+    latest_comment: Option<&str>,
+    elapsed_secs: u64,
+    window_secs: u64,
+) -> RabbitWait {
+    if let Some(body) = latest_comment {
+        if body.contains("Review limit reached") {
+            let mins = rabbit_rate_limit_minutes(body)
+                .map(|m| format!(" ({m} min)"))
+                .unwrap_or_default();
+            return RabbitWait::Stop(format!("rate-limited{mins}; not waiting"));
+        }
+    }
+    if elapsed_secs >= window_secs {
+        return RabbitWait::Stop(format!("no review within {window_secs}s"));
+    }
+    if latest_comment.is_some_and(|b| b.contains("Draft PR not reviewed")) && elapsed_secs > 60 {
+        return RabbitWait::Ask;
+    }
+    RabbitWait::Poll
 }
 
 async fn gh_json(repo_root: &Path, endpoint: &str) -> serde_json::Value {
@@ -3221,16 +3266,14 @@ async fn rabbit_pr_comments(repo_root: &Path, pr: u64) -> Vec<serde_json::Value>
     .unwrap_or_default()
 }
 
-/// Poll for CodeRabbit's review of `head_sha`, up to the wait window.
-/// After 90 s without one, ask once (`@coderabbitai review` — old drafts
-/// predate the config and were explicitly not reviewed); a rate-limit
-/// notice is honoured by waiting out the minutes it names, then asking again.
+/// CodeRabbit's review of `head_sha` if it exists or arrives within the
+/// short poll window; otherwise `unavailable` — which never blocks. A
+/// rate-limit notice ends the poll immediately.
 async fn wait_for_rabbit(repo_root: &Path, pr: u64, head_sha: &str) -> RabbitReview {
     let gh = gh_bin();
-    let window = std::time::Duration::from_secs(rabbit_wait_secs());
+    let window = rabbit_wait_secs();
     let started = std::time::Instant::now();
     let mut asked = false;
-    let mut limit_seen = false;
     loop {
         let reviews = gh_json(
             repo_root,
@@ -3252,47 +3295,33 @@ async fn wait_for_rabbit(repo_root: &Path, pr: u64, head_sha: &str) -> RabbitRev
             );
             return r;
         }
-        // The newest CodeRabbit comment tells us whether it is rate-limited.
         let latest = rabbit_pr_comments(repo_root, pr).await.pop();
-        let limited = latest
+        let latest_body = latest
             .as_ref()
-            .and_then(|c| c.get("body").and_then(serde_json::Value::as_str))
-            .filter(|b| b.contains("Review limit reached"))
-            .and_then(rabbit_rate_limit_minutes);
-        if let Some(mins) = limited.filter(|_| !limit_seen) {
-            limit_seen = true;
-            let pause = std::time::Duration::from_secs(mins * 60 + 30);
-            if started.elapsed() + pause < window {
-                info!(pr, mins, "CodeRabbit rate-limited; waiting it out");
-                tokio::time::sleep(pause).await;
-                asked = false; // re-ask once the limit has lifted
-                continue;
+            .and_then(|c| c.get("body").and_then(serde_json::Value::as_str));
+        match rabbit_wait_decision(latest_body, started.elapsed().as_secs(), window) {
+            RabbitWait::Stop(why) => {
+                info!(pr, head = short_sha(head_sha), %why, "no CodeRabbit verdict; proceeding without it");
+                return RabbitReview::unavailable(&why);
             }
-            return RabbitReview::unavailable(&format!("rate-limited for {mins} min"));
+            RabbitWait::Ask if !asked => {
+                let _ = run(
+                    &gh,
+                    &[
+                        "pr",
+                        "comment",
+                        &pr.to_string(),
+                        "--body",
+                        "@coderabbitai review",
+                    ],
+                    repo_root,
+                )
+                .await;
+                asked = true;
+            }
+            RabbitWait::Ask | RabbitWait::Poll => {}
         }
-        if !asked && started.elapsed() > std::time::Duration::from_secs(90) {
-            let _ = run(
-                &gh,
-                &[
-                    "pr",
-                    "comment",
-                    &pr.to_string(),
-                    "--body",
-                    "@coderabbitai review",
-                ],
-                repo_root,
-            )
-            .await;
-            asked = true;
-        }
-        if started.elapsed() >= window {
-            return RabbitReview::unavailable(&format!(
-                "no review of {} within {}s",
-                short_sha(head_sha),
-                window.as_secs()
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
     }
 }
 
@@ -3708,8 +3737,8 @@ async fn resume_draft_pr(
             independent_review(&issue, &summary, &diff, worktree.clone(), prior_notes.as_deref())
                 .await;
         prior_notes = Some(independent.notes.clone());
-        // #936 — CodeRabbit is the third reviewer. It judges the PUSHED
-        // head, so push first (a no-op when nothing changed).
+        // #936 — CodeRabbit is the (advisory) third reviewer. It judges the
+        // PUSHED head, so push first (a no-op when nothing changed).
         let rabbit = if dry_run {
             RabbitReview::skipped()
         } else {
@@ -3726,9 +3755,10 @@ async fn resume_draft_pr(
             }
         };
         notes_log.push(format!(
-            "round {rounds_done}: codex {}; CodeRabbit {}",
+            "round {rounds_done}: codex {}; CodeRabbit {} ({})",
             independent.status(),
-            rabbit.status()
+            rabbit.status(),
+            rabbit.note
         ));
         if independent.approved() && rabbit.approved() {
             if rounds_done > 0 {
@@ -3814,32 +3844,6 @@ async fn resume_draft_pr(
             }
             notify_discord(&format!("✅ resumed draft merged: {} — PR #{pr}", issue.title)).await;
             return Ok(RunReport::built(format!("PR #{pr}: resumed and MERGED")));
-        }
-
-        if independent.approved() && !rabbit.available && !rabbit.skipped {
-            // #936 — nothing to revise against; leave the draft for the next
-            // resume rather than spend a builder round on a missing verdict.
-            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-            let _ = run(
-                &gh,
-                &[
-                    "pr",
-                    "comment",
-                    &pr.to_string(),
-                    "--body",
-                    &format!(
-                        "Auto-resume: codex LGTM, but {} — not merging without it; \
-                            the loop resumes this draft again.",
-                        rabbit.note
-                    ),
-                ],
-                repo_root,
-            )
-            .await;
-            return Ok(RunReport::built(format!(
-                "PR #{pr}: codex LGTM, CodeRabbit review pending ({})",
-                rabbit.note
-            )));
         }
 
         if rounds_done >= revise_rounds() {
@@ -8755,15 +8759,21 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             rabbit_findings_for_head(&bare, &comments, "bbbb222").actionable,
             1
         );
-        // No review for this head ⇒ unavailable, never approved.
+        // No review for this head ⇒ unavailable: advisory, so it never blocks.
         let none = rabbit_findings_for_head(&reviews, &comments, "cccc333");
-        assert!(!none.available && !none.approved());
+        assert!(!none.available && !none.blocks() && none.approved());
     }
 
+    // Owner directive 2026-09-02: CodeRabbit is advisory — its findings gate
+    // the merge when a review of the head exists; when it is rate-limited or
+    // has not reviewed, the loop proceeds on the double LGTM and never waits
+    // for it.
     #[test]
-    fn rabbit_unavailable_is_not_approval() {
-        assert!(!RabbitReview::unavailable("timeout").approved());
-        let ok = RabbitReview {
+    fn rabbit_absent_never_blocks_but_findings_do() {
+        assert!(RabbitReview::unavailable("rate-limited").approved());
+        assert!(!RabbitReview::unavailable("rate-limited").blocks());
+        assert!(RabbitReview::skipped().approved());
+        let clean = RabbitReview {
             available: true,
             skipped: false,
             head_sha: "x".into(),
@@ -8771,16 +8781,57 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             findings: vec![],
             note: String::new(),
         };
-        assert!(ok.approved());
-        let bad = RabbitReview {
-            actionable: 1,
-            ..ok
+        assert!(clean.approved() && !clean.blocks());
+        let dirty = RabbitReview {
+            actionable: 2,
+            ..clean
         };
-        assert!(!bad.approved());
-        assert!(
-            RabbitReview::skipped().approved(),
-            "no CodeRabbit on the repo ⇒ double LGTM"
-        );
+        assert!(!dirty.approved() && dirty.blocks());
+    }
+
+    #[test]
+    fn rate_limited_or_absent_rabbit_is_not_waited_for() {
+        // Rate-limited: stop at once, whatever the clock says.
+        assert!(matches!(
+            rabbit_wait_decision(Some("> ## Review limit reached\n> **Next included review available in 41 minutes.**"), 0, 300),
+            RabbitWait::Stop(ref why) if why.contains("rate-limited")
+        ));
+        // Window exhausted: stop.
+        assert!(matches!(
+            rabbit_wait_decision(None, 300, 300),
+            RabbitWait::Stop(_)
+        ));
+        assert!(matches!(
+            rabbit_wait_decision(Some("Walkthrough"), 301, 300),
+            RabbitWait::Stop(_)
+        ));
+        // A zero window means "consider only what is already there".
+        assert!(matches!(
+            rabbit_wait_decision(Some("review in progress"), 0, 0),
+            RabbitWait::Stop(_)
+        ));
+        // A review in progress is worth a short poll.
+        assert!(matches!(
+            rabbit_wait_decision(
+                Some("Currently processing new changes in this PR."),
+                30,
+                300
+            ),
+            RabbitWait::Poll
+        ));
+        assert!(matches!(
+            rabbit_wait_decision(None, 30, 300),
+            RabbitWait::Poll
+        ));
+        // An old draft CodeRabbit explicitly skipped is asked once, after a minute.
+        assert!(matches!(
+            rabbit_wait_decision(Some("## Draft PR not reviewed"), 61, 300),
+            RabbitWait::Ask
+        ));
+        assert!(matches!(
+            rabbit_wait_decision(Some("## Draft PR not reviewed"), 30, 300),
+            RabbitWait::Poll
+        ));
     }
 
     #[test]
@@ -8819,7 +8870,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     fn resume_merge_requires_rabbit_approval() {
         let src = include_str!("self_improve.rs");
         let start = src.find("async fn resume_draft_pr(").expect("resume fn");
-        let body = &src[start..];
+        let end = start + src[start..].find("\n}\n").expect("resume fn end");
+        let body = &src[start..end];
         let gate = body
             .find("if independent.approved() && rabbit.approved() {")
             .expect("both approvals guard the merge");
@@ -8828,6 +8880,11 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             .expect("gh pr ready");
         assert!(gate < ready);
         assert!(!body[gate..ready].contains("if independent.approved() {"));
+        // Advisory: a missing CodeRabbit verdict never parks the draft.
+        assert!(
+            !body.contains("CodeRabbit review pending"),
+            "absent CodeRabbit must not block or park"
+        );
     }
 
     #[test]
