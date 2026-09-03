@@ -20,5 +20,5 @@ pub use identity::{Identities, IdentityIndex, PersonPage};
 pub use index::{rebuild_index, IndexStats};
 pub use layout::WikiLayout;
 pub use locks::{with_page_lock, LOCK_TIMEOUT};
-pub use reader::WikiReader;
+pub use reader::{transcripts_meetings_dir_from_env, WikiReader};
 pub use slug::slug_from_email;

@@ -416,7 +416,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             .as_ref()
             .map(|root| {
                 let layout = augmentagent_wiki::WikiLayout::new(root.clone());
-                augmentagent_wiki::WikiReader::new(&layout).triage_hint(&email)
+                augmentagent_wiki::WikiReader::new(&layout)
+                    .with_transcripts_dir(augmentagent_wiki::transcripts_meetings_dir_from_env())
+                    .triage_hint(&email)
             })
             .unwrap_or_default();
         let triage_prompt = triage_user_message(&email, learned, &wiki_hint);
@@ -804,7 +806,11 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     .as_ref()
                     .map(|root| {
                         let layout = augmentagent_wiki::WikiLayout::new(root.clone());
-                        augmentagent_wiki::WikiReader::new(&layout).draft_hint(&email)
+                        augmentagent_wiki::WikiReader::new(&layout)
+                            .with_transcripts_dir(
+                                augmentagent_wiki::transcripts_meetings_dir_from_env(),
+                            )
+                            .draft_hint(&email)
                     })
                     .unwrap_or_default();
                 let tone_block = pick_tone_block(&self.store, entity_id, &email.from);

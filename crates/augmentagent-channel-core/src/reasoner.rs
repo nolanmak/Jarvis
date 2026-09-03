@@ -2359,6 +2359,31 @@ mod tests {
         }
     }
 
+    /// #921 — the ask path's production half already shipped and must not be
+    /// re-added: `ask_opts` has opened the transcript clone via `add_dirs`
+    /// since #915 and forwarded `AUGMENTAGENT_TRANSCRIPTS_DIR` to the scope
+    /// guard since #922, pinned configured-and-unconfigured by the two
+    /// `ask_opts_*transcript*` tests below, and #922 wrote the
+    /// `## Meeting transcripts` section of `schema/wiki-ask.md`. What was
+    /// unpinned is the join: an open directory nobody is told about is one the
+    /// ask agent never greps, so a schema edit dropping that section must fail
+    /// here rather than quietly cost us the words. (The ingest half of the same
+    /// contract — `fotw:` citations in `schema/wiki-skill.md` — is pinned in
+    /// `augmentagent-channel-fotw`, next to `source_id`.)
+    #[test]
+    fn ask_opts_prompt_documents_the_transcript_clone() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+
+        for needle in ["## Meeting transcripts", "AUGMENTAGENT_TRANSCRIPTS_DIR"] {
+            assert!(
+                opts.system_prompt.contains(needle),
+                "wiki-ask.md lost the #921 transcripts section: {needle:?}"
+            );
+        }
+    }
+
     /// #317 — the reasoner routes `mcpServers` to `--mcp-config` and keeps
     /// the rest on `--settings`.
     #[test]
