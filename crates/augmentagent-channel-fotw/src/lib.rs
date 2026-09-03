@@ -39,3 +39,25 @@ pub const KIND: &str = "meeting_transcript";
 pub fn source_id(meeting_id: &str) -> String {
     format!("fotw:{meeting_id}")
 }
+
+#[cfg(test)]
+mod tests {
+    /// PR review of #921 — the draft hint tells the drafter that a wiki
+    /// meeting fact cites `fotw:<id>`, and `source_id` mints exactly that
+    /// string, but the side that has to *write* the citation is the ingest
+    /// agent, and it only learns the rule from `schema/wiki-skill.md`. That
+    /// file is read from disk at runtime, so an edit dropping the section
+    /// breaks nothing at build time and silently costs every meeting fact its
+    /// attribution. Pin it here, where the namespace is defined.
+    #[test]
+    fn the_wiki_schema_still_requires_meeting_facts_to_cite_fotw() {
+        let schema = include_str!("../../../schema/wiki-skill.md");
+        let rule = format!("cites `{}` in `sources:`", super::source_id("<meeting-id>"));
+        for needle in ["### The `fotw:` source namespace", &rule] {
+            assert!(
+                schema.contains(needle),
+                "wiki-skill.md lost the #921 fotw: attribution rule: {needle:?}"
+            );
+        }
+    }
+}
