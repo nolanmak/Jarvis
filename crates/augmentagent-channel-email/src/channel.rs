@@ -415,6 +415,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             .wiki_root
             .as_ref()
             .map(|root| {
+                // Resolving the clone is path arithmetic and its listing is
+                // memoised process-wide, so the added filesystem cost here is
+                // one bounded `read_dir` a minute — never another hint's I/O.
                 let layout = augmentagent_wiki::WikiLayout::new(root.clone());
                 augmentagent_wiki::WikiReader::new(&layout)
                     .with_transcripts_dir(augmentagent_wiki::transcripts_meetings_dir_from_env())
