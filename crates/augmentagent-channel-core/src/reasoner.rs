@@ -2359,15 +2359,11 @@ mod tests {
         }
     }
 
-    /// #921 acceptance, end to end on the ask path: with a clone configured the
-    /// agent can REACH the transcripts (`--add-dir` plus the scope guard's env,
-    /// shipped in #915/#922) *and* is TOLD they exist (`schema/wiki-ask.md`);
-    /// with none configured, nothing changes. The reach half was already
-    /// pinned; the join was not, and an open directory nobody is told about is
-    /// one the ask agent never greps, so a schema edit dropping that section
-    /// must fail here rather than quietly cost us the words. (The ingest half
-    /// of the same contract — `fotw:` citations in `schema/wiki-skill.md` — is
-    /// pinned in `augmentagent-channel-fotw`, next to `source_id`.)
+    /// #921 acceptance on the ask path: with a clone configured the agent can
+    /// REACH the transcripts (`--add-dir` plus the scope guard's env) *and* is
+    /// TOLD they exist (`schema/wiki-ask.md`); with none configured, nothing
+    /// changes. An open directory nobody is told about is one the ask agent
+    /// never greps, so a schema edit dropping that section must fail here.
     #[test]
     fn ask_opts_opens_and_documents_the_transcript_clone() {
         let repo = tempfile::tempdir().expect("repo tmpdir");
