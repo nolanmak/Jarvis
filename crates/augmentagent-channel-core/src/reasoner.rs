@@ -2359,23 +2359,47 @@ mod tests {
         }
     }
 
-    /// #921 — the ask path's production half already shipped and must not be
-    /// re-added: `ask_opts` has opened the transcript clone via `add_dirs`
-    /// since #915 and forwarded `AUGMENTAGENT_TRANSCRIPTS_DIR` to the scope
-    /// guard since #922, pinned configured-and-unconfigured by the two
-    /// `ask_opts_*transcript*` tests below, and #922 wrote the
-    /// `## Meeting transcripts` section of `schema/wiki-ask.md`. What was
-    /// unpinned is the join: an open directory nobody is told about is one the
-    /// ask agent never greps, so a schema edit dropping that section must fail
-    /// here rather than quietly cost us the words. (The ingest half of the same
-    /// contract — `fotw:` citations in `schema/wiki-skill.md` — is pinned in
-    /// `augmentagent-channel-fotw`, next to `source_id`.)
+    /// #921 acceptance, end to end on the ask path: with a clone configured the
+    /// agent can REACH the transcripts (`--add-dir` plus the scope guard's env,
+    /// shipped in #915/#922) *and* is TOLD they exist (`schema/wiki-ask.md`);
+    /// with none configured, nothing changes. The reach half was already
+    /// pinned; the join was not, and an open directory nobody is told about is
+    /// one the ask agent never greps, so a schema edit dropping that section
+    /// must fail here rather than quietly cost us the words. (The ingest half
+    /// of the same contract — `fotw:` citations in `schema/wiki-skill.md` — is
+    /// pinned in `augmentagent-channel-fotw`, next to `source_id`.)
     #[test]
-    fn ask_opts_prompt_documents_the_transcript_clone() {
+    fn ask_opts_opens_and_documents_the_transcript_clone() {
         let repo = tempfile::tempdir().expect("repo tmpdir");
         let wiki = tempfile::tempdir().expect("wiki tmpdir");
-        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+        let clone = tempfile::tempdir().expect("clone tmpdir");
 
+        // Unconfigured: the wiki and nothing else. One live EnvGuard at a time
+        // — it holds the global env lock, so a second would self-deadlock.
+        let bare = {
+            let _g = EnvGuard::unset("AUGMENTAGENT_TRANSCRIPTS_DIR");
+            ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf())
+        };
+        assert_eq!(bare.add_dirs.len(), 1, "nothing to open without a clone");
+        assert!(!bare
+            .env
+            .iter()
+            .any(|(k, _)| k == "AUGMENTAGENT_TRANSCRIPTS_DIR"));
+
+        let _g = EnvGuard::set(
+            "AUGMENTAGENT_TRANSCRIPTS_DIR",
+            clone.path().to_str().expect("utf8 tmpdir"),
+        );
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+        assert!(
+            opts.add_dirs.iter().any(|d| d.as_path() == clone.path()),
+            "the clone must be opened for the session"
+        );
+        assert!(
+            opts.env.iter().any(|(k, v)| k == "AUGMENTAGENT_TRANSCRIPTS_DIR"
+                && v.as_str() == clone.path().to_string_lossy()),
+            "the scope guard must see the same clone"
+        );
         for needle in ["## Meeting transcripts", "AUGMENTAGENT_TRANSCRIPTS_DIR"] {
             assert!(
                 opts.system_prompt.contains(needle),
