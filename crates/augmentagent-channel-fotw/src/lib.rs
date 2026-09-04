@@ -42,13 +42,11 @@ pub fn source_id(meeting_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    /// PR review of #921 — the draft hint tells the drafter that a wiki
-    /// meeting fact cites `fotw:<id>`, and `source_id` mints exactly that
-    /// string, but the side that has to *write* the citation is the ingest
-    /// agent, and it only learns the rule from `schema/wiki-skill.md`. That
-    /// file is read from disk at runtime, so an edit dropping the section
-    /// breaks nothing at build time and silently costs every meeting fact its
-    /// attribution. Pin it here, where the namespace is defined.
+    /// #921 — the draft hint promises that a wiki meeting fact cites
+    /// `fotw:<id>`, but the side that has to *write* the citation is the
+    /// ingest agent, which learns the rule only from `schema/wiki-skill.md` —
+    /// read from disk at runtime, so dropping the section breaks nothing at
+    /// build time and silently costs every meeting fact its attribution.
     #[test]
     fn the_wiki_schema_still_requires_meeting_facts_to_cite_fotw() {
         let schema = include_str!("../../../schema/wiki-skill.md");
