@@ -6,6 +6,8 @@
 //! Claude doesn't have to guess file paths.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use augmentagent_store::Email;
 
@@ -14,22 +16,20 @@ use crate::layout::WikiLayout;
 /// How many of the newest meeting files a hint scan reads. FlyOnTheWall names
 /// them `YYYY-MM-DD-{slug}-{id8}.md`, so reverse-lexicographic is newest-first.
 const MEETING_SCAN_LIMIT: usize = 20;
+/// How long one clone scan is reused process-wide (see [`memoized_scan`]).
+const MEETING_SCAN_TTL: Duration = Duration::from_secs(60);
 /// Most meeting paths a draft hint names.
 const MEETING_HINT_MAX: usize = 3;
-/// How much of a meeting file the scan reads. The title and summary sit right
-/// below the frontmatter; the transcript underneath is megabytes we never want
-/// on the hot path, so the cap is on the read, not just on the match.
+/// The title and summary sit right below the frontmatter; the transcript
+/// underneath is megabytes, so the cap is on the read, not just on the match.
 const MEETING_HEAD_BYTES: u64 = 8192;
 /// Ceilings on the FINISHED hint, not just on the block #921 appends: meeting
-/// paths are absolute under a host-configured `AUGMENTAGENT_TRANSCRIPTS_DIR`,
-/// so this crate cannot assume they are short. Triage keeps the ≤400 bytes
-/// `triage_hint_stays_short` has always pinned; the draft hint gets a larger
-/// line because its pre-#921 wiki prose alone runs ~370 bytes, and the
-/// meetings block fills only what is left under it.
+/// paths are absolute under a host-configured dir, so this crate cannot assume
+/// they are short. The draft hint gets the larger line because its pre-#921
+/// wiki prose alone runs ~370 bytes; triage keeps the ≤400 it always had.
 const TRIAGE_HINT_MAX_BYTES: usize = 400;
 const DRAFT_HINT_MAX_BYTES: usize = 600;
-/// Preamble for the draft hint's meetings block. Named so the byte budget can
-/// account for it before the first path is appended.
+/// Named so the byte budget can account for it before the first path.
 const MEETING_HINT_HEADER: &str =
     "Recent meetings mentioning this person (full transcripts; wiki meeting facts cite fotw:<id>):";
 
@@ -48,7 +48,6 @@ impl<'a> WikiReader<'a> {
 
     /// Point the reader at the FlyOnTheWall clone's `meetings/` directory so
     /// hints can name the transcript that carries the actual words (#921).
-    /// Without it the hints are exactly what they were before.
     pub fn with_transcripts_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.transcripts_meetings_dir = dir;
         self
@@ -88,8 +87,7 @@ impl<'a> WikiReader<'a> {
         };
 
         // The meetings block gets what is left of the whole hint's budget once
-        // the wiki prose and the blank line joining them are paid for, so #921
-        // can never push the finished hint past [`DRAFT_HINT_MAX_BYTES`].
+        // the wiki prose and the blank line joining them are paid for.
         let spent = if wiki_block.is_empty() {
             0
         } else {
@@ -131,9 +129,8 @@ impl<'a> WikiReader<'a> {
         }
 
         // One path only, and no "open it" nudge: triage's add-dir is the wiki
-        // alone, so the transcript is a recency/importance signal here, not
-        // something this call can read. Dropped outright when the wiki lines
-        // plus this path would carry the hint past its budget.
+        // alone, so the transcript is a recency signal here, not something this
+        // call can read. Dropped outright when it would breach the budget.
         if let Some(path) = self.meetings_mentioning(email, 1).into_iter().next() {
             let line = format!("- Sender appeared in a recent meeting transcript: {path}");
             let used: usize = lines.iter().map(|l| l.len() + 1).sum();
@@ -151,15 +148,11 @@ impl<'a> WikiReader<'a> {
 
     /// Newest-first paths of recent meeting files whose title or summary block
     /// names the sender. Empty whenever no transcript clone is configured, the
-    /// sender has no display name, or nothing matches — which is what keeps
-    /// the hints byte-identical to their pre-#921 text in the common case.
-    ///
-    /// Per-email cost is bounded by construction: one streaming `read_dir`
-    /// pass holding only the [`MEETING_SCAN_LIMIT`] window (see
-    /// [`recent_meeting_files`]), then at most that many reads capped at
-    /// [`MEETING_HEAD_BYTES`] each (~160 KB worst case), short-circuited as
-    /// soon as `max` hits are found. Every I/O failure degrades to no hint —
-    /// a hint is advisory, so a slow or broken clone must never fail an email.
+    /// sender has no display name, or nothing matches — which is what keeps the
+    /// hints byte-identical to their pre-#921 text in the common case. Costs a
+    /// memoised directory lookup plus at most [`MEETING_SCAN_LIMIT`] reads of
+    /// [`MEETING_HEAD_BYTES`], short-circuited at `max` hits; every I/O failure
+    /// degrades to no hint, because a slow clone must never fail an email.
     fn meetings_mentioning(&self, email: &Email, max: usize) -> Vec<String> {
         let Some(dir) = self.transcripts_meetings_dir.as_deref() else {
             return Vec::new();
@@ -168,14 +161,13 @@ impl<'a> WikiReader<'a> {
             return Vec::new();
         };
         let needle = name.to_lowercase();
-        // Under three characters is an initials-or-junk substring, and it would
-        // match half the clone.
+        // An initials-or-junk substring would match half the clone.
         if needle.chars().count() < 3 {
             return Vec::new();
         }
 
         let mut hits = Vec::new();
-        for path in recent_meeting_files(dir) {
+        for path in memoized_scan(&MEETING_SCAN_MEMO, dir) {
             if meeting_head(&path).is_some_and(|head| head.contains(&needle)) {
                 hits.push(path.to_string_lossy().into_owned());
                 if hits.len() == max {
@@ -188,27 +180,47 @@ impl<'a> WikiReader<'a> {
 }
 
 /// `AUGMENTAGENT_TRANSCRIPTS_DIR/meetings`, when the clone is actually there.
-/// The daemon calls this once per hint; a missing clone is the normal state on
-/// a host that doesn't run FlyOnTheWall.
+/// A missing clone is the normal state on a host without FlyOnTheWall.
 pub fn transcripts_meetings_dir_from_env() -> Option<PathBuf> {
     let dir = PathBuf::from(std::env::var_os("AUGMENTAGENT_TRANSCRIPTS_DIR")?).join("meetings");
     dir.is_dir().then_some(dir)
 }
 
-/// `Display Name <addr>` → the display name. A bare address carries no name,
-/// and a name is the only thing a transcript can be scanned for.
+/// `Display Name <addr>` → the display name, the only thing worth scanning for.
 fn display_name(from: &str) -> Option<&str> {
     let (name, _) = from.split_once('<')?;
     let name = name.trim().trim_matches('"').trim();
     (!name.is_empty()).then_some(name)
 }
 
-/// The newest [`MEETING_SCAN_LIMIT`] transcript files, newest first. A live
-/// clone accumulates meetings without bound and this runs per email, so the
-/// window is kept by insertion during a single `read_dir` pass: no vector of
-/// every entry, no sort of the whole directory, and the cheap name test runs
-/// before the `file_type` syscall.
-fn recent_meeting_files(dir: &Path) -> Vec<PathBuf> {
+type ScanMemo = Mutex<Option<(PathBuf, Instant, Vec<PathBuf>)>>;
+static MEETING_SCAN_MEMO: ScanMemo = Mutex::new(None);
+
+/// The scan window, re-derived at most once per [`MEETING_SCAN_TTL`].
+/// [`scan_meeting_files`] bounds what it *keeps*, but a `read_dir` still walks
+/// the whole clone, which grows without limit — and hints run per email on the
+/// unattended inbox. Rate-limiting discovery is what bounds that: a burst of
+/// mail costs one directory pass, not one per message. The price is that a
+/// just-synced meeting can miss one TTL of hints, and a hint is advisory.
+fn memoized_scan(memo: &ScanMemo, dir: &Path) -> Vec<PathBuf> {
+    let mut memo = memo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((cached, taken, files)) = memo.as_ref() {
+        if cached == dir && taken.elapsed() < MEETING_SCAN_TTL {
+            return files.clone();
+        }
+    }
+    let files = scan_meeting_files(dir);
+    *memo = Some((dir.to_path_buf(), Instant::now(), files.clone()));
+    files
+}
+
+/// The newest [`MEETING_SCAN_LIMIT`] transcript files, newest first. The window
+/// is kept by insertion during a single `read_dir` pass: no vector of every
+/// entry, no sort of the whole directory, and the cheap name test runs before
+/// the `file_type` syscall.
+fn scan_meeting_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -233,10 +245,9 @@ fn recent_meeting_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// `YYYY-MM-DD-{slug}-{id8}.md`, the shape FlyOnTheWall exports. Demanding the
-/// date prefix is what makes the lexicographic window above a newest-first
-/// one: an undated file (`zzz.md`, a stray `README.md`, the OKF `index.md` /
-/// `log.md`) sorts above every dated name and would otherwise evict real
-/// meetings from the scan window.
+/// date prefix is what makes the lexicographic window newest-first: an undated
+/// stray (`README.md`, the OKF `index.md` / `log.md`) sorts above every dated
+/// name and would otherwise evict real meetings from the window.
 fn is_dated_meeting(name: &str) -> bool {
     let b = name.as_bytes();
     b.len() > 10
@@ -252,8 +263,7 @@ fn is_dated_meeting(name: &str) -> bool {
 }
 
 /// Header plus one line per path, filled newest-first while the whole block
-/// stays inside `budget` bytes. Empty when even one path does not fit: a hint
-/// is advisory, so a path too long to name is simply not named.
+/// stays inside `budget` bytes. A path too long to name is simply not named.
 fn meeting_block(paths: &[String], budget: usize) -> String {
     let mut block = String::new();
     for p in paths {
@@ -274,10 +284,9 @@ fn meeting_block(paths: &[String], budget: usize) -> String {
     block
 }
 
-/// Lowercased `# Title` + summary block of a meeting file — everything above
-/// the first `## ` section. Stopping there is the point: a name spoken in
-/// `## Transcript` is not evidence that the meeting was *about* that person,
-/// and the raw words never enter a prompt. An unreadable file yields `None`.
+/// Lowercased `# Title` + summary block — everything above the first `## `
+/// section. Stopping there is the point: a name spoken in `## Transcript` is
+/// not evidence the meeting was *about* that person. Unreadable → `None`.
 fn meeting_head(path: &Path) -> Option<String> {
     use std::io::Read;
 
@@ -287,8 +296,8 @@ fn meeting_head(path: &Path) -> Option<String> {
         .take(MEETING_HEAD_BYTES)
         .read_to_end(&mut buf)
         .ok()?;
-    // Lossy, because the cap can land mid-codepoint; a replacement char in
-    // the tail cannot create a false match on a name.
+    // Lossy: the cap can land mid-codepoint, and a replacement char in the
+    // tail cannot create a false match on a name.
     let text = String::from_utf8_lossy(&buf);
     let head = text.split("\n## ").next().unwrap_or_default();
     Some(head.to_lowercase())
@@ -403,8 +412,8 @@ mod tests {
         assert!(hint.len() < 400, "triage hint too long: {} chars", hint.len());
     }
 
-    /// A meeting file in the FlyOnTheWall export shape: frontmatter, `# Title`,
-    /// summary prose, then the sections the hint scan must never read.
+    /// The FlyOnTheWall export shape: frontmatter, `# Title`, summary prose,
+    /// then the sections the hint scan must never read.
     fn meeting_file(dir: &Path, name: &str, title: &str, summary: &str, transcript: &str) {
         std::fs::write(
             dir.join(name),
@@ -485,29 +494,13 @@ mod tests {
         // Case-insensitive: the summary spells the name lowercase.
         assert!(hint.contains("2026-08-19-azure-cost-bbbb2222.md"));
         assert!(!hint.contains("2026-08-18-standup-cccc3333.md"));
-    }
-
-    #[test]
-    fn draft_hint_skips_a_sender_with_no_display_name() {
-        let d = TempDir::new().unwrap();
-        let layout = WikiLayout::new(d.path().to_path_buf());
-        layout.bootstrap().unwrap();
-        let dir = meetings_dir(&d);
-        meeting_file(
-            &dir,
-            "2026-08-20-sync-aaaa1111.md",
-            "Sync with dana@example.com",
-            "Notes.",
-            "[00:01] S0: unrelated",
-        );
-
-        let r = WikiReader::new(&layout).with_transcripts_dir(Some(dir));
+        // A bare address carries no display name to scan the clone for.
         assert_eq!(r.draft_hint(&email("dana@example.com", None)), "");
     }
 
-    /// PR review of #921 — the ceiling is on the FINISHED hint, not on the
-    /// block this change appends: a sender with a person page, a thread page
-    /// AND matching transcripts must still land inside the budget.
+    /// PR review of #921 — the ceiling is on the FINISHED hint, not just on the
+    /// block this change appends: a person page, a thread page AND matching
+    /// transcripts together must still land inside the budget.
     #[test]
     fn draft_hint_is_bounded() {
         let d = TempDir::new().unwrap();
@@ -532,29 +525,20 @@ mod tests {
             .with_transcripts_dir(Some(dir))
             .draft_hint(&e);
         assert!(hint.starts_with(&before), "wiki block lost: {hint}");
-        assert!(
-            hint.len() <= DRAFT_HINT_MAX_BYTES,
-            "draft hint too long: {} bytes",
-            hint.len()
-        );
+        assert!(hint.len() <= DRAFT_HINT_MAX_BYTES, "too long: {hint}");
         let paths: Vec<&str> = hint.lines().filter(|l| l.contains("-sync-")).collect();
-        // 40 candidates, at most three named — and fewer still when the host's
-        // temp root is long enough that a third line would breach the budget.
+        // 40 candidates, at most three named — fewer on a long temp root.
         assert!(
             (1..=MEETING_HINT_MAX).contains(&paths.len()),
             "expected 1..=3 paths: {paths:?}"
         );
-        assert!(
-            Path::new(paths[0].trim_start_matches("- ")).is_absolute(),
-            "meeting path must be absolute: {}",
-            paths[0]
-        );
+        let p = paths[0].trim_start_matches("- ");
+        assert!(Path::new(p).is_absolute(), "path must be absolute: {p}");
     }
 
-    /// PR review of #921 — the meetings block appends absolute paths rooted at
-    /// a host-configured `AUGMENTAGENT_TRANSCRIPTS_DIR`, so nothing about the
-    /// deployment guarantees they are short: whatever budget the caller has
-    /// left has to be enforced on the real output, path lengths included.
+    /// PR review of #921 — meeting paths are absolute under a host-configured
+    /// dir, so nothing guarantees they are short: the caller's remaining budget
+    /// has to be enforced on the real output, path lengths included.
     #[test]
     fn meeting_block_never_exceeds_the_callers_budget() {
         let paths = |root: &str, n: usize| -> Vec<String> {
@@ -564,27 +548,25 @@ mod tests {
         };
         let budget = 400;
 
-        let short = meeting_block(&paths("/home/o/transcripts/meetings", MEETING_HINT_MAX), budget);
+        let short = meeting_block(&paths("/home/o/transcripts", MEETING_HINT_MAX), budget);
         assert_eq!(short.matches("\n- ").count(), MEETING_HINT_MAX);
         assert!(short.len() <= budget, "{short}");
 
         // A deep clone path: 150-byte entries fit once, not three times.
-        let deep = meeting_block(
-            &paths(&format!("/{}", "d".repeat(120)), MEETING_HINT_MAX),
-            budget,
-        );
+        let deep_root = format!("/{}", "d".repeat(120));
+        let deep = meeting_block(&paths(&deep_root, MEETING_HINT_MAX), budget);
         assert_eq!(deep.matches("\n- ").count(), 1, "{deep}");
         assert!(deep.len() <= budget, "{deep}");
 
-        // Longer than the whole budget: no header, no dangling bullet.
+        // Longer than the whole budget: no header, no dangling bullet. And a
+        // caller with nothing left to spend gets nothing.
         assert_eq!(meeting_block(&paths(&"d".repeat(500), 1), budget), "");
-        // And a caller with nothing left to spend gets nothing.
         assert_eq!(meeting_block(&paths("/o", MEETING_HINT_MAX), 0), "");
     }
 
     /// PR review of #921 — same discipline on the triage side, where the wiki
-    /// lines have already spent part of the budget: a transcript path from a
-    /// deep clone is dropped rather than allowed to push the hint over.
+    /// lines have already spent part of the budget: a deep clone's path is
+    /// dropped rather than allowed to push the hint over.
     #[test]
     fn a_deep_clone_path_cannot_push_the_triage_hint_over_budget() {
         let d = TempDir::new().unwrap();
@@ -605,18 +587,13 @@ mod tests {
         let r = WikiReader::new(&layout).with_transcripts_dir(Some(dir));
         let hint = r.triage_hint(&email("Dana Reyes <dana@example.com>", Some("t1")));
         assert!(hint.contains("threads/t1.md"), "wiki lines lost: {hint}");
-        assert!(
-            hint.len() <= TRIAGE_HINT_MAX_BYTES,
-            "triage hint too long: {} chars",
-            hint.len()
-        );
+        assert!(hint.len() <= TRIAGE_HINT_MAX_BYTES, "too long: {hint}");
     }
 
-    /// PR review of #921 — this runs per email against a live clone that keeps
-    /// growing, so the scan must never materialise or sort the whole directory:
-    /// it hands back the newest [`MEETING_SCAN_LIMIT`] *dated* names and no
-    /// more. Undated strays (`README.md`, the OKF `index.md` / `log.md`) sort
-    /// above every `YYYY-MM-DD-` name and would otherwise evict real meetings.
+    /// PR review of #921 — the scan must never materialise or sort the whole
+    /// directory: it hands back the newest [`MEETING_SCAN_LIMIT`] *dated* names
+    /// and no more. Undated strays sort above every `YYYY-MM-DD-` name and
+    /// would otherwise evict real meetings from the window.
     #[test]
     fn the_scan_window_is_bounded_and_newest_first() {
         let d = TempDir::new().unwrap();
@@ -627,7 +604,7 @@ mod tests {
             std::fs::write(dir.join(format!("zzz-{i:03}.md")), "x").unwrap();
         }
 
-        let names: Vec<String> = recent_meeting_files(&dir)
+        let names: Vec<String> = scan_meeting_files(&dir)
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
@@ -636,6 +613,28 @@ mod tests {
         sorted.sort_unstable_by(|a, b| b.cmp(a));
         assert_eq!(names, sorted, "window is not newest-first: {names:?}");
         assert_eq!(names[0], "2026-05-08-sync-a.md", "newest meeting missed");
+    }
+
+    /// PR review of #921 — bounding what the scan *keeps* does not bound what
+    /// `read_dir` walks, and hints run per email, so discovery is derived once
+    /// per TTL and reused. The memo is injected here; in production it is the
+    /// one process-wide [`MEETING_SCAN_MEMO`].
+    #[test]
+    fn clone_discovery_is_memoized_across_hints() {
+        let d = TempDir::new().unwrap();
+        let dir = meetings_dir(&d);
+        std::fs::write(dir.join("2026-08-20-sync-aaaa1111.md"), "x").unwrap();
+        let memo = ScanMemo::new(None);
+
+        let first = memoized_scan(&memo, &dir);
+        assert_eq!(first.len(), 1);
+        std::fs::write(dir.join("2026-08-21-sync-bbbb2222.md"), "x").unwrap();
+        assert_eq!(memoized_scan(&memo, &dir), first, "clone re-enumerated");
+
+        // Expiry, and a different clone, both re-scan.
+        *memo.lock().unwrap() = None;
+        assert_eq!(memoized_scan(&memo, &dir).len(), 2, "never refreshes");
+        assert!(memoized_scan(&memo, d.path()).is_empty(), "wrong clone");
     }
 
     #[test]
@@ -684,8 +683,8 @@ mod tests {
         .unwrap();
 
         let e = email("Dana Reyes <dana@example.com>", None);
-        // The OKF index/log and the non-markdown file are excluded, the huge
-        // file is read only up to the byte cap, and nothing panics.
+        // OKF sidecars and non-markdown are excluded, the huge file is read
+        // only up to the byte cap, and nothing panics.
         let r = WikiReader::new(&layout).with_transcripts_dir(Some(dir));
         assert_eq!(r.draft_hint(&e), "");
         // Same for a configured clone that isn't there at all.
