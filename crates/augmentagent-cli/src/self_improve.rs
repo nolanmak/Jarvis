@@ -43,6 +43,13 @@ const BRANCH_PREFIX: &str = "agent-fix/issue-";
 const FIXABLE_LABEL: &str = "agent-fixable";
 /// Label stamped on an issue once the loop has given up on it (back-off).
 const GAVE_UP_LABEL: &str = "agent-gave-up";
+/// The sentence the not-fixable scoping verdict leaves on the issue, and the
+/// marker #955's re-triage sweep matches on: it is what tells a scoper
+/// label-out apart from a back-off at [`MAX_ATTEMPTS`] or a blast-radius
+/// refusal, both of which stay terminal.
+const SCOPE_GAVE_UP_MARKER: &str = "the scoping pass judged this issue not agent-fixable";
+/// Hidden marker prefixing every recorded-attempt comment.
+const ATTEMPT_MARKER: &str = "<!-- self-improve-attempt -->";
 /// Max changed lines we'll allow in a single self-improvement diff.
 const MAX_DIFF_LINES: usize = 600;
 /// Consecutive failed attempts before we comment + back off (label marker).
@@ -278,15 +285,7 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
         .filter(|iss| iss.get("pull_request").is_none())
         .filter_map(|iss| {
             let number = iss.get("number").and_then(serde_json::Value::as_u64)?;
-            let gave_up = iss
-                .get("labels")
-                .and_then(serde_json::Value::as_array)
-                .map(|ls| {
-                    ls.iter()
-                        .any(|l| l.get("name").and_then(|n| n.as_str()) == Some(GAVE_UP_LABEL))
-                })
-                .unwrap_or(false);
-            if gave_up {
+            if has_gave_up_label(iss) {
                 return None;
             }
             let s = |k: &str| {
@@ -310,6 +309,16 @@ fn rest_issue_candidates(v: &serde_json::Value) -> Vec<RestIssue> {
             })
         })
         .collect()
+}
+
+/// Does this REST issue row carry [`GAVE_UP_LABEL`]?
+fn has_gave_up_label(iss: &serde_json::Value) -> bool {
+    iss.get("labels")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|ls| {
+            ls.iter()
+                .any(|l| l.get("name").and_then(|n| n.as_str()) == Some(GAVE_UP_LABEL))
+        })
 }
 
 /// True if any blast-radius pattern appears in `text` (case-insensitive).
@@ -662,6 +671,12 @@ async fn pick_issue(repo_root: &Path) -> Result<Option<Issue>> {
     let issues: serde_json::Value =
         serde_json::from_str(&stdout).context("parse gh api issues")?;
 
+    // #955 — before picking, give back the issues a not-fixable verdict
+    // labelled out on evidence that does not support it. They rejoin the pool
+    // on the next tick's listing rather than this one: the sweep is here to
+    // undo a terminal label, not to reorder the current pass.
+    retriage_gave_up(repo_root, &issues).await;
+
     // #787 — human-filed issues first, newest-first within each group. The
     // research pipeline files 3/day and the daily cap is 3, so strict
     // newest-first would hand it the entire budget forever and human bug
@@ -900,8 +915,11 @@ alters every outbound email is `hard`; a 300-line self-contained validator \
 with tests is `medium`.\n\
 If the issue carries a 'Prior attempts on this issue' section, treat it as \
 ground truth about what did not work: your spec must address each stated \
-cause, and repeated failures on the same cause are evidence the issue is \
-not-fixable as written.\n\
+cause. Only two or more recorded attempts with the same kind (two \
+review-rejects, two gate-reds) are evidence the issue is not-fixable as \
+written; a single failed attempt never is — re-plan around it instead. The \
+section states how many attempts there were; read the count before you \
+reach for that verdict.\n\
 Output ONLY the header and spec/reason, no preamble.";
 
 /// Complexity grade the scoping pass assigns (#653). Anything above
@@ -995,6 +1013,79 @@ fn parse_scope_output(raw: &str) -> ScopeOutcome {
         guarded_paths,
         body: body_lines.join("\n").trim().to_string(),
     }
+}
+
+/// The implementation spec to hand the builder, or `None`. A not-fixable
+/// verdict's body is a refusal reason, not a spec (#955): on the
+/// previously-built fall-through path it must never reach the builder
+/// labelled "implementation spec".
+fn spec_from_scope(scope: Option<&ScopeOutcome>) -> Option<String> {
+    scope
+        .filter(|s| s.fixable)
+        .map(|s| s.body.clone())
+        .filter(|b| !b.is_empty())
+}
+
+/// #955 — may a not-fixable scoping verdict label this issue out for good?
+///
+/// Since #803 the scoper reads the prior-attempts digest, and one failed
+/// attempt was enough for it to call an issue unfixable; the label is
+/// terminal, so four issues (#915, #916, #917, #926) left the pool that way.
+/// The rule the prompt states is enforced here rather than trusted:
+///
+/// - a review-reject or a red gate means the issue WAS built — an agent
+///   produced a reviewable diff for it, so it is never labelled out;
+/// - no charged failure at all is the first-pass triage the label exists for
+///   (research ask, epic, owner decision) — label it out;
+/// - otherwise the verdict needs a repeated cause: two failures of the same
+///   kind, not one. An epic that failed once before being scoped therefore
+///   costs one further attempt, and the second failure closes it out.
+///
+/// `kinds` comes from [`label_out_evidence`]. Harness kinds are ignored for
+/// the same reason they are never charged as attempts (#803): a reasoner
+/// outage says nothing about the issue.
+fn may_label_out(kinds: &[FailureKind]) -> bool {
+    let charged: Vec<FailureKind> = kinds
+        .iter()
+        .copied()
+        .filter(|k| k.counts_toward_max_attempts())
+        .collect();
+    if was_built(&charged) {
+        return false;
+    }
+    charged.is_empty()
+        || charged
+            .iter()
+            .any(|k| charged.iter().filter(|other| *other == k).count() >= 2)
+}
+
+/// #955 — do these failure kinds prove the issue WAS built? Only a build can
+/// produce a reviewable diff to reject or a gate to redden.
+fn was_built(kinds: &[FailureKind]) -> bool {
+    kinds
+        .iter()
+        .any(|k| matches!(k, FailureKind::ReviewReject | FailureKind::GateRed))
+}
+
+/// #955 — the builder's context when a not-fixable verdict is overruled.
+///
+/// The refusal reason is not an implementation spec ([`spec_from_scope`]
+/// refuses to pass it off as one), but it is the objection the diff has to
+/// answer, so it reaches the builder as context instead of being dropped.
+fn overruled_scope_note(prior: Option<&str>, reason: &str) -> String {
+    let mut out = prior.unwrap_or_default().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(&format!(
+        "### Scoping pass on THIS attempt called the issue not agent-fixable \
+         (overruled)\nAn earlier attempt built a reviewable diff for it, so \
+         the verdict was overruled and you have no spec. Treat the objection \
+         below as what your fix has to answer, not as permission to \
+         stop:\n{}",
+        truncate(reason, 1200)
+    ));
+    out
 }
 
 /// #843 — should this scoped issue be refused BEFORE the build?
@@ -1758,9 +1849,9 @@ fn build_scope_prompt(issue: &Issue, prior: Option<&str>) -> String {
 fn prior_attempts_section(prior: Option<&str>) -> String {
     match prior {
         Some(p) => format!(
-            "\n\n## Prior attempts on this issue (each of these already \
-             failed — address the stated cause explicitly and say in your \
-             summary how this attempt differs)\n{p}"
+            "\n\n## Prior attempts on this issue (what happened last time — \
+             address the stated cause explicitly and say in your summary how \
+             this attempt differs)\n{p}"
         ),
         None => String::new(),
     }
@@ -4408,7 +4499,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // attributable to capability or to harness friction. `reasoner` is built
     // per attempt, so its usage counters are exactly this attempt's.
     let started = std::time::Instant::now();
-    let prior_attempts = AttemptHistory::load(&attempt_history_path()).digest(issue.number);
+    let mut prior_attempts = AttemptHistory::load(&attempt_history_path()).digest(issue.number);
     let rec = |kind: FailureKind, stage: &str, detail: &str, diffstat: &str, lines: usize| {
         AttemptRecord {
             at: unix_now(),
@@ -4450,28 +4541,42 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // #932 — a red-main issue is never labelled out: that would hold the
         // loop until a human notices, which is the outage this exists to end.
         if !s.fixable && !is_red_main_issue(&issue.body) {
-            // #653 — the scoper judged this not agent-fixable (research ask,
-            // epic, owner decision, …). Label it out so it is scoped at most
-            // once, and leave the reason on the issue.
-            cleanup(worktree, branch, repo_root.to_path_buf()).await;
-            backoff_comment(
-                repo_root,
-                issue.number,
-                &format!(
-                    "Auto-fix triage: the scoping pass judged this issue not \
-                     agent-fixable, so the pipeline is leaving it for a \
-                     human. Reason:\n\n{}\n\nRemove the `{GAVE_UP_LABEL}` \
-                     label to have it re-triaged.",
-                    truncate(&s.body, 1200)
-                ),
-            )
-            .await
-            .ok();
-            label_gave_up(repo_root, issue.number).await.ok();
-            return Ok(RunReport::triage(format!(
-                "issue #{}: scoped as not agent-fixable — labeled out",
-                issue.number
-            )));
+            if label_out_evidence(repo_root, issue.number)
+                .await
+                .is_some_and(|kinds| may_label_out(&kinds))
+            {
+                // #653 — the scoper judged this not agent-fixable (research
+                // ask, epic, owner decision, …). Label it out so it is scoped
+                // at most once, and leave the reason on the issue.
+                cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                backoff_comment(
+                    repo_root,
+                    issue.number,
+                    &format!(
+                        "Auto-fix triage: {SCOPE_GAVE_UP_MARKER}, so the \
+                         pipeline is leaving it for a human. Reason:\n\n{}\n\n\
+                         Remove the `{GAVE_UP_LABEL}` label to have it \
+                         re-triaged.",
+                        truncate(&s.body, 1200)
+                    ),
+                )
+                .await
+                .ok();
+                label_gave_up(repo_root, issue.number).await.ok();
+                return Ok(RunReport::triage(format!(
+                    "issue #{}: scoped as not agent-fixable — labeled out",
+                    issue.number
+                )));
+            }
+            // #955 — the evidence does not carry the verdict (see
+            // `may_label_out`): the run falls through to the builder with the
+            // objection as context rather than spending the terminal label.
+            info!(
+                issue = issue.number,
+                "scoped as not agent-fixable on evidence that does not support \
+                 it — building anyway instead of labeling out"
+            );
+            prior_attempts = Some(overruled_scope_note(prior_attempts.as_deref(), &s.body));
         }
     }
     // #843 — the scoper's own predictions, made binding. A refusal here has
@@ -4506,10 +4611,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }
 
     let complexity = scope.as_ref().map(|s| s.complexity).unwrap_or(Complexity::Hard);
-    let plan = scope
-        .as_ref()
-        .map(|s| s.body.clone())
-        .filter(|b| !b.is_empty());
+    let plan = spec_from_scope(scope.as_ref());
 
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
     let opts = fix_opts(worktree.clone());
@@ -5347,7 +5449,7 @@ async fn record_attempt(repo_root: &Path, issue: u64, rec: Option<AttemptRecord>
         repo_root,
     )
     .await?;
-    let prior = stdout.matches("<!-- self-improve-attempt -->").count() as u32;
+    let prior = stdout.matches(ATTEMPT_MARKER).count() as u32;
     // #851 — a model failure is remembered for the rest of the UTC day so
     // the picker moves on instead of handing this issue straight back next
     // tick (a deterministic refusal would only be re-bought). Harness
@@ -5399,6 +5501,129 @@ async fn label_gave_up(repo_root: &Path, issue: u64) -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+/// #955 — gave-up issues re-checked per tick. Each costs one `gh issue view`:
+/// no reasoner call, so nothing here touches the daily cap. A backlog past
+/// this bound drains over successive ticks (one issue is picked per tick
+/// anyway, so restoring them faster would buy nothing).
+const MAX_RETRIAGE_PER_TICK: usize = 10;
+
+/// #955 — the failure kinds recorded in an issue's `gh issue view --json
+/// comments` blob, oldest first. Marker shape (see [`attempt_marker_body`]):
+/// `<!-- self-improve-attempt --> attempt 2 — gate-red at gate after 41s: …`.
+fn marker_kinds(comments: &str) -> Vec<FailureKind> {
+    comments
+        .split(ATTEMPT_MARKER)
+        .skip(1)
+        .filter_map(|tail| {
+            let (_, rest) = tail.split_once('—')?;
+            FailureKind::parse(rest.split_whitespace().next()?)
+        })
+        .collect()
+}
+
+/// #955 — the failures GitHub durably records for `issue`, for
+/// [`may_label_out`]. `None` when they could not be read: a `gh` outage is
+/// not evidence that nothing was ever attempted, and the label is terminal,
+/// so the caller withholds it rather than guessing.
+///
+/// The markers, not the local [`AttemptHistory`]: that file rolls over at
+/// `MAX_HISTORY_PER_ISSUE`, so a run of harness failures can evict the
+/// review-reject that proves an issue was built. Only charged attempts leave
+/// a marker, which is exactly what the policy weighs.
+async fn label_out_evidence(repo_root: &Path, issue: u64) -> Option<Vec<FailureKind>> {
+    let gh = gh_bin();
+    match run(
+        &gh,
+        &["issue", "view", &issue.to_string(), "--json", "comments"],
+        repo_root,
+    )
+    .await
+    {
+        Ok((true, comments, _)) => Some(marker_kinds(&comments)),
+        _ => None,
+    }
+}
+
+/// #955 — was this issue labelled out by a not-fixable verdict that its own
+/// history refutes? Retroactively only one thing does: [`was_built`] — the
+/// issue already came back as a reviewable diff, so it was never the
+/// triage-only ask the verdict called it.
+///
+/// Deliberately narrower than [`may_label_out`], which also spares a
+/// never-built issue on a single failure. That branch is a decision to spend
+/// one more attempt, and it belongs to a run that re-scopes the issue first;
+/// the sweep only removes a label, so an epic or research ask whose one
+/// attempt produced no diff (no-changes, guard refusal) keeps its label
+/// rather than being handed back on a guess — #915 is such an epic and stays
+/// terminal. Two more label-outs stay terminal: a back-off at
+/// [`MAX_ATTEMPTS`] (the budget doing its job — without that floor an issue
+/// scoped out once and later built to exhaustion would be revived every tick
+/// forever), and any label-out with no scoping verdict behind it.
+fn gave_up_is_stale(comments: &str) -> bool {
+    if !comments.contains(SCOPE_GAVE_UP_MARKER) {
+        return false;
+    }
+    let kinds = marker_kinds(comments);
+    let charged = kinds
+        .iter()
+        .filter(|k| k.counts_toward_max_attempts())
+        .count();
+    charged < MAX_ATTEMPTS as usize && was_built(&kinds)
+}
+
+/// The open issues in a REST issues array that carry [`GAVE_UP_LABEL`] —
+/// exactly the rows [`rest_issue_candidates`] drops.
+fn gave_up_numbers(v: &serde_json::Value) -> Vec<u64> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|iss| iss.get("pull_request").is_none() && has_gave_up_label(iss))
+                .filter_map(|iss| iss.get("number").and_then(serde_json::Value::as_u64))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// #955 — hand back the issues the not-fixable verdict labelled out although
+/// an earlier attempt had already built a diff for them. Removing the label
+/// is the whole re-triage: the next tick sees them as ordinary candidates
+/// again.
+async fn retriage_gave_up(repo_root: &Path, issues: &serde_json::Value) {
+    let gh = gh_bin();
+    for number in gave_up_numbers(issues).into_iter().take(MAX_RETRIAGE_PER_TICK) {
+        let n = number.to_string();
+        let Ok((true, comments, _)) =
+            run(&gh, &["issue", "view", &n, "--json", "comments"], repo_root).await
+        else {
+            continue;
+        };
+        if !gave_up_is_stale(&comments) {
+            continue;
+        }
+        if let Ok((true, _, _)) = run(
+            &gh,
+            &["issue", "edit", &n, "--remove-label", GAVE_UP_LABEL],
+            repo_root,
+        )
+        .await
+        {
+            info!(issue = number, "re-triage: removed `{GAVE_UP_LABEL}` (#955)");
+            backoff_comment(
+                repo_root,
+                number,
+                &format!(
+                    "Auto-fix triage: removing `{GAVE_UP_LABEL}` — an earlier \
+                     attempt already built a reviewable diff for this issue, \
+                     which #955 no longer squares with a not-agent-fixable \
+                     verdict."
+                ),
+            )
+            .await
+            .ok();
+        }
+    }
 }
 
 /// Clip `s` to a `max`-BYTE budget, appending an ellipsis.
@@ -6296,6 +6521,23 @@ impl FailureKind {
         }
     }
 
+    const ALL: [Self; 8] = [
+        Self::NoChanges,
+        Self::GuardRefusal,
+        Self::GateRed,
+        Self::ReviewReject,
+        Self::PublishFailed,
+        Self::ReasonerError,
+        Self::Infra,
+        Self::Other,
+    ];
+
+    /// Inverse of [`as_str`](Self::as_str): #955's re-triage sweep reads
+    /// kinds back out of the durable GitHub marker comments.
+    fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == name)
+    }
+
     /// Model-attributable kinds count toward `MAX_ATTEMPTS`; harness kinds
     /// (a reasoner error, an infrastructure failure) are remembered but
     /// never charged — #803's "harness failures must not become model
@@ -6510,14 +6752,19 @@ impl AttemptHistory {
     /// on its own if it alone exceeds the budget).
     fn digest(&self, issue: u64) -> Option<String> {
         let recs = self.issues.get(&issue).filter(|r| !r.is_empty())?;
+        // #955 — the scoper may only call an issue not-fixable on two or more
+        // same-kind failures, so the per-kind tally is stated outright: it
+        // covers every record, including the ones the byte budget below drops.
+        let header = attempt_tally(recs);
+        let budget = MAX_DIGEST_BYTES.saturating_sub(header.len() + 1);
         let mut kept: Vec<String> = Vec::new();
         let mut used = 0usize;
         for rec in recs.iter().rev() {
             let entry = digest_entry(rec);
             let cost = entry.len() + usize::from(!kept.is_empty());
-            if used + cost > MAX_DIGEST_BYTES {
+            if used + cost > budget {
                 if kept.is_empty() {
-                    kept.push(truncate_tail(&entry, MAX_DIGEST_BYTES));
+                    kept.push(truncate_tail(&entry, budget));
                 }
                 break;
             }
@@ -6525,8 +6772,29 @@ impl AttemptHistory {
             kept.push(entry);
         }
         kept.reverse();
+        kept.insert(0, header);
         Some(kept.join("\n"))
     }
+}
+
+/// #955 — `"3 prior attempts (2 review-reject, 1 no-changes):"`. The scoper's
+/// ≥2-same-kind rule can only be applied to counts it can see, so the tally
+/// is derived from every record rather than from the digest entries that fit.
+fn attempt_tally(recs: &[AttemptRecord]) -> String {
+    let mut by_kind: Vec<(FailureKind, usize)> = Vec::new();
+    for rec in recs {
+        match by_kind.iter_mut().find(|(k, _)| *k == rec.kind) {
+            Some((_, n)) => *n += 1,
+            None => by_kind.push((rec.kind, 1)),
+        }
+    }
+    let tally = by_kind
+        .iter()
+        .map(|(k, n)| format!("{n} {}", k.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let plural = if recs.len() == 1 { "attempt" } else { "attempts" };
+    format!("{} prior {plural} ({tally}):", recs.len())
 }
 
 fn digest_entry(rec: &AttemptRecord) -> String {
@@ -6608,7 +6876,7 @@ fn record_reasoner_error(issue: u64, rec: AttemptRecord) {
 /// (the count is derived from it) and now says what happened.
 fn attempt_marker_body(n: u32, rec: &AttemptRecord) -> String {
     let head = format!(
-        "<!-- self-improve-attempt --> attempt {n} — {} at {} after {}s",
+        "{ATTEMPT_MARKER} attempt {n} — {} at {} after {}s",
         rec.kind.as_str(),
         rec.stage,
         rec.wall_secs
@@ -8945,6 +9213,31 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         );
     }
 
+    // Structural (#955): the terminal label-out is gated on `may_label_out`,
+    // and the fall-through hands the overruled verdict to the builder as
+    // context instead of dropping it.
+    #[test]
+    fn not_fixable_label_out_is_gated_on_may_label_out() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let body = &src[start..];
+        let at = body.find("if !s.fixable").expect("fixability branch");
+        let block = &body[at..];
+        let guard = block
+            .find("label_out_evidence(repo_root, issue.number)")
+            .expect("label-out is gated on the #955 policy");
+        let weighed = block
+            .find(".is_some_and(|kinds| may_label_out(&kinds))")
+            .expect("a `gh` failure (None) must not label the issue out");
+        assert!(weighed > guard && weighed - guard < 100, "{guard} {weighed}");
+        let label = block.find("label_gave_up(").expect("label-out");
+        let note = block
+            .find("prior_attempts = Some(overruled_scope_note(")
+            .expect("the overruled verdict reaches the builder");
+        assert!(guard < label, "the policy gate must precede label_gave_up");
+        assert!(label < note, "the fall-through follows the guarded return");
+    }
+
     // Structural: the #931 "not charged" exit does not apply to the red-main
     // issue itself — its failing tests are the job, so a red gate there is a
     // real attempt.
@@ -9662,6 +9955,186 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let a = digest.find(&format!("attempt-{} ", newest - 1)).unwrap();
         let b = digest.find(&format!("attempt-{newest} ")).unwrap();
         assert!(a < b);
+    }
+
+    // --- #955: one failed attempt is not evidence an issue is unfixable ----
+
+    #[test]
+    fn attempt_history_digest_tallies_attempts_per_kind() {
+        let mut h = AttemptHistory::default();
+        h.push(7, test_record(FailureKind::ReviewReject, "qa-review", "x"));
+        assert!(
+            h.digest(7).unwrap().starts_with("1 prior attempt (1 review-reject):"),
+            "singular, per kind: {:?}",
+            h.digest(7)
+        );
+        for _ in 0..2 {
+            h.push(7, test_record(FailureKind::GateRed, "gate", "y"));
+        }
+        assert!(
+            h.digest(7)
+                .unwrap()
+                .starts_with("3 prior attempts (1 review-reject, 2 gate-red):"),
+            "{:?}",
+            h.digest(7)
+        );
+
+        // Entries dropped for the byte budget must not shrink the tally: the
+        // scoper's ≥2-same-kind rule reads the header, not the entries.
+        let mut big = AttemptHistory::default();
+        for i in 0..MAX_HISTORY_PER_ISSUE {
+            let detail = format!("attempt-{i} {}", "x".repeat(1_150));
+            big.push(7, test_record(FailureKind::ReviewReject, "qa-review", &detail));
+        }
+        let digest = big.digest(7).unwrap();
+        assert!(!digest.contains("attempt-0 "), "entries were dropped");
+        assert!(
+            digest.starts_with(&format!(
+                "{MAX_HISTORY_PER_ISSUE} prior attempts ({MAX_HISTORY_PER_ISSUE} review-reject):"
+            )),
+            "{digest}"
+        );
+    }
+
+    #[test]
+    fn may_label_out_needs_a_repeated_cause_and_never_a_built_issue() {
+        use FailureKind::*;
+        // The label exists for the first-pass triage verdict: no attempt.
+        assert!(may_label_out(&[]));
+        // #926 verbatim: ONE review-reject, then a not-fixable verdict. Built
+        // once is built — a later same-kind pile-up changes nothing.
+        assert!(!may_label_out(&[ReviewReject]));
+        assert!(!may_label_out(&[GateRed]));
+        assert!(!may_label_out(&[ReviewReject, ReviewReject]));
+        assert!(!may_label_out(&[NoChanges, NoChanges, GateRed]));
+        // Never built: one failure is not evidence, two of a kind are.
+        for kind in [NoChanges, GuardRefusal, PublishFailed, Other] {
+            assert!(!may_label_out(&[kind]), "{kind:?}: one failure");
+            assert!(may_label_out(&[kind, kind]), "{kind:?}: repeated cause");
+        }
+        assert!(!may_label_out(&[NoChanges, GuardRefusal]), "different causes");
+        // Harness failures are not the issue's fault and never count (#803).
+        assert!(may_label_out(&[ReasonerError, Infra, ReasonerError]));
+        assert!(!may_label_out(&[ReasonerError, NoChanges]));
+    }
+
+    #[test]
+    fn overruled_scope_note_hands_the_builder_the_objection() {
+        let note = overruled_scope_note(Some("1 prior attempt:"), "needs an owner decision");
+        assert!(note.starts_with("1 prior attempt:"), "{note}");
+        assert!(note.contains("overruled") && note.contains("needs an owner decision"), "{note}");
+        assert!(overruled_scope_note(None, "no spec for you").contains("no spec for you"));
+    }
+
+    #[test]
+    fn scope_prompt_requires_two_same_kind_failures() {
+        assert!(SCOPE_SYSTEM.contains("two or more"), "the ≥2 rule is stated");
+        assert!(SCOPE_SYSTEM.contains("same kind"));
+        assert!(
+            !SCOPE_SYSTEM.contains("repeated failures on the same cause"),
+            "the #859 clause that treated one failure as terminal is gone"
+        );
+        assert!(
+            SCOPE_SYSTEM.contains("address each stated cause"),
+            "the prior-attempts ground-truth instruction stays"
+        );
+    }
+
+    #[test]
+    fn spec_from_scope_drops_a_not_fixable_body() {
+        let fixable = parse_scope_output("VERDICT: fixable\nCOMPLEXITY: simple\n\nthe spec");
+        assert_eq!(spec_from_scope(Some(&fixable)).as_deref(), Some("the spec"));
+        let refused = parse_scope_output("VERDICT: not-fixable\n\nthis needs an owner decision");
+        assert_eq!(
+            spec_from_scope(Some(&refused)),
+            None,
+            "a refusal reason is never handed to the builder as a spec"
+        );
+        assert_eq!(spec_from_scope(None), None);
+        let empty = parse_scope_output("VERDICT: fixable\nCOMPLEXITY: simple\n");
+        assert_eq!(spec_from_scope(Some(&empty)), None);
+    }
+
+    /// A `gh issue view --json comments` blob, as the sweep reads it.
+    fn comments_blob(bodies: &[String]) -> String {
+        let comments: Vec<_> = bodies.iter().map(|b| serde_json::json!({"body": b})).collect();
+        serde_json::json!({ "comments": comments }).to_string()
+    }
+
+    fn scope_gave_up_comment() -> String {
+        format!("Auto-fix triage: {SCOPE_GAVE_UP_MARKER}, so the pipeline is leaving it for a human.")
+    }
+
+    // The reported case (#955) verbatim: #915, #916, #917 and #926 were each
+    // labelled `agent-gave-up` by the not-fixable scoping verdict after a
+    // SINGLE failed attempt, and the label is terminal — the pool drained.
+    // The sweep hands back the ones an attempt had already built; #915, the
+    // epic whose attempt produced no diff, is correctly terminal and stays.
+    #[test]
+    fn single_failure_label_outs_are_re_triaged() {
+        let listing = serde_json::json!([
+            {"number": 915, "labels": [{"name": GAVE_UP_LABEL}]},
+            {"number": 916, "labels": [{"name": GAVE_UP_LABEL}]},
+            {"number": 917, "labels": [{"name": GAVE_UP_LABEL}]},
+            {"number": 926, "labels": [{"name": GAVE_UP_LABEL}]},
+            {"number": 940, "labels": [{"name": FIXABLE_LABEL}]},
+            {"number": 941, "labels": [{"name": GAVE_UP_LABEL}], "pull_request": {}},
+        ]);
+        assert_eq!(gave_up_numbers(&listing), vec![915, 916, 917, 926]);
+        assert!(
+            rest_issue_candidates(&listing).iter().all(|i| i.number == 940),
+            "the labelled rows are exactly the ones the picker drops"
+        );
+        let after_one = |kind| {
+            let attempt = attempt_marker_body(1, &test_record(kind, "qa-review", "REVIEW: reject"));
+            comments_blob(&[attempt, scope_gave_up_comment()])
+        };
+        // #916, #917, #926: one attempt, and it came back as a diff.
+        for kind in [FailureKind::ReviewReject, FailureKind::GateRed] {
+            assert!(gave_up_is_stale(&after_one(kind)), "{kind:?}: built once");
+        }
+        // #915: one attempt, no diff out of it. The sweep does not re-scope,
+        // so a verdict it cannot refute is left standing.
+        for kind in [FailureKind::NoChanges, FailureKind::GuardRefusal] {
+            assert!(!gave_up_is_stale(&after_one(kind)), "{kind:?}: never built");
+        }
+    }
+
+    #[test]
+    fn gave_up_stays_terminal_where_the_verdict_holds() {
+        let markers = |kind, n: u32| {
+            (1..=n)
+                .map(|i| attempt_marker_body(i, &test_record(kind, "gate", "cargo test failed")))
+                .collect::<Vec<_>>()
+        };
+        // A first-pass verdict with no attempt behind it: research ask, epic,
+        // owner decision — exactly what the label is for.
+        assert!(!gave_up_is_stale(&comments_blob(&[scope_gave_up_comment()])));
+        // Two failures of one kind, never built: the verdict now holds.
+        let mut twice = markers(FailureKind::GuardRefusal, 2);
+        twice.push(scope_gave_up_comment());
+        assert!(!gave_up_is_stale(&comments_blob(&twice)));
+        // Back-off at MAX_ATTEMPTS. Without this floor an issue that was
+        // scoped out once and later built to exhaustion would be revived on
+        // every tick forever.
+        let mut spent = markers(FailureKind::GateRed, MAX_ATTEMPTS);
+        spent.push(scope_gave_up_comment());
+        assert!(!gave_up_is_stale(&comments_blob(&spent)));
+        // No scoping verdict behind the label (blast-radius, publish failure).
+        assert!(!gave_up_is_stale(&comments_blob(&[
+            attempt_marker_body(1, &test_record(FailureKind::ReviewReject, "qa-review", "x")),
+            "Self-improve gave up after 3 attempts: publishing kept failing.".into(),
+        ])));
+    }
+
+    #[test]
+    fn marker_kinds_reads_back_every_recorded_kind() {
+        for kind in FailureKind::ALL {
+            // The detail's own em dash must not be mistaken for the marker's.
+            let body = attempt_marker_body(2, &test_record(kind, "gate", "an — em dash in detail"));
+            assert_eq!(marker_kinds(&comments_blob(&[body])), vec![kind], "{kind:?}");
+        }
+        assert!(marker_kinds("no attempt markers here").is_empty());
     }
 
     #[test]
