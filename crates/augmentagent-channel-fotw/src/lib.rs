@@ -44,9 +44,8 @@ pub fn source_id(meeting_id: &str) -> String {
 mod tests {
     /// #921 — the draft hint promises a wiki meeting fact cites `fotw:<id>`,
     /// but the ingest agent that writes the citation learns that rule only from
-    /// `schema/wiki-skill.md`, read at runtime: dropping it silently costs
-    /// every meeting fact its attribution without breaking the build. The rule
-    /// itself landed with #915; #921 leans on it, so pin it here.
+    /// `schema/wiki-skill.md`, read at runtime: dropping it silently costs every
+    /// meeting fact its attribution without breaking the build.
     #[test]
     fn the_wiki_schema_still_requires_meeting_facts_to_cite_fotw() {
         let schema = include_str!("../../../schema/wiki-skill.md");

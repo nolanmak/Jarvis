@@ -18,22 +18,23 @@ use crate::layout::WikiLayout;
 const MEETING_SCAN_LIMIT: usize = 20;
 /// How long one clone scan is reused process-wide (see [`memoized_meetings`]).
 const MEETING_SCAN_TTL: Duration = Duration::from_secs(60);
-/// Most meeting paths a draft hint names.
+/// Most meeting paths a hint names, budget permitting.
 const MEETING_HINT_MAX: usize = 3;
 /// The title and summary sit right below the frontmatter; the transcript
 /// underneath is megabytes, so the cap is on the read, not just on the match.
 const MEETING_HEAD_BYTES: u64 = 8192;
-/// Ceilings on the FINISHED hint, not just on the block #921 appends: meeting
-/// paths are absolute under a host-configured dir, so nothing here can assume
-/// they are short. The pre-#921 400-byte rule (`triage_hint_stays_short`) is a
-/// *triage* invariant and triage keeps it exactly; it cannot also be the draft
-/// ceiling, because the draft hint's own boilerplate already spends most of 400
-/// before a page is named (`draft_hint_is_bounded` pins that), so reusing it
-/// there would silently disable #921 in the common case. Draft gets headroom.
+/// The whole triage nudge, as before #921: a meeting line that would breach it
+/// is dropped rather than shortened.
 const TRIAGE_HINT_MAX_BYTES: usize = 400;
-const DRAFT_HINT_MAX_BYTES: usize = TRIAGE_HINT_MAX_BYTES + 200;
-const MEETING_HINT_HEADER: &str =
-    "Recent meetings mentioning this person (full transcripts; wiki meeting facts cite fotw:<id>):";
+/// Review of #921 asked for that same 400 on the FINISHED draft hint. It cannot
+/// be: the untouched prose already spends ~380 of it before a meeting is named,
+/// so a 400 ceiling would drop the block for exactly the senders the issue is
+/// about — the ones who already have a wiki page (pinned by
+/// `the_reported_sender_gets_a_transcript_that_400_could_not_hold`). #921 owes
+/// the drafting prompt a bounded *delta* instead: at most this many bytes —
+/// still one absolute path at the configured clone's lengths, as before.
+const MEETING_HINT_MAX_BYTES: usize = 200;
+const MEETING_HINT_HEADER: &str = "Recent meetings naming this person (wiki facts cite fotw:<id>):";
 
 pub struct WikiReader<'a> {
     pub layout: &'a WikiLayout,
@@ -88,16 +89,11 @@ impl<'a> WikiReader<'a> {
             )
         };
 
-        // The meetings block gets what is left of the whole hint's budget once
-        // the wiki prose and the blank line joining them are paid for.
-        let spent = if wiki_block.is_empty() {
-            0
-        } else {
-            wiki_block.len() + 2
-        };
+        // A fixed allowance, not a share of one total: what the wiki prose
+        // costs is not #921's to spend (see [`MEETING_HINT_MAX_BYTES`]).
         let meetings = meeting_block(
             &self.meetings_mentioning(email, MEETING_HINT_MAX),
-            DRAFT_HINT_MAX_BYTES.saturating_sub(spent),
+            MEETING_HINT_MAX_BYTES,
         );
         match (wiki_block.is_empty(), meetings.is_empty()) {
             (true, _) => meetings,
@@ -152,8 +148,7 @@ impl<'a> WikiReader<'a> {
     /// names the sender. Empty with no clone configured, no display name, or no
     /// match — which keeps the hints byte-identical to their pre-#921 text in
     /// the common case. Inside a TTL this is a memo lookup and a substring
-    /// compare, no syscall at all (see [`memoized_meetings`]); I/O failure on a
-    /// refresh degrades to no hint, never to a failed hint.
+    /// compare, no syscall at all; I/O failure degrades to no hint.
     fn meetings_mentioning(&self, email: &Email, max: usize) -> Vec<String> {
         let Some(dir) = self.transcripts_meetings_dir.as_deref() else {
             return Vec::new();
@@ -202,12 +197,10 @@ static MEETING_SCAN_MEMO: ScanMemo = Mutex::new(None);
 /// The scan window *and its heads*, re-derived at most once per
 /// [`MEETING_SCAN_TTL`]. Hints run per email on the unattended inbox, so
 /// uncached each message would pay a whole-clone `read_dir` plus
-/// [`MEETING_SCAN_LIMIT`] head reads — latency a slow configured mount cannot
-/// afford. Caching the heads, not just the paths, is what keeps the hot path
-/// free of syscalls; the cost is a just-synced meeting missing one TTL of
-/// hints, and a hint is advisory. The memo is `try_lock`ed and never held
-/// across the I/O, so a hung mount stalls only the email that triggered the
-/// refresh: a concurrent hint takes the miss and scans on its own thread.
+/// [`MEETING_SCAN_LIMIT`] head reads — latency a slow mount cannot afford; the
+/// cost is a just-synced meeting missing one TTL of hints, and a hint is
+/// advisory. The memo is `try_lock`ed and never held across the I/O, so a hung
+/// mount stalls only the email that triggered the refresh.
 fn memoized_meetings(memo: &ScanMemo, dir: &Path) -> Meetings {
     if let Ok(state) = memo.try_lock() {
         if let Some((cached, taken, meetings)) = state.as_ref() {
@@ -490,34 +483,49 @@ mod tests {
         );
 
         let r = WikiReader::new(&layout).with_transcripts_dir(Some(dir));
-        let hint = r.draft_hint(&email("Dana Reyes <dana@example.com>", None));
-        assert!(
-            hint.contains("Recent meetings mentioning this person"),
-            "missing meetings block: {hint}"
-        );
+        let e = email("Dana Reyes <dana@example.com>", None);
+        // A title match and — the summary spells the name lowercase — a
+        // case-insensitive summary match, newest first. The name spoken only in
+        // the diarised body is not a match.
+        let hits = r.meetings_mentioning(&e, MEETING_HINT_MAX);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits[0].ends_with("kubernetes-migration-aaaa1111.md"), "{hits:?}");
+        assert!(hits[1].ends_with("azure-cost-bbbb2222.md"), "{hits:?}");
+        let hint = r.draft_hint(&e);
+        assert!(hint.starts_with(MEETING_HINT_HEADER), "missing block: {hint}");
         assert!(hint.contains("2026-08-20-kubernetes-migration-aaaa1111.md"));
-        // Case-insensitive: the summary spells the name lowercase.
-        assert!(hint.contains("2026-08-19-azure-cost-bbbb2222.md"));
         assert!(!hint.contains("2026-08-18-standup-cccc3333.md"));
         // A bare address carries no display name to scan the clone for.
         assert_eq!(r.draft_hint(&email("dana@example.com", None)), "");
     }
 
-    /// PR review of #921 — the ceiling is on the FINISHED hint, not just on the
-    /// block this change appends: a person page, a thread page AND matching
-    /// transcripts together must still land inside the budget.
+    /// #921's reported case, and the answer to the review that asked for a
+    /// 400-byte ceiling on the FINISHED draft hint: `Dana Reyes` is a known
+    /// sender, so her page and her thread are already in the hint and the
+    /// untouched prose leaves less of 400 than a bare header needs — that
+    /// ceiling would drop the block for precisely the senders #921 is about.
+    /// The growth is bounded instead: the prose survives byte-identically as a
+    /// prefix, and however many candidates match, the block adds at most
+    /// [`MEETING_HINT_MAX_BYTES`].
     #[test]
-    fn draft_hint_is_bounded() {
+    fn the_reported_sender_gets_a_transcript_that_400_could_not_hold() {
         let d = TempDir::new().unwrap();
         let layout = WikiLayout::new(d.path().to_path_buf());
         layout.bootstrap().unwrap();
-        std::fs::write(layout.person_page("dana@example.com"), "# Dana\n").unwrap();
+        std::fs::write(layout.person_page("dana@example.com"), "# Dana Reyes\n").unwrap();
         std::fs::write(layout.thread_page("t1"), "# t1\n").unwrap();
         let dir = meetings_dir(&d);
+        meeting_file(
+            &dir,
+            "2026-08-20-kubernetes-migration-aaaa1111.md",
+            "Kubernetes migration with Dana Reyes",
+            "Scoped the cutover.",
+            "[00:01] S0: unrelated",
+        );
         for i in 0..40 {
             meeting_file(
                 &dir,
-                &format!("2026-08-{:02}-sync-{i:04}aaaa.md", (i % 28) + 1),
+                &format!("2026-08-{:02}-sync-{i:04}aaaa.md", (i % 19) + 1),
                 "Weekly sync",
                 "Dana Reyes attended.",
                 "[00:01] S0: unrelated",
@@ -530,19 +538,18 @@ mod tests {
             .with_transcripts_dir(Some(dir))
             .draft_hint(&e);
         assert!(hint.starts_with(&before), "wiki block lost: {hint}");
-        assert!(hint.len() <= DRAFT_HINT_MAX_BYTES, "too long: {hint}");
-        // PR review of #921 asked for triage's 400 here too; this is why it
-        // cannot be. The untouched pre-#921 prose already spends nearly all of
-        // it, so a 400 ceiling would name no meeting at all in the common case.
-        let floor = TRIAGE_HINT_MAX_BYTES - MEETING_HINT_HEADER.len();
-        assert!(before.len() > floor, "draft prose shrank: {before}");
-        let paths: Vec<&str> = hint.lines().filter(|l| l.contains("-sync-")).collect();
-        // 40 candidates, at most three named — fewer on a long temp root.
         assert!(
-            (1..=MEETING_HINT_MAX).contains(&paths.len()),
-            "expected 1..=3 paths: {paths:?}"
+            hint.contains("2026-08-20-kubernetes-migration-aaaa1111.md"),
+            "reported case lost its transcript: {hint}"
         );
-        let p = paths[0].trim_start_matches("- ");
+        assert!(hint.len() <= before.len() + 2 + MEETING_HINT_MAX_BYTES, "grew: {hint}");
+        // The arithmetic that rules 400 out — if the prose ever shrinks enough
+        // for a block to fit, drop the allowance and use the one ceiling.
+        assert!(
+            TRIAGE_HINT_MAX_BYTES.saturating_sub(before.len()) < MEETING_HINT_HEADER.len(),
+            "400 would now fit a meetings block: {before}"
+        );
+        let p = hint.lines().last().expect("a path line").trim_start_matches("- ");
         assert!(Path::new(p).is_absolute(), "path must be absolute: {p}");
     }
 
@@ -596,8 +603,7 @@ mod tests {
     }
 
     /// PR review of #921 — the scan never materialises or sorts the whole
-    /// directory: only the newest [`MEETING_SCAN_LIMIT`] *dated* names survive,
-    /// so undated strays cannot evict real meetings.
+    /// directory: only the newest [`MEETING_SCAN_LIMIT`] *dated* names survive.
     #[test]
     fn the_scan_window_is_bounded_and_newest_first() {
         let d = TempDir::new().unwrap();
@@ -620,8 +626,7 @@ mod tests {
 
     /// PR review of #921 — a hint on the unattended inbox's hot path must not
     /// touch the clone at all: neither the `read_dir` nor the per-candidate head
-    /// reads may run per email, so BOTH are derived once per TTL. Memo injected
-    /// here; production has one, static.
+    /// reads may run per email, so BOTH are derived once per TTL.
     #[test]
     fn clone_discovery_and_heads_are_memoized_across_hints() {
         let d = TempDir::new().unwrap();
@@ -643,10 +648,9 @@ mod tests {
         assert!(memoized_meetings(&memo, d.path()).is_empty(), "wrong clone");
     }
 
-    /// PR review of #921 — no hint may wait on another hint's clone I/O. A
+    /// PR review of #921 — no hint may wait on another hint's clone I/O: a
     /// refresh in flight (stood in for by a held memo) costs the next email a
-    /// private scan, not a queue: holding the lock across `read_dir` would park
-    /// every concurrent triage behind one hung mount.
+    /// private scan, not a queue behind one hung mount.
     #[test]
     fn a_refresh_in_flight_never_blocks_another_hint() {
         let d = TempDir::new().unwrap();
