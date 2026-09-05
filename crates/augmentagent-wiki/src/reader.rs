@@ -6,7 +6,7 @@
 //! Claude doesn't have to guess file paths.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use augmentagent_store::Email;
@@ -16,7 +16,7 @@ use crate::layout::WikiLayout;
 /// How many of the newest meeting files a hint scan reads. FlyOnTheWall names
 /// them `YYYY-MM-DD-{slug}-{id8}.md`, so reverse-lexicographic is newest-first.
 const MEETING_SCAN_LIMIT: usize = 20;
-/// How long one clone scan is reused process-wide (see [`memoized_scan`]).
+/// How long one clone scan is reused process-wide (see [`memoized_meetings`]).
 const MEETING_SCAN_TTL: Duration = Duration::from_secs(60);
 /// Most meeting paths a draft hint names.
 const MEETING_HINT_MAX: usize = 3;
@@ -25,9 +25,13 @@ const MEETING_HINT_MAX: usize = 3;
 const MEETING_HEAD_BYTES: u64 = 8192;
 /// Ceilings on the FINISHED hint, not just on the block #921 appends: meeting
 /// paths are absolute under a host-configured dir, so nothing here can assume
-/// they are short. The draft hint's pre-#921 prose alone runs ~370 bytes.
+/// they are short. The pre-#921 400-byte rule (`triage_hint_stays_short`) is a
+/// *triage* invariant and triage keeps it exactly; it cannot also be the draft
+/// ceiling, because the draft hint's own boilerplate already spends most of 400
+/// before a page is named (`draft_hint_is_bounded` pins that), so reusing it
+/// there would silently disable #921 in the common case. Draft gets headroom.
 const TRIAGE_HINT_MAX_BYTES: usize = 400;
-const DRAFT_HINT_MAX_BYTES: usize = 600;
+const DRAFT_HINT_MAX_BYTES: usize = TRIAGE_HINT_MAX_BYTES + 200;
 const MEETING_HINT_HEADER: &str =
     "Recent meetings mentioning this person (full transcripts; wiki meeting facts cite fotw:<id>):";
 
@@ -132,7 +136,7 @@ impl<'a> WikiReader<'a> {
         if let Some(path) = self.meetings_mentioning(email, 1).into_iter().next() {
             let line = format!("- Sender appeared in a recent meeting transcript: {path}");
             let used: usize = lines.iter().map(|l| l.len() + 1).sum();
-            if used + line.len() <= TRIAGE_HINT_MAX_BYTES {
+            if used + line.len() < TRIAGE_HINT_MAX_BYTES {
                 lines.push(line);
             }
         }
@@ -147,9 +151,9 @@ impl<'a> WikiReader<'a> {
     /// Newest-first paths of recent meeting files whose title or summary block
     /// names the sender. Empty with no clone configured, no display name, or no
     /// match — which keeps the hints byte-identical to their pre-#921 text in
-    /// the common case. Costs a memoised directory lookup plus at most
-    /// [`MEETING_SCAN_LIMIT`] reads of [`MEETING_HEAD_BYTES`], short-circuited
-    /// at `max` hits; every I/O failure degrades to no hint, never to a fail.
+    /// the common case. Inside a TTL this is a memo lookup and a substring
+    /// compare, no syscall at all (see [`memoized_meetings`]); I/O failure on a
+    /// refresh degrades to no hint, never to a failed hint.
     fn meetings_mentioning(&self, email: &Email, max: usize) -> Vec<String> {
         let Some(dir) = self.transcripts_meetings_dir.as_deref() else {
             return Vec::new();
@@ -164,8 +168,8 @@ impl<'a> WikiReader<'a> {
         }
 
         let mut hits = Vec::new();
-        for path in memoized_scan(&MEETING_SCAN_MEMO, dir) {
-            if meeting_head(&path).is_some_and(|head| head.contains(&needle)) {
+        for (path, head) in memoized_meetings(&MEETING_SCAN_MEMO, dir).iter() {
+            if head.contains(&needle) {
                 hits.push(path.to_string_lossy().into_owned());
                 if hits.len() == max {
                     break;
@@ -190,31 +194,36 @@ fn display_name(from: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-type ScanMemo = Mutex<Option<(PathBuf, Instant, Vec<PathBuf>)>>;
+/// `Arc` so a cache hit is a refcount bump, not a copy of every head.
+type Meetings = Arc<[(PathBuf, String)]>;
+type ScanMemo = Mutex<Option<(PathBuf, Instant, Meetings)>>;
 static MEETING_SCAN_MEMO: ScanMemo = Mutex::new(None);
 
-/// The scan window, re-derived at most once per [`MEETING_SCAN_TTL`].
-/// [`scan_meeting_files`] bounds what it *keeps*, but a `read_dir` still walks
-/// the whole clone, which grows without limit — and hints run per email on the
-/// unattended inbox. Rate-limiting discovery bounds that: a burst of mail costs
-/// one directory pass, not one per message, at the price of a just-synced
-/// meeting missing one TTL of hints — a hint is advisory. The memo is
-/// `try_lock`ed and never held across the walk, so a clone on a slow or hung
-/// mount stalls the email that triggered the refresh and nothing else: a
-/// concurrent hint takes the miss and scans on its own thread.
-fn memoized_scan(memo: &ScanMemo, dir: &Path) -> Vec<PathBuf> {
+/// The scan window *and its heads*, re-derived at most once per
+/// [`MEETING_SCAN_TTL`]. Hints run per email on the unattended inbox, so
+/// uncached each message would pay a whole-clone `read_dir` plus
+/// [`MEETING_SCAN_LIMIT`] head reads — latency a slow configured mount cannot
+/// afford. Caching the heads, not just the paths, is what keeps the hot path
+/// free of syscalls; the cost is a just-synced meeting missing one TTL of
+/// hints, and a hint is advisory. The memo is `try_lock`ed and never held
+/// across the I/O, so a hung mount stalls only the email that triggered the
+/// refresh: a concurrent hint takes the miss and scans on its own thread.
+fn memoized_meetings(memo: &ScanMemo, dir: &Path) -> Meetings {
     if let Ok(state) = memo.try_lock() {
-        if let Some((cached, taken, files)) = state.as_ref() {
+        if let Some((cached, taken, meetings)) = state.as_ref() {
             if cached == dir && taken.elapsed() < MEETING_SCAN_TTL {
-                return files.clone();
+                return Arc::clone(meetings);
             }
         }
     }
-    let files = scan_meeting_files(dir);
+    let meetings: Meetings = scan_meeting_files(dir)
+        .into_iter()
+        .filter_map(|p| meeting_head(&p).map(|head| (p, head)))
+        .collect();
     if let Ok(mut state) = memo.try_lock() {
-        *state = Some((dir.to_path_buf(), Instant::now(), files.clone()));
+        *state = Some((dir.to_path_buf(), Instant::now(), Arc::clone(&meetings)));
     }
-    files
+    meetings
 }
 
 /// The newest [`MEETING_SCAN_LIMIT`] transcript files, newest first. The window
@@ -414,13 +423,10 @@ mod tests {
     /// The FlyOnTheWall export shape: frontmatter, `# Title`, summary prose,
     /// then the sections the hint scan must never read.
     fn meeting_file(dir: &Path, name: &str, title: &str, summary: &str, transcript: &str) {
-        std::fs::write(
-            dir.join(name),
-            format!(
-                "---\nid: \"{name}\"\ntype: meeting\n---\n\n# {title}\n\n{summary}\n\n## Transcript\n\n{transcript}\n"
-            ),
-        )
-        .unwrap();
+        let body = format!(
+            "---\nid: \"{name}\"\ntype: meeting\n---\n\n# {title}\n\n{summary}\n\n## Transcript\n\n{transcript}\n"
+        );
+        std::fs::write(dir.join(name), body).unwrap();
     }
 
     fn meetings_dir(d: &TempDir) -> PathBuf {
@@ -525,6 +531,11 @@ mod tests {
             .draft_hint(&e);
         assert!(hint.starts_with(&before), "wiki block lost: {hint}");
         assert!(hint.len() <= DRAFT_HINT_MAX_BYTES, "too long: {hint}");
+        // PR review of #921 asked for triage's 400 here too; this is why it
+        // cannot be. The untouched pre-#921 prose already spends nearly all of
+        // it, so a 400 ceiling would name no meeting at all in the common case.
+        let floor = TRIAGE_HINT_MAX_BYTES - MEETING_HINT_HEADER.len();
+        assert!(before.len() > floor, "draft prose shrank: {before}");
         let paths: Vec<&str> = hint.lines().filter(|l| l.contains("-sync-")).collect();
         // 40 candidates, at most three named — fewer on a long temp root.
         assert!(
@@ -585,8 +596,8 @@ mod tests {
     }
 
     /// PR review of #921 — the scan never materialises or sorts the whole
-    /// directory: it hands back the newest [`MEETING_SCAN_LIMIT`] *dated* names
-    /// and no more, so undated strays cannot evict real meetings.
+    /// directory: only the newest [`MEETING_SCAN_LIMIT`] *dated* names survive,
+    /// so undated strays cannot evict real meetings.
     #[test]
     fn the_scan_window_is_bounded_and_newest_first() {
         let d = TempDir::new().unwrap();
@@ -607,24 +618,29 @@ mod tests {
         assert_eq!(names[0], "2026-05-08-sync-a.md", "newest meeting missed");
     }
 
-    /// PR review of #921 — bounding what the scan *keeps* does not bound what
-    /// `read_dir` walks, and hints run per email, so discovery is derived once
-    /// per TTL. The memo is injected here; production has one, static.
+    /// PR review of #921 — a hint on the unattended inbox's hot path must not
+    /// touch the clone at all: neither the `read_dir` nor the per-candidate head
+    /// reads may run per email, so BOTH are derived once per TTL. Memo injected
+    /// here; production has one, static.
     #[test]
-    fn clone_discovery_is_memoized_across_hints() {
+    fn clone_discovery_and_heads_are_memoized_across_hints() {
         let d = TempDir::new().unwrap();
         let dir = meetings_dir(&d);
-        std::fs::write(dir.join("2026-08-20-sync-aaaa1111.md"), "x").unwrap();
+        std::fs::write(dir.join("2026-08-20-sync-aaaa1111.md"), "# dana reyes").unwrap();
         let memo = ScanMemo::new(None);
-        let first = memoized_scan(&memo, &dir);
+        let first = memoized_meetings(&memo, &dir);
         assert_eq!(first.len(), 1);
+        // A new meeting AND a rewritten head are both invisible until expiry.
         std::fs::write(dir.join("2026-08-21-sync-bbbb2222.md"), "x").unwrap();
-        assert_eq!(memoized_scan(&memo, &dir), first, "clone re-enumerated");
+        std::fs::write(dir.join("2026-08-20-sync-aaaa1111.md"), "# gone").unwrap();
+        let cached = memoized_meetings(&memo, &dir);
+        assert_eq!(cached.len(), 1, "clone re-enumerated");
+        assert_eq!(cached[0].1, "# dana reyes", "head re-read on the hot path");
 
         // Expiry, and a different clone, both re-scan.
         *memo.lock().unwrap() = None;
-        assert_eq!(memoized_scan(&memo, &dir).len(), 2, "never refreshes");
-        assert!(memoized_scan(&memo, d.path()).is_empty(), "wrong clone");
+        assert_eq!(memoized_meetings(&memo, &dir).len(), 2, "never refreshes");
+        assert!(memoized_meetings(&memo, d.path()).is_empty(), "wrong clone");
     }
 
     /// PR review of #921 — no hint may wait on another hint's clone I/O. A
@@ -640,7 +656,7 @@ mod tests {
         let held = memo.lock().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::scope(|s| {
-            s.spawn(|| tx.send(memoized_scan(&memo, &dir).len()).unwrap());
+            s.spawn(|| tx.send(memoized_meetings(&memo, &dir).len()).unwrap());
             let got = rx.recv_timeout(Duration::from_secs(10));
             drop(held);
             assert_eq!(got, Ok(1), "hint queued behind an in-flight refresh");

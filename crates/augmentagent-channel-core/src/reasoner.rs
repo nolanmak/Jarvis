@@ -2359,39 +2359,22 @@ mod tests {
         }
     }
 
-    /// #921 acceptance on the ask path: with a clone configured the agent can
-    /// REACH the transcripts (`--add-dir` plus the scope guard's env) *and* is
-    /// TOLD they exist (`schema/wiki-ask.md`); with none configured, nothing
-    /// changes. An open directory nobody is told about is never grepped.
+    /// #921's ask-path half needs no production change here: `ask_opts` already
+    /// opens the clone via `--add-dir` and forwards AUGMENTAGENT_TRANSCRIPTS_DIR
+    /// to the scope guard (#915/#922, pinned by
+    /// `ask_opts_add_the_transcript_clone_only_when_it_exists` and
+    /// `ask_opts_forwards_transcripts_dir_to_the_scope_guard`). Reach is only
+    /// half of it — an open directory nobody is TOLD about is never grepped —
+    /// and the telling lives in `schema/wiki-ask.md`, which is `include_str!`d,
+    /// so dropping that section would silently un-surface the transcripts
+    /// without failing a build. Hence this guard.
     #[test]
-    fn ask_opts_opens_and_documents_the_transcript_clone() {
+    fn ask_prompt_documents_the_transcript_clone() {
         let repo = tempfile::tempdir().expect("repo tmpdir");
         let wiki = tempfile::tempdir().expect("wiki tmpdir");
-        let clone = tempfile::tempdir().expect("clone tmpdir");
-        let key = "AUGMENTAGENT_TRANSCRIPTS_DIR";
-
-        // Unconfigured: the wiki and nothing else. One live EnvGuard at a time
-        // — it holds the global env lock, so a second would self-deadlock.
-        let bare = {
-            let _g = EnvGuard::unset(key);
-            ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf())
-        };
-        assert_eq!(bare.add_dirs.len(), 1, "nothing to open without a clone");
-        assert!(!bare.env.iter().any(|(k, _)| k == key));
-
-        let _g = EnvGuard::set(key, clone.path().to_str().expect("utf8 tmpdir"));
         let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
-        assert!(
-            opts.add_dirs.iter().any(|d| d.as_path() == clone.path()),
-            "the clone must be opened for the session"
-        );
-        assert!(
-            opts.env
-                .iter()
-                .any(|(k, v)| k == key && v.as_str() == clone.path().to_string_lossy()),
-            "the scope guard must see the same clone"
-        );
-        for needle in ["## Meeting transcripts", key] {
+
+        for needle in ["## Meeting transcripts", "AUGMENTAGENT_TRANSCRIPTS_DIR"] {
             assert!(
                 opts.system_prompt.contains(needle),
                 "wiki-ask.md lost the #921 transcripts section: {needle:?}"
