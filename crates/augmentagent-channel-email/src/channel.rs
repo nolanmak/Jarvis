@@ -416,7 +416,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             .as_ref()
             .map(|root| {
                 // Resolving the clone is path arithmetic and its listing is
-                // memoised process-wide: one bounded `read_dir` a minute.
+                // memoised process-wide: one bounded `read_dir` a minute, on
+                // the local checkout `fotw sync` fast-forwards — the same disk
+                // this hint already stats per email for the wiki pages.
                 let layout = augmentagent_wiki::WikiLayout::new(root.clone());
                 augmentagent_wiki::WikiReader::new(&layout)
                     .with_transcripts_dir(augmentagent_wiki::transcripts_meetings_dir_from_env())

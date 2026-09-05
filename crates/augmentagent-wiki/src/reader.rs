@@ -18,23 +18,27 @@ use crate::layout::WikiLayout;
 const MEETING_SCAN_LIMIT: usize = 20;
 /// How long one clone scan is reused process-wide (see [`memoized_meetings`]).
 const MEETING_SCAN_TTL: Duration = Duration::from_secs(60);
-/// Most meeting paths a hint names, budget permitting.
-const MEETING_HINT_MAX: usize = 3;
 /// The title and summary sit right below the frontmatter; the transcript
 /// underneath is megabytes, so the cap is on the read, not just on the match.
 const MEETING_HEAD_BYTES: u64 = 8192;
 /// The whole triage nudge, as before #921: a meeting line that would breach it
 /// is dropped rather than shortened.
 const TRIAGE_HINT_MAX_BYTES: usize = 400;
-/// Review of #921 asked for that same 400 on the FINISHED draft hint. It cannot
-/// be: the untouched prose already spends ~380 of it before a meeting is named,
-/// so a 400 ceiling would drop the block for exactly the senders the issue is
-/// about — the ones who already have a wiki page (pinned by
-/// `the_reported_sender_gets_a_transcript_that_400_could_not_hold`). #921 owes
-/// the drafting prompt a bounded *delta* instead: at most this many bytes —
-/// still one absolute path at the configured clone's lengths, as before.
-const MEETING_HINT_MAX_BYTES: usize = 200;
-const MEETING_HINT_HEADER: &str = "Recent meetings naming this person (wiki facts cite fotw:<id>):";
+/// Most bytes #921 may add to a hint: one meeting, named, and nothing else.
+///
+/// Review asked for that same 400 on the FINISHED draft hint instead. The 400
+/// is `triage_hint`'s own pre-#921 budget (see `triage_hint_stays_short`) and
+/// will not stretch over the draft: the untouched drafting prose already spends
+/// most of it before a meeting is named, so a 400 ceiling there would drop the
+/// block for exactly the senders #921 is about — the ones who already have a
+/// wiki page. `the_reported_sender_gets_a_transcript_that_400_could_not_hold`
+/// pins that arithmetic. So what is bounded is the *delta*, and this is it.
+const MEETING_HINT_MAX_BYTES: usize = 160;
+/// Neither hint's call is granted the clone — the fotw channel's rule 2 keeps
+/// raw transcripts out of prompts — so a hint names the meeting rather than a
+/// path it would only be denied for Reading. What these calls *can* read is the
+/// wiki, where the same meeting's distilled facts cite `fotw:<id>`.
+const MEETING_HINT_HEADER: &str = "Recent meeting naming this person (wiki facts cite fotw:<id>):";
 
 pub struct WikiReader<'a> {
     pub layout: &'a WikiLayout,
@@ -90,11 +94,13 @@ impl<'a> WikiReader<'a> {
         };
 
         // A fixed allowance, not a share of one total: what the wiki prose
-        // costs is not #921's to spend (see [`MEETING_HINT_MAX_BYTES`]).
-        let meetings = meeting_block(
-            &self.meetings_mentioning(email, MEETING_HINT_MAX),
-            MEETING_HINT_MAX_BYTES,
-        );
+        // costs is not #921's to spend (see [`MEETING_HINT_MAX_BYTES`]). A name
+        // too long to fit is dropped rather than shortened.
+        let meetings = self
+            .meeting_named_for(email)
+            .map(|m| format!("{MEETING_HINT_HEADER}\n- {m}"))
+            .filter(|block| block.len() <= MEETING_HINT_MAX_BYTES)
+            .unwrap_or_default();
         match (wiki_block.is_empty(), meetings.is_empty()) {
             (true, _) => meetings,
             (_, true) => wiki_block,
@@ -126,11 +132,11 @@ impl<'a> WikiReader<'a> {
             }
         }
 
-        // One path only, and no "open it" nudge: triage's add-dir is the wiki
-        // alone, so the transcript is a recency signal, not something this call
-        // can read. Dropped outright when it would breach the budget.
-        if let Some(path) = self.meetings_mentioning(email, 1).into_iter().next() {
-            let line = format!("- Sender appeared in a recent meeting transcript: {path}");
+        // No "open it" nudge, same as the draft side: triage's add-dir is the
+        // wiki alone, so the meeting is a recency signal, not something this
+        // call can read. Dropped outright when it would breach the budget.
+        if let Some(m) = self.meeting_named_for(email) {
+            let line = format!("- Sender appeared in a recent meeting transcript: {m}");
             let used: usize = lines.iter().map(|l| l.len() + 1).sum();
             if used + line.len() < TRIAGE_HINT_MAX_BYTES {
                 lines.push(line);
@@ -144,34 +150,25 @@ impl<'a> WikiReader<'a> {
         }
     }
 
-    /// Newest-first paths of recent meeting files whose title or summary block
-    /// names the sender. Empty with no clone configured, no display name, or no
-    /// match — which keeps the hints byte-identical to their pre-#921 text in
-    /// the common case. Inside a TTL this is a memo lookup and a substring
-    /// compare, no syscall at all; I/O failure degrades to no hint.
-    fn meetings_mentioning(&self, email: &Email, max: usize) -> Vec<String> {
-        let Some(dir) = self.transcripts_meetings_dir.as_deref() else {
-            return Vec::new();
-        };
-        let Some(name) = display_name(&email.from) else {
-            return Vec::new();
-        };
-        let needle = name.to_lowercase();
+    /// The `YYYY-MM-DD-{slug}-{id8}.md` name of the newest recent meeting whose
+    /// title or summary block names the sender. `None` with no clone
+    /// configured, no display name, or no match — which keeps the hints
+    /// byte-identical to their pre-#921 text in the common case. Inside a TTL
+    /// this is a memo lookup and a substring compare, no syscall at all; I/O
+    /// failure degrades to no hint.
+    fn meeting_named_for(&self, email: &Email) -> Option<String> {
+        let dir = self.transcripts_meetings_dir.as_deref()?;
+        let needle = display_name(&email.from)?.to_lowercase();
         // An initials-or-junk substring would match half the clone.
         if needle.chars().count() < 3 {
-            return Vec::new();
+            return None;
         }
 
-        let mut hits = Vec::new();
-        for (path, head) in memoized_meetings(&MEETING_SCAN_MEMO, dir).iter() {
-            if head.contains(&needle) {
-                hits.push(path.to_string_lossy().into_owned());
-                if hits.len() == max {
-                    break;
-                }
-            }
-        }
-        hits
+        memoized_meetings(&MEETING_SCAN_MEMO, dir)
+            .iter()
+            .find(|(_, head)| head.contains(&needle))
+            .and_then(|(path, _)| path.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
     }
 }
 
@@ -261,28 +258,6 @@ fn is_dated_meeting(name: &str) -> bool {
                 c.is_ascii_digit()
             }
         })
-}
-
-/// Header plus one line per path, filled newest-first while the whole block
-/// stays inside `budget` bytes. A path too long to name is simply not named.
-fn meeting_block(paths: &[String], budget: usize) -> String {
-    let mut block = String::new();
-    for p in paths {
-        let line = format!("\n- {p}");
-        let base = if block.is_empty() {
-            MEETING_HINT_HEADER.len()
-        } else {
-            block.len()
-        };
-        if base + line.len() > budget {
-            break;
-        }
-        if block.is_empty() {
-            block.push_str(MEETING_HINT_HEADER);
-        }
-        block.push_str(&line);
-    }
-    block
 }
 
 /// Lowercased `# Title` + summary block — everything above the first `## `
@@ -454,47 +429,42 @@ mod tests {
     }
 
     #[test]
-    fn draft_hint_names_meetings_that_mention_the_counterpart() {
+    fn draft_hint_names_the_newest_meeting_that_mentions_the_counterpart() {
         let d = TempDir::new().unwrap();
         let layout = WikiLayout::new(d.path().to_path_buf());
         layout.bootstrap().unwrap();
         let dir = meetings_dir(&d);
+        // Newest, but named only in the diarised body — must NOT match.
         meeting_file(
             &dir,
-            "2026-08-20-kubernetes-migration-aaaa1111.md",
-            "Kubernetes migration with Dana Reyes",
-            "Scoped the cutover.",
-            "[00:01] S0: unrelated",
-        );
-        meeting_file(
-            &dir,
-            "2026-08-19-azure-cost-bbbb2222.md",
-            "Azure cost review",
-            "dana reyes owns the savings plan follow-up.",
-            "[00:01] S0: unrelated",
-        );
-        // Named only in the diarised body — must NOT match.
-        meeting_file(
-            &dir,
-            "2026-08-18-standup-cccc3333.md",
+            "2026-08-21-standup-cccc3333.md",
             "Standup",
             "Routine.",
             "[00:01] S0: Dana Reyes said she'd take it",
         );
+        meeting_file(
+            &dir,
+            "2026-08-20-azure-cost-bbbb2222.md",
+            "Azure cost review",
+            "dana reyes owns the savings plan follow-up.",
+            "[00:01] S0: unrelated",
+        );
+        meeting_file(
+            &dir,
+            "2026-08-19-kubernetes-migration-aaaa1111.md",
+            "Kubernetes migration with Dana Reyes",
+            "Scoped the cutover.",
+            "[00:01] S0: unrelated",
+        );
 
         let r = WikiReader::new(&layout).with_transcripts_dir(Some(dir));
-        let e = email("Dana Reyes <dana@example.com>", None);
-        // A title match and — the summary spells the name lowercase — a
-        // case-insensitive summary match, newest first. The name spoken only in
-        // the diarised body is not a match.
-        let hits = r.meetings_mentioning(&e, MEETING_HINT_MAX);
-        assert_eq!(hits.len(), 2, "{hits:?}");
-        assert!(hits[0].ends_with("kubernetes-migration-aaaa1111.md"), "{hits:?}");
-        assert!(hits[1].ends_with("azure-cost-bbbb2222.md"), "{hits:?}");
-        let hint = r.draft_hint(&e);
+        let hint = r.draft_hint(&email("Dana Reyes <dana@example.com>", None));
         assert!(hint.starts_with(MEETING_HINT_HEADER), "missing block: {hint}");
-        assert!(hint.contains("2026-08-20-kubernetes-migration-aaaa1111.md"));
-        assert!(!hint.contains("2026-08-18-standup-cccc3333.md"));
+        // One line, and it is the newest *matching* meeting: the summary
+        // matched case-insensitively, the title match below it is older, and
+        // the name spoken only in the diarised body above it is not a match.
+        assert!(hint.ends_with("\n- 2026-08-20-azure-cost-bbbb2222.md"), "{hint}");
+        assert_eq!(hint.matches("\n- ").count(), 1, "one meeting only: {hint}");
         // A bare address carries no display name to scan the clone for.
         assert_eq!(r.draft_hint(&email("dana@example.com", None)), "");
     }
@@ -505,8 +475,8 @@ mod tests {
     /// untouched prose leaves less of 400 than a bare header needs — that
     /// ceiling would drop the block for precisely the senders #921 is about.
     /// The growth is bounded instead: the prose survives byte-identically as a
-    /// prefix, and however many candidates match, the block adds at most
-    /// [`MEETING_HINT_MAX_BYTES`].
+    /// prefix, and however many candidates match, the block adds one meeting
+    /// and at most [`MEETING_HINT_MAX_BYTES`].
     #[test]
     fn the_reported_sender_gets_a_transcript_that_400_could_not_hold() {
         let d = TempDir::new().unwrap();
@@ -538,9 +508,13 @@ mod tests {
             .with_transcripts_dir(Some(dir))
             .draft_hint(&e);
         assert!(hint.starts_with(&before), "wiki block lost: {hint}");
-        assert!(
-            hint.contains("2026-08-20-kubernetes-migration-aaaa1111.md"),
-            "reported case lost its transcript: {hint}"
+        let block = hint
+            .rsplit_once(MEETING_HINT_HEADER)
+            .expect("reported case lost its transcript")
+            .1;
+        assert_eq!(
+            block, "\n- 2026-08-20-kubernetes-migration-aaaa1111.md",
+            "the newest matching meeting, and only it"
         );
         assert!(hint.len() <= before.len() + 2 + MEETING_HINT_MAX_BYTES, "grew: {hint}");
         // The arithmetic that rules 400 out — if the prose ever shrinks enough
@@ -549,57 +523,35 @@ mod tests {
             TRIAGE_HINT_MAX_BYTES.saturating_sub(before.len()) < MEETING_HINT_HEADER.len(),
             "400 would now fit a meetings block: {before}"
         );
-        let p = hint.lines().last().expect("a path line").trim_start_matches("- ");
-        assert!(Path::new(p).is_absolute(), "path must be absolute: {p}");
     }
 
-    /// PR review of #921 — the caller's remaining budget is enforced on the
-    /// real output, path lengths included.
+    /// PR review of #921 — both budgets are enforced on the real output: a
+    /// meeting whose name would breach one is dropped rather than truncated,
+    /// and never at the wiki lines' expense.
     #[test]
-    fn meeting_block_never_exceeds_the_callers_budget() {
-        let paths = |root: &str, n: usize| -> Vec<String> {
-            (0..n)
-                .map(|i| format!("{root}/2026-08-2{i}-weekly-sync-aaaa111{i}.md"))
-                .collect()
-        };
-        let budget = 400;
-        let short = meeting_block(&paths("/home/o/transcripts", MEETING_HINT_MAX), budget);
-        assert_eq!(short.matches("\n- ").count(), MEETING_HINT_MAX);
-        assert!(short.len() <= budget, "{short}");
-        // A deep clone root: entries that long fit once, not three times.
-        let deep = meeting_block(&paths(&"/dddd".repeat(30), MEETING_HINT_MAX), budget);
-        assert_eq!(deep.matches("\n- ").count(), 1, "{deep}");
-        assert!(deep.len() <= budget, "{deep}");
-        // Longer than the whole budget: no header, no dangling bullet. And a
-        // caller with nothing left to spend gets nothing.
-        assert_eq!(meeting_block(&paths(&"d".repeat(500), 1), budget), "");
-        assert_eq!(meeting_block(&paths("/o", MEETING_HINT_MAX), 0), "");
-    }
-
-    /// PR review of #921 — same discipline on the triage side, where the wiki
-    /// lines have already spent part of the budget: a deep clone's path is
-    /// dropped rather than allowed to push the hint over.
-    #[test]
-    fn a_deep_clone_path_cannot_push_the_triage_hint_over_budget() {
+    fn a_long_meeting_name_is_dropped_rather_than_breaching_either_budget() {
         let d = TempDir::new().unwrap();
         let layout = WikiLayout::new(d.path().to_path_buf());
         layout.bootstrap().unwrap();
         std::fs::write(layout.person_page("dana@example.com"), "# Dana\n").unwrap();
         std::fs::write(layout.thread_page("t1"), "# t1\n").unwrap();
-        let dir = d.path().join("d".repeat(200)).join("meetings");
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = meetings_dir(&d);
         meeting_file(
             &dir,
-            "2026-08-20-kickoff-aaaa1111.md",
+            &format!("2026-08-20-{}-aaaa1111.md", "kickoff-".repeat(25)),
             "Kickoff with Dana Reyes",
             "Scoped the rollout.",
             "[00:01] S0: unrelated",
         );
 
         let r = WikiReader::new(&layout).with_transcripts_dir(Some(dir));
-        let hint = r.triage_hint(&email("Dana Reyes <dana@example.com>", Some("t1")));
-        assert!(hint.contains("threads/t1.md"), "wiki lines lost: {hint}");
-        assert!(hint.len() <= TRIAGE_HINT_MAX_BYTES, "too long: {hint}");
+        let e = email("Dana Reyes <dana@example.com>", Some("t1"));
+        assert!(r.meeting_named_for(&e).is_some(), "fixture must match");
+        let triage = r.triage_hint(&e);
+        assert!(triage.contains("threads/t1.md"), "wiki lines lost: {triage}");
+        assert!(!triage.contains("kickoff-"), "over triage budget: {triage}");
+        let bare = WikiReader::new(&layout);
+        assert_eq!(r.draft_hint(&e), bare.draft_hint(&e), "over draft budget");
     }
 
     /// PR review of #921 — the scan never materialises or sorts the whole

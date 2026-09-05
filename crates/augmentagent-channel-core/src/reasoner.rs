@@ -2359,12 +2359,14 @@ mod tests {
         }
     }
 
-    /// #921's ask-path half needs no production change here: `ask_opts` already
-    /// opens the clone and forwards AUGMENTAGENT_TRANSCRIPTS_DIR to the scope
-    /// guard (#915/#922). But reach is half of it — an open directory nobody is
-    /// TOLD about is never grepped — and the telling lives in the `include_str!`d
-    /// `schema/wiki-ask.md`, so dropping that section would silently un-surface
-    /// the transcripts without failing a build. Hence this guard.
+    /// #921's ask-path half shipped ahead of it, in #915/#922: `ask_opts`
+    /// already opens the clone and forwards AUGMENTAGENT_TRANSCRIPTS_DIR to the
+    /// scope guard, and `schema/wiki-ask.md` already carries the section that
+    /// tells the agent to grep it — which is why neither appears in this diff,
+    /// and why re-adding them would only duplicate. But reach is half of it: an
+    /// open directory nobody is TOLD about is never grepped, and the telling
+    /// lives in an `include_str!`d prompt, so dropping that section would
+    /// silently un-surface the transcripts without failing a build.
     #[test]
     fn ask_prompt_documents_the_transcript_clone() {
         let repo = tempfile::tempdir().expect("repo tmpdir");
