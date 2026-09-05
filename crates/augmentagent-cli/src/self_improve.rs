@@ -5503,10 +5503,14 @@ async fn label_gave_up(repo_root: &Path, issue: u64) -> Result<()> {
     Ok(())
 }
 
-/// #955 — gave-up issues re-checked per tick. Each costs one `gh issue view`:
-/// no reasoner call, so nothing here touches the daily cap. A backlog past
-/// this bound drains over successive ticks (one issue is picked per tick
-/// anyway, so restoring them faster would buy nothing).
+/// #955 — gave-up issues handed back per tick. Bounds the label REMOVALS, not
+/// the `gh issue view` reads behind them: a label-out the sweep leaves
+/// standing is terminal and keeps its place in the newest-first listing, so a
+/// read budget would park a stale issue behind the first ten terminal ones
+/// forever. The reads are bounded anyway by the `per_page=50` listing and
+/// cost no reasoner call, and a removal backlog past this bound drains over
+/// successive ticks (one issue is picked per tick anyway, so restoring them
+/// faster would buy nothing).
 const MAX_RETRIAGE_PER_TICK: usize = 10;
 
 /// #955 — the failure kinds recorded in an issue's `gh issue view --json
@@ -5586,22 +5590,34 @@ fn gave_up_numbers(v: &serde_json::Value) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+/// #955 — of the gave-up issues whose comments were read, the ones to hand
+/// back this tick: the stale ones, capped at [`MAX_RETRIAGE_PER_TICK`].
+fn stale_gave_up(fetched: &[(u64, String)]) -> Vec<u64> {
+    fetched
+        .iter()
+        .filter(|(_, comments)| gave_up_is_stale(comments))
+        .map(|(number, _)| *number)
+        .take(MAX_RETRIAGE_PER_TICK)
+        .collect()
+}
+
 /// #955 — hand back the issues the not-fixable verdict labelled out although
 /// an earlier attempt had already built a diff for them. Removing the label
 /// is the whole re-triage: the next tick sees them as ordinary candidates
 /// again.
 async fn retriage_gave_up(repo_root: &Path, issues: &serde_json::Value) {
     let gh = gh_bin();
-    for number in gave_up_numbers(issues).into_iter().take(MAX_RETRIAGE_PER_TICK) {
+    let mut fetched = Vec::new();
+    for number in gave_up_numbers(issues) {
         let n = number.to_string();
-        let Ok((true, comments, _)) =
+        if let Ok((true, comments, _)) =
             run(&gh, &["issue", "view", &n, "--json", "comments"], repo_root).await
-        else {
-            continue;
-        };
-        if !gave_up_is_stale(&comments) {
-            continue;
+        {
+            fetched.push((number, comments));
         }
+    }
+    for number in stale_gave_up(&fetched) {
+        let n = number.to_string();
         if let Ok((true, _, _)) = run(
             &gh,
             &["issue", "edit", &n, "--remove-label", GAVE_UP_LABEL],
@@ -10098,6 +10114,20 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         for kind in [FailureKind::NoChanges, FailureKind::GuardRefusal] {
             assert!(!gave_up_is_stale(&after_one(kind)), "{kind:?}: never built");
         }
+
+        // The per-tick bound is on the removals, not on the reads: terminal
+        // label-outs never leave the head of the newest-first listing, so a
+        // read budget would wedge #916/#917/#926 behind them forever.
+        let mut fetched: Vec<(u64, String)> = (1000..1012)
+            .map(|n| (n, comments_blob(&[scope_gave_up_comment()])))
+            .collect();
+        fetched.extend([916u64, 917, 926].map(|n| (n, after_one(FailureKind::ReviewReject))));
+        assert_eq!(stale_gave_up(&fetched), vec![916, 917, 926]);
+        // And the bound still bites once there are that many to hand back.
+        let backlog: Vec<(u64, String)> = (1..=12)
+            .map(|n| (n, after_one(FailureKind::GateRed)))
+            .collect();
+        assert_eq!(stale_gave_up(&backlog).len(), MAX_RETRIAGE_PER_TICK);
     }
 
     #[test]
