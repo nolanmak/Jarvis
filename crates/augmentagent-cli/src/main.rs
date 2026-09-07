@@ -1005,8 +1005,8 @@ enum PersonOp {
         #[arg(long)]
         apply: bool,
     },
-    /// #927 — on demand, the scan the daemon also runs: a Discord approval
-    /// card per high-confidence duplicate. Writes nothing until Approve.
+    /// #927 — on demand, the scan the daemon also runs after every iMessage
+    /// poll: a card per high-confidence duplicate. Writes nothing until Approve.
     ProposeMerges,
 }
 
@@ -9969,8 +9969,7 @@ impl ReplyApprover {
                 status: action.action.status,
             };
         }
-        // #927 — kind first: a merge card carries platform "wiki" and no draft,
-        // so every arm below would either miss it or fail it.
+        // #927 — kind first: a merge card carries platform "wiki" and no draft.
         if action.email.kind == IDENTITY_MERGE_KIND {
             let wiki = self.wiki_root.as_deref();
             return Self::approve_identity_merge(&self.store, wiki, action_id, action);
@@ -10221,18 +10220,17 @@ impl ReplyApprover {
         }
     }
 
-    /// #927 — Approve on a merge card: claim the row, parse the payload off
-    /// `originalBody` (never the rendered card), then run the same executor
-    /// `person merge --apply` does, guards and all.
+    /// #927 — Approve: claim the row, parse the payload off `originalBody`
+    /// (never the card), then run the executor `person merge --apply` runs.
     fn approve_identity_merge(
         store: &Store,
         wiki_root: Option<&Path>,
         action_id: &str,
         action: augmentagent_store::ActionWithEmail,
     ) -> ApprovalActionOutcome {
-        // CAS `pending → sending` before ANY write — the wiki's or this row's. A
-        // double-click must not run the merge twice (the second would fail on
-        // the deleted stub), and a racing Skip must not reject one that ran.
+        // CAS `pending → sending` before ANY write — the wiki's or this row's:
+        // a double-click must not run the merge twice (the second would fail on
+        // the deleted stub), nor a racing Skip reject one that ran.
         match store.claim_action_for_send(action_id, ActionStatus::Pending, "discord") {
             Ok(true) => {}
             Ok(false) => {
@@ -10256,13 +10254,11 @@ impl ReplyApprover {
         let (stub, into) = (&payload.stub_slug, &payload.candidate_slug);
         match execute_person_merge(wiki_root, store, stub, into, true) {
             Ok(report) => {
-                let filled = report.moved.join(", ");
+                let moved = report.moved.join(", ");
+                let filled = if moved.is_empty() { "nothing" } else { &moved };
                 let summary = format!(
-                    "merged {} into {} (filled: {}; phone rows repointed: {})",
-                    report.from,
-                    report.into,
-                    if filled.is_empty() { "nothing" } else { &filled },
-                    report.phone_rows_repointed,
+                    "merged {} into {} (filled: {filled}; phone rows repointed: {})",
+                    report.from, report.into, report.phone_rows_repointed,
                 );
                 let _ = store.update_action_status(action_id, ActionStatus::Sent, Some(&summary), None);
                 let _ = store.mark_email_processed(&action.email.message_id, TriageResult::Reply);
@@ -10279,9 +10275,8 @@ impl ReplyApprover {
         }
     }
 
-    /// #927 — Skip on a merge card: no draft to delete and no platform to tell,
-    /// so all it owes is the CAS off `pending` — which loses to an Approve that
-    /// claimed the row, and whose `rejected` stops the scan re-proposing.
+    /// #927 — Skip: no draft to delete and no platform to tell, so all it owes
+    /// is the CAS off `pending`, whose `rejected` stops the scan re-proposing.
     fn skip_identity_merge(store: &Store, action_id: &str) -> ApprovalActionOutcome {
         let reason = Some("merge declined by approver");
         match store.try_resolve_action(action_id, ActionStatus::Rejected, "discord", reason) {
@@ -10299,6 +10294,17 @@ impl ReplyApprover {
     fn current_status(store: &Store, action_id: &str) -> String {
         let row = store.get_action_with_email(action_id).ok().flatten();
         row.map(|a| a.action.status).unwrap_or_else(|| "resolved".into())
+    }
+
+    /// #927 — what every verb but Approve and Skip owes a merge card. Revise
+    /// brings the quick-refine select and the fill-ask modal with it (both
+    /// funnel into `revise`); Schedule brings its select and its custom-time
+    /// modal, and refusing it also keeps Send Now / Cancel / Back to queue
+    /// unreachable, since all three need a `scheduled` row.
+    fn reject_identity_merge_verb(e: &augmentagent_store::Email) -> Option<ApprovalActionOutcome> {
+        (e.kind == IDENTITY_MERGE_KIND).then(|| ApprovalActionOutcome::Failed {
+            message: "not applicable to identity merges — Approve or Skip".into(),
+        })
     }
 
     async fn run_skip(&self, action_id: &str) -> ApprovalActionOutcome {
@@ -10384,10 +10390,8 @@ impl ReplyApprover {
                 status: action.action.status,
             };
         }
-        if action.email.kind == IDENTITY_MERGE_KIND {
-            return ApprovalActionOutcome::Failed {
-                message: "not applicable to identity merges".into(),
-            };
+        if let Some(out) = Self::reject_identity_merge_verb(&action.email) {
+            return out;
         }
         if action.email.platform == "gcal" {
             // v1 (#398): no LLM re-draft for calendar proposals. The card
@@ -10629,6 +10633,9 @@ impl ReplyApprover {
         let Some(action) = self.handle_load(action_id) else {
             return ApprovalActionOutcome::NotFound;
         };
+        if let Some(out) = Self::reject_identity_merge_verb(&action.email) {
+            return out;
+        }
         // The scheduled pipeline is a deferred Gmail send_draft (#499), but
         // the Schedule select rides on EVERY card — gate non-email cards out
         // BEFORE arming, or the engine would claim the row at fire time and
@@ -11850,25 +11857,23 @@ fn run_person_merge(cli: &Cli, store: Arc<Store>, from: &str, into: &str, apply:
 /// any platform check.
 const IDENTITY_MERGE_KIND: &str = "identity_merge";
 
-/// #927 — the machine payload Approve executes, carried on the row's
-/// `originalBody`, never re-read out of the rendered card text.
+/// #927 — the payload Approve executes, on `originalBody`, never the card text.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct IdentityMergePayload {
     stub_slug: String,
     candidate_slug: String,
 }
 
-/// #927 — decided? `pending` = a card is up, `sent` = it ran, `rejected` = the
-/// cooldown Skip arms. A `superseded`/`error` row never reached a decision.
+/// #927 — decided? A card is up (`pending`), it ran (`sent`), or Skip armed the
+/// cooldown (`rejected`). A `superseded`/`error` row never reached a decision.
 fn identity_merge_is_settled(status: &str) -> bool {
     matches!(status, "pending" | "sent" | "rejected")
 }
 
-/// #927 — synthesize the approval card, as `(card, machine payload for the
-/// row's originalBody, draft)`. `from` is the stub's display name and `body`
-/// its evidence — who this is, where the texts came from — because that is what
-/// the owner judges. Neither is a mailbox and `thread_id` is `None`, which is
-/// why `pending_actions_for_reconcile` has to exclude this kind.
+/// #927 — synthesize the card, as `(card, payload for originalBody, draft)`.
+/// `from` is the stub's display name and `body` its evidence — what the owner
+/// judges. Neither is a mailbox and `thread_id` is `None`, which is why
+/// `pending_actions_for_reconcile` has to exclude this kind.
 fn build_identity_merge_card(
     report: &PersonMergeReport,
 ) -> (augmentagent_store::Email, String, String) {
@@ -11879,8 +11884,8 @@ fn build_identity_merge_card(
     })
     .expect("IdentityMergePayload serializes");
     // How much history is at stake, off the `iMessage history: N messages
-    // through <date>` provenance the syncer writes: the owner shouldn't have to
-    // count Source bullets to see what a wrong merge would cost.
+    // through <date>` provenance the syncer writes — so the owner doesn't have
+    // to count Source bullets to see what a wrong merge would cost.
     let messages: u32 = report
         .evidence
         .iter()
@@ -11914,8 +11919,7 @@ fn build_identity_merge_card(
     (email, payload, draft)
 }
 
-/// #927 — persist the proposal. The action row IS the suggestion record: its
-/// status is the pending / decided state, its `originalBody` the payload.
+/// #927 — the action row IS the suggestion: status = decision, body = payload.
 fn record_identity_merge_proposal(
     store: &Store,
     inbound: &augmentagent_store::Email,
@@ -11931,9 +11935,8 @@ fn record_identity_merge_proposal(
 }
 
 /// #927 — the suggester: every `*_at_contact` stub whose phone, iMessage handle
-/// or email already sits on exactly ONE canonical page. That shared identity is
-/// what makes the pair high-confidence; a stub matching two is ambiguous, and
-/// ambiguity is left for a human rather than guessed at.
+/// or email already sits on exactly ONE canonical page. A stub matching two is
+/// ambiguous, and ambiguity is left for a human rather than guessed at.
 fn high_confidence_merge_candidates(wiki_dir: &Path) -> Result<Vec<(String, String)>> {
     let layout = augmentagent_wiki::WikiLayout::new(wiki_dir.to_path_buf());
     let index = augmentagent_wiki::IdentityIndex::build(&layout)?;
@@ -11960,13 +11963,12 @@ fn high_confidence_merge_candidates(wiki_dir: &Path) -> Result<Vec<(String, Stri
     Ok(pairs)
 }
 
-/// #927 — cards one scan may raise, so a first pass over a 1,300-page wiki can't
-/// bury the channel; the rest come up on the next pass.
+/// #927 — a first pass over a 1,300-page wiki must not bury the channel.
 const MAX_MERGE_CARDS_PER_SCAN: usize = 5;
 
 /// #927 — the unattended path, run after every iMessage poll (and by `person
-/// propose-merges` on demand): suggest, then raise a card for each. Returns how
-/// many went up; one bad pair must not swallow the scan.
+/// propose-merges`): suggest, then raise a card each. One bad pair must not
+/// swallow the scan.
 async fn propose_high_confidence_merges(
     wiki_dir: &Path,
     store: &Store,
@@ -11985,10 +11987,9 @@ async fn propose_high_confidence_merges(
     Ok(raised)
 }
 
-/// #927 — raise one suggested merge as an approval card; `false` when the pair
-/// is already decided. Nothing is written to the wiki here: the dry run only
-/// re-proves the guards and collects the evidence, and the merge runs when —
-/// and only when — Approve is clicked.
+/// #927 — raise one suggested merge as a card; `false` when the pair is already
+/// decided. Nothing is written to the wiki here: the dry run only re-proves the
+/// guards and collects evidence, and the merge runs only when Approve is clicked.
 async fn propose_identity_merge(
     wiki_dir: &Path,
     store: &Store,
@@ -12014,8 +12015,7 @@ async fn propose_identity_merge(
         anyhow::bail!(msg);
     }
     // Claim the nudge slot (count 0 → 1) exactly as the compose card does, or
-    // the NudgeScheduler sees a pending row still at nudgeCount=0 and posts a
-    // duplicate of the card the owner is looking at (#412).
+    // the NudgeScheduler sees nudgeCount=0 and re-posts the card (#412).
     let now_ms = chrono::Utc::now().timestamp_millis();
     if let Err(e) = store.record_nudge(&action_id, now_ms + augmentagent_store::NUDGE_INTERVAL_MS) {
         warn!(action_id, "record_nudge after identity-merge card failed: {e}");
@@ -12122,8 +12122,7 @@ async fn imessage_poll_loop(
                 "imessage poll ingested new messages"
             );
         }
-        // #927 — the stubs this sync leaves behind ARE the duplicates the merge
-        // scan proposes, so the owner gets the card unattended, one poll later.
+        // #927 — the stubs this sync leaves ARE what the merge scan proposes.
         if let Some(root) = &wiki_root {
             if let Err(e) = propose_high_confidence_merges(root, &store, broker.as_ref()).await {
                 warn!("identity-merge scan failed: {e:#}");
@@ -16768,8 +16767,7 @@ mod linkedin_approve_dispatch_tests {
     }
 }
 
-/// #927 — the identity-merge card. Earlier versions worked in isolation and died
-/// in the daemon (bulk-sender sweep, unclaimed nudge slot) — pinned here.
+/// #927 — the merge card, plus the daemon behaviours earlier versions died on.
 #[cfg(test)]
 mod identity_merge_tests {
     use super::*;
@@ -16779,9 +16777,9 @@ mod identity_merge_tests {
 
     const STUB: &str = "landlord_philly_at_contact";
     const TARGET: &str = "centra-associates";
+    const PHONE: &str = "+15550000001";
 
-    /// What actually reached Discord, as `(action_id, rendered card)`. `dead`
-    /// fails the post the way an outage or a revoked token does.
+    /// What reached Discord; `dead` fails the post the way an outage does.
     #[derive(Default)]
     struct RecordingBroker {
         posts: std::sync::Mutex<Vec<(String, String)>>,
@@ -16804,8 +16802,7 @@ mod identity_merge_tests {
         }
     }
 
-    /// A store plus the two pages a real merge sees, written through the same
-    /// `merge_person_page` path that produced them. Only the stub is dated.
+    /// The two pages a real merge sees, through the writer that produced them.
     fn seeded_env() -> (Store, TempDir, PathBuf) {
         use augmentagent_channel_imessage::bump_updated;
         use augmentagent_wiki::crm::{merge_person_page, PersonPatch};
@@ -16818,20 +16815,17 @@ mod identity_merge_tests {
             let p = updated.and_then(|d| bump_updated(&p, d)).unwrap_or(p);
             std::fs::write(wiki.join("people").join(format!("{slug}.md")), p).unwrap();
         };
-        write(
-            STUB,
-            PersonPatch::new()
-                .with_display_name("Landlord Philly")
-                .identity("imessage", "+15550000001")
-                .identity("phone", "+15550000001")
-                .source("iMessage history: 412 messages through 2026-08-26 (SMS)"),
-            Some("2026-08-26"),
-        );
+        let stub = PersonPatch::new()
+            .with_display_name("Landlord Philly")
+            .identity("imessage", PHONE)
+            .identity("phone", PHONE)
+            .source("iMessage history: 412 messages through 2026-08-26 (SMS)");
+        // The number both pages carry is what makes the pair high-confidence.
         let target = PersonPatch::new()
             .with_display_name("Centra Associates")
-            // The shared number is what makes the pair high-confidence.
-            .identity("phone", "+15550000001")
+            .identity("phone", PHONE)
             .source("Hand-written: property manager for the Fishtown unit");
+        write(STUB, stub, Some("2026-08-26"));
         write(TARGET, target, None);
         (store, tmp, wiki)
     }
@@ -16844,9 +16838,8 @@ mod identity_merge_tests {
         store.get_action_with_email(id).unwrap().unwrap().action.status
     }
 
-    /// The card names the stub, per the contract — and must still survive the
-    /// daemon: the stale-approval sweep's bulk-sender rule fails any `from`
-    /// without an `@`, so merge cards are excluded from the sweep instead.
+    /// The card names the stub, per the contract — and must survive the daemon:
+    /// the sweep's bulk-sender rule fails any `from` without an `@`.
     #[test]
     fn a_proposed_merge_card_survives_the_stale_approval_sweep() {
         let (store, _t, wiki) = seeded_env();
@@ -16856,8 +16849,7 @@ mod identity_merge_tests {
         // Control — the identical row under any other kind IS retired, so this
         // cannot pass on a sweep that does nothing at all.
         let mut other = email.clone();
-        other.message_id = "merge:control".into();
-        other.kind = "dm".into();
+        (other.message_id, other.kind) = ("merge:control".into(), "dm".into());
         let control = record_identity_merge_proposal(&store, &other, &payload, &draft).unwrap();
         assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 1);
         assert_eq!(status_of(&store, &proposed), "pending", "must stay clickable");
@@ -16878,22 +16870,20 @@ mod identity_merge_tests {
     }
 
     /// The issue end to end, starting where #927 starts — the scan, not an
-    /// operator typing slugs. The high-confidence duplicate goes up as a pending
-    /// `identity_merge` card that writes NOTHING, claims its nudge slot (#412)
-    /// and is not re-raised; one Approve click then runs the merge.
+    /// operator typing slugs. The duplicate goes up as a pending card that
+    /// writes NOTHING, claims its nudge slot (#412) and is not re-raised; one
+    /// Approve click then runs the merge.
     #[tokio::test]
     async fn a_high_confidence_duplicate_becomes_a_card_and_approve_runs_the_merge() {
         let (store, _t, wiki) = seeded_env();
         let people = wiki.join("people");
-        let phone = "+15550000001";
-        store
-            .upsert_phone_identity(&PhoneIdentity {
-                phone: phone.into(),
-                person_slug: STUB.into(),
-                display_name: Some("Landlord Philly".into()),
-                source: "carddav".into(),
-            })
-            .unwrap();
+        let carddav = PhoneIdentity {
+            phone: PHONE.into(),
+            person_slug: STUB.into(),
+            display_name: Some("Landlord Philly".into()),
+            source: "carddav".into(),
+        };
+        store.upsert_phone_identity(&carddav).unwrap();
         let discord = RecordingBroker::default();
         let scan = || propose_high_confidence_merges(&wiki, &store, &discord);
         // An identity two canonical pages share names no single survivor: the
@@ -16902,6 +16892,13 @@ mod identity_merge_tests {
         std::fs::copy(people.join(format!("{TARGET}.md")), &twin).unwrap();
         assert_eq!(scan().await.unwrap(), 0, "ambiguous ⇒ no card");
         std::fs::remove_file(&twin).unwrap();
+        // A card Discord never got is unclickable AND holds the `merge:` key,
+        // so it is parked `error` — never "settled" — and the scan re-raises it.
+        let outage = RecordingBroker { dead: true, ..Default::default() };
+        assert_eq!(propose_high_confidence_merges(&wiki, &store, &outage).await.unwrap(), 0);
+        let key = format!("merge:{STUB}->{TARGET}");
+        let (errored, ..) = store.latest_action_for_message(&key).unwrap().unwrap();
+        assert_eq!(status_of(&store, &errored), "error");
         assert_eq!(scan().await.unwrap(), 1);
         let (id, card) = discord.posts.lock().unwrap().remove(0);
         assert!(card.contains(&format!("Merge 'Landlord Philly' into {TARGET}?")), "{card}");
@@ -16930,27 +16927,29 @@ mod identity_merge_tests {
         assert!(merged.contains("imessage:"), "identities moved:\n{merged}");
         assert!(merged.contains("updated: 2026-08-26"), "last-text date carried forward");
         assert!(merged.contains("Hand-written: property"), "fill-blanks only:\n{merged}");
-        let row = store.lookup_person_by_phone(phone).unwrap().unwrap();
+        let row = store.lookup_person_by_phone(PHONE).unwrap().unwrap();
         assert_eq!(row.person_slug, TARGET, "future syncs hit the survivor");
         assert!(matches!(click(), ApprovalActionOutcome::AlreadyResolved { .. }));
     }
 
-    /// A card Discord never got is unclickable AND holds the `merge:` key, so
-    /// it is parked `error` — never "settled" — and the next scan re-raises it.
-    #[tokio::test]
-    async fn a_card_that_never_reached_discord_is_raised_again() {
+    /// Approve and Skip are not the only verbs that dispatch on kind: the
+    /// quick-refine select and the fill-ask modal both funnel into `revise`,
+    /// and both schedule verbs into `run_schedule`, whose ladder names
+    /// platforms only — never "wiki" — so a schedule custom_id would otherwise
+    /// park the merge in `scheduled`, awaiting a Gmail send that cannot fire.
+    #[test]
+    fn no_other_verb_can_act_on_a_merge_card() {
         let (store, _t, wiki) = seeded_env();
-        let outage = RecordingBroker { dead: true, ..Default::default() };
-        assert_eq!(propose_high_confidence_merges(&wiki, &store, &outage).await.unwrap(), 0);
-        let key = format!("merge:{STUB}->{TARGET}");
-        let (id, ..) = store.latest_action_for_message(&key).unwrap().unwrap();
-        assert_eq!(status_of(&store, &id), "error");
-        let discord = RecordingBroker::default();
-        assert_eq!(propose_high_confidence_merges(&wiki, &store, &discord).await.unwrap(), 1);
+        let (mut card, ..) = build_identity_merge_card(&dry_run(&store, &wiki));
+        let refuse = |e: &Email| ReplyApprover::reject_identity_merge_verb(e).is_some();
+        assert!(refuse(&card));
+        let ladder = ["discord", "slack", "telegram", "github", "gcal", "socialapi"];
+        assert!(!ladder.contains(&&*card.platform), "the kind check is the only stop");
+        card.kind = "reply".into();
+        assert!(!refuse(&card), "email cards still revise and schedule");
     }
 
-    /// Skip declines the pair and cools it off, but must lose to an Approve
-    /// that already claimed the row.
+    /// Skip declines the pair and cools it off, but loses a claimed Approve.
     #[test]
     fn skip_declines_a_merge_and_loses_to_a_claimed_approve() {
         let (store, _t, wiki) = seeded_env();

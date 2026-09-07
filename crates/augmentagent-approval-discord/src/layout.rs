@@ -952,7 +952,8 @@ mod tests {
     }
 
     /// #927 — Approve (which runs the merge) and Skip are the only verbs the
-    /// merge handler implements, so they are the only ones rendered.
+    /// merge handler implements, so they are the only ones rendered. The
+    /// handler rejects the rest by kind, in case a stale card carries one.
     #[test]
     fn identity_merge_card_offers_only_approve_and_skip() {
         let mut e = email();
