@@ -68,7 +68,10 @@ mod tests {
 
     #[test]
     fn no_double_underscores() {
-        assert_eq!(slug_from_email("a..b@x.example.com"), "a_b_at_x_example_com");
+        assert_eq!(
+            slug_from_email("a..b@x.example.com"),
+            "a_b_at_x_example_com"
+        );
     }
 
     #[test]
