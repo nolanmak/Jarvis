@@ -209,7 +209,7 @@ Default path. Saves to Gmail/Drafts; doesn't send.
 ```
 augmentagent gmail compose \
   --account me@example.com \
-  --to "jeremy@acme.com" \
+  --to "jeremy@acme.example.com" \
   --subject "Re: deadline" \
   --body "Hi Jeremy,\n\n…"
 ```
@@ -220,7 +220,7 @@ A threaded write goes out under **the thread's** subject; `--subject` only threa
 
 For multi-line or long bodies, write the body to a tempfile and pass `--body-file /path/to/body.txt` (or `--body-file -` to read stdin). Inline `--body` values interpret `\n` and `\t` escapes as real newlines/tabs (write `\\n` for a literal backslash-n), so short multi-paragraph bodies work inline too. Returns a `draft_id` and a Gmail URL the user can open to review/send.
 
-**Multiple recipients (#439):** `--to` takes several addresses — repeat the flag (`--to a@x.com --to b@y.com`) or pass one comma-separated value (`--to 'a@x.com, b@y.com'`). `--cc` and `--bcc` work the same way and exist on `compose`, `send-now`, and `update-draft`. When the user says "respond to Bo and his assistant" or "reply all", put EVERY named person on `--to`/`--cc` — do not address one person and merely mention the other in the body. The approval card shows `[to: …]`/`[cc: …]`/`[bcc: …]` lines under the draft; card **Revise** re-creates the draft with that same envelope (#473), so recipients survive revision — but attachments still don't (re-pass `--attach` via `update-draft`). `update-draft` only carries what you re-pass, so repeat `--cc`/`--bcc` there too.
+**Multiple recipients (#439):** `--to` takes several addresses — repeat the flag (`--to a@x.example.com --to b@y.example.com`) or pass one comma-separated value (`--to 'a@x.example.com, b@y.example.com'`). `--cc` and `--bcc` work the same way and exist on `compose`, `send-now`, and `update-draft`. When the user says "respond to Bo and his assistant" or "reply all", put EVERY named person on `--to`/`--cc` — do not address one person and merely mention the other in the body. The approval card shows `[to: …]`/`[cc: …]`/`[bcc: …]` lines under the draft; card **Revise** re-creates the draft with that same envelope (#473), so recipients survive revision — but attachments still don't (re-pass `--attach` via `update-draft`). `update-draft` only carries what you re-pass, so repeat `--cc`/`--bcc` there too.
 
 **The envelope must match the body (#473).** If your draft body reassigns recipients — the classic double-opt-in intro reply: "thanks Josh, moving you to BCC; Omer, great to meet you" — the compose flags must implement what the body says: `--to <new contact>` and `--bcc <introducer>`, with `--thread-id`/`--reply-to-message-id` keeping the thread. Never leave a reply's default To (the original sender) in place when the body promises different routing: a body that says "moving you to BCC" while the envelope still has that person on To (and the new contact nowhere) is a failed email, even if the words are perfect. Before reporting the card, check its `[to:]`/`[cc:]`/`[bcc:]` lines against what the body claims.
 
@@ -308,7 +308,7 @@ augmentagent gmail send --account me@example.com --draft-id <id>
 ```
 augmentagent gmail send-now \
   --account me@example.com \
-  --to "jeremy@acme.com" \
+  --to "jeremy@acme.example.com" \
   --subject "Re: deadline" \
   --body "Hi Jeremy,..."
 ```
@@ -477,14 +477,14 @@ augmentagent calendar list-events --from 2026-07-09T00:00:00-04:00 --to 2026-07-
 
 ### Creating calendar events
 
-When the user asks you to schedule something — "set up a 30-min call with sarah@acme.com Thursday at 2pm", "block lunch with Ben tomorrow" — use `calendar create-event` with `--post true`:
+When the user asks you to schedule something — "set up a 30-min call with sarah@acme.example.com Thursday at 2pm", "block lunch with Ben tomorrow" — use `calendar create-event` with `--post true`:
 
 ```
 augmentagent calendar create-event \
   --summary "Intro call: Nolan × Sarah" \
   --start 2026-07-09T14:00:00-04:00 \
   --duration-min 30 \
-  --attendees sarah@acme.com \
+  --attendees sarah@acme.example.com \
   --post true
 ```
 

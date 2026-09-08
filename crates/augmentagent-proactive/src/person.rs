@@ -229,7 +229,7 @@ mod tests {
         let d = TempDir::new().unwrap();
         let p = write(
             d.path(),
-            "jane_at_corp_com",
+            "jane_at_corp_example_com",
             "---\nname: Jane Corp\ncadence: monthly\nupdated: 2026-01-01\n---\n\n# Jane\n",
         );
         let pp = parse_person_page(&p).unwrap();

@@ -271,13 +271,13 @@ mod tests {
             }),
             attendees: Some(vec![
                 RawAttendee {
-                    email: Some("me@x.com".into()),
+                    email: Some("me@x.example.com".into()),
                     self_: Some(true),
                     response_status: Some("accepted".into()),
                     ..Default::default()
                 },
                 RawAttendee {
-                    email: Some("other@y.com".into()),
+                    email: Some("other@y.example.com".into()),
                     response_status: Some("accepted".into()),
                     ..Default::default()
                 },
@@ -404,6 +404,6 @@ mod tests {
         let text = render_upcoming(&p, t(9, 40));
         assert!(text.contains("Meeting a"), "{text}");
         assert!(text.contains("starts in 20 min"), "{text}");
-        assert!(text.contains("other@y.com"), "{text}");
+        assert!(text.contains("other@y.example.com"), "{text}");
     }
 }

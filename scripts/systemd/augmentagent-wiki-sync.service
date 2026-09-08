@@ -5,13 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/nolan-makatche/AugmentAgent
+WorkingDirectory=%h/AugmentAgent
 # Two-way sync: commit local KB changes, pull owner edits (owner-wins), push.
-ExecStart=/home/nolan-makatche/AugmentAgent/target/release/augmentagent --wiki-dir ./wiki wiki sync
+ExecStart=%h/AugmentAgent/target/release/augmentagent --wiki-dir ./wiki wiki sync
 # gh (credential helper) lives in ~/.local/bin; git in /usr/bin.
-Environment=PATH=/home/nolan-makatche/.local/bin:/home/nolan-makatche/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 Environment=RUST_LOG=info
 # KB commits are authored from AUGMENTAGENT_GIT_AUTHOR_NAME/EMAIL, loaded
 # from ./.env via WorkingDirectory (no PII hardcoded in this template).
-StandardOutput=append:/home/nolan-makatche/.local/state/augmentagent/wiki-sync.log
-StandardError=append:/home/nolan-makatche/.local/state/augmentagent/wiki-sync.log
+StateDirectory=augmentagent
+StandardOutput=append:%h/.local/state/augmentagent/wiki-sync.log
+StandardError=append:%h/.local/state/augmentagent/wiki-sync.log

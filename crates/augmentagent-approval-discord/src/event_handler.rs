@@ -2202,7 +2202,7 @@ mod tests {
             .log_action(
                 "m-473",
                 None,
-                "josh@x.com",
+                "josh@x.example.com",
                 "intro",
                 None,
                 Some("draft"),
@@ -2216,10 +2216,10 @@ mod tests {
     #[test]
     fn envelope_markers_show_overridden_to_and_bcc() {
         let (s, id, _f) =
-            store_with_envelope(Some("omer@y.com"), None, Some("josh@x.com"));
-        let out = append_envelope_markers("body".into(), Some(&s), &id, "josh@x.com");
-        assert!(out.contains("[to: omer@y.com]"), "missing to marker: {out}");
-        assert!(out.contains("[bcc: josh@x.com]"), "missing bcc marker: {out}");
+            store_with_envelope(Some("omer@y.example.com"), None, Some("josh@x.example.com"));
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "josh@x.example.com");
+        assert!(out.contains("[to: omer@y.example.com]"), "missing to marker: {out}");
+        assert!(out.contains("[bcc: josh@x.example.com]"), "missing bcc marker: {out}");
         assert!(out.starts_with("body"), "body must lead: {out}");
     }
 
@@ -2246,10 +2246,10 @@ mod tests {
         // New-email cards: the card's From line already IS the recipient
         // list, so a [to:] marker would be redundant noise.
         let (s, id, _f) =
-            store_with_envelope(Some("a@b.com"), Some("cc@d.com"), None);
-        let out = append_envelope_markers("body".into(), Some(&s), &id, "a@b.com");
+            store_with_envelope(Some("a@b.example.com"), Some("cc@d.example.com"), None);
+        let out = append_envelope_markers("body".into(), Some(&s), &id, "a@b.example.com");
         assert!(!out.contains("[to:"), "redundant to marker: {out}");
-        assert!(out.contains("[cc: cc@d.com]"), "missing cc marker: {out}");
+        assert!(out.contains("[cc: cc@d.example.com]"), "missing cc marker: {out}");
     }
 
     #[test]
@@ -2304,7 +2304,7 @@ mod tests {
             .log_action(
                 "m-none",
                 None,
-                "a@b.com",
+                "a@b.example.com",
                 "s",
                 None,
                 Some("d"),
@@ -2313,11 +2313,11 @@ mod tests {
             .unwrap();
         // Row exists but no envelope was ever recorded (auto-triage shape).
         assert_eq!(
-            append_envelope_markers("body".into(), Some(&s), &id, "a@b.com"),
+            append_envelope_markers("body".into(), Some(&s), &id, "a@b.example.com"),
             "body"
         );
         // No store wired at all.
-        assert_eq!(append_envelope_markers("body".into(), None, &id, "a@b.com"), "body");
+        assert_eq!(append_envelope_markers("body".into(), None, &id, "a@b.example.com"), "body");
     }
 
     // ---- #501: verb-aware startup sweep ----

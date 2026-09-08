@@ -305,7 +305,7 @@ mod tests {
             cc: String::new(),
             message_id: "m".into(),
             thread_id: None,
-            from: "a@b.com".into(),
+            from: "a@b.example.com".into(),
             subject: "s".into(),
             body: "b".into(),
             date: "d".into(),

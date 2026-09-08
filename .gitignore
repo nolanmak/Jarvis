@@ -19,6 +19,7 @@ wiki/groceries/orders/*
 
 .env
 .env.*
+!.env.example
 
 # Browser/grocery session-cookie profile dirs — live session cookies
 # (Giant, social, Gmail). Never commit; treat as secret.
@@ -78,3 +79,8 @@ public/tailwind.css
 # force-recreates, and deletes (#630/#692). Never a source of tracked files —
 # and if it leaks past a crash it must not make the deploy tree look dirty.
 .self-improve-worktrees/
+
+# Interrupted credential exports and local security-audit reports.
+*-auth.json.tmp
+*-cookies.json.tmp
+gitleaks-report.*

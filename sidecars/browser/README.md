@@ -69,7 +69,7 @@ sudo apt install -y x11vnc
 DISPLAY=:99 x11vnc -display :99 -localhost -nopw -forever -shared -rfbport 5900
 
 # On your workstation: forward the loopback VNC port over SSH
-ssh -L 5900:127.0.0.1:5900 nolan-makatche@<box-host>
+ssh -L 5900:127.0.0.1:5900 <user>@<box-host>
 
 # Still on your workstation: open VNC against the local end of the tunnel
 vncviewer 127.0.0.1:5900

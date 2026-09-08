@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn clean_strips_gmail_reply_preamble() {
-        let raw = "Sounds good — let's ship Friday.\n\nOn Thu, Apr 18, 2026 at 3:14 PM, Alex <alex@x.io> wrote:\n> any update?\n> still on track?\n";
+        let raw = "Sounds good — let's ship Friday.\n\nOn Thu, Apr 18, 2026 at 3:14 PM, Alex <alex@x.example.com> wrote:\n> any update?\n> still on track?\n";
         assert_eq!(clean_sent_body(raw), "Sounds good — let's ship Friday.");
     }
 
@@ -178,8 +178,8 @@ mod tests {
 
     #[test]
     fn clean_strips_rfc3676_signature() {
-        let raw = "Body proper.\n\nThanks,\nNolan\n\n-- \nNolan Makatche\n+1-555-0100\n";
-        assert_eq!(clean_sent_body(raw), "Body proper.\n\nThanks,\nNolan");
+        let raw = "Body proper.\n\nThanks,\nAlex\n\n-- \nAlex Example\n+1-555-0100\n";
+        assert_eq!(clean_sent_body(raw), "Body proper.\n\nThanks,\nAlex");
     }
 
     #[test]
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn filter_drops_short_body() {
         assert_eq!(
-            should_keep_for_tone("thanks!", "alex@x.com", &[]),
+            should_keep_for_tone("thanks!", "alex@x.example.com", &[]),
             ToneFilter::DropTooShort
         );
     }
@@ -245,7 +245,7 @@ mod tests {
     fn filter_drops_oversize_body() {
         let big = "x".repeat(4_500);
         assert_eq!(
-            should_keep_for_tone(&big, "alex@x.com", &[]),
+            should_keep_for_tone(&big, "alex@x.example.com", &[]),
             ToneFilter::DropTooLong
         );
     }
@@ -263,11 +263,11 @@ mod tests {
     fn filter_drops_noreply_pattern() {
         let body = "This is a long-enough body to pass the chars filter, easily.";
         for to in [
-            "no-reply@stripe.com",
-            "noreply@github.com",
-            "notifications@linkedin.com",
-            "alerts@aws.com",
-            "donotreply@calendly.com",
+            "no-reply@stripe.com", // pii-ok: public automated sender fixture
+            "noreply@github.com", // pii-ok: public automated sender fixture
+            "notifications@linkedin.com", // pii-ok: public automated sender fixture
+            "alerts@aws.com", // pii-ok: public automated sender fixture
+            "donotreply@calendly.com", // pii-ok: public automated sender fixture
         ] {
             assert_eq!(
                 should_keep_for_tone(body, to, &[]),
@@ -281,7 +281,7 @@ mod tests {
     fn filter_keeps_normal_body() {
         let body = "Sounds great — Friday at 2pm works for me. I'll send a calendar invite.";
         assert_eq!(
-            should_keep_for_tone(body, "alex@startup.io", &["me@example.com".into()]),
+            should_keep_for_tone(body, "alex@startup.example.com", &["me@example.com".into()]),
             ToneFilter::Keep
         );
     }

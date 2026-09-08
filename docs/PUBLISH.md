@@ -1,49 +1,65 @@
-# Public repo & publishing
+# Public repository and release checklist
 
-## Where this code lives
+The public project is <https://github.com/nolanmak/Jarvis>. Existing deployment
+checkouts may still use a remote named `origin` pointing at MyAgentAssistant.
+Do not change deployment remotes, rewrite history, or restart services as part
+of a source-only release cleanup. The updater follows `origin/main`.
 
-- **Public, canonical, agent-tracked:** `github.com/nolanmak/MyAgentAssistant`
-  — the deploy box's `origin`. The **current tree** is scrubbed of operator PII
-  (#305/#357). **History is not fully scrubbed yet:** some older commits still
-  carry personal-gmail author/committer metadata and pre-scrub file PII; a
-  `git filter-repo --mailmap` + force-push pass (#358/#359) is still pending.
-  In the meantime CI (`no-gmail-authors.yml`) blocks any *new* gmail-authored
-  commit so the git-config regression can't reappear. No `refs/pull/*` baggage
-  (fresh repo).
-- **Archived snapshot (do NOT push to, do NOT publish):**
-  `github.com/nolanmak/AugmentAgent` — kept private and archived on GitHub.
-  Its branch history is clean, but GitHub's un-rewritable `refs/pull/*` for
-  old merged PRs still pin pre-rewrite commits containing the home
-  address/phone/emails. **Never flip that repo public.** It exists only as a
-  historical issue/PR archive. New issues, PRs, and pushes must go to
-  MyAgentAssistant.
+## Source checks
 
-## Why a fresh repo (not "make the old one public")
+Run from a clean checkout with dependencies installed:
 
-`git filter-repo` + force-push cannot rewrite GitHub's `refs/pull/*`; on a
-public repo those old merged-PR diffs would expose PII. A brand-new repo has no
-such refs, so pushing only the scrubbed `main` yields a guaranteed-clean public
-history. This repo was created that way and the agent was cut over to it.
+```sh
+bash scripts/check-no-personal-data.sh --tracked
+python3 scripts/tests/check-no-personal-data.test.py
+npm run build
+npm test
+cargo test --workspace
+```
 
-## Keeping it clean going forward
+Use reserved `example.com`, `example.net`, `example.org`, `.example`, or `.test`
+domains in examples, including their subdomains. Keep test inputs and expected
+values consistent. `pii-ok` is only for reviewed synthetic credentials or
+service identifiers whose format is necessary to a test; it must never exempt
+a real person's address, a copied message, or a credential.
 
-- Personal/business data lives ONLY in gitignored `.env` / sqlite DB / `wiki/`
-  — never committed. See `docs/SECURITY.md`.
-- Pre-commit guard installed (`scripts/install-git-hooks.sh` →
-  `scripts/check-no-personal-data.sh`) blocks secrets/PII in staged content.
-- The deploy checkout's **local** git identity is set to the GitHub noreply
-  (`git config user.email`), so future commits never re-introduce the personal
-  gmail into the public history. Don't override it with the gmail.
-- There is **no** private→public sync job: there is only one live repo
-  (MyAgentAssistant — the agent's `origin`). You push there normally. Do not
-  push to nolanmak/AugmentAgent under any circumstance — it is archived.
+The privacy workflow checks the tracked tree and scans an archive of that tree
+with Gitleaks. Templates are scanned too. A green check is a backstop, not a
+complete privacy or application-security audit.
 
-## Rollback / safety
+## Historical exposure is a separate release gate
 
-- Pre-migration full backup: `/tmp/aa-pre-public-20260519-131910.tgz`
-  (+ `.bundle`) — complete `.git` + tree restore point taken before any change.
-- WIP from prior sessions is preserved in 4 git stashes on the deploy checkout
-  (untouched by the migration).
-- If commit identity ever regresses to a personal email, fix with
-  `git filter-repo --mailmap` (map gmail → the noreply) on a fresh clone, then
-  force-push (safe here: no forks/PRs on the public repo).
+Deleting an address in a new commit does not remove it from earlier commits,
+branches, pull-request diffs, issue comments, Actions logs, or existing clones.
+The September 2026 audit found personal email metadata in 14 commits reachable
+from the audited `main`, and personal-looking addresses in source examples.
+The remote also has older branches and GitHub-managed pull-request refs.
+
+Before promoting the repository:
+
+- Scan all branches and tags, commit metadata, and GitHub-managed PR refs.
+- Review issue/PR bodies, comments, and published artifacts for copied private
+  context. Do not attach unredacted audit reports to public issues.
+- Coordinate a history rewrite with deployment checkouts and collaborators.
+  GitHub-managed PR refs cannot be cleaned with an ordinary branch force-push;
+  retained objects may require GitHub assistance. Alternatively, publish a
+  fresh repository from a reviewed source archive and keep the old repository
+  private. Neither option recalls existing third-party copies.
+- Rotate any credential confirmed to have been exposed. The initial Gitleaks
+  audit found synthetic examples, not confirmed live credentials.
+- Resolve the grocery-provider permission check in
+  [third-party notices](../THIRD_PARTY_NOTICES.md).
+
+The private AugmentAgent repository is a historical archive and must stay
+private. Do not assume it is protected merely because an old document called
+it archived; verify the actual GitHub settings before any migration.
+
+## Packaging
+
+Build a release archive from the reviewed commit with `git archive`, never
+by zipping a running deployment directory. This excludes ignored `.env`
+backups, databases, session cookies, and private wiki content. Only the empty
+grocery wiki scaffold belongs in the release.
+
+No version tag or public release should be published until the source checks,
+historical-data review, and third-party permission check are complete.

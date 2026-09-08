@@ -21,7 +21,7 @@ jobs:
           if [ -n "$bad" ]; then
             echo "::error::Commit(s) in this PR use a personal gmail author/committer address:"
             echo "$bad"
-            echo "Commit as the nolanmak GitHub noreply instead — see docs/PUBLISH.md and CLAUDE.md."
+            echo "Commit as the nolanmak GitHub noreply instead — see docs/PUBLISH.md."
             exit 1
           fi
           echo "OK: no gmail author/committer emails in this PR's commits."

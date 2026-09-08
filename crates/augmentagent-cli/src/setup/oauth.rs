@@ -458,12 +458,12 @@ mod tests {
     #[test]
     fn gmail_diff_detects_new_account() {
         let before = json!({
-            "gmail": {"accounts": [{"id": "a1", "email": "old@x.com"}], "lastError": null}
+            "gmail": {"accounts": [{"id": "a1", "email": "old@x.example.com"}], "lastError": null}
         });
         let now = json!({
             "gmail": {"accounts": [
-                {"id": "a1", "email": "old@x.com"},
-                {"id": "a2", "email": "new@x.com"},
+                {"id": "a1", "email": "old@x.example.com"},
+                {"id": "a2", "email": "new@x.example.com"},
             ], "lastError": null}
         });
         let hit = new_connection_appeared(OauthProvider::Gmail, &before, &now);
