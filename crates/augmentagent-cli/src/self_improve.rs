@@ -3478,6 +3478,7 @@ async fn resume_draft_pr(
     dry_run: bool,
 ) -> Result<RunReport> {
     let gh = gh_bin();
+    note_current_issue(issue_no);
     info!(pr, issue = issue_no, %branch, "resuming sitting draft PR");
 
     // Whatever happens next counts as today's attempt on this issue, so a
@@ -4313,6 +4314,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             return Ok(RunReport::idle());
         }
     };
+    note_current_issue(0); // This run has not committed to an issue yet (#954).
 
     // Refuse to run from a dirty tree / detached state — protects the deploy.
     let (ok, status_out, _) = run("git", &["status", "--porcelain"], repo_root).await?;
@@ -4411,6 +4413,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             issue
         }
     };
+    note_current_issue(issue.number);
     info!(issue = issue.number, title = %issue.title, "selected issue");
 
     // #300 — Trust gate. If the issue author is not trusted (not the owner /
@@ -6867,6 +6870,15 @@ fn attempt_history_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("autopr-attempt-history.json"))
 }
 
+/// The issue the in-flight run committed to, so a tick the loop has to abandon
+/// (#954) is recorded against it instead of vanishing. Process-global because
+/// #816's `RunLock` allows at most one run at a time; 0 = none yet.
+static CURRENT_ISSUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_current_issue(issue: u64) {
+    CURRENT_ISSUE.store(issue, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A harness failure: remembered for the next attempt's context, never
 /// charged as an attempt.
 ///
@@ -6958,6 +6970,30 @@ impl AutoPrLoop {
     const DEFAULT_DAILY_CAP: u32 = 3;
     /// How many consecutive triage-only refusals one tick may clear.
     const MAX_TRIAGE_PER_TICK: u32 = 5;
+    /// #954 — no tick may outlive this. Generous (a builder legitimately
+    /// compiles for tens of minutes), but 15 h is a wedge, and awaiting one
+    /// forever stops every later tick.
+    const MAX_TICK: std::time::Duration = std::time::Duration::from_secs(3 * 60 * 60);
+
+    /// A tick that outran its budget is dropped — its #816 `RunLock` and any
+    /// half-built worktree go with it — and recorded as an `Infra` harness
+    /// failure: never charged to the model, so the next tick may retry it.
+    fn abandon_wedged_tick(max_tick: std::time::Duration) {
+        let secs = max_tick.as_secs();
+        let issue = CURRENT_ISSUE.swap(0, std::sync::atomic::Ordering::Relaxed);
+        warn!(issue, budget_secs = secs, "auto-PR: tick outran its budget; abandoned (#954)");
+        if issue == 0 {
+            return; // Wedged before committing to an issue; nothing to charge.
+        }
+        let rec = AttemptRecord {
+            kind: FailureKind::Infra,
+            stage: "abandoned-tick".into(),
+            detail: format!("no result in {secs}s; run abandoned so the loop keeps ticking"),
+            wall_secs: secs,
+            ..AttemptRecord::unspecified()
+        };
+        record_reasoner_error(issue, rec);
+    }
 
     /// Env-gated constructor: `None` unless `AUGMENTAGENT_AUTOPR=1|true`.
     /// `AUGMENTAGENT_AUTOPR_INTERVAL_SECS` (default 1800, floor 300 — the
@@ -7006,6 +7042,25 @@ impl AutoPrLoop {
     }
 
     pub async fn run(self, shutdown: tokio_util::sync::CancellationToken) -> Result<()> {
+        let (root, dry_run) = (self.repo_root.clone(), self.dry_run);
+        self.run_with(shutdown, Self::MAX_TICK, move || {
+            let root = root.clone();
+            async move { run_once(&root, dry_run).await }
+        })
+        .await
+    }
+
+    /// The loop body, over an injectable tick + budget (#954's wedge, tested).
+    async fn run_with<F, T>(
+        self,
+        shutdown: tokio_util::sync::CancellationToken,
+        max_tick: std::time::Duration,
+        tick: F,
+    ) -> Result<()>
+    where
+        F: Fn() -> T,
+        T: std::future::Future<Output = Result<RunReport>>,
+    {
         info!(
             interval_secs = self.interval.as_secs(),
             daily_cap = self.daily_cap,
@@ -7037,7 +7092,22 @@ impl AutoPrLoop {
             // refusal, so this burst is self-limiting.
             let mut triaged = 0u32;
             loop {
-                match run_once(&self.repo_root, self.dry_run).await {
+                // #954 — bounded AND cancellable: the 15 h freeze swallowed
+                // shutdown, and awaiting a wedged run forever stopped every
+                // later tick. Abandoning one costs a single tick.
+                let outcome = tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {
+                        info!("auto-PR loop stopped mid-tick");
+                        return Ok(());
+                    }
+                    r = tokio::time::timeout(max_tick, tick()) => r,
+                };
+                let Ok(outcome) = outcome else {
+                    Self::abandon_wedged_tick(max_tick);
+                    break;
+                };
+                match outcome {
                     Ok(r) if r.is_idle() => break,
                     Ok(r) if r.billed => {
                         counter.record(today);
@@ -7609,6 +7679,39 @@ mod tests {
         assert_eq!(c.runs_today(101), 0);
         c.record(101);
         assert_eq!(c.runs_today(101), 1);
+    }
+
+    /// #954 verbatim, loop side: on 2026-09-04 a run parked forever on a
+    /// leaked CLI-gate permit (15 h, no email triage, no auto-PR). The loop
+    /// must abandon that run and keep ticking, not await it for good.
+    #[tokio::test]
+    async fn a_wedged_tick_is_abandoned_so_the_loop_keeps_ticking() {
+        use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(AutoPrLoop::MAX_TICK, std::time::Duration::from_secs(3 * 60 * 60));
+        // Cap `u32::MAX`: the tick that matters is the one AFTER the wedge.
+        let (root, cap) = (PathBuf::from("/nonexistent"), u32::MAX);
+        let lp = AutoPrLoop { repo_root: root, dry_run: true, interval: ms(5), daily_cap: cap };
+        let calls = Arc::new(AtomicU32::new(0));
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (seen, stop) = (Arc::clone(&calls), shutdown.clone());
+        let run = lp.run_with(shutdown, ms(50), move || {
+            let (nth, stop) = (seen.fetch_add(1, SeqCst), stop.clone());
+            async move {
+                if nth == 0 {
+                    std::future::pending::<()>().await; // The freeze, verbatim.
+                }
+                stop.cancel();
+                Ok(RunReport::idle())
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("a wedged run must not stop every later tick")
+            .expect("abandoning a tick is not a loop failure");
+        assert_eq!(calls.load(SeqCst), 2);
+        // Abandoned mid-run, the attempt is the harness's, never the model's.
+        assert!(!FailureKind::Infra.counts_toward_max_attempts());
     }
 
     // ---- throughput: cheap triage must not cost a build's budget ----
@@ -10401,6 +10504,10 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let body = &src[start..start + 4000];
         assert!(body.contains("Ok(r) if r.billed => {"), "billed reports are what the cap counts");
         assert!(body.contains("counter.record(today);"));
+        // #954 — the production tick runs on MAX_TICK, the budget whose
+        // expiry `a_wedged_tick_is_abandoned_so_the_loop_keeps_ticking` drives.
+        assert!(body.contains("self.run_with(shutdown, Self::MAX_TICK, move ||"), "prod budget");
+        assert!(body.contains("r = tokio::time::timeout(max_tick, tick()) => r,"), "bounded tick");
     }
 
     // Structural (codex on #859): a revision-round failure is recorded with
