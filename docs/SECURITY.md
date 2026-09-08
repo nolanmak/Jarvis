@@ -50,7 +50,9 @@ and tracking
 not a substitute for not hardcoding data. Templates are scanned too. Prefer
 reserved example domains; use an inline
 `pii-ok` marker only for a reviewed synthetic credential or service identifier.
-Never use that marker for a real person or live credential. The CI workflow
+Never use that marker for a real person or live credential. Addresses at
+common personal mailbox providers are rejected even with that marker, and
+security documentation is scanned too. The CI workflow
 also runs Gitleaks independently of these markers. Findings report locations
 without printing matched values.
 

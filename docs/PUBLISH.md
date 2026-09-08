@@ -21,7 +21,8 @@ Use reserved `example.com`, `example.net`, `example.org`, `.example`, or `.test`
 domains in examples, including their subdomains. Keep test inputs and expected
 values consistent. `pii-ok` is only for reviewed synthetic credentials or
 service identifiers whose format is necessary to a test; it must never exempt
-a real person's address, a copied message, or a credential.
+a real person's address, a copied message, or a credential. Common personal
+mailbox providers are always rejected, even with an inline fixture marker.
 
 The privacy workflow checks the tracked tree and scans an archive of that tree
 with Gitleaks. Templates are scanned too. A green check is a backstop, not a

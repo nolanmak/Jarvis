@@ -41,6 +41,16 @@ class PrivacyGateTests(unittest.TestCase):
                 self.write("fixture.txt", "person" + "@" + domain)
                 self.assertEqual(self.scan("fixture.txt").returncode, 1)
 
+    def test_personal_mailbox_cannot_be_exempted_by_a_fixture_marker(self):
+        for domain in ["gmail.com", "GMAIL.COM", "outlook.com", "proton.me"]:
+            with self.subTest(domain=domain):
+                self.write("fixture.txt", "person" + "@" + domain + " // pii-ok: synthetic")
+                self.assertEqual(self.scan("fixture.txt").returncode, 1)
+
+    def test_security_documentation_is_scanned(self):
+        self.write("docs/SECURITY.md", "person" + "@" + "gmail.com")
+        self.assertEqual(self.scan("docs/SECURITY.md").returncode, 1)
+
     def test_templates_are_scanned_and_values_are_not_printed(self):
         token = "github_pat_" + "A1b2" * 12
         self.write(".env.example", "GITHUB_TOKEN=" + token)
