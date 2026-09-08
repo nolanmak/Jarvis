@@ -46,7 +46,7 @@ use tracing::{debug, warn};
 
 use crate::providers::{model_for, tier_of, ProviderKind};
 use crate::reasoner::{
-    parse_reset_hint, reasoner_timeout, Reasoner, ReasonerError, ReasonerOpts,
+    caller_tag, parse_reset_hint, reasoner_timeout, Reasoner, ReasonerError, ReasonerOpts,
 };
 
 /// Codex binary override (`CODEX_CLI`, mirroring `CLAUDE_CLI`) — also how
@@ -101,8 +101,11 @@ impl CodexCliReasoner {
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
         let dur = reasoner_timeout();
-        // #898 — CLI slot taken before the watchdog starts (see cli_gate).
-        let _permit = self.gate.acquire("codex").await;
+        // #898 — CLI slot before the watchdog starts; #954 — the wait carries
+        // the same budget, so it can never outlive the call it precedes.
+        let caller = caller_tag(opts);
+        let acquire = self.gate.acquire_timed("codex", &caller, dur);
+        let _permit = acquire.await.map_err(ReasonerError::from)?;
         match tokio::time::timeout(dur, self.call_once(opts, user_message, all_blocks)).await {
             // Post-classify any untyped failure (stdin EPIPE, read/wait IO)
             // as provider-side Unavailable (#655 review) — an untyped error
