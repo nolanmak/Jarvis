@@ -653,22 +653,28 @@ fn format_body(email_body: &str, draft: &str) -> String {
 /// shortened, and then line by line, dropping whole addresses and saying how
 /// many are hidden, so the card never quietly under-reports the recipients.
 fn fit_markers(markers: &str, budget: usize) -> String {
+    // The block is fitted as a WHOLE, not line by line: a long `[to: …]` next
+    // to a short `[cc: …]` is the common reply-all shape, and as long as the
+    // two together clear the reservation neither is touched.
     if markers.len() <= budget {
         return markers.to_string();
     }
     let lines: Vec<&str> = markers.lines().collect();
-    // The newlines rejoining the lines come off the top; each line then takes
-    // an equal share of what is still unspent, so a short `[subject: …]`
-    // hands its slack to the long `[cc: …]` that follows.
+    // Past that, the newlines rejoining the lines come off the top and the
+    // rest is shared max-min fairly: visit the lines SHORTEST first, so one
+    // that needs less than its share leaves the remainder to the longer lines
+    // still to come. Visiting in card order instead would hand a long `[to:]`
+    // only an equal share and then strand what the short `[cc:]` below it
+    // never used, dropping recipients the card had the room to show.
     let mut left = budget.saturating_sub(lines.len() - 1);
-    let mut fitted = Vec::with_capacity(lines.len());
-    for (i, line) in lines.iter().enumerate() {
-        let line = shorten_marker_line(line, left / (lines.len() - i));
-        left -= line.len();
-        if !line.is_empty() {
-            fitted.push(line);
-        }
+    let mut order: Vec<usize> = (0..lines.len()).collect();
+    order.sort_by_key(|&i| lines[i].len());
+    let mut fitted = vec![String::new(); lines.len()];
+    for (rank, &i) in order.iter().enumerate() {
+        fitted[i] = shorten_marker_line(lines[i], left / (lines.len() - rank));
+        left -= fitted[i].len();
     }
+    fitted.retain(|line| !line.is_empty());
     fitted.join("\n")
 }
 
@@ -1385,6 +1391,37 @@ mod tests {
         }
         assert!(!d.contains("more)]"), "nothing was hidden, so claim nothing");
         assert!(d.len() <= MAX_EMBED_DESCRIPTION);
+    }
+
+    #[test]
+    fn a_long_to_list_beside_a_short_cc_keeps_both_whole() {
+        // ~2KiB of `[to:]` under a one-address `[cc:]`. The block is fitted as
+        // a whole and clears the reservation, so neither line may be touched —
+        // a per-line share would have clipped the To list to about half.
+        let addrs = corporate_recipients(52);
+        let markers = format!("[to: {}]\n[cc: {}]", addrs.join(", "), addrs[0]);
+        assert!(markers.len() > 2000, "case must exercise a ~2KiB [to:] line");
+        let mut e = email();
+        e.body = long_inbound();
+        let draft = format!("{}\n{markers}", long_draft());
+        let d = description(&approval_message("act-e6", &e, &draft, 0));
+        assert!(d.ends_with(&markers), "the whole envelope must survive: {d}");
+        assert!(d.contains("Thanks all"), "the draft prose must still be shown");
+        assert!(d.len() <= MAX_EMBED_DESCRIPTION);
+    }
+
+    #[test]
+    fn a_short_marker_line_hands_its_slack_to_the_long_one() {
+        // Once the block really does overflow, the reservation is shared
+        // max-min fairly rather than in equal per-line slices: the `[cc:]`
+        // needs 43 of 1000 bytes, so the `[to:]` above it must get the rest.
+        let addrs = corporate_recipients(40);
+        let cc = format!("[cc: {}]", addrs[0]);
+        let fitted = fit_markers(&format!("[to: {}]\n{cc}", addrs.join(", ")), 1000);
+        assert!(fitted.len() <= 1000);
+        assert!(fitted.ends_with(&cc), "the short line stays whole: {fitted}");
+        let to = fitted.lines().next().expect("the [to:] line survives");
+        assert!(to.len() > 900, "[to:] got only {} bytes", to.len());
     }
 
     #[test]
