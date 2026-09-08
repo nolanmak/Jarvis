@@ -625,7 +625,11 @@ fn format_body(email_body: &str, draft: &str) -> String {
     // either can push a recipient off the card. No markers ⇒ the reservation
     // is zero and the split is byte-identical to the pre-#963 one.
     let (prose, markers) = split_trailing_envelope_markers(draft);
-    let markers = fit_markers(&markers, budget);
+    // The reservation is capped at two thirds so the envelope can never claim
+    // the card outright: approving a reply you cannot read is worse than a Cc
+    // that says `(+N more)`. Two thirds still clears a reply-all envelope of
+    // ~2.5KiB whole, far past any real chain.
+    let markers = fit_markers(&markers, budget * 2 / 3);
     let reserved = if markers.is_empty() {
         0
     } else {
@@ -1403,6 +1407,28 @@ mod tests {
         let shown = line.matches("@northwind-example.com").count();
         assert_eq!(shown + hidden, addrs.len(), "the count must be truthful");
         assert!(shown > 0, "some recipients must still be visible");
+    }
+
+    #[test]
+    fn a_giant_envelope_still_leaves_the_draft_on_the_card() {
+        // The recipient list may never crowd out the draft itself: approving a
+        // reply you cannot read is worse than a shortened Cc. However long the
+        // envelope, both halves of the card keep their room.
+        let addrs = corporate_recipients(400);
+        let draft = format!("{}\n[cc: {}]", long_draft(), addrs.join(", "));
+        let mut e = email();
+        e.body = long_inbound();
+        let d = description(&approval_message("act-e5", &e, &draft, 0));
+        let (inbound, reply) = d.split_once(SEPARATOR).expect("card has both halves");
+        assert!(
+            inbound.contains("quoted line from the chain"),
+            "the inbound mail must still be shown: {d}"
+        );
+        assert!(
+            reply.contains("Thanks all"),
+            "the draft prose must still be shown: {d}"
+        );
+        assert!(d.len() <= MAX_EMBED_DESCRIPTION);
     }
 
     #[test]
