@@ -20,8 +20,8 @@
 //! read once when the global gate is first used.
 //!
 //! #954 — on 2026-09-04 four permits were held by futures neither running a
-//! child nor timing out; every call queued behind them for 15 h in silence. So
-//! the wait is bounded, it says so, and a watchdog names holds past budget.
+//! child nor timing out; every call queued behind them for 15 h in silence.
+//! So the wait is bounded, it says so, and a watchdog names holds past budget.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -38,10 +38,8 @@ pub const DEFAULT_MAX_INFLIGHT: usize = 4;
 pub const ENV_MAX_INFLIGHT: &str = "AUGMENTAGENT_REASONER_MAX_INFLIGHT";
 /// How long one call may sit queued in silence, and the floor between lines.
 const QUEUED_WARN_EVERY: Duration = Duration::from_secs(60);
-/// Overdue at 1× (below); at this multiple the owner is asked to let go.
-const REVOKE_AFTER: u32 = 2;
-/// Sweep-period ceiling, and so the snapshot's heartbeat (see `doctor`).
-pub const WATCHDOG_EVERY: Duration = Duration::from_secs(30);
+/// Sweep-period ceiling (see [`CliGate::sweep_holds`]).
+const WATCHDOG_EVERY: Duration = Duration::from_secs(30);
 
 /// A caller gave up waiting for a permit — ours, not the provider's fault.
 #[derive(Debug, thiserror::Error)]
@@ -58,8 +56,6 @@ struct Held {
     caller: String,
     since: Instant,
     budget: Duration,
-    /// Asks the owner to stop — the watchdog's only lever ([`CliGate::sweep_holds`]).
-    revoke: Arc<Notify>,
     overdue: bool,
 }
 
@@ -150,10 +146,10 @@ impl CliGate {
         let started = Instant::now();
         let deadline = started + max_wait;
         let queued = WaitGuard::enter(self);
-        // Sliced, not one `timeout`: a caller stuck behind a leaked permit must
-        // say so every `warn_every`, not only when it gives up — the freeze
-        // never queued more callers than the gate is wide, so a depth-gated
-        // warning stayed silent. Carrying the future keeps its FIFO place.
+        // Sliced, not one `timeout`: a caller stuck behind a leaked permit says
+        // so every `warn_every`, not only when it gives up — the freeze never
+        // queued more callers than the gate is wide, so #898's depth-gated
+        // warning stayed silent. Reusing the future keeps its FIFO place.
         let acquire = Arc::clone(&self.sem).acquire_owned();
         tokio::pin!(acquire);
         let granted = loop {
@@ -174,13 +170,11 @@ impl CliGate {
         drop(queued);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (provider, caller) = (provider.to_string(), caller.to_string());
-        let revoke = Arc::new(Notify::new());
-        let (r, since, budget) = (Arc::clone(&revoke), Instant::now(), max_wait);
-        self.held()
-            .insert(id, Held { provider, caller, since, budget, revoke: r, overdue: false });
+        let (since, budget) = (Instant::now(), max_wait);
+        self.held().insert(id, Held { provider, caller, since, budget, overdue: false });
         self.arm_watchdog();
         self.write_snapshot();
-        Ok(CliPermit { _permit: granted, gate: Arc::clone(self), id, revoke })
+        Ok(CliPermit { _permit: granted, gate: Arc::clone(self), id })
     }
 
     /// One sweeper task per gate, armed by the first grant. Without it a leak is
@@ -205,23 +199,17 @@ impl CliGate {
         soonest.map_or(WATCHDOG_EVERY, |b| b / 4).clamp(Duration::from_millis(5), WATCHDOG_EVERY)
     }
 
-    /// One watchdog pass. A hold outliving its caller's budget is named the
-    /// moment it does — #656 arms that budget *after* the permit is taken, so
-    /// a call still holding at 1× has stopped making progress, and saying so
-    /// is the diagnosis #954 never printed. Revocation waits one more budget:
-    /// it is the heavier lever, and even then it only *asks*. The owner may
-    /// still have a CLI child attached, and `add_permits` would let a fifth
-    /// start beside it — the overcommit #897 OOM-killed the box for. Cancelling
-    /// drops the owner's call future, which kills the child (`kill_on_drop`)
-    /// and the permit, so a slot only comes back through [`CliPermit::drop`].
+    /// One watchdog pass. #656 arms a call's budget *after* the permit is
+    /// taken, so a hold still there at 1× has stopped making progress — naming
+    /// it, once, is the diagnosis #954 never printed. Reporting is all it does:
+    /// `add_permits` would let a fifth child start beside a hold that may still
+    /// have one, the overcommit #897 OOM-killed the box for. Slots come back
+    /// only through [`CliPermit::drop`] — but nothing blocks on one any more.
     fn sweep_holds(&self) {
         for h in self.held().values_mut() {
             let age = h.since.elapsed();
             if age <= h.budget {
                 continue;
-            }
-            if age > h.budget.saturating_mul(REVOKE_AFTER) {
-                h.revoke.notify_one(); // Idempotent; re-sent until it lets go.
             }
             if std::mem::replace(&mut h.overdue, true) {
                 continue; // Already named; `doctor` carries it from here.
@@ -232,8 +220,8 @@ impl CliGate {
                 caller = h.caller,
                 held_secs = age.as_secs(),
                 budget_secs = h.budget.as_secs(),
-                "reasoner CLI gate: permit held past its caller's budget; \
-                 owner asked to cancel at {REVOKE_AFTER}× and free the slot (#954)"
+                "reasoner CLI gate: permit held past its caller's budget — the \
+                 gate is that much narrower until it is dropped (#954)"
             );
         }
     }
@@ -256,7 +244,6 @@ impl CliGate {
             oldest_caller: oldest.map(|h| h.caller.clone()),
             oldest_since_unix: oldest.map(|h| now.saturating_sub(h.since.elapsed().as_secs())),
             oldest_budget_secs: oldest.map(|h| h.budget.as_secs()),
-            updated_unix: now,
         };
         drop(held);
         if let Some(dir) = path.parent() {
@@ -301,21 +288,11 @@ impl CliGate {
     }
 }
 
-/// Held for the lifetime of one CLI child. Dropping it is the *only* thing that
-/// frees a slot, so the gate can never admit a caller beside a live child.
+/// Held for the lifetime of one CLI child. Dropping it frees the slot.
 pub struct CliPermit {
     _permit: OwnedSemaphorePermit,
     gate: Arc<CliGate>,
     id: u64,
-    revoke: Arc<Notify>,
-}
-
-impl CliPermit {
-    /// Resolves when the hold watchdog gives up on this permit (#954). The owner
-    /// must then stop: dropping its call future kills the child and this permit.
-    pub async fn revoked(&self) {
-        self.revoke.notified().await;
-    }
 }
 
 impl Drop for CliPermit {
@@ -333,12 +310,10 @@ pub struct GateSnapshot {
     pub in_flight: usize,
     pub waiting: usize,
     pub oldest_provider: Option<String>,
-    /// Which preset holds it, and the class-aware budget it promised (#655) —
-    /// only the daemon knows either, so `doctor` reads them from here (#954).
+    /// Which preset holds it — "claude" alone cannot say *which* call leaked.
     pub oldest_caller: Option<String>,
     pub oldest_since_unix: Option<u64>,
     pub oldest_budget_secs: Option<u64>,
-    pub updated_unix: u64,
 }
 
 /// `${XDG_RUNTIME_DIR}/augmentagent/reasoner-gate.json` — tmpfs, so per boot.
@@ -424,67 +399,37 @@ mod tests {
     }
 
     /// #954 verbatim: capacity 4, all four permits held by futures neither
-    /// running a child nor timing out, so every reasoner call queues behind them
-    /// — 15 h with no email triage, no auto-PR loop, no log line. The one caller
-    /// that arrives gives up and leaves, so **nothing calls the gate again**.
+    /// running a child nor timing out, so every reasoner call queues behind
+    /// them — 15 h with no email triage, no auto-PR loop, no log line.
     #[tokio::test]
-    async fn leaked_permits_are_reported_and_revoked_without_a_later_acquire() {
-        let budget = Duration::from_millis(300);
+    async fn leaked_permits_are_named_and_bound_the_call_behind_them() {
+        let budget = Duration::from_millis(200);
         let mut gate = CliGate::new(DEFAULT_MAX_INFLIGHT);
         gate.warn_every = budget / 5;
         let gate = Arc::new(gate);
-        let mut owners = Vec::new();
+        let mut leaked = Vec::new();
         for _ in 0..DEFAULT_MAX_INFLIGHT {
-            let gate = Arc::clone(&gate);
-            owners.push(tokio::spawn(async move {
-                let permit = gate.acquire_timed("claude", "triage", budget).await.unwrap();
-                permit.revoked().await; // A parked call's only way out.
-            }));
-        }
-        while gate.in_flight() < DEFAULT_MAX_INFLIGHT {
-            tokio::task::yield_now().await;
+            leaked.push(gate.acquire_timed("claude", "triage", budget).await.unwrap());
         }
         let Err(err) = gate.acquire_timed("claude", "triage", budget).await else {
             panic!("every slot is held; nothing can be granted");
         };
         assert_eq!(err.provider, "claude");
-        assert_eq!(gate.waiting(), 0, "timed-out waiter must not stay counted");
-        // One call behind four stuck holds never makes the queue deeper than the
-        // gate, so it has to name itself *while waiting*.
+        assert_eq!(gate.waiting(), 0, "a timed-out waiter must not stay counted");
+        // One call behind four stuck holds never makes the queue deeper than
+        // the gate, so it has to name itself *while waiting*.
         let warned = gate.queued_warnings();
-        let want = "a queued caller must be named every interval it waits, not only at the end";
-        assert!(warned >= 2, "{want} (saw {warned})");
-
+        assert!(warned >= 2, "a queued caller must be named every interval ({warned})");
+        // Not one more acquire from here: the watchdog task alone has to name
+        // the leak, because "there is no next call" is exactly #954.
         let by = Instant::now() + budget * 20;
         while gate.overdue_holds() < DEFAULT_MAX_INFLIGHT as u64 && Instant::now() < by {
             tokio::time::sleep(budget / 8).await;
         }
-        // Named at 1×: every owner is still parked on `revoked()` at that point.
         assert_eq!(gate.overdue_holds(), DEFAULT_MAX_INFLIGHT as u64, "named once each");
-        assert!(owners.iter().all(|o| !o.is_finished()), "reported a budget before revoked");
-        // Not one more acquire from here: the watchdog task alone must name the
-        // leak and unstick it, or the gate stays narrow for good.
-        for owner in owners {
-            tokio::time::timeout(budget * 10, owner).await.expect("revoked").unwrap();
-        }
-        assert_eq!(gate.in_flight(), 0);
-        assert_eq!(gate.sem.available_permits(), DEFAULT_MAX_INFLIGHT);
-        gate.acquire_timed("claude", "triage", budget).await.expect("gate is usable");
-    }
-
-    /// #954 review — the watchdog may *ask* for a slot back but must never take
-    /// it: a deaf owner may still have a child, and a second one is #897.
-    #[tokio::test]
-    async fn a_revoked_hold_that_never_lets_go_keeps_its_slot() {
-        let budget = Duration::from_millis(100);
-        let gate = Arc::new(CliGate::new(1));
-        let deaf = gate.acquire_timed("claude", "triage", budget).await.unwrap();
-        tokio::time::timeout(budget * 20, deaf.revoked()).await.expect("the watchdog must ask");
-        assert_eq!(gate.sem.available_permits(), 0, "but never widen the gate");
-        assert!(gate.acquire_timed("claude", "triage", budget).await.is_err());
-        assert_eq!(gate.in_flight(), 1);
-        drop(deaf);
-        assert_eq!(gate.sem.available_permits(), 1, "the owner's Drop frees it");
+        assert_eq!(gate.sem.available_permits(), 0, "naming a hold must not widen the gate");
+        drop(leaked);
+        gate.acquire_timed("claude", "triage", budget).await.expect("gate is usable again");
     }
 
     #[test]

@@ -743,7 +743,7 @@ fn reasoner_chain_finding(raw: &str, ineligible: &[(ProviderKind, String)]) -> F
 }
 
 /// #954 — the #898 gate lives in the daemon, so doctor reads its snapshot: a
-/// permit past its promised timeout, or a stale snapshot, is the freeze.
+/// permit held past the timeout it promised is the freeze, and says whose.
 fn check_reasoner_gate() -> Finding {
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
     gate_finding(cli_gate::read_snapshot(), now.map_or(0, |d| d.as_secs()))
@@ -758,12 +758,6 @@ fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64) -> Finding {
         return Finding::ok("reasoner_gate", format!("stale snapshot from pid {}", s.pid));
     }
     let state = format!("in_flight {}/{}, waiting {}", s.in_flight, s.capacity, s.waiting);
-    // Rewritten every sweep while held: stale under a live pid = no sweeping.
-    let quiet_for = now.saturating_sub(s.updated_unix);
-    if s.in_flight > 0 && quiet_for > cli_gate::WATCHDOG_EVERY.as_secs() * 3 {
-        let msg = format!("{state}; gate snapshot {quiet_for}s stale — watchdog not sweeping");
-        return Finding::warn("reasoner_gate", msg, Some(HINT));
-    }
     // The permit carries its own class-aware budget (#655), so "overdue" is one
     // timeout — the same threshold the daemon's own watchdog reports at (#954).
     let (Some(provider), Some(since), Some(budget), Some(caller)) =
@@ -1147,16 +1141,12 @@ mod tests {
             oldest_caller: Some("TextOnly:triage-42".to_string()),
             oldest_since_unix: Some(now - held_for),
             oldest_budget_secs: Some(900),
-            updated_unix: now, // the watchdog sweeps; it is the holds that stick
         };
         // One second past its own budget is already the report #954 wanted.
         let stuck = gate_finding(Some(wedged(901)), now);
         assert_eq!(stuck.severity, Severity::Warn);
         let want = "in_flight 4/4, waiting 7; oldest permit (claude, TextOnly:triage-42) held 901s";
         assert!(stuck.message.starts_with(want), "{}", stuck.message);
-        // A snapshot no longer being refreshed says the sweep itself stopped.
-        let quiet = cli_gate::GateSnapshot { updated_unix: now - 600, ..wedged(120) };
-        assert!(gate_finding(Some(quiet), now).message.contains("not sweeping"));
         // Inside budget, a dead daemon and a fresh box are all fine.
         let dead = cli_gate::GateSnapshot { pid: u32::MAX, ..wedged(54_000) };
         for ok in [Some(wedged(900)), Some(dead), None] {

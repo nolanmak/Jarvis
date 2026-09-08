@@ -705,18 +705,11 @@ impl ClaudeCliReasoner {
         // carries the same budget: unbounded, it froze the daemon for 15 h.
         let caller = caller_tag(opts);
         let acquire = self.gate.acquire_timed("claude", &caller, dur);
-        let permit =
+        let _permit =
             acquire.await.map_err(|e| CallError::GateTimeout { waited_secs: e.waited_secs })?;
-        let call = tokio::time::timeout(dur, self.call_once(opts, user_message, capture));
-        // A revoked permit ends the call the way the watchdog does: the future
-        // is dropped, the child dies with it, and only Drop frees the slot.
-        let outcome = tokio::select! {
-            r = call => r.map_err(|_| ()),
-            _ = permit.revoked() => Err(()),
-        };
-        match outcome {
+        match tokio::time::timeout(dur, self.call_once(opts, user_message, capture)).await {
             Ok(r) => r,
-            Err(()) => {
+            Err(_) => {
                 warn!(
                     "claude call exceeded the {}s watchdog; child killed (see \
                      AUGMENTAGENT_REASONER_TIMEOUT_SECS, #656)",

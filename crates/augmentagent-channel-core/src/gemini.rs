@@ -80,17 +80,12 @@ impl GeminiCliReasoner {
         user_message: &str,
     ) -> anyhow::Result<String> {
         let dur = reasoner_timeout();
-        // #898 — CLI slot before the watchdog starts; #954 — bounded wait.
+        // #898 — CLI slot before the watchdog starts; #954 — the wait carries
+        // the same budget, so it can never outlive the call it precedes.
         let caller = caller_tag(opts);
         let acquire = self.gate.acquire_timed("gemini", &caller, dur);
-        let permit = acquire.await.map_err(ReasonerError::from)?;
-        let call = tokio::time::timeout(dur, self.call_once(opts, user_message));
-        // A revoked permit ends the call like the watchdog does (#954).
-        let outcome = tokio::select! {
-            r = call => r.map_err(|_| ()),
-            _ = permit.revoked() => Err(()),
-        };
-        match outcome {
+        let _permit = acquire.await.map_err(ReasonerError::from)?;
+        match tokio::time::timeout(dur, self.call_once(opts, user_message)).await {
             // Post-classify untyped failures (stdin EPIPE, read/wait IO) as
             // provider-side Unavailable (#655 review) so they fail over
             // instead of aborting the whole chain.

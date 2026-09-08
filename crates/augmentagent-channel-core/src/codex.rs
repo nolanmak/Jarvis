@@ -101,17 +101,12 @@ impl CodexCliReasoner {
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
         let dur = reasoner_timeout();
-        // #898 — CLI slot before the watchdog starts; #954 — bounded wait.
+        // #898 — CLI slot before the watchdog starts; #954 — the wait carries
+        // the same budget, so it can never outlive the call it precedes.
         let caller = caller_tag(opts);
         let acquire = self.gate.acquire_timed("codex", &caller, dur);
-        let permit = acquire.await.map_err(ReasonerError::from)?;
-        let call = tokio::time::timeout(dur, self.call_once(opts, user_message, all_blocks));
-        // A revoked permit ends the call like the watchdog does (#954).
-        let outcome = tokio::select! {
-            r = call => r.map_err(|_| ()),
-            _ = permit.revoked() => Err(()),
-        };
-        match outcome {
+        let _permit = acquire.await.map_err(ReasonerError::from)?;
+        match tokio::time::timeout(dur, self.call_once(opts, user_message, all_blocks)).await {
             // Post-classify any untyped failure (stdin EPIPE, read/wait IO)
             // as provider-side Unavailable (#655 review) — an untyped error
             // would abort the whole chain instead of failing over.
