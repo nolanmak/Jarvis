@@ -16,6 +16,19 @@ use crate::presets::{MAX_REDRAFT_ITERATIONS, PRESETS};
 const MAX_EMBED_DESCRIPTION: usize = 3800;
 const SEPARATOR: &str = "\n\n— DRAFT —\n\n";
 
+/// Names of the display-only envelope markers the card carries as trailing
+/// `[name: value]` lines — `[to:]`/`[cc:]`/`[bcc:]` (#439/#473),
+/// `[attachment:]` (#417), `[sends:]` (#502) and `[subject:]` (#652). Mirrors
+/// the grammar the CLI's `strip_approval_envelope_markers` recognises, kept
+/// local because the dep edge runs CLI→approval (as with [`label_for`]).
+const ENVELOPE_MARKER_NAMES: [&str; 6] = ["to", "cc", "bcc", "subject", "attachment", "sends"];
+
+/// The subset of [`ENVELOPE_MARKER_NAMES`] whose value is an address LIST, so
+/// the only ones with recipient boundaries to preserve. `[subject:]`,
+/// `[attachment:]` and `[sends:]` each carry one value, in which a comma is
+/// just text.
+const RECIPIENT_MARKER_NAMES: [&str; 3] = ["to", "cc", "bcc"];
+
 /// Sentinel that fences the "needs your input" payload appended to the
 /// persisted draft body by the email channel (#35 Phase 5). It is an HTML
 /// comment so it never reaches a recipient even if a code path skipped the
@@ -604,10 +617,191 @@ pub fn revise_modal(action_id: &str, previous_feedback: Option<&str>) -> CreateM
 
 fn format_body(email_body: &str, draft: &str) -> String {
     let budget = MAX_EMBED_DESCRIPTION.saturating_sub(SEPARATOR.len());
-    let half = budget / 2;
-    let email_part = truncate(email_body, half);
-    let draft_part = truncate(draft, budget - email_part.len());
+    // #963: the envelope markers are the LAST lines of the draft, so a plain
+    // tail-truncation drops recipients off exactly the cards that need them
+    // most — a reply on a long quoted chain, addressed to everyone. Reserve
+    // the whole block off the description budget up front, then split what is
+    // left between the inbound mail and the draft prose, so no length of
+    // either can push a recipient off the card. No markers ⇒ the reservation
+    // is zero and the split is byte-identical to the pre-#963 one.
+    let (prose, markers) = split_trailing_envelope_markers(draft);
+    // The reservation is capped at two thirds so the envelope can never claim
+    // the card outright: approving a reply you cannot read is worse than a Cc
+    // that says `(+N more)`. Two thirds still clears a reply-all envelope of
+    // ~2.5KiB whole, far past any real chain.
+    let markers = fit_markers(&markers, budget * 2 / 3);
+    let reserved = if markers.is_empty() {
+        0
+    } else {
+        markers.len() + 1 // the newline rejoining prose and markers
+    };
+    let rest = budget.saturating_sub(reserved);
+    let email_part = truncate_within(email_body, rest / 2);
+    let mut draft_part = truncate_within(&prose, rest - email_part.len());
+    if !markers.is_empty() {
+        if !draft_part.is_empty() {
+            draft_part.push('\n');
+        }
+        draft_part.push_str(&markers);
+    }
     format!("{email_part}{SEPARATOR}{draft_part}")
+}
+
+/// Fit the envelope-marker block into `budget`. The block is kept WHOLE
+/// whenever it fits, which is the point of #963 — the card has to name
+/// everyone on the chain. Only a block that cannot fit the card at all is
+/// shortened, and then line by line, dropping whole addresses and saying how
+/// many are hidden, so the card never quietly under-reports the recipients.
+fn fit_markers(markers: &str, budget: usize) -> String {
+    // The block is fitted as a WHOLE, not line by line: a long `[to: …]` next
+    // to a short `[cc: …]` is the common reply-all shape, and as long as the
+    // two together clear the reservation neither is touched.
+    if markers.len() <= budget {
+        return markers.to_string();
+    }
+    let lines: Vec<&str> = markers.lines().collect();
+    // Past that, the newlines rejoining the lines come off the top and the
+    // rest is shared max-min fairly: visit the lines SHORTEST first, so one
+    // that needs less than its share leaves the remainder to the longer lines
+    // still to come. Visiting in card order instead would hand a long `[to:]`
+    // only an equal share and then strand what the short `[cc:]` below it
+    // never used, dropping recipients the card had the room to show.
+    let mut left = budget.saturating_sub(lines.len() - 1);
+    let mut order: Vec<usize> = (0..lines.len()).collect();
+    order.sort_by_key(|&i| lines[i].len());
+    let mut fitted = vec![String::new(); lines.len()];
+    for (rank, &i) in order.iter().enumerate() {
+        fitted[i] = shorten_marker_line(lines[i], left / (lines.len() - rank));
+        left -= fitted[i].len();
+    }
+    fitted.retain(|line| !line.is_empty());
+    fitted.join("\n")
+}
+
+/// Shorten one `[to: a@…, b@…]` marker line to `max` bytes by dropping whole
+/// RECIPIENTS off the tail and naming how many it dropped, so a card that
+/// cannot show everyone still says truthfully how many it hid. Boundaries
+/// come from [`split_address_list`], never from a bare comma scan — a
+/// display name is one recipient, comma and all. A marker that is not an
+/// address list has no boundaries to respect and takes a plain ellipsis
+/// rather than a fabricated recipient count.
+fn shorten_marker_line(line: &str, max: usize) -> String {
+    let line = line.trim();
+    if line.len() <= max {
+        return line.to_string();
+    }
+    let recipients = line
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .and_then(|s| s.split_once(':'))
+        .filter(|(name, _)| {
+            RECIPIENT_MARKER_NAMES.contains(&name.trim().to_ascii_lowercase().as_str())
+        });
+    let Some((name, values)) = recipients else {
+        return truncate_within(line, max);
+    };
+    let values = split_address_list(values);
+    let mut shown = String::new();
+    let mut count = 0;
+    for value in &values {
+        let candidate = if shown.is_empty() {
+            (*value).to_string()
+        } else {
+            format!("{shown}, {value}")
+        };
+        if render_marker_line(name, &candidate, values.len() - count - 1).len() > max {
+            break;
+        }
+        shown = candidate;
+        count += 1;
+    }
+    if count == 0 {
+        return String::new();
+    }
+    render_marker_line(name, &shown, values.len() - count)
+}
+
+/// Split an RFC 5322 address list on the commas that actually separate
+/// recipients: one inside a quoted display name (`"Doe, Jane" <j@…>`) or
+/// inside angle brackets belongs to the address. Mirrors the email channel's
+/// `split_recipient_entries`, kept local because the dep edge runs
+/// channel→approval.
+fn split_address_list(values: &str) -> Vec<&str> {
+    let mut entries = Vec::new();
+    let mut start = 0;
+    let (mut quoted, mut angled) = (false, false);
+    for (i, c) in values.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '<' if !quoted => angled = true,
+            '>' if !quoted => angled = false,
+            ',' if !quoted && !angled => {
+                entries.push(values[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    entries.push(values[start..].trim());
+    entries.retain(|e| !e.is_empty());
+    entries
+}
+
+fn render_marker_line(name: &str, values: &str, hidden: usize) -> String {
+    if hidden == 0 {
+        format!("[{name}: {values}]")
+    } else {
+        format!("[{name}: {values} (+{hidden} more)]")
+    }
+}
+
+/// Split the trailing envelope-marker lines off a draft. Scans from the END
+/// and lifts consecutive [`is_envelope_marker_line`] lines, stopping at the
+/// first line that is not one — so a `[to: …]` sitting inside the body stays
+/// body. No trailing markers ⇒ `(draft, "")`, the byte-identical path.
+fn split_trailing_envelope_markers(draft: &str) -> (String, String) {
+    let mut end = draft.trim_end().len();
+    let scanned_from = end;
+    while end > 0 {
+        let line_start = draft[..end].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        if !is_envelope_marker_line(&draft[line_start..end]) {
+            break;
+        }
+        // Also drop the newline that separated this line from the one above.
+        end = line_start.saturating_sub(1);
+    }
+    if end == scanned_from {
+        return (draft.to_string(), String::new());
+    }
+    (draft[..end].to_string(), draft[end..].trim().to_string())
+}
+
+/// Is this line one of the card's display-only envelope markers?
+fn is_envelope_marker_line(line: &str) -> bool {
+    let Some(inner) = line
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+    else {
+        return false;
+    };
+    let Some((name, value)) = inner.split_once(':') else {
+        return false;
+    };
+    !value.trim().is_empty()
+        && ENVELOPE_MARKER_NAMES.contains(&name.trim().to_ascii_lowercase().as_str())
+}
+
+/// [`truncate`], but yielding "" rather than a bare `...` when not even the
+/// ellipsis fits: once the envelope block is reserved off the top, the budget
+/// left for the inbound mail or the prose can legitimately reach zero.
+fn truncate_within(s: &str, max: usize) -> String {
+    let out = truncate(s, max);
+    if out.len() > max {
+        String::new()
+    } else {
+        out
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1063,6 +1257,252 @@ mod tests {
         assert!(v.contains("aa:act-s5:schedule_modal"));
         assert!(v.contains("\"when\""));
         assert!(v.contains("tomorrow 9am"));
+    }
+
+    // ---------------------------------------------------------------------
+    // #963: a long reply card must still list EVERY To/Cc recipient. The
+    // envelope markers are the last lines of the draft, so the old
+    // truncate-from-the-end chopped them off exactly when the chain was long.
+    // ---------------------------------------------------------------------
+
+    /// The embed description as Discord would receive it.
+    fn description(m: &CreateMessage) -> String {
+        let v: serde_json::Value = serde_json::from_str(&json(m)).expect("card json parses");
+        v["embeds"][0]["description"]
+            .as_str()
+            .expect("embed has a description")
+            .to_string()
+    }
+
+    const RECIPIENTS: [&str; 7] = [
+        "gaurav@example.com",
+        "rohit@example.com",
+        "sanjay@example.com",
+        "mahir@example.com",
+        "chris@example.com",
+        "casey@example.com",
+        "chase@example.com",
+    ];
+
+    fn envelope_markers() -> String {
+        format!(
+            "[to: {}]\n[cc: {}]",
+            RECIPIENTS[..4].join(", "),
+            RECIPIENTS[4..].join(", ")
+        )
+    }
+
+    /// Inbound quoted chain long enough to claim its half of the budget.
+    fn long_inbound() -> String {
+        "> quoted line from the chain\n".repeat(150)
+    }
+
+    fn long_draft() -> String {
+        "Thanks all - here is the update on the rollout.\n".repeat(55)
+    }
+
+    #[test]
+    fn long_reply_card_lists_every_recipient() {
+        let mut e = email();
+        e.body = long_inbound();
+        let draft = format!("{}\n{}", long_draft(), envelope_markers());
+        let d = description(&approval_message("act-e1", &e, &draft, 0));
+        for addr in RECIPIENTS {
+            assert!(
+                d.contains(addr),
+                "recipient {addr} dropped from the card: {d}"
+            );
+        }
+        assert!(d.len() <= MAX_EMBED_DESCRIPTION);
+        // The ellipsis lands in the prose, not in the recipient list.
+        assert!(d.contains("Thanks all"));
+        assert!(d.ends_with(']'));
+    }
+
+    #[test]
+    fn markers_survive_alongside_the_other_two_carriers() {
+        // Production ordering (#785): body → assumes → [to:]/[cc:] →
+        // needs-input, under the same long-chain budget pressure.
+        let with_assumes = append_assumes_marker(
+            &long_draft(),
+            &["the rollout date is still the 14th".into()],
+        );
+        let with_markers = format!("{with_assumes}\n{}", envelope_markers());
+        let body = append_needs_input_marker(
+            &with_markers,
+            &[("share_doc".into(), "the rollout plan".into())],
+        );
+        let mut e = email();
+        e.body = long_inbound();
+        let msg = approval_message("act-e2", &e, &body, 0);
+        let d = description(&msg);
+        for addr in RECIPIENTS {
+            assert!(
+                d.contains(addr),
+                "recipient {addr} dropped from the card: {d}"
+            );
+        }
+        assert!(d.len() <= MAX_EMBED_DESCRIPTION);
+        let v = json(&msg);
+        assert!(v.contains("Assumes"));
+        assert!(v.contains("Needs your input"));
+        assert!(!v.contains("aa:assumes"));
+        assert!(!v.contains("aa:needs-input"));
+    }
+
+    #[test]
+    fn marker_free_long_draft_renders_exactly_as_before() {
+        let budget = MAX_EMBED_DESCRIPTION - SEPARATOR.len();
+        let inbound = long_inbound();
+        let draft = long_draft();
+        let email_part = truncate(&inbound, budget / 2);
+        let legacy = format!(
+            "{email_part}{SEPARATOR}{}",
+            truncate(&draft, budget - email_part.len())
+        );
+        assert_eq!(format_body(&inbound, &draft), legacy);
+    }
+
+    /// `n` distinct corporate-looking addresses, ~37 bytes apiece.
+    fn corporate_recipients(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("person.number{i:03}@northwind-example.com"))
+            .collect()
+    }
+
+    #[test]
+    fn a_reply_all_envelope_over_a_kilobyte_keeps_every_address() {
+        // A 36-way corporate reply-all: the envelope alone runs past a KiB but
+        // still fits the card, so every address has to render — no reserve cap
+        // may clip the block short of the room actually available.
+        let addrs = corporate_recipients(36);
+        let markers = format!(
+            "[to: {}]\n[cc: {}]",
+            addrs[..6].join(", "),
+            addrs[6..].join(", ")
+        );
+        assert!(markers.len() > 1024, "case must exercise a >1KiB envelope");
+        let mut e = email();
+        e.body = long_inbound();
+        let draft = format!("{}\n{markers}", long_draft());
+        let d = description(&approval_message("act-e3", &e, &draft, 0));
+        for addr in &addrs {
+            assert!(d.contains(addr), "recipient {addr} dropped from the card");
+        }
+        assert!(!d.contains("more)]"), "nothing was hidden, so claim nothing");
+        assert!(d.len() <= MAX_EMBED_DESCRIPTION);
+    }
+
+    #[test]
+    fn a_long_to_list_beside_a_short_cc_keeps_both_whole() {
+        // ~2KiB of `[to:]` under a one-address `[cc:]`. The block is fitted as
+        // a whole and clears the reservation, so neither line may be touched —
+        // a per-line share would have clipped the To list to about half.
+        let addrs = corporate_recipients(52);
+        let markers = format!("[to: {}]\n[cc: {}]", addrs.join(", "), addrs[0]);
+        assert!(markers.len() > 2000, "case must exercise a ~2KiB [to:] line");
+        let mut e = email();
+        e.body = long_inbound();
+        let draft = format!("{}\n{markers}", long_draft());
+        let d = description(&approval_message("act-e6", &e, &draft, 0));
+        assert!(d.ends_with(&markers), "the whole envelope must survive: {d}");
+        assert!(d.contains("Thanks all"), "the draft prose must still be shown");
+        assert!(d.len() <= MAX_EMBED_DESCRIPTION);
+    }
+
+    #[test]
+    fn a_short_marker_line_hands_its_slack_to_the_long_one() {
+        // Once the block really does overflow, the reservation is shared
+        // max-min fairly rather than in equal per-line slices: the `[cc:]`
+        // needs 43 of 1000 bytes, so the `[to:]` above it must get the rest.
+        let addrs = corporate_recipients(40);
+        let cc = format!("[cc: {}]", addrs[0]);
+        let fitted = fit_markers(&format!("[to: {}]\n{cc}", addrs.join(", ")), 1000);
+        assert!(fitted.len() <= 1000);
+        assert!(fitted.ends_with(&cc), "the short line stays whole: {fitted}");
+        let to = fitted.lines().next().expect("the [to:] line survives");
+        assert!(to.len() > 900, "[to:] got only {} bytes", to.len());
+    }
+
+    #[test]
+    fn a_list_too_long_for_the_card_reports_what_it_hid() {
+        // Only an envelope that cannot fit the embed at all loses addresses,
+        // and then the card states the count instead of trailing off.
+        let addrs = corporate_recipients(400);
+        let draft = format!("{}\n[cc: {}]", long_draft(), addrs.join(", "));
+        let mut e = email();
+        e.body = long_inbound();
+        let d = description(&approval_message("act-e4", &e, &draft, 0));
+        assert!(d.len() <= MAX_EMBED_DESCRIPTION);
+        let line = d.lines().last().expect("card ends with the marker line");
+        let hidden: usize = line
+            .rsplit_once("(+")
+            .and_then(|(_, tail)| tail.strip_suffix(" more)]"))
+            .expect("an over-long list states its overflow")
+            .parse()
+            .expect("the overflow count is a number");
+        let shown = line.matches("@northwind-example.com").count();
+        assert_eq!(shown + hidden, addrs.len(), "the count must be truthful");
+        assert!(shown > 0, "some recipients must still be visible");
+    }
+
+    #[test]
+    fn a_giant_envelope_still_leaves_the_draft_on_the_card() {
+        // The recipient list may never crowd out the draft itself: approving a
+        // reply you cannot read is worse than a shortened Cc. However long the
+        // envelope, both halves of the card keep their room.
+        let addrs = corporate_recipients(400);
+        let draft = format!("{}\n[cc: {}]", long_draft(), addrs.join(", "));
+        let mut e = email();
+        e.body = long_inbound();
+        let d = description(&approval_message("act-e5", &e, &draft, 0));
+        let (inbound, reply) = d.split_once(SEPARATOR).expect("card has both halves");
+        assert!(
+            inbound.contains("quoted line from the chain"),
+            "the inbound mail must still be shown: {d}"
+        );
+        assert!(
+            reply.contains("Thanks all"),
+            "the draft prose must still be shown: {d}"
+        );
+        assert!(d.len() <= MAX_EMBED_DESCRIPTION);
+    }
+
+    #[test]
+    fn shortening_a_list_never_splits_a_name_on_its_own_comma() {
+        // `"Doe, Jane" <…>` is ONE recipient. A bare comma scan sees two,
+        // which both mis-states the hidden count and can end the line on
+        // half a name.
+        let line = r#"[cc: "Doe, Jane" <jane@example.com>, "Roe, Rick" <rick@example.com>, ann@example.com]"#;
+        let one = r#"[cc: "Doe, Jane" <jane@example.com> (+2 more)]"#;
+        assert_eq!(shorten_marker_line(line, one.len()), one);
+        // Not even one whole recipient fits ⇒ drop the line rather than
+        // render a fragment of a name.
+        assert_eq!(shorten_marker_line(line, 20), "");
+        // A single-valued marker has no recipient boundaries at all, so it
+        // gets an ellipsis instead of an invented "(+N more)".
+        let subject = "[subject: Rollout, phase two, and the follow-up]";
+        assert!(!shorten_marker_line(subject, 30).contains("more)"));
+    }
+
+    #[test]
+    fn only_trailing_marker_lines_are_lifted() {
+        // A body line that merely looks like a marker stays in the prose: the
+        // scan stops at the first non-marker line from the end.
+        let draft = "Hi,\n\n[to: earlier@example.com]\nstill body\n\n[cc: a@example.com]";
+        let (prose, markers) = split_trailing_envelope_markers(draft);
+        assert_eq!(markers, "[cc: a@example.com]");
+        assert!(prose.contains("[to: earlier@example.com]"));
+        assert!(prose.contains("still body"));
+        // No trailing markers ⇒ the draft comes back untouched.
+        let plain = "Hi,\n\nSee you then.\n";
+        let (prose, markers) = split_trailing_envelope_markers(plain);
+        assert_eq!(prose, plain);
+        assert!(markers.is_empty());
+        // A bracketed line that isn't an envelope name is prose.
+        let (prose, markers) = split_trailing_envelope_markers("body\n[note: hi]");
+        assert_eq!(prose, "body\n[note: hi]");
+        assert!(markers.is_empty());
     }
 
     #[test]
