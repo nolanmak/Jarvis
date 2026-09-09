@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillEntry {
     /// Stable identifier used both in the on-disk path and in the index
-    /// line shown to the model. E.g. `"email-triage"`, `"grocery"`.
+    /// line shown to the model. E.g. `"email-triage"`, `"wiki-search"`.
     pub name: String,
     /// One-line summary the model sees in the advertised index. Keep this
     /// short (target <= 80 chars) so the joined index stays small.
@@ -209,10 +209,6 @@ const STARTER_SKILLS: &[(&str, &str)] = &[
         "Decide reply/skip/flag for inbound WhatsApp messages.",
     ),
     (
-        "grocery",
-        "Build a weekly grocery order from the user's pantry + preferences.",
-    ),
-    (
         "draft-archetypes",
         "Reusable reply scaffolds (decline, defer, confirm, intro) for outbound drafts.",
     ),
@@ -244,7 +240,7 @@ mod tests {
         // Pinning the set we ship today; if you add to STARTER_SKILLS, add
         // an assertion here so the prompt change is intentional.
         assert!(reg.contains("email-triage"));
-        assert!(reg.contains("grocery"));
+        assert!(!reg.contains("grocery"));
         assert!(reg.contains("wiki-search"));
         assert!(!reg.is_empty());
     }
@@ -287,21 +283,21 @@ mod tests {
     fn with_skills_dir_attaches_roots_for_existing_subdirs() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("email-triage")).unwrap();
-        // grocery dir intentionally absent so we can confirm "missing -> None".
+        // optional-example dir intentionally absent so we can confirm "missing -> None".
         let mut reg = SkillRegistry::new();
         reg.register(SkillEntry::new("email-triage", "x"));
-        reg.register(SkillEntry::new("grocery", "y"));
+        reg.register(SkillEntry::new("optional-example", "y"));
         let reg = reg.with_skills_dir(tmp.path());
         let email = reg
             .entries()
             .find(|s| s.name == "email-triage")
             .expect("email-triage present");
         assert_eq!(email.root, Some(tmp.path().join("email-triage")));
-        let grocery = reg
+        let optional = reg
             .entries()
-            .find(|s| s.name == "grocery")
-            .expect("grocery present");
-        assert!(grocery.root.is_none(), "missing dir => None root");
+            .find(|s| s.name == "optional-example")
+            .expect("optional-example present");
+        assert!(optional.root.is_none(), "missing dir => None root");
     }
 
     #[test]

@@ -29,7 +29,7 @@ the failing `attempts` log so the agent can decide what to do.
 
 ## Wire protocol
 
-NDJSON over a Unix socket — same shape as `sidecars/grocery`.
+NDJSON over a Unix socket, with request IDs correlating responses.
 
 Request frame:
 ```json
