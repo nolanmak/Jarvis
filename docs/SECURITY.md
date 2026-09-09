@@ -80,3 +80,14 @@ Order matters:
 - [ ] `.env`, `*.db`, `discord-creds.json`, `wiki/`, `tenant.env` are gitignored
       and not tracked (`git ls-files | rg -i 'env|\.db|creds'` → only `.example`)
 - [ ] `.env.example` has every required key as a placeholder, no real values
+
+## Public issue reports
+
+Report software behavior using synthetic examples. Do not include real recipient
+lists, message IDs, subjects, private message excerpts, personal names, phone
+numbers, local paths, or credentials from the inbox or wiki. Use reserved
+`example.com` addresses. The query agent's `aa-gh` shim checks explicit issue
+titles and bodies for obvious emails and credentials before posting. It cannot
+detect every private fact; review the content before requesting a report.
+Reports require an explicit `--body` or `--body-file`; interactive editors and
+templates are refused because their final contents cannot be checked first.

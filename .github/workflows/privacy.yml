@@ -14,7 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Test privacy gate
-        run: python3 scripts/tests/check-no-personal-data.test.py
+        run: |
+          python3 scripts/tests/check-no-personal-data.test.py
+          python3 scripts/tests/aa-gh-privacy.test.py
       - name: Check tracked files, including templates
         run: bash scripts/check-no-personal-data.sh --tracked
       - name: Install pinned secret scanner
