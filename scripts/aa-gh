@@ -38,4 +38,63 @@ case "$2" in
     ;;
 esac
 
-exec "$GH_BIN" "$@"
+if [[ "$2" == "list" || "$2" == "view" ]]; then
+  exec "$GH_BIN" "$@"
+fi
+
+# Public issue reports must not copy account details or credentials from the
+# private inbox/wiki. Snapshot body files so the checked bytes are sent.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+GH_ARGS=("$1" "$2")
+shift 2
+BODY_SET=0
+TITLE=""
+TITLE_SET=0
+refuse() { echo "aa-gh: $1" >&2; exit 2; }
+set_body() {
+  [[ "$BODY_SET" == 0 ]] || refuse "supply exactly one explicit body"
+  BODY_SET=1
+  GH_ARGS+=(--body-file "$TMP_DIR/body.txt")
+}
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --body|-b)
+      [[ $# -ge 2 ]] || refuse "body value is missing"
+      set_body; printf '%s' "$2" > "$TMP_DIR/body.txt"; shift 2 ;;
+    --body=*)
+      set_body; printf '%s' "${1#*=}" > "$TMP_DIR/body.txt"; shift ;;
+    --body-file|-F)
+      [[ $# -ge 2 ]] || refuse "body file is missing"
+      set_body
+      if [[ "$2" == "-" ]]; then cat > "$TMP_DIR/body.txt"; else cat -- "$2" > "$TMP_DIR/body.txt"; fi
+      shift 2 ;;
+    --body-file=*)
+      set_body
+      if [[ "${1#*=}" == "-" ]]; then cat > "$TMP_DIR/body.txt"; else cat -- "${1#*=}" > "$TMP_DIR/body.txt"; fi
+      shift ;;
+    --title|-t)
+      [[ $# -ge 2 ]] || refuse "title value is missing"
+      [[ "$TITLE_SET" == 0 ]] || refuse "supply exactly one title"
+      TITLE_SET=1; TITLE="$2"; GH_ARGS+=("$1" "$2"); shift 2 ;;
+    --title=*)
+      [[ "$TITLE_SET" == 0 ]] || refuse "supply exactly one title"
+      TITLE_SET=1; TITLE="${1#*=}"; GH_ARGS+=("$1"); shift ;;
+    --editor|-e|--web|-w|--template|--template=*|--recover|--recover=*)
+      refuse "interactive/template bodies cannot be privacy-checked; use --body or --body-file" ;;
+    --repo|-R|--label|-l|--assignee|-a|--milestone|-m|--project|-p)
+      [[ $# -ge 2 ]] || refuse "option value is missing"
+      GH_ARGS+=("$1" "$2"); shift 2 ;;
+    --repo=*|--label=*|--assignee=*|--milestone=*|--project=*|--edit-last|--create-if-none)
+      GH_ARGS+=("$1"); shift ;;
+    -*) refuse "unsupported write option; use explicit long options" ;;
+    *) GH_ARGS+=("$1"); shift ;;
+  esac
+done
+[[ "$BODY_SET" == 1 ]] || refuse "an explicit --body or --body-file is required"
+{ printf '%s\n' "$TITLE"; cat "$TMP_DIR/body.txt"; } | sed 's/pii-ok//g' > "$TMP_DIR/report.txt"
+if ! bash "$SCRIPT_DIR/check-no-personal-data.sh" "$TMP_DIR/report.txt" >&2; then
+  refuse "report may contain private data; use example.com addresses and synthetic identifiers, then retry"
+fi
+"$GH_BIN" "${GH_ARGS[@]}"
