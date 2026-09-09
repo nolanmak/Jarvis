@@ -128,13 +128,13 @@ mod tests {
             }),
             attendees: Some(vec![
                 RawAttendee {
-                    email: Some("me@x.com".into()),
+                    email: Some("me@x.example.com".into()),
                     self_: Some(true),
                     response_status: Some("accepted".into()),
                     ..Default::default()
                 },
                 RawAttendee {
-                    email: Some("a@y.com".into()),
+                    email: Some("a@y.example.com".into()),
                     response_status: Some("accepted".into()),
                     ..Default::default()
                 },
@@ -190,7 +190,7 @@ mod tests {
     fn drops_solo_block() {
         let mut e = base();
         e.attendees = Some(vec![RawAttendee {
-            email: Some("me@x.com".into()),
+            email: Some("me@x.example.com".into()),
             self_: Some(true),
             response_status: Some("accepted".into()),
             ..Default::default()
@@ -203,12 +203,12 @@ mod tests {
         let mut e = base();
         e.attendees = Some(vec![
             RawAttendee {
-                email: Some("me@x.com".into()),
+                email: Some("me@x.example.com".into()),
                 self_: Some(true),
                 ..Default::default()
             },
             RawAttendee {
-                email: Some("room-a@x.com".into()),
+                email: Some("room-a@x.example.com".into()),
                 resource: Some(true),
                 ..Default::default()
             },
@@ -220,7 +220,7 @@ mod tests {
     fn drops_subscribed_calendar_organizer() {
         let mut e = base();
         e.organizer = Some(RawOrganizer {
-            email: Some("birthdays@group.calendar.google.com".into()),
+            email: Some("birthdays@group.calendar.google.com".into()), // pii-ok: Google calendar service identifier
             ..Default::default()
         });
         assert_eq!(

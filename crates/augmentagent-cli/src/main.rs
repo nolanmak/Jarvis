@@ -1534,7 +1534,7 @@ enum DocOp {
 #[derive(Subcommand)]
 enum GmailOp {
     /// Search all connected Gmail accounts with a Gmail query string
-    /// (e.g. `from:jeremy@acme.com`, `subject:deadline after:2026/04/01`).
+    /// (e.g. `from:jeremy@acme.example.com`, `subject:deadline after:2026/04/01`).
     /// Prints a short listing (from / subject / date / messageId / threadId)
     /// by default.
     Search {
@@ -1618,8 +1618,8 @@ enum GmailOp {
         #[arg(long)]
         account: Option<String>,
         /// Recipient address(es). Repeat the flag or pass a comma-separated
-        /// list for multiple To recipients (#439): `--to a@x.com --to b@y.com`
-        /// or `--to 'a@x.com, b@y.com'`. Display names are stripped.
+        /// list for multiple To recipients (#439): `--to a@x.example.com --to b@y.example.com`
+        /// or `--to 'a@x.example.com, b@y.example.com'`. Display names are stripped.
         #[arg(long, required = true)]
         to: Vec<String>,
         /// Cc recipient(s). Repeatable / comma-separated like `--to` (#439).
@@ -2042,7 +2042,7 @@ enum WikiOp {
     /// Backfill v2 schema fields onto cold person pages via Haiku. See #78.
     ///
     /// Re-runnable; per-page idempotent via the `migrated:` marker. Writes
-    /// per-batch git commits authored as Nolan Makatche.
+    /// per-batch git commits authored using the configured operator identity.
     Migrate {
         /// Schema version target. Only `v2` is supported today.
         #[arg(long, default_value = "v2")]
@@ -4053,7 +4053,7 @@ fn run_ratelimit_caps() -> Result<()> {
 }
 
 /// Match an account against a `--account` filter (#482): exact entity-id match,
-/// or a case-insensitive substring of the email — so `nolanmak7` and the full
+/// or a case-insensitive substring of the email — so `operator` and the full
 /// address both select the same account.
 fn account_matches(account: &augmentagent_store::Account, filter: &str) -> bool {
     let f = filter.trim();
@@ -4179,10 +4179,10 @@ mod gmail_search_account_filter_tests {
 
     #[test]
     fn account_matches_by_entity_id_and_email_substring() {
-        let a = acct("augmentagent-123", "nolanmak7@gmail.com"); // pii-ok: synthetic
+        let a = acct("augmentagent-123", "operator@example.com"); // pii-ok: synthetic
         assert!(super::account_matches(&a, "augmentagent-123")); // exact entity id
-        assert!(super::account_matches(&a, "NOLANMAK7@gmail.com")); // pii-ok: full email, case-insensitive
-        assert!(super::account_matches(&a, "nolanmak7")); // pii-ok: email substring (the ergonomic form)
+        assert!(super::account_matches(&a, "OPERATOR@EXAMPLE.COM")); // pii-ok: full email, case-insensitive
+        assert!(super::account_matches(&a, "operator")); // pii-ok: email substring (the ergonomic form)
         assert!(!super::account_matches(&a, "someone-else")); // pii-ok: non-match
         assert!(!super::account_matches(&a, "")); // empty never matches
     }
@@ -7312,7 +7312,7 @@ fn relpath(p: &std::path::Path, wiki_root: &std::path::Path) -> String {
         .to_string()
 }
 
-/// Stage and commit a batch of migrated pages. Authored as Nolan Makatche
+/// Stage and commit a batch of migrated pages. Authored using the configured operator identity
 /// per project convention; per-command `-c user.name/email` to avoid
 /// requiring global git config.
 async fn git_commit_batch(
@@ -8328,10 +8328,10 @@ mod approval_body_tests {
 
     #[test]
     fn removes_display_only_recipient_lines() {
-        let body = "Hi Bo,\n\nThanks.\n\nCC: ccrimi75@gmail.com";
+        let body = "Hi Bo,\n\nThanks.\n\nCC: assistant@example.com";
         assert_eq!(strip_approval_envelope_markers(body), "Hi Bo,\n\nThanks.");
         assert_eq!(
-            strip_approval_envelope_markers("Hi\n[cc: ccrimi75@gmail.com]"),
+            strip_approval_envelope_markers("Hi\n[cc: assistant@example.com]"),
             "Hi"
         );
         assert_eq!(
@@ -15741,16 +15741,16 @@ mod tone_cli_tests {
     #[test]
     fn parse_tone_scope_domain_lowercases() {
         assert_eq!(
-            parse_tone_scope("domain:Acme.COM").unwrap(),
-            ("domain".into(), "acme.com".into())
+            parse_tone_scope("domain:Acme.Example.COM").unwrap(),
+            ("domain".into(), "acme.example.com".into())
         );
     }
 
     #[test]
     fn parse_tone_scope_recipient_lowercases() {
         assert_eq!(
-            parse_tone_scope("recipient:Alex@Startup.IO").unwrap(),
-            ("recipient".into(), "alex@startup.io".into())
+            parse_tone_scope("recipient:Alex@Startup.Example.COM").unwrap(),
+            ("recipient".into(), "alex@startup.example.com".into())
         );
     }
 
@@ -16287,7 +16287,7 @@ mod auto_expire_sweep_tests {
             cc: String::new(),
             message_id: message_id.into(),
             thread_id: None,
-            from: "a@b.com".into(), // pii-ok
+            from: "a@b.example.com".into(), // pii-ok
             subject: "hi".into(),
             body: "hello".into(),
             date: "2026-04-13T12:00:00Z".into(),
@@ -16390,13 +16390,13 @@ mod auto_expire_sweep_tests {
         store.upsert_email(&sample_email("mid5")).unwrap();
         store.upsert_email(&sample_email("fresh1")).unwrap();
         let id_old = store // pii-ok
-            .log_action("old10", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
+            .log_action("old10", None, "a@b.example.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
             .unwrap();
         let id_mid = store // pii-ok
-            .log_action("mid5", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
+            .log_action("mid5", None, "a@b.example.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
             .unwrap();
         let id_fresh = store // pii-ok
-            .log_action("fresh1", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
+            .log_action("fresh1", None, "a@b.example.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
             .unwrap();
         backdate(&db_path, &id_old, 10);
         backdate(&db_path, &id_mid, 5);
@@ -16420,7 +16420,7 @@ mod auto_expire_sweep_tests {
         let db_path = tmp.path().join("data.db");
         store.upsert_email(&sample_email("old99")).unwrap();
         let id_old = store // pii-ok
-            .log_action("old99", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
+            .log_action("old99", None, "a@b.example.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
             .unwrap();
         backdate(&db_path, &id_old, 99);
 
@@ -16531,8 +16531,8 @@ mod stale_reconcile_tests {
     #[test]
     fn retires_cards_on_threads_the_user_already_answered() {
         let (store, _t) = fresh_store();
-        let answered = seed_pending(&store, "m-1", Some("T-answered"), "dana@example-labs.ai"); // pii-ok: synthetic
-        let untouched = seed_pending(&store, "m-2", Some("T-open"), "sam@example-labs.ai"); // pii-ok: synthetic
+        let answered = seed_pending(&store, "m-1", Some("T-answered"), "dana@labs.example.com"); // pii-ok: synthetic
+        let untouched = seed_pending(&store, "m-2", Some("T-open"), "sam@labs.example.com"); // pii-ok: synthetic
 
         // The OutboundObserver saw the user reply on T-answered.
         store
@@ -16555,8 +16555,8 @@ mod stale_reconcile_tests {
     fn retires_cards_from_bulk_senders() {
         let (store, _t) = fresh_store();
         let blast =
-            seed_pending(&store, "m-3", Some("T-3"), "Brand <marketing@engage.examplebrand.com>"); // pii-ok: synthetic
-        let human = seed_pending(&store, "m-4", Some("T-4"), "Dana Rivera <dana@example-labs.ai>"); // pii-ok: synthetic
+            seed_pending(&store, "m-3", Some("T-3"), "Brand <marketing@engage.brand.example.com>"); // pii-ok: synthetic
+        let human = seed_pending(&store, "m-4", Some("T-4"), "Dana Rivera <dana@labs.example.com>"); // pii-ok: synthetic
 
         let n = reconcile_stale_approvals_tick(&store).unwrap();
         assert_eq!(n, 1);
@@ -16572,7 +16572,7 @@ mod stale_reconcile_tests {
     #[test]
     fn reconcile_is_idempotent_and_noop_on_a_clean_queue() {
         let (store, _t) = fresh_store();
-        seed_pending(&store, "m-5", Some("T-5"), "Dana Rivera <dana@example-labs.ai>"); // pii-ok: synthetic
+        seed_pending(&store, "m-5", Some("T-5"), "Dana Rivera <dana@labs.example.com>"); // pii-ok: synthetic
         assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
         assert_eq!(reconcile_stale_approvals_tick(&store).unwrap(), 0);
     }
@@ -16590,18 +16590,18 @@ mod stale_reconcile_tests {
             &store,
             "m-6",
             Some("T-6"),
-            "Dana Rivera <dana@example-labs.ai>", // pii-ok: synthetic
+            "Dana Rivera <dana@labs.example.com>", // pii-ok: synthetic
             None,
         );
         let whitespace = seed_pending_draft(
             &store,
             "m-7",
             Some("T-7"),
-            "Sam Okafor <sam@example-labs.ai>", // pii-ok: synthetic
+            "Sam Okafor <sam@labs.example.com>", // pii-ok: synthetic
             Some("   \n  "),
         );
         // A real person with a real draft must be left alone.
-        let good = seed_pending(&store, "m-8", Some("T-8"), "Alex Chen <alex@examplesoft.net>"); // pii-ok: synthetic
+        let good = seed_pending(&store, "m-8", Some("T-8"), "Alex Chen <alex@software.example.net>"); // pii-ok: synthetic
 
         let n = reconcile_stale_approvals_tick(&store).unwrap();
         assert_eq!(n, 2);

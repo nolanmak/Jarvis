@@ -307,7 +307,7 @@ mod tests {
             "No contact in 45 days (cadence 30)",
             dedup,
         )
-        .with_person("jane_at_corp_com")
+        .with_person("jane_at_corp_example_com")
     }
 
     #[test]
@@ -321,7 +321,7 @@ mod tests {
         assert_eq!(rows[0].status, "pending");
         assert_eq!(
             rows[0].signal.person_slug.as_deref(),
-            Some("jane_at_corp_com")
+            Some("jane_at_corp_example_com")
         );
     }
 

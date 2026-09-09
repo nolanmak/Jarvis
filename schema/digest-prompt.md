@@ -49,16 +49,16 @@ Use Discord markdown:
 **24h inbox** — 47 new, 42 auto-skipped, 3 flagged, 2 sent replies.
 
 **Flagged (3)**
-- `jake.oshea@antler.co` — Re: Thursday call — reopened thread, wants a time
-- `legal@acme.com` — Updated MSA v3 — needs your sign-off
-- `noreply@stripe.com` — Payout failed — bank detail issue
+- `alex@example.com` — Re: Thursday call — reopened thread, wants a time
+- `legal@acme.example.com` — Updated MSA v3 — needs your sign-off
+- `noreply@billing.example.com` — Payout failed — bank detail issue
 
 **Pending approvals (2)**
-- `jeremy.doe@acme.com` — Re: partnership scope — waiting 2d
-- `sam@orchid.studio` — Re: invoice question — waiting 5h
+- `jeremy.doe@acme.example.com` — Re: partnership scope — waiting 2d
+- `sam@example.com` — Re: invoice question — waiting 5h
 
 **Notable**
-- `jeremy.doe@acme.com` (see `people/jeremy_doe_at_acme_com.md`) — confirmed meeting for next Tue
+- `jeremy.doe@acme.example.com` (see `people/jeremy_doe_at_acme_example_com.md`) — confirmed meeting for next Tue
 ```
 
 Enumerate every flagged and pending row. Outside those two contractually-exhaustive sections, shorter is better than longer. If there's truly nothing to report (both lists empty, no notable activity), a single line is fine.
@@ -84,8 +84,8 @@ Example:
 
 ```
 **Relationships** — 4 overdue, 1 commitment past due, 1 birthday this week.
-- `jane@corp.com` — no contact in 96d (your cadence: monthly)
-- `sam@acme.com` — you owe "send the deck", 12d late
+- `jane@corp.example.com` — no contact in 96d (your cadence: monthly)
+- `sam@acme.example.com` — you owe "send the deck", 12d late
 - Priya's birthday is in 3 days
 - +2 more. Full list + actions: /relationships
 ```

@@ -7,7 +7,7 @@
 #
 # Usage:
 #   ./scripts/linkedin-harvest-from-intercept.sh
-#   LINKEDIN_SSH_TARGET=nolan@host ./scripts/linkedin-harvest-from-intercept.sh
+#   LINKEDIN_SSH_TARGET=operator@host ./scripts/linkedin-harvest-from-intercept.sh
 #
 # Produces the same JSON shape as ./linkedin-harvest.sh — both feed
 # `augmentagent linkedin login`.
@@ -17,7 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 OUT_LOCAL="${OUT_LOCAL:-$REPO_ROOT/linkedin-auth.json}"
-CAPTURES_DB="${CAPTURES_DB:-/Users/nolanmakatche/claude_intercept/captures/captures.db}"
+CAPTURES_DB="${CAPTURES_DB:-$HOME/claude_intercept/captures/captures.db}"
 
 if [[ ! -f "$CAPTURES_DB" ]]; then
     echo "error: captures db not found at $CAPTURES_DB" >&2

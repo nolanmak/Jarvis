@@ -177,7 +177,7 @@ mod tests {
                     label TEXT, entityId TEXT NOT NULL, active INTEGER DEFAULT 1,
                     createdAt INTEGER NOT NULL
                 );
-                INSERT INTO gmail_accounts VALUES ('a1', 'c1', 'me@x.com', NULL, 'acc1', 1, 0);
+                INSERT INTO gmail_accounts VALUES ('a1', 'c1', 'me@x.example.com', NULL, 'acc1', 1, 0);
                 "#,
             )
             .unwrap();
@@ -200,13 +200,13 @@ mod tests {
             }),
             attendees: Some(vec![
                 RawAttendee {
-                    email: Some("me@x.com".into()),
+                    email: Some("me@x.example.com".into()),
                     self_: Some(true),
                     response_status: Some("accepted".into()),
                     ..Default::default()
                 },
                 RawAttendee {
-                    email: Some("a@y.com".into()),
+                    email: Some("a@y.example.com".into()),
                     response_status: Some("accepted".into()),
                     ..Default::default()
                 },

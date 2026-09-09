@@ -818,16 +818,16 @@ mod tests {
 
     #[test]
     fn email_identity_is_union_merged() {
-        let existing = "---\nkind: person\nidentities:\n  email:\n    - a@x.com\n---\n\n# Jane\n";
+        let existing = "---\nkind: person\nidentities:\n  email:\n    - a@x.example.com\n---\n\n# Jane\n";
         let patch = PersonPatch::new()
-            .identity("email", "a@x.com")
-            .identity("email", "b@y.com");
+            .identity("email", "a@x.example.com")
+            .identity("email", "b@y.example.com");
         let r = merge_person_page(Some(existing), &patch);
         assert!(r.changed);
-        assert!(r.content.contains("- a@x.com"));
-        assert!(r.content.contains("- b@y.com"));
-        // a@x.com not duplicated.
-        assert_eq!(r.content.matches("a@x.com").count(), 1);
+        assert!(r.content.contains("- a@x.example.com"));
+        assert!(r.content.contains("- b@y.example.com"));
+        // a@x.example.com not duplicated.
+        assert_eq!(r.content.matches("a@x.example.com").count(), 1);
     }
 
     #[test]

@@ -1632,8 +1632,8 @@ mod tests {
         let people = d.path().join("people");
         std::fs::create_dir_all(&people).unwrap();
         std::fs::write(
-            people.join("sarah_chen_at_acme_com.md"),
-            "---\nkind: person\nkey: sarah\nidentities:\n  email: [sarah.chen@acme.com]\n---\n\n# Sarah Chen\n",
+            people.join("sarah_chen_at_acme_example_com.md"),
+            "---\nkind: person\nkey: sarah\nidentities:\n  email: [sarah.chen@acme.example.com]\n---\n\n# Sarah Chen\n",
         )
         .unwrap();
         let ctx = ResolveCtx {
@@ -1649,7 +1649,7 @@ mod tests {
         assert!(f.fill.contains("SUGGESTION"));
         assert!(f.fill.contains("MUST NOT"));
         assert!(f.fill.contains("explicit"));
-        assert!(f.fill.contains("sarah.chen@acme.com"));
+        assert!(f.fill.contains("sarah.chen@acme.example.com"));
     }
 
     #[tokio::test]
@@ -2015,7 +2015,7 @@ mod tests {
             cc: String::new(),
             message_id: "m1".into(),
             thread_id: Some("t1".into()),
-            from: "a@b.com".into(),
+            from: "a@b.example.com".into(),
             subject: "Re: hi".into(),
             body: "the inbound message".into(),
             date: "2026-05-18T00:00:00Z".into(),

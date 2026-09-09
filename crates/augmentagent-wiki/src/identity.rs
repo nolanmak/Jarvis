@@ -275,7 +275,7 @@ mod tests {
     fn parses_identities_block() {
         let (_d, layout) = layout_with_pages(&[(
             "jane",
-            "kind: person\nkey: jane\nidentities:\n  email: [jane@corp.com, jane@personal.com]\n  linkedin: urn:li:fsd_profile:XYZ\n  discord: \"999\"",
+            "kind: person\nkey: jane\nidentities:\n  email: [jane@corp.example.com, jane@personal.example.com]\n  linkedin: urn:li:fsd_profile:XYZ\n  discord: \"999\"",
         )]);
         let index = IdentityIndex::build(&layout).unwrap();
         let page = index.lookup("linkedin", "urn:li:fsd_profile:XYZ").unwrap();
@@ -294,7 +294,7 @@ mod tests {
             (
                 "bob",
                 // close but no linkedin identity → excluded from watch-list
-                "kind: person\nkey: bob\nclose: true\nidentities:\n  email: [bob@x.com]",
+                "kind: person\nkey: bob\nclose: true\nidentities:\n  email: [bob@x.example.com]",
             ),
             (
                 "carol",
@@ -337,21 +337,21 @@ mod tests {
     fn lookup_by_email_is_case_insensitive() {
         let (_d, layout) = layout_with_pages(&[(
             "jane",
-            "kind: person\nkey: jane\nidentities:\n  email: [Jane@Corp.COM]",
+            "kind: person\nkey: jane\nidentities:\n  email: [Jane@Corp.Example.COM]",
         )]);
         let index = IdentityIndex::build(&layout).unwrap();
-        assert!(index.lookup("email", "jane@corp.com").is_some());
-        assert!(index.lookup("email", "JANE@CORP.COM").is_some());
+        assert!(index.lookup("email", "jane@corp.example.com").is_some());
+        assert!(index.lookup("email", "JANE@CORP.EXAMPLE.COM").is_some());
     }
 
     #[test]
     fn lookup_by_discord_matches_exact() {
         let (_d, layout) = layout_with_pages(&[(
             "bob",
-            "kind: person\nkey: bob\nidentities:\n  discord: \"123456789012345678\"",
+            "kind: person\nkey: bob\nidentities:\n  discord: \"999\"",
         )]);
         let index = IdentityIndex::build(&layout).unwrap();
-        assert!(index.lookup("discord", "123456789012345678").is_some());
+        assert!(index.lookup("discord", "999").is_some());
         assert!(index.lookup("discord", "000").is_none());
     }
 
@@ -379,13 +379,13 @@ mod tests {
     fn lookup_by_imessage_handle_matches_declared_handles() {
         let (_d, layout) = layout_with_pages(&[(
             "jane",
-            "kind: person\nkey: jane\nidentities:\n  imessage: [\"+14155550123\", \"Jane@iCloud.com\"]",
+            "kind: person\nkey: jane\nidentities:\n  imessage: [\"+14155550123\", \"Jane@iCloud.example.com\"]",
         )]);
         let index = IdentityIndex::build(&layout).unwrap();
         // E.164 handles compare verbatim (normalized upstream)
         assert!(index.lookup("imessage", "+14155550123").is_some());
         // Apple-ID email handles are case-insensitive like email
-        assert!(index.lookup("imessage", "jane@icloud.com").is_some());
+        assert!(index.lookup("imessage", "jane@icloud.example.com").is_some());
         assert!(index.lookup("imessage", "+10000000000").is_none());
     }
 
@@ -401,7 +401,7 @@ mod tests {
         let index = IdentityIndex::build(&layout).unwrap();
         assert!(index.lookup("imessage", "+14155550999").is_some());
         // but not the reverse: an imessage email handle is not a phone
-        assert!(index.lookup("phone", "bob@icloud.com").is_none());
+        assert!(index.lookup("phone", "bob@icloud.example.com").is_none());
     }
 
     #[test]

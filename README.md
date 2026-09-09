@@ -1,9 +1,9 @@
 # Jarvis
 
 A self-hosted personal-assistant daemon. It triages your inbound messages
-across many channels, drafts replies in your voice, and routes everything
-through a human approval step before anything is sent — plus a proactive CRM
-layer, a personal wiki, and a growing set of social/posting integrations.
+across many channels, drafts replies in your voice, and provides a human
+approval workflow for outbound replies — plus relationship reminders, a
+personal wiki, and social/posting integrations.
 
 > **Self-hosted & single-operator.** An open-source personal-assistant daemon
 > built around one operator's environment. It handles your live accounts and
@@ -14,8 +14,8 @@ layer, a personal wiki, and a growing set of social/posting integrations.
 
 - **Triage → draft → approve.** Inbound items (email, DMs, notifications) are
   classified, a reply is drafted using a tone profile learned from your sent
-  mail, and the draft is held for you to Approve / Revise / Skip. Nothing goes
-  out without explicit approval.
+  mail, and the draft is held for you to Approve / Revise / Skip. Explicit CLI
+  send commands and configured automations can also perform outbound actions.
 - **Many channels.** Email (Gmail), Discord, Slack, Telegram, LinkedIn,
   WhatsApp, Twitter/X, Instagram, Reddit, GitHub, Linear, Notion, Calendly,
   Google Calendar, Google Drive, Meetup, and a voice-capture channel.
@@ -36,7 +36,7 @@ layer, a personal wiki, and a growing set of social/posting integrations.
 Dual implementation with shared behavior:
 
 - **Rust daemon (`crates/`)** — the primary runtime. A Cargo workspace of
-  ~28 crates: `augmentagent-cli` (the `augmentagent` binary), the
+  40 crates: `augmentagent-cli` (the `augmentagent` binary), the
   `augmentagent-channel-*` channels, `augmentagent-channel-core` (the
   `Trigger`/`ChannelRunner` contract, reasoner, prompts, RateGovernor),
   `augmentagent-store` (SQLite), `augmentagent-wiki`, `augmentagent-proactive`,
@@ -52,6 +52,14 @@ Other top-level dirs: `schema/` (prompt + wiki schemas), `skills/`
 (hot-reloadable triage/draft fragments), `wiki/` (the person wiki),
 `systemd/` (user units), `scripts/` (build/update helpers), `docs/`
 (protocol/architecture notes), `views/` (dashboard templates).
+
+## Release status
+
+Jarvis is an experimental, Linux-first assistant built for a single operator.
+Self-hosting the daemon does not make model inference local: configured model
+providers and integrations receive the context needed for their requests.
+See [security notes](docs/SECURITY.md) and the
+[release checklist](docs/PUBLISH.md) before connecting live accounts.
 
 ## Running
 
@@ -187,3 +195,9 @@ searches the store catalog, and posts a cart-for-review card to Discord
 with Approve / Feedback / Skip buttons. It stops at the cart — the user
 finishes checkout in the Giant web app — and folds feedback back into
 the KG (e.g. "skip salmon next time" → `dislikes.md`).
+
+## License
+
+Original Jarvis code is licensed under [ISC](LICENSE). See
+[third-party notices](THIRD_PARTY_NOTICES.md) for separately sourced components
+and the outstanding grocery-provider provenance check.

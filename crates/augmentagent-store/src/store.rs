@@ -7397,7 +7397,7 @@ mod tests {
             cc: String::new(),
             message_id: message_id.into(),
             thread_id: None,
-            from: "a@b.com".into(),
+            from: "a@b.example.com".into(),
             subject: "hi".into(),
             body: "hello".into(),
             date: "2026-04-13T12:00:00Z".into(),
@@ -7502,7 +7502,7 @@ mod tests {
             .log_action(
                 "m1",
                 None,
-                "a@b.com",
+                "a@b.example.com",
                 "subj",
                 None,
                 None,
@@ -7524,7 +7524,7 @@ mod tests {
     fn is_message_processed_reflects_action_existence() {
         let (s, _f) = fresh_store();
         assert!(!s.is_message_processed("nope").unwrap());
-        s.log_action("m1", None, "a@b.com", "s", None, None, ActionStatus::DryRun)
+        s.log_action("m1", None, "a@b.example.com", "s", None, None, ActionStatus::DryRun)
             .unwrap();
         assert!(s.is_message_processed("m1").unwrap());
     }
@@ -7534,7 +7534,7 @@ mod tests {
         // #34: quick-refine analytics + iteration cap counter.
         let (s, _f) = fresh_store();
         let id = s
-            .log_action("m1", None, "a@b.com", "s", None, Some("v0"), ActionStatus::Pending)
+            .log_action("m1", None, "a@b.example.com", "s", None, Some("v0"), ActionStatus::Pending)
             .unwrap();
         assert_eq!(s.redraft_count(&id).unwrap(), 0);
 
@@ -7560,23 +7560,23 @@ mod tests {
     fn action_envelope_round_trips_and_defaults_to_none() {
         let (s, _f) = fresh_store();
         let id = s
-            .log_action("m1", None, "josh@x.com", "intro", None, Some("v0"), ActionStatus::Pending)
+            .log_action("m1", None, "josh@x.example.com", "intro", None, Some("v0"), ActionStatus::Pending)
             .unwrap();
         // Pre-#473 shape: nothing recorded → None, so revise falls back to from.
         assert_eq!(s.get_action_envelope(&id).unwrap(), None);
 
-        s.set_action_envelope(&id, Some("omer@y.com"), None, Some("josh@x.com"))
+        s.set_action_envelope(&id, Some("omer@y.example.com"), None, Some("josh@x.example.com"))
             .unwrap();
         let env = s.get_action_envelope(&id).unwrap().expect("envelope set");
-        assert_eq!(env.to.as_deref(), Some("omer@y.com"));
+        assert_eq!(env.to.as_deref(), Some("omer@y.example.com"));
         assert_eq!(env.cc, None);
-        assert_eq!(env.bcc.as_deref(), Some("josh@x.com"));
+        assert_eq!(env.bcc.as_deref(), Some("josh@x.example.com"));
 
         // Empty strings are normalized to NULL, not stored as "".
-        s.set_action_envelope(&id, Some("a@b.com, c@d.com"), Some(""), Some("  "))
+        s.set_action_envelope(&id, Some("a@b.example.com, c@d.example.com"), Some(""), Some("  "))
             .unwrap();
         let env = s.get_action_envelope(&id).unwrap().expect("envelope set");
-        assert_eq!(env.to.as_deref(), Some("a@b.com, c@d.com"));
+        assert_eq!(env.to.as_deref(), Some("a@b.example.com, c@d.example.com"));
         assert_eq!(env.cc, None);
         assert_eq!(env.bcc, None);
 
@@ -7657,10 +7657,10 @@ mod tests {
         s.upsert_email(&sample_email("m1")).unwrap();
         s.upsert_email(&sample_email("m2")).unwrap();
         let a1 = s
-            .log_action("m1", None, "a@b.com", "s1", None, Some("old body"), ActionStatus::Pending)
+            .log_action("m1", None, "a@b.example.com", "s1", None, Some("old body"), ActionStatus::Pending)
             .unwrap();
         let a2 = s
-            .log_action("m2", None, "a@b.com", "s2", None, Some("x"), ActionStatus::Pending)
+            .log_action("m2", None, "a@b.example.com", "s2", None, Some("x"), ActionStatus::Pending)
             .unwrap();
         s.set_action_draft_id(&a1, "r-old").unwrap();
         s.set_action_draft_id(&a2, "r-other").unwrap();
@@ -7688,7 +7688,7 @@ mod tests {
         let (s, _f) = fresh_store();
         s.upsert_email(&sample_email("m1")).unwrap();
         let id = s
-            .log_action("m1", None, "a@b.com", "s", None, Some("draft"), ActionStatus::Pending)
+            .log_action("m1", None, "a@b.example.com", "s", None, Some("draft"), ActionStatus::Pending)
             .unwrap();
         // Next nudge is roughly 6h out — query directly to verify.
         let conn = Connection::open(_f.path().join("store-test.db")).unwrap();
@@ -7715,7 +7715,7 @@ mod tests {
         let (s, _f) = fresh_store();
         s.upsert_email(&sample_email("m1")).unwrap();
         let id = s
-            .log_action("m1", None, "a@b.com", "s", None, None, ActionStatus::DryRun)
+            .log_action("m1", None, "a@b.example.com", "s", None, None, ActionStatus::DryRun)
             .unwrap();
         let conn = Connection::open(_f.path().join("store-test.db")).unwrap();
         let next: Option<i64> = conn
@@ -7734,12 +7734,12 @@ mod tests {
         s.upsert_email(&sample_email("m1")).unwrap();
         s.upsert_email(&sample_email("m2")).unwrap();
         let id1 = s
-            .log_action("m1", None, "a@b.com", "s1", None, Some("d1"), ActionStatus::Pending)
+            .log_action("m1", None, "a@b.example.com", "s1", None, Some("d1"), ActionStatus::Pending)
             .unwrap();
         // Slight delay so m2's createdAt > m1's.
         std::thread::sleep(std::time::Duration::from_millis(2));
         let _id2 = s
-            .log_action("m2", None, "a@b.com", "s2", None, Some("d2"), ActionStatus::Pending)
+            .log_action("m2", None, "a@b.example.com", "s2", None, Some("d2"), ActionStatus::Pending)
             .unwrap();
         // Initial promotion is no longer gated by the 6h timer — fresh
         // backlog rows are eligible immediately. Oldest createdAt wins.
@@ -7757,11 +7757,11 @@ mod tests {
         s.upsert_email(&sample_email("m1")).unwrap();
         s.upsert_email(&sample_email("m2")).unwrap();
         let id1 = s
-            .log_action("m1", None, "a@b.com", "s1", None, Some("d1"), ActionStatus::Pending)
+            .log_action("m1", None, "a@b.example.com", "s1", None, Some("d1"), ActionStatus::Pending)
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
         let id2 = s
-            .log_action("m2", None, "a@b.com", "s2", None, Some("d2"), ActionStatus::Pending)
+            .log_action("m2", None, "a@b.example.com", "s2", None, Some("d2"), ActionStatus::Pending)
             .unwrap();
         // m1 is the active card (nudgeCount=1); next promotion should pick m2.
         s.record_nudge(&id1, now_millis() + NUDGE_INTERVAL_MS).unwrap();
@@ -7777,7 +7777,7 @@ mod tests {
         let (s, _f) = fresh_store();
         s.upsert_email(&sample_email("m1")).unwrap();
         let id = s
-            .log_action("m1", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .log_action("m1", None, "a@b.example.com", "s", None, Some("d"), ActionStatus::Pending)
             .unwrap();
         assert!(s.find_active_nudge().unwrap().is_none());
         s.record_nudge(&id, now_millis() + NUDGE_INTERVAL_MS).unwrap();
@@ -7792,7 +7792,7 @@ mod tests {
         let (s, _f) = fresh_store();
         s.upsert_email(&sample_email("m1")).unwrap();
         let id = s
-            .log_action("m1", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .log_action("m1", None, "a@b.example.com", "s", None, Some("d"), ActionStatus::Pending)
             .unwrap();
         s.record_nudge(&id, now_millis() + NUDGE_INTERVAL_MS).unwrap();
         s.update_action_status(&id, ActionStatus::Approved, None, None)
@@ -7808,10 +7808,10 @@ mod tests {
         let (s, _f) = fresh_store();
         s.upsert_email(&sample_email("m1")).unwrap();
         s.upsert_email(&sample_email("m2")).unwrap();
-        s.log_action("m1", None, "a@b.com", "s", None, None, ActionStatus::Pending)
+        s.log_action("m1", None, "a@b.example.com", "s", None, None, ActionStatus::Pending)
             .unwrap();
         let id2 = s
-            .log_action("m2", None, "a@b.com", "s", None, None, ActionStatus::Pending)
+            .log_action("m2", None, "a@b.example.com", "s", None, None, ActionStatus::Pending)
             .unwrap();
         // Promote m2 so it's active. Both should still count as overdue when
         // we query past the timer.
@@ -7825,7 +7825,7 @@ mod tests {
         let (s, _f) = fresh_store();
         s.upsert_email(&sample_email("m1")).unwrap();
         let id = s
-            .log_action("m1", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .log_action("m1", None, "a@b.example.com", "s", None, Some("d"), ActionStatus::Pending)
             .unwrap();
         let now = now_millis();
         s.record_nudge(&id, now + NUDGE_INTERVAL_MS).unwrap();
@@ -7847,7 +7847,7 @@ mod tests {
         let (s, _f) = fresh_store();
         s.upsert_email(&sample_email("m1")).unwrap();
         let id = s
-            .log_action("m1", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .log_action("m1", None, "a@b.example.com", "s", None, Some("d"), ActionStatus::Pending)
             .unwrap();
         // Promote, then re-nudge once → count = 2.
         s.record_nudge(&id, now_millis()).unwrap();
@@ -8012,7 +8012,7 @@ mod tests {
         let (s, _f) = fresh_store();
         s.upsert_email(&sample_email("m1")).unwrap();
         let action_id = s
-            .log_action("m1", None, "a@b.com", "s", None, Some("v0"), ActionStatus::Pending)
+            .log_action("m1", None, "a@b.example.com", "s", None, Some("v0"), ActionStatus::Pending)
             .unwrap();
         let revised_id = s
             .record_revision_triple(&action_id, "v0", "less formal please", "v1")
@@ -8035,7 +8035,7 @@ mod tests {
         let (s, _f) = fresh_store();
         s.upsert_email(&sample_email("m1")).unwrap();
         let action_id = s
-            .log_action("m1", None, "a@b.com", "s", None, Some("v0"), ActionStatus::Pending)
+            .log_action("m1", None, "a@b.example.com", "s", None, Some("v0"), ActionStatus::Pending)
             .unwrap();
         s.record_revision_triple(&action_id, "v0", "less formal", "v1")
             .unwrap();
@@ -8060,7 +8060,7 @@ mod tests {
         let (s, _f) = fresh_store();
         s.upsert_email(&sample_email("m1")).unwrap();
         let action_id = s
-            .log_action("m1", None, "a@b.com", "s", None, Some("v0"), ActionStatus::Pending)
+            .log_action("m1", None, "a@b.example.com", "s", None, Some("v0"), ActionStatus::Pending)
             .unwrap();
         s.record_revision_triple(&action_id, "v0", "less formal", "v1")
             .unwrap();
@@ -8134,8 +8134,8 @@ mod tests {
                 None,
                 Some("gmail-msg-1"),
                 "acc1",
-                "jeremy@acme.com",
-                "acme.com",
+                "jeremy@acme.example.com",
+                "acme.example.com",
                 Some("Re: stuff"),
                 "Hey — quick reply.",
                 1_700_000_000_000,
@@ -8144,7 +8144,7 @@ mod tests {
             .unwrap();
         assert!(!id.is_empty(), "insert returns a non-empty uuid");
         let recents = s
-            .recent_tone_examples("recipient", "jeremy@acme.com", Some("acc1"), 10)
+            .recent_tone_examples("recipient", "jeremy@acme.example.com", Some("acc1"), 10)
             .unwrap();
         assert_eq!(recents.len(), 1);
         assert_eq!(recents[0].source, "sent_backfill");
@@ -8219,7 +8219,7 @@ mod tests {
                 None,
                 Some(&format!("m{i}")),
                 "acc1",
-                "x@y.com",
+                "x@y.example.com",
                 "y.com",
                 None,
                 "body",
@@ -8229,7 +8229,7 @@ mod tests {
             .unwrap();
         }
         let recents = s
-            .recent_tone_examples("recipient", "x@y.com", Some("acc1"), 2)
+            .recent_tone_examples("recipient", "x@y.example.com", Some("acc1"), 2)
             .unwrap();
         assert_eq!(recents.len(), 2);
         assert_eq!(recents[0].sent_at_ms, 3000);
@@ -8239,7 +8239,7 @@ mod tests {
     #[test]
     fn count_tone_examples_per_scope() {
         let (s, _f) = fresh_store();
-        for to in ["a@acme.com", "b@acme.com", "c@other.com"] {
+        for to in ["a@acme.example.com", "b@acme.example.com", "c@other.example.com"] {
             let domain = to.split('@').nth(1).unwrap();
             s.insert_tone_example(
                 "sent_backfill",
@@ -8256,11 +8256,11 @@ mod tests {
             .unwrap();
         }
         assert_eq!(
-            s.count_tone_examples("recipient", "a@acme.com", Some("acc1")).unwrap(),
+            s.count_tone_examples("recipient", "a@acme.example.com", Some("acc1")).unwrap(),
             1
         );
         assert_eq!(
-            s.count_tone_examples("domain", "acme.com", Some("acc1")).unwrap(),
+            s.count_tone_examples("domain", "acme.example.com", Some("acc1")).unwrap(),
             2
         );
         assert_eq!(
@@ -8274,14 +8274,14 @@ mod tests {
         let (s, _f) = fresh_store();
         // Seed an email + an action that's been transitioned to Sent.
         let mut email = sample_email("m-edit");
-        email.from = "Alex <alex@startup.io>".into();
+        email.from = "Alex <alex@startup.example.com>".into();
         email.subject = "Re: launch".into();
         s.upsert_email(&email).unwrap();
         let action_id = s
             .log_action(
                 "m-edit",
                 None,
-                "Alex <alex@startup.io>",
+                "Alex <alex@startup.example.com>",
                 "Re: launch",
                 Some("inbound body"),
                 Some("This is the post-edit draft the user actually sent."),
@@ -8294,12 +8294,12 @@ mod tests {
         let new_id = s.record_user_edit_as_tone_example(&action_id).unwrap();
         assert!(new_id.is_some(), "expected a tone example to be recorded");
         let recents = s
-            .recent_tone_examples("recipient", "alex@startup.io", Some("acc"), 10)
+            .recent_tone_examples("recipient", "alex@startup.example.com", Some("acc"), 10)
             .unwrap();
         assert_eq!(recents.len(), 1);
         assert_eq!(recents[0].source, "user_edit");
         assert!((recents[0].weight - 1.5).abs() < f64::EPSILON);
-        assert_eq!(recents[0].recipient_domain, "startup.io");
+        assert_eq!(recents[0].recipient_domain, "startup.example.com");
         assert_eq!(
             recents[0].body,
             "This is the post-edit draft the user actually sent."
@@ -8315,7 +8315,7 @@ mod tests {
             .log_action(
                 "m-pending",
                 None,
-                "a@b.com",
+                "a@b.example.com",
                 "subj",
                 None,
                 Some("draft"),
@@ -8329,7 +8329,7 @@ mod tests {
             .log_action(
                 "m-pending",
                 None,
-                "a@b.com",
+                "a@b.example.com",
                 "subj",
                 None,
                 None,
@@ -8548,7 +8548,7 @@ mod tests {
             .log_action(
                 "m-cas",
                 None,
-                "a@b.com",
+                "a@b.example.com",
                 "subj",
                 None,
                 None,
@@ -8998,9 +8998,9 @@ mod tests {
         let e2 = sample_email("f2");
         s.upsert_email(&e1).unwrap();
         s.upsert_email(&e2).unwrap();
-        s.log_flagged_action("f1", None, "alice@x.com", "Re: contract", None, "needs sign-off")
+        s.log_flagged_action("f1", None, "alice@x.example.com", "Re: contract", None, "needs sign-off")
             .unwrap();
-        s.log_flagged_action("f2", None, "bob@x.com", "Payout failed", None, "")
+        s.log_flagged_action("f2", None, "bob@x.example.com", "Payout failed", None, "")
             .unwrap();
 
         let flagged = s.flagged_actions_since(0).unwrap();
@@ -9010,8 +9010,8 @@ mod tests {
             .iter()
             .map(|(f, _s, r)| (f.as_str(), r.as_str()))
             .collect();
-        assert_eq!(by_from["alice@x.com"], "needs sign-off");
-        assert_eq!(by_from["bob@x.com"], "flagged");
+        assert_eq!(by_from["alice@x.example.com"], "needs sign-off");
+        assert_eq!(by_from["bob@x.example.com"], "flagged");
     }
 
     #[test]
@@ -9019,7 +9019,7 @@ mod tests {
         let (s, _f) = fresh_store();
         let e = sample_email("fw");
         s.upsert_email(&e).unwrap();
-        s.log_flagged_action("fw", None, "a@b.com", "s", None, "r").unwrap();
+        s.log_flagged_action("fw", None, "a@b.example.com", "s", None, "r").unwrap();
         // A far-future `since` excludes everything.
         let future = now_millis() + 60_000;
         assert!(s.flagged_actions_since(future).unwrap().is_empty());
@@ -9033,13 +9033,13 @@ mod tests {
             let mid = format!("p{i}");
             let e = sample_email(&mid);
             s.upsert_email(&e).unwrap();
-            s.log_action(&mid, None, &format!("u{i}@x.com"), "s", None, Some("d"), ActionStatus::Pending)
+            s.log_action(&mid, None, &format!("u{i}@x.example.com"), "s", None, Some("d"), ActionStatus::Pending)
                 .unwrap();
         }
         // A flagged row must not show up in the pending list.
         let ef = sample_email("pf");
         s.upsert_email(&ef).unwrap();
-        s.log_flagged_action("pf", None, "z@x.com", "s", None, "r").unwrap();
+        s.log_flagged_action("pf", None, "z@x.example.com", "s", None, "r").unwrap();
 
         let pending = s.pending_actions().unwrap();
         assert_eq!(pending.len(), 3, "all pending, no LIMIT; flagged excluded");
@@ -9056,7 +9056,7 @@ mod tests {
         let e = sample_email("ex");
         s.upsert_email(&e).unwrap();
         let id = s
-            .log_action("ex", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .log_action("ex", None, "a@b.example.com", "s", None, Some("d"), ActionStatus::Pending)
             .unwrap();
         // Cutoff in the past → nothing expired (row is fresh).
         assert!(s.expire_pending_older_than(0).unwrap().is_empty());
@@ -9086,13 +9086,13 @@ mod tests {
         s.upsert_email(&sample_email("mid5")).unwrap();
         s.upsert_email(&sample_email("fresh1")).unwrap();
         let id_old = s // pii-ok
-            .log_action("old10", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
+            .log_action("old10", None, "a@b.example.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
             .unwrap();
         let id_mid = s // pii-ok
-            .log_action("mid5", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
+            .log_action("mid5", None, "a@b.example.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
             .unwrap();
         let id_fresh = s // pii-ok
-            .log_action("fresh1", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
+            .log_action("fresh1", None, "a@b.example.com", "s", None, Some("d"), ActionStatus::Pending) // pii-ok
             .unwrap();
 
         // Backdate createdAt directly so we can model real wall-clock
@@ -9152,7 +9152,7 @@ mod tests {
         let e = sample_email("ap");
         s.upsert_email(&e).unwrap();
         let id = s
-            .log_action("ap", None, "a@b.com", "s", None, Some("d"), ActionStatus::Pending)
+            .log_action("ap", None, "a@b.example.com", "s", None, Some("d"), ActionStatus::Pending)
             .unwrap();
         assert!(s.mark_pending_approved(&id).unwrap());
         assert_eq!(s.pending_reply_count().unwrap(), 0);
@@ -9812,18 +9812,18 @@ mod tests {
     /// Two pending drafts on T1 + one pending on T2 ⇒ only T1's flip;
     /// T2 untouched; returns the two ids. Also asserts errorMessage carries
     /// the reason so the dashboard can render context.
-    // pii-ok — synthetic test fixtures (a@b.com is the local fresh_store convention).
+    // pii-ok — synthetic test fixtures (a@b.example.com is the local fresh_store convention).
     #[test]
     fn mark_pending_drafts_superseded_by_thread_only_flips_matching_thread() {
         let (s, _f) = fresh_store();
         let id1 = s
-            .log_action("m1", Some("T1"), "a@b.com", "s1", None, Some("d1"), ActionStatus::Pending) // pii-ok
+            .log_action("m1", Some("T1"), "a@b.example.com", "s1", None, Some("d1"), ActionStatus::Pending) // pii-ok
             .unwrap();
         let id2 = s
-            .log_action("m2", Some("T1"), "a@b.com", "s2", None, Some("d2"), ActionStatus::Pending) // pii-ok
+            .log_action("m2", Some("T1"), "a@b.example.com", "s2", None, Some("d2"), ActionStatus::Pending) // pii-ok
             .unwrap();
         let id3 = s
-            .log_action("m3", Some("T2"), "a@b.com", "s3", None, Some("d3"), ActionStatus::Pending) // pii-ok
+            .log_action("m3", Some("T2"), "a@b.example.com", "s3", None, Some("d3"), ActionStatus::Pending) // pii-ok
             .unwrap();
 
         let affected = s
@@ -9857,12 +9857,12 @@ mod tests {
     /// `dry_run` rows on the same thread also get swept — they're equivalent
     /// to pending from the user's perspective (a card the daemon would
     /// surface if dry_run flipped off).
-    // pii-ok — synthetic test fixture (a@b.com is the local fresh_store convention).
+    // pii-ok — synthetic test fixture (a@b.example.com is the local fresh_store convention).
     #[test]
     fn mark_pending_drafts_superseded_by_thread_includes_dry_run() {
         let (s, _f) = fresh_store();
         let id_dry = s
-            .log_action("m1", Some("T1"), "a@b.com", "s1", None, Some("d1"), ActionStatus::DryRun) // pii-ok
+            .log_action("m1", Some("T1"), "a@b.example.com", "s1", None, Some("d1"), ActionStatus::DryRun) // pii-ok
             .unwrap();
         let affected = s
             .mark_pending_drafts_superseded_by_thread("T1", "")
@@ -9872,18 +9872,18 @@ mod tests {
 
     /// Non-pending rows (already sent / rejected / superseded) on the same
     /// thread stay put — the observer must not "un-send" history.
-    // pii-ok — synthetic test fixtures (a@b.com is the local fresh_store convention).
+    // pii-ok — synthetic test fixtures (a@b.example.com is the local fresh_store convention).
     #[test]
     fn mark_pending_drafts_superseded_by_thread_leaves_terminal_rows_alone() {
         let (s, _f) = fresh_store();
         let id_pending = s
-            .log_action("m1", Some("T1"), "a@b.com", "s1", None, Some("d1"), ActionStatus::Pending) // pii-ok
+            .log_action("m1", Some("T1"), "a@b.example.com", "s1", None, Some("d1"), ActionStatus::Pending) // pii-ok
             .unwrap();
         let id_sent = s
-            .log_action("m2", Some("T1"), "a@b.com", "s2", None, Some("d2"), ActionStatus::Sent) // pii-ok
+            .log_action("m2", Some("T1"), "a@b.example.com", "s2", None, Some("d2"), ActionStatus::Sent) // pii-ok
             .unwrap();
         let id_rej = s
-            .log_action("m3", Some("T1"), "a@b.com", "s3", None, Some("d3"), ActionStatus::Rejected) // pii-ok
+            .log_action("m3", Some("T1"), "a@b.example.com", "s3", None, Some("d3"), ActionStatus::Rejected) // pii-ok
             .unwrap();
 
         let affected = s
