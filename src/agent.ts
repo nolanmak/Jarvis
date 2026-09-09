@@ -14,12 +14,10 @@ import dotenv from "dotenv";
 
 import { createDraft, sendDraft } from "./gmailService";
 import { getGroupEvents } from "./meetupService";
-import { sendForApproval, sendCartForApproval } from "./discordService";
+import { sendForApproval } from "./discordService";
 import { logAction, updateActionStatus, markEmailProcessed } from "./db";
 import { extractEmailAddress } from "./types";
 import type { Email } from "./types";
-import { grocery as grocerySidecar } from "./grocerySidecar";
-import { kgList, kgRead, kgWrite, kgAppend, recordOrder, type OrderRecord } from "./groceryKg";
 import { webFetch as fetchSidecar, type LayerId } from "./fetchSidecar";
 import { intercept as runIntercept, interceptAvailable, type InterceptParams } from "./interceptTool";
 
@@ -280,162 +278,6 @@ Returns JSON: { totalCount, count, events: [{ id, title, url, status, dateTime, 
   },
 }) as Tool;
 
-const groceryTool = (tool as any)({
-  name: "grocery",
-  description: `Order groceries from the configured provider (default: Giant Food Stores) and read/write the wiki/groceries/ knowledge graph.
-
-The tool is the hands, you are the brain. Search returns options; you decide which products to add. The flow ends at a Discord approval card — checkout itself is finished by the user in the browser.
-
-Available actions:
-- session_check: Verify the grocery store session. No params. Returns { authenticated, userId?, storeId?, firstName? }.
-- login: Log in to the grocery store. params: { email?, password? } (both default to env vars). If OTP required, returns { status: "otp_sent", channel, maskedValue }. If success, returns { status: "success", userId }.
-- verify_otp: Complete OTP login. params: { code: string, channel?: string }. Returns { userId }.
-- search: Search products. params: { query: string, limit?: number }. Returns { query, products: [{ prodId, name, brand, price, regularPrice, size, inStock, onSale }] }.
-- search_batch: Search multiple queries at once. params: { queries: string[], limit_per_query?: number }. Returns { results: [...] }.
-- products_by_id: Look up known products by id (fallback when search misses a known staple). params: { prodIds: number[] }.
-- cart_view: Show current cart. No params. Returns { cartId, items, subtotal, tax, total, storeId }.
-- cart_add: Add items by product id. params: { items: [{ productId, quantity }] }. Returns { added, errors }.
-- cart_remove: Remove an item by product id. params: { productId }.
-- submit_for_approval: Post the cart summary to Discord and wait for human approve/skip. params: { title: string, body_md: string }. Returns { approved: boolean, feedback: string }. ALWAYS use this before treating the order as final.
-- kg_list: List all pages under wiki/groceries/. No params. Returns { pages: string[] }.
-- kg_read: Read a page from wiki/groceries/. params: { page: string } (relative path under wiki/groceries/, e.g. "staples.md", "orders/2026-05-21.md"). Returns { page, content }.
-- kg_write: Overwrite a page in wiki/groceries/. params: { page: string, content: string }.
-- kg_append: Append to a page in wiki/groceries/. params: { page: string, content: string }.
-- record_order: Append a structured order record to wiki/groceries/orders/<date>.md. params: { date?: string (YYYY-MM-DD, defaults to today), order: { items_ordered: [{ name, qty, brand?, prodId?, price? }], items_oos?, substitutions?, total?, feedback?, approved? } }. Returns { page }.
-- schedule_set: Create or replace a grocery-order schedule via systemd user timers. params: { kind: "recurring" | "oneshot", oncalendar: string (systemd OnCalendar=, e.g. "Sun *-*-* 10:00:00" or "2026-05-30 09:00:00"), label?: string (required for oneshot, matches ^[a-z0-9-]{1,32}$) }. Recurring is a single slot — calling again replaces the previous recurring timer. Returns { ok: true, unit, next, kind, oncalendar }.
-- schedule_list: List scheduled grocery-order timers. No params. Returns [{ name, next, last, kind }].
-- schedule_clear: Cancel a grocery schedule. params: { name?: string } (omit name to clear all). Returns { ok: true, cleared: [unit, ...] }.`,
-  parameters: z.object({
-    action: z.enum([
-      "session_check",
-      "login",
-      "verify_otp",
-      "search",
-      "search_batch",
-      "products_by_id",
-      "cart_view",
-      "cart_add",
-      "cart_remove",
-      "submit_for_approval",
-      "kg_list",
-      "kg_read",
-      "kg_write",
-      "kg_append",
-      "record_order",
-      "schedule_set",
-      "schedule_list",
-      "schedule_clear",
-    ]),
-    params: z.record(z.string(), z.unknown()).nullable().optional(),
-  }),
-  execute: async (input: { action: string; params?: Record<string, unknown> | null }) => {
-    const params = input.params ?? {};
-    try {
-      switch (input.action) {
-        case "session_check":
-          return JSON.stringify(await grocerySidecar.sessionCheck());
-        case "login":
-          return JSON.stringify(await grocerySidecar.login(params.email as string | undefined, params.password as string | undefined));
-        case "verify_otp": {
-          const code = params.code as string | undefined;
-          if (!code) return JSON.stringify({ error: "verify_otp requires { code }" });
-          return JSON.stringify(await grocerySidecar.verifyOtp(code, params.channel as string | undefined));
-        }
-        case "search": {
-          const query = params.query as string | undefined;
-          if (!query) return JSON.stringify({ error: "search requires { query }" });
-          const limit = Number(params.limit);
-          return JSON.stringify(await grocerySidecar.search(query, Number.isFinite(limit) ? limit : undefined));
-        }
-        case "search_batch": {
-          const queries = params.queries;
-          if (!Array.isArray(queries)) return JSON.stringify({ error: "search_batch requires { queries: string[] }" });
-          const lpq = Number(params.limit_per_query);
-          return JSON.stringify(await grocerySidecar.searchBatch(queries.map(String), Number.isFinite(lpq) ? lpq : undefined));
-        }
-        case "products_by_id": {
-          const prodIds = params.prodIds;
-          if (!Array.isArray(prodIds)) return JSON.stringify({ error: "products_by_id requires { prodIds: number[] }" });
-          return JSON.stringify(await grocerySidecar.productsById(prodIds as Array<string | number>));
-        }
-        case "cart_view":
-          return JSON.stringify(await grocerySidecar.cartView());
-        case "cart_add": {
-          const items = params.items;
-          if (!Array.isArray(items)) return JSON.stringify({ error: "cart_add requires { items: [{ productId, quantity }] }" });
-          return JSON.stringify(await grocerySidecar.cartAdd(items as any));
-        }
-        case "cart_remove": {
-          const productId = params.productId;
-          if (productId == null) return JSON.stringify({ error: "cart_remove requires { productId }" });
-          return JSON.stringify(await grocerySidecar.cartRemove(productId as any));
-        }
-        case "submit_for_approval": {
-          const title = (params.title as string) ?? "Grocery cart for review";
-          const body = (params.body_md as string) ?? "(empty cart)";
-          const result = await sendCartForApproval(title, body);
-          return JSON.stringify(result);
-        }
-        case "kg_list":
-          return JSON.stringify({ pages: kgList() });
-        case "kg_read": {
-          const page = params.page as string | undefined;
-          if (!page) return JSON.stringify({ error: "kg_read requires { page }" });
-          return JSON.stringify({ page, content: kgRead(page) });
-        }
-        case "kg_write": {
-          const page = params.page as string | undefined;
-          const content = params.content as string | undefined;
-          if (!page || content == null) return JSON.stringify({ error: "kg_write requires { page, content }" });
-          kgWrite(page, content);
-          return JSON.stringify({ success: true, page });
-        }
-        case "kg_append": {
-          const page = params.page as string | undefined;
-          const content = params.content as string | undefined;
-          if (!page || content == null) return JSON.stringify({ error: "kg_append requires { page, content }" });
-          kgAppend(page, content);
-          return JSON.stringify({ success: true, page });
-        }
-        case "record_order": {
-          const date = (params.date as string) || new Date().toISOString().slice(0, 10);
-          const order = params.order as OrderRecord | undefined;
-          if (!order || !Array.isArray(order.items_ordered)) {
-            return JSON.stringify({ error: "record_order requires { order: { items_ordered: [...] } }" });
-          }
-          const page = recordOrder(date, order);
-          return JSON.stringify({ success: true, page });
-        }
-        case "schedule_set": {
-          const kind = params.kind as string | undefined;
-          const oncalendar = params.oncalendar as string | undefined;
-          const label = params.label as string | undefined;
-          if (kind !== "recurring" && kind !== "oneshot") {
-            return JSON.stringify({ error: "schedule_set requires { kind: 'recurring' | 'oneshot' }" });
-          }
-          if (!oncalendar || typeof oncalendar !== "string") {
-            return JSON.stringify({ error: "schedule_set requires { oncalendar: string }" });
-          }
-          if (kind === "oneshot" && (!label || !/^[a-z0-9-]{1,32}$/.test(label))) {
-            return JSON.stringify({ error: "schedule_set kind=oneshot requires { label: ^[a-z0-9-]{1,32}$ }" });
-          }
-          return JSON.stringify(await grocerySidecar.scheduleSet(kind as "recurring" | "oneshot", oncalendar, label));
-        }
-        case "schedule_list":
-          return JSON.stringify(await grocerySidecar.scheduleList());
-        case "schedule_clear": {
-          const name = params.name as string | undefined;
-          return JSON.stringify(await grocerySidecar.scheduleClear(name));
-        }
-        default:
-          return JSON.stringify({ error: `Unknown action: ${input.action}` });
-      }
-    } catch (err: any) {
-      return JSON.stringify({ error: err?.message ?? String(err), kind: err?.kind });
-    }
-  },
-}) as Tool;
-
 // --- Agent Instructions (static prefix + skill file, cacheable per session) ---
 
 function buildInstructions(): string {
@@ -569,7 +411,7 @@ If the proxy is not installed, the tool reports it cleanly — do not retry. If 
   },
 }) as Tool;
 
-const agentTools: Tool[] = [gmailTool, notifyTool, meetupTool, groceryTool, webFetchTool, interceptTool];
+const agentTools: Tool[] = [gmailTool, notifyTool, meetupTool, webFetchTool, interceptTool];
 
 function createAgent(model: any, instructions: string = buildInstructions()): Agent {
   return new Agent({
@@ -583,10 +425,7 @@ function createAgent(model: any, instructions: string = buildInstructions()): Ag
 // Ad-hoc query mode: same tools, but the agent answers a one-off request
 // instead of running the email-triage workflow. Used by POST /api/ask.
 function buildQueryInstructions(): string {
-  const grocerySkill = loadSkillFile("grocery");
-  const groceryLearned = loadLearnedPatterns("grocery");
-
-  return `You are AugmentAgent answering a one-off request from the operator. Use the available tools to answer, then reply with the answer only — no triage, no email processing, no Discord approval (unless the grocery workflow specifically requires it).
+  return `You are AugmentAgent answering a one-off request from the operator. Use the available tools to answer, then reply with the answer only — no triage, no email processing, no unsolicited Discord approval.
 
 ## Meetup events
 Use the meetup_events tool for any request about Meetup events. Group name → urlname mapping:
@@ -600,12 +439,6 @@ When asked for events (e.g. "C&C events on meetup", "upcoming Code & Coffee meet
    - <location: venue name + city, or "Online" if isOnline> · <url>
 3. Start with a one-line header like "Upcoming Code & Coffee events (<count> of <totalCount>):". If there are no events, say so plainly. If the tool returns an { error }, report it briefly (a stale-hash error means the Meetup API hash needs refreshing via /intercept).
 Keep it concise — title, time, location, link. No descriptions unless asked.
-
-## Groceries
-Use the grocery tool for any request about ordering groceries, the staples list, pantry state, preferences, dislikes, or past orders. Knowledge lives in wiki/groceries/ — always read it before acting and write back what you learn.
-
-${grocerySkill}
-${groceryLearned}
 
 ## Web fetching
 For ANY URL the operator asks you to read, summarize, or pull data from, use the web_fetch tool — never assume a URL's contents or make raw HTTP calls. It tries plain HTTPS first (free), escalates to a headless-Chromium render for JS-rendered SPAs, then to Firecrawl / Bright Data if API keys are configured. If the first response looks like an empty SPA shell or is unexpectedly short, retry with force_render: true. The returned markdown is what you should reason over; cite final_url when surfacing links.
