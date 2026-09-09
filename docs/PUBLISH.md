@@ -48,8 +48,9 @@ Before promoting the repository:
   private. Neither option recalls existing third-party copies.
 - Rotate any credential confirmed to have been exposed. The initial Gitleaks
   audit found synthetic examples, not confirmed live credentials.
-- Resolve the grocery-provider permission check in
-  [third-party notices](../THIRD_PARTY_NOTICES.md).
+- Remove historical copies of the retired grocery integration, whose
+  redistribution permission was not established. The current tree excludes
+  it; see [third-party notices](../THIRD_PARTY_NOTICES.md).
 
 The private AugmentAgent repository is a historical archive and must stay
 private. Do not assume it is protected merely because an old document called
@@ -59,8 +60,7 @@ it archived; verify the actual GitHub settings before any migration.
 
 Build a release archive from the reviewed commit with `git archive`, never
 by zipping a running deployment directory. This excludes ignored `.env`
-backups, databases, session cookies, and private wiki content. Only the empty
-grocery wiki scaffold belongs in the release.
+backups, databases, session cookies, and private wiki content. No personal wiki content belongs in the release.
 
 No version tag or public release should be published until the source checks,
-historical-data review, and third-party permission check are complete.
+historical-data review, and removal of historical unlicensed components are complete.

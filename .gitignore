@@ -2,27 +2,15 @@ node_modules/
 dist/
 target/
 
-# Wiki content is user-private by default. The grocery KG scaffold is an
-# exception — it ships in the repo so `kg_read("staples.md")` works on a
-# fresh checkout. User-authored order records under wiki/groceries/orders/
-# stay untracked except for the .gitkeep that pins the directory.
-wiki/*
-!wiki/groceries/
-wiki/groceries/*
-!wiki/groceries/staples.md
-!wiki/groceries/preferences.md
-!wiki/groceries/pantry.md
-!wiki/groceries/dislikes.md
-!wiki/groceries/orders/
-wiki/groceries/orders/*
-!wiki/groceries/orders/.gitkeep
+# All wiki content is user-private runtime data.
+wiki/
 
 .env
 .env.*
 !.env.example
 
-# Browser/grocery session-cookie profile dirs — live session cookies
-# (Giant, social, Gmail). Never commit; treat as secret.
+# Browser session-cookie profile dirs — live session cookies.
+# Never commit; treat as secret.
 **/chrome-profile/
 **/*-chrome-profile/
 
