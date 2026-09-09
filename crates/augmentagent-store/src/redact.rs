@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn masks_authorization_bearer() {
-        let input = "Authorization: Bearer sk-fake-1234567890abcdef";
+        let input = "Authorization: Bearer sk-fake-1234567890abcdef"; // pii-ok: fake credential for redaction regression test
         let out = mask(input);
         assert_eq!(out, "Authorization: Bearer [REDACTED]");
         assert!(matches!(out, Cow::Owned(_)));
@@ -180,10 +180,10 @@ mod tests {
 
     #[test]
     fn masks_raw_slack_token() {
-        let input = "token=xoxb-1234567890-abcdefghij-FAKE";
+        let input = "token=xoxb-1234567890-abcdefghij-FAKE"; // pii-ok: fake credential for redaction regression test
         let out = mask(input);
         assert!(out.contains("[REDACTED]"));
-        assert!(!out.contains("xoxb-1234567890"));
+        assert!(!out.contains("xoxb-1234567890")); // pii-ok: fake credential for redaction regression test
     }
 
     #[test]
@@ -233,7 +233,7 @@ mod tests {
     fn multiple_secrets_in_one_blob() {
         let input = concat!(
             "POST /v1/things\n",
-            "Authorization: Bearer sk-fake-abcdefghijklmnop\n",
+            "Authorization: Bearer sk-fake-abcdefghijklmnop\n", // pii-ok: fake credential for redaction regression test
             "Content-Type: application/json\n\n",
             r#"{"api_key":"ak_fakefakefakefake","name":"widget"}"#,
         );
@@ -255,7 +255,7 @@ mod tests {
         let filler = "lorem ipsum dolor sit amet ".repeat(150); // ~4 KB
         let mut body = String::with_capacity(filler.len() + 64);
         body.push_str(&filler[..2000]);
-        body.push_str("Authorization: Bearer sk-fake-1234567890abcdef\n");
+        body.push_str("Authorization: Bearer sk-fake-1234567890abcdef\n"); // pii-ok: fake credential for redaction regression test
         body.push_str(&filler[2000..]);
 
         // Warm up the lazy regex compile + JIT cache so the timed run

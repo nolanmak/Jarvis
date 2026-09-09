@@ -93,7 +93,7 @@ mod tests {
     fn sample() -> GithubAuth {
         GithubAuth {
             username: "nolanmak".into(),
-            token: "ghp_AAAABBBBCCCCDDDDEEEE".into(),
+            token: "ghp_AAAABBBBCCCCDDDDEEEE".into(), // pii-ok: synthetic authentication fixture
             fetched_at_ms: 1776600000000,
         }
     }

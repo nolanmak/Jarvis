@@ -398,16 +398,16 @@ mod tests {
             "items": [
               {
                 "id": "evt-1",
-                "iCalUID": "evt-1@google.com",
+                "iCalUID": "evt-1@example.com",
                 "status": "confirmed",
                 "summary": "Q3 planning",
                 "start": { "dateTime": "2026-05-14T15:00:00Z" },
                 "end":   { "dateTime": "2026-05-14T15:45:00Z" },
                 "attendees": [
-                  { "email": "me@x.com", "self": true, "responseStatus": "accepted" },
-                  { "email": "sarah@acme.com", "displayName": "Sarah", "responseStatus": "accepted" }
+                  { "email": "me@x.example.com", "self": true, "responseStatus": "accepted" },
+                  { "email": "sarah@acme.example.com", "displayName": "Sarah", "responseStatus": "accepted" }
                 ],
-                "organizer": { "email": "me@x.com", "self": true }
+                "organizer": { "email": "me@x.example.com", "self": true }
               }
             ]
           }
@@ -495,7 +495,7 @@ mod tests {
                         "start_datetime": "2026-07-10T15:00:00-04:00",
                         "event_duration_hour": 0,
                         "event_duration_minutes": 30,
-                        "attendees": ["sarah@acme.com"],
+                        "attendees": ["sarah@acme.example.com"],
                         "send_updates": "all",
                     }
                 })),
@@ -513,7 +513,7 @@ mod tests {
             summary: "Coffee chat".into(),
             start_datetime: "2026-07-10T15:00:00-04:00".into(),
             duration_minutes: 30,
-            attendees: vec!["sarah@acme.com".into()],
+            attendees: vec!["sarah@acme.example.com".into()],
             description: None,
             create_meeting_room: false,
         };

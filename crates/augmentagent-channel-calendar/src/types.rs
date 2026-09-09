@@ -349,20 +349,20 @@ mod tests {
             }),
             attendees: Some(vec![
                 RawAttendee {
-                    email: Some("me@x.com".into()),
+                    email: Some("me@x.example.com".into()),
                     self_: Some(true),
                     response_status: Some("accepted".into()),
                     ..Default::default()
                 },
                 RawAttendee {
-                    email: Some("sarah@acme.com".into()),
+                    email: Some("sarah@acme.example.com".into()),
                     display_name: Some("Sarah".into()),
                     response_status: Some("accepted".into()),
                     ..Default::default()
                 },
             ]),
             organizer: Some(RawOrganizer {
-                email: Some("me@x.com".into()),
+                email: Some("me@x.example.com".into()),
                 self_: Some(true),
                 ..Default::default()
             }),

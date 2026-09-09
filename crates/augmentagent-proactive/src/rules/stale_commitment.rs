@@ -156,7 +156,7 @@ mod tests {
         let wd = tempfile::tempdir().unwrap();
         let layout = WikiLayout::new(wd.path().to_path_buf());
         layout.bootstrap().unwrap();
-        std::fs::write(layout.person_page("sam@x.com"), body).unwrap();
+        std::fs::write(layout.person_page("sam@x.example.com"), body).unwrap();
         let ctx = ScanCtx::new(store, wd.path().to_path_buf(), 0);
         (dbd, wd, ctx)
     }

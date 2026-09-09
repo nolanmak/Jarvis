@@ -755,7 +755,7 @@ mod tests {
                     augmentagent_store::rusqlite::params![
                         format!("a{i}"),
                         format!("c{i}"),
-                        format!("{ent}@x.com"),
+                        format!("{ent}@x.example.com"),
                         ent
                     ],
                 )

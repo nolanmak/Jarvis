@@ -655,7 +655,7 @@ pub fn is_meeting_invite(subject: &str, body: &str, attachments: &[String]) -> b
 ///
 /// Uses the LAST `<addr>` pair: RFC 5322 puts the addr-spec after the display
 /// name, so a spoofed bracketed fragment inside the display name (e.g.
-/// `"<a@gmail.com>" <noreply@stripe.com>`) must not shadow the real address // pii-ok
+/// `"<a@example.com>" <noreply@stripe.com>`) must not shadow the real address // pii-ok
 /// and bypass the human-sender / event-blast gates (#253).
 fn extract_bare(from: &str) -> String {
     let trimmed = from.trim();
@@ -1215,7 +1215,7 @@ mod tests {
 
     #[test]
     fn density_block_with_phone() {
-        let body = "Approved — ship it.\n\nJane Doe\nAcme Corp\n415-555-0100\njane@acme.com";
+        let body = "Approved — ship it.\n\nJane Doe\nAcme Corp\n415-555-0100\njane@acme.example.com";
         let b = detect_signature_block(body).unwrap();
         assert!(b.text.contains("415-555-0100"));
     }
@@ -1315,7 +1315,7 @@ mod tests {
         // Plain personal mailbox at a generic domain, no automation signals.
         assert!(is_human_sender("alice@example.com", "Hey, want to grab coffee?")); // pii-ok
         assert!(is_human_sender(
-            "\"Bob Smith\" <bob.smith@startup.io>", // pii-ok
+            "\"Bob Smith\" <bob.smith@startup.example.com>", // pii-ok
             "thanks for the intro",
         ));
         assert!(is_human_sender("Carol <carol@acme.co>", "")); // pii-ok
@@ -1337,7 +1337,7 @@ mod tests {
             "billing@saas.com",       // pii-ok
             "receipts@uber.com",      // pii-ok
             "team@somecompany.co",    // pii-ok
-            "hello@fuggit.dev",       // pii-ok
+            "hello@project.example.com",       // pii-ok
             "support+sub@github.com", // pii-ok
         ] {
             assert!(!is_human_sender(from, ""), "{from} should not be human");
@@ -1349,7 +1349,7 @@ mod tests {
         // pii-ok — synthetic ESP-domain fixtures verifying domain matcher.
         // Even with an innocuous local part, the domain alone classifies them as non-human.
         for from in [
-            "lenny@substack.com",      // pii-ok
+            "example-writer@substack.com",      // pii-ok
             "writer@beehiiv.com",      // pii-ok
             "alice@buttondown.email",  // pii-ok
             "bounce@mailgun.example.net", // pii-ok
@@ -1369,7 +1369,7 @@ mod tests {
         let from = "alex@some-random-domain.com"; // pii-ok
         assert!(!is_human_sender(
             from,
-            "Hi! List-Unsubscribe: <mailto:u@x.com>\nDeal of the day...", // pii-ok
+            "Hi! List-Unsubscribe: <mailto:u@x.example.com>\nDeal of the day...", // pii-ok
         ));
         assert!(!is_human_sender(
             from,
@@ -1592,7 +1592,7 @@ mod tests {
             "Sounds good — see you at the usual spot at 9am.",   // pii-ok
         ));
         assert!(!is_event_blast(
-            "bob.smith@startup.io",                              // pii-ok
+            "bob.smith@startup.example.com",                              // pii-ok
             "Quick question on the deploy",                      // pii-ok
             "Hey — did the migration land yet? Need to plan around it.", // pii-ok
         ));
@@ -1752,13 +1752,13 @@ mod bulk_sender_449 {
     fn bulk_senders_from_the_live_queue_are_not_human() {
         for from in [
             // bulk local-part on a sending subdomain
-            "Brand <marketing@engage.examplebrand.com>", // pii-ok: synthetic test fixture
+            "Brand <marketing@engage.brand.example.com>", // pii-ok: synthetic test fixture
             // `offers@` — the local-part that proved the list was too short
             "\"Example News\" <offers@examplenews.com>", // pii-ok: synthetic test fixture
             // single-letter `e.` sending subdomain
             "EXAMPLE RACK <rack@e.examplerack.com>", // pii-ok: synthetic test fixture
             // known ESP domain
-            "A Writer <writer-c0ed52@mail.beehiiv.com>", // pii-ok: synthetic test fixture
+            "A Writer <example-writer@mail.beehiiv.com>", // pii-ok: synthetic test fixture
             // `newsletter@` local-part
             "Example Digest <newsletter@digest.example.com>", // pii-ok: synthetic test fixture
             // `events@` local-part
@@ -1777,10 +1777,10 @@ mod bulk_sender_449 {
     #[test]
     fn real_humans_are_still_human() {
         for from in [
-            "Dana Rivera <dana@example-labs.ai>", // pii-ok: synthetic test fixture
-            "Sam Okafor <sam@example-labs.ai>",   // pii-ok: synthetic test fixture
-            "Alex Chen <alex@examplesoft.net>",   // pii-ok: synthetic test fixture
-            "A Person <a.person@gmail.com>",      // pii-ok: synthetic test fixture
+            "Dana Rivera <dana@labs.example.com>", // pii-ok: synthetic test fixture
+            "Sam Okafor <sam@labs.example.com>",   // pii-ok: synthetic test fixture
+            "Alex Chen <alex@software.example.net>",   // pii-ok: synthetic test fixture
+            "A Person <a.person@example.com>",      // pii-ok: synthetic test fixture
             "Someone <someone@hey.com>",          // pii-ok: synthetic test fixture
         ] {
             assert!(
@@ -1795,7 +1795,7 @@ mod bulk_sender_449 {
     /// of a 3+-label domain are considered.
     #[test]
     fn apex_domains_are_not_mistaken_for_sending_subdomains() {
-        assert!(is_human_sender("A <a@gmail.com>", "")); // pii-ok: synthetic test fixture
+        assert!(is_human_sender("A <a@example.com>", "")); // pii-ok: synthetic test fixture
         assert!(!is_human_sender("C <c@news.example.com>", "")); // pii-ok: synthetic
         assert!(!is_human_sender("D <d@e.retailer.com>", "")); // pii-ok: synthetic
     }
@@ -1807,7 +1807,7 @@ mod bulk_sender_449 {
         use super::extract_bare;
         assert_eq!(extract_bare("Foo <foo@bar.com>"), "foo@bar.com"); // pii-ok: synthetic
         assert_eq!(
-            extract_bare("\"<a@gmail.com>\" <noreply@stripe.com>"), // pii-ok: synthetic
+            extract_bare("\"<a@example.com>\" <noreply@stripe.com>"), // pii-ok: synthetic
             "noreply@stripe.com" // pii-ok: synthetic
         );
         assert_eq!(extract_bare("plain@nobrackets.com"), "plain@nobrackets.com"); // pii-ok: synthetic
@@ -1819,10 +1819,10 @@ mod bulk_sender_449 {
     #[test]
     fn is_human_rejects_embedded_bracket_spoof() {
         assert!(
-            !is_human_sender("\"<a@gmail.com>\" <noreply@stripe.com>", ""), // pii-ok: synthetic
+            !is_human_sender("\"<a@example.com>\" <noreply@stripe.com>", ""), // pii-ok: synthetic
             "embedded-bracket spoof must not bypass the human-sender gate"
         );
         // Regression: a genuine human is unaffected by the rfind change.
-        assert!(is_human_sender("A Person <a.person@gmail.com>", "")); // pii-ok: synthetic
+        assert!(is_human_sender("A Person <a.person@example.com>", "")); // pii-ok: synthetic
     }
 }

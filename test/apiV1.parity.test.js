@@ -36,7 +36,7 @@ function seed() {
   logAction({
     messageId: "m1",
     threadId: null,
-    fromEmail: "a@b.com",
+    fromEmail: "a@b.example.com",
     subject: "first",
     originalBody: "hi",
     draftBody: "draft1",
@@ -46,7 +46,7 @@ function seed() {
   logAction({
     messageId: "m2",
     threadId: null,
-    fromEmail: "c@d.com",
+    fromEmail: "c@d.example.com",
     subject: "second",
     originalBody: "yo",
     draftBody: "draft2",

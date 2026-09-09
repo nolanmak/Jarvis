@@ -254,12 +254,12 @@ mod tests {
 
     #[test]
     fn parses_minimal_v3() {
-        let v = "BEGIN:VCARD\nVERSION:3.0\nFN:Jane Doe\nTEL;TYPE=CELL:+1 415 555 0100\nEMAIL:jane@x.com\nEND:VCARD\n";
+        let v = "BEGIN:VCARD\nVERSION:3.0\nFN:Jane Doe\nTEL;TYPE=CELL:+1 415 555 0100\nEMAIL:jane@x.example.com\nEND:VCARD\n";
         let cards = parse_vcards(v);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].full_name, "Jane Doe");
         assert_eq!(cards[0].phones, vec!["+1 415 555 0100"]);
-        assert_eq!(cards[0].emails, vec!["jane@x.com"]);
+        assert_eq!(cards[0].emails, vec!["jane@x.example.com"]);
     }
 
     #[test]
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn handles_multiple_cards_and_multiple_tels() {
-        let v = "BEGIN:VCARD\nFN:A\nTEL:111\nTEL:222\nEND:VCARD\nBEGIN:VCARD\nFN:B\nEMAIL:b@b.com\nEND:VCARD\n";
+        let v = "BEGIN:VCARD\nFN:A\nTEL:111\nTEL:222\nEND:VCARD\nBEGIN:VCARD\nFN:B\nEMAIL:b@b.example.com\nEND:VCARD\n";
         let cards = parse_vcards(v);
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0].phones, vec!["111", "222"]);

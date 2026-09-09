@@ -394,7 +394,7 @@ mod tests {
             "direction": "outgoing",
             "text": "see you there",
             "sender_id": "17841460244944904",
-            "sender_name": "nolan_makatche",
+            "sender_name": "example_owner",
             "attachment_type": null,
             "attachment_url": null,
             "created_at": "2026-08-03T00:39:29Z"

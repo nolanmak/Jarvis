@@ -609,7 +609,7 @@ mod tests {
                     label TEXT, entityId TEXT NOT NULL, active INTEGER DEFAULT 1,
                     createdAt INTEGER NOT NULL
                 );
-                INSERT INTO gmail_accounts VALUES ('a1', 'c1', 'me@x.com', NULL, 'acc1', 1, 0);
+                INSERT INTO gmail_accounts VALUES ('a1', 'c1', 'me@x.example.com', NULL, 'acc1', 1, 0);
                 "#,
             )
             .unwrap();
@@ -634,26 +634,26 @@ mod tests {
             }),
             attendees: Some(vec![
                 RawAttendee {
-                    email: Some("me@x.com".into()),
+                    email: Some("me@x.example.com".into()),
                     self_: Some(true),
                     response_status: Some("accepted".into()),
                     ..Default::default()
                 },
                 RawAttendee {
-                    email: Some("sarah@acme.com".into()),
+                    email: Some("sarah@acme.example.com".into()),
                     display_name: Some("Sarah".into()),
                     response_status: Some("accepted".into()),
                     ..Default::default()
                 },
                 RawAttendee {
-                    email: Some("ben@acme.com".into()),
+                    email: Some("ben@acme.example.com".into()),
                     display_name: Some("Ben".into()),
                     response_status: Some("tentative".into()),
                     ..Default::default()
                 },
             ]),
             organizer: Some(RawOrganizer {
-                email: Some("me@x.com".into()),
+                email: Some("me@x.example.com".into()),
                 self_: Some(true),
                 ..Default::default()
             }),
@@ -752,7 +752,7 @@ mod tests {
         let attendee = payload
             .attendees
             .iter()
-            .find(|a| a.email == "sarah@acme.com")
+            .find(|a| a.email == "sarah@acme.example.com")
             .cloned()
             .unwrap();
         let email = synthetic_attendee_email(&payload, &attendee);

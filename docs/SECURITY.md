@@ -41,12 +41,20 @@ Not sensitive — fine in a public repo (don't churn these):
 ./scripts/check-no-personal-data.sh --tracked    # audit the whole tree anytime
 ```
 
-The hook blocks staged changes containing secret shapes (PEM keys, `ghp_`,
+The hook scans staged file contents, including renames, and blocks files
+containing secret shapes (PEM keys, `ghp_`,
 `xox*-`, `sk-`, `AIza…`, `secret/api_key/token = "…"`), US phone numbers, real
-email addresses (anything not `@example.com`/`localhost`), and ever tracking
+email addresses outside reserved example domains and protocol identifiers,
+and tracking
 `.env` / `*.db` / `*creds*.json` / `tenant.env` / key files. It is a backstop,
-not a substitute for not hardcoding data. Override a confirmed false positive
-(e.g. an `*.example` template) with `git commit --no-verify`.
+not a substitute for not hardcoding data. Templates are scanned too. Prefer
+reserved example domains; use an inline
+`pii-ok` marker only for a reviewed synthetic credential or service identifier.
+Never use that marker for a real person or live credential. Addresses at
+common personal mailbox providers are rejected even with that marker, and
+security documentation is scanned too. The CI workflow
+also runs Gitleaks independently of these markers. Findings report locations
+without printing matched values.
 
 ## If something sensitive is committed
 
@@ -60,8 +68,10 @@ Order matters:
 4. **Purge git history** — gitignoring or deleting a value does **not** remove
    it from past commits/clones/forks/caches. Use `git filter-repo` (or BFG) to
    excise the strings, then force-push; coordinate with anyone holding clones.
-5. Only then is it safe to make public again — or, simpler, seed a **fresh**
-   repo from the scrubbed tree (no history to purge).
+5. Review GitHub-managed PR refs, issue comments, and retained artifacts before
+   making the repo public again. Branch rewriting alone does not clean those
+   surfaces. A **fresh** repo from the scrubbed tree avoids carrying old Git
+   history forward, but cannot recall existing copies.
 
 ## Before flipping a repo public — checklist
 

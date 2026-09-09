@@ -289,7 +289,7 @@ mod tests {
         let p = serde_json::json!({
             "resourceName": "people/c123",
             "names": [{ "displayName": "Jane Doe" }],
-            "emailAddresses": [{ "value": "jane@x.com" }],
+            "emailAddresses": [{ "value": "jane@x.example.com" }],
             "phoneNumbers": [{ "value": "+1 415 555 2671" }],
             "addresses": [{ "formattedValue": "123 Main St\nAnytown CA" }],
             "organizations": [{ "name": "Acme", "title": "Staff Engineer" }],
@@ -297,7 +297,7 @@ mod tests {
         });
         let c = person_to_vcard(&p).unwrap();
         assert_eq!(c.full_name, "Jane Doe");
-        assert_eq!(c.emails, vec!["jane@x.com"]);
+        assert_eq!(c.emails, vec!["jane@x.example.com"]);
         assert_eq!(c.phones, vec!["+1 415 555 2671"]);
         assert_eq!(c.address.as_deref(), Some("123 Main St, Anytown CA"));
         assert_eq!(c.organization.as_deref(), Some("Acme"));

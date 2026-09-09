@@ -263,7 +263,7 @@ pub struct ToneProfile {
     pub id: String,
     /// `global` | `domain` | `recipient`.
     pub scope_kind: String,
-    /// `*` for global, `acme.com` for domain, `jeremy@acme.com` for recipient.
+    /// `*` for global, `acme.com` for domain, `jeremy@acme.example.com` for recipient.
     pub scope_value: String,
     /// Per-account so distinct Gmail identities don't blend voices. `None`
     /// means cross-account (only meaningful for `global`).

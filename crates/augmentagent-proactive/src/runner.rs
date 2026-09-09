@@ -283,7 +283,7 @@ mod tests {
             .format("%Y-%m-%d")
             .to_string();
         std::fs::write(
-            layout.person_page("jane@x.com"),
+            layout.person_page("jane@x.example.com"),
             format!("---\nname: Jane\ncadence: weekly\nupdated: {old}\n---\n# Jane\n"),
         )
         .unwrap();

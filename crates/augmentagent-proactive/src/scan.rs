@@ -208,12 +208,12 @@ mod tests {
             "detail",
             "dedup-1",
         )
-        .with_person("jane_at_corp_com")
+        .with_person("jane_at_corp_example_com")
         .with_action(SuggestedAction {
             label: "Draft check-in".into(),
             draft_prompt: Some("Reconnect with Jane".into()),
         });
-        assert_eq!(s.person_slug.as_deref(), Some("jane_at_corp_com"));
+        assert_eq!(s.person_slug.as_deref(), Some("jane_at_corp_example_com"));
         assert_eq!(s.suggested_action.unwrap().label, "Draft check-in");
         assert!(s.id.is_empty());
     }

@@ -159,7 +159,7 @@ mod tests {
 
     fn sample() -> TelegramBotAuth {
         TelegramBotAuth {
-            bot_token: "123456789:AAH-fake-secret".into(),
+            bot_token: "123456789:AAH-fake-secret".into(), // pii-ok: synthetic authentication fixture
             bot_username: "nolan_triage_bot".into(),
             bot_id: 123456789,
             owner_chat_id: 987654321,

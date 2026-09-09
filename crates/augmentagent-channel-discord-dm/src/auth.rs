@@ -5,8 +5,8 @@
 //! ```json
 //! {
 //!   "user_id": "<YOUR_USER_ID>",
-//!   "token": "MTE5...rI7FQECJj6iNi8",
-//!   "super_properties_b64": "eyJvcyI6...",
+//!   "token": "<YOUR_DISCORD_USER_TOKEN>",
+//!   "super_properties_b64": "<YOUR_SUPER_PROPERTIES_BASE64>",
 //!   "user_agent": "Mozilla/5.0 (Macintosh; ...) Chrome/147.0.0.0 ..."
 //! }
 //! ```
@@ -157,7 +157,7 @@ mod tests {
     fn sample() -> DiscordAuth {
         DiscordAuth {
             user_id: "<YOUR_USER_ID>".into(),
-            token: "<YOUR_DISCORD_USER_TOKEN>".into(),
+            token: "<YOUR_DISCORD_USER_TOKEN>".into(), // pii-ok: synthetic authentication fixture
             super_properties_b64: "eyJvcyI6Ik1hYyBPUyBYIn0=".into(),
             user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/147.0.0.0".into(),
         }

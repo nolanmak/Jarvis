@@ -323,7 +323,7 @@ mod tests {
     async fn dry_run_writes_nothing_but_reports() {
         let (_d, l, s) = env();
         let src = FakeSource {
-            cards: vec![card("Jane Doe", "(415) 555-2671", "jane@x.com")],
+            cards: vec![card("Jane Doe", "(415) 555-2671", "jane@x.example.com")],
             token: Some("tok1".into()),
         };
         let syncer = ContactsSyncer {
@@ -350,7 +350,7 @@ mod tests {
     async fn apply_writes_indexes_and_is_idempotent() {
         let (_d, l, s) = env();
         let src = FakeSource {
-            cards: vec![card("Jane Doe", "+1 415 555 2671", "jane@x.com")],
+            cards: vec![card("Jane Doe", "+1 415 555 2671", "jane@x.example.com")],
             token: Some("tok1".into()),
         };
         let syncer = ContactsSyncer {
@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(r1.created, 1);
         let page = l
             .people_dir()
-            .join(format!("{}.md", contact_slug(&card("Jane Doe", "", "jane@x.com"))));
+            .join(format!("{}.md", contact_slug(&card("Jane Doe", "", "jane@x.example.com"))));
         assert!(page.is_file());
         let body = std::fs::read_to_string(&page).unwrap();
         assert!(body.contains("  phone:\n    - \"+14155552671\"\n"), "{body}");
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn slug_prefers_email_for_shared_space() {
-        let c = card("Jane Doe", "+1555", "jane@x.com");
-        assert_eq!(contact_slug(&c), slug_from_email("jane@x.com"));
+        let c = card("Jane Doe", "+1555", "jane@x.example.com");
+        assert_eq!(contact_slug(&c), slug_from_email("jane@x.example.com"));
     }
 }

@@ -2,7 +2,7 @@
 
 /// Convert an email header-style string to a filesystem-safe slug.
 ///
-/// Extracts the address from forms like `"Name <x@y.com>"` and normalizes
+/// Extracts the address from forms like `"Name <x@y.example.com>"` and normalizes
 /// `@` → `_at_`, `.` → `_`, lowercasing along the way.
 pub fn slug_from_email(raw: &str) -> String {
     let addr = extract_address(raw);
@@ -61,14 +61,17 @@ mod tests {
     #[test]
     fn plus_addressing() {
         assert_eq!(
-            slug_from_email("me+label@gmail.com"),
-            "me_label_at_gmail_com"
+            slug_from_email("me+label@example.com"),
+            "me_label_at_example_com"
         );
     }
 
     #[test]
     fn no_double_underscores() {
-        assert_eq!(slug_from_email("a..b@x.com"), "a_b_at_x_com");
+        assert_eq!(
+            slug_from_email("a..b@x.example.com"),
+            "a_b_at_x_example_com"
+        );
     }
 
     #[test]

@@ -1939,7 +1939,7 @@ mod tests {
                     label TEXT, entityId TEXT NOT NULL, active INTEGER DEFAULT 1,
                     createdAt INTEGER NOT NULL
                 );
-                INSERT INTO gmail_accounts VALUES ('a1', 'c1', 'me@x.com', NULL, 'acc1', 1, 0);
+                INSERT INTO gmail_accounts VALUES ('a1', 'c1', 'me@x.example.com', NULL, 'acc1', 1, 0);
                 "#,
             )
             .unwrap();
@@ -1957,7 +1957,7 @@ mod tests {
                 cc: String::new(),
                 message_id: "m1".into(),
                 thread_id: None,
-                from: "noreply@foo.com".into(),
+                from: "noreply@foo.example.com".into(),
                 subject: "Newsletter".into(),
                 body: "buy things".into(),
                 date: "2026-04-13".into(),
@@ -2114,7 +2114,7 @@ mod tests {
                 cc: String::new(),
                 message_id: "m-flag".into(),
                 thread_id: None,
-                from: "friend@edu.com".into(),
+                from: "friend@edu.example.com".into(),
                 subject: "Catching up".into(),
                 body: "saw your post, wanted to reach out...".into(),
                 date: "2026-04-19".into(),
@@ -2162,7 +2162,7 @@ mod tests {
                 cc: String::new(),
                 message_id: "m-skip".into(),
                 thread_id: None,
-                from: "noreply@marketing.com".into(),
+                from: "noreply@marketing.example.com".into(),
                 subject: "50% off!".into(),
                 body: "deal deal".into(),
                 date: "2026-04-19".into(),
@@ -2628,7 +2628,7 @@ Where: Microsoft Teams
             emails: vec![Email {
                 attachments: Vec::new(),
                 to: "gwhitaker@example.com".into(),
-                cc: "Me <me@x.com>, Casey <casey@example.com>, Sam <sam@example.com>".into(), // pii-ok: synthetic test fixture
+                cc: "Me <me@x.example.com>, Casey <casey@example.com>, Sam <sam@example.com>".into(), // pii-ok: synthetic test fixture
                 message_id: "m-cc-only".into(),
                 thread_id: Some("T-cc-only".into()),
                 from: "Priya <priya@example.com>".into(),
@@ -2722,13 +2722,13 @@ Where: Microsoft Teams
     async fn cc_only_guard_leaves_everything_else_on_the_drafting_path() {
         // Ordinary addressed mail: owner on To, headers populated, guard
         // silent. The owner's address is the one tmp_store seeds.
-        let owner = "Me <me@x.com>"; // pii-ok: synthetic test fixture
+        let owner = "Me <me@x.example.com>"; // pii-ok: synthetic test fixture
         drafts_with_headers("m-845-to", owner, "other@example.com", "Hi Gary!").await;
         // The Cc line is also where a sender puts someone they still expect an
         // answer from: "Hi Robin, …" with Robin only on Cc is addressed to the
         // owner. (The remaining header shapes — empty To, owner on neither
         // header — are pinned in sigextract::tests.)
-        let owner_cc = "Robin <me@x.com>"; // pii-ok: synthetic test fixture
+        let owner_cc = "Robin <me@x.example.com>"; // pii-ok: synthetic test fixture
         drafts_with_headers(
             "m-845-greeted",
             "gwhitaker@example.com",
@@ -2894,7 +2894,7 @@ Where: Microsoft Teams
             message_id: "m-ra".into(),
             thread_id: Some("t-ra".into()),
             from: "Matt Elder <matt@example.com>".into(),
-            to: "me@x.com, Will <will@example.com>".into(), // pii-ok: synthetic; matches tmp_store seed
+            to: "me@x.example.com, Will <will@example.com>".into(), // pii-ok: synthetic; matches tmp_store seed
             cc: "zack@example.com".into(),
             subject: "Receipts".into(),
             body: "can you send those over?".into(),
@@ -2914,7 +2914,7 @@ Where: Microsoft Teams
         let mut earlier = threaded_inbound();
         earlier.message_id = "m-ra0".into();
         earlier.from = "chase@example.com".into();
-        earlier.to = "matt@example.com, me@x.com".into(); // pii-ok: synthetic; matches tmp_store seed
+        earlier.to = "matt@example.com, me@x.example.com".into(); // pii-ok: synthetic; matches tmp_store seed
         earlier.cc = "milan@example.com".into();
         let gmail = Arc::new(ThreadedGmail {
             emails: vec![threaded_inbound()],
@@ -2946,7 +2946,7 @@ Where: Microsoft Teams
         // Sender goes on To (full display form, as before)…
         assert_eq!(to, "Matt Elder <matt@example.com>");
         // …and Cc holds every other participant across the thread: the
-        // owner's own account (me@x.com, seeded in tmp_store) and the — pii-ok
+        // owner's own account (me@x.example.com, seeded in tmp_store) and the — pii-ok
         // sender are excluded; order is first-seen; no duplicates.
         assert_eq!(
             cc,
@@ -3303,7 +3303,7 @@ Where: Microsoft Teams
                 cc: String::new(),
                 message_id: "m-blast".into(),
                 thread_id: Some("t-blast".into()),
-                from: "Brand <marketing@engage.examplebrand.com>".into(), // pii-ok: synthetic
+                from: "Brand <marketing@engage.brand.example.com>".into(), // pii-ok: synthetic
                 subject: "Last chance to get 15% off".into(),
                 body: "Shop the sale now!".into(),
                 date: "Mon, 13 Jul 2026 12:00:00 +0000".into(),
@@ -3405,7 +3405,7 @@ Where: Microsoft Teams
                 cc: String::new(),
                 message_id: "m-human".into(),
                 thread_id: Some("t-human".into()),
-                from: "Dana Rivera <dana@example-labs.ai>".into(), // pii-ok: synthetic
+                from: "Dana Rivera <dana@labs.example.com>".into(), // pii-ok: synthetic
                 subject: "Re: Catching up + next steps".into(),
                 body: "Does Thursday still work for you?".into(),
                 date: "Mon, 13 Jul 2026 12:00:00 +0000".into(),
@@ -3633,7 +3633,7 @@ Where: Microsoft Teams
                 cc: String::new(),
                 message_id: "m-529".into(),
                 thread_id: None,
-                from: "Royal Box Weekly <royalbox@substack.com>".into(), // pii-ok: synthetic substack fixture
+                from: "Royal Box Weekly <example-newsletter@substack.com>".into(), // pii-ok: synthetic substack fixture
                 subject: "The Royal Box at Wimbledon".into(),
                 body: "I want to switch gears this week to my favorite sport: Tennis.".into(),
                 date: "2026-06-24".into(),
@@ -3706,7 +3706,7 @@ Where: Microsoft Teams
     #[test]
     fn pick_tone_block_returns_empty_when_no_profiles() {
         let (store, _f) = tmp_store();
-        let out = super::pick_tone_block(&store, "acc1", "alex@startup.io");
+        let out = super::pick_tone_block(&store, "acc1", "alex@startup.example.com");
         assert!(out.is_empty());
     }
 
@@ -3717,19 +3717,19 @@ Where: Microsoft Teams
             .upsert_tone_profile("global", "*", Some("acc1"), "GLOBAL", "[]", 50)
             .unwrap();
         store
-            .upsert_tone_profile("domain", "startup.io", Some("acc1"), "DOMAIN", "[]", 10)
+            .upsert_tone_profile("domain", "startup.example.com", Some("acc1"), "DOMAIN", "[]", 10)
             .unwrap();
         store
             .upsert_tone_profile(
                 "recipient",
-                "alex@startup.io",
+                "alex@startup.example.com",
                 Some("acc1"),
                 "RECIPIENT",
                 "[]",
                 4,
             )
             .unwrap();
-        let out = super::pick_tone_block(&store, "acc1", "Alex <alex@startup.io>");
+        let out = super::pick_tone_block(&store, "acc1", "Alex <alex@startup.example.com>");
         assert_eq!(out, "RECIPIENT");
     }
 
@@ -3740,20 +3740,20 @@ Where: Microsoft Teams
             .upsert_tone_profile("global", "*", Some("acc1"), "GLOBAL", "[]", 50)
             .unwrap();
         store
-            .upsert_tone_profile("domain", "startup.io", Some("acc1"), "DOMAIN", "[]", 10)
+            .upsert_tone_profile("domain", "startup.example.com", Some("acc1"), "DOMAIN", "[]", 10)
             .unwrap();
         // sample_count=2 → below the 3-message recipient threshold.
         store
             .upsert_tone_profile(
                 "recipient",
-                "alex@startup.io",
+                "alex@startup.example.com",
                 Some("acc1"),
                 "RECIPIENT",
                 "[]",
                 2,
             )
             .unwrap();
-        let out = super::pick_tone_block(&store, "acc1", "alex@startup.io");
+        let out = super::pick_tone_block(&store, "acc1", "alex@startup.example.com");
         assert_eq!(out, "DOMAIN");
     }
 
@@ -3765,9 +3765,9 @@ Where: Microsoft Teams
             .unwrap();
         // sample_count=3 → below the 5-message domain threshold.
         store
-            .upsert_tone_profile("domain", "startup.io", Some("acc1"), "DOMAIN", "[]", 3)
+            .upsert_tone_profile("domain", "startup.example.com", Some("acc1"), "DOMAIN", "[]", 3)
             .unwrap();
-        let out = super::pick_tone_block(&store, "acc1", "alex@startup.io");
+        let out = super::pick_tone_block(&store, "acc1", "alex@startup.example.com");
         assert_eq!(out, "GLOBAL");
     }
 
@@ -3782,14 +3782,14 @@ Where: Microsoft Teams
         store
             .upsert_tone_profile(
                 "recipient",
-                "alex@startup.io",
+                "alex@startup.example.com",
                 Some("acc1"),
                 "{\"register\":\"insufficient_sample\"}",
                 "[]",
                 4,
             )
             .unwrap();
-        let out = super::pick_tone_block(&store, "acc1", "alex@startup.io");
+        let out = super::pick_tone_block(&store, "acc1", "alex@startup.example.com");
         assert_eq!(out, "GLOBAL");
     }
 
@@ -3861,7 +3861,7 @@ Where: Microsoft Teams
             cc: String::new(),
             message_id: "cr-skip".into(),
             thread_id: None,
-            from: "noreply@marketing.com".into(),
+            from: "noreply@marketing.example.com".into(),
             subject: "50% off!".into(),
             body: "deal deal".into(),
             date: "2026-05-18".into(),
@@ -3875,7 +3875,7 @@ Where: Microsoft Teams
             cc: String::new(),
             message_id: "cr-flag".into(),
             thread_id: None,
-            from: "friend@edu.com".into(),
+            from: "friend@edu.example.com".into(),
             subject: "Catching up".into(),
             body: "wanted to reach out".into(),
             date: "2026-05-18".into(),

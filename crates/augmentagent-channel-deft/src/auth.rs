@@ -105,7 +105,7 @@ mod tests {
     fn sample() -> DeftAuth {
         DeftAuth {
             workspace_id: "ws_abc123".into(),
-            token: "dft_AAAABBBBCCCC".into(),
+            token: "dft_AAAABBBBCCCC".into(), // pii-ok: synthetic authentication fixture
             base_url: DEFAULT_BASE_URL.into(),
             fetched_at_ms: 1776600000000,
         }

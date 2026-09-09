@@ -61,7 +61,7 @@ A **periodic synthesis writer** is the right shape. Direct rule extraction is to
 
 This makes "learning" inspectable, batched, and bounded — one Claude call per active sender per cycle, not per email.
 
-**Sender scoping.** Per-sender by default. A revision to `friend@gmail.com` should not change drafts to `boss@work.com`. Domain-level rollups are for fallback only (when a sender has no individual overlay, the domain overlay applies). Global rules are reserved for things like "kill the standard greeting" — they require explicit operator approval before activating, via a Discord audit card. <!-- pii-ok: synthetic example addresses -->
+**Sender scoping.** Per-sender by default. A revision to `friend@example.com` should not change drafts to `boss@work.example.com`. Domain-level rollups are for fallback only (when a sender has no individual overlay, the domain overlay applies). Global rules are reserved for things like "kill the standard greeting" — they require explicit operator approval before activating, via a Discord audit card. <!-- pii-ok: synthetic example addresses -->
 
 
 **Eval-before-flip.** Every overlay change runs a tiny replay step before being committed live: take the last N revisions for that sender, re-render the draft prompt with the *new* overlay, diff against the *old* draft, and surface the diff to the operator in the audit card. If the operator approves, the overlay flips to active; if rejected, it's discarded. This pairs with the A/B replay harness from #165 — same primitive.

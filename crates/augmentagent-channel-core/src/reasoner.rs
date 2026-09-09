@@ -369,7 +369,7 @@ pub fn parse_reset_hint(message: &str) -> Option<chrono::DateTime<chrono::Utc>> 
         (h, true) => h + 12,
         (h, false) => h,
     };
-    // Timezone token: "(America/New_York)". Absent → UTC is assumed, which
+    // Timezone suffix: "(America/New_York)". Absent → UTC is assumed, which
     // can be hours wrong — tolerable ONLY because of the plausibility cap
     // below, which bounds any tz mistake at a short latch or a None.
     let tz: chrono_tz::Tz = rest

@@ -1,6 +1,6 @@
 {
   "id": "evt-meeting-1",
-  "iCalUID": "evt-meeting-1@google.com",
+  "iCalUID": "evt-meeting-1@example.com",
   "status": "confirmed",
   "summary": "Q3 planning",
   "start": { "dateTime": "2026-05-14T15:00:00Z" },
@@ -9,11 +9,11 @@
   "visibility": "default",
   "eventType": "default",
   "attendees": [
-    { "email": "me@x.com", "self": true, "responseStatus": "accepted" },
-    { "email": "sarah@acme.com", "displayName": "Sarah", "responseStatus": "accepted" },
-    { "email": "ben@acme.com",   "displayName": "Ben",   "responseStatus": "tentative" }
+    { "email": "me@x.example.com", "self": true, "responseStatus": "accepted" },
+    { "email": "sarah@acme.example.com", "displayName": "Sarah", "responseStatus": "accepted" },
+    { "email": "ben@acme.example.com",   "displayName": "Ben",   "responseStatus": "tentative" }
   ],
-  "organizer": { "email": "me@x.com", "self": true },
+  "organizer": { "email": "me@x.example.com", "self": true },
   "conferenceData": {
     "conferenceSolution": {
       "name": "Google Meet",

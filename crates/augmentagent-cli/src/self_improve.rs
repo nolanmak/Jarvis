@@ -585,7 +585,7 @@ async fn trusted_authors(repo_root: &Path) -> Vec<String> {
 }
 
 /// Best-effort: parse the `owner` segment of the repo's `origin` remote URL
-/// (handles both `git@github.com:owner/repo.git` and
+/// (handles both `git@github.com:owner/repo.git` and // pii-ok: public SSH endpoint
 /// `https://github.com/owner/repo` forms). Used only as the trust-gate
 /// fallback when no explicit trusted-author config is present.
 async fn repo_owner_from_remote(repo_root: &Path) -> Option<String> {

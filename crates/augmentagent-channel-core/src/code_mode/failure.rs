@@ -1207,7 +1207,7 @@ mod tests {
             .log_action_code_mode(
                 "m-trace",
                 Some("t-trace"),
-                "x@y.com",
+                "x@y.example.com",
                 "subj",
                 Some("body"),
                 Some("draft"),

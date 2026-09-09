@@ -124,7 +124,7 @@ mod tests {
         let layout = WikiLayout::new(d.path().to_path_buf());
         layout.bootstrap().unwrap();
         let r = WikiReader::new(&layout);
-        assert_eq!(r.draft_hint(&email("a@b.com", Some("t1"))), "");
+        assert_eq!(r.draft_hint(&email("a@b.example.com", Some("t1"))), "");
     }
 
     #[test]
@@ -132,10 +132,10 @@ mod tests {
         let d = TempDir::new().unwrap();
         let layout = WikiLayout::new(d.path().to_path_buf());
         layout.bootstrap().unwrap();
-        std::fs::write(layout.person_page("a@b.com"), "# A\n").unwrap();
+        std::fs::write(layout.person_page("a@b.example.com"), "# A\n").unwrap();
         let r = WikiReader::new(&layout);
-        let hint = r.draft_hint(&email("a@b.com", None));
-        assert!(hint.contains("people/a_at_b_com.md"));
+        let hint = r.draft_hint(&email("a@b.example.com", None));
+        assert!(hint.contains("people/a_at_b_example_com.md"));
     }
 
     #[test]
@@ -145,7 +145,7 @@ mod tests {
         layout.bootstrap().unwrap();
         std::fs::write(layout.thread_page("t1"), "# t1\n").unwrap();
         let r = WikiReader::new(&layout);
-        let hint = r.draft_hint(&email("a@b.com", Some("t1")));
+        let hint = r.draft_hint(&email("a@b.example.com", Some("t1")));
         assert!(hint.contains("threads/t1.md"));
     }
 
@@ -155,7 +155,7 @@ mod tests {
         let layout = WikiLayout::new(d.path().to_path_buf());
         layout.bootstrap().unwrap();
         let r = WikiReader::new(&layout);
-        assert_eq!(r.triage_hint(&email("a@b.com", Some("t1"))), "");
+        assert_eq!(r.triage_hint(&email("a@b.example.com", Some("t1"))), "");
     }
 
     #[test]
@@ -163,10 +163,10 @@ mod tests {
         let d = TempDir::new().unwrap();
         let layout = WikiLayout::new(d.path().to_path_buf());
         layout.bootstrap().unwrap();
-        std::fs::write(layout.person_page("a@b.com"), "# A\n").unwrap();
+        std::fs::write(layout.person_page("a@b.example.com"), "# A\n").unwrap();
         let r = WikiReader::new(&layout);
-        let hint = r.triage_hint(&email("a@b.com", None));
-        assert!(hint.contains("people/a_at_b_com.md"));
+        let hint = r.triage_hint(&email("a@b.example.com", None));
+        assert!(hint.contains("people/a_at_b_example_com.md"));
         assert!(hint.contains("Relationship"));
     }
 
@@ -177,7 +177,7 @@ mod tests {
         layout.bootstrap().unwrap();
         std::fs::write(layout.thread_page("t1"), "# t1\n").unwrap();
         let r = WikiReader::new(&layout);
-        let hint = r.triage_hint(&email("a@b.com", Some("t1")));
+        let hint = r.triage_hint(&email("a@b.example.com", Some("t1")));
         assert!(hint.contains("threads/t1.md"));
     }
 
@@ -188,10 +188,10 @@ mod tests {
         let d = TempDir::new().unwrap();
         let layout = WikiLayout::new(d.path().to_path_buf());
         layout.bootstrap().unwrap();
-        std::fs::write(layout.person_page("a@b.com"), "# A\n").unwrap();
+        std::fs::write(layout.person_page("a@b.example.com"), "# A\n").unwrap();
         std::fs::write(layout.thread_page("t1"), "# t1\n").unwrap();
         let r = WikiReader::new(&layout);
-        let hint = r.triage_hint(&email("a@b.com", Some("t1")));
+        let hint = r.triage_hint(&email("a@b.example.com", Some("t1")));
         assert!(hint.len() < 400, "triage hint too long: {} chars", hint.len());
     }
 }

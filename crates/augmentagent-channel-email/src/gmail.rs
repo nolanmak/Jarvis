@@ -39,7 +39,7 @@ pub trait GmailApi: Send + Sync {
     /// Fetch unread emails for an entity. Returns up to `limit` messages.
     async fn fetch_unread(&self, entity_id: &str, limit: u32) -> Result<Vec<Email>, GmailError>;
 
-    /// Fetch emails matching a Gmail search query (e.g. `from:jeremy@acme.com`,
+    /// Fetch emails matching a Gmail search query (e.g. `from:jeremy@acme.example.com`,
     /// `subject:deadline after:2026/04/01`). Returns up to `limit` messages.
     async fn fetch_with_query(
         &self,
@@ -579,7 +579,7 @@ impl ComposioClient {
     /// so test fakes and the triage channel — which never attach or cc —
     /// stay untouched.
     ///
-    /// `to` may carry SEVERAL addresses (`a@x.com, b@y.com`, display names
+    /// `to` may carry SEVERAL addresses (`a@x.example.com, b@y.example.com`, display names
     /// allowed). Composio's `GMAIL_CREATE_EMAIL_DRAFT` takes exactly one
     /// `recipient_email` string plus an `extra_recipients` array — a
     /// comma-joined string is rejected as "Invalid email format" (#439) —
@@ -826,7 +826,7 @@ pub fn guess_mimetype(filename: &str) -> &'static str {
 }
 
 /// Extract the bare email address from an RFC 5322 header-style string.
-/// `Name <x@y.com>` → `x@y.com`. Already-bare addresses pass through.
+/// `Name <x@y.example.com>` → `x@y.example.com`. Already-bare addresses pass through.
 pub fn extract_bare_email(raw: &str) -> String {
     if let (Some(open), Some(close)) = (raw.find('<'), raw.rfind('>')) {
         if open < close {
@@ -957,14 +957,14 @@ mod tests {
 
     #[test]
     fn extract_bare_strips_display_name() {
-        assert_eq!(extract_bare_email("Name <x@y.com>"), "x@y.com");
-        assert_eq!(extract_bare_email("\"Quoted Name\" <x@y.com>"), "x@y.com");
+        assert_eq!(extract_bare_email("Name <x@y.example.com>"), "x@y.example.com");
+        assert_eq!(extract_bare_email("\"Quoted Name\" <x@y.example.com>"), "x@y.example.com");
     }
 
     #[test]
     fn extract_bare_passes_through_simple() {
-        assert_eq!(extract_bare_email("x@y.com"), "x@y.com");
-        assert_eq!(extract_bare_email("  x@y.com  "), "x@y.com");
+        assert_eq!(extract_bare_email("x@y.example.com"), "x@y.example.com");
+        assert_eq!(extract_bare_email("  x@y.example.com  "), "x@y.example.com");
     }
 
     #[test]
@@ -992,21 +992,21 @@ mod tests {
 
     #[test]
     fn split_recipients_single_passthrough() {
-        assert_eq!(split_recipients("x@y.com"), vec!["x@y.com"]);
-        assert_eq!(split_recipients("Name <x@y.com>"), vec!["x@y.com"]);
+        assert_eq!(split_recipients("x@y.example.com"), vec!["x@y.example.com"]);
+        assert_eq!(split_recipients("Name <x@y.example.com>"), vec!["x@y.example.com"]);
     }
 
     #[test]
     fn split_recipients_display_names_with_quoted_comma() {
         assert_eq!(
-            split_recipients(r#""Doe, John" <j@x.com>, Jane <jane@y.com>"#),
-            vec!["j@x.com", "jane@y.com"]
+            split_recipients(r#""Doe, John" <j@x.example.com>, Jane <jane@y.example.com>"#),
+            vec!["j@x.example.com", "jane@y.example.com"]
         );
     }
 
     #[test]
     fn split_recipients_drops_empty_parts() {
-        assert_eq!(split_recipients("a@x.com,, b@y.com,"), vec!["a@x.com", "b@y.com"]);
+        assert_eq!(split_recipients("a@x.example.com,, b@y.example.com,"), vec!["a@x.example.com", "b@y.example.com"]);
         assert!(split_recipients("").is_empty());
         assert!(split_recipients(" , ").is_empty());
     }
@@ -1583,8 +1583,8 @@ mod tests {
                 "body",
                 None,
                 None,
-                &["cc1@x.com,cc2@y.com".into()],
-                &["hidden@z.com".into()],
+                &["cc1@x.example.com,cc2@y.example.com".into()],
+                &["hidden@z.example.com".into()],
             )
             .await
             .expect("multi-recipient draft must succeed");
@@ -1596,8 +1596,8 @@ mod tests {
         let args = &v["arguments"];
         assert_eq!(args["recipient_email"], "nayra@example.com");
         assert_eq!(args["extra_recipients"], serde_json::json!(["bo@example.com"]));
-        assert_eq!(args["cc"], serde_json::json!(["cc1@x.com", "cc2@y.com"]));
-        assert_eq!(args["bcc"], serde_json::json!(["hidden@z.com"]));
+        assert_eq!(args["cc"], serde_json::json!(["cc1@x.example.com", "cc2@y.example.com"]));
+        assert_eq!(args["bcc"], serde_json::json!(["hidden@z.example.com"]));
     }
 
     #[tokio::test]
@@ -1607,7 +1607,7 @@ mod tests {
         let client = ComposioClient::new("ak_fake".into()).with_base_url(format!("http://{addr}"));
 
         client
-            .create_draft("entity-x", "solo@x.com", "s", "b", None)
+            .create_draft("entity-x", "solo@x.example.com", "s", "b", None)
             .await
             .expect("single-recipient draft");
 
@@ -1615,7 +1615,7 @@ mod tests {
         let json_start = raw.find("\r\n\r\n").expect("has body") + 4;
         let v: serde_json::Value = serde_json::from_str(&raw[json_start..]).expect("json body");
         let args = &v["arguments"];
-        assert_eq!(args["recipient_email"], "solo@x.com");
+        assert_eq!(args["recipient_email"], "solo@x.example.com");
         // Absent — Composio treats empty arrays fine, but the pre-#439 wire
         // shape (no extra keys) is preserved for the single case.
         assert!(args.get("extra_recipients").is_none());

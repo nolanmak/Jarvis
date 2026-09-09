@@ -1021,7 +1021,7 @@ mod tests {
     #[tokio::test]
     async fn own_reply_with_lying_is_owner_flag_is_skipped() {
         let (store, _f) = tmp_store();
-        seed_account(&store, "acc_1", "nolan_makatche");
+        seed_account(&store, "acc_1", "example_owner");
         let now = now_millis();
         store
             .upsert_own_post(PLATFORM, "post_1", now, now + 86_400_000)
@@ -1032,11 +1032,11 @@ mod tests {
             &server,
             "post_1",
             serde_json::json!({"data": [
-                {"platform_id":"c_owner","text":"@rlee8808 ty!","author_name":"nolan_makatche",
-                 "author_username":"nolan_makatche","is_owner":false,
+                {"platform_id":"c_owner","text":"@example_reader ty!","author_name":"example_owner",
+                 "author_username":"example_owner","is_owner":false,
                  "created_at":"2026-05-28T00:00:00Z"},
-                {"platform_id":"c_real","text":"Denver baby!","author_name":"rlee8808",
-                 "author_username":"rlee8808","is_owner":false,
+                {"platform_id":"c_real","text":"Looks great!","author_name":"example_reader",
+                 "author_username":"example_reader","is_owner":false,
                  "created_at":"2026-05-28T00:01:00Z"}
             ]}),
         )

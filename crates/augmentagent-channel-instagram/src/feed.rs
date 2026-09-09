@@ -357,7 +357,7 @@ mod tests {
         write_page(
             &people,
             "jane",
-            "kind: person\nclose: true\nidentities:\n  email: [j@x.com]",
+            "kind: person\nclose: true\nidentities:\n  email: [j@x.example.com]",
         );
         // instagram but not close → excluded
         write_page(

@@ -1,7 +1,7 @@
 {
   "name": "augmentagent",
   "version": "1.0.0",
-  "description": "",
+  "description": "Self-hosted personal assistant with message triage, reply approvals, and relationship reminders",
   "main": "dist/index.js",
   "scripts": {
     "dev": "nodemon --exec ts-node src/index.ts",
@@ -25,15 +25,15 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nolanmak/MyAgentAssistant.git"
+    "url": "git+https://github.com/nolanmak/Jarvis.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "bugs": {
-    "url": "https://github.com/nolanmak/MyAgentAssistant/issues"
+    "url": "https://github.com/nolanmak/Jarvis/issues"
   },
-  "homepage": "https://github.com/nolanmak/MyAgentAssistant#readme",
+  "homepage": "https://github.com/nolanmak/Jarvis#readme",
   "dependencies": {
     "@ai-sdk/groq": "^3.0.31",
     "@ai-sdk/provider": "^3.0.8",
