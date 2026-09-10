@@ -238,6 +238,7 @@ impl EventHandler for Handler {
         let allowed_user_id = self.state.allowed_user_id;
         let wiki_root = self.state.wiki_root.clone();
 
+        info!(%channel_id, %msg_id, "discord query received");
         tokio::spawn(async move {
             // Fetch recent messages in this channel/DM so follow-up questions
             // see the prior exchange. Bounded by age + char cap inside the fn.
@@ -284,6 +285,7 @@ impl EventHandler for Handler {
             };
             let result =
                 run_with_typing(&http, channel_id, handler.answer(&audit_ctx, &prompt)).await;
+            info!(%channel_id, %msg_id, success = result.is_ok(), "discord query completed");
 
             // Best-effort cleanup. Tempfiles aren't load-bearing for the reply
             // we're about to post, so we tolerate failures.
@@ -997,29 +999,24 @@ async fn run_with_typing<F, T>(http: &Http, channel_id: ChannelId, fut: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
-    // Send the first ping unconditionally so the indicator appears within a
-    // round-trip of the user's message, even if the reasoner finishes quickly.
-    if let Err(e) = channel_id.broadcast_typing(http).await {
-        debug!("initial broadcast_typing failed: {e}");
-    }
-    tokio::pin!(fut);
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(TYPING_REFRESH_SECS));
-    // Discord's indicator times out at ~10s; an early extra tick is fine but
-    // we don't want to re-fire immediately on the first poll.
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Consume the immediate first tick so the first refresh happens after the
-    // configured interval rather than at t=0.
-    ticker.tick().await;
-    loop {
-        tokio::select! {
-            biased;
-            out = &mut fut => return out,
-            _ = ticker.tick() => {
-                if let Err(e) = channel_id.broadcast_typing(http).await {
-                    debug!("broadcast_typing refresh failed: {e}");
-                }
+    // Poll the entire typing loop concurrently, including HTTP awaits. A
+    // stalled initial ping or refresh must never prevent the answer future
+    // from starting, progressing, or returning. Dropping this future also
+    // cancels any pending ping; no detached typing task survives the answer.
+    let typing = async {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(TYPING_REFRESH_SECS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Err(e) = channel_id.broadcast_typing(http).await {
+                debug!("broadcast_typing failed: {e}");
             }
         }
+    };
+    tokio::select! {
+        biased;
+        out = fut => out,
+        _ = typing => unreachable!("typing loop runs until the answer completes"),
     }
 }
 
@@ -2174,6 +2171,64 @@ fn hard_split(s: &str, max: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use augmentagent_docs::doc_command_for;
+
+    #[tokio::test]
+    async fn stalled_typing_request_does_not_block_answer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http = serenity::http::HttpBuilder::new("test-token")
+            .proxy(format!("http://{}", listener.local_addr().unwrap()))
+            .ratelimiter_disabled(true)
+            .build();
+        let (accepted, request_started) = tokio::sync::oneshot::channel();
+        // A reachable Discord endpoint that accepts the request but never replies.
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            accepted.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_with_typing(&http, ChannelId::new(1), async {
+                request_started.await.unwrap();
+                "answer"
+            }),
+        )
+        .await;
+        server.abort();
+        assert_eq!(answer.expect("typing must not block the answer"), "answer");
+    }
+
+    #[tokio::test]
+    async fn stalled_typing_refresh_does_not_block_answer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http = serenity::http::HttpBuilder::new("test-token")
+            .proxy(format!("http://{}", listener.local_addr().unwrap()))
+            .ratelimiter_disabled(true)
+            .build();
+        let (accepted, refresh_started) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").await.unwrap();
+            drop(socket);
+            let (_socket, _) = listener.accept().await.unwrap();
+            accepted.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(TYPING_REFRESH_SECS + 2),
+            run_with_typing(&http, ChannelId::new(1), async {
+                refresh_started.await.unwrap();
+                "answer"
+            }),
+        )
+        .await;
+        server.abort();
+        assert_eq!(answer.expect("typing refresh must not block the answer"), "answer");
+    }
 
     // ---- #303: fail-closed owner-allowlist check ----
 
