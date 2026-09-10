@@ -544,6 +544,25 @@ pub fn source_lines(page: &str) -> Vec<String> {
     out
 }
 
+/// The `(platform, value)` identity pairs a page carries for the list-valued
+/// platforms (`MULTI_VALUED` — the only kind a contact stub ever holds). Public
+/// so a merge proposal can SHOW who each side of the pair is (#968). A page
+/// whose frontmatter doesn't parse yields an empty list rather than an error,
+/// the same skip-don't-fail stance `IdentityIndex::build` takes: this feeds a
+/// card's prose, and no amount of bad YAML may break the merge itself.
+pub fn identity_summary(page: &str) -> Vec<(String, String)> {
+    let Some((fm_inner, _)) = split_frontmatter(page) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for plat in MULTI_VALUED {
+        for v in extract_list_values(fm_inner, plat) {
+            out.push((plat.to_string(), v));
+        }
+    }
+    out
+}
+
 /// YAML-quote a scalar only when it could be misparsed (`:` `#` leading `-`,
 /// etc). Emails / urns / phone are safe bare in practice but we quote
 /// defensively when in doubt.
@@ -977,6 +996,24 @@ mod tests {
         let stub = "---\nkind: person\nidentities:\n  phone: [\"+15550002\"]\n---\n\n# Q\n\n## Source\n";
         let r = merge_stub_into(target, stub, "q_at_contact");
         assert!(r.content.contains("  phone: [\"+15550001\", \"+15550002\"]"), "{}", r.content);
+    }
+
+    #[test]
+    fn identity_summary_reads_every_list_shape_a_page_carries() {
+        let page = "---\nkind: person\nidentities:\n  email:\n    - a@example.com\n    - b@example.com\n  phone: [\"+15550000001\"]\n  imessage: \"+15550000001\"\n  phone_home: \"+15550000009\"\n---\n\n# Jane\n";
+        assert_eq!(
+            identity_summary(page),
+            vec![
+                ("email".to_string(), "a@example.com".to_string()),
+                ("email".to_string(), "b@example.com".to_string()),
+                ("phone".to_string(), "+15550000001".to_string()),
+                ("imessage".to_string(), "+15550000001".to_string()),
+            ]
+        );
+        // Unparseable / absent front-matter is skipped, never fatal: this only
+        // feeds a card's prose.
+        assert!(identity_summary("# Jane\n\nno front-matter here\n").is_empty());
+        assert!(identity_summary("---\nkind: person\nidentities:\n  phone: [\"+1\"]\n").is_empty());
     }
 
     #[test]

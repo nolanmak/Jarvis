@@ -11817,7 +11817,15 @@ fn execute_person_merge(
             .with_context(|| format!("removing stub {}", from_path.display()))?;
         repointed = store.repoint_phone_identity(from, into)?;
     }
-    let title = stub_src.lines().find_map(|l| l.strip_prefix("# ").map(str::trim));
+    let display_name = |src: &str, slug: &str| {
+        src.lines()
+            .find_map(|l| l.strip_prefix("# ").map(str::trim))
+            .filter(|t| !t.is_empty())
+            .unwrap_or(slug)
+            .to_string()
+    };
+    let stub_identities = augmentagent_wiki::crm::identity_summary(&stub_src);
+    let target_identities = augmentagent_wiki::crm::identity_summary(&target_src);
     Ok(PersonMergeReport {
         from: from.to_string(),
         into: into.to_string(),
@@ -11826,13 +11834,52 @@ fn execute_person_merge(
         updated_bumped: bumped,
         moved: merged.moved,
         phone_rows_repointed: repointed,
-        stub_title: title.filter(|t| !t.is_empty()).unwrap_or(from).to_string(),
+        stub_title: display_name(&stub_src, from),
+        target_title: display_name(&target_src, into),
         last_message: stub_updated,
         evidence: augmentagent_wiki::crm::source_lines(&stub_src),
+        target_evidence: augmentagent_wiki::crm::source_lines(&target_src),
+        shared_identities: shared_identities(&stub_identities, &target_identities),
+        stub_identities,
+        target_identities,
     })
 }
 
-/// What one run did, plus the stub facts the card's evidence needs (#927).
+/// #968 — why the pair matched: the identity values both pages carry, labelled
+/// by the target's platform and compared the way `Identities::matches` does
+/// (emails and Apple-ID handles case-insensitive, E.164 verbatim, and a
+/// phone-shaped iMessage handle counted against the target's `phone` too,
+/// which is how most texters arrive). Empty when nothing overlaps — a manual
+/// merge of an arbitrary pair gets no match line rather than a made-up one.
+fn shared_identities(
+    stub: &[(String, String)],
+    target: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (platform, value) in stub {
+        let email_like = value.contains('@');
+        let hit = target.iter().find(|(tp, tv)| {
+            let comparable =
+                tp == platform || (platform == "imessage" && tp == "phone" && !email_like);
+            comparable
+                && if platform == "email" || email_like {
+                    tv.eq_ignore_ascii_case(value)
+                } else {
+                    tv == value
+                }
+        });
+        if let Some((tp, _)) = hit {
+            let pair = (tp.clone(), value.clone());
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
+    }
+    out
+}
+
+/// What one run did, plus the facts the card's evidence needs about BOTH sides
+/// of the pair (#927, #968).
 #[derive(Debug, serde::Serialize)]
 struct PersonMergeReport {
     from: String,
@@ -11843,8 +11890,13 @@ struct PersonMergeReport {
     moved: Vec<String>,
     phone_rows_repointed: usize,
     stub_title: String,
+    target_title: String,
     last_message: Option<String>,
     evidence: Vec<String>,
+    target_evidence: Vec<String>,
+    stub_identities: Vec<(String, String)>,
+    target_identities: Vec<(String, String)>,
+    shared_identities: Vec<(String, String)>,
 }
 
 fn run_person_merge(cli: &Cli, store: Arc<Store>, from: &str, into: &str, apply: bool) -> Result<()> {
@@ -11870,6 +11922,17 @@ fn identity_merge_is_settled(status: &str) -> bool {
     matches!(status, "pending" | "sent" | "rejected")
 }
 
+/// #968 — Discord hands `email.body` half of the embed's ~3.8K description and
+/// tail-truncates the rest, so the card is bounded twice over: how MANY Source
+/// lines and identities each side shows, and how LONG any one rendered value
+/// may be. Both are needed — one 2K Source line or display name would push the
+/// target section, and the Match line that closes the body, off the card just
+/// as surely as a hundred short ones. Together they hold the body under ~1.7K
+/// whatever the two pages carry.
+const MAX_CARD_SOURCE_LINES: usize = 4;
+const MAX_CARD_IDENTITIES: usize = 3;
+const MAX_CARD_VALUE: usize = 64;
+
 /// #927 — synthesize the card, as `(card, payload for originalBody, draft)`.
 /// `from` is the stub's display name and `body` its evidence — what the owner
 /// judges. Neither is a mailbox and `thread_id` is `None`, which is why
@@ -11891,9 +11954,58 @@ fn build_identity_merge_card(
         .iter()
         .filter_map(|l| l.split_once(" messages")?.0.rsplit(' ').next()?.parse::<u32>().ok())
         .sum();
-    let (stub, last) = (&report.from, report.last_message.as_deref().unwrap_or("unknown"));
-    let mut evidence = format!("Contact stub {stub} — {messages} messages, last text {last}\n");
-    evidence.extend(report.evidence.iter().map(|l| format!("• {l}\n")));
+    // #968 — both sides are named, with their identities and provenance, so the
+    // owner can decide in place instead of looking two wiki pages up first.
+    let clip = |v: &str| truncate(v, MAX_CARD_VALUE);
+    let identity_list = |list: &[(String, String)]| {
+        let shown = list
+            .iter()
+            .take(MAX_CARD_IDENTITIES)
+            .map(|(platform, v)| clip(&format!("{platform} {v}")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match list.len().saturating_sub(MAX_CARD_IDENTITIES) {
+            0 => shown,
+            more => format!("{shown} (+{more} more)"),
+        }
+    };
+    let identities = |list: &[(String, String)]| match identity_list(list) {
+        shown if shown.is_empty() => String::new(),
+        shown => format!(" — {shown}"),
+    };
+    let provenance = |list: &[String]| {
+        let mut out: String = list
+            .iter()
+            .take(MAX_CARD_SOURCE_LINES)
+            .map(|l| format!("• {}\n", clip(l)))
+            .collect();
+        let more = list.len().saturating_sub(MAX_CARD_SOURCE_LINES);
+        if more > 0 {
+            out.push_str(&format!("• … and {more} more\n"));
+        }
+        out
+    };
+    let last = clip(report.last_message.as_deref().unwrap_or("unknown"));
+    let mut evidence = format!(
+        "Stub: {} ({}.md){} — {messages} messages, last text {last}\n",
+        clip(&report.stub_title),
+        clip(&report.from),
+        identities(&report.stub_identities),
+    );
+    evidence.push_str(&provenance(&report.evidence));
+    evidence.push_str(&format!(
+        "Target: {} ({}.md){}\n",
+        clip(&report.target_title),
+        clip(&report.into),
+        identities(&report.target_identities),
+    ));
+    evidence.push_str(&provenance(&report.target_evidence));
+    if !report.shared_identities.is_empty() {
+        evidence.push_str(&format!(
+            "Match: both pages carry {}\n",
+            identity_list(&report.shared_identities),
+        ));
+    }
     let moved = report.moved.join(", ");
     let fills = if moved.is_empty() { "(nothing new — provenance only)" } else { &moved };
     let draft = format!(
@@ -11909,7 +12021,7 @@ fn build_identity_merge_card(
         message_id: format!("merge:{}->{}", report.from, report.into),
         thread_id: None,
         from: report.stub_title.clone(),
-        subject: format!("Merge '{}' into {}?", report.stub_title, report.into),
+        subject: format!("Merge '{}' into {}?", report.stub_title, report.target_title),
         body: evidence,
         date: report.last_message.clone().unwrap_or_default(),
         account_entity_id: None,
@@ -16901,11 +17013,18 @@ mod identity_merge_tests {
         assert_eq!(status_of(&store, &errored), "error");
         assert_eq!(scan().await.unwrap(), 1);
         let (id, card) = discord.posts.lock().unwrap().remove(0);
-        assert!(card.contains(&format!("Merge 'Landlord Philly' into {TARGET}?")), "{card}");
+        assert!(card.contains("Merge 'Landlord Philly' into Centra Associates?"), "{card}");
         // The volume at stake is ON the card, not left in the wiki to look up.
         assert!(card.contains("412 messages, last text 2026-08-26"), "{card}");
         assert!(card.contains("• iMessage history: 412 messages"), "provenance: {card}");
         assert!(card.contains("deletes the stub"), "what Approve will do: {card}");
+        // #968: who each side IS, and why they matched — decidable in place,
+        // without looking either page up first.
+        assert!(card.contains(&format!("({STUB}.md)")), "which page the stub is: {card}");
+        assert!(card.contains(&format!("Target: Centra Associates ({TARGET}.md)")), "{card}");
+        assert!(card.contains(&format!("phone {PHONE}")), "the stub's identity: {card}");
+        assert!(card.contains("• Hand-written: property manager"), "target facts: {card}");
+        assert!(card.contains(&format!("Match: both pages carry phone {PHONE}")), "{card}");
         let row = store.get_action_with_email(&id).unwrap().unwrap();
         assert_eq!((&*row.action.status, &*row.email.kind), ("pending", IDENTITY_MERGE_KIND));
         // Approve executes the payload off the row, never the rendered text.
@@ -16930,6 +17049,47 @@ mod identity_merge_tests {
         let row = store.lookup_person_by_phone(PHONE).unwrap().unwrap();
         assert_eq!(row.person_slug, TARGET, "future syncs hit the survivor");
         assert!(matches!(click(), ApprovalActionOutcome::AlreadyResolved { .. }));
+    }
+
+    /// #968 — Discord hands `email.body` half of the embed's ~3.8K description,
+    /// so a canonical page must not push the target section, or the Match line
+    /// that closes the body, off the card — whether it is long because it
+    /// carries MANY Source lines and identities or because any one of them, or
+    /// its display name, is huge.
+    #[test]
+    fn an_oversized_target_page_still_leaves_room_for_the_match_line() {
+        let (store, _t, wiki) = seeded_env();
+        let target = wiki.join("people").join(format!("{TARGET}.md"));
+        let mut page = std::fs::read_to_string(&target).unwrap().replace(
+            "# Centra Associates",
+            &format!("# Centra Associates {}", "of Fishtown ".repeat(80)),
+        );
+        page = page.replace(
+            "  phone:",
+            &format!(
+                "  email:\n    - {0}1@example.com\n    - {0}2@example.com\n    \
+                 - {0}3@example.com\n  phone:",
+                "leasing".repeat(60)
+            ),
+        );
+        page.push_str(&format!("- Hand-written: {}\n", "a very long lease clause ".repeat(90)));
+        for i in 0..40 {
+            page.push_str(&format!("- Hand-written: note {i} on the Fishtown unit\n"));
+        }
+        std::fs::write(&target, page).unwrap();
+        let (email, ..) = build_identity_merge_card(&dry_run(&store, &wiki));
+        let body = &email.body;
+        assert!(body.contains(&format!("Match: both pages carry phone {PHONE}")), "{body}");
+        assert!(body.contains("… and 38 more"), "line count capped: {body}");
+        assert!(body.contains("(+1 more)"), "identity count capped: {body}");
+        // The long values are shown, clipped — not dropped, not unbounded. No
+        // line outgrows a header's title, slug and three clipped identities.
+        for probe in ["Centra Associates of", "email leasing", "a very long lease clause"] {
+            assert!(body.contains(probe), "{probe} dropped: {body}");
+        }
+        assert!(body.lines().all(|l| l.len() <= 6 * MAX_CARD_VALUE), "unbounded line: {body}");
+        // Discord's half-slice of the description, which the body must clear.
+        assert!(body.len() < 1_893, "{} chars of body: {body}", body.len());
     }
 
     /// Approve and Skip are not the only verbs that dispatch on kind: the
