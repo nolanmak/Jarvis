@@ -1,0 +1,44 @@
+name: Finance integration
+on:
+  pull_request:
+    paths:
+      - 'crates/augmentagent-finance/**'
+      - 'crates/augmentagent-cli/**'
+      - 'crates/augmentagent-store/**'
+      - 'crates/augmentagent-wiki/**'
+      - 'crates/augmentagent-channel-core/src/reasoner.rs'
+      - 'scripts/systemd/augmentagent-finance-sync.*'
+      - '.github/workflows/finance.yml'
+      - 'Cargo.*'
+permissions:
+  contents: read
+jobs:
+  finance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format finance crate
+        run: cargo fmt -p augmentagent-finance -- --check
+      - name: Finance lint
+        run: cargo clippy -p augmentagent-finance --all-targets -- -D warnings
+      - name: Finance and wiki behavior
+        run: cargo test -p augmentagent-finance -p augmentagent-wiki
+      - name: Store and agent integration
+        run: |
+          cargo test -p augmentagent-store --lib finance_evidence
+          cargo test -p augmentagent-channel-core --lib finance_allowlist
+      - name: CLI unit and process tests
+        run: |
+          cargo test -p augmentagent-cli --bin augmentagent finance::tests
+          cargo test -p augmentagent-cli --test finance_cli
+          cargo test -p augmentagent-cli --test status_schema

@@ -1,0 +1,25 @@
+[package]
+name = "augmentagent-finance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust", "vendored"] }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+rusqlite.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+sha2 = "0.10"
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+wiremock.workspace = true
+tempfile = "3"

@@ -72,3 +72,7 @@ public/tailwind.css
 *-auth.json.tmp
 *-cookies.json.tmp
 gitleaks-report.*
+
+# Cross-process finance importer lock (no content).
+*.finance.lock
+*.db-journal

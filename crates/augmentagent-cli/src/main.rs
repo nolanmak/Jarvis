@@ -54,6 +54,7 @@ mod doc_cmd;
 mod doctor;
 mod env_cfg;
 mod gmail_attach;
+mod finance;
 mod installers;
 mod logs;
 mod loop_cmd;
@@ -95,6 +96,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Connect bank accounts, sync transactions, and query local finance records.
+    Finance {
+        #[command(subcommand)]
+        op: finance::FinanceCommand,
+    },
     /// Run one poll cycle and exit.
     PollOnce {
         /// Dry-run (default): writes `dry_run` actions, no drafts, no sends.
@@ -2144,6 +2150,9 @@ async fn main() -> Result<()> {
         .clone()
         .or_else(|| std::env::var("AUGMENTAGENT_DB").ok().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("data.db"));
+    if let Cmd::Finance { ref op } = cli.cmd {
+        return finance::run(op, &db_path, cli.wiki_dir.as_deref()).await;
+    }
     info!(db = %db_path.display(), "opening store");
     let store = Arc::new(Store::open(&db_path).context("open store")?);
 
@@ -2153,11 +2162,12 @@ async fn main() -> Result<()> {
     {
         let store = Arc::clone(&store);
         augmentagent_channel_core::ingest::set_first_seen_resolver(Arc::new(move |id: &str| {
-            store.email_first_seen_at(id).ok().flatten()
+            store.evidence_first_seen_at(id).ok().flatten()
         }));
     }
 
     match cli.cmd {
+        Cmd::Finance { .. } => unreachable!("finance dispatched before general store"),
         Cmd::AccountsList => {
             let accounts = store.get_active_gmail_accounts()?;
             if accounts.is_empty() {
@@ -6797,7 +6807,7 @@ async fn run_wiki_lint(cli: &Cli, store: Arc<Store>, out: Option<PathBuf>) -> Re
     // Computed freshness (#642) — mechanical, produced before the model
     // pass so the report carries it even if the reasoner has nothing to say.
     let freshness_section =
-        wiki_freshness_section(&wiki_root, &|id| store.email_first_seen_at(id).ok().flatten());
+        wiki_freshness_section(&wiki_root, &|id| store.evidence_first_seen_at(id).ok().flatten());
 
     let reasoner = build_reasoner();
     let opts = augmentagent_channel_core::reasoner::lint_opts(schema, wiki_root.clone());
@@ -6842,7 +6852,7 @@ fn wiki_freshness_section(
     let mut deprecated = 0usize;
     let mut expired: Vec<(String, freshness::Date)> = Vec::new();
 
-    for dir in ["people", "threads", "projects"] {
+    for dir in ["people", "threads", "projects", "finance"] {
         let Ok(rd) = std::fs::read_dir(wiki_root.join(dir)) else {
             continue;
         };
@@ -6963,7 +6973,7 @@ fn run_wiki_index(cli: &Cli, store: Arc<Store>, rebuild: bool) -> Result<()> {
     if rebuild {
         let stats =
             augmentagent_wiki::rebuild_index(&wiki_root, &|id: &str| {
-                store.email_first_seen_at(id).ok().flatten()
+                store.evidence_first_seen_at(id).ok().flatten()
             })?;
         let skipped = if stats.unreadable > 0 {
             format!(", {} unreadable pages skipped", stats.unreadable)
@@ -6971,10 +6981,11 @@ fn run_wiki_index(cli: &Cli, store: Arc<Store>, rebuild: bool) -> Result<()> {
             String::new()
         };
         println!(
-            "index.md rebuilt: {} people, {} threads, {} projects — {} pages{skipped}",
+            "index.md rebuilt: {} people, {} threads, {} projects, {} finance — {} pages{skipped}",
             stats.people,
             stats.threads,
             stats.projects,
+            stats.finance,
             stats.total(),
         );
         return Ok(());
@@ -6992,7 +7003,7 @@ fn run_wiki_index(cli: &Cli, store: Arc<Store>, rebuild: bool) -> Result<()> {
         .collect();
 
     let mut missing_total = 0usize;
-    for dir in ["people", "threads", "projects"] {
+    for dir in ["people", "threads", "projects", "finance"] {
         let mut on_disk = 0usize;
         let mut missing = 0usize;
         if let Ok(rd) = std::fs::read_dir(wiki_root.join(dir)) {

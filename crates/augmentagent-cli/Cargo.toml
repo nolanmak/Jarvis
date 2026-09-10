@@ -11,6 +11,7 @@ name = "augmentagent"
 path = "src/main.rs"
 
 [dependencies]
+augmentagent-finance = { path = "../augmentagent-finance" }
 augmentagent-store = { path = "../augmentagent-store" }
 augmentagent-channel-core = { path = "../augmentagent-channel-core" }
 augmentagent-channel-reddit = { path = "../augmentagent-channel-reddit" }
@@ -85,6 +86,7 @@ libc = "0.2"
 # is the idiomatic Rust snapshot crate; `tempfile` gives the test an isolated
 # sqlite db path so probe output is deterministic on a fresh box.
 [dev-dependencies]
+wiremock.workspace = true
 insta = { version = "1", features = ["json", "redactions"] }
 tempfile = "3"
 # Used by the snapshot test to pre-seed the legacy schema tables (`actions`,
