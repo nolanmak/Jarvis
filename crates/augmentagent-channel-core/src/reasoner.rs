@@ -952,6 +952,12 @@ impl ClaudeCliReasoner {
         if !opts.env.is_empty() {
             cmd.envs(opts.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         }
+        // Bank credentials belong to the importer, never to model subprocesses.
+        for (key, _) in std::env::vars().chain(opts.env.iter().cloned()) {
+            if key.starts_with("PLAID_") {
+                cmd.env_remove(key);
+            }
+        }
         let mut child = cmd.spawn()?;
 
         if let Some(mut stdin) = child.stdin.take() {
@@ -1641,6 +1647,18 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             "mcp__memory__search_conversation_history".into(),
             "mcp__memory__memory_search".into(),
             "mcp__memory__memory_recent".into(),
+            "Bash(augmentagent finance status)".into(),
+            format!("Bash({} finance status)", bin.display()),
+            "Bash(augmentagent finance status *)".into(),
+            format!("Bash({} finance status *)", bin.display()),
+            "Bash(augmentagent finance transactions)".into(),
+            format!("Bash({} finance transactions)", bin.display()),
+            "Bash(augmentagent finance transactions *)".into(),
+            format!("Bash({} finance transactions *)", bin.display()),
+            "Bash(augmentagent finance summary)".into(),
+            format!("Bash({} finance summary)", bin.display()),
+            "Bash(augmentagent finance summary *)".into(),
+            format!("Bash({} finance summary *)", bin.display()),
             bash_gmail_abs,
             bash_gmail_bare,
             bash_loop_abs,
@@ -3622,5 +3640,23 @@ echo '{"type":"result","result":"You'\''ve hit your session limit · resets 9:30
         unsafe { std::env::set_var("AUGMENTAGENT_TRANSCRIPTS_DIR", "/nonexistent/aa-x") };
         assert_eq!(ask_opts(wiki, repo).add_dirs.len(), 1);
         unsafe { std::env::remove_var("AUGMENTAGENT_TRANSCRIPTS_DIR") };
+    }
+}
+
+#[cfg(test)]
+mod finance_allowlist_tests {
+    #[test]
+    fn finance_agent_can_query_but_cannot_connect_or_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = super::ask_opts(dir.path().to_owned(), dir.path().to_owned());
+        for verb in ["status", "transactions", "summary"] {
+            assert!(opts.allowed_tools.contains(&format!("Bash(augmentagent finance {verb})")));
+            assert!(opts.allowed_tools.contains(&format!("Bash(augmentagent finance {verb} *)")));
+        }
+        for verb in ["connect", "complete", "sync", "export"] {
+            assert!(!opts.allowed_tools.iter().any(|s| s.contains(&format!("finance {verb}"))));
+        }
+        assert!(!opts.allowed_tools.contains(&"Bash(augmentagent finance *)".into()));
+        assert!(!opts.env.iter().any(|(key, _)| key.starts_with("PLAID_")));
     }
 }

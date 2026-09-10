@@ -173,3 +173,48 @@ are not supported by the underlying API.
 
 Original Jarvis code is licensed under [ISC](LICENSE). See
 [third-party notices](THIRD_PARTY_NOTICES.md) for dependency licensing and the historical grocery-provider removal.
+
+### Automatic personal finance (Plaid)
+
+Set `PLAID_CLIENT_ID`, `PLAID_SECRET`, and `PLAID_ENV=production` in the local
+`.env` (Trial accounts use production). Bank access tokens are stored in Linux
+Secret Service; the login keyring must be available to your user service.
+
+```bash
+augmentagent finance check
+augmentagent finance connect --alias Household --countries US
+# Open the returned Hosted Link URL and authorize your bank, then:
+augmentagent finance complete --session SESSION_ID
+augmentagent --wiki-dir ./wiki finance sync
+augmentagent finance status
+augmentagent finance summary --start 2026-09-01 --end 2026-09-30
+augmentagent finance transactions --account ACCOUNT_ID --start 2026-09-01
+```
+
+Connection URLs expire; complete the Link flow promptly and retrieve its result
+within six hours. To repair an expired connection, run `finance connect --alias
+Household --update-item ITEM_ID`, then `finance complete` with the new session.
+This preserves the existing connection rather than spending another Trial slot.
+
+For supported US banks, add `--statements` when connecting, or use it with
+`--update-item` to grant Statements consent later. Sync then archives original
+PDFs and their checksums under `wiki/finance/`, requests statement refresh once
+per seven days, and picks up asynchronous results on subsequent syncs.
+Requesting Statements requires that bank to support the product; Transactions
+can be used alone. Refreshes may incur charges on paid Plaid plans.
+
+Install `scripts/systemd/augmentagent-finance-sync.{service,timer}` in
+`~/.config/systemd/user/`, run `systemctl --user daemon-reload`, then
+`systemctl --user enable --now augmentagent-finance-sync.timer` for six-hour
+imports. Units assume the checkout is `~/AugmentAgent`. The existing private
+wiki mirror timer handles Git backups. Keep that mirror private: its finance
+pages and optional PDFs contain financial records. Tokens and the local
+transaction database are not backed up by the wiki mirror.
+
+`finance export` regenerates KB pages from local records after an interrupted
+export. Query commands require no Plaid credentials and report connection
+freshness. Amounts use decimal arithmetic; totals are per currency, exclude
+pending transactions and Plaid-classified transfers/loan payments, and may
+still include unclassified transfers. Bank descriptions are treated as data,
+not instructions. The agent is allowed only `finance status`, `transactions`,
+and `summary`, not connection or sync operations.

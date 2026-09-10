@@ -35,6 +35,10 @@ impl WikiLayout {
         self.root.join("threads")
     }
 
+    pub fn finance_dir(&self) -> PathBuf {
+        self.root.join("finance")
+    }
+
     pub fn projects_dir(&self) -> PathBuf {
         self.root.join("projects")
     }

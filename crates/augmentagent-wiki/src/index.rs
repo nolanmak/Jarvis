@@ -34,6 +34,7 @@ const SECTIONS: &[(&str, &str)] = &[
     ("People", "people"),
     ("Threads", "threads"),
     ("Projects", "projects"),
+    ("Finance", "finance"),
 ];
 
 /// Longest summary we will emit after the `— ` separator. Long enough for
@@ -51,6 +52,7 @@ pub struct IndexStats {
     pub people: usize,
     pub threads: usize,
     pub projects: usize,
+    pub finance: usize,
     /// Pages that could not be read (I/O error or non-UTF8). Listed nowhere;
     /// counted so callers can surface the gap instead of silently shrinking
     /// the index.
@@ -59,7 +61,7 @@ pub struct IndexStats {
 
 impl IndexStats {
     pub fn total(&self) -> usize {
-        self.people + self.threads + self.projects
+        self.people + self.threads + self.projects + self.finance
     }
 }
 
@@ -105,6 +107,7 @@ pub fn render_index(root: &Path, resolve: FirstSeenResolver) -> Result<(String, 
             "people" => stats.people = entries.len(),
             "threads" => stats.threads = entries.len(),
             "projects" => stats.projects = entries.len(),
+            "finance" => stats.finance = entries.len(),
             _ => unreachable!(),
         }
         doc.push_str(&format!("\n## {title}\n\n"));
@@ -250,7 +253,8 @@ mod tests {
 
     #[test]
     fn summary_strips_bullet_and_collapses_whitespace() {
-        let page = "---\nkind: thread\n---\n\n## Timeline\n\n- **2026-04-20**  |  hello\n   world\n";
+        let page =
+            "---\nkind: thread\n---\n\n## Timeline\n\n- **2026-04-20**  |  hello\n   world\n";
         assert_eq!(derive_summary(page).unwrap(), "**2026-04-20** | hello");
     }
 
@@ -284,7 +288,11 @@ mod tests {
             "threads/t1.md",
             "---\nkind: thread\n---\n\n## Subject\nRe: contract\n",
         );
-        write(root, "projects/q2.md", "---\nkind: project\n---\n\n## Project\n\nQ2 launch.\n");
+        write(
+            root,
+            "projects/q2.md",
+            "---\nkind: project\n---\n\n## Project\n\nQ2 launch.\n",
+        );
         // Non-md and nested files are ignored.
         write(root, "people/notes.txt", "not a page");
 
@@ -318,13 +326,20 @@ mod tests {
     fn rebuild_replaces_stale_index_and_tolerates_missing_dirs() {
         let td = TempDir::new().unwrap();
         let root = td.path();
-        std::fs::write(root.join("index.md"), "# Wiki Index\n\n- [people/gone.md](people/gone.md) — stale\n").unwrap();
+        std::fs::write(
+            root.join("index.md"),
+            "# Wiki Index\n\n- [people/gone.md](people/gone.md) — stale\n",
+        )
+        .unwrap();
         write(root, "people/here.md", PERSON);
 
         let stats = rebuild_index(root, &|_| None).unwrap();
         assert_eq!(stats.total(), 1);
         let doc = std::fs::read_to_string(root.join("index.md")).unwrap();
-        assert!(!doc.contains("gone.md"), "stale entries must not survive a rebuild");
+        assert!(
+            !doc.contains("gone.md"),
+            "stale entries must not survive a rebuild"
+        );
         assert!(doc.contains("here.md"));
         // threads/ and projects/ don't exist — sections render empty.
         assert!(doc.contains("## Threads"));
@@ -355,5 +370,30 @@ mod tests {
         rebuild_index(root, &|_| Some(1776549330000)).unwrap();
         let doc = std::fs::read_to_string(root.join("index.md")).unwrap();
         assert!(doc.contains("- [projects/old.md](projects/old.md) — Retired effort. · deprecated"));
+    }
+}
+
+#[cfg(test)]
+mod finance_tests {
+    #[test]
+    fn finance_pages_are_discoverable_with_resolved_evidence() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir(d.path().join("finance")).unwrap();
+        std::fs::write(
+            d.path().join("finance/plaid-production.md"),
+            "---\nkind: finance\nsources: [plaid/production/item]\n---\n# Finance\n",
+        )
+        .unwrap();
+        let (index, stats) = super::render_index(d.path(), &|id| {
+            if id == "plaid/production/item" {
+                Some(1788912000000)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+        assert!(index.contains("finance/plaid-production.md"));
+        assert!(index.contains("facts as of 2026-09-09"));
+        assert_eq!(stats.total(), 1);
     }
 }

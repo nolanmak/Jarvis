@@ -1,0 +1,63 @@
+use augmentagent_finance::{sync_statements, Client, FinanceStore};
+use serde_json::json;
+use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+#[tokio::test]
+async fn pdf_archive_is_idempotent_and_rejects_non_pdf_responses() {
+    let server = MockServer::start().await;
+    let client = Client::for_test(&server.uri());
+    let s = FinanceStore::memory().unwrap();
+    s.add_item("sandbox", "item", "Household").unwrap();
+    Mock::given(path("/statements/list")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"accounts":[{"account_id":"checking","statements":[{"statement_id":"../../untrusted","year":2026,"month":8}]}]}))).mount(&server).await;
+    Mock::given(path("/statements/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"%PDF-1.7\nfixture".to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let root = tempfile::tempdir().unwrap();
+    assert_eq!(
+        sync_statements(
+            &client,
+            &s,
+            "sandbox",
+            "item",
+            "fixture-access",
+            root.path()
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sync_statements(
+            &client,
+            &s,
+            "sandbox",
+            "item",
+            "fixture-access",
+            root.path()
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    let files = std::fs::read_dir(root.path().join("finance"))
+        .unwrap()
+        .count();
+    assert_eq!(files, 2);
+    server.reset().await;
+    Mock::given(path("/statements/list")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"accounts":[{"account_id":"checking","statements":[{"statement_id":"bad","year":2026,"month":9}]}]}))).mount(&server).await;
+    Mock::given(path("/statements/download"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("<html>error</html>"))
+        .mount(&server)
+        .await;
+    assert!(sync_statements(
+        &client,
+        &s,
+        "sandbox",
+        "item",
+        "fixture-access",
+        root.path()
+    )
+    .await
+    .is_err());
+}
