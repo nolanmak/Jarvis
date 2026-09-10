@@ -1991,10 +1991,14 @@ and lands in the PR.\n\
 - Do NOT touch deploy/auth/secret/CI files (systemd units, scripts/check-for-updates, \
 .github/workflows, anything with credentials/keyring/.env).\n\
 - Keep the diff small and focused on the issue.\n\
-- Test fixtures must use INVENTED placeholder emails, names, and handles \
-(alice@example.com, not a real address quoted in the issue). A pre-commit \
-hook rejects real-looking personal data and the commit will fail after all \
-your work.\n\
+- Every email address, phone number, name and handle you write — in code, \
+tests, fixtures, doc comments, or any commit-visible string — must be \
+INVENTED and use an RFC 2606 reserved name: `@example.com`, `@example.org`, \
+`@example.net`, or a `.example` / `.test` / `.invalid` TLD. Anything else \
+(any other domain — x.io, y.com, acme.io) is REJECTED by the pre-commit guard \
+`scripts/check-no-personal-data.sh`, which discards your entire run. Never \
+quote a real address from the issue. A line that genuinely needs a \
+real-looking value must carry a `pii-ok` comment.\n\
 - Do NOT run git commit, git push, or gh. Just edit files.\n\
 - If the prompt carries a 'Prior attempts on this issue' section, treat it as \
 ground truth about what did not work: do not re-run those dead ends, fix the \
@@ -2832,6 +2836,99 @@ async fn red_main_plan(repo_root: &Path, red: &RedMain) -> RedMainPlan {
         author_trusted,
         research_filed: false,
     })
+}
+
+// ---------------------------------------------------------------------------
+// The pre-commit personal-data guard blocks the commit, not the diff (PR #973).
+//
+// `scripts/check-no-personal-data.sh` runs on every commit and refuses
+// real-looking emails/phones. On 2026-09-09 it rejected two finished runs
+// (#962, #887) over placeholder fixtures on non-reserved domains (x.io) and
+// a doc comment showing a header format — ~2.2 hours of builder work at the
+// last step, two of that day's three slots gone, and an attempt charged to
+// each issue. The guard is right to be strict; the run just has to be able
+// to fix the lines it names and try again.
+// ---------------------------------------------------------------------------
+
+/// Files and line numbers the guard flagged, parsed from a failed `git
+/// commit`'s stderr. Empty when the failure was anything else (a hook that
+/// is not this one, a merge conflict, an empty commit).
+fn pii_guard_hits(commit_err: &str) -> Vec<(String, Vec<u32>)> {
+    let mut out: Vec<(String, Vec<u32>)> = Vec::new();
+    for line in commit_err.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("POSSIBLE secret/PII in ") {
+            // "<path> (staged blob; values withheld):" or "<path> (added lines):"
+            let path = rest
+                .split(" (")
+                .next()
+                .unwrap_or(rest)
+                .trim_end_matches(':')
+                .trim();
+            if !path.is_empty() {
+                out.push((path.to_string(), Vec::new()));
+            }
+            continue;
+        }
+        if let Some(n) = t.strip_prefix("line ").and_then(|n| n.trim().parse::<u32>().ok()) {
+            if let Some(last) = out.last_mut() {
+                last.1.push(n);
+            }
+            continue;
+        }
+        // The non-staged form prints `  <n>:<the offending line>`.
+        if let Some((num, _)) = t.split_once(':') {
+            if let Ok(n) = num.trim().parse::<u32>() {
+                if let Some(last) = out.last_mut() {
+                    last.1.push(n);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The brief for the repair round: fix exactly what the guard named, change
+/// nothing else, and do not weaken a test to dodge the check.
+fn build_pii_fix_prompt(hits: &[(String, Vec<u32>)]) -> String {
+    let list = hits
+        .iter()
+        .map(|(f, lines)| {
+            if lines.is_empty() {
+                format!("- {f}")
+            } else {
+                format!(
+                    "- {f}: line{} {}",
+                    if lines.len() == 1 { "" } else { "s" },
+                    lines
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Your change is complete and correct, but `git commit` was REFUSED by \
+         this repo's pre-commit personal-data guard \
+         (`scripts/check-no-personal-data.sh`). It flagged these locations:\n{list}\n\n\
+         Fix exactly those lines and nothing else. The rule: every email \
+         address, phone number, name and handle in the diff — including ones \
+         inside doc comments and format examples — must be invented AND use an \
+         RFC 2606 reserved name: `@example.com`, `@example.org`, \
+         `@example.net`, or a `.example` / `.test` / `.invalid` TLD. So an \
+         address on any other domain (x.io, y.com, acme.io) keeps its local \
+         part and moves to example.com — including inside a doc comment that \
+         shows a header format — and a phone number becomes a 555 number.\n\n\
+         Do NOT delete or weaken a test to make the guard pass, do NOT add \
+         `pii-ok` to silence it unless the value genuinely must look real, and \
+         do NOT touch anything the guard did not name. Keep the behaviour of \
+         the change identical: these are placeholder values, so only the \
+         literals change. Do not run git commands. When done, say which \
+         literals you replaced."
+    )
 }
 
 /// #817 — delete untracked files the builder left at the worktree ROOT,
@@ -5145,20 +5242,69 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         .unwrap_or_else(|_| "augmentagent@localhost".to_string());
     let name_arg = format!("user.name={git_name}");
     let email_arg = format!("user.email={git_email}");
-    let (ok, _o, e) = run(
-        "git",
-        &[
-            "-c",
-            &name_arg,
-            "-c",
-            &email_arg,
-            "commit",
-            "-m",
-            &commit_msg,
-        ],
-        &worktree,
-    )
-    .await?;
+    let commit_args: Vec<&str> = vec![
+        "-c",
+        &name_arg,
+        "-c",
+        &email_arg,
+        "commit",
+        "-m",
+        &commit_msg,
+    ];
+    let (mut ok, mut _o, mut e) = run("git", &commit_args, &worktree).await?;
+    // PR #973 — a commit refused by the personal-data guard is a fixable
+    // literal, not a failed run: let the builder correct exactly the lines
+    // the guard named and try the commit once more. Anything else (a merge
+    // conflict, an empty commit, another hook) falls through unchanged.
+    if !ok {
+        let hits = pii_guard_hits(&e);
+        if !hits.is_empty() {
+            info!(
+                issue = issue.number,
+                files = hits.len(),
+                "commit refused by the personal-data guard; one repair round"
+            );
+            match reasoner
+                .call(&fix_opts(worktree.clone()), &build_pii_fix_prompt(&hits))
+                .await
+            {
+                Ok(summary_of_fix) => {
+                    let _ = drop_root_scratch(&worktree).await;
+                    let _ = run("git", &["add", "-A"], &worktree).await?;
+                    let (ok2, _o2, e2) = run("git", &commit_args, &worktree).await?;
+                    ok = ok2;
+                    e = e2;
+                    if ok {
+                        // The repair edited the tree: the PR body and the
+                        // failure records must describe what actually landed.
+                        let (_ok, stat, _) =
+                            run("git", &["show", "--stat", "--format=", "HEAD"], &worktree).await?;
+                        if !stat.trim().is_empty() {
+                            diff = stat;
+                        }
+                        let (_ok, full_now, _) =
+                            run("git", &["diff", "origin/main...HEAD"], &worktree).await?;
+                        lines = diff_line_count(&full_now);
+                        info!(
+                            issue = issue.number,
+                            "personal-data repair landed the commit: {}",
+                            truncate(&summary_of_fix, 200)
+                        );
+                    } else {
+                        warn!(
+                            issue = issue.number,
+                            "personal-data repair did not satisfy the guard: {}",
+                            truncate(&e, 400)
+                        );
+                    }
+                }
+                Err(err) => warn!(
+                    issue = issue.number,
+                    "personal-data repair round failed: {err:#}"
+                ),
+            }
+        }
+    }
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git commit failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git commit", &detail, &diff, lines) }).await));
@@ -10610,5 +10756,84 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let (kind, _) = publish_outcome("! [remote rejected] main -> main (protected branch hook declined)");
         assert_eq!(kind, FailureKind::PublishFailed);
         assert!(kind.counts_toward_max_attempts());
+    }
+
+    // --- personal-data guard: repair instead of discarding the run (#973) --
+
+    const PII_REPORT: &str = "POSSIBLE secret/PII in crates/augmentagent-cli/src/main.rs (staged blob; values withheld):\n  line 152\n  line 164\nPOSSIBLE secret/PII in crates/augmentagent-wiki/src/slug.rs (staged blob; values withheld):\n  line 1\n\n✗ Personal-data / secret check failed. Do NOT commit this.\n";
+
+    #[test]
+    fn pii_guard_hits_parses_the_guard_report() {
+        let hits = pii_guard_hits(PII_REPORT);
+        assert_eq!(
+            hits,
+            vec![
+                ("crates/augmentagent-cli/src/main.rs".to_string(), vec![152, 164]),
+                ("crates/augmentagent-wiki/src/slug.rs".to_string(), vec![1]),
+            ]
+        );
+        // The non-staged form prints `<n>:<line>` instead of `line <n>`.
+        let inline = "POSSIBLE secret/PII in a.rs (added lines):\n  86:            (\"bob\", \"x\"),\n";
+        assert_eq!(pii_guard_hits(inline), vec![("a.rs".to_string(), vec![86])]);
+        // Any other commit failure is not this guard.
+        assert!(pii_guard_hits("error: pathspec 'x' did not match").is_empty());
+        assert!(pii_guard_hits("nothing to commit, working tree clean").is_empty());
+        assert!(pii_guard_hits("").is_empty());
+    }
+
+    #[test]
+    fn pii_fix_prompt_names_every_location_and_forbids_weakening() {
+        let p = build_pii_fix_prompt(&pii_guard_hits(PII_REPORT));
+        assert!(p.contains("crates/augmentagent-cli/src/main.rs: lines 152, 164"), "{p}");
+        assert!(p.contains("crates/augmentagent-wiki/src/slug.rs: line 1"), "{p}");
+        assert!(p.contains("example.com"), "the rule must name the reserved domains");
+        assert!(p.contains(".invalid"), "RFC 2606 TLDs too");
+        assert!(p.contains("weaken a test"), "must forbid deleting the test to pass");
+        assert!(p.contains("did not name"), "must forbid unrelated edits");
+        // A file with no line numbers still appears.
+        let bare = build_pii_fix_prompt(&[("x.rs".to_string(), Vec::new())]);
+        assert!(bare.contains("- x.rs"), "{bare}");
+    }
+
+    // Structural: the commit is retried once after a guard-refused commit,
+    // and only for THIS guard.
+    #[test]
+    fn commit_refusal_gets_one_personal_data_repair_round() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let end = start + src[start..].find("\n}\n").expect("end");
+        let body = &src[start..end];
+        let first = body.find("run(\"git\", &commit_args, &worktree)").expect("first commit");
+        let fail = body.find(r#"record_hard_failure(repo_root, issue.number, "git commit failed""#).expect("failure path");
+        let arm = &body[first..fail];
+        let gate = arm.find("pii_guard_hits(&e)").expect("guard detection");
+        let repair = arm.find("build_pii_fix_prompt(").expect("repair prompt");
+        let retry = arm.rfind("run(\"git\", &commit_args, &worktree)").expect("retry commit");
+        assert!(gate < repair && repair < retry, "detect, repair, then retry");
+        assert!(arm.contains(r#"&["add", "-A"]"#), "the repair must be staged before the retry");
+        // The arm starts AT the first commit call, so it holds that plus one
+        // retry — never a retry loop.
+        assert_eq!(
+            arm.matches("run(\"git\", &commit_args, &worktree)").count(),
+            2,
+            "the initial commit and exactly one retry"
+        );
+    }
+
+    // The guard script itself must exempt every RFC 2606 reserved name —
+    // the #962/#887 false positives were `.invalid` and placeholder domains.
+    #[test]
+    fn guard_script_exempts_rfc2606_reserved_names() {
+        let script = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/check-no-personal-data.sh"
+        ))
+        .expect("the personal-data guard script");
+        assert!(
+            script.contains("(?:example|test|invalid)"),
+            "the .example/.test/.invalid TLDs must all be exempt"
+        );
+        assert!(script.contains("example\\.(?:com|org|net)"), "example.com/org/net exempt");
+        assert!(script.contains("pii-ok"), "the reviewed-fixture marker survives");
     }
 }
