@@ -225,3 +225,22 @@ async fn summary_separates_currencies_and_excludes_pending_and_classified_transf
     assert_eq!(totals[1]["pending_count"], 1);
     assert_eq!(totals[1]["excluded_transfer_or_loan_payment_count"], 1);
 }
+
+#[tokio::test]
+async fn posted_transaction_supersedes_pending_even_when_pending_arrives_on_later_page() {
+    let server = MockServer::start().await;
+    let client = Client::for_test(&server.uri());
+    let mut s = store();
+    let mut posted = transaction("posted", json!(10));
+    posted["pending_transaction_id"] = json!("pending");
+    let mut pending = transaction("pending", json!(10));
+    pending["pending"] = json!(true);
+    reply(&server, "", page(json!([posted]), "p1", true)).await;
+    reply(&server, "p1", page(json!([pending]), "done", false)).await;
+    sync_item(&client, &mut s, "sandbox", "item", "fixture-access")
+        .await
+        .unwrap();
+    let rows = s.transactions("sandbox", None, None, None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["transaction_id"], "posted");
+}

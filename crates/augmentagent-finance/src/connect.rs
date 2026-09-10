@@ -117,18 +117,15 @@ pub async fn complete(
     let response = client
         .call("/link/token/get", json!({"link_token":link}))
         .await?;
-    let sessions = response["link_sessions"]
-        .as_array()
-        .context("missing Link sessions")?;
+    let sessions = response["link_sessions"].as_array().context(
+        "bank connection not complete; open Hosted Link and authorize your bank, then retry",
+    )?;
     let mut items = Vec::new();
     if let Some(item) = update {
         // An exit or a finished timestamp alone is not proof of successful consent.
-        let succeeded = sessions.iter().any(|s| {
-            s.get("on_success").is_some_and(|v| v.is_object())
-                || s.pointer("/results/item_update_results")
-                    .and_then(Value::as_array)
-                    .is_some_and(|a| !a.is_empty())
-        });
+        let succeeded = sessions
+            .iter()
+            .any(|s| s.get("on_success").is_some_and(|v| v.is_object()));
         if !succeeded {
             bail!("bank reconnection not complete; finish Hosted Link and retry");
         }

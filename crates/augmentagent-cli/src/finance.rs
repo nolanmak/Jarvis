@@ -157,6 +157,7 @@ pub async fn run(op: &FinanceCommand, db: &Path, wiki: Option<&Path>) -> Result<
                     .await;
                     if let Err(e) = result {
                         failed += 1;
+                        store.error(&env, &id, "STATEMENTS_FAILED")?;
                         eprintln!("finance statements failed: {e}");
                     }
                 }

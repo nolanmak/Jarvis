@@ -6852,7 +6852,7 @@ fn wiki_freshness_section(
     let mut deprecated = 0usize;
     let mut expired: Vec<(String, freshness::Date)> = Vec::new();
 
-    for dir in ["people", "threads", "projects"] {
+    for dir in ["people", "threads", "projects", "finance"] {
         let Ok(rd) = std::fs::read_dir(wiki_root.join(dir)) else {
             continue;
         };
@@ -6981,10 +6981,11 @@ fn run_wiki_index(cli: &Cli, store: Arc<Store>, rebuild: bool) -> Result<()> {
             String::new()
         };
         println!(
-            "index.md rebuilt: {} people, {} threads, {} projects — {} pages{skipped}",
+            "index.md rebuilt: {} people, {} threads, {} projects, {} finance — {} pages{skipped}",
             stats.people,
             stats.threads,
             stats.projects,
+            stats.finance,
             stats.total(),
         );
         return Ok(());
@@ -7002,7 +7003,7 @@ fn run_wiki_index(cli: &Cli, store: Arc<Store>, rebuild: bool) -> Result<()> {
         .collect();
 
     let mut missing_total = 0usize;
-    for dir in ["people", "threads", "projects"] {
+    for dir in ["people", "threads", "projects", "finance"] {
         let mut on_disk = 0usize;
         let mut missing = 0usize;
         if let Ok(rd) = std::fs::read_dir(wiki_root.join(dir)) {
