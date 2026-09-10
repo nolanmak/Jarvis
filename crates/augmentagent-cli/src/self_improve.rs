@@ -2839,7 +2839,7 @@ async fn red_main_plan(repo_root: &Path, red: &RedMain) -> RedMainPlan {
 }
 
 // ---------------------------------------------------------------------------
-// #965 — the pre-commit personal-data guard blocks the commit, not the diff.
+// The pre-commit personal-data guard blocks the commit, not the diff (PR #973).
 //
 // `scripts/check-no-personal-data.sh` runs on every commit and refuses
 // real-looking emails/phones. On 2026-09-09 it rejected two finished runs
@@ -5252,7 +5252,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         &commit_msg,
     ];
     let (mut ok, mut _o, mut e) = run("git", &commit_args, &worktree).await?;
-    // #965 — a commit refused by the personal-data guard is a fixable
+    // PR #973 — a commit refused by the personal-data guard is a fixable
     // literal, not a failed run: let the builder correct exactly the lines
     // the guard named and try the commit once more. Anything else (a merge
     // conflict, an empty commit, another hook) falls through unchanged.
@@ -10758,7 +10758,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(kind.counts_toward_max_attempts());
     }
 
-    // --- #965 personal-data guard: repair instead of discarding the run ----
+    // --- personal-data guard: repair instead of discarding the run (#973) --
 
     const PII_REPORT: &str = "POSSIBLE secret/PII in crates/augmentagent-cli/src/main.rs (staged blob; values withheld):\n  line 152\n  line 164\nPOSSIBLE secret/PII in crates/augmentagent-wiki/src/slug.rs (staged blob; values withheld):\n  line 1\n\n✗ Personal-data / secret check failed. Do NOT commit this.\n";
 
