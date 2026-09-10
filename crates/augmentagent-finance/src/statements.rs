@@ -25,15 +25,15 @@ pub async fn refresh_statements(
         )
         .optional()?
         .flatten();
-    if last
-        .and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
-        .is_some_and(|last| (now - last).num_days() < 7)
-    {
+    let last_date = last.and_then(|s| chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok());
+    if last_date.is_some_and(|last| (now - last).num_days() < 7) {
         return Ok(false);
     }
-    let start = now
-        .checked_sub_months(chrono::Months::new(2))
-        .context("date overflow")?;
+    // Catch up after a stopped timer, with overlap for delayed monthly PDFs.
+    // Plaid accepts at most two years in one extraction request.
+    let start = (last_date.unwrap_or(now - chrono::Duration::days(31))
+        - chrono::Duration::days(31))
+    .max(now - chrono::Duration::days(730));
     client.call("/statements/refresh",json!({"access_token":access,"start_date":start.to_string(),"end_date":now.to_string()})).await?;
     store.conn.execute("INSERT INTO finance_statement_items VALUES(?1,?2,?3) ON CONFLICT(env,item_id) DO UPDATE SET last_refresh=excluded.last_refresh",params![env,item,today])?;
     Ok(true)
