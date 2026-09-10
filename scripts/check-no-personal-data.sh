@@ -35,8 +35,9 @@ fi
 # Filenames that must never be tracked at all.
 BANNED_NAMES='(^|/)\.env$|(^|/)\.env\.(?!example$)|\.db$|\.db-(wal|shm)$|discord-creds.*\.json$|tenant\.env$|\.pem$|id_rsa|\.p12$|(^|/)(linkedin|twitter|instagram)-(auth|cookies|session)\.json$|(^|/)chrome-profile/|(^|/)[^/]*-chrome-profile/'
 
-# Content patterns: secret shapes + PII. Reserved example domains and
-# protocol identifiers are allowed; these are not personal mailboxes.
+# Content patterns: secret shapes + PII. RFC 2606 reserved names
+# (example.com/org/net and the .example/.test/.invalid TLDs) and protocol
+# identifiers are allowed; these are not personal mailboxes.
 read -r -d '' PATTERNS <<'PAT' || true
 -----BEGIN [A-Z ]*PRIVATE KEY-----
 ghp_[A-Za-z0-9]{30,}
@@ -45,7 +46,7 @@ xox[baprs]-[A-Za-z0-9-]{10,}
 sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}
 AIza[A-Za-z0-9_-]{30,}
 \b[0-9]{3}[-.](?!555[-.])[0-9]{3}[-.][0-9]{4}\b
-(?i)(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@(?!(?:[A-Za-z0-9-]+\.)*example\.(?:com|org|net)(?![A-Za-z0-9.-])|(?:[A-Za-z0-9-]+\.)*(?:example|test)(?![A-Za-z0-9.-])|localhost(?![A-Za-z0-9.-])|s\.whatsapp\.net(?![A-Za-z0-9.-])|g\.us(?![A-Za-z0-9.-])|users\.noreply\.github\.com(?![A-Za-z0-9.-]))[A-Za-z0-9.-]+\.[A-Za-z]{2,}
+(?i)(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@(?!(?:[A-Za-z0-9-]+\.)*example\.(?:com|org|net)(?![A-Za-z0-9.-])|(?:[A-Za-z0-9-]+\.)*(?:example|test|invalid)(?![A-Za-z0-9.-])|localhost(?![A-Za-z0-9.-])|s\.whatsapp\.net(?![A-Za-z0-9.-])|g\.us(?![A-Za-z0-9.-])|users\.noreply\.github\.com(?![A-Za-z0-9.-]))[A-Za-z0-9.-]+\.[A-Za-z]{2,}
 (secret|api[_-]?key|token|password)\s*[=:]\s*["'][^"']{12,}["']
 PAT
 
