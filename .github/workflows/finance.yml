@@ -41,3 +41,4 @@ jobs:
         run: |
           cargo test -p augmentagent-cli --bin augmentagent finance::tests
           cargo test -p augmentagent-cli --test finance_cli
+          cargo test -p augmentagent-cli --test status_schema

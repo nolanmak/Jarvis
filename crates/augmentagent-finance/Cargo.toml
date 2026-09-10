@@ -11,7 +11,7 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust", "ve
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
-serde_json = { workspace = true, features = ["arbitrary_precision"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 rusqlite.workspace = true
 reqwest.workspace = true
 tokio.workspace = true

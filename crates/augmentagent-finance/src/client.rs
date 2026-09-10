@@ -83,7 +83,11 @@ impl Client {
                 tokio::time::sleep(Duration::from_millis(250 << attempt)).await;
                 continue;
             }
-            let data: Value = response.json().await.map_err(|_| {
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|_| anyhow::anyhow!("Plaid response interrupted"))?;
+            let mut data: Value = serde_json::from_slice(&bytes).map_err(|_| {
                 anyhow::anyhow!("Plaid returned invalid JSON (HTTP {})", status.as_u16())
             })?;
             if !status.is_success() {
@@ -103,6 +107,9 @@ impl Client {
                     status: status.as_u16(),
                 }
                 .into());
+            }
+            if path == "/transactions/sync" {
+                preserve_amounts(&bytes, &mut data)?;
             }
             return Ok(data);
         }
@@ -137,4 +144,37 @@ impl Client {
         }
         Ok(bytes)
     }
+}
+
+// Parse amount lexemes directly from the response instead of enabling
+// serde_json/arbitrary_precision workspace-wide (it changes generic Serde
+// serialization, including existing status snapshots). No f64 round-trip.
+#[derive(serde::Deserialize)]
+struct RawAmount {
+    amount: Box<serde_json::value::RawValue>,
+}
+#[derive(serde::Deserialize)]
+struct SyncAmounts {
+    added: Vec<RawAmount>,
+    modified: Vec<RawAmount>,
+}
+fn preserve_amounts(bytes: &[u8], data: &mut Value) -> Result<()> {
+    let amounts: SyncAmounts =
+        serde_json::from_slice(bytes).context("invalid transaction amounts")?;
+    for (name, raw) in [("added", amounts.added), ("modified", amounts.modified)] {
+        let rows = data[name]
+            .as_array_mut()
+            .context("missing transaction array")?;
+        for (row, value) in rows.iter_mut().zip(raw) {
+            let raw = value.amount.get();
+            let amount = if raw.contains(['e', 'E']) {
+                rust_decimal::Decimal::from_scientific(raw)
+            } else {
+                rust_decimal::Decimal::from_str_exact(raw)
+            }
+            .context("transaction amount cannot be represented exactly")?;
+            row["amount"] = json!(amount.normalize().to_string());
+        }
+    }
+    Ok(())
 }

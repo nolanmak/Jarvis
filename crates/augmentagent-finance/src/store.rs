@@ -21,7 +21,11 @@ pub(crate) fn field<'a>(v: &'a Value, name: &str) -> Result<&'a str> {
         .with_context(|| format!("Plaid response missing {name}"))
 }
 pub(crate) fn money(v: &Value) -> Result<Decimal> {
-    Decimal::from_str(&v.to_string()).context("invalid decimal amount")
+    Decimal::from_str_exact(
+        v.as_str()
+            .context("amount was not parsed as an exact decimal")?,
+    )
+    .context("invalid decimal amount")
 }
 impl FinanceStore {
     pub fn open(path: &Path) -> Result<Self> {

@@ -244,3 +244,18 @@ async fn posted_transaction_supersedes_pending_even_when_pending_arrives_on_late
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["transaction_id"], "posted");
 }
+
+#[tokio::test]
+async fn bank_amounts_preserve_digits_beyond_binary_float_precision() {
+    let server = MockServer::start().await;
+    let client = Client::for_test(&server.uri());
+    let mut s = store();
+    Mock::given(path("/transactions/sync")).respond_with(ResponseTemplate::new(200).set_body_string(r#"{"accounts":[],"added":[{"transaction_id":"precise","account_id":"a","date":"2026-09-01","name":"Fixture","amount":9007199254740993.01,"iso_currency_code":"USD","pending":false}],"modified":[],"removed":[],"next_cursor":"done","has_more":false,"transactions_update_status":"HISTORICAL_UPDATE_COMPLETE"}"#)).mount(&server).await;
+    sync_item(&client, &mut s, "sandbox", "item", "fixture-access")
+        .await
+        .unwrap();
+    assert_eq!(
+        s.summary("sandbox", None, None, None).unwrap()[0]["net_outflow"],
+        "9007199254740993.01"
+    );
+}
