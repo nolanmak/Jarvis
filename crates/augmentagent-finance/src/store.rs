@@ -181,6 +181,10 @@ impl FinanceStore {
                 tx.execute("UPDATE finance_transactions SET removed=1 WHERE env=?1 AND item_id=?2 AND id=?3",params![env,item,field(t,"transaction_id")?])?;
             }
         }
+        // Page order is not a lifecycle guarantee: a posted row can precede
+        // its pending predecessor in a later page or replay. Reconcile after
+        // the entire batch, in the same transaction as the cursor.
+        tx.execute("UPDATE finance_transactions SET removed=1 WHERE env=?1 AND item_id=?2 AND pending=1 AND id IN (SELECT json_extract(payload,'$.pending_transaction_id') FROM finance_transactions WHERE env=?1 AND item_id=?2 AND pending=0)",params![env,item])?;
         let last = pages.last().context("empty sync")?;
         tx.execute("UPDATE finance_items SET cursor=?3,status='ok',synced_at=?4,history_status=?5 WHERE env=?1 AND id=?2",params![env,item,field(last,"next_cursor")?,chrono::Utc::now().to_rfc3339(),last["transactions_update_status"].as_str().unwrap_or("UNKNOWN")])?;
         tx.commit()?;

@@ -136,3 +136,103 @@ async fn incomplete_link_does_not_create_an_item() {
     .is_err());
     assert!(s.status("sandbox").unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn unopened_hosted_link_reports_pending_instead_of_schema_failure() {
+    let server = MockServer::start().await;
+    let client = Client::for_test(&server.uri());
+    let store = FinanceStore::memory().unwrap();
+    let vault = MemoryVault::default();
+    response(&server,"/link/token/create",json!({"link_token":"fixture-link","hosted_link_url":"https://secure.plaid.com/hl/fixture","expiration":"2099-01-01T00:00:00Z"})).await;
+    let link = connect(
+        &client,
+        &store,
+        &vault,
+        "sandbox",
+        ConnectOptions {
+            alias: "Household",
+            countries: &["US".into()],
+            update_item: None,
+            statements: false,
+        },
+    )
+    .await
+    .unwrap();
+    response(
+        &server,
+        "/link/token/get",
+        json!({"expiration":"2099-01-01T00:00:00Z"}),
+    )
+    .await;
+    let e = complete(
+        &client,
+        &store,
+        &vault,
+        "sandbox",
+        link["session_id"].as_str().unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert!(e.to_string().contains("bank connection not complete"));
+}
+#[tokio::test]
+async fn update_mode_preserves_item_and_requires_successful_consent() {
+    let server = MockServer::start().await;
+    let client = Client::for_test(&server.uri());
+    let store = FinanceStore::memory().unwrap();
+    let vault = MemoryVault::default();
+    store.add_item("sandbox", "item", "Household").unwrap();
+    vault.put("sandbox/item/item", "fixture-access").unwrap();
+    Mock::given(path("/link/token/create")).and(body_partial_json(json!({"access_token":"fixture-access"})))
+      .respond_with(ResponseTemplate::new(200).set_body_json(json!({"link_token":"fixture-link","hosted_link_url":"https://secure.plaid.com/hl/fixture","expiration":"2099-01-01T00:00:00Z"}))).mount(&server).await;
+    let link = connect(
+        &client,
+        &store,
+        &vault,
+        "sandbox",
+        ConnectOptions {
+            alias: "Household",
+            countries: &["US".into()],
+            update_item: Some("item"),
+            statements: false,
+        },
+    )
+    .await
+    .unwrap();
+    response(
+        &server,
+        "/link/token/get",
+        json!({"link_sessions":[{"finished_at":"2026-09-10T00:00:00Z","on_exit":{}}]}),
+    )
+    .await;
+    assert!(complete(
+        &client,
+        &store,
+        &vault,
+        "sandbox",
+        link["session_id"].as_str().unwrap()
+    )
+    .await
+    .is_err());
+    server.reset().await;
+    response(
+        &server,
+        "/link/token/get",
+        json!({"link_sessions":[{"on_success":{"public_token":"not-needed-for-update"}}]}),
+    )
+    .await;
+    complete(
+        &client,
+        &store,
+        &vault,
+        "sandbox",
+        link["session_id"].as_str().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(store.status("sandbox").unwrap().len(), 1);
+    assert_eq!(
+        access_token(&vault, "sandbox", "item").unwrap(),
+        "fixture-access"
+    );
+}

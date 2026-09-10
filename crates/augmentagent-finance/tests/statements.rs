@@ -61,3 +61,35 @@ async fn pdf_archive_is_idempotent_and_rejects_non_pdf_responses() {
     .await
     .is_err());
 }
+
+#[tokio::test]
+async fn refresh_requests_are_bounded_and_do_not_claim_extraction_completed() {
+    let server = MockServer::start().await;
+    let client = Client::for_test(&server.uri());
+    let s = FinanceStore::memory().unwrap();
+    s.add_item("sandbox", "item", "Household").unwrap();
+    s.enable_statements("sandbox", "item").unwrap();
+    Mock::given(path("/statements/refresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"request_id":"fixture"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(augmentagent_finance::refresh_statements(
+        &client,
+        &s,
+        "sandbox",
+        "item",
+        "fixture-access"
+    )
+    .await
+    .unwrap());
+    assert!(!augmentagent_finance::refresh_statements(
+        &client,
+        &s,
+        "sandbox",
+        "item",
+        "fixture-access"
+    )
+    .await
+    .unwrap());
+}
