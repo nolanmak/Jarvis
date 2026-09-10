@@ -1824,6 +1824,33 @@ impl Store {
     /// cites, and the first time we saw a message bounds how old the facts
     /// derived from it are. `None` = unknown id (the caller must treat that
     /// as "unknown", never "fresh").
+    /// Resolve message evidence or a Plaid account retrieval without inventing emails.
+    /// Finance tables are optional on installations that have never connected a bank.
+    pub fn evidence_first_seen_at(&self, id: &str) -> StoreResult<Option<i64>> {
+        let Some(rest) = id.strip_prefix("plaid/") else {
+            return self.email_first_seen_at(id);
+        };
+        let Some((env, item)) = rest.split_once('/') else {
+            return Ok(None);
+        };
+        let guard = self.conn.lock().expect("store mutex poisoned");
+        let exists: bool = guard.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='finance_items')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(None);
+        }
+        let raw: Option<Option<String>> = guard
+            .query_row(
+                "SELECT synced_at FROM finance_items WHERE env=?1 AND id=?2",
+                params![env, item],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw
+            .flatten()
+            .and_then(|s| time::OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339).ok())
+            .and_then(|d| i64::try_from(d.unix_timestamp_nanos() / 1_000_000).ok()))
+    }
+
     pub fn email_first_seen_at(&self, message_id: &str) -> StoreResult<Option<i64>> {
         let guard = self.conn.lock().expect("store mutex poisoned");
         let row: Option<i64> = guard
@@ -10101,5 +10128,23 @@ mod tests {
             !store.journal_entry_ingested("other", "e1", 3).unwrap(),
             "scoped per owner"
         );
+    }
+}
+
+#[cfg(test)]
+mod finance_evidence_tests {
+    use super::*;
+    #[test]
+    fn finance_evidence_is_optional_and_resolves_retrieval_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("data.db")).unwrap();
+        assert_eq!(store.evidence_first_seen_at("plaid/production/item").unwrap(), None);
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("CREATE TABLE finance_items(env TEXT,id TEXT,synced_at TEXT); INSERT INTO finance_items VALUES('production','item','2026-09-09T00:00:00Z');").unwrap();
+        }
+        assert_eq!(store.evidence_first_seen_at("plaid/production/item").unwrap(), Some(1788912000000));
+        assert_eq!(store.evidence_first_seen_at("plaid/sandbox/item").unwrap(), None);
+        assert_eq!(store.evidence_first_seen_at("unknown-email").unwrap(), None);
     }
 }
