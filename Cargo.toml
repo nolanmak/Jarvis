@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/augmentagent-finance",
     "crates/augmentagent-store",
     "crates/augmentagent-channel-core",
     "crates/augmentagent-channel-email",

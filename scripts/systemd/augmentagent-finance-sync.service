@@ -1,0 +1,12 @@
+[Unit]
+Description=Import Plaid transactions into the private knowledge base
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/AugmentAgent
+ExecStart=%h/AugmentAgent/target/release/augmentagent --wiki-dir ./wiki finance sync
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+UMask=0077
+TimeoutStartSec=15min

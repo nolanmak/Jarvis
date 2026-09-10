@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh bank transactions every six hours
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:17:00
+RandomizedDelaySec=5min
+Persistent=true
+Unit=augmentagent-finance-sync.service
+
+[Install]
+WantedBy=timers.target
