@@ -129,12 +129,16 @@ impl NudgeScheduler {
         now: i64,
     ) -> anyhow::Result<bool> {
         let action_id = card.action.action.id.clone();
-        let draft = card
-            .action
-            .action
-            .draft_body
-            .clone()
-            .unwrap_or_default();
+        // #473 / #962 — the stored draft is the clean body; the recorded
+        // envelope is re-rendered as `[to: …]`/`[cc: …]`/`[bcc: …]` so a
+        // re-posted compose card names its recipient exactly like the
+        // original card (and the Revise / Back-to-queue reposts) did.
+        let draft = crate::append_envelope_markers(
+            card.action.action.draft_body.clone().unwrap_or_default(),
+            Some(self.store.as_ref()),
+            &action_id,
+            &card.action.email.from,
+        );
 
         // Compute X/Y. Update session state for new promotions only — re-nudges
         // of the active card don't bump `shown`.
@@ -253,5 +257,79 @@ mod tests {
     #[test]
     fn nudge_interval_is_six_hours() {
         assert_eq!(NUDGE_INTERVAL_MS, 6 * 60 * 60 * 1000);
+    }
+
+    /// #962 — a new-email compose card carries the sending account in From
+    /// and its recipient only in the #473 envelope. Both nudge posts (the
+    /// promotion and the 6h re-post) must render that envelope as `[to: …]`
+    /// exactly like the original card, or the owner can Approve a send
+    /// whose recipient the card never names.
+    #[tokio::test]
+    async fn nudge_posts_carry_the_compose_envelope_markers() {
+        use augmentagent_store::ActionStatus;
+
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(Store::open(f.path()).unwrap());
+        let email = Email {
+            attachments: Vec::new(),
+            to: String::new(),
+            cc: String::new(),
+            message_id: "compose:r1".into(),
+            thread_id: None,
+            from: "me@acct.invalid".into(),
+            subject: "Scribble demo scheduling".into(),
+            body: String::new(),
+            date: String::new(),
+            account_entity_id: Some("acc".into()),
+            platform: "gmail".into(),
+            kind: "dm".into(),
+        };
+        store.upsert_email(&email).unwrap();
+        let id = store
+            .log_action(
+                "compose:r1",
+                None,
+                "me@acct.invalid",
+                "Scribble demo scheduling",
+                Some(""),
+                Some("Hi Tess, does Tuesday work?"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        store
+            .set_action_envelope(
+                &id,
+                Some("tess@example.invalid"),
+                Some("cc@example.invalid"),
+                None,
+            )
+            .unwrap();
+
+        let broker = Arc::new(CountingBroker::default());
+        let sched = NudgeScheduler::new(store.clone(), broker.clone());
+
+        // Promotion from the backlog (nudgeCount 0 → 1).
+        assert!(sched.post_next_if_idle().await.unwrap());
+        // Re-nudge of the now-active card once its timer has fired.
+        store.record_nudge(&id, 0).unwrap();
+        assert!(sched.post_next_if_idle().await.unwrap());
+
+        let posts = broker.posts.lock().unwrap();
+        assert_eq!(posts.len(), 2, "expected a promotion and a re-nudge post");
+        for (_, body) in posts.iter() {
+            assert!(body.starts_with("🔔 reminder"), "header must lead: {body}");
+            assert!(
+                body.contains("Hi Tess, does Tuesday work?"),
+                "draft lost: {body}"
+            );
+            assert!(
+                body.contains("[to: tess@example.invalid]"),
+                "recipient missing from nudged card: {body}"
+            );
+            assert!(
+                body.contains("[cc: cc@example.invalid]"),
+                "cc missing from nudged card: {body}"
+            );
+        }
     }
 }

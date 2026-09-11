@@ -2298,8 +2298,9 @@ mod tests {
 
     #[test]
     fn envelope_markers_omit_to_when_it_matches_card_from() {
-        // New-email cards: the card's From line already IS the recipient
-        // list, so a [to:] marker would be redundant noise.
+        // Self-send (#962: a new-email card's From is the sending account,
+        // and here that IS the recipient), so a [to:] marker would be
+        // redundant noise — From = To is already the truth.
         let (s, id, _f) =
             store_with_envelope(Some("a@b.example.com"), Some("cc@d.example.com"), None);
         let out = append_envelope_markers("body".into(), Some(&s), &id, "a@b.example.com");
