@@ -35,6 +35,7 @@ augmentagent-channel-telegram-bot = { path = "../augmentagent-channel-telegram-b
 augmentagent-channel-calendar = { path = "../augmentagent-channel-calendar" }
 augmentagent-channel-journal = { path = "../augmentagent-channel-journal" }
 augmentagent-channel-imessage = { path = "../augmentagent-channel-imessage" }
+augmentagent-channel-whatsapp-history = { path = "../augmentagent-channel-whatsapp-history" }
 augmentagent-approval-discord = { path = "../augmentagent-approval-discord" }
 augmentagent-auth = { path = "../augmentagent-auth" }
 augmentagent-wiki = { path = "../augmentagent-wiki" }

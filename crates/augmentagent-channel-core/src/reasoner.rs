@@ -1645,6 +1645,7 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             // (not a wildcard) so the write tool `memory_write` is NOT exposed
             // here — durable-fact persistence is a separate, deliberate surface.
             "mcp__memory__search_conversation_history".into(),
+            "mcp__memory__read_conversation_thread".into(),
             "mcp__memory__memory_search".into(),
             "mcp__memory__memory_recent".into(),
             "Bash(augmentagent finance status)".into(),
@@ -2459,6 +2460,7 @@ mod tests {
         let joined = opts.allowed_tools.join("\n");
         for needle in [
             "mcp__memory__search_conversation_history",
+            "mcp__memory__read_conversation_thread",
             "mcp__memory__memory_search",
             "mcp__memory__memory_recent",
         ] {

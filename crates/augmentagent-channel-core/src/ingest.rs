@@ -59,6 +59,8 @@ pub enum IngestTrigger {
     /// New iMessage bundle entries synced into the wiki (#886). Pairs with
     /// `DecisionKind::Capture`; never fired on a first full-history pass.
     ImessageHistory,
+    /// New exported WhatsApp messages; no outbound or initial-history fan-out.
+    WhatsappHistory,
 }
 
 impl IngestTrigger {
@@ -73,6 +75,7 @@ impl IngestTrigger {
             Self::Meeting => "meeting",
             Self::Journal => "journal",
             Self::ImessageHistory => "imessage-history",
+            Self::WhatsappHistory => "whatsapp-history",
         }
     }
 }

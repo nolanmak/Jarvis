@@ -1,0 +1,35 @@
+name: WhatsApp history
+on:
+  pull_request:
+    paths:
+      - 'scripts/whatsapp/**'
+      - 'crates/augmentagent-channel-whatsapp-history/**'
+      - 'crates/augmentagent-channel-imessage/**'
+      - 'crates/augmentagent-mcp-memory/**'
+      - 'crates/augmentagent-cli/**'
+      - 'crates/augmentagent-channel-core/**'
+      - 'Cargo.*'
+      - '.github/workflows/whatsapp-history.yml'
+permissions:
+  contents: read
+jobs:
+  history:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 -m unittest discover -s scripts/whatsapp/tests -v
+      - run: cargo test -p augmentagent-channel-whatsapp-history -p augmentagent-channel-imessage -p augmentagent-mcp-memory
+      - run: cargo test -p augmentagent-cli --test whatsapp_history_cli
+      - run: cargo test -p augmentagent-channel-core --lib ask_opts_registers_memory_mcp_server_and_recall_tools
