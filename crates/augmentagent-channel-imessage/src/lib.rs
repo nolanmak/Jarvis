@@ -1,7 +1,7 @@
 //! iMessage history → knowledge base (#882).
 //!
-//! Reads the operator's external OKF v0.2 conversation bundle (kept fresh by
-//! an out-of-repo sync job) and feeds it into the KB three ways:
+//! Reads a private OKF v0.2 conversation bundle (kept fresh by the bundled
+//! scripts/imessage exporter or a legacy external job) and feeds it into the KB:
 //! - person-page backfill via `merge_person_page` (fill-blanks-only),
 //! - `emails` rows (`platform = "imessage"`) so `search_conversation_history`
 //!   covers texting history,

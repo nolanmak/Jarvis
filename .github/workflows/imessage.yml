@@ -1,0 +1,17 @@
+name: iMessage exporter
+on:
+  pull_request:
+    paths:
+      - 'scripts/imessage/**'
+      - '.github/workflows/imessage.yml'
+permissions:
+  contents: read
+jobs:
+  exporter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - run: python3 -m unittest discover -s scripts/imessage/tests -v
