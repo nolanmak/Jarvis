@@ -22,6 +22,9 @@ personal wiki, and social/posting integrations.
 - **iMessage history.** A bundled Mac exporter and scheduler import texting
   history locally or over SSH, without a second repository. See
   [iMessage setup](docs/IMESSAGE.md).
+- **WhatsApp history.** Export WhatsApp Desktop conversations into searchable
+  history and incremental wiki capture, with local or SSH setup and support for
+  existing private Git feeds. See [WhatsApp history setup](docs/WHATSAPP-HISTORY.md).
 - **SocialAPI.ai backend.** An official unified REST integration for
   cross-posting and reading/replying to comments + DMs across connected
   social accounts. See [SocialAPI.ai integration](#socialapiai-integration).

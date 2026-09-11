@@ -48,6 +48,7 @@ use augmentagent_channel_contacts::{
 use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
+mod whatsapp_history;
 mod channel_router;
 mod code_mode;
 mod doc_cmd;
@@ -269,6 +270,11 @@ enum Cmd {
     Imessage {
         #[command(subcommand)]
         op: ImessageOp,
+    },
+    /// Read-only WhatsApp archive ingestion (independent of the live channel).
+    WhatsappHistory {
+        #[command(subcommand)]
+        op: whatsapp_history::Op,
     },
     /// Person-page maintenance (identity-merge groundwork).
     Person {
@@ -2753,6 +2759,25 @@ async fn main() -> Result<()> {
                     warn!("shadownote journal channel disabled: {e:#}");
                 }
             }
+            match augmentagent_channel_whatsapp_history::Config::load() {
+                Ok(Some(config)) => {
+                    let store_c = Arc::clone(&store);
+                    let reasoner = build_reasoner();
+                    let root = cli.wiki_dir.clone();
+                    let schema = root
+                        .as_ref()
+                        .and_then(|_| std::fs::read_to_string("schema/wiki-skill.md").ok());
+                    let sd = shutdown.clone();
+                    tasks.push(tokio::spawn(async move {
+                        whatsapp_history::run_loop(config, store_c, reasoner, root, schema, sd)
+                            .await
+                    }));
+                }
+                Ok(None) => {
+                    info!("WhatsApp history disabled: AUGMENTAGENT_WHATSAPP_HISTORY_DIR not set")
+                }
+                Err(e) => warn!("WhatsApp history disabled: {e:#}"),
+            }
             // #886 — iMessage bundle → emails + wiki ingest. Self-gates on
             // AUGMENTAGENT_IMESSAGE_REPO_DIR; an unconfigured box logs and
             // moves on, same as the journal gate above.
@@ -3356,6 +3381,7 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::WhatsappHistory { .. } => whatsapp_history::poll_command(store).await,
         Cmd::Imessage { ref op } => match op {
             ImessageOp::Sync { apply } => {
                 run_imessage_sync(&cli, store, *apply)?;
