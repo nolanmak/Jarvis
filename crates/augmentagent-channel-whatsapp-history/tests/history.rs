@@ -147,6 +147,55 @@ async fn plain_directory_skips_git_and_failed_pull_keeps_readable_history() {
     assert_eq!(report.inserted, 2);
 }
 
+#[tokio::test]
+async fn git_feed_pull_imports_new_committed_messages() {
+    use augmentagent_channel_whatsapp_history::refresh;
+    let tmp = tempfile::tempdir().unwrap();
+    let upstream = tmp.path().join("upstream");
+    bundle(&upstream);
+    let git = |args: &[&str]| {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&upstream)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.com"
+            ])
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["init", "--quiet"]);
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "initial fixture"]);
+    let checkout = tmp.path().join("checkout");
+    assert!(Command::new("git")
+        .args(["clone", "--quiet"])
+        .arg(&upstream)
+        .arg(&checkout)
+        .status()
+        .unwrap()
+        .success());
+    let store = Store::open(tmp.path().join("db")).unwrap();
+    assert_eq!(poll_once(&checkout, &store).unwrap().inserted, 2);
+    let path = upstream.join("conversations/Friend/messages.md");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text.push_str("\n### [2026-08-26T12:02:00+00:00] me\nNew upstream message\n");
+    fs::write(path, text).unwrap();
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "new fixture message"]);
+    let config = Config::from_path(Some(checkout.to_str().unwrap()))
+        .unwrap()
+        .unwrap();
+    assert!(refresh(&config).await.unwrap());
+    let delta = poll_once(&checkout, &store).unwrap();
+    assert_eq!(delta.inserted, 1);
+    assert!(!delta.deltas[0].first_run);
+}
+
 #[test]
 fn capture_is_bounded_for_unicode_and_shrunken_bundle_keeps_cursor() {
     let tmp = tempfile::tempdir().unwrap();
