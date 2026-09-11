@@ -4833,6 +4833,55 @@ fn compose_pending_disposition(
     ComposePendingDisposition::Create
 }
 
+/// The address a compose card is identified by — its From line, and the
+/// `emails.from` / `actions.fromEmail` the approve/revise/skip handlers read.
+/// A reply card is anchored to the inbound it answers, so that is whoever it
+/// replies to (`--reply-to-from`, else the To it goes back to). A new email
+/// (#962) has no inbound: its identity is the account sending it, and the
+/// recipient rides the #473 envelope, rendered as `[to: …]` because it
+/// differs from this From. Using the recipient here mislabeled it "From"
+/// and hid the sending account entirely.
+fn compose_card_identity(
+    is_reply: bool,
+    reply_to_from: Option<&str>,
+    to: &str,
+    account_email: &str,
+) -> String {
+    if is_reply {
+        reply_to_from.unwrap_or(to).to_string()
+    } else {
+        account_email.to_string()
+    }
+}
+
+/// Recipient a Revise recreates the draft for: the #473 envelope To when one
+/// was recorded, else the card's From — for a reply card the sender it
+/// answers, where a pre-#473 auto-triage reply always went; for a new-email
+/// card (`compose:` message id) the RECIPIENT, which is what pre-#962 cards
+/// stored there. Post-#962 the row is inserted with its envelope, so an
+/// envelope-less compose card can only be that legacy shape — unless its
+/// From is the sending account itself (`sending_account`, None when the
+/// account can't be resolved), in which case the fallback would address the
+/// redraft to the owner: refuse instead, and the card stays pending.
+fn revise_recipient(
+    envelope_to: Option<&str>,
+    message_id: &str,
+    card_from: &str,
+    sending_account: Option<&str>,
+) -> Result<String, String> {
+    if let Some(to) = envelope_to {
+        return Ok(to.to_string());
+    }
+    if message_id.starts_with("compose:")
+        && sending_account.is_none_or(|acct| card_from.eq_ignore_ascii_case(acct))
+    {
+        return Err(
+            "no recorded recipient for this new-email card — Skip it and recompose".into(),
+        );
+    }
+    Ok(card_from.to_string())
+}
+
 /// Subject to recreate a revised Gmail draft with. `thread_id` is what makes a
 /// card a reply — the same field the recreated draft is threaded off — so the
 /// `Re:` prefix follows it: new-email compose cards (#675) keep the subject the
@@ -5193,8 +5242,9 @@ async fn run_gmail_compose(
 ///   anchored to the real inbound message, exactly the #352 flow.
 /// - **New email**: both absent — there is no inbound, so the action is keyed
 ///   on a synthetic `compose:<draft_id>` message id (the same convention the
-///   compose fan-out uses), the card's From field shows the recipient, and
-///   Revise redrafts against the draft body alone. Approve → send_draft,
+///   compose fan-out uses), the card's From field shows the sending account
+///   with the recipient rendered as `[to: …]` from the #473 envelope (#962),
+///   and Revise redrafts against the draft body alone. Approve → send_draft,
 ///   Skip → delete_draft, identical to replies.
 #[allow(clippy::too_many_arguments)]
 async fn post_reply_approval_card(
@@ -5250,7 +5300,8 @@ async fn post_reply_approval_card(
         (None, Some(p)) => read_body(None, Some(p.to_string()))?,
         (None, None) => String::new(),
     };
-    let original_from = reply_to_from.unwrap_or(to).to_string();
+    let original_from =
+        compose_card_identity(reply_msg_id.is_some(), reply_to_from, to, account_email);
     let stripped = out_subject
         .strip_prefix("Re:")
         .or_else(|| out_subject.strip_prefix("re:"))
@@ -5287,8 +5338,16 @@ async fn post_reply_approval_card(
         .upsert_email(&inbound)
         .context("upsert inbound email for action linkage")?;
 
+    // #473 — record the envelope the draft was actually created with, so the
+    // Revise redraft re-sends to the SAME To/cc/bcc instead of falling back
+    // to the card's From (the original sender on reply cards — which dropped
+    // an overridden To and every cc/bcc). Written by the INSERT itself
+    // (#962): on a new-email card the envelope is the only place the
+    // recipient lives, and a separate best-effort UPDATE could fail — or be
+    // outrun by the nudge scheduler — leaving a pending card that names
+    // nobody. Now the row either exists with its envelope or not at all.
     let action_id = store
-        .log_action(
+        .log_action_with_envelope(
             msg_id,
             thread,
             &original_from,
@@ -5296,24 +5355,14 @@ async fn post_reply_approval_card(
             Some(&original_body),
             Some(draft_body),
             ActionStatus::Pending,
+            Some(to),
+            Some(&cc.join(", ")),
+            Some(&bcc.join(", ")),
         )
         .context("log action row")?;
     store
         .set_action_draft_id(&action_id, draft_id)
         .context("set action draft id")?;
-    // #473 — record the envelope the draft was actually created with, so the
-    // Revise redraft re-sends to the SAME To/cc/bcc instead of falling back
-    // to the card's From (the original sender on reply cards — which dropped
-    // an overridden To and every cc/bcc). Best-effort: a failure leaves the
-    // pre-#473 from-based revise behavior, never blocks the card.
-    if let Err(e) = store.set_action_envelope(
-        &action_id,
-        Some(to),
-        Some(&cc.join(", ")),
-        Some(&bcc.join(", ")),
-    ) {
-        tracing::warn!(action_id, "set_action_envelope after compose card failed: {e}");
-    }
     // #502 — persist the --send-at proposal on the still-PENDING row. The
     // owner still approves; run_approve sees the future proposal and ARMS
     // the schedule instead of sending. Back-to-queue and unschedule clear
@@ -5336,7 +5385,8 @@ async fn post_reply_approval_card(
     let mut markers = String::new();
     // #473 — when the envelope To differs from the card's From display (a
     // reply card whose routing was overridden, e.g. the intro pattern:
-    // reply-to Josh, To Omer), surface it: the whole bug was body and
+    // reply-to Josh, To Omer; every new-email card, whose From is the
+    // sending account — #962), surface it: the whole bug was body and
     // envelope disagreeing with nothing on the card to show it.
     if !original_from.eq_ignore_ascii_case(to) {
         markers.push_str(&format!("\n[to: {to}]"));
@@ -5380,7 +5430,6 @@ async fn post_reply_approval_card(
         tracing::warn!(action_id, "record_nudge after compose card failed: {e}");
     }
 
-    let _ = account_email;
     Ok(())
 }
 
@@ -6373,11 +6422,12 @@ fn reconcile_stale_approvals_tick(store: &Store) -> Result<usize> {
     // below. Both properties are load-bearing: the pending pass's Rule 1 is
     // deliberately UNbounded ("any reply ever"), so sharing its thread list
     // would cancel armed schedules over replies that predate them; and Rule 2
-    // must never run on scheduled rows (`fromEmail` on compose cards holds
-    // the RECIPIENT — the bulk-sender heuristic would cancel a scheduled
-    // send to any newsletter-looking address). This durable pass is the
-    // backstop for the engine's fire-time guard: a transient failure there
-    // would otherwise let the send fire over the owner's manual reply.
+    // must never run on scheduled rows (`fromEmail` on a compose card is the
+    // sending account or the replied-to sender, #962 — the bulk-sender
+    // heuristic would cancel a scheduled reply to any newsletter-looking
+    // address). This durable pass is the backstop for the engine's
+    // fire-time guard: a transient failure there would otherwise let the
+    // send fire over the owner's manual reply.
     let mut scheduled_retired = 0usize;
     for (action_id, tid, armed_at_ms) in &scheduled {
         match store.thread_has_user_reply_after(tid, *armed_at_ms) {
@@ -8338,11 +8388,121 @@ mod unescape_body_tests {
 #[cfg(test)]
 mod approval_body_tests {
     use super::{
-        body_without_leaked_subject, compose_pending_disposition, revise_subject, revised_subject,
-        strip_approval_envelope_markers, strip_leading_subject_line, subjects_agree,
-        thread_for_revised_subject, thread_subject_conflict, ComposePendingDisposition,
-        ThreadSubject,
+        body_without_leaked_subject, compose_card_identity, compose_pending_disposition,
+        revise_recipient, revise_subject, revised_subject, strip_approval_envelope_markers,
+        strip_leading_subject_line, subjects_agree, thread_for_revised_subject,
+        thread_subject_conflict, ComposePendingDisposition, ThreadSubject,
     };
+
+    // #962 — who the card's From line (and the actions/emails rows) name.
+    #[test]
+    fn reply_cards_keep_the_replied_to_sender_as_their_identity() {
+        assert_eq!(
+            compose_card_identity(
+                true,
+                Some("josh@example.invalid"),
+                "omer@example.invalid",
+                "me@acct.invalid",
+            ),
+            "josh@example.invalid"
+        );
+        // No --reply-to-from: the reply still goes back to whoever it is
+        // addressed to.
+        assert_eq!(
+            compose_card_identity(true, None, "peer@example.invalid", "me@acct.invalid"),
+            "peer@example.invalid"
+        );
+    }
+
+    #[test]
+    fn new_email_cards_are_from_the_sending_account() {
+        // The issue's repro: the recipient must not render under "From"; it
+        // rides the envelope as `[to: …]`, which fires because From ≠ to.
+        let from = compose_card_identity(false, None, "tess@example.invalid", "me@acct.invalid");
+        assert_eq!(from, "me@acct.invalid");
+        assert!(!from.eq_ignore_ascii_case("tess@example.invalid"));
+        // A stray --reply-to-from without a reply anchor never becomes the
+        // identity of a new email.
+        assert_eq!(
+            compose_card_identity(
+                false,
+                Some("josh@example.invalid"),
+                "tess@example.invalid",
+                "me@acct.invalid",
+            ),
+            "me@acct.invalid"
+        );
+        // Self-send: From = To is truthful, so the `[to:]` marker's ≠ check
+        // suppressing it is the deliberate outcome.
+        let from = compose_card_identity(false, None, "Me@Acct.invalid", "me@acct.invalid");
+        assert!(from.eq_ignore_ascii_case("Me@Acct.invalid"));
+    }
+
+    // #962 — Revise on a new-email card must never fall back to drafting to
+    // the card's From, which is now the sending account itself.
+    #[test]
+    fn revise_uses_the_recorded_envelope_recipient() {
+        assert_eq!(
+            revise_recipient(
+                Some("tess@example.invalid"),
+                "compose:r1",
+                "me@acct.invalid",
+                Some("me@acct.invalid"),
+            ),
+            Ok("tess@example.invalid".to_string())
+        );
+        assert_eq!(
+            revise_recipient(
+                Some("omer@example.invalid"),
+                "18f3a2",
+                "josh@example.invalid",
+                Some("me@acct.invalid"),
+            ),
+            Ok("omer@example.invalid".to_string())
+        );
+    }
+
+    #[test]
+    fn reply_cards_without_an_envelope_still_revise_to_the_sender() {
+        // Auto-triage replies never record an envelope (pre-#473 shape).
+        assert_eq!(
+            revise_recipient(None, "18f3a2", "josh@example.invalid", Some("me@acct.invalid")),
+            Ok("josh@example.invalid".to_string())
+        );
+    }
+
+    #[test]
+    fn a_legacy_compose_card_without_an_envelope_revises_to_its_from() {
+        // A pending pre-#962 new-email card stored its recipient in From;
+        // it must stay revisable (not "Skip it and recompose").
+        assert_eq!(
+            revise_recipient(
+                None,
+                "compose:r5739",
+                "Tess@Example.invalid",
+                Some("me@acct.invalid"),
+            ),
+            Ok("Tess@Example.invalid".to_string())
+        );
+    }
+
+    #[test]
+    fn a_compose_card_with_no_envelope_fails_revise_loudly() {
+        // From IS the sending account (post-#962 shape) — or the account
+        // can't be resolved to tell: never draft to the owner themselves.
+        for acct in [Some("Me@Acct.invalid"), None] {
+            let err = revise_recipient(None, "compose:r5739", "me@acct.invalid", acct)
+                .expect_err("must not draft to the sending account");
+            assert!(
+                err.contains("no recorded recipient"),
+                "unhelpful message: {err}"
+            );
+            assert!(
+                !err.contains("me@acct.invalid"),
+                "must not suggest the account as To: {err}"
+            );
+        }
+    }
 
     #[test]
     fn pending_follow_up_replaces_the_existing_card() {
@@ -10472,6 +10632,47 @@ impl ReplyApprover {
         .0;
         let previous_draft = augmentagent_approval_discord::split_assumes(&previous_draft).0;
 
+        // #473 — the envelope the card was composed with, when one was
+        // recorded. Pre-#473 behavior (To = emails.from, no cc/bcc) silently
+        // dropped an overridden To and every cc/bcc on reply cards: the intro
+        // pattern ("moving you to BCC") lost its BCC — and its actual
+        // recipient — the moment the user hit Revise. Resolved BEFORE the
+        // reasoner call so a card that cannot be re-addressed (#962) fails
+        // without spending a redraft.
+        let envelope = self
+            .store
+            .get_action_envelope(action_id)
+            .unwrap_or_else(|e| {
+                tracing::warn!(action_id, "revise: envelope lookup failed: {e}");
+                None
+            });
+        let envelope_to = envelope.as_ref().and_then(|env| env.to.as_deref());
+        // #962 — only an envelope-less card needs to know whether its From
+        // is the sending account (a legacy compose card stored the recipient
+        // there; a post-#962 one never lacks an envelope): resolve it then.
+        let sending_account = match envelope_to {
+            Some(_) => None,
+            None => self
+                .store
+                .get_active_gmail_accounts()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|a| a.entity_id == entity_id)
+                .map(|a| a.email),
+        };
+        let to = match revise_recipient(
+            envelope_to,
+            &action.email.message_id,
+            &action.email.from,
+            sending_account.as_deref(),
+        ) {
+            Ok(to) => to,
+            Err(message) => {
+                tracing::warn!(action_id, "revise: {message}");
+                return ApprovalActionOutcome::Failed { message };
+            }
+        };
+
         // 1. Generate revised draft via reasoner.
         let opts = draft_opts(self.draft_skill.clone(), self.wiki_root.clone());
         let prompt =
@@ -10491,19 +10692,8 @@ impl ReplyApprover {
         let (new_subject, redraft) =
             augmentagent_channel_core::prompt::split_redraft_subject(&redraft);
 
-        // 2. Create a fresh Gmail draft with the revised body.
-        // #473 — recreate the draft with the envelope the card was composed
-        // with, when one was recorded. Pre-#473 behavior (To = emails.from,
-        // no cc/bcc) silently dropped an overridden To and every cc/bcc on
-        // reply cards: the intro pattern ("moving you to BCC") lost its BCC
-        // — and its actual recipient — the moment the user hit Revise.
-        let envelope = self
-            .store
-            .get_action_envelope(action_id)
-            .unwrap_or_else(|e| {
-                tracing::warn!(action_id, "revise: envelope lookup failed: {e}");
-                None
-            });
+        // 2. Create a fresh Gmail draft with the revised body, addressed with
+        // the envelope resolved above.
         // The thread id is kept whichever subject wins — this is still the
         // same reply, just with the header the user asked for.
         let subject = revised_subject(
@@ -10531,10 +10721,6 @@ impl ReplyApprover {
                 };
             }
         };
-        let to = envelope
-            .as_ref()
-            .and_then(|env| env.to.clone())
-            .unwrap_or_else(|| action.email.from.clone());
         let split = |v: &Option<String>| -> Vec<String> {
             v.as_deref()
                 .map(augmentagent_channel_email::gmail::split_recipients)

@@ -1933,6 +1933,42 @@ impl Store {
         draft_body: Option<&str>,
         status: ActionStatus,
     ) -> StoreResult<String> {
+        self.log_action_with_envelope(
+            message_id,
+            thread_id,
+            from_email,
+            subject,
+            original_body,
+            draft_body,
+            status,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// #962 — [`Self::log_action`] with the #473 envelope (To/cc/bcc,
+    /// comma-joined bare addresses; empty ⇒ NULL, as [`Self::set_action_envelope`])
+    /// written by the same INSERT. A new-email card's recipient lives only
+    /// in `toEmails`, so its row must never exist — pending, promotable by
+    /// the nudge scheduler — without one; insert-then-update left that gap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_action_with_envelope(
+        &self,
+        message_id: &str,
+        thread_id: Option<&str>,
+        from_email: &str,
+        subject: &str,
+        original_body: Option<&str>,
+        draft_body: Option<&str>,
+        status: ActionStatus,
+        to: Option<&str>,
+        cc: Option<&str>,
+        bcc: Option<&str>,
+    ) -> StoreResult<String> {
+        fn nz(v: Option<&str>) -> Option<&str> {
+            v.filter(|s| !s.trim().is_empty())
+        }
         let id = Uuid::new_v4().to_string();
         let now = now_millis();
         let next_nudge_at_ms = match status {
@@ -1952,8 +1988,8 @@ impl Store {
         // byte-identical post-migration. Code-mode callers use the dedicated
         // `log_action_code_mode` helper.
         guard.execute(
-            "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9, 0, ?10)",
+            "INSERT INTO actions (id, messageId, threadId, fromEmail, subject, originalBody, draftBody, status, errorMessage, createdAt, updatedAt, nudgeCount, nextNudgeAtMs, toEmails, ccEmails, bccEmails) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?9, 0, ?10, ?11, ?12, ?13)",
             params![
                 id,
                 message_id,
@@ -1965,6 +2001,9 @@ impl Store {
                 status.as_str(),
                 now,
                 next_nudge_at_ms,
+                nz(to),
+                nz(cc),
+                nz(bcc),
             ],
         )?;
         Ok(id)
@@ -3465,8 +3504,9 @@ impl Store {
     /// the latter must be refused, not silently replaced: the supersede in
     /// the Replace arm is pending-only, so "replacing" a scheduled row would
     /// leave the old schedule armed alongside the new card (double send).
-    /// `fromEmail` holds the recipient for compose-originated cards (the
-    /// card's From field shows who the mail goes to), so matching on it plus
+    /// The recipient is the #473 envelope `toEmails` (#962: `fromEmail` on a
+    /// new-email card is the SENDING account), falling back to `fromEmail`
+    /// for pre-#962 pending rows that never recorded one; matching that plus
     /// the emails-row entity id catches "the same email asked twice".
     pub fn find_pending_action_for_recipient(
         &self,
@@ -3481,7 +3521,7 @@ impl Store {
                  JOIN emails e ON a.messageId = e.messageId \
                  WHERE a.status IN ('pending', 'scheduled') \
                    AND e.accountEntityId = ?1 \
-                   AND LOWER(a.fromEmail) = LOWER(?2) \
+                   AND LOWER(COALESCE(a.toEmails, a.fromEmail)) = LOWER(?2) \
                    AND a.subject = ?3 \
                  ORDER BY a.createdAt DESC LIMIT 1",
                 params![account_entity_id, recipient, subject],
@@ -4705,13 +4745,14 @@ impl Store {
             Option<String>,
             Option<String>,
             Option<i64>,
+            Option<String>,
         )>;
         {
             let guard = self.conn.lock().expect("store mutex poisoned");
             row = guard
                 .query_row(
                     "SELECT a.draftBody, a.fromEmail, a.threadId, a.messageId, a.subject, \
-                            e.body, e.accountEntityId, e.firstSeenAt \
+                            e.body, e.accountEntityId, e.firstSeenAt, a.toEmails \
                        FROM actions a \
                        LEFT JOIN emails e ON a.messageId = e.messageId \
                       WHERE a.id = ?1 AND a.status = 'sent'",
@@ -4726,6 +4767,7 @@ impl Store {
                             r.get::<_, Option<String>>(5)?,
                             r.get::<_, Option<String>>(6)?,
                             r.get::<_, Option<i64>>(7)?,
+                            r.get::<_, Option<String>>(8)?,
                         ))
                     },
                 )
@@ -4740,6 +4782,7 @@ impl Store {
             _orig_body,
             account_entity_id,
             received_at_ms,
+            to_emails,
         )) = row
         else {
             return Ok(None);
@@ -4752,9 +4795,17 @@ impl Store {
             // the per-account scoping invariant on tone_examples is intentional.
             return Ok(None);
         };
-        // Recipient is the row we replied TO. `actions.fromEmail` is the
-        // sender of the inbound mail; that IS the address we just replied to.
-        let recipient_email = bare_lower(&from_email);
+        // Recipient is the address the draft went TO: the first #473 envelope
+        // recipient when one was recorded (#962 — on a new-email card
+        // `fromEmail` is the sending account, not who it went to), else the
+        // inbound sender in `actions.fromEmail`, which IS the address an
+        // auto-triage reply went to.
+        let recipient_email = to_emails
+            .as_deref()
+            .and_then(|t| t.split(',').next())
+            .map(bare_lower)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| bare_lower(&from_email));
         let recipient_domain = recipient_email
             .split_once('@')
             .map(|(_, d)| d.to_string())
@@ -5641,9 +5692,10 @@ impl Store {
     /// Armed scheduled rows with a real thread, for the reconcile sweep's
     /// Rule-1-only pass (#500): "did the user reply on this thread since the
     /// schedule was ARMED?" Rule 2 (bulk-sender heuristic) must NOT run on
-    /// these — `fromEmail` on compose cards holds the RECIPIENT, and a
-    /// scheduled send to a newsletter-looking address would be wrongly
-    /// cancelled. Rows are (action_id, thread_id, armed_at_ms) —
+    /// these — `fromEmail` on a compose card is the sending account or the
+    /// replied-to sender (#962), never an inbound to judge, and a scheduled
+    /// reply to a newsletter-looking address would be wrongly cancelled.
+    /// Rows are (action_id, thread_id, armed_at_ms) —
     /// `armed_at_ms` = `COALESCE(status_updated_at, createdAt)`, the same
     /// arming-moment bound the engine's fire-time guard uses, so a reply the
     /// owner sent BEFORE deliberately arming the schedule never cancels it.
@@ -7679,6 +7731,61 @@ mod tests {
     }
 
     #[test]
+    fn find_pending_action_for_recipient_reads_the_envelope_on_new_email_cards() {
+        // #962 — a new-email card stores the sending account in fromEmail
+        // and the recipient in the #473 envelope, written by the same INSERT
+        // (empty cc/bcc ⇒ NULL, so `get_action_envelope` stays clean); the
+        // guard must key on the envelope so "the same email asked twice"
+        // still dedupes, while a pre-#962 pending row (recipient in
+        // fromEmail, no envelope) keeps matching through the fallback.
+        let (s, _f) = fresh_store();
+        s.upsert_email(&sample_email("compose:r1")).unwrap();
+        s.upsert_email(&sample_email("compose:r2")).unwrap();
+        let new_style = s
+            .log_action_with_envelope(
+                "compose:r1",
+                None,
+                "me@acct.invalid",
+                "Scribble demo",
+                Some(""),
+                Some("d"),
+                ActionStatus::Pending,
+                Some("Tess@Example.invalid"),
+                Some(""),
+                None,
+            )
+            .unwrap();
+        let env = s.get_action_envelope(&new_style).unwrap().unwrap();
+        assert_eq!(env.to.as_deref(), Some("Tess@Example.invalid"));
+        assert_eq!((env.cc, env.bcc), (None, None));
+        let legacy = s
+            .log_action(
+                "compose:r2",
+                None,
+                "pat@example.invalid",
+                "Old card",
+                Some(""),
+                Some("d"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+
+        let hit = s
+            .find_pending_action_for_recipient("acc", "tess@example.invalid", "Scribble demo")
+            .unwrap();
+        assert_eq!(hit.map(|(id, _, _)| id), Some(new_style.clone()));
+        // The sending account is not a recipient: no dedupe against it.
+        assert!(s
+            .find_pending_action_for_recipient("acc", "me@acct.invalid", "Scribble demo")
+            .unwrap()
+            .is_none());
+        let hit = s
+            .find_pending_action_for_recipient("acc", "pat@example.invalid", "Old card")
+            .unwrap();
+        assert_eq!(hit.map(|(id, _, _)| id), Some(legacy));
+    }
+
+    #[test]
     fn card_sync_queries_find_and_update_pending_actions_by_draft() {
         let (s, _f) = fresh_store();
         s.upsert_email(&sample_email("m1")).unwrap();
@@ -8331,6 +8438,49 @@ mod tests {
             recents[0].body,
             "This is the post-edit draft the user actually sent."
         );
+    }
+
+    #[test]
+    fn record_user_edit_takes_the_recipient_from_the_envelope_on_compose_cards() {
+        // #962 — a new-email card's fromEmail is the SENDING account; the
+        // address the draft went to lives in the #473 envelope. Recording
+        // the account as the tone-example recipient would file the owner's
+        // own voice under their own address.
+        let (s, _f) = fresh_store();
+        let mut email = sample_email("compose:r1");
+        email.from = "me@acct.invalid".into();
+        s.upsert_email(&email).unwrap();
+        let action_id = s
+            .log_action(
+                "compose:r1",
+                None,
+                "me@acct.invalid",
+                "Scribble demo",
+                Some(""),
+                Some("Hi Tess, does Tuesday work?"),
+                ActionStatus::Pending,
+            )
+            .unwrap();
+        s.set_action_envelope(
+            &action_id,
+            Some("Tess@Example.invalid, second@example.invalid"),
+            None,
+            None,
+        )
+        .unwrap();
+        s.update_action_status(&action_id, ActionStatus::Sent, None, None)
+            .unwrap();
+
+        assert!(s.record_user_edit_as_tone_example(&action_id).unwrap().is_some());
+        let recents = s
+            .recent_tone_examples("recipient", "tess@example.invalid", Some("acc"), 10)
+            .unwrap();
+        assert_eq!(recents.len(), 1, "example must be filed under the first recipient");
+        assert_eq!(recents[0].recipient_domain, "example.invalid");
+        assert!(s
+            .recent_tone_examples("recipient", "me@acct.invalid", Some("acc"), 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
