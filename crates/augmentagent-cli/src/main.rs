@@ -12212,16 +12212,22 @@ async fn imessage_poll_loop(
             _ = shutdown.cancelled() => return Ok(()),
             _ = tick.tick() => {}
         }
-        // The bundle repo is kept current by the operator's own sync job;
-        // a pull failure (offline, not a git repo) degrades to reading
+        // The bundle is kept current by scripts/imessage or a legacy sync job;
+        // a pull failure (e.g. offline) degrades to reading
         // whatever is on disk.
-        let pull = tokio::process::Command::new("git")
-            .arg("-C")
-            .arg(&config.repo_dir)
-            .args(["pull", "--ff-only", "--quiet"])
-            .output()
-            .await;
-        if let Ok(out) = &pull {
+        let pull = if config.repo_dir.join(".git").exists() {
+            Some(
+                tokio::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&config.repo_dir)
+                    .args(["pull", "--ff-only", "--quiet"])
+                    .output()
+                    .await,
+            )
+        } else {
+            None
+        };
+        if let Some(Ok(out)) = &pull {
             if !out.status.success() {
                 warn!(
                     stderr = %String::from_utf8_lossy(&out.stderr).trim(),

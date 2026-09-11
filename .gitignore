@@ -76,3 +76,10 @@ gitleaks-report.*
 # Cross-process finance importer lock (no content).
 *.finance.lock
 *.db-journal
+
+# Private iMessage exports/config and Python bytecode (export outside checkout).
+conversations/
+.sync_state.json
+.sync.lock
+scripts/imessage/config.json
+__pycache__/

@@ -19,6 +19,9 @@ personal wiki, and social/posting integrations.
 - **Many channels.** Email (Gmail), Discord, Slack, Telegram, LinkedIn,
   WhatsApp, Twitter/X, Instagram, Reddit, GitHub, Linear, Notion, Calendly,
   Google Calendar, Google Drive, Meetup, and a voice-capture channel.
+- **iMessage history.** A bundled Mac exporter and scheduler import texting
+  history locally or over SSH, without a second repository. See
+  [iMessage setup](docs/IMESSAGE.md).
 - **SocialAPI.ai backend.** An official unified REST integration for
   cross-posting and reading/replying to comments + DMs across connected
   social accounts. See [SocialAPI.ai integration](#socialapiai-integration).
