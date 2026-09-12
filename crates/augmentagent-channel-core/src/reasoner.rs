@@ -1511,6 +1511,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     let bash_linkedin_dm_bare = "Bash(augmentagent linkedin dm *)".to_string();
     let bash_linkedin_comment_abs = format!("Bash({} linkedin comment *)", bin.display());
     let bash_linkedin_comment_bare = "Bash(augmentagent linkedin comment *)".to_string();
+    // #888 — `imessage fetch-attachment <s3-uri>` downloads one bundle attachment into this
+    // session's `/tmp/aa-imsg/<session>/` (allowlist + 25 MB cap in the CLI). Only this verb: `sync --apply` writes.
+    let bash_imessage_fetch_abs = format!("Bash({} imessage fetch-attachment *)", bin.display());
+    let bash_imessage_fetch_bare = "Bash(augmentagent imessage fetch-attachment *)".to_string();
     // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
     // lookup would fail. Ship an absolute `AUGMENTAGENT_DB` so `main.rs`
     // resolves the db regardless of cwd.
@@ -1628,6 +1632,26 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             env.push(("DISCORD_CHANNEL_ID".into(), cid));
         }
     }
+    // #888 — `imessage fetch-attachment` reads `AUGMENTAGENT_IMESSAGE_S3_*` and signs via the
+    // default AWS credential chain, which any `AWS_*` var may steer: forward both prefixes whole,
+    // only with a bucket configured (no keys leak where the feature is off). The download dir is
+    // minted per session: the guard admits Reads only there; the call site deletes exactly it.
+    if std::env::var("AUGMENTAGENT_IMESSAGE_S3_BUCKET").is_ok_and(|b| !b.trim().is_empty()) {
+        for (k, v) in std::env::vars() {
+            if (k.starts_with("AWS_") || k.starts_with("AUGMENTAGENT_IMESSAGE_S3_"))
+                && !v.trim().is_empty()
+            {
+                env.push((k, v));
+            }
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        env.push((
+            "AUGMENTAGENT_IMESSAGE_TMP_DIR".into(),
+            format!("/tmp/aa-imsg/{}-{nanos}", std::process::id()),
+        ));
+    }
 
     ReasonerOpts {
         system_prompt: include_str!("../../../schema/wiki-ask.md").to_string(),
@@ -1686,6 +1710,8 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             bash_linkedin_dm_bare,
             bash_linkedin_comment_abs,
             bash_linkedin_comment_bare,
+            bash_imessage_fetch_abs,
+            bash_imessage_fetch_bare,
             format!("Bash({} issue create *)", aa_gh.display()),
             format!("Bash({} issue list *)", aa_gh.display()),
             format!("Bash({} issue view *)", aa_gh.display()),
@@ -2626,6 +2652,46 @@ mod tests {
                 .any(|d| d.as_path() == transcripts.path()),
             "transcript clone must be in add_dirs"
         );
+    }
+
+    /// #888 — `imessage fetch-attachment` reachable in both Bash forms (only that verb); the sub-CLI sees
+    /// the bucket plus whatever `AWS_*` steers the credential chain (Codex: a fixed list dropped `AWS_CONFIG_FILE`).
+    #[test]
+    fn ask_opts_allows_imessage_fetch_attachment_and_forwards_s3_config() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        std::fs::write(repo.path().join("data.db"), b"").unwrap();
+        // One EnvGuard (it holds the global lock); the other var by hand.
+        let _bucket = EnvGuard::set("AUGMENTAGENT_IMESSAGE_S3_BUCKET", "imsg-bundle");
+        std::env::set_var("AWS_CONFIG_FILE", "/tmp/aa-test-aws-config");
+
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+        let again = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+
+        std::env::remove_var("AWS_CONFIG_FILE");
+        let joined = opts.allowed_tools.join("\n");
+        let abs = format!("Bash({} imessage fetch-attachment *)", repo.path().join("target/release/augmentagent").display());
+        for needle in ["Bash(augmentagent imessage fetch-attachment *)".to_string(), abs] {
+            assert!(opts.allowed_tools.contains(&needle), "missing {needle}; got:\n{joined}");
+        }
+        assert!(!joined.contains("imessage *"), "no imessage wildcard (sync writes pages): {joined}");
+        let env = |o: &ReasonerOpts, k: &str| o.env.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+        assert_eq!(env(&opts, "AUGMENTAGENT_IMESSAGE_S3_BUCKET").as_deref(), Some("imsg-bundle"));
+        assert_eq!(env(&opts, "AWS_CONFIG_FILE").as_deref(), Some("/tmp/aa-test-aws-config"));
+        let dir = env(&opts, "AUGMENTAGENT_IMESSAGE_TMP_DIR").expect("session dir minted");
+        assert!(dir.starts_with("/tmp/aa-imsg/"), "{dir}");
+        assert_ne!(Some(dir), env(&again, "AUGMENTAGENT_IMESSAGE_TMP_DIR"), "one dir per session");
+    }
+
+    /// #888 — the session-dir Read carve-out's cases live in `scripts/tests/aa-wiki-scope-guard.test.sh` (needs jq).
+    #[test]
+    fn wiki_scope_guard_shell_tests_pass() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/tests/aa-wiki-scope-guard.test.sh");
+        if std::process::Command::new("jq").arg("--version").output().is_err() {
+            return;
+        }
+        let out = std::process::Command::new("bash").arg(script).output().expect("bash runs");
+        assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     }
 
     /// Regression test for the PR #199 follow-up: `aa-gh` must be
