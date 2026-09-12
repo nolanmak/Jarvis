@@ -16,6 +16,7 @@
 //!   data key, then CryptoJS/OpenSSL-EVP AES-256-CBC for the body.
 //! - [`config`] — opt-in configuration via keyring/env (`SHADOWNOTE_*`).
 //!   Absent config must degrade to "feature off", never to a crash.
+//! - [`s3`] — #888, allowlisted, size-capped S3 GET of iMessage attachments (SigV4 lives here).
 //!
 //! Two invariants callers must not break:
 //!
@@ -33,6 +34,7 @@ pub mod compose;
 pub mod config;
 pub mod crypto;
 pub mod html;
+pub mod s3;
 
 pub use channel::{
     JournalChannel, JournalChannelConfig, JournalRuntime, PollOutcome, DEFAULT_BASE_SYNC_THRESHOLD,

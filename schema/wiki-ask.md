@@ -581,6 +581,22 @@ The clone is read-only, and the scope guard enforces exactly that: `Read`,
 and `Edit` stay wiki-only. Never write there: FlyOnTheWall owns that repo and
 re-pushes meetings to the same paths.
 
+## iMessage attachments (#888)
+
+When an iMessage entry's `[attachment: <mime> <name> s3://…]` line carries an
+`s3://` pointer and the question turns on what the file shows, fetch it —
+quote the URI, conversation dirs contain spaces:
+
+```
+augmentagent imessage fetch-attachment 's3://<bucket>/conversations/<dir>/attachments/<id>-<name>'
+```
+
+It prints `saved: /tmp/aa-imsg/<session>/<name> (<bytes> bytes)`; that dir is
+yours alone and the one `/tmp` place your Read carve-out admits, so **Read the
+printed path** (images render). Only the configured bucket/prefix is reachable
+and files over 25 MB are refused (videos usually are) — say so and answer from
+the text, never guess the content. Each fetch bills a Glacier retrieval: fetch
+only what the answer needs. Files are deleted when your session ends.
 
 ## Personal finance
 
