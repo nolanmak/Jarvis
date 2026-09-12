@@ -552,11 +552,14 @@ impl<R: Reasoner + 'static> TelegramBotChannel<R> {
         let Some(index) = &self.identity_index else {
             return String::new();
         };
-        let tg_id = extract_telegram_user_id(&email.from).unwrap_or_default();
-        if tg_id.is_empty() {
-            return String::new();
-        }
-        match index.lookup(PLATFORM, &tg_id) {
+        // Telegram id first; on a miss the bare handle resolves through the
+        // same resolver `WikiReader` uses (#887), so a sender the owner only
+        // knows from texting (phone-keyed page) still hints.
+        let page = extract_telegram_user_id(&email.from)
+            .filter(|id| !id.is_empty())
+            .and_then(|id| index.lookup(PLATFORM, &id))
+            .or_else(|| index.lookup_sender(&email.from));
+        match page {
             Some(page) => format!(
                 "Sender's wiki page: {} (open with Read; weight the decision by their documented tone/importance).",
                 page.slug
@@ -1016,6 +1019,28 @@ mod tests {
             },
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn wiki_hint_resolves_phone_handle_via_index() {
+        // #887: a sender the owner only knows from texting has a
+        // phone-keyed page — it must hint. (The `telegram:` id branch is
+        // not exercised: `Identities` has no telegram field yet.)
+        let (store, _f) = tmp_store();
+        let b: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker::default());
+        let mut ch = build_channel(store, Arc::new(ScriptedReasoner::new([])), b);
+        let wiki = tempfile::TempDir::new().unwrap();
+        let layout = augmentagent_wiki::WikiLayout::new(wiki.path().to_path_buf());
+        layout.bootstrap().unwrap();
+        let fm = "---\nkind: person\nkey: bob-park\nidentities:\n  phone: [\"+14155550999\"]\n---\n\n# bob-park\n";
+        std::fs::write(layout.people_dir().join("bob-park.md"), fm).unwrap();
+        let mut e = message_to_email(&handle(), &sample_msg(1, 12345, "hi"), &sub(SubscriptionMode::Priority, "12345"));
+        e.from = "Bob <+14155550999>".into();
+        assert_eq!(ch.wiki_hint_for_sender(&e), "", "no index → no hint");
+        ch.identity_index = Some(Arc::new(augmentagent_wiki::IdentityIndex::build(&layout).unwrap()));
+        assert!(ch.wiki_hint_for_sender(&e).contains("Sender's wiki page: bob-park"));
+        e.from = "Stranger <telegram:0>".into();
+        assert_eq!(ch.wiki_hint_for_sender(&e), "");
     }
 
     #[tokio::test]
