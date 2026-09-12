@@ -103,5 +103,19 @@ expect_block "An unresolvable transcripts dir grants nothing" \
 expect_allow "The wiki stays allowed when the transcripts dir is unresolvable" \
   Read file_path "$WIKI/people/dana.md" "AUGMENTAGENT_TRANSCRIPTS_DIR=$TMP/does-not-exist"
 
+# #888 — `imessage fetch-attachment` lands files in $AUGMENTAGENT_IMESSAGE_TMP_DIR
+# (/tmp/aa-imsg/<session>); only Read, one segment deep, never another session's.
+I_ENV="AUGMENTAGENT_IMESSAGE_TMP_DIR=/tmp/aa-imsg/4242-17"
+expect_allow "Read of this session's fetched iMessage attachment is allowed" \
+  Read file_path "/tmp/aa-imsg/4242-17/9-IMG_001-3fa2b1c0.jpeg" "$I_ENV"
+expect_block "Read of a concurrent session's attachment is blocked" \
+  Read file_path "/tmp/aa-imsg/4242-18/9-IMG_001-3fa2b1c0.jpeg" "$I_ENV"
+expect_block "Read under /tmp/aa-imsg without a session dir is blocked" \
+  Read file_path "/tmp/aa-imsg/4242-17/9-IMG_001-3fa2b1c0.jpeg"
+expect_block "Read escaping the session dir via .. is blocked" \
+  Read file_path "/tmp/aa-imsg/4242-17/../../etc/passwd" "$I_ENV"
+expect_block "Write into the session dir is blocked" \
+  Write file_path "/tmp/aa-imsg/4242-17/x" "$I_ENV"
+
 printf '\n%d ok, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -1036,6 +1036,12 @@ enum ImessageOp {
     /// entries as `emails` rows and advance the per-conversation cursor.
     /// Does not fire wiki ingest — that's the daemon loop's job.
     PollOnce,
+    /// Download one bundle attachment by its `s3://` pointer (#888) into the
+    /// ask session's `/tmp/aa-imsg/<session>/` and print the path.
+    FetchAttachment {
+        /// The `s3://<bucket>/<key>` from an `[attachment: …]` line.
+        s3_uri: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3391,6 +3397,7 @@ async fn main() -> Result<()> {
                 run_imessage_poll_once(store)?;
                 Ok(())
             }
+            ImessageOp::FetchAttachment { s3_uri } => run_imessage_fetch_attachment(s3_uri).await,
         },
         Cmd::Calendar { op } => match op {
             CalendarOp::Backfill { .. } => {
@@ -6824,7 +6831,9 @@ async fn run_wiki_ask(cli: &Cli, question: String, post: bool) -> Result<()> {
     // #446 — `call_transcript`, not `call`: the ask prompt puts the deliverable
     // first and the wiki-filing receipt last, and `call` keeps only the final
     // text block, so the receipt would overwrite the answer.
-    let answer = reasoner.call_transcript(&opts, &question).await?;
+    let answer = reasoner.call_transcript(&opts, &question).await;
+    sweep_imessage_attachments(&opts.env);
+    let answer = answer?;
     println!("{answer}");
 
     // #440 — `--post` pushes the answer through the same ATTACH-marker
@@ -8199,7 +8208,9 @@ impl QueryHandler for WikiQuerier {
         let prompt = format!("{}{prompt}", now_awareness_line());
         // #446 — see `wiki ask`: the Discord reply must carry every text block
         // the model emitted, not just the trailing wiki-filing receipt.
-        self.reasoner.call_transcript(&opts, &prompt).await
+        let answer = self.reasoner.call_transcript(&opts, &prompt).await;
+        sweep_imessage_attachments(&opts.env);
+        answer
     }
 }
 
@@ -8255,7 +8266,9 @@ impl LoopRunner for LoopReasonerRunner {
         // #236 — prepend the current time so loop-driven queries know "now".
         let prompt = format!("{}{prompt}", now_awareness_line());
         // #446 — loops render their output to Discord too; same reasoning.
-        self.reasoner.call_transcript(&opts, &prompt).await
+        let answer = self.reasoner.call_transcript(&opts, &prompt).await;
+        sweep_imessage_attachments(&opts.env);
+        answer
     }
 }
 
@@ -12404,6 +12417,68 @@ fn run_imessage_poll_once(store: Arc<Store>) -> Result<()> {
         })
     );
     Ok(())
+}
+
+/// #888 — one attachment for the ask agent, into this session's (verified) dir;
+/// dirs a killed daemon left behind are reclaimed so they cannot pile up.
+async fn run_imessage_fetch_attachment(s3_uri: &str) -> Result<()> {
+    use augmentagent_channel_journal::s3;
+    let source = s3::AttachmentSource::from_env()?;
+    let dir = s3::session_dir();
+    s3::prepare_tmp_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
+    s3::sweep_stale_sessions(Path::new(s3::ATTACHMENT_TMP_ROOT), s3::GC_MAX_AGE);
+    let dest = dir.join(s3::local_name(&source.resolve_key(s3_uri)?));
+    let bytes = source.fetch(s3_uri, &dest).await?;
+    println!("saved: {} ({bytes} bytes)", dest.display());
+    Ok(())
+}
+
+/// #888 — the ask agent cannot delete what it fetched (`rm` is off its Bash
+/// allowlist, `/tmp` is write-blocked by the scope guard), so each ask call
+/// site removes the session dir `ask_opts` minted — only that one.
+fn sweep_imessage_attachments(env: &[(String, String)]) {
+    use augmentagent_channel_journal::s3;
+    let Some((_, dir)) = env.iter().find(|(k, _)| k == s3::SESSION_DIR_ENV) else { return };
+    if s3::remove_session_dir(Path::new(dir)) {
+        info!(dir, "removed this session's fetched iMessage attachments");
+    }
+}
+
+#[cfg(test)]
+mod imessage_fetch_attachment_tests {
+    use super::*;
+    use augmentagent_channel_journal::s3;
+
+    /// Codex review — the clap verb must dispatch, with env-configured bucket
+    /// + credentials, to a file in this session's dir, which the call site
+    /// then removes. Env keys here are unique to this test.
+    #[tokio::test]
+    async fn fetch_attachment_dispatch_saves_into_the_session_dir() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/imsg-bundle/conversations/Alice%20B/attachments/9-IMG_001.jpeg")
+            .match_header("authorization", mockito::Matcher::Regex("^AWS4-HMAC-SHA256 ".into()))
+            .with_body(b"jpegbytes")
+            .create_async()
+            .await;
+        let session = format!("{}/test-{}", s3::ATTACHMENT_TMP_ROOT, std::process::id());
+        std::env::set_var("AUGMENTAGENT_IMESSAGE_S3_BUCKET", "imsg-bundle");
+        std::env::set_var("AUGMENTAGENT_IMESSAGE_S3_ENDPOINT", server.url());
+        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDTEST");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "SECRETTEST");
+        std::env::set_var(s3::SESSION_DIR_ENV, &session);
+        let key = "conversations/Alice B/attachments/9-IMG_001.jpeg";
+        let uri = format!("s3://imsg-bundle/{key}");
+        let cli = Cli::try_parse_from(["augmentagent", "imessage", "fetch-attachment", &uri]).expect("verb parses");
+        assert!(matches!(cli.cmd, Cmd::Imessage { op: ImessageOp::FetchAttachment { ref s3_uri } } if *s3_uri == uri));
+
+        run_imessage_fetch_attachment(&uri).await.expect("fetch");
+
+        mock.assert_async().await;
+        assert_eq!(std::fs::read(Path::new(&session).join(s3::local_name(key))).expect("saved"), b"jpegbytes");
+        sweep_imessage_attachments(&[(s3::SESSION_DIR_ENV.into(), session.clone())]);
+        assert!(!Path::new(&session).exists(), "call site removes the session dir");
+    }
 }
 
 /// #886 — daemon loop: refresh the bundle repo, poll for new entries, and
