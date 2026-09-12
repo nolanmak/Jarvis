@@ -768,11 +768,14 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
         let Some(index) = &self.identity_index else {
             return String::new();
         };
-        let slack_id = extract_slack_id(&email.from).unwrap_or_default();
-        if slack_id.is_empty() {
-            return String::new();
-        }
-        match index.lookup(PLATFORM, &slack_id) {
+        // Slack id first; on a miss the bare handle resolves through the
+        // same resolver `WikiReader` uses (#887), so a sender the owner only
+        // knows from texting (phone-keyed page) still hints.
+        let page = extract_slack_id(&email.from)
+            .filter(|id| !id.is_empty())
+            .and_then(|id| index.lookup(PLATFORM, &id))
+            .or_else(|| index.lookup_sender(&email.from));
+        match page {
             Some(page) => format!(
                 "Sender's wiki page: {} (open with Read; weight the decision by their documented tone/importance).",
                 page.slug
@@ -1166,6 +1169,30 @@ mod tests {
             },
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn wiki_hint_resolves_slack_id_then_phone_handle() {
+        // #887: a sender the owner only knows from texting has a
+        // phone-keyed page — it must hint just like a `slack:`-keyed one.
+        let (store, _f) = tmp_store();
+        let b: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker::default());
+        let mut ch = build_channel(store, Arc::new(ScriptedReasoner::new([])), b);
+        let wiki = tempfile::TempDir::new().unwrap();
+        let layout = augmentagent_wiki::WikiLayout::new(wiki.path().to_path_buf());
+        layout.bootstrap().unwrap();
+        for (slug, ids) in [("bob-park", "phone: [\"+14155550999\"]"), ("alice", "slack: \"U2\"")] {
+            let fm = format!("---\nkind: person\nkey: {slug}\nidentities:\n  {ids}\n---\n\n# {slug}\n");
+            std::fs::write(layout.people_dir().join(format!("{slug}.md")), fm).unwrap();
+        }
+        let mut e = message_to_email(&sample_msg("100.000001", "hi"), &sub_with_mode(SubscriptionMode::Priority), "me");
+        assert_eq!(ch.wiki_hint_for_sender(&e), "", "no index → no hint");
+        ch.identity_index = Some(Arc::new(augmentagent_wiki::IdentityIndex::build(&layout).unwrap()));
+        assert!(ch.wiki_hint_for_sender(&e).contains("Sender's wiki page: alice"));
+        e.from = "Bob <+14155550999>".into();
+        assert!(ch.wiki_hint_for_sender(&e).contains("Sender's wiki page: bob-park"));
+        e.from = "Stranger <slack:U0>".into();
+        assert_eq!(ch.wiki_hint_for_sender(&e), "");
     }
 
     #[tokio::test]

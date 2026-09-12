@@ -17,6 +17,7 @@ use serde_yaml_ng::Value;
 use tracing::warn;
 
 use crate::layout::WikiLayout;
+use crate::slug::extract_address;
 
 /// Multi-platform identity block lifted from a `people/<slug>.md` front-matter.
 ///
@@ -187,6 +188,23 @@ impl IdentityIndex {
     /// O(n) scan — hundreds of pages, irrelevant at our scale.
     pub fn lookup(&self, platform: &str, id: &str) -> Option<&PersonPage> {
         self.people.iter().find(|p| p.identities.matches(platform, id))
+    }
+
+    /// Resolve a message's `from` header by the bare handle inside
+    /// `Name <handle>` (#887): `+E.164` → `imessage` (which also matches
+    /// `phone`, the key iMessage/Contacts pages are written under); an
+    /// address → `email`, then `imessage` for Apple-ID handles. Chat ids
+    /// (`<discord:…>`) are neither — callers do that platform lookup first.
+    pub fn lookup_sender(&self, from: &str) -> Option<&PersonPage> {
+        let handle = extract_address(from);
+        if handle.contains('@') {
+            self.lookup("email", &handle)
+                .or_else(|| self.lookup("imessage", &handle))
+        } else if handle.starts_with('+') {
+            self.lookup("imessage", &handle)
+        } else {
+            None
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -402,6 +420,25 @@ mod tests {
         assert!(index.lookup("imessage", "+14155550999").is_some());
         // but not the reverse: an imessage email handle is not a phone
         assert!(index.lookup("phone", "bob@icloud.example.com").is_none());
+    }
+
+    #[test]
+    fn lookup_sender_classifies_the_handle_inside_the_from_header() {
+        let (_d, layout) = layout_with_pages(&[
+            ("bob-park", "kind: person\nkey: bob-park\nidentities:\n  phone: [\"+14155550999\"]"),
+            (
+                "jane",
+                "kind: person\nkey: jane\nidentities:\n  email: [jane@corp.example.com]\n  imessage: [\"jane@icloud.example.com\"]\n  discord: \"999\"",
+            ),
+        ]);
+        let index = IdentityIndex::build(&layout).unwrap();
+        let slug = |from: &str| index.lookup_sender(from).map(|p| p.slug.clone());
+        assert_eq!(slug("Bob <+14155550999>").as_deref(), Some("bob-park"));
+        assert_eq!(slug("+14155550999").as_deref(), Some("bob-park"));
+        assert_eq!(slug("Jane <jane@corp.example.com>").as_deref(), Some("jane"));
+        assert_eq!(slug("Jane@iCloud.example.com").as_deref(), Some("jane"), "Apple-ID handle");
+        assert_eq!(slug("Jane <discord:999>"), None, "chat ids are the caller's lookup");
+        assert_eq!(slug("Stranger <+10000000000>"), None);
     }
 
     #[test]

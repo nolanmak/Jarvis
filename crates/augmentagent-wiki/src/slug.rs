@@ -29,7 +29,10 @@ pub fn slug_from_email(raw: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
-fn extract_address(raw: &str) -> String {
+/// Strip the display name from a `"Name <user@example.com>"` header, leaving
+/// the bare handle. Bare input (no angle brackets) is returned trimmed, so
+/// non-email handles like `+14155550123` pass through unchanged.
+pub(crate) fn extract_address(raw: &str) -> String {
     if let (Some(open), Some(close)) = (raw.find('<'), raw.rfind('>')) {
         if open < close {
             return raw[open + 1..close].to_string();

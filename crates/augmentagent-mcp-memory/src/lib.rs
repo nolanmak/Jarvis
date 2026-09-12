@@ -650,7 +650,7 @@ fn tool_descriptors() -> Value {
                     "keyword": { "type": "string", "description": "case-insensitive substring matched against message subject/body" },
                     "since":   { "type": "string", "description": "lower bound on timestamp; ISO 8601 or YYYY-MM-DD" },
                     "until":   { "type": "string", "description": "upper bound on timestamp; ISO 8601 or YYYY-MM-DD" },
-                    "channel": { "type": "string", "description": "restrict to one platform (e.g. discord, gmail, slack, linkedin)" },
+                    "channel": { "type": "string", "description": "restrict to one platform (e.g. discord, gmail, slack, linkedin, whatsapp, imessage — the owner's texting history)" },
                     "limit":   { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 }
                 }
             }

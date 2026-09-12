@@ -416,7 +416,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
             .as_ref()
             .map(|root| {
                 let layout = augmentagent_wiki::WikiLayout::new(root.clone());
-                augmentagent_wiki::WikiReader::new(&layout).triage_hint(&email)
+                let index = identity_index(&layout);
+                augmentagent_wiki::WikiReader::new(&layout)
+                    .triage_hint_with_index(&email, index.as_ref())
             })
             .unwrap_or_default();
         let triage_prompt = triage_user_message(&email, learned, &wiki_hint);
@@ -804,7 +806,9 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                     .as_ref()
                     .map(|root| {
                         let layout = augmentagent_wiki::WikiLayout::new(root.clone());
-                        augmentagent_wiki::WikiReader::new(&layout).draft_hint(&email)
+                        let index = identity_index(&layout);
+                        augmentagent_wiki::WikiReader::new(&layout)
+                            .draft_hint_with_index(&email, index.as_ref())
                     })
                     .unwrap_or_default();
                 let tone_block = pick_tone_block(&self.store, entity_id, &email.from);
@@ -1737,6 +1741,22 @@ impl<G: GmailApi + 'static, R: Reasoner + 'static> WorkItemHandler for GmailWork
                 error!("gmail handle (channel-runner): process_email failed: {e:#}");
                 Ok(())
             }
+        }
+    }
+}
+
+/// Identity index for the wiki hints (#887), so kebab-slug / phone-keyed
+/// people pages resolve. Built per message rather than snapshotted at
+/// startup like the chat channels' copy: iMessage/contacts syncs and ingest
+/// create pages while the daemon runs, and the walk (hundreds of small
+/// files) is noise next to the reasoner call that follows. A build failure
+/// only costs the fallback — the email-slug page still hints.
+fn identity_index(layout: &augmentagent_wiki::WikiLayout) -> Option<augmentagent_wiki::IdentityIndex> {
+    match augmentagent_wiki::IdentityIndex::build(layout) {
+        Ok(index) => Some(index),
+        Err(e) => {
+            warn!("identity index build failed; wiki hint falls back to the email slug: {e}");
+            None
         }
     }
 }
