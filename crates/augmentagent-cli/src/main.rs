@@ -12431,10 +12431,9 @@ async fn run_imessage_fetch_attachment(s3_uri: &str) -> Result<()> {
     Ok(())
 }
 
-/// #888 — the ask agent cannot delete what it fetched (`rm` is off its Bash
-/// allowlist, `/tmp` is write-blocked by the scope guard), so each ask call
-/// site removes the session dir `ask_opts` minted — only that one. Day-old dirs
-/// (an ask killed mid-session) are reclaimed here and on every imessage poll tick.
+/// #888 — the ask agent cannot delete what it fetched (`rm` is off its Bash allowlist, `/tmp`
+/// is write-blocked by the scope guard), so each ask call site removes the session dir `ask_opts`
+/// minted — only that one. Day-old dirs (an ask killed mid-session) are reclaimed here and on every poll tick.
 fn sweep_imessage_attachments(env: &[(String, String)]) {
     use augmentagent_channel_journal::s3;
     let stale = s3::sweep_stale_sessions(Path::new(s3::ATTACHMENT_TMP_ROOT), s3::GC_MAX_AGE);
@@ -12452,9 +12451,8 @@ mod imessage_fetch_attachment_tests {
     use super::*;
     use augmentagent_channel_journal::s3;
 
-    /// Codex reviews — the clap verb must dispatch, with env-configured bucket +
-    /// credentials, to a file in this session's dir; the call-site sweep (not the
-    /// fetch) then removes that dir AND a day-old sibling a killed ask stranded.
+    /// Codex reviews — the clap verb must dispatch, with env-configured bucket + credentials, to a file
+    /// in this session's dir; the call-site sweep (not the fetch) then removes that dir AND a day-old stranded sibling.
     #[tokio::test]
     async fn fetch_attachment_dispatch_saves_into_the_session_dir() {
         let stale = Path::new(s3::ATTACHMENT_TMP_ROOT).join(format!("test-stale-{}", std::process::id()));

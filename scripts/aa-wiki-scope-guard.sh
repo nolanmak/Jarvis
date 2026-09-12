@@ -124,9 +124,8 @@ if [[ "$TOOL" == "Read" && "$ABS" =~ ^/tmp/aa-(txt|img|doc)-[0-9]+-[0-9]+\.[a-zA
 fi
 
 # #888 — `augmentagent imessage fetch-attachment` saves bundle attachments as
-# $AUGMENTAGENT_IMESSAGE_TMP_DIR/<name>: a /tmp/aa-imsg/<session> dir minted
-# per ask session, <name> CLI-sanitized to [A-Za-z0-9._-]. Read-only like the
-# carve-out above; ABS is `..`-resolved, the quoted variable matches literally.
+# $AUGMENTAGENT_IMESSAGE_TMP_DIR/<name>: a /tmp/aa-imsg/<session> dir minted per ask session,
+# <name> CLI-sanitized. Read-only like the carve-out above; ABS is `..`-resolved, the quoted var matches literally.
 if [[ "$TOOL" == "Read" && "${AUGMENTAGENT_IMESSAGE_TMP_DIR:-}" =~ ^/tmp/aa-imsg/[A-Za-z0-9._-]+$ \
       && "$ABS" =~ ^"$AUGMENTAGENT_IMESSAGE_TMP_DIR"/[A-Za-z0-9._-]+$ ]]; then
   exit 0

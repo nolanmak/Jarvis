@@ -1511,9 +1511,8 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
     let bash_linkedin_dm_bare = "Bash(augmentagent linkedin dm *)".to_string();
     let bash_linkedin_comment_abs = format!("Bash({} linkedin comment *)", bin.display());
     let bash_linkedin_comment_bare = "Bash(augmentagent linkedin comment *)".to_string();
-    // #888 — `imessage fetch-attachment <s3-uri>` downloads one bundle
-    // attachment into this session's `/tmp/aa-imsg/<session>/` (allowlist
-    // and 25 MB cap live in the CLI). Only this verb: `sync --apply` writes.
+    // #888 — `imessage fetch-attachment <s3-uri>` downloads one bundle attachment into this
+    // session's `/tmp/aa-imsg/<session>/` (allowlist + 25 MB cap in the CLI). Only this verb: `sync --apply` writes.
     let bash_imessage_fetch_abs = format!("Bash({} imessage fetch-attachment *)", bin.display());
     let bash_imessage_fetch_bare = "Bash(augmentagent imessage fetch-attachment *)".to_string();
     // The sub-CLI inherits our cwd = wiki_root, so its default `data.db`
@@ -1633,11 +1632,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             env.push(("DISCORD_CHANNEL_ID".into(), cid));
         }
     }
-    // #888 — `imessage fetch-attachment` takes its allowlist from
-    // `AUGMENTAGENT_IMESSAGE_S3_*` and signs via the default AWS credential chain,
-    // which any `AWS_*` var may steer — forward both prefixes whole, but only with a
-    // bucket configured (a box without the feature leaks no keys). The download dir
-    // is minted per session: the guard admits Reads only there; the call site deletes exactly it.
+    // #888 — `imessage fetch-attachment` reads `AUGMENTAGENT_IMESSAGE_S3_*` and signs via the
+    // default AWS credential chain, which any `AWS_*` var may steer: forward both prefixes whole,
+    // only with a bucket configured (no keys leak where the feature is off). The download dir is
+    // minted per session: the guard admits Reads only there; the call site deletes exactly it.
     if std::env::var("AUGMENTAGENT_IMESSAGE_S3_BUCKET").is_ok_and(|b| !b.trim().is_empty()) {
         for (k, v) in std::env::vars() {
             if (k.starts_with("AWS_") || k.starts_with("AUGMENTAGENT_IMESSAGE_S3_"))
@@ -2656,9 +2654,8 @@ mod tests {
         );
     }
 
-    /// #888 — `imessage fetch-attachment` reachable in both Bash forms (only that
-    /// verb); the sub-CLI sees the bucket plus whatever `AWS_*` steers the credential
-    /// chain (Codex: a fixed list dropped `AWS_CONFIG_FILE`); one download dir per session.
+    /// #888 — `imessage fetch-attachment` reachable in both Bash forms (only that verb); the sub-CLI sees
+    /// the bucket plus whatever `AWS_*` steers the credential chain (Codex: a fixed list dropped `AWS_CONFIG_FILE`).
     #[test]
     fn ask_opts_allows_imessage_fetch_attachment_and_forwards_s3_config() {
         let repo = tempfile::tempdir().expect("repo tmpdir");
@@ -2672,10 +2669,9 @@ mod tests {
         let again = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
 
         std::env::remove_var("AWS_CONFIG_FILE");
-        let bin = repo.path().join("target/release/augmentagent");
         let joined = opts.allowed_tools.join("\n");
-        let bare = "Bash(augmentagent imessage fetch-attachment *)".to_string();
-        for needle in [bare, format!("Bash({} imessage fetch-attachment *)", bin.display())] {
+        let abs = format!("Bash({} imessage fetch-attachment *)", repo.path().join("target/release/augmentagent").display());
+        for needle in ["Bash(augmentagent imessage fetch-attachment *)".to_string(), abs] {
             assert!(opts.allowed_tools.contains(&needle), "missing {needle}; got:\n{joined}");
         }
         assert!(!joined.contains("imessage *"), "no imessage wildcard (sync writes pages): {joined}");

@@ -103,8 +103,7 @@ expect_block "An unresolvable transcripts dir grants nothing" \
 expect_allow "The wiki stays allowed when the transcripts dir is unresolvable" \
   Read file_path "$WIKI/people/dana.md" "AUGMENTAGENT_TRANSCRIPTS_DIR=$TMP/does-not-exist"
 
-# #888 — `imessage fetch-attachment` lands files in $AUGMENTAGENT_IMESSAGE_TMP_DIR
-# (/tmp/aa-imsg/<session>); only Read, one segment deep, never another session's.
+# #888 — fetched iMessage attachments: only Read, one segment deep, never another session's dir.
 I_ENV="AUGMENTAGENT_IMESSAGE_TMP_DIR=/tmp/aa-imsg/4242-17"
 expect_allow "Read of this session's fetched iMessage attachment is allowed" \
   Read file_path "/tmp/aa-imsg/4242-17/9-IMG_001-3fa2b1c0.jpeg" "$I_ENV"

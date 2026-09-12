@@ -1,9 +1,8 @@
 //! #888 — allowlisted, size-capped download of one iMessage attachment (the
 //! `s3://<bucket>/conversations/<dir>/attachments/<id>-<name>` pointer on a bundle
 //! `[attachment: …]` line) by `augmentagent imessage fetch-attachment` into the ask
-//! session's own dir under [`ATTACHMENT_TMP_ROOT`]. Enforced here: the pre-network
-//! bucket/prefix allowlist, the streamed [`MAX_ATTACHMENT_BYTES`] cap, private
-//! (verified) temp dirs, per-session cleanup and the stale-session sweep.
+//! session's own dir under [`ATTACHMENT_TMP_ROOT`]. Enforced here: the pre-network bucket/prefix
+//! allowlist, the streamed [`MAX_ATTACHMENT_BYTES`] cap, private (verified) temp dirs, the cleanup.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -54,7 +53,7 @@ pub struct AttachmentSource {
     /// Always ends in `/`.
     prefix: String,
     region: String,
-    /// Path-style base URL for tests; virtual-hosted S3 when `None`.
+    /// Path-style base URL for tests/S3-compatible servers; AWS S3 when `None`.
     endpoint: Option<String>,
     http: reqwest::Client,
 }
@@ -182,9 +181,12 @@ impl AttachmentSource {
     }
 
     fn object_url(&self, key: &str) -> String {
+        let (bucket, region, key) = (&self.bucket, &self.region, encode_key(key));
         match &self.endpoint {
-            Some(base) => format!("{base}/{}/{}", self.bucket, encode_key(key)),
-            None => format!("https://{}.s3.{}.amazonaws.com/{}", self.bucket, self.region, encode_key(key)),
+            Some(base) => format!("{base}/{bucket}/{key}"),
+            // Dotted buckets go path-style (as the AWS SDKs do): `<a.b>.s3.…` fails S3's one-label wildcard cert.
+            None if bucket.contains('.') => format!("https://s3.{region}.amazonaws.com/{bucket}/{key}"),
+            None => format!("https://{bucket}.s3.{region}.amazonaws.com/{key}"),
         }
     }
 
@@ -338,6 +340,14 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"jpegbytes");
     }
 
+    /// Codex review — a dotted bucket must not be virtual-hosted (TLS would fail).
+    #[test]
+    fn dotted_bucket_is_addressed_path_style() {
+        let url = |b: &str| AttachmentSource::new(b, None, "us-east-1").object_url("conversations/Alice B/x.jpeg");
+        assert_eq!(url("imsg-bundle"), "https://imsg-bundle.s3.us-east-1.amazonaws.com/conversations/Alice%20B/x.jpeg");
+        assert_eq!(url("imessage.example.com"), "https://s3.us-east-1.amazonaws.com/imessage.example.com/conversations/Alice%20B/x.jpeg");
+    }
+
     #[tokio::test]
     async fn oversized_body_is_aborted_and_partial_file_removed() {
         let mut server = mockito::Server::new_async().await;
@@ -355,10 +365,9 @@ mod tests {
         assert!(!dest.exists(), "partial file must be deleted");
     }
 
-    /// Codex reviews — a root another user pre-planted in sticky `/tmp` (symlink, or
-    /// writable by them) and a session dir swapped for a link are refused before
-    /// anything is written; our own private dirs are reusable. Ending one session
-    /// removes only its dir; the sweep reclaims only day-old (crashed) siblings.
+    /// Codex reviews — a root another user pre-planted in sticky `/tmp` (symlink, or writable
+    /// by them) and a session dir swapped for a link are refused before anything is written; our
+    /// own dirs are reusable. Ending a session removes only its dir; the sweep only day-old siblings.
     #[test]
     fn hostile_tmp_entries_are_refused_and_cleanup_is_per_session() {
         use std::fs::{set_permissions, Permissions};
