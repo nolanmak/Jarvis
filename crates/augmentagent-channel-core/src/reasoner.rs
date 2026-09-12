@@ -1634,11 +1634,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         }
     }
     // #888 — `imessage fetch-attachment` takes its allowlist from
-    // `AUGMENTAGENT_IMESSAGE_S3_*` and signs with the default AWS credential
-    // chain, every link of which is steered by some `AWS_*` var — forward the
-    // whole prefix (only with a bucket configured, so a box without the
-    // feature leaks no keys). The download dir is minted per session: the
-    // guard admits Reads only there; the call site deletes exactly it.
+    // `AUGMENTAGENT_IMESSAGE_S3_*` and signs via the default AWS credential chain,
+    // which any `AWS_*` var may steer — forward both prefixes whole, but only with a
+    // bucket configured (a box without the feature leaks no keys). The download dir
+    // is minted per session: the guard admits Reads only there; the call site deletes exactly it.
     if std::env::var("AUGMENTAGENT_IMESSAGE_S3_BUCKET").is_ok_and(|b| !b.trim().is_empty()) {
         for (k, v) in std::env::vars() {
             if (k.starts_with("AWS_") || k.starts_with("AUGMENTAGENT_IMESSAGE_S3_"))
@@ -2657,10 +2656,9 @@ mod tests {
         );
     }
 
-    /// #888 — `imessage fetch-attachment` reachable in both Bash forms (only
-    /// that verb); the sub-CLI sees the bucket plus whatever `AWS_*` steers
-    /// the credential chain (Codex: a fixed list dropped `AWS_CONFIG_FILE`);
-    /// each session gets its own download dir.
+    /// #888 — `imessage fetch-attachment` reachable in both Bash forms (only that
+    /// verb); the sub-CLI sees the bucket plus whatever `AWS_*` steers the credential
+    /// chain (Codex: a fixed list dropped `AWS_CONFIG_FILE`); one download dir per session.
     #[test]
     fn ask_opts_allows_imessage_fetch_attachment_and_forwards_s3_config() {
         let repo = tempfile::tempdir().expect("repo tmpdir");
@@ -2689,8 +2687,7 @@ mod tests {
         assert_ne!(Some(dir), env(&again, "AUGMENTAGENT_IMESSAGE_TMP_DIR"), "one dir per session");
     }
 
-    /// #888 — the session-dir Read carve-out's cases live in
-    /// `scripts/tests/aa-wiki-scope-guard.test.sh`; run them here (needs jq).
+    /// #888 — the session-dir Read carve-out's cases live in `scripts/tests/aa-wiki-scope-guard.test.sh` (needs jq).
     #[test]
     fn wiki_scope_guard_shell_tests_pass() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/tests/aa-wiki-scope-guard.test.sh");

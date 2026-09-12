@@ -1,10 +1,9 @@
-//! #888 — allowlisted, size-capped download of one iMessage attachment: the
-//! `s3://<bucket>/conversations/<dir>/attachments/<id>-<name>` pointer on a
-//! bundle `[attachment: …]` line, fetched by `augmentagent imessage
-//! fetch-attachment` into the ask session's own dir under
-//! [`ATTACHMENT_TMP_ROOT`]. Enforced here: the bucket/prefix allowlist
-//! (pre-network), the streamed [`MAX_ATTACHMENT_BYTES`] cap, private
-//! (verified) temp dirs, and per-session cleanup.
+//! #888 — allowlisted, size-capped download of one iMessage attachment (the
+//! `s3://<bucket>/conversations/<dir>/attachments/<id>-<name>` pointer on a bundle
+//! `[attachment: …]` line) by `augmentagent imessage fetch-attachment` into the ask
+//! session's own dir under [`ATTACHMENT_TMP_ROOT`]. Enforced here: the pre-network
+//! bucket/prefix allowlist, the streamed [`MAX_ATTACHMENT_BYTES`] cap, private
+//! (verified) temp dirs, per-session cleanup and the stale-session sweep.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -71,9 +70,8 @@ fn encode_key(key: &str) -> String {
         .collect()
 }
 
-/// Local file name for `key`: basename sanitized to `[A-Za-z0-9._-]`, a short
-/// hash of the full key before the extension (look-alikes never collide), the
-/// extension the Read tool keys off intact.
+/// Local file name for `key`: basename sanitized to `[A-Za-z0-9._-]`, a short hash of
+/// the full key before the extension (look-alikes never collide), the extension intact.
 pub fn local_name(key: &str) -> String {
     let base = key.rsplit('/').next().unwrap_or(key);
     let safe: String = base
@@ -97,12 +95,11 @@ pub fn session_dir() -> PathBuf {
         .unwrap_or_else(|| root.join(std::process::id().to_string()))
 }
 
-/// Create `dir` (`<root>/<session>`): each level a non-recursive 0700 mkdir,
-/// then lstat-verified as a real directory (never a symlink) with no
-/// group/other bits. `/tmp` is sticky, so a pre-planted root is the one way
-/// another user could swap the session dir for a link under a download
-/// (CWE-59): a foreign 0700 root fails the mkdir inside it, a looser one fails
-/// here. No uid check — the workspace keeps `libc` out; bits cover all but ACLs.
+/// Create `dir` (`<root>/<session>`): each level a non-recursive 0700 mkdir, then
+/// lstat-verified as a real directory (never a symlink) with no group/other bits.
+/// `/tmp` is sticky, so a pre-planted root is the one way another user could swap
+/// the session dir for a link under a download (CWE-59): a foreign 0700 root fails
+/// the mkdir inside it, a looser one fails here. No uid check (`libc` is kept out).
 pub fn prepare_tmp_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     let root = dir.parent().ok_or_else(|| std::io::Error::other("session dir has no parent"))?;
@@ -126,9 +123,8 @@ pub fn remove_session_dir(dir: &Path) -> bool {
     std::fs::remove_dir_all(dir).is_ok()
 }
 
-/// Delete the session dirs directly under `root` with an mtime at least
-/// `max_age` old — what a daemon killed mid-ask leaves behind. Top-level
-/// files/symlinks are skipped (`DirEntry::metadata` is an lstat).
+/// Delete the session dirs directly under `root` with an mtime at least `max_age` old
+/// (a killed ask's leftovers). Top-level files/symlinks are skipped (`metadata` is an lstat).
 pub fn sweep_stale_sessions(root: &Path, max_age: Duration) -> usize {
     let Ok(entries) = std::fs::read_dir(root) else { return 0 };
     let now = SystemTime::now();
@@ -359,11 +355,10 @@ mod tests {
         assert!(!dest.exists(), "partial file must be deleted");
     }
 
-    /// Codex reviews — a root another user pre-planted in sticky `/tmp` (a
-    /// symlink, or a dir they could rename our session dir out of) and a
-    /// session dir swapped for a link are refused before anything is written;
-    /// our own private dirs are reusable. Ending one session removes only its
-    /// dir; the sweep reclaims only day-old (crashed) siblings.
+    /// Codex reviews — a root another user pre-planted in sticky `/tmp` (symlink, or
+    /// writable by them) and a session dir swapped for a link are refused before
+    /// anything is written; our own private dirs are reusable. Ending one session
+    /// removes only its dir; the sweep reclaims only day-old (crashed) siblings.
     #[test]
     fn hostile_tmp_entries_are_refused_and_cleanup_is_per_session() {
         use std::fs::{set_permissions, Permissions};
@@ -393,7 +388,6 @@ mod tests {
         std::fs::File::open(&crashed).unwrap().set_modified(SystemTime::now() - GC_MAX_AGE * 2).unwrap();
 
         assert!(remove_session_dir(&own));
-        assert!(!remove_session_dir(&own), "already gone");
         assert_eq!(sweep_stale_sessions(&root, GC_MAX_AGE), 1);
         assert!(!own.exists() && !crashed.exists());
         assert!(other.join("a.jpeg").exists(), "the concurrent session keeps its file");

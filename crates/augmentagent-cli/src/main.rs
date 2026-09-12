@@ -12419,14 +12419,12 @@ fn run_imessage_poll_once(store: Arc<Store>) -> Result<()> {
     Ok(())
 }
 
-/// #888 — one attachment for the ask agent, into this session's (verified) dir;
-/// dirs a killed daemon left behind are reclaimed so they cannot pile up.
+/// #888 — one attachment for the ask agent, into this session's (verified) dir.
 async fn run_imessage_fetch_attachment(s3_uri: &str) -> Result<()> {
     use augmentagent_channel_journal::s3;
     let source = s3::AttachmentSource::from_env()?;
     let dir = s3::session_dir();
     s3::prepare_tmp_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
-    s3::sweep_stale_sessions(Path::new(s3::ATTACHMENT_TMP_ROOT), s3::GC_MAX_AGE);
     let dest = dir.join(s3::local_name(&source.resolve_key(s3_uri)?));
     let bytes = source.fetch(s3_uri, &dest).await?;
     println!("saved: {} ({bytes} bytes)", dest.display());
@@ -12435,9 +12433,14 @@ async fn run_imessage_fetch_attachment(s3_uri: &str) -> Result<()> {
 
 /// #888 — the ask agent cannot delete what it fetched (`rm` is off its Bash
 /// allowlist, `/tmp` is write-blocked by the scope guard), so each ask call
-/// site removes the session dir `ask_opts` minted — only that one.
+/// site removes the session dir `ask_opts` minted — only that one. Day-old dirs
+/// (an ask killed mid-session) are reclaimed here and on every imessage poll tick.
 fn sweep_imessage_attachments(env: &[(String, String)]) {
     use augmentagent_channel_journal::s3;
+    let stale = s3::sweep_stale_sessions(Path::new(s3::ATTACHMENT_TMP_ROOT), s3::GC_MAX_AGE);
+    if stale > 0 {
+        info!(stale, "reclaimed crashed ask sessions' iMessage attachment dirs");
+    }
     let Some((_, dir)) = env.iter().find(|(k, _)| k == s3::SESSION_DIR_ENV) else { return };
     if s3::remove_session_dir(Path::new(dir)) {
         info!(dir, "removed this session's fetched iMessage attachments");
@@ -12449,11 +12452,14 @@ mod imessage_fetch_attachment_tests {
     use super::*;
     use augmentagent_channel_journal::s3;
 
-    /// Codex review — the clap verb must dispatch, with env-configured bucket
-    /// + credentials, to a file in this session's dir, which the call site
-    /// then removes. Env keys here are unique to this test.
+    /// Codex reviews — the clap verb must dispatch, with env-configured bucket +
+    /// credentials, to a file in this session's dir; the call-site sweep (not the
+    /// fetch) then removes that dir AND a day-old sibling a killed ask stranded.
     #[tokio::test]
     async fn fetch_attachment_dispatch_saves_into_the_session_dir() {
+        let stale = Path::new(s3::ATTACHMENT_TMP_ROOT).join(format!("test-stale-{}", std::process::id()));
+        s3::prepare_tmp_dir(&stale).expect("plant crashed session");
+        std::fs::File::open(&stale).unwrap().set_modified(std::time::SystemTime::now() - s3::GC_MAX_AGE * 2).unwrap();
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("GET", "/imsg-bundle/conversations/Alice%20B/attachments/9-IMG_001.jpeg")
@@ -12476,8 +12482,10 @@ mod imessage_fetch_attachment_tests {
 
         mock.assert_async().await;
         assert_eq!(std::fs::read(Path::new(&session).join(s3::local_name(key))).expect("saved"), b"jpegbytes");
+        assert!(stale.exists(), "still stranded: only the sweep below may reclaim it");
         sweep_imessage_attachments(&[(s3::SESSION_DIR_ENV.into(), session.clone())]);
         assert!(!Path::new(&session).exists(), "call site removes the session dir");
+        assert!(!stale.exists(), "the same sweep reclaims the day-old crashed session");
     }
 }
 
@@ -12499,6 +12507,8 @@ async fn imessage_poll_loop(
             _ = shutdown.cancelled() => return Ok(()),
             _ = tick.tick() => {}
         }
+        // #888 — reclaim day-old attachment dirs a killed ask left behind (first tick is immediate).
+        sweep_imessage_attachments(&[]);
         // The bundle is kept current by scripts/imessage or a legacy sync job;
         // a pull failure (e.g. offline) degrades to reading
         // whatever is on disk.
