@@ -5,10 +5,11 @@
 //! just produces a short hint string that points at likely-relevant pages, so
 //! Claude doesn't have to guess file paths.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use augmentagent_store::Email;
 
+use crate::identity::IdentityIndex;
 use crate::layout::WikiLayout;
 
 pub struct WikiReader<'a> {
@@ -24,10 +25,17 @@ impl<'a> WikiReader<'a> {
     /// should consider opening for this email. Empty-string return means "no
     /// prior context yet — rely on the raw email only".
     pub fn draft_hint(&self, email: &Email) -> String {
+        self.draft_hint_with_index(email, None)
+    }
+
+    /// [`Self::draft_hint`], plus an `IdentityIndex` fallback for senders
+    /// whose page isn't at the email-derived slug (#887): iMessage/Contacts
+    /// pages are phone-keyed under kebab-name slugs, and email senders may
+    /// only be listed in a kebab page's `identities.email`.
+    pub fn draft_hint_with_index(&self, email: &Email, index: Option<&IdentityIndex>) -> String {
         let mut lines: Vec<String> = Vec::new();
 
-        let person_page = self.layout.person_page(&email.from);
-        if exists(&person_page) {
+        if let Some(person_page) = self.person_page_for(email, index) {
             lines.push(format!(
                 "- {} (sender history + preferred tone)",
                 relative_to_root(&self.layout.root, &person_page)
@@ -58,10 +66,15 @@ impl<'a> WikiReader<'a> {
     /// prose — triage is cost-sensitive so we keep the token footprint under
     /// 100 chars. Empty string when no relevant wiki page exists.
     pub fn triage_hint(&self, email: &Email) -> String {
+        self.triage_hint_with_index(email, None)
+    }
+
+    /// [`Self::triage_hint`] with the same `IdentityIndex` fallback as
+    /// [`Self::draft_hint_with_index`].
+    pub fn triage_hint_with_index(&self, email: &Email, index: Option<&IdentityIndex>) -> String {
         let mut lines: Vec<String> = Vec::new();
 
-        let person_page = self.layout.person_page(&email.from);
-        if exists(&person_page) {
+        if let Some(person_page) = self.person_page_for(email, index) {
             lines.push(format!(
                 "- Sender has a wiki page ({}) — open with Read; weight importance by Relationship/Tone.",
                 relative_to_root(&self.layout.root, &person_page)
@@ -83,6 +96,21 @@ impl<'a> WikiReader<'a> {
         } else {
             lines.join("\n")
         }
+    }
+
+    /// The sender's people page, if any. The email-derived slug wins; the
+    /// index is consulted only when that page is absent, so a sender is
+    /// never listed twice (see [`IdentityIndex::lookup_sender`] for how the
+    /// handle picks the platform).
+    fn person_page_for(&self, email: &Email, index: Option<&IdentityIndex>) -> Option<PathBuf> {
+        let by_slug = self.layout.person_page(&email.from);
+        if exists(&by_slug) {
+            return Some(by_slug);
+        }
+        index?
+            .lookup_sender(&email.from)
+            .map(|page| page.path.clone())
+            .filter(|p| exists(p))
     }
 }
 
@@ -193,5 +221,89 @@ mod tests {
         let r = WikiReader::new(&layout);
         let hint = r.triage_hint(&email("a@b.example.com", Some("t1")));
         assert!(hint.len() < 400, "triage hint too long: {} chars", hint.len());
+    }
+
+    /// Bootstrapped wiki with one kebab-slug people page carrying the given
+    /// `identities:` front-matter lines, plus the index built over it.
+    fn wiki_with_person(slug: &str, identities: &str) -> (TempDir, WikiLayout, IdentityIndex) {
+        let d = TempDir::new().unwrap();
+        let layout = WikiLayout::new(d.path().to_path_buf());
+        layout.bootstrap().unwrap();
+        std::fs::write(
+            layout.people_dir().join(format!("{slug}.md")),
+            format!("---\nkind: person\nkey: {slug}\nidentities:\n{identities}\n---\n\n# {slug}\n"),
+        )
+        .unwrap();
+        let index = IdentityIndex::build(&layout).unwrap();
+        (d, layout, index)
+    }
+
+    #[test]
+    fn phone_keyed_sender_resolves_via_identity_index() {
+        // iMessage backfill (#883) keys people by phone under kebab slugs —
+        // the email-slug path can never find them.
+        let (_d, layout, index) = wiki_with_person("bob-park", "  phone: [\"+14155550999\"]");
+        let r = WikiReader::new(&layout);
+        let e = email("Bob Park <+14155550999>", None);
+        assert_eq!(r.triage_hint(&e), "", "index-less path must stay byte-identical");
+        assert_eq!(r.draft_hint(&e), "");
+        let triage = r.triage_hint_with_index(&e, Some(&index));
+        assert!(triage.contains("people/bob-park.md"), "got: {triage}");
+        assert!(triage.contains("Relationship"));
+        assert!(triage.len() < 200, "resolved line too long: {} chars", triage.len());
+        let draft = r.draft_hint_with_index(&e, Some(&index));
+        assert!(draft.contains("people/bob-park.md"), "got: {draft}");
+    }
+
+    #[test]
+    fn bare_phone_sender_resolves_via_identity_index() {
+        // `channel-imessage` synthesises `from` as the bare handle, no
+        // display name.
+        let (_d, layout, index) = wiki_with_person("bob-park", "  imessage: [\"+14155550999\"]");
+        let r = WikiReader::new(&layout);
+        let hint = r.triage_hint_with_index(&email("+14155550999", None), Some(&index));
+        assert!(hint.contains("people/bob-park.md"), "got: {hint}");
+    }
+
+    #[test]
+    fn email_keyed_kebab_page_resolves_only_with_index() {
+        let (_d, layout, index) =
+            wiki_with_person("jane-doe", "  email: [jane@corp.example.com]");
+        let r = WikiReader::new(&layout);
+        let e = email("Jane Doe <jane@corp.example.com>", None);
+        assert_eq!(r.triage_hint(&e), "");
+        assert_eq!(r.triage_hint_with_index(&e, None), "");
+        let hint = r.triage_hint_with_index(&e, Some(&index));
+        assert!(hint.contains("people/jane-doe.md"), "got: {hint}");
+        assert!(!hint.contains("jane_at_corp_example_com"));
+    }
+
+    #[test]
+    fn index_is_not_consulted_when_email_slug_page_exists() {
+        // At most one person line: the email-slug page wins and the index
+        // fallback never runs, so a person with both pages isn't double-listed.
+        let (_d, layout, index) =
+            wiki_with_person("jane-doe", "  email: [jane@corp.example.com]");
+        std::fs::write(layout.person_page("jane@corp.example.com"), "# J\n").unwrap();
+        let r = WikiReader::new(&layout);
+        let e = email("jane@corp.example.com", Some("t1"));
+        let hint = r.triage_hint_with_index(&e, Some(&index));
+        assert!(hint.contains("people/jane_at_corp_example_com.md"));
+        assert!(!hint.contains("people/jane-doe.md"));
+        assert_eq!(hint.matches("people/").count(), 1);
+    }
+
+    #[test]
+    fn unknown_sender_with_index_yields_empty_hint() {
+        let (_d, layout, index) = wiki_with_person("bob-park", "  phone: [\"+14155550999\"]");
+        let r = WikiReader::new(&layout);
+        assert_eq!(
+            r.triage_hint_with_index(&email("Stranger <+10000000000>", None), Some(&index)),
+            ""
+        );
+        assert_eq!(
+            r.draft_hint_with_index(&email("nobody@example.org", None), Some(&index)),
+            ""
+        );
     }
 }

@@ -114,7 +114,6 @@ pub struct TelegramBotChannel<R: Reasoner> {
     pub reasoner: Arc<R>,
     pub approvals: Arc<dyn ApprovalBroker>,
     pub config: TelegramBotChannelConfig,
-    pub identity_index: Option<Arc<IdentityIndex>>,
     wiki_schema: Option<String>,
 }
 
@@ -124,7 +123,6 @@ impl<R: Reasoner + 'static> TelegramBotChannel<R> {
         reasoner: Arc<R>,
         approvals: Arc<dyn ApprovalBroker>,
         config: TelegramBotChannelConfig,
-        identity_index: Option<Arc<IdentityIndex>>,
     ) -> Self {
         let wiki_schema = match (&config.wiki_root, &config.wiki_schema_path) {
             (Some(root), Some(schema_path)) => {
@@ -146,7 +144,6 @@ impl<R: Reasoner + 'static> TelegramBotChannel<R> {
             reasoner,
             approvals,
             config,
-            identity_index,
             wiki_schema,
         }
     }
@@ -549,14 +546,22 @@ impl<R: Reasoner + 'static> TelegramBotChannel<R> {
     }
 
     fn wiki_hint_for_sender(&self, email: &Email) -> String {
-        let Some(index) = &self.identity_index else {
+        // Built per message (like Gmail/WhatsApp), not snapshotted at
+        // startup: iMessage/Contacts syncs write people pages while the
+        // daemon runs, and those senders must hint without a restart (#887).
+        let Some(index) = self.config.wiki_root.as_ref().and_then(|root| {
+            IdentityIndex::build_or_warn(&augmentagent_wiki::WikiLayout::new(root.clone()))
+        }) else {
             return String::new();
         };
-        let tg_id = extract_telegram_user_id(&email.from).unwrap_or_default();
-        if tg_id.is_empty() {
-            return String::new();
-        }
-        match index.lookup(PLATFORM, &tg_id) {
+        // Telegram id first; on a miss the bare handle resolves through the
+        // same resolver `WikiReader` uses, so a sender the owner only knows
+        // from texting (phone-keyed page) still hints.
+        let page = extract_telegram_user_id(&email.from)
+            .filter(|id| !id.is_empty())
+            .and_then(|id| index.lookup(PLATFORM, &id))
+            .or_else(|| index.lookup_sender(&email.from));
+        match page {
             Some(page) => format!(
                 "Sender's wiki page: {} (open with Read; weight the decision by their documented tone/importance).",
                 page.slug
@@ -1014,8 +1019,31 @@ mod tests {
                 skill_dir: PathBuf::from("skills/telegram-triage"),
                 long_poll_secs: 0,
             },
-            None,
         )
+    }
+
+    #[tokio::test]
+    async fn wiki_hint_resolves_phone_handle_via_index() {
+        // #887: a sender the owner only knows from texting has a
+        // phone-keyed page — it must hint, including when the iMessage sync
+        // writes that page while the channel runs. (The `telegram:` id
+        // branch is not exercised: `Identities` has no telegram field yet.)
+        let (store, _f) = tmp_store();
+        let b: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker::default());
+        let mut ch = build_channel(store, Arc::new(ScriptedReasoner::new([])), b);
+        let mut e = message_to_email(&handle(), &sample_msg(1, 12345, "hi"), &sub(SubscriptionMode::Priority, "12345"));
+        e.from = "Bob <+14155550999>".into();
+        assert_eq!(ch.wiki_hint_for_sender(&e), "", "no wiki → no hint");
+        let wiki = tempfile::TempDir::new().unwrap();
+        let layout = augmentagent_wiki::WikiLayout::new(wiki.path().to_path_buf());
+        layout.bootstrap().unwrap();
+        ch.config.wiki_root = Some(wiki.path().to_path_buf());
+        assert_eq!(ch.wiki_hint_for_sender(&e), "", "no pages yet → no hint");
+        let fm = "---\nkind: person\nkey: bob-park\nidentities:\n  phone: [\"+14155550999\"]\n---\n\n# bob-park\n";
+        std::fs::write(layout.people_dir().join("bob-park.md"), fm).unwrap();
+        assert!(ch.wiki_hint_for_sender(&e).contains("Sender's wiki page: bob-park"), "page written after startup");
+        e.from = "Stranger <telegram:0>".into();
+        assert_eq!(ch.wiki_hint_for_sender(&e), "");
     }
 
     #[tokio::test]

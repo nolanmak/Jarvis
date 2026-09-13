@@ -52,7 +52,7 @@ use augmentagent_store::{
 };
 
 use crate::api::WaClient;
-use crate::types::{WaEvent, WaMessage};
+use crate::types::{extract_sender_jid, Jid, WaEvent, WaMessage};
 use crate::PLATFORM;
 
 /// Drain cadence. The socket is long-lived so events arrive in real time;
@@ -355,8 +355,9 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
         outcome.messages_dispatched += 1;
 
         // --- TRIAGE ---
+        let wiki_hint = self.wiki_hint_for_sender(&email);
         let triage = triage_opts(self.config.wiki_root.clone());
-        let triage_prompt = triage_user_message(&email, "", "");
+        let triage_prompt = triage_user_message(&email, "", &wiki_hint);
         let raw = self.reasoner.call(&triage, &triage_prompt).await?;
         let decision = match parse_decision(&raw) {
             Ok(d) => d,
@@ -446,13 +447,12 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                 // broker with the same action id, so the sidecar sees no
                 // difference between code-mode and classic actions.
                 //
-                // WhatsApp has no wiki / tone / thread / archetype / ask
-                // resolver wiring (unlike email), so all of those block
-                // strings are passed empty and short-circuit in the prompt
-                // builders.
+                // WhatsApp has no tone / thread / archetype / ask resolver
+                // wiring (unlike email), so those block strings are passed
+                // empty and short-circuit in the prompt builders.
                 let manifest = manifest_v1();
                 let system_prompt = code_mode_system(&manifest);
-                let user_msg = code_mode_user_message(&email, "", "", "", "", "");
+                let user_msg = code_mode_user_message(&email, &wiki_hint, "", "", "", "");
                 let code_mode_opts = augmentagent_channel_core::ReasonerOpts {
                     system_prompt,
                     model: None,
@@ -491,7 +491,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                         message_ctx.clone(),
                         ts_source.clone(),
                     )
-                    .with_wiki_hint(String::new());
+                    .with_wiki_hint(wiki_hint.clone());
                     if let Err(e) = code_mode::run_program(&ts_source, &manifest, &dispatcher).await {
                         let wrapped = augmentagent_channel_core::code_mode::CodeModeError::ReasonerFailed(
                             anyhow::anyhow!("run_program: {e}"),
@@ -527,7 +527,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                             user_msg: user_msg.clone(),
                             manifest: manifest.clone(),
                             message_ctx: message_ctx.clone(),
-                            wiki_hint: String::new(),
+                            wiki_hint: wiki_hint.clone(),
                             store: Arc::clone(&self.store),
                             broker: Arc::clone(&self.approvals),
                             gh: Arc::clone(&self.gh_issue_runner),
@@ -633,7 +633,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                     std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
                         .unwrap_or_default();
                 let draft = draft_opts(skill_system, self.config.wiki_root.clone());
-                let draft_prompt = draft_user_message(&email, "", "", "", "", "");
+                let draft_prompt = draft_user_message(&email, &wiki_hint, "", "", "", "");
                 let drafted = match self.reasoner.call(&draft, &draft_prompt).await {
                     Ok(s) => s.trim().to_string(),
                     Err(e) => {
@@ -676,7 +676,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                             user_msg: user_msg.clone(),
                             manifest: manifest.clone(),
                             message_ctx: message_ctx.clone(),
-                            wiki_hint: String::new(),
+                            wiki_hint: wiki_hint.clone(),
                             store: Arc::clone(&self.store),
                             broker: Arc::clone(&self.approvals),
                             gh: Arc::clone(&self.gh_issue_runner),
@@ -714,7 +714,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                         user_msg: user_msg.clone(),
                         manifest: manifest.clone(),
                         message_ctx: message_ctx.clone(),
-                        wiki_hint: String::new(),
+                        wiki_hint: wiki_hint.clone(),
                         store: Arc::clone(&self.store),
                         broker: Arc::clone(&self.approvals),
                         gh: Arc::clone(&self.gh_issue_runner),
@@ -759,6 +759,42 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                 outcome.skipped += 1;
                 Ok(())
             }
+        }
+    }
+
+    /// Mirrors the Discord channel's hint (#887): the sender's people page,
+    /// resolved by `whatsapp:` identity first (the schema only says
+    /// `"<phone>"`, so accept the JID, bare digits or E.164), then — a
+    /// personal JID's user part is the E.164 number without `+` — via
+    /// `imessage`, which also matches the `phone:` list that
+    /// iMessage/Contacts pages are keyed by.
+    fn wiki_hint_for_sender(&self, email: &Email) -> String {
+        let Some(root) = &self.config.wiki_root else {
+            return String::new();
+        };
+        let Some(jid) = extract_sender_jid(&email.from) else {
+            return String::new();
+        };
+        let layout = augmentagent_wiki::WikiLayout::new(root.clone());
+        let Some(index) = augmentagent_wiki::IdentityIndex::build_or_warn(&layout) else {
+            return String::new();
+        };
+        let user = Jid::new(jid.as_str()).user().to_string();
+        let phone = format!("+{user}");
+        let page = [
+            (PLATFORM, jid.as_str()),
+            (PLATFORM, user.as_str()),
+            (PLATFORM, phone.as_str()),
+            ("imessage", phone.as_str()),
+        ]
+        .into_iter()
+        .find_map(|(platform, id)| index.lookup(platform, id));
+        match page {
+            Some(page) => format!(
+                "Sender's wiki page: {} (open with Read; weight the decision by their documented tone/importance).",
+                page.slug
+            ),
+            None => String::new(),
         }
     }
 
@@ -990,6 +1026,55 @@ mod tests {
             timestamp: 1776630000,
             from_me: false,
         }
+    }
+
+    /// Bootstrapped wiki with one `people/<slug>.md` page carrying the given
+    /// `identities:` lines.
+    fn wiki_with_person(slug: &str, identities: &str) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let layout = augmentagent_wiki::WikiLayout::new(dir.path().to_path_buf());
+        layout.bootstrap().unwrap();
+        std::fs::write(
+            layout.people_dir().join(format!("{slug}.md")),
+            format!("---\nkind: person\nkey: {slug}\nidentities:\n{identities}\n---\n\n# {slug}\n"),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn wiki_hint_resolves_sender_jid_to_phone_keyed_page() {
+        // iMessage/Contacts pages (#883) carry the number under `phone:` —
+        // the WhatsApp JID user part IS that number, minus the `+`.
+        let (store, _f) = tmp_store();
+        let r = Arc::new(ScriptedReasoner::new([]));
+        let b: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker::default());
+        let mut ch = channel(store, r, b);
+        let email = msg("m1", "hi").into_email("15559998888");
+        assert_eq!(ch.wiki_hint_for_sender(&email), "", "no wiki root → no hint");
+
+        let wiki = wiki_with_person("bob-park", "  phone: [\"+15551234567\"]");
+        ch.config.wiki_root = Some(wiki.path().to_path_buf());
+        let hint = ch.wiki_hint_for_sender(&email);
+        assert!(hint.contains("bob-park"), "got: {hint}");
+        assert!(hint.contains("Sender's wiki page"), "got: {hint}");
+    }
+
+    #[test]
+    fn wiki_hint_prefers_whatsapp_identity_and_ignores_strangers() {
+        let (store, _f) = tmp_store();
+        let r = Arc::new(ScriptedReasoner::new([]));
+        let b: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker::default());
+        let mut ch = channel(store, r, b);
+        let wiki = wiki_with_person("bob-park", "  whatsapp: \"15551234567\"");
+        ch.config.wiki_root = Some(wiki.path().to_path_buf());
+        let known = msg("m1", "hi").into_email("15559998888");
+        assert!(ch.wiki_hint_for_sender(&known).contains("bob-park"));
+
+        let mut stranger = msg("m2", "hi");
+        stranger.sender = Jid::new("15550000000@s.whatsapp.net");
+        let email = stranger.into_email("15559998888");
+        assert_eq!(ch.wiki_hint_for_sender(&email), "");
     }
 
     #[tokio::test]

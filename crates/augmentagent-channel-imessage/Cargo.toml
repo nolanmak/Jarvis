@@ -20,4 +20,5 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+augmentagent-mcp-memory = { path = "../augmentagent-mcp-memory" }
 tempfile = "3"
