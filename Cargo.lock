@@ -548,6 +548,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "augmentagent-channel-core",
+ "augmentagent-mcp-memory",
  "augmentagent-store",
  "augmentagent-wiki",
  "chrono",

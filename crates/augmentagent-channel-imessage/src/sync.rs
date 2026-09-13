@@ -776,6 +776,36 @@ mod tests {
     }
 
     #[test]
+    fn polled_texts_are_reachable_through_the_recall_tools() {
+        // #887: wiki-ask reaches texting history through the db-backed
+        // recall tools, never the bundle — `channel: "imessage"` finds the
+        // rows `poll_once` wrote, and their thread id reads the bodies back
+        // with sender attribution.
+        let (dir, _layout, store) = fresh_env();
+        let bundle = fixture_bundle(
+            dir.path(),
+            &[("+14155550123", "John_Smith", "John Smith", DM_MD)],
+        );
+        poll_once(&bundle, &store).unwrap();
+        let server = augmentagent_mcp_memory::Server::open(dir.path().join("test.db")).unwrap();
+        let hits = server
+            .search_conversation_history(Some("yo"), None, None, Some("imessage"), None)
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].channel, "imessage");
+        assert_eq!(hits[0].thread_id.as_deref(), Some("imessage:+14155550123"));
+        let thread = server
+            .read_conversation_thread("imessage:+14155550123", 0, 0, 20)
+            .unwrap();
+        let messages = thread["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2, "{thread}");
+        assert_eq!(messages[0]["sender"], "me");
+        assert_eq!(messages[0]["body"], "hey");
+        assert_eq!(messages[1]["sender"], "+14155550123");
+        assert_eq!(messages[1]["body"], "yo");
+    }
+
+    #[test]
     fn batched_delta_email_joins_entries_and_caps_size() {
         let conv = Conversation {
             identifier: "+14155550123".into(),

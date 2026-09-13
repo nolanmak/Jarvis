@@ -13741,13 +13741,6 @@ fn build_discord_channel(
         }
         None => (None, None),
     };
-    let identity_index = wiki_root
-        .as_ref()
-        .and_then(|root| {
-            let layout = augmentagent_wiki::WikiLayout::new(root.clone());
-            augmentagent_wiki::IdentityIndex::build(&layout).ok().map(Arc::new)
-        });
-
     let config = DiscordChannelConfig {
         poll_interval: Duration::from_secs(augmentagent_channel_discord_dm::channel::DEFAULT_POLL_SECS),
         dry_run,
@@ -13762,7 +13755,6 @@ fn build_discord_channel(
         broker,
         my_user_id,
         config,
-        identity_index,
     ))
 }
 
@@ -14160,13 +14152,6 @@ fn build_slack_channel(
         }
         None => (None, None),
     };
-    let identity_index = wiki_root.as_ref().and_then(|root| {
-        let layout = augmentagent_wiki::WikiLayout::new(root.clone());
-        augmentagent_wiki::IdentityIndex::build(&layout)
-            .ok()
-            .map(Arc::new)
-    });
-
     let config = SlackChannelConfig {
         poll_interval: Duration::from_secs(augmentagent_channel_slack::channel::DEFAULT_POLL_SECS),
         dry_run,
@@ -14179,7 +14164,6 @@ fn build_slack_channel(
         reasoner,
         broker,
         config,
-        identity_index,
     ))
 }
 
@@ -14449,13 +14433,6 @@ fn build_telegram_bot_channel(
         }
         None => (None, None),
     };
-    let identity_index = wiki_root.as_ref().and_then(|root| {
-        let layout = augmentagent_wiki::WikiLayout::new(root.clone());
-        augmentagent_wiki::IdentityIndex::build(&layout)
-            .ok()
-            .map(Arc::new)
-    });
-
     let config = TelegramBotChannelConfig {
         poll_interval: Duration::from_secs(
             augmentagent_channel_telegram_bot::channel::DEFAULT_POLL_SECS,
@@ -14473,7 +14450,6 @@ fn build_telegram_bot_channel(
         reasoner,
         broker,
         config,
-        identity_index,
     ))
 }
 
