@@ -252,18 +252,7 @@ impl SocialApiDmPayload {
             Some(p) => format!("[{p} DM from {}]", self.with),
             None => format!("[DM from {}]", self.with),
         };
-        // #573: put the shared media in the BODY, not just a card marker.
-        // `emails.body` is what the triage and draft prompts read, so this is
-        // the difference between the model knowing "they sent a Reel" and it
-        // reporting that the message was empty. Appended rather than
-        // substituted so a caption plus a Reel keeps both.
-        let body = match self.attachment_url.as_deref() {
-            Some(url) if self.text.trim().is_empty() => {
-                format!("[shared media, no caption]\n{url}")
-            }
-            Some(url) => format!("{}\n\n[shared media]\n{url}", self.text),
-            None => self.text,
-        };
+        let body = body_with_media(self.text, self.attachment_url.as_deref());
         Email {
             attachments: Vec::new(),
             to: String::new(),
@@ -278,6 +267,18 @@ impl SocialApiDmPayload {
             platform: PLATFORM.to_string(),
             kind: work_item_kind::DM.to_string(),
         }
+    }
+}
+
+/// #573: put shared media in the BODY, not just a card marker — `emails.body`
+/// is what triage and draft read, so this is the difference between "they
+/// sent a Reel" and "the message was empty". Appended, so a caption plus a
+/// Reel keeps both. Shared by the DM and own-post comment paths (#858).
+pub(crate) fn body_with_media(text: String, attachment_url: Option<&str>) -> String {
+    match attachment_url {
+        Some(url) if text.trim().is_empty() => format!("[shared media, no caption]\n{url}"),
+        Some(url) => format!("{text}\n\n[shared media]\n{url}"),
+        None => text,
     }
 }
 
@@ -800,13 +801,24 @@ impl<R: Reasoner + 'static> SocialApiDmChannel<R> {
         let skill_system =
             std::fs::read_to_string(self.config.skill_dir.join("SKILL.md")).unwrap_or_default();
         let draft_opts = socialapi_draft_opts(skill_system, self.config.wiki_root.clone());
-        let draft_prompt = draft_user_message(&email, "", "", "", "", "");
+        let mut draft_prompt = draft_user_message(&email, "", "", "", "", "");
+        // #858: let the drafter SEE a shared image. Best-effort — a failed fetch
+        // leaves the #573 URL note as the fallback; the guard drops the tempfile.
+        let image = match dm.attachment_url.as_deref() {
+            Some(url) => crate::media::fetch_image_to_tmp(url, &email.message_id).await,
+            None => None,
+        };
+        if let Some(img) = &image {
+            draft_prompt.push('\n');
+            draft_prompt.push_str(&augmentagent_channel_core::image_marker_line(&img.path));
+        }
         let draft = self
             .reasoner
             .call(&draft_opts, &draft_prompt)
             .await?
             .trim()
             .to_string();
+        drop(image);
 
         if self.config.dry_run {
             if let Some(p) = permit {
@@ -925,17 +937,25 @@ mod tests {
 
     struct ScriptedReasoner {
         responses: std::sync::Mutex<std::collections::VecDeque<String>>,
+        prompts: std::sync::Mutex<Vec<String>>,
+        /// `IMAGE:` paths that EXISTED at call time (the handler removes them after).
+        images_seen: std::sync::Mutex<Vec<std::path::PathBuf>>,
     }
     impl ScriptedReasoner {
         fn new<I: IntoIterator<Item = &'static str>>(r: I) -> Self {
             Self {
                 responses: std::sync::Mutex::new(r.into_iter().map(String::from).collect()),
+                prompts: std::sync::Mutex::new(Vec::new()),
+                images_seen: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
     #[async_trait]
     impl Reasoner for ScriptedReasoner {
-        async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+        async fn call(&self, _: &ReasonerOpts, prompt: &str) -> anyhow::Result<String> {
+            self.prompts.lock().unwrap().push(prompt.to_string());
+            let seen = augmentagent_channel_core::images::extract_image_markers(prompt).images;
+            self.images_seen.lock().unwrap().extend(seen);
             let mut q = self.responses.lock().unwrap();
             Ok(q.pop_front()
                 .unwrap_or_else(|| "{\"decision\":\"skip\",\"reason\":\"stub\"}".into()))
@@ -1876,6 +1896,43 @@ mod tests {
         p.text = "just text".into();
         p.attachment_url = None;
         assert_eq!(p.into_email().body, "just text");
+    }
+
+    /// #858: the DM draft prompt ends with a valid `IMAGE:` marker line when
+    /// the media downloads, triage stays URL-note-only, and the tempfile is
+    /// removed once the draft call returns (the guard covers the error path
+    /// too — `media::caps_body_and_removes_file_on_drop`).
+    #[tokio::test]
+    async fn dm_draft_prompt_carries_image_marker_when_media_downloads() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/shared.png"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/png")
+                    .set_body_bytes(b"\x89PNG fake".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let (store, _f) = tmp_store();
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"sent a photo"}"#,
+            "Great picture!",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let ch = channel(Arc::clone(&store), Arc::clone(&reasoner), Arc::clone(&broker), false);
+        let mut p = dm_payload("instagram");
+        p.message_id = "m_img_ok".into();
+        p.text = String::new();
+        p.attachment_url = Some(format!("{}/shared.png", server.uri()));
+        assert!(ch.handle_dm(p).await.unwrap());
+
+        let prompts = reasoner.prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 2, "triage then draft");
+        assert!(!prompts[0].contains("\nIMAGE: "), "triage must not download: {}", prompts[0]);
+        let expected = std::path::PathBuf::from("/tmp/aa-img-mimgok-0.png");
+        assert_eq!(*reasoner.images_seen.lock().unwrap(), vec![expected.clone()], "{}", prompts[1]);
+        assert!(!expected.exists(), "tempfile must be removed after the draft call");
     }
 
     /// #574: `Muhammad Rashid <socialapi:>` — a display name followed by an

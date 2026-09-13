@@ -21,6 +21,7 @@
 pub mod auth;
 pub mod client;
 pub mod inbound;
+mod media;
 pub mod own_posts;
 pub mod types;
 
