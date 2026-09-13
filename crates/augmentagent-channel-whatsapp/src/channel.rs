@@ -767,8 +767,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
     /// `"<phone>"`, so accept the JID, bare digits or E.164), then — a
     /// personal JID's user part is the E.164 number without `+` — via
     /// `imessage`, which also matches the `phone:` list that
-    /// iMessage/Contacts pages are keyed by. The index is built on demand;
-    /// any failure degrades to no hint.
+    /// iMessage/Contacts pages are keyed by.
     fn wiki_hint_for_sender(&self, email: &Email) -> String {
         let Some(root) = &self.config.wiki_root else {
             return String::new();
@@ -777,12 +776,8 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
             return String::new();
         };
         let layout = augmentagent_wiki::WikiLayout::new(root.clone());
-        let index = match augmentagent_wiki::IdentityIndex::build(&layout) {
-            Ok(i) => i,
-            Err(e) => {
-                warn!("identity index build failed; skipping wiki hint: {e}");
-                return String::new();
-            }
+        let Some(index) = augmentagent_wiki::IdentityIndex::build_or_warn(&layout) else {
+            return String::new();
         };
         let user = Jid::new(jid.as_str()).user().to_string();
         let phone = format!("+{user}");

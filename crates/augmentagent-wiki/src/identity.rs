@@ -185,6 +185,22 @@ impl IdentityIndex {
         Ok(Self { people })
     }
 
+    /// [`Self::build`] for the per-message hint call sites: a failed walk
+    /// logs and yields `None` so the hint degrades to nothing rather than
+    /// failing the message. Call it at hint time, never as a startup
+    /// snapshot — iMessage/Contacts syncs and ingest create people pages
+    /// while the daemon runs (#887), and the walk is noise next to the
+    /// reasoner call that follows.
+    pub fn build_or_warn(layout: &WikiLayout) -> Option<Self> {
+        match Self::build(layout) {
+            Ok(index) => Some(index),
+            Err(e) => {
+                warn!("identity index build failed; wiki hint degrades to none: {e}");
+                None
+            }
+        }
+    }
+
     /// O(n) scan — hundreds of pages, irrelevant at our scale.
     pub fn lookup(&self, platform: &str, id: &str) -> Option<&PersonPage> {
         self.people.iter().find(|p| p.identities.matches(platform, id))

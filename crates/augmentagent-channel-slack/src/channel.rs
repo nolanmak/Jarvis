@@ -92,7 +92,6 @@ pub struct SlackChannel<R: Reasoner> {
     pub reasoner: Arc<R>,
     pub approvals: Arc<dyn ApprovalBroker>,
     pub config: SlackChannelConfig,
-    pub identity_index: Option<Arc<IdentityIndex>>,
     wiki_schema: Option<String>,
     /// gh CLI runner for I7 postmortems on code-mode failures. Behind a trait
     /// so tests can swap in a recorder; production defaults to
@@ -106,7 +105,6 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
         reasoner: Arc<R>,
         approvals: Arc<dyn ApprovalBroker>,
         config: SlackChannelConfig,
-        identity_index: Option<Arc<IdentityIndex>>,
     ) -> Self {
         let wiki_schema = match (&config.wiki_root, &config.wiki_schema_path) {
             (Some(root), Some(schema_path)) => {
@@ -128,7 +126,6 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
             reasoner,
             approvals,
             config,
-            identity_index,
             wiki_schema,
             gh_issue_runner: Arc::new(GhCliIssueRunner::new()),
         }
@@ -765,12 +762,17 @@ impl<R: Reasoner + 'static> SlackChannel<R> {
     }
 
     fn wiki_hint_for_sender(&self, email: &Email) -> String {
-        let Some(index) = &self.identity_index else {
+        // Built per message (like Gmail/WhatsApp), not snapshotted at
+        // startup: iMessage/Contacts syncs write people pages while the
+        // daemon runs, and those senders must hint without a restart (#887).
+        let Some(index) = self.config.wiki_root.as_ref().and_then(|root| {
+            IdentityIndex::build_or_warn(&augmentagent_wiki::WikiLayout::new(root.clone()))
+        }) else {
             return String::new();
         };
         // Slack id first; on a miss the bare handle resolves through the
-        // same resolver `WikiReader` uses (#887), so a sender the owner only
-        // knows from texting (phone-keyed page) still hints.
+        // same resolver `WikiReader` uses, so a sender the owner only knows
+        // from texting (phone-keyed page) still hints.
         let page = extract_slack_id(&email.from)
             .filter(|id| !id.is_empty())
             .and_then(|id| index.lookup(PLATFORM, &id))
@@ -1167,28 +1169,29 @@ mod tests {
                 wiki_schema_path: None,
                 skill_dir: PathBuf::from("skills/slack-triage"),
             },
-            None,
         )
     }
 
     #[tokio::test]
     async fn wiki_hint_resolves_slack_id_then_phone_handle() {
         // #887: a sender the owner only knows from texting has a
-        // phone-keyed page — it must hint just like a `slack:`-keyed one.
+        // phone-keyed page — it must hint just like a `slack:`-keyed one,
+        // including pages the iMessage sync writes while the channel runs.
         let (store, _f) = tmp_store();
         let b: Arc<dyn ApprovalBroker> = Arc::new(CountingBroker::default());
         let mut ch = build_channel(store, Arc::new(ScriptedReasoner::new([])), b);
+        let mut e = message_to_email(&sample_msg("100.000001", "hi"), &sub_with_mode(SubscriptionMode::Priority), "me");
+        assert_eq!(ch.wiki_hint_for_sender(&e), "", "no wiki → no hint");
         let wiki = tempfile::TempDir::new().unwrap();
         let layout = augmentagent_wiki::WikiLayout::new(wiki.path().to_path_buf());
         layout.bootstrap().unwrap();
+        ch.config.wiki_root = Some(wiki.path().to_path_buf());
+        assert_eq!(ch.wiki_hint_for_sender(&e), "", "no pages yet → no hint");
         for (slug, ids) in [("bob-park", "phone: [\"+14155550999\"]"), ("alice", "slack: \"U2\"")] {
             let fm = format!("---\nkind: person\nkey: {slug}\nidentities:\n  {ids}\n---\n\n# {slug}\n");
             std::fs::write(layout.people_dir().join(format!("{slug}.md")), fm).unwrap();
         }
-        let mut e = message_to_email(&sample_msg("100.000001", "hi"), &sub_with_mode(SubscriptionMode::Priority), "me");
-        assert_eq!(ch.wiki_hint_for_sender(&e), "", "no index → no hint");
-        ch.identity_index = Some(Arc::new(augmentagent_wiki::IdentityIndex::build(&layout).unwrap()));
-        assert!(ch.wiki_hint_for_sender(&e).contains("Sender's wiki page: alice"));
+        assert!(ch.wiki_hint_for_sender(&e).contains("Sender's wiki page: alice"), "page written after startup");
         e.from = "Bob <+14155550999>".into();
         assert!(ch.wiki_hint_for_sender(&e).contains("Sender's wiki page: bob-park"));
         e.from = "Stranger <slack:U0>".into();
@@ -1313,7 +1316,6 @@ mod tests {
                 wiki_schema_path: None,
                 skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
             },
-            None,
         );
         let sub = sub_with_mode(SubscriptionMode::Priority);
         let m = sample_msg("100.000001", "any update?");
@@ -1410,7 +1412,6 @@ mod tests {
                 wiki_schema_path: None,
                 skill_dir: PathBuf::from("/tmp/nonexistent-skill"),
             },
-            None,
         )
         .with_gh_issue_runner(gh.clone());
 
