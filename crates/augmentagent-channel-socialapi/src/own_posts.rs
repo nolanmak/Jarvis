@@ -87,6 +87,11 @@ pub struct SocialApiOwnPostCommentPayload {
     /// Empty for payloads queued before this field existed.
     #[serde(default)]
     pub sub_platform: String,
+    /// Media on the tagged/mentioned post (#858). Mentions enter as comment
+    /// rows, and until this field existed the media was dropped at every
+    /// layer — so the draft read as if no attachment came in.
+    #[serde(default)]
+    pub attachment_url: Option<String>,
 }
 
 /// Normalized comment webhook event body (#249) as persisted by the Express
@@ -108,6 +113,9 @@ struct CommentWebhookPayload {
     /// Underlying network, when the push states it.
     #[serde(default)]
     sub_platform: String,
+    /// Shared media on the pushed comment/mention (#858).
+    #[serde(default)]
+    attachment_url: Option<String>,
 }
 
 impl From<CommentWebhookPayload> for SocialApiOwnPostCommentPayload {
@@ -120,6 +128,7 @@ impl From<CommentWebhookPayload> for SocialApiOwnPostCommentPayload {
             created_at: w.created_at,
             account_id: w.account_id,
             sub_platform: w.sub_platform,
+            attachment_url: w.attachment_url.filter(|u| !u.trim().is_empty()),
         }
     }
 }
@@ -140,6 +149,7 @@ impl SocialApiOwnPostCommentPayload {
             } else {
                 c.platform.clone()
             },
+            attachment_url: c.attachment_url.clone().filter(|u| !u.trim().is_empty()),
         }
     }
 
@@ -172,7 +182,7 @@ impl SocialApiOwnPostCommentPayload {
             thread_id: Some(self.post_id),
             from,
             subject,
-            body: self.text,
+            body: crate::inbound::body_with_media(self.text, self.attachment_url.as_deref()),
             date: self.created_at,
             account_entity_id: Some(account_entity),
             platform: PLATFORM.to_string(),
@@ -481,6 +491,7 @@ impl<R: Reasoner + 'static> SocialApiOwnPostCommentEngagement<R> {
         &self,
         payload: SocialApiOwnPostCommentPayload,
     ) -> anyhow::Result<bool> {
+        let attachment_url = payload.attachment_url.clone();
         let email = payload.into_email();
         self.store.upsert_email(&email)?;
         if self.store.is_message_processed(&email.message_id)? {
@@ -557,13 +568,24 @@ impl<R: Reasoner + 'static> SocialApiOwnPostCommentEngagement<R> {
             std::fs::read_to_string(self.config.skill_dir.join("SKILL.md"))
                 .unwrap_or_default();
         let draft_opts = socialapi_draft_opts(skill_system, self.config.wiki_root.clone());
-        let draft_prompt = draft_user_message(&email, "", "", "", "", "");
+        let mut draft_prompt = draft_user_message(&email, "", "", "", "", "");
+        // #858: let the drafter SEE a tagged image. Best-effort — a failed fetch
+        // leaves the #573 URL note as the fallback; the guard drops the tempfile.
+        let image = match attachment_url.as_deref() {
+            Some(url) => crate::media::fetch_image_to_tmp(url, &email.message_id).await,
+            None => None,
+        };
+        if let Some(img) = &image {
+            draft_prompt.push('\n');
+            draft_prompt.push_str(&augmentagent_channel_core::image_marker_line(&img.path));
+        }
         let draft = self
             .reasoner
             .call(&draft_opts, &draft_prompt)
             .await?
             .trim()
             .to_string();
+        drop(image);
 
         if self.config.dry_run {
             if let Some(p) = permit {
@@ -692,6 +714,9 @@ mod tests {
 
     struct ScriptedReasoner {
         responses: std::sync::Mutex<std::collections::VecDeque<String>>,
+        prompts: std::sync::Mutex<Vec<String>>,
+        /// `IMAGE:` paths that EXISTED at call time (the handler removes them after).
+        images_seen: std::sync::Mutex<Vec<std::path::PathBuf>>,
     }
     impl ScriptedReasoner {
         fn new<I: IntoIterator<Item = &'static str>>(r: I) -> Self {
@@ -699,12 +724,17 @@ mod tests {
                 responses: std::sync::Mutex::new(
                     r.into_iter().map(String::from).collect(),
                 ),
+                prompts: std::sync::Mutex::new(Vec::new()),
+                images_seen: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
     #[async_trait]
     impl Reasoner for ScriptedReasoner {
-        async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+        async fn call(&self, _: &ReasonerOpts, prompt: &str) -> anyhow::Result<String> {
+            self.prompts.lock().unwrap().push(prompt.to_string());
+            let seen = augmentagent_channel_core::images::extract_image_markers(prompt).images;
+            self.images_seen.lock().unwrap().extend(seen);
             let mut q = self.responses.lock().unwrap();
             Ok(q.pop_front()
                 .unwrap_or_else(|| "{\"decision\":\"skip\",\"reason\":\"stub\"}".into()))
@@ -814,6 +844,7 @@ mod tests {
             "post_1",
             serde_json::json!({"data": [
                 {"platform_id":"c1","text":"nice!","author_name":"jane","is_owner":false,
+                 "attachment_url":"https://cdn.example/tagged.jpg",
                  "created_at":"2026-05-28T00:00:00Z"},
                 {"platform_id":"c2","text":"gg","author_name":"bob","is_owner":false,
                  "created_at":"2026-05-28T00:01:00Z"},
@@ -829,6 +860,8 @@ mod tests {
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].kind, work_item_kind::OWN_POST_COMMENT);
         assert_eq!(first[0].platform, PLATFORM);
+        let p: SocialApiOwnPostCommentPayload = serde_json::from_value(first[0].payload.clone()).unwrap();
+        assert_eq!(p.attachment_url.as_deref(), Some("https://cdn.example/tagged.jpg"));
         // Second poll → all already in socialapi_seen_comments → empty.
         let second = trig.next_work_items(&cancel).await.unwrap();
         assert!(second.is_empty());
@@ -853,7 +886,8 @@ mod tests {
                 None,
                 &serde_json::json!({
                     "type":"comment","id":"c1","post_id":"post_1",
-                    "author":"jane","text":"nice!","created_at":"2026-05-28T00:00:00Z"
+                    "author":"jane","text":"nice!","created_at":"2026-05-28T00:00:00Z",
+                    "attachment_url":"https://cdn.example/tagged.jpg"
                 })
                 .to_string(),
             )
@@ -889,6 +923,8 @@ mod tests {
         let first = trig.next_work_items(&cancel).await.unwrap();
         assert_eq!(first.len(), 1, "only the watched-post webhook comment surfaces");
         assert_eq!(first[0].external_id, "c1");
+        let p: SocialApiOwnPostCommentPayload = serde_json::from_value(first[0].payload.clone()).unwrap();
+        assert_eq!(p.attachment_url.as_deref(), Some("https://cdn.example/tagged.jpg"));
         // Both webhook events are now processed; poll re-sees c1 deduped → empty.
         let second = trig.next_work_items(&cancel).await.unwrap();
         assert!(second.is_empty(), "no duplicate from webhook+poll convergence");
@@ -1048,6 +1084,111 @@ mod tests {
             .unwrap();
         assert_eq!(items.len(), 1, "only the genuine third-party comment drafts");
         assert_eq!(items[0].external_id, "c_real");
+    }
+
+    // --- #858 attachments on tagged/mentioned posts ---
+
+    fn comment_payload(text: &str, attachment_url: Option<&str>) -> SocialApiOwnPostCommentPayload {
+        SocialApiOwnPostCommentPayload {
+            post_id: "post_1".into(),
+            comment_id: "c1".into(),
+            author: "jane".into(),
+            text: text.into(),
+            created_at: "2026-08-30T00:00:00Z".into(),
+            account_id: "acc_1".into(),
+            sub_platform: "instagram".into(),
+            attachment_url: attachment_url.map(String::from),
+        }
+    }
+
+    /// The reported bug: a mention/tag that carried media reached the draft
+    /// prompt as bare text (or nothing), so the reply read as if no attachment
+    /// came in. `emails.body` is what triage and draft read, so the media must
+    /// be named there — same #573 posture as the DM path.
+    #[test]
+    fn comment_with_attachment_reaches_the_draft_context() {
+        let url = "https://cdn.example/p.jpg";
+        let body = comment_payload("look at this", Some(url)).into_email().body;
+        assert!(body.contains("look at this") && body.contains("[shared media]"), "{body}");
+        assert!(body.contains(url), "{body}");
+        // Attachment-only mention: never an empty body.
+        let body = comment_payload("", Some(url)).into_email().body;
+        assert!(body.contains("[shared media, no caption]") && body.contains(url), "{body}");
+        // Plain comment is untouched.
+        assert_eq!(comment_payload("just text", None).into_email().body, "just text");
+    }
+
+    /// Payloads queued before the field existed must still decode, and the
+    /// Express layer's `""` for "no media" must not become a `[shared media]`
+    /// note with an empty URL.
+    #[test]
+    fn absent_or_blank_attachment_url_decodes_to_none() {
+        let p: SocialApiOwnPostCommentPayload = serde_json::from_value(serde_json::json!({
+            "post_id": "post_1", "comment_id": "c1", "author": "jane",
+            "text": "hi", "created_at": "2026-08-30T00:00:00Z"
+        })).unwrap();
+        assert_eq!(p.attachment_url, None);
+        let w: CommentWebhookPayload = serde_json::from_value(serde_json::json!({
+            "id": "c1", "post_id": "post_1", "attachment_url": ""
+        })).unwrap();
+        assert_eq!(SocialApiOwnPostCommentPayload::from(w).attachment_url, None);
+    }
+
+    /// Draft stage actually READS the image: when the media downloads, the
+    /// draft prompt ends with a valid `IMAGE:` marker line (see
+    /// `augmentagent_channel_core::images`), triage stays URL-note-only, and
+    /// the tempfile is gone once the handler returns. A failed download never
+    /// blocks the draft: the URL note still reaches the prompt, sans marker.
+    #[tokio::test]
+    async fn draft_prompt_carries_image_marker_when_media_downloads() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/tagged.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "image/jpeg")
+                    .set_body_bytes(b"\xFF\xD8\xFF fake jpeg".to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let (store, _f) = tmp_store();
+        let reasoner = Arc::new(ScriptedReasoner::new([
+            r#"{"decision":"reply","reason":"tagged us with a photo"}"#,
+            "Love this shot!",
+            r#"{"decision":"reply","reason":"tagged us"}"#,
+            "Thanks for the tag!",
+        ]));
+        let broker = Arc::new(RecordingBroker::default());
+        let eng = engagement(
+            Arc::clone(&store),
+            client(&server),
+            Arc::clone(&reasoner),
+            Arc::clone(&broker),
+            false,
+        );
+        let mut payload = comment_payload("", Some(&format!("{}/tagged.jpg", server.uri())));
+        payload.comment_id = "c_img_ok".into();
+        assert!(eng.handle_comment(payload).await.unwrap());
+
+        let prompts = reasoner.prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 2, "triage then draft");
+        assert!(prompts[0].contains("[shared media, no caption]"), "{}", prompts[0]);
+        assert!(!prompts[0].contains("\nIMAGE: "), "triage must not download: {}", prompts[0]);
+        // `extract_image_markers` only yields a path that exists with an
+        // allowlisted extension, so this also proves the download landed.
+        let expected = std::path::PathBuf::from("/tmp/aa-img-cimgok-0.jpg");
+        assert_eq!(*reasoner.images_seen.lock().unwrap(), vec![expected.clone()], "{}", prompts[1]);
+        assert!(!expected.exists(), "tempfile must be removed after the draft call");
+
+        // Fetch failure (404): draft still goes out, URL note intact, no marker.
+        let url = format!("{}/gone.jpg", server.uri());
+        let mut payload = comment_payload("check this", Some(&url));
+        payload.comment_id = "c_img_404".into();
+        assert!(eng.handle_comment(payload).await.unwrap());
+        assert_eq!(broker.posts.lock().unwrap().len(), 2);
+        let draft = reasoner.prompts.lock().unwrap()[3].clone();
+        assert!(draft.contains("[shared media]") && draft.contains(&url), "{draft}");
+        assert!(!draft.contains("\nIMAGE: "), "{draft}");
     }
 
     /// A pushed comment on a watched post still becomes a work item via the
