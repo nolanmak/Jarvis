@@ -26,6 +26,7 @@ use std::path::Path;
 use tracing::{debug, info, warn};
 
 mod ocr;
+pub mod pdf;
 
 pub use ocr::{OcrClient, OcrResult, DEFAULT_OCR_BASE_URL, DEFAULT_OCR_MODEL, MAX_OCR_BYTES};
 
