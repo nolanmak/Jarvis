@@ -38,6 +38,11 @@ class RenderPdfTests(unittest.TestCase):
         md = '| Evidence |\n| --- |\n| ' + 'Long detail. ' * 2000 + 'FINAL CELL |'
         self.assertIn('FINAL CELL', extracted(render_pdf(md)))
 
+    def test_numbered_list_preserves_starting_number(self):
+        text = extracted(render_pdf('7. Seventh exhibit\n8. Eighth exhibit'))
+        self.assertIn('7. Seventh exhibit', text)
+        self.assertIn('8. Eighth exhibit', text)
+
     def test_empty_document_is_rejected(self):
         with self.assertRaisesRegex(ValueError, 'empty'):
             render_pdf('  \n')

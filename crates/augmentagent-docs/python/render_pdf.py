@@ -110,7 +110,7 @@ def render_pdf(source):
         for child in node:
             tag = child.tag
             if tag in ('ul', 'ol'):
-                for number, item in enumerate(child, 1):
+                for number, item in enumerate(child, int(child.get('start', '1'))):
                     prefix = f'{number}.' if tag == 'ol' else '•'
                     style = ParagraphStyle(f'List{depth}', parent=body, leftIndent=16 * (depth + 1))
                     # Nested lists are separate flowables so long lists paginate.
