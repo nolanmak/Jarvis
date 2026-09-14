@@ -76,6 +76,11 @@ pub struct HealthInputs {
     pub red_main_since: Option<DateTime<Utc>>,
     /// `(pr, reason, times seen)` for resume refusals in the scanned window.
     pub repeated_refusals: Vec<(u64, String, u32)>,
+    /// Open PR numbers, when they could be listed. A refusal loop only
+    /// matters while the PR is still there to be re-refused; once it is
+    /// closed the finding is history, not a problem. `None` = unknown, in
+    /// which case refusals are judged on the window alone.
+    pub open_prs: Option<Vec<u64>>,
     /// `(pr, age in days)` for open agent drafts.
     pub draft_ages_days: Vec<(u64, i64)>,
 }
@@ -205,7 +210,8 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
     }
 
     for (pr, reason, times) in &i.repeated_refusals {
-        if *times >= 2 {
+        let still_open = i.open_prs.as_ref().is_none_or(|open| open.contains(pr));
+        if *times >= 2 && still_open {
             out.push(Finding {
                 severity: Severity::Warn,
                 code: "refusal-loop",
@@ -431,6 +437,23 @@ fn red_main_since(dir: &Path) -> Option<DateTime<Utc>> {
     Some(DateTime::<Utc>::from(mtime))
 }
 
+/// Every open PR number, or `None` when `gh` could not be asked — unknown
+/// must not silence a real finding.
+fn open_pr_numbers() -> Option<Vec<u64>> {
+    let out = std::process::Command::new("gh")
+        .args(["pr", "list", "--state", "open", "--limit", "100", "--json", "number"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    Some(
+        v.as_array()?
+            .iter()
+            .filter_map(|p| p.get("number")?.as_u64())
+            .collect(),
+    )
+}
+
 fn open_draft_ages(now: DateTime<Utc>) -> Vec<(u64, i64)> {
     let out = std::process::Command::new("gh")
         .args([
@@ -504,6 +527,7 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
             .flatten(),
         red_main_since: red_main_since(&dir),
         repeated_refusals: scan_repeated_refusals(&log, now - chrono::Duration::days(3)),
+        open_prs: open_pr_numbers(),
         draft_ages_days: open_draft_ages(now),
     }
 }
@@ -588,6 +612,7 @@ mod tests {
             free_gb_gate: Some(53.0),
             red_main_since: None,
             repeated_refusals: vec![],
+            open_prs: None,
             draft_ages_days: vec![(990, 0)],
         }
     }
@@ -676,6 +701,23 @@ mod tests {
         assert_eq!(codes(&f), vec!["refusal-loop"], "only the repeat fires");
         assert!(f[0].detail.contains("#987") && f[0].detail.contains("2 times"));
         assert_eq!(f[0].severity, Severity::Warn);
+
+        // Once the PR is closed the loop cannot recur, so the finding is
+        // history — reporting it would train the reader to ignore the alert.
+        let closed = HealthInputs {
+            open_prs: Some(vec![990]),
+            ..i.clone()
+        };
+        assert!(analyze(&closed, &Thresholds::default()).is_empty());
+        // Still open ⇒ still reported.
+        let open = HealthInputs {
+            open_prs: Some(vec![987, 990]),
+            ..i.clone()
+        };
+        assert_eq!(codes(&analyze(&open, &Thresholds::default())), vec!["refusal-loop"]);
+        // `gh` unavailable ⇒ unknown must not silence it.
+        let unknown = HealthInputs { open_prs: None, ..i };
+        assert_eq!(codes(&analyze(&unknown, &Thresholds::default())), vec!["refusal-loop"]);
     }
 
     #[test]
