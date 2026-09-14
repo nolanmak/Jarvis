@@ -805,12 +805,12 @@ impl<R: Reasoner + 'static> SocialApiDmChannel<R> {
         // #858: let the drafter SEE a shared image. Best-effort — a failed fetch
         // leaves the #573 URL note as the fallback; the guard drops the tempfile.
         let image = match dm.attachment_url.as_deref() {
-            Some(url) => crate::media::fetch_image_to_tmp(url, &email.message_id).await,
+            Some(url) => crate::media::fetch_image_to_tmp(url).await,
             None => None,
         };
         if let Some(img) = &image {
             draft_prompt.push('\n');
-            draft_prompt.push_str(&augmentagent_channel_core::image_marker_line(&img.path));
+            draft_prompt.push_str(&augmentagent_channel_core::image_marker_line(img.path()));
         }
         let draft = self
             .reasoner
@@ -1930,9 +1930,10 @@ mod tests {
         let prompts = reasoner.prompts.lock().unwrap().clone();
         assert_eq!(prompts.len(), 2, "triage then draft");
         assert!(!prompts[0].contains("\nIMAGE: "), "triage must not download: {}", prompts[0]);
-        let expected = std::path::PathBuf::from("/tmp/aa-img-mimgok-0.png");
-        assert_eq!(*reasoner.images_seen.lock().unwrap(), vec![expected.clone()], "{}", prompts[1]);
-        assert!(!expected.exists(), "tempfile must be removed after the draft call");
+        let seen = reasoner.images_seen.lock().unwrap().clone();
+        let [img] = seen.as_slice() else { panic!("one image marker: {seen:?}\n{}", prompts[1]) };
+        assert!(img.starts_with("/tmp") && img.extension().is_some_and(|e| e == "png"), "{}", img.display());
+        assert!(!img.exists(), "tempfile must be removed after the draft call");
     }
 
     /// #574: `Muhammad Rashid <socialapi:>` — a display name followed by an

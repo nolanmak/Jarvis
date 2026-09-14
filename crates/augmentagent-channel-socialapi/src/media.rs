@@ -2,21 +2,29 @@
 //!
 //! A tagged post or DM with an image reaches the prompts as a `[shared
 //! media]` URL note (#573) — the model knows media exists, not what is in
-//! it. This fetches the image to `/tmp/aa-img-<msgid>-0.<ext>` so the draft
-//! prompt can carry an `IMAGE:` marker line ([`augmentagent_channel_core::images`]).
-//! Strictly additive: any failure (a Reel, a CDN 403, a timeout, an oversize
-//! body, a refused origin) returns `None` and the draft goes out with the URL
-//! note alone; a download must never error the handler (#671 re-feeds).
+//! it. This fetches the image to a `/tmp/aa-img-<random>.<ext>` tempfile so
+//! the draft prompt can carry an `IMAGE:` marker line
+//! ([`augmentagent_channel_core::images`]). Strictly additive: any failure (a
+//! Reel, a CDN 403, a timeout, an oversize body, a refused origin) returns
+//! `None` and the draft goes out with the URL note alone; a download must
+//! never error the handler (#671 re-feeds).
+//!
+//! The name is random, not the Discord channels' `<msgid>-<idx>` shape (that
+//! shape serves the wiki-ask scope guard, which the draft preset does not
+//! install): a message-derived name collides across the same event handled
+//! twice, and the first guard to drop would unlink the file the other
+//! reasoner is still reading. `NamedTempFile` is `O_EXCL` and self-unlinking.
 //!
 //! The URL comes off inbound traffic, so the fetch is fenced: `https` only,
 //! no redirects, no proxy, host must resolve exclusively to public addresses,
 //! and that resolution is pinned onto the client so a DNS rebind cannot swap
 //! the target between the check and the connect.
 
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
 use std::time::Duration;
 
+use tempfile::NamedTempFile;
 use tracing::debug;
 
 use augmentagent_channel_core::images::IMAGE_EXT_ALLOWLIST;
@@ -33,28 +41,15 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// release build never relaxes the fence.
 const ALLOW_LOOPBACK_HTTP: bool = cfg!(test);
 
-/// A downloaded image that deletes itself when dropped, so the tempfile lives
-/// exactly as long as the draft call that reads it — reasoner success, error
-/// and early return alike (attachment traffic is continuous; a leak fills `/tmp`).
-pub(crate) struct TempImage {
-    pub(crate) path: PathBuf,
+/// Fetch `url` to a fresh `/tmp/aa-img-<random>.<ext>` when it is an image
+/// under [`MAX_IMAGE_BYTES`] on a public `https` origin; `None` on any
+/// failure. The guard unlinks the file on drop: hold it for exactly the draft
+/// call that reads it (attachment traffic is continuous; a leak fills `/tmp`).
+pub(crate) async fn fetch_image_to_tmp(url: &str) -> Option<NamedTempFile> {
+    fetch_image_to_tmp_capped(url, MAX_IMAGE_BYTES).await
 }
 
-impl Drop for TempImage {
-    fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.path) {
-            debug!("socialapi media: remove {} failed: {e}", self.path.display());
-        }
-    }
-}
-
-/// Fetch `url` to `/tmp/aa-img-<msgid>-0.<ext>` when it is an image under
-/// [`MAX_IMAGE_BYTES`] on a public `https` origin. `None` on any failure.
-pub(crate) async fn fetch_image_to_tmp(url: &str, message_id: &str) -> Option<TempImage> {
-    fetch_image_to_tmp_capped(url, message_id, MAX_IMAGE_BYTES).await
-}
-
-async fn fetch_image_to_tmp_capped(url: &str, message_id: &str, max_bytes: u64) -> Option<TempImage> {
+async fn fetch_image_to_tmp_capped(url: &str, max_bytes: u64) -> Option<NamedTempFile> {
     let parsed = reqwest::Url::parse(url).ok()?;
     let addrs = match public_addrs(&parsed).await {
         Ok(a) => a,
@@ -105,14 +100,14 @@ async fn fetch_image_to_tmp_capped(url: &str, message_id: &str, max_bytes: u64) 
             }
         }
     }
-    let path = image_tmp_path(message_id, ext);
-    match tokio::fs::write(&path, &buf).await {
-        Ok(()) => Some(TempImage { path }),
-        Err(e) => {
-            debug!(url, "socialapi media fetch: write {} failed: {e}", path.display());
-            None
-        }
-    }
+    // The extension is what `images::is_valid_image_path` keys off.
+    tempfile::Builder::new()
+        .prefix("aa-img-")
+        .suffix(&format!(".{ext}"))
+        .tempfile_in("/tmp")
+        .and_then(|mut f| f.write_all(&buf).map(|()| f))
+        .map_err(|e| debug!(url, "socialapi media fetch: tempfile write failed: {e}"))
+        .ok()
 }
 
 /// A client that can only ever open a socket to `addrs`. No redirects: a hop
@@ -188,15 +183,6 @@ fn is_public_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// `/tmp/aa-img-<msgid>-0.<ext>`, the path shape the wiki-ask scope guard
-/// carves out (#441). Message ids are platform strings, so only their
-/// alphanumerics survive — a hostile id cannot traverse out of `/tmp`.
-fn image_tmp_path(message_id: &str, ext: &str) -> PathBuf {
-    let safe: String = message_id.chars().filter(char::is_ascii_alphanumeric).collect();
-    let safe = if safe.is_empty() { "socialapi" } else { safe.as_str() };
-    PathBuf::from(format!("/tmp/aa-img-{safe}-0.{ext}"))
-}
-
 /// Allowlisted image extension for a response: the `Content-Type` decides
 /// when it names an image; a generic or missing type falls back to the URL's
 /// path extension; an explicit non-image type (a Reel's `video/mp4`, a login
@@ -244,13 +230,31 @@ mod tests {
         mount_png(&server, "/big.png", png(vec![0u8; 64])).await;
         mount_png(&server, "/ok.png", png(b"\x89PNG".to_vec())).await;
         let big = format!("{}/big.png", server.uri());
-        assert!(fetch_image_to_tmp_capped(&big, "media_big", 16).await.is_none());
-        assert!(!std::path::Path::new("/tmp/aa-img-mediabig-0.png").exists());
-        let img = fetch_image_to_tmp(&format!("{}/ok.png", server.uri()), "drop_me").await.unwrap();
-        let path = img.path.clone();
+        assert!(fetch_image_to_tmp_capped(&big, 16).await.is_none());
+        let img = fetch_image_to_tmp(&format!("{}/ok.png", server.uri())).await.unwrap();
+        let path = img.path().to_path_buf();
+        assert!(path.starts_with("/tmp") && path.extension().is_some_and(|e| e == "png"), "{}", path.display());
         assert_eq!(std::fs::read(&path).unwrap(), b"\x89PNG");
         drop(img);
         assert!(!path.exists());
+    }
+
+    /// Review finding: a message-id-derived name let two handlers for one
+    /// event share a path — the second write clobbered the first image and
+    /// the first guard to drop unlinked the file the other reasoner was still
+    /// reading. Each fetch gets its own file, untouched by the other's lifetime.
+    #[tokio::test]
+    async fn concurrent_fetches_of_one_event_never_share_a_file() {
+        let server = MockServer::start().await;
+        let png = ResponseTemplate::new(200).insert_header("content-type", "image/png").set_body_bytes(b"\x89PNG".to_vec());
+        mount_png(&server, "/same.png", png).await;
+        let url = format!("{}/same.png", server.uri());
+        let (a, b) = tokio::join!(fetch_image_to_tmp(&url), fetch_image_to_tmp(&url));
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_ne!(a.path(), b.path());
+        let b_path = b.path().to_path_buf();
+        drop(a);
+        assert_eq!(std::fs::read(&b_path).unwrap(), b"\x89PNG", "b survives a's drop");
     }
 
     /// The pinned resolution only holds when WE open the socket: through a
@@ -278,8 +282,7 @@ mod tests {
         let redirect = ResponseTemplate::new(302).insert_header("location", "https://x.example/a.png");
         mount_png(&server, "/redir.png", redirect).await;
         let url = format!("{}/redir.png", server.uri());
-        assert!(fetch_image_to_tmp(&url, "ssrf").await.is_none());
-        assert!(!std::path::Path::new("/tmp/aa-img-ssrf-0.png").exists());
+        assert!(fetch_image_to_tmp(&url).await.is_none());
     }
 
     /// One address per IANA special-purpose registry row, in registry order
@@ -301,12 +304,6 @@ mod tests {
         for ip in good.split_whitespace() {
             assert!(is_public_ip(ip.parse().unwrap()), "{ip}");
         }
-    }
-
-    #[test]
-    fn tmp_path_strips_everything_but_alphanumerics() {
-        assert_eq!(image_tmp_path("../../etc/passwd", "png"), PathBuf::from("/tmp/aa-img-etcpasswd-0.png"));
-        assert_eq!(image_tmp_path("///", "gif"), PathBuf::from("/tmp/aa-img-socialapi-0.gif"));
     }
 
     #[test]
