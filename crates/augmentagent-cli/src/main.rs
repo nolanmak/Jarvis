@@ -12510,15 +12510,15 @@ mod imessage_fetch_attachment_tests {
         std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDTEST");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "SECRETTEST");
         std::env::set_var(s3::SESSION_DIR_ENV, &session);
-        let key = "conversations/Alice B/attachments/9-IMG_001.jpeg";
-        let uri = format!("s3://imsg-bundle/{key}");
+        let object_path = "conversations/Alice B/attachments/9-IMG_001.jpeg";
+        let uri = format!("s3://imsg-bundle/{object_path}");
         let cli = Cli::try_parse_from(["augmentagent", "imessage", "fetch-attachment", &uri]).expect("verb parses");
         assert!(matches!(cli.cmd, Cmd::Imessage { op: ImessageOp::FetchAttachment { ref s3_uri } } if *s3_uri == uri));
 
         run_imessage_fetch_attachment(&uri).await.expect("fetch");
 
         mock.assert_async().await;
-        assert_eq!(std::fs::read(Path::new(&session).join(s3::local_name(key))).expect("saved"), b"jpegbytes");
+        assert_eq!(std::fs::read(Path::new(&session).join(s3::local_name(object_path))).expect("saved"), b"jpegbytes");
         assert!(stale.exists(), "still stranded: only the sweep below may reclaim it");
         sweep_imessage_attachments(&[(s3::SESSION_DIR_ENV.into(), session.clone())]);
         assert!(!Path::new(&session).exists(), "call site removes the session dir");

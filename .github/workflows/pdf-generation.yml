@@ -34,4 +34,4 @@ jobs:
       - run: cargo test --locked -p augmentagent-docs
       - run: cargo test --locked -p augmentagent-cli --test pdf_generation
       - run: cargo test --locked -p augmentagent-channel-core ask_opts_pdf_generation --lib
-      - run: cargo test --locked -p augmentagent-approval-discord attachments:: --lib
+      - run: "cargo test --locked -p augmentagent-approval-discord attachments:: --lib"
