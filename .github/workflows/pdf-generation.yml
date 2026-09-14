@@ -1,0 +1,37 @@
+name: PDF generation
+on:
+  pull_request:
+    paths:
+      - 'crates/augmentagent-docs/**'
+      - 'crates/augmentagent-cli/**'
+      - 'crates/augmentagent-channel-core/src/reasoner.rs'
+      - 'crates/augmentagent-approval-discord/src/attachments.rs'
+      - 'schema/wiki-ask.md'
+      - 'Cargo.*'
+      - '.github/workflows/pdf-generation.yml'
+permissions:
+  contents: read
+jobs:
+  pdf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y fonts-liberation poppler-utils
+      - run: python3 -m pip install -r crates/augmentagent-docs/python/requirements.txt
+      - run: python3 -m unittest discover -s crates/augmentagent-docs/python -v
+      - run: cargo test --locked -p augmentagent-docs
+      - run: cargo test --locked -p augmentagent-cli --test pdf_generation
+      - run: cargo test --locked -p augmentagent-channel-core ask_opts_pdf_generation --lib
+      - run: cargo test --locked -p augmentagent-approval-discord attachments:: --lib

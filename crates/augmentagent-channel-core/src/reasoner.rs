@@ -1684,6 +1684,8 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             format!("Bash({} finance summary)", bin.display()),
             "Bash(augmentagent finance summary *)".into(),
             format!("Bash({} finance summary *)", bin.display()),
+            "Bash(augmentagent doc render-pdf *)".into(),
+            format!("Bash({} doc render-pdf *)", bin.display()),
             bash_gmail_abs,
             bash_gmail_bare,
             bash_loop_abs,
@@ -2652,6 +2654,31 @@ mod tests {
                 .any(|d| d.as_path() == transcripts.path()),
             "transcript clone must be in add_dirs"
         );
+    }
+
+    #[test]
+    fn ask_opts_pdf_generation_is_available_and_narrowly_scoped() {
+        let repo = tempfile::tempdir().unwrap();
+        let wiki = tempfile::tempdir().unwrap();
+        let opts = ask_opts(wiki.path().into(), repo.path().into());
+        assert!(opts
+            .allowed_tools
+            .contains(&"Bash(augmentagent doc render-pdf *)".into()));
+        assert!(opts.allowed_tools.contains(&format!(
+            "Bash({} doc render-pdf *)",
+            repo.path().join("target/release/augmentagent").display()
+        )));
+        assert!(!opts
+            .allowed_tools
+            .contains(&"Bash(augmentagent doc *)".into()));
+        assert!(opts
+            .env
+            .iter()
+            .any(|(k, v)| k == "WIKI_ROOT" && v == wiki.path().to_str().unwrap()));
+        assert!(opts.system_prompt.contains("augmentagent doc render-pdf"));
+        assert!(opts
+            .system_prompt
+            .contains("ATTACH: deliverables/packet.pdf"));
     }
 
     /// #888 — `imessage fetch-attachment` reachable in both Bash forms (only that verb); the sub-CLI sees
