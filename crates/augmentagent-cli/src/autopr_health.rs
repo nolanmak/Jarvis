@@ -17,6 +17,7 @@
 //! | `disk-low`       | 2026-09-05→08: root full → false red main → deadlock |
 //! | `red-main-stuck` | 2026-09-07: red verdict held behind a gave-up issue  |
 //! | `refusal-loop`   | 2026-09-13/14: PR #987 re-refused daily on Cargo.lock|
+//! | `updater-stalled`| 2026-09-14: diverged checkout, updater quietly stopped|
 //! | `no-progress`    | the catch-all: nothing merged in N days             |
 //! | `draft-stale`    | a draft nobody will ever finish                     |
 //!
@@ -69,6 +70,12 @@ pub struct HealthInputs {
     pub last_loop_line: Option<DateTime<Utc>>,
     /// Last commit on `origin/main` authored by anything.
     pub last_merge: Option<DateTime<Utc>>,
+    /// `true` when the deployed build stamp matches `origin/main`. `false`
+    /// means the daemon is running code older than main.
+    pub deployed_is_current: Option<bool>,
+    /// How long the deployed build has been behind `origin/main`, measured
+    /// from that commit's own timestamp.
+    pub deploy_lag_mins: Option<i64>,
     pub free_gb_root: Option<f64>,
     pub free_gb_gate: Option<f64>,
     /// When the cached red-`main` verdict was written, if `main` is currently
@@ -92,6 +99,7 @@ pub struct Thresholds {
     pub loop_silent_mins: i64,
     pub free_gb_floor: f64,
     pub no_merge_days: i64,
+    pub deploy_lag_mins: i64,
     pub red_main_hours: i64,
     pub draft_stale_days: i64,
 }
@@ -107,6 +115,9 @@ impl Default for Thresholds {
             // A workspace test build needs well over this.
             free_gb_floor: 15.0,
             no_merge_days: 3,
+            // The updater ticks every 5 min and a full rebuild is minutes;
+            // an hour behind means it is not deploying, not merely slow.
+            deploy_lag_mins: 60,
             red_main_hours: 6,
             draft_stale_days: 5,
         }
@@ -221,6 +232,23 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                 ),
                 fix: "A refusal that repeats is deterministic: close the PR or \
                       remove the cause, rather than letting it recur."
+                    .into(),
+            });
+        }
+    }
+
+    if i.deployed_is_current == Some(false) {
+        if let Some(lag) = i.deploy_lag_mins.filter(|l| *l >= t.deploy_lag_mins) {
+            out.push(Finding {
+                severity: Severity::Alert,
+                code: "updater-stalled",
+                detail: format!(
+                    "the daemon has been running code {lag} min older than origin/main; \
+                     merges are landing but not reaching the box"
+                ),
+                fix: "Check `update.log`. A diverged deploy checkout is the usual \
+                      cause — the updater now preserves and resets by itself, so a \
+                      persistent stall means a dirty tree or a failing build."
                     .into(),
             });
         }
@@ -389,7 +417,7 @@ pub fn scan_repeated_refusals(log: &str, since: DateTime<Utc>) -> Vec<(u64, Stri
             .next()
             .unwrap_or(tail)
             .trim()
-            .trim_end_matches(|c: char| c == ';' || c == ',')
+            .trim_end_matches([';', ','])
             .to_string();
         *seen.entry((pr, reason)).or_insert(0) += 1;
     }
@@ -489,6 +517,40 @@ fn open_draft_ages(now: DateTime<Utc>) -> Vec<(u64, i64)> {
         .unwrap_or_default()
 }
 
+/// Is the deployed build at `origin/main`, and if not, how stale is it?
+/// Measured from the commit date of what is deployed, so the answer does not
+/// depend on when the updater last ran.
+fn deploy_state(repo_root: &Path, state_dir: &Path) -> (Option<bool>, Option<i64>) {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo_root)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let Some(remote) = git(&["rev-parse", "origin/main"]) else {
+        return (None, None);
+    };
+    let Ok(built) = std::fs::read_to_string(state_dir.join("built-commit")) else {
+        return (None, None);
+    };
+    let built = built.trim().to_string();
+    if built.is_empty() {
+        return (None, None);
+    }
+    if built == remote {
+        return (Some(true), Some(0));
+    }
+    // Age of the deployed commit, not of the stamp file: a rebuild that never
+    // happened leaves the stamp fresh and the code old.
+    let lag = git(&["log", "-1", "--format=%cI", &built])
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|d| (Utc::now() - d.with_timezone(&Utc)).num_minutes());
+    (Some(false), lag)
+}
+
 fn last_merge(repo_root: &Path) -> Option<DateTime<Utc>> {
     let out = std::process::Command::new("git")
         .args(["log", "-1", "--format=%cI", "origin/main"])
@@ -514,12 +576,15 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
                 .unwrap_or_else(|| PathBuf::from("."))
         });
 
+    let deploy = deploy_state(repo_root, &dir);
     HealthInputs {
         now_or_epoch: Some(now),
         daemon_active: daemon_active(),
         last_reasoner_poll: last_timestamp_with(&log, r#"poll complete channel="gmail""#),
         last_loop_line: last_timestamp_with(&log, "augmentagent::self_improve"),
         last_merge: last_merge(repo_root),
+        deployed_is_current: deploy.0,
+        deploy_lag_mins: deploy.1,
         free_gb_root: free_gb(Path::new("/")),
         free_gb_gate: gate_dir
             .exists()
@@ -608,6 +673,8 @@ mod tests {
             last_reasoner_poll: Some(t0() - Duration::minutes(4)),
             last_loop_line: Some(t0() - Duration::minutes(12)),
             last_merge: Some(t0() - Duration::hours(20)),
+            deployed_is_current: Some(true),
+            deploy_lag_mins: Some(0),
             free_gb_root: Some(70.0),
             free_gb_gate: Some(53.0),
             red_main_since: None,
@@ -718,6 +785,37 @@ mod tests {
         // `gh` unavailable ⇒ unknown must not silence it.
         let unknown = HealthInputs { open_prs: None, ..i };
         assert_eq!(codes(&analyze(&unknown, &Thresholds::default())), vec!["refusal-loop"]);
+    }
+
+    /// 2026-09-14: a session committed on the deploy checkout's `main`, the
+    /// PR was squash-merged, local and origin diverged, and the updater bailed
+    /// into a log nobody reads. Merges kept landing; none reached the box.
+    #[test]
+    fn catches_an_updater_that_stopped_deploying() {
+        let i = HealthInputs {
+            deployed_is_current: Some(false),
+            deploy_lag_mins: Some(6 * 60),
+            ..healthy()
+        };
+        let f = analyze(&i, &Thresholds::default());
+        assert_eq!(codes(&f), vec!["updater-stalled"]);
+        assert_eq!(f[0].severity, Severity::Alert);
+        assert!(f[0].detail.contains("older than origin/main"), "{:?}", f[0]);
+        assert!(f[0].fix.contains("update.log"), "{:?}", f[0]);
+        // A deploy that is merely mid-rebuild is not a stall.
+        let building = HealthInputs {
+            deployed_is_current: Some(false),
+            deploy_lag_mins: Some(9),
+            ..healthy()
+        };
+        assert!(analyze(&building, &Thresholds::default()).is_empty());
+        // Unknown (no stamp, no git) stays quiet.
+        let unknown = HealthInputs {
+            deployed_is_current: None,
+            deploy_lag_mins: None,
+            ..healthy()
+        };
+        assert!(analyze(&unknown, &Thresholds::default()).is_empty());
     }
 
     #[test]

@@ -45,6 +45,16 @@ DASHBOARD_SYSTEMD_UNIT="augmentagent-dashboard.service"
 stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s [update] %s\n' "$(stamp)" "$*" >> "$LOG"; }
 
+# Tell the owner on Discord. Best effort and never fatal: a webhook that is
+# unset or down must not stop a deploy. Anything this function reports is a
+# state a human has to know about, not routine progress.
+notify_owner() {
+  [ -n "${DISCORD_WEBHOOK_URL:-}" ] || return 0
+  curl -fsS -m 10 -X POST -H 'Content-Type: application/json' \
+    --data "$(printf '{"content": %s}' "$(printf '%s' "⚙️ $*" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')")" \
+    "$DISCORD_WEBHOOK_URL" >/dev/null 2>&1 || true
+}
+
 # #826 — restart_unit / should_write_stamp. Sourced after log() so the
 # library's diagnostics land in update.log like everything else.
 # shellcheck source=lib/service-restart.sh
@@ -233,11 +243,49 @@ if git merge-base --is-ancestor "$REMOTE" "$LOCAL"; then
 fi
 
 # If HEAD is not an ancestor of origin/main, the branches have diverged. A
-# non-ff pull would fail anyway; bail cleanly so a developer can reconcile.
-# (Once reconciled, the build-stamp check above guarantees the binary is
-# rebuilt even if the reconcile lands HEAD == origin out of band.)
+# non-ff pull would fail anyway.
+#
+# This used to bail and wait for a human — and nobody is watching this log, so
+# it stalled SILENTLY: the daemon ran stale code for as long as the divergence
+# lasted (2026-09-14, and before that). Divergence here is almost always
+# benign and self-inflicted: a session committed on the deploy checkout's
+# `main`, the PR was squash-merged upstream, and the local commits are the
+# same work under different SHAs. `scripts/check-not-on-main.sh` now stops
+# that at the source, but the updater must never be the thing that quietly
+# stops deploying.
+#
+# So: preserve, then proceed. The local-only commits are saved on a rescue
+# branch (nothing is ever lost — same discipline as `wiki sync`'s
+# kb-conflict-<sha> branches) and the checkout is reset to origin/main. A
+# DIRTY tree is the one case still left alone: uncommitted work is not ours
+# to move, so that stays a loud no-op.
 if ! git merge-base --is-ancestor "$LOCAL" "$REMOTE"; then
-  log "LOCAL ($LOCAL) and origin/main ($REMOTE) have diverged — manual reconcile required"
+  AHEAD=$(git rev-list --count "$REMOTE".."$LOCAL" 2>/dev/null || echo "?")
+  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    log "DIVERGED and the tree is dirty: LOCAL ($LOCAL, $AHEAD commit(s) not on origin/main) vs origin/main ($REMOTE)."
+    log "  Not touching uncommitted work. Commit or stash, then this recovers itself on the next tick."
+    notify_owner "Auto-updater stalled: the deploy checkout has diverged from origin/main and has uncommitted changes, so it will not deploy. Commit or stash in ~/AugmentAgent, and it recovers on the next tick."
+    exit 0
+  fi
+  RESCUE="updater-rescue/$(date -u +%Y%m%d-%H%M%S)-$(git rev-parse --short "$LOCAL")"
+  if git branch "$RESCUE" "$LOCAL" >/dev/null 2>&1; then
+    log "DIVERGED: preserved $AHEAD local commit(s) on '$RESCUE'"
+  else
+    log "DIVERGED: could not create rescue branch '$RESCUE' — refusing to reset"
+    exit 0
+  fi
+  if git reset --hard "$REMOTE" >/dev/null 2>&1; then
+    log "DIVERGED: reset the checkout to origin/main ($REMOTE); deploying normally"
+    notify_owner "Auto-updater recovered: the deploy checkout had diverged from origin/main. $AHEAD local commit(s) preserved on branch '$RESCUE'; the checkout is reset and deploying again."
+    LOCAL=$(git rev-parse HEAD)
+    # The reset is out-of-band relative to the stamp, so force a rebuild
+    # rather than trusting a diff range that no longer applies.
+    NEEDS_REBUILD=1
+    NEEDS_NODE_REBUILD=1
+    apply_update "$LOCAL"
+    exit 0
+  fi
+  log "DIVERGED: reset failed — manual reconcile required (local commits are on '$RESCUE')"
   exit 0
 fi
 
