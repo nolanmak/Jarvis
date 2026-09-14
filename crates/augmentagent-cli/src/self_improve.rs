@@ -3814,16 +3814,46 @@ async fn resume_draft_pr(
         // Guards re-run every round — the rules have changed since the draft
         // opened, and a revision can add lines or touch new paths.
         if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff) {
+            // A blast-radius verdict on a sitting draft is DETERMINISTIC: the
+            // branch's diff is fixed, so tomorrow's tick reaches the identical
+            // refusal. Until now this returned a billed report with no attempt
+            // recorded, so the resume lane re-picked the same PR every day,
+            // burned a daily slot on it and never reached gave-up — PR #987
+            // did exactly that on 2026-09-13 and -14 over `Cargo.lock`. Stand
+            // down for good instead: unbilled, attempt recorded, labelled and
+            // closed, with the way back spelled out on the PR.
             cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            let reason = format!("the diff touches the guarded path `{pattern}`");
             let _ = run(
                 &gh,
                 &["pr", "comment", &pr.to_string(), "--body",
-                  &format!("Auto-resume refused: the diff touches `{pattern}`:\n```\n{line}\n```")],
+                  &format!(
+                      "Auto-resume refused: the diff touches `{pattern}`:\n```\n{line}\n```\n\n\
+                       This verdict cannot change on a later tick — the branch's diff is \
+                       fixed — so the loop is standing down on this PR rather than \
+                       re-refusing it every day. To bring it back: push a diff that avoids \
+                       the guarded path, remove the `{GAVE_UP_LABEL}` label from the issue, \
+                       and reopen."
+                  )],
                 repo_root,
             )
             .await;
-            return Ok(RunReport::built(format!(
-                "PR #{pr}: resume refused — blast radius on `{pattern}`"
+            let attempts = record_attempt(
+                repo_root,
+                issue.number,
+                Some(failure_record(
+                    reasoner,
+                    FailureKind::GuardRefusal,
+                    "resume:blast-radius",
+                    &reason,
+                )),
+            )
+            .await
+            .unwrap_or(1);
+            label_gave_up(repo_root, issue.number).await.ok();
+            close_gave_up_pr(repo_root, pr, issue.number, attempts, &reason).await;
+            return Ok(RunReport::triage(format!(
+                "PR #{pr}: resume refused — blast radius on `{pattern}`; stood down"
             )));
         }
         let lines_now = diff_line_count(&diff);
@@ -9797,8 +9827,8 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             from = abs + 1;
         }
         assert_eq!(
-            sites, 3,
-            "conflict-exhausted, gate-exhausted, review-exhausted"
+            sites, 4,
+            "blast-radius (terminal), conflict-, gate-, review-exhausted"
         );
         let cstart = src.find("async fn close_gave_up_pr(").expect("close fn");
         let cend = cstart + src[cstart..].find("\n}\n").expect("close fn end");
@@ -10835,5 +10865,28 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         );
         assert!(script.contains("example\\.(?:com|org|net)"), "example.com/org/net exempt");
         assert!(script.contains("pii-ok"), "the reviewed-fixture marker survives");
+    }
+
+    // A deterministic guard verdict on a sitting draft must be terminal: the
+    // branch's diff cannot change on a later tick, so re-refusing it daily
+    // burns a slot forever (PR #987 did, twice, over `Cargo.lock`).
+    #[test]
+    fn resume_blast_radius_refusal_stands_down_for_good() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = start + src[start..].find("\n}\n").expect("end");
+        let body = &src[start..end];
+        let at = body
+            .find("if let Some((pattern, line)) = blast_radius_hit_in_diff(&diff) {")
+            .expect("blast-radius arm");
+        let ret = at + body[at..].find("return Ok(RunReport::").expect("arm return");
+        let arm = &body[at..ret];
+        assert!(arm.contains("record_attempt("), "the attempt must be recorded");
+        assert!(arm.contains("label_gave_up("), "and the issue labelled out");
+        assert!(arm.contains("close_gave_up_pr("), "and the PR closed");
+        assert!(
+            body[ret..].starts_with("return Ok(RunReport::triage("),
+            "no builder ran, so the refusal must be unbilled"
+        );
     }
 }
