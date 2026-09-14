@@ -352,10 +352,19 @@ pub fn last_timestamp_with(log: &str, needle: &str) -> Option<DateTime<Utc>> {
 
 /// `(pr, reason, count)` for resume refusals — the signature of a loop that
 /// is spending slots to reach the same verdict again and again.
-pub fn scan_repeated_refusals(log: &str) -> Vec<(u64, String, u32)> {
+///
+/// Only refusals at or after `since` count. The log tail spans days, so an
+/// unbounded scan keeps reporting a PR that was closed last week — and a
+/// watchdog that alerts on solved problems is one you learn to ignore. A
+/// line with no parsable timestamp is skipped for the same reason.
+pub fn scan_repeated_refusals(log: &str, since: DateTime<Utc>) -> Vec<(u64, String, u32)> {
     let mut seen: std::collections::BTreeMap<(u64, String), u32> = Default::default();
     for raw in log.lines() {
         let line = strip_ansi(raw);
+        match line_timestamp(&line) {
+            Some(ts) if ts >= since => {}
+            _ => continue,
+        }
         let Some(rest) = line.split("PR #").nth(1) else {
             continue;
         };
@@ -494,7 +503,7 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
             .then(|| free_gb(&gate_dir))
             .flatten(),
         red_main_since: red_main_since(&dir),
-        repeated_refusals: scan_repeated_refusals(&log),
+        repeated_refusals: scan_repeated_refusals(&log, now - chrono::Duration::days(3)),
         draft_ages_days: open_draft_ages(now),
     }
 }
@@ -743,7 +752,7 @@ mod tests {
             "2026-09-13T00:38:01.1Z  {esc}INFO{reset} augmentagent::self_improve: auto-PR: PR #987: resume refused — blast radius on `Cargo.lock` {esc}runs_today{reset}=1\n\
              2026-09-14T00:27:02.2Z  {esc}INFO{reset} augmentagent::self_improve: auto-PR: PR #987: resume refused — blast radius on `Cargo.lock` {esc}runs_today{reset}=1\n"
         );
-        let r = scan_repeated_refusals(&log);
+        let r = scan_repeated_refusals(&log, t0() - Duration::days(3));
         assert_eq!(r.len(), 1, "the escapes must not split the group: {r:?}");
         assert_eq!(r[0].2, 2);
         assert!(!r[0].1.contains('\u{1b}'), "no escapes in the alert: {:?}", r[0].1);
@@ -751,6 +760,37 @@ mod tests {
         assert!(strip_ansi(&format!("{esc}x{reset}y")) == "xy");
         // A timestamp behind a colour escape still parses.
         assert!(line_timestamp(&format!("{esc}2026-09-14T00:27:02.2Z{reset} INFO x")).is_some());
+    }
+
+    /// A refusal that was dealt with must stop being reported once it ages
+    /// out of the window, even though the log tail still contains it.
+    #[test]
+    fn refusal_scan_is_time_bounded() {
+        let log = "\
+2026-09-01T00:38:01.1Z  INFO augmentagent::self_improve: auto-PR: PR #987: resume refused — blast radius on `Cargo.lock` runs_today=1
+2026-09-02T00:27:02.2Z  INFO augmentagent::self_improve: auto-PR: PR #987: resume refused — blast radius on `Cargo.lock` runs_today=1
+2026-09-13T00:38:01.1Z  INFO augmentagent::self_improve: auto-PR: PR #991: resume skipped — merge conflict with main runs_today=1
+";
+        // A three-day window at 2026-09-14 sees only the recent one, which on
+        // its own is not yet a loop.
+        let recent = scan_repeated_refusals(log, t0() - Duration::days(3));
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].0, 991);
+        assert_eq!(recent[0].2, 1, "one refusal is not a repeat");
+        assert!(
+            analyze(
+                &HealthInputs { repeated_refusals: recent, ..healthy() },
+                &Thresholds::default()
+            )
+            .is_empty(),
+            "a single refusal must not alert"
+        );
+        // A wide window still sees the historical pair.
+        let all = scan_repeated_refusals(log, t0() - Duration::days(30));
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.iter().find(|r| r.0 == 987).unwrap().2, 2);
+        // Lines without a timestamp are never counted.
+        assert!(scan_repeated_refusals("PR #987: resume refused — x", t0() - Duration::days(30)).is_empty());
     }
 
     #[test]
@@ -767,7 +807,7 @@ mod tests {
         assert_eq!(loop_line.format("%Y-%m-%dT%H:%M").to_string(), "2026-09-14T01:03");
         assert!(last_timestamp_with(log, "nothing matches this").is_none());
 
-        let refusals = scan_repeated_refusals(log);
+        let refusals = scan_repeated_refusals(log, t0() - Duration::days(3));
         assert_eq!(refusals.len(), 1, "the merge is not a refusal: {refusals:?}");
         let (pr, reason, times) = &refusals[0];
         assert_eq!(*pr, 987);
