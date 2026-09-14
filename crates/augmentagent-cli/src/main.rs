@@ -1528,6 +1528,17 @@ enum DiscordOp {
 
 #[derive(Subcommand)]
 enum DocOp {
+    /// Render Markdown to a real PDF under WIKI_ROOT, ready for Discord attachment.
+    RenderPdf {
+        /// Wiki-relative Markdown or text file (absolute paths must also be inside WIKI_ROOT).
+        file: PathBuf,
+        /// Output .pdf path; defaults to the input with a .pdf extension. Must not exist.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Print a JSON receipt including the ATTACH marker.
+        #[arg(long)]
+        json: bool,
+    },
     /// Extract text from a PDF / DOCX / DOC. Writes `<file>.txt` beside the
     /// input unless `--out` is given (`--out -` prints the text to stdout after
     /// the receipt line) and reports whether the OCR stage ran.
@@ -2164,6 +2175,33 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("data.db"));
     if let Cmd::Finance { ref op } = cli.cmd {
         return finance::run(op, &db_path, cli.wiki_dir.as_deref()).await;
+    }
+    // PDF exports need no database or network credentials. In particular, do
+    // not try to create data.db when invoked from a fresh wiki directory.
+    if let Cmd::Doc {
+        op:
+            DocOp::RenderPdf {
+                ref file,
+                ref out,
+                json,
+            },
+    } = cli.cmd
+    {
+        let root = std::env::var_os("WIKI_ROOT")
+            .map(PathBuf::from)
+            .context("WIKI_ROOT must be set to the wiki directory for PDF generation")?;
+        let receipt = augmentagent_docs::pdf::render_pdf(&root, file, out.as_deref()).await?;
+        if json {
+            println!("{}", serde_json::to_string(&receipt)?);
+        } else {
+            println!(
+                "Rendered {} ({} bytes)\n{}",
+                receipt.path.display(),
+                receipt.bytes,
+                receipt.attach
+            );
+        }
+        return Ok(());
     }
     info!(db = %db_path.display(), "opening store");
     let store = Arc::new(Store::open(&db_path).context("open store")?);
@@ -3120,6 +3158,7 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Doc { ref op } => match op {
+            DocOp::RenderPdf { .. } => unreachable!("PDF rendering dispatched before store initialization"),
             DocOp::Extract { file, out, kind, no_ocr, json } => {
                 doc_cmd::run_doc_extract(file.clone(), out.clone(), kind.clone(), *no_ocr, *json)
                     .await
@@ -12471,15 +12510,15 @@ mod imessage_fetch_attachment_tests {
         std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDTEST");
         std::env::set_var("AWS_SECRET_ACCESS_KEY", "SECRETTEST");
         std::env::set_var(s3::SESSION_DIR_ENV, &session);
-        let key = "conversations/Alice B/attachments/9-IMG_001.jpeg";
-        let uri = format!("s3://imsg-bundle/{key}");
+        let object_path = "conversations/Alice B/attachments/9-IMG_001.jpeg";
+        let uri = format!("s3://imsg-bundle/{object_path}");
         let cli = Cli::try_parse_from(["augmentagent", "imessage", "fetch-attachment", &uri]).expect("verb parses");
         assert!(matches!(cli.cmd, Cmd::Imessage { op: ImessageOp::FetchAttachment { ref s3_uri } } if *s3_uri == uri));
 
         run_imessage_fetch_attachment(&uri).await.expect("fetch");
 
         mock.assert_async().await;
-        assert_eq!(std::fs::read(Path::new(&session).join(s3::local_name(key))).expect("saved"), b"jpegbytes");
+        assert_eq!(std::fs::read(Path::new(&session).join(s3::local_name(object_path))).expect("saved"), b"jpegbytes");
         assert!(stale.exists(), "still stranded: only the sweep below may reclaim it");
         sweep_imessage_attachments(&[(s3::SESSION_DIR_ENV.into(), session.clone())]);
         assert!(!Path::new(&session).exists(), "call site removes the session dir");
