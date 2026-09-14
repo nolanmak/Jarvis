@@ -49,6 +49,7 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod whatsapp_history;
+mod autopr_health;
 mod channel_router;
 mod code_mode;
 mod doc_cmd;
@@ -450,6 +451,19 @@ enum Cmd {
     /// tool binaries on `$PATH`, build freshness, `.env` presence). Emits
     /// severity-tagged findings; exit 0 unless any check is `error`. `--fix`
     /// lands as a follow-up issue — doctor stays strictly read-only.
+    /// Health watchdog for the auto-PR loop (#997). Reads the same evidence
+    /// a human would — the daemon log, the baseline cache, free disk, open
+    /// drafts — and reports anything that stops the loop shipping. Run on a
+    /// timer with `--notify` so an outage announces itself instead of
+    /// waiting to be noticed. Exit 1 when anything is an alert.
+    AutoprHealth {
+        /// Post the findings to Discord (DISCORD_WEBHOOK_URL). Silent when healthy.
+        #[arg(long, default_value_t = false)]
+        notify: bool,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Doctor {
         /// Force JSON (`--json`) or human table. Default: auto — JSON when
         /// stdout is piped, table on a tty.
@@ -3830,6 +3844,11 @@ async fn main() -> Result<()> {
         // === setup+maintenance subcommands (alphabetical) ===
         Cmd::Channel { name, op, args } => channel_router::dispatch(name, op, args).await,
         Cmd::CodeMode { op } => code_mode::run(store, op).await,
+        Cmd::AutoprHealth { notify, json } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let code = autopr_health::run(&root, notify, json).await?;
+            std::process::exit(code);
+        }
         Cmd::Doctor { json, deep } => {
             let code = doctor::run(store, json, deep).await?;
             std::process::exit(code);
