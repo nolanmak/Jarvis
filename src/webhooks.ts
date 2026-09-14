@@ -369,7 +369,8 @@ router.post(
 // WorkItem payload without another API call:
 //   DM:      { type:"dm",      id, conversation_id, account_id, with, author,
 //              text, created_at }
-//   Comment: { type:"comment", id, post_id, author, text, created_at }
+//   Comment: { type:"comment", id, post_id, author, text, created_at,
+//              attachment_url }
 
 interface NormalizedWebhookEvent {
   kind: "dm" | "comment";
@@ -498,6 +499,9 @@ function normalizeSocialApiEvent(ev: Record<string, unknown>): NormalizedWebhook
       // Which network the comment landed on — see the DM branch above.
       sub_platform: str(ev, "platform", "network", "provider"),
       author: str(ev, "author", "from"),
+      // #858: a tag/mention that carries media. Same aliases as the DM
+      // branch; dropping it here left the draft blind to the attachment.
+      attachment_url: str(ev, "attachment_url", "media_url", "attachment"),
       text: str(ev, "text", "body", "message"),
       created_at: str(ev, "created_at", "timestamp", "ts"),
     },

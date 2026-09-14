@@ -214,6 +214,7 @@ test("socialapi post mentions are not misclassified as DMs", async () => {
       platform: "instagram",
       author: "block_space_phl",
       text: "@phillyteche",
+      attachment_url: "https://cdn.example/tagged.jpg",
     });
     const res = await post(port, "/webhooks/socialapi", body, {
       "content-type": "application/json",
@@ -223,9 +224,15 @@ test("socialapi post mentions are not misclassified as DMs", async () => {
     assert.strictEqual(JSON.parse(res.body).accepted, 1);
     const row = db
       .getDb()
-      .prepare("SELECT kind FROM socialapi_webhook_events WHERE id = ?")
+      .prepare("SELECT kind, payload_json FROM socialapi_webhook_events WHERE id = ?")
       .get("socialapi:comment:post_1:comment_1");
     assert.strictEqual(row.kind, "comment");
+    // #858: the media on a tagged post must survive normalization, or the
+    // Rust drain drafts as if nothing was attached.
+    assert.strictEqual(
+      JSON.parse(row.payload_json).attachment_url,
+      "https://cdn.example/tagged.jpg"
+    );
   } finally {
     s.close();
   }

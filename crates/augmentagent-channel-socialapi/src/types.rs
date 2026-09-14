@@ -184,6 +184,10 @@ pub struct Comment {
     /// Parent comment id for threaded replies.
     #[serde(default, deserialize_with = "null_to_default")]
     pub parent_id: Option<String>,
+    /// Media on a tagged/mentioned post (#858). Same wire posture as
+    /// [`DmMessage::attachment_url`].
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub attachment_url: Option<String>,
     #[serde(default, deserialize_with = "null_to_default")]
     pub created_at: String,
     #[serde(default, deserialize_with = "null_to_default")]
@@ -495,6 +499,25 @@ mod tests {
         assert_eq!(c.platform_id, "cmt_1");
         assert_eq!(c.author_display(), "");
         assert!(!c.capabilities.can_reply);
+    }
+
+    /// #858: a tagged/mentioned post's media rides `attachment_url`; a
+    /// literal `null` is `None`.
+    #[test]
+    fn comment_decodes_attachment_url_and_null() {
+        let live = |v: serde_json::Value| -> Comment {
+            serde_json::from_value(serde_json::json!({
+                "platform_id": "cmt_1", "text": null, "author_name": "jane",
+                "is_owner": false, "created_at": "2026-08-30T00:00:00Z",
+                "attachment_url": v
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            live(serde_json::json!("https://cdn.example/tagged.jpg")).attachment_url.as_deref(),
+            Some("https://cdn.example/tagged.jpg")
+        );
+        assert_eq!(live(serde_json::Value::Null).attachment_url, None);
     }
 
     #[test]
