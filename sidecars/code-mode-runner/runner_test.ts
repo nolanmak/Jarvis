@@ -546,6 +546,117 @@ Deno.test("#183: typescript type-cast program parses and runs", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// #989 regression: `console.log` inside the program must NOT land on stdout.
+// Stdout is the NDJSON protocol channel — the Rust frame reader hard-fails
+// on the first non-JSON line (`protocol: decode "wiki hint: ": expected
+// value`). The runner rebinds console.* to stderr so a chatty program still
+// completes: every stdout line is a JSON frame, the run ends with
+// {"final": null} / exit 0, and the logged text is visible on stderr.
+// ---------------------------------------------------------------------------
+Deno.test("#989: console.log goes to stderr, never corrupts stdout frames", async () => {
+  const program = `
+    async function main(){
+      const hint = await tools.wiki.draftHint({ from: "x" });
+      console.log("wiki hint:", hint);
+      console.info("info", { nested: true });
+      console.warn("warn line");
+      console.error("error line");
+      console.debug("debug line");
+      await tools.draft("gmail", "body", "reason");
+    }
+    await main();
+  `;
+  const cmd = new Deno.Command(Deno.execPath(), {
+    args: ["run", RUNNER],
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "piped",
+  });
+  const child = cmd.spawn();
+  const writer = child.stdin.getWriter();
+  await writer.write(
+    new TextEncoder().encode(
+      JSON.stringify({ program, manifest: ["wiki.draftHint", "draft"] }) + "\n",
+    ),
+  );
+
+  // Raw stdout capture — we assert on the bytes, not on pre-parsed frames,
+  // because the defect is precisely a non-JSON line on this stream.
+  const rawLines: string[] = [];
+  const reader = child.stdout.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  let stdinClosed = false;
+  const deadline = Date.now() + 15_000;
+  while (true) {
+    if (Date.now() > deadline) {
+      try {
+        child.kill("SIGKILL");
+      } catch { /* already dead */ }
+      throw new Error("test wall clock exceeded");
+    }
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value);
+    let idx;
+    while ((idx = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, idx);
+      buf = buf.slice(idx + 1);
+      if (line.length === 0) continue;
+      rawLines.push(line);
+      let frame: Frame | undefined;
+      try {
+        frame = JSON.parse(line) as Frame;
+      } catch {
+        // Leave it unparsed; the assertion below reports the offending line.
+      }
+      if (frame && "call" in frame && !stdinClosed) {
+        const result = frame.call === "wiki.draftHint" ? "podcast-invite" : null;
+        await writer.write(
+          new TextEncoder().encode(JSON.stringify({ id: frame.id, result }) + "\n"),
+        );
+      }
+      if (frame && ("final" in frame || "error" in frame) && !stdinClosed) {
+        stdinClosed = true;
+        try {
+          await writer.close();
+        } catch { /* already closed */ }
+      }
+    }
+  }
+  if (!stdinClosed) {
+    try {
+      await writer.close();
+    } catch { /* ignore */ }
+  }
+  reader.releaseLock();
+  const stderr = new TextDecoder().decode(await new Response(child.stderr).bytes());
+  const status = await child.status;
+
+  const bad = rawLines.filter((l) => {
+    try {
+      JSON.parse(l);
+      return false;
+    } catch {
+      return true;
+    }
+  });
+  assertEquals(bad, [], `non-JSON line(s) on stdout would break the Rust frame reader`);
+  assertEquals(status.code, 0, `stderr: ${stderr}`);
+  const frames = rawLines.map((l) => JSON.parse(l) as Frame);
+  const finals = frames.filter((f) => "final" in f);
+  assertEquals(finals.length, 1, "expected exactly one final frame");
+  assertEquals(finals[0].final, null);
+  const draftCalls = frames.filter((f) => "call" in f && f.call === "draft");
+  assertEquals(draftCalls.length, 1, "draft must still land after console output");
+  // The logged text is preserved on stderr for the parent to forward.
+  assertStringIncludes(stderr, "wiki hint: podcast-invite");
+  assertStringIncludes(stderr, "warn line");
+  assertStringIncludes(stderr, "error line");
+  assertStringIncludes(stderr, "debug line");
+});
+
+// ---------------------------------------------------------------------------
 // #183 unit test: `wrapProgramForModule` strips a trailing `main();` /
 // `await main();` so the injected `export const __result__ = await main();`
 // doesn't double-invoke. Also leaves programs with no trailing main() alone.

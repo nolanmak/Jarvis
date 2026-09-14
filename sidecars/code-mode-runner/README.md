@@ -65,7 +65,9 @@ is therefore launched as `deno run runner.ts`.
 
 NDJSON, one JSON object per line, both directions over stdin/stdout. Stderr is
 unused by the protocol (Deno may print warnings there; the Rust caller should
-log them).
+log them). The runner rebinds the program's `console.*` methods to stderr
+before the program runs, so `console.log(...)` inside a program never lands a
+non-JSON line on stdout.
 
 ### Header (parent → runner, first line)
 
