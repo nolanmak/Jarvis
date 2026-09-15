@@ -718,7 +718,7 @@ impl RateGovernor for SqliteGovernor {
 // =============================================================================
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicI64, Ordering};
     use tempfile::TempDir;

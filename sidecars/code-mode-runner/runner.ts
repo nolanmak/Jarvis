@@ -38,6 +38,35 @@ function writeLine(obj: unknown): Promise<void> {
   return Deno.stdout.write(encoder.encode(line)).then(() => {});
 }
 
+// Stdout is the protocol channel, so program-side `console.*` output (which
+// the system prompt explicitly permits) must never reach it — one stray
+// `console.log("wiki hint:", …)` line makes the parent's frame decoder fail
+// (#989). Rebind every console method to stderr, which the parent drains as
+// plain log text. Stdio needs no `--allow-*` permission.
+//
+// The writes are synchronous on purpose: console output stays ordered with
+// the tool calls around it and nothing is lost when the run ends. A full
+// pipe cannot wedge the run — the Rust parent (`drain_stderr` in
+// crates/augmentagent-channel-core/src/code_mode/runner.rs) reads stderr on
+// a background task from before it sends the header, so `writeSync` only
+// stalls until the parent catches up; a looping program is still cut off by
+// the wall clock. `console_log_in_program_does_not_corrupt_protocol` pushes
+// well over a pipe buffer through here to keep that contract honest.
+function redirectConsoleToStderr(): void {
+  const write = (...args: unknown[]) => {
+    const line = args
+      .map((a) => (typeof a === "string" ? a : Deno.inspect(a)))
+      .join(" ") + "\n";
+    let buf = encoder.encode(line);
+    while (buf.length > 0) {
+      buf = buf.subarray(Deno.stderr.writeSync(buf));
+    }
+  };
+  for (const level of ["log", "info", "warn", "error", "debug", "trace"] as const) {
+    console[level] = write;
+  }
+}
+
 // Pending RPCs keyed by id.
 type Pending = {
   resolve: (v: unknown) => void;
@@ -318,6 +347,10 @@ async function run(): Promise<void> {
   const tree = buildTree(manifest as string[]);
   // deno-lint-ignore no-explicit-any
   (globalThis as any).tools = makeProxy(tree, []);
+  // Must precede the program import below: the module shares `globalThis`
+  // (and therefore `console`) with the runner, so this covers top-level
+  // logging as well as anything inside main().
+  redirectConsoleToStderr();
 
   startReaderLoop();
 

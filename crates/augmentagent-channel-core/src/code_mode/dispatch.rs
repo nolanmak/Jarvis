@@ -188,10 +188,11 @@ impl Dispatcher for StubDispatcher {
 /// row when `tools.draft` fires.
 ///
 /// `channel` is the canonical platform string (`"gmail"`, `"linkedin"`, …)
-/// the program passes as the first arg to `tools.draft(channel, body,
-/// reason)`. The dispatcher rejects a draft whose channel arg doesn't match
-/// the dispatcher's own `channel` — this prevents a code-mode program from
-/// landing a draft on a different channel than the triage flow set up.
+/// the triage flow is wired for. It is the source of truth for the terminal
+/// `tools.draft(channel, body, reason)` call: the program's own channel arg
+/// is advisory only (the model routinely guesses `"gmail"` for a DM, #989),
+/// so a disagreement is logged and the draft still lands on this channel.
+/// A code-mode program therefore cannot redirect a draft elsewhere.
 #[derive(Debug, Clone)]
 pub struct MessageContext {
     /// Canonical channel name (e.g. `"gmail"`, `"linkedin"`).
@@ -350,12 +351,14 @@ impl<'a> DefaultDispatcher<'a> {
         self.trace.lock().expect("trace mutex poisoned").clone()
     }
 
-    /// Map the dispatcher's `MessageContext` + the program's `(channel,
-    /// reason)` arg into the `ActionRequest` the rate governor wants. v1 uses
-    /// the conservative defaults (`Risk::Medium`, treat target as a stranger
-    /// so the approval-required matrix kicks in for unknown senders).
-    fn build_action_request(&self, channel: &str, reason: &str) -> ActionRequest {
-        let platform = Platform::parse(channel).unwrap_or(Platform::Twitter);
+    /// Map the dispatcher's `MessageContext` + the program's `reason` arg
+    /// into the `ActionRequest` the rate governor wants. The platform comes
+    /// from the wired channel, never from the program. v1 uses the
+    /// conservative defaults (`Risk::Medium`, treat target as a stranger so
+    /// the approval-required matrix kicks in for unknown senders).
+    fn build_action_request(&self, reason: &str) -> ActionRequest {
+        let platform =
+            Platform::parse(&self.message_ctx.channel).unwrap_or(Platform::Twitter);
         ActionRequest {
             platform,
             action: ActionKind::Reply,
@@ -479,16 +482,19 @@ impl<'a> DefaultDispatcher<'a> {
             "draft" => {
                 let (channel, body, reason) =
                     parse_draft_args(args).map_err(DispatchError::BadArgs)?;
+                // The `.d.ts` never declares the `Channel` union and every
+                // prompt example says `"gmail"`, so the model's channel arg
+                // is unreliable (#989). Route on the wired channel — the
+                // action row is built from `message_ctx.email` anyway.
                 if !channel.eq_ignore_ascii_case(&self.message_ctx.channel) {
-                    let msg = format!(
-                        "channel mismatch: program targeted {channel:?}, dispatcher \
-                         is wired for {:?}",
-                        self.message_ctx.channel
+                    tracing::warn!(
+                        program_channel = %channel,
+                        wired_channel = %self.message_ctx.channel,
+                        "code-mode draft targeted a different channel; using the wired one"
                     );
-                    return Err(DispatchError::Internal(msg));
                 }
                 if let Some(gov) = self.governor {
-                    let req = self.build_action_request(&channel, &reason);
+                    let req = self.build_action_request(&reason);
                     if let Err(d) = gov.permit(req).await {
                         return Err(DispatchError::PermitDenied(d.to_string()));
                     }
@@ -690,5 +696,104 @@ mod tests {
         assert_eq!(c, "gmail");
         assert_eq!(b, "body");
         assert_eq!(r, "reason");
+    }
+
+    /// Grants every permit and keeps the requests it was shown, so a test
+    /// can assert which platform the dispatcher derived.
+    #[derive(Default)]
+    struct RecordingGovernor(Mutex<Vec<ActionRequest>>);
+
+    #[async_trait]
+    impl RateGovernor for RecordingGovernor {
+        async fn permit(
+            &self,
+            req: ActionRequest,
+        ) -> Result<crate::governor::Permit, crate::governor::Denial> {
+            self.0.lock().unwrap().push(req.clone());
+            Ok(crate::governor::Permit {
+                id: uuid::Uuid::new_v4(),
+                req,
+                reserved_at_ms: 0,
+            })
+        }
+        async fn record(
+            &self,
+            _: crate::governor::Permit,
+            _: crate::governor::Outcome,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn record_halt(
+            &self,
+            _: Platform,
+            _: crate::governor::HaltReason,
+            _: i64,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn halt_status(&self, _: Platform) -> Option<crate::governor::HaltState> {
+            None
+        }
+        async fn is_halted(&self, _: Platform) -> Option<i64> {
+            None
+        }
+    }
+
+    fn linkedin_email() -> Email {
+        Email {
+            attachments: Vec::new(),
+            to: String::new(),
+            cc: String::new(),
+            message_id: "urn:li:messagingMessage:test-989".into(),
+            thread_id: Some("urn:li:msg_conversation:test-989".into()),
+            from: "linkedin:urn:li:fsd_profile:sender-989".into(),
+            subject: "[LinkedIn DM from Sam Example]".into(),
+            body: "Hey, any chance you've seen that email?".into(),
+            date: "2026-09-13T23:49:06Z".into(),
+            account_entity_id: Some("acc1".into()),
+            platform: "linkedin".into(),
+            kind: "dm".into(),
+        }
+    }
+
+    /// #989 — the `.d.ts` never declares the `Channel` union and every prompt
+    /// example says `tools.draft("gmail", …)`, so the model guessed `"gmail"`
+    /// for a LinkedIn DM and the dispatcher hard-failed the whole run. The
+    /// wired channel is the source of truth: the draft must land, and the
+    /// governor must be asked about LinkedIn, not the model's guess.
+    #[tokio::test]
+    async fn draft_uses_wired_channel_over_program_arg() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dispatch-989.db");
+        crate::governor::tests::seed_node_owned_tables(&path);
+        let store = Store::open(&path).unwrap();
+        let gov = RecordingGovernor::default();
+        let ctx = MessageContext {
+            channel: "linkedin".into(),
+            email: linkedin_email(),
+            account_id: Some("acc1".into()),
+        };
+        let d = DefaultDispatcher::new(&store, ctx, "// source").with_governor(&gov);
+
+        let v = d
+            .call("draft", json!(["gmail", "Thanks — I'll take a look.", "ack"]))
+            .await
+            .expect("draft must land despite the model's channel guess");
+        assert_eq!(v, Value::Null);
+        assert!(d.last_action_id().is_some(), "action row must be written");
+
+        let seen = gov.0.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].platform,
+            Platform::LinkedIn,
+            "governor must see the wired channel, not the program's arg"
+        );
+        drop(seen);
+
+        let trace = d.drain_trace();
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].call, "draft");
+        assert!(trace[0].error.is_none(), "trace: {trace:?}");
     }
 }

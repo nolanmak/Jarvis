@@ -235,6 +235,10 @@ pub async fn run_program(
     // Drain stderr in the background so a chatty `deno run` warning can't
     // wedge the pipe. We log it at debug level (it's almost always boilerplate
     // about "Warning: ..."), but keep the join handle so the future is owned.
+    // Since #989 the sidecar also routes the program's `console.*` output
+    // here with synchronous writes, so this must be running before the
+    // header goes out and for the whole RPC loop — a full pipe would block
+    // the sidecar mid-program.
     let stderr_task = tokio::spawn(drain_stderr(stderr));
 
     // First NDJSON frame: header. Serialise the manifest the runner.ts
