@@ -4961,10 +4961,45 @@ fn body_for_gmail_write(body: String, subject: &str) -> Result<String> {
                      the subject header is --subject ({subject})"
                 );
             }
+            // `WIKI_ROOT` is in the env only when the wiki-ask drafter is
+            // the caller (`ask_opts` sets it under `restrict_env`).
+            let drafter = std::env::var_os("WIKI_ROOT").is_some();
+            let (clean, receipt) = strip_register_receipt(&clean, drafter)?;
+            if receipt {
+                eprintln!("note: checked and dropped the \"register:\" receipt line from the body (#994)");
+            }
             Ok(clean)
         }
         Err(e) => anyhow::bail!("{e}; pass the intended subject as --subject"),
     }
+}
+
+/// #994 — the wiki-ask drafter heads an email body with its `register:`
+/// receipt, which makes this the one place holding both the receipt and the
+/// whole draft, so the tool-sent draft is gated here, before any Gmail
+/// write: a `drafter` body with no receipt is refused (the one deterministic
+/// way to make the drafter classify the recipient), a body contradicting its
+/// receipt is refused (recase and re-run), and the owner-facing receipt is
+/// dropped so it never ships. Only the first line is read as a receipt; a
+/// body that mentions "register:" anywhere else is recipient content and is
+/// returned verbatim, as is any hand-run body without one.
+fn strip_register_receipt(body: &str, drafter: bool) -> Result<(String, bool)> {
+    use augmentagent_approval_discord::register::{audit_register_receipts, is_register_receipt};
+    let lead = body.trim_start_matches(['\r', '\n']);
+    let (first, rest) = lead.split_once('\n').unwrap_or((lead, ""));
+    if !is_register_receipt(first) {
+        anyhow::ensure!(
+            !drafter,
+            "the body has no `register:` receipt as its first line (#994): classify the \
+             recipient's casing from their own messages, put `register: standard|lowercase|\
+             unknown ...` above the body, and re-run"
+        );
+        return Ok((body.to_string(), false));
+    }
+    if let Some(note) = audit_register_receipts(lead).into_iter().next() {
+        anyhow::bail!("{note}: recase the body to match its receipt, then re-run");
+    }
+    Ok((rest.trim_start_matches(['\r', '\n']).to_string(), true))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -8559,9 +8594,32 @@ mod approval_body_tests {
     use super::{
         body_without_leaked_subject, compose_card_identity, compose_pending_disposition,
         revise_recipient, revise_subject, revised_subject, strip_approval_envelope_markers,
-        strip_leading_subject_line, subjects_agree, thread_for_revised_subject,
-        thread_subject_conflict, ComposePendingDisposition, ThreadSubject,
+        strip_leading_subject_line, strip_register_receipt, subjects_agree,
+        thread_for_revised_subject, thread_subject_conflict, ComposePendingDisposition,
+        ThreadSubject,
     };
+
+    /// #994 — a Gmail body is checked against the `register:` receipt on its
+    /// first line and refused on a contradiction; a matching receipt is
+    /// dropped so it never ships; the drafter is refused without one; and a
+    /// body without one is otherwise untouched, even when a later line reads
+    /// like a receipt (CRLF and trailing newline included).
+    #[test]
+    fn register_receipt_gates_and_is_dropped_from_a_gmail_body() {
+        let receipt = "register: standard (she capitalizes), mirroring\n\n";
+        let good = "Hi Alice,\n\nThanks for checking in on the proposal.\n";
+        assert_eq!(
+            strip_register_receipt(&format!("{receipt}{good}"), true).unwrap(),
+            (good.to_string(), true)
+        );
+        let bad = format!("{receipt}hi alice,\n\nthanks for checking in on the proposal.\n");
+        let err = strip_register_receipt(&bad, true).unwrap_err().to_string();
+        assert!(err.contains("register mismatch") && err.contains("recase"), "{err}");
+        let plain = "Hi Alice,\r\n\r\nregister: standard is the one we discussed.\r\n";
+        assert_eq!(strip_register_receipt(plain, false).unwrap(), (plain.to_string(), false));
+        let err = strip_register_receipt(plain, true).unwrap_err().to_string();
+        assert!(err.contains("no `register:` receipt as its first line"), "{err}");
+    }
 
     // #962 — who the card's From line (and the actions/emails rows) name.
     #[test]

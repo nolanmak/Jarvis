@@ -649,7 +649,7 @@ impl LoopScheduler {
         match self.runner.run_prompt(&l.prompt).await {
             Ok(answer) => {
                 let header = format!("🔁 loop `{}` · _{}_", l.id, truncate(&l.prompt, 80));
-                let body = format!("{header}\n\n{answer}");
+                let body = loop_result_body(&header, &answer);
                 if let Err(e) = self.poster.post_to(&l.channel_ref, &body).await {
                     warn!(loop_id = %l.id, "loop post failed: {e:#}");
                     let _ = self.store.record_user_loop_run(
@@ -675,6 +675,18 @@ impl LoopScheduler {
             }
         }
     }
+}
+
+/// The posted text for one loop result. Loops draft through the same
+/// wiki-ask toolbelt as interactive asks but post through [`LoopPoster`],
+/// not `prepare_answer_delivery`, so the #994 register audit runs here.
+fn loop_result_body(header: &str, answer: &str) -> String {
+    let mut body = format!("{header}\n\n{answer}");
+    for note in crate::register::audit_discord_reply(answer) {
+        body.push_str("\n\u{26a0}\u{fe0f} ");
+        body.push_str(&note);
+    }
+    body
 }
 
 fn now_millis() -> i64 {
@@ -901,6 +913,17 @@ mod cron_helpers_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #994 — a loop-drafted message is audited like an interactive one.
+    #[test]
+    fn loop_results_carry_the_register_audit() {
+        let answer = "register: standard (she capitalizes), mirroring\n```\n\
+                      hey casey, thanks for checking in on the proposal.\n```";
+        let body = loop_result_body("🔁 loop `x`", answer);
+        assert!(body.starts_with("🔁 loop `x`\n\nregister:"), "{body}");
+        assert!(body.contains("\u{26a0}\u{fe0f} register mismatch"), "{body}");
+        assert_eq!(loop_result_body("h", "all quiet."), "h\n\nall quiet.");
+    }
 
     #[test]
     fn interval_parsing() {

@@ -142,6 +142,13 @@ pub async fn prepare_answer_delivery(
 ) -> (String, Vec<CreateAttachment>) {
     let extracted = extract_attach_markers(answer, wiki_root);
     let mut notes = extracted.notes;
+    // #994 — a `register:` receipt that contradicts the draft under it, or a
+    // draft with no receipt at all, is flagged here, in the same visible
+    // channel as a refused marker, rather than posted as if the draft
+    // matched the recipient. Every Discord post of a wiki-ask answer is one
+    // of: `event_handler.rs` (`prepare_answer_delivery`), `wiki ask --post`
+    // (`main.rs`, same fn), or a `/loop` result (`loops::loop_result_body`).
+    notes.extend(crate::register::audit_discord_reply(&extracted.text));
 
     let mut attachments = Vec::with_capacity(extracted.files.len());
     for path in &extracted.files {
@@ -313,5 +320,25 @@ mod tests {
         assert_eq!(files2.len(), 1);
         assert!(text2.starts_with("Summary here."));
         assert!(!text2.contains("ATTACH:"));
+    }
+
+    /// #994 — the posted reply carries a visible note when the draft
+    /// contradicts its receipt or was returned bare (no receipt, no fence —
+    /// the reported turn), and stays byte-identical when it matches (the
+    /// receipt line itself is owner-facing and kept).
+    #[tokio::test]
+    async fn register_mismatch_is_posted_as_a_warning() {
+        let draft = "hey casey, thanks for checking in. i'll send the proposal tonight.";
+        let bad = format!("register: standard (she capitalizes), mirroring\n{draft}");
+        let (text, _) = prepare_answer_delivery(&bad, None).await;
+        assert!(text.starts_with(&bad), "draft must still be posted: {text}");
+        assert!(text.contains("\u{26a0}\u{fe0f} register mismatch"), "{text}");
+        let (text, _) = prepare_answer_delivery(draft, None).await;
+        assert!(text.starts_with(draft), "{text}");
+        assert!(text.contains("\u{26a0}\u{fe0f} draft with no `register:` receipt"), "{text}");
+        let good = "register: standard (she capitalizes), mirroring\n\
+                    Hey Casey, thanks for checking in. I'll send the proposal tonight.";
+        let (text, _) = prepare_answer_delivery(good, None).await;
+        assert_eq!(text, good);
     }
 }

@@ -2533,6 +2533,37 @@ mod tests {
         }
     }
 
+    /// #994 — an all-lowercase text was drafted for a recipient who
+    /// capitalizes, even though the owner's chameleon rule was injected as
+    /// a top-priority owner rule. The prompt half of the fix lives in
+    /// `wiki-ask.md`, which `ask_opts` embeds for every drafting entry point
+    /// (Discord `WikiQuerier`, `wiki ask`, `/loop` runs); the deterministic
+    /// half is `augmentagent_approval_discord::register`, which checks the
+    /// draft against the receipt at delivery. This pins the receipt format
+    /// that parser expects, so a prompt edit can't silently desync the two.
+    #[test]
+    fn ask_opts_prompt_requires_register_receipt_on_drafts() {
+        let repo = tempfile::tempdir().expect("repo tmpdir");
+        let wiki = tempfile::tempdir().expect("wiki tmpdir");
+        let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
+
+        assert!(opts.system_prompt.contains("## Register matching (drafts)"));
+        for receipt in [
+            "register: standard (she capitalizes), mirroring",
+            "register: lowercase (he types all-lowercase), mirroring",
+            "register: unknown, defaulting to lowercase (no samples on file)",
+        ] {
+            assert!(
+                opts.system_prompt.contains(receipt),
+                "wiki-ask.md lost the #994 register-matching protocol: {receipt:?}"
+            );
+            assert!(
+                augmentagent_approval_discord::register::is_register_receipt(receipt),
+                "prompt example is not parseable by the delivery-layer audit: {receipt:?}"
+            );
+        }
+    }
+
     /// #317 — the reasoner routes `mcpServers` to `--mcp-config` and keeps
     /// the rest on `--settings`.
     #[test]
