@@ -88,5 +88,8 @@ scripts/whatsapp/config.json
 *.sqlite-shm
 __pycache__/
 
-# Token-usage accounting — machine-local runtime data, never tracked (#1001).
+# Observability logs — machine-local runtime data, never tracked (#1001/#1004).
+# Both normally live in ~/.local/state/augmentagent; these entries are belt
+# and braces for anyone pointing the env overrides at the working tree.
 token-usage.jsonl
+tool-audit.log

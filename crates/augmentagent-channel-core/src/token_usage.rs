@@ -122,6 +122,11 @@ pub fn default_usage_log_path() -> PathBuf {
 pub struct UsageLogger {
     path: PathBuf,
     write_lock: Arc<Mutex<()>>,
+    /// When this process last ran a retention pass (#1004).
+    last_prune: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Only the process-global daemon log prunes itself; a logger built with
+    /// an explicit path is a plain writer (#1004).
+    manages_retention: bool,
 }
 
 impl UsageLogger {
@@ -129,12 +134,57 @@ impl UsageLogger {
         Self {
             path,
             write_lock: Arc::new(Mutex::new(())),
+            last_prune: Arc::new(Mutex::new(None)),
+            manages_retention: false,
+        }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    /// Drop records past the retention window, at most once an hour per
+    /// process. Cheap in the common case: the first-line check reads a few
+    /// bytes and returns. Runs under the append lock so a concurrent write
+    /// cannot be lost to the rewrite.
+    fn maybe_prune(&self) {
+        if !self.manages_retention {
+            return;
+        }
+        let days = crate::log_retention::token_usage_retention_days();
+        if days == 0 {
+            return;
+        }
+        {
+            let mut last = self.last_prune.lock().unwrap_or_else(|e| e.into_inner());
+            let due = last.is_none_or(|t: std::time::Instant| {
+                t.elapsed() >= std::time::Duration::from_secs(3600)
+            });
+            if !due {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let out = crate::log_retention::prune_file(&self.path, crate::log_retention::cutoff(days));
+        if out.removed > 0 {
+            tracing::info!(
+                removed = out.removed,
+                kept = out.kept,
+                days,
+                "token-usage: pruned records past the retention window"
+            );
         }
     }
 
     pub fn global() -> Arc<UsageLogger> {
         static GLOBAL: std::sync::OnceLock<Arc<UsageLogger>> = std::sync::OnceLock::new();
-        Arc::clone(GLOBAL.get_or_init(|| Arc::new(UsageLogger::new(default_usage_log_path()))))
+        Arc::clone(GLOBAL.get_or_init(|| {
+            Arc::new(UsageLogger {
+                manages_retention: true,
+                ..UsageLogger::new(default_usage_log_path())
+            })
+        }))
     }
 
     /// Best effort by design: accounting must never fail a call the model
@@ -158,6 +208,10 @@ impl UsageLogger {
             }
             Err(e) => tracing::debug!("token usage log unavailable: {e}"),
         }
+        // #1004 — housekeeping after the record has landed and the append
+        // lock is released, so retention can never delay or reorder a write.
+        drop(_guard);
+        self.maybe_prune();
     }
 }
 
@@ -377,6 +431,25 @@ mod tests {
         for k in ["ts", "provider", "model", "input", "output", "duration_ms"] {
             assert!(first.get(k).is_some(), "missing {k} in {first}");
         }
+    }
+
+    /// #1004 — a logger built with an explicit path must behave like a plain
+    /// writer. Retention belongs to the managed daemon log alone; anything
+    /// else would make "write it, read it back" untrue for a caller pointing
+    /// a logger at a file of their own (and silently ate a fixture in the
+    /// tool-audit suite before this distinction existed).
+    #[test]
+    fn only_the_global_logger_prunes_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit.jsonl");
+        let logger = UsageLogger::new(path.clone());
+        assert!(!logger.manages_retention);
+        // A record far older than any retention window survives.
+        logger.append(&serde_json::from_str(&rec("2020-01-01T00:00:00Z", "m", 5, 5)).unwrap());
+        logger.append(&serde_json::from_str(&rec("2020-01-02T00:00:00Z", "m", 5, 5)).unwrap());
+        let back = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(back.lines().count(), 2, "an explicit logger never deletes: {back}");
+        assert!(UsageLogger::global().manages_retention, "the daemon log does");
     }
 
     #[test]

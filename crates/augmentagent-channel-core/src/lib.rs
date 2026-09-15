@@ -30,6 +30,7 @@ pub mod resolve;
 pub mod secret_loader;
 pub mod skills;
 pub mod timeparse;
+pub mod log_retention;
 pub mod token_usage;
 pub mod tool_audit;
 pub mod trigger;
