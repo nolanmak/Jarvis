@@ -9075,6 +9075,43 @@ CODEX-REVIEW: lgtm").0);
         );
     }
 
+    /// #1006 — the refusal path rests entirely on this helper's contract:
+    /// it must answer `false` and never propagate an error, or the tick it
+    /// was written to protect dies anyway. The sibling test above covers
+    /// present and absent against a real remote; this covers the third case,
+    /// an origin that cannot be reached at all, which is the one an origin
+    /// outage produces and the one a caller is most likely to get wrong.
+    #[tokio::test]
+    async fn an_unreachable_origin_reads_as_no_branch_rather_than_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr));
+        };
+        git(&work, &["init", "-q", "-b", "main", "."]);
+        git(&work, &["remote", "add", "origin",
+                     &dir.path().join("does-not-exist.git").to_string_lossy()]);
+
+        // Returning at all is half the assertion: the signature is `bool`,
+        // so there is no error to propagate and nothing can kill the tick.
+        assert!(
+            !remote_branch_exists(&work, &format!("{BRANCH_PREFIX}1")).await,
+            "an unreachable origin must read as `no branch`, so the resume \
+             lane refuses cheaply instead of failing the whole tick"
+        );
+
+        // No remote at all is the same story.
+        git(&work, &["remote", "remove", "origin"]);
+        assert!(!remote_branch_exists(&work, &format!("{BRANCH_PREFIX}1")).await);
+    }
+
     // ---- #816: single-flight lock ----
 
     #[test]
