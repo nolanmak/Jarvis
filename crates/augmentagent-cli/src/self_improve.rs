@@ -1653,11 +1653,16 @@ async fn find_resumable_draft(
         return None;
     };
 
+    // #1006 — resolved once here because the closing sweep below needs it
+    // too: closing a PR is a write, and the loop must not perform one on a
+    // pull request it cannot prove is its own.
+    let owner = repo_owner_from_remote(repo_root).await;
+
     // #934 — a draft whose issue already gave up is closed on sight (branch
     // kept, revival instructions in the comment) so `gh pr list` shows only
     // work that is actually in play.
     if !dry_run {
-        for (pr, issue) in drafts_to_close(&prs, &gave_up) {
+        for (pr, issue) in drafts_to_close(&prs, &gave_up, owner.as_deref()) {
             close_gave_up_pr(
                 repo_root,
                 pr,
@@ -1670,7 +1675,6 @@ async fn find_resumable_draft(
     }
 
     let ledger = AttemptLedger::load(&attempt_ledger_path());
-    let owner = repo_owner_from_remote(repo_root).await;
     resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only, owner.as_deref())
 }
 
@@ -3272,9 +3276,18 @@ async fn close_gave_up_pr(
 /// Open DRAFTS on agent branches whose issue already carries the gave-up
 /// label: `(pr, issue)`. A ready PR is a human's decision now; a human
 /// branch is never ours.
+///
+/// #1006 — and neither is a fork's. This is the one lane of the three that
+/// does not merely skip work: its caller CLOSES what it returns. A stranger's
+/// draft named `agent-fix/issue-<N>`, for an issue carrying the gave-up label,
+/// would be closed with a comment by an automation with no business touching
+/// it. So it fails closed on no evidence ([`head_is_ours`] returning `None`):
+/// leaving one of our own stale drafts open is harmless and self-corrects,
+/// and closing someone else's pull request is not undone by an apology.
 fn drafts_to_close(
     prs: &serde_json::Value,
     gave_up: &std::collections::HashSet<u64>,
+    owner: Option<&str>,
 ) -> Vec<(u64, u64)> {
     prs.as_array()
         .map(|a| {
@@ -3284,6 +3297,9 @@ fn drafts_to_close(
                     let number = pr.get("number")?.as_u64()?;
                     let branch = pr.get("headRefName")?.as_str()?;
                     let issue = issue_from_branch(branch)?;
+                    if !head_is_ours(pr, owner).unwrap_or(false) {
+                        return None;
+                    }
                     (draft && gave_up.contains(&issue)).then_some((number, issue))
                 })
                 .collect()
@@ -3653,6 +3669,25 @@ async fn resume_draft_pr(
     note_current_issue(issue_no);
     info!(pr, issue = issue_no, %branch, "resuming sitting draft PR");
 
+    // #1006 — before anything else, and specifically BEFORE the ledger mark
+    // below. The head may not be in this repository at all (a fork), or may
+    // have been deleted after a merge; either way there is nothing to check
+    // out. `ls-remote` cannot distinguish "no such ref" from "could not
+    // reach origin", and both land here, so doing this after the mark would
+    // let a single origin blip retire a perfectly good draft until tomorrow.
+    // Probing first costs one tick instead. This also used to `bail!` out of
+    // the worktree add, killing the tick and every draft behind it.
+    if !remote_branch_exists(repo_root, branch).await {
+        // Records nothing, per #1006: no ledger mark, and no GitHub write.
+        // The loop re-reads its open drafts every tick, so a `gh pr comment`
+        // here would be one note per tick, forever, on a PR that nobody is
+        // going to resume. The log line and the report are the trace.
+        warn!(pr, %branch, "resume: head branch is not on origin; skipping");
+        return Ok(RunReport::triage(format!(
+            "PR #{pr}: head branch `{branch}` is not on origin; skipped"
+        )));
+    }
+
     // Whatever happens next counts as today's attempt on this issue, so a
     // failing resume moves on to other work instead of re-running every tick.
     AttemptLedger::mark_persist(&attempt_ledger_path(), utc_day_now(), issue_no);
@@ -3713,25 +3748,6 @@ async fn resume_draft_pr(
         .join(".self-improve-worktrees")
         .join(lane_from_env().worktree_name());
     reclaim_worktree(repo_root, &worktree, branch).await;
-    // #1006 — the PR's head may not be in this repository at all (a fork), or
-    // may have been deleted after a merge. Either way there is nothing to
-    // check out. This used to `bail!` from the worktree add, which returns
-    // `Err` and kills the whole tick — taking every other draft behind it.
-    //
-    // Ask before fetching. `ls-remote` needs no local ref, and fetching a
-    // branch that is not there is a guaranteed-to-fail network round trip
-    // whose survival would otherwise rest on `run` reporting a non-zero exit
-    // as `Ok((false, ..))` rather than `Err`.
-    if !remote_branch_exists(repo_root, branch).await {
-        // Records nothing, per #1006. The loop re-reads its open drafts every
-        // tick, so a `gh pr comment` here would not be one note — it would be
-        // one per tick, forever, on a PR that nobody is going to resume. The
-        // log line and the returned report are the trace.
-        warn!(pr, %branch, "resume: head branch is not on origin; skipping");
-        return Ok(RunReport::triage(format!(
-            "PR #{pr}: head branch `{branch}` is not on origin; skipped"
-        )));
-    }
     let _ = run("git", &["fetch", "origin", branch], repo_root).await?;
     let (ok, _o, e) = run(
         "git",
@@ -9889,16 +9905,16 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn drafts_to_close_are_open_drafts_of_gave_up_issues() {
         let prs: serde_json::Value = serde_json::json!([
-            {"number": 853, "isDraft": true, "headRefName": "agent-fix/issue-845"},
-            {"number": 855, "isDraft": true, "headRefName": "agent-fix/issue-652"},
-            {"number": 900, "isDraft": false, "headRefName": "agent-fix/issue-700"},
-            {"number": 901, "isDraft": true, "headRefName": "feature/human"},
+            {"number": 853, "isDraft": true, "headRefName": "agent-fix/issue-845", "isCrossRepository": false},
+            {"number": 855, "isDraft": true, "headRefName": "agent-fix/issue-652", "isCrossRepository": false},
+            {"number": 900, "isDraft": false, "headRefName": "agent-fix/issue-700", "isCrossRepository": false},
+            {"number": 901, "isDraft": true, "headRefName": "feature/human", "isCrossRepository": false},
         ]);
         let gave_up: std::collections::HashSet<u64> = [845u64, 700].into_iter().collect();
         // Only DRAFTS on agent branches whose issue gave up; a ready PR (900)
         // is a human's decision now, a human branch (901) is never ours.
-        assert_eq!(drafts_to_close(&prs, &gave_up), vec![(853u64, 845u64)]);
-        assert!(drafts_to_close(&prs, &std::collections::HashSet::new()).is_empty());
+        assert_eq!(drafts_to_close(&prs, &gave_up, Some("nolanmak")), vec![(853u64, 845u64)]);
+        assert!(drafts_to_close(&prs, &std::collections::HashSet::new(), Some("nolanmak")).is_empty());
     }
 
     // Structural: every gave-up in resume_draft_pr closes the PR (branch
@@ -11049,6 +11065,64 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         }
     }
 
+    /// CodeRabbit on this PR found a THIRD lane consuming the same
+    /// branch-name trust, and it is the worst of them: `drafts_to_close`
+    /// does not merely skip work, it makes the loop CLOSE a pull request.
+    /// A stranger's fork draft named `agent-fix/issue-<N>`, for an issue that
+    /// happens to carry the gave-up label, would be closed with a comment by
+    /// an automation that has no business touching it.
+    ///
+    /// Fails closed on no evidence: leaving one of our own stale drafts open
+    /// is harmless and self-corrects, while closing someone else's PR is not
+    /// something an apology undoes.
+    #[test]
+    fn the_loop_never_closes_a_pr_it_cannot_prove_is_its_own() {
+        let gave_up: std::collections::HashSet<u64> = [10u64].into_iter().collect();
+        let ours = pr_json(100, "agent-fix/issue-10", true, Some("nolanmak"));
+        let fork = pr_json(101, "agent-fix/issue-10", true, Some("stranger"));
+        let flagged_fork = pr_json_full(102, "agent-fix/issue-10", true, None, Some(true));
+
+        assert_eq!(
+            drafts_to_close(&serde_json::json!([ours, fork, flagged_fork]), &gave_up, Some("nolanmak")),
+            vec![(100, 10)],
+            "only our own draft may be closed"
+        );
+        // No evidence at all: close nothing rather than guess.
+        assert!(
+            drafts_to_close(&serde_json::json!([pr_json(103, "agent-fix/issue-10", true, None)]), &gave_up, None)
+                .is_empty(),
+            "an unidentifiable PR must never be closed by the loop"
+        );
+        // And GitHub's flag alone is enough to keep working with no owner.
+        assert_eq!(
+            drafts_to_close(
+                &serde_json::json!([pr_json_full(104, "agent-fix/issue-10", true, None, Some(false))]),
+                &gave_up,
+                None
+            ),
+            vec![(104, 10)],
+        );
+    }
+
+    /// CodeRabbit's second finding. `resume_draft_pr` marks the issue as
+    /// attempted-today at its very top, so any skip below that point retires
+    /// the draft until tomorrow. A failed `ls-remote` is indistinguishable
+    /// from an absent branch, so one origin blip would park a perfectly good
+    /// draft for a day. Probe before the ledger is touched, and the blip
+    /// costs one tick instead.
+    #[test]
+    fn an_origin_blip_does_not_retire_a_draft_for_the_day() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+        let probe = body.find("remote_branch_exists(repo_root, branch)").expect("origin probe");
+        let mark = body.find("AttemptLedger::mark_persist").expect("ledger mark");
+        assert!(
+            probe < mark,
+            "probe origin before spending the day's attempt on this issue"
+        );
+    }
+
     /// With no evidence at all the two lanes must fall back in OPPOSITE
     /// directions, because their unsafe sides are opposite.
     ///
@@ -11181,8 +11255,12 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(check < worktree_add, "check before creating a worktree from it");
         let ret = check + body[check..].find("return Ok(RunReport::").expect("a report, not a bail");
         assert!(ret < worktree_add, "the missing-branch path returns before the worktree add");
+        // Scoped to the guard block itself. Everything after it may still
+        // `bail!` on its own terms — the #300 trust refusal does — but this
+        // path must not, because a fork's branch is not an error condition
+        // for the tick.
         assert!(
-            !body[check..worktree_add].contains("bail!"),
+            !body[check..ret].contains("bail!"),
             "a fork's branch is not an error condition for the tick"
         );
         // And nothing fallible may run against the branch BEFORE the check.
