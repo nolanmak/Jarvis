@@ -220,6 +220,45 @@ async fn ts_type_assertions_in_program_do_not_crash_runner() {
     assert_eq!(out.trace[0].call, "draft");
 }
 
+/// Regression for #989: the sidecar's stdout *is* the NDJSON protocol, so a
+/// program that `console.log`s (which the system prompt explicitly permits)
+/// used to put `wiki hint: …` on the wire and the frame reader failed with
+/// `protocol: decode "wiki hint: ": expected value`. The runner now routes
+/// console output to stderr; the run must complete with a clean trace.
+///
+/// The sidecar writes stderr synchronously, so this also pushes well past a
+/// Linux pipe buffer (64 KiB) before the terminal call: if the parent ever
+/// stopped draining stderr concurrently the sidecar would block on the full
+/// pipe and the run would die by wall clock instead of landing the draft.
+#[tokio::test]
+async fn console_log_in_program_does_not_corrupt_protocol() {
+    if maybe_skip("console_log_in_program_does_not_corrupt_protocol") {
+        return;
+    }
+    let dispatcher = StubDispatcher::new(vec![
+        ("wiki.draftHint".into(), json!("podcast-invite")),
+        ("draft".into(), json!(null)),
+    ]);
+    let program = r#"
+        async function main() {
+            const hint = await tools.wiki.draftHint({from: "fixture@example.com"});
+            console.log("wiki hint:", hint);
+            console.error("not a frame either");
+            for (let i = 0; i < 2000; i++) console.log("chatty".padEnd(100, "."), i);
+            await tools.draft("gmail", "body", "reason");
+        }
+        await main();
+    "#;
+
+    let out = run_program(program, &v1_manifest(), &dispatcher)
+        .await
+        .expect("console output must not reach the protocol stream");
+    assert_eq!(out.final_value, json!(null));
+    assert_eq!(out.trace.len(), 2, "trace: {:#?}", out.trace);
+    assert_eq!(out.trace[0].call, "wiki.draftHint");
+    assert_eq!(out.trace[1].call, "draft");
+}
+
 #[tokio::test]
 async fn infinite_loop_is_killed_under_61s() {
     if maybe_skip("infinite_loop_is_killed_under_61s") {
