@@ -737,6 +737,7 @@ async fn create_issue(cfg: &ResearchConfig, gap: &Gap) -> Result<u64> {
         "{}\n\n---\n_Source: {}_\n_Auto-filed by the daily `augmentagent research` pipeline._",
         gap.body, gap.source
     );
+    augmentagent_channel_core::public_report::validate(&gap.title, &body)?;
     let out = tokio::process::Command::new(&cfg.gh_bin)
         .arg("issue")
         .arg("create")

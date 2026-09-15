@@ -98,3 +98,8 @@ model labels and message/action identifiers remain out of the public report.
 The original failed program remains in the private action store for diagnosis.
 Query-agent and maintenance-agent prompts require synthetic technical summaries;
 quoted user requests and private message context do not belong in public reports.
+
+The Rust issue publisher, research issue filer and maintenance issue/PR writes
+also validate titles and bodies before spawning GitHub commands. Recognizable
+emails, phone numbers, token shapes and raw diagnostic identifiers cause a
+refusal with values withheld. Reserved example domains remain valid fixtures.

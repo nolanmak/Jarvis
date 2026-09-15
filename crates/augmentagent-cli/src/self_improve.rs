@@ -433,6 +433,18 @@ pub fn diff_line_count(diff: &str) -> usize {
 }
 
 async fn run(cmd: &str, args: &[&str], cwd: &Path) -> Result<(bool, String, String)> {
+    // All maintenance issue/PR writes flow through this runner. Return a normal
+    // failed-command result so callers still clean up their worktree and record
+    // the refusal, without sending private text to GitHub or echoing it in logs.
+    if matches!(args.first(), Some(&"issue" | &"pr")) {
+        for pair in args.windows(2) {
+            if matches!(pair[0], "--title" | "--body" | "--comment") {
+                if let Err(err) = augmentagent_channel_core::public_report::validate("", pair[1]) {
+                    return Ok((false, String::new(), err.to_string()));
+                }
+            }
+        }
+    }
     let out = Command::new(cmd)
         .args(args)
         .current_dir(cwd)
@@ -2724,6 +2736,7 @@ async fn red_main_recent_commits(repo_root: &Path, packages: &[String]) -> Strin
 /// `gh issue create` for a red main; the number parsed from the URL gh
 /// prints. Labels are best-effort: a repo without them still gets the issue.
 async fn file_red_main_issue(repo_root: &Path, title: &str, body: &str) -> Result<u64> {
+    augmentagent_channel_core::public_report::validate(title, body)?;
     let gh = gh_bin();
     let labelled = [
         "issue",
@@ -10897,5 +10910,21 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             body[ret..].starts_with("return Ok(RunReport::triage("),
             "no builder ran, so the refusal must be unbilled"
         );
+    }
+}
+
+#[cfg(test)]
+mod public_write_tests {
+    #[tokio::test]
+    async fn rejects_private_issue_and_pr_payloads_before_spawning() {
+        let private = "person".to_owned() + "@" + "gmail.com";
+        for surface in ["issue", "pr"] {
+            let (ok, out, err) = super::run("/nonexistent/gh-must-not-run",
+                &[surface, "comment", "1", "--body", &private], std::path::Path::new(".")).await.unwrap();
+            assert!(!ok);
+            assert!(out.is_empty());
+            assert!(err.starts_with("public report blocked:"));
+            assert!(!err.contains(&private));
+        }
     }
 }

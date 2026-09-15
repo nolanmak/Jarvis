@@ -63,7 +63,7 @@ pathlib.Path(os.environ['TEST_SENT']).write_text(json.dumps({'args': args, 'body
     def test_raw_private_report_shapes_are_blocked(self):
         for body in ["User's words: quoted private request", "Original program: private input",
                      "urn:li:messagingMessage:private", "phone: " + "+1" + "2025550199",
-                     "messageId: abcdef1234567890", "/home/" + "private-owner/app"]:
+                     "phone: (202) " + "555-0199", "messageId: abcdef1234567890", "/home/" + "private-owner/app"]:
             with self.subTest(body=body):
                 self.assertNotEqual(self.invoke('comment', '1', '--body', body).returncode, 0)
                 self.assertFalse(self.result.exists())

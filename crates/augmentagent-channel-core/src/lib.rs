@@ -24,6 +24,7 @@ pub mod mcp;
 pub mod memory_nudge;
 pub mod prompt;
 pub mod providers;
+pub mod public_report;
 pub mod reasoner;
 pub mod resolve;
 pub mod secret_loader;

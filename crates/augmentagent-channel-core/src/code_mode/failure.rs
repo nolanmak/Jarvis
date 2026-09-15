@@ -155,6 +155,7 @@ impl GhCliIssueRunner {
 #[async_trait]
 impl GhIssueRunner for GhCliIssueRunner {
     async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> anyhow::Result<u64> {
+        crate::public_report::validate(title, body)?;
         // Escape hatch for tests / CI runs that should never touch the real
         // repo. Setting `AUGMENTAGENT_GH_DISABLE=1` makes every invocation
         // a no-op-that-errors-immediately so the reporter logs+continues
@@ -923,6 +924,17 @@ mod tests {
 
         assert!(body.contains("**Repair attempted:** yes"));
         assert!(body.contains("**Final draft mode:** classic"));
+    }
+
+    #[tokio::test]
+    async fn publisher_rejects_private_input_before_invoking_gh() {
+        let gh = GhCliIssueRunner {
+            bin: "/nonexistent/no-gh-must-run".into(),
+        };
+        let private = "private".to_owned() + "@" + "gmail.com";
+        let err = gh.create_issue("Failure", &private, &[]).await.unwrap_err();
+        assert!(err.to_string().starts_with("public report blocked:"));
+        assert!(!err.to_string().contains(&private));
     }
 
     #[test]
