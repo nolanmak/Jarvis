@@ -779,7 +779,7 @@ async fn has_open_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
         &gh,
         &[
             "pr", "list", "--state", "open", "--head", &branch, "--json",
-            "number,headRepositoryOwner",
+            "number,isCrossRepository,headRepositoryOwner",
         ],
         repo_root,
     )
@@ -1605,7 +1605,7 @@ async fn find_resumable_draft(
             "--state",
             "open",
             "--json",
-            "number,isDraft,headRefName,headRepositoryOwner",
+            "number,isDraft,headRefName,isCrossRepository,headRepositoryOwner",
         ],
         repo_root,
     )
@@ -1674,47 +1674,45 @@ async fn find_resumable_draft(
     resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only, owner.as_deref())
 }
 
-/// The oldest eligible draft `(pr, issue, branch)` — or, with `only`, that
-/// issue's draft and nothing else (#932: a red main's fix PR outranks every
-/// other draft, and must never fall back to "some other PR").
-/// #1006 — is this PR's head branch in OUR repository?
+/// Is this PR's head branch in THIS repository, rather than a fork?
 ///
-/// The repo is public, so anyone can open a PR from a fork, and the loop
-/// selected PRs by branch NAME alone. A fork branch called
-/// `agent-fix/issue-<N>` therefore looked exactly like one the loop had
-/// created: the resume lane would pick it (lowest PR number wins) and then
-/// die fetching a branch that is not on origin, and the dedup guard would
-/// report the issue as already claimed and skip it forever, silently.
+/// Tri-state on purpose. `Some(true)`/`Some(false)` are answers; `None` means
+/// the row carries no evidence either way, and the two callers fall back in
+/// OPPOSITE directions because their unsafe sides are opposite — see
+/// [`agent_pr_exists`] and [`resumable_from`].
 ///
-/// Only an answer we are SURE of excludes a PR. A missing
-/// `headRepositoryOwner` (a `gh` that cannot report it) or an unknown repo
-/// owner (no usable `origin` remote) both fall back to the pre-#1006
-/// name-only behaviour.
-///
-/// That direction is deliberate. Excluding on a guess is the worse failure:
-/// an owner we failed to resolve would make every PR look foreign, so the
-/// loop would resume nothing at all and — because the same predicate backs
-/// the dedup guard — would stop seeing its own open PRs and start opening
-/// duplicates. A fork slipping through costs one skipped tick; that costs
-/// the whole lane.
-fn is_same_repo_head(pr: &serde_json::Value, owner: Option<&str>) -> bool {
-    let Some(owner) = owner.map(str::trim).filter(|o| !o.is_empty()) else {
-        return true;
-    };
-    match pr
-        .pointer("/headRepositoryOwner/login")
-        .and_then(serde_json::Value::as_str)
+/// `isCrossRepository` is GitHub's own answer and outranks everything else: it
+/// needs no `origin` remote, no network call and no local configuration, so a
+/// box that cannot resolve its own repo owner is still protected. The login
+/// comparison is only the fallback for a `gh` too old to report the flag.
+fn head_is_ours(pr: &serde_json::Value, owner: Option<&str>) -> Option<bool> {
+    if let Some(cross) = pr
+        .get("isCrossRepository")
+        .and_then(serde_json::Value::as_bool)
     {
-        Some(login) => login.eq_ignore_ascii_case(owner),
-        None => true,
+        return Some(!cross);
     }
+    let owner = owner.map(str::trim).filter(|o| !o.is_empty())?;
+    let login = pr
+        .pointer("/headRepositoryOwner/login")
+        .and_then(serde_json::Value::as_str)?;
+    Some(login.eq_ignore_ascii_case(owner))
 }
 
 /// Does an OPEN agent PR of ours appear in this `gh pr list --head` result?
 /// Pure, so the fork case is testable without a network call.
+///
+/// Fails OPEN on no evidence: an unidentifiable PR counts as ours, so the
+/// issue reads as claimed and is skipped. The other direction is far worse —
+/// reporting "no agent PR" for an issue that already has one in flight makes
+/// the loop open a DUPLICATE against its own live branch. A skipped issue
+/// returns on the next tick; two PRs racing one issue do not un-happen.
 fn agent_pr_exists(prs: &serde_json::Value, owner: Option<&str>) -> bool {
     prs.as_array()
-        .map(|a| a.iter().any(|pr| is_same_repo_head(pr, owner)))
+        .map(|a| {
+            a.iter()
+                .any(|pr| head_is_ours(pr, owner).unwrap_or(true))
+        })
         .unwrap_or(false)
 }
 
@@ -1734,7 +1732,10 @@ fn resumable_from(
             let branch = pr.get("headRefName")?.as_str()?;
             let issue = issue_from_branch(branch)?;
             // #1006 — a fork's branch is never ours to resume.
-            if !is_same_repo_head(pr, owner) {
+            // Fails CLOSED on no evidence (`unwrap_or(false)`): refusing to
+            // resume costs one unbilled tick and the next retries, whereas
+            // checking out a head we cannot prove is ours is exactly #1006.
+            if !head_is_ours(pr, owner).unwrap_or(false) {
                 return None;
             }
             let wanted = only.is_none_or(|o| o == issue);
@@ -9651,16 +9652,18 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(line.contains("&& !is_red_main_issue(&issue.body)"), "{line}");
     }
 
-    /// #932. Its fixtures carry no `headRepositoryOwner`, so this doubles as
-    /// the #1006 compatibility case: a `gh` that cannot report the head repo
-    /// must keep the old name-only selection rather than resuming nothing.
+    /// #932, with its fixtures brought up to what `gh` actually returns now
+    /// that #1006 filters on head provenance. `isCrossRepository: false` is
+    /// the ordinary case for every PR this loop opens, and carrying it here
+    /// keeps the pinning rules under test independent of the fork guard —
+    /// which has its own tests for the degraded-evidence directions.
     #[test]
     fn resumable_draft_can_be_pinned_to_one_issue() {
         let prs: serde_json::Value = serde_json::json!([
-            {"number": 101, "isDraft": true, "headRefName": "agent-fix/issue-11"},
-            {"number": 100, "isDraft": true, "headRefName": "agent-fix/issue-10"},
-            {"number": 102, "isDraft": false, "headRefName": "agent-fix/issue-12"},
-            {"number": 103, "isDraft": true, "headRefName": "feature/human"},
+            {"number": 101, "isDraft": true, "headRefName": "agent-fix/issue-11", "isCrossRepository": false},
+            {"number": 100, "isDraft": true, "headRefName": "agent-fix/issue-10", "isCrossRepository": false},
+            {"number": 102, "isDraft": false, "headRefName": "agent-fix/issue-12", "isCrossRepository": false},
+            {"number": 103, "isDraft": true, "headRefName": "feature/human", "isCrossRepository": false},
         ]);
         let mut ledger = AttemptLedger::default();
         let gave_up: std::collections::HashSet<u64> = [12u64].into_iter().collect();
@@ -10988,8 +10991,16 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
     // --- #1006: a fork must not be mistaken for the loop's own branch ------
 
-    /// `gh pr list --json ...headRepositoryOwner` shape, for one PR.
-    fn pr_json(number: u64, branch: &str, draft: bool, head_owner: Option<&str>) -> serde_json::Value {
+    /// `gh pr list --json ...isCrossRepository,headRepositoryOwner` shape.
+    /// A `gh pr list` row. `head_owner` absent models a `gh` that cannot
+    /// report it; `cross` absent models one without `isCrossRepository`.
+    fn pr_json_full(
+        number: u64,
+        branch: &str,
+        draft: bool,
+        head_owner: Option<&str>,
+        cross: Option<bool>,
+    ) -> serde_json::Value {
         let mut v = serde_json::json!({
             "number": number,
             "isDraft": draft,
@@ -10998,48 +11009,90 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         if let Some(owner) = head_owner {
             v["headRepositoryOwner"] = serde_json::json!({ "login": owner });
         }
+        if let Some(cross) = cross {
+            v["isCrossRepository"] = serde_json::json!(cross);
+        }
         v
+    }
+
+    /// The common case: login evidence only, no `isCrossRepository`.
+    fn pr_json(number: u64, branch: &str, draft: bool, head_owner: Option<&str>) -> serde_json::Value {
+        pr_json_full(number, branch, draft, head_owner, None)
     }
 
     #[test]
     fn a_forks_branch_is_not_ours_however_it_is_named() {
         // The whole attack is a branch NAME the loop trusts, in a repo it
         // does not own.
-        assert!(is_same_repo_head(&pr_json(1, "agent-fix/issue-10", true, Some("nolanmak")), Some("nolanmak")));
-        assert!(is_same_repo_head(&pr_json(1, "agent-fix/issue-10", true, Some("NolanMak")), Some("nolanmak")),
+        let b = "agent-fix/issue-10";
+        assert_eq!(head_is_ours(&pr_json(1, b, true, Some("nolanmak")), Some("nolanmak")), Some(true));
+        assert_eq!(head_is_ours(&pr_json(1, b, true, Some("NolanMak")), Some("nolanmak")), Some(true),
             "GitHub logins are case-insensitive");
-        assert!(!is_same_repo_head(&pr_json(2, "agent-fix/issue-10", true, Some("stranger")), Some("nolanmak")));
-        // Field absent (an older `gh` that cannot report it): keep the
-        // pre-#1006 behaviour rather than refusing to resume anything at all.
-        assert!(is_same_repo_head(&pr_json(3, "agent-fix/issue-10", true, None), Some("nolanmak")));
+        assert_eq!(head_is_ours(&pr_json(2, b, true, Some("stranger")), Some("nolanmak")), Some(false));
+
+        // `isCrossRepository` is GitHub's own answer, so it needs no local
+        // config and it OUTRANKS the login comparison. Without this the guard
+        // would be only as good as our ability to resolve `origin`.
+        for owner in [None, Some(""), Some("nolanmak"), Some("wrong")] {
+            assert_eq!(head_is_ours(&pr_json_full(3, b, true, None, Some(false)), owner), Some(true),
+                "authoritative not-cross settles it for owner {owner:?}");
+            assert_eq!(head_is_ours(&pr_json_full(4, b, true, None, Some(true)), owner), Some(false),
+                "authoritative cross settles it for owner {owner:?}");
+        }
+
+        // Genuinely no evidence: neither field, or no resolvable owner to
+        // compare a login against. The predicate says so rather than guessing;
+        // each lane picks its own safe direction.
+        assert_eq!(head_is_ours(&pr_json(5, b, true, None), Some("nolanmak")), None);
+        for unknown in [None, Some(""), Some("   ")] {
+            assert_eq!(head_is_ours(&pr_json(6, b, true, Some("stranger")), unknown), None, "{unknown:?}");
+        }
     }
 
-    /// The failure direction that matters more than the attack: if the repo
-    /// owner cannot be resolved, every PR would look foreign — the loop would
-    /// resume nothing and, sharing this predicate, stop recognising its own
-    /// open PRs and start opening duplicates. Unknown must mean "ours".
+    /// With no evidence at all the two lanes must fall back in OPPOSITE
+    /// directions, because their unsafe sides are opposite.
+    ///
+    /// Resume fails closed: refusing to resume costs an unbilled tick and the
+    /// next one retries, whereas checking out an unproven head is the very
+    /// thing #1006 is about.
+    ///
+    /// Dedup fails open — "assume it is ours, so the issue is claimed."
+    /// Failing closed there would report no agent PR for an issue that already
+    /// has one in flight, so the loop would open a DUPLICATE against its own
+    /// live branch. A skipped issue comes back next tick. Duplicate PRs racing
+    /// the same issue do not un-happen.
     #[test]
-    fn an_unresolvable_owner_falls_back_instead_of_excluding_everything() {
+    fn with_no_evidence_each_lane_fails_to_its_own_safe_side() {
         let ours = pr_json(100, "agent-fix/issue-10", true, Some("nolanmak"));
         let fork = pr_json(101, "agent-fix/issue-11", true, Some("stranger"));
-        for unknown in [None, Some(""), Some("   ")] {
-            assert!(is_same_repo_head(&ours, unknown), "{unknown:?}");
-            assert!(is_same_repo_head(&fork, unknown), "{unknown:?} must not exclude");
-        }
-        let prs = serde_json::json!([ours, fork]);
         let ledger = AttemptLedger::default();
         let gave_up = std::collections::HashSet::new();
+
+        for unknown in [None, Some(""), Some("   ")] {
+            assert_eq!(head_is_ours(&ours, unknown), None, "{unknown:?}");
+            assert_eq!(
+                resumable_from(&serde_json::json!([ours, fork]), &ledger, 100, &gave_up, None, unknown),
+                None,
+                "resume must fail closed on no evidence ({unknown:?})"
+            );
+            assert!(
+                agent_pr_exists(&serde_json::json!([ours]), unknown),
+                "dedup must fail open on no evidence, or the loop opens duplicates ({unknown:?})"
+            );
+        }
+
+        // And the authoritative flag rescues both lanes without any owner:
+        // degraded local config stops mattering the moment GitHub answers.
+        let ours_flagged = pr_json_full(100, "agent-fix/issue-10", true, None, Some(false));
+        let fork_flagged = pr_json_full(99, "agent-fix/issue-9", true, None, Some(true));
         assert_eq!(
-            resumable_from(&prs, &ledger, 100, &gave_up, None, None),
+            resumable_from(&serde_json::json!([fork_flagged, ours_flagged]), &ledger, 100, &gave_up, None, None),
             Some((100, 10, "agent-fix/issue-10".to_string())),
-            "an unknown owner must not stop the lane"
+            "the flag alone must skip the fork and still reach our draft"
         );
         assert!(
-            agent_pr_exists(
-                &serde_json::json!([pr_json(1, "agent-fix/issue-10", true, Some("x"))]),
-                None
-            ),
-            "dedup must keep working, or the loop opens duplicates"
+            !agent_pr_exists(&serde_json::json!([fork_flagged]), None),
+            "a PR GitHub calls cross-repository must never claim an issue"
         );
     }
 
@@ -11100,8 +11153,14 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             let start = src.find(f).expect(f);
             let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
             assert!(
+                body.contains("isCrossRepository"),
+                "{f} must request GitHub's own cross-repository answer; without \
+                 it the guard is only as good as resolving our own `origin`"
+            );
+            assert!(
                 body.contains("headRepositoryOwner"),
-                "{f} must select the head repository, not just the branch name"
+                "{f} must also request the login, the fallback for a `gh` too \
+                 old to report the flag"
             );
         }
     }
