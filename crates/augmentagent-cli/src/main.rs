@@ -451,6 +451,18 @@ enum Cmd {
     /// tool binaries on `$PATH`, build freshness, `.env` presence). Emits
     /// severity-tagged findings; exit 0 unless any check is `error`. `--fix`
     /// lands as a follow-up issue — doctor stays strictly read-only.
+    /// Token usage per day (#1001). Reads the append-only log the reasoner
+    /// writes on every call (`~/.local/state/augmentagent/token-usage.jsonl`,
+    /// outside the repo) and rolls it up by day and model — the measurement
+    /// behind "does the loop have room to take more issues?".
+    TokenUsage {
+        /// Only the last N days.
+        #[arg(long, default_value_t = 14)]
+        days: u32,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Health watchdog for the auto-PR loop (#997). Reads the same evidence
     /// a human would — the daemon log, the baseline cache, free disk, open
     /// drafts — and reports anything that stops the loop shipping. Run on a
@@ -3844,6 +3856,24 @@ async fn main() -> Result<()> {
         // === setup+maintenance subcommands (alphabetical) ===
         Cmd::Channel { name, op, args } => channel_router::dispatch(name, op, args).await,
         Cmd::CodeMode { op } => code_mode::run(store, op).await,
+        Cmd::TokenUsage { days, json } => {
+            use augmentagent_channel_core::token_usage as tu;
+            let path = tu::default_usage_log_path();
+            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            let mut rolled = tu::rollup(&raw);
+            if rolled.len() > days as usize {
+                rolled.drain(..rolled.len() - days as usize);
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rolled)?);
+            } else {
+                print!("{}", tu::format_report(&rolled));
+                if raw.is_empty() {
+                    println!("  (log: {})", path.display());
+                }
+            }
+            Ok(())
+        }
         Cmd::AutoprHealth { notify, json } => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let code = autopr_health::run(&root, notify, json).await?;
