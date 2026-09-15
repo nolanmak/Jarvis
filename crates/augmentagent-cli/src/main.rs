@@ -1035,6 +1035,14 @@ enum JournalOp {
     /// drop any in-progress cursor, so only entries changed from now on
     /// are ingested.
     SkipToNow,
+    /// Read-only: fetch and print one journal entry (default: the latest by
+    /// created_at; --date YYYY-MM-DD picks that day's latest). Walks the
+    /// owner's entries via list_entries and decrypts locally — no sync
+    /// state is read or written, nothing is marked ingested.
+    Show {
+        #[arg(long)]
+        date: Option<String>,
+    },
     /// #900 — print the persisted watermark and in-progress cursor.
     Status,
 }
@@ -3444,6 +3452,10 @@ async fn main() -> Result<()> {
             }
             JournalOp::SkipToNow => {
                 run_journal_skip_to_now(store).await?;
+                Ok(())
+            }
+            JournalOp::Show { date } => {
+                run_journal_show(date.clone()).await?;
                 Ok(())
             }
             JournalOp::Status => {
@@ -15448,6 +15460,56 @@ async fn run_journal_poll_once(
             outcome.deferred
         );
     }
+    Ok(())
+}
+
+/// Read-only fetch of one entry for QA (`journal show`). Walks the owner's
+/// partition via `list_entries`, picks the newest live entry (optionally
+/// date-filtered), decrypts locally, prints. Touches no sync state.
+async fn run_journal_show(date: Option<String>) -> Result<()> {
+    use augmentagent_channel_journal::client::{pick_latest, JournalApi};
+    use augmentagent_channel_journal::{crypto, html, section, JournalRuntime};
+
+    let Some(runtime) = JournalRuntime::from_env().await? else {
+        println!("shadownote journal not configured; nothing to show");
+        return Ok(());
+    };
+    let mut items = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..200 {
+        let page = runtime.client.list_entries(token).await?;
+        items.extend(page.items);
+        token = page.next_token;
+        if token.is_none() {
+            break;
+        }
+    }
+    let Some(entry) = pick_latest(items.iter(), date.as_deref()) else {
+        println!(
+            "no live entry found{}",
+            date.map(|d| format!(" for {d}")).unwrap_or_default()
+        );
+        return Ok(());
+    };
+    let content = entry.content.as_deref().expect("pick_latest guarantees content");
+    let text = crypto::decrypt_entry_content(content, runtime.dek.as_ref())
+        .await
+        .map(|h| html::html_to_text(&h))
+        .context("decrypt entry")?;
+    println!("id:      {}", entry.id);
+    println!("created: {}", entry.created_at);
+    if let Some(u) = entry.updated_at.as_deref() {
+        println!("updated: {u}");
+    }
+    if let Some(t) = entry.topic.as_deref() {
+        println!("topic:   {t}");
+    }
+    if let Some(t) = entry.title.as_deref() {
+        println!("title:   {t}");
+    }
+    println!("section: wiki/{}", section::entry_rel_path(entry).display());
+    println!("---");
+    println!("{text}");
     Ok(())
 }
 
