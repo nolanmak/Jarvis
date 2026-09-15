@@ -1,0 +1,14 @@
+[Unit]
+Description=Check auto-PR loop health every 2 hours
+
+[Timer]
+# Wall-clock, so a suspended laptop catches up instead of drifting.
+OnCalendar=*-*-* 00/2:07:00
+# Catch a miss after a reboot or a long sleep.
+Persistent=true
+# The first check shortly after boot, once the daemon has settled.
+OnBootSec=10min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

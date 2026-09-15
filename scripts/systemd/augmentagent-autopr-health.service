@@ -1,0 +1,15 @@
+[Unit]
+Description=AugmentAgent auto-PR loop health watchdog (one check)
+Documentation=https://github.com/nolanmak/Jarvis/pull/997
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/nolan-makatche/AugmentAgent
+EnvironmentFile=-/home/nolan-makatche/AugmentAgent/.env
+# Out of process on purpose: a wedged or dead daemon cannot report itself.
+ExecStart=/home/nolan-makatche/AugmentAgent/target/release/augmentagent autopr-health --notify
+# A finding exits 1; that is a report, not a unit failure.
+SuccessExitStatus=0 1
+StandardOutput=append:/home/nolan-makatche/.local/state/augmentagent/autopr-health.log
+StandardError=append:/home/nolan-makatche/.local/state/augmentagent/autopr-health.log
