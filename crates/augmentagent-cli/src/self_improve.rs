@@ -3712,11 +3712,15 @@ async fn resume_draft_pr(
         .join(".self-improve-worktrees")
         .join(lane_from_env().worktree_name());
     reclaim_worktree(repo_root, &worktree, branch).await;
-    let _ = run("git", &["fetch", "origin", branch], repo_root).await?;
     // #1006 — the PR's head may not be in this repository at all (a fork), or
     // may have been deleted after a merge. Either way there is nothing to
     // check out. This used to `bail!` from the worktree add, which returns
     // `Err` and kills the whole tick — taking every other draft behind it.
+    //
+    // Ask before fetching. `ls-remote` needs no local ref, and fetching a
+    // branch that is not there is a guaranteed-to-fail network round trip
+    // whose survival would otherwise rest on `run` reporting a non-zero exit
+    // as `Ok((false, ..))` rather than `Err`.
     if !remote_branch_exists(repo_root, branch).await {
         warn!(pr, %branch, "resume: head branch is not on origin; skipping");
         let _ = run(
@@ -3733,6 +3737,7 @@ async fn resume_draft_pr(
             "PR #{pr}: head branch `{branch}` is not on origin; skipped"
         )));
     }
+    let _ = run("git", &["fetch", "origin", branch], repo_root).await?;
     let (ok, _o, e) = run(
         "git",
         &[
@@ -11126,6 +11131,16 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(
             !body[check..worktree_add].contains("bail!"),
             "a fork's branch is not an error condition for the tick"
+        );
+        // And nothing fallible may run against the branch BEFORE the check.
+        // `git fetch origin <fork-branch>` is guaranteed to fail; today `run`
+        // reports that as Ok((false, ..)) so it happens to be survivable, but
+        // resting a denial-of-service guard on that semantic is how the hole
+        // comes back. Ask for the branch first, then touch the network.
+        let fetch = body.find(r#""fetch", "origin", branch"#).expect("resume fetches the branch");
+        assert!(
+            check < fetch,
+            "confirm the branch is on origin before fetching it, so no failure path precedes the guard"
         );
     }
 
