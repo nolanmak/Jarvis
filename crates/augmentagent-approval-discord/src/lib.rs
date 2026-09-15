@@ -17,6 +17,9 @@ mod layout;
 mod loops;
 mod nudge;
 mod process_loops;
+// #994 — register-receipt audit for outbound drafts. Public: the delivery
+// layer checks receipts here and `gmail compose` gates its body on one.
+pub mod register;
 mod status_bus;
 mod surface;
 mod presets;
