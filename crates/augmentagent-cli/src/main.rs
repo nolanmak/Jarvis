@@ -15391,6 +15391,19 @@ async fn run_journal_poll_once(
         DEFAULT_MAX_ENTRIES_PER_POLL, DEFAULT_MAX_PAGES_PER_POLL,
     };
 
+    // #1010 postmortem — a LIVE pass consumes entries (journal_ingested
+    // rows advance) as it processes them. Without a wiki root there is no
+    // section write and the fire-and-forget LLM ingest dies with this CLI
+    // process, so entries are consumed with nothing produced and never
+    // revisited. Exactly this ate 400 entries on 2026-09-15 (recovered by
+    // clearing journal_ingested + journal_sync_cursor and restarting).
+    if !dry_run && wiki_dir.is_none() {
+        anyhow::bail!(
+            "a live journal pass requires --wiki-dir (entries would be marked \
+             ingested with nothing written); use --dry-run true to only count"
+        );
+    }
+
     let Some(runtime) = JournalRuntime::from_env().await? else {
         println!(
             "shadownote journal not configured (SHADOWNOTE_APPSYNC_URL / \
