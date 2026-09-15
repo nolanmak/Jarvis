@@ -778,7 +778,8 @@ async fn has_open_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
     let (ok, stdout, _) = run(
         &gh,
         &[
-            "pr", "list", "--state", "open", "--head", &branch, "--json", "number",
+            "pr", "list", "--state", "open", "--head", &branch, "--json",
+            "number,headRepositoryOwner",
         ],
         repo_root,
     )
@@ -790,7 +791,11 @@ async fn has_open_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
         return Ok(true);
     }
     let arr: serde_json::Value = serde_json::from_str(&stdout).unwrap_or(serde_json::json!([]));
-    Ok(arr.as_array().map(|a| !a.is_empty()).unwrap_or(false))
+    // #1006 — only OUR branch claims the issue. A fork may carry the same
+    // name, and treating that as a claim skips the issue forever with no
+    // comment, no label and no trace.
+    let owner = repo_owner_from_remote(repo_root).await;
+    Ok(agent_pr_exists(&arr, owner.as_deref()))
 }
 
 /// Reasoner opts scoped to write/edit/bash within the per-attempt worktree.
@@ -1600,7 +1605,7 @@ async fn find_resumable_draft(
             "--state",
             "open",
             "--json",
-            "number,isDraft,headRefName",
+            "number,isDraft,headRefName,headRepositoryOwner",
         ],
         repo_root,
     )
@@ -1665,18 +1670,61 @@ async fn find_resumable_draft(
     }
 
     let ledger = AttemptLedger::load(&attempt_ledger_path());
-    resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only)
+    let owner = repo_owner_from_remote(repo_root).await;
+    resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only, owner.as_deref())
 }
 
 /// The oldest eligible draft `(pr, issue, branch)` — or, with `only`, that
 /// issue's draft and nothing else (#932: a red main's fix PR outranks every
 /// other draft, and must never fall back to "some other PR").
+/// #1006 — is this PR's head branch in OUR repository?
+///
+/// The repo is public, so anyone can open a PR from a fork, and the loop
+/// selected PRs by branch NAME alone. A fork branch called
+/// `agent-fix/issue-<N>` therefore looked exactly like one the loop had
+/// created: the resume lane would pick it (lowest PR number wins) and then
+/// die fetching a branch that is not on origin, and the dedup guard would
+/// report the issue as already claimed and skip it forever, silently.
+///
+/// Only an answer we are SURE of excludes a PR. A missing
+/// `headRepositoryOwner` (a `gh` that cannot report it) or an unknown repo
+/// owner (no usable `origin` remote) both fall back to the pre-#1006
+/// name-only behaviour.
+///
+/// That direction is deliberate. Excluding on a guess is the worse failure:
+/// an owner we failed to resolve would make every PR look foreign, so the
+/// loop would resume nothing at all and — because the same predicate backs
+/// the dedup guard — would stop seeing its own open PRs and start opening
+/// duplicates. A fork slipping through costs one skipped tick; that costs
+/// the whole lane.
+fn is_same_repo_head(pr: &serde_json::Value, owner: Option<&str>) -> bool {
+    let Some(owner) = owner.map(str::trim).filter(|o| !o.is_empty()) else {
+        return true;
+    };
+    match pr
+        .pointer("/headRepositoryOwner/login")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(login) => login.eq_ignore_ascii_case(owner),
+        None => true,
+    }
+}
+
+/// Does an OPEN agent PR of ours appear in this `gh pr list --head` result?
+/// Pure, so the fork case is testable without a network call.
+fn agent_pr_exists(prs: &serde_json::Value, owner: Option<&str>) -> bool {
+    prs.as_array()
+        .map(|a| a.iter().any(|pr| is_same_repo_head(pr, owner)))
+        .unwrap_or(false)
+}
+
 fn resumable_from(
     prs: &serde_json::Value,
     ledger: &AttemptLedger,
     today: u64,
     gave_up: &std::collections::HashSet<u64>,
     only: Option<u64>,
+    owner: Option<&str>,
 ) -> Option<(u64, u64, String)> {
     prs.as_array()?
         .iter()
@@ -1685,6 +1733,10 @@ fn resumable_from(
             let number = pr.get("number")?.as_u64()?;
             let branch = pr.get("headRefName")?.as_str()?;
             let issue = issue_from_branch(branch)?;
+            // #1006 — a fork's branch is never ours to resume.
+            if !is_same_repo_head(pr, owner) {
+                return None;
+            }
             let wanted = only.is_none_or(|o| o == issue);
             (draft && wanted && !ledger.attempted_today(today, issue) && !gave_up.contains(&issue))
                 .then(|| (number, issue, branch.to_string()))
@@ -3661,6 +3713,26 @@ async fn resume_draft_pr(
         .join(lane_from_env().worktree_name());
     reclaim_worktree(repo_root, &worktree, branch).await;
     let _ = run("git", &["fetch", "origin", branch], repo_root).await?;
+    // #1006 — the PR's head may not be in this repository at all (a fork), or
+    // may have been deleted after a merge. Either way there is nothing to
+    // check out. This used to `bail!` from the worktree add, which returns
+    // `Err` and kills the whole tick — taking every other draft behind it.
+    if !remote_branch_exists(repo_root, branch).await {
+        warn!(pr, %branch, "resume: head branch is not on origin; skipping");
+        let _ = run(
+            &gh,
+            &["pr", "comment", &pr.to_string(), "--body",
+              "Auto-resume skipped: this PR's head branch is not in this \
+               repository, so the loop has nothing to check out. A branch \
+               named `agent-fix/…` on a fork is not picked up; push the work \
+               to a branch here if it should be resumed."],
+            repo_root,
+        )
+        .await;
+        return Ok(RunReport::triage(format!(
+            "PR #{pr}: head branch `{branch}` is not on origin; skipped"
+        )));
+    }
     let (ok, _o, e) = run(
         "git",
         &[
@@ -9580,6 +9652,9 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(line.contains("&& !is_red_main_issue(&issue.body)"), "{line}");
     }
 
+    /// #932. Its fixtures carry no `headRepositoryOwner`, so this doubles as
+    /// the #1006 compatibility case: a `gh` that cannot report the head repo
+    /// must keep the old name-only selection rather than resuming nothing.
     #[test]
     fn resumable_draft_can_be_pinned_to_one_issue() {
         let prs: serde_json::Value = serde_json::json!([
@@ -9592,21 +9667,21 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let gave_up: std::collections::HashSet<u64> = [12u64].into_iter().collect();
         // Unpinned: oldest eligible draft.
         assert_eq!(
-            resumable_from(&prs, &ledger, 100, &gave_up, None),
+            resumable_from(&prs, &ledger, 100, &gave_up, None, Some("nolanmak")),
             Some((100, 10, "agent-fix/issue-10".to_string()))
         );
         // Pinned to the red-main issue: that draft even though it is newer.
         assert_eq!(
-            resumable_from(&prs, &ledger, 100, &gave_up, Some(11)),
+            resumable_from(&prs, &ledger, 100, &gave_up, Some(11), Some("nolanmak")),
             Some((101, 11, "agent-fix/issue-11".to_string()))
         );
         // Pinned to an issue without an eligible draft: nothing, never a
         // fallback to some other PR.
-        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(12)), None);
-        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(99)), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(12), Some("nolanmak")), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(99), Some("nolanmak")), None);
         // The daily ledger still applies to the pinned draft.
         ledger.mark(100, 11);
-        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(11)), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(11), Some("nolanmak")), None);
     }
 
     // --- #933 auto-rebase: the builder resolves a draft's merge conflict ---
@@ -10911,6 +10986,149 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             "no builder ran, so the refusal must be unbilled"
         );
     }
+
+    // --- #1006: a fork must not be mistaken for the loop's own branch ------
+
+    /// `gh pr list --json ...headRepositoryOwner` shape, for one PR.
+    fn pr_json(number: u64, branch: &str, draft: bool, head_owner: Option<&str>) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "number": number,
+            "isDraft": draft,
+            "headRefName": branch,
+        });
+        if let Some(owner) = head_owner {
+            v["headRepositoryOwner"] = serde_json::json!({ "login": owner });
+        }
+        v
+    }
+
+    #[test]
+    fn a_forks_branch_is_not_ours_however_it_is_named() {
+        // The whole attack is a branch NAME the loop trusts, in a repo it
+        // does not own.
+        assert!(is_same_repo_head(&pr_json(1, "agent-fix/issue-10", true, Some("nolanmak")), Some("nolanmak")));
+        assert!(is_same_repo_head(&pr_json(1, "agent-fix/issue-10", true, Some("NolanMak")), Some("nolanmak")),
+            "GitHub logins are case-insensitive");
+        assert!(!is_same_repo_head(&pr_json(2, "agent-fix/issue-10", true, Some("stranger")), Some("nolanmak")));
+        // Field absent (an older `gh` that cannot report it): keep the
+        // pre-#1006 behaviour rather than refusing to resume anything at all.
+        assert!(is_same_repo_head(&pr_json(3, "agent-fix/issue-10", true, None), Some("nolanmak")));
+    }
+
+    /// The failure direction that matters more than the attack: if the repo
+    /// owner cannot be resolved, every PR would look foreign — the loop would
+    /// resume nothing and, sharing this predicate, stop recognising its own
+    /// open PRs and start opening duplicates. Unknown must mean "ours".
+    #[test]
+    fn an_unresolvable_owner_falls_back_instead_of_excluding_everything() {
+        let ours = pr_json(100, "agent-fix/issue-10", true, Some("nolanmak"));
+        let fork = pr_json(101, "agent-fix/issue-11", true, Some("stranger"));
+        for unknown in [None, Some(""), Some("   ")] {
+            assert!(is_same_repo_head(&ours, unknown), "{unknown:?}");
+            assert!(is_same_repo_head(&fork, unknown), "{unknown:?} must not exclude");
+        }
+        let prs = serde_json::json!([ours, fork]);
+        let ledger = AttemptLedger::default();
+        let gave_up = std::collections::HashSet::new();
+        assert_eq!(
+            resumable_from(&prs, &ledger, 100, &gave_up, None, None),
+            Some((100, 10, "agent-fix/issue-10".to_string())),
+            "an unknown owner must not stop the lane"
+        );
+        assert!(
+            agent_pr_exists(
+                &serde_json::json!([pr_json(1, "agent-fix/issue-10", true, Some("x"))]),
+                None
+            ),
+            "dedup must keep working, or the loop opens duplicates"
+        );
+    }
+
+    /// Attack 1 from #1006: a fork draft named `agent-fix/issue-<N>` for an
+    /// issue the OWNER wrote. It sorts to the front by PR number and the
+    /// resume lane would pick it, then die fetching a branch not on origin.
+    #[test]
+    fn resume_ignores_fork_drafts_and_still_picks_our_own() {
+        let prs = serde_json::json!([
+            pr_json(100, "agent-fix/issue-10", true, Some("stranger")),
+            pr_json(101, "agent-fix/issue-11", true, Some("nolanmak")),
+        ]);
+        let ledger = AttemptLedger::default();
+        let gave_up = std::collections::HashSet::new();
+        assert_eq!(
+            resumable_from(&prs, &ledger, 100, &gave_up, None, Some("nolanmak")),
+            Some((101, 11, "agent-fix/issue-11".to_string())),
+            "the lower-numbered fork PR must not win the queue"
+        );
+        // Pinning to the fork's issue finds nothing rather than falling back.
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(10), Some("nolanmak")), None);
+        // With no fork in play, selection is unchanged.
+        let ours = serde_json::json!([pr_json(100, "agent-fix/issue-10", true, Some("nolanmak"))]);
+        assert_eq!(
+            resumable_from(&ours, &ledger, 100, &gave_up, None, Some("nolanmak")),
+            Some((100, 10, "agent-fix/issue-10".to_string()))
+        );
+    }
+
+    /// Attack 2 from #1006: the same fork PR makes the dedup guard report
+    /// "already claimed", so the issue is skipped forever with no comment,
+    /// no label and no trace.
+    #[test]
+    fn dedup_does_not_let_a_fork_claim_an_issue() {
+        let only_fork = serde_json::json!([pr_json(100, "agent-fix/issue-10", false, Some("stranger"))]);
+        assert!(
+            !agent_pr_exists(&only_fork, Some("nolanmak")),
+            "a stranger's branch must never claim one of our issues"
+        );
+        // Our own PR still claims it, draft or not.
+        let ours = serde_json::json!([pr_json(101, "agent-fix/issue-10", true, Some("nolanmak"))]);
+        assert!(agent_pr_exists(&ours, Some("nolanmak")));
+        // Mixed: ours wins.
+        let mixed = serde_json::json!([
+            pr_json(100, "agent-fix/issue-10", false, Some("stranger")),
+            pr_json(101, "agent-fix/issue-10", true, Some("nolanmak")),
+        ]);
+        assert!(agent_pr_exists(&mixed, Some("nolanmak")));
+        assert!(!agent_pr_exists(&serde_json::json!([]), Some("nolanmak")));
+    }
+
+    /// The loop must ask GitHub for the head repository, or the filters above
+    /// have nothing to judge.
+    #[test]
+    fn pr_queries_request_the_head_repository() {
+        let src = include_str!("self_improve.rs");
+        for f in ["async fn find_resumable_draft(", "async fn has_open_agent_pr("] {
+            let start = src.find(f).expect(f);
+            let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+            assert!(
+                body.contains("headRepositoryOwner"),
+                "{f} must select the head repository, not just the branch name"
+            );
+        }
+    }
+
+    /// A head branch we cannot fetch (a fork, or one deleted after merge)
+    /// must end the run as triage, not as an `Err` that kills the whole tick
+    /// and every other draft behind it.
+    #[test]
+    fn an_unfetchable_head_branch_does_not_kill_the_tick() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = start + src[start..].find("\n}\n").expect("fn end");
+        let body = &src[start..end];
+        let check = body
+            .find("remote_branch_exists(repo_root, branch)")
+            .expect("resume must confirm the head branch is on origin");
+        let worktree_add = body.find(r#""worktree", "add""#).expect("worktree add");
+        assert!(check < worktree_add, "check before creating a worktree from it");
+        let ret = check + body[check..].find("return Ok(RunReport::").expect("a report, not a bail");
+        assert!(ret < worktree_add, "the missing-branch path returns before the worktree add");
+        assert!(
+            !body[check..worktree_add].contains("bail!"),
+            "a fork's branch is not an error condition for the tick"
+        );
+    }
+
 }
 
 #[cfg(test)]
