@@ -8433,7 +8433,7 @@ CODEX-REVIEW: lgtm").0);
         assert!(p.contains("#845"));
         // The live #853 resume burned four rounds because "do not start
         // over" entrenched a structurally wrong approach: the guard matched
-        // greeting names against address tokens ("Gary" vs "glozoff"), codex
+        // greeting names against address tokens ("Alex" vs "unrelated_handle"), codex
         // showed the reported case could never pass, and the builder kept
         // patching details around the hole. Revisions must be allowed to
         // pivot when the finding is architectural.
