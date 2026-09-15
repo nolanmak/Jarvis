@@ -3722,17 +3722,11 @@ async fn resume_draft_pr(
     // whose survival would otherwise rest on `run` reporting a non-zero exit
     // as `Ok((false, ..))` rather than `Err`.
     if !remote_branch_exists(repo_root, branch).await {
+        // Records nothing, per #1006. The loop re-reads its open drafts every
+        // tick, so a `gh pr comment` here would not be one note — it would be
+        // one per tick, forever, on a PR that nobody is going to resume. The
+        // log line and the returned report are the trace.
         warn!(pr, %branch, "resume: head branch is not on origin; skipping");
-        let _ = run(
-            &gh,
-            &["pr", "comment", &pr.to_string(), "--body",
-              "Auto-resume skipped: this PR's head branch is not in this \
-               repository, so the loop has nothing to check out. A branch \
-               named `agent-fix/…` on a fork is not picked up; push the work \
-               to a branch here if it should be resumed."],
-            repo_root,
-        )
-        .await;
         return Ok(RunReport::triage(format!(
             "PR #{pr}: head branch `{branch}` is not on origin; skipped"
         )));
@@ -11141,6 +11135,13 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(
             check < fetch,
             "confirm the branch is on origin before fetching it, so no failure path precedes the guard"
+        );
+        // #1006 asks for a refusal that "records nothing". The loop re-reads
+        // its open drafts every tick, so any GitHub write here is not one
+        // note — it is one per tick, forever, on a PR nobody is resuming.
+        assert!(
+            !body[check..ret].contains("\"comment\""),
+            "the missing-branch refusal must not write to GitHub; it repeats every tick"
         );
     }
 
