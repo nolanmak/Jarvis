@@ -988,9 +988,17 @@ impl ClaudeCliReasoner {
         // (#446).
         let mut text_blocks: Vec<String> = Vec::new();
         let mut result_text: Option<String> = None;
+        // #1001 — the CLI reports exact usage on its terminal `result` event.
+        // It costs nothing to read and is the only measurement of what this
+        // daemon actually spends, so capture it as the stream goes by.
+        let call_started = std::time::Instant::now();
+        let mut observed_usage: Option<crate::token_usage::TokenUsage> = None;
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
+            }
+            if let Some(u) = crate::token_usage::parse_usage(&line) {
+                observed_usage = Some(u);
             }
             if audit_active {
                 audit_stream_line(
@@ -1023,6 +1031,19 @@ impl ClaudeCliReasoner {
             }
         }
         let final_text = select_final_text(&text_blocks, result_text.as_deref(), capture);
+        // #1001 — record what the call cost. Best effort by construction: the
+        // logger swallows its own IO errors, so accounting can never fail a
+        // call the model already answered.
+        if let Some(usage) = observed_usage {
+            crate::token_usage::UsageLogger::global().append(&crate::token_usage::UsageRecord {
+                ts: chrono::Utc::now().to_rfc3339(),
+                provider: "claude".into(),
+                model: opts.model.clone().unwrap_or_else(|| "(inherited)".into()),
+                class: format!("{:?}", crate::providers::classify(opts)),
+                usage,
+                duration_ms: call_started.elapsed().as_millis() as u64,
+            });
+        }
 
         let status = child.wait().await?;
         if !status.success() {

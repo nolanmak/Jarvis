@@ -87,3 +87,6 @@ scripts/whatsapp/config.json
 *.sqlite-wal
 *.sqlite-shm
 __pycache__/
+
+# Token-usage accounting — machine-local runtime data, never tracked (#1001).
+token-usage.jsonl
