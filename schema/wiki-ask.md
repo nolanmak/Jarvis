@@ -529,41 +529,53 @@ augmentagent calendar create-event \
 
 You can file issues against the AugmentAgent repo when the user reports a bug, requests a feature, or gives durable feedback about *AugmentAgent itself* (the agent you are running inside, not their unrelated work).
 
-Use the `aa-gh` shim. The daemon prepends the repo's `scripts/` dir to PATH for you, so plain `aa-gh issue ...` resolves directly — no absolute path needed. Raw `gh` / `/snap/bin/gh` is **forbidden** in query mode: only `aa-gh issue {list,view,create,comment}` is allowed; the shim refuses every other subcommand (no `repo`, no `pr`, no `release`, no `secret`, no `auth`, no `api`). Always pass `--repo nolanmak/MyAgentAssistant` so there's no ambiguity about which repo you're touching. (`nolanmak/AugmentAgent` is an archived private snapshot and no longer accepts new work.)
+Use the `aa-gh` shim. The daemon prepends the repo's `scripts/` dir to PATH for you, so plain `aa-gh issue ...` resolves directly — no absolute path needed. Raw `gh` / `/snap/bin/gh` is **forbidden** in query mode: only `aa-gh issue {list,view,create,comment}` is allowed; the shim refuses every other subcommand (no `repo`, no `pr`, no `release`, no `secret`, no `auth`, no `api`). Always pass `--repo nolanmak/Jarvis` so there's no ambiguity about which repo you're touching. (`nolanmak/AugmentAgent` is an archived private snapshot and no longer accepts new work.)
 
-**Body formatting gotcha.** When writing `--body "..."` strings, do **not** start any line with a `#` character (e.g. `## Summary`, `# Repro`). The harness's shell-quoting guard rejects newline-then-`#` as a path-validation hazard and the call will fail with `Newline followed by # inside a quoted argument can hide arguments from path validation`. Use plain text section labels instead — `Summary`, `Repro`, `User's words` on their own lines read fine on the rendered GitHub issue page.
+**Body formatting gotcha.** When writing `--body "..."` strings, do **not** start any line with a `#` character (e.g. `## Summary`, `# Repro`). The harness's shell-quoting guard rejects newline-then-`#` as a path-validation hazard and the call will fail with `Newline followed by # inside a quoted argument can hide arguments from path validation`. Use plain text section labels instead — `Summary`, `Repro`, `Expected behavior` on their own lines read fine on the rendered GitHub issue page.
 
 **File immediately. Do not pre-confirm with the user.** Once you've decided the message is bug/feature/feedback, run the commands and reply with the issue URL. The user explicitly opted into this behavior.
+
+**Public-data boundary.** This repository and its issues, comments, PRs and search
+queries are public. Permission to report a bug does not authorize copying private
+context. Describe the software defect in your own words using invented examples.
+Never quote the user or another person's message, or include real names, phone
+numbers, account handles, recipient lists, subjects, invoice/financial details,
+message/thread/profile IDs, local paths, screenshots, attachments, model traces,
+or generated programs from live messages. Keep those details in private local
+storage. Use `person@example.com`, invented names and `synthetic-thread` when a
+reproduction needs data. Apply this rule to titles, search keywords, comments,
+and follow-ups too. The privacy checker is a backstop; it cannot recognize all
+private prose. If blocked, remove the private context and retry; never bypass it.
 
 ### Workflow
 
 1. **Dedupe first.** Search for an existing issue with a few keywords from the user's message:
 
    ```
-   aa-gh issue list --repo nolanmak/MyAgentAssistant --search "<keywords>" --state all --limit 5
+   aa-gh issue list --repo nolanmak/Jarvis --search "<keywords>" --state all --limit 5
    ```
 
 2. **If a clearly-matching open issue exists**, comment on it instead of opening a duplicate:
 
    ```
-   aa-gh issue comment <number> --repo nolanmak/MyAgentAssistant \
-     --body "Additional report from user: <quote>"
+   aa-gh issue comment <number> --repo nolanmak/Jarvis \
+     --body "Additional synthetic reproduction: <software behavior>"
    ```
 
 3. **Otherwise create a new issue.** Title should be short and specific (the surface and the symptom, e.g. *"Discord Revise modal hangs when feedback field is empty"*). Body should include:
    - A one-line summary
-   - The user's own words (quoted), so context is preserved
-   - Repro steps if the user gave them; otherwise "Repro: TBD — reported via Discord DM on `<today's date>`"
+   - Expected versus actual software behavior, using invented examples
+   - Repro steps if the user gave them; otherwise "Synthetic reproduction pending"
 
    ```
-   aa-gh issue create --repo nolanmak/MyAgentAssistant \
+   aa-gh issue create --repo nolanmak/Jarvis \
      --title "<concise title>" \
-     --body "<details with user quote>"
+     --body "<technical behavior and synthetic reproduction>"
    ```
 
    `aa-gh` prints the issue URL on its last stdout line — capture it.
 
-4. **Reply to the user** with the issue URL and a one-line summary of what you filed. Example: *"Filed as https://github.com/nolanmak/MyAgentAssistant/issues/123 — Discord Revise modal hangs on empty feedback."*
+4. **Reply to the user** with the issue URL and a one-line summary of what you filed. Example: *"Filed as https://github.com/nolanmak/Jarvis/issues/123 — Discord Revise modal hangs on empty feedback."*
 
 ### When the user asks about an existing issue by number
 

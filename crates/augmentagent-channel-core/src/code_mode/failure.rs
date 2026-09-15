@@ -125,12 +125,7 @@ impl FailureStage {
 /// should `log+warn`, not abort — the Discord notice is best-effort by design.
 #[async_trait]
 pub trait GhIssueRunner: Send + Sync {
-    async fn create_issue(
-        &self,
-        title: &str,
-        body: &str,
-        labels: &[&str],
-    ) -> anyhow::Result<u64>;
+    async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> anyhow::Result<u64>;
 }
 
 /// Production implementation: shells out to `gh issue create`. The binary
@@ -159,12 +154,7 @@ impl GhCliIssueRunner {
 
 #[async_trait]
 impl GhIssueRunner for GhCliIssueRunner {
-    async fn create_issue(
-        &self,
-        title: &str,
-        body: &str,
-        labels: &[&str],
-    ) -> anyhow::Result<u64> {
+    async fn create_issue(&self, title: &str, body: &str, labels: &[&str]) -> anyhow::Result<u64> {
         // Escape hatch for tests / CI runs that should never touch the real
         // repo. Setting `AUGMENTAGENT_GH_DISABLE=1` makes every invocation
         // a no-op-that-errors-immediately so the reporter logs+continues
@@ -185,7 +175,13 @@ impl GhIssueRunner for GhCliIssueRunner {
         // and a test-run storm filed ~70 duplicates).
         let list = tokio::process::Command::new(&self.bin)
             .args([
-                "issue", "list", "--state", "open", "--limit", "100", "--json",
+                "issue",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                "100",
+                "--json",
                 "number,title",
             ])
             .output()
@@ -463,14 +459,13 @@ pub async fn report_classic_fallback(
 
     // 2. File the gh issue. Failure here is logged but doesn't abort —
     // the Discord notice will fire with `issue=None`.
-    let title = build_issue_title(&record.original_error);
-    let body = build_postmortem(
-        ctx,
-        record,
-        classic_action_id,
-        FinalDraftMode::Classic,
-    );
-    let issue_number = match ctx.gh.create_issue(&title, &body, &["code-mode-failure"]).await {
+    let title = build_issue_title(record.original_stage);
+    let body = build_postmortem(ctx, record, classic_action_id, FinalDraftMode::Classic);
+    let issue_number = match ctx
+        .gh
+        .create_issue(&title, &body, &["code-mode-failure"])
+        .await
+    {
         Ok(n) => Some(n),
         Err(e) => {
             error!(
@@ -531,31 +526,23 @@ impl FinalDraftMode {
     }
 }
 
-fn build_issue_title(err: &str) -> String {
-    // Squash newlines + clip to ~60 chars so the GitHub title stays
-    // grep-friendly. The full error lives in the body.
-    let one_line: String = err
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let trimmed = one_line.trim();
-    const MAX: usize = 60;
-    let summary: String = trimmed.chars().take(MAX).collect();
-    let dots = if trimmed.chars().count() > MAX { "…" } else { "" };
-    format!("[code-mode] {summary}{dots}")
+// Public reports must be assembled only from bounded, non-content metadata.
+// Errors, generated programs and model labels can all contain private messages.
+fn build_issue_title(stage: FailureStage) -> String {
+    format!("[code-mode] {} failed; classic fallback", stage.as_str())
 }
 
 fn build_postmortem(
     ctx: &FailureCtx<'_>,
     record: &FailureRecord,
-    action_id: &str,
+    _action_id: &str,
     final_mode: FinalDraftMode,
 ) -> String {
-    let model = ctx
-        .model
-        .clone()
-        .or_else(|| ctx.opts.model.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let channel = match ctx.channel.as_str() {
+        "gmail" | "email" | "linkedin" | "twitter" | "instagram" | "discord" | "discord-dm"
+        | "slack" | "whatsapp" | "telegram" | "imessage" => ctx.channel.as_str(),
+        _ => "other",
+    };
     let repair_attempted = if record.repair_stage.is_some() {
         "yes"
     } else {
@@ -565,36 +552,15 @@ fn build_postmortem(
         .repair_stage
         .unwrap_or(record.original_stage)
         .as_str();
-    let repair_source = record.repair_source.as_deref().unwrap_or("N/A");
-    let combined_error = match (&record.repair_error, record.repair_stage) {
-        (Some(rep_err), Some(stage)) => format!(
-            "{}\n\n[repair: {}]\n{}",
-            record.original_error,
-            stage.as_str(),
-            rep_err
-        ),
-        _ => record.original_error.clone(),
-    };
     format!(
         "## Postmortem\n\n\
-         **Action id:** {action_id}\n\
-         **Message id:** {msg_id}\n\
+         Code-mode drafting failed and used the classic fallback.\n\n\
          **Channel:** {channel}\n\
-         **Model:** {model}\n\
-         **Manifest version:** {manifest_version}\n\
          **Failure stage:** {final_stage}\n\
-         **Error:**\n\
-         ```\n{combined_error}\n```\n\
-         **Original program:**\n\
-         ```ts\n{original_source}\n```\n\
          **Repair attempted:** {repair_attempted}\n\
-         **Repair program:**\n\
-         ```ts\n{repair_source}\n```\n\
-         **Final draft mode:** {final_mode}\n",
-        msg_id = ctx.email.message_id,
-        channel = ctx.channel,
-        manifest_version = ctx.manifest_version,
-        original_source = record.original_source,
+         **Final draft mode:** {final_mode}\n\n\
+         Private diagnostic source remains in the local action store. Reproduce with \
+         synthetic messages before adding technical details to this public issue.\n",
         final_mode = final_mode.as_str(),
     )
 }
@@ -602,7 +568,11 @@ fn build_postmortem(
 fn render_runner_error(e: &RunnerError) -> String {
     // RunnerError's Display is concise; embed the kind/stack where present.
     match e {
-        RunnerError::RuntimeError { message, stack, kind } => {
+        RunnerError::RuntimeError {
+            message,
+            stack,
+            kind,
+        } => {
             let kind = kind.as_deref().unwrap_or("runtime");
             format!("[{kind}] {message}\n{stack}")
         }
@@ -735,19 +705,10 @@ mod tests {
     }
     #[async_trait]
     impl ApprovalBroker for RecordingBroker {
-        async fn post_approval(
-            &self,
-            _: &str,
-            _: &Email,
-            _: &str,
-        ) -> Result<(), ApprovalError> {
+        async fn post_approval(&self, _: &str, _: &Email, _: &str) -> Result<(), ApprovalError> {
             Ok(())
         }
-        async fn post_flag_notice(
-            &self,
-            email: &Email,
-            reason: &str,
-        ) -> Result<(), ApprovalError> {
+        async fn post_flag_notice(&self, email: &Email, reason: &str) -> Result<(), ApprovalError> {
             self.notices
                 .lock()
                 .unwrap()
@@ -917,14 +878,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postmortem_template_renders_all_fields() {
+    async fn public_postmortem_excludes_private_diagnostics() {
         // Pure template render — no async needed, but kept as tokio for
         // sibling-test ergonomics.
         let store = tmp_store();
         let broker: Arc<dyn ApprovalBroker> = Arc::new(NoopBroker);
         let gh: Arc<dyn GhIssueRunner> = Arc::new(RecordingGh::new(1));
         let r = ScriptedReasoner::new(["unused"]);
-        let ctx = build_ctx(&r, store, broker, gh, sample_email());
+        let mut ctx = build_ctx(&r, store, broker, gh, sample_email());
+        ctx.model = Some("private-model-label".into());
+        ctx.email.body = "private-message-content".into();
+        ctx.manifest_version = "private-manifest-label";
         let record = FailureRecord {
             original_source: "async function main(){ throw 'x'; }".into(),
             original_error: "runtime: throw 'x'".into(),
@@ -935,31 +899,38 @@ mod tests {
         };
         let body = build_postmortem(&ctx, &record, "act-123", FinalDraftMode::Classic);
         assert!(body.contains("## Postmortem"));
-        assert!(body.contains("**Action id:** act-123"));
-        assert!(body.contains("**Message id:** msg-i7-test"));
+
         assert!(body.contains("**Channel:** gmail"));
-        assert!(body.contains("**Model:** test-model"));
-        assert!(body.contains("**Manifest version:** v1"));
+        for private in [
+            "act-123",
+            "msg-i7-test",
+            "private-model-label",
+            "private-message-content",
+            "private-manifest-label",
+            "throw 'x'",
+            "still bad",
+            "async function",
+        ] {
+            assert!(!body.contains(private), "public report leaked {private}");
+        }
+        ctx.channel = "private-channel-label".into();
+        let unknown = build_postmortem(&ctx, &record, "act-123", FinalDraftMode::Classic);
+        assert!(unknown.contains("**Channel:** other"));
+        assert!(!unknown.contains("private-channel-label"));
+
         // Final stage reflects the repair stage when repair was attempted.
         assert!(body.contains("**Failure stage:** repair_run_program"));
-        assert!(body.contains("throw 'x'"));
-        assert!(body.contains("still bad"));
+
         assert!(body.contains("**Repair attempted:** yes"));
         assert!(body.contains("**Final draft mode:** classic"));
     }
 
-    #[tokio::test]
-    async fn issue_title_caps_at_60_chars_and_collapses_newlines() {
-        let long = "a".repeat(120);
-        let title = build_issue_title(&long);
-        assert!(title.starts_with("[code-mode] "));
-        // 12-char prefix + 60-char summary + ellipsis = 12 + 60 + 1.
-        // We're not strict on length; just check truncation happened.
-        assert!(title.contains('…'));
-        assert!(title.len() <= "[code-mode] ".len() + 60 + 4); // 4 = utf8 ellipsis
-        let multi = "line1\nline2\nline3";
-        let t2 = build_issue_title(multi);
-        assert!(!t2.contains('\n'));
+    #[test]
+    fn public_title_uses_only_typed_stage() {
+        assert_eq!(
+            build_issue_title(FailureStage::RunProgram),
+            "[code-mode] run_program failed; classic fallback"
+        );
     }
 
     /// #660 — a provider-side reasoner failure (rate limit / outage /
@@ -982,13 +953,15 @@ mod tests {
                 reset_at: None,
             },
         ));
-        let out =
-            handle_code_mode_failure(&ctx, "", &quota, FailureStage::CallCodeMode).await;
+        let out = handle_code_mode_failure(&ctx, "", &quota, FailureStage::CallCodeMode).await;
         match out {
             DraftOutcome::ClassicNeeded(rec) => {
                 assert!(rec.repair_source.is_none(), "no repair program must exist");
                 assert!(
-                    rec.repair_error.as_deref().unwrap_or("").contains("skipped"),
+                    rec.repair_error
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("skipped"),
                     "record must say the repair was skipped: {:?}",
                     rec.repair_error
                 );
@@ -1003,8 +976,7 @@ mod tests {
 
         // Contrast: a content-level failure (NoCodeBlock) still repairs.
         let content = CodeModeError::NoCodeBlock;
-        let out2 =
-            handle_code_mode_failure(&ctx, "", &content, FailureStage::CallCodeMode).await;
+        let out2 = handle_code_mode_failure(&ctx, "", &content, FailureStage::CallCodeMode).await;
         assert_eq!(
             r.responses.lock().unwrap().len(),
             0,
@@ -1105,14 +1077,18 @@ mod tests {
         let (title, body, labels) = &gh_calls[0];
         assert!(title.starts_with("[code-mode]"));
         assert!(body.contains("## Postmortem"));
-        assert!(body.contains("**Action id:** "));
-        assert!(body.contains(&action_id[..]));
+        assert!(!body.contains("**Action id:** "));
+        assert!(!body.contains(&action_id[..]));
         assert!(body.contains("**Final draft mode:** classic"));
         assert_eq!(labels, &vec!["code-mode-failure".to_string()]);
 
         // Discord notice posted with issue number.
         let notices = broker.notices.lock().unwrap();
-        assert_eq!(notices.len(), 1, "exactly one Discord notice should be posted");
+        assert_eq!(
+            notices.len(),
+            1,
+            "exactly one Discord notice should be posted"
+        );
         let (_, reason) = &notices[0];
         assert!(reason.contains("#42"));
         assert!(reason.contains(&action_id[..]));
@@ -1142,12 +1118,7 @@ mod tests {
         struct AlwaysFailGh;
         #[async_trait]
         impl GhIssueRunner for AlwaysFailGh {
-            async fn create_issue(
-                &self,
-                _: &str,
-                _: &str,
-                _: &[&str],
-            ) -> anyhow::Result<u64> {
+            async fn create_issue(&self, _: &str, _: &str, _: &[&str]) -> anyhow::Result<u64> {
                 anyhow::bail!("gh not installed (test stub)")
             }
         }
@@ -1201,8 +1172,7 @@ mod tests {
         // `handle_code_mode_failure` takes on a successful repair.
         use augmentagent_store::ActionStatus;
         let store = tmp_store();
-        let initial_trace =
-            r#"[{"call":"db.recentEmailsFrom","args_summary":[],"result_summary":[],"error":null,"timestamp_ms":0},{"call":"draft","args_summary":[],"result_summary":null,"error":null,"timestamp_ms":1}]"#;
+        let initial_trace = r#"[{"call":"db.recentEmailsFrom","args_summary":[],"result_summary":[],"error":null,"timestamp_ms":0},{"call":"draft","args_summary":[],"result_summary":null,"error":null,"timestamp_ms":1}]"#;
         let action_id = store
             .log_action_code_mode(
                 "m-trace",

@@ -94,6 +94,14 @@ while [[ $# -gt 0 ]]; do
 done
 [[ "$BODY_SET" == 1 ]] || refuse "an explicit --body or --body-file is required"
 { printf '%s\n' "$TITLE"; cat "$TMP_DIR/body.txt"; } | sed 's/pii-ok//g' > "$TMP_DIR/report.txt"
+# Reject common raw-report payloads even when they contain no email address.
+# This is a backstop; the prompt also requires synthetic technical summaries.
+if LC_ALL=C grep -aqP '(?i)user.s words|original program|repair program|urn:li:|(?<![A-Za-z0-9])\+[1-9][0-9]{7,14}(?![0-9])|/home/[^/[:space:]]+|/Users/[^/[:space:]]+|(?:message|thread|profile)[ _-]?id["\x27]?[[:space:]]*[:=][[:space:]]*["\x27]?(?:[0-9a-f]{12,}|urn:)' "$TMP_DIR/report.txt"; then
+  refuse "raw private-report content detected; describe the defect using synthetic examples"
+fi
+if LC_ALL=C grep -aqP '\x00' "$TMP_DIR/report.txt"; then
+  refuse "binary report content is not supported"
+fi
 if ! bash "$SCRIPT_DIR/check-no-personal-data.sh" "$TMP_DIR/report.txt" >&2; then
   refuse "report may contain private data; use example.com addresses and synthetic identifiers, then retry"
 fi

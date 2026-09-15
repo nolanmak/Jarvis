@@ -34,3 +34,16 @@ jobs:
           mkdir "$RUNNER_TEMP/release-source"
           git archive HEAD | tar -x -C "$RUNNER_TEMP/release-source"
           "$RUNNER_TEMP/gitleaks" dir "$RUNNER_TEMP/release-source" --redact=100 --no-banner
+
+  node-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: npm audit --omit=dev --audit-level=moderate

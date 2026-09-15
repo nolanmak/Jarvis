@@ -841,7 +841,8 @@ fn scope_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     }
 }
 
-const SCOPE_SYSTEM: &str = "You are the scoping pass of a staged autonomous \
+const SCOPE_SYSTEM: &str = "PUBLIC OUTPUT RULE: This response may become a public PR description. Use only technical behavior and invented examples. Never copy private messages, personal names, account or invoice details, live traces, local paths, or generated programs with private inputs.\n\
+You are the scoping pass of a staged autonomous \
 fix pipeline for this codebase. You are given a GitHub issue that may be \
 vague, under-specified, or not actually fixable by a coding agent at all \
 (research asks, epics, infrastructure/purchasing decisions). READ the \
@@ -1146,7 +1147,8 @@ fn review_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     }
 }
 
-const REVIEW_SYSTEM: &str = "You are the QA review pass of a staged autonomous \
+const REVIEW_SYSTEM: &str = "PUBLIC OUTPUT RULE: This response may become a public PR description. Use only technical behavior and invented examples. Never copy private messages, personal names, account or invoice details, live traces, local paths, or generated programs with private inputs.\n\
+You are the QA review pass of a staged autonomous \
 fix pipeline. A separate builder agent has just edited this worktree to fix a \
 GitHub issue; the build and test suite already pass. Your job is to review the \
 work like a skeptical senior engineer before it ships. Run `git diff` and read \
@@ -1333,7 +1335,8 @@ fn codex_review_opts(worktree: PathBuf, system_prompt: &str) -> augmentagent_cha
     }
 }
 
-const CODEX_DIFF_REVIEW_SYSTEM: &str = "You are an INDEPENDENT reviewer on a \
+const CODEX_DIFF_REVIEW_SYSTEM: &str = "PUBLIC OUTPUT RULE: This response may become a public PR description. Use only technical behavior and invented examples. Never copy private messages, personal names, account or invoice details, live traces, local paths, or generated programs with private inputs.\n\
+You are an INDEPENDENT reviewer on a \
 staged autonomous fix pipeline. A different model wrote the change you are \
 about to read; its own QA pass already approved it. You are the second \
 opinion, and you were chosen because you do not share that model's blind \
@@ -1375,7 +1378,8 @@ Then a blank line, then 3-8 sentences: for lgtm, what you verified and how \
 file:line and why each is material. Read-only — do NOT edit anything. Output \
 ONLY the verdict line and your notes.";
 
-const CODEX_SYSTEM_REVIEW_SYSTEM: &str = "You are an INDEPENDENT reviewer on a \
+const CODEX_SYSTEM_REVIEW_SYSTEM: &str = "PUBLIC OUTPUT RULE: This response may become a public PR description. Use only technical behavior and invented examples. Never copy private messages, personal names, account or invoice details, live traces, local paths, or generated programs with private inputs.\n\
+You are an INDEPENDENT reviewer on a \
 staged autonomous fix pipeline, and this is the SYSTEM-INTERACTION pass. A \
 separate review already judged the diff on its own terms. Your job is the \
 question that one cannot answer from the hunks: what does this change do to \
@@ -1969,7 +1973,12 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     }
 }
 
-const SELF_IMPROVE_SYSTEM: &str = "You are an autonomous maintenance engineer for the \
+const SELF_IMPROVE_SYSTEM: &str = "PUBLIC OUTPUT RULE: PR descriptions, review summaries, issue comments and committed \
+fixtures must contain only technical behavior and synthetic examples. Do not copy \
+private messages, names, account details, invoice data, local paths, live traces \
+or generated programs containing private inputs from an issue or local runtime. \
+Paraphrase the software defect and use reserved example.com addresses.\n\
+You are an autonomous maintenance engineer for the \
 AugmentAgent codebase. You are given a single GitHub issue (usually with an \
 implementation spec from a scoping pass). Implement the smallest correct fix. \
 Constraints you MUST honor:\n\
