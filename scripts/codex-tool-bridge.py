@@ -7,6 +7,7 @@ The execution transport is wired separately from this policy core.
 """
 import os
 import json
+import math
 import subprocess
 import fnmatch
 import re
@@ -41,6 +42,12 @@ FILE_TOOLS = {'Read', 'Write', 'Edit', 'Glob', 'Grep', 'LS'}
 KNOWN_TOOLS = FILE_TOOLS | {'WebSearch', 'WebFetch', 'NotebookEdit'}
 CONTROL_PARTS = {'.git', '.codex', '.claude', '.ssh', '.gnupg', '.aws', '.azure'}
 MAX_FILE_BYTES = 8 * 1024 * 1024
+# Tool paths: components below the scope root, and bytes of the absolute path
+# (Linux PATH_MAX). Enforced for every read, write and search entry (#1042).
+MAX_PATH_DEPTH = 32
+MAX_PATH_BYTES = 4096
+# One JSON-RPC line. A maximal Write (8 MiB) fits even when fully escaped.
+MAX_REQUEST_BYTES = 64 * 1024 * 1024
 
 
 def literal_command_argv(command):
@@ -479,6 +486,8 @@ class Policy:
         if not isinstance(name, str) or not name or '\x00' in name:
             raise Denied('invalid path')
         candidate = Path(os.path.abspath(self.cwd / name))
+        if len(os.fsencode(str(candidate))) > MAX_PATH_BYTES:
+            raise Denied('path exceeds length limit')
         roots = self.write_roots if writing else self.read_roots
         for root in sorted(roots, key=lambda p: len(p.parts), reverse=True):
             try:
@@ -487,6 +496,8 @@ class Policy:
                 continue
             if not rel.parts:
                 raise Denied('operation requires a file')
+            if len(rel.parts) > MAX_PATH_DEPTH:
+                raise Denied('path exceeds depth limit')
             if any(p in CONTROL_PARTS or p == '.env' or p.startswith('.env.')
                    for p in rel.parts):
                 raise Denied('credential and control paths are excluded')
@@ -694,36 +705,50 @@ class Policy:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         count = 0
 
-        def walk(fd, relative):
-            nonlocal count
+        def sorted_names(fd):
             with os.scandir(fd) as entries:
-                names = sorted(entry.name for entry in entries)
-            for name in names:
-                count += 1
-                if count > 10000:
-                    raise Denied('search exceeds entry limit; narrow its path')
-                child = relative / name
-                absolute = str(base / child)
-                try:
-                    self._relative(absolute)
-                except Denied:
-                    continue
-                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                if stat.S_ISDIR(info.st_mode):
-                    if name in excluded_dirs:
-                        continue
-                    child_fd = os.open(name, flags, dir_fd=fd)
-                    try:
-                        yield from walk(child_fd, child)
-                    finally:
-                        os.close(child_fd)
-                elif stat.S_ISREG(info.st_mode):
-                    yield absolute, str(child)
+                return iter(sorted(entry.name for entry in entries))
 
         # A synthetic leaf lets parent() verify and open every directory
         # component without following symlinks, including the search root.
-        with self.parent(str(base / '__search_scope__')) as (fd, _):
-            yield from walk(fd, Path('.'))
+        with self.parent(str(base / '__search_scope__')) as (root_fd, _):
+            # Explicit depth-first stack in sorted pre-order: a deep tree can
+            # neither exhaust the interpreter stack nor leak descriptors (#1042).
+            stack = [(root_fd, Path('.'), sorted_names(root_fd))]
+            try:
+                while stack:
+                    fd, relative, names = stack[-1]
+                    name = next(names, None)
+                    if name is None:
+                        stack.pop()
+                        if fd != root_fd:
+                            os.close(fd)
+                        continue
+                    count += 1
+                    if count > 10000:
+                        raise Denied('search exceeds entry limit; narrow its path')
+                    child = relative / name
+                    absolute = str(base / child)
+                    try:
+                        self._relative(absolute)
+                    except Denied:
+                        continue
+                    info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    if stat.S_ISDIR(info.st_mode):
+                        if name in excluded_dirs:
+                            continue
+                        child_fd = os.open(name, flags, dir_fd=fd)
+                        try:
+                            stack.append((child_fd, child, sorted_names(child_fd)))
+                        except BaseException:
+                            os.close(child_fd)
+                            raise
+                    elif stat.S_ISREG(info.st_mode):
+                        yield absolute, str(child)
+            finally:
+                for fd, _, _ in stack:
+                    if fd != root_fd:
+                        os.close(fd)
 
     def glob(self, pattern, path='.'):
         self.require('Glob')
@@ -1630,8 +1655,11 @@ class Server:
         if method == 'tools/list':
             return {'tools': self.tools()}
         if method == 'tools/call':
+            params = request.get('params')
+            if (not isinstance(params, dict) or not isinstance(params.get('name'), str)
+                    or not isinstance(params.get('arguments', {}), dict)):
+                raise InvalidParams('tools/call requires a string name and object arguments')
             try:
-                params = request['params']
                 output = self.call(params['name'], params.get('arguments', {}))
                 return output if isinstance(output, dict) else {'content': [{'type': 'text', 'text': output}]}
             except ReconciliationRequired:
@@ -1640,10 +1668,96 @@ class Server:
                     'Do not repeat or start external changes until that outcome is reconciled.'}]}
             except Readiness as error:
                 return {'isError': True, 'content': [{'type': 'text', 'text': str(error)}]}
-            except (Denied, KeyError, TypeError, UnicodeError, OSError, ValueError):
+            except (Denied, KeyError, TypeError, UnicodeError, OSError, ValueError,
+                    RecursionError, MemoryError):
                 return {'isError': True, 'content': [{'type': 'text',
                         'text': 'Operation denied or invalid for the configured profile.'}]}
         raise Denied('unsupported protocol method')
+
+
+class InvalidParams(Exception):
+    """JSON-RPC -32602: the method exists but its params have the wrong shape."""
+
+
+class OversizedRequest:
+    """A request line longer than MAX_REQUEST_BYTES; only its head is kept."""
+    def __init__(self, prefix):
+        self.prefix = prefix
+
+
+def read_request_lines(stream, limit=MAX_REQUEST_BYTES):
+    """Yield newline-framed requests without ever buffering more than `limit`."""
+    while True:
+        line = stream.readline(limit + 1)
+        if not line:
+            return
+        if len(line) > limit and not line.endswith(b'\n'):
+            prefix = line[:256]
+            while line and not line.endswith(b'\n'):
+                line = stream.readline(1024 * 1024)
+            yield OversizedRequest(prefix)
+        else:
+            yield line
+
+
+def rpc_error(identifier, code, message):
+    return {'jsonrpc': '2.0', 'id': identifier, 'error': {'code': code, 'message': message}}
+
+
+def oversized_response(request):
+    # Codex serializes jsonrpc then id first. Trust an id only in that exact
+    # head position, never one found inside params, so no other pending call
+    # can be completed by mistake. Otherwise the id is unknown (null).
+    match = re.match(rb'\{"jsonrpc":"2\.0","id":(-?[0-9]{1,18}|"[A-Za-z0-9_.:-]{1,128}")[,}]', request.prefix)
+    identifier = json.loads(match[1]) if match else None
+    return json.dumps(rpc_error(identifier, -32600, 'Request exceeds size limit'))
+
+
+def safe_dispatch(server, line):
+    """Serve one request line; return the serialized response, or None.
+
+    Nothing a client sends may terminate the bridge (#1042). Unparsable input
+    gets -32700 and a non-request -32600, both with a null id because none can
+    be trusted. Codex's rmcp client (3.2.0 in codex-cli 0.154) parses id-less
+    errors as JsonRpcError with id None and drops them, and never answers an
+    error, so these replies cannot complete, wedge or echo against a pending
+    call. Notifications and client responses carry no id and are never answered.
+    """
+    if isinstance(line, OversizedRequest):
+        return oversized_response(line)
+    if not line.strip():
+        return None
+    identifier = None
+    try:
+        try:
+            request = json.loads(line.decode('utf-8'))
+        except (ValueError, RecursionError, MemoryError):
+            return json.dumps(rpc_error(None, -32700, 'Parse error'))
+        if not isinstance(request, dict):
+            return json.dumps(rpc_error(None, -32600, 'Invalid Request'))
+        if 'id' not in request:
+            return None
+        if 'method' not in request and ('result' in request or 'error' in request):
+            return None
+        candidate = request['id']
+        if not (candidate is None or type(candidate) in (str, int)
+                or type(candidate) is float and math.isfinite(candidate)):
+            return json.dumps(rpc_error(None, -32600, 'Invalid Request'))
+        identifier = candidate
+        if request.get('jsonrpc') != '2.0' or not isinstance(request.get('method'), str):
+            return json.dumps(rpc_error(identifier, -32600, 'Invalid Request'))
+        try:
+            response = {'jsonrpc': '2.0', 'id': identifier, 'result': server.dispatch(request)}
+        except Readiness as error:
+            response = rpc_error(identifier, -32001, str(error))
+        except InvalidParams:
+            response = rpc_error(identifier, -32602, 'Invalid params')
+        except Denied:
+            response = rpc_error(identifier, -32601, 'Unsupported method')
+        return json.dumps(response)
+    except Exception:
+        # Never echo internal details; the tool journal owns effect uncertainty.
+        return json.dumps(rpc_error(identifier, -32603, 'Internal error'))
 
 
 def serve(config_path):
@@ -1678,19 +1792,10 @@ def serve(config_path):
     threading.Thread(target=watch_parent, daemon=True).start()
     server = Server(Policy(config))
     try:
-        for line in sys.stdin:
-            request = json.loads(line)
-            if 'id' not in request:
-                continue
-            try:
-                response = {'jsonrpc': '2.0', 'id': request['id'], 'result': server.dispatch(request)}
-            except Readiness as error:
-                response = {'jsonrpc': '2.0', 'id': request['id'],
-                            'error': {'code': -32001, 'message': str(error)}}
-            except Denied:
-                response = {'jsonrpc': '2.0', 'id': request['id'],
-                            'error': {'code': -32601, 'message': 'Unsupported method'}}
-            print(json.dumps(response), flush=True)
+        for line in read_request_lines(sys.stdin.buffer):
+            response = safe_dispatch(server, line)
+            if response is not None:
+                print(response, flush=True)
     finally:
         server.close()
         os.close(parent_fd)

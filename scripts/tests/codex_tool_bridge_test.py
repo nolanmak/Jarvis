@@ -1347,6 +1347,209 @@ for line in sys.stdin:
                 release.set();httpd.shutdown();httpd.server_close()
 
 
+def make_deep_tree(parent, depth, leaf='deep.txt'):
+    """Build a directory chain deeper than PATH_MAX-relative helpers allow."""
+    import os
+    descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for _ in range(depth):
+            os.mkdir('d', dir_fd=descriptor)
+            child = os.open('d', os.O_RDONLY | os.O_DIRECTORY, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        handle = os.open(leaf, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=descriptor)
+        os.write(handle, b'SYNTHETIC_DEEP needle\n')
+        os.close(handle)
+    finally:
+        os.close(descriptor)
+
+
+def remove_tree_iteratively(path):
+    # shutil.rmtree recurses per directory level on Python 3.12.
+    import os
+    if not os.path.lexists(path):
+        return
+    for base, directories, files in os.walk(path, topdown=False):
+        for name in files:
+            os.unlink(os.path.join(base, name))
+        for name in directories:
+            target = os.path.join(base, name)
+            if os.path.islink(target):
+                os.unlink(target)
+            else:
+                os.rmdir(target)
+    os.rmdir(path)
+
+
+class BridgeResilienceTests(unittest.TestCase):
+    """#1042: no model or client input may terminate the bridge process."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / 'workspace'
+        self.root.mkdir()
+        # Runs before the temporary directory cleanup (cleanups are LIFO).
+        self.addCleanup(remove_tree_iteratively, str(self.root / 'd'))
+        self.config = {'cwd': str(self.root), 'read_roots': [str(self.root)],
+                       'write_roots': [str(self.root)],
+                       'allowed_tools': ['Read', 'Write', 'Edit', 'Glob', 'Grep']}
+        self.policy = bridge.Policy(self.config)
+
+    def run_bridge(self, lines):
+        config = Path(self.temp.name) / 'policy.json'
+        config.write_text(json.dumps(self.config))
+        config.chmod(0o600)
+        run = subprocess.run([sys.executable, '-I', str(SPEC.origin), str(config)],
+                             input=b''.join(lines), capture_output=True, timeout=60)
+        return run, [json.loads(line) for line in run.stdout.splitlines()]
+
+    @staticmethod
+    def line(message):
+        return json.dumps(message).encode() + b'\n'
+
+    def test_deep_path_write_is_denied_without_creating_a_junk_tree(self):
+        with self.assertRaisesRegex(bridge.Denied, 'depth'):
+            self.policy.write('d/' * 1500 + 'f', 'SYNTHETIC')
+        self.assertFalse((self.root / 'd').exists())
+
+    def test_path_depth_and_length_caps_apply_to_reads_and_writes(self):
+        limit = bridge.MAX_PATH_DEPTH
+        self.policy.write('w/' * (limit - 1) + 'f', 'SYNTHETIC_AT_LIMIT')
+        self.assertEqual(self.policy.read('w/' * (limit - 1) + 'f'), 'SYNTHETIC_AT_LIMIT')
+        with self.assertRaisesRegex(bridge.Denied, 'depth'):
+            self.policy.write('w/' * limit + 'f', 'SYNTHETIC_TOO_DEEP')
+        self.assertFalse((self.root.joinpath(*['w'] * limit)).exists())
+        make_deep_tree(self.root, limit + 4)
+        with self.assertRaisesRegex(bridge.Denied, 'depth'):
+            self.policy.read('d/' * (limit + 4) + 'deep.txt')
+        long_name = '/'.join(['n' * 250] * 20) + '/f'
+        for action in (lambda: self.policy.write(long_name, 'SYNTHETIC'),
+                       lambda: self.policy.read(long_name)):
+            with self.assertRaisesRegex(bridge.Denied, 'length'):
+                action()
+        self.assertFalse((self.root / ('n' * 250)).exists())
+
+    def test_glob_and_grep_over_an_existing_deep_tree_do_not_crash_dispatch(self):
+        (self.root / 'shallow.txt').write_text('SYNTHETIC_SHALLOW needle\n')
+        make_deep_tree(self.root, 1500)
+        server = bridge.Server(self.policy)
+        glob = server.dispatch({'method': 'tools/call', 'params': {
+            'name': 'Glob', 'arguments': {'pattern': '**/*.txt'}}})
+        self.assertFalse(glob.get('isError', False), glob)
+        self.assertEqual(json.loads(glob['content'][0]['text']), ['shallow.txt'])
+        grep = server.dispatch({'method': 'tools/call', 'params': {
+            'name': 'Grep', 'arguments': {'pattern': 'needle'}}})
+        self.assertFalse(grep.get('isError', False), grep)
+        self.assertEqual([hit['path'] for hit in json.loads(grep['content'][0]['text'])], ['shallow.txt'])
+
+    def test_recursion_and_memory_errors_in_a_tool_become_tool_errors(self):
+        server = bridge.Server(self.policy)
+        for error in (RecursionError, MemoryError):
+            def explode(*args, **kwargs):
+                raise error('synthetic')
+            self.policy.glob = explode
+            with self.subTest(error=error.__name__):
+                response = server.dispatch({'method': 'tools/call', 'params': {
+                    'name': 'Glob', 'arguments': {'pattern': '*'}}})
+                self.assertTrue(response['isError'])
+
+    def test_unexpected_failure_is_an_internal_error_not_a_crash(self):
+        server = bridge.Server(self.policy)
+        def explode(request):
+            raise LookupError('SYNTHETIC_PRIVATE_DETAIL')
+        server.dispatch = explode
+        response = json.loads(bridge.safe_dispatch(server, self.line(
+            {'jsonrpc': '2.0', 'id': 3, 'method': 'ping'})))
+        self.assertEqual(response['id'], 3)
+        self.assertEqual(response['error']['code'], -32603)
+        self.assertNotIn('SYNTHETIC_PRIVATE_DETAIL', json.dumps(response))
+
+    def test_stdio_bridge_survives_deep_tree_and_deep_write(self):
+        make_deep_tree(self.root, 1500)
+        run, replies = self.run_bridge([
+            self.line({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call',
+                       'params': {'name': 'Glob', 'arguments': {'pattern': '*'}}}),
+            self.line({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call',
+                       'params': {'name': 'Write', 'arguments': {'file_path': 'e/' * 1500 + 'f', 'content': 'x'}}}),
+            self.line({'jsonrpc': '2.0', 'id': 3, 'method': 'ping'}),
+        ])
+        self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+        self.assertEqual([reply['id'] for reply in replies], [1, 2, 3])
+        self.assertIn('result', replies[0])
+        self.assertTrue(replies[1]['result']['isError'])
+        self.assertEqual(replies[2]['result'], {})
+        self.assertFalse((self.root / 'e').exists())
+
+    def test_malformed_line_is_answered_and_next_request_is_served(self):
+        run, replies = self.run_bridge([
+            b'{"jsonrpc": "2.0", "id": 1, "method": \n',
+            b'\xff\xfe not utf-8\n',
+            b'[[[[[[[[[[' * 20000 + b'\n',
+            self.line({'jsonrpc': '2.0', 'id': 2, 'method': 'ping'}),
+        ])
+        self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+        self.assertEqual(len(replies), 4, replies)
+        for reply in replies[:3]:
+            self.assertEqual(reply, {'jsonrpc': '2.0', 'id': None,
+                                     'error': {'code': -32700, 'message': 'Parse error'}})
+        self.assertEqual(replies[3], {'jsonrpc': '2.0', 'id': 2, 'result': {}})
+
+    def test_non_object_and_malformed_requests_get_invalid_request(self):
+        run, replies = self.run_bridge([
+            b'[1, 2]\n', b'5\n', b'"ping"\n', b'null\n',
+            self.line({'jsonrpc': '2.0', 'id': 4, 'method': 5}),
+            self.line({'jsonrpc': '1.0', 'id': 5, 'method': 'ping'}),
+            self.line({'jsonrpc': '2.0', 'id': {'nested': 1}, 'method': 'ping'}),
+            self.line({'jsonrpc': '2.0', 'id': True, 'method': 'ping'}),
+            # Notifications and client responses are never answered.
+            self.line({'jsonrpc': '2.0', 'method': 'tools/call', 'params': {'name': 5}}),
+            self.line({'jsonrpc': '2.0', 'id': 6, 'result': {}}),
+            self.line({'jsonrpc': '2.0', 'id': 7, 'method': 'ping'}),
+        ])
+        self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+        invalid = {'code': -32600, 'message': 'Invalid Request'}
+        self.assertEqual(replies, [
+            {'jsonrpc': '2.0', 'id': None, 'error': invalid},
+            {'jsonrpc': '2.0', 'id': None, 'error': invalid},
+            {'jsonrpc': '2.0', 'id': None, 'error': invalid},
+            {'jsonrpc': '2.0', 'id': None, 'error': invalid},
+            {'jsonrpc': '2.0', 'id': 4, 'error': invalid},
+            {'jsonrpc': '2.0', 'id': 5, 'error': invalid},
+            {'jsonrpc': '2.0', 'id': None, 'error': invalid},
+            {'jsonrpc': '2.0', 'id': None, 'error': invalid},
+            {'jsonrpc': '2.0', 'id': 7, 'result': {}},
+        ])
+
+    def test_invalid_tool_call_params_get_invalid_params(self):
+        calls = [{'name': 5}, 'Read', {'arguments': {}}, {'name': 'Read', 'arguments': 'note.txt'},
+                 {'name': 'Read', 'arguments': None}]
+        messages = [self.line({'jsonrpc': '2.0', 'id': index, 'method': 'tools/call', 'params': params})
+                    for index, params in enumerate(calls)]
+        messages.append(self.line({'jsonrpc': '2.0', 'id': 'after', 'method': 'tools/call'}))
+        messages.append(self.line({'jsonrpc': '2.0', 'id': 'served', 'method': 'ping'}))
+        run, replies = self.run_bridge(messages)
+        self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+        self.assertEqual([reply['id'] for reply in replies], [0, 1, 2, 3, 4, 'after', 'served'])
+        for reply in replies[:6]:
+            self.assertEqual(reply['error'], {'code': -32602, 'message': 'Invalid params'}, reply)
+        self.assertEqual(replies[6]['result'], {})
+
+    def test_oversized_request_lines_are_discarded_and_reading_continues(self):
+        import io
+        request = b'{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"arguments":{"id":7,"content":"'
+        stream = io.BytesIO(request + b'x' * 50 + b'"}}}\n' + b'{"ok": 1}\n' + b'{"id":9,' + b'y' * 60)
+        lines = list(bridge.read_request_lines(stream, 64))
+        self.assertEqual(len(lines), 3)
+        self.assertIsInstance(lines[0], bridge.OversizedRequest)
+        self.assertEqual(lines[1], b'{"ok": 1}\n')
+        self.assertIsInstance(lines[2], bridge.OversizedRequest)
+        # Only an id at the head of a compact request is trusted; never a nested one.
+        self.assertEqual(json.loads(bridge.oversized_response(lines[0])),
+                         {'jsonrpc': '2.0', 'id': 42, 'error': {'code': -32600, 'message': 'Request exceeds size limit'}})
+        self.assertIsNone(json.loads(bridge.oversized_response(lines[2]))['id'])
+
+
 class TransportTests(unittest.TestCase):
     def test_bridge_survives_launcher_thread_exit_while_parent_process_is_alive(self):
         import queue

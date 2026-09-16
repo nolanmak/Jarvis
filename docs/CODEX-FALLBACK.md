@@ -21,6 +21,29 @@ pre-tool guards. Every filesystem path component is opened without following
 symlinks. Read roots and write roots are separate; transcript context is not a
 writable workspace. Credential and control directories are excluded.
 
+Tool paths are capped at 32 components below their scope root and at 4096 bytes
+as an absolute path (Linux `PATH_MAX`). The caps apply to Read, Write and Edit and
+to every Glob/Grep entry. A deeper Write is refused before any directory is
+created. Searches skip deeper entries and walk with an explicit stack, so an
+existing deep tree cannot exhaust the interpreter stack (#1042).
+
+No client or model input can end the bridge process short of SIGKILL. Each
+request line passes through one `safe_dispatch` wrapper. Unparsable input
+(invalid JSON, invalid UTF-8 or excessive nesting) gets JSON-RPC `-32700`. A
+value that is not a request object, or has an unusable id, gets `-32600`. Both
+use a null id because no id can be trusted. A request with a readable id but a
+wrong `jsonrpc`/`method` gets `-32600` with that id. A `tools/call` whose params
+are not an object, whose `name` is not a string, or whose `arguments` are not an
+object gets `-32602`. Any other unexpected failure gets `-32603` with no details.
+Tool-level `RecursionError`/`MemoryError` become ordinary tool errors. Lines
+longer than 64 MiB are discarded without being buffered. They get `-32600`,
+carrying the id only when it is the compact request's leading field. Notifications
+and client responses are never answered. We checked the null-id replies against
+Codex's MCP client (rmcp 3.2.0 in codex-cli 0.154.0). It parses an error without
+an id as `JsonRpcError { id: None }`, logs it and drops it, and it never replies
+to an error. A null-id reply therefore cannot complete or stall a pending call,
+and cannot start an echo loop.
+
 The original guards run inside the bridge and fail closed on crash, timeout,
 malformed output or explicit denial. Native Codex hooks are not the enforcement
 boundary: a live synthetic probe found that a crashing hook allowed an MCP call
@@ -348,6 +371,10 @@ cannot stand in for any tool-using profile.
 - Bridge tests cover file read/write/edit, nested writes, bounded search, tool
   declaration, traversal and intermediate symlink escapes, sensitive paths,
   command parsing, and guard denial/crash/malformed-response handling.
+- `BridgeResilienceTests` pin the path depth/length caps for reads and writes,
+  Glob/Grep over a 1500-level tree, and a stdio bridge that keeps serving after
+  deep paths, malformed lines, non-object requests and invalid `tools/call`
+  params, with the JSON-RPC codes above.
 - File-tool schemas and dispatch support optional line ranges, scoped/file
   searches, case-insensitive matching, explicit replace-all edits and bounded
   command timeouts. Invalid or unknown local arguments are rejected before
