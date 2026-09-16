@@ -1195,6 +1195,268 @@ fn build_failure_hold(
     }
 }
 
+/// #1029 — finish work that is already approved, without spending anything.
+///
+/// With `.coderabbit.yaml` present a fresh PR opens as a draft and merging is
+/// deferred; the resume lane does it. But the resume lane sits below the daily
+/// cap check, so once the cap is spent an approved PR cannot be merged until
+/// the next UTC day — and if that day's slots also go to new builds, it may
+/// never be. #1000 sat two days; #1020 sat until a human merged it.
+///
+/// The cap exists to bound BILLED reasoner work. Merging a draft whose reviews
+/// are already recorded spends no reasoner call at all — it reads PR state and
+/// merges — so gating it on a reasoner budget is a category error, and it is
+/// the direct cause of drafts piling up.
+///
+/// Reads only. Every unknown is treated as "do not merge": the sweep's whole
+/// justification is that it finishes work already approved, and acting on a
+/// guess would make it something else.
+async fn merge_sweep(repo_root: &Path) -> usize {
+    let gh = gh_bin();
+    let (ok, out, _) = match run(
+        &gh,
+        &[
+            "pr", "list", "--state", "open", "--limit", "50", "--json",
+            "number,headRefName,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body",
+        ],
+        repo_root,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("merge sweep: could not list PRs: {e:#}");
+            return 0;
+        }
+    };
+    if !ok {
+        return 0;
+    }
+    let prs: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
+    let Some(rows) = prs.as_array() else {
+        return 0;
+    };
+    let owner = repo_owner_from_remote(repo_root).await;
+    let mut merged = 0usize;
+
+    for row in rows {
+        if merged >= MAX_SWEEP_MERGES {
+            break;
+        }
+        let Some(pr) = row.get("number").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let branch = row
+            .get("headRefName")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let Some(issue) = issue_from_branch(branch) else {
+            continue;
+        };
+        if row.get("isDraft").and_then(serde_json::Value::as_bool) != Some(true) {
+            continue;
+        }
+        let body = row
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let candidate = SweepCandidate {
+            pr,
+            issue,
+            ours: head_is_ours(row, owner.as_deref()),
+            mergeable: match row.get("mergeable").and_then(serde_json::Value::as_str) {
+                Some("MERGEABLE") => Some(true),
+                Some("CONFLICTING") => Some(false),
+                _ => None,
+            },
+            checks_green: checks_green(repo_root, pr).await,
+            codex_lgtms: body.matches("CODEX-REVIEW: lgtm").count() as u32,
+            rabbit_blocks: false,
+            policy: MergePolicy {
+                automerge_enabled: automerge_enabled_value(
+                    std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
+                ),
+                complexity: complexity_from_pr_body(body),
+                codex_approved: body.matches("CODEX-REVIEW: lgtm").count() >= 2,
+                reviews_approved: true,
+                research_filed: false,
+                receipt_gated_file: None,
+                lgtm_overrides_receipt: std::env::var("AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT")
+                    .ok(),
+                issue_author: owner.clone().unwrap_or_default(),
+                repo_owner: owner.clone(),
+                automerge_authors: std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS").ok(),
+            },
+        };
+        match sweep_verdict(&candidate) {
+            SweepVerdict::Skip(why) => {
+                // Said, not swallowed: a silent skip is indistinguishable from
+                // the sweep being broken.
+                info!("merge sweep skipped {why}");
+            }
+            SweepVerdict::Merge => {
+                let _ = run(&gh, &["pr", "ready", &pr.to_string()], repo_root).await;
+                let (ok, _o, e) = run(
+                    &gh,
+                    &["pr", "merge", &pr.to_string(), "--squash", "--delete-branch"],
+                    repo_root,
+                )
+                .await
+                .unwrap_or((false, String::new(), "spawn failed".into()));
+                if ok {
+                    merged += 1;
+                    info!(
+                        pr = candidate.pr,
+                        issue = candidate.issue,
+                        "merge sweep: merged an already-approved draft"
+                    );
+                    notify_discord(&format!(
+                        "✅ auto-PR merged (sweep): #{} for issue #{}",
+                        candidate.pr, candidate.issue
+                    ))
+                    .await;
+                } else {
+                    warn!(pr, "merge sweep: merge failed, left open: {}", truncate(&e, 200));
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// Are every one of this PR's checks green? `None` when that cannot be
+/// determined, which the sweep treats as "do not merge".
+async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
+    let (ok, out, _) = run(
+        &gh_bin(),
+        &["pr", "checks", &pr.to_string(), "--json", "state"],
+        repo_root,
+    )
+    .await
+    .ok()?;
+    if !ok {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&out).ok()?;
+    let rows = v.as_array()?;
+    Some(rows.iter().all(|r| {
+        matches!(
+            r.get("state").and_then(serde_json::Value::as_str),
+            Some("SUCCESS") | Some("SKIPPED") | Some("NEUTRAL")
+        )
+    }))
+}
+
+/// #1029 — every input the auto-merge decision takes, in one place.
+///
+/// Extracted so the fresh path and the merge sweep share ONE policy. Two
+/// copies drift, and the failure is silent: a PR the fresh path would never
+/// have merged gets merged a day later by the sweep, on rules nobody compared.
+#[derive(Debug, Clone)]
+struct MergePolicy {
+    automerge_enabled: bool,
+    complexity: Complexity,
+    /// Both independent codex passes approved.
+    codex_approved: bool,
+    /// The whole independent stage approved (codex, and CodeRabbit where it
+    /// had an opinion).
+    reviews_approved: bool,
+    /// #787 — the daemon's own speculative proposals never auto-merge.
+    research_filed: bool,
+    /// The receipt-gated file this diff touches, if any (#823).
+    receipt_gated_file: Option<String>,
+    lgtm_overrides_receipt: Option<String>,
+    issue_author: String,
+    repo_owner: Option<String>,
+    automerge_authors: Option<String>,
+}
+
+/// May this change auto-merge? The single answer both paths use.
+fn may_automerge(p: &MergePolicy) -> bool {
+    if !p.automerge_enabled || !p.reviews_approved || p.research_filed {
+        return false;
+    }
+    // #828 — an independent LGTM is REQUIRED, and with the override set it
+    // also releases the `hard` band: two independent reviewers is a real
+    // answer to blast radius where one model grading its own family's work
+    // was not.
+    let complexity_ok = p.complexity.auto_mergeable() || (p.codex_approved && codex_unlocks_hard());
+    if !complexity_ok {
+        return false;
+    }
+    if !automerge_receipt_ok(
+        p.receipt_gated_file.as_deref(),
+        p.codex_approved,
+        p.lgtm_overrides_receipt.as_deref(),
+    ) {
+        return false;
+    }
+    automerge_eligible(
+        &p.issue_author,
+        p.repo_owner.as_deref(),
+        p.automerge_authors.as_deref(),
+    )
+}
+
+/// #1029 — one open draft, as the sweep sees it through `gh`.
+///
+/// Every field that can be unknown is an `Option`, and unknown is always
+/// treated as "do not merge". The sweep's whole justification is that it only
+/// finishes work already approved; acting on a guess would make it something
+/// else entirely.
+#[derive(Debug, Clone)]
+struct SweepCandidate {
+    pr: u64,
+    issue: u64,
+    /// #1006 — is this head in THIS repository? `None` means unprovable.
+    ours: Option<bool>,
+    mergeable: Option<bool>,
+    checks_green: Option<bool>,
+    codex_lgtms: u32,
+    rabbit_blocks: bool,
+    policy: MergePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SweepVerdict {
+    Merge,
+    /// Left alone, with the reason — a silent skip is indistinguishable from
+    /// the sweep being broken.
+    Skip(String),
+}
+
+/// Should the sweep merge this draft? Pure: the sweep spends no reasoner call,
+/// so the whole decision is evidence already on the PR.
+fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
+    let skip = |why: &str| SweepVerdict::Skip(format!("PR #{}: {why}", c.pr));
+    if c.ours != Some(true) {
+        return skip("not ours — the loop only finishes work it opened (#1006)");
+    }
+    if c.mergeable != Some(true) {
+        return skip("conflict with main, or mergeability unknown; a rebase is the resume lane's job");
+    }
+    if c.checks_green != Some(true) {
+        return skip("checks are not green, or their state is unknown");
+    }
+    if c.codex_lgtms < 2 {
+        return skip(&format!(
+            "only {} independent review approval(s) recorded; two are required",
+            c.codex_lgtms
+        ));
+    }
+    if c.rabbit_blocks {
+        return skip("CodeRabbit has actionable findings on this head");
+    }
+    if !may_automerge(&c.policy) {
+        return skip("the merge policy withholds it (complexity, receipt gate, or author)");
+    }
+    SweepVerdict::Merge
+}
+
+/// #1029 — how many drafts one sweep may merge. Bounded so a backlog cannot
+/// stall a tick; the next tick takes the rest.
+const MAX_SWEEP_MERGES: usize = 3;
+
 /// #1030 — is this failure "every provider that could serve the call is
 /// latched", rather than something actually broken?
 ///
@@ -6027,54 +6289,26 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // auto-merge when the owner opted in AND the scoper graded the work
     // simple/medium (#653 — hard work always gets human eyes).
     let automerge = {
-        let enabled = automerge_enabled_value(
-            std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
-        );
-        // #787 — research-filed issues never auto-merge: they are the
-        // daemon's own speculative proposals, auto-filed with the owner's gh
-        // auth (so they pass the owner-authored test), and they change core
-        // behaviour. They land as draft PRs for human review.
-        // #828 — an independent LGTM is REQUIRED for any auto-merge, and
-        // when `AUGMENTAGENT_AUTOPR_CODEX_UNLOCKS_HARD` is set it also
-        // releases the `hard` band: two independent reviewers is a real
-        // answer to blast radius, where one model grading its own family's
-        // work was not. Receipt-gated paths stay human-only either way —
-        // those change live behaviour no reviewer can verify by reading.
-        let complexity_ok = complexity.auto_mergeable() || (independent.codex_approved() && codex_unlocks_hard());
-        // Owner policy 2026-08-31: a double codex LGTM may override the
-        // receipt gate (env-gated; see `automerge_receipt_ok`).
-        let receipt_ok = automerge_receipt_ok(
-            gated.as_deref(),
-            independent.codex_approved(),
-            std::env::var("AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT").ok().as_deref(),
-        );
-        // #936 — with CodeRabbit configured, a fresh PR is never merged
-        // here: it opens as a draft, CodeRabbit reviews it, and the resume
-        // lane merges on triple LGTM.
-        // #1032 — CodeRabbit is advisory, and on this path it cannot have an
-        // opinion: the PR is created a few lines below, so there is nothing
-        // for it to have reviewed. Deferring every merge merely because
-        // `.coderabbit.yaml` exists handed the decision to the resume lane,
-        // which cannot run once the daily cap is spent (#1029) — and on the
-        // free tier, an exhausted quota made the loop's throughput a function
-        // of somebody else's billing plan. Findings still withhold a merge in
-        // the resume lane, where a review can actually exist.
-        if enabled && complexity_ok && independent.approved() && !issue.research_filed
-            && receipt_ok
-        {
-            let owner = std::env::var(GH_OWNER_ENV)
-                .ok()
-                .or(repo_owner_from_remote(repo_root).await);
-            automerge_eligible(
-                &issue.author,
-                owner.as_deref(),
-                std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS")
-                    .ok()
-                    .as_deref(),
-            )
-        } else {
-            false
-        }
+        // #1029 — one policy, shared with the merge sweep. Two copies drift,
+        // and the drift is silent: a PR the fresh path would never merge gets
+        // merged a day later by the sweep, on rules nobody compared.
+        let owner = std::env::var(GH_OWNER_ENV)
+            .ok()
+            .or(repo_owner_from_remote(repo_root).await);
+        may_automerge(&MergePolicy {
+            automerge_enabled: automerge_enabled_value(
+                std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
+            ),
+            complexity,
+            codex_approved: independent.codex_approved(),
+            reviews_approved: independent.approved(),
+            research_filed: issue.research_filed,
+            receipt_gated_file: gated.clone(),
+            lgtm_overrides_receipt: std::env::var("AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT").ok(),
+            issue_author: issue.author.clone(),
+            repo_owner: owner,
+            automerge_authors: std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS").ok(),
+        })
     };
     let gh = gh_bin();
     let plan_section = plan
@@ -8064,6 +8298,14 @@ impl AutoPrLoop {
                 }
                 _ = tokio::time::sleep(self.interval) => {}
             }
+            // #1029 — finish already-approved drafts FIRST, and outside the
+            // cap. This spends no reasoner call, so a reasoner budget must not
+            // gate it; gating it is what let approved PRs sit for days.
+            let swept = merge_sweep(&self.repo_root).await;
+            if swept > 0 {
+                info!(swept, "auto-PR: merged already-approved drafts (unbilled)");
+            }
+
             let today = utc_day_now();
             if counter.runs_today(today) >= self.daily_cap {
                 info!(
@@ -10481,6 +10723,165 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             {"number": 8, "title": title, "labels": [], "pull_request": {"url": "x"}},
         ]);
         assert_eq!(red_main_issue_lookup(&prs_only, &title), None);
+    }
+
+    // ---- #1029: merging an approved draft costs no reasoner call ----
+
+    fn policy(complexity: Complexity) -> MergePolicy {
+        MergePolicy {
+            automerge_enabled: true,
+            complexity,
+            codex_approved: true,
+            reviews_approved: true,
+            research_filed: false,
+            receipt_gated_file: None,
+            lgtm_overrides_receipt: Some("1".into()),
+            issue_author: "nolanmak".into(),
+            repo_owner: Some("nolanmak".into()),
+            automerge_authors: None,
+        }
+    }
+
+    /// C2 — the sweep must not restate the fresh path's policy, or the two
+    /// drift and a PR the fresh path would never have merged gets merged a day
+    /// later by the sweep. One function, both callers.
+    #[test]
+    fn both_merge_paths_consult_the_same_policy() {
+        let src = include_str!("self_improve.rs");
+        let fresh_start = src.find("pub async fn run_once(").expect("run_once");
+        let fresh = &src[fresh_start..fresh_start + src[fresh_start..].find("\n}\n").expect("end")];
+        assert!(
+            fresh.contains("may_automerge("),
+            "the fresh path must go through the shared policy"
+        );
+        // The sweep reaches the policy through `sweep_verdict`, which is the
+        // thing that adds the sweep-only conditions on top of it.
+        let sweep_start = src.find("async fn merge_sweep(").expect("the sweep");
+        let sweep = &src[sweep_start..sweep_start + src[sweep_start..].find("\n}\n").expect("end")];
+        assert!(
+            sweep.contains("sweep_verdict("),
+            "the sweep must decide through sweep_verdict"
+        );
+        let v_start = src.find("fn sweep_verdict(").expect("sweep_verdict");
+        let verdict = &src[v_start..v_start + src[v_start..].find("\n}\n").expect("end")];
+        assert!(
+            verdict.contains("may_automerge("),
+            "and sweep_verdict must defer to the shared policy, or the two drift"
+        );
+    }
+
+    /// The policy itself: every gate the fresh path applies still applies.
+    #[test]
+    fn the_shared_policy_keeps_every_gate_it_had() {
+        assert!(may_automerge(&policy(Complexity::Simple)));
+        assert!(may_automerge(&policy(Complexity::Medium)));
+
+        // Hard needs the codex override, exactly as before.
+        let hard = policy(Complexity::Hard);
+        assert_eq!(may_automerge(&hard), codex_unlocks_hard());
+
+        type Mutation = (&'static str, fn(&mut MergePolicy));
+        let mutations: [Mutation; 4] = [
+            ("automerge disabled", |p| p.automerge_enabled = false),
+            ("reviews not approved", |p| p.reviews_approved = false),
+            ("research-filed issue", |p| p.research_filed = true),
+            ("someone else's issue", |p| p.issue_author = "a-stranger".into()),
+        ];
+        for (label, mutate) in mutations {
+            let mut p = policy(Complexity::Simple);
+            mutate(&mut p);
+            assert!(!may_automerge(&p), "{label} must still withhold the merge");
+        }
+
+        // The receipt gate: only a double codex LGTM may override it, and only
+        // when the owner opted in.
+        let mut gated = policy(Complexity::Simple);
+        gated.receipt_gated_file = Some("crates/augmentagent-channel-core/src/reasoner.rs".into());
+        assert!(may_automerge(&gated), "a double LGTM may override, per owner policy");
+        gated.lgtm_overrides_receipt = None;
+        assert!(!may_automerge(&gated), "without the opt-in the receipt gate holds");
+        gated.lgtm_overrides_receipt = Some("1".into());
+        gated.codex_approved = false;
+        assert!(!may_automerge(&gated), "and never without the codex approval");
+    }
+
+    /// C3, C4, C6 — what the sweep refuses to touch, and why each refusal is
+    /// stated rather than silent.
+    #[test]
+    fn the_sweep_merges_only_a_draft_it_can_fully_vouch_for() {
+        let ready = SweepCandidate {
+            pr: 1020,
+            issue: 1007,
+            ours: Some(true),
+            mergeable: Some(true),
+            checks_green: Some(true),
+            codex_lgtms: 2,
+            rabbit_blocks: false,
+            policy: policy(Complexity::Medium),
+        };
+        assert_eq!(sweep_verdict(&ready), SweepVerdict::Merge);
+
+        let refuse = |mutate: fn(&mut SweepCandidate), expect: &str| {
+            let mut c = SweepCandidate { ..ready.clone() };
+            mutate(&mut c);
+            match sweep_verdict(&c) {
+                SweepVerdict::Skip(why) => assert!(
+                    why.to_lowercase().contains(expect),
+                    "skip reason {why:?} must mention {expect:?}"
+                ),
+                SweepVerdict::Merge => panic!("must not merge: expected {expect}"),
+            }
+        };
+
+        // C6 — a PR the loop did not open is never touched.
+        refuse(|c| c.ours = Some(false), "not ours");
+        refuse(|c| c.ours = None, "not ours");
+        // C4 — conflicts and red checks.
+        refuse(|c| c.mergeable = Some(false), "conflict");
+        refuse(|c| c.mergeable = None, "conflict");
+        refuse(|c| c.checks_green = Some(false), "checks");
+        refuse(|c| c.checks_green = None, "checks");
+        // C3 — an incomplete approval record.
+        refuse(|c| c.codex_lgtms = 1, "review");
+        refuse(|c| c.rabbit_blocks = true, "coderabbit");
+        refuse(|c| c.policy.reviews_approved = false, "policy");
+    }
+
+    /// C1, C5, C7 — the sweep runs while capped, spends no reasoner call, and
+    /// is bounded so a backlog cannot stall a tick.
+    #[test]
+    fn the_sweep_is_free_bounded_and_runs_while_capped() {
+        let src = include_str!("self_improve.rs");
+        // `run` delegates; the tick loop itself is `run_with`.
+        let start = src.find("async fn run_with<F, T>(").expect("the tick loop");
+        let body = &src[start..start + src[start..].find("\n    }\n").expect("end")];
+        let sweep = body.find("merge_sweep(").expect("the tick must run the sweep");
+        let cap = body.find("daily cap reached").expect("the cap check");
+        assert!(
+            sweep < cap,
+            "the sweep must run BEFORE the cap check; merging an approved \
+             draft spends no reasoner call, so a reasoner budget must not gate it"
+        );
+
+        let fn_start = src.find("async fn merge_sweep(").expect("the sweep");
+        let fn_body = &src[fn_start..fn_start + src[fn_start..].find("\n}\n").expect("end")];
+        // C5 — no reasoner, at all.
+        for forbidden in ["reasoner", "build_reasoner", ".call("] {
+            assert!(
+                !fn_body.contains(forbidden),
+                "the sweep must spend no reasoner call, found {forbidden:?}"
+            );
+        }
+        // C7 — bounded.
+        assert!(
+            fn_body.contains("MAX_SWEEP_MERGES"),
+            "bound the work per tick so a backlog cannot stall it"
+        );
+        // And it must never touch the counter.
+        assert!(
+            !fn_body.contains("counter.record("),
+            "a free merge must not charge the daily cap"
+        );
     }
 
     // ---- #1030: a lane with no provider HOLDS, it does not fail ----
