@@ -38,9 +38,10 @@ pathlib.Path(os.environ['TEST_SENT']).write_text(json.dumps({'args': args, 'body
             result = self.invoke('create', '--title', 'Example', '--body', 'Synthetic report', *selector)
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(self.result.exists())
-        result = self.invoke('comment', 'https://github.com/example/private-docs/issues/1', '--body', 'Synthetic report')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(self.result.exists())
+        for target in ['https://github.com/example/private-docs/issues/1', 'http://github.com/example/private-docs/issues/1', 'example/private-docs#1']:
+            result = self.invoke('comment', target, '--body', 'Synthetic report')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(self.result.exists())
 
     def test_reads_pass_through(self):
         for verb in ['list', 'view']:

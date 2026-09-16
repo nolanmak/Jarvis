@@ -120,7 +120,8 @@ while [[ $# -gt 0 ]]; do
     --repo=*|--label=*|--assignee=*|--milestone=*|--project=*|--edit-last|--create-if-none)
       GH_ARGS+=("$1"); shift ;;
     -*) refuse "unsupported write option; use explicit long options" ;;
-    *) GH_ARGS+=("$1"); shift ;;
+    *) [[ "$1" =~ ^[0-9]+$ ]] || refuse "issue writes require a numeric issue number"
+       GH_ARGS+=("$1"); shift ;;
   esac
 done
 [[ "$BODY_SET" == 1 ]] || refuse "an explicit --body or --body-file is required"
