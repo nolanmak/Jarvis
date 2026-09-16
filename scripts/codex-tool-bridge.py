@@ -81,7 +81,9 @@ def read_only_operation(name, arguments):
     Unknown tools/commands remain potentially mutating. The SocialAPI verb set
     mirrors its existing mandatory read-only guard's operation contract.
     """
-    if name in ('Read', 'Glob', 'Grep', 'LS', 'WebSearch', 'WebFetch'):
+    # Native discovery loads tool definitions; it does not execute those tools.
+    # Their own permission hooks and operation contracts still apply on invocation.
+    if name in ('Read', 'Glob', 'Grep', 'LS', 'WebSearch', 'WebFetch', 'ToolSearch'):
         return True
     # These are explicit query contracts in augmentagent-mcp-memory, not
     # arbitrary server annotations or a prefix-based read exemption.
