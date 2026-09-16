@@ -115,8 +115,13 @@ MAX_FILE_BYTES = 8 * 1024 * 1024
 # (Linux PATH_MAX). Enforced for every read, write and search entry (#1042).
 MAX_PATH_DEPTH = 32
 MAX_PATH_BYTES = 4096
-# One JSON-RPC line. A maximal Write (8 MiB) fits even when fully escaped.
-MAX_REQUEST_BYTES = 64 * 1024 * 1024
+# One JSON-RPC line. The largest legitimate request is a Write of
+# MAX_FILE_BYTES of text. JSON escaping at most doubles such text ('"', '\\',
+# newline and tab become two bytes; non-ASCII stays raw UTF-8 in serde_json),
+# giving 16 MiB. The other 8 MiB covers the envelope, the path and a margin
+# for occasional \uXXXX control-character escapes. The cap also bounds
+# json.loads memory: a line of tiny objects costs about 27x its size to parse.
+MAX_REQUEST_BYTES = 24 * 1024 * 1024
 # Grep (#1038): Python's re has no timeout, so matching runs in a disposable
 # child that is killed at the deadline. The walk, reads and match share one
 # wall-clock budget and one total-bytes budget. 1.5 s plus kill/reap keeps
@@ -1897,7 +1902,11 @@ class OversizedRequest:
 
 
 def read_request_lines(stream, limit=MAX_REQUEST_BYTES):
-    """Yield newline-framed requests without ever buffering more than `limit`."""
+    """Yield newline-framed requests, holding at most `limit + 1` bytes of a line.
+
+    An oversized line is detected once that much has been read; its remainder
+    is skipped in 1 MiB reads and never accumulated.
+    """
     while True:
         line = stream.readline(limit + 1)
         if not line:

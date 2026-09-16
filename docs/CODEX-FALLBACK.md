@@ -47,9 +47,14 @@ use a null id because no id can be trusted. A request with a readable id but a
 wrong `jsonrpc`/`method` gets `-32600` with that id. A `tools/call` whose params
 are not an object, whose `name` is not a string, or whose `arguments` are not an
 object gets `-32602`. Any other unexpected failure gets `-32603` with no details.
-Tool-level `RecursionError`/`MemoryError` become ordinary tool errors. Lines
-longer than 64 MiB are discarded without being buffered. They get `-32600`,
-carrying the id only when it is the compact request's leading field. Notifications
+Tool-level `RecursionError`/`MemoryError` become ordinary tool errors. A request
+line may be at most 24 MiB. That fits the largest legitimate request, an 8 MiB
+Write whose JSON escaping doubles its size, plus envelope and margin. It also
+bounds parse memory: a line of tiny JSON objects costs about 27 times its size
+in `json.loads`. The bridge reads at most 24 MiB of a longer line, skips the rest
+in 1 MiB reads without keeping them, and answers `-32600`. The reply carries the
+id only when it is the compact request's leading field, in JSON integer or simple
+string form. Notifications
 and client responses are never answered. We checked the null-id replies against
 Codex's MCP client (rmcp 3.2.0 in codex-cli 0.154.0). It parses an error without
 an id as `JsonRpcError { id: None }`, logs it and drops it, and it never replies
