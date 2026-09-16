@@ -6013,27 +6013,19 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // no waiting: findings on THIS head withhold the merge and are said out
     // loud on the PR; every flavour of absence (no review, rate-limited,
     // free-tier quota gone) merges on the double codex LGTM.
-    // The head this PR was opened on. Read LOCALLY first: the push above
-    // updated `refs/remotes/origin/<branch>` in this repository, and that is
-    // the same commit GitHub recorded, obtained without a network call that
-    // can fail transiently. `gh` is the fallback for the case where the
-    // remote-tracking ref is somehow missing.
+    // The head GitHub actually has for this PR. A CodeRabbit review is keyed
+    // to the commit GitHub recorded, so GitHub is the authority and is asked
+    // first — codex is right that a local remote-tracking ref can be stale,
+    // and filtering reviews against an old sha would miss findings on the very
+    // head being merged.
     //
-    // This matters more than it looks. Codex put it exactly right: a policy
-    // that ABSENCE does not block says nothing about an existing review we
-    // merely failed to READ. Unknown is not absent — the same lesson as
-    // #1006 — so the fix is to make the lookup reliable rather than to decide
-    // what an unreliable one means.
+    // The local ref is the FALLBACK, not the source: it covers a transient API
+    // failure without inventing an answer. If both are unavailable the state
+    // is reported as unknown rather than assumed clean — unknown is not
+    // absent, which is the lesson this whole path is built around.
     let head_sha = {
-        let local = run("git", &["rev-parse", &format!("refs/remotes/origin/{branch}")], repo_root)
-            .await
-            .ok()
-            .filter(|(ok, ..)| *ok)
-            .map(|(_, out, _)| out.trim().to_string())
-            .filter(|sha| sha.len() == 40);
-        match (local, pr_number) {
-            (Some(sha), _) => sha,
-            (None, Some(n)) => run(
+        let authoritative = match pr_number {
+            Some(n) => run(
                 &gh,
                 &["pr", "view", &n.to_string(), "--json", "headRefOid", "-q", ".headRefOid"],
                 repo_root,
@@ -6042,8 +6034,22 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             .ok()
             .filter(|(ok, ..)| *ok)
             .map(|(_, out, _)| out.trim().to_string())
+            .filter(|sha| sha.len() == 40),
+            None => None,
+        };
+        match authoritative {
+            Some(sha) => sha,
+            None => run(
+                "git",
+                &["rev-parse", &format!("refs/remotes/origin/{branch}")],
+                repo_root,
+            )
+            .await
+            .ok()
+            .filter(|(ok, ..)| *ok)
+            .map(|(_, out, _)| out.trim().to_string())
+            .filter(|sha| sha.len() == 40)
             .unwrap_or_default(),
-            (None, None) => String::new(),
         }
     };
     if pr_number.is_none() {
