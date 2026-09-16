@@ -78,6 +78,11 @@ pub struct EvalRow {
     pub issue: u64,
     pub base: Option<String>,
     pub expect: Expect,
+    /// Fingerprint of the exact question this row answered: the cached issue
+    /// text as well as the expectation and pinned commit. `--refresh` rewrites
+    /// that text, and without this a refreshed issue would render its OLD
+    /// verdict as though it had graded the new wording.
+    pub fingerprint: String,
     pub actual: String,
     pub pass: bool,
     pub note: String,
@@ -248,6 +253,31 @@ fn one_line(s: &str, max: usize) -> String {
     format!("{}…", &flat[..cut])
 }
 
+/// A fingerprint of the exact question a case asks.
+///
+/// Covers the cached issue text as well as the expectation and pinned commit,
+/// because `--refresh` rewrites that text: without it, refreshing an issue and
+/// re-rendering would present the old verdict as though it had graded the new
+/// wording. A baseline that reports a stale score is worse than none.
+fn case_fingerprint(c: &EvalCase) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |s: &str| {
+        for b in s.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        // Field separator, so concatenation cannot collide.
+        h ^= 0xff;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    };
+    eat(&c.title);
+    eat(&c.body);
+    eat(&c.author);
+    eat(c.expect.label());
+    eat(c.base.as_deref().unwrap_or(""));
+    format!("{h:016x}")
+}
+
 /// Grade one case. `None` means the scoper never answered (reasoner error,
 /// timeout): a miss rather than a skip, or an outage would read as a perfect
 /// score.
@@ -258,6 +288,7 @@ pub fn grade(case: &EvalCase, observed: Option<&Observed>) -> EvalRow {
             issue: case.issue,
             base: case.base.clone(),
             expect: case.expect,
+            fingerprint: case_fingerprint(case),
             actual: "no verdict".into(),
             pass: false,
             note: "the scoping pass produced no parseable verdict".into(),
@@ -290,6 +321,7 @@ pub fn grade(case: &EvalCase, observed: Option<&Observed>) -> EvalRow {
         issue: case.issue,
         base: case.base.clone(),
         expect: case.expect,
+        fingerprint: case_fingerprint(case),
         actual: actual.into(),
         pass,
         note: one_line(&note, 200),
@@ -373,7 +405,7 @@ fn rows_for(saved: &[EvalRow], cases: &[&EvalCase]) -> Vec<EvalRow> {
                 // stale pass for a case that was never re-graded. A baseline
                 // that reports a stale score is worse than none: it is
                 // believed.
-                .find(|r| r.id == c.id && r.expect == c.expect && r.base == c.base)
+                .find(|r| r.id == c.id && r.fingerprint == case_fingerprint(c))
                 .cloned()
                 .unwrap_or_else(|| grade(c, None))
         })
@@ -477,6 +509,7 @@ pub fn rows_to_json(rows: &[EvalRow]) -> Result<String> {
                 "issue": r.issue,
                 "base": r.base,
                 "expect": r.expect.label(),
+                "fingerprint": r.fingerprint,
                 "actual": r.actual,
                 "pass": r.pass,
                 "note": r.note,
@@ -511,6 +544,14 @@ pub fn rows_from_json(json: &str) -> Result<Vec<EvalRow>> {
                     .map(str::to_string),
                 expect: Expect::parse(&expect_raw)
                     .with_context(|| format!("saved row #{i} has unknown expect {expect_raw:?}"))?,
+                // Absent in a pre-fingerprint file: leave it empty, which can
+                // never match a real fingerprint, so those rows read as unrun
+                // rather than being trusted.
+                fingerprint: r
+                    .get("fingerprint")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
                 actual: str_at("actual")?,
                 pass: r
                     .get("pass")
@@ -1511,6 +1552,33 @@ mod tests {
     /// A selected case the saved run never covered must not be silently
     /// dropped — that would quietly shrink the denominator and inflate the
     /// score.
+    /// Codex, once the review harness was fixed and actually ran: `--refresh`
+    /// rewrites the cached title, body and author, but a saved row was matched
+    /// on id, expectation and commit alone — so refreshing an issue and
+    /// re-rendering would present the OLD verdict as though it had graded the
+    /// new text. The fingerprint covers the whole question.
+    #[test]
+    fn refreshed_issue_text_invalidates_a_saved_row() {
+        let original = case("E1", 1, Expect::Fixable);
+        let saved = [grade(&original, Some(&observed(true, "graded then")))];
+        assert_eq!(rows_for(&saved, &[&original]), saved.to_vec());
+
+        let mut reworded = original.clone();
+        reworded.body = "the issue was rewritten after a discussion".into();
+        let rows = rows_for(&saved, &[&reworded]);
+        assert!(!rows[0].pass, "a rewritten issue is a different question");
+        assert!(rows[0].actual.contains("no verdict"), "{}", rows[0].actual);
+
+        for mutate in [
+            |c: &mut EvalCase| c.title = "new title".into(),
+            |c: &mut EvalCase| c.author = "someone-else".into(),
+        ] {
+            let mut changed = original.clone();
+            mutate(&mut changed);
+            assert!(!rows_for(&saved, &[&changed])[0].pass);
+        }
+    }
+
     /// Codex, system pass: saved rows were matched by id alone, so editing a
     /// fixture's expectation or its pinned commit kept the old row — verdict,
     /// base and all — and `--report-only` reported a pass for a case that had
