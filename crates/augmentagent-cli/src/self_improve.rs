@@ -1621,10 +1621,7 @@ fn opened_prs_path() -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local/state/augmentagent/autopr-opened-prs.json")
+    augmentagent_channel_core::state_dir::state_dir_or(".").join("autopr-opened-prs.json")
 }
 
 /// What the loop recorded when it opened a PR: which PR, and the head its
@@ -9009,6 +9006,7 @@ for tool, arguments in [
                 "AUGMENTAGENT_AUTOPR_BASELINE_FILE",
                 "AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE",
                 "AUGMENTAGENT_AUTOPR_HISTORY_FILE",
+                "AUGMENTAGENT_AUTOPR_OPENED_FILE",
                 "AUGMENTAGENT_COOLDOWN_FILE",
             ] {
                 child.env_remove(key);
@@ -9024,6 +9022,7 @@ for tool, arguments in [
         assert_eq!(attempt_ledger_path(), state.join("autopr-attempted.json"));
         assert_eq!(attempt_history_path(), state.join("autopr-attempt-history.json"));
         assert_eq!(daily_counter_path(), state.join("autopr-daily-runs.json"));
+        assert_eq!(opened_prs_path(), state.join("autopr-opened-prs.json"));
         assert_eq!(run_lock_path().parent(), Some(state.as_path()));
         assert_eq!(augmentagent_channel_core::CooldownLatch::system().path(), state.join("reasoner-cooldowns.json"));
     }
