@@ -39,6 +39,26 @@ impl BridgeLaunch {
         if object.keys().any(|k| !matches!(k.as_str(), "hooks" | "mcpServers")) {
             anyhow::bail!("unsupported settings: refusing to drop provider policy");
         }
+        let web_search = opts.allowed_tools.iter().any(|tool| tool == "WebSearch");
+        let web_fetch = opts.allowed_tools.iter().any(|tool| tool == "WebFetch");
+        if web_search || web_fetch {
+            // Native web exposes search and page retrieval as one capability.
+            // It does not traverse the bridge's original PreToolUse hooks.
+            anyhow::ensure!(web_search && web_fetch,
+                "native web requires both WebSearch and WebFetch; refusing broader tool access");
+            if let Some(groups) = settings.pointer("/hooks/PreToolUse").and_then(|value| value.as_array()) {
+                for group in groups {
+                    if !group.get("hooks").and_then(|value| value.as_array()).is_some_and(|hooks| !hooks.is_empty()) {
+                        continue;
+                    }
+                    let matcher = group.get("matcher").and_then(|value| value.as_str()).unwrap_or(".*");
+                    let matcher = regex::Regex::new(&format!("\\A(?:{matcher})\\z"))
+                        .map_err(|_| anyhow::anyhow!("unsupported native web guard matcher"))?;
+                    anyhow::ensure!(!matcher.is_match("WebSearch") && !matcher.is_match("WebFetch"),
+                        "native web cannot enforce the configured web hook; refusing to bypass it");
+                }
+            }
+        }
         let cwd = opts.cwd.as_ref().or(opts.add_dirs.first()).cloned()
             .unwrap_or(std::env::current_dir()?).canonicalize()?;
         let mut roots = opts.add_dirs.iter().map(|p| p.canonicalize())
@@ -87,7 +107,7 @@ impl BridgeLaunch {
             "project_doc_max_bytes=0".into(),
             "web_search=disabled".into(),
         ];
-        if opts.allowed_tools.iter().any(|t| matches!(t.as_str(), "WebSearch" | "WebFetch")) {
+        if web_search && web_fetch {
             config_overrides.push("web_search=live".into());
         }
         for feature in ["shell_tool", "apps", "plugins", "multi_agent", "browser_use",
@@ -107,6 +127,29 @@ impl BridgeLaunch {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn native_web_cannot_expand_a_fetch_only_profile_or_bypass_matching_hooks() {
+        let fixture = tempfile::tempdir().unwrap();
+        for tools in [vec!["WebFetch"], vec!["WebSearch"]] {
+            let mut opts = crate::reasoner::resume_opts(fixture.path().into());
+            opts.allowed_tools = tools.into_iter().map(str::to_string).collect();
+            let launch = tempfile::tempdir().unwrap();
+            assert!(BridgeLaunch::prepare(&opts, launch.path()).is_err());
+        }
+        for matcher in ["WebSearch", "WebFetch", ".*", "Read|WebFetch"] {
+            let mut opts = crate::reasoner::resume_opts(fixture.path().into());
+            opts.allowed_tools = vec!["WebSearch".into(), "WebFetch".into()];
+            opts.settings_json = Some(serde_json::json!({"hooks":{"PreToolUse":[{
+                "matcher":matcher,"hooks":[{"type":"command","command":"true"}]
+            }]}}).to_string());
+            let launch = tempfile::tempdir().unwrap();
+            assert!(BridgeLaunch::prepare(&opts, launch.path()).is_err(), "web guard was ignored: {matcher}");
+        }
+        let opts = crate::reasoner::ask_opts(fixture.path().into(), fixture.path().into());
+        let launch = tempfile::tempdir().unwrap();
+        assert!(BridgeLaunch::prepare(&opts, launch.path()).is_ok(), "file-only query hooks must remain supported");
+    }
 
     #[test]
     fn vm_configuration_uses_durable_default_and_preserves_explicit_overrides() {

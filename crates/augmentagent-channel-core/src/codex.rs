@@ -61,11 +61,17 @@ pub struct CodexCliReasoner {
 
 async fn record_tool_item(opts: &ReasonerOpts, item: &serde_json::Value) {
     use crate::tool_audit::{build_audit_record, is_high_risk};
-    if item.get("type").and_then(|v| v.as_str()) != Some("mcp_tool_call") { return; }
+    let native_web = item.get("type").and_then(|v| v.as_str()) == Some("web_search");
+    if !native_web && item.get("type").and_then(|v| v.as_str()) != Some("mcp_tool_call") { return; }
     let server = item.get("server").and_then(|v| v.as_str()).unwrap_or("unknown");
     let leaf = item.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let tool = if server == "jarvis" { leaf.to_string() } else { format!("mcp__{server}__{leaf}") };
-    let args = item.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+    // Codex reports searches and page opens under the same native event type.
+    // Preserve its action verbatim; an opaque `other` is not proof of a fetch.
+    let tool = if native_web { "WebSearch".into() }
+        else if server == "jarvis" { leaf.to_string() } else { format!("mcp__{server}__{leaf}") };
+    let args = if native_web {
+        serde_json::json!({"query": item.get("query"), "action": item.get("action")})
+    } else { item.get("arguments").cloned().unwrap_or(serde_json::Value::Null) };
     let result = item.get("result");
     let content = result.and_then(|r| r.get("content")).and_then(|r| r.as_array())
         .map(|items| items.iter().filter_map(|r| r.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n"))
@@ -684,6 +690,45 @@ exit 1
         assert!(records.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .any(|r| r["tool"] == "Bash" && r["provider"] == "codex" && r["exit_code"] == 0
                 && r["stdout_truncated"].as_str().is_some_and(|s| s.contains("1 passed"))));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Codex login and public web access; reads example.com only"]
+    async fn live_native_web_call_reaches_common_audit_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let mut options = crate::reasoner::resume_opts(dir.path().into());
+        options.allowed_tools = vec!["WebSearch".into(), "WebFetch".into()];
+        options.system_prompt = "Use the native web tool for the requested public page.".into();
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(log.clone())));
+        let response = CodexCliReasoner::openai().call(&options,
+            "Open https://example.com with the web tool and report its heading.").await.unwrap();
+        assert!(response.contains("Example Domain"), "{response}");
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(log).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert!(records.iter().any(|record| record["provider"] == "codex"
+            && record["tool"] == "WebSearch"
+            && record["args"].to_string().contains("example.com")));
+    }
+
+    #[tokio::test]
+    async fn native_web_events_are_audited_without_inventing_response_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let mut options = crate::reasoner::resume_opts(dir.path().into());
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(log.clone())));
+        // Observed CLI completion schema: native fetches also use web_search
+        // with an opaque `other` action and no page response in the event.
+        record_tool_item(&options, &serde_json::json!({
+            "type": "web_search", "query": "https://example.com",
+            "action": {"type": "other"}
+        })).await;
+        let record: serde_json::Value = serde_json::from_str(std::fs::read_to_string(log).unwrap().trim()).unwrap();
+        assert_eq!(record["tool"], "WebSearch");
+        assert_eq!(record["provider"], "codex");
+        assert_eq!(record["args"]["query"], "https://example.com");
+        assert_eq!(record["args"]["action"]["type"], "other");
+        assert_eq!(record["stdout_truncated"], "");
     }
 
     #[tokio::test]

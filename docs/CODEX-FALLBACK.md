@@ -339,6 +339,17 @@ cannot stand in for any tool-using profile.
 
 ## Remaining integration gates
 
+Native web calls now appear in the common audit log with the Codex provider,
+query and native action. A live public-page fixture passed through the adapter
+and verified the audit entry. The CLI uses the same `web_search` event for
+searches and page opens, sometimes with an opaque `other` action; it does not
+include page content in that event. Records preserve this limited evidence.
+Because native web combines search and retrieval and bypasses bridge hooks,
+the adapter requires both WebSearch and WebFetch and rejects matching web
+hooks. The production query preset's file-only hooks remain supported.
+Single-web-tool and web-hook profiles need a guarded implementation before
+they can be accepted; they are not silently broadened or claimed as parity.
+
 1. Complete writable build/test snapshots, production integration conformance,
    web/document support and precise readiness reporting. Validate all accepted
    settings and tool schemas; never silently discard a required capability.
