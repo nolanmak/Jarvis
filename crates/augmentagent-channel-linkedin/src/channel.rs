@@ -314,21 +314,12 @@ impl<L: LinkedInApi, R: Reasoner + 'static> LinkedInChannel<L, R> {
                 // Opts mirror the classic `draft_opts` shape: same permission
                 // mode, no allowed_tools / add_dirs — the Deno sandbox is
                 // the tool surface, not the host claude CLI's Read/Grep/Glob.
-                let code_mode_opts = augmentagent_channel_core::ReasonerOpts {
+                // #1046: pin the quality tier. `model: None` emits no `--model`, so this
+                // draft inherited the owner's interactive model and quota (#448).
+                let code_mode_opts = augmentagent_channel_core::ReasonerOpts::pinned(
+                    augmentagent_channel_core::ModelTier::Quality,
                     system_prompt,
-                    model: None,
-                    allowed_tools: Vec::new(),
-                    add_dirs: Vec::new(),
-                    permission_mode: "default".into(),
-                    cwd: None,
-                    env: Vec::new(),
-                    settings_json: None,
-                    restrict_env: false,
-                    audit_logger: None,
-                    audit_notifier: None,
-                    session_id: None,
-                    handoff_path: None,
-                };
+                );
                 let message_ctx = MessageContext {
                     channel: "linkedin".to_string(),
                     email: email.clone(),

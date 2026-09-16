@@ -167,9 +167,10 @@ pub fn model_for(kind: ProviderKind, tier: ModelTier) -> String {
         }
     }
     match (kind, tier) {
-        // Claude cells are unused in practice (presets pin their own model,
-        // which the Claude adapter passes through) but kept total so the
-        // map has no panicking holes.
+        // The `*_opts` presets pin their own Claude model, which the Claude
+        // adapter passes through. Call sites built with
+        // `ReasonerOpts::pinned(tier, ..)` (#1046) take their model from these
+        // two cells.
         (ProviderKind::Claude, ModelTier::Quality) => "claude-opus-4-8".into(),
         (ProviderKind::Claude, ModelTier::Fast) => "claude-haiku-4-5-20251001".into(),
         (ProviderKind::Codex, ModelTier::Quality) => "gpt-5.6-terra".into(),

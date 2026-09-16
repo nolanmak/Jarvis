@@ -518,6 +518,41 @@ pub struct ReasonerOpts {
     pub handoff_path: Option<PathBuf>,
 }
 
+impl ReasonerOpts {
+    /// #1046: text-only opts with the model pinned by tier.
+    ///
+    /// Call sites outside the `*_opts` presets used to build this struct by
+    /// hand with `model: None`. That emits no `--model` flag, so the spawned
+    /// CLI inherits the owner's interactive `~/.claude/settings.json` model
+    /// and quota (#448). Here the tier is a required argument, and the model
+    /// comes from the same per-provider tier map the fallback chain uses
+    /// ([`crate::providers::model_for`], overridable per cell with
+    /// `AUGMENTAGENT_MODEL_CLAUDE_QUALITY` / `AUGMENTAGENT_MODEL_CLAUDE_FAST`).
+    ///
+    /// No tools, no extra dirs, default permission mode. A call that needs
+    /// more should widen those fields explicitly. The model stays pinned.
+    pub fn pinned(tier: crate::providers::ModelTier, system_prompt: impl Into<String>) -> Self {
+        Self {
+            system_prompt: system_prompt.into(),
+            model: Some(crate::providers::model_for(
+                crate::providers::ProviderKind::Claude,
+                tier,
+            )),
+            allowed_tools: Vec::new(),
+            add_dirs: Vec::new(),
+            permission_mode: "default".into(),
+            cwd: None,
+            env: Vec::new(),
+            settings_json: None,
+            restrict_env: false,
+            audit_logger: None,
+            audit_notifier: None,
+            session_id: None,
+            handoff_path: None,
+        }
+    }
+}
+
 /// Trait the channel uses to reach Claude. Test doubles stub this.
 ///
 /// `call_code_mode` and `call_code_mode_with_repair` are sibling entrypoints
@@ -3409,7 +3444,10 @@ mod model_pin_tests {
     /// their own coding.
     ///
     /// Every preset the daemon runs unattended must name its model out loud.
-    /// If you add a preset, pin it — do not let `None` back in.
+    /// If you add a preset, pin it — do not let `None` back in. Call sites
+    /// outside these presets are covered by the source scan in
+    /// `capability_inventory::every_production_callsite_pins_its_documented_model_tier`
+    /// (#1046).
     #[test]
     fn no_daemon_preset_inherits_the_owners_interactive_model() {
         let wiki = PathBuf::from("/tmp/wiki");
@@ -3427,6 +3465,8 @@ mod model_pin_tests {
             ("archetype_pick", archetype_pick_opts()),
             ("ingest", ingest_opts("sys".into(), wiki.clone())),
             ("wiki_migrate", wiki_migrate_opts("sys".into(), wiki.clone())),
+            ("pinned(Quality)", ReasonerOpts::pinned(crate::providers::ModelTier::Quality, "sys")),
+            ("pinned(Fast)", ReasonerOpts::pinned(crate::providers::ModelTier::Fast, "sys")),
         ];
         for (name, opts) in presets {
             let model = opts.model.as_deref().unwrap_or("");
@@ -3442,6 +3482,21 @@ mod model_pin_tests {
                 "{name}_opts pins a context-window alias ({model}); pin a real \
                  model id so the tier can't drift"
             );
+        }
+    }
+
+    /// #1046: the tier constructor resolves through the provider tier map and
+    /// stays text-only, so it cannot widen a call site's tool surface.
+    #[test]
+    fn pinned_constructor_uses_the_claude_tier_map() {
+        use crate::providers::{classify, model_for, CapabilityClass, ModelTier, ProviderKind};
+        for tier in [ModelTier::Quality, ModelTier::Fast] {
+            let opts = ReasonerOpts::pinned(tier, "sys");
+            assert_eq!(opts.model, Some(model_for(ProviderKind::Claude, tier)));
+            assert_eq!(opts.system_prompt, "sys");
+            assert_eq!(opts.permission_mode, "default");
+            assert_eq!(classify(&opts), CapabilityClass::TextOnly);
+            assert!(opts.add_dirs.is_empty() && opts.cwd.is_none() && opts.env.is_empty());
         }
     }
 
