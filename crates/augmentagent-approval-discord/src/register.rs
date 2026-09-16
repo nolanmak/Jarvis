@@ -8,28 +8,19 @@
 //!
 //! The receipt is model-authored, so by itself it is a promise. This module
 //! is the deterministic half: every sentence start of the draft under a
-//! receipt is compared with the receipt, and one that contradicts it becomes
-//! a note the caller posts as a visible `⚠️` line — the same channel a
-//! refused `ATTACH:` marker uses. The receipt line is the whole envelope:
-//! text with no receipt is not audited, so a code example in a wiki answer,
-//! a quoted inbound email or a loop's status report never draws a note.
-//! Guessing at drafts from their shape (a bare fence, a greeting line) was
-//! tried and flagged ordinary answers; a drafter that skips the protocol
-//! entirely is a prompt failure the owner sees as a draft with no receipt.
+//! receipt is compared with the receipt, and a contradiction becomes a note
+//! the caller posts as a visible `⚠️` line (the channel a refused `ATTACH:`
+//! uses). The receipt line is the whole envelope: text with no receipt is
+//! not audited, so a code example, a quoted inbound email or a loop's status
+//! report never draws a note (guessing drafts from their shape was tried and
+//! flagged ordinary answers). Where the recipient's own message is in hand —
+//! an email reply's `--reply-to-body*` — the draft is also held to *their*
+//! casing ([`audit_draft_against_sample`]), so a receipt that misclassifies
+//! them (the #994 failure) vouches for nothing.
 //!
-//! Where drafts leave the system, and where this audit runs (verified call
-//! sites, not the protocol's wish list):
-//! - Discord replies (the owner hand-pastes texts, DMs and social replies
-//!   from them): the two posters of wiki-ask answers, `event_handler.rs`
-//!   and `wiki ask --post` in `main.rs`, both via
-//!   `attachments::prepare_answer_delivery`; `/loop` results post via
-//!   `LoopPoster` and audit in `loops.rs`. The WhatsApp control surface also
-//!   calls `QueryHandler::answer`, but the CLI never constructs it (#74).
-//! - Email bodies, the one recipient-facing payload a wiki-ask tool sends:
-//!   `gmail compose|update-draft|send-now` (`main.rs`) require the receipt
-//!   as the body's first line when run from the drafter's env, refuse a
-//!   contradiction before any Gmail write, then strip the receipt.
-//!   `calendar create-event` and `aa-gh issue` do not address a recipient.
+//! Call sites: Discord replies via `attachments::prepare_answer_delivery`
+//! and `/loop` results in `loops.rs`; email bodies via `gmail compose|
+//! update-draft|send-now` in `main.rs`, refused before any Gmail write.
 
 use std::fmt;
 
@@ -107,18 +98,17 @@ fn is_break(line: &str) -> bool {
 
 /// The draft a receipt vouches for, as paragraphs, plus the line to resume
 /// scanning at. A fenced block under the receipt is the draft in full (the
-/// protocol's form); a run of `>` blockquote lines is bounded the same way.
-/// Anything else is read through to the next receipt or the end of the
-/// reply, so an unfenced multi-paragraph draft is still inspected whole — at
-/// the cost of also reading any commentary the drafter put after it, which
-/// is what the fence exists to separate.
-fn draft_paragraphs<'a>(lines: &[&'a str], receipt_idx: usize) -> (Vec<Vec<&'a str>>, usize) {
-    let mut i = receipt_idx + 1;
+/// protocol's form); a run of `>` blockquote lines is bounded the same way;
+/// anything else reads through to the next receipt or the end, commentary
+/// included — that is what the fence exists to separate. With no receipt
+/// (an email body checked against its inbound) the whole text is the draft.
+fn draft_paragraphs<'a>(lines: &[&'a str], receipt_idx: Option<usize>) -> (Vec<Vec<&'a str>>, usize) {
+    let mut i = receipt_idx.map_or(0, |r| r + 1);
     while i < lines.len() && is_break(lines[i]) {
         i += 1;
     }
-    let fenced = i < lines.len() && is_fence(lines[i]);
-    let quoted = !fenced && i < lines.len() && lines[i].trim_start().starts_with('>');
+    let fenced = receipt_idx.is_some() && i < lines.len() && is_fence(lines[i]);
+    let quoted = receipt_idx.is_some() && !fenced && i < lines.len() && lines[i].trim_start().starts_with('>');
     i += usize::from(fenced);
     let (mut paragraphs, mut current, mut in_code) = (Vec::new(), Vec::new(), false);
     while i < lines.len() {
@@ -156,10 +146,9 @@ fn draft_paragraphs<'a>(lines: &[&'a str], receipt_idx: usize) -> (Vec<Vec<&'a s
 /// Casing at each sentence start of the paragraph: the first word of every
 /// line and every word after a `.`/`!`/`?`. Only sentence-shaped lines (three
 /// or more words) are evidence — a greeting or a sign-off is cased either
-/// way — and so is a list item's first word, so a list marker demotes it.
-/// URL/handle/abbreviation/brand-shaped words (`github.com/x`, `@sam`,
-/// `e.g.`, `iPhone`) are skipped because their casing says nothing about
-/// register.
+/// way — a list marker demotes the item's first word, and URL/handle/
+/// abbreviation/brand-shaped words (`github.com/x`, `@sam`, `e.g.`,
+/// `iPhone`) are skipped: their casing says nothing about register.
 fn sentence_starts(paragraph: &[&str]) -> (usize, usize) {
     let (mut upper, mut lower) = (0, 0);
     for line in paragraph {
@@ -196,11 +185,12 @@ fn sentence_starts(paragraph: &[&str]) -> (usize, usize) {
     (upper, lower)
 }
 
-/// The first paragraph with a sentence start that contradicts `declared`,
-/// as a note. One is enough: a `standard` recipient reading a draft that
-/// opens `hey Casey, thanks for checking in. I'll send it tonight.` still
-/// gets the lowercase opener, so mixed evidence is a violation, not a wash.
-fn contradiction(declared: Register, paragraphs: &[Vec<&str>]) -> Option<String> {
+/// The first paragraph with a sentence start that contradicts `declared`
+/// (by `who`: the receipt, or the recipient's own message), as a note. One
+/// is enough: a `standard` recipient reading a draft that opens `hey Casey,
+/// thanks for checking in. I'll send it tonight.` still gets the lowercase
+/// opener, so mixed evidence is a violation, not a wash.
+fn contradiction(who: &str, declared: Register, paragraphs: &[Vec<&str>]) -> Option<String> {
     paragraphs.iter().enumerate().find_map(|(n, p)| {
         let (upper, lower) = sentence_starts(p);
         let how = match declared {
@@ -209,11 +199,36 @@ fn contradiction(declared: Register, paragraphs: &[Vec<&str>]) -> Option<String>
             _ => return None,
         };
         Some(format!(
-            "register mismatch: the receipt says {declared} but paragraph {} of the \
-             draft under it starts a sentence {how} (#994) — ask for a recase",
+            "register mismatch: {who} {declared} but paragraph {} of the draft \
+             starts a sentence {how} (#994) — ask for a recase",
             n + 1
         ))
     })
+}
+
+/// The register a person writes in, from one message of theirs: its sentence
+/// starts, read up to the first quoted line so the owner's earlier turn under
+/// `On … wrote:` is not taken for theirs. Mixed or no evidence is `None`.
+fn register_of(sample: &str) -> Option<Register> {
+    let own: Vec<&str> = sample
+        .lines()
+        .take_while(|l| !l.trim_start().starts_with('>') && !l.trim_end().ends_with("wrote:"))
+        .collect();
+    match sentence_starts(&own) {
+        (0, 0) => None,
+        (_, 0) => Some(Register::Standard),
+        (0, _) => Some(Register::Lowercase),
+        _ => None,
+    }
+}
+
+/// Note when `draft` contradicts the register `sample` — the recipient's own
+/// message — is written in: the receipt-free check for a reply whose inbound
+/// is in the payload, where the classification is not the drafter's word.
+pub fn audit_draft_against_sample(sample: &str, draft: &str) -> Option<String> {
+    let declared = register_of(sample)?;
+    let (paragraphs, _) = draft_paragraphs(&draft.lines().collect::<Vec<_>>(), None);
+    contradiction("the recipient writes in", declared, &paragraphs)
 }
 
 /// Notes for a reply or body: each `register:` receipt is checked against
@@ -226,9 +241,9 @@ pub fn audit_register_receipts(text: &str) -> Vec<String> {
     let mut i = 0;
     while i < lines.len() {
         if let Some(declared) = parse_receipt(lines[i]) {
-            let (paragraphs, next) = draft_paragraphs(&lines, i);
+            let (paragraphs, next) = draft_paragraphs(&lines, Some(i));
             if let Some(declared) = declared {
-                notes.extend(contradiction(declared, &paragraphs));
+                notes.extend(contradiction("the receipt says", declared, &paragraphs));
             }
             i = next;
         } else if is_fence(lines[i]) {
@@ -263,8 +278,28 @@ mod tests {
             let notes = audit_register_receipts(&reply);
             assert_eq!(notes.len(), 1, "{notes:?}");
             assert!(notes[0].contains("receipt says standard"), "{}", notes[0]);
-            assert!(notes[0].contains("paragraph 1 of the draft under it starts a sentence in lowercase"), "{}", notes[0]);
+            assert!(notes[0].contains("paragraph 1 of the draft starts a sentence in lowercase"), "{}", notes[0]);
         }
+    }
+
+    /// #994 verbatim, held to the recipient's own message instead of a
+    /// receipt: her "Hi, I wanted to check in on the proposal." is standard
+    /// (the owner's quoted lowercase turn under `wrote:` does not count), so
+    /// the all-lowercase draft is a mismatch; a sample with no evidence holds nothing.
+    #[test]
+    fn issue_994_draft_is_held_to_the_recipients_own_casing() {
+        let inbound = "Hi,\n\nI wanted to check in on the proposal. Does Thursday still work?\n\n\
+                       Thanks,\nCasey\n\nOn Tue, Sep 8, 2026, Jo <jo@example.com> wrote:\n\
+                       > hey casey, sending it over this week";
+        let lower = "hey casey, thanks for checking in. i'll have the proposal over tonight, \
+                     let me know if thursday still works.";
+        let note = audit_draft_against_sample(inbound, lower).expect("mismatch");
+        assert!(note.contains("the recipient writes in standard"), "{note}");
+        assert!(note.contains("paragraph 1 of the draft starts a sentence in lowercase"), "{note}");
+        let cased = "Hey Casey, thanks for checking in. I'll have the proposal over tonight.";
+        assert!(audit_draft_against_sample(inbound, cased).is_none());
+        assert!(audit_draft_against_sample("ok\n\n> Hi, I wanted to check in on the proposal.", cased).is_none());
+        assert!(audit_draft_against_sample("hey jo, are we still on for thursday?", cased).is_some());
     }
 
     /// Review finding: a paragraph that mixes registers (`hey Casey, ...
@@ -272,16 +307,15 @@ mod tests {
     /// recipient still sees, not compliant "mixed evidence".
     #[test]
     fn a_single_contradicting_sentence_start_is_flagged() {
-        let mixed = "register: standard (she capitalizes), mirroring\n```\n\
-                     hey Casey, thanks for checking in. I'll send it tonight.\n```";
-        let notes = audit_register_receipts(mixed);
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].contains("starts a sentence in lowercase"), "{}", notes[0]);
-        let mixed = "register: lowercase (he types all-lowercase), mirroring\n```\n\
-                     hey sam, running late. I'll be there by eight.\n```";
-        let notes = audit_register_receipts(mixed);
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].contains("starts a sentence with a capital"), "{}", notes[0]);
+        for (reply, how) in [
+            ("register: standard (she capitalizes), mirroring\n```\nhey Casey, thanks for checking in. I'll send it tonight.\n```", "in lowercase"),
+            ("register: lowercase (he types all-lowercase), mirroring\n```\nhey sam, running late. I'll be there by eight.\n```", "with a capital"),
+            ("Register: lowercase (you asked)\n```\nHey Sam, running late. Order without me.\n```", "with a capital"),
+        ] {
+            let notes = audit_register_receipts(reply);
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert!(notes[0].contains(&format!("starts a sentence {how}")), "{}", notes[0]);
+        }
     }
 
     /// Review finding: a wrong-register paragraph after a matching one must
@@ -289,46 +323,28 @@ mod tests {
     /// a fence bounds the draft so commentary after it is not.
     #[test]
     fn every_paragraph_of_the_draft_is_audited() {
-        let unfenced = "register: lowercase (he types all-lowercase), mirroring\n\
-                        hey Sam,\n\nThanks for checking in on the proposal.";
+        let unfenced = "register: lowercase (he types all-lowercase), mirroring\nhey Sam,\n\nThanks for checking in on the proposal.";
         let notes = audit_register_receipts(unfenced);
         assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].contains("paragraph 2 of the draft under it starts a sentence with a capital"), "{}", notes[0]);
-        let fenced = "register: lowercase (he types all-lowercase), mirroring\n```\n\
-                      hey sam, running late.\n\nThanks for checking in on the proposal.\n```\n\n\
-                      Filed the thread to people/sam.md.";
-        assert_eq!(audit_register_receipts(fenced).len(), 1);
-        let fenced_ok = "register: lowercase (he types all-lowercase), mirroring\n```\n\
-                         hey sam, running late.\n\nthanks for checking in on the proposal.\n```\n\n\
-                         Filed the thread to people/sam.md.";
-        assert!(audit_register_receipts(fenced_ok).is_empty());
+        assert!(notes[0].contains("paragraph 2 of the draft starts a sentence with a capital"), "{}", notes[0]);
+        let fenced = "register: lowercase (he types all-lowercase), mirroring\n```\nhey sam, running late.\n\n{}\n```\n\nFiled the thread to people/sam.md.";
+        assert_eq!(audit_register_receipts(&fenced.replace("{}", "Thanks for checking in on the proposal.")).len(), 1);
+        assert!(audit_register_receipts(&fenced.replace("{}", "thanks for checking in on the proposal.")).is_empty());
     }
 
     #[test]
-    fn matching_drafts_pass_silently() {
-        let standard = "register: standard (she capitalizes), mirroring\n```\n\
-                        Hey Casey, thanks for checking in. I'll have the proposal \
-                        over tonight.\n\nTalk soon.\n```\nFiled to people/casey.md.";
-        assert!(audit_register_receipts(standard).is_empty());
+    fn quoted_drafts_and_unknown_receipts() {
         let quoted = "register: lowercase (he types all-lowercase), mirroring\n\
                       > hey sam, running 10 late. order without me\n>\n> see you there in a bit\n\n\
                       Filed to people/sam.md.";
         assert!(audit_register_receipts(quoted).is_empty());
-    }
-
-    #[test]
-    fn capitalized_draft_under_lowercase_or_defaulted_receipt_is_flagged() {
-        let notes = audit_register_receipts("Register: lowercase (you asked)\n```\nHey Sam, running late. Order without me.\n```");
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].contains("receipt says lowercase") && notes[0].contains("with a capital"), "{}", notes[0]);
         let draft = "Hi Alex, quick question about the venue.";
         assert_eq!(audit_register_receipts(&format!("register: unknown, defaulting to lowercase (no samples on file)\n{draft}")).len(), 1);
         assert!(audit_register_receipts(&format!("register: unknown (no samples on file)\n{draft}")).is_empty());
     }
 
-    /// Review finding: the receipt is the envelope. Ordinary answer traffic
-    /// — a code example, a quoted inbound email, a loop status line, a fence
-    /// that quotes the receipt format — carries no receipt and draws no note.
+    /// Review finding: the receipt is the envelope — a code example, a quoted
+    /// inbound, a loop status line, a fence quoting the receipt format draw no note.
     #[test]
     fn text_without_a_receipt_is_not_audited() {
         for reply in [
@@ -341,20 +357,19 @@ mod tests {
         }
     }
 
+    /// URL/handle/brand sentence starts, greetings, sign-offs, list items
+    /// and code snippets inside an email body are not evidence; prose that
+    /// merely mentions the word is not a receipt.
     #[test]
     fn non_evidence_words_and_lines_are_left_alone() {
-        let standard = "register: standard (he capitalizes), mirroring\n";
-        // URL, handle or brand at a sentence start is not evidence; the sentence after it is.
-        let url_first = format!("{standard}github.com/example/repo is failing on main. iPhone builds too. Can you take a look?");
-        assert!(audit_register_receipts(&url_first).is_empty());
-        // Greetings, sign-offs and list items are cased either way.
-        let short_and_listed = format!("{standard}hi alice,\n\nHere is the plan for Thursday:\n- send the deck\n- book the room\n\nbest,\njo");
-        assert!(audit_register_receipts(&short_and_listed).is_empty());
-        // A code snippet inside an email body is content, not a sentence.
-        let with_code = format!("{standard}Here is the failing call:\n```\ncargo test -p foo\n```\nThanks for taking a look.");
-        assert!(audit_register_receipts(&with_code).is_empty());
-        assert!(audit_register_receipts("register: standard\n\n").is_empty());
-        // Prose that merely mentions the word is not a receipt.
+        for draft in [
+            "github.com/example/repo is failing on main. iPhone builds too. Can you take a look?",
+            "hi alice,\n\nHere is the plan for Thursday:\n- send the deck\n- book the room\n\nbest,\njo",
+            "Here is the failing call:\n```\ncargo test -p foo\n```\nThanks for taking a look.",
+            "",
+        ] {
+            assert!(audit_register_receipts(&format!("register: standard (he capitalizes), mirroring\n{draft}")).is_empty(), "{draft}");
+        }
         assert!(!is_register_receipt("the register: standard here"));
         assert!(!is_register_receipt("register: closed for the night"));
         assert!(is_register_receipt("  Register: Standard (she capitalizes)"));

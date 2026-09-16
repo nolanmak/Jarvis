@@ -2533,20 +2533,16 @@ mod tests {
         }
     }
 
-    /// #994 — an all-lowercase text was drafted for a recipient who
-    /// capitalizes, even though the owner's chameleon rule was injected as
-    /// a top-priority owner rule. The prompt half of the fix lives in
-    /// `wiki-ask.md`, which `ask_opts` embeds for every drafting entry point
-    /// (Discord `WikiQuerier`, `wiki ask`, `/loop` runs); the deterministic
-    /// half is `augmentagent_approval_discord::register`, which checks the
-    /// draft against the receipt at delivery. This pins the receipt format
-    /// that parser expects, so a prompt edit can't silently desync the two.
+    /// #994 — the prompt half of the fix lives in `wiki-ask.md`, which
+    /// `ask_opts` embeds for every drafting entry point (Discord, `wiki
+    /// ask`, `/loop`); the deterministic half is
+    /// `augmentagent_approval_discord::register`. This pins the receipt
+    /// format that parser expects, so a prompt edit can't desync the two.
     #[test]
     fn ask_opts_prompt_requires_register_receipt_on_drafts() {
         let repo = tempfile::tempdir().expect("repo tmpdir");
         let wiki = tempfile::tempdir().expect("wiki tmpdir");
         let opts = ask_opts(wiki.path().to_path_buf(), repo.path().to_path_buf());
-
         assert!(opts.system_prompt.contains("## Register matching (drafts)"));
         for receipt in [
             "register: standard (she capitalizes), mirroring",

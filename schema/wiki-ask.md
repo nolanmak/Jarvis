@@ -42,9 +42,7 @@ Before emitting ANY outbound draft — text, DM, email, social reply, comment �
    ````
    register: standard (she capitalizes), mirroring
    ```
-   Hey Sam, thanks for checking in.
-
-   I'll have the doc over tonight.
+   Hey Sam, thanks for checking in. I'll have the doc over tonight.
    ```
    ````
 
@@ -55,7 +53,7 @@ Precedence and scope:
 - **Casing/register** comes from this protocol. **Everything else** — word choice, length, no em-dashes, no emojis, formality — comes from the owner's "Writing style preferences" in `about/me.md` (see "Email actions"). An explicit owner instruction *this turn* ("make it formal", "all lowercase is fine") beats detection; say so in the receipt (`register: lowercase (you asked)`).
 - **No sentence-shaped samples** (first contact, owner-initiated outreach, only one-word replies on file) → `unknown`. Do not stop to ask: a draft-less reply is a failed turn under "Deliverable placement", and the receipt IS the question, answerable in one word. Apply the owner's stated default for that channel from `about/me.md` (new casual texts/DMs in the owner's own lowercase voice; professional email stays clean, i.e. standard) and name it: `register: unknown, defaulting to lowercase (no samples on file)`.
 - **Revision turns** ("make it shorter", "add the link") keep the previously detected register and repeat the receipt; re-detect only if the owner overrides or new recipient messages arrived.
-- **Email bodies** (`gmail compose` / `update-draft` / `send-now`): the receipt is the **first line of the `--body` / `--body-file`**, with the body under it. The command refuses a body without one, checks the whole body against it, refuses a mismatch before anything reaches Gmail (recase and re-run), and strips the receipt so it never ships. When the body went to an approval card, the reply does not repeat the receipt.
+- **Email bodies** (`gmail compose` / `update-draft` / `send-now`): the receipt is the **first line of the `--body` / `--body-file`**, with the body under it. The command checks the whole body against it, and a reply also against the inbound you pass as `--reply-to-body*` — the recipient's own casing outranks your receipt, so a misclassified receipt does not get a draft through; only `(you asked)` (an owner override this turn) is exempt. A mismatch is refused before anything reaches Gmail (recase and re-run); the receipt is stripped so it never ships. When the body went to an approval card, the reply does not repeat the receipt.
 - **The receipt is for the owner's eyes only.** It sits above the fence, never inside it, an `ATTACH`ed file, a card body, or anything else that could be sent. Texts, DMs and social replies are hand-pasted by the owner from the fenced block; email is the only draft a tool sends, and it is gated as above.
 - **Non-draft answers** — lookups, summaries, filing an issue, answering a question — do NOT get a receipt line. The receipt is the only thing the delivery layer keys on: a draft you emit without one is checked by nobody, which is the #994 failure again.
 

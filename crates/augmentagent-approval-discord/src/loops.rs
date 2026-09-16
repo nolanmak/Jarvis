@@ -677,11 +677,10 @@ impl LoopScheduler {
     }
 }
 
-/// The posted text for one loop result. Loops draft through the same
-/// wiki-ask toolbelt as interactive asks but post through [`LoopPoster`],
-/// not `prepare_answer_delivery`, so the #994 register audit runs here. It
-/// keys on a `register:` receipt line, so a loop's status report or code
-/// output (no receipt) posts exactly as before.
+/// The posted text for one loop result. Loops draft through the wiki-ask
+/// toolbelt but post through [`LoopPoster`], not `prepare_answer_delivery`,
+/// so the #994 register audit runs here; it keys on a `register:` receipt,
+/// so a receiptless status report or code output posts exactly as before.
 fn loop_result_body(header: &str, answer: &str) -> String {
     let mut body = format!("{header}\n\n{answer}");
     for note in crate::register::audit_register_receipts(answer) {
@@ -920,11 +919,9 @@ mod tests {
     /// a receiptless result (status text, a code fence) is posted as-is.
     #[test]
     fn loop_results_carry_the_register_audit() {
-        let answer = "register: standard (she capitalizes), mirroring\n```\n\
-                      hey casey, thanks for checking in on the proposal.\n```";
+        let answer = "register: standard (she capitalizes), mirroring\n```\nhey casey, thanks for checking in on the proposal.\n```";
         let body = loop_result_body("🔁 loop `x`", answer);
-        assert!(body.starts_with("🔁 loop `x`\n\nregister:"), "{body}");
-        assert!(body.contains("\u{26a0}\u{fe0f} register mismatch"), "{body}");
+        assert!(body.starts_with("🔁 loop `x`\n\nregister:") && body.contains("\u{26a0}\u{fe0f} register mismatch"), "{body}");
         let plain = "all quiet.\n```\n$ df -h /mnt/build\n```";
         assert_eq!(loop_result_body("h", plain), format!("h\n\n{plain}"));
     }

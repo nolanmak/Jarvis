@@ -4963,8 +4963,9 @@ fn body_without_leaked_subject(
 
 /// CLI adapter for [`body_without_leaked_subject`]: a body-level `Subject:`
 /// naming something other than `--subject` is a usage error, and one that
-/// merely repeats `--subject` is dropped with a note.
-fn body_for_gmail_write(body: String, subject: &str) -> Result<String> {
+/// merely repeats `--subject` is dropped with a note. `inbound` is the
+/// message being replied to (`--reply-to-body*`), when the caller has it.
+fn body_for_gmail_write(body: String, subject: &str, inbound: Option<&str>) -> Result<String> {
     match body_without_leaked_subject(&body, subject) {
         Ok((clean, dropped)) => {
             if let Some(dropped) = dropped {
@@ -4973,16 +4974,7 @@ fn body_for_gmail_write(body: String, subject: &str) -> Result<String> {
                      the subject header is --subject ({subject})"
                 );
             }
-            // `WIKI_ROOT` is in the env only when the wiki-ask drafter is
-            // the caller: `ask_opts` sets it for that one subprocess under
-            // `restrict_env`, and nothing else exports it. Every body that
-            // reaches this fn is a fresh `--body`/`--body-file` from that
-            // drafter or from the owner's shell; queued, scheduled and
-            // retried sends go out by Gmail draft id (`send_draft`) inside
-            // the daemon and never re-enter the CLI, so a body drafted
-            // before the protocol cannot be refused here for lacking one.
-            let drafter = std::env::var_os("WIKI_ROOT").is_some();
-            let (clean, receipt) = strip_register_receipt(&clean, drafter)?;
+            let (clean, receipt) = strip_register_receipt(&clean, inbound)?;
             if receipt {
                 eprintln!("note: checked and dropped the \"register:\" receipt line from the body (#994)");
             }
@@ -4992,32 +4984,37 @@ fn body_for_gmail_write(body: String, subject: &str) -> Result<String> {
     }
 }
 
-/// #994 — the wiki-ask drafter heads an email body with its `register:`
-/// receipt, which makes this the one place holding both the receipt and the
-/// whole draft, so the tool-sent draft is gated here, before any Gmail
-/// write: a `drafter` body with no receipt is refused (the one deterministic
-/// way to make the drafter classify the recipient), a body contradicting its
-/// receipt is refused (recase and re-run), and the owner-facing receipt is
-/// dropped so it never ships. Only the first line is read as a receipt; a
-/// body that mentions "register:" anywhere else is recipient content and is
-/// returned verbatim, as is any hand-run body without one.
-fn strip_register_receipt(body: &str, drafter: bool) -> Result<(String, bool)> {
-    use augmentagent_approval_discord::register::{audit_register_receipts, is_register_receipt};
+/// #994 — the register gate on a Gmail body, keyed on the payload alone (not
+/// the env: `WIKI_ROOT` is also an owner-shell variable, `docs/PDF-GENERATION.md`).
+/// A `register:` receipt on the first line (the wiki-ask drafter's) is
+/// audited against the body and dropped so it never ships; `inbound`, the
+/// recipient's own message, is classified deterministically and the body
+/// held to *their* casing — a receipt that misclassifies them is the #994
+/// failure, so it does not outrank them, unless it records an owner override
+/// this turn (`register: lowercase (you asked)`). Either check refuses with
+/// a recase-and-re-run error. A body with neither is returned verbatim:
+/// nothing is refused for merely lacking a receipt, so a hand-run body sends.
+fn strip_register_receipt(body: &str, inbound: Option<&str>) -> Result<(String, bool)> {
+    use augmentagent_approval_discord::register as reg;
     let lead = body.trim_start_matches(['\r', '\n']);
     let (first, rest) = lead.split_once('\n').unwrap_or((lead, ""));
-    if !is_register_receipt(first) {
-        anyhow::ensure!(
-            !drafter,
-            "the body has no `register:` receipt as its first line (#994): classify the \
-             recipient's casing from their own messages, put `register: standard|lowercase|\
-             unknown ...` above the body, and re-run"
-        );
-        return Ok((body.to_string(), false));
+    let receipt = reg::is_register_receipt(first);
+    let clean = if receipt {
+        if let Some(note) = reg::audit_register_receipts(lead).into_iter().next() {
+            anyhow::bail!("{note}: recase the body to match its receipt, then re-run");
+        }
+        rest.trim_start_matches(['\r', '\n'])
+    } else {
+        body
+    };
+    let owner_override = receipt && first.to_ascii_lowercase().contains("you asked");
+    if let Some(note) = inbound
+        .filter(|_| !owner_override)
+        .and_then(|sample| reg::audit_draft_against_sample(sample, clean))
+    {
+        anyhow::bail!("{note}: recase the body (and its receipt) to match the recipient's own message, then re-run");
     }
-    if let Some(note) = audit_register_receipts(lead).into_iter().next() {
-        anyhow::bail!("{note}: recase the body to match its receipt, then re-run");
-    }
-    Ok((rest.trim_start_matches(['\r', '\n']).to_string(), true))
+    Ok((clean.to_string(), receipt))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -5269,7 +5266,16 @@ async fn run_gmail_compose(
     let to = to.join(", ");
     let cc = normalize_recipients("--cc", &cc)?;
     let bcc = normalize_recipients("--bcc", &bcc)?;
-    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject)?;
+    let body = read_body(body, body_file)?;
+    // #994 — the inbound is read here, ahead of the body gate, so a reply
+    // is held to the recipient's own casing before any Gmail write.
+    let inbound = match (reply_to_body, reply_to_body_file) {
+        (Some(_), Some(_)) => anyhow::bail!("--reply-to-body and --reply-to-body-file are mutually exclusive"),
+        (Some(b), None) => Some(b),
+        (None, Some(p)) => Some(read_body(None, Some(p))?),
+        (None, None) => None,
+    };
+    let body_str = body_for_gmail_write(body, &subject, inbound.as_deref())?;
     // Validate the --post flag pairing BEFORE any Gmail write, so a usage
     // error can't strand an orphan draft in the mailbox (#412).
     if post
@@ -5356,8 +5362,8 @@ async fn run_gmail_compose(
             reply_to_message_id.as_deref(),
             reply_to_from.as_deref(),
             reply_to_subject.as_deref(),
-            reply_to_body.as_deref(),
-            reply_to_body_file.as_deref(),
+            inbound.as_deref(),
+            None,
             send_at_ms,
         )
         .await?;
@@ -6123,7 +6129,7 @@ async fn run_gmail_update_draft(
     let to = to.join(", ");
     let cc = normalize_recipients("--cc", &cc)?;
     let bcc = normalize_recipients("--bcc", &bcc)?;
-    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject)?;
+    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject, None)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     // #500 — refuse while a send of exactly this draft is in flight: update
     // is create-replacement + DELETE-old, which would yank the draft out
@@ -6298,7 +6304,7 @@ async fn run_gmail_send_now(
     let to = to.join(", ");
     let cc = normalize_recipients("--cc", &cc)?;
     let bcc = normalize_recipients("--bcc", &bcc)?;
-    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject)?;
+    let body_str = body_for_gmail_write(read_body(body, body_file)?, &subject, None)?;
     let (entity_id, email) = resolve_gmail_entity_id(&store, account)?;
     let api_key = std::env::var("COMPOSIO_API_KEY").context("COMPOSIO_API_KEY env var required")?;
     let gmail = ComposioClient::new(api_key);
@@ -8609,34 +8615,52 @@ mod unescape_body_tests {
 
 #[cfg(test)]
 mod approval_body_tests {
+    use super::strip_register_receipt;
     use super::{
         body_without_leaked_subject, compose_card_identity, compose_pending_disposition,
         revise_recipient, revise_subject, revised_subject, strip_approval_envelope_markers,
-        strip_leading_subject_line, strip_register_receipt, subjects_agree,
-        thread_for_revised_subject, thread_subject_conflict, ComposePendingDisposition,
-        ThreadSubject,
+        strip_leading_subject_line, subjects_agree, thread_for_revised_subject,
+        thread_subject_conflict, ComposePendingDisposition, ThreadSubject,
     };
 
     /// #994 — a Gmail body is checked against the `register:` receipt on its
     /// first line and refused on a contradiction; a matching receipt is
-    /// dropped so it never ships; the drafter is refused without one; and a
-    /// body without one is otherwise untouched, even when a later line reads
-    /// like a receipt (CRLF and trailing newline included).
+    /// dropped so it never ships; a body without one is untouched, even when
+    /// a later line reads like a receipt (CRLF and trailing newline included).
     #[test]
     fn register_receipt_gates_and_is_dropped_from_a_gmail_body() {
         let receipt = "register: standard (she capitalizes), mirroring\n\n";
         let good = "Hi Alice,\n\nThanks for checking in on the proposal.\n";
         assert_eq!(
-            strip_register_receipt(&format!("{receipt}{good}"), true).unwrap(),
+            strip_register_receipt(&format!("{receipt}{good}"), None).unwrap(),
             (good.to_string(), true)
         );
         let bad = format!("{receipt}hi alice,\n\nthanks for checking in on the proposal.\n");
-        let err = strip_register_receipt(&bad, true).unwrap_err().to_string();
+        let err = strip_register_receipt(&bad, None).unwrap_err().to_string();
         assert!(err.contains("register mismatch") && err.contains("recase"), "{err}");
         let plain = "Hi Alice,\r\n\r\nregister: standard is the one we discussed.\r\n";
-        assert_eq!(strip_register_receipt(plain, false).unwrap(), (plain.to_string(), false));
-        let err = strip_register_receipt(plain, true).unwrap_err().to_string();
-        assert!(err.contains("no `register:` receipt as its first line"), "{err}");
+        assert_eq!(strip_register_receipt(plain, None).unwrap(), (plain.to_string(), false));
+    }
+
+    /// #994 verbatim on the send path that holds the recipient's own
+    /// message: she wrote "Hi, I wanted to check in on the proposal." and
+    /// the reply came out all-lowercase. Refused from the inbound alone —
+    /// with no receipt, and with one that misclassifies her (the reported
+    /// failure); only an owner override is exempt; no inbound, no refusal.
+    #[test]
+    fn issue_994_lowercase_reply_to_a_capitalizing_sender_is_refused() {
+        let inbound = "Hi,\n\nI wanted to check in on the proposal. Does Thursday still work?\n\nThanks,\nCasey\n";
+        let lower = "hey casey, thanks for checking in. i'll have the proposal over tonight, \
+                     let me know if thursday still works.\n";
+        for body in [lower.to_string(), format!("register: lowercase (she types all-lowercase), mirroring\n{lower}")] {
+            let err = strip_register_receipt(&body, Some(inbound)).unwrap_err().to_string();
+            assert!(err.contains("the recipient writes in standard") && err.contains("recase"), "{err}");
+        }
+        let cased = "Hey Casey, thanks for checking in. I'll have the proposal over tonight.\n";
+        assert_eq!(strip_register_receipt(cased, Some(inbound)).unwrap(), (cased.to_string(), false));
+        let asked = format!("register: lowercase (you asked)\n{lower}");
+        assert_eq!(strip_register_receipt(&asked, Some(inbound)).unwrap(), (lower.to_string(), true));
+        assert_eq!(strip_register_receipt(lower, None).unwrap(), (lower.to_string(), false));
     }
 
     // #962 — who the card's From line (and the actions/emails rows) name.
