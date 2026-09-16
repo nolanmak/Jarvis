@@ -1044,8 +1044,20 @@ fn split_criteria(raw: &str) -> (String, Vec<String>) {
         }
         kept.push(line);
     }
+    cap_criteria(&mut criteria);
+    (kept.join("\n"), criteria)
+}
+
+/// #1012 — the one place criteria are bounded.
+///
+/// Both entry points call it: the scope parser, and the PR-body reader that a
+/// resumed run goes through. Sharing it is the point. When only the parser
+/// capped, a PR body written before the cap existed — or edited by hand —
+/// pushed unbounded strings straight into both review prompts on resume, which
+/// is exactly the context blow-out the cap exists to prevent.
+fn cap_criteria(criteria: &mut Vec<String>) {
     criteria.truncate(MAX_CRITERIA);
-    for c in &mut criteria {
+    for c in criteria.iter_mut() {
         if c.chars().count() > MAX_CRITERION_CHARS {
             let cut = c
                 .char_indices()
@@ -1055,7 +1067,6 @@ fn split_criteria(raw: &str) -> (String, Vec<String>) {
             *c = format!("{}…", &c[..cut]);
         }
     }
-    (kept.join("\n"), criteria)
 }
 
 /// The PR-body section carrying the criteria, or nothing at all.
@@ -1100,7 +1111,7 @@ fn criteria_from_pr_body(body: &str) -> Vec<String> {
         }
         break;
     }
-    out.truncate(MAX_CRITERIA);
+    cap_criteria(&mut out);
     out
 }
 
@@ -9858,6 +9869,70 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         for c in &out.criteria {
             assert!(c.chars().count() <= MAX_CRITERION_CHARS, "width {}", c.chars().count());
         }
+    }
+
+    /// Codex review, second finding: the resume path read criteria back from
+    /// a PR body applying only the COUNT cap, so a body written before the cap
+    /// existed — or edited by hand — could push unbounded strings straight
+    /// into both review prompts. Both entry points must cap identically, so
+    /// they share one function and cannot drift.
+    #[test]
+    fn criteria_are_capped_identically_however_they_enter_the_pipeline() {
+        let long = "C1: ".to_string() + &"x".repeat(1_000);
+        let many: Vec<String> = (1..=30).map(|i| format!("C{i}: {}", "y".repeat(500))).collect();
+
+        let body = format!(
+            "## Acceptance criteria (from the scoping pass)\n- {}\n{}\n",
+            long,
+            many.iter().map(|c| format!("- {c}")).collect::<Vec<_>>().join("\n")
+        );
+        let from_body = criteria_from_pr_body(&body);
+        assert!(from_body.len() <= MAX_CRITERIA, "count {}", from_body.len());
+        for c in &from_body {
+            assert!(
+                c.chars().count() <= MAX_CRITERION_CHARS,
+                "a resumed run must not carry a {}-char criterion into review",
+                c.chars().count()
+            );
+        }
+
+        let scoped = parse_scope_output(&format!(
+            "VERDICT: fixable\nCRITERIA:\n- {}\n\nspec",
+            long
+        ));
+        assert_eq!(
+            scoped.criteria.len(),
+            1,
+            "the two paths must agree on what a capped list looks like"
+        );
+        assert_eq!(scoped.criteria[0].chars().count(), MAX_CRITERION_CHARS);
+    }
+
+    /// Codex review, first finding, and a clarification of C1 rather than a
+    /// change to it. A block that opens correctly and later drifts into prose
+    /// keeps the bullets it already stated and hands the prose back to the
+    /// spec. Discarding a well-formed criterion because a later line was not a
+    /// bullet would lose real information for a cosmetic reason; the property
+    /// C1 actually protects is that nothing here can fail a run.
+    #[test]
+    fn a_block_that_drifts_into_prose_keeps_its_bullets_and_returns_the_prose() {
+        let out = parse_scope_output(
+            "VERDICT: fixable\nCRITERIA:\n\
+             - C1: every lane is guarded\n\
+             Note: a second criterion was considered and dropped.\n\
+             - Files to touch: a.rs\n",
+        );
+        assert_eq!(out.criteria, vec!["C1: every lane is guarded".to_string()]);
+        assert!(
+            out.body.contains("Note: a second criterion"),
+            "prose returns to the spec:\n{}",
+            out.body
+        );
+        assert!(
+            out.body.contains("Files to touch: a.rs"),
+            "and so does everything after it, which is the whole point:\n{}",
+            out.body
+        );
     }
 
     /// C2 — the PR body is the durable store, exactly as it already is for
