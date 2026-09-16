@@ -319,7 +319,7 @@ impl FallbackReasoner {
         if request_opts.handoff_path.is_none() && matches!(class,
             crate::providers::CapabilityClass::WriteTools | crate::providers::CapabilityClass::FullAgentic) {
             if let Some(root) = &self.handoff_root {
-                request_opts.handoff_path = Some(crate::handoff::request_path(root, opts, user_message)?);
+                request_opts.handoff_path = Some(crate::handoff::request_path(root, opts)?);
             }
         }
         let opts = &request_opts;

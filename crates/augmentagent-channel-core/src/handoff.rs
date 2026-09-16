@@ -15,13 +15,15 @@ pub(crate) fn system_root() -> Option<PathBuf> {
 /// A channel turn id makes a replay after restart address the same journal.
 /// Calls without a turn id receive an isolated id rather than conflating two
 /// intentional, identical requests from the same user.
-pub(crate) fn request_path(root: &Path, opts: &ReasonerOpts, message: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn request_path(root: &Path, opts: &ReasonerOpts) -> anyhow::Result<PathBuf> {
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    let identity = opts.session_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let contract = json!([identity, message, opts.system_prompt, opts.allowed_tools,
-        opts.cwd, opts.add_dirs, opts.settings_json]);
-    let digest = Sha256::digest(serde_json::to_vec(&contract)?);
+    let identity = opts.session_id.as_deref().filter(|id| !id.trim().is_empty() && *id != "-")
+        .map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Prompt context contains clocks, refreshed owner instructions and runtime
+    // settings. None of those makes a replayed channel event a new request.
+    // Callers must supply a globally namespaced per-turn id, not a chat id.
+    let digest = Sha256::digest(serde_json::to_vec(&json!(["turn-v1", identity]))?);
     let request = root.join(format!("{digest:x}"));
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&request)?;
     for path in [root, request.as_path()] {
@@ -196,19 +198,24 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn request_identity_survives_restart_but_separates_turns_and_changed_requests() {
+    fn request_identity_survives_refreshed_context_but_separates_turns() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("state");
         let mut opts = crate::reasoner::loop_parse_opts();
         opts.session_id = Some("synthetic-turn-1".into());
-        let first = request_path(&root, &opts, "synthetic request").unwrap();
-        assert_eq!(first, request_path(&root, &opts, "synthetic request").unwrap());
-        assert_ne!(first, request_path(&root, &opts, "different request").unwrap());
+        let first = request_path(&root, &opts).unwrap();
+        assert_eq!(first, request_path(&root, &opts).unwrap());
+        // The query handler prepends the current clock and owner context each
+        // time it runs. Refreshing those must not lose an earlier receipt.
+        opts.system_prompt.push_str(" Refreshed deployment instructions.");
+        assert_eq!(first, request_path(&root, &opts).unwrap());
         opts.session_id = Some("synthetic-turn-2".into());
-        assert_ne!(first, request_path(&root, &opts, "synthetic request").unwrap());
+        assert_ne!(first, request_path(&root, &opts).unwrap());
         assert!(!first.to_string_lossy().contains("synthetic-turn"));
         opts.session_id = None;
-        assert_ne!(request_path(&root, &opts, "same").unwrap(), request_path(&root, &opts, "same").unwrap());
+        assert_ne!(request_path(&root, &opts).unwrap(), request_path(&root, &opts).unwrap());
+        opts.session_id = Some("-".into());
+        assert_ne!(request_path(&root, &opts).unwrap(), request_path(&root, &opts).unwrap());
     }
 
     #[test]

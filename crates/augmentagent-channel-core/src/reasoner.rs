@@ -508,7 +508,9 @@ pub struct ReasonerOpts {
     /// Logical session id stamped on every audit record produced by
     /// this call (#132 / #201). Typically `format!("{channel}:{msg}")`
     /// so a reviewer can correlate audit rows with a single Discord
-    /// turn. `None` falls back to `"-"` in the recorded row.
+    /// turn. Also identifies durable handoff state: use a globally namespaced
+    /// per-turn id, never a whole-chat id. Replays of that turn must reuse it.
+    /// `None` falls back to `"-"` in the recorded row and a fresh journal.
     pub session_id: Option<String>,
     /// Owner-private operation journal for a single logical request. The
     /// dispatcher owns its identity/lifetime; adapters must never expose this

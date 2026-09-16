@@ -166,8 +166,13 @@ symlink state, model-scope exclusion and actual bridge receipt reuse.
 
 Production dispatch now assigns private journal paths for write/agentic calls and
 forwards recorded progress to the next provider. Requests with a channel turn id
-have a stable hashed identity across restart; callers without an id get distinct
-journals and still need caller-owned restart identity. Claude receives pre-tool,
+have a stable hashed identity across restart, independent of refreshed clocks,
+owner context and provider settings. WhatsApp uses the stable message id as well
+as the chat id, so separate turns do not share receipts. Scheduled loops pass a
+persisted occurrence identity derived from the loop id and last recorded run;
+a crash before that record reuses the same journal. Callers without an id (or
+with the empty audit placeholder) get distinct journals and still need
+caller-owned restart identity if they resume work. Claude receives pre-tool,
 post-tool and failed-tool hooks using the documented [hook event contract](https://code.claude.com/docs/en/hooks).
 The pre-tool hook persists started state; successful post-tool events normalize
 results for Codex. The generated command turns script startup failures into exit

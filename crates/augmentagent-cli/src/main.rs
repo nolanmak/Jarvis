@@ -8615,8 +8615,9 @@ struct LoopReasonerRunner {
 
 #[async_trait]
 impl LoopRunner for LoopReasonerRunner {
-    async fn run_prompt(&self, prompt: &str) -> anyhow::Result<String> {
-        let opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
+    async fn run_prompt(&self, request_id: &str, prompt: &str) -> anyhow::Result<String> {
+        let mut opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
+        opts.session_id = Some(request_id.to_string());
         // #389 — loops fire through the same query toolbelt, so they carry
         // the same owner-rules preamble as interactive asks.
         let prompt = match owner_rules_block(&self.wiki_root) {
