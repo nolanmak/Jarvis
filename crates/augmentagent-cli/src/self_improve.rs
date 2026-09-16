@@ -3803,6 +3803,14 @@ async fn rabbit_review_now(repo_root: &Path, pr: u64, head_sha: &str) -> RabbitR
         &format!("repos/{{owner}}/{{repo}}/pulls/{pr}/comments?per_page=100"),
     )
     .await;
+    // `gh_json` returns `Null` for a failed call, and `rabbit_findings_for_head`
+    // would read that as an empty review list — turning "we could not ask"
+    // into "there is nothing", which is the unknown-is-not-absent mistake one
+    // layer down from where I first fixed it. An empty ARRAY is a real answer;
+    // `Null` is not.
+    if reviews.is_null() || comments.is_null() {
+        return RabbitReview::unavailable("its state could not be read (GitHub call failed)");
+    }
     rabbit_findings_for_head(&reviews, &comments, head_sha)
 }
 
@@ -11436,6 +11444,38 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             body[read..merge].contains("rabbit_merge_note(&rabbit)")
                 && body[read..merge].contains(r#""pr", "edit""#),
             "the non-blocking path must write what the read found into the body"
+        );
+    }
+
+    /// Codex, system pass, and a concrete instance of the very thing I had
+    /// just written a policy note about: `gh_json` returns `Null` when the
+    /// call fails, and `rabbit_findings_for_head` reads a missing array as an
+    /// empty one. So a failed GitHub read became "no review" — silently
+    /// merging over findings that exist. An empty ARRAY is an answer; `Null`
+    /// is not, and the two must not collapse.
+    #[test]
+    fn a_failed_github_read_is_unknown_not_an_empty_review_list() {
+        let head = "bbbb222";
+        let null = serde_json::Value::Null;
+        let empty = serde_json::json!([]);
+
+        // The parser cannot tell them apart, which is why the caller must.
+        assert!(rabbit_findings_for_head(&null, &empty, head).approved());
+        assert!(rabbit_findings_for_head(&empty, &empty, head).approved());
+
+        // So the fetch wrapper refuses to parse a null and says why.
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn rabbit_review_now(").expect("fetch wrapper");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+        let guard = body.find("is_null()").expect("must reject a failed read");
+        let parse = body.find("rabbit_findings_for_head(").expect("the parse");
+        assert!(
+            guard < parse,
+            "check for a failed call BEFORE parsing, or absence and failure collapse"
+        );
+        assert!(
+            body[guard..parse].contains("unavailable("),
+            "a failed read must become a stated unknown, not a default"
         );
     }
 
