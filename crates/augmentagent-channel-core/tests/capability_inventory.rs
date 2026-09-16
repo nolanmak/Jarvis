@@ -152,6 +152,83 @@ fn core_presets_match_permission_contracts() {
     }
 }
 
+/// Exercise the packaged MCP process with real production policies, rather than
+/// only checking serialized allowlists. Model output contracts are separate.
+#[test]
+fn core_presets_execute_scoped_file_contracts_through_packaged_bridge() {
+    use augmentagent_channel_core::{reasoner::*, codex_tools::BridgeLaunch};
+    use serde_json::{json, Value};
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let wiki = fixture.path().join("wiki");
+    std::fs::create_dir(&wiki).unwrap();
+    let outside = fixture.path().join("outside.txt");
+    std::fs::write(&outside, "SYNTHETIC_PRIVATE").unwrap();
+    let presets = vec![
+        ("triage", triage_opts(Some(wiki.clone()))),
+        ("draft", draft_opts("Synthetic".into(), Some(wiki.clone()))),
+        ("digest", digest_opts(Some(wiki.clone()))),
+        ("lint", lint_opts("Synthetic".into(), wiki.clone())),
+        ("migration", wiki_migrate_opts("Synthetic".into(), wiki.clone())),
+        ("ingest", ingest_opts("Synthetic".into(), wiki.clone())),
+        ("resume", resume_opts(wiki.clone())),
+        ("ask", ask_opts(wiki.clone(), repo)),
+        ("tone", tone_summarize_opts()),
+        ("social", social_adapter_opts("Synthetic".into())),
+        ("loop", loop_parse_opts()),
+        ("archetype", archetype_pick_opts()),
+    ];
+    for (name, opts) in presets {
+        std::fs::write(wiki.join("source.txt"), "SYNTHETIC_SOURCE\n").unwrap();
+        let output_path = wiki.join(format!("{name}-result.txt"));
+        let launch_dir = fixture.path().join(name);
+        std::fs::create_dir(&launch_dir).unwrap();
+        let launch = BridgeLaunch::prepare(&opts, &launch_dir).unwrap();
+        let calls = [
+            ("Read", json!({"file_path":wiki.join("source.txt")})),
+            ("Glob", json!({"pattern":"source.txt", "path":wiki})),
+            ("Grep", json!({"pattern":"SYNTHETIC_SOURCE", "path":wiki})),
+            ("Write", json!({"file_path":output_path,"content":"SYNTHETIC_BEFORE\n"})),
+            ("Edit", json!({"file_path":output_path,"old_string":"BEFORE","new_string":"AFTER"})),
+            ("Read", json!({"file_path":outside})),
+            ("Write", json!({"file_path":outside,"content":"UNAUTHORIZED"})),
+        ];
+        let mut child = Command::new("python3").arg(launch_dir.join("tool-bridge.py"))
+            .arg(launch.policy_path).stdin(Stdio::piped()).stdout(Stdio::piped())
+            .stderr(Stdio::piped()).spawn().unwrap();
+        let mut input = child.stdin.take().unwrap();
+        for (id, (tool, arguments)) in calls.iter().enumerate() {
+            writeln!(input, "{}", json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":tool,"arguments":arguments}})).unwrap();
+        }
+        drop(input);
+        let result = child.wait_with_output().unwrap();
+        assert!(result.status.success(), "{name}: bridge exited: {}", String::from_utf8_lossy(&result.stderr));
+        let responses: Vec<Value> = String::from_utf8(result.stdout).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(responses.len(), calls.len(), "{name}: lost MCP responses");
+        for (id, (tool, _)) in calls.iter().enumerate() {
+            let permitted = id < 5 && opts.allowed_tools.iter().any(|allowed| allowed == tool);
+            let response = &responses[id];
+            let succeeded = response.get("error").is_none()
+                && response["result"]["isError"] != true;
+            assert_eq!(succeeded, permitted, "{name}: {tool} response {response}");
+            if permitted && id < 3 {
+                let expected = if id == 1 { "source.txt" } else { "SYNTHETIC_SOURCE" };
+                assert!(response.to_string().contains(expected), "{name}: empty file-tool result");
+            }
+        }
+        if opts.allowed_tools.iter().any(|tool| tool == "Write") {
+            assert_eq!(std::fs::read_to_string(output_path).unwrap(), "SYNTHETIC_AFTER\n");
+        } else {
+            assert!(!output_path.exists(), "{name}: read-only policy wrote a file");
+        }
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "SYNTHETIC_PRIVATE");
+    }
+}
+
 #[test]
 fn optional_mcp_profiles_preserve_readonly_guard_and_private_auth() {
     use augmentagent_channel_core::{reasoner::*, providers::{classify, CapabilityClass}, codex_tools::BridgeLaunch};

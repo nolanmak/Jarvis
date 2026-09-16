@@ -181,9 +181,28 @@ core presets and check capability classification, declared tools and bridge writ
 scope, including optional wiki access. Isolated opt-in integration tests cover
 both wrapper constructors with the feature disabled and enabled, preserving
 private authentication configuration and executing the original read-only guard
-through the bridge against allowed-read and denied-write probes. Provider execution/output coverage is
+through the bridge against allowed-read and denied-write probes. All twelve core
+presets also execute file operations through the packaged stdio bridge: scoped
+Read/Glob/Grep, permitted Write/Edit, read-only mutation denial and outside-root
+read/write denial. These deterministic probes cover file tools; they do not
+substitute for MCP initialization or model output contracts. Provider execution/output coverage is
 tracked separately as pending; inventory and policy checks alone do not prove
-full workflow parity. The remaining provider conformance suite must cover:
+full workflow parity.
+
+The live `live_wiki_query_profile_executes_files_and_memory_mcp` test uses the
+production query instructions, tool inventory and scope hook, with a synthetic
+wiki/database and a built memory server selected by `JARVIS_TEST_MEMORY_BIN`.
+It exposed an existing memory-server notification bug: an unsolicited response
+to `notifications/initialized` broke the bridge handshake. The server now ignores
+notifications and does not execute id-less tool calls; a real stdio regression
+test covers both. After that fix, live Codex completed Glob/Grep/Read/Write/Edit
+and `memory_recent`, with successful provider-attributed audit records. One
+earlier post-fix call initialized but did not produce the requested file; the
+test now includes the synthetic response/audit when that assertion fails.
+This live receipt does not establish automatic fallback, delivery-handler
+coverage or reliability across all output contracts.
+
+The remaining provider conformance suite must cover:
 
 | Source | Presets / operations |
 |---|---|

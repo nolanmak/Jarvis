@@ -84,7 +84,8 @@
       "permission_profile": "text",
       "output_contract": "Structured archetype selection",
       "conformance": [
-        "capability_inventory::core_presets_match_permission_contracts"
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
       ],
       "provider_conformance": "pending"
     },
@@ -93,7 +94,8 @@
       "permission_profile": "wiki-agentic",
       "output_contract": "Complete assistant transcript with original ATTACH markers and image context",
       "conformance": [
-        "capability_inventory::core_presets_match_permission_contracts"
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
       ],
       "provider_conformance": "pending"
     },
@@ -102,7 +104,8 @@
       "permission_profile": "wiki-read-optional",
       "output_contract": "Digest prose with supplied coverage and tone requirements",
       "conformance": [
-        "capability_inventory::core_presets_match_permission_contracts"
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
       ],
       "provider_conformance": "pending"
     },
@@ -111,7 +114,8 @@
       "permission_profile": "wiki-read-optional",
       "output_contract": "Draft response; sending remains approval-gated",
       "conformance": [
-        "capability_inventory::core_presets_match_permission_contracts"
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
       ],
       "provider_conformance": "pending"
     },
@@ -120,7 +124,8 @@
       "permission_profile": "wiki-write",
       "output_contract": "Wiki update and completion response",
       "conformance": [
-        "capability_inventory::core_presets_match_permission_contracts"
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
       ],
       "provider_conformance": "pending"
     },
@@ -129,7 +134,8 @@
       "permission_profile": "wiki-read",
       "output_contract": "Structured lint findings",
       "conformance": [
-        "capability_inventory::core_presets_match_permission_contracts"
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
       ],
       "provider_conformance": "pending"
     },
@@ -138,7 +144,8 @@
       "permission_profile": "text",
       "output_contract": "Structured recurring-task specification",
       "conformance": [
-        "capability_inventory::core_presets_match_permission_contracts"
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
       ],
       "provider_conformance": "pending"
     },
@@ -147,7 +154,8 @@
       "permission_profile": "wiki-write",
       "output_contract": "Seeded wiki files and completion response",
       "conformance": [
-        "capability_inventory::core_presets_match_permission_contracts"
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
       ],
       "provider_conformance": "pending"
     },
@@ -156,7 +164,8 @@
       "permission_profile": "text",
       "output_contract": "Platform-specific content adaptation",
       "conformance": [
-        "capability_inventory::core_presets_match_permission_contracts"
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
       ],
       "provider_conformance": "pending"
     },
@@ -174,7 +183,8 @@
       "permission_profile": "text",
       "output_contract": "Structured voice descriptor",
       "conformance": [
-        "capability_inventory::core_presets_match_permission_contracts"
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
       ],
       "provider_conformance": "pending"
     },
@@ -183,7 +193,8 @@
       "permission_profile": "wiki-read-optional",
       "output_contract": "Structured triage decision",
       "conformance": [
-        "capability_inventory::core_presets_match_permission_contracts"
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
       ],
       "provider_conformance": "pending"
     },
@@ -192,7 +203,8 @@
       "permission_profile": "wiki-read",
       "output_contract": "Structured migration patch; caller preserves existing frontmatter",
       "conformance": [
-        "capability_inventory::core_presets_match_permission_contracts"
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
       ],
       "provider_conformance": "pending"
     },

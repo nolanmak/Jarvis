@@ -539,6 +539,50 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
     }
 
     #[tokio::test]
+    #[ignore = "requires Codex login and JARVIS_TEST_MEMORY_BIN; synthetic wiki and database only"]
+    async fn live_wiki_query_profile_executes_files_and_memory_mcp() {
+        let memory_bin = std::env::var_os("JARVIS_TEST_MEMORY_BIN")
+            .map(std::path::PathBuf::from).expect("set JARVIS_TEST_MEMORY_BIN to the built memory server");
+        assert!(memory_bin.is_absolute() && memory_bin.is_file());
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        std::fs::create_dir(&wiki).unwrap();
+        std::fs::write(wiki.join("source.txt"), "SYNTHETIC_QUERY_83AF\n").unwrap();
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut options = crate::reasoner::ask_opts(wiki.clone(), repo);
+        // Replace deployment-specific dependencies with isolated fixture state;
+        // retain the production instructions, tool inventory and scope hook.
+        options.add_dirs = vec![wiki.clone()];
+        let database = dir.path().join("synthetic.db");
+        let mut settings: serde_json::Value = serde_json::from_str(options.settings_json.as_ref().unwrap()).unwrap();
+        settings["mcpServers"]["memory"]["command"] = serde_json::json!(memory_bin);
+        settings["mcpServers"]["memory"]["env"]["AUGMENTAGENT_DB"] = serde_json::json!(database);
+        options.settings_json = Some(settings.to_string());
+        options.env.retain(|(key, _)| matches!(key.as_str(), "PATH" | "WIKI_ROOT" | "AUGMENTAGENT_REPO_ROOT"));
+        options.env.push(("AUGMENTAGENT_DB".into(), database.to_string_lossy().into_owned()));
+        let audit = dir.path().join("audit.jsonl");
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
+        let response = CodexCliReasoner::openai().call(&options,
+            "Run this synthetic local verification only. Use jarvis Glob to find source.txt, \
+             Grep to search for SYNTHETIC_QUERY in it, and Read to read it. Write its exact bytes \
+             to result.txt, then Edit result.txt to replace QUERY with VERIFIED, preserving the newline. \
+             Call the configured memory_recent MCP tool with limit 1 on the empty synthetic database. \
+             Do not call any external services or shell commands. Report the actual tool results.")
+            .await.unwrap();
+        assert!(wiki.join("result.txt").is_file(), "query did not write the fixture: {response}; audit: {}",
+            std::fs::read_to_string(&audit).unwrap_or_default());
+        assert_eq!(std::fs::read(wiki.join("result.txt")).unwrap(), b"SYNTHETIC_VERIFIED_83AF\n");
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(audit).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        for tool in ["Glob", "Grep", "Read", "Write", "Edit", "mcp__memory__memory_recent"] {
+            assert!(records.iter().any(|record| record["provider"] == "codex" && record["tool"] == tool
+                && record["stdout_truncated"].as_str().is_some_and(|text| !text.is_empty())
+                && record["stderr_truncated"].as_str().is_none_or(|text| text.is_empty())),
+                "missing successful audited {tool}");
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "requires a logged-in Codex CLI; reads a synthetic image only"]
     async fn live_scoped_image_read_is_visible_to_codex() {
         let dir = tempfile::tempdir().unwrap();
