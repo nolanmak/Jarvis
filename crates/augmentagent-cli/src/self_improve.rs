@@ -5223,13 +5223,26 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // be served at all. The build preset is the demanding one; when every
     // provider cleared for it is latched on quota, the scoping call buys
     // nothing and the tick used to end as a failure rather than a pause.
-    if let Some(latched) = reasoner.unavailable_reason(
-        augmentagent_channel_core::CapabilityClass::FullAgentic,
-    ) {
-        let why = no_provider_message("FullAgentic", &latched, SpentBeforeHold::Nothing);
-        info!(issue = issue.number, "auto-PR held: {why}");
-        cleanup(worktree, branch, repo_root.to_path_buf()).await;
-        return Ok(RunReport::held(why));
+    match reasoner.lane_availability(augmentagent_channel_core::CapabilityClass::FullAgentic) {
+        augmentagent_channel_core::LaneAvailability::Available => {}
+        augmentagent_channel_core::LaneAvailability::AllLatched(latched) => {
+            let why = no_provider_message("FullAgentic", &latched, SpentBeforeHold::Nothing);
+            info!(issue = issue.number, "auto-PR held: {why}");
+            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+            return Ok(RunReport::held(why));
+        }
+        augmentagent_channel_core::LaneAvailability::NoEligibleProvider => {
+            // NOT a pause. No provider in the chain is cleared for the build
+            // preset at all, so waiting will never fix it — that is a
+            // configuration or deployment fault and must stay loud, or a
+            // misconfigured chain looks exactly like a quiet quota day.
+            cleanup(worktree, branch, repo_root.to_path_buf()).await;
+            bail!(
+                "no provider in the chain is cleared for a FullAgentic call; \
+                 the build lane cannot run until the chain is fixed \
+                 (`augmentagent reasoner-selftest`)"
+            );
+        }
     }
 
     let scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
@@ -5351,17 +5364,28 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 // Re-ask the chain so the message names who is latched and
                 // until when, rather than echoing the fallback layer's own
                 // text, which says neither.
-                let why = match reasoner.unavailable_reason(
-                    augmentagent_channel_core::CapabilityClass::FullAgentic,
-                ) {
-                    Some(latched) => {
-                        no_provider_message("FullAgentic", &latched, SpentBeforeHold::ScopingCall)
+                // Only a confirmed all-latched chain is a pause. The chain's
+                // own error text cannot tell "everyone is on cooldown" from
+                // "nobody is cleared for this preset", and those are a wait
+                // and a fault respectively — so ask the chain directly rather
+                // than inferring from the message.
+                match reasoner
+                    .lane_availability(augmentagent_channel_core::CapabilityClass::FullAgentic)
+                {
+                    augmentagent_channel_core::LaneAvailability::AllLatched(latched) => {
+                        let why = no_provider_message(
+                            "FullAgentic",
+                            &latched,
+                            SpentBeforeHold::ScopingCall,
+                        );
+                        info!(issue = issue.number, "auto-PR held: {why}");
+                        cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                        return Ok(RunReport::held(why));
                     }
-                    None => no_provider_message("FullAgentic", &[], SpentBeforeHold::ScopingCall),
-                };
-                info!(issue = issue.number, "auto-PR held: {why}");
-                cleanup(worktree, branch, repo_root.to_path_buf()).await;
-                return Ok(RunReport::held(why));
+                    // Not latched, or nothing eligible: a real failure either
+                    // way, so fall through to the recording below.
+                    _ => {}
+                }
             }
             record_reasoner_error(
                 issue.number,
@@ -10539,6 +10563,37 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         );
     }
 
+    /// Codex, system pass: "every eligible provider is on cooldown" and "no
+    /// provider is cleared for this preset at all" are a WAIT and a FAULT.
+    /// Treating both as a pause would let a misconfigured chain look exactly
+    /// like a quiet quota day — and waiting never fixes configuration.
+    #[test]
+    fn an_unservable_lane_is_a_fault_while_a_latched_one_is_a_pause() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+
+        let none = body
+            .find("LaneAvailability::NoEligibleProvider")
+            .expect("the no-eligible case must be handled explicitly");
+        let arm = &body[none..none + 700];
+        assert!(
+            arm.contains("bail!"),
+            "a chain that can never serve this preset must fail loudly, not hold"
+        );
+        assert!(
+            body.contains("LaneAvailability::AllLatched"),
+            "and an all-latched chain must still hold"
+        );
+        // The build-race path must ask the chain rather than trust the error
+        // text, which cannot tell the two apart.
+        let err_arm = body.find("Err(err) => {").expect("build error arm");
+        assert!(
+            body[err_arm..].contains("lane_availability("),
+            "the race path must confirm all-latched before calling it a pause"
+        );
+    }
+
     /// C3 — check before spending the scoping call. The scoper ran, produced a
     /// decision, and only then did the build discover there was nobody to
     /// build with; that call bought nothing.
@@ -10548,7 +10603,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let start = src.find("pub async fn run_once(").expect("run_once");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
         let check = body
-            .find("unavailable_reason(")
+            .find("lane_availability(")
             .expect("run_once must ask whether the build lane can be served");
         let scope = body
             .find("build_scope_prompt(")

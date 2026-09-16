@@ -203,6 +203,20 @@ pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
     })
 }
 
+/// #1030 — whether the chain can serve a capability class, and if not, which
+/// kind of "no" it is. See [`FallbackReasoner::lane_availability`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaneAvailability {
+    /// At least one eligible provider is ready.
+    Available,
+    /// Every eligible provider is on a cooldown, with its reset where known.
+    /// A pause: the caller should hold, unbilled.
+    AllLatched(Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>),
+    /// No provider in the chain is cleared for this class at all. A
+    /// configuration fault, not a pause — waiting will never fix it.
+    NoEligibleProvider,
+}
+
 impl FallbackReasoner {
     /// Claude-only composite — behaviorally identical to the pre-#655
     /// `ClaudeCliReasoner` construction it replaces.
@@ -239,35 +253,36 @@ impl FallbackReasoner {
     }
 
     /// Providers currently configured (for status surfaces).
-    /// #1030 — which providers eligible for `class` are currently latched, or
-    /// `None` if at least one can serve the call right now.
+    /// #1030 — can this chain serve `class` right now, and if not, why not?
     ///
-    /// Lets a caller ask BEFORE spending a reasoner call on a lane that cannot
-    /// finish. The auto-PR loop used to run its scoping pass, produce a
-    /// decision, and only then discover at the build call that every provider
-    /// for the write-tools preset was on cooldown — a call that bought
-    /// nothing, on a tick that then ended as a failure rather than a pause.
-    ///
-    /// Returns the latched providers with their reset times where known, so
-    /// the caller can say when work resumes instead of just that it stopped.
-    pub fn unavailable_reason(
+    /// The two "no" answers are different problems and must not be conflated.
+    /// Every eligible provider being on a quota cooldown is a PAUSE: work
+    /// resumes on its own, and the caller should hold. No provider being
+    /// eligible at all is a CONFIGURATION fault — a chain that cannot serve
+    /// this preset will never serve it, and reporting that as a pause masks a
+    /// deployment problem as a normal wait.
+    pub fn lane_availability(
         &self,
         class: crate::providers::CapabilityClass,
-    ) -> Option<Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>> {
+    ) -> LaneAvailability {
         let mut latched = Vec::new();
+        let mut eligible = 0usize;
         for entry in &self.entries {
             if !allowed_for(entry.kind, class) {
                 continue;
             }
+            eligible += 1;
             let name = entry.kind.name();
             match self.latch.latched_until(name) {
-                // Something can serve it: not unavailable.
-                None => return None,
+                None => return LaneAvailability::Available,
                 Some(until) => latched.push((name.to_string(), Some(until))),
             }
         }
-        // No eligible provider at all is also unavailable, with nothing to name.
-        Some(latched)
+        if eligible == 0 {
+            LaneAvailability::NoEligibleProvider
+        } else {
+            LaneAvailability::AllLatched(latched)
+        }
     }
 
     pub fn provider_names(&self) -> Vec<&'static str> {
