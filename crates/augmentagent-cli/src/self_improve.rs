@@ -6005,18 +6005,38 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // no waiting: findings on THIS head withhold the merge and are said out
     // loud on the PR; every flavour of absence (no review, rate-limited,
     // free-tier quota gone) merges on the double codex LGTM.
-    // Ask GitHub for the head it actually has, rather than inferring it: a
-    // review is keyed to the commit GitHub recorded, so anything else risks
-    // comparing against a sha it never saw.
-    let head_sha = match pr_number {
-        Some(n) => run(&gh, &["pr", "view", &n.to_string(), "--json", "headRefOid",
-                              "-q", ".headRefOid"], repo_root)
+    // The head this PR was opened on. Read LOCALLY first: the push above
+    // updated `refs/remotes/origin/<branch>` in this repository, and that is
+    // the same commit GitHub recorded, obtained without a network call that
+    // can fail transiently. `gh` is the fallback for the case where the
+    // remote-tracking ref is somehow missing.
+    //
+    // This matters more than it looks. Codex put it exactly right: a policy
+    // that ABSENCE does not block says nothing about an existing review we
+    // merely failed to READ. Unknown is not absent — the same lesson as
+    // #1006 — so the fix is to make the lookup reliable rather than to decide
+    // what an unreliable one means.
+    let head_sha = {
+        let local = run("git", &["rev-parse", &format!("refs/remotes/origin/{branch}")], repo_root)
+            .await
+            .ok()
+            .filter(|(ok, ..)| *ok)
+            .map(|(_, out, _)| out.trim().to_string())
+            .filter(|sha| sha.len() == 40);
+        match (local, pr_number) {
+            (Some(sha), _) => sha,
+            (None, Some(n)) => run(
+                &gh,
+                &["pr", "view", &n.to_string(), "--json", "headRefOid", "-q", ".headRefOid"],
+                repo_root,
+            )
             .await
             .ok()
             .filter(|(ok, ..)| *ok)
             .map(|(_, out, _)| out.trim().to_string())
             .unwrap_or_default(),
-        None => String::new(),
+            (None, None) => String::new(),
+        }
     };
     if let Some(n) = pr_number {
         // A failed head lookup is NOT silence. The owner directive is that a
@@ -6065,6 +6085,16 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             )
             .await
             .unwrap_or((false, String::new(), "spawn failed".into()));
+            // One retry: the state is worth a second attempt before it only
+            // exists in a log line.
+            let edited = if edited {
+                true
+            } else {
+                run(&gh, &["pr", "edit", &n.to_string(), "--body", &observed], repo_root)
+                    .await
+                    .map(|(ok, ..)| ok)
+                    .unwrap_or(false)
+            };
             if !edited {
                 // Explicit, not swallowed: the body keeps the placeholder, so
                 // say in the log what the body could not. Still merging — the
