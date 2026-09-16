@@ -1266,6 +1266,8 @@ async fn merge_sweep(repo_root: &Path) -> usize {
     // cannot be produced from GitHub, and the half that binds to a specific
     // pull request rather than to a shape.
     let opened = opened_prs_path();
+    // Resolved the same way the fresh path resolves it, override included.
+    let policy_owner = merge_policy_owner(repo_root).await;
     let mut merged = 0usize;
 
     for row in rows {
@@ -1333,7 +1335,7 @@ async fn merge_sweep(repo_root: &Path) -> usize {
                 // drafts for issues the fresh path would have refused. An
                 // unknown author stays empty, which that gate rejects.
                 issue_author: issue_author(repo_root, issue).await.unwrap_or_default(),
-                repo_owner: owner.clone(),
+                repo_owner: policy_owner.clone(),
                 automerge_authors: std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS").ok(),
             },
         };
@@ -1427,6 +1429,20 @@ async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
             Some("SUCCESS") | Some("SKIPPED") | Some("NEUTRAL")
         )
     }))
+}
+
+/// #1029 — the repo owner as the merge policy sees it, resolved ONE way.
+///
+/// The fresh path honours `GH_OWNER_ENV` first and falls back to the remote;
+/// the sweep only read the remote. With an override set they disagree, and
+/// then the fresh path merges a PR the sweep would refuse — the policy
+/// divergence C2 exists to prevent, arriving through an input rather than
+/// through the policy itself.
+async fn merge_policy_owner(repo_root: &Path) -> Option<String> {
+    std::env::var(GH_OWNER_ENV)
+        .ok()
+        .filter(|o| !o.trim().is_empty())
+        .or(repo_owner_from_remote(repo_root).await)
 }
 
 /// #1029 — where this box records the pull requests the loop itself opened.
@@ -6482,9 +6498,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // #1029 — one policy, shared with the merge sweep. Two copies drift,
         // and the drift is silent: a PR the fresh path would never merge gets
         // merged a day later by the sweep, on rules nobody compared.
-        let owner = std::env::var(GH_OWNER_ENV)
-            .ok()
-            .or(repo_owner_from_remote(repo_root).await);
+        let owner = merge_policy_owner(repo_root).await;
         may_automerge(&MergePolicy {
             automerge_enabled: automerge_enabled_value(
                 std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
@@ -10958,6 +10972,19 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             sweep.contains("sweep_verdict("),
             "the sweep must decide through sweep_verdict"
         );
+        // C2 reaches the INPUTS too: the fresh path honours GH_OWNER_ENV
+        // before the remote, and a sweep that only read the remote would
+        // refuse PRs the fresh path merges whenever an override is set.
+        for path in [fresh, {
+            let i = src.find("async fn merge_sweep(").expect("the sweep");
+            &src[i..i + src[i..].find("\n}\n").expect("end")]
+        }] {
+            assert!(
+                path.contains("merge_policy_owner("),
+                "both paths must resolve the owner the same way"
+            );
+        }
+
         let v_start = src.find("fn sweep_verdict(").expect("sweep_verdict");
         let verdict = &src[v_start..v_start + src[v_start..].find("\n}\n").expect("end")];
         assert!(
