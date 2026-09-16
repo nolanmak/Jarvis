@@ -85,7 +85,9 @@
       "output_contract": "Structured archetype selection",
       "conformance": [
         "capability_inventory::core_presets_match_permission_contracts",
-        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_production_structured_output_contracts",
+        "provider_output_contracts::claude_production_structured_output_contracts"
       ],
       "provider_conformance": "pending"
     },
@@ -145,7 +147,9 @@
       "output_contract": "Structured recurring-task specification",
       "conformance": [
         "capability_inventory::core_presets_match_permission_contracts",
-        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_production_structured_output_contracts",
+        "provider_output_contracts::claude_production_structured_output_contracts"
       ],
       "provider_conformance": "pending"
     },
@@ -184,7 +188,9 @@
       "output_contract": "Structured voice descriptor",
       "conformance": [
         "capability_inventory::core_presets_match_permission_contracts",
-        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_production_structured_output_contracts",
+        "provider_output_contracts::claude_production_structured_output_contracts"
       ],
       "provider_conformance": "pending"
     },
@@ -194,7 +200,9 @@
       "output_contract": "Structured triage decision",
       "conformance": [
         "capability_inventory::core_presets_match_permission_contracts",
-        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_production_structured_output_contracts",
+        "provider_output_contracts::claude_production_structured_output_contracts"
       ],
       "provider_conformance": "pending"
     },
@@ -228,7 +236,10 @@
       "callsite": "crates/augmentagent-channel-discord-dm/src/channel.rs::handle_priority",
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
-      "conformance": [],
+      "conformance": [
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
+      ],
       "provider_conformance": "pending"
     },
     {
@@ -242,7 +253,10 @@
       "callsite": "crates/augmentagent-channel-email/src/channel.rs::process_email",
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
-      "conformance": [],
+      "conformance": [
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
+      ],
       "provider_conformance": "pending"
     },
     {
@@ -256,7 +270,10 @@
       "callsite": "crates/augmentagent-channel-instagram/src/channel.rs::handle_dm",
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
-      "conformance": [],
+      "conformance": [
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
+      ],
       "provider_conformance": "pending"
     },
     {
@@ -270,21 +287,30 @@
       "callsite": "crates/augmentagent-channel-linkedin/src/channel.rs::process_email",
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
-      "conformance": [],
+      "conformance": [
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
+      ],
       "provider_conformance": "pending"
     },
     {
       "callsite": "crates/augmentagent-channel-slack/src/channel.rs::handle_priority",
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
-      "conformance": [],
+      "conformance": [
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
+      ],
       "provider_conformance": "pending"
     },
     {
       "callsite": "crates/augmentagent-channel-twitter/src/channel.rs::dispatch_reply_arm",
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
-      "conformance": [],
+      "conformance": [
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
+      ],
       "provider_conformance": "pending"
     },
     {
@@ -298,7 +324,10 @@
       "callsite": "crates/augmentagent-channel-whatsapp/src/channel.rs::handle_message",
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
-      "conformance": [],
+      "conformance": [
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
+      ],
       "provider_conformance": "pending"
     },
     {

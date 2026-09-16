@@ -339,6 +339,15 @@ cannot stand in for any tool-using profile.
 
 ## Remaining integration gates
 
+The shared live output-contract suite passed through both Claude and Codex:
+interval parsing, missing-timezone errors, archetype selection, newsletter
+triage and insufficient-sample tone descriptors. It also generated and executed
+a synthetic draft through the real Deno code-mode runner, with exactly one
+draft operation and no sending capability. The loop prompt now explicitly
+requires clarification inside JSON after the Claude baseline returned a prose
+question that its consumer could not parse. These checks cover shared output
+contracts; they do not establish every channel's integration behavior.
+
 Native web calls now appear in the common audit log with the Codex provider,
 query and native action. A live public-page fixture passed through the adapter
 and verified the audit entry. The CLI uses the same `web_search` event for

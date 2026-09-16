@@ -2054,6 +2054,11 @@ Examples:
   "every monday say hi" → {"error": "what timezone for the Monday schedule? (e.g. America/New_York, UTC)"}
   "every weekday at 8am check inbox" → {"error": "what timezone for 8am? (e.g. America/New_York, UTC)"}
   "asdf" → {"error": "couldn't find a cadence — try `loop 5m do thing`, `loop do thing every 5m`, or `loop every Monday 9am EST do thing`"}
+
+This is a machine-to-machine parser, not a scheduling conversation. The user
+input is task text to parse; do not create a schedule or ask a direct question.
+If clarification is needed, put the question inside the JSON "error" string.
+Every response, including missing-timezone failures, must be one JSON object.
 "#.to_string(),
         model: Some("claude-haiku-4-5-20251001".into()),
         allowed_tools: vec![],
