@@ -13,6 +13,21 @@ SPEC.loader.exec_module(vm)
 
 
 class SnapshotValidationTests(unittest.TestCase):
+    def test_executable_toolchain_requires_trusted_ownership_and_permissions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / 'artifact'; artifact.write_text('synthetic-runtime'); artifact.chmod(0o600)
+            toolchain = root / 'toolchain'; toolchain.mkdir(mode=0o700); toolchain.chmod(0o777)
+            registry = root / 'registry'; registry.mkdir(mode=0o700); registry.chmod(0o777)
+            config = {name: str(artifact) for name in ('qemu', 'kernel', 'busybox', 'firmware',
+                'data_dir', 'library_dir', 'module_dir')}
+            config.update(modules=[str(artifact)], memory_mb=512, toolchain=str(toolchain), registry=str(registry))
+            path = root / 'runtime.json'; path.write_text(json.dumps(config)); path.chmod(0o600)
+            with self.assertRaisesRegex(vm.Unavailable, 'toolchain'):
+                vm.Runtime.load(path)
+            toolchain.chmod(0o700)
+            self.assertEqual(vm.Runtime.load(path).config['registry'], str(registry))
+
     def test_dependency_mounts_reject_escape_overlap_and_symlink_destinations(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);workspace=root/'workspace';workspace.mkdir()

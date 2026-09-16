@@ -95,6 +95,7 @@ impl BridgeLaunch {
         private_file(&server_path, include_bytes!("../../../scripts/codex-tool-bridge.py"))?;
         private_file(&directory.join("codex-command-sandbox.py"), include_bytes!("../../../scripts/codex-command-sandbox.py"))?;
         private_file(&directory.join("codex-build-vm.py"), include_bytes!("../../../scripts/codex-build-vm.py"))?;
+        private_file(&directory.join("build-dependency-proxy.py"), include_bytes!("../../../scripts/build-dependency-proxy.py"))?;
         private_file(&directory.join("provider-supervisor.py"), include_bytes!("../../../scripts/provider-supervisor.py"))?;
         let native_cwd = directory.join("native-workspace");
         std::fs::create_dir(&native_cwd)?;
@@ -191,7 +192,7 @@ mod tests {
         let policy: serde_json::Value = serde_json::from_slice(&std::fs::read(&launch.policy_path).unwrap()).unwrap();
         assert_eq!(policy["handoff_path"], serde_json::json!(opts.handoff_path));
         assert_ne!(policy["build_vm_config"], "untrusted-profile-override");
-        for helper in ["codex-build-vm.py", "provider-supervisor.py"] {
+        for helper in ["codex-build-vm.py", "build-dependency-proxy.py", "provider-supervisor.py"] {
             assert_eq!(std::fs::metadata(launch_dir.join(helper)).unwrap().permissions().mode() & 0o777, 0o600);
         }
         assert_eq!(policy["write_roots"], serde_json::json!([wiki]));

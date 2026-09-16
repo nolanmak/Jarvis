@@ -395,6 +395,7 @@ class Policy:
         self.read_roots = self._roots(config.get('read_roots', []))
         self.write_roots = self._roots(config.get('write_roots', []))
         self._node_install_cache = None
+        self._cargo_cache = None
         self.build_vm_config = config.get('build_vm_config')
         if self.build_vm_config:
             path = Path(self.build_vm_config)
@@ -970,11 +971,38 @@ class Policy:
                 if install:
                     for relative, source in dependencies:
                         copy_dependency_tree(source, snapshot.root / relative)
-                result = vm.run(runtime, snapshot.root, guest, {}, timeout=timeout,
-                    node_workspaces=[] if install else dependencies)
+                build_environment = {}
+                cargo_home = None
+                if name == 'cargo' and (self._cargo_cache or '--offline' not in guest):
+                    cargo_home = snapshot.root / '.cargo-home'
+                    cargo_home.mkdir(mode=0o700)
+                    for cache_name, config_key in [('registry', 'registry'), ('git', 'cargo_git')]:
+                        source = (Path(self._cargo_cache.name) / cache_name if self._cargo_cache and cache_name == 'registry'
+                            else Path(runtime.config[config_key]) if config_key in runtime.config else None)
+                        if source is not None and source.exists():
+                            copy_dependency_tree(source, cargo_home / cache_name)
+                    build_environment = {'CARGO_HOME': '/workspace/.cargo-home',
+                        'CARGO_NET_OFFLINE': 'true' if {'--offline', '--frozen'} & set(guest) else 'false'}
+                downloads = {}
+                result = vm.run(runtime, snapshot.root, guest, build_environment, timeout=timeout,
+                    node_workspaces=[] if install else dependencies, download_info=downloads)
                 if initial_manifests is not None and initial_manifests != self.node_manifest_state():
                     raise Denied('dependency manifests changed during build; retry before syncing sources')
                 snapshot.sync()
+                if cargo_home is not None:
+                    owner = tempfile.TemporaryDirectory(prefix='jarvis-cargo-cache-')
+                    try:
+                        copy_cargo_downloads(cargo_home, Path(owner.name))
+                        previous = self._cargo_cache
+                        self._cargo_cache = None
+                        if previous:
+                            previous.cleanup()
+                        import weakref
+                        weakref.finalize(self, owner.cleanup)
+                        self._cargo_cache = owner
+                    except Exception:
+                        owner.cleanup()
+                        raise
                 if install and result['exit_code'] == 0:
                     # Never install guest-produced executables into the host
                     # checkout. Retain this bridge's private dependency copy and
@@ -1010,6 +1038,9 @@ class Policy:
             raise Denied('VM runtime or source reconciliation is unavailable') from exc
 
     def close(self):
+        if self._cargo_cache:
+            self._cargo_cache.cleanup()
+            self._cargo_cache = None
         if self._node_install_cache:
             self._node_install_cache[2].cleanup()
             self._node_install_cache = None
@@ -1152,6 +1183,24 @@ def npm_subcommand(argv):
         else:
             return value
     return None
+
+
+def copy_cargo_downloads(source, destination):
+    """Retain package archives/index data, never guest-modified extracted code.
+
+    Each invocation re-extracts archives through Cargo's checksum validation.
+    Git dependencies are always seeded from the provisioned operator cache.
+    The retained cache remains untrusted data confined to the build guest.
+    """
+    source, destination = Path(source), Path(destination)
+    registry = source / 'registry'
+    if registry.is_symlink():
+        raise Denied('Cargo registry cache must be a regular directory')
+    for name in ('cache', 'index'):
+        path = registry / name
+        if path.exists() or path.is_symlink():
+            (destination / 'registry').mkdir(mode=0o700, exist_ok=True)
+            copy_dependency_tree(path, destination / 'registry' / name)
 
 
 def copy_dependency_tree(source, destination):

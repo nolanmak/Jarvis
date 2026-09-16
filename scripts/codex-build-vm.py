@@ -5,15 +5,23 @@ Runtime configuration is owner-private operator state. No network device, host
 home, daemon environment or host process namespace is made available to jobs.
 """
 import gzip
+import importlib.util
 import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import shlex
 import stat
 import subprocess
 import sys
 import tempfile
+import time
+
+PROXY_SPEC = importlib.util.spec_from_file_location('jarvis_dependency_proxy',
+    Path(__file__).with_name('build-dependency-proxy.py'))
+dependency_proxy = importlib.util.module_from_spec(PROXY_SPEC)
+PROXY_SPEC.loader.exec_module(dependency_proxy)
 
 MAX_OUTPUT = 8 * 1024 * 1024
 
@@ -47,6 +55,10 @@ class Runtime:
             candidate = Path(config[key])
             if not candidate.is_absolute() or not candidate.is_dir():
                 raise Unavailable('invalid read-only dependency directory')
+            if key == 'toolchain':
+                info = candidate.stat()
+                if info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022:
+                    raise Unavailable('VM executable toolchain is not trusted')
         for raw in [config[key] for key in expected - {'modules', 'memory_mb'}] + config['modules']:
             candidate = Path(raw)
             info = candidate.stat()
@@ -70,7 +82,8 @@ def initrd(entries):
     return gzip.compress(bytes(archive), mtime=0)
 
 
-GUEST_RUNNER = r'''import ctypes,json,os,selectors,signal,subprocess
+GUEST_RUNNER = dependency_proxy.GUEST_PROXY + r'''
+import ctypes,json,os,re,selectors,signal,subprocess
 from pathlib import Path
 job=json.loads(Path('/job.json').read_text())
 uid=job['uid'];gid=job['gid']
@@ -79,10 +92,28 @@ os.chown('/home/worker',uid,gid)
 os.chown('/cargo',uid,gid)
 Path('/etc/passwd').write_text(f'root:x:0:0:root:/root:/bin/sh\nworker:x:{uid}:{gid}:worker:/home/worker:/bin/sh\n')
 Path('/etc/group').write_text(f'root:x:0:\nworker:x:{gid}:\n')
-Path('/etc/hosts').write_text('127.0.0.1 localhost\n::1 localhost\n')
+Path('/etc/hosts').write_text('127.0.0.1 localhost registry.npmjs.org index.crates.io static.crates.io\n::1 localhost\n')
 environment={'PATH':'/toolchain/bin:/usr/bin:/bin','HOME':'/home/worker','USER':'worker','LOGNAME':'worker',
     'LANG':'C.UTF-8','TMPDIR':'/tmp','CARGO_HOME':'/cargo','CARGO_NET_OFFLINE':'true','CARGO_TARGET_DIR':'/workspace/target'}
 environment.update(job['environment'])
+registry=make_proxy('/root/control')
+environment.update({'NODE_EXTRA_CA_CERTS':'/etc/jarvis-registry-ca.pem',
+    'CARGO_HTTP_CAINFO':'/etc/jarvis-registry-ca.pem', 'NPM_CONFIG_AUDIT':'false',
+    'NPM_CONFIG_UPDATE_NOTIFIER':'false'})
+# Use the matching, read-only system headers for native addons. No package code
+# runs here: this probes only the trusted runtime's Node executable and headers.
+headers=Path('/usr/include/node/node_version.h')
+if headers.is_file() and Path('/usr/bin/node').is_file():
+    try:
+        text=headers.read_text()
+        version='v'+'.'.join(re.search(r'^#define NODE_'+part+r'_VERSION\s+(\d+)',text,re.M).group(1)
+            for part in ('MAJOR','MINOR','PATCH'))
+        installed=subprocess.check_output(['/usr/bin/node','--version'],env={'PATH':'/usr/bin:/bin'},
+            stderr=subprocess.DEVNULL,timeout=5,text=True).strip()
+        if version==installed:
+            environment.update({'npm_config_nodedir':'/usr','npm_config_build_from_source':'true'})
+    except (OSError,AttributeError,subprocess.SubprocessError):
+        pass
 libc=ctypes.CDLL(None)
 def worker():
     if libc.prctl(38,1,0,0,0)!=0: raise OSError('cannot enforce no-new-privileges')
@@ -92,6 +123,7 @@ try:
     process=subprocess.Popen(job['argv'],cwd='/workspace',env=environment,
         stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
         start_new_session=True,preexec_fn=worker)
+    threading.Thread(target=registry.serve_forever,daemon=True).start()
     outputs={'stdout':bytearray(),'stderr':bytearray()}
     size=0; exceeded=False
     with selectors.DefaultSelector() as streams:
@@ -126,7 +158,7 @@ with path.open('w') as receipt:
 '''
 
 
-def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, node_workspaces=()):
+def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, node_workspaces=(), download_info=None):
     """Execute argv in a disposable source snapshot; return after verified VM exit."""
     workspace = Path(workspace)
     if os.getuid() == 0:
@@ -167,11 +199,29 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, n
     with tempfile.TemporaryDirectory(prefix='jarvis-build-vm-') as temporary:
         private = Path(temporary)
         control = private / 'control'; control.mkdir(mode=0o700)
+        openssl = shutil.which('openssl', path=os.defpath)
+        if not openssl:
+            raise Unavailable('registry gateway requires the trusted OpenSSL executable')
+        info = Path(openssl).stat()
+        if info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022:
+            raise Unavailable('registry gateway OpenSSL executable is untrusted')
+        certificate, key = private / 'registry-ca.pem', private / 'registry-key.pem'
+        try:
+            subprocess.run([openssl, 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+                '-keyout', str(key), '-out', str(certificate), '-days', '1',
+                '-subj', '/CN=Jarvis build registry gateway', '-addext',
+                'subjectAltName=DNS:registry.npmjs.org,DNS:index.crates.io,DNS:static.crates.io'],
+                env={'PATH': os.defpath}, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=10, check=True)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise Unavailable('registry gateway certificate setup failed') from error
         entries = []
         for name in ('bootstrap', 'dev', 'proc', 'sys', 'tmp', 'modules', 'usr', 'workspace', 'etc', 'home',
                      'cargo', 'cargo/registry', 'cargo/git', 'toolchain', 'etc/alternatives'):
             entries.append((name, stat.S_IFDIR | (0o1777 if name == 'tmp' else 0o755), b'', 0, 0))
         entries.extend([('root', stat.S_IFDIR | 0o700, b'', 0, 0), ('root/control', stat.S_IFDIR | 0o700, b'', 0, 0)])
+        entries.extend([('etc/jarvis-registry-ca.pem', stat.S_IFREG | 0o444, certificate.read_bytes(), 0, 0),
+                        ('root/registry-key.pem', stat.S_IFREG | 0o400, key.read_bytes(), 0, 0)])
         entries.append(('dev/console', stat.S_IFCHR | 0o600, b'', 5, 1))
         entries.append(('bootstrap/busybox', stat.S_IFREG | 0o755, Path(config['busybox']).read_bytes(), 0, 0))
         for name in ('sh', 'mount', 'ip', 'insmod', 'poweroff'):
@@ -228,14 +278,22 @@ poweroff -f
         host_environment = {'PATH': os.defpath, 'LD_LIBRARY_PATH': config['library_dir'], 'QEMU_MODULE_DIR': config['module_dir']}
         supervisor = Path(__file__).with_name('provider-supervisor.py')
         cleanup = private / 'cleanup-complete'
+        broker = dependency_proxy.Broker(control)
         with tempfile.TemporaryFile() as log:
             process = subprocess.Popen([sys.executable, '-I', str(supervisor), str(cleanup), *command],
                 env=host_environment, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
             try:
-                try:
-                    status = process.wait(timeout=min(max(timeout, 1), 900))
-                except subprocess.TimeoutExpired as exc:
-                    raise Unavailable('VM command timed out') from exc
+                deadline = time.monotonic() + min(max(timeout, 1), 900)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise Unavailable('VM command timed out')
+                    broker.poll(remaining)
+                    try:
+                        status = process.wait(timeout=min(0.05, max(0.001, deadline - time.monotonic())))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
                 if status or not cleanup.is_file() or cleanup.read_text() != 'all-descendants-reaped\n':
                     raise Unavailable('VM execution or cleanup failed')
                 try:
@@ -244,6 +302,8 @@ poweroff -f
                     raise Unavailable('VM did not produce a trusted command result') from exc
                 if 'error' in result:
                     raise Unavailable(result['error'])
+                if download_info is not None:
+                    download_info.update(requests=broker.requests, bytes=broker.bytes)
                 if set(result) != {'exit_code', 'stdout', 'stderr'} or type(result['exit_code']) is not int:
                     raise Unavailable('invalid VM result')
                 return result

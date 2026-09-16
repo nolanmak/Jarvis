@@ -313,6 +313,21 @@ else:
         with self.assertRaises((bridge.Denied, OSError)):
             bridge.copy_dependency_tree(source, Path(self.temp.name) / 'fifo-copy')
 
+    def test_cargo_cache_retains_downloads_but_not_guest_modified_sources(self):
+        source = Path(self.temp.name) / 'cargo-home'
+        for relative in ('registry/cache/example/pkg.crate', 'registry/index/example/config.json',
+                         'registry/src/example/pkg/lib.rs', 'git/checkouts/example/lib.rs'):
+            path = source / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('SYNTHETIC_PACKAGE_DATA')
+        target = Path(self.temp.name) / 'retained'
+        target.mkdir()
+        bridge.copy_cargo_downloads(source, target)
+        self.assertTrue((target / 'registry/cache/example/pkg.crate').is_file())
+        self.assertTrue((target / 'registry/index/example/config.json').is_file())
+        self.assertFalse((target / 'registry/src').exists())
+        self.assertFalse((target / 'git').exists())
+
     def test_real_cargo_can_build_and_test_a_dependency_free_fixture(self):
         import shutil
         if not shutil.which('cargo'):
@@ -327,6 +342,85 @@ else:
         self.assertIn('1 passed',outcome['stdout'])
         self.assertFalse((self.root/'target').exists())
 
+    @unittest.skipUnless(__import__('os').environ.get('JARVIS_TEST_VM_CONFIG') and
+                         __import__('os').environ.get('JARVIS_TEST_PACKAGE_NETWORK'),
+                         'requires private KVM runtime and explicit public crate GET probe')
+    def test_vm_builds_uncached_public_crate_and_reuses_it_offline(self):
+        import os
+        private = Path(self.temp.name)
+        registry = private / 'empty-registry'; registry.mkdir()
+        config = json.loads(Path(os.environ['JARVIS_TEST_VM_CONFIG']).read_text())
+        config['registry'] = str(registry)
+        config_file = private / 'runtime.json'; config_file.write_text(json.dumps(config)); config_file.chmod(0o600)
+        (self.root / 'src').mkdir()
+        (self.root / 'Cargo.toml').write_text('[package]\nname="synthetic-registry-probe"\nversion="0.1.0"\nedition="2021"\n[dependencies]\nitoa="=1.0.15"\n')
+        (self.root / 'src/lib.rs').write_text('#[test] fn formats_fixture() { assert_eq!(itoa::Buffer::new().format(42), "42"); }\n')
+        policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+            'write_roots': [str(self.root)], 'allowed_tools': ['Read', 'Write', 'Bash(cargo *)'],
+            'build_vm_config': str(config_file)})
+        self.addCleanup(policy.close)
+        first = policy.run_command('cargo test', timeout=90)
+        self.assertEqual(first['exit_code'], 0, first)
+        self.assertIn('1 passed', first['stdout'])
+        second = policy.run_command('cargo test --offline', timeout=90)
+        self.assertEqual(second['exit_code'], 0, second)
+        retained = Path(policy._cargo_cache.name)
+        self.assertFalse((retained / 'registry/src').exists())
+        archives = list((retained / 'registry/cache').glob('*/*.crate'))
+        self.assertTrue(archives)
+        archives[0].write_bytes(b'SYNTHETIC_CORRUPTED_ARCHIVE')
+        corrupt = policy.run_command('cargo test --offline', timeout=90)
+        self.assertNotEqual(corrupt['exit_code'], 0, corrupt)
+        self.assertEqual(list(registry.iterdir()), [], 'operator cache must stay read-only')
+        self.assertIn('registry+https://github.com/rust-lang/crates.io-index', (self.root / 'Cargo.lock').read_text())
+        self.assertNotIn('127.0.0.1', (self.root / 'Cargo.lock').read_text())
+        self.assertFalse((self.root / 'target').exists())
+        self.assertFalse((self.root / '.cargo-home').exists(), 'private caches must not be reconciled into source')
+
+    @unittest.skipUnless(__import__('os').environ.get('JARVIS_TEST_VM_CONFIG') and
+                         __import__('os').environ.get('JARVIS_TEST_PACKAGE_NETWORK'),
+                         'requires private KVM runtime and explicit public package GET probe')
+    def test_vm_installs_uncached_public_npm_package_without_general_network(self):
+        import os
+        (self.root / 'package.json').write_text(json.dumps({'name': 'synthetic-registry-probe',
+            'version': '1.0.0', 'scripts': {'test': 'node probe.js'}}))
+        (self.root / 'probe.js').write_text("""const assert=require('assert'),fs=require('fs'),net=require('net'),https=require('https');
+assert.equal(require('is-number')(42),true); assert.equal(require('is-number')('abc'),false);
+assert.deepEqual(fs.readdirSync('/sys/class/net'),['lo']);
+assert.throws(()=>fs.readFileSync('/root/registry-key.pem'),error=>error.code==='EACCES');
+const direct=new Promise((resolve,reject)=>{
+ const socket=net.connect({host:'1.1.1.1',port:80}); socket.once('connect',()=>reject(new Error('general network escaped')));
+ socket.once('error',()=>resolve());
+});
+function denied(options,expected) { return new Promise((resolve,reject)=>{
+ const request=https.request('https://registry.npmjs.org/is-number',options,response=>{
+  try { assert.equal(response.statusCode,expected); response.resume(); response.once('end',resolve); }
+  catch(error) { reject(error); }
+ }); request.once('error',reject); request.end();
+}); }
+Promise.all([direct,denied({method:'POST'},405),denied({servername:'registry.npmjs.org',headers:{Host:'example.invalid'}},403)])
+ .then(()=>console.log('SYNTHETIC_PUBLIC_PACKAGE_OK_NETWORK_BLOCKED')).catch(error=>{console.error(error);process.exitCode=1;});""")
+        policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+            'write_roots': [str(self.root)], 'allowed_tools': ['Read', 'Write', 'Bash(npm *)'],
+            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG']})
+        self.addCleanup(policy.close)
+        installed = policy.run_command('npm install is-number@7.0.0 --no-audit --no-fund --fetch-retries=0 --fetch-timeout=10000', timeout=60)
+        self.assertEqual(installed['exit_code'], 0, installed)
+        self.assertEqual(json.loads((self.root / 'package.json').read_text())['dependencies']['is-number'], '^7.0.0')
+        self.assertIn('https://registry.npmjs.org/is-number/', (self.root / 'package-lock.json').read_text())
+        self.assertNotIn('127.0.0.1', (self.root / 'package-lock.json').read_text())
+        built = policy.run_command('npm test --offline', timeout=60)
+        self.assertEqual(built['exit_code'], 0, built)
+        self.assertIn('SYNTHETIC_PUBLIC_PACKAGE_OK_NETWORK_BLOCKED', built['stdout'])
+        self.assertFalse((self.root / 'node_modules').exists())
+        fresh = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+            'write_roots': [str(self.root)], 'allowed_tools': ['Read', 'Write', 'Bash(npm *)'],
+            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG']})
+        self.addCleanup(fresh.close)
+        restored = fresh.run_command('npm ci --no-audit --no-fund --fetch-retries=0 --fetch-timeout=10000', timeout=60)
+        self.assertEqual(restored['exit_code'], 0, restored)
+
+
     @unittest.skipUnless(__import__('os').environ.get('JARVIS_TEST_VM_CONFIG'), 'requires private KVM runtime')
     def test_vm_npm_ci_installs_local_locked_dependency_and_next_build_uses_it(self):
         import io
@@ -335,9 +429,11 @@ else:
         with tarfile.open(self.root / 'fixture.tgz', 'w:gz') as archive:
             for name, data in {
                 'package/package.json': json.dumps({'name': 'fixture', 'version': '1.0.0',
-                    'scripts': {'install': 'node install.js'}}),
-                'package/index.js': "module.exports='SYNTHETIC_INSTALLED';",
+                    'scripts': {'install': 'node-gyp rebuild && node install.js'}}),
+                'package/index.js': "if(require('./build/Release/fixture.node').answer!==42) throw new Error('native fixture failed'); module.exports='SYNTHETIC_INSTALLED';",
                 'package/install.js': "require('fs').writeFileSync('installed.txt','SYNTHETIC_GUEST_INSTALL');",
+                'package/binding.gyp': json.dumps({'targets': [{'target_name': 'fixture', 'sources': ['fixture.cc']}]}),
+                'package/fixture.cc': '#include <node_api.h>\nnapi_value Init(napi_env env, napi_value exports) { napi_value answer; napi_create_int32(env,42,&answer); napi_set_named_property(env,exports,"answer",answer); return exports; }\nNAPI_MODULE(NODE_GYP_MODULE_NAME, Init)\n',
             }.items():
                 raw = data.encode(); info = tarfile.TarInfo(name); info.size = len(raw)
                 archive.addfile(info, io.BytesIO(raw))

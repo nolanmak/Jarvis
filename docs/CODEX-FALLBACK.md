@@ -44,26 +44,17 @@ use opened inodes and exclude credential/control paths. The current general
 command profile is read-only. Cargo/npm commands run in disposable source
 snapshots with separate temporary configuration and output directories. Existing
 Cargo caches, Rust toolchains and npm dependencies are read-only; missing
-dependencies cannot currently be downloaded. UTF-8 source changes pass through
+public dependencies can be retrieved through the read-only gateway described below. UTF-8 source changes pass through
 the original write guards and concurrent-edit checks before being copied back.
 Binary source changes and file deletions also reconcile under the source-build
 profile, retaining scope and concurrent-edit checks; build artifact directories
 remain excluded. A profile with a matching text-only Write hook rejects binary
 or deletion reconciliation explicitly, because those effects cannot faithfully
 be represented as a text Write event. Real synthetic Cargo and npm tests verify
-execution; dependency provisioning, cache persistence and full project builds
-remain integration gates.
-An actual `cargo check -p augmentagent-channel-core --offline -j 2` completed
-inside the build sandbox, compiling the real dependency tree. Running the core
-unit suite inside it exposed further gaps: local HTTP fixtures cannot open sockets,
-process supervision tests cannot create sessions/groups, and the sanitized HOME
-environment changes one path-redaction fixture. That run had 340 passes, 22
-failures (including the expected routing regression), and one ignored live test.
-These failures are outstanding build parity work, not grounds to skip the tests
-or globally remove confinement.
-The HOME identity is now preserved as an OS environment value; a focused
-regression confirms that this still grants no read access to files in that home.
-The subsequent VM run described below resolved the socket, session and HOME failures.
+execution, private dependency installation/reuse, and scoped source reconciliation.
+The actual project installation, build and Node suite also pass through the VM.
+The HOME identity is preserved as an OS environment value without granting read
+access to files in that home.
 Git inspection receives read-only repository metadata and disables external diff
 helpers, hooks, fsmonitor and user/system configuration. On the tested deployment, the default Codex
 command sandbox fails during loopback setup. Its legacy Landlock backend runs a
@@ -82,13 +73,10 @@ device, and QEMU's seccomp sandbox enabled. Inside the guest, loopback socket I/
 and a detached process session both worked. A synthetic read-only 9p share was
 readable; attempted writes failed, and a symlink to a host file outside the share
 could not be read. The guest exposed only `lo` and powered off successfully.
-These probes establish a possible local build runner without administrative
-setup, not complete build parity. Runtime provisioning, scoped build/cache shares,
-resource limits, cancellation, source reconciliation and actual project-suite QA
-must be integrated before replacing the current command sandbox. QEMU device,
-share and sandbox options follow its [invocation reference](https://www.qemu.org/docs/master/system/qemu-manpage.html).
+QEMU device, share and sandbox options follow its
+[invocation reference](https://www.qemu.org/docs/master/system/qemu-manpage.html).
 
-The prototype `scripts/codex-build-vm.py` now executes a disposable snapshot in
+The runner `scripts/codex-build-vm.py` executes a disposable snapshot in
 that guest. The workload runs as an unprivileged UID with no-new-privileges;
 runtime and dependency mounts are read-only and disable setuid/device semantics.
 A root-only guest control directory separates the command result from workload
@@ -113,9 +101,9 @@ updates and guard denial. Live Codex QA ran a Cargo socket test through the
 packaged bridge, verified its successful tool audit and confirmed build outputs
 stayed out of the source worktree. A durable private runtime was provisioned with
 a package/version/hash record; a second live test passed using default discovery
-without an environment override. This did not restart or deploy the daemon. Cache
-reuse, missing dependency provisioning and resource policy remain integration
-work. A real VM test runs npm in a nested workspace whose path contains spaces,
+without an environment override. This did not restart or deploy the daemon. Cache reuse and public dependency
+retrieval are covered by the verification below; runtime limits are documented
+in BUILD-VM.md. A real VM test runs npm in a nested workspace whose path contains spaces,
 loads its local dependency, verifies dependency writes are denied and reconciles
 the generated source output. Real-VM Python tests
 require `JARVIS_TEST_VM_CONFIG` pointing to owner-private runtime configuration;
@@ -141,9 +129,8 @@ Exhausted-chain errors now distinguish capability exclusion, active cooldown,
 attempted quota failure, timeout, provider unavailability, local readiness failure
 and CLI-gate timeout for the entries in the chain. The display contains only
 provider names and failure categories. The original typed provider error remains
-in the error chain for existing cooldown/retry callers. Constructor-time exclusions
-and detailed binary/auth/sandbox readiness still require integration with status
-and doctor output.
+in the error chain for existing cooldown/retry callers. Doctor reports constructor-time capability exclusions and binary/auth preflight;
+concrete sandbox and MCP readiness are validated when a request starts.
 
 ## Handoff journal implementation status
 
@@ -236,8 +223,8 @@ normal retirement and persistence after supervisor destruction. After a daemon
 crash, recovery accepts only an owner-private receipt confirming all descendants
 were reaped. A lifecycle lock and invocation-specific receipt path keep an older
 invocation from retiring a newer invocation's marker. Tests kill a real parent
-process and verify detached work stops before recovery. Callers without stable
-turn identities remain integration work; markers are never cleared by age.
+process and verify detached work stops before recovery. Production query and loop callers supply stable turn identities; markers are
+never cleared by age.
 
 ## Capability inventory
 
@@ -397,7 +384,7 @@ cannot stand in for any tool-using profile.
   Live independent Claude review after Codex builds and the controlled full
   lifecycle have passed. Public-service deployment remains unverified.
 
-## Remaining integration gates
+## Integration contracts and release gates
 
 Both optional social drafting presets now exercise their production policy
 through an authenticated local HTTP MCP fixture. Reads reach the endpoint with
@@ -412,9 +399,8 @@ a synthetic arithmetic defect yields a parseable implementation plan and
 acceptance criteria, and a constant-return patch is rejected after reading
 source and inspecting its Git diff. Source bytes remain unchanged by both
 passes. A repeatable broker test also verifies that these presets reject
-Write, Edit, Git commits and build commands. This covers the inspection stages;
-the complete auto-ship publication, merge and deployment lifecycle is still
-an outstanding gate.
+Write, Edit, Git commits and build commands. This covers the inspection stages. The controlled lifecycle described above
+also covers merge and fresh-checkout acceptance; service rollout remains open.
 
 The shared live output-contract suite passed through both Claude and Codex:
 interval parsing, missing-timezone errors, archetype selection, newsletter
@@ -436,19 +422,10 @@ hooks. The production query preset's file-only hooks remain supported.
 Single-web-tool and web-hook profiles need a guarded implementation before
 they can be accepted; they are not silently broadened or claimed as parity.
 
-1. Complete writable build/test snapshots, production integration conformance,
-   web/document support and precise readiness reporting. Validate all accepted
-   settings and tool schemas; never silently discard a required capability.
-2. Finish lifecycle verification for the integrated adapter and audit stream,
-   including startup failure, timeout, cancellation and descendant cleanup.
-3. Add durable handoff accounting for completed and uncertain mutations. Seed the
-   fallback with known progress, reconcile uncertain effects, and prevent replay.
-4. Complete the machine-checked capability manifest and provider conformance tests.
-5. Release the expanded capability routing only after these contracts pass.
-   Development routing is enabled for integration QA; preserve independent
-   auto-ship review and all existing merge gates before deployment.
-6. Verify the deployed query/delivery path and a controlled full auto-ship lifecycle,
-   document rollback, merge green reviewed changes and remove task-owned worktrees.
+The implementation and candidate conformance contracts above are complete.
+Release still requires final independent review and CI, merge, verification of
+the deployed revision and CLI behavior, rollback readiness, and task-worktree
+cleanup. Candidate-only receipts must not be described as production deployment.
 
 All fixtures and publishable receipts must use synthetic data. Live account
 configuration, private correspondence and raw runtime logs stay outside this repo.
@@ -465,7 +442,7 @@ contracts cover matching resolution, script-only edits, mismatches, symlinked
 manifests, unrelated installs, and a real guest build from a fresh Git worktree.
 A separate fresh checkout of this project passed `npm run build --offline` and
 all 26 `npm test --offline` tests through the VM bridge, then was removed.
-Fetching packages that are not installed remains a provisioning prerequisite.
+Uncached public packages can now be fetched through the guest dependency gateway.
 
 
 ### Shared output-contract verification
@@ -478,7 +455,8 @@ verify exhaustive digest coverage, booking-link extraction through the productio
 ask detector, and read-only linting with audited source inspection and a reported
 broken link. The lint preset explicitly identifies the configured wiki root so
 schema examples do not imply an extra `wiki/` subdirectory. These receipts verify
-the named contracts; they do not establish deployment or the remaining profiles.
+the named contracts; the inventory table records the other profiles. They do
+not establish deployment.
 
 
 ### Shared wiki mutation and migration contracts
@@ -510,9 +488,9 @@ inventory now rejects entries without a named conformance test (red regression
 confirmed, then all five inventory tests passed).
 
 These receipts apply to the candidate worktree. They do not prove deployment.
-The remaining release audit must verify the recovery path and intended
-dependency-provisioning workflow, complete
-independent review and CI, then verify the deployed revision and CLI behavior.
+Recovery and public dependency provisioning have separate verified contracts
+below. Final independent review, CI and deployed revision/CLI verification remain
+release gates.
 
 
 ### Operator recovery for uncertain effects
@@ -570,5 +548,28 @@ the pre-sync manifest check now rejects it without writing that lockfile. The
 full bridge suite passed all 76 tests after these changes.
 
 This closes writable local installation and reuse within one bridge session.
-Uncached registry retrieval is still required before claiming full dependency
-provisioning or merging the complete fallback release.
+The public dependency gateway below supplies uncached npm and Cargo packages.
+Final release review and deployed CLI QA remain separate acceptance gates.
+
+
+### Uncached dependency verification
+
+The networkless guest now has a read-only public registry gateway. Canonical
+HTTPS URLs are preserved through a guest-only CA; fixed host origins, GET/HEAD
+restrictions, credential isolation, request/byte limits and the enclosing build
+deadline remain enforced. See [runtime setup](BUILD-VM.md#public-dependency-gateway).
+
+Live VM fixtures fetched a public npm package into an empty environment, compiled
+an uncached Cargo dependency, then rebuilt it offline using the private session
+cache. Extracted crate sources and guest-modified Git checkouts are not retained
+between builds; an offline rebuild rejects a corrupted cached archive. They
+verify canonical lockfiles, unchanged operator caches, source-cache
+exclusion, blocked direct networking/HTTP writes and an inaccessible signing key.
+The local install fixture now compiles and loads a synthetic native Node addon.
+
+A fresh worktree of the real project passed `npm ci --no-audit --no-fund`,
+`npm run build --offline` and all 26 `npm test --offline` tests. The native SQLite
+addon compiled against matching system Node headers in the guest. That worktree
+was removed afterward. Runtime setup now pins a private compiler copy without
+changing the operator's existing Rust installation. These checks establish build
+and dependency contracts; they do not claim service deployment or a merged PR.
