@@ -475,6 +475,22 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Remove finished reasoner handoff journals idle past the retention
+    /// grace (#1035): `AUGMENTAGENT_HANDOFF_RETENTION_HOURS`, default 24.
+    /// The daemon sweeps at start and hourly; this is the on-demand pass.
+    /// In-flight, cleanup-unverified and uncertain journals are never
+    /// removed — those stay for `codex-tool-bridge.py --handoff-reconcile`.
+    HandoffPrune {
+        /// Count what would be removed; take no locks and change nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Journal root. Default: ~/.local/state/augmentagent/reasoner-handoffs
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Token usage per day (#1001). Reads the append-only log the reasoner
     /// writes on every call (`~/.local/state/augmentagent/token-usage.jsonl`,
     /// outside the repo) and rolls it up by day and model — the measurement
@@ -2264,6 +2280,15 @@ async fn main() -> Result<()> {
     if let Cmd::RepoDocs { ref op } = cli.cmd {
         return repo_docs::run(op, cli.wiki_dir.as_deref()).await;
     }
+    // Journal housekeeping needs no database.
+    if let Cmd::HandoffPrune {
+        dry_run,
+        json,
+        ref root,
+    } = cli.cmd
+    {
+        return run_handoff_prune(dry_run, json, root.clone());
+    }
     let db_path = cli
         .db
         .clone()
@@ -2678,6 +2703,16 @@ async fn main() -> Result<()> {
             });
             // Collect the enabled channels' runners + optional digest scheduler.
             let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
+
+            // #1035 — reasoner handoff journals: remove finished ones idle past
+            // the grace period, at start and hourly, on the blocking pool.
+            // Never in-flight or uncertain ones; failures only log.
+            tasks.push(tokio::spawn(augmentagent_channel_core::handoff::run_sweep_loop(
+                augmentagent_channel_core::handoff::journal_root(),
+                augmentagent_channel_core::handoff::retention_from_env(),
+                augmentagent_channel_core::handoff::SWEEP_INTERVAL,
+                shutdown.clone(),
+            )));
 
             // Voice-capture listener (#80): long-poll the capture bot. Inert
             // unless a token is in the keyring AND the chat allowlist is
@@ -3157,6 +3192,7 @@ async fn main() -> Result<()> {
             max_issues,
         } => research::run_research(store, since_hours, post_discord, dry_run, max_issues).await,
         Cmd::RepoDocs { .. } => unreachable!("handled before database initialization"),
+        Cmd::HandoffPrune { .. } => unreachable!("handled before database initialization"),
         Cmd::Gmail { ref op } => match op {
             GmailOp::Search { query, limit, full, account } => {
                 run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await
@@ -6574,6 +6610,52 @@ fn scheduled_send_interval_secs_from_env() -> u64 {
         })
 }
 
+
+/// #1035 — one on-demand journal retention pass. A dry run reads only.
+fn run_handoff_prune(dry_run: bool, json: bool, root: Option<PathBuf>) -> Result<()> {
+    use augmentagent_channel_core::handoff;
+    let root = root
+        .or_else(handoff::journal_root)
+        .context("no --root and no HOME to locate the handoff journal root")?;
+    let grace = handoff::retention_from_env();
+    let report = handoff::sweep_finished(&root, grace, dry_run)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "root": root.display().to_string(),
+                "grace_hours": grace.as_secs() / 3600,
+                "dry_run": dry_run,
+                "report": report,
+            }))?
+        );
+        return Ok(());
+    }
+    const MIB: u64 = 1024 * 1024;
+    println!("handoff journals: {}", root.display());
+    println!(
+        "grace {}h; {} entries, {} MB",
+        grace.as_secs() / 3600,
+        report.entries,
+        report.bytes / MIB
+    );
+    println!(
+        "{} {} ({} MB); keep {} (recent {}, active {}, unfinished {}, busy {}, untrusted {})",
+        if dry_run { "would remove" } else { "removed" },
+        report.removed,
+        report.removed_bytes / MIB,
+        report.kept(),
+        report.kept_recent,
+        report.kept_active,
+        report.kept_unfinished,
+        report.kept_busy,
+        report.kept_untrusted,
+    );
+    if dry_run {
+        println!("\n(dry run — nothing was locked, created or removed)");
+    }
+    Ok(())
+}
 
 /// #449 — retire approval cards that no longer deserve the user's attention,
 /// without being asked to.

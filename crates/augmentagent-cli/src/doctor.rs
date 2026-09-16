@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use augmentagent_channel_core::cli_gate;
+use augmentagent_channel_core::{cli_gate, handoff};
 use augmentagent_channel_core::providers::{model_for, parse_chain, ModelTier, ProviderKind};
 use augmentagent_store::{rusqlite, Store};
 
@@ -180,6 +180,8 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
     findings.extend(check_reasoner_workloads());
     // 14. reasoner CLI gate — is the daemon's #898 gate wedged? (#954)
     findings.push(check_reasoner_gate());
+    // 15. handoff journals — is the retention sweep keeping them bounded? (#1035)
+    findings.push(check_handoff_journals());
 
     // --- Deep checks (off by default).
     if deep {
@@ -813,6 +815,48 @@ fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64) -> Finding {
     Finding::warn("reasoner_gate", format!("{msg} — reasoning is wedged"), Some(HINT))
 }
 
+/// #1035 — doctor warns when the journal root is past either bound.
+const HANDOFF_WARN_REQUESTS: u64 = 5_000;
+const HANDOFF_WARN_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+
+/// A read-only dry run over the live root: no locks, nothing created.
+fn check_handoff_journals() -> Finding {
+    let Some(root) = handoff::journal_root() else {
+        return Finding::ok("handoff_journals", "no HOME; journal root unknown");
+    };
+    let grace = handoff::retention_from_env();
+    handoff_journal_finding(handoff::sweep_finished(&root, grace, true), grace)
+}
+
+fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration) -> Finding {
+    const NAME: &str = "handoff_journals";
+    const HINT: &str = "augmentagent handoff-prune --dry-run";
+    let report = match report {
+        Ok(report) => report,
+        Err(e) => return Finding::warn(NAME, format!("journal root refused: {e:#}"), Some(HINT)),
+    };
+    let msg = format!(
+        "{} request dirs, {} MB; {} active, {} unfinished (operator recovery), {} finished past the {}h grace",
+        report.entries,
+        report.bytes / (1024 * 1024),
+        report.kept_active,
+        report.kept_unfinished,
+        report.removed,
+        grace.as_secs() / 3600,
+    );
+    if report.entries > HANDOFF_WARN_REQUESTS || report.bytes > HANDOFF_WARN_BYTES {
+        return Finding::warn(
+            NAME,
+            format!(
+                "{msg} — over {HANDOFF_WARN_REQUESTS} dirs or {} GiB; is the daemon's hourly sweep running?",
+                HANDOFF_WARN_BYTES / (1024 * 1024 * 1024)
+            ),
+            Some(HINT),
+        );
+    }
+    Finding::ok(NAME, msg)
+}
+
 // ---------------------------------------------------------------------------
 // `--deep` checks.
 // ---------------------------------------------------------------------------
@@ -1226,6 +1270,34 @@ mod tests {
         let dead = cli_gate::GateSnapshot { pid: u32::MAX, ..wedged(54_000) };
         for ok in [Some(wedged(900)), Some(dead), None] {
             assert_eq!(gate_finding(ok, now).severity, Severity::Ok);
+        }
+    }
+
+    /// #1035 — a journal root past the count or size bound is a warning that
+    /// names the operator entry point; an unreadable or public root too.
+    #[test]
+    fn handoff_journal_finding_warns_over_count_or_size() {
+        let grace = Duration::from_secs(24 * 3600);
+        let healthy = handoff::SweepReport {
+            entries: 420,
+            bytes: 900 * 1024 * 1024,
+            kept_active: 3,
+            kept_unfinished: 2,
+            ..Default::default()
+        };
+        let ok = handoff_journal_finding(Ok(healthy), grace);
+        assert_eq!(ok.severity, Severity::Ok, "{}", ok.message);
+        assert!(ok.message.contains("420"), "{}", ok.message);
+        let many = handoff::SweepReport { entries: HANDOFF_WARN_REQUESTS + 1, ..healthy };
+        let large = handoff::SweepReport { bytes: HANDOFF_WARN_BYTES + 1, ..healthy };
+        let refused = Err(anyhow::anyhow!("handoff directory is not private"));
+        for finding in [
+            handoff_journal_finding(Ok(many), grace),
+            handoff_journal_finding(Ok(large), grace),
+            handoff_journal_finding(refused, grace),
+        ] {
+            assert_eq!(finding.severity, Severity::Warn, "{}", finding.message);
+            assert_eq!(finding.suggested_cmd.as_deref(), Some("augmentagent handoff-prune --dry-run"));
         }
     }
 

@@ -50,7 +50,7 @@ pub(crate) fn spawn(command: &mut Command) -> std::io::Result<(Child, ProcessGro
     spawn_supervised(command, false, Arc::new(AtomicBool::new(true)), None)
 }
 
-fn private_directory(path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn private_directory(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::symlink_metadata(path)?;
     if !path.is_absolute() || !metadata.is_dir() || metadata.file_type().is_symlink()
@@ -75,18 +75,81 @@ fn private_read(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn lifecycle_lock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+fn lock_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    options
+}
+
+/// Open and flock an owner-private lock file without following links.
+fn flock_private(path: &std::path::Path, options: &std::fs::OpenOptions, wait: bool) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::MetadataExt;
-    private_directory(path.parent().ok_or_else(|| std::io::Error::other("invalid lifecycle path"))?)?;
-    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path.with_extension("lifecycle-lock"))?;
+    let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
         return Err(std::io::Error::other("invalid lifecycle lock"));
     }
-    // Held only across bounded local state reads/writes, never provider work.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 { return Err(std::io::Error::last_os_error()); }
+    let operation = if wait { libc::LOCK_EX } else { libc::LOCK_EX | libc::LOCK_NB };
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 { return Err(std::io::Error::last_os_error()); }
     Ok(file) // closing the descriptor releases the cross-process lock
+}
+
+pub(crate) fn lifecycle_lock_path(journal: &std::path::Path) -> PathBuf {
+    journal.with_extension("lifecycle-lock")
+}
+
+fn lifecycle_lock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    private_directory(path.parent().ok_or_else(|| std::io::Error::other("invalid lifecycle path"))?)?;
+    // Held only across bounded local state reads/writes, never provider work.
+    flock_private(&lifecycle_lock_path(path), lock_options().create(true), true)
+}
+
+/// Housekeeping's lock (#1035): never waits, so contention is `WouldBlock`
+/// and the caller skips the request. Also reports whether this call created
+/// the file, since creating one moves the directory's modification time.
+pub(crate) fn try_private_lock(path: &std::path::Path) -> std::io::Result<(std::fs::File, bool)> {
+    private_directory(path.parent().ok_or_else(|| std::io::Error::other("invalid lock path"))?)?;
+    match flock_private(path, lock_options().create_new(true), false) {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists =>
+            flock_private(path, &lock_options(), false).map(|file| (file, false)),
+        result => result.map(|file| (file, true)),
+    }
+}
+
+/// The one definition of an idle request (#1035): no lifecycle marker of any
+/// kind. A marker, even one whose cleanup receipt would verify, means a
+/// provider may still run or its descendants' cleanup is unproven. The resume
+/// gate may verify and clear such a marker under the lock; journal retention
+/// never does, and removes a request only while this holds.
+pub(crate) fn request_idle(journal: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(journal.with_extension("active")) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// Addressing a request restarts its retention clock (#1035). The directory
+/// timestamp moves under the lifecycle lock, so a sweep either observes the
+/// new time or has already removed the whole request. `false` means the lock
+/// this call waited on was removed with its request; address it again.
+pub(crate) fn touch_request(journal: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let lock = match lifecycle_lock(journal) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        result => result?,
+    };
+    let held = lock.metadata()?;
+    match std::fs::symlink_metadata(lifecycle_lock_path(journal)) {
+        Ok(linked) if (linked.dev(), linked.ino()) == (held.dev(), held.ino()) => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    let request = journal.parent().ok_or_else(|| std::io::Error::other("invalid handoff path"))?;
+    std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(request)?.set_modified(std::time::SystemTime::now())?;
+    Ok(true)
 }
 
 fn marker_receipt(marker: &std::path::Path) -> std::io::Result<PathBuf> {
@@ -112,10 +175,10 @@ fn retire_request(marker: &std::path::Path, receipt: &std::path::Path) -> std::i
 }
 
 pub(crate) fn ensure_request_idle(journal: &std::path::Path) -> std::io::Result<()> {
-    let marker = journal.with_extension("active");
-    if matches!(std::fs::symlink_metadata(&marker), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+    if request_idle(journal)? {
         return Ok(());
     }
+    let marker = journal.with_extension("active");
     let _lock = lifecycle_lock(&marker)?;
     let receipt = match marker_receipt(&marker) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -241,6 +304,42 @@ mod tests {
         begin_request(Some(&journal), &other).unwrap();
         retire_request(&marker, &receipt).unwrap();
         assert!(marker.exists(), "old invocation removed the newer owner's marker");
+    }
+
+    /// #1035 — retention may only remove a request the resume gate would
+    /// also admit without any cleanup; any marker keeps a journal.
+    #[test]
+    fn resume_gate_and_retention_share_one_idle_predicate() {
+        use std::os::unix::fs::symlink;
+        let write = |path: &std::path::Path, bytes: &[u8]| {
+            let mut file = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(path).unwrap();
+            file.write_all(bytes).unwrap();
+        };
+        for case in ["absent", "unverified", "partial-receipt", "dangling-link", "corrupt", "verified"] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let journal = directory.path().join("operations.json");
+            write(&journal, br#"{"version":1,"operations":[]}"#);
+            let marker = journal.with_extension("active");
+            let receipt = directory.path().join("cleanup-complete");
+            let marker_json = serde_json::json!({"version":1,"receipt":receipt}).to_string();
+            match case {
+                "absent" => {}
+                "unverified" => write(&marker, marker_json.as_bytes()),
+                "partial-receipt" => { write(&marker, marker_json.as_bytes()); write(&receipt, b"partial"); }
+                "dangling-link" => symlink(directory.path().join("missing"), &marker).unwrap(),
+                "corrupt" => write(&marker, b"not json"),
+                "verified" => { write(&marker, marker_json.as_bytes()); write(&receipt, b"all-descendants-reaped\n"); }
+                _ => unreachable!(),
+            }
+            let finished = crate::handoff::request_finished(&journal).unwrap();
+            assert_eq!(finished, case == "absent", "{case}: any marker means not finished");
+            let admitted = ensure_request_idle(&journal).is_ok();
+            assert!(!finished || admitted, "{case}: retention must never outrun the resume gate");
+            assert_eq!(admitted, matches!(case, "absent" | "verified"), "{case}");
+            // Once the gate has verified and cleared cleanup, both agree again.
+            assert_eq!(crate::handoff::request_finished(&journal).unwrap(), admitted, "{case}");
+        }
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@ pub mod engagement;
 pub mod fallback;
 pub mod gemini;
 pub mod governor;
-mod handoff;
+pub mod handoff;
 mod review_history;
 mod process_tree;
 pub mod images;

@@ -202,8 +202,9 @@ See [operator recovery](#operator-recovery-for-uncertain-effects) below.
 Argument matching does not identify all semantically duplicate actions expressed
 through different commands or tools. To intentionally repeat an identical external
 action, use a new user request so it has a separate operation journal. Journals are
-retained privately without age-based deletion; unresolved receipts must not be
-removed to force progress. Hook observations do not substitute for verified
+retained privately. The daemon removes only finished journals idle past a grace
+period; unresolved receipts are never removed, by the sweep or by hand, to force
+progress (see [journal retention](#handoff-journal-retention)). Hook observations do not substitute for verified
 termination of the previous provider and its descendants before handoff.
 
 Both CLI adapters now launch beneath a private Linux subreaper supervisor. On
@@ -535,6 +536,61 @@ in errors. A completed decision supplies the result on replay; an absence decisi
 keeps the original attempt and permits a new one. Resume the same logical request
 through its normal entry point. Keep receipts through rollout and rollback;
 older adapters reject unknown receipt states rather than replaying them.
+The retention sweep below never removes a journal with a `started` row, so an
+uncertain journal waits for this command however old it is.
+
+
+### Handoff journal retention
+
+Each write or agentic dispatch creates a request directory under
+`~/.local/state/augmentagent/reasoner-handoffs/`, and its journal keeps the full
+tool arguments and results. Without retention that directory grew by about a
+gigabyte a day (#1035). The daemon removes a request directory only when all of
+these hold:
+
+- **Idle.** No `operations.active` lifecycle marker exists. This is the same
+  predicate the resume gate uses; a marker whose cleanup receipt would verify
+  still counts as active until a resume clears it.
+- **Settled.** Every journal row is `completed` with its result, or
+  `not_applied` with operator evidence (or no journal was ever written).
+  A `started` row (an uncertain outcome), any other or future status, and an
+  unreadable, oversized, linked or non-private journal all keep the directory.
+- **Expired.** Nothing in the directory changed for the grace period:
+  `AUGMENTAGENT_HANDOFF_RETENTION_HOURS`, in whole hours, **default 24**
+  (accepted range 1 to 8760; anything else falls back to 24 with a warning).
+  Dispatch refreshes the directory timestamp under the lifecycle lock every
+  time it addresses a request, so a turn that keeps retrying keeps its receipts.
+- **Confirmed.** The daemon's previous pass already saw the request settled,
+  expired and unchanged. A restarted daemon removes nothing during its first
+  interval, which gives turns replayed at startup time to re-address their
+  journals however long the daemon was down.
+
+The sweep runs at daemon start and then hourly, on the blocking pool, and logs
+one `handoff journal sweep` INFO line with `removed` and `kept` counts (split
+into recent, active, unfinished, pending, busy and untrusted). It takes the
+lifecycle and journal locks without waiting and skips a request whose lock is
+held, re-checks the request under both locks before removing it, removes
+entries relative to an opened directory without following links, and refuses a
+root or request directory that is not owner-private or holds unexpected
+entries. Failures are logged and never stop the daemon.
+
+It never touches in-flight, cleanup-unverified or uncertain journals; those stay
+for the recovery command above. Do not delete handoff state by hand.
+
+An on-demand pass is available; `--dry-run` takes no locks and changes nothing.
+Unlike the daemon, the on-demand pass does not wait for a confirming pass:
+
+```sh
+augmentagent handoff-prune --dry-run
+augmentagent handoff-prune
+```
+
+`augmentagent doctor` reports the journal count and size (read-only) and warns
+above 5000 request directories or 3 GiB.
+
+Limit: a turn first re-dispatched more than the grace period after it last ran,
+and more than one sweep interval after the daemon started, is treated as a new
+request with an empty journal.
 
 
 The recovery change passed all 73 bridge tests, including both provider hook

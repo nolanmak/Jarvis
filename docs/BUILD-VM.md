@@ -99,7 +99,9 @@ execution, a passing Cargo socket test and the tool audit.
 Installing runtime files does not deploy or restart the daemon. Retain the previous
 binary and runtime configuration for rollback, including private provider cooldown
 and handoff state. Restore the prior binary/configuration and restart through the
-normal service procedure. Do not delete handoff state to force a retry. Before
+normal service procedure. Do not delete handoff state to force a retry; the
+daemon's own sweep removes only finished, expired journals (see
+[journal retention](CODEX-FALLBACK.md#handoff-journal-retention)). Before
 rolling back to a version that cannot read the new handoff journals, pause task
 intake and scheduled mutation workflows. Reconcile in-flight/uncertain operations
 using the current recovery tooling before resuming them; an older binary cannot
