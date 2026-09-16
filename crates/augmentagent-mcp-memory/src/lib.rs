@@ -791,8 +791,21 @@ pub fn serve_stdio(server: Server) -> anyhow::Result<()> {
         if trimmed.is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<McpRequest>(trimmed) {
-            Ok(req) => server.dispatch(&req),
+        let parsed = serde_json::from_str::<Value>(trimmed).and_then(|mut value| {
+            let notification = value.get("id").is_none();
+            if notification {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("id".into(), Value::Null);
+                }
+            }
+            serde_json::from_value::<McpRequest>(value).map(|request| (request, notification))
+        });
+        let response = match parsed {
+            // MCP initialized/cancelled notifications have no response. Do not
+            // dispatch id-less tools/call messages either: tools require a
+            // request ID so their effects and results can be correlated.
+            Ok((_, true)) => continue,
+            Ok((req, false)) => server.dispatch(&req),
             Err(e) => json!({
                 "jsonrpc": "2.0",
                 "id": Value::Null,
