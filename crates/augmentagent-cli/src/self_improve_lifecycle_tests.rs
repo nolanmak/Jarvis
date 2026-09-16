@@ -92,6 +92,8 @@ else:
             ("AUGMENTAGENT_AUTOPR_HISTORY_FILE", "history.json"),
             ("AUGMENTAGENT_AUTOPR_BASELINE_FILE", "baseline.json"),
             ("AUGMENTAGENT_AUTOPR_COUNTER_FILE", "counter.json"),
+            ("AUGMENTAGENT_AUTOPR_OPENED_FILE", "opened-prs.json"),
+            ("AUGMENTAGENT_AUTOPR_UNREVIEWABLE_FILE", "unreviewable.json"),
         ] { child.env(key, root.join(file)); }
         let result = child.output().unwrap();
         assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
@@ -144,12 +146,17 @@ else:
     let history_before_wait = std::fs::read(root.join("history.json")).ok();
     let unavailable = augmentagent_channel_core::build_reasoner();
     let waiting = resume_draft_pr(&repo, &unavailable, 1, 700001, "agent-fix/issue-700001", false).await.unwrap();
-    assert!(waiting.message.contains("independent review unavailable; still draft"), "{}", waiting.message);
+    // #1037 — held, unbilled, and named for what it is: the one independent
+    // reviewer is latched, which is neither missing capacity nor provenance.
+    assert!(waiting.message.contains("independent review unavailable")
+        && waiting.message.contains("still draft"), "{}", waiting.message);
+    assert!(!waiting.billed, "no builder ran, so no daily-cap slot: {}", waiting.message);
     assert!(unavailable.mutation_providers().is_empty());
     assert_eq!(std::fs::read(root.join("history.json")).ok(), history_before_wait);
     assert_eq!(git(&remote, &["rev-parse", "refs/heads/agent-fix/issue-700001"]), before_wait);
     let calls = std::fs::read_to_string(root.join("gh-calls.jsonl")).unwrap();
-    assert!(calls.contains("independent review capacity is unavailable"));
+    assert!(calls.contains("reviewer latched until"), "{calls}");
+    assert!(!calls.contains("provenance"), "{calls}");
     assert!(!calls.contains("review round"), "capacity loss must not spend revision rounds");
     assert_eq!(git(&repo, &["worktree", "list", "--porcelain"]).lines().filter(|line| line.starts_with("worktree ")).count(),1);
     if recover {

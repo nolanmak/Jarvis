@@ -2657,8 +2657,12 @@ async fn find_resumable_draft(
                 repo_root,
                 pr,
                 issue,
-                MAX_ATTEMPTS,
-                "see the attempt comments on the issue",
+                &gave_up_close_comment(
+                    pr,
+                    issue,
+                    MAX_ATTEMPTS,
+                    "see the attempt comments on the issue",
+                ),
             )
             .await;
         }
@@ -2748,7 +2752,68 @@ struct IndependentReview {
     diff_ok: bool,
     system_ok: bool,
     notes: String,
+    /// #1037 — why `available` is false. `None` whenever a reviewer ran.
+    why_unavailable: Option<ReviewUnavailable>,
 }
+
+/// #1037 — the independent stage's result as the three things a caller can do
+/// something about. See [`IndependentReview::outcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewOutcome {
+    Approved,
+    ChangesRequested,
+    Unavailable(ReviewUnavailable),
+}
+
+/// #1037 — why a draft cannot get an independent review.
+///
+/// This used to be one word, "unavailable", and every case was reported as
+/// missing capacity. They are three different problems with three different
+/// readers: unknown provenance needs a human, missing capacity needs
+/// configuration, and a latched reviewer needs nothing but time. Saying the
+/// wrong one sends the reader to fix the wrong thing, every day.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewUnavailable {
+    /// No complete record of which providers built this draft: it was opened
+    /// before builder history existed, or its record was lost. A resume
+    /// records missing history as unknown and it stays unknown, so this can
+    /// never change on a later tick.
+    ProvenanceUnknown,
+    /// A record exists but could not be read or trusted (a busy lock, wrong
+    /// permissions, a corrupt file). Possibly transient. `error` is for the
+    /// log only: it may carry local detail a public comment must not.
+    ProvenanceUnverifiable { error: String },
+    /// Every provider the loop reviews with already built this draft, so none
+    /// is independent. Cannot change for this draft: its record only grows
+    /// until a fresh attempt supersedes the branch.
+    AllReviewersBuiltIt,
+    /// An independent reviewer exists in principle, but none is configured,
+    /// authenticated, or able to serve. `detail` is for the log only (it can
+    /// name a local binary path).
+    NoCapacity {
+        reviewers: Vec<augmentagent_channel_core::ProviderKind>,
+        detail: String,
+    },
+    /// Every independent reviewer is on a quota cooldown: `(provider, reset)`.
+    Latched {
+        until: Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>,
+    },
+}
+
+/// #1037 — can one provider review right now, as far as this box can tell
+/// without calling it?
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewerStatus {
+    Ready,
+    /// Not installed or not authenticated; the reason is for the log.
+    NotConfigured(String),
+    Latched(Option<chrono::DateTime<chrono::Utc>>),
+}
+
+/// #1037 — how many different UTC days a draft may go without any independent
+/// review before the loop gives up on it. Only for reasons that can change on
+/// their own; a verdict that cannot change stands the loop down at once.
+pub(crate) const REVIEW_UNAVAILABLE_BUDGET_DAYS: u32 = 3;
 
 impl IndependentReview {
     fn approved(&self) -> bool {
@@ -2764,7 +2829,10 @@ impl IndependentReview {
     /// One-line outcome for logs, the dry-run message, and the PR body.
     fn status(&self) -> String {
         if !self.available {
-            return "unavailable".into();
+            return match &self.why_unavailable {
+                Some(why) => format!("unavailable ({})", why.headline()),
+                None => "unavailable".into(),
+            };
         }
         match (self.diff_ok, self.system_ok) {
             (true, true) => "lgtm (diff + system)".into(),
@@ -2774,24 +2842,181 @@ impl IndependentReview {
         }
     }
 
-    fn unavailable(reason: String) -> Self {
+    fn unavailable(why: ReviewUnavailable) -> Self {
         Self {
             provider: None,
             available: false,
             diff_ok: false,
             system_ok: false,
-            notes: format!("Independent review unavailable: {reason}"),
+            notes: format!(
+                "Independent review unavailable: {}; merge remains blocked",
+                why.headline()
+            ),
+            why_unavailable: Some(why),
         }
+    }
+
+    /// #1037 — the one mapping from this struct to what happened.
+    fn outcome(&self) -> ReviewOutcome {
+        if !self.available {
+            return ReviewOutcome::Unavailable(self.why_unavailable.clone().unwrap_or(
+                ReviewUnavailable::NoCapacity {
+                    reviewers: vec![],
+                    detail: "no reason was recorded".into(),
+                },
+            ));
+        }
+        if self.approved() {
+            ReviewOutcome::Approved
+        } else {
+            ReviewOutcome::ChangesRequested
+        }
+    }
+}
+
+impl ReviewUnavailable {
+    /// Stable name for the three categories: the log, the state file and the
+    /// health watchdog all key on it.
+    fn code(&self) -> &'static str {
+        match self {
+            Self::ProvenanceUnknown | Self::ProvenanceUnverifiable { .. } => "provenance-unknown",
+            Self::AllReviewersBuiltIt | Self::NoCapacity { .. } => "no-reviewer-capacity",
+            Self::Latched { .. } => "reviewer-latched",
+        }
+    }
+
+    /// A verdict no later tick can change for this draft, so the loop stands
+    /// down at once rather than re-reaching it daily (the #987 lesson).
+    fn permanent(&self) -> bool {
+        matches!(self, Self::ProvenanceUnknown | Self::AllReviewersBuiltIt)
+    }
+
+    /// One line naming the reason. Safe for a public PR comment: provider
+    /// names and a reset time, never a path or an error string.
+    fn headline(&self) -> String {
+        let names = |kinds: &[augmentagent_channel_core::ProviderKind]| {
+            kinds.iter().map(|k| k.name()).collect::<Vec<_>>().join(", ")
+        };
+        let at = |t: &Option<chrono::DateTime<chrono::Utc>>| {
+            t.map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "an unknown reset".to_string())
+        };
+        match self {
+            Self::ProvenanceUnknown => "provenance unknown: there is no complete record of which \
+                                       providers built this draft"
+                .into(),
+            Self::ProvenanceUnverifiable { .. } => "provenance unknown: the record of which \
+                                                    providers built this draft could not be read \
+                                                    or verified"
+                .into(),
+            Self::AllReviewersBuiltIt => format!(
+                "no reviewer capacity: every provider the loop reviews with ({}) already built \
+                 this draft, so none of them is independent",
+                names(&REVIEWER_POOL)
+            ),
+            Self::NoCapacity { reviewers, .. } => format!(
+                "no reviewer capacity: no independent reviewer ({}) is configured and able to serve",
+                names(reviewers)
+            ),
+            Self::Latched { until } => {
+                // Soonest reset first: that is when the draft can move again.
+                let mut until = until.clone();
+                until.sort_by_key(|(_, t)| t.map_or(i64::MAX, |t| t.timestamp()));
+                match until.split_first() {
+                    None => "reviewer latched until an unknown reset".into(),
+                    Some(((name, t), rest)) if rest.is_empty() => {
+                        format!("reviewer latched until {} ({name})", at(t))
+                    }
+                    Some(((name, t), rest)) => format!(
+                        "reviewer latched until {} ({name}); also latched: {}",
+                        at(t),
+                        rest.iter()
+                            .map(|(n, t)| format!("{n} until {}", at(t)))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The headline plus the local detail a comment must not carry.
+    fn log_line(&self) -> String {
+        match self {
+            Self::ProvenanceUnverifiable { error } => format!("{} ({error})", self.headline()),
+            Self::NoCapacity { detail, .. } if !detail.is_empty() => {
+                format!("{} ({detail})", self.headline())
+            }
+            _ => self.headline(),
+        }
+    }
+}
+
+/// #1037 — what this box can say about `kind` as a reviewer without calling
+/// it: the same eligibility check `build_pinned` makes, then the cooldown
+/// latch the fallback chain writes.
+fn reviewer_status(kind: augmentagent_channel_core::ProviderKind) -> ReviewerStatus {
+    if let Some(why) = augmentagent_channel_core::ineligible_reason(kind) {
+        return ReviewerStatus::NotConfigured(why);
+    }
+    match augmentagent_channel_core::CooldownLatch::system().latched_until(kind.name()) {
+        Some(until) => ReviewerStatus::Latched(Some(until)),
+        None => ReviewerStatus::Ready,
+    }
+}
+
+/// #1037 — pick the independent reviewer for a draft, or say precisely why
+/// there is none.
+///
+/// Pure over its inputs so every branch is tested without a provider. The
+/// resume lane calls it BEFORE spending anything and `independent_review`
+/// calls it to choose, so the two cannot disagree about a draft.
+fn select_reviewer(
+    authors: std::result::Result<Option<Vec<augmentagent_channel_core::ProviderKind>>, String>,
+    status: impl Fn(augmentagent_channel_core::ProviderKind) -> ReviewerStatus,
+) -> std::result::Result<augmentagent_channel_core::ProviderKind, ReviewUnavailable> {
+    let authors = match authors {
+        Ok(Some(authors)) => authors,
+        Ok(None) => return Err(ReviewUnavailable::ProvenanceUnknown),
+        Err(error) => return Err(ReviewUnavailable::ProvenanceUnverifiable { error }),
+    };
+    let candidates = independent_reviewer_candidates(Some(&authors));
+    if candidates.is_empty() {
+        return Err(ReviewUnavailable::AllReviewersBuiltIt);
+    }
+    let mut latched = Vec::new();
+    let mut missing = Vec::new();
+    for candidate in &candidates {
+        match status(*candidate) {
+            ReviewerStatus::Ready => return Ok(*candidate),
+            ReviewerStatus::Latched(until) => latched.push((candidate.name().to_string(), until)),
+            ReviewerStatus::NotConfigured(why) => missing.push(format!("{}: {why}", candidate.name())),
+        }
+    }
+    // A latch names when the draft can move again, so it outranks a reviewer
+    // that is merely not set up: waiting fixes the first, not the second.
+    if latched.is_empty() {
+        Err(ReviewUnavailable::NoCapacity {
+            reviewers: candidates,
+            detail: missing.join("; "),
+        })
+    } else {
+        Err(ReviewUnavailable::Latched { until: latched })
     }
 }
 
 /// Select only providers outside every recorded builder attempt. Unknown
 /// legacy provenance requires human review rather than assuming Claude built it.
 fn independent_reviewer_candidates(authors: Option<&[augmentagent_channel_core::ProviderKind]>) -> Vec<augmentagent_channel_core::ProviderKind> {
-    use augmentagent_channel_core::ProviderKind::{Claude, Codex};
     let Some(authors) = authors else { return vec![] };
-    [Codex, Claude].into_iter().filter(|provider| !authors.contains(provider)).collect()
+    REVIEWER_POOL.into_iter().filter(|provider| !authors.contains(provider)).collect()
 }
+
+/// Every provider the loop reviews with, in preference order.
+const REVIEWER_POOL: [augmentagent_channel_core::ProviderKind; 2] = [
+    augmentagent_channel_core::ProviderKind::Codex,
+    augmentagent_channel_core::ProviderKind::Claude,
+];
 
 /// Two independent passes with a pinned provider that did not build this draft.
 /// Review never falls back to the builder when independent capacity is absent.
@@ -2804,18 +3029,21 @@ async fn independent_review(
     prior_findings: Option<&str>,
     criteria: &[String],
 ) -> IndependentReview {
-    let authors = match builder.review_authors() {
-        Ok(Some(authors)) => authors,
-        Ok(None) => return IndependentReview::unavailable(
-            "builder provenance is unknown; preserve this draft for human review".into()),
-        Err(_) => return IndependentReview::unavailable(
-            "builder provenance could not be verified; preserve this draft for human review".into()),
+    // #1037 — the same selection the resume lane's preflight makes, so the
+    // two can never disagree about whether this draft is reviewable, or why.
+    let provider = match select_reviewer(
+        builder.review_authors().map_err(|e| format!("{e:#}")),
+        reviewer_status,
+    ) {
+        Ok(provider) => provider,
+        Err(why) => return IndependentReview::unavailable(why),
     };
-    let selected = independent_reviewer_candidates(Some(&authors)).into_iter()
-        .find_map(|provider| augmentagent_channel_core::build_pinned(provider).map(|reasoner| (provider, reasoner)));
-    let Some((provider, reasoner)) = selected else {
-        return IndependentReview::unavailable(
-            "no authenticated independent reviewer remains outside the draft's builders".into());
+    let Some(reasoner) = augmentagent_channel_core::build_pinned(provider) else {
+        // Eligible a moment ago; a race, not a verdict.
+        return IndependentReview::unavailable(ReviewUnavailable::NoCapacity {
+            reviewers: vec![provider],
+            detail: format!("{} could not be constructed", provider.name()),
+        });
     };
 
     // #889 — on revision rounds the reviewer sees its own prior findings, so
@@ -2854,6 +3082,7 @@ async fn independent_review(
         diff_ok: false,
         system_ok: false,
         notes: String::new(),
+        why_unavailable: None,
     };
 
     let evidence = caller_evidence(&worktree, diff).await;
@@ -2888,7 +3117,18 @@ async fn independent_review(
                 // Provider-side failure is "no independent review", never an
                 // approval and never a rejection of the diff.
                 warn!(issue = issue.number, provider = provider.name(), pass = label, "independent review failed: {e:#}");
-                return IndependentReview::unavailable(format!("{} {label} failed; merge remains blocked", provider.name()));
+                // #1037 — a quota refusal latches the reviewer, and then the
+                // honest reason is "latched until <reset>", not "no capacity".
+                let why = match reviewer_status(provider) {
+                    ReviewerStatus::Latched(until) => ReviewUnavailable::Latched {
+                        until: vec![(provider.name().to_string(), until)],
+                    },
+                    _ => ReviewUnavailable::NoCapacity {
+                        reviewers: vec![provider],
+                        detail: format!("{} {label} failed: {e:#}", provider.name()),
+                    },
+                };
+                return IndependentReview::unavailable(why);
             }
         }
     }
@@ -4291,18 +4531,11 @@ fn gave_up_close_comment(pr: u64, issue: u64, attempts: u32, last_failure: &str)
 
 /// `gh pr close --comment`, never `--delete-branch`. Best-effort like the
 /// label call: a failure here must not abort the run that already gave up.
-async fn close_gave_up_pr(
-    repo_root: &Path,
-    pr: u64,
-    issue: u64,
-    attempts: u32,
-    last_failure: &str,
-) {
+async fn close_gave_up_pr(repo_root: &Path, pr: u64, issue: u64, body: &str) {
     let gh = gh_bin();
-    let body = gave_up_close_comment(pr, issue, attempts, last_failure);
     match run(
         &gh,
-        &["pr", "close", &pr.to_string(), "--comment", &body],
+        &["pr", "close", &pr.to_string(), "--comment", body],
         repo_root,
     )
     .await
@@ -4311,6 +4544,304 @@ async fn close_gave_up_pr(
         Ok((false, _, e)) => warn!(pr, "could not close gave-up draft: {}", truncate(&e, 300)),
         Err(e) => warn!(pr, "close gave-up draft errored: {e:#}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// #1037 — a draft no independent reviewer can take.
+// ---------------------------------------------------------------------------
+
+/// What the resume lane does about a draft it cannot get reviewed: said once,
+/// decided in one place ([`unreviewable_plan`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnreviewablePlan {
+    /// True only when a builder call was actually made on this run.
+    billed: bool,
+    /// Posted on the PR while the loop keeps waiting.
+    wait_comment: Option<String>,
+    /// The close comment when the loop stands down: the issue is labelled
+    /// `agent-gave-up` and the draft closed with this, branch kept.
+    stand_down: Option<String>,
+    /// The run report's message.
+    message: String,
+}
+
+/// #1037 — the ONE place an unavailable review becomes an action.
+///
+/// - **Billing.** `billed` is exactly `builder_ran`. The daily cap bounds
+///   builder spend, and until now this path billed a run in which nothing was
+///   built — one unreviewable draft took a third of every day's budget.
+/// - **Unknown provenance needs a human.** The loop cannot show that any model
+///   reviewing such a draft is independent of the model that built it (before
+///   #1021 the primary built everything), so it never reviews, revises or
+///   merges one. Merging takes one human approval. The alternative the issue
+///   offered, "reviewable by the primary only", would let the merge gates open
+///   on the builder grading its own work with nobody independent looking.
+/// - **A verdict that cannot change stands down at once**: unknown
+///   provenance, and every permitted reviewer having built the draft. Its
+///   record only grows, so tomorrow reaches the same verdict; re-posting it
+///   daily is the #987 pattern.
+/// - **Everything else waits, on a budget**: a latched reviewer, a missing or
+///   failing one, an unreadable record. After
+///   [`REVIEW_UNAVAILABLE_BUDGET_DAYS`] different UTC days without a review,
+///   the loop gives up with the reason.
+fn unreviewable_plan(
+    pr: u64,
+    issue: u64,
+    why: &ReviewUnavailable,
+    days: u32,
+    builder_ran: bool,
+) -> UnreviewablePlan {
+    let budget = REVIEW_UNAVAILABLE_BUDGET_DAYS;
+    let headline = why.headline();
+    let cost = if builder_ran {
+        " (billed: a builder call was made)"
+    } else {
+        " (unbilled)"
+    };
+    if why.permanent() {
+        return UnreviewablePlan {
+            billed: builder_ran,
+            wait_comment: None,
+            stand_down: Some(format!(
+                "Auto-resume: closing draft #{pr}. The loop gave up on #{issue} (issue \
+                 labelled `{GAVE_UP_LABEL}`) because no independent review of this draft is \
+                 possible: **{headline}**.\n\n\
+                 That cannot change on a later tick, so the loop is standing down now instead \
+                 of repeating it every day. It never reviews, revises or merges a draft it \
+                 cannot vouch for, so merging this one needs one human approval: review the \
+                 diff yourself, then reopen this PR, mark it ready for review, and merge it by \
+                 hand. A draft on a labelled issue is closed again on the next tick, so mark \
+                 it ready before anything else.\n\n\
+                 The branch is kept. To have the loop build the fix again instead, remove the \
+                 `{GAVE_UP_LABEL}` label from #{issue} and leave this PR closed: a fresh \
+                 attempt starts from `main`, records its builders from the start, and replaces \
+                 this branch."
+            )),
+            message: format!(
+                "PR #{pr}: independent review impossible, {headline}; stood down for a human{cost}"
+            ),
+        };
+    }
+    if days >= budget {
+        let after = match why {
+            ReviewUnavailable::Latched { .. } => {
+                "The reviewer was on a cooldown each time the loop came back to this draft."
+            }
+            ReviewUnavailable::ProvenanceUnverifiable { .. } => {
+                "The record of this draft's builders could not be read on any of those days, \
+                 and it needs a look before any review of this draft can be vouched for."
+            }
+            _ => {
+                "Check the reviewers with `augmentagent doctor` and `augmentagent \
+                 reasoner-selftest` before reviving it."
+            }
+        };
+        return UnreviewablePlan {
+            billed: builder_ran,
+            wait_comment: None,
+            stand_down: Some(format!(
+                "Auto-resume: closing draft #{pr}. The loop gave up on #{issue} (issue \
+                 labelled `{GAVE_UP_LABEL}`) after no independent review was possible on {days} \
+                 different days (budget {budget}). Latest reason: **{headline}**.\n\n{after}\n\n\
+                 The branch is kept. To retry once a reviewer is available, remove the \
+                 `{GAVE_UP_LABEL}` label from #{issue} and reopen this PR; the loop resumes it \
+                 on its next tick."
+            )),
+            message: format!(
+                "PR #{pr}: no independent review on {days} different days, {headline}; gave up{cost}"
+            ),
+        };
+    }
+    let advice = match why {
+        ReviewUnavailable::Latched { .. } => {
+            "Nothing needs doing: the loop tries again on its next pass after the reset (at \
+             most once a UTC day)."
+        }
+        ReviewUnavailable::ProvenanceUnverifiable { .. } => {
+            "The record of this draft's builders exists but could not be read. The loop tries \
+             again on its next pass (at most once a UTC day)."
+        }
+        _ => {
+            "Nothing is wrong with the draft itself. `augmentagent doctor` and `augmentagent \
+             reasoner-selftest` show which reviewers are installed, authenticated and serving."
+        }
+    };
+    let spent = if builder_ran {
+        "A builder call was made on this run before the reviewer went away, so the run is \
+         billed; its commits are pushed."
+    } else {
+        "No builder call was made on this run, so it costs no daily-cap run (unbilled)."
+    };
+    UnreviewablePlan {
+        billed: builder_ran,
+        wait_comment: Some(format!(
+            "Auto-resume: no independent review for this draft today: **{headline}**.\n\n\
+             {advice}\n\n{spent} This is day {days} of {budget}: if no independent review is \
+             possible on {budget} different days, the loop gives up on this draft and says why."
+        )),
+        stand_down: None,
+        message: format!(
+            "PR #{pr}: independent review unavailable, {headline}; still draft, day {days} of {budget}{cost}"
+        ),
+    }
+}
+
+/// One draft's run of days without an independent review.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct UnreviewableRecord {
+    issue: u64,
+    /// Distinct UTC days with an unavailable outcome and no verdict since.
+    days: Vec<u64>,
+    /// [`ReviewUnavailable::code`] of the latest outcome.
+    code: String,
+    /// [`ReviewUnavailable::headline`] of the latest outcome (public-safe).
+    reason: String,
+}
+
+/// #1037 — where the unavailable-review budget is kept, per draft.
+fn unreviewable_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AUGMENTAGENT_AUTOPR_UNREVIEWABLE_FILE") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    std::env::var_os("HOME")
+        .map(|h| {
+            PathBuf::from(h)
+                .join(".local/state/augmentagent")
+                .join("autopr-unreviewable.json")
+        })
+        .unwrap_or_else(|| PathBuf::from("autopr-unreviewable.json"))
+}
+
+fn read_unreviewable(path: &Path) -> std::collections::BTreeMap<String, UnreviewableRecord> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Record today's unavailable outcome for `pr`; returns how many different
+/// UTC days it has now gone without a review.
+fn note_unreviewable(
+    path: &Path,
+    pr: u64,
+    issue: u64,
+    day: u64,
+    why: &ReviewUnavailable,
+) -> u32 {
+    let mut map = read_unreviewable(path);
+    let entry = map.entry(pr.to_string()).or_default();
+    entry.issue = issue;
+    if !entry.days.contains(&day) {
+        entry.days.push(day);
+    }
+    entry.code = why.code().to_string();
+    entry.reason = why.headline();
+    let days = entry.days.len() as u32;
+    write_unreviewable(path, &map);
+    days
+}
+
+/// Atomic replace. Only the resume lane writes this file, one run at a time.
+fn write_unreviewable(path: &Path, map: &std::collections::BTreeMap<String, UnreviewableRecord>) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(map) {
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+/// A verdict arrived, or the loop stood down: the count starts over.
+fn forget_unreviewable(path: &Path, pr: u64) {
+    let mut map = read_unreviewable(path);
+    if map.remove(&pr.to_string()).is_some() {
+        write_unreviewable(path, &map);
+    }
+}
+
+/// #1037 C6 — `(pr, code, reason, days)` for every draft currently waiting
+/// on an independent review, for the health watchdog.
+pub(crate) fn unreviewable_drafts() -> Vec<(u64, String, String, u32)> {
+    unreviewable_drafts_in(&unreviewable_path())
+}
+
+fn unreviewable_drafts_in(path: &Path) -> Vec<(u64, String, String, u32)> {
+    read_unreviewable(path)
+        .into_iter()
+        .filter_map(|(pr, r)| Some((pr.parse().ok()?, r.code, r.reason, r.days.len() as u32)))
+        .collect()
+}
+
+/// #1037 — act on a draft that cannot be reviewed: record the day, say why on
+/// the PR, stand down when the verdict cannot change or the budget is spent.
+async fn hold_unreviewable(
+    repo_root: &Path,
+    pr: u64,
+    issue: u64,
+    why: &ReviewUnavailable,
+    builder_ran: bool,
+    dry_run: bool,
+) -> RunReport {
+    let path = unreviewable_path();
+    let today = utc_day_now();
+    // A verdict that cannot change is not counted: it stands down now.
+    let days = if why.permanent() {
+        0
+    } else if dry_run {
+        let seen = read_unreviewable(&path)
+            .get(&pr.to_string())
+            .map(|r| r.days.clone())
+            .unwrap_or_default();
+        seen.len() as u32 + u32::from(!seen.contains(&today))
+    } else {
+        note_unreviewable(&path, pr, issue, today, why)
+    };
+    let plan = unreviewable_plan(pr, issue, why, days, builder_ran);
+    // C2 — the log names the same reason, plus the local detail (a binary
+    // path, an I/O error) that a public comment must not carry.
+    warn!(
+        pr,
+        issue,
+        reason = why.code(),
+        days,
+        billed = plan.billed,
+        detail = %why.log_line(),
+        "auto-PR: {}",
+        plan.message
+    );
+    let report = |message: String| {
+        if plan.billed {
+            RunReport::built(message)
+        } else {
+            RunReport::held(message)
+        }
+    };
+    if dry_run {
+        return report(format!("DRY RUN — {}", plan.message));
+    }
+    let gh = gh_bin();
+    if let Some(body) = &plan.wait_comment {
+        let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body", body], repo_root).await;
+    }
+    if let Some(body) = &plan.stand_down {
+        // Label first. With the label on, nothing rebuilds the issue over the
+        // kept branch, and a draft a failed close leaves open is closed by the
+        // #934 sweep on the next tick.
+        label_gave_up(repo_root, issue).await.ok();
+        close_gave_up_pr(repo_root, pr, issue, body).await;
+        forget_unreviewable(&path, pr);
+        notify_discord(&format!(
+            "📝 auto-PR stood down on draft #{pr} (issue #{issue}), it needs a human: {}",
+            why.headline()
+        ))
+        .await;
+    }
+    report(plan.message.clone())
 }
 
 /// Open DRAFTS on agent branches whose issue already carries the gave-up
@@ -4862,6 +5393,26 @@ async fn resume_draft_pr(
 
     reasoner.track_review_history(repo_root, branch, true)?;
 
+    // #1037 — ask BEFORE spending anything whether an independent review of
+    // this draft is possible at all. Until now the lane built a worktree,
+    // merged `main`, ran the full gate and only then discovered there was
+    // nobody to review it — then billed the run and blamed "capacity" for
+    // what was usually unknown provenance, every day, forever.
+    if let Err(why) = select_reviewer(
+        reasoner.review_authors().map_err(|e| format!("{e:#}")),
+        reviewer_status,
+    ) {
+        return Ok(hold_unreviewable(
+            repo_root,
+            pr,
+            issue.number,
+            &why,
+            reasoner.calls() > 0,
+            dry_run,
+        )
+        .await);
+    }
+
     // Worktree from the PR's branch, brought up to date with main. A merge
     // conflict is a human's job — say so on the PR and move on.
     let worktree = repo_root
@@ -5014,7 +5565,7 @@ async fn resume_draft_pr(
                 let attempts = record_attempt(repo_root, issue.number, Some(failure_record(reasoner, FailureKind::GuardRefusal, "resume:conflict", &why))).await.unwrap_or(1);
                 if attempts >= MAX_ATTEMPTS {
                     label_gave_up(repo_root, issue.number).await.ok();
-                    close_gave_up_pr(repo_root, pr, issue.number, attempts, &why).await;
+                    close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts, &why)).await;
                 }
                 let message = format!(
                     "PR #{pr}: merge conflict with main not resolved ({why}); attempt {attempts}"
@@ -5081,7 +5632,7 @@ async fn resume_draft_pr(
             .await
             .unwrap_or(1);
             label_gave_up(repo_root, issue.number).await.ok();
-            close_gave_up_pr(repo_root, pr, issue.number, attempts, &reason).await;
+            close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts, &reason)).await;
             return Ok(RunReport::triage(format!(
                 "PR #{pr}: resume refused — blast radius on `{pattern}`; stood down"
             )));
@@ -5237,7 +5788,7 @@ async fn resume_draft_pr(
             let attempts = record_attempt(repo_root, issue.number, Some({ let (kind, detail) = gate_outcome(&format!("{gate_err:#}")); failure_record(reasoner, kind, "resume:gate", &detail) })).await.unwrap_or(1);
             if attempts >= MAX_ATTEMPTS {
                 label_gave_up(repo_root, issue.number).await.ok();
-                close_gave_up_pr(repo_root, pr, issue.number, attempts, &format!("{gate_err:#}")).await;
+                close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts, &format!("{gate_err:#}"))).await;
             }
             return Ok(RunReport::built(format!(
                 "PR #{pr}: resume gate failed (attempt {attempts})"
@@ -5248,23 +5799,39 @@ async fn resume_draft_pr(
             independent_review(reasoner, &issue, &summary, &diff, worktree.clone(), prior_notes.as_deref(), &resumed_criteria)
                 .await;
         prior_notes = Some(independent.notes.clone());
-        if !independent.available {
-            // Capacity cannot be repaired by another code revision. Preserve
-            // the draft and retry after recovery without consuming rejection
-            // attempts or recruiting the reviewer as a builder.
-            if !dry_run {
-                let (ok, _, error) = run("git", &["push", "origin", branch], &worktree).await?;
-                if !ok {
-                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-                    bail!("resume: preserving draft failed: {error}");
+        match independent.outcome() {
+            ReviewOutcome::Unavailable(why) => {
+                // Reachable only when the reviewer went away AFTER the
+                // preflight above (a latch mid-run, a failed call). Another
+                // code revision cannot repair it, so preserve whatever this
+                // run committed and let the one mapping decide the rest —
+                // including whether this run is billed, which it is only if a
+                // builder call was actually made.
+                if !dry_run {
+                    let (ok, _, error) = run("git", &["push", "origin", branch], &worktree).await?;
+                    if !ok {
+                        cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                        bail!("resume: preserving draft failed: {error}");
+                    }
                 }
-                let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body",
-                    "Auto-resume: independent review capacity is unavailable. Verified changes remain in this draft; merge is blocked until an independent reviewer is available."], repo_root).await;
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                return Ok(hold_unreviewable(
+                    repo_root,
+                    pr,
+                    issue.number,
+                    &why,
+                    reasoner.calls() > 0,
+                    dry_run,
+                )
+                .await);
             }
-            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
-            return Ok(RunReport::built(format!(
-                "PR #{pr}: independent review unavailable; still draft"
-            )));
+            // A verdict, either way: the draft was reviewable today, so its
+            // run of unreviewable days is over.
+            ReviewOutcome::Approved | ReviewOutcome::ChangesRequested => {
+                if !dry_run {
+                    forget_unreviewable(&unreviewable_path(), pr);
+                }
+            }
         }
         // #936 — CodeRabbit is the (advisory) third reviewer. It judges the
         // PUSHED head, so push first (a no-op when nothing changed).
@@ -5407,7 +5974,7 @@ async fn resume_draft_pr(
                 // Every future resume would replay the same disagreement;
                 // the label hands it to a human with the exchange attached.
                 label_gave_up(repo_root, issue.number).await.ok();
-                close_gave_up_pr(repo_root, pr, issue.number, attempts, &independent.notes).await;
+                close_gave_up_pr(repo_root, pr, issue.number, &gave_up_close_comment(pr, issue.number, attempts, &independent.notes)).await;
             }
             notify_discord(&format!(
                 "📝 resumed draft still needs review after {rounds_done} rounds: {} — PR #{pr}",
@@ -6683,6 +7250,20 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     if !ok {
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
         return Ok(RunReport::built(record_hard_failure(repo_root, issue.number, "git push failed", &e, { let (kind, detail) = publish_outcome(&e); rec(kind, "publish:git push", &detail, &diff, lines) }).await));
+    }
+    // #1037 — the push landed, plainly or by superseding an orphan above, so
+    // the remote branch is now exactly this attempt's work, built from `main`.
+    // Its record becomes this attempt's builders: earlier authors described
+    // content that no longer exists, and keeping them disqualified reviewers
+    // (a stale `[claude, codex]` left nobody) for work they never touched.
+    // Only here — until the push lands the old work may still be on the
+    // remote, so the branch record stays the union. A failure leaves the
+    // union too, which excludes more reviewers, never fewer.
+    if let Err(e) = reasoner.supersede_review_history() {
+        warn!(
+            issue = issue.number,
+            "review history not superseded; the branch keeps its earlier authors as well: {e:#}"
+        );
     }
 
     // Open the PR. Draft + human merge for everyone; owner-authored issues
@@ -8978,7 +9559,10 @@ for tool, arguments in [
             dir.path().join("nonexistent-worktree"), None, &[]).await;
         assert!(!review.available);
         assert!(!review.approved());
-        assert!(review.notes.contains("provenance is unknown"));
+        // #1037 — named as provenance, never as missing capacity.
+        assert!(review.notes.contains("provenance unknown"), "{}", review.notes);
+        assert!(!review.notes.contains("capacity"), "{}", review.notes);
+        assert_eq!(review.outcome(), ReviewOutcome::Unavailable(ReviewUnavailable::ProvenanceUnknown));
         assert_eq!(builder.calls(), 0);
     }
     use super::*;
@@ -9782,6 +10366,7 @@ CODEX-REVIEW: lgtm").0);
             diff_ok,
             system_ok,
             notes: String::new(),
+            why_unavailable: None,
         };
         assert!(mk(true, true, true).approved());
         assert!(mk(true, true, true).codex_approved());
@@ -14345,6 +14930,444 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             !body[check..ret].contains("\"comment\""),
             "the missing-branch refusal must not write to GitHub; it repeats every tick"
         );
+    }
+
+    // ---- #1037: a draft nobody independent can review ----
+
+    fn synthetic_reset() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 9, 14, 13, 30, 0).unwrap()
+    }
+
+    /// One of each reason, with whether a later tick can change it.
+    fn every_review_gap() -> Vec<(ReviewUnavailable, &'static str, &'static str, bool)> {
+        use augmentagent_channel_core::ProviderKind::Codex;
+        vec![
+            (ReviewUnavailable::ProvenanceUnknown, "provenance-unknown", "provenance unknown", true),
+            (
+                ReviewUnavailable::ProvenanceUnverifiable {
+                    error: "/synthetic/state/review-history: permission denied".into(),
+                },
+                "provenance-unknown",
+                "provenance unknown",
+                false,
+            ),
+            (ReviewUnavailable::AllReviewersBuiltIt, "no-reviewer-capacity", "no reviewer capacity", true),
+            (
+                ReviewUnavailable::NoCapacity {
+                    reviewers: vec![Codex],
+                    detail: "codex: \"/synthetic/bin/codex\" not installed".into(),
+                },
+                "no-reviewer-capacity",
+                "no reviewer capacity",
+                false,
+            ),
+            (
+                ReviewUnavailable::Latched {
+                    until: vec![("claude".into(), Some(synthetic_reset()))],
+                },
+                "reviewer-latched",
+                "reviewer latched until 2026-09-14 13:30 UTC",
+                false,
+            ),
+        ]
+    }
+
+    /// C2 — the three reasons are told apart, and the selection that decides
+    /// them is one pure function the preflight and the review both call.
+    #[test]
+    fn review_gaps_are_told_apart_before_anything_is_spent() {
+        use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+        let ready = |_| ReviewerStatus::Ready;
+        assert_eq!(select_reviewer(Ok(None), ready), Err(ReviewUnavailable::ProvenanceUnknown));
+        assert!(matches!(
+            select_reviewer(Err("lock busy".into()), ready),
+            Err(ReviewUnavailable::ProvenanceUnverifiable { .. })
+        ));
+        assert_eq!(
+            select_reviewer(Ok(Some(vec![Claude, Codex])), ready),
+            Err(ReviewUnavailable::AllReviewersBuiltIt)
+        );
+        assert_eq!(select_reviewer(Ok(Some(vec![Claude])), ready), Ok(Codex));
+        assert_eq!(select_reviewer(Ok(Some(vec![Codex])), ready), Ok(Claude));
+
+        let reset = synthetic_reset();
+        let codex_latched = move |k| {
+            if k == Codex { ReviewerStatus::Latched(Some(reset)) } else { ReviewerStatus::Ready }
+        };
+        assert_eq!(
+            select_reviewer(Ok(Some(vec![Claude])), codex_latched),
+            Err(ReviewUnavailable::Latched { until: vec![("codex".into(), Some(reset))] })
+        );
+        assert_eq!(
+            select_reviewer(Ok(Some(vec![])), codex_latched),
+            Ok(Claude),
+            "a latched reviewer gives way to another independent one that is ready"
+        );
+        let codex_missing = |k| {
+            if k == Codex { ReviewerStatus::NotConfigured("not installed".into()) } else { ReviewerStatus::Ready }
+        };
+        assert!(matches!(
+            select_reviewer(Ok(Some(vec![Claude])), codex_missing),
+            Err(ReviewUnavailable::NoCapacity { .. })
+        ));
+        let missing_and_latched = move |k| {
+            if k == Codex {
+                ReviewerStatus::NotConfigured("not installed".into())
+            } else {
+                ReviewerStatus::Latched(Some(reset))
+            }
+        };
+        assert_eq!(
+            select_reviewer(Ok(Some(vec![])), missing_and_latched),
+            Err(ReviewUnavailable::Latched { until: vec![("claude".into(), Some(reset))] }),
+            "a latch names when it comes back, so it outranks a missing reviewer"
+        );
+
+        let categories = ["provenance", "capacity", "latched"];
+        for (why, code, headline, permanent) in every_review_gap() {
+            let text = why.headline();
+            assert_eq!(why.code(), code, "{why:?}");
+            assert!(text.starts_with(headline), "{text}");
+            assert_eq!(why.permanent(), permanent, "{why:?}");
+            let own = categories.iter().filter(|c| text.contains(*c)).count();
+            assert_eq!(own, 1, "a headline names exactly one of the three reasons: {text}");
+            // The comment is public; local detail belongs in the log only.
+            assert!(!text.contains("/synthetic"), "{text}");
+            assert!(augmentagent_channel_core::public_report::validate("", &text).is_ok(), "{text}");
+            assert!(why.log_line().starts_with(&text), "{}", why.log_line());
+        }
+        let unverifiable = &every_review_gap()[1].0;
+        assert!(unverifiable.log_line().contains("permission denied"), "the log keeps the detail");
+    }
+
+    /// C1 + C2 — no builder ran, so no slot; the comment says which reason,
+    /// and a verdict that cannot change stands down at once, for a human.
+    #[test]
+    fn an_unreviewable_draft_costs_no_slot_and_says_why() {
+        for (why, _, headline, permanent) in every_review_gap() {
+            let plan = unreviewable_plan(71000, 70994, &why, 1, false);
+            assert!(!plan.billed, "no builder call was made, so no daily-cap run: {why:?}");
+            assert!(
+                unreviewable_plan(71000, 70994, &why, 1, true).billed,
+                "billed exactly when a builder call was made"
+            );
+            let said = plan.wait_comment.clone().or(plan.stand_down.clone()).expect("always says why");
+            assert!(said.contains(headline), "{said}");
+            let wrong: &[&str] = match why.code() {
+                "provenance-unknown" => &["capacity", "latched"],
+                "no-reviewer-capacity" => &["provenance", "latched"],
+                _ => &["provenance", "capacity"],
+            };
+            for w in wrong {
+                assert!(!said.contains(w), "{why:?} must not be described as {w}: {said}");
+            }
+            assert!(plan.message.contains("PR #71000"), "{}", plan.message);
+            if permanent {
+                assert!(plan.wait_comment.is_none(), "a verdict that cannot change is not repeated daily");
+                let close = plan.stand_down.expect("stood down on first sight");
+                for needed in ["#70994", GAVE_UP_LABEL, "branch is kept", "human", "reopen", "ready for review"] {
+                    assert!(close.contains(needed), "missing {needed:?}: {close}");
+                }
+            } else {
+                assert!(plan.stand_down.is_none(), "day 1 of a transient reason waits");
+                let wait = plan.wait_comment.expect("the wait is explained");
+                assert!(wait.contains("day 1 of 3"), "{wait}");
+                assert!(wait.contains("unbilled"), "{wait}");
+                assert!(plan.message.contains("still draft"), "{}", plan.message);
+            }
+        }
+    }
+
+    /// C3 — a separate, smaller budget: three different UTC days without a
+    /// review, then the loop gives up and names the reason.
+    #[test]
+    fn unavailable_reviews_give_up_after_three_different_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/unreviewable.json");
+        let latched = ReviewUnavailable::Latched { until: vec![("claude".into(), Some(synthetic_reset()))] };
+        let missing = ReviewUnavailable::NoCapacity {
+            reviewers: vec![augmentagent_channel_core::ProviderKind::Codex],
+            detail: "codex: not installed".into(),
+        };
+        assert_eq!(note_unreviewable(&path, 71000, 70994, 20_000, &latched), 1);
+        assert_eq!(note_unreviewable(&path, 71000, 70994, 20_000, &latched), 1, "one day counts once");
+        assert_eq!(note_unreviewable(&path, 71000, 70994, 20_001, &latched), 2);
+        assert!(unreviewable_plan(71000, 70994, &latched, 2, false).stand_down.is_none());
+        assert_eq!(
+            note_unreviewable(&path, 71000, 70994, 20_003, &missing),
+            3,
+            "different days without a review in between, not necessarily adjacent ones"
+        );
+        let plan = unreviewable_plan(71000, 70994, &missing, 3, false);
+        assert!(plan.wait_comment.is_none());
+        let close = plan.stand_down.expect("the budget is spent");
+        for needed in ["no reviewer capacity", "3 different days", GAVE_UP_LABEL, "#70994", "reopen", "branch is kept"] {
+            assert!(close.contains(needed), "missing {needed:?}: {close}");
+        }
+        assert!(!plan.billed);
+        assert!(plan.message.contains("gave up"), "{}", plan.message);
+
+        // The watchdog reads the same record.
+        assert_eq!(
+            unreviewable_drafts_in(&path),
+            vec![(71000, "no-reviewer-capacity".to_string(), missing.headline(), 3)]
+        );
+        // A verdict resets the count; other drafts keep their own.
+        forget_unreviewable(&path, 71000);
+        assert!(unreviewable_drafts_in(&path).is_empty());
+        assert_eq!(note_unreviewable(&path, 71000, 70994, 20_004, &latched), 1);
+        assert_eq!(note_unreviewable(&path, 71001, 70995, 20_004, &latched), 1);
+        // A corrupt record restarts the count; it never gives up early.
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(note_unreviewable(&path, 71000, 70994, 20_005, &latched), 1);
+    }
+
+    /// C1 + TDD 4 — structural: the lane asks before it spends, both exits go
+    /// through the one mapping, and billing follows real builder calls.
+    #[test]
+    fn the_resume_lane_asks_first_and_bills_only_real_builder_calls() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        let bind = body.find("track_review_history(").expect("history is bound");
+        let ask = body.find("select_reviewer(").expect("the lane must ask before spending");
+        assert!(bind < ask, "provenance is read after it is bound");
+        for spend in [r#""worktree", "add""#, r#""merge", "--no-edit""#, "verification_gate(", "call_revision("] {
+            let at = body.find(spend).unwrap_or_else(|| panic!("{spend} is in the lane"));
+            assert!(ask < at, "ask before {spend}");
+        }
+        let holds: Vec<usize> = body.match_indices("hold_unreviewable(").map(|(i, _)| i).collect();
+        assert_eq!(holds.len(), 2, "the preflight and the post-review race, nothing else");
+        for at in holds {
+            let call = &body[at..at + body[at..].find(".await").expect("awaited")];
+            assert!(call.contains("reasoner.calls() > 0"), "billing must follow builder calls: {call}");
+        }
+        assert!(
+            !body.contains("independent review capacity is unavailable"),
+            "the old blanket message is gone"
+        );
+        let review = src.find("async fn independent_review(").expect("review fn");
+        let review_body = &src[review..review + src[review..].find("\n}\n").expect("end")];
+        assert!(review_body.contains("select_reviewer("), "the review selects exactly like the preflight");
+    }
+
+    /// C4 — structural: the branch record is superseded where the push has
+    /// landed (plain or orphan force-push), and nowhere before it.
+    #[test]
+    fn a_published_attempt_supersedes_the_branch_review_history() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        let force = body.find(r#""push", "--force""#).expect("the orphan force-push");
+        let failed = body.find("\"git push failed\"").expect("the push-failure exit");
+        let supersede = body.find("supersede_review_history(").expect("the reset");
+        let create = body.find(r#""pr", "create""#).expect("PR creation");
+        assert!(force < supersede && failed < supersede, "only after the push has landed");
+        assert!(supersede < create, "before anything else can resume the branch");
+        assert_eq!(body.matches("supersede_review_history(").count(), 1);
+        let resume = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let resume_body = &src[resume..resume + src[resume..].find("\n}\n").expect("end")];
+        assert!(!resume_body.contains("supersede_review_history("), "a resume only appends");
+    }
+
+    /// Fake `gh` for the #1037 fixtures: records every call, answers the reads
+    /// the resume lane makes, accepts the writes, refuses anything else.
+    fn fake_gh_1037(root: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let gh = root.join("fake-gh.py");
+        std::fs::write(&gh, r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ['JARVIS_1037_ROOT'])
+args = sys.argv[1:]
+with (root/'gh-calls.jsonl').open('a') as log:
+    log.write(json.dumps(args)+'\n')
+if args[:1]==['api'] and args[1].endswith('/issues/70994'):
+    print(json.dumps({'number':70994,'title':'Synthetic casing rule','body':'Synthetic issue body.',
+        'state':'open','user':{'login':'synthetic-owner'},'author_association':'OWNER'}))
+elif args[:2]==['pr','view']:
+    print(json.dumps({'body':'Automated self-improvement for #70994.\n\n## Summary\nSynthetic.\n\n- complexity (scoping pass): simple\n'}))
+elif args[:2] in (['pr','comment'],['pr','close'],['issue','edit']):
+    print('ok')
+else:
+    sys.stderr.write('unsupported fake gh call: '+json.dumps(args)+'\n')
+    sys.exit(1)
+"#).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        gh
+    }
+
+    /// Run `name` again in a child process with every piece of state the loop
+    /// touches redirected under `root`, so nothing live is read or written and
+    /// no environment is shared with sibling tests.
+    fn run_1037_child(name: &str, root: &Path) {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args(["--exact", name, "--nocapture"])
+            .env("JARVIS_1037_ROOT", root)
+            .env("HOME", root.join("home"))
+            .env("GH_BIN", fake_gh_1037(root))
+            .env("AUGMENTAGENT_SELFIMPROVE_TRUSTED_AUTHORS", "synthetic-owner")
+            .env("AUGMENTAGENT_GH_OWNER", "synthetic-owner")
+            .env("AUGMENTAGENT_REASONER_CHAIN", "claude")
+            .env("CLAUDE_CLI", "/nonexistent-synthetic-claude")
+            .env("CODEX_CLI", "/nonexistent-synthetic-codex")
+            .env_remove("DISCORD_WEBHOOK_URL")
+            .env_remove("AUGMENTAGENT_AUTOPR_LANE");
+        for (key, file) in [
+            ("AUGMENTAGENT_COOLDOWN_FILE", "cooldown.json"),
+            ("AUGMENTAGENT_SELFIMPROVE_LOCK", "self-improve.lock"),
+            ("AUGMENTAGENT_AUTOPR_ATTEMPTED_FILE", "attempted.json"),
+            ("AUGMENTAGENT_AUTOPR_HISTORY_FILE", "history.json"),
+            ("AUGMENTAGENT_AUTOPR_BASELINE_FILE", "baseline.json"),
+            ("AUGMENTAGENT_AUTOPR_COUNTER_FILE", "counter.json"),
+            ("AUGMENTAGENT_AUTOPR_OPENED_FILE", "opened-prs.json"),
+            ("AUGMENTAGENT_AUTOPR_UNREVIEWABLE_FILE", "unreviewable.json"),
+        ] {
+            child.env(key, root.join(file));
+        }
+        let out = child.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn gh_call_is(call: &[String], prefix: &[&str]) -> bool {
+        call.len() >= prefix.len() && call.iter().zip(prefix).all(|(a, b)| a == b)
+    }
+
+    fn gh_calls_1037(root: &Path) -> Vec<Vec<String>> {
+        std::fs::read_to_string(root.join("gh-calls.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// C5 — the currently open pre-deploy draft, as a synthetic fixture: an
+    /// agent draft on origin, opened before builder history existed, so the
+    /// resume finds no record for it. The real lane resolves it in ONE tick:
+    /// held, unbilled, no worktree, no builder, no gate — labelled and closed
+    /// for a human with the reason named as provenance. A dry run first shows
+    /// the same verdict while touching nothing.
+    #[tokio::test]
+    async fn a_pre_deploy_draft_with_unknown_provenance_resolves_in_one_tick() {
+        const NAME: &str = "self_improve::tests::a_pre_deploy_draft_with_unknown_provenance_resolves_in_one_tick";
+        let Some(root) = std::env::var_os("JARVIS_1037_ROOT").map(PathBuf::from) else {
+            let fixture = tempfile::tempdir().unwrap();
+            run_1037_child(NAME, fixture.path());
+            return;
+        };
+        let branch = format!("{BRANCH_PREFIX}70994");
+        let repo = root.join("repo");
+        let remote = root.join("remote.git");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git").current_dir(cwd).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let id = ["-c", "user.name=Synthetic", "-c", "user.email=fixture@example.com"];
+        git(&root, &["init", "-q", "--bare", "--initial-branch=main", remote.to_str().unwrap()]);
+        git(&repo, &["init", "-q", "--initial-branch=main"]);
+        git(&repo, &[&id[..], &["commit", "-q", "--allow-empty", "-m", "synthetic baseline"][..]].concat());
+        git(&repo, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&repo, &["push", "-q", "origin", "main"]);
+        git(&repo, &["checkout", "-q", "-b", &branch]);
+        std::fs::write(repo.join("synthetic.txt"), "a draft from before the deploy\n").unwrap();
+        git(&repo, &["add", "synthetic.txt"]);
+        git(&repo, &[&id[..], &["commit", "-q", "-m", "synthetic pre-deploy draft"][..]].concat());
+        git(&repo, &["push", "-q", "origin", &branch]);
+        git(&repo, &["checkout", "-q", "main"]);
+        let head_before = git(&remote, &["rev-parse", &branch]);
+
+        // Dry run: the same decision, nothing written anywhere.
+        let dry_reasoner = build_reasoner();
+        let dry = resume_draft_pr(&repo, &dry_reasoner, 71000, 70994, &branch, true).await.unwrap();
+        assert!(!dry.billed && dry.is_idle(), "held and unbilled: {}", dry.message);
+        assert!(dry.message.contains("DRY RUN") && dry.message.contains("provenance unknown"), "{}", dry.message);
+        assert!(
+            !gh_calls_1037(&root).iter().any(|c| gh_call_is(c, &["pr", "comment"])
+                || gh_call_is(c, &["pr", "close"])
+                || gh_call_is(c, &["issue", "edit"])),
+            "a dry run writes nothing to GitHub"
+        );
+        assert_eq!(dry_reasoner.calls(), 0);
+
+        // The real tick.
+        let reasoner = build_reasoner();
+        let report = resume_draft_pr(&repo, &reasoner, 71000, 70994, &branch, false).await.unwrap();
+        assert!(!report.billed, "C1: no daily-cap run: {}", report.message);
+        assert!(report.is_idle(), "held, not built: {}", report.message);
+        assert!(report.message.contains("provenance unknown"), "{}", report.message);
+        assert_eq!(reasoner.calls(), 0, "no builder, no reviewer");
+        assert!(!repo.join(".self-improve-worktrees").exists(), "no worktree, so no gate either");
+        assert_eq!(git(&remote, &["rev-parse", &branch]), head_before, "the draft's work is untouched");
+
+        let calls = gh_calls_1037(&root);
+        let labelled = calls.iter().any(|c| gh_call_is(c, &["issue", "edit", "70994"])
+            && c.windows(2).any(|w| w[0] == "--add-label" && w[1] == GAVE_UP_LABEL));
+        assert!(labelled, "the issue is labelled out so nothing rebuilds over the kept branch: {calls:?}");
+        let close = calls
+            .iter()
+            .find(|c| gh_call_is(c, &["pr", "close", "71000"]))
+            .unwrap_or_else(|| panic!("the draft is closed for a human: {calls:?}"));
+        let comment = &close[close.iter().position(|a| a == "--comment").unwrap() + 1];
+        assert!(comment.contains("provenance unknown") && comment.contains("human"), "{comment}");
+        assert!(!comment.contains("capacity"), "C2: not blamed on capacity: {comment}");
+        assert!(!close.iter().any(|a| a == "--delete-branch"));
+        assert!(
+            !calls.iter().any(|c| gh_call_is(c, &["pr", "comment"])),
+            "one close comment, not a comment and a close"
+        );
+        assert!(read_unreviewable(&root.join("unreviewable.json")).is_empty(), "nothing left to count");
+    }
+
+    /// C3 end to end: a reviewer latched in the (redirected) cooldown file
+    /// holds the draft with a dated reason, and on the third different day the
+    /// loop gives up, labels, and closes with that reason.
+    #[tokio::test]
+    async fn a_latched_reviewer_holds_the_draft_then_gives_up_on_the_third_day() {
+        const NAME: &str = "self_improve::tests::a_latched_reviewer_holds_the_draft_then_gives_up_on_the_third_day";
+        let Some(root) = std::env::var_os("JARVIS_1037_ROOT").map(PathBuf::from) else {
+            let fixture = tempfile::tempdir().unwrap();
+            run_1037_child(NAME, fixture.path());
+            return;
+        };
+        use augmentagent_channel_core::ProviderKind::Codex;
+        let until = chrono::Utc::now() + chrono::Duration::hours(2);
+        augmentagent_channel_core::CooldownLatch::system().latch("claude", until, "synthetic quota");
+        // Codex built it, so Claude is the only independent reviewer.
+        let why = select_reviewer(Ok(Some(vec![Codex])), reviewer_status).unwrap_err();
+        assert_eq!(why.code(), "reviewer-latched", "{why:?}");
+        let when = until.format("%Y-%m-%d %H:%M UTC").to_string();
+        assert!(why.headline().contains(&format!("reviewer latched until {when}")), "{}", why.headline());
+
+        let first = hold_unreviewable(&root, 71001, 70995, &why, false, false).await;
+        assert!(!first.billed && first.is_idle(), "{}", first.message);
+        let calls = gh_calls_1037(&root);
+        let wait = calls.iter().find(|c| gh_call_is(c, &["pr", "comment", "71001"])).expect("the wait is explained");
+        assert!(wait[4].contains(&format!("reviewer latched until {when}")) && wait[4].contains("day 1 of 3"), "{}", wait[4]);
+        assert!(!calls.iter().any(|c| gh_call_is(c, &["pr", "close"])));
+
+        // The two days before today went the same way.
+        let path = root.join("unreviewable.json");
+        let today = utc_day_now();
+        let mut record = read_unreviewable(&path);
+        record.get_mut("71001").expect("today was counted").days = vec![today - 2, today - 1];
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        let third = hold_unreviewable(&root, 71001, 70995, &why, false, false).await;
+        assert!(!third.billed, "{}", third.message);
+        assert!(third.message.contains("gave up"), "{}", third.message);
+        let calls = gh_calls_1037(&root);
+        assert!(calls.iter().any(|c| gh_call_is(c, &["issue", "edit", "70995"]) && c.contains(&GAVE_UP_LABEL.to_string())));
+        let close = calls.iter().find(|c| gh_call_is(c, &["pr", "close", "71001"])).expect("closed with the reason");
+        assert!(close[4].contains("reviewer latched until") && close[4].contains("3 different days"), "{}", close[4]);
+        assert!(!read_unreviewable(&path).contains_key("71001"), "the loop stops touching it");
     }
 
 }

@@ -112,7 +112,14 @@ struct Entry {
 
 #[derive(Default)]
 struct ReviewLifecycle {
+    /// The record review decisions read and every builder is added to: the
+    /// branch's when resuming, the attempt's own when fresh (#1037).
     path: Option<std::path::PathBuf>,
+    /// #1037 — fresh attempts only: the branch record. It receives every
+    /// builder too, because until the attempt's push lands the remote may
+    /// still hold the earlier work, and [`FallbackReasoner::supersede_review_history`]
+    /// replaces it with the attempt's record once the push has landed.
+    branch: Option<std::path::PathBuf>,
     admitted: bool,
 }
 
@@ -331,6 +338,11 @@ impl FallbackReasoner {
     /// Bind a draft's durable authorship before any builder invocation. The
     /// state stays outside the worktree, so model edits cannot erase authors.
     /// Missing provenance on resume remains unknown and cannot authorize review.
+    ///
+    /// #1037 — a fresh attempt (`resuming == false`) reviews against its own
+    /// builders only, because it builds from `main`; the branch record keeps
+    /// every earlier author as well until [`Self::supersede_review_history`]
+    /// says the attempt's push replaced the branch.
     pub fn track_review_history(&self, repository: &std::path::Path, branch: &str, resuming: bool) -> anyhow::Result<()> {
         let mut bound = self.review_history.lock().unwrap_or_else(|e| e.into_inner());
         anyhow::ensure!(!bound.admitted, "review history must be bound before reasoning starts");
@@ -338,8 +350,33 @@ impl FallbackReasoner {
         let root = self.handoff_root.as_ref().and_then(|p| p.parent())
             .ok_or_else(|| anyhow::anyhow!("private review history storage unavailable"))?.join("review-history");
         let repository = repository.canonicalize()?;
-        let path = crate::review_history::initialize(&root, &repository.to_string_lossy(), branch, resuming)?;
-        bound.path = Some(path);
+        let repository = repository.to_string_lossy();
+        if resuming {
+            bound.path = Some(crate::review_history::initialize(&root, &repository, branch, true)?);
+        } else {
+            let (branch_record, attempt) = crate::review_history::begin_attempt(&root, &repository, branch)?;
+            bound.path = Some(attempt);
+            bound.branch = Some(branch_record);
+        }
+        Ok(())
+    }
+
+    /// #1037 — this fresh attempt's push replaced the branch on the remote.
+    ///
+    /// From here the branch record is exactly this attempt's builders, and any
+    /// later builder is recorded there. Call it only once the push has landed:
+    /// before that the remote may still hold the earlier work, which is why
+    /// the branch record is the union until now. Only a fresh attempt can do
+    /// this; a resumed draft appends to the branch it found and never replaces
+    /// its authors.
+    pub fn supersede_review_history(&self) -> anyhow::Result<()> {
+        let mut bound = self.review_history.lock().unwrap_or_else(|e| e.into_inner());
+        let (Some(attempt), Some(branch)) = (bound.path.clone(), bound.branch.clone()) else {
+            anyhow::bail!("only a fresh attempt's review history can supersede a branch");
+        };
+        crate::review_history::supersede(&branch, &attempt)?;
+        bound.path = Some(branch);
+        bound.branch = None;
         Ok(())
     }
 
@@ -470,7 +507,16 @@ impl FallbackReasoner {
                 None => user_message.to_string(),
             };
             if mutating {
-                let history = self.review_history.lock().unwrap_or_else(|e| e.into_inner()).path.clone();
+                let (history, branch_record) = {
+                    let bound = self.review_history.lock().unwrap_or_else(|e| e.into_inner());
+                    (bound.path.clone(), bound.branch.clone())
+                };
+                // #1037 — the branch record first: if the attempt's write then
+                // fails, the provider has not run and the branch merely lists
+                // one author too many, which excludes a reviewer, never admits one.
+                if let Some(path) = branch_record {
+                    crate::review_history::record(&path, entry.kind)?;
+                }
                 if let Some(path) = history {
                     crate::review_history::record(&path, entry.kind)?;
                 }
@@ -781,6 +827,68 @@ mod tests {
         assert!(fb.call(&opts, "synthetic revision").await.is_err());
         assert_eq!(primary.count(), 1, "no provider runs without durable attribution");
         assert_eq!(fb.calls(), 1);
+    }
+
+    /// #1037 C4 — history `[claude, codex]` on a branch, then a fresh attempt
+    /// that only Codex builds. Its own review must see Codex alone (so Claude
+    /// can review it); a resume before the push lands must still see both
+    /// (the old content may still be on the remote); and once the push has
+    /// superseded the branch, a resume sees Codex alone and Claude is eligible
+    /// again. Before this, the stale pair disqualified every reviewer forever.
+    #[tokio::test]
+    async fn a_superseded_branch_drops_the_authors_of_the_work_it_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let handoffs = dir.path().join("private/handoffs");
+        let mut opts = text_only_opts();
+        opts.allowed_tools = vec!["Write".into()];
+
+        // Earlier attempt: Claude timed out mid-build, Codex finished.
+        let claude_timeout = Scripted::err(|| anyhow::Error::new(ReasonerError::Timeout {
+            provider: "claude".into(),
+            secs: 1,
+        }));
+        let mut earlier = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, claude_timeout as Arc<dyn Reasoner>),
+            (ProviderKind::Codex, Scripted::ok("built") as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
+        earlier.handoff_root = Some(handoffs.clone());
+        earlier.track_review_history(dir.path(), "synthetic-superseded", false).unwrap();
+        earlier.call(&opts, "synthetic build").await.unwrap();
+        earlier.supersede_review_history().unwrap();
+        let resume = |label: &str| {
+            let mut r = FallbackReasoner::for_tests(vec![], latch_in(&dir));
+            r.handoff_root = Some(handoffs.clone());
+            r.track_review_history(dir.path(), "synthetic-superseded", true)
+                .unwrap_or_else(|e| panic!("{label}: {e:#}"));
+            r.review_authors().unwrap()
+        };
+        assert_eq!(resume("published earlier attempt"),
+            Some(vec![ProviderKind::Claude, ProviderKind::Codex]));
+
+        // A fresh attempt on the same branch, built by Codex alone.
+        let mut fresh = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, Scripted::ok("rebuilt") as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
+        fresh.handoff_root = Some(handoffs.clone());
+        fresh.track_review_history(dir.path(), "synthetic-superseded", false).unwrap();
+        fresh.call(&opts, "synthetic rebuild from main").await.unwrap();
+        assert_eq!(fresh.review_authors().unwrap(), Some(vec![ProviderKind::Codex]),
+            "the attempt's own review judges work only Codex wrote");
+        assert_eq!(resume("before the push lands"),
+            Some(vec![ProviderKind::Claude, ProviderKind::Codex]),
+            "unpublished: the remote may still hold the old work, so fail closed");
+
+        fresh.supersede_review_history().unwrap();
+        assert_eq!(resume("after the push superseded the branch"), Some(vec![ProviderKind::Codex]),
+            "published: the stale Claude attribution is gone and Claude may review");
+        assert_eq!(fresh.review_authors().unwrap(), Some(vec![ProviderKind::Codex]));
+
+        // Only a fresh attempt replaces anything; a resumed draft never does.
+        let mut resumed = FallbackReasoner::for_tests(vec![], latch_in(&dir));
+        resumed.handoff_root = Some(handoffs);
+        resumed.track_review_history(dir.path(), "synthetic-superseded", true).unwrap();
+        assert!(resumed.supersede_review_history().is_err(),
+            "a resume appends to the branch it found; it never replaces its authors");
     }
 
     #[tokio::test]

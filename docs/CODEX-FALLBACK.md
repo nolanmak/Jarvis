@@ -409,6 +409,57 @@ Review revisions, conflict repairs, and privacy repairs stay within the draft's
 recorded builder providers. A recovered primary remains available for independent
 review instead of becoming another author. Unknown provenance or unavailable
 builders fail closed; missing review capacity does not consume rejection rounds.
+
+### Drafts without an independent review (#1037)
+
+The resume lane asks whether a draft can be independently reviewed before it
+creates a worktree, merges `main`, runs the gate or calls a builder.
+`independent_review` chooses its reviewer through the same function, so the two
+cannot disagree. When no review is possible the tick is `held`, and it bills a
+daily-cap run only if a builder call was actually made on that run. The PR
+comment and the log name one of three reasons:
+
+| Reason | Cause | What the loop does |
+|---|---|---|
+| Provenance unknown | No complete record of the draft's builders: it predates builder history, or the record was lost. A missing record on resume is written as unknown and stays unknown. | Stands down at once |
+| Provenance unknown | The record exists but cannot be read or trusted (busy lock, permissions, corruption) | Waits, on the budget |
+| No reviewer capacity | Every provider the loop reviews with already built the draft | Stands down at once |
+| No reviewer capacity | The independent reviewer is not installed or authenticated, or its call failed | Waits, on the budget |
+| Reviewer latched until a named reset | The independent reviewer is on a quota cooldown | Waits, on the budget |
+
+**Unknown provenance requires one human approval.** The loop never reviews,
+revises or merges such a draft. It cannot show that any model reviewing the
+draft is independent of the model that built it, because before #1021 the
+primary built every draft. The other option, reviewing with the primary
+provider only, would let the merge gates open on the builder grading its own
+work with nobody independent looking. Standing down labels the issue
+`agent-gave-up` and closes the draft with the reason; the branch is kept. The
+label also stops a fresh attempt from rebuilding over that branch. A human
+merges the draft by reopening it, marking it ready for review and merging it by
+hand, or removes the label to have the loop rebuild the fix from `main`.
+
+**Retry budget.** A reason that can clear on its own waits. The resume lane
+reaches a draft at most once per UTC day (its attempt ledger), and each
+unavailable outcome is recorded per draft in `autopr-unreviewable.json`
+(`AUGMENTAGENT_AUTOPR_UNREVIEWABLE_FILE`). After three different UTC days with
+no review verdict in between, the loop gives up the same way and names the
+latest reason. Any verdict, approval or changes requested, resets the count. A
+reason that cannot change for the draft stands down on first sight, instead of
+posting the same verdict for three days.
+
+**Branch history resets when the branch is superseded.** A fresh attempt builds
+from `main`, so its own review consults a record of only the builders it
+dispatched. Every builder is also added to the branch record, which keeps
+describing the remote branch. Until the attempt's push lands, the earlier work
+may still be there, so the branch record stays the union and fails closed.
+Once the push lands, either plainly or by force-pushing over an orphaned branch
+(#815), the branch record becomes exactly the attempt's builders. That is also
+the only way a record of unknown provenance becomes complete. A resume only
+appends.
+
+`augmentagent autopr-health` reports drafts that are waiting under
+`review-held`. The warning says the loop is not wedged and gives each draft's
+reason and day count. Those drafts are left out of `draft-stale`.
 Behavior tests cover provider recovery and builder failure without dispatching an
 independent provider as a replacement author.
 
@@ -500,8 +551,10 @@ run the opt-in ones with `XDG_STATE_HOME` state isolation.
   including failed and cancelled calls. Text-only calls, cooldown skips and
   capability exclusions do not count as builders. Auto-ship binds a private,
   durable history per repository and branch before invoking any builder. History
-  writes must succeed before a provider runs; restarting or opening a fresh
-  attempt cannot erase earlier authors. Missing legacy history remains unknown.
+  writes must succeed before a provider runs; restarting cannot erase earlier
+  authors, and neither can opening a fresh attempt. Only a fresh attempt's
+  landed push replaces them, with that attempt's own builders (#1037). Missing
+  legacy history remains unknown.
 - Independent review selects Codex or Claude only when that provider is absent
   from the draft's complete builder history. Unknown/corrupt history or no
   independent capacity blocks approval. Claude reviews use an explicit model
