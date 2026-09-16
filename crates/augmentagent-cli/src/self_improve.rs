@@ -1262,6 +1262,9 @@ async fn merge_sweep(repo_root: &Path) -> usize {
         return 0;
     };
     let owner = repo_owner_from_remote(repo_root).await;
+    // This box's own record of what it has worked on. Read once: it is the
+    // half of provenance that cannot be forged from GitHub.
+    let history = AttemptHistory::load(&attempt_history_path());
     let mut merged = 0usize;
 
     for row in rows {
@@ -1293,7 +1296,7 @@ async fn merge_sweep(repo_root: &Path) -> usize {
             pr,
             issue,
             ours: head_is_ours(row, owner.as_deref()),
-            loop_authored: loop_authored(body, issue),
+            loop_authored: loop_authored(body, issue, history.digest(issue).is_some()),
             mergeable: match row.get("mergeable").and_then(serde_json::Value::as_str) {
                 Some("MERGEABLE") => Some(true),
                 Some("CONFLICTING") => Some(false),
@@ -1418,9 +1421,20 @@ async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
 /// familiar.
 const SELF_IMPROVE_BODY_MARKER: &str = "Automated self-improvement for #";
 
-/// Did the loop write this PR body, for this issue?
-fn loop_authored(body: &str, issue: u64) -> bool {
-    body.contains(&format!("{SELF_IMPROVE_BODY_MARKER}{issue}."))
+/// Did the LOOP open this pull request, for this issue?
+///
+/// Two independent pieces of evidence, because neither alone is proof:
+///
+/// - the signature on the PR body, which anyone with write access could type;
+/// - a record in this box's own attempt history, which they could not — it
+///   lives in the daemon state directory and is written only when the loop
+///   actually worked the issue.
+///
+/// Codex was right that a body string is forgeable. The local record is the
+/// part that is not, and requiring both means a human would have to both
+/// impersonate the format AND have this daemon have worked the same issue.
+fn loop_authored(body: &str, issue: u64, attempted_here: bool) -> bool {
+    attempted_here && body.contains(&format!("{SELF_IMPROVE_BODY_MARKER}{issue}."))
 }
 
 /// #1029 — every input the auto-merge decision takes, in one place.
@@ -10945,12 +10959,22 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     /// signature cannot drift out from under the check.
     #[test]
     fn same_repository_is_not_the_same_as_loop_authored() {
-        assert!(loop_authored("Automated self-improvement for #1007.\n\n## Summary", 1007));
-        // A human PR on an agent-shaped branch.
-        assert!(!loop_authored("Fixes #1007 by hand.\n\n## Summary", 1007));
+        let signed = "Automated self-improvement for #1007.\n\n## Summary";
+        assert!(loop_authored(signed, 1007, true));
+
+        // Codex: a body string is FORGEABLE. Someone with write access can
+        // type the signature, so it cannot be the only evidence — this box's
+        // own attempt record is the half they cannot write.
+        assert!(
+            !loop_authored(signed, 1007, false),
+            "a forged signature with no local record must not pass"
+        );
+        // And the local record alone is not enough either: the loop attempts
+        // issues it never opens a PR for.
+        assert!(!loop_authored("Fixes #1007 by hand.\n\n## Summary", 1007, true));
         // Right shape, wrong issue: not this PR's provenance.
-        assert!(!loop_authored("Automated self-improvement for #999.", 1007));
-        assert!(!loop_authored("", 1007));
+        assert!(!loop_authored("Automated self-improvement for #999.", 1007, true));
+        assert!(!loop_authored("", 1007, true));
 
         // The writer must use the same constant, or the signature drifts away
         // from the check and every sweep silently stops merging.
