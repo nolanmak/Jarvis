@@ -3784,6 +3784,30 @@ fn coderabbit_configured(repo_root: &Path) -> bool {
     repo_root.join(".coderabbit.yaml").exists() || repo_root.join(".coderabbit.yml").exists()
 }
 
+/// What to record about CodeRabbit when a merge is taken.
+///
+/// #1032, owner directive: a double codex LGTM is the bar and CodeRabbit is
+/// advisory. On the FRESH path it cannot have an opinion yet — the PR is being
+/// created by this very call — so the note says that plainly rather than
+/// implying a review happened. The resume lane, which sees PRs that have
+/// existed long enough to be reviewed, still respects findings through
+/// [`RabbitReview::blocks`].
+fn rabbit_merge_note(review: &RabbitReview) -> String {
+    if review.blocks() {
+        return format!(
+            "CodeRabbit: {} actionable finding(s) on this head — merge withheld.",
+            review.actionable
+        );
+    }
+    if review.available {
+        return "CodeRabbit: reviewed this head, nothing actionable.".to_string();
+    }
+    format!(
+        "CodeRabbit: advisory, not waited for ({}).",
+        if review.note.is_empty() { "no review" } else { &review.note }
+    )
+}
+
 /// How long to poll for a review that is on its way (default 5 min; `0`
 /// = consider only what is already there).
 fn rabbit_wait_secs() -> u64 {
@@ -5813,9 +5837,16 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // #936 — with CodeRabbit configured, a fresh PR is never merged
         // here: it opens as a draft, CodeRabbit reviews it, and the resume
         // lane merges on triple LGTM.
+        // #1032 — CodeRabbit is advisory, and on this path it cannot have an
+        // opinion: the PR is created a few lines below, so there is nothing
+        // for it to have reviewed. Deferring every merge merely because
+        // `.coderabbit.yaml` exists handed the decision to the resume lane,
+        // which cannot run once the daily cap is spent (#1029) — and on the
+        // free tier, an exhausted quota made the loop's throughput a function
+        // of somebody else's billing plan. Findings still withhold a merge in
+        // the resume lane, where a review can actually exist.
         if enabled && complexity_ok && independent.approved() && !issue.research_filed
             && receipt_ok
-            && !coderabbit_configured(repo_root)
         {
             let owner = std::env::var(GH_OWNER_ENV)
                 .ok()
@@ -5837,9 +5868,14 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         .map(|p| format!("\n\n## Implementation spec (scoping pass)\n{}", truncate(p, 1500)))
         .unwrap_or_default();
     let merge_note = match (automerge, gated.as_deref()) {
-        (true, _) => "Auto-merged: owner-authored issue graded ≤medium, \
-                      AUGMENTAGENT_AUTOPR_AUTOMERGE=1."
-            .to_string(),
+        (true, _) => format!(
+            "Auto-merged: owner-authored issue graded ≤medium, \
+             AUGMENTAGENT_AUTOPR_AUTOMERGE=1, and two independent codex \
+             reviews approved it. {}",
+            rabbit_merge_note(&RabbitReview::unavailable(
+                "the PR did not exist until this merge"
+            ))
+        ),
         // #823 — name the file, so the reviewer knows why this is a draft
         // even though the grade alone would have merged it.
         (false, Some(f)) => format!(
@@ -5854,11 +5890,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
              review did not approve it ({}).",
             independent.status()
         ),
-        (false, None) if coderabbit_configured(repo_root) => {
-            "Draft — CodeRabbit reviews it next; the resume lane merges on triple LGTM \
-             (builder QA, independent reviewer, CodeRabbit)."
-                .to_string()
-        }
+        // #1032 removed the arm that said "CodeRabbit reviews it next; the
+        // resume lane merges on triple LGTM". That is no longer why a PR is a
+        // draft, and a note describing a path the code no longer takes is
+        // worse than no note: it sends a reader looking for a resume that is
+        // never coming.
         (false, None) => "Draft — a human must review and merge.".to_string(),
     };
     // #817 — say so in the PR when the builder left scratch behind; a drop
@@ -11065,19 +11101,108 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
     // Structural: with CodeRabbit configured, run_once never merges a fresh
     // PR itself — it opens a draft and the resume lane merges on triple LGTM.
+    /// #1032, owner directive: a double codex LGTM is the bar. CodeRabbit is
+    /// advisory, and the fresh path must decide on what is ALREADY posted.
+    ///
+    /// This replaces the rule that merely having `.coderabbit.yaml` deferred
+    /// every merge to the resume lane. With #1029 — the resume lane cannot run
+    /// once the daily cap is spent — that turned an approved PR into one that
+    /// sits indefinitely, and on CodeRabbit's free tier an exhausted quota
+    /// made the loop's throughput a function of somebody else's billing plan.
     #[test]
-    fn run_once_defers_merge_when_coderabbit_is_configured() {
+    fn the_fresh_path_decides_on_coderabbit_without_waiting_for_it() {
         let src = include_str!("self_improve.rs");
         let start = src.find("pub async fn run_once(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end");
         let body = &src[start..end];
         let am = body.find("let automerge = {").expect("automerge block");
         let create = body.find(r#"vec!["pr", "create"]"#).expect("pr create");
+        let decision = &body[am..create];
+
         assert!(
-            body[am..create].contains("coderabbit_configured("),
-            "the automerge decision must consult the CodeRabbit config"
+            !decision.contains("coderabbit_configured("),
+            "presence of a config file must not decide a merge; its findings must"
+        );
+        // Never wait. `wait_for_rabbit` polls for up to `rabbit_wait_secs`;
+        // the fresh path must not spend that window — and cannot usefully,
+        // since the PR is created a few lines later.
+        assert!(
+            !decision.contains("wait_for_rabbit("),
+            "the fresh path must not poll or sleep for a review"
+        );
+
+        // Advisory is not the same as ignored: the RESUME lane still withholds
+        // a merge on findings, which is where a review can actually exist.
+        let resume_start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let resume = &src[resume_start..resume_start + src[resume_start..].find("\n}\n").unwrap()];
+        assert!(
+            resume.contains("wait_for_rabbit(") || resume.contains("rabbit"),
+            "the resume lane must still consult CodeRabbit"
         );
     }
+
+    /// C1-C4 as one table: only a review OF THIS HEAD with actionable findings
+    /// withholds a merge. Every flavour of absence — never reviewed, rate
+    /// limited, quota exhausted, draft skipped, or a review of older code —
+    /// means merge on the codex verdict.
+    #[test]
+    fn only_findings_on_the_current_head_withhold_a_merge() {
+        let head = "bbbb222";
+        let review_on = |sha: &str, count: u32| {
+            serde_json::json!([{
+                "user": {"login": RABBIT_LOGIN},
+                "commit_id": sha,
+                "body": format!("**Actionable comments posted: {count}**"),
+            }])
+        };
+        let none = serde_json::json!([]);
+
+        // A review of THIS head with findings: blocks.
+        let blocking = rabbit_findings_for_head(&review_on(head, 3), &none, head);
+        assert!(blocking.blocks(), "findings on the current head must block");
+        assert!(!blocking.approved());
+
+        // A review of this head with nothing actionable: merges.
+        assert!(rabbit_findings_for_head(&review_on(head, 0), &none, head).approved());
+
+        // A review of OLDER code never blocks — it did not see this diff.
+        assert!(
+            rabbit_findings_for_head(&review_on("aaaa111", 9), &none, head).approved(),
+            "a stale review must not withhold a merge"
+        );
+
+        // No review at all.
+        assert!(rabbit_findings_for_head(&none, &none, head).approved());
+
+        // Rate limited, quota exhausted, draft skipped: all absence.
+        for note in [
+            "> ## Review limit reached\n> Next included review available in 11 minutes.",
+            "Draft PR not reviewed",
+        ] {
+            let comments = serde_json::json!([{ "user": {"login": RABBIT_LOGIN}, "body": note }]);
+            assert!(
+                rabbit_findings_for_head(&none, &comments, head).approved(),
+                "absence must never block: {note:?}"
+            );
+        }
+    }
+
+    /// C7 — a merge has to be explainable afterwards, so the note says what
+    /// CodeRabbit's state was at the moment it was taken.
+    #[test]
+    fn the_merge_note_records_what_coderabbit_had_said() {
+        for (review, expect) in [
+            (RabbitReview::unavailable("rate-limited (11 min); not waiting"), "rate-limited"),
+            (RabbitReview::unavailable("no review yet"), "no review"),
+        ] {
+            let note = rabbit_merge_note(&review);
+            assert!(
+                note.to_lowercase().contains(&expect.to_lowercase()),
+                "note {note:?} must record {expect:?}"
+            );
+        }
+    }
+
 
     #[test]
     fn rate_limit_note_parses_minutes() {
