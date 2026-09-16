@@ -599,6 +599,62 @@ class HandoffTests(unittest.TestCase):
             with self.assertRaisesRegex(bridge.Denied,'reconciliation'):
                 journal.execute(event['tool_name'],event['tool_input'],lambda:None)
 
+    def test_primary_new_tool_id_cannot_repeat_a_completed_external_action(self):
+        operations=[('mcp__fixture__create_issue',{'title':'Synthetic'}),
+                    ('Bash',{'command':'aa-gh issue create --title Synthetic'}),
+                    ('Bash',{'command':'augmentagent gmail compose --body Synthetic'})]
+        for name, arguments in operations:
+            with self.subTest(tool=name), tempfile.TemporaryDirectory() as tmp:
+                journal=bridge.HandoffJournal(Path(tmp)/'handoff.json')
+                event={'hook_event_name':'PreToolUse','tool_use_id':'synthetic-first',
+                    'tool_name':name,'tool_input':arguments}
+                journal.observe_hook(event)
+                journal.observe_hook(dict(event,hook_event_name='PostToolUse',tool_response='synthetic-created'))
+                before=journal.path.read_bytes()
+                retry=dict(event,tool_use_id='synthetic-retry')
+                with self.assertRaisesRegex(bridge.Denied,'completed'):
+                    journal.observe_hook(retry)
+                self.assertEqual(journal.path.read_bytes(),before)
+                hook=subprocess.run([sys.executable,'-I',str(Path(bridge.__file__)),
+                    '--handoff-hook',str(journal.path)],input=json.dumps(retry),text=True,capture_output=True)
+                self.assertEqual(hook.returncode,2)
+                self.assertIn('already completed',hook.stderr)
+                self.assertNotIn('Synthetic',hook.stderr)
+                self.assertEqual(hook.stdout,'')
+                # A separately identified user request is not deduplicated with
+                # this one merely because the requested action is identical.
+                fresh=bridge.HandoffJournal(Path(tmp)/'another-request.json')
+                fresh.observe_hook(retry)
+                self.assertEqual(len(fresh.load()['operations']),1)
+
+    def test_primary_can_rerun_a_local_build_after_editing_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal=bridge.HandoffJournal(Path(tmp)/'handoff.json')
+            event={'hook_event_name':'PreToolUse','tool_use_id':'synthetic-first',
+                'tool_name':'Bash','tool_input':{'command':'cargo test --offline'}}
+            journal.observe_hook(event)
+            journal.observe_hook(dict(event,hook_event_name='PostToolUse',tool_response='passed'))
+            journal.observe_hook(dict(event,tool_use_id='synthetic-after-edit'))
+            self.assertEqual(len(journal.load()['operations']),2)
+
+    def test_command_receipt_survives_quoting_spacing_and_timeout_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal=bridge.HandoffJournal(Path(tmp)/'handoff.json')
+            original={'command':'aa-gh issue create --title Synthetic','timeout':30}
+            equivalent={'command':"aa-gh  issue create --title 'Synthetic'",'timeout':90}
+            result={'content':[{'type':'text','text':'synthetic-created'}]}
+            journal.execute('Bash',original,lambda:result)
+            def forbidden():
+                self.fail('equivalent command repeated external action')
+            self.assertEqual(journal.execute('Bash',equivalent,forbidden),result)
+            with self.assertRaises(bridge.CompletedOperation):
+                journal.observe_hook({'hook_event_name':'PreToolUse','tool_use_id':'synthetic-retry',
+                    'tool_name':'Bash','tool_input':equivalent})
+            changed={'command':'aa-gh issue create --title Different'}
+            different={'content':[{'type':'text','text':'synthetic-second'}]}
+            self.assertEqual(journal.execute('Bash',changed,lambda:different),different)
+            self.assertEqual(len(journal.load()['operations']),2)
+
     def test_later_uncertain_attempt_cannot_be_hidden_by_an_older_receipt(self):
         with tempfile.TemporaryDirectory() as tmp:
             journal=bridge.HandoffJournal(Path(tmp)/'handoff.json')
@@ -606,7 +662,12 @@ class HandoffTests(unittest.TestCase):
                 'tool_name':'mcp__fixture__update','tool_input':{'value':'Synthetic'}}
             journal.observe_hook(event)
             journal.observe_hook(dict(event,hook_event_name='PostToolUse',tool_response='first result'))
-            journal.observe_hook(dict(event,tool_use_id='synthetic-call-2'))
+            # Historical journals may already contain a repeated attempt from
+            # before primary hooks blocked identical completed actions.
+            state=journal.load()
+            state['operations'].append({'tool':event['tool_name'],'arguments':event['tool_input'],
+                'primary_id':'synthetic-call-2','status':'started'})
+            journal.save(state)
             with self.assertRaisesRegex(bridge.Denied,'reconciliation'):
                 journal.execute(event['tool_name'],event['tool_input'],lambda:None)
 

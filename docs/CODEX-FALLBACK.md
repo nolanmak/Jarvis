@@ -171,11 +171,25 @@ results for Codex. The generated command turns script startup failures into exit
 2. Tests execute that command, including quoted paths and blocking results, and
 exercise receipt forwarding through the dispatcher.
 
-This is not completed cross-provider handoff. Live primary hook conformance,
+Primary hooks now also block a new tool-call id from repeating a completed
+MCP or broker service action in the same request. Both providers compare parsed
+command arguments, ignoring shell quoting, whitespace, descriptions and timeout
+changes; they retain the original inputs in the journal. Completed local builds
+can run again after source edits. Separate request journals permit a new user
+request with identical arguments. Intentionally repeating the same external
+action inside one request still needs explicit operation identity support.
+
+A live two-provider fixture passed: Claude invoked a synthetic MCP counter,
+its real hooks persisted the completed receipt, and Codex then requested the
+same action without being given recovery prose. Codex returned the first
+receipt and the counter remained one. This verifies actual primary hook and
+fallback broker interoperability for a completed action.
+
+This is not completed cross-provider handoff. Live interrupted-effect recovery,
 effect-aware read/reconciliation operations, retention, caller identity coverage,
 intentional repeated-action semantics and interruption cleanup remain gates.
-Exact argument matching does not identify semantically duplicate actions expressed
-with different arguments. Hook observations do not substitute for verified
+Argument matching does not identify all semantically duplicate actions expressed
+through different commands or tools. Hook observations do not substitute for verified
 termination of the previous provider and its descendants before handoff.
 
 Both CLI adapters now launch beneath a private Linux subreaper supervisor. On

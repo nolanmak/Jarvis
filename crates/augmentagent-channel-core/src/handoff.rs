@@ -104,6 +104,71 @@ impl ClaudeHooks {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[ignore = "requires Claude and Codex login; synthetic MCP counter only"]
+    async fn live_primary_receipt_prevents_codex_repeating_an_external_effect() {
+        use crate::reasoner::{ClaudeCliReasoner, Reasoner};
+        use crate::codex::CodexCliReasoner;
+        use std::os::unix::fs::PermissionsExt;
+        let private = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let counter = private.path().join("counter.txt");
+        let server = private.path().join("fixture.py");
+        std::fs::write(&server, r#"
+import json, pathlib, sys
+counter = pathlib.Path(sys.argv[1])
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'initialize':
+        result = {'protocolVersion':'2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'fixture','version':'1'}}
+    elif method == 'tools/list':
+        result = {'tools':[{'name':'record','description':'Record one synthetic event and return its receipt.',
+            'inputSchema':{'type':'object','properties':{'value':{'type':'string'}},'required':['value'],'additionalProperties':False}}]}
+    elif method == 'tools/call':
+        assert request['params']['name'] == 'record'
+        assert request['params']['arguments'] == {'value':'synthetic'}
+        count = int(counter.read_text()) + 1 if counter.exists() else 1
+        counter.write_text(str(count))
+        result = {'content':[{'type':'text','text':'SYNTHETIC_RECEIPT_'+str(count)}]}
+    else:
+        result = {}
+    print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
+"#).unwrap();
+        let mut opts = crate::reasoner::loop_parse_opts();
+        opts.system_prompt = "Use only the supplied fixture MCP tool. Report its actual receipt. Do not use files or shell tools.".into();
+        opts.allowed_tools = vec!["mcp__fixture__record".into()];
+        opts.cwd = Some(workspace.path().into());
+        opts.restrict_env = true;
+        opts.settings_json = Some(json!({"mcpServers":{"fixture":{
+            "command":"python3","args":["-I",server,counter]
+        }}}).to_string());
+        let journal = private.path().join("operations.json");
+        opts.handoff_path = Some(journal.clone());
+        let request = "Call the fixture record tool with value=synthetic and return its receipt.";
+        let first = ClaudeCliReasoner::new().call(&opts, request).await.unwrap();
+        assert!(first.contains("SYNTHETIC_RECEIPT_1"), "{first}");
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+        let state: Value = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        let operations = state["operations"].as_array().unwrap();
+        let effects: Vec<_> = operations.iter().filter(|row| row["tool"] == "mcp__fixture__record").collect();
+        // Claude may also perform built-in MCP discovery before the call.
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0]["status"], "completed");
+        assert!(effects[0]["primary_id"].is_string());
+        assert!(operations.iter().all(|row| row["status"] == "completed"));
+        // Deliberately omit recovery prose: durable enforcement must still
+        // return the receipt if the fallback tries to repeat the operation.
+        let second = CodexCliReasoner::openai().call(&opts, request).await.unwrap();
+        assert!(second.contains("SYNTHETIC_RECEIPT_1"), "{second}");
+        assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+        let after: Value = serde_json::from_slice(&std::fs::read(journal).unwrap()).unwrap();
+        assert_eq!(after, state);
+    }
+
     #[test]
     fn request_identity_survives_restart_but_separates_turns_and_changed_requests() {
         let temp = tempfile::tempdir().unwrap();

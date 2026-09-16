@@ -106,6 +106,42 @@ def read_only_operation(name, arguments):
     return program == 'aa-gh' and argv[1] in {'issue', 'pr'} and argv[2] in {'list', 'view', 'diff', 'checks'}
 
 
+def external_operation(name, arguments):
+    """Integration operations dispatched by this broker, shared by both providers."""
+    if name.startswith('mcp__'):
+        return True
+    if name != 'Bash' or not isinstance(arguments.get('command'), str):
+        return False
+    try:
+        argv = literal_command_argv(arguments['command'])
+    except Denied:
+        # The broker rejects these commands. Primary hooks cannot prove they
+        # are local, so do not permit them to replay a completed effect.
+        return True
+    return bool(argv) and Path(argv[0]).name in ('augmentagent', 'aa-gh')
+
+
+class CompletedOperation(Denied):
+    pass
+
+
+def same_operation(row, name, arguments):
+    if row['tool'] != name:
+        return False
+    def identity(values):
+        if name != 'Bash' or not isinstance(values.get('command'), str):
+            return values
+        try:
+            argv = literal_command_argv(values['command'])
+        except Denied:
+            return values
+        # Quotes, whitespace, the display description and execution timeout
+        # do not change the external action. Preserve all other inputs.
+        return {**{key: value for key, value in values.items()
+                   if key not in ('command', 'timeout', 'description')}, 'command': argv}
+    return identity(row['arguments']) == identity(arguments)
+
+
 class HandoffJournal:
     """Durable operation receipts. Uncertain effects require reconciliation.
 
@@ -191,7 +227,7 @@ class HandoffJournal:
         with self.locked():
             state = self.load()
             for row in reversed(state['operations']):
-                if row['tool'] == name and row['arguments'] == arguments:
+                if same_operation(row, name, arguments):
                     if row['status'] != 'completed':
                         raise ReconciliationRequired('latest operation requires reconciliation')
                     return row['result']
@@ -223,6 +259,10 @@ class HandoffJournal:
             if phase == 'PreToolUse':
                 if matching or any(row['status'] == 'started' for row in state['operations']):
                     raise ReconciliationRequired('unfinished primary operation requires reconciliation')
+                if external_operation(name, arguments) and any(
+                        same_operation(row, name, arguments)
+                        and row['status'] == 'completed' for row in state['operations']):
+                    raise CompletedOperation('external operation already completed for this request; use its prior receipt instead of repeating it')
                 state['operations'].append({'tool': name, 'arguments': arguments,
                     'primary_id': identifier, 'status': 'started'})
                 self.save(state)
@@ -1204,11 +1244,9 @@ class Server:
                 if ('minimum' in field and value < field['minimum']) or ('maximum' in field and value > field['maximum']):
                     raise Denied('tool argument outside supported range')
         self.policy.before(name, arguments)
-        external = name.startswith('mcp__')
         if name == 'Bash':
-            argv = self.policy.command_argv(arguments['command'])
-            external = Path(argv[0]).name in ('augmentagent', 'aa-gh')
-        if external and self.policy.handoff and not read_only_operation(name, arguments):
+            self.policy.command_argv(arguments['command'])
+        if external_operation(name, arguments) and self.policy.handoff and not read_only_operation(name, arguments):
             return self.policy.handoff.execute(name, arguments,
                 lambda: self.execute(name, arguments))
         return self.execute(name, arguments)
@@ -1322,6 +1360,9 @@ if __name__ == '__main__':
     if len(sys.argv) == 3 and sys.argv[1] == '--handoff-hook':
         try:
             HandoffJournal(sys.argv[2]).observe_hook(json.load(sys.stdin))
+        except CompletedOperation:
+            print('External operation already completed for this request; use its prior result instead of repeating it.', file=sys.stderr)
+            sys.exit(2)
         except Exception:
             # Claude uses exit 2 to deny PreToolUse, while ordinary script
             # failures can be non-blocking. Never expose journal payloads here.
