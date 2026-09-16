@@ -292,8 +292,23 @@ the sole recorded builder and is excluded from review. With Claude still latched
 the independent review is unavailable and cannot approve. After clearing only the
 synthetic test cooldown, real Claude completes and approves the focused-diff and
 system-interaction passes. That approval does not grant Codex-specific merge
-overrides. This proves the builder and reviewer slices; the full issue/PR/merge/
-deployment lifecycle remains a separate acceptance requirement.
+overrides.
+
+The controlled `live_fallback_pipeline_resumes_after_independent_reviewer_recovers`
+test now runs the production auto-ship state machine with real providers and Cargo
+checks, an isolated local Git remote, and a simulated GitHub transport. A latched
+primary routes scoping/building to Codex. Missing independent review capacity
+preserves the draft, including on resume, without further mutation calls. After
+synthetic primary recovery, independent review gates the merge; a fresh checkout
+of the exact merged revision passes additional acceptance tests. Both paths clean
+the pipeline worktree. This does not prove public GitHub or daemon deployment QA.
+
+Review revisions, conflict repairs, and privacy repairs stay within the draft's
+recorded builder providers. A recovered primary remains available for independent
+review instead of becoming another author. Unknown provenance or unavailable
+builders fail closed; missing review capacity does not consume rejection rounds.
+Behavior tests cover provider recovery and builder failure without dispatching an
+independent provider as a replacement author.
 
 The remaining provider conformance suite must cover:
 

@@ -375,6 +375,11 @@ impl AuditLogger {
         if let Err(e) = file.write_all(&payload).await {
             warn!("tool-audit: write {} failed: {e}", self.path.display());
         }
+        // Tokio file writes may still be buffered after write_all returns.
+        // Finish the append before readers or retention observe this file.
+        if let Err(e) = file.flush().await {
+            warn!("tool-audit: flush {} failed: {e}", self.path.display());
+        }
         // #1004 — housekeeping runs AFTER the record has landed, and only
         // once the append lock is released. Pruning first delayed the first
         // write of each process, which was enough to reorder concurrent

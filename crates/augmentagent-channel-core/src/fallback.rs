@@ -261,6 +261,14 @@ impl FallbackReasoner {
         }
     }
 
+    /// Revise an existing draft without recruiting its independent reviewer
+    /// into the builder role. Unknown provenance cannot authorize revisions.
+    pub async fn call_revision(&self, opts: &ReasonerOpts, message: &str) -> anyhow::Result<String> {
+        let authors = self.review_authors()?.filter(|authors| !authors.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("revision requires known builder provenance"))?;
+        self.dispatch(opts, message, false, Some(&authors)).await
+    }
+
     /// Providers dispatched with mutation-capable tools on this instance.
     /// Record attempts before awaiting execution: an error or cancellation
     /// does not prove the provider left the workspace unchanged. Review
@@ -313,6 +321,7 @@ impl FallbackReasoner {
         opts: &ReasonerOpts,
         user_message: &str,
         transcript: bool,
+        revision_authors: Option<&[ProviderKind]>,
     ) -> anyhow::Result<String> {
         let class = classify(opts);
         let mut request_opts = opts.clone();
@@ -335,6 +344,10 @@ impl FallbackReasoner {
 
         for entry in &self.entries {
             let name = entry.kind.name();
+            if revision_authors.is_some_and(|authors| !authors.contains(&entry.kind)) {
+                diagnostics.push(format!("{name}: reserved for independent review"));
+                continue;
+            }
             if !allowed_for(entry.kind, class) {
                 diagnostics.push(format!("{name}: skipped ({class:?} unsupported)"));
                 continue;
@@ -472,7 +485,7 @@ impl FallbackReasoner {
 #[async_trait]
 impl Reasoner for FallbackReasoner {
     async fn call(&self, opts: &ReasonerOpts, user_message: &str) -> anyhow::Result<String> {
-        self.dispatch(opts, user_message, false).await
+        self.dispatch(opts, user_message, false, None).await
     }
 
     /// Forwarded explicitly so the LastBlock/AllBlocks capture semantics
@@ -483,7 +496,7 @@ impl Reasoner for FallbackReasoner {
         opts: &ReasonerOpts,
         user_message: &str,
     ) -> anyhow::Result<String> {
-        self.dispatch(opts, user_message, true).await
+        self.dispatch(opts, user_message, true, None).await
     }
 }
 
@@ -493,6 +506,63 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ---- #828: single-provider pinning for the independent review ----
+
+    #[tokio::test]
+    async fn revisions_keep_original_builder_after_primary_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = Scripted::ok("primary must remain independent");
+        let builder = Scripted::ok("revision");
+        let mut fb = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>),
+            (ProviderKind::Codex, builder.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
+        fb.handoff_root = Some(dir.path().join("private/handoffs"));
+        fb.track_review_history(dir.path(), "synthetic-revision", false).unwrap();
+        let path = fb.review_history.lock().unwrap().clone().unwrap();
+        crate::review_history::record(&path, ProviderKind::Codex).unwrap();
+        let mut opts = text_only_opts();
+        opts.allowed_tools = vec!["Write".into()];
+        assert_eq!(fb.call_revision(&opts, "repair regression").await.unwrap(), "revision");
+        assert_eq!(primary.count(), 0);
+        assert_eq!(builder.count(), 1);
+        assert_eq!(fb.review_authors().unwrap(), Some(vec![ProviderKind::Codex]));
+    }
+
+    #[tokio::test]
+    async fn revision_builder_failure_never_dispatches_independent_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let reviewer = Scripted::ok("must remain independent");
+        let builder = Scripted::err(rate_limited);
+        let mut fb = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, builder.clone() as Arc<dyn Reasoner>),
+            (ProviderKind::Claude, reviewer.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
+        fb.handoff_root = Some(dir.path().join("private/handoffs"));
+        fb.track_review_history(dir.path(), "synthetic-unavailable-builder", false).unwrap();
+        let path = fb.review_history.lock().unwrap().clone().unwrap();
+        crate::review_history::record(&path, ProviderKind::Codex).unwrap();
+        let mut opts = text_only_opts();
+        opts.allowed_tools = vec!["Write".into()];
+        assert!(fb.call_revision(&opts, "repair").await.is_err());
+        assert!(fb.call_revision(&opts, "retry while latched").await.is_err());
+        assert_eq!(builder.count(), 1);
+        assert_eq!(reviewer.count(), 0);
+        assert_eq!(fb.review_authors().unwrap(), Some(vec![ProviderKind::Codex]));
+    }
+
+    #[tokio::test]
+    async fn revision_refuses_unknown_or_empty_authorship() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = Scripted::ok("must not run");
+        let mut fb = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
+        fb.handoff_root = Some(dir.path().join("private/handoffs"));
+        assert!(fb.call_revision(&text_only_opts(), "repair").await.is_err());
+        fb.track_review_history(dir.path(), "synthetic-empty", false).unwrap();
+        assert!(fb.call_revision(&text_only_opts(), "repair").await.is_err());
+        assert_eq!(primary.count(), 0);
+    }
 
     #[tokio::test]
     async fn durable_authorship_is_required_before_a_bound_builder_runs() {

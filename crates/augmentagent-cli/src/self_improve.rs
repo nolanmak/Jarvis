@@ -4060,7 +4060,7 @@ async fn resume_draft_pr(
                 let (_ok, hunks, _) = run("git", &["diff"], &worktree).await?;
                 builder_ran = true;
                 match reasoner
-                    .call(
+                    .call_revision(
                         &fix_opts(worktree.clone()),
                         &build_conflict_prompt(&issue, &pr_body, &files, &hunks),
                     )
@@ -4261,7 +4261,7 @@ async fn resume_draft_pr(
             rounds_done += 1;
             info!(pr, issue = issue.number, round = rounds_done, lines_now, "resume: shrink round");
             match reasoner
-                .call(
+                .call_revision(
                     &fix_opts(worktree.clone()),
                     &build_revise_prompt(&issue, &shrink_findings(lines_now), lines_now, prior_attempts.as_deref()),
                 )
@@ -4341,7 +4341,7 @@ async fn resume_draft_pr(
                     "resume: gate-repair round"
                 );
                 match reasoner
-                    .call(
+                    .call_revision(
                         &fix_opts(worktree.clone()),
                         &build_revise_prompt(&issue, &gate_findings(&gate_text), lines_now, prior_attempts.as_deref()),
                     )
@@ -4398,6 +4398,24 @@ async fn resume_draft_pr(
             independent_review(reasoner, &issue, &summary, &diff, worktree.clone(), prior_notes.as_deref(), &resumed_criteria)
                 .await;
         prior_notes = Some(independent.notes.clone());
+        if !independent.available {
+            // Capacity cannot be repaired by another code revision. Preserve
+            // the draft and retry after recovery without consuming rejection
+            // attempts or recruiting the reviewer as a builder.
+            if !dry_run {
+                let (ok, _, error) = run("git", &["push", "origin", branch], &worktree).await?;
+                if !ok {
+                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                    bail!("resume: preserving draft failed: {error}");
+                }
+                let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body",
+                    "Auto-resume: independent review capacity is unavailable. Verified changes remain in this draft; merge is blocked until an independent reviewer is available."], repo_root).await;
+            }
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            return Ok(RunReport::built(format!(
+                "PR #{pr}: independent review unavailable; still draft"
+            )));
+        }
         // #936 — CodeRabbit is the (advisory) third reviewer. It judges the
         // PUSHED head, so push first (a no-op when nothing changed).
         let rabbit = if dry_run {
@@ -4566,7 +4584,7 @@ async fn resume_draft_pr(
             "resume: revising against findings"
         );
         let rev_summary = match reasoner
-            .call(
+            .call_revision(
                 &fix_opts(worktree.clone()),
                 &build_revise_prompt(&issue, &findings, lines_now, prior_attempts.as_deref()),
             )
@@ -5267,7 +5285,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // shrink ⇒ the refusal below proceeds unchanged.
         info!(issue = issue.number, lines, "initial diff over cap; one shrink attempt");
         if let Ok(rs) = reasoner
-            .call(
+            .call_revision(
                 &fix_opts(worktree.clone()),
                 &build_revise_prompt(&issue, &shrink_findings(lines), lines, prior_attempts.as_deref()),
             )
@@ -5469,7 +5487,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         info!(issue = issue.number, round, max_rounds, "revising against the independent findings");
         let round1 = independent.status();
         match reasoner
-            .call(
+            .call_revision(
                 &fix_opts(worktree.clone()),
                 &build_revise_prompt(&issue, &findings, lines, prior_attempts.as_deref()),
             )
@@ -5694,7 +5712,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 "commit refused by the personal-data guard; one repair round"
             );
             match reasoner
-                .call(&fix_opts(worktree.clone()), &build_pii_fix_prompt(&hits))
+                .call_revision(&fix_opts(worktree.clone()), &build_pii_fix_prompt(&hits))
                 .await
             {
                 Ok(summary_of_fix) => {
@@ -7726,6 +7744,10 @@ impl AutoPrLoop {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "self_improve_lifecycle_tests.rs"]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {

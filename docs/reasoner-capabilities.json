@@ -341,7 +341,9 @@
       "callsite": "crates/augmentagent-cli/src/self_improve.rs::codex_review_opts",
       "permission_profile": "text",
       "output_contract": "Independent review of supplied diff and caller evidence",
-      "conformance": [],
+      "conformance": [
+        "self_improve::lifecycle_tests::live_fallback_pipeline_resumes_after_independent_reviewer_recovers"
+      ],
       "provider_conformance": "pending"
     },
     {
@@ -349,7 +351,8 @@
       "permission_profile": "source-build",
       "output_contract": "Source edits and verification results; no self-approval",
       "conformance": [
-        "self_improve::tests::live_codex_fallback_builder_fixes_code_and_runs_red_green_tests"
+        "self_improve::tests::live_codex_fallback_builder_fixes_code_and_runs_red_green_tests",
+        "self_improve::lifecycle_tests::live_fallback_pipeline_resumes_after_independent_reviewer_recovers"
       ],
       "provider_conformance": "pending"
     },
@@ -359,7 +362,8 @@
       "output_contract": "Review findings and acceptance grading",
       "conformance": [
         "self_improve::tests::source_inspection_presets_enforce_read_only_bridge_access",
-        "self_improve::tests::live_codex_scopes_source_and_rejects_an_incomplete_fix"
+        "self_improve::tests::live_codex_scopes_source_and_rejects_an_incomplete_fix",
+        "self_improve::lifecycle_tests::live_fallback_pipeline_resumes_after_independent_reviewer_recovers"
       ],
       "provider_conformance": "pending"
     },
@@ -369,7 +373,8 @@
       "output_contract": "Scope verdict, complexity, implementation plan and acceptance criteria",
       "conformance": [
         "self_improve::tests::source_inspection_presets_enforce_read_only_bridge_access",
-        "self_improve::tests::live_codex_scopes_source_and_rejects_an_incomplete_fix"
+        "self_improve::tests::live_codex_scopes_source_and_rejects_an_incomplete_fix",
+        "self_improve::lifecycle_tests::live_fallback_pipeline_resumes_after_independent_reviewer_recovers"
       ],
       "provider_conformance": "pending"
     }
