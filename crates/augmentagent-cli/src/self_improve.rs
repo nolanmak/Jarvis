@@ -1333,7 +1333,16 @@ async fn merge_sweep(repo_root: &Path) -> usize {
                 info!("merge sweep skipped {why}");
             }
             SweepVerdict::Merge => {
-                let _ = run(&gh, &["pr", "ready", &pr.to_string()], repo_root).await;
+                // Marking ready is a state change, and the merge right after
+                // it can still fail — a check that went red between the read
+                // and now, mergeability that changed, branch protection. The
+                // contract is "merge, or leave it alone", so a failure here
+                // must put the draft back: the sweep only ever considers
+                // drafts, and a PR stranded as ready would drop out of every
+                // future sweep as well as not having merged.
+                let (readied, ..) = run(&gh, &["pr", "ready", &pr.to_string()], repo_root)
+                    .await
+                    .unwrap_or((false, String::new(), String::new()));
                 let (ok, _o, e) = run(
                     &gh,
                     &["pr", "merge", &pr.to_string(), "--squash", "--delete-branch"],
@@ -1341,6 +1350,19 @@ async fn merge_sweep(repo_root: &Path) -> usize {
                 )
                 .await
                 .unwrap_or((false, String::new(), "spawn failed".into()));
+                if !ok && readied {
+                    let (undone, ..) =
+                        run(&gh, &["pr", "ready", &pr.to_string(), "--undo"], repo_root)
+                            .await
+                            .unwrap_or((false, String::new(), String::new()));
+                    if !undone {
+                        warn!(
+                            pr = candidate.pr,
+                            "merge sweep: merge failed AND the draft state could \
+                             not be restored; this PR needs a human"
+                        );
+                    }
+                }
                 if ok {
                     merged += 1;
                     info!(
@@ -10915,6 +10937,32 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             reader.contains("return true;"),
             "an unknown head must count as blocking, not as approval"
         );
+    }
+
+    /// Codex: `gh pr ready` is a state change and the merge after it can
+    /// still fail. Leaving the PR ready-but-unmerged breaks "merge, or leave
+    /// it alone" twice over — the sweep only ever considers DRAFTS, so a
+    /// stranded PR also falls out of every future sweep.
+    #[test]
+    fn a_failed_merge_puts_the_draft_back() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn merge_sweep(").expect("the sweep");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+
+        let ready = body.find(r#""pr", "ready""#).expect("the sweep marks ready");
+        let merge = body.find(r#""pr", "merge""#).expect("then merges");
+        assert!(ready < merge, "ready comes first");
+        assert!(
+            body[merge..].contains(r#""--undo""#),
+            "a failed merge must restore the draft state"
+        );
+        // The revert must be conditional on the merge having failed, not
+        // unconditional, and must only undo a transition we made.
+        let undo = body[merge..].find(r#""--undo""#).expect("the undo");
+        let guard = body[merge..merge + undo].rfind("if ").expect("a guard");
+        let cond = &body[merge + guard..merge + undo];
+        assert!(cond.contains("!ok"), "only on failure: {cond:?}");
+        assert!(cond.contains("readied"), "only if we made the transition: {cond:?}");
     }
 
     /// C1, C5, C7 — the sweep runs while capped, spends no reasoner call, and
