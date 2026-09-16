@@ -1418,6 +1418,20 @@ async fn merge_sweep(repo_root: &Path) -> usize {
                 let (readied, ..) = run(&gh, &["pr", "ready", &pr.to_string()], repo_root)
                     .await
                     .unwrap_or((false, String::new(), String::new()));
+                // Codex: a check can go green-to-red without a new commit —
+                // a CI re-run, a flaky job retried, a required check added.
+                // `--match-head-commit` catches a moved HEAD, not a changed
+                // verdict on the same one, so the checks are re-read after
+                // readying and immediately before merging.
+                if checks_green(repo_root, pr).await != Some(true) {
+                    warn!(pr, "merge sweep: checks are no longer green; leaving it alone");
+                    if readied {
+                        let _ = run(&gh, &["pr", "ready", &pr.to_string(), "--undo"], repo_root)
+                            .await;
+                    }
+                    continue;
+                }
+
                 // Pin the head. Everything above was read from a snapshot;
                 // a commit pushed between that read and this call would
                 // otherwise merge without either codex pass having seen it.
@@ -11455,6 +11469,30 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(
             body[merge..].contains(r#""--match-head-commit""#),
             "the merge must pin the validated head, or the checks are a TOCTOU"
+        );
+
+        // Codex: pinning the head catches a moved commit, not a check that
+        // went green-to-red on the SAME commit — a CI re-run, a flaky job
+        // retried, a required check added. So the checks are re-read after
+        // readying and immediately before merging.
+        let rechecks: Vec<usize> = body
+            .match_indices("checks_green(")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            rechecks.len() >= 2,
+            "checks must be read again just before the merge, not only at scan time"
+        );
+        let last = *rechecks.last().unwrap();
+        assert!(
+            ready < last && last < merge,
+            "the re-read must sit between readying and merging: \
+             ready={ready} recheck={last} merge={merge}"
+        );
+        // And a red re-read must put the draft back rather than merge.
+        assert!(
+            body[last..merge].contains(r#""--undo""#),
+            "a check that went red after readying must restore the draft"
         );
         assert!(
             body[merge..].contains(r#""--undo""#),
