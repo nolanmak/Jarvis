@@ -1,5 +1,5 @@
 //! Source inventory: adding a production preset requires an explicit contract.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use syn::visit::{self, Visit};
 
@@ -9,14 +9,31 @@ fn test_only(attributes: &[syn::Attribute]) -> bool {
             .is_ok_and(|path| path.is_ident("test"))))
 }
 
+/// What the scanner learned about one production callsite.
+#[derive(Default, Debug)]
+struct Site {
+    /// Builds a `ReasonerOpts` (a literal naming `model`, or
+    /// `ReasonerOpts::pinned`) rather than wrapping or narrowing one built
+    /// elsewhere.
+    constructs: bool,
+    /// #448/#1046: a literal `model: None` or an `opts.model = None`. No
+    /// `--model` flag is emitted, so the spawned CLI inherits the owner's
+    /// interactive `~/.claude/settings.json` model and quota.
+    unpinned: bool,
+    /// Tiers the source states: the `ModelTier` passed to
+    /// `ReasonerOpts::pinned`, or what a literal model id implies (haiku is
+    /// fast, anything else quality, as in `providers::tier_of`).
+    tiers: BTreeSet<String>,
+}
+
 #[derive(Default)]
 struct Inventory {
     scope: Vec<String>,
-    presets: BTreeSet<String>,
+    presets: BTreeMap<String, Site>,
 }
 
 impl Inventory {
-    fn record(&mut self) { self.presets.insert(self.scope.join("::")); }
+    fn record(&mut self) -> &mut Site { self.presets.entry(self.scope.join("::")).or_default() }
     fn returns_opts(&mut self, signature: &syn::Signature) {
         if let syn::ReturnType::Type(_, ty) = &signature.output {
             if let syn::Type::Path(path) = &**ty {
@@ -26,9 +43,26 @@ impl Inventory {
             }
         }
     }
-    fn policy_field(expression: &syn::Expr) -> bool {
+    fn named_field(expression: &syn::Expr, names: &[&str]) -> bool {
         matches!(expression, syn::Expr::Field(field) if matches!(&field.member,
-            syn::Member::Named(name) if name == "allowed_tools" || name == "settings_json"))
+            syn::Member::Named(name) if names.iter().any(|wanted| name == wanted)))
+    }
+    fn policy_field(expression: &syn::Expr) -> bool {
+        Self::named_field(expression, &["allowed_tools", "settings_json"])
+    }
+    fn is_none(expression: &syn::Expr) -> bool {
+        matches!(expression, syn::Expr::Path(path) if path.path.is_ident("None"))
+    }
+    /// The model id in `Some("claude-…".into())`-shaped literals; `None` when
+    /// the model comes from a helper or env lookup (checked at runtime instead).
+    fn literal_model(expression: &syn::Expr) -> Option<String> {
+        match expression {
+            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(value), .. }) => Some(value.value()),
+            syn::Expr::Call(call) if matches!(&*call.func,
+                syn::Expr::Path(path) if path.path.is_ident("Some")) => call.args.first().and_then(Self::literal_model),
+            syn::Expr::MethodCall(call) if call.args.is_empty() => Self::literal_model(&call.receiver),
+            _ => None,
+        }
     }
 }
 
@@ -55,12 +89,52 @@ impl<'ast> Visit<'ast> for Inventory {
     }
     fn visit_expr_struct(&mut self, item: &'ast syn::ExprStruct) {
         if item.path.segments.last().is_some_and(|segment| segment.ident == "ReasonerOpts") {
-            self.record();
+            let model = item.fields.iter().find(|field| matches!(&field.member,
+                syn::Member::Named(name) if name == "model")).map(|field| &field.expr);
+            let site = self.record();
+            if let Some(model) = model {
+                site.constructs = true;
+                if Self::is_none(model) {
+                    site.unpinned = true;
+                } else if let Some(id) = Self::literal_model(model) {
+                    site.tiers.insert(if id.to_ascii_lowercase().contains("haiku") { "fast" } else { "quality" }.into());
+                }
+            }
         }
         visit::visit_expr_struct(self, item);
     }
+    fn visit_expr_call(&mut self, item: &'ast syn::ExprCall) {
+        // #1046: `ReasonerOpts::pinned(tier, prompt)` is a construction whose
+        // tier is spelled at the call site.
+        if let syn::Expr::Path(path) = &*item.func {
+            let segments: Vec<String> = path.path.segments.iter().rev().take(2)
+                .map(|segment| segment.ident.to_string()).collect();
+            if segments == ["pinned", "ReasonerOpts"] {
+                // Only a spelled-out `ModelTier::Quality` / `ModelTier::Fast`
+                // can be checked against the manifest; a variable cannot.
+                let tier = match item.args.first() {
+                    Some(syn::Expr::Path(tier)) => {
+                        let names: Vec<String> = tier.path.segments.iter()
+                            .map(|segment| segment.ident.to_string()).collect();
+                        match names.as_slice() {
+                            [.., kind, name] if kind == "ModelTier" => Some(name.to_ascii_lowercase()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let site = self.record();
+                site.constructs = true;
+                site.tiers.insert(tier.unwrap_or_else(|| "unstated at the call site".into()));
+            }
+        }
+        visit::visit_expr_call(self, item);
+    }
     fn visit_expr_assign(&mut self, item: &'ast syn::ExprAssign) {
         if Self::policy_field(&item.left) { self.record(); }
+        if Self::named_field(&item.left, &["model"]) && Self::is_none(&item.right) {
+            self.record().unpinned = true;
+        }
         visit::visit_expr_assign(self, item);
     }
     fn visit_expr_method_call(&mut self, item: &'ast syn::ExprMethodCall) {
@@ -72,7 +146,7 @@ impl<'ast> Visit<'ast> for Inventory {
     }
 }
 
-fn collect(directory: &Path, root: &Path, found: &mut BTreeSet<String>) {
+fn collect(directory: &Path, root: &Path, found: &mut BTreeMap<String, Site>) {
     for entry in std::fs::read_dir(directory).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() { collect(&path, root, found); }
@@ -81,21 +155,28 @@ fn collect(directory: &Path, root: &Path, found: &mut BTreeSet<String>) {
             let mut inventory = Inventory::default();
             inventory.visit_file(&syn::parse_file(&source).unwrap());
             let relative = path.strip_prefix(root).unwrap().to_string_lossy();
-            for name in inventory.presets { found.insert(format!("{relative}::{name}")); }
+            for (name, site) in inventory.presets { found.insert(format!("{relative}::{name}"), site); }
         }
     }
 }
 
-#[test]
-fn inventory_accounts_for_every_production_preset_and_wrapper() {
+/// Every production callsite in the workspace, plus the checked-in manifest.
+fn scan_workspace() -> (BTreeMap<String, Site>, serde_json::Value) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
-    let mut found = BTreeSet::new();
+    let mut found = BTreeMap::new();
     for entry in std::fs::read_dir(root.join("crates")).unwrap() {
         let src = entry.unwrap().path().join("src");
         if src.is_dir() { collect(&src, &root, &mut found); }
     }
-    let manifest: serde_json::Value = serde_json::from_slice(
+    let manifest = serde_json::from_slice(
         &std::fs::read(root.join("docs/reasoner-capabilities.json")).unwrap()).unwrap();
+    (found, manifest)
+}
+
+#[test]
+fn inventory_accounts_for_every_production_preset_and_wrapper() {
+    let (found, manifest) = scan_workspace();
+    let found: BTreeSet<String> = found.into_keys().collect();
     let entries = manifest["presets"].as_array().unwrap();
     let mut declared = BTreeSet::new();
     for entry in entries {
@@ -113,9 +194,39 @@ fn inventory_accounts_for_every_production_preset_and_wrapper() {
     assert_eq!(found, declared, "production presets changed; update the capability contract and conformance coverage");
 }
 
+/// #448/#1046: `model: None` emits no `--model`, so the spawned CLI inherits
+/// the owner's interactive model and bills their subscription. Every
+/// production construction must pin a model, and the manifest must document
+/// the tier each callsite runs on, agreeing with any tier the source states.
+#[test]
+fn every_production_callsite_pins_its_documented_model_tier() {
+    let (found, manifest) = scan_workspace();
+    let unpinned: Vec<&String> = found.iter().filter(|(_, site)| site.unpinned).map(|(name, _)| name).collect();
+    assert!(unpinned.is_empty(), "production callsites build ReasonerOpts with model: None and inherit \
+        the owner's interactive model (#448); build them with ReasonerOpts::pinned(tier, ..): {unpinned:#?}");
+    for entry in manifest["presets"].as_array().unwrap() {
+        let callsite = entry["callsite"].as_str().unwrap();
+        let tier = entry["model_tier"].as_str().unwrap_or_default();
+        assert!(entry["tier_rationale"].as_str().is_some_and(|why| !why.trim().is_empty()),
+            "missing tier_rationale: {callsite}");
+        // A callsite missing from source is reported by the inventory test.
+        let Some(site) = found.get(callsite) else { continue };
+        if site.constructs {
+            assert!(matches!(tier, "quality" | "fast"),
+                "{callsite} builds ReasonerOpts: model_tier must be \"quality\" or \"fast\", got {tier:?}");
+        } else {
+            assert_eq!(tier, "preserved",
+                "{callsite} wraps options built elsewhere: model_tier must be \"preserved\"");
+        }
+        for stated in &site.tiers {
+            assert_eq!(stated, tier, "{callsite}: source pins {stated} but the manifest documents {tier}");
+        }
+    }
+}
+
 #[test]
 fn core_presets_match_permission_contracts() {
-    use augmentagent_channel_core::{reasoner::*, providers::{classify, CapabilityClass::*}, codex_tools::BridgeLaunch};
+    use augmentagent_channel_core::{reasoner::*, providers::{classify, tier_of, ModelTier, CapabilityClass::*}, codex_tools::BridgeLaunch};
     let fixture = tempfile::tempdir().unwrap();
     let wiki = fixture.path().join("wiki");
     std::fs::create_dir(&wiki).unwrap();
@@ -148,6 +259,10 @@ fn core_presets_match_permission_contracts() {
         let entry = manifest["presets"].as_array().unwrap().iter().find(|entry| entry["callsite"] == site).unwrap();
         assert!(entry["conformance"].as_array().unwrap().iter().any(|test|
             test == "capability_inventory::core_presets_match_permission_contracts"));
+        // Presets whose model comes from a helper or env lookup are only
+        // checkable at runtime; this keeps the documented tier honest.
+        let tier = match tier_of(&opts) { ModelTier::Quality => "quality", ModelTier::Fast => "fast" };
+        assert_eq!(entry["model_tier"], tier, "{name}: documented model tier drifted");
     }
     for opts in [triage_opts(None), draft_opts("Synthetic".into(), None), digest_opts(None)] {
         assert_eq!(classify(&opts), TextOnly, "optional wiki context must not grant tools when absent");
@@ -331,5 +446,32 @@ fn scanner_handles_presets_after_test_modules_and_opt_in_wrappers() {
     "#;
     let mut inventory = Inventory::default();
     inventory.visit_file(&syn::parse_file(source).unwrap());
-    assert_eq!(inventory.presets, BTreeSet::from(["resume_opts".into(), "optional".into(), "handle".into(), "mutate".into()]));
+    assert_eq!(inventory.presets.into_keys().collect::<BTreeSet<String>>(),
+        BTreeSet::from(["resume_opts".into(), "optional".into(), "handle".into(), "mutate".into()]));
+}
+
+#[test]
+fn scanner_reports_unpinned_models_and_stated_tiers() {
+    let source = r#"
+        #[cfg(test)] mod tests { fn fixture() -> ReasonerOpts { ReasonerOpts { model: None } } }
+        fn inherits() { let opts = core::ReasonerOpts { system_prompt: s, model: None }; }
+        fn clears(opts: &mut ReasonerOpts) { opts.model = None; }
+        fn cheap() -> ReasonerOpts { ReasonerOpts { model: Some("claude-haiku-4-5".into()) } }
+        fn helper() -> ReasonerOpts { ReasonerOpts { model: Some(opus_model()) } }
+        impl Channel { async fn handle(&self) { let o = core::ReasonerOpts::pinned(core::ModelTier::Quality, p); } }
+        fn dynamic(t: ModelTier) { let o = ReasonerOpts::pinned(t, p); }
+        fn wraps(opts: ReasonerOpts) -> ReasonerOpts { opts }
+    "#;
+    let mut inventory = Inventory::default();
+    inventory.visit_file(&syn::parse_file(source).unwrap());
+    let sites = inventory.presets;
+    assert!(!sites.contains_key("tests::fixture"), "test modules are not production callsites");
+    assert!(sites["inherits"].unpinned && sites["inherits"].constructs);
+    assert!(sites["clears"].unpinned);
+    assert_eq!(sites["cheap"].tiers, BTreeSet::from(["fast".into()]));
+    assert!(!sites["helper"].unpinned && sites["helper"].constructs && sites["helper"].tiers.is_empty());
+    assert!(sites["handle"].constructs && !sites["handle"].unpinned);
+    assert_eq!(sites["handle"].tiers, BTreeSet::from(["quality".into()]));
+    assert_eq!(sites["dynamic"].tiers, BTreeSet::from(["unstated at the call site".into()]));
+    assert!(!sites["wraps"].constructs && sites["wraps"].tiers.is_empty());
 }

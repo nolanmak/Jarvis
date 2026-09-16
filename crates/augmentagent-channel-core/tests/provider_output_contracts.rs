@@ -1,7 +1,7 @@
 //! Shared live output contracts using production presets and synthetic inputs.
 //! These tests do not send messages or read account data.
 use augmentagent_channel_core::{archetype, codex::CodexCliReasoner, decision,
-    reasoner::{self, ClaudeCliReasoner, Reasoner}};
+    reasoner::{self, ClaudeCliReasoner, Reasoner, ReasonerOpts}};
 use serde_json::Value;
 
 // Consumers tolerate fenced JSON; tone profiles store the descriptor as text.
@@ -50,14 +50,29 @@ async fn structured_outputs(provider: &dyn Reasoner) {
 
 mod common;
 
+/// The code-mode draft profile. All seven communication handlers construct
+/// this exact model/tool profile.
+fn code_mode_draft_options(manifest: &augmentagent_channel_core::code_mode::ToolManifest) -> ReasonerOpts {
+    ReasonerOpts::pinned(augmentagent_channel_core::ModelTier::Quality,
+        augmentagent_channel_core::prompt::code_mode_system(manifest))
+}
+
+/// #1046: the profile pins the quality-tier model instead of inheriting the
+/// owner's interactive `~/.claude/settings.json` model (#448).
+#[test]
+fn code_mode_draft_profile_pins_the_quality_model() {
+    use augmentagent_channel_core::providers::{classify, model_for, CapabilityClass, ModelTier, ProviderKind};
+    let options = code_mode_draft_options(&augmentagent_channel_core::code_mode::manifest_v1());
+    assert_eq!(options.model, Some(model_for(ProviderKind::Claude, ModelTier::Quality)),
+        "code-mode drafts must pass --model, not inherit the owner's interactive model");
+    assert_eq!(classify(&options), CapabilityClass::TextOnly, "host tools stay disabled");
+}
+
 async fn executable_draft(provider: &dyn Reasoner) {
     use augmentagent_channel_core::{code_mode, prompt};
     use augmentagent_store::{Store, models::Email};
     let manifest = code_mode::manifest_v1();
-    let mut options = reasoner::triage_opts(None);
-    // All seven communication handlers construct this exact model/tool profile.
-    options.system_prompt = prompt::code_mode_system(&manifest);
-    options.model = None;
+    let options = code_mode_draft_options(&manifest);
     let fixture = tempfile::tempdir().unwrap();
     let db = fixture.path().join("synthetic.db");
     common::seed_node_owned_tables(&db);

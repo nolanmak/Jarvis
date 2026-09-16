@@ -144,12 +144,22 @@ pub fn allowed_for(kind: ProviderKind, class: CapabilityClass) -> bool {
     }
 }
 
+/// The env var the Opus presets have always read. See [`model_for`].
+pub const OPUS_MODEL_ENV: &str = "AUGMENTAGENT_OPUS_MODEL";
+
 /// Default tier→model map per provider. Every cell is overridable without a
 /// rebuild via `AUGMENTAGENT_MODEL_<PROVIDER>_<TIER>` (e.g.
 /// `AUGMENTAGENT_MODEL_CODEX_QUALITY=gpt-5.6-sol`) — the "swap models in and
 /// out" requirement. Defaults chosen 2026-08-19; the doctor check (#667)
 /// flags pinned ids that stop existing (Cerebras deprecated five model
 /// families in twelve months).
+///
+/// #1046: the Claude quality cell is the one knob for every Opus-class Claude
+/// call. [`OPUS_MODEL_ENV`], which the Opus presets have always read, wins;
+/// then `AUGMENTAGENT_MODEL_CLAUDE_QUALITY`; then the default. The presets
+/// (`draft_opts`, `lint_opts`, …), `ReasonerOpts::pinned(Quality, ..)` and the
+/// reasoner selftest all resolve here, so a classic draft and the code-mode
+/// draft it falls back from can never run different models.
 pub fn model_for(kind: ProviderKind, tier: ModelTier) -> String {
     let tier_name = match tier {
         ModelTier::Quality => "QUALITY",
@@ -160,17 +170,24 @@ pub fn model_for(kind: ProviderKind, tier: ModelTier) -> String {
         kind.name().to_ascii_uppercase(),
         tier_name
     );
-    if let Ok(v) = std::env::var(&env_key) {
-        let v = v.trim().to_string();
-        if !v.is_empty() {
-            return v;
+    let mut keys = Vec::with_capacity(2);
+    if kind == ProviderKind::Claude && tier == ModelTier::Quality {
+        keys.push(OPUS_MODEL_ENV);
+    }
+    keys.push(env_key.as_str());
+    for key in keys {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return v;
+            }
         }
     }
     match (kind, tier) {
-        // Claude cells are unused in practice (presets pin their own model,
-        // which the Claude adapter passes through) but kept total so the
-        // map has no panicking holes.
-        (ProviderKind::Claude, ModelTier::Quality) => "claude-opus-4-8".into(),
+        // Every quality-tier Claude call resolves through this cell (see
+        // above). The fast cell serves `ReasonerOpts::pinned(Fast, ..)`; the
+        // Haiku presets still pin their own id.
+        (ProviderKind::Claude, ModelTier::Quality) => crate::reasoner::OPUS_MODEL.into(),
         (ProviderKind::Claude, ModelTier::Fast) => "claude-haiku-4-5-20251001".into(),
         (ProviderKind::Codex, ModelTier::Quality) => "gpt-5.6-terra".into(),
         (ProviderKind::Codex, ModelTier::Fast) => "gpt-5.6-luna".into(),

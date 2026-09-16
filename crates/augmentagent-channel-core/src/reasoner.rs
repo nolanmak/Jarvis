@@ -518,6 +518,42 @@ pub struct ReasonerOpts {
     pub handoff_path: Option<PathBuf>,
 }
 
+impl ReasonerOpts {
+    /// #1046: text-only opts with the model pinned by tier.
+    ///
+    /// Call sites outside the `*_opts` presets used to build this struct by
+    /// hand with `model: None`. That emits no `--model` flag, so the spawned
+    /// CLI inherits the owner's interactive `~/.claude/settings.json` model
+    /// and quota (#448). Here the tier is a required argument, and the model
+    /// comes from the same per-provider tier map the fallback chain uses
+    /// ([`crate::providers::model_for`]). Quality follows the Opus presets'
+    /// knob, `AUGMENTAGENT_OPUS_MODEL` (then `AUGMENTAGENT_MODEL_CLAUDE_QUALITY`);
+    /// fast follows `AUGMENTAGENT_MODEL_CLAUDE_FAST`.
+    ///
+    /// No tools, no extra dirs, default permission mode. A call that needs
+    /// more should widen those fields explicitly. The model stays pinned.
+    pub fn pinned(tier: crate::providers::ModelTier, system_prompt: impl Into<String>) -> Self {
+        Self {
+            system_prompt: system_prompt.into(),
+            model: Some(crate::providers::model_for(
+                crate::providers::ProviderKind::Claude,
+                tier,
+            )),
+            allowed_tools: Vec::new(),
+            add_dirs: Vec::new(),
+            permission_mode: "default".into(),
+            cwd: None,
+            env: Vec::new(),
+            settings_json: None,
+            restrict_env: false,
+            audit_logger: None,
+            audit_notifier: None,
+            session_id: None,
+            handoff_path: None,
+        }
+    }
+}
+
 /// Trait the channel uses to reach Claude. Test doubles stub this.
 ///
 /// `call_code_mode` and `call_code_mode_with_repair` are sibling entrypoints
@@ -1389,13 +1425,19 @@ fn triage_model() -> String {
 /// background draft, digest and answer onto their Max subscription. Saying
 /// "Opus" out loud makes the intent real and the daemon immune to `/model`.
 ///
-/// Overridable via `AUGMENTAGENT_OPUS_MODEL` for a no-rebuild tier change.
+/// Overridable via `AUGMENTAGENT_OPUS_MODEL` for a no-rebuild tier change
+/// (or `AUGMENTAGENT_MODEL_CLAUDE_QUALITY`, which it outranks). #1046: this
+/// is the Claude quality cell of the provider tier map, so the presets and
+/// `ReasonerOpts::pinned(ModelTier::Quality, ..)` always agree.
 fn opus_model() -> String {
-    std::env::var("AUGMENTAGENT_OPUS_MODEL").unwrap_or_else(|_| OPUS_MODEL.to_string())
+    crate::providers::model_for(
+        crate::providers::ProviderKind::Claude,
+        crate::providers::ModelTier::Quality,
+    )
 }
 
 /// Default tier for the quality-critical presets. See [`opus_model`].
-const OPUS_MODEL: &str = "claude-opus-4-8";
+pub(crate) const OPUS_MODEL: &str = "claude-opus-4-8";
 
 /// Default triage tier. Opus is a deliberate quality call (see `triage_opts`) —
 /// what #448 removes is the *inherited* `opus[1m]` / `xhigh` variant, not Opus.
@@ -3409,7 +3451,10 @@ mod model_pin_tests {
     /// their own coding.
     ///
     /// Every preset the daemon runs unattended must name its model out loud.
-    /// If you add a preset, pin it — do not let `None` back in.
+    /// If you add a preset, pin it — do not let `None` back in. Call sites
+    /// outside these presets are covered by the source scan in
+    /// `capability_inventory::every_production_callsite_pins_its_documented_model_tier`
+    /// (#1046).
     #[test]
     fn no_daemon_preset_inherits_the_owners_interactive_model() {
         let wiki = PathBuf::from("/tmp/wiki");
@@ -3427,6 +3472,8 @@ mod model_pin_tests {
             ("archetype_pick", archetype_pick_opts()),
             ("ingest", ingest_opts("sys".into(), wiki.clone())),
             ("wiki_migrate", wiki_migrate_opts("sys".into(), wiki.clone())),
+            ("pinned(Quality)", ReasonerOpts::pinned(crate::providers::ModelTier::Quality, "sys")),
+            ("pinned(Fast)", ReasonerOpts::pinned(crate::providers::ModelTier::Fast, "sys")),
         ];
         for (name, opts) in presets {
             let model = opts.model.as_deref().unwrap_or("");
@@ -3445,6 +3492,21 @@ mod model_pin_tests {
         }
     }
 
+    /// #1046: the tier constructor resolves through the provider tier map and
+    /// stays text-only, so it cannot widen a call site's tool surface.
+    #[test]
+    fn pinned_constructor_uses_the_claude_tier_map() {
+        use crate::providers::{classify, model_for, CapabilityClass, ModelTier, ProviderKind};
+        for tier in [ModelTier::Quality, ModelTier::Fast] {
+            let opts = ReasonerOpts::pinned(tier, "sys");
+            assert_eq!(opts.model, Some(model_for(ProviderKind::Claude, tier)));
+            assert_eq!(opts.system_prompt, "sys");
+            assert_eq!(opts.permission_mode, "default");
+            assert_eq!(classify(&opts), CapabilityClass::TextOnly);
+            assert!(opts.add_dirs.is_empty() && opts.cwd.is_none() && opts.env.is_empty());
+        }
+    }
+
     /// The env overrides exist so a tier change needs no rebuild.
     #[test]
     fn env_overrides_take_precedence() {
@@ -3452,6 +3514,95 @@ mod model_pin_tests {
         assert_eq!(TRIAGE_MODEL, "claude-opus-4-8");
         assert_eq!(OPUS_MODEL, "claude-opus-4-8");
         assert!(!TRIAGE_MODEL.contains("[1m]"));
+    }
+
+    /// #1046 review: one env var moves every quality-tier Claude call. The
+    /// Opus presets read `AUGMENTAGENT_OPUS_MODEL`; `ReasonerOpts::pinned`
+    /// resolves through `providers::model_for`. If the two resolved
+    /// differently, a classic `draft_opts` fallback and the code-mode draft
+    /// it replaces would run different models. Env is process-global, so
+    /// each scenario runs this test again in a child process.
+    #[test]
+    fn one_env_knob_moves_every_quality_tier_call() {
+        use crate::providers::{model_for, ModelTier, ProviderKind};
+        const CHILD: &str = "AUGMENTAGENT_TEST_1046_QUALITY_KNOB";
+        const OPUS: &str = "AUGMENTAGENT_OPUS_MODEL";
+        const CELL: &str = "AUGMENTAGENT_MODEL_CLAUDE_QUALITY";
+        let Ok(expected) = std::env::var(CHILD) else {
+            // (AUGMENTAGENT_OPUS_MODEL, AUGMENTAGENT_MODEL_CLAUDE_QUALITY, model every call must run)
+            for (opus, cell, want) in [
+                (Some("fixture-opus-knob"), None, "fixture-opus-knob"),
+                (None, Some("fixture-cell-knob"), "fixture-cell-knob"),
+                (
+                    Some("fixture-opus-knob"),
+                    Some("fixture-cell-knob"),
+                    "fixture-opus-knob",
+                ),
+                (None, None, OPUS_MODEL),
+            ] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "reasoner::model_pin_tests::one_env_knob_moves_every_quality_tier_call",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, want)
+                    .env_remove(OPUS)
+                    .env_remove(CELL);
+                if let Some(value) = opus {
+                    child.env(OPUS, value);
+                }
+                if let Some(value) = cell {
+                    child.env(CELL, value);
+                }
+                let output = child.output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains("1 passed"),
+                    "{OPUS}={opus:?} {CELL}={cell:?}:\n{stdout}{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let wiki = PathBuf::from("/nonexistent/wiki-1046");
+        let quality = [
+            ("draft_opts", draft_opts("sys".into(), None).model),
+            ("lint_opts", lint_opts("sys".into(), wiki.clone()).model),
+            (
+                "ask_opts",
+                ask_opts(wiki.clone(), PathBuf::from("/nonexistent/repo-1046")).model,
+            ),
+            ("digest_opts", digest_opts(None).model),
+            (
+                "social_adapter_opts",
+                social_adapter_opts("sys".into()).model,
+            ),
+            ("resume_opts", resume_opts(wiki).model),
+            (
+                "ReasonerOpts::pinned(Quality)",
+                ReasonerOpts::pinned(ModelTier::Quality, "sys").model,
+            ),
+            (
+                "model_for(Claude, Quality)",
+                Some(model_for(ProviderKind::Claude, ModelTier::Quality)),
+            ),
+        ];
+        for (name, model) in quality {
+            assert_eq!(
+                model.as_deref(),
+                Some(expected.as_str()),
+                "{name} did not follow the quality knob"
+            );
+        }
+        // The quality knob must not leak into the fast tier.
+        let fast = ReasonerOpts::pinned(ModelTier::Fast, "sys").model.unwrap();
+        assert_eq!(fast, model_for(ProviderKind::Claude, ModelTier::Fast));
+        assert!(
+            !fast.contains("fixture-"),
+            "quality knob leaked into the fast tier: {fast}"
+        );
     }
 }
 

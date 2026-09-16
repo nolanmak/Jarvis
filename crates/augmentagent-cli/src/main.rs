@@ -8331,14 +8331,16 @@ async fn run_reasoner_selftest(prompt: &str) -> Result<()> {
 
     // Text-only opts (no tools) so every configured provider is eligible —
     // this is the widest possible probe of the chain. Quality tier keeps the
-    // probe on the same models the important presets use.
+    // probe on the same models the important presets use: it resolves through
+    // the same knob as `draft_opts` (#1046).
     let opts = ReasonerOpts {
         system_prompt: "You are a diagnostic probe. Follow the user's instruction exactly, \
                         with no preamble."
             .into(),
-        model: Some(
-            std::env::var("AUGMENTAGENT_OPUS_MODEL").unwrap_or_else(|_| "claude-opus-4-8".into()),
-        ),
+        model: Some(augmentagent_channel_core::providers::model_for(
+            augmentagent_channel_core::ProviderKind::Claude,
+            augmentagent_channel_core::ModelTier::Quality,
+        )),
         allowed_tools: vec![],
         add_dirs: vec![],
         permission_mode: "default".into(),

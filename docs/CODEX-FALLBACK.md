@@ -245,6 +245,15 @@ substitute for MCP initialization or model output contracts. Provider execution/
 31 entries now have named conformance evidence; inventory and policy checks alone
 do not prove operational rollout.
 
+Each entry also records its `model_tier` (`quality`, `fast`, or `preserved` for
+wrappers that keep the model of the options they receive) and a
+`tier_rationale` (#1046). The same AST scan fails on any production
+construction that leaves `model: None`: no `--model` flag means the spawned CLI
+inherits the owner's interactive model (#448). It also fails when a tier spelled
+at a `ReasonerOpts::pinned(ModelTier::…)` call, or implied by a literal model id,
+disagrees with the manifest. Core presets whose model comes from a helper are
+checked at runtime against `providers::tier_of`.
+
 The live `live_wiki_query_profile_executes_files_and_memory_mcp` test uses the
 production query instructions, tool inventory and scope hook, with a synthetic
 wiki/database and a built memory server selected by `JARVIS_TEST_MEMORY_BIN`.
