@@ -1,0 +1,77 @@
+{
+  "rows": [
+    {
+      "actual": "fixable",
+      "base": "3bcd247",
+      "expect": "fixable",
+      "id": "E989",
+      "issue": 989,
+      "note": "complexity medium, est ~320 lines, 5 criteria",
+      "pass": true
+    },
+    {
+      "actual": "fixable",
+      "base": "350a2a3",
+      "expect": "fixable",
+      "id": "E962",
+      "issue": 962,
+      "note": "complexity hard, est ~500 lines, 5 criteria",
+      "pass": true
+    },
+    {
+      "actual": "fixable",
+      "base": "967fcd1",
+      "expect": "fixable",
+      "id": "E968",
+      "issue": 968,
+      "note": "complexity medium, est ~280 lines, 5 criteria",
+      "pass": true
+    },
+    {
+      "actual": "fixable",
+      "base": "d0db8e0",
+      "expect": "fixable",
+      "id": "E963",
+      "issue": 963,
+      "note": "complexity medium, est ~250 lines, 5 criteria",
+      "pass": true
+    },
+    {
+      "actual": "fixable",
+      "base": "26b7df7",
+      "expect": "fixable",
+      "id": "E954",
+      "issue": 954,
+      "note": "complexity hard, est ~450 lines, 5 criteria",
+      "pass": true
+    },
+    {
+      "actual": "not-fixable",
+      "base": null,
+      "expect": "not-fixable",
+      "id": "E977",
+      "issue": 977,
+      "note": "refused: This issue is an owner-action acceptance checklist, not a coding task: the implementation already exists and is merged (`crates/augmentagent-finance/` with connect/client/statements/export m…",
+      "pass": true
+    },
+    {
+      "actual": "not-fixable",
+      "base": null,
+      "expect": "not-fixable",
+      "id": "E929",
+      "issue": 929,
+      "note": "refused: This is a tracking epic, not a shippable unit: its completion is the closure of its dependency-ordered children (#926–#928), not a single focused diff, and a build against the tracker would …",
+      "pass": true
+    },
+    {
+      "actual": "not-fixable",
+      "base": null,
+      "expect": "not-fixable",
+      "id": "E882",
+      "issue": 882,
+      "note": "refused: This is a tracking/epic issue, not a unit of implementable work: four of its six sub-issues (#883–#886) are already shipped (the `augmentagent-channel-imessage` crate, sync CLI, and ingest k…",
+      "pass": true
+    }
+  ],
+  "started": "2026-09-16T01:36:20Z"
+}

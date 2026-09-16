@@ -584,7 +584,10 @@ pub async fn run(
         std::env::set_var(k, v);
     }
 
-    let saved_path = cases_path.with_file_name(".last-run.json");
+    // Committed, not ignored: `--report-only` must render the committed eval
+    // on a fresh clone without first spending a reasoner call per case, and a
+    // machine-readable baseline can be diffed rather than eyeballed.
+    let saved_path = cases_path.with_file_name("last-run.json");
     let mut started = started;
     let mut rows: Vec<EvalRow> = Vec::with_capacity(cases.len());
     if report_only {
@@ -1168,6 +1171,29 @@ mod tests {
     }
 
     // ---- C8: the committed fixture file is real and loads ----
+
+    /// Codex review: C8 requires `--report-only` to render the committed eval,
+    /// and it could not on a fresh clone because the saved run was ignored.
+    /// Committing it also gives the baseline a machine-readable twin, so a
+    /// later run can be diffed against it rather than eyeballed.
+    #[test]
+    fn the_committed_baseline_run_loads_and_matches_the_fixtures() {
+        let saved = include_str!("../../../eval/last-run.json");
+        let (rows, started) = load_run(saved).expect("the committed baseline must load");
+        assert!(!started.trim().is_empty(), "a baseline with no date cannot be compared");
+
+        let cases = parse_cases(include_str!("../../../eval/autopr-cases.json")).expect("fixtures");
+        assert_eq!(
+            rows.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            cases.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            "the baseline and the fixtures must describe the same suite"
+        );
+        assert!(
+            rows.iter().all(|r| r.pass),
+            "a baseline is only useful if it is the state we want to hold: {:?}",
+            rows.iter().filter(|r| !r.pass).map(|r| &r.id).collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn the_committed_fixture_file_parses_and_covers_both_expectations() {
