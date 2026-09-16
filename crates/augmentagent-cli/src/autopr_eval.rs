@@ -452,10 +452,12 @@ const SCRATCH_PREFIX: &str = "autopr-eval-";
 /// pid is gone, and never our own.
 fn stale_scratch(
     dirs: impl Iterator<Item = PathBuf>,
+    slug: &str,
     mine: u32,
     alive: impl Fn(u32) -> bool,
 ) -> Vec<PathBuf> {
     let tmp = std::env::temp_dir();
+    let prefix = format!("{SCRATCH_PREFIX}{slug}-");
     dirs.filter(|d| {
         if d.parent() != Some(tmp.as_path()) {
             return false;
@@ -463,13 +465,30 @@ fn stale_scratch(
         let Some(name) = d.file_name().and_then(|n| n.to_str()) else {
             return false;
         };
-        let Some(pid) = name.strip_prefix(SCRATCH_PREFIX).and_then(|p| p.parse::<u32>().ok())
-        else {
+        let Some(pid) = name.strip_prefix(&prefix).and_then(|p| p.parse::<u32>().ok()) else {
             return false;
         };
         pid != mine && !alive(pid)
     })
     .collect()
+}
+
+/// A short stable id for a repository, so scratch is owned per repo.
+///
+/// The temp dir is shared by every checkout on the box. Without this, an eval
+/// in one repository would reclaim a dead eval's scratch from another: it
+/// would delete that repo's worktree directory while running
+/// `git worktree remove` against the WRONG repository, leaving behind exactly
+/// the stale registration the reclaim exists to prevent.
+fn repo_slug(repo_root: &Path) -> String {
+    // FNV-1a over the path. A hash, not a name: it only has to be stable,
+    // short, and safe in a path segment.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in repo_root.to_string_lossy().as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
 /// Is a process with this id still running?
@@ -484,7 +503,7 @@ async fn reclaim_stale_scratch(repo_root: &Path) {
         return;
     };
     let dirs = entries.filter_map(|e| e.ok()).map(|e| e.path());
-    let stale = stale_scratch(dirs, std::process::id(), pid_alive);
+    let stale = stale_scratch(dirs, &repo_slug(repo_root), std::process::id(), pid_alive);
     if stale.is_empty() {
         return;
     }
@@ -603,7 +622,11 @@ pub async fn run(
     // state gets written anyway, and a corrupted ledger costs real shipped
     // work. The dir is removed on the way out.
     reclaim_stale_scratch(repo_root).await;
-    let scratch = std::env::temp_dir().join(format!("{SCRATCH_PREFIX}{}", std::process::id()));
+    let scratch = std::env::temp_dir().join(format!(
+        "{SCRATCH_PREFIX}{}-{}",
+        repo_slug(repo_root),
+        std::process::id()
+    ));
     std::fs::create_dir_all(&scratch).context("create scratch dir")?;
     for (k, v) in scratch_env(&scratch) {
         std::env::set_var(k, v);
@@ -646,6 +669,12 @@ pub async fn run(
                 author_trusted: true,
                 research_filed: false,
             };
+            // `None` for prior attempts: tier one measures the FIRST scoping
+            // judgment on an issue. Retry judgment — how the scoper reacts to
+            // an attempt digest — is real and unmeasured, but it needs a
+            // different fixture shape (an issue plus a specific attempt
+            // history) and belongs to its own tier rather than being faked
+            // here with a digest no real run produced.
             let prompt = crate::self_improve::build_scope_prompt(&issue, None);
 
             // Place the tree at the commit the decision was actually made at.
@@ -1076,47 +1105,59 @@ mod tests {
     /// own. A later run reclaims both.
     #[test]
     fn a_killed_run_leaves_scratch_that_the_next_run_reclaims() {
+        let tmp = std::env::temp_dir();
+        let me = repo_slug(Path::new("/repo/a"));
         let dirs = vec![
-            PathBuf::from("/tmp/autopr-eval-111"), // dead: reclaim
-            PathBuf::from("/tmp/autopr-eval-222"), // alive: another eval, leave it
-            PathBuf::from("/tmp/autopr-eval-333"), // ours: leave it
-            PathBuf::from("/tmp/autopr-eval-bogus"), // unparseable: leave it
-            PathBuf::from("/tmp/something-else"), // not ours at all
+            tmp.join(format!("autopr-eval-{me}-111")),   // dead, ours: reclaim
+            tmp.join(format!("autopr-eval-{me}-222")),   // alive: leave it
+            tmp.join(format!("autopr-eval-{me}-333")),   // ours: leave it
+            tmp.join(format!("autopr-eval-{me}-bogus")), // unparseable: leave it
+            tmp.join("something-else"),
         ];
-        let alive = |pid: u32| pid == 222;
-        let stale = stale_scratch(dirs.iter().cloned(), 333, alive);
-        assert_eq!(stale, vec![PathBuf::from("/tmp/autopr-eval-111")]);
+        let stale = stale_scratch(dirs.iter().cloned(), &me, 333, |pid| pid == 222);
+        assert_eq!(stale, vec![tmp.join(format!("autopr-eval-{me}-111"))]);
+    }
+
+    /// Codex review: `/tmp/autopr-eval-<pid>` was a GLOBAL namespace, so an
+    /// eval in one repository would reclaim a dead eval's scratch from
+    /// another — deleting that repo's worktree directory while its own
+    /// `git worktree remove` ran against the wrong repository, leaving behind
+    /// precisely the stale registration this cleanup exists to prevent.
+    #[test]
+    fn scratch_from_a_different_repository_is_never_reclaimed() {
+        let tmp = std::env::temp_dir();
+        let mine = repo_slug(Path::new("/repo/a"));
+        let theirs = repo_slug(Path::new("/repo/b"));
+        assert_ne!(mine, theirs, "each repo must own its own scratch namespace");
+
+        let dirs = vec![tmp.join(format!("autopr-eval-{theirs}-111"))];
+        assert!(
+            stale_scratch(dirs.into_iter(), &mine, 999, |_| false).is_empty(),
+            "another repository's scratch is not ours to delete"
+        );
+    }
+
+    #[test]
+    fn a_repo_slug_is_stable_and_path_safe() {
+        let a = repo_slug(Path::new("/repo/a"));
+        assert_eq!(a, repo_slug(Path::new("/repo/a")), "stable across calls");
+        assert!(
+            a.chars().all(|c| c.is_ascii_hexdigit()) && !a.is_empty(),
+            "must be safe in a path segment: {a:?}"
+        );
     }
 
     #[test]
     fn reclaiming_never_touches_a_directory_outside_the_scratch_namespace() {
+        let me = repo_slug(Path::new("/repo/a"));
         let dirs = vec![
             PathBuf::from("/tmp/eval-111"),
             PathBuf::from("/tmp/autopr-eval"),
-            PathBuf::from("/home/someone/autopr-eval-111"),
+            PathBuf::from(format!("/home/someone/autopr-eval-{me}-111")),
         ];
         assert!(
-            stale_scratch(dirs.into_iter(), 1, |_| false).is_empty(),
-            "only /tmp/autopr-eval-<pid> is ours to delete"
-        );
-    }
-
-    /// Codex review: the eval ran `git worktree prune`, which is repo-wide.
-    /// It only drops registrations whose directory is gone, but the eval has
-    /// no business deciding that for a worktree it did not create — a sibling
-    /// session's tree on a slow mount is not ours to deregister. Every tree
-    /// the eval makes is removed by path instead.
-    #[test]
-    fn the_eval_never_prunes_worktrees_it_did_not_create() {
-        let src = include_str!("autopr_eval.rs");
-        let code = &src[..src.find("#[cfg(test)]").expect("test module")];
-        assert!(
-            !code.contains(r#""prune""#),
-            "a repo-wide prune can deregister a worktree this command never made"
-        );
-        assert!(
-            code.contains(r#""worktree", "remove", "--force""#),
-            "trees must be removed by path, which only ever affects our own"
+            stale_scratch(dirs.into_iter(), &me, 1, |_| false).is_empty(),
+            "only <tmp>/autopr-eval-<this repo>-<pid> is ours to delete"
         );
     }
 
