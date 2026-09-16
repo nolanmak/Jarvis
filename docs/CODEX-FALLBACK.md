@@ -435,6 +435,11 @@ cannot stand in for any tool-using profile.
 
 ## Current verification
 
+[TESTING.md](TESTING.md) lists which of these suites run in CI (the Python
+bridge, sandbox, VM-snapshot and dependency-proxy suites, on every PR), which are
+owner-run (live providers, the real VM via `JARVIS_TEST_VM_CONFIG`), and how to
+run the opt-in ones with `XDG_STATE_HOME` state isolation.
+
 - The production-shaped wiki-ask quota regression now passes, alongside routing
   tests for all four capability classes and live handler/delivery fallback QA.
 - Bridge tests cover file read/write/edit, nested writes, bounded search, tool
@@ -619,7 +624,8 @@ An error or timeout does not prove that an external write failed. First inspect
 the authoritative service using read-only access. Stop the affected request and
 let normal supervisor cleanup complete. From the trusted checkout, inspect its
 owner-private journal (the directory is under
-`~/.local/state/augmentagent/reasoner-handoffs/`):
+`~/.local/state/augmentagent/reasoner-handoffs/`, or
+`$XDG_STATE_HOME/augmentagent/reasoner-handoffs/` when that is set):
 
 ```sh
 python3 scripts/codex-tool-bridge.py --handoff-status /absolute/private/request/operations.json
