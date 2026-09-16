@@ -27,6 +27,13 @@ to continue. Another live probe confirmed that the restricted native permission
 profile rejected an edit while the bridge successfully read and wrote a synthetic
 file, preserving its bytes.
 
+The bridge tracks its parent process with a Linux pidfd. A live builder probe
+exposed that the previous parent-death signal was tied to Codex's launching
+thread: when that thread retired, the bridge exited while Codex remained alive.
+A deterministic regression reproduces that failure and now passes. A companion
+test keeps stdin open after the parent exits and verifies the bridge still
+terminates, retaining the parent-process lifecycle boundary.
+
 Commands must use parsed argv, never a model-generated shell script. Matching a
 command prefix alone does not sandbox programs such as Cargo or npm: they can
 execute project code. Build execution therefore needs a separately verified
@@ -225,6 +232,16 @@ primary and a quota-refusing primary, including a second request during cooldown
 The previously failing production-shaped wiki-ask regression passes. The full
 core unit suite reports 379 passes and five ignored live tests with routing
 enabled; live tests are run explicitly for the receipts described above.
+
+The live `live_codex_fallback_builder_fixes_code_and_runs_red_green_tests` fixture
+uses auto-ship's actual `fix_opts` prompt and tools, a latched primary, private
+handoff state and real Codex. It observes a failing Cargo regression, edits the
+source, passes the same unchanged acceptance test, and successfully inspects
+`git diff`. Cargo executes inside the VM; no target directory is produced in the
+source checkout. The author record contains Codex and reviewer candidate
+selection excludes it. This proves the builder slice; durable resume provenance,
+qualifying live independent review and the full issue/PR/merge/deployment lifecycle
+remain separate acceptance requirements.
 
 The remaining provider conformance suite must cover:
 

@@ -1208,14 +1208,27 @@ def serve(config_path):
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise Denied('policy must be a private owner-controlled regular file')
         config = json.load(stream)
-    import ctypes
     import signal
+    import select
+    import threading
     def stop(signum, frame):
         raise SystemExit(128 + signum)
     signal.signal(signal.SIGTERM, stop)
     parent = os.getppid()
-    if ctypes.CDLL(None).prctl(1, signal.SIGTERM, 0, 0, 0) != 0 or os.getppid() != parent:
+    # PR_SET_PDEATHSIG follows the spawning *thread*, which may retire while
+    # a multithreaded Codex process remains healthy. A pidfd follows the whole
+    # process and cannot be confused by PID reuse.
+    parent_fd = os.pidfd_open(parent)
+    if os.getppid() != parent:
+        os.close(parent_fd)
         raise Denied('cannot bind bridge lifetime to parent')
+    def watch_parent():
+        watcher = select.poll()
+        watcher.register(parent_fd, select.POLLIN)
+        events = watcher.poll()
+        if any(flags & (select.POLLIN | select.POLLHUP) for _, flags in events):
+            os.kill(os.getpid(), signal.SIGTERM)
+    threading.Thread(target=watch_parent, daemon=True).start()
     server = Server(Policy(config))
     try:
         for line in sys.stdin:
@@ -1230,6 +1243,7 @@ def serve(config_path):
             print(json.dumps(response), flush=True)
     finally:
         server.close()
+        os.close(parent_fd)
 
 
 if __name__ == '__main__':

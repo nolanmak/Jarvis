@@ -7729,6 +7729,58 @@ impl AutoPrLoop {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[ignore = "requires Codex login and private build VM; synthetic auto-ship builder fixture"]
+    async fn live_codex_fallback_builder_fixes_code_and_runs_red_green_tests() {
+        use augmentagent_channel_core::{FallbackReasoner, CooldownLatch, ProviderKind, Reasoner};
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path();
+        std::fs::create_dir(repo.join("src")).unwrap();
+        std::fs::create_dir(repo.join("tests")).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname=\"synthetic-builder\"\nversion=\"0.1.0\"\nedition=\"2021\"\n").unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn add(a:i32,b:i32)->i32 { a-b }\n").unwrap();
+        let regression = "#[test]\nfn sum_is_correct(){assert_eq!(synthetic_builder::add(2,3),5);assert_eq!(synthetic_builder::add(-4,7),3);}\n";
+        std::fs::write(repo.join("tests/add.rs"), regression).unwrap();
+        for args in [vec!["init", "-q"], vec!["add", "."],
+            vec!["-c", "user.name=Synthetic", "-c", "user.email=builder@example.com", "commit", "-qm", "Synthetic baseline"]] {
+            assert!(std::process::Command::new("git").current_dir(repo).args(args).status().unwrap().success());
+        }
+        let private_state = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(private_state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let latch = CooldownLatch::at(private_state.path().join("cooldown.json"));
+        latch.latch("claude", chrono::Utc::now() + chrono::Duration::minutes(5), "synthetic quota");
+        let reasoner = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, std::sync::Arc::new(augmentagent_channel_core::ClaudeCliReasoner::default())),
+            (ProviderKind::Codex, std::sync::Arc::new(augmentagent_channel_core::codex::CodexCliReasoner::openai())),
+        ], latch);
+        let mut opts = fix_opts(repo.into());
+        opts.handoff_path = Some(private_state.path().join("operations.json"));
+        let audit_dir = tempfile::tempdir().unwrap();
+        let audit = audit_dir.path().join("audit.jsonl");
+        opts.audit_logger = Some(std::sync::Arc::new(augmentagent_channel_core::tool_audit::AuditLogger::new(audit.clone())));
+        let summary = reasoner.call(&opts,
+            "Fix the synthetic add function so it returns the sum. The existing tests/add.rs regression is authoritative: \
+             do not change it. First run cargo test --offline and observe the failure, then fix src/lib.rs and rerun \
+             cargo test --offline until it passes. Inspect git diff before finishing. Do not commit or publish anything.")
+            .await.unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("tests/add.rs")).unwrap(), regression, "builder changed the acceptance test");
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(audit).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        let test_runs: Vec<_> = records.iter().filter(|record| record["provider"] == "codex" && record["tool"] == "Bash"
+            && record["args"]["command"].as_str().is_some_and(|command| command.contains("cargo test"))).collect();
+        assert!(test_runs.len() >= 2, "missing red/green test runs: {summary}; synthetic audit: {records:?}");
+        assert!(test_runs[0]["exit_code"].as_i64().is_some_and(|code| code != 0), "initial regression did not fail");
+        assert!(test_runs.iter().skip(1).any(|record| record["exit_code"] == 0
+            && record["stdout_truncated"].as_str().is_some_and(|out| out.contains("1 passed"))), "missing passing regression: {summary}");
+        assert!(records.iter().any(|record| record["tool"] == "Bash" && record["exit_code"] == 0
+            && record["args"]["command"].as_str().is_some_and(|command| command.starts_with("git diff"))), "missing diff review: {summary}");
+        assert_eq!(reasoner.usage(), vec![("codex", 1, 1)]);
+        assert_eq!(reasoner.mutation_providers(), vec![ProviderKind::Codex]);
+        assert_eq!(independent_reviewer_candidates(Some(&reasoner.mutation_providers())), vec![ProviderKind::Claude]);
+        assert!(!repo.join("target").exists(), "build output escaped the disposable VM snapshot");
+    }
+
     #[test]
     fn independent_reviewer_excludes_all_builders_and_unknown_history() {
         use augmentagent_channel_core::ProviderKind::{Claude, Codex};

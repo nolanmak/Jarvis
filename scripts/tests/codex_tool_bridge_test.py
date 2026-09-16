@@ -726,6 +726,70 @@ for line in sys.stdin:
 
 
 class TransportTests(unittest.TestCase):
+    def test_bridge_survives_launcher_thread_exit_while_parent_process_is_alive(self):
+        import queue
+        import threading
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            config=root/'policy.json'
+            config.write_text(json.dumps({'cwd':str(root),'read_roots':[str(root)],
+                'write_roots':[],'allowed_tools':['Read']}))
+            config.chmod(0o600)
+            launched=queue.Queue()
+            def launch():
+                child=subprocess.Popen([sys.executable,str(SPEC.origin),str(config)],
+                    stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                child.stdin.write(json.dumps({'jsonrpc':'2.0','id':1,'method':'initialize'})+'\n');child.stdin.flush()
+                initialized=child.stdout.readline()
+                launched.put((child,initialized))
+            thread=threading.Thread(target=launch);thread.start();thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+            child,initialized=launched.get(timeout=1)
+            try:
+                self.assertIn('result',json.loads(initialized))
+                child.stdin.write(json.dumps({'jsonrpc':'2.0','id':2,'method':'ping'})+'\n');child.stdin.flush()
+                response=child.stdout.readline()
+                self.assertTrue(response,'bridge died when only its launcher thread exited')
+                self.assertEqual(json.loads(response)['id'],2)
+            finally:
+                child.terminate();child.communicate(timeout=5)
+
+    def test_bridge_stops_when_parent_process_exits_even_if_stdin_stays_open(self):
+        import os
+        import select
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);config=root/'policy.json'
+            config.write_text(json.dumps({'cwd':str(root),'read_roots':[str(root)],
+                'write_roots':[],'allowed_tools':['Read']}));config.chmod(0o600)
+            # A separate inherited pipe remains open in this test process, so
+            # EOF alone cannot provide the lifecycle guarantee being tested.
+            read_fd,write_fd=os.pipe()
+            program="""import json,os,subprocess,sys
+child=subprocess.Popen([sys.executable,sys.argv[1],sys.argv[2]],stdin=int(sys.argv[3]),stdout=subprocess.PIPE)
+ready=child.stdout.readline()
+assert 'result' in json.loads(ready)
+print(child.pid,flush=True)
+sys.stdin.readline()
+"""
+            parent=subprocess.Popen([sys.executable,'-c',program,str(SPEC.origin),str(config),str(read_fd)],
+                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,pass_fds=(read_fd,),text=True)
+            pidfd=None
+            try:
+                os.write(write_fd,(json.dumps({'jsonrpc':'2.0','id':1,'method':'initialize'})+'\n').encode())
+                pid=int(parent.stdout.readline());pidfd=os.pidfd_open(pid)
+                parent.communicate('exit\n',timeout=5)
+                watcher=select.poll();watcher.register(pidfd,select.POLLIN)
+                self.assertTrue(watcher.poll(5000),'bridge outlived its parent process')
+            finally:
+                os.close(read_fd);os.close(write_fd)
+                if pidfd is not None:
+                    import signal
+                    try: signal.pidfd_send_signal(pidfd,signal.SIGKILL)
+                    except ProcessLookupError: pass
+                    os.close(pidfd)
+                if parent.poll() is None:
+                    parent.kill();parent.communicate(timeout=5)
+
     def test_stdio_exposes_only_declared_tools_and_denies_unknown_calls(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'workspace'

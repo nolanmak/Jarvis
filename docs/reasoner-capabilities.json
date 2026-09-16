@@ -319,7 +319,9 @@
       "callsite": "crates/augmentagent-cli/src/self_improve.rs::fix_opts",
       "permission_profile": "source-build",
       "output_contract": "Source edits and verification results; no self-approval",
-      "conformance": [],
+      "conformance": [
+        "self_improve::tests::live_codex_fallback_builder_fixes_code_and_runs_red_green_tests"
+      ],
       "provider_conformance": "pending"
     },
     {
