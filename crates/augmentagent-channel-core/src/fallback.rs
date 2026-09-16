@@ -71,6 +71,12 @@ struct Entry {
     reasoner: Arc<dyn Reasoner>,
 }
 
+#[derive(Default)]
+struct ReviewLifecycle {
+    path: Option<std::path::PathBuf>,
+    admitted: bool,
+}
+
 /// The composite. Concrete (not `dyn`) so the ~28 construction sites and the
 /// channel generics swap from `ClaudeCliReasoner` with a one-word change.
 pub struct FallbackReasoner {
@@ -82,7 +88,7 @@ pub struct FallbackReasoner {
     /// spend and the record of which provider actually served it.
     usage: std::sync::Mutex<Vec<(&'static str, u32, u32)>>,
     mutation_providers: std::sync::Mutex<Vec<ProviderKind>>,
-    review_history: std::sync::Mutex<Option<std::path::PathBuf>>,
+    review_history: std::sync::Mutex<ReviewLifecycle>,
     handoff_root: Option<std::path::PathBuf>,
 }
 
@@ -168,7 +174,7 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
         latch: CooldownLatch::system(),
         usage: std::sync::Mutex::new(Vec::new()),
         mutation_providers: std::sync::Mutex::new(Vec::new()),
-        review_history: std::sync::Mutex::new(None),
+        review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
         handoff_root: crate::handoff::system_root(),
     })
 }
@@ -191,7 +197,7 @@ pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
             mutation_providers: std::sync::Mutex::new(Vec::new()),
-            review_history: std::sync::Mutex::new(None),
+            review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
             handoff_root: crate::handoff::system_root(),
         })
     })
@@ -209,7 +215,7 @@ impl FallbackReasoner {
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
             mutation_providers: std::sync::Mutex::new(Vec::new()),
-            review_history: std::sync::Mutex::new(None),
+            review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
             handoff_root: crate::handoff::system_root(),
         }
     }
@@ -227,7 +233,7 @@ impl FallbackReasoner {
             latch,
             usage: std::sync::Mutex::new(Vec::new()),
             mutation_providers: std::sync::Mutex::new(Vec::new()),
-            review_history: std::sync::Mutex::new(None),
+            review_history: std::sync::Mutex::new(ReviewLifecycle::default()),
             handoff_root: None,
         }
     }
@@ -241,20 +247,20 @@ impl FallbackReasoner {
     /// state stays outside the worktree, so model edits cannot erase authors.
     /// Missing provenance on resume remains unknown and cannot authorize review.
     pub fn track_review_history(&self, repository: &std::path::Path, branch: &str, resuming: bool) -> anyhow::Result<()> {
-        anyhow::ensure!(self.calls() == 0, "review history must be bound before reasoning starts");
         let mut bound = self.review_history.lock().unwrap_or_else(|e| e.into_inner());
-        anyhow::ensure!(bound.is_none(), "review history already bound");
+        anyhow::ensure!(!bound.admitted, "review history must be bound before reasoning starts");
+        anyhow::ensure!(bound.path.is_none(), "review history already bound");
         let root = self.handoff_root.as_ref().and_then(|p| p.parent())
             .ok_or_else(|| anyhow::anyhow!("private review history storage unavailable"))?.join("review-history");
         let repository = repository.canonicalize()?;
         let path = crate::review_history::initialize(&root, &repository.to_string_lossy(), branch, resuming)?;
-        *bound = Some(path);
+        bound.path = Some(path);
         Ok(())
     }
 
     /// `None` means unknown provenance, not an empty list of authors.
     pub fn review_authors(&self) -> anyhow::Result<Option<Vec<ProviderKind>>> {
-        let path = self.review_history.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let path = self.review_history.lock().unwrap_or_else(|e| e.into_inner()).path.clone();
         match path {
             Some(path) => crate::review_history::authors(&path),
             None => Ok(None),
@@ -323,6 +329,9 @@ impl FallbackReasoner {
         transcript: bool,
         revision_authors: Option<&[ProviderKind]>,
     ) -> anyhow::Result<String> {
+        // Binding and admission share one lock. Once admitted, no caller can
+        // retrofit a history that misses an earlier mutating dispatch.
+        self.review_history.lock().unwrap_or_else(|e| e.into_inner()).admitted = true;
         let class = classify(opts);
         let mut request_opts = opts.clone();
         if request_opts.handoff_path.is_none() && matches!(class,
@@ -364,7 +373,7 @@ impl FallbackReasoner {
             };
             if matches!(class, crate::providers::CapabilityClass::WriteTools
                 | crate::providers::CapabilityClass::FullAgentic) {
-                let history = self.review_history.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let history = self.review_history.lock().unwrap_or_else(|e| e.into_inner()).path.clone();
                 if let Some(path) = history {
                     crate::review_history::record(&path, entry.kind)?;
                 }
@@ -508,6 +517,47 @@ mod tests {
     // ---- #828: single-provider pinning for the independent review ----
 
     #[tokio::test]
+    async fn review_history_cannot_bind_after_dispatch_admission_even_without_provider_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fb = FallbackReasoner::for_tests(vec![], latch_in(&dir));
+        fb.handoff_root = Some(dir.path().join("private/handoffs"));
+        assert!(fb.call(&text_only_opts(), "synthetic request").await.is_err());
+        assert_eq!(fb.calls(), 0);
+        assert!(fb.track_review_history(dir.path(), "synthetic-late-binding", false).is_err(),
+            "admission must seal history before provider selection or execution");
+    }
+
+    #[test]
+    fn concurrent_binding_either_precedes_dispatch_or_is_refused() {
+        for _ in 0..32 {
+            let dir = tempfile::tempdir().unwrap();
+            let primary = Scripted::ok("synthetic change");
+            let mut fb = FallbackReasoner::for_tests(vec![
+                (ProviderKind::Claude, primary as Arc<dyn Reasoner>),
+            ], latch_in(&dir));
+            fb.handoff_root = Some(dir.path().join("private/handoffs"));
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let dispatch = scope.spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                    let mut opts = text_only_opts();
+                    opts.allowed_tools = vec!["Write".into()];
+                    barrier.wait();
+                    runtime.block_on(fb.call(&opts, "synthetic mutation")).unwrap();
+                });
+                barrier.wait();
+                let bound = fb.track_review_history(dir.path(), "synthetic-racing-bind", false);
+                dispatch.join().unwrap();
+                if bound.is_ok() {
+                    assert_eq!(fb.review_authors().unwrap(), Some(vec![ProviderKind::Claude]));
+                } else {
+                    assert!(fb.review_authors().unwrap().is_none());
+                }
+            });
+        }
+    }
+
+    #[tokio::test]
     async fn revisions_keep_original_builder_after_primary_recovers() {
         let dir = tempfile::tempdir().unwrap();
         let primary = Scripted::ok("primary must remain independent");
@@ -518,7 +568,7 @@ mod tests {
         ], latch_in(&dir));
         fb.handoff_root = Some(dir.path().join("private/handoffs"));
         fb.track_review_history(dir.path(), "synthetic-revision", false).unwrap();
-        let path = fb.review_history.lock().unwrap().clone().unwrap();
+        let path = fb.review_history.lock().unwrap().path.clone().unwrap();
         crate::review_history::record(&path, ProviderKind::Codex).unwrap();
         let mut opts = text_only_opts();
         opts.allowed_tools = vec!["Write".into()];
@@ -539,7 +589,7 @@ mod tests {
         ], latch_in(&dir));
         fb.handoff_root = Some(dir.path().join("private/handoffs"));
         fb.track_review_history(dir.path(), "synthetic-unavailable-builder", false).unwrap();
-        let path = fb.review_history.lock().unwrap().clone().unwrap();
+        let path = fb.review_history.lock().unwrap().path.clone().unwrap();
         crate::review_history::record(&path, ProviderKind::Codex).unwrap();
         let mut opts = text_only_opts();
         opts.allowed_tools = vec!["Write".into()];
@@ -581,7 +631,7 @@ mod tests {
         resumed.handoff_root = fb.handoff_root.clone();
         resumed.track_review_history(dir.path(), "synthetic-branch", true).unwrap();
         assert_eq!(resumed.review_authors().unwrap(), Some(vec![ProviderKind::Claude]));
-        let path = fb.review_history.lock().unwrap().clone().unwrap();
+        let path = fb.review_history.lock().unwrap().path.clone().unwrap();
         std::fs::write(&path, b"invalid").unwrap();
         assert!(fb.call(&opts, "synthetic revision").await.is_err());
         assert_eq!(primary.count(), 1, "no provider runs without durable attribution");
