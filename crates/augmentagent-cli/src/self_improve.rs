@@ -1270,8 +1270,9 @@ async fn merge_sweep(repo_root: &Path) -> usize {
     let policy_owner = merge_policy_owner(repo_root).await;
     let mut merged = 0usize;
 
+    let mut examined = 0usize;
     for row in rows {
-        if merged >= MAX_SWEEP_MERGES {
+        if merged >= MAX_SWEEP_MERGES || examined >= MAX_SWEEP_EXAMINED {
             break;
         }
         let Some(pr) = row.get("number").and_then(serde_json::Value::as_u64) else {
@@ -1291,6 +1292,8 @@ async fn merge_sweep(repo_root: &Path) -> usize {
             .get("body")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
+        // Past the free filters, so this candidate costs network reads.
+        examined += 1;
         let head_sha = row
             .get("headRefOid")
             .and_then(serde_json::Value::as_str)
@@ -1659,9 +1662,17 @@ fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
     SweepVerdict::Merge
 }
 
-/// #1029 — how many drafts one sweep may merge. Bounded so a backlog cannot
-/// stall a tick; the next tick takes the rest.
+/// #1029 — how many drafts one sweep may merge. The next tick takes the rest.
 const MAX_SWEEP_MERGES: usize = 3;
+
+/// How many candidates one sweep may EXAMINE.
+///
+/// Codex: bounding merges alone does not bound the tick. Each candidate costs
+/// a checks read, a CodeRabbit read and an issue-author read, so a backlog of
+/// ineligible drafts — or a slow GitHub — could stall an unattended tick while
+/// merging nothing at all. The expensive work is the looking, so that is what
+/// has to be bounded.
+const MAX_SWEEP_EXAMINED: usize = 10;
 
 /// #1030 — is this failure "every provider that could serve the call is
 /// latched", rather than something actually broken?
@@ -11263,10 +11274,17 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
                 "the sweep must spend no reasoner call, found {forbidden:?}"
             );
         }
-        // C7 — bounded.
+        // C7 — bounded on BOTH axes. Codex: capping merges does not cap the
+        // tick, because the expensive part is the looking — a checks read, a
+        // CodeRabbit read and an author read per candidate. A backlog of
+        // ineligible drafts could stall a tick while merging nothing.
         assert!(
             fn_body.contains("MAX_SWEEP_MERGES"),
-            "bound the work per tick so a backlog cannot stall it"
+            "bound how many merges one tick performs"
+        );
+        assert!(
+            fn_body.contains("MAX_SWEEP_EXAMINED"),
+            "and bound how many candidates it examines, which is the real cost"
         );
         // And it must never touch the counter.
         assert!(
