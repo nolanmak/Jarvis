@@ -13,16 +13,17 @@ bridge = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bridge)
 
 # Tests that run commands or render PDFs go through the kernel sandbox. A host
-# that cannot enforce it (hosted CI kernels older than Linux 6.12, no
-# libseccomp, no Poppler) skips them with the reason instead of failing.
+# that cannot enforce it (kernels older than Linux 6.12, no libseccomp, no
+# Poppler) skips them with the reason, or fails them in CI, where
+# REQUIRE_ENFORCEABLE_SANDBOX=1.
 CAPABILITIES_SPEC = importlib.util.spec_from_file_location(
     'host_capabilities', Path(__file__).with_name('host_capabilities.py'))
 capabilities = importlib.util.module_from_spec(CAPABILITIES_SPEC)
 CAPABILITIES_SPEC.loader.exec_module(capabilities)
 SANDBOX_UNAVAILABLE = capabilities.sandbox_unavailable_reason()
 POPPLER_UNAVAILABLE = capabilities.poppler_unavailable_reason()
-requires_sandbox = unittest.skipIf(SANDBOX_UNAVAILABLE, SANDBOX_UNAVAILABLE or 'sandbox available')
-requires_poppler = unittest.skipIf(POPPLER_UNAVAILABLE, POPPLER_UNAVAILABLE or 'Poppler available')
+requires_sandbox = capabilities.requirement(SANDBOX_UNAVAILABLE)
+requires_poppler = capabilities.requirement(POPPLER_UNAVAILABLE)
 
 
 class ToolPolicyTests(unittest.TestCase):
