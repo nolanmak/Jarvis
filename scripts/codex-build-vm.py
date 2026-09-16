@@ -69,7 +69,7 @@ def initrd(entries):
     return gzip.compress(bytes(archive), mtime=0)
 
 
-GUEST_RUNNER = r'''import ctypes,json,os,subprocess
+GUEST_RUNNER = r'''import ctypes,json,os,selectors,signal,subprocess
 from pathlib import Path
 job=json.loads(Path('/job.json').read_text())
 uid=job['uid'];gid=job['gid']
@@ -87,21 +87,41 @@ def worker():
     if libc.prctl(38,1,0,0,0)!=0: raise OSError('cannot enforce no-new-privileges')
     os.setgroups([]); os.setgid(gid); os.setuid(uid)
     os.umask(0o022)
-with open('/stdout','w+b') as stdout,open('/stderr','w+b') as stderr:
-    try:
-        process=subprocess.Popen(job['argv'],cwd='/workspace',env=environment,
-            stdin=subprocess.DEVNULL,stdout=stdout,stderr=stderr,start_new_session=True,preexec_fn=worker)
-        status=process.wait()
-        stdout.seek(0); stderr.seek(0)
-        result={'exit_code':status,'stdout':stdout.read(8*1024*1024+1).decode('utf-8','replace'),
-                'stderr':stderr.read(8*1024*1024+1).decode('utf-8','replace')}
+try:
+    process=subprocess.Popen(job['argv'],cwd='/workspace',env=environment,
+        stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+        start_new_session=True,preexec_fn=worker)
+    outputs={'stdout':bytearray(),'stderr':bytearray()}
+    size=0; exceeded=False
+    with selectors.DefaultSelector() as streams:
+        streams.register(process.stdout,selectors.EVENT_READ,'stdout')
+        streams.register(process.stderr,selectors.EVENT_READ,'stderr')
+        while streams.get_map() and not exceeded:
+            for key,_ in streams.select():
+                chunk=os.read(key.fileobj.fileno(),65536)
+                if not chunk:
+                    streams.unregister(key.fileobj); key.fileobj.close(); continue
+                size+=len(chunk)
+                if size>8*1024*1024:
+                    exceeded=True; break
+                outputs[key.data].extend(chunk)
+    if exceeded:
+        # The entire guest is shut down after this receipt, including detached
+        # descendants. Kill the foreground group promptly to stop its output.
+        try: os.killpg(process.pid,signal.SIGKILL)
+        except ProcessLookupError: pass
+        process.wait()
+        result={'error':'VM command exceeded output limit'}
+    else:
+        result={'exit_code':process.wait(),**{key:value.decode('utf-8','replace') for key,value in outputs.items()}}
         if len(result['stdout'].encode())+len(result['stderr'].encode())>8*1024*1024:
             result={'error':'VM command exceeded output limit'}
-    except OSError:
-        result={'error':'VM command could not start'}
-    path=Path('/root/control/outcome.json')
-    with path.open('w') as receipt:
-        os.chmod(path,0o600);json.dump(result,receipt);receipt.flush();os.fsync(receipt.fileno())
+except OSError:
+    result={'error':'VM command could not start'}
+path=Path('/root/control/outcome.json')
+with path.open('w') as receipt:
+    os.chmod(path,0o600);json.dump(result,receipt);receipt.flush();os.fsync(receipt.fileno())
+
 '''
 
 

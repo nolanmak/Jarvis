@@ -52,6 +52,10 @@ The guest mounts host `/usr` read-only for compiler and Python userspace. Option
 Commands run offline. npm dependencies currently come from the checkout's root
 `node_modules` directory, mounted read-only. Memory must be 512–4096 MiB; guests
 use two virtual CPUs. A configuration file alone does not prove runtime readiness.
+The guest supervisor collects stdout and stderr through pipes with a combined
+8 MiB cap, terminating an overproducing command while it is still running. Output
+is not spooled to unbounded guest files. The host accepts a result only after VM
+shutdown and verified supervisor cleanup.
 
 ## Verification and rollback
 

@@ -25,6 +25,16 @@ class SnapshotValidationTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('JARVIS_TEST_VM_CONFIG'), 'requires a provisioned private KVM runtime')
 class BuildVmTests(unittest.TestCase):
+    def test_output_limit_stops_a_running_command_before_its_deadline(self):
+        runtime = vm.Runtime.load(Path(os.environ['JARVIS_TEST_VM_CONFIG']))
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / 'workspace'; workspace.mkdir()
+            # The producer never exits by itself: enforce the cap while reading,
+            # rather than allowing unbounded spool files until process exit.
+            program = "import os,time; os.write(1,b'x'*(9*1024*1024)); time.sleep(60)"
+            with self.assertRaisesRegex(vm.Unavailable, 'exceeded output limit'):
+                vm.run(runtime, workspace, ['/usr/bin/python3', '-c', program], {}, timeout=10)
+
     def test_cargo_compiles_and_runs_tests_with_loopback_and_process_sessions(self):
         runtime = vm.Runtime.load(Path(os.environ['JARVIS_TEST_VM_CONFIG']))
         self.assertIn('toolchain', runtime.config, 'provision Rust for the build contract')
