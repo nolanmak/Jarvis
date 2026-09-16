@@ -161,6 +161,17 @@ pub fn parse_cases(json: &str) -> Result<Vec<EvalCase>> {
         if id.is_empty() {
             bail!("eval case #{i} has no id");
         }
+        // The id becomes a directory name under the scratch dir, so keep it
+        // to what a label needs and a path cannot escape.
+        if !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            bail!(
+                "eval case id {id:?} must be letters, digits, dash or underscore: \
+                 it becomes a directory name"
+            );
+        }
         if out.iter().any(|c| c.id == id) {
             bail!("duplicate eval case id {id:?}; ids name rows in the report and must be unique");
         }
@@ -818,6 +829,30 @@ mod tests {
         assert!(msg.contains("probably?"), "and the bad value: {msg}");
     }
 
+    /// A case id becomes a directory name (`tree-<id>`) under the scratch
+    /// dir. Codex flagged this non-blocking; it is five lines to make the
+    /// invariant executable instead of implied, and I filed the same finding
+    /// against someone else's repo this week. An id is a label, so restrict it
+    /// to what a label needs and a path cannot escape.
+    #[test]
+    fn an_id_that_could_escape_the_scratch_directory_is_refused() {
+        // No backslash case: JSON would eat it as an escape, so it tests the
+        // decoder rather than the guard. The traversal shapes below cover it.
+        for bad in ["../../etc", "a/b", ".", "..", "with space", "semi;colon", "~root"] {
+            let json = format!(
+                r#"[{{"id":"{bad}","issue":1,"title":"t","body":"b","author":"a","expect":"fixable"}}]"#
+            );
+            let err = parse_cases(&json).expect_err("must refuse id {bad:?}");
+            assert!(format!("{err:#}").contains(bad), "the offending id must be named");
+        }
+        for ok in ["E1", "E1006", "case_1", "case-1"] {
+            let json = format!(
+                r#"[{{"id":"{ok}","issue":1,"title":"t","body":"b","author":"a","expect":"fixable"}}]"#
+            );
+            assert!(parse_cases(&json).is_ok(), "{ok:?} is a perfectly good id");
+        }
+    }
+
     #[test]
     fn duplicate_ids_are_refused_so_a_row_cannot_shadow_another() {
         let json = r#"[
@@ -1107,7 +1142,7 @@ mod tests {
     fn a_killed_run_leaves_scratch_that_the_next_run_reclaims() {
         let tmp = std::env::temp_dir();
         let me = repo_slug(Path::new("/repo/a"));
-        let dirs = vec![
+        let dirs = [
             tmp.join(format!("autopr-eval-{me}-111")),   // dead, ours: reclaim
             tmp.join(format!("autopr-eval-{me}-222")),   // alive: leave it
             tmp.join(format!("autopr-eval-{me}-333")),   // ours: leave it
@@ -1189,7 +1224,7 @@ mod tests {
             grade(&case("E2", 2, Expect::Fixable), Some(&observed(true, "ok"))),
             grade(&case("E3", 3, Expect::NotFixable), Some(&observed(false, "ok"))),
         ];
-        let cases = vec![case("E1", 1, Expect::Fixable), case("E3", 3, Expect::NotFixable)];
+        let cases = [case("E1", 1, Expect::Fixable), case("E3", 3, Expect::NotFixable)];
         let picked = rows_for(&all, &cases.iter().collect::<Vec<_>>());
         assert_eq!(
             picked.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
@@ -1203,7 +1238,7 @@ mod tests {
     #[test]
     fn a_selected_case_missing_from_the_saved_run_is_reported_as_unrun() {
         let all = vec![grade(&case("E1", 1, Expect::Fixable), Some(&observed(true, "ok")))];
-        let cases = vec![case("E1", 1, Expect::Fixable), case("E9", 9, Expect::Fixable)];
+        let cases = [case("E1", 1, Expect::Fixable), case("E9", 9, Expect::Fixable)];
         let picked = rows_for(&all, &cases.iter().collect::<Vec<_>>());
         assert_eq!(picked.len(), 2, "the denominator must not shrink");
         let missing = picked.iter().find(|r| r.id == "E9").expect("E9 present");
