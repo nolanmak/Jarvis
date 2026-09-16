@@ -884,6 +884,17 @@ risk. 'medium' = a few files or a subtle interaction, still well-understood. \
 wrong. Grade honestly — 'hard' work is NOT auto-merged, it goes to human \
 review.\n\
 \n\
+For fixable issues, emit an acceptance-criteria block before the spec, as \
+`CRITERIA:` followed by 2-5 `- ` bullets. Each states a CHECKABLE PROPERTY \
+the finished change must have — something a reviewer who has not read the \
+code can verify from the diff — never an implementation instruction. At \
+least one must be an ENUMERATION over the codebase ('every call site that \
+...', 'each path which ...'), because that is the class a reviewer looking \
+only at a diff structurally cannot check: it cannot see what is missing. \
+These are written before any code exists and an independent reviewer grades \
+the result against them, so they are the one target the builder did not also \
+author. Keep each under 200 characters.\n\
+\n\
 For fixable issues, after the header produce the spec:\n\
 - Interpretation: what the issue is actually asking for, resolving any \
 ambiguity with the most reasonable reading of the code and stating the \
@@ -983,6 +994,125 @@ struct ScopeOutcome {
     /// The spec (fixable) or the refusal reason (not-fixable) — the raw text
     /// with the header lines removed.
     body: String,
+    /// #1012 — checkable properties the change must satisfy, written BEFORE
+    /// any code exists. The builder writes the code and its tests, so a
+    /// passing test proves only that the builder was self-consistent; these
+    /// are the one independent target in the pipeline. Empty is always valid
+    /// and changes nothing (see [`criteria_pr_section`]).
+    criteria: Vec<String>,
+}
+
+/// #1012 — caps applied at the parser so nothing downstream has to remember.
+/// A scope output is model text: without a bound, one runaway run would push
+/// the diff out of the reviewer's context and quietly make reviews worse.
+const MAX_CRITERIA: usize = 8;
+const MAX_CRITERION_CHARS: usize = 200;
+
+/// Split a `criteria:` block out of a scope output, returning the remaining
+/// text and the parsed list.
+///
+/// Lifted OUT of the body rather than copied, so the spec the builder receives
+/// does not repeat the criteria back at it. Every degraded shape — no header,
+/// an empty block, blank items — yields an empty list: criteria improve
+/// reviews, and must never become a new way for a run to stall.
+fn split_criteria(raw: &str) -> (String, Vec<String>) {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut criteria: Vec<String> = Vec::new();
+    let mut in_block = false;
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.to_ascii_lowercase().starts_with("criteria:") {
+            in_block = true;
+            continue;
+        }
+        if in_block {
+            if let Some(item) = t.strip_prefix('-') {
+                let item = item.trim();
+                if !item.is_empty() {
+                    criteria.push(item.to_string());
+                }
+                continue;
+            }
+            if t.is_empty() {
+                continue;
+            }
+            in_block = false;
+        }
+        kept.push(line);
+    }
+    criteria.truncate(MAX_CRITERIA);
+    for c in &mut criteria {
+        if c.chars().count() > MAX_CRITERION_CHARS {
+            let cut = c
+                .char_indices()
+                .nth(MAX_CRITERION_CHARS - 1)
+                .map(|(i, _)| i)
+                .unwrap_or(c.len());
+            *c = format!("{}…", &c[..cut]);
+        }
+    }
+    (kept.join("\n"), criteria)
+}
+
+/// The PR-body section carrying the criteria, or nothing at all.
+///
+/// The PR body is already the loop's durable store for scope metadata
+/// (`complexity_from_pr_body` reads it back on resume), so criteria ride the
+/// same rail and survive a resumed run. Empty yields an empty string, which is
+/// what keeps an omitted block byte-identical to today.
+fn criteria_pr_section(criteria: &[String]) -> String {
+    if criteria.is_empty() {
+        return String::new();
+    }
+    let items: Vec<String> = criteria.iter().map(|c| format!("- {c}")).collect();
+    format!(
+        "\n\n## Acceptance criteria (from the scoping pass)\n{}",
+        items.join("\n")
+    )
+}
+
+/// Read criteria back out of a PR body, for a resumed run.
+fn criteria_from_pr_body(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_block = false;
+    for line in body.lines() {
+        let t = line.trim();
+        if t.starts_with("## Acceptance criteria") {
+            in_block = true;
+            continue;
+        }
+        if !in_block {
+            continue;
+        }
+        if let Some(item) = t.strip_prefix("- ") {
+            let item = item.trim();
+            if !item.is_empty() {
+                out.push(item.to_string());
+            }
+            continue;
+        }
+        if t.is_empty() {
+            continue;
+        }
+        break;
+    }
+    out.truncate(MAX_CRITERIA);
+    out
+}
+
+/// The block handed to both codex passes.
+fn criteria_review_section(criteria: &[String]) -> String {
+    if criteria.is_empty() {
+        return String::new();
+    }
+    let items: Vec<String> = criteria.iter().map(|c| format!("- {c}")).collect();
+    format!(
+        "\n\n## Acceptance criteria (written by the scoping pass BEFORE any \
+         code existed)\nGive a verdict for each: met, not met, or not \
+         addressed, naming your evidence. These are a FLOOR, not a ceiling — \
+         still report anything material they missed.\n{}",
+        items.join("\n")
+    )
 }
 
 /// Parse the scoper's `VERDICT:` / `COMPLEXITY:` header, tolerantly: the
@@ -991,6 +1121,8 @@ struct ScopeOutcome {
 /// fix); missing/unknown complexity defaults to *hard* (never auto-merge on
 /// a formatting glitch — the conservative direction).
 fn parse_scope_output(raw: &str) -> ScopeOutcome {
+    let (raw, criteria) = split_criteria(raw);
+    let raw = raw.as_str();
     let mut fixable = true;
     let mut complexity = Complexity::Hard;
     let mut est_diff_lines: Option<usize> = None;
@@ -1034,6 +1166,7 @@ fn parse_scope_output(raw: &str) -> ScopeOutcome {
         est_diff_lines,
         guarded_paths,
         body: body_lines.join("\n").trim().to_string(),
+        criteria,
     }
 }
 
@@ -1388,6 +1521,14 @@ evidence. A NEW finding on a revision round must clear the materiality bar \
 with room to spare — each round of fresh eyes will always find something \
 smaller, and that ratchet is a process failure, not rigor.\n\
 \n\
+\n\
+ACCEPTANCE CRITERIA (#1012): when the message carries an acceptance-criteria \
+block, it was written by the scoping pass BEFORE any code existed. Give a \
+verdict for each one — met, not met, or not addressed — naming the evidence \
+you used. An unmet criterion is `changes-requested` on its own. They are a \
+FLOOR and not a ceiling: still report anything material they missed, and if \
+a criterion is itself wrong or impossible, say so and argue why rather than \
+failing the change over it.\n\
 Your output MUST start with this line EXACTLY:\n\
 CODEX-REVIEW: lgtm | changes-requested\n\
 Then a blank line, then 3-8 sentences: for lgtm, what you verified and how \
@@ -1420,6 +1561,14 @@ this change behaviour for traffic nobody asked it to change? Is it hot-path?\n\
 returns something unexpected?\n\
 - Duplication: does this reimplement something the repo already has?\n\
 \n\
+\n\
+ACCEPTANCE CRITERIA (#1012): when the message carries an acceptance-criteria \
+block, it was written by the scoping pass BEFORE any code existed. Give a \
+verdict for each one — met, not met, or not addressed — naming the evidence \
+you used. An unmet criterion is `changes-requested` on its own. They are a \
+FLOOR and not a ceiling: still report anything material they missed, and if \
+a criterion is itself wrong or impossible, say so and argue why rather than \
+failing the change over it.\n\
 Your output MUST start with this line EXACTLY:\n\
 CODEX-REVIEW: lgtm | changes-requested\n\
 Then a blank line, then 3-8 sentences naming the specific callers/invariants \
@@ -1800,6 +1949,7 @@ async fn independent_review(
     diff: &str,
     worktree: PathBuf,
     prior_findings: Option<&str>,
+    criteria: &[String],
 ) -> IndependentReview {
     let Some(reasoner) = augmentagent_channel_core::build_pinned(
         augmentagent_channel_core::ProviderKind::Codex,
@@ -1834,7 +1984,10 @@ async fn independent_review(
         truncate(summary, 2000),
         truncate(diff, 60_000),
     );
-    let context = format!("{context}{prior_section}");
+    let context = format!(
+        "{context}{}{prior_section}",
+        criteria_review_section(criteria)
+    );
 
     let mut out = IndependentReview {
         available: true,
@@ -1880,6 +2033,31 @@ async fn independent_review(
 
 /// Build the stage-2 prompt: the issue plus (when the scoping pass produced
 /// one) the implementation spec.
+/// #1012 — the builder is told what "done" means before it writes anything,
+/// and asked to name the test that proves each. An empty list delegates to
+/// [`build_fix_prompt`] verbatim, so a scoper that emits no criteria leaves
+/// this prompt byte-identical to what it was.
+fn build_fix_prompt_with_criteria(
+    issue: &Issue,
+    plan: Option<&str>,
+    prior: Option<&str>,
+    criteria: &[String],
+) -> String {
+    let base = build_fix_prompt(issue, plan, prior);
+    if criteria.is_empty() {
+        return base;
+    }
+    let items: Vec<String> = criteria.iter().map(|c| format!("- {c}")).collect();
+    format!(
+        "{base}\n\n## Acceptance criteria (written before any code existed)\n\
+         Your change must satisfy every one of these, and an independent \
+         reviewer will grade it against them. In your summary, name the TEST \
+         that proves each. If one is wrong or impossible, say so explicitly \
+         and argue why rather than working around it.\n{}",
+        items.join("\n")
+    )
+}
+
 fn build_fix_prompt(issue: &Issue, plan: Option<&str>, prior: Option<&str>) -> String {
     let spec = match plan {
         Some(p) => format!(
@@ -3741,6 +3919,10 @@ async fn resume_draft_pr(
     } else {
         complexity_from_pr_body(&pr_body)
     };
+    // #1012 — the PR body is the durable store, exactly as it already is for
+    // complexity. A resumed run must be graded against the criteria the
+    // original scoping pass wrote, not a fresh set nobody agreed to.
+    let resumed_criteria = criteria_from_pr_body(&pr_body);
 
     // Worktree from the PR's branch, brought up to date with main. A merge
     // conflict is a human's job — say so on the PR and move on.
@@ -4125,7 +4307,7 @@ async fn resume_draft_pr(
         }
 
         let independent =
-            independent_review(&issue, &summary, &diff, worktree.clone(), prior_notes.as_deref())
+            independent_review(&issue, &summary, &diff, worktree.clone(), prior_notes.as_deref(), &resumed_criteria)
                 .await;
         prior_notes = Some(independent.notes.clone());
         // #936 — CodeRabbit is the (advisory) third reviewer. It judges the
@@ -4855,10 +5037,18 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
 
     let complexity = scope.as_ref().map(|s| s.complexity).unwrap_or(Complexity::Hard);
     let plan = spec_from_scope(scope.as_ref());
+    // #1012 — written before any code exists, so they are the one target in
+    // this pipeline the builder did not also author. Empty when the scoping
+    // pass failed or emitted no block, which changes nothing downstream.
+    let criteria: Vec<String> = scope
+        .as_ref()
+        .map(|s| s.criteria.clone())
+        .unwrap_or_default();
 
     // Stage 2: hand the issue (+ spec) to the builder inside the worktree.
     let opts = fix_opts(worktree.clone());
-    let prompt = build_fix_prompt(&issue, plan.as_deref(), prior_attempts.as_deref());
+    let prompt =
+        build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria);
     let mut summary = match reasoner.call(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
@@ -5145,7 +5335,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // carrying both verdicts for a human. It does count as a failed attempt,
     // because a second opinion disagreeing is exactly what this stage is for.
     let mut independent =
-        independent_review(&issue, &summary, &full_diff, worktree.clone(), None).await;
+        independent_review(&issue, &summary, &full_diff, worktree.clone(), None, &criteria).await;
     let mut revision_note = String::new();
     if independent.available && !independent.approved() {
         warn!(
@@ -5302,7 +5492,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 lines = lines2;
                 let prior = independent.notes.clone();
                 independent =
-                    independent_review(&issue, &rev_summary, &diff2, worktree.clone(), Some(&prior))
+                    independent_review(&issue, &rev_summary, &diff2, worktree.clone(), Some(&prior), &criteria)
                         .await;
                 revision_note.push_str(&format!(
                     "\n### Revision round {round} (prior verdict: {round1})\n{}\n\n\
@@ -5570,9 +5760,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         "\n\n## Independent review (codex)\n{}{revision_note}\n",
         truncate(&independent.notes, 3000)
     );
+    // #1012 — durable, so a resumed run reviews against the same criteria the
+    // original run was given rather than inventing new ones.
+    let criteria_section = criteria_pr_section(&criteria);
     let pr_body = format!(
         "Automated self-improvement for #{}.\n\n## Summary\n{}{plan_section}\n\n\
-         ## QA review (approved)\n{}{independent_section}\n## Verification\n\
+         ## QA review (approved)\n{}{independent_section}{criteria_section}\n## Verification\n\
          - complexity (scoping pass): {}\n\
          - `cargo build --workspace`: pass\n- `cargo test --workspace`: pass\n\
          - diff size: {lines} lines (cap {MAX_DIFF_LINES}){scratch_note}\n\n\
@@ -9573,6 +9766,185 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert_eq!(red_main_issue_lookup(&prs_only, &title), None);
     }
 
+    // ---- #1012: acceptance criteria from the scoping pass ----
+
+    fn crit(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// C1 — the block parses, and every degraded shape yields an empty list
+    /// rather than failing the run. A scoper that omits criteria must cost us
+    /// nothing; criteria are an improvement to reviews, not a new way to stall.
+    #[test]
+    fn criteria_parse_and_every_degraded_shape_is_simply_empty() {
+        let out = parse_scope_output(
+            "VERDICT: fixable\nCOMPLEXITY: simple\nCRITERIA:\n\
+             - C1: every path that identifies a PR by branch name is guarded\n\
+             - C2: an unknown owner does not stop the loop seeing its own PRs\n\n\
+             Now the spec body.",
+        );
+        assert_eq!(
+            out.criteria,
+            crit(&[
+                "C1: every path that identifies a PR by branch name is guarded",
+                "C2: an unknown owner does not stop the loop seeing its own PRs",
+            ])
+        );
+        assert!(
+            !out.body.contains("C1: every path"),
+            "criteria must be lifted out of the spec body, not duplicated into it"
+        );
+
+        for degraded in [
+            "VERDICT: fixable\n\nA spec with no criteria block at all.",
+            "VERDICT: fixable\nCRITERIA:\n\nnothing under the header",
+            "VERDICT: fixable\nCRITERIA:\n- \n-\n\nblank items only",
+        ] {
+            assert!(
+                parse_scope_output(degraded).criteria.is_empty(),
+                "degraded input must yield no criteria: {degraded:?}"
+            );
+        }
+    }
+
+    /// C7 — a runaway scope output must not blow the review context. The cap
+    /// is applied at the parser, so nothing downstream has to remember to.
+    #[test]
+    fn criteria_are_capped_in_count_and_width_at_the_parser() {
+        let many: String = (1..=40)
+            .map(|i| format!("- C{i}: {}\n", "x".repeat(400)))
+            .collect();
+        let out = parse_scope_output(&format!("VERDICT: fixable\nCRITERIA:\n{many}\nspec"));
+        assert!(out.criteria.len() <= MAX_CRITERIA, "count {}", out.criteria.len());
+        for c in &out.criteria {
+            assert!(c.chars().count() <= MAX_CRITERION_CHARS, "width {}", c.chars().count());
+        }
+    }
+
+    /// C2 — the PR body is the durable store, exactly as it already is for
+    /// complexity, so a resumed run reviews against the same criteria the
+    /// original run was given.
+    #[test]
+    fn criteria_round_trip_through_the_pr_body() {
+        let original = crit(&[
+            "C1: plain one",
+            "C2: contains: a colon and `a | pipe`",
+            "-v is accepted as a flag",
+            "C4: trailing spaces are trimmed",
+        ]);
+        let section = criteria_pr_section(&original);
+        let body = format!(
+            "Automated self-improvement for #7.\n\n## Summary\ns{section}\n\n\
+             ## Verification\n- complexity (scoping pass): simple\n\nFixes #7"
+        );
+        assert_eq!(criteria_from_pr_body(&body), original);
+        // And the neighbouring parser is undisturbed.
+        assert_eq!(complexity_from_pr_body(&body), Complexity::Simple);
+    }
+
+    #[test]
+    fn a_pr_body_without_criteria_yields_none_not_a_stray_line() {
+        let body = "## Verification\n- complexity (scoping pass): hard\n- some other bullet\n";
+        assert!(criteria_from_pr_body(body).is_empty());
+        assert!(criteria_pr_section(&[]).is_empty(), "C6: no block when there are none");
+    }
+
+    /// C3 — the builder is told what done means, and asked to prove each one.
+    #[test]
+    fn the_fix_prompt_embeds_the_criteria_and_asks_for_the_proving_test() {
+        let issue = Issue {
+            number: 7,
+            title: "t".into(),
+            body: "b".into(),
+            author: "nolanmak".into(),
+            author_trusted: true,
+            research_filed: false,
+        };
+        let cs = crit(&["C1: every lane is enumerated", "C2: unknown evidence fails closed"]);
+        let p = build_fix_prompt_with_criteria(&issue, Some("spec"), None, &cs);
+        assert!(p.contains("C1: every lane is enumerated"));
+        assert!(p.contains("C2: unknown evidence fails closed"));
+        assert!(
+            p.to_lowercase().contains("test"),
+            "the builder must be asked which test proves each criterion"
+        );
+    }
+
+    /// C6 — an empty list changes nothing. This is what makes the feature safe
+    /// to ship: a scoper that never emits a criteria block leaves every prompt
+    /// byte-identical to today.
+    #[test]
+    fn with_no_criteria_every_prompt_is_byte_identical_to_today() {
+        let issue = Issue {
+            number: 7,
+            title: "t".into(),
+            body: "b".into(),
+            author: "nolanmak".into(),
+            author_trusted: true,
+            research_filed: false,
+        };
+        assert_eq!(
+            build_fix_prompt_with_criteria(&issue, Some("spec"), None, &[]),
+            build_fix_prompt(&issue, Some("spec"), None),
+            "an empty list must not perturb the fix prompt"
+        );
+        assert!(criteria_review_section(&[]).is_empty());
+        assert!(criteria_pr_section(&[]).is_empty());
+    }
+
+    /// C4 — both reviewers grade against the list, and neither loses the rules
+    /// that stop them ratcheting.
+    #[test]
+    fn both_codex_prompts_require_a_verdict_per_criterion() {
+        for sys in [CODEX_DIFF_REVIEW_SYSTEM, CODEX_SYSTEM_REVIEW_SYSTEM] {
+            let l = sys.to_lowercase();
+            assert!(
+                l.contains("acceptance criteria"),
+                "a reviewer that is not told about the criteria will ignore them"
+            );
+            assert!(
+                l.contains("met") && l.contains("not addressed"),
+                "the per-criterion verdict vocabulary must be spelled out"
+            );
+            // The criteria are a floor. Without this the reviewer checks the
+            // list and stops thinking, which is worse than having no list.
+            assert!(
+                l.contains("floor") || l.contains("not a ceiling"),
+                "criteria must not become a checklist that replaces judgement"
+            );
+        }
+        assert!(CODEX_DIFF_REVIEW_SYSTEM.contains("MATERIALITY"));
+        assert!(CODEX_DIFF_REVIEW_SYSTEM.contains("CONVERGENCE"));
+    }
+
+    #[test]
+    fn the_review_section_lists_every_criterion_for_the_reviewer() {
+        let cs = crit(&["C1: one", "C2: two"]);
+        let sec = criteria_review_section(&cs);
+        assert!(sec.contains("C1: one") && sec.contains("C2: two"));
+        assert!(
+            sec.to_lowercase().contains("acceptance criteria"),
+            "the section must be labelled or the reviewer cannot tell what it is"
+        );
+    }
+
+    /// C5 — the scope prompt has to ASK for criteria, including the
+    /// enumeration requirement, or none of the above ever fires.
+    #[test]
+    fn the_scope_prompt_asks_for_criteria_including_an_enumeration() {
+        let l = SCOPE_SYSTEM.to_lowercase();
+        assert!(l.contains("criteria:"), "the scoper must be given the output key");
+        assert!(
+            l.contains("every"),
+            "at least one criterion must be an enumeration — that is the class \
+             a diff reviewer structurally cannot check"
+        );
+        assert!(
+            l.contains("property") || l.contains("checkable"),
+            "criteria state a property, not an implementation"
+        );
+    }
+
     #[test]
     fn red_main_prompt_forbids_assertion_weakening() {
         let red = red_fixture();
@@ -10722,9 +11094,11 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             "no anonymous attempt in run_once"
         );
         assert!(body.contains("build_scope_prompt(&issue, prior_attempts.as_deref())"));
-        assert!(
-            body.contains("build_fix_prompt(&issue, plan.as_deref(), prior_attempts.as_deref())")
-        );
+        // #1012 added the criteria argument. Same intent as before: the fix
+        // prompt gets the issue, the scoped plan and the prior attempts.
+        assert!(body.contains(
+            "build_fix_prompt_with_criteria(&issue, plan.as_deref(), prior_attempts.as_deref(), &criteria)"
+        ));
     }
 
     // Structural: a harness failure must stay retryable next tick — the
