@@ -31,7 +31,7 @@ impl BridgeLaunch {
         let writes = opts.allowed_tools.iter().any(|t| matches!(t.as_str(), "Write" | "Edit" | "NotebookEdit"));
         let write_roots = if writes { vec![cwd.clone()] } else { vec![] };
         let mut environment: BTreeMap<String, String> = BTreeMap::new();
-        for key in ["HOME", "PATH", "USER", "LOGNAME", "LANG", "TERM", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"] {
+        for key in ["HOME", "PATH", "USER", "LOGNAME", "LANG", "TERM", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
             if let Ok(value) = std::env::var(key) { environment.insert(key.into(), value); }
         }
         environment.extend(opts.env.iter().cloned());

@@ -33,7 +33,16 @@ filesystem/process/network boundary. The command helper now enforces Landlock
 ABI 6+ read/write scopes plus a seccomp deny list for networking, process
 introspection and escape from the cleanup process group. Source-file read grants
 use opened inodes and exclude credential/control paths. The current general
-command profile is read-only; writable build snapshots remain to be integrated. On the tested deployment, the default Codex
+command profile is read-only. Cargo/npm commands run in disposable source
+snapshots with separate temporary configuration and output directories. Existing
+Cargo caches, Rust toolchains and npm dependencies are read-only; missing
+dependencies cannot currently be downloaded. UTF-8 source changes pass through
+the original write guards and concurrent-edit checks before being copied back.
+Build artifacts, binary changes and deletions are not copied back. Real synthetic
+Cargo and npm tests verify execution; dependency provisioning, cache persistence,
+binary/deletion reconciliation and full project builds remain integration gates.
+Git inspection receives read-only repository metadata and disables external diff
+helpers, hooks, fsmonitor and user/system configuration. On the tested deployment, the default Codex
 command sandbox fails during loopback setup. Its legacy Landlock backend runs a
 simple command but rejects permission profiles requiring direct runtime
 enforcement; selecting that backend alone does not prove read confinement.
@@ -71,6 +80,9 @@ cannot stand in for any tool-using profile.
   environment interpolation, missing-tool readiness and hung-child cleanup.
 - Kernel sandbox tests verify scoped I/O, outside/symlink/credential-read denial,
   blocked network sockets and blocked signals to the parent.
+- Real Cargo and npm fixtures verify compilation/test execution, read-only npm
+  dependencies, source reconciliation and exclusion of build outputs. Git diff
+  verifies repository metadata access without granting metadata writes.
 - The live Codex adapter smoke test performs scoped reads, exact writes and an
   allowed command; the common audit log verifies the serving provider and exit
   status. This is still not full chat, integration or auto-ship parity.

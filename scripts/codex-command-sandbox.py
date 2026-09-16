@@ -73,7 +73,7 @@ def source_read_entries(roots):
             os.close(fd)
 
 
-def restrict(read_roots, write_roots):
+def restrict(read_roots, write_roots, runtime_reads=()):
     if platform.system() != 'Linux' or platform.machine() not in ('x86_64', 'aarch64'):
         raise RuntimeError('command sandbox requires supported Linux architecture')
     libc = ctypes.CDLL(None, use_errno=True)
@@ -104,8 +104,13 @@ def restrict(read_roots, write_roots):
             if libc.syscall(445, ruleset, 1, ctypes.byref(rule), 0) != 0:
                 raise OSError(ctypes.get_errno(), 'cannot add source scope')
         entries = [(p, fs_access) for p in write_roots]
+        entries += [(p, read_access) for p in runtime_reads]
         entries += [(p, read_access) for p in ('/usr', '/bin', '/lib', '/lib64') if Path(p).exists()]
-        entries += [(p, read_access) for p in ('/etc/ld.so.cache',) if Path(p).exists()]
+        # Node loads the system OpenSSL configuration before running scripts.
+        # Grant the file itself, never /etc/ssl (which may contain private keys).
+        entries += [(p, read_access) for p in (
+            '/etc/ld.so.cache', '/etc/ssl/openssl.cnf', '/etc/passwd', '/etc/nsswitch.conf'
+        ) if Path(p).exists()]
         entries += [('/dev/null', (1 << 1) | (1 << 2))]
         for raw, access in entries:
             path = Path(raw).resolve(strict=True)
@@ -166,8 +171,10 @@ def main():
     resource.setrlimit(resource.RLIMIT_FSIZE, (256 * 1024 * 1024, 256 * 1024 * 1024))
     environment = {key: value for key, value in os.environ.items() if key in (
         'PATH', 'LANG', 'LC_ALL', 'TERM', 'CARGO_HOME', 'RUSTUP_HOME', 'RUSTUP_TOOLCHAIN',
-        'CARGO_TARGET_DIR', 'TMPDIR', 'NPM_CONFIG_CACHE', 'CARGO_NET_OFFLINE')}
-    restrict(policy['read_roots'], policy['write_roots'])
+        'CARGO_TARGET_DIR', 'TMPDIR', 'NPM_CONFIG_CACHE', 'CARGO_NET_OFFLINE',
+        'NPM_CONFIG_USERCONFIG', 'NPM_CONFIG_GLOBALCONFIG',
+        'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_OPTIONAL_LOCKS', 'GIT_DIR', 'GIT_WORK_TREE')}
+    restrict(policy['read_roots'], policy['write_roots'], policy.get('runtime_reads', []))
     os.execvpe(sys.argv[2], sys.argv[2:], environment)
 
 

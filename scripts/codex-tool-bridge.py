@@ -156,6 +156,9 @@ class Policy:
         return self._read(name)
 
     def _read(self, name):
+        return self._read_bytes(name).decode('utf-8')
+
+    def _read_bytes(self, name):
         with self.parent(name) as (parent, leaf):
             fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
                          dir_fd=parent)
@@ -166,7 +169,7 @@ class Policy:
                 data = stream.read(MAX_FILE_BYTES + 1)
                 if len(data) > MAX_FILE_BYTES:
                     raise Denied('file exceeds size limit')
-                return data.decode('utf-8')
+                return data
 
     def _write(self, name, content):
         data = content.encode('utf-8')
@@ -206,7 +209,7 @@ class Policy:
             raise Denied('edit must identify exactly one match')
         self._write(name, content.replace(old, new, 1))
 
-    def files(self, path='.'):
+    def files(self, path='.', excluded_dirs=()):
         base = Path(os.path.abspath(self.cwd / path))
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         count = 0
@@ -227,6 +230,8 @@ class Policy:
                     continue
                 info = os.stat(name, dir_fd=fd, follow_symlinks=False)
                 if stat.S_ISDIR(info.st_mode):
+                    if name in excluded_dirs:
+                        continue
                     child_fd = os.open(name, flags, dir_fd=fd)
                     try:
                         yield from walk(child_fd, child)
@@ -310,9 +315,11 @@ class Policy:
         executable = shutil.which(argv[0], path=self.environment.get('PATH', os.defpath))
         if not executable:
             raise Denied('configured command is not installed')
-        executable = Path(executable).resolve(strict=True)
-        if any(executable == root or root in executable.parents for root in self.write_roots):
+        executable = Path(executable).absolute()
+        resolved_executable = executable.resolve(strict=True)
+        if any(resolved_executable == root or root in resolved_executable.parents for root in self.write_roots):
             raise Denied('command executable is in a model-writable directory')
+        build = Path(argv[0]).name in ('cargo', 'npm', 'npx')
         service = Path(argv[0]).name in ('augmentagent', 'aa-gh')
         if service:
             self.check_service_argv(argv)
@@ -322,14 +329,77 @@ class Policy:
             raise Denied('command sandbox helper is unavailable')
         with tempfile.TemporaryDirectory(prefix='jarvis-command-') as temporary:
             directory = Path(temporary)
+            snapshot = BuildSnapshot(self, directory / 'workspace') if build else None
+            run_cwd = snapshot.root if snapshot else self.cwd
+            run_env = dict(self.environment)
+            runtime_reads = [str(resolved_executable)]
+            dependency_roots = []
+            if Path(argv[0]).name == 'git':
+                if any(arg.split('=', 1)[0] in ('--ext-diff', '--textconv') for arg in argv[1:]):
+                    raise Denied('external Git diff helpers are not permitted')
+                git_env = {'PATH': self.environment.get('PATH', os.defpath),
+                    'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
+                    'GIT_OPTIONAL_LOCKS': '0'}
+                paths = subprocess.run([str(executable), 'rev-parse', '--absolute-git-dir', '--git-common-dir'],
+                    cwd=self.cwd, env=git_env, capture_output=True, text=True, timeout=10)
+                if paths.returncode:
+                    raise Denied('Git metadata is unavailable for the scoped workspace')
+                metadata = [(self.cwd / line).resolve(strict=True) for line in paths.stdout.splitlines()]
+                runtime_reads.extend(str(path) for path in metadata)
+                run_env.update(git_env)
+                run_env.update({'GIT_DIR': str(metadata[0]), 'GIT_WORK_TREE': str(self.cwd)})
+                argv = [argv[0], '--no-pager', '-c', 'core.hooksPath=/dev/null',
+                        '-c', 'core.fsmonitor=false', *argv[1:]]
+            if snapshot:
+                if Path(argv[0]).name in ('npm', 'npx'):
+                    dependencies = self.cwd / 'node_modules'
+                    if dependencies.is_symlink():
+                        raise Denied('dependency directory must not be a symlink')
+                    if dependencies.is_dir():
+                        (run_cwd / 'node_modules').symlink_to(dependencies, target_is_directory=True)
+                        dependency_roots.append(str(dependencies))
+                home = Path(self.environment.get('HOME', str(Path.home())))
+                cargo_home = Path(self.environment.get('CARGO_HOME', str(home / '.cargo')))
+                rustup_home = Path(self.environment.get('RUSTUP_HOME', str(home / '.rustup')))
+                toolchains = rustup_home / 'toolchains'
+                isolated_cargo = run_cwd / '.cargo-home'
+                isolated_rustup = run_cwd / '.rustup-home'
+                isolated_cargo.mkdir(); isolated_rustup.mkdir()
+                for name in ('registry', 'git'):
+                    cache = cargo_home / name
+                    if cache.is_dir():
+                        runtime_reads.append(str(cache))
+                        (isolated_cargo / name).symlink_to(cache, target_is_directory=True)
+                if toolchains.is_dir():
+                    runtime_reads.append(str(toolchains))
+                    (isolated_rustup / 'toolchains').symlink_to(toolchains, target_is_directory=True)
+                # Rustup reads settings even with a selected toolchain. Copy only
+                # the public default selector, not host path overrides or state.
+                settings = rustup_home / 'settings.toml'
+                if settings.is_file():
+                    import tomllib
+                    default = tomllib.loads(settings.read_text()).get('default_toolchain')
+                    if isinstance(default, str):
+                        (isolated_rustup / 'settings.toml').write_text(
+                            'version = "12"\ndefault_toolchain = ' + json.dumps(default) + '\n')
+                run_env.update({'CARGO_HOME': str(isolated_cargo), 'RUSTUP_HOME': str(isolated_rustup),
+                    'CARGO_TARGET_DIR': str(run_cwd / 'target'), 'CARGO_NET_OFFLINE': 'true',
+                    'TMPDIR': str(run_cwd / '.build-tmp'), 'NPM_CONFIG_CACHE': str(run_cwd / '.npm-cache'),
+                    'NPM_CONFIG_USERCONFIG': str(run_cwd / '.build-tmp/npm-user.conf'),
+                    'NPM_CONFIG_GLOBALCONFIG': str(run_cwd / '.build-tmp/npm-global.conf')})
+                (run_cwd / '.build-tmp').mkdir()
+                (run_cwd / '.build-tmp/npm-user.conf').touch()
+                (run_cwd / '.build-tmp/npm-global.conf').touch()
             policy_file = directory / 'policy.json'
-            policy_file.write_text(json.dumps({'cwd': str(self.cwd),
-                'read_roots': [str(p) for p in self.read_roots], 'write_roots': []}))
+            policy_file.write_text(json.dumps({'cwd': str(run_cwd),
+                'read_roots': [str(run_cwd), *dependency_roots] if snapshot else [str(p) for p in self.read_roots],
+                'write_roots': [str(run_cwd)] if snapshot else [],
+                'runtime_reads': runtime_reads}))
             policy_file.chmod(0o600)
             with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
                 launch = argv if service else [sys.executable, '-I', str(helper), str(policy_file), *argv]
                 process = subprocess.Popen(launch,
-                    cwd=self.cwd, env=self.environment, stdin=subprocess.DEVNULL,
+                    cwd=run_cwd, env=run_env, stdin=subprocess.DEVNULL,
                     stdout=stdout, stderr=stderr, start_new_session=True)
                 deadline = time.monotonic() + min(max(timeout, 1), 900)
                 try:
@@ -342,6 +412,15 @@ class Policy:
                             process.wait(timeout=0.1)
                         except subprocess.TimeoutExpired:
                             pass
+                    # Stop background writers before reconciling the snapshot.
+                    # Waiting only for the top-level process leaves descendants
+                    # able to race the source-copy validation below.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    if snapshot:
+                        snapshot.sync()
                     stdout.seek(0); stderr.seek(0)
                     return {'exit_code': process.returncode,
                             'stdout': stdout.read(MAX_FILE_BYTES).decode(errors='replace'),
@@ -388,6 +467,56 @@ class Policy:
             if argv == tokens or (prefix and argv[:len(tokens)] == tokens):
                 return argv
         raise Denied('command is not permitted by this profile')
+
+
+class BuildSnapshot:
+    """Disposable source copy for commands that execute project-supplied code.
+
+    Secrets and repository control paths are excluded. Source edits made by
+    formatters/code generators are reconciled through the ordinary scoped writer;
+    build outputs never become executable artifacts in the live service checkout.
+    """
+    EXCLUDED = {'target', 'node_modules', '.build-tmp', '.npm-cache', '.cargo-home', '.rustup-home', 'dist', 'build', '__pycache__'}
+
+    def __init__(self, policy, root):
+        self.policy = policy
+        self.root = root
+        root.mkdir(mode=0o700)
+        self.original = {}
+        for absolute, relative in policy.files(excluded_dirs=self.EXCLUDED):
+            data = policy._read_bytes(absolute)
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+            destination.chmod(os.stat(absolute, follow_symlinks=False).st_mode & 0o777)
+            self.original[relative] = data
+
+    def sync(self):
+        if 'Write' not in self.policy.tools:
+            return
+        view = Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+                       'write_roots': [], 'allowed_tools': ['Read']})
+        changes = []
+        for absolute, relative in view.files(excluded_dirs=self.EXCLUDED):
+            data = view._read_bytes(absolute)
+            if self.original.get(relative) == data:
+                continue
+            # Reconciliation cannot quietly overwrite edits from another actor.
+            destination = self.policy.cwd / relative
+            if relative in self.original:
+                if self.policy._read_bytes(str(destination)) != self.original[relative]:
+                    raise Denied('source changed during build; reconcile before retrying')
+            elif destination.exists() or destination.is_symlink():
+                raise Denied('source path appeared during build; reconcile before retrying')
+            try:
+                text = data.decode('utf-8')
+            except UnicodeError:
+                continue  # binary build outputs stay in the disposable workspace
+            self.policy._relative(str(destination), writing=True)
+            changes.append((str(destination), text))
+        for destination, text in changes:
+            self.policy.before('Write', {'file_path': destination, 'content': text})
+            self.policy.write(destination, text)
 
 
 TOOL_SCHEMAS = {

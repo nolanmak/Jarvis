@@ -155,6 +155,142 @@ class ToolPolicyTests(unittest.TestCase):
             with self.subTest(argv=argv),self.assertRaises(bridge.Denied):
                 policy.check_service_argv(argv)
 
+    def test_build_command_uses_disposable_workspace_and_syncs_safe_source_changes(self):
+        fakebin=Path(self.temp.name)/'bin';fakebin.mkdir()
+        cargo=fakebin/'cargo'
+        cargo.write_text("""#!/usr/bin/python3
+from pathlib import Path
+import os
+assert 'SYNTHETIC_TOKEN' not in os.environ
+assert not Path('.env').exists()
+Path('source.rs').write_text('formatted source\\n')
+Path('Cargo.lock').write_text('synthetic lock\\n')
+Path('target').mkdir(exist_ok=True)
+Path('target/artifact').write_text('generated build output')
+print('SYNTHETIC_BUILD_OK')
+""")
+        cargo.chmod(0o700)
+        (self.root/'source.rs').write_text('source')
+        (self.root/'.env').write_text('SYNTHETIC_TOKEN=PRIVATE')
+        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+            'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Edit','Bash(cargo *)'],
+            'environment':{'PATH':str(fakebin)+':/usr/bin','SYNTHETIC_TOKEN':'PRIVATE'}})
+        result=policy.run_command('cargo test')
+        self.assertEqual(result['exit_code'],0,result)
+        self.assertIn('SYNTHETIC_BUILD_OK',result['stdout'])
+        self.assertEqual((self.root/'source.rs').read_text(),'formatted source\n')
+        self.assertEqual((self.root/'Cargo.lock').read_text(),'synthetic lock\n')
+        self.assertFalse((self.root/'target').exists())
+        self.assertEqual((self.root/'.env').read_text(),'SYNTHETIC_TOKEN=PRIVATE')
+
+    def test_real_cargo_can_build_and_test_a_dependency_free_fixture(self):
+        import shutil
+        if not shutil.which('cargo'):
+            self.skipTest('Cargo is not installed')
+        (self.root/'src').mkdir()
+        (self.root/'Cargo.toml').write_text('[package]\nname="synthetic-build"\nversion="0.1.0"\nedition="2021"\n')
+        (self.root/'src/lib.rs').write_text('#[test] fn synthetic_passes() { assert_eq!(2 + 2, 4); }\n')
+        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+            'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Edit','Bash(cargo *)']})
+        outcome=policy.run_command('cargo test --offline',timeout=60)
+        self.assertEqual(outcome['exit_code'],0,outcome)
+        self.assertIn('1 passed',outcome['stdout'])
+        self.assertFalse((self.root/'target').exists())
+
+    def test_build_reconciliation_preserves_concurrent_source_edits(self):
+        (self.root/'source.rs').write_text('original')
+        snapshot=bridge.BuildSnapshot(self.policy,Path(self.temp.name)/'snapshot')
+        (snapshot.root/'source.rs').write_text('formatter output')
+        (self.root/'source.rs').write_text('concurrent editor output')
+        with self.assertRaisesRegex(bridge.Denied,'source changed during build'):
+            snapshot.sync()
+        self.assertEqual((self.root/'source.rs').read_text(),'concurrent editor output')
+
+    def test_build_background_child_is_stopped_when_parent_exits(self):
+        import os
+        import time
+        fakebin=Path(self.temp.name)/'bin';fakebin.mkdir()
+        cargo=fakebin/'cargo'
+        cargo.write_text('''#!/usr/bin/python3
+import subprocess
+child=subprocess.Popen(['/usr/bin/python3','-c','import time; time.sleep(30)'])
+print(child.pid, flush=True)
+''')
+        cargo.chmod(0o700)
+        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+            'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Bash(cargo *)'],
+            'environment':{'PATH':str(fakebin)+':/usr/bin'}})
+        outcome=policy.run_command('cargo test')
+        self.assertEqual(outcome['exit_code'],0,outcome)
+        pid=int(outcome['stdout'].strip())
+        deadline=time.monotonic()+2
+        while time.monotonic()<deadline:
+            try:
+                state=Path(f'/proc/{pid}/stat').read_text().split(') ',1)[1].split()[0]
+            except FileNotFoundError:
+                return
+            if state=='Z':
+                return
+            time.sleep(0.01)
+        self.fail('command descendant survived process-group cleanup')
+
+    def test_build_reconciliation_does_not_follow_created_symlinks(self):
+        snapshot=bridge.BuildSnapshot(self.policy,Path(self.temp.name)/'snapshot')
+        (snapshot.root/'escape.txt').symlink_to(self.outside)
+        snapshot.sync()
+        self.assertFalse((self.root/'escape.txt').exists())
+
+    def test_git_diff_reads_worktree_metadata_without_writing_it(self):
+        subprocess.run(['git','init','-q',str(self.root)],check=True)
+        (self.root/'tracked.txt').write_text('before\n')
+        subprocess.run(['git','-C',str(self.root),'add','tracked.txt'],check=True)
+        subprocess.run(['git','-C',str(self.root),'-c','user.name=Synthetic Tester',
+                        '-c','user.email=tester@example.com','commit','-qm','fixture'],check=True)
+        (self.root/'tracked.txt').write_text('after\n')
+        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+            'write_roots':[],'allowed_tools':['Bash(git diff*)','Bash(git status*)']})
+        result=policy.run_command('git diff -- tracked.txt')
+        self.assertEqual(result['exit_code'],0,result)
+        self.assertIn('+after',result['stdout'])
+        with self.assertRaises(bridge.Denied):
+            policy.run_command('git diff --ext-diff')
+
+    def test_real_npm_can_run_a_dependency_free_project_test(self):
+        import shutil
+        if not shutil.which('npm'):
+            self.skipTest('npm is not installed')
+        (self.root/'package.json').write_text(json.dumps({'name':'synthetic-build','version':'1.0.0',
+            'scripts':{'test':"node -e \"require('node:assert').equal(2+2,4); console.log('NPM_FIXTURE_OK')\""}}))
+        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+            'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Edit','Bash(npm *)']})
+        outcome=policy.run_command('npm test --offline',timeout=60)
+        self.assertEqual(outcome['exit_code'],0,outcome)
+        self.assertIn('NPM_FIXTURE_OK',outcome['stdout'])
+        self.assertFalse((self.root/'.npm-cache').exists())
+
+    def test_npm_uses_existing_dependencies_without_allowing_changes(self):
+        import shutil
+        if not shutil.which('npm'):
+            self.skipTest('npm is not installed')
+        module=self.root/'node_modules/synthetic-dependency'
+        module.mkdir(parents=True)
+        (module/'index.js').write_text('module.exports = 42;\n')
+        (self.root/'test.js').write_text('''const assert = require('node:assert');
+const fs = require('node:fs');
+assert.equal(require('synthetic-dependency'), 42);
+assert.throws(() => fs.writeFileSync(require.resolve('synthetic-dependency'), 'bad'),
+              error => error.code === 'EACCES' || error.code === 'EPERM');
+console.log('DEPENDENCY_FIXTURE_OK');
+''')
+        (self.root/'package.json').write_text(json.dumps({'name':'synthetic-build','version':'1.0.0',
+            'scripts':{'test':'node test.js'}}))
+        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+            'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Edit','Bash(npm *)']})
+        outcome=policy.run_command('npm test --offline',timeout=60)
+        self.assertEqual(outcome['exit_code'],0,outcome)
+        self.assertIn('DEPENDENCY_FIXTURE_OK',outcome['stdout'])
+        self.assertEqual((module/'index.js').read_text(),'module.exports = 42;\n')
+
     def test_literal_shell_characters_in_argument_are_data(self):
         self.assertEqual(self.policy.command_argv("printf 'hello; world'"),
                          ['printf', 'hello; world'])
