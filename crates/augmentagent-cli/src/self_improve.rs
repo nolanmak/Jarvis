@@ -5369,22 +5369,18 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 // "nobody is cleared for this preset", and those are a wait
                 // and a fault respectively — so ask the chain directly rather
                 // than inferring from the message.
-                match reasoner
+                // Only a confirmed all-latched chain is a pause. Anything
+                // else — not latched at all, or nothing eligible for this
+                // preset — is a real failure and falls through to the
+                // recording below.
+                if let augmentagent_channel_core::LaneAvailability::AllLatched(latched) = reasoner
                     .lane_availability(augmentagent_channel_core::CapabilityClass::FullAgentic)
                 {
-                    augmentagent_channel_core::LaneAvailability::AllLatched(latched) => {
-                        let why = no_provider_message(
-                            "FullAgentic",
-                            &latched,
-                            SpentBeforeHold::ScopingCall,
-                        );
-                        info!(issue = issue.number, "auto-PR held: {why}");
-                        cleanup(worktree, branch, repo_root.to_path_buf()).await;
-                        return Ok(RunReport::held(why));
-                    }
-                    // Not latched, or nothing eligible: a real failure either
-                    // way, so fall through to the recording below.
-                    _ => {}
+                    let why =
+                        no_provider_message("FullAgentic", &latched, SpentBeforeHold::ScopingCall);
+                    info!(issue = issue.number, "auto-PR held: {why}");
+                    cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                    return Ok(RunReport::held(why));
                 }
             }
             record_reasoner_error(
