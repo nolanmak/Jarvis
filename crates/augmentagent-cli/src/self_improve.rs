@@ -3882,6 +3882,13 @@ async fn rabbit_pr_comments(repo_root: &Path, pr: u64) -> Vec<serde_json::Value>
 /// short poll window; otherwise `unavailable` — which never blocks. A
 /// rate-limit notice ends the poll immediately.
 async fn wait_for_rabbit(repo_root: &Path, pr: u64, head_sha: &str) -> RabbitReview {
+    // #1032 — in a repo with no `.coderabbit.yaml` nothing will ever review
+    // this PR, so polling for one spends the whole window discovering that.
+    // The fresh path no longer consults this config at all; short-circuiting
+    // the resume lane is the only place it still earns its keep.
+    if !coderabbit_configured(repo_root) {
+        return RabbitReview::unavailable("CodeRabbit is not configured for this repo");
+    }
     let gh = gh_bin();
     let window = rabbit_wait_secs();
     let started = std::time::Instant::now();
@@ -11185,6 +11192,24 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
                 "absence must never block: {note:?}"
             );
         }
+    }
+
+    /// Removing the fresh-path check left `coderabbit_configured` with no
+    /// caller. Rather than delete it, it moved to where it does real work: a
+    /// repo with no `.coderabbit.yaml` will never be reviewed, so the resume
+    /// lane must not spend its polling window learning that.
+    #[test]
+    fn the_resume_poll_short_circuits_when_coderabbit_is_not_configured() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn wait_for_rabbit(").expect("wait fn");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+        let guard = body.find("coderabbit_configured(").expect("must check the config");
+        let poll = body.find("loop {").expect("the polling loop");
+        assert!(
+            guard < poll,
+            "check before polling, or the window is spent discovering there is \
+             nobody to wait for"
+        );
     }
 
     /// C7 — a merge has to be explainable afterwards, so the note says what
