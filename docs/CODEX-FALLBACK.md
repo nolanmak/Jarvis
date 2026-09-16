@@ -21,6 +21,18 @@ pre-tool guards. Every filesystem path component is opened without following
 symlinks. Read roots and write roots are separate; transcript context is not a
 writable workspace. Credential and control directories are excluded.
 
+The rejected escape classes are traversal outside a root, absolute paths
+outside a root, symlinks at any component, credential/control paths, and hard
+links. A hard link can give a name inside a read root to an inode that also
+lives outside it. Bridge Read, Edit and Write refuse any file with more than one
+link, Grep skips it, and Glob does not list it (#1043). The command sandbox
+never grants Landlock access to such a file. One helper decides this for both:
+`verify_regular_private_file` in `scripts/codex-command-sandbox.py` accepts only
+a regular file with `st_nlink == 1`. Both scripts run as `python3 -I`, so a plain
+import between them cannot work. The bridge therefore loads the sandbox module
+by explicit path from the packaged launch directory. The sandbox is already
+embedded beside the bridge, so no new file is shipped.
+
 Tool paths are capped at 32 components below their scope root and at 4096 bytes
 as an absolute path (Linux `PATH_MAX`). The caps apply to Read, Write and Edit and
 to every Glob/Grep entry. A deeper Write is refused before any directory is
@@ -369,7 +381,7 @@ cannot stand in for any tool-using profile.
 - The production-shaped wiki-ask quota regression now passes, alongside routing
   tests for all four capability classes and live handler/delivery fallback QA.
 - Bridge tests cover file read/write/edit, nested writes, bounded search, tool
-  declaration, traversal and intermediate symlink escapes, sensitive paths,
+  declaration, traversal, intermediate symlink and hard-link escapes, sensitive paths,
   command parsing, and guard denial/crash/malformed-response handling.
 - `BridgeResilienceTests` pin the path depth/length caps for reads and writes,
   Glob/Grep over a 1500-level tree, and a stdio bridge that keeps serving after
@@ -401,7 +413,7 @@ cannot stand in for any tool-using profile.
   rejection of unknown settings.
 - Stdio and HTTP MCP tests cover tool allowlists, session/auth forwarding,
   environment interpolation, missing-tool readiness and hung-child cleanup.
-- Kernel sandbox tests verify scoped I/O, outside/symlink/credential-read denial,
+- Kernel sandbox tests verify scoped I/O, outside/symlink/hard-link/credential-read denial,
   blocked network sockets and blocked signals to the parent.
 - Real Cargo and npm fixtures verify compilation/test execution, read-only npm
   dependencies, source reconciliation and exclusion of build outputs. Git diff

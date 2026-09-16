@@ -50,6 +50,39 @@ MAX_PATH_BYTES = 4096
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 
 
+_FILE_VERIFICATION = None
+
+
+def file_verification(write_roots=()):
+    """The command sandbox module, whose file-verification rule the bridge reuses.
+
+    Both scripts run as `python3 -I`, which keeps the script directory off
+    sys.path, so the sandbox is loaded by explicit path. It is always packaged
+    beside the bridge (codex_tools.rs) and is already trusted to confine
+    commands. Sharing its module keeps one hard-link/regular-file rule for
+    bridge reads and Landlock grants (#1043). Loading happens once per process,
+    and only while the helper is outside the calling policy's writable scopes.
+    """
+    global _FILE_VERIFICATION
+    if _FILE_VERIFICATION is None:
+        import importlib.util
+        try:
+            helper = Path(__file__).with_name('codex-command-sandbox.py').resolve(strict=True)
+            if any(helper == root or root in helper.parents for root in write_roots):
+                raise Denied('file verification helper is in a model-writable directory')
+            spec = importlib.util.spec_from_file_location('jarvis_command_sandbox', helper)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            if not (callable(module.regular_private_file) and callable(module.verify_regular_private_file)):
+                raise Denied('file verification helper is incomplete')
+        except Denied:
+            raise
+        except Exception as exc:
+            raise Denied('file verification helper is unavailable') from exc
+        _FILE_VERIFICATION = module
+    return _FILE_VERIFICATION
+
+
 def literal_command_argv(command):
     # Quotes may contain ordinary punctuation as literal argument data.
     # Reject expansion syntax even inside double quotes, and never invoke
@@ -648,12 +681,14 @@ class Policy:
         return self._read_bytes(name).decode('utf-8')
 
     def _read_bytes(self, name):
+        verification = file_verification(self.write_roots)
         with self.parent(name) as (parent, leaf):
             fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
                          dir_fd=parent)
             with os.fdopen(fd, 'rb') as stream:
-                metadata = os.fstat(stream.fileno())
-                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_FILE_BYTES:
+                # Verified on the opened descriptor: regular, one hard link.
+                metadata = verification.verify_regular_private_file(stream.fileno())
+                if metadata is None or metadata.st_size > MAX_FILE_BYTES:
                     raise Denied('read requires a bounded regular file')
                 data = stream.read(MAX_FILE_BYTES + 1)
                 if len(data) > MAX_FILE_BYTES:
@@ -666,10 +701,11 @@ class Policy:
     def _write_bytes(self, name, data):
         if len(data) > MAX_FILE_BYTES:
             raise Denied('file exceeds size limit')
+        verification = file_verification(self.write_roots)
         with self.parent(name, writing=True) as (parent, leaf):
             try:
                 existing = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
-                if not stat.S_ISREG(existing.st_mode):
+                if not verification.regular_private_file(existing):
                     raise Denied('write requires a regular file')
                 mode = stat.S_IMODE(existing.st_mode) & 0o777
             except FileNotFoundError:
@@ -703,6 +739,7 @@ class Policy:
     def files(self, path='.', excluded_dirs=()):
         base = Path(os.path.abspath(self.cwd / path))
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        verification = file_verification(self.write_roots)
         count = 0
 
         def sorted_names(fd):
@@ -743,7 +780,7 @@ class Policy:
                         except BaseException:
                             os.close(child_fd)
                             raise
-                    elif stat.S_ISREG(info.st_mode):
+                    elif verification.regular_private_file(info):
                         yield absolute, str(child)
             finally:
                 for fd, _, _ in stack:

@@ -168,6 +168,53 @@ class ToolPolicyTests(unittest.TestCase):
             self.policy.write('dirlink/created.txt', 'bad')
         self.assertFalse((self.outside.parent / 'created.txt').exists())
 
+    def test_hard_link_escape_is_denied_for_read_grep_edit_write_and_skipped_by_glob(self):
+        import os
+        # A pre-existing hard link: a name inside the scope, an inode outside it.
+        os.link(self.outside, self.root / 'linked.txt')
+        (self.root / 'plain.txt').write_text('SYNTHETIC_PUBLIC\n')
+        server = bridge.Server(self.policy)
+        with self.assertRaises(bridge.Denied):
+            self.policy.read('linked.txt')
+        response = server.dispatch({'method': 'tools/call', 'params': {
+            'name': 'Read', 'arguments': {'file_path': 'linked.txt'}}})
+        self.assertTrue(response['isError'])
+        self.assertNotIn('SYNTHETIC_PRIVATE', json.dumps(response))
+        self.assertEqual(self.policy.grep('SYNTHETIC'), [
+            {'path': 'plain.txt', 'line': 1, 'text': 'SYNTHETIC_PUBLIC'}])
+        self.assertEqual(self.policy.grep('SYNTHETIC', 'linked.txt'), [])
+        self.assertEqual(self.policy.glob('*.txt'), ['plain.txt'])
+        for action in (lambda: self.policy.edit('linked.txt', 'PRIVATE', 'CHANGED'),
+                       lambda: self.policy.write('linked.txt', 'REPLACED')):
+            with self.assertRaises(bridge.Denied):
+                action()
+        self.assertEqual(self.outside.read_text(), 'SYNTHETIC_PRIVATE')
+        self.assertEqual(os.stat(self.root / 'linked.txt').st_nlink, 2)
+        # The rule is about the inode, not where the other name lives.
+        os.link(self.root / 'plain.txt', self.root / 'alias.txt')
+        with self.assertRaises(bridge.Denied):
+            self.policy.read('plain.txt')
+
+    def test_bridge_and_command_sandbox_share_one_file_verification_helper(self):
+        import os
+        verifier = bridge.file_verification()
+        self.assertEqual(Path(verifier.__file__).resolve(),
+                         (Path(bridge.__file__).parent / 'codex-command-sandbox.py').resolve())
+        (self.root / 'plain.txt').write_text('SYNTHETIC_PUBLIC\n')
+        self.assertEqual(self.policy.read('plain.txt'), 'SYNTHETIC_PUBLIC\n')
+        granted = [access for descriptor, access in verifier.source_read_entries([str(self.root)])
+                   if access != 1 << 3]
+        self.assertEqual(len(granted), 1)
+        original = verifier.regular_private_file
+        verifier.regular_private_file = lambda info: False
+        self.addCleanup(setattr, verifier, 'regular_private_file', original)
+        with self.assertRaises(bridge.Denied):
+            self.policy.read('plain.txt')
+        self.assertEqual(self.policy.glob('*.txt'), [])
+        granted = [access for descriptor, access in verifier.source_read_entries([str(self.root)])
+                   if access != 1 << 3]
+        self.assertEqual(granted, [])
+
     def test_search_rejects_intermediate_directory_symlinks(self):
         outside_dir = Path(self.temp.name) / 'external'
         (outside_dir / 'nested').mkdir(parents=True)
