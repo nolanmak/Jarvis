@@ -363,7 +363,13 @@ fn rows_for(saved: &[EvalRow], cases: &[&EvalCase]) -> Vec<EvalRow> {
         .map(|c| {
             saved
                 .iter()
-                .find(|r| r.id == c.id)
+                // Matched on the whole question, not just the id. Editing a
+                // fixture's expectation or its pinned commit asks a DIFFERENT
+                // question, and inheriting the old verdict would report a
+                // stale pass for a case that was never re-graded. A baseline
+                // that reports a stale score is worse than none: it is
+                // believed.
+                .find(|r| r.id == c.id && r.expect == c.expect && r.base == c.base)
                 .cloned()
                 .unwrap_or_else(|| grade(c, None))
         })
@@ -1344,6 +1350,35 @@ mod tests {
     /// A selected case the saved run never covered must not be silently
     /// dropped — that would quietly shrink the denominator and inflate the
     /// score.
+    /// Codex, system pass: saved rows were matched by id alone, so editing a
+    /// fixture's expectation or its pinned commit kept the old row — verdict,
+    /// base and all — and `--report-only` reported a pass for a case that had
+    /// materially changed and never been re-graded. A baseline that reports a
+    /// stale score is worse than none, because it is believed.
+    #[test]
+    fn a_saved_row_is_ignored_once_its_case_has_materially_changed() {
+        let mut pinned = case("E1", 1, Expect::Fixable);
+        pinned.base = Some("aaaaaaa".into());
+        let saved = [grade(&pinned, Some(&observed(true, "graded then")))];
+
+        // Same id, different expectation.
+        let mut flipped = pinned.clone();
+        flipped.expect = Expect::NotFixable;
+        let rows = rows_for(&saved, &[&flipped]);
+        assert!(!rows[0].pass, "a changed expectation cannot inherit an old pass");
+        assert!(rows[0].actual.contains("no verdict"), "{}", rows[0].actual);
+
+        // Same id, different pinned commit.
+        let mut moved = pinned.clone();
+        moved.base = Some("bbbbbbb".into());
+        let rows = rows_for(&saved, &[&moved]);
+        assert!(!rows[0].pass, "a different commit is a different question");
+
+        // Unchanged: the saved row is reused exactly, which is the property
+        // that matters and a stronger claim than poking at its note.
+        assert_eq!(rows_for(&saved, &[&pinned]), saved.to_vec());
+    }
+
     #[test]
     fn a_selected_case_missing_from_the_saved_run_is_reported_as_unrun() {
         let all = vec![grade(&case("E1", 1, Expect::Fixable), Some(&observed(true, "ok")))];
