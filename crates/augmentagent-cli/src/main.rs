@@ -8369,9 +8369,14 @@ fn owner_rules_block(wiki_root: &std::path::Path) -> Option<String> {
     }
 
     let rendered = |sec: &str, body: &str| format!("### {sec}\n{body}\n\n");
+    // CHARACTERS, not bytes. The cap is named and documented in characters,
+    // and `str::len()` counts UTF-8 bytes — so an owner writing accented
+    // words, curly quotes or emoji had their rules cut thousands of
+    // characters early, which is #1007 reintroduced for anyone not writing
+    // pure ASCII.
     let total: usize = sections
         .iter()
-        .map(|(sec, body)| rendered(sec, body).len())
+        .map(|(sec, body)| rendered(sec, body).chars().count())
         .sum();
     if total <= OWNER_RULES_MAX_CHARS {
         return Some(sections.iter().map(|(s, b)| rendered(s, b)).collect());
@@ -8386,9 +8391,9 @@ fn owner_rules_block(wiki_root: &std::path::Path) -> Option<String> {
     let mut left = OWNER_RULES_MAX_CHARS;
     for (i, (sec, body)) in sections.iter().enumerate() {
         let share = left / (sections.len() - i);
-        let body_budget = share.saturating_sub(rendered(sec, "").len());
+        let body_budget = share.saturating_sub(rendered(sec, "").chars().count());
         let part = rendered(sec, &truncate_rules_body(body, body_budget));
-        left = left.saturating_sub(part.len());
+        left = left.saturating_sub(part.chars().count());
         block.push_str(&part);
     }
     Some(block)
@@ -8410,6 +8415,9 @@ const OWNER_RULES_TRUNCATED: &str = "[truncated — read wiki/about/me.md for th
 /// paid for out of `budget`, so the result never exceeds it and the caller's
 /// cap is a real ceiling.
 ///
+/// `budget` counts CHARACTERS. Byte offsets are still used to slice, but only
+/// ever at line boundaries, which are always char boundaries too.
+///
 /// Rules are only ever dropped whole. Half a bullet is worse than no bullet —
 /// "- Never send email without an approval card" cut mid-line reads as
 /// "- Never send email", a rule that means something else entirely — so a
@@ -8417,19 +8425,24 @@ const OWNER_RULES_TRUNCATED: &str = "[truncated — read wiki/about/me.md for th
 /// marker alone. Line boundaries are also char boundaries, so no UTF-8 walk is
 /// needed.
 fn truncate_rules_body(body: &str, budget: usize) -> String {
-    if body.len() <= budget {
+    if body.chars().count() <= budget {
         return body.to_string();
     }
     // Shares are thousands of chars, so the marker always fits; the guard just
     // keeps the "never exceeds `budget`" promise unconditional.
-    let Some(room) = budget.checked_sub(OWNER_RULES_TRUNCATED.len() + 1) else {
+    let Some(room) = budget.checked_sub(OWNER_RULES_TRUNCATED.chars().count() + 1) else {
         return String::new();
     };
+    // `kept_chars` spends the budget; `cut` is the byte offset to slice at.
+    // They advance together and only ever at line boundaries.
     let mut cut = 0;
+    let mut kept_chars = 0;
     for line in body.split_inclusive('\n') {
-        if cut + line.len() > room {
+        let line_chars = line.chars().count();
+        if kept_chars + line_chars > room {
             break;
         }
+        kept_chars += line_chars;
         cut += line.len();
     }
     let mut kept = body[..cut].trim_end().to_string();
@@ -9206,6 +9219,60 @@ mod owner_rules_tests {
              is the text itself. (user said, 2026-07-08)\n\n### Agent behavior rules\n- Email asks \
              end with an approval card.\n\n"
         );
+    }
+
+    /// CodeRabbit on PR #1020: the cap is named and documented in CHARACTERS
+    /// but every sum used `str::len()`, which counts UTF-8 bytes. An owner
+    /// writing rules with accented words, curly quotes or emoji would have
+    /// their rules silently truncated thousands of characters early — which is
+    /// #1007, the bug this PR exists to fix, reintroduced through the back
+    /// door for anyone not writing pure ASCII.
+    #[test]
+    fn a_non_ascii_rule_set_is_measured_in_characters_not_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+
+        // Three bytes per character, so this is ~12k characters but ~36k
+        // bytes: comfortably inside a 16,000-CHARACTER ceiling and far outside
+        // a 16,000-byte one.
+        let rule = format!("- Répondre en français — {}\n", "é".repeat(200));
+        let body: String = std::iter::repeat(rule.as_str()).take(55).collect();
+        assert!(body.chars().count() < OWNER_RULES_MAX_CHARS, "fixture must fit the char cap");
+        assert!(body.len() > OWNER_RULES_MAX_CHARS, "fixture must exceed the byte cap");
+
+        let me = format!("# About Me\n\n## Agent behavior rules\n\n{body}");
+        std::fs::write(tmp.path().join("about").join("me.md"), me).unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+
+        assert!(
+            !block.contains("wiki/about/me.md"),
+            "a rule set inside the character cap must not be truncated:\n{}",
+            &block[block.len().saturating_sub(200)..]
+        );
+        assert_eq!(
+            block.matches("Répondre en français").count(),
+            55,
+            "every rule must survive"
+        );
+    }
+
+    /// And the ceiling itself is a character ceiling, so a genuinely oversized
+    /// non-ASCII file is still bounded — in characters, not bytes.
+    #[test]
+    fn the_cap_bounds_characters_even_when_bytes_run_far_ahead() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        let rule = format!("- Règle — {}\n", "é".repeat(200));
+        let body: String = std::iter::repeat(rule.as_str()).take(400).collect();
+        let me = format!("# About Me\n\n## Agent behavior rules\n\n{body}");
+        std::fs::write(tmp.path().join("about").join("me.md"), me).unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+        assert!(
+            block.chars().count() <= OWNER_RULES_MAX_CHARS,
+            "block is {} chars, cap is {OWNER_RULES_MAX_CHARS}",
+            block.chars().count()
+        );
+        assert!(block.contains("wiki/about/me.md"), "an over-cap file must say so");
     }
 
     #[test]
