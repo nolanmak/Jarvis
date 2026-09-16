@@ -1,19 +1,16 @@
 //! Scope-pass eval harness for the auto-PR loop (#1011).
 //!
-//! Every test of the loop's prompts proves a sentence is *in* a prompt, never
-//! that the model *obeys* it, so each change to the loop's judgment (#955,
-//! #973, #996, #1006) shipped unmeasured — and the model resolves through a
-//! live pointer, so the judgment can drift with no commit at all. This
-//! replays cached issue fixtures through the real stage-1 scoping pass (same
-//! system prompt, model resolution and parser) and grades only the
-//! fixable / not-fixable verdict. A ruler, not a rule: nothing feeds back
-//! into a merge decision and nothing touches loop state (pinned by
-//! `never_touches_production_state`).
+//! Prompt tests prove a sentence is *in* a prompt, never that the model
+//! *obeys* it, so every change to the loop's judgment shipped unmeasured.
+//! This replays cached issue fixtures through the real stage-1 scoping pass
+//! (same system prompt, model resolution and parser) and grades only the
+//! fixable / not-fixable verdict. A ruler, not a rule: nothing feeds back into
+//! a merge decision or loop state (pinned by `never_touches_production_state`).
 
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::self_improve::{
     build_scope_prompt, parse_scope_output, scope_opts, truncate, Issue, ScopeOutcome,
@@ -28,7 +25,7 @@ const MAX_NOTE_CHARS: usize = 500;
 const MAX_CELL_CHARS: usize = 160;
 
 /// The scoper's verdict, in the fixture's vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Expectation {
     Fixable,
@@ -45,7 +42,7 @@ impl Expectation {
 }
 
 /// One fixture case: a cached issue plus the verdict we expect for it.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvalCase {
     pub id: String,
     pub issue: u64,
@@ -58,40 +55,69 @@ pub struct EvalCase {
     pub author: String,
 }
 
-/// Parse the fixture. An unknown `expect` (serde names the value and line),
-/// a duplicate id, or an empty file is a hard error: a fixture typo must
-/// never grade as a pass, and a suite that ran nothing would render 0/0.
+/// Parse the fixture. An unknown `expect`, a duplicate id, or an empty file
+/// is a hard error: a fixture typo must never grade as a pass, and a suite
+/// that ran nothing would render 0/0. Cases are decoded one at a time so the
+/// error names the offending case: serde alone says `unknown variant
+/// "maybe"`, which does not locate the typo in a long fixture.
 pub fn parse_cases(json: &str) -> Result<Vec<EvalCase>> {
-    let cases: Vec<EvalCase> = serde_json::from_str(json).context("parse eval cases")?;
-    if cases.is_empty() {
+    let raw: Vec<serde_json::Value> = serde_json::from_str(json).context("parse eval cases")?;
+    if raw.is_empty() {
         bail!("no eval cases in fixture");
     }
-    for (i, c) in cases.iter().enumerate() {
-        if c.id.trim().is_empty() {
+    let mut cases: Vec<EvalCase> = Vec::with_capacity(raw.len());
+    for (i, v) in raw.into_iter().enumerate() {
+        let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let c: EvalCase = serde_json::from_value(v)
+            .with_context(|| format!("eval case {id:?} (index {i}) in fixture"))?;
+        if id.trim().is_empty() {
             bail!("eval case for issue #{} has an empty id", c.issue);
         }
-        if cases[..i].iter().any(|p| p.id == c.id) {
-            bail!("duplicate eval case id {:?}", c.id);
+        if cases.iter().any(|p| p.id == id) {
+            bail!("duplicate eval case id {id:?}");
         }
+        cases.push(c);
     }
     Ok(cases)
 }
 
 /// Apply `--only id,id`, keeping fixture order. An unknown id is an error.
 pub fn select_cases(cases: Vec<EvalCase>, only: Option<&str>) -> Result<Vec<EvalCase>> {
-    let Some(only) = only.map(str::trim).filter(|s| !s.is_empty()) else {
+    let wanted: Vec<&str> = only.unwrap_or_default().split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    if wanted.is_empty() {
         return Ok(cases);
-    };
-    let wanted: Vec<&str> = only.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    }
     for id in &wanted {
         if !cases.iter().any(|c| c.id == *id) {
             bail!("--only names unknown eval case {id:?}");
         }
     }
-    Ok(cases
-        .into_iter()
-        .filter(|c| wanted.contains(&c.id.as_str()))
-        .collect())
+    Ok(cases.into_iter().filter(|c| wanted.contains(&c.id.as_str())).collect())
+}
+
+/// `--refresh`: re-fetch title, body and author of the selected cases from
+/// the live issue (`gh issue view`, a read — never a write) and rewrite the
+/// fixture so the cache tracks edits to the issue. The rewritten file is a
+/// local cache; whether it is committed is the operator's call.
+async fn refresh_cases(gh: &str, repo_root: &Path, path: &Path, all: &mut [EvalCase], only: Option<&str>) -> Result<()> {
+    let ids: Vec<String> = select_cases(all.to_vec(), only)?.into_iter().map(|c| c.id).collect();
+    for c in all.iter_mut().filter(|c| ids.contains(&c.id)) {
+        let n = c.issue.to_string();
+        let out = tokio::process::Command::new(gh)
+            .args(["issue", "view", &n, "--json", "title,body,author"])
+            .current_dir(repo_root)
+            .output()
+            .await
+            .with_context(|| format!("spawn {gh} issue view {n}"))?;
+        if !out.status.success() {
+            bail!("gh issue view {n}: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).context("parse gh issue view")?;
+        let field = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+        (c.title, c.body, c.author) = (field(&v["title"]), field(&v["body"]), field(&v["author"]["login"]));
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&*all)? + "\n")
+        .with_context(|| format!("write {}", path.display()))
 }
 
 /// What one case produced: the scoper's verdict plus ungraded observations,
@@ -102,8 +128,7 @@ pub enum Observed {
         actual: Expectation,
         complexity: &'static str,
         est_diff_lines: Option<usize>,
-        /// The refusal reason or the spec head, so a miss is diagnosable
-        /// from the scoper's own words rather than just red.
+        /// Refusal reason or spec head: a miss is diagnosable from the scoper's own words.
         note: String,
     },
     /// The reasoner call failed. Neither a pass nor a miss; still non-zero.
@@ -115,11 +140,7 @@ impl Observed {
     /// Grade what the real parser made of the scoper's text.
     pub fn graded(scope: &ScopeOutcome) -> Self {
         Self::Graded {
-            actual: if scope.fixable {
-                Expectation::Fixable
-            } else {
-                Expectation::NotFixable
-            },
+            actual: if scope.fixable { Expectation::Fixable } else { Expectation::NotFixable },
             complexity: scope.complexity.as_str(),
             est_diff_lines: scope.est_diff_lines,
             note: truncate(&scope.body, MAX_NOTE_CHARS),
@@ -158,8 +179,7 @@ pub fn needs_attention(rows: &[Row]) -> bool {
     passed < graded || errors > 0
 }
 
-/// Make a string safe inside one markdown table cell: a `|` would open a
-/// new column and a newline a new row, and the scoper's reasons contain both.
+/// One markdown cell: a `|` would open a column and a newline a row; reasons contain both.
 pub fn escape_cell(s: &str) -> String {
     s.replace('|', "\\|").replace(['\n', '\r'], " ")
 }
@@ -175,31 +195,19 @@ pub fn render_report(rows: &[Row], model: &str, run_at: &str) -> String {
         rows.len()
     );
     for r in rows {
-        let cells: [String; 5] = match (&r.observed, r.pass()) {
-            (
-                Observed::Graded {
-                    actual,
-                    complexity,
-                    est_diff_lines,
-                    note,
-                },
-                pass,
-            ) => [
+        let pass = r.pass() == Some(true);
+        let cells: [String; 5] = match &r.observed {
+            Observed::Graded { actual, complexity, est_diff_lines, note } => [
                 actual.as_str().into(),
-                if pass == Some(true) { "pass" } else { "MISS" }.into(),
+                if pass { "pass" } else { "MISS" }.into(),
                 (*complexity).into(),
                 est_diff_lines.map_or("—".into(), |n| n.to_string()),
-                if pass == Some(true) { String::new() } else { truncate(note, MAX_CELL_CHARS) },
+                if pass { String::new() } else { truncate(note, MAX_CELL_CHARS) },
             ],
-            (Observed::Error(e), _) => ["error".into(), "error".into(), "—".into(), "—".into(), truncate(e, MAX_CELL_CHARS)],
-            (Observed::Skipped, _) => ["—".into(), "—".into(), "—".into(), "—".into(), String::new()],
+            Observed::Error(e) => ["error".into(), "error".into(), "—".into(), "—".into(), truncate(e, MAX_CELL_CHARS)],
+            Observed::Skipped => ["—".into(), "—".into(), "—".into(), "—".into(), String::new()],
         };
-        out.push_str(&format!(
-            "| {} | #{} | {} |",
-            escape_cell(&r.case.id),
-            r.case.issue,
-            r.case.expect.as_str()
-        ));
+        out.push_str(&format!("| {} | #{} | {} |", escape_cell(&r.case.id), r.case.issue, r.case.expect.as_str()));
         for c in &cells {
             out.push_str(&format!(" {} |", escape_cell(c)));
         }
@@ -213,9 +221,7 @@ pub fn render_report(rows: &[Row], model: &str, run_at: &str) -> String {
         _ => format!("\nPass: {passed}/{graded} ({errors} errors)\n"),
     });
     for (i, r) in rows.iter().filter(|r| r.pass() == Some(false)).enumerate() {
-        let Observed::Graded { actual, note, .. } = &r.observed else {
-            unreachable!("a miss is always graded")
-        };
+        let Observed::Graded { actual, note, .. } = &r.observed else { unreachable!("a miss is always graded") };
         if i == 0 {
             out.push_str("\n## Misses\n");
         }
@@ -234,14 +240,8 @@ pub fn render_report(rows: &[Row], model: &str, run_at: &str) -> String {
 }
 
 fn issue_for(c: &EvalCase) -> Issue {
-    Issue {
-        number: c.issue,
-        title: c.title.clone(),
-        body: c.body.clone(),
-        author: c.author.clone(),
-        author_trusted: true,
-        research_filed: false,
-    }
+    let (title, body, author) = (c.title.clone(), c.body.clone(), c.author.clone());
+    Issue { number: c.issue, title, body, author, author_trusted: true, research_filed: false }
 }
 
 /// Entry point for the `autopr-eval` subcommand. Exit 0 when every graded
@@ -250,12 +250,19 @@ pub async fn run(
     repo_root: &Path,
     cases: Option<&Path>,
     only: Option<&str>,
+    report: Option<&Path>,
+    refresh: bool,
     report_only: bool,
 ) -> Result<i32> {
     let cases_path = cases.map_or_else(|| repo_root.join(DEFAULT_CASES), Path::to_path_buf);
+    let report_path = report.map_or_else(|| repo_root.join(DEFAULT_REPORT), Path::to_path_buf);
     let raw = std::fs::read_to_string(&cases_path)
         .with_context(|| format!("read {}", cases_path.display()))?;
-    let cases = select_cases(parse_cases(&raw)?, only)?;
+    let mut cases = parse_cases(&raw)?;
+    if refresh {
+        refresh_cases(&crate::self_improve::gh_bin(), repo_root, &cases_path, &mut cases, only).await?;
+    }
+    let cases = select_cases(cases, only)?;
 
     let opts = scope_opts(repo_root.to_path_buf());
     let model = opts.model.clone().unwrap_or_else(|| "(inherited)".to_string());
@@ -279,7 +286,6 @@ pub async fn run(
     }
 
     let report = render_report(&rows, &model, &chrono::Utc::now().to_rfc3339());
-    let report_path = repo_root.join(DEFAULT_REPORT);
     if let Some(dir) = report_path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
@@ -296,14 +302,8 @@ mod tests {
     use Expectation::{Fixable, NotFixable};
 
     fn case(id: &str, issue: u64, expect: Expectation) -> EvalCase {
-        EvalCase {
-            id: id.to_string(),
-            issue,
-            expect,
-            title: format!("title {id}"),
-            body: format!("body {id}"),
-            author: "owner".to_string(),
-        }
+        let (title, body, author) = (format!("title {id}"), format!("body {id}"), "owner".into());
+        EvalCase { id: id.into(), issue, expect, title, body, author }
     }
 
     fn graded(id: &str, issue: u64, expect: Expectation, scoper_text: &str) -> Row {
@@ -329,7 +329,7 @@ mod tests {
 
         let bad = r#"[{"id":"E1","issue":10,"expect":"fixable"},{"id":"E2","issue":11,"expect":"maybe"}]"#;
         let msg = format!("{:#}", parse_cases(bad).expect_err("unknown expect must not parse"));
-        assert!(msg.contains("maybe"), "error must quote the bad value: {msg}");
+        assert!(msg.contains("maybe") && msg.contains("\"E2\""), "must name value and case: {msg}");
 
         let dup = r#"[{"id":"E1","issue":10,"expect":"fixable"},{"id":"E1","issue":11,"expect":"fixable"}]"#;
         assert!(format!("{:#}", parse_cases(dup).unwrap_err()).contains("E1"));
@@ -365,28 +365,16 @@ mod tests {
         }
         // Ungraded observations ride along; the note is bounded.
         let long = format!("VERDICT: not-fixable\n\n{}", "x".repeat(2_000));
-        let Observed::Graded { complexity, est_diff_lines, note, .. } =
-            Observed::graded(&parse_scope_output(&long))
-        else {
-            panic!()
-        };
+        let Observed::Graded { complexity, est_diff_lines, note, .. } = Observed::graded(&parse_scope_output(&long)) else { panic!() };
         assert_eq!((complexity, est_diff_lines), ("hard", None));
         assert!(note.chars().count() <= MAX_NOTE_CHARS + 1 && note.ends_with('…'));
         let scope = parse_scope_output("VERDICT: fixable\nCOMPLEXITY: medium\nEST-DIFF-LINES: ~120\n\nspec");
         let Observed::Graded { complexity, est_diff_lines, .. } = Observed::graded(&scope) else { panic!() };
         assert_eq!((complexity, est_diff_lines), ("medium", Some(120)));
-        // Errors and skips grade as nothing.
+        // Errors and skips grade as nothing; an error is still never green.
         assert_eq!(errored("E", 1, Fixable, "boom").pass(), None);
+        assert!(needs_attention(&[errored("E", 1, Fixable, "boom")]));
         assert_eq!(Row { case: case("E", 1, Fixable), observed: Observed::Skipped }.pass(), None);
-    }
-
-    #[test]
-    fn counts_pass_over_graded_cases_only_and_an_error_is_never_green() {
-        let clean = [graded("E1", 1, Fixable, "VERDICT: fixable\n\nspec")];
-        assert_eq!(counts(&clean), (1, 1, 0));
-        assert!(!needs_attention(&clean));
-        assert!(needs_attention(&[errored("E1", 1, Fixable, "boom")]));
-        assert!(needs_attention(&[graded("E1", 1, NotFixable, "VERDICT: fixable\n\nspec")]));
     }
 
     #[test]
@@ -399,7 +387,7 @@ mod tests {
             errored("E5", 5, Fixable, "reasoner: quota"),
         ];
         assert_eq!(counts(&rows), (4, 2, 1));
-        assert!(needs_attention(&rows));
+        assert!(needs_attention(&rows) && !needs_attention(&rows[..1]));
         let report = render_report(&rows, "claude-test", "2026-09-15T00:00:00Z");
         let rows = table_rows(&report);
         assert_eq!(rows.len(), 5);
@@ -413,22 +401,17 @@ mod tests {
         for row in &rows {
             assert_eq!(row.replace("\\|", "").matches('|').count(), header_cols, "{row}");
         }
-        assert!(report.contains("Pass: 2/4 (1 error)\n"), "{report}");
-        assert!(report.contains("scope model: claude-test · cases: 5\n"));
+        assert!(report.contains("Pass: 2/4 (1 error)\n") && report.contains("scope model: claude-test · cases: 5\n"), "{report}");
         // Both miss directions are diagnosable from the scoper's own words.
         assert!(report.contains("## Misses\n\n### E2 — #2: expected fixable, scoper said not-fixable\n\n> needs a \\| decision\n> from the owner \\| and budget\n"), "{report}");
         assert!(report.contains("### E4 — #4: expected not-fixable, scoper said fixable\n\n> big spec\n"), "{report}");
-        assert_eq!(escape_cell("a | b\nc\r\nd"), "a \\| b c  d");
     }
 
     #[test]
     fn report_only_and_only_subset_render_dashes_without_a_pass_count() {
         let all = vec![case("E1", 1, Fixable), case("E2", 2, NotFixable), case("E3", 3, Fixable)];
-        let rows: Vec<Row> = select_cases(all, Some("E2,E3"))
-            .unwrap()
-            .into_iter()
-            .map(|case| Row { case, observed: Observed::Skipped })
-            .collect();
+        let picked = select_cases(all, Some("E2,E3")).unwrap();
+        let rows: Vec<Row> = picked.into_iter().map(|case| Row { case, observed: Observed::Skipped }).collect();
         assert!(!needs_attention(&rows));
         let report = render_report(&rows, "m", "now");
         let rows = table_rows(&report);
@@ -444,15 +427,39 @@ mod tests {
     fn committed_fixture_parses_and_covers_both_expectations() {
         let cases = parse_cases(include_str!("../../../eval/autopr-cases.json"))
             .expect("eval/autopr-cases.json must parse");
-        assert!(cases.iter().any(|c| c.expect == Fixable));
-        assert!(cases.iter().any(|c| c.expect == NotFixable));
-        for c in &cases {
-            assert!(!c.title.is_empty() && !c.body.is_empty(), "case {} is not cached", c.id);
-        }
+        assert!(cases.iter().any(|c| c.expect == Fixable) && cases.iter().any(|c| c.expect == NotFixable));
+        assert!(cases.iter().all(|c| !c.title.is_empty() && !c.body.is_empty()), "every case is cached");
+    }
+
+    #[tokio::test]
+    async fn report_goes_where_asked_and_refresh_rewrites_only_the_selected_cases() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = dir.path().join("cases.json");
+        std::fs::write(&fixture, r#"[{"id":"E1","issue":7,"expect":"fixable","title":"stale","body":"stale","author":"x"},
+                                    {"id":"E2","issue":8,"expect":"not-fixable","title":"keep","body":"keep","author":"x"}]"#).unwrap();
+        // A stand-in `gh issue view` returning the live issue as gh would.
+        let gh = dir.path().join("gh");
+        std::fs::write(&gh, "#!/bin/sh\necho '{\"title\":\"fresh\",\"body\":\"fresh | body\",\"author\":{\"login\":\"owner\"}}'\n").unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut all = parse_cases(&std::fs::read_to_string(&fixture).unwrap()).unwrap();
+        refresh_cases(gh.to_str().unwrap(), dir.path(), &fixture, &mut all, Some("E1")).await.unwrap();
+        let again = parse_cases(&std::fs::read_to_string(&fixture).unwrap()).unwrap();
+        assert_eq!(again, all, "the fixture is rewritten with the refreshed cache");
+        assert_eq!((again[0].title.as_str(), again[0].body.as_str(), again[0].author.as_str()), ("fresh", "fresh | body", "owner"));
+        assert_eq!((again[1].title.as_str(), again[1].expect), ("keep", NotFixable), "unselected case untouched");
+        assert!(refresh_cases("/nonexistent/gh", dir.path(), &fixture, &mut all, None).await.is_err());
+        // `--report` picks the destination; the default path is not written.
+        let report = dir.path().join("out/custom.md");
+        assert_eq!(run(dir.path(), Some(&fixture), Some("E2"), Some(&report), false, true).await.unwrap(), 0);
+        assert!(std::fs::read_to_string(&report).unwrap().contains("| E2 | #8 | not-fixable | — |"));
+        assert!(!dir.path().join(DEFAULT_REPORT).exists());
     }
 
     /// Structural pins on the module source: the eval must grade through
-    /// the shipped parser and never reach loop state or write to GitHub.
+    /// the shipped parser and never reach loop state or write to GitHub
+    /// (`--refresh` reads via `gh issue view`; every write subcommand stays
+    /// forbidden here).
     #[test]
     fn never_touches_production_state() {
         let src = include_str!("autopr_eval.rs");
@@ -460,7 +467,7 @@ mod tests {
         for forbidden in [
             "attempt_ledger_path", "attempt_history_path", "daily_counter_path",
             "baseline_cache_path", "AttemptLedger", "AttemptHistory", "run_once(",
-            "gh_bin", "\"comment\"", "\"create\"", "\"edit\"", "\"label\"", "\"merge\"",
+            "\"comment\"", "\"create\"", "\"edit\"", "\"label\"", "\"merge\"", "\"close\"",
             "\"worktree\"", "fn parse_scope_output", "\"verdict:\"",
         ] {
             assert!(!code.contains(forbidden), "eval module must not reference {forbidden}");

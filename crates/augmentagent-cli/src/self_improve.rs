@@ -559,7 +559,7 @@ async fn run_sandboxed(
     ))
 }
 
-fn gh_bin() -> String {
+pub(crate) fn gh_bin() -> String {
     // Prod systemd PATH lacks /snap/bin; honor an override, else try snap.
     std::env::var("GH_BIN").unwrap_or_else(|_| {
         if Path::new("/snap/bin/gh").exists() {

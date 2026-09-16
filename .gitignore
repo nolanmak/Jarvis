@@ -68,8 +68,7 @@ public/tailwind.css
 # and if it leaks past a crash it must not make the deploy tree look dirty.
 .self-improve-worktrees/
 
-# Scope-pass eval output (#1011): rewritten by every `autopr-eval` run. The
-# fixture next to it (eval/autopr-cases.json) IS tracked.
+# Scope-pass eval output (#1011), rewritten by every run; the fixture IS tracked.
 eval/RESULTS.md
 
 # Interrupted credential exports and local security-audit reports.

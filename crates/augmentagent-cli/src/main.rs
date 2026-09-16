@@ -506,6 +506,13 @@ enum Cmd {
         /// Comma-separated case ids to run; the report covers only these.
         #[arg(long)]
         only: Option<String>,
+        /// Report destination (default: eval/RESULTS.md).
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Re-fetch title/body/author of the selected cases from GitHub
+        /// (`gh issue view`, a read) and rewrite the fixture cache first.
+        #[arg(long, default_value_t = false)]
+        refresh: bool,
         /// Render the report from the fixture alone: no reasoner calls.
         #[arg(long, default_value_t = false)]
         report_only: bool,
@@ -2252,9 +2259,10 @@ async fn main() -> Result<()> {
     }
     // The scope-pass eval (#1011) needs no database: dispatch before the
     // store opens so a run from a scratch checkout creates no data.db.
-    if let Cmd::AutoprEval { ref cases, ref only, report_only } = cli.cmd {
+    if let Cmd::AutoprEval { ref cases, ref only, ref report, refresh, report_only } = cli.cmd {
         let root = std::env::current_dir().context("current_dir")?;
-        let code = autopr_eval::run(&root, cases.as_deref(), only.as_deref(), report_only).await?;
+        let (cases, only, report) = (cases.as_deref(), only.as_deref(), report.as_deref());
+        let code = autopr_eval::run(&root, cases, only, report, refresh, report_only).await?;
         std::process::exit(code);
     }
     // PDF exports need no database or network credentials. In particular, do
