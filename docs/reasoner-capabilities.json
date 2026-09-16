@@ -289,7 +289,7 @@
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "model_tier": "quality",
-      "tier_rationale": "Quality (Opus class). Generates the reply-draft program the owner approves: the code-mode successor of draft_opts (quality) in the same flow, whose classic fallback still runs draft_opts. Until #1046 it passed model: None and inherited the owner's interactive Opus, so quality keeps the tier it actually ran on. Volume is bounded to messages that survive triage and the reply guards.",
+      "tier_rationale": "Quality. Generates the reply-draft program the owner approves, in the same flow as its classic fallback draft_opts (quality). Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon quality tier (claude-opus-4-8 by default, env-overridable via AUGMENTAGENT_OPUS_MODEL, the same knob draft_opts reads, or AUGMENTAGENT_MODEL_CLAUDE_QUALITY). Volume is bounded to messages that survive triage and the reply guards.",
       "conformance": [
         "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
         "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
@@ -315,7 +315,7 @@
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "model_tier": "quality",
-      "tier_rationale": "Quality (Opus class). Generates the reply-draft program the owner approves: the code-mode successor of draft_opts (quality) in the same flow, whose classic fallback still runs draft_opts. Until #1046 it passed model: None and inherited the owner's interactive Opus, so quality keeps the tier it actually ran on. Volume is bounded to messages that survive triage and the reply guards.",
+      "tier_rationale": "Quality. Generates the reply-draft program the owner approves, in the same flow as its classic fallback draft_opts (quality). Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon quality tier (claude-opus-4-8 by default, env-overridable via AUGMENTAGENT_OPUS_MODEL, the same knob draft_opts reads, or AUGMENTAGENT_MODEL_CLAUDE_QUALITY). Volume is bounded to messages that survive triage and the reply guards.",
       "conformance": [
         "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
         "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
@@ -329,7 +329,7 @@
       "permission_profile": "text",
       "output_contract": "Structured extraction from supplied context",
       "model_tier": "fast",
-      "tier_rationale": "Fast (Haiku class). Strict-JSON extraction of contact fields from an already-detected signature block, the same output contract as resolve.rs::extract_opts and voice extract.rs::opts, which pin Haiku. Runs only in the manual backfill-signatures batch (up to --limit 2000 emails), where Opus multiplies quota burn. Output is guarded: per-field confidence gates auto-fill (0.7 default), merges are fill-blanks-only, a regex fallback covers parse failures, and low-confidence fields go to a Discord digest. Until #1046 it inherited the owner's interactive Opus; this is the one site whose tier changes.",
+      "tier_rationale": "Fast. Strict-JSON extraction of contact fields from an already-detected signature block, the same output contract as resolve.rs::extract_opts and voice extract.rs::opts, which pin Haiku. Runs only in the manual backfill-signatures batch (up to --limit 2000 emails). Output is guarded: per-field confidence gates auto-fill (0.7 default), merges are fill-blanks-only, a regex fallback covers parse failures, and low-confidence fields go to a Discord digest. Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon fast tier (claude-haiku-4-5-20251001 by default, env-overridable via AUGMENTAGENT_MODEL_CLAUDE_FAST).",
       "conformance": [
         "provider_channel_tests::live_codex_channel_formats",
         "provider_channel_tests::live_claude_channel_formats"
@@ -341,7 +341,7 @@
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "model_tier": "quality",
-      "tier_rationale": "Quality (Opus class). Generates the reply-draft program the owner approves: the code-mode successor of draft_opts (quality) in the same flow, whose classic fallback still runs draft_opts. Until #1046 it passed model: None and inherited the owner's interactive Opus, so quality keeps the tier it actually ran on. Volume is bounded to messages that survive triage and the reply guards.",
+      "tier_rationale": "Quality. Generates the reply-draft program the owner approves, in the same flow as its classic fallback draft_opts (quality). Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon quality tier (claude-opus-4-8 by default, env-overridable via AUGMENTAGENT_OPUS_MODEL, the same knob draft_opts reads, or AUGMENTAGENT_MODEL_CLAUDE_QUALITY). Volume is bounded to messages that survive triage and the reply guards.",
       "conformance": [
         "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
         "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
@@ -367,7 +367,7 @@
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "model_tier": "quality",
-      "tier_rationale": "Quality (Opus class). Generates the reply-draft program the owner approves: the code-mode successor of draft_opts (quality) in the same flow, whose classic fallback still runs draft_opts. Until #1046 it passed model: None and inherited the owner's interactive Opus, so quality keeps the tier it actually ran on. Volume is bounded to messages that survive triage and the reply guards.",
+      "tier_rationale": "Quality. Generates the reply-draft program the owner approves, in the same flow as its classic fallback draft_opts (quality). Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon quality tier (claude-opus-4-8 by default, env-overridable via AUGMENTAGENT_OPUS_MODEL, the same knob draft_opts reads, or AUGMENTAGENT_MODEL_CLAUDE_QUALITY). Volume is bounded to messages that survive triage and the reply guards.",
       "conformance": [
         "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
         "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
@@ -381,7 +381,7 @@
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "model_tier": "quality",
-      "tier_rationale": "Quality (Opus class). Generates the reply-draft program the owner approves: the code-mode successor of draft_opts (quality) in the same flow, whose classic fallback still runs draft_opts. Until #1046 it passed model: None and inherited the owner's interactive Opus, so quality keeps the tier it actually ran on. Volume is bounded to messages that survive triage and the reply guards.",
+      "tier_rationale": "Quality. Generates the reply-draft program the owner approves, in the same flow as its classic fallback draft_opts (quality). Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon quality tier (claude-opus-4-8 by default, env-overridable via AUGMENTAGENT_OPUS_MODEL, the same knob draft_opts reads, or AUGMENTAGENT_MODEL_CLAUDE_QUALITY). Volume is bounded to messages that survive triage and the reply guards.",
       "conformance": [
         "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
         "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
@@ -395,7 +395,7 @@
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "model_tier": "quality",
-      "tier_rationale": "Quality (Opus class). Generates the reply-draft program the owner approves: the code-mode successor of draft_opts (quality) in the same flow, whose classic fallback still runs draft_opts. Until #1046 it passed model: None and inherited the owner's interactive Opus, so quality keeps the tier it actually ran on. Volume is bounded to messages that survive triage and the reply guards.",
+      "tier_rationale": "Quality. Generates the reply-draft program the owner approves, in the same flow as its classic fallback draft_opts (quality). Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon quality tier (claude-opus-4-8 by default, env-overridable via AUGMENTAGENT_OPUS_MODEL, the same knob draft_opts reads, or AUGMENTAGENT_MODEL_CLAUDE_QUALITY). Volume is bounded to messages that survive triage and the reply guards.",
       "conformance": [
         "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
         "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
@@ -421,7 +421,7 @@
       "permission_profile": "text",
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "model_tier": "quality",
-      "tier_rationale": "Quality (Opus class). Generates the reply-draft program the owner approves: the code-mode successor of draft_opts (quality) in the same flow, whose classic fallback still runs draft_opts. Until #1046 it passed model: None and inherited the owner's interactive Opus, so quality keeps the tier it actually ran on. Volume is bounded to messages that survive triage and the reply guards.",
+      "tier_rationale": "Quality. Generates the reply-draft program the owner approves, in the same flow as its classic fallback draft_opts (quality). Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon quality tier (claude-opus-4-8 by default, env-overridable via AUGMENTAGENT_OPUS_MODEL, the same knob draft_opts reads, or AUGMENTAGENT_MODEL_CLAUDE_QUALITY). Volume is bounded to messages that survive triage and the reply guards.",
       "conformance": [
         "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
         "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
@@ -435,7 +435,7 @@
       "permission_profile": "text",
       "output_contract": "Selftest response used for text-only failover diagnosis",
       "model_tier": "quality",
-      "tier_rationale": "Pins Opus (AUGMENTAGENT_OPUS_MODEL) so the probe exercises the models the important presets use.",
+      "tier_rationale": "Pins the daemon quality tier (AUGMENTAGENT_OPUS_MODEL, the same knob as draft_opts) so the probe exercises the models the important presets use.",
       "conformance": [
         "reasoner_failover_e2e::quota_refusal_fails_over_to_codex_and_latches",
         "reasoner_failover_e2e::healthy_primary_never_spawns_fallback"

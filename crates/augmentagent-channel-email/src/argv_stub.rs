@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use augmentagent_channel_core::cli_gate::CliGate;
 use augmentagent_channel_core::ClaudeCliReasoner;
 
 /// `ClaudeCliReasoner` reads `CLAUDE_CLI` once, at construction. Serialize the
@@ -52,7 +53,9 @@ impl ArgvStub {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = std::env::var_os("CLAUDE_CLI");
         std::env::set_var("CLAUDE_CLI", &self.bin);
-        let reasoner = ClaudeCliReasoner::new();
+        // A private gate: the global one publishes the running daemon's
+        // `$XDG_RUNTIME_DIR/augmentagent/reasoner-gate.json` (#954).
+        let reasoner = ClaudeCliReasoner::new().with_gate(std::sync::Arc::new(CliGate::new(4)));
         match previous {
             Some(value) => std::env::set_var("CLAUDE_CLI", value),
             None => std::env::remove_var("CLAUDE_CLI"),
