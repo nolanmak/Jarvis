@@ -81,6 +81,7 @@ pub struct FallbackReasoner {
     /// auto-PR loop builds one reasoner per attempt, so this IS the attempt's
     /// spend and the record of which provider actually served it.
     usage: std::sync::Mutex<Vec<(&'static str, u32, u32)>>,
+    mutation_providers: std::sync::Mutex<Vec<ProviderKind>>,
     handoff_root: Option<std::path::PathBuf>,
 }
 
@@ -165,6 +166,7 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
         entries,
         latch: CooldownLatch::system(),
         usage: std::sync::Mutex::new(Vec::new()),
+        mutation_providers: std::sync::Mutex::new(Vec::new()),
         handoff_root: crate::handoff::system_root(),
     })
 }
@@ -186,6 +188,7 @@ pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
             entries: vec![entry],
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
+            mutation_providers: std::sync::Mutex::new(Vec::new()),
             handoff_root: crate::handoff::system_root(),
         })
     })
@@ -202,6 +205,7 @@ impl FallbackReasoner {
             }],
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
+            mutation_providers: std::sync::Mutex::new(Vec::new()),
             handoff_root: crate::handoff::system_root(),
         }
     }
@@ -218,6 +222,7 @@ impl FallbackReasoner {
                 .collect(),
             latch,
             usage: std::sync::Mutex::new(Vec::new()),
+            mutation_providers: std::sync::Mutex::new(Vec::new()),
             handoff_root: None,
         }
     }
@@ -225,6 +230,15 @@ impl FallbackReasoner {
     /// Providers currently configured (for status surfaces).
     pub fn provider_names(&self) -> Vec<&'static str> {
         self.entries.iter().map(|e| e.kind.name()).collect()
+    }
+
+    /// Providers dispatched with mutation-capable tools on this instance.
+    /// Record attempts before awaiting execution: an error or cancellation
+    /// does not prove the provider left the workspace unchanged. Review
+    /// selection must exclude every such provider, not just the final one.
+    /// Callers resuming a draft must also load its persisted authorship.
+    pub fn mutation_providers(&self) -> Vec<ProviderKind> {
+        self.mutation_providers.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// One more call dispatched to `name` (before the provider runs).
@@ -302,11 +316,16 @@ impl FallbackReasoner {
                 tracing::debug!(provider = name, %until, "provider latched; skipping");
                 continue;
             }
-            self.note_call(name);
             let resumed_message = match &opts.handoff_path {
                 Some(path) => crate::handoff::resume_message(path, user_message)?,
                 None => user_message.to_string(),
             };
+            self.note_call(name);
+            if matches!(class, crate::providers::CapabilityClass::WriteTools
+                | crate::providers::CapabilityClass::FullAgentic) {
+                let mut authors = self.mutation_providers.lock().unwrap_or_else(|e| e.into_inner());
+                if !authors.contains(&entry.kind) { authors.push(entry.kind); }
+            }
             let res = if transcript {
                 entry.reasoner.call_transcript(opts, &resumed_message).await
             } else {
@@ -441,6 +460,64 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // ---- #828: single-provider pinning for the independent review ----
+
+    #[tokio::test]
+    async fn review_exclusions_include_failed_mutating_attempts_but_not_text_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = Scripted::err(|| anyhow::anyhow!("synthetic interrupted build"));
+        let fb = FallbackReasoner::for_tests(
+            vec![(ProviderKind::Claude, primary as Arc<dyn Reasoner>)], latch_in(&dir));
+        let mut opts = text_only_opts();
+        let _ = fb.call(&opts, "synthetic scope").await;
+        assert!(fb.mutation_providers().is_empty());
+        opts.allowed_tools = vec!["Write".into()];
+        let _ = fb.call(&opts, "synthetic build").await;
+        assert_eq!(fb.mutation_providers(), vec![ProviderKind::Claude]);
+        let _ = fb.call_transcript(&opts, "synthetic revision").await;
+        assert_eq!(fb.mutation_providers(), vec![ProviderKind::Claude]);
+    }
+
+    #[tokio::test]
+    async fn excluded_or_latched_providers_are_not_recorded_as_builders() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = Scripted::err(rate_limited);
+        let fb = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary as Arc<dyn Reasoner>),
+            (ProviderKind::Gemini, Scripted::ok("scope") as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
+        fb.call(&text_only_opts(), "synthetic scope").await.unwrap();
+        let mut opts = text_only_opts();
+        opts.allowed_tools = vec!["Write".into()];
+        assert!(fb.call(&opts, "synthetic build").await.is_err());
+        assert!(fb.mutation_providers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_mutating_provider_attribution() {
+        struct InterruptedBuilder(Arc<tokio::sync::Notify>);
+        #[async_trait]
+        impl Reasoner for InterruptedBuilder {
+            async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let fb = Arc::new(FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, Arc::new(InterruptedBuilder(started.clone())) as Arc<dyn Reasoner>),
+        ], latch_in(&dir)));
+        let builder = fb.clone();
+        let task = tokio::spawn(async move {
+            let mut opts = text_only_opts();
+            opts.allowed_tools = vec!["Bash(cargo *)".into()];
+            builder.call(&opts, "synthetic build").await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified()).await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(fb.mutation_providers(), vec![ProviderKind::Claude]);
+    }
 
     // #803 — the loop reads this per attempt for its resource accounting.
     #[tokio::test]

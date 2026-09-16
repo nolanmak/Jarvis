@@ -120,9 +120,12 @@ retires it; missing cleanup confirmation preserves it. The dispatcher checks
 this marker before reading any operation receipts, so a restarted request cannot
 silently retry, even if the crash preceded the first tool call. The marker also
 prevents concurrent invocation of the same request. Tests cover exclusivity,
-normal retirement and persistence after supervisor destruction. Automatic
-reconciliation after a daemon crash and callers without stable turn identities
-remain integration work; stale markers are deliberately not cleared by age.
+normal retirement and persistence after supervisor destruction. After a daemon
+crash, recovery accepts only an owner-private receipt confirming all descendants
+were reaped. A lifecycle lock and invocation-specific receipt path keep an older
+invocation from retiring a newer invocation's marker. Tests kill a real parent
+process and verify detached work stops before recovery. Callers without stable
+turn identities remain integration work; markers are never cleared by age.
 
 ## Capability inventory
 
@@ -163,6 +166,8 @@ cannot stand in for any tool-using profile.
   searches, case-insensitive matching, explicit replace-all edits and bounded
   command timeouts. Invalid or unknown local arguments are rejected before
   guards and execution instead of silently being ignored.
+- Recognized but unimplemented local tools fail readiness instead of silently
+  disappearing from the advertised tool list.
 - Rust launch tests check private configuration permissions, exclusion of secrets
   from arguments, native tool restrictions, separate read/write roots and
   rejection of unknown settings.
@@ -176,6 +181,11 @@ cannot stand in for any tool-using profile.
 - The live Codex adapter smoke test performs scoped reads, exact writes and an
   allowed command; the common audit log verifies the serving provider and exit
   status. This is still not full chat, integration or auto-ship parity.
+- The dispatcher records every provider attempted with mutation-capable tools,
+  including failed and cancelled calls. Text-only calls, cooldown skips and
+  capability exclusions do not count as builders. This is instance-local
+  attribution; durable draft authorship and independent reviewer selection are
+  still required before enabling auto-ship fallback.
 
 ## Remaining integration gates
 
