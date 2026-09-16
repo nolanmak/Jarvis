@@ -56,6 +56,31 @@ an id as `JsonRpcError { id: None }`, logs it and drops it, and it never replies
 to an error. A null-id reply therefore cannot complete or stall a pending call,
 and cannot start an echo loop.
 
+Grep cannot stall the bridge (#1038). Python's `re` has no timeout, and a
+pattern such as `(a+)+$` on a 40-character line would otherwise run for hours on
+the bridge's only thread, holding the provider's CLI-gate slot until the reasoner
+watchdog. The bridge still walks and reads files itself, through the same scoped
+descriptors and symlink/hard-link checks as Read. Only the regular expression runs
+in a short-lived `python3 -I -S` child. The child gets the pattern and file bytes
+over a pipe, never a path. It has an empty environment, a 1 GiB address-space
+limit, a 3 s CPU limit and a parent-death signal. The walk, reads and match share
+one budget per call: 1.5 s of wall clock and 64 MiB of file bytes. When the
+budget runs out the child is killed, and the model gets a tool error telling it
+to simplify the pattern or narrow the path, so every Grep replies in under 2 s.
+The walk also stops at 10,000 entries, the matcher at 1,000 results, and each
+file at 8 MiB. The bridge answers the next request normally. A SIGTERM from the
+parent watcher now interrupts a long search, which an in-process C-level match
+could not.
+Linear-time engines (the `regex` module, `rg`) are not on the host. A heuristic
+that rejects nested quantifiers would miss patterns like `(a|aa)+$` and refuse
+legitimate ones, so the wall clock is the bound. For a wiki-sized synthetic tree
+(27 MB in 7,000 files) a full-tree Grep takes about 0.5 s. Matching per line is
+unchanged. Grep parity with the Claude path is pinned by a fixed pattern table in
+the shared Python/ripgrep regex subset. The bridge side always runs. The ripgrep
+side runs only where `rg` is installed, and this host has none. Known divergences
+are regex dialect (lookaround and backreferences exist only in Python) and
+ripgrep's default ignore/hidden/binary-file filtering.
+
 The original guards run inside the bridge and fail closed on crash, timeout,
 malformed output or explicit denial. Native Codex hooks are not the enforcement
 boundary: a live synthetic probe found that a crashing hook allowed an MCP call
@@ -387,6 +412,13 @@ cannot stand in for any tool-using profile.
   Glob/Grep over a 1500-level tree, and a stdio bridge that keeps serving after
   deep paths, malformed lines, non-object requests and invalid `tools/call`
   params, with the JSON-RPC codes above.
+- `BoundedGrepTests` pin a pathological pattern replying in under 2 s while the
+  next request is served, a bridge and its matcher exiting within 1 s of parent
+  death mid-match, the scan byte cap, and the fixed parity table. The live-gate
+  unit test
+  `codex::tests::pathological_bridge_grep_releases_the_cli_gate_slot_within_its_bound`
+  drives the real packaged bridge through a Codex stand-in under a one-slot
+  `CliGate`. The slot is free again right after the bounded Grep reply.
 - File-tool schemas and dispatch support optional line ranges, scoped/file
   searches, case-insensitive matching, explicit replace-all edits and bounded
   command timeouts. Invalid or unknown local arguments are rejected before

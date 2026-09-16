@@ -13,6 +13,7 @@ import fnmatch
 import re
 import shlex
 import stat
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -38,6 +39,74 @@ class ReconciliationRequired(Denied):
     """Prior effects are uncertain; reads may gather evidence, writes must wait."""
 
 
+class SearchLimit(Denied):
+    """A search stopped at a fixed resource bound; the message is public."""
+
+
+class SearchBudget:
+    """One wall-clock deadline and total-bytes allowance per search call."""
+    def __init__(self):
+        self.deadline = time.monotonic() + GREP_TIME_LIMIT_SECONDS
+        self.remaining_bytes = MAX_SEARCH_BYTES
+
+    def remaining_seconds(self):
+        return self.deadline - time.monotonic()
+
+    def check_time(self):
+        if self.remaining_seconds() <= 0:
+            self.expire()
+
+    def expire(self):
+        self.deadline = 0
+        raise SearchLimit('Grep stopped at its time limit; simplify the pattern '
+                          '(avoid nested repetition such as (a+)+) or narrow the path.')
+
+    def consume(self, size):
+        self.remaining_bytes -= size
+        if self.remaining_bytes < 0:
+            raise SearchLimit('Grep stopped at its total scan size limit; narrow the path.')
+
+
+# Runs as `python3 -I -S -c GREP_MATCHER <bridge pid>` with an empty environment.
+# It receives the pattern and already scope-checked file bytes on a pipe, never
+# a path, so it cannot open anything itself. It exits with the bridge (parent
+# death signal) and on a 3 s CPU limit even if the bridge is SIGKILLed.
+# Per-line matching is the same as the earlier in-process implementation.
+GREP_MATCHER = r'''
+import ctypes, json, os, re, resource, sys
+resource.setrlimit(resource.RLIMIT_CPU, (3, 3))
+resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
+if ctypes.CDLL(None).prctl(1, 9, 0, 0, 0) != 0 or os.getppid() != int(sys.argv[1]):
+    sys.exit(3)
+source = sys.stdin.buffer
+header = json.loads(source.readline())
+try:
+    expression = re.compile(header['pattern'], re.IGNORECASE if header['ignore_case'] else 0)
+except Exception:
+    sys.stdout.write('{"invalid": true}')
+    sys.exit(0)
+matches = []
+limit = header['limit']
+index = 0
+while len(matches) < limit:
+    size = source.readline()
+    if not size:
+        break
+    data = source.read(int(size))
+    try:
+        text = data.decode('utf-8')
+    except UnicodeError:
+        text = ''
+    for number, line in enumerate(text.splitlines(), 1):
+        if expression.search(line):
+            matches.append([index, number, line[:2000]])
+            if len(matches) >= limit:
+                break
+    index += 1
+sys.stdout.write(json.dumps({'matches': matches}))
+'''
+
+
 FILE_TOOLS = {'Read', 'Write', 'Edit', 'Glob', 'Grep', 'LS'}
 KNOWN_TOOLS = FILE_TOOLS | {'WebSearch', 'WebFetch', 'NotebookEdit'}
 CONTROL_PARTS = {'.git', '.codex', '.claude', '.ssh', '.gnupg', '.aws', '.azure'}
@@ -48,6 +117,13 @@ MAX_PATH_DEPTH = 32
 MAX_PATH_BYTES = 4096
 # One JSON-RPC line. A maximal Write (8 MiB) fits even when fully escaped.
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
+# Grep (#1038): Python's re has no timeout, so matching runs in a disposable
+# child that is killed at the deadline. The walk, reads and match share one
+# wall-clock budget and one total-bytes budget. 1.5 s plus kill/reap keeps
+# every Grep reply under 2 s.
+GREP_TIME_LIMIT_SECONDS = 1.5
+MAX_SEARCH_BYTES = 64 * 1024 * 1024
+MAX_GREP_RESULTS = 1000
 
 
 _FILE_VERIFICATION = None
@@ -518,23 +594,26 @@ class Policy:
     def _relative(self, name, writing=False):
         if not isinstance(name, str) or not name or '\x00' in name:
             raise Denied('invalid path')
-        candidate = Path(os.path.abspath(self.cwd / name))
-        if len(os.fsencode(str(candidate))) > MAX_PATH_BYTES:
+        # String form of Path(os.path.abspath(cwd / name)).relative_to(root):
+        # abspath output is normalized and roots are resolved without a
+        # trailing separator. Searches call this per entry, so avoid pathlib.
+        candidate = os.path.abspath(os.path.join(str(self.cwd), name))
+        if len(os.fsencode(candidate)) > MAX_PATH_BYTES:
             raise Denied('path exceeds length limit')
         roots = self.write_roots if writing else self.read_roots
         for root in sorted(roots, key=lambda p: len(p.parts), reverse=True):
-            try:
-                rel = candidate.relative_to(root)
-            except ValueError:
-                continue
-            if not rel.parts:
+            prefix = str(root)
+            if candidate == prefix:
                 raise Denied('operation requires a file')
-            if len(rel.parts) > MAX_PATH_DEPTH:
+            if not candidate.startswith(prefix + '/'):
+                continue
+            parts = tuple(candidate[len(prefix) + 1:].split('/'))
+            if len(parts) > MAX_PATH_DEPTH:
                 raise Denied('path exceeds depth limit')
             if any(p in CONTROL_PARTS or p == '.env' or p.startswith('.env.')
-                   for p in rel.parts):
+                   for p in parts):
                 raise Denied('credential and control paths are excluded')
-            return root, rel.parts
+            return root, parts
         raise Denied('path is outside the permitted workspace')
 
     @contextmanager
@@ -681,19 +760,26 @@ class Policy:
         return self._read_bytes(name).decode('utf-8')
 
     def _read_bytes(self, name):
-        verification = file_verification(self.write_roots)
         with self.parent(name) as (parent, leaf):
-            fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                         dir_fd=parent)
+            return self._read_at(parent, leaf)
+
+    def _read_at(self, directory, leaf):
+        """Read `leaf` in an already verified, O_NOFOLLOW-opened directory."""
+        verification = file_verification(self.write_roots)
+        try:
+            fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                         dir_fd=directory)
             with os.fdopen(fd, 'rb') as stream:
                 # Verified on the opened descriptor: regular, one hard link.
                 metadata = verification.verify_regular_private_file(stream.fileno())
                 if metadata is None or metadata.st_size > MAX_FILE_BYTES:
                     raise Denied('read requires a bounded regular file')
                 data = stream.read(MAX_FILE_BYTES + 1)
-                if len(data) > MAX_FILE_BYTES:
-                    raise Denied('file exceeds size limit')
-                return data
+        except OSError as exc:
+            raise Denied('path cannot be accessed safely') from exc
+        if len(data) > MAX_FILE_BYTES:
+            raise Denied('file exceeds size limit')
+        return data
 
     def _write(self, name, content):
         self._write_bytes(name, content.encode('utf-8'))
@@ -737,6 +823,15 @@ class Policy:
         self._write(name, content.replace(old, new, -1 if replace_all else 1))
 
     def files(self, path='.', excluded_dirs=()):
+        for absolute, relative, _, _ in self._walk(path, excluded_dirs):
+            yield absolute, relative
+
+    def _walk(self, path='.', excluded_dirs=(), budget=None):
+        """Yield (absolute, relative, directory fd, name) for scoped regular files.
+
+        The descriptor is the entry's verified parent directory and stays open
+        only until the generator resumes.
+        """
         base = Path(os.path.abspath(self.cwd / path))
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         verification = file_verification(self.write_roots)
@@ -764,6 +859,8 @@ class Policy:
                     count += 1
                     if count > 10000:
                         raise Denied('search exceeds entry limit; narrow its path')
+                    if budget is not None:
+                        budget.check_time()
                     child = relative / name
                     absolute = str(base / child)
                     try:
@@ -781,7 +878,7 @@ class Policy:
                             os.close(child_fd)
                             raise
                     elif verification.regular_private_file(info):
-                        yield absolute, str(child)
+                        yield absolute, str(child), fd, name
             finally:
                 for fd, _, _ in stack:
                     if fd != root_fd:
@@ -796,28 +893,105 @@ class Policy:
                 (pattern.startswith('**/') and fnmatch.fnmatchcase(relative, pattern[3:]))]
 
     def grep(self, pattern, path='.', ignore_case=False):
+        """Line search with a bounded matcher (#1038).
+
+        The bridge still walks and reads files itself through the scoped,
+        symlink- and hard-link-refusing path. Only the model-supplied regular
+        expression runs elsewhere: in a short-lived child fed through a pipe
+        and killed when the shared budget expires, so no pattern can stall
+        this process. The child stops reading at the result limit, which also
+        ends the walk early.
+        """
+        import select
+        import sys
         self.require('Grep')
         if not isinstance(pattern, str) or len(pattern) > 1024:
             raise Denied('invalid search pattern')
-        try:
-            expression = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
-        except re.error as exc:
-            raise Denied('invalid search expression') from exc
-        results = []
+        budget = SearchBudget()
         candidate = Path(os.path.abspath(self.cwd / path))
         self._relative(str(candidate / '__search_scope__') if candidate.is_dir() else str(candidate))
-        candidates = [(str(candidate), candidate.name)] if candidate.is_file() else self.files(path)
-        for absolute, relative in candidates:
+        if candidate.is_file():
+            candidates = [(str(candidate), candidate.name, None, None)]
+        else:
+            candidates = self._walk(path, budget=budget)
+        output = os.memfd_create('jarvis-grep-output', os.MFD_CLOEXEC)
+        reader, writer = os.pipe2(os.O_CLOEXEC)
+        process = None
+        try:
+            process = subprocess.Popen([sys.executable, '-I', '-S', '-c', GREP_MATCHER, str(os.getpid())],
+                stdin=reader, stdout=output, stderr=subprocess.DEVNULL, cwd='/', env={})
+            os.close(reader)
+            reader = None
+            os.set_blocking(writer, False)
+
+            def emit(data):
+                # False once the matcher has stopped reading (result limit or exit).
+                view = memoryview(data)
+                while view:
+                    try:
+                        view = view[os.write(writer, view):]
+                    except BlockingIOError:
+                        remaining = budget.remaining_seconds()
+                        if remaining > 0:
+                            select.select([], [writer], [], remaining)
+                        budget.check_time()
+                    except BrokenPipeError:
+                        return False
+                return True
+
+            paths = []
             try:
-                text = self._read(absolute)
-            except (Denied, UnicodeError):
-                continue
-            for number, line in enumerate(text.splitlines(), 1):
-                if expression.search(line):
-                    results.append({'path': relative, 'line': number, 'text': line[:2000]})
-                    if len(results) >= 1000:
-                        return results
-        return results
+                header = json.dumps({'pattern': pattern, 'ignore_case': bool(ignore_case),
+                                     'limit': MAX_GREP_RESULTS}).encode() + b'\n'
+                if emit(header):
+                    for absolute, relative, directory, leaf in candidates:
+                        budget.check_time()
+                        try:
+                            # Walked entries are read through their verified parent
+                            # descriptor, never by re-resolving a path string.
+                            data = (self._read_bytes(absolute) if directory is None
+                                    else self._read_at(directory, leaf))
+                        except Denied:
+                            continue
+                        budget.consume(len(data))
+                        paths.append(relative)
+                        if not (emit(b'%d\n' % len(data)) and emit(data)):
+                            break
+            finally:
+                close = getattr(candidates, 'close', None)
+                if close:
+                    close()
+            os.close(writer)
+            writer = None
+            try:
+                status = process.wait(timeout=max(0.0, budget.remaining_seconds()))
+            except subprocess.TimeoutExpired:
+                budget.expire()
+            if status != 0:
+                raise Denied('search expression could not be evaluated')
+            os.lseek(output, 0, os.SEEK_SET)
+            raw = b''
+            while len(raw) <= 4 * MAX_FILE_BYTES:
+                chunk = os.read(output, 1024 * 1024)
+                if not chunk:
+                    break
+                raw += chunk
+            if len(raw) > 4 * MAX_FILE_BYTES:
+                raise Denied('search output exceeds limit')
+            outcome = json.loads(raw)
+            if outcome.get('invalid'):
+                raise Denied('invalid search expression')
+            return [{'path': paths[index], 'line': number, 'text': text}
+                    for index, number, text in outcome['matches']]
+        finally:
+            for descriptor in (reader, writer):
+                if descriptor is not None:
+                    os.close(descriptor)
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+            os.close(output)
 
     def check_service_argv(self, argv):
         name = Path(argv[0]).name
@@ -1703,7 +1877,7 @@ class Server:
                 return {'isError': True, 'content': [{'type': 'text', 'text':
                     'An earlier operation has an uncertain outcome. Use read-only tools to inspect current state. '
                     'Do not repeat or start external changes until that outcome is reconciled.'}]}
-            except Readiness as error:
+            except (Readiness, SearchLimit) as error:
                 return {'isError': True, 'content': [{'type': 'text', 'text': str(error)}]}
             except (Denied, KeyError, TypeError, UnicodeError, OSError, ValueError,
                     RecursionError, MemoryError):

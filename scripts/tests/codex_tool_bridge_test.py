@@ -1597,6 +1597,214 @@ class BridgeResilienceTests(unittest.TestCase):
         self.assertIsNone(json.loads(bridge.oversized_response(lines[2]))['id'])
 
 
+GREP_PARITY_TREE = {
+    'data/numbers.csv': 'id,value\n1,100\n22,2000\n333,30000\n',
+    'notes/alpha.md': 'Synthetic Alpha heading\nalpha beta gamma\nTODO: write synthetic tests\n',
+    'notes/beta.txt': 'beta\nBETA upper\n  indented beta\n',
+    'src/lib.rs': 'pub fn add(a: i32, b: i32) -> i32 { a + b }\npub fn sub(a: i32, b: i32) -> i32 { a - b }\n',
+    'src/main.rs': 'fn main() {\n    println!("synthetic");\n}\n// TODO(owner): synthetic\n',
+}
+# Fixed expectations in the regex subset shared by Python re and ripgrep.
+GREP_PARITY_TABLE = [
+    ('beta', False, [('notes/alpha.md', 2), ('notes/beta.txt', 1), ('notes/beta.txt', 3)]),
+    ('beta', True, [('notes/alpha.md', 2), ('notes/beta.txt', 1), ('notes/beta.txt', 2), ('notes/beta.txt', 3)]),
+    ('^TODO', False, [('notes/alpha.md', 3)]),
+    ('TODO', False, [('notes/alpha.md', 3), ('src/main.rs', 4)]),
+    (r'\bfn\s+\w+\(', False, [('src/lib.rs', 1), ('src/lib.rs', 2), ('src/main.rs', 1)]),
+    (r'[0-9]{3,}$', False, [('data/numbers.csv', 2), ('data/numbers.csv', 3), ('data/numbers.csv', 4)]),
+    ('alpha|gamma', False, [('notes/alpha.md', 2)]),
+    ('synthetic', True, [('notes/alpha.md', 1), ('notes/alpha.md', 3), ('src/main.rs', 2), ('src/main.rs', 4)]),
+    (r'a \+ b|a - b', False, [('src/lib.rs', 1), ('src/lib.rs', 2)]),
+    (r'^\s+\S', False, [('notes/beta.txt', 3), ('src/main.rs', 2)]),
+    ('^beta$', False, [('notes/beta.txt', 1)]),
+    (r'\d+,\d{4}', False, [('data/numbers.csv', 3), ('data/numbers.csv', 4)]),
+]
+
+
+class BoundedGrepTests(unittest.TestCase):
+    """#1038: a model-supplied pattern cannot stall the bridge or its CLI slot."""
+    PATHOLOGICAL = '(a+)+$'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / 'workspace'
+        self.root.mkdir()
+        # 40 characters of backtracking bait: exponential for Python's re.
+        (self.root / 'bait.txt').write_text('a' * 40 + 'b\n')
+        self.config = Path(self.temp.name) / 'policy.json'
+        self.config.write_text(json.dumps({'cwd': str(self.root), 'read_roots': [str(self.root)],
+                                           'write_roots': [], 'allowed_tools': ['Read', 'Grep']}))
+        self.config.chmod(0o600)
+
+    def write_tree(self):
+        for relative, content in GREP_PARITY_TREE.items():
+            (self.root / relative).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / relative).write_text(content)
+        (self.root / 'bait.txt').unlink()
+
+    def start_bridge(self):
+        import os
+        import signal
+        process = subprocess.Popen([sys.executable, '-I', str(SPEC.origin), str(self.config)],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        def stop():
+            try:
+                os.kill(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            process.stdin.close()
+            process.stdout.close()
+        self.addCleanup(stop)
+        self.pending = b''
+        return process
+
+    def send(self, process, message):
+        process.stdin.write(json.dumps(message).encode() + b'\n')
+        process.stdin.flush()
+
+    def receive(self, process, seconds):
+        import os
+        import select
+        import time
+        deadline = time.monotonic() + seconds
+        while b'\n' not in self.pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                return None
+            chunk = os.read(process.stdout.fileno(), 65536)
+            if not chunk:
+                return None
+            self.pending += chunk
+        line, self.pending = self.pending.split(b'\n', 1)
+        return json.loads(line)
+
+    def test_pathological_pattern_returns_within_two_seconds_and_bridge_keeps_serving(self):
+        import time
+        process = self.start_bridge()
+        self.send(process, {'jsonrpc': '2.0', 'id': 1, 'method': 'ping'})
+        self.assertEqual(self.receive(process, 10)['id'], 1)
+        started = time.monotonic()
+        self.send(process, {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {
+            'name': 'Grep', 'arguments': {'pattern': self.PATHOLOGICAL}}})
+        self.send(process, {'jsonrpc': '2.0', 'id': 3, 'method': 'ping'})
+        reply = self.receive(process, 5)
+        elapsed = time.monotonic() - started
+        self.assertIsNotNone(reply, 'bridge stalled on a pathological Grep pattern')
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(reply['id'], 2)
+        self.assertTrue(reply['result']['isError'])
+        self.assertIn('time limit', reply['result']['content'][0]['text'])
+        self.assertEqual(self.receive(process, 2), {'jsonrpc': '2.0', 'id': 3, 'result': {}})
+
+    def test_parent_death_during_a_long_match_ends_the_bridge_and_its_matcher(self):
+        import os
+        import select
+        import time
+        program = """import json,subprocess,sys
+child=subprocess.Popen([sys.executable,'-I',sys.argv[1],sys.argv[2]],stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL)
+def send(message):
+    child.stdin.write((json.dumps(message)+'\\n').encode()); child.stdin.flush()
+send({'jsonrpc':'2.0','id':1,'method':'ping'})
+assert json.loads(child.stdout.readline())['id']==1
+send({'jsonrpc':'2.0','id':2,'method':'tools/call','params':{'name':'Grep','arguments':{'pattern':sys.argv[3]}}})
+print(child.pid,flush=True)
+sys.stdin.readline()
+"""
+        parent = subprocess.Popen([sys.executable, '-c', program, str(SPEC.origin), str(self.config), self.PATHOLOGICAL],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        pidfd = None
+        pid = None
+        try:
+            pid = int(parent.stdout.readline())
+            pidfd = os.pidfd_open(pid)
+            time.sleep(0.2)
+            children = None
+            try:
+                children = [int(value) for value in
+                            Path(f'/proc/{pid}/task/{pid}/children').read_text().split()]
+            except FileNotFoundError:
+                pass  # kernel without CONFIG_PROC_CHILDREN
+            parent.communicate('exit\n', timeout=5)
+            watcher = select.poll()
+            watcher.register(pidfd, select.POLLIN)
+            self.assertTrue(watcher.poll(1000), 'bridge kept running a match after its parent died')
+            if children is not None:
+                self.assertTrue(children, 'no matcher process was observed during the search')
+            deadline = time.monotonic() + 2
+            for child in children or []:
+                while time.monotonic() < deadline:
+                    try:
+                        state = Path(f'/proc/{child}/stat').read_text().rsplit(') ', 1)[1].split()[0]
+                    except FileNotFoundError:
+                        break
+                    if state == 'Z':
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail('matcher process outlived the bridge')
+        finally:
+            if pidfd is not None:
+                import signal
+                try:
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                os.close(pidfd)
+            if parent.poll() is None:
+                parent.kill()
+                parent.communicate(timeout=5)
+
+    def test_legitimate_patterns_match_the_fixed_expected_table(self):
+        self.write_tree()
+        policy = bridge.Policy(json.loads(self.config.read_text()))
+        server = bridge.Server(policy)
+        for pattern, ignore_case, expected in GREP_PARITY_TABLE:
+            with self.subTest(pattern=pattern, ignore_case=ignore_case):
+                hits = json.loads(server.call('Grep', {'pattern': pattern, 'ignore_case': ignore_case}))
+                self.assertEqual([(hit['path'], hit['line']) for hit in hits], expected)
+                for hit in hits:
+                    self.assertEqual(hit['text'], GREP_PARITY_TREE[hit['path']].splitlines()[hit['line'] - 1])
+        single = json.loads(server.call('Grep', {'pattern': 'beta', 'path': 'notes/beta.txt'}))
+        self.assertEqual([(hit['path'], hit['line']) for hit in single], [('beta.txt', 1), ('beta.txt', 3)])
+        invalid = server.dispatch({'method': 'tools/call', 'params': {
+            'name': 'Grep', 'arguments': {'pattern': '(unclosed'}}})
+        self.assertTrue(invalid['isError'])
+
+    @unittest.skipUnless(__import__('shutil').which('rg'), 'ripgrep (the Claude Grep engine) is not installed')
+    def test_ripgrep_matches_the_same_fixed_table(self):
+        self.write_tree()
+        for pattern, ignore_case, expected in GREP_PARITY_TABLE:
+            with self.subTest(pattern=pattern, ignore_case=ignore_case):
+                run = subprocess.run(['rg', '--line-number', '--no-heading', '--with-filename', '--color', 'never',
+                                      *(['-i'] if ignore_case else []), '-e', pattern, '.'],
+                                     cwd=self.root, capture_output=True, text=True, timeout=30)
+                self.assertIn(run.returncode, (0, 1), run.stderr)
+                hits = []
+                for line in run.stdout.splitlines():
+                    path, number, _ = line.split(':', 2)
+                    hits.append((path.removeprefix('./'), int(number)))
+                self.assertEqual(sorted(hits), expected)
+
+    def test_total_scanned_bytes_are_capped(self):
+        from unittest.mock import patch
+        self.write_tree()
+        policy = bridge.Policy(json.loads(self.config.read_text()))
+        server = bridge.Server(policy)
+        total = sum(len(content.encode()) for content in GREP_PARITY_TREE.values())
+        with patch.object(bridge, 'MAX_SEARCH_BYTES', total):
+            self.assertEqual(len(json.loads(server.call('Grep', {'pattern': 'beta'}))), 3)
+        with patch.object(bridge, 'MAX_SEARCH_BYTES', total - 1):
+            with self.assertRaises(bridge.SearchLimit):
+                policy.grep('beta')
+            response = server.dispatch({'method': 'tools/call', 'params': {
+                'name': 'Grep', 'arguments': {'pattern': 'beta'}}})
+        self.assertTrue(response['isError'])
+        self.assertIn('scan size limit', response['content'][0]['text'])
+
+
 class TransportTests(unittest.TestCase):
     def test_bridge_survives_launcher_thread_exit_while_parent_process_is_alive(self):
         import queue
