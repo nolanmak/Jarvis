@@ -308,7 +308,11 @@ pub fn summarize(rows: &[EvalRow]) -> Summary {
 /// free text written by a model. Unescaped, one backtick-quoted alternation
 /// silently adds a column and shifts every cell after it.
 fn cell(s: &str) -> String {
-    s.replace('|', r"\|")
+    // Backslashes FIRST. Escaping only pipes turns `a\|b` into `a\\|b`, where
+    // the doubled backslash is itself an escaped backslash and the pipe goes
+    // back to being a live delimiter — the exact corruption this guards
+    // against, reintroduced by the guard.
+    s.replace('\\', r"\\").replace('|', r"\|")
 }
 
 pub fn render_report(rows: &[EvalRow], cases_path: &str, started: &str) -> String {
@@ -1066,9 +1070,11 @@ mod tests {
 
     #[test]
     fn a_pipe_in_the_reason_cannot_break_the_markdown_table() {
+        // Both shapes: a bare pipe, and a pipe already preceded by a
+        // backslash, which is what a scoper writing about a regex produces.
         let rows = vec![grade(
             &case("E1", 10, Expect::Fixable),
-            Some(&observed(false, "refused: `a | b` is ambiguous")),
+            Some(&observed(false, r"refused: `a | b` and regex a\|b are ambiguous")),
         )];
         let md = render_report(&rows, "eval/autopr-cases.json", "2026-09-15T00:00:00Z");
         let row_line = md
@@ -1076,13 +1082,15 @@ mod tests {
             .find(|l| l.contains("E1") && l.starts_with('|'))
             .expect("a row for E1");
         assert!(row_line.contains(r"\|"), "the pipe must be escaped: {row_line}");
-        // Counting every '|' would count the escaped one too. A cell
-        // separator is a pipe NOT preceded by a backslash, and that is what
-        // decides how many columns markdown actually renders.
+        // Counting every '|' would count the escaped one too, and counting a
+        // single preceding backslash gets `a\\|b` wrong. A pipe is a live
+        // delimiter when an EVEN number of backslashes precede it.
         let separators = |l: &str| {
             let b = l.as_bytes();
             (0..b.len())
-                .filter(|&i| b[i] == b'|' && (i == 0 || b[i - 1] != b'\\'))
+                .filter(|&i| {
+                    b[i] == b'|' && (0..i).rev().take_while(|&j| b[j] == b'\\').count() % 2 == 0
+                })
                 .count()
         };
         let header = md.lines().find(|l| l.contains("| # |")).expect("header");
