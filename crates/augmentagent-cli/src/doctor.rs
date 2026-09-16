@@ -836,15 +836,26 @@ fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration
         Err(e) => return Finding::warn(NAME, format!("journal root refused: {e:#}"), Some(HINT)),
     };
     let msg = format!(
-        "{} request dirs, {} MB; {} active, {} unfinished (operator recovery), {} finished past the {}h grace",
-        report.entries,
+        "{} request dirs, {} MB; {} finished past the {}h grace ({} by over two sweep intervals); \
+         for information: {} unfinished (operator recovery), {} with lifecycle markers",
+        report.requests,
         report.bytes / (1024 * 1024),
-        report.kept_active,
-        report.kept_unfinished,
         report.removed,
         grace.as_secs() / 3600,
+        report.finished_overdue,
+        report.kept_unfinished,
+        report.kept_active,
     );
-    if report.entries > HANDOFF_WARN_REQUESTS || report.bytes > HANDOFF_WARN_BYTES {
+    // A live sweep removes every finished journal within two intervals of its
+    // expiry, so one still here means the sweep stopped (#1035 review).
+    if report.finished_overdue > 0 {
+        return Finding::warn(
+            NAME,
+            format!("{msg} — the daemon's hourly sweep does not appear to be running"),
+            Some(HINT),
+        );
+    }
+    if report.requests > HANDOFF_WARN_REQUESTS || report.bytes > HANDOFF_WARN_BYTES {
         return Finding::warn(
             NAME,
             format!(
@@ -1279,21 +1290,32 @@ mod tests {
     fn handoff_journal_finding_warns_over_count_or_size() {
         let grace = Duration::from_secs(24 * 3600);
         let healthy = handoff::SweepReport {
-            entries: 420,
+            entries: 423,
+            requests: 420,
             bytes: 900 * 1024 * 1024,
+            removed: 40,
+            finished_overdue: 0,
             kept_active: 3,
             kept_unfinished: 2,
             ..Default::default()
         };
         let ok = handoff_journal_finding(Ok(healthy), grace);
         assert_eq!(ok.severity, Severity::Ok, "{}", ok.message);
-        assert!(ok.message.contains("420"), "{}", ok.message);
-        let many = handoff::SweepReport { entries: HANDOFF_WARN_REQUESTS + 1, ..healthy };
+        // Counts only request dirs, and reports what needs an operator as information.
+        assert!(ok.message.contains("420 request dirs") && !ok.message.contains("423"), "{}", ok.message);
+        assert!(ok.message.contains("3 with lifecycle markers") && ok.message.contains("2 unfinished"), "{}", ok.message);
+        let many = handoff::SweepReport { requests: HANDOFF_WARN_REQUESTS + 1, ..healthy };
         let large = handoff::SweepReport { bytes: HANDOFF_WARN_BYTES + 1, ..healthy };
+        // Past grace by more than two sweep intervals: a live sweep removes
+        // every such journal, so even one means the sweep is not running.
+        let stalled = handoff::SweepReport { finished_overdue: 1, ..healthy };
+        let stalled_finding = handoff_journal_finding(Ok(stalled), grace);
+        assert!(stalled_finding.message.contains("sweep does not appear to be running"), "{}", stalled_finding.message);
         let refused = Err(anyhow::anyhow!("handoff directory is not private"));
         for finding in [
             handoff_journal_finding(Ok(many), grace),
             handoff_journal_finding(Ok(large), grace),
+            stalled_finding,
             handoff_journal_finding(refused, grace),
         ] {
             assert_eq!(finding.severity, Severity::Warn, "{}", finding.message);

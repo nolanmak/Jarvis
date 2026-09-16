@@ -143,6 +143,8 @@ pub const DEFAULT_RETENTION_HOURS: u64 = 24;
 pub const MAX_RETENTION_HOURS: u64 = 24 * 365;
 /// The daemon sweeps at start and then this often.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Two sweep intervals (observe, then confirm) plus a quarter interval of slack.
+pub const OVERDUE_AFTER: Duration = Duration::from_secs(SWEEP_INTERVAL.as_secs() * 9 / 4);
 
 const JOURNAL: &str = "operations.json";
 /// `HandoffJournal.locked` in the bridge.
@@ -162,18 +164,85 @@ pub fn journal_root() -> Option<PathBuf> {
 /// Grace from [`RETENTION_ENV`]. Zero, negative, fractional, absurd or
 /// unparseable values fall back to the default with a warning.
 pub fn retention_from_env() -> Duration {
-    retention_from(std::env::var(RETENTION_ENV).ok().as_deref())
+    retention_setting_from_env().grace
 }
 
-fn retention_from(raw: Option<&str>) -> Duration {
-    let default = Duration::from_secs(DEFAULT_RETENTION_HOURS * 3600);
-    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else { return default };
-    match raw.parse::<u64>() {
-        Ok(hours) if (1..=MAX_RETENTION_HOURS).contains(&hours) => Duration::from_secs(hours * 3600),
-        _ => {
-            tracing::warn!("{RETENTION_ENV}={raw:?} is not a whole number of hours in 1..={MAX_RETENTION_HOURS}; \
-                using the {DEFAULT_RETENTION_HOURS}h default");
-            default
+/// Where an effective grace came from, for operators.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetentionSource {
+    /// [`RETENTION_ENV`] unset or blank.
+    Default,
+    /// Accepted from [`RETENTION_ENV`] (trimmed).
+    Env(String),
+    /// [`RETENTION_ENV`] set but rejected; the default applies.
+    Rejected(String),
+}
+
+impl std::fmt::Display for RetentionSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RetentionSource::Default => write!(f, "default; {RETENTION_ENV} unset"),
+            RetentionSource::Env(raw) => write!(f, "{RETENTION_ENV}={raw}"),
+            RetentionSource::Rejected(raw) => write!(f, "default; {RETENTION_ENV}={raw:?} rejected"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionSetting {
+    pub grace: Duration,
+    pub source: RetentionSource,
+}
+
+/// The grace this process would use, and why.
+pub fn retention_setting_from_env() -> RetentionSetting {
+    retention_from(std::env::var(RETENTION_ENV).ok().as_deref(), retention_floor())
+}
+
+/// The longest a dispatched request can wait at the CLI gate before its
+/// provider starts (#1035 review). During that wait the request directory
+/// exists but has no lifecycle marker. Taken from the reasoner's own
+/// per-class gate budgets, so a changed timeout or class policy moves it.
+fn longest_gate_wait() -> Duration {
+    let text = crate::reasoner::loop_parse_opts();
+    let with_tools = |tool: &str| {
+        let mut opts = text.clone();
+        opts.allowed_tools = vec![tool.into()];
+        opts
+    };
+    [with_tools("Read"), with_tools("Write"), with_tools("Bash(true)"), text.clone()]
+        .iter().map(crate::reasoner::reasoner_timeout_for).max().unwrap_or_default()
+}
+
+/// Slack between the longest gate wait and the shortest accepted grace.
+const RETENTION_FLOOR_MARGIN: Duration = Duration::from_secs(60 * 60);
+
+/// Gate wait plus the margin, rounded up to whole hours.
+fn retention_floor_for(gate_wait: Duration) -> Duration {
+    let seconds = gate_wait.as_secs().saturating_add(u64::from(gate_wait.subsec_nanos() > 0))
+        .saturating_add(RETENTION_FLOOR_MARGIN.as_secs());
+    Duration::from_secs(seconds.div_ceil(3600).max(1).saturating_mul(3600))
+}
+
+/// The shortest grace accepted: 3 hours at the default reasoner timeout.
+pub fn retention_floor() -> Duration {
+    retention_floor_for(longest_gate_wait())
+}
+
+fn retention_from(raw: Option<&str>, floor: Duration) -> RetentionSetting {
+    let default = Duration::from_secs(DEFAULT_RETENTION_HOURS * 3600).max(floor);
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return RetentionSetting { grace: default, source: RetentionSource::Default };
+    };
+    let accepted = raw.parse::<u64>().ok().filter(|hours| *hours <= MAX_RETENTION_HOURS)
+        .map(|hours| Duration::from_secs(hours * 3600)).filter(|grace| *grace >= floor);
+    match accepted {
+        Some(grace) => RetentionSetting { grace, source: RetentionSource::Env(raw.into()) },
+        None => {
+            tracing::warn!("{RETENTION_ENV}={raw:?} is not a whole number of hours from {}h (the longest \
+                CLI-gate wait plus an hour) to {MAX_RETENTION_HOURS}; using the {}h default",
+                floor.as_secs() / 3600, default.as_secs() / 3600);
+            RetentionSetting { grace: default, source: RetentionSource::Rejected(raw.into()) }
         }
     }
 }
@@ -183,6 +252,12 @@ fn retention_from(raw: Option<&str>) -> Duration {
 pub struct SweepReport {
     /// Entries under the root, request directories or not.
     pub entries: u64,
+    /// Of `entries`, real directories (not links) named like requests.
+    pub requests: u64,
+    /// Of `removed`: idle past grace by more than [`OVERDUE_AFTER`]. A live
+    /// daemon removes a finished journal within two sweep intervals of its
+    /// expiry, so any of these means its sweep is not running.
+    pub finished_overdue: u64,
     /// Bytes held by trusted request directories before the sweep.
     pub bytes: u64,
     pub removed: u64,
@@ -340,7 +415,9 @@ enum Pass<'a> {
     DryRun,
     Remove,
     /// The daemon removes a candidate only when the previous pass saw it
-    /// finished, expired and byte-for-byte unchanged. A turn replayed after a
+    /// finished, expired and unchanged: the same device, inode, nanosecond
+    /// mtime and length for the directory and every entry (metadata, not
+    /// contents; every writer here replaces or appends). A turn replayed after a
     /// restart therefore gets one interval to re-address its journal first,
     /// however long the daemon was down.
     Confirm(&'a mut HashMap<OsString, Snapshot>),
@@ -372,6 +449,9 @@ fn sweep(root: &Path, grace: Duration, mut pass: Pass) -> anyhow::Result<SweepRe
         let request = name.to_str().is_some_and(|name| name.len() == 64
             && name.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
         let directory = root.join(&name);
+        if request && std::fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.file_type().is_dir()) {
+            report.requests += 1;
+        }
         let snapshot = match request.then(|| Snapshot::read(&directory)) {
             Some(Ok(Some(snapshot))) => snapshot,
             _ => {
@@ -381,22 +461,26 @@ fn sweep(root: &Path, grace: Duration, mut pass: Pass) -> anyhow::Result<SweepRe
         };
         report.bytes += snapshot.bytes();
         let journal = directory.join(JOURNAL);
+        let idle = snapshot.idle_for(now);
         let verdict = match crate::process_tree::request_idle(&journal) {
             Err(_) => Verdict::Untrusted,
             Ok(false) => Verdict::Active,
-            Ok(true) if snapshot.idle_for(now) < grace => Verdict::Recent,
+            Ok(true) if idle < grace => Verdict::Recent,
             Ok(true) if !journal_settled(&journal) => Verdict::Unfinished,
-            Ok(true) => match &mut pass {
-                Pass::DryRun => Verdict::Removed,
-                Pass::Confirm(previous) if previous.get(&name) != Some(&snapshot) => {
-                    confirmed.insert(name.clone(), snapshot.clone());
-                    Verdict::Pending
+            Ok(true) => {
+                report.finished_overdue += u64::from(idle >= grace.saturating_add(OVERDUE_AFTER));
+                match &mut pass {
+                    Pass::DryRun => Verdict::Removed,
+                    Pass::Confirm(previous) if previous.get(&name) != Some(&snapshot) => {
+                        confirmed.insert(name.clone(), snapshot.clone());
+                        Verdict::Pending
+                    }
+                    Pass::Confirm(_) | Pass::Remove => remove_request(&root, &name, &snapshot).unwrap_or_else(|error| {
+                        tracing::warn!(request = %name.to_string_lossy(), "handoff journal sweep left a request: {error}");
+                        Verdict::Untrusted
+                    }),
                 }
-                Pass::Confirm(_) | Pass::Remove => remove_request(&root, &name, &snapshot).unwrap_or_else(|error| {
-                    tracing::warn!(request = %name.to_string_lossy(), "handoff journal sweep left a request: {error}");
-                    Verdict::Untrusted
-                }),
-            },
+            }
         };
         match verdict {
             Verdict::Removed => {
@@ -1022,15 +1106,23 @@ for line in sys.stdin:
         let (_temp, root) = private_root();
         let journal = request(&root, "synthetic-contended-turn", Some(json!([completed_row()])));
         let lock = hold_lock(&journal.with_extension("lifecycle-lock"));
+        let (opened, waiting) = std::sync::mpsc::channel();
+        let (resume, paused) = std::sync::mpsc::channel::<()>();
         let waiter = std::thread::spawn({
             let root = root.clone();
             move || {
+                // Deterministic interleaving: pause once the waiter holds a
+                // descriptor for the lock file, before it takes the lock.
+                crate::process_tree::BEFORE_WAITING_LOCK.set(Some(Box::new(move || {
+                    opened.send(()).unwrap();
+                    paused.recv().unwrap();
+                })));
                 let mut opts = crate::reasoner::loop_parse_opts();
                 opts.session_id = Some("synthetic-contended-turn".into());
                 request_path(&root, &opts)
             }
         });
-        std::thread::sleep(Duration::from_millis(300));
+        waiting.recv_timeout(Duration::from_secs(10)).expect("request_path never reached the lifecycle lock");
         // What a sweep does while it holds the lock: remove the request.
         let directory = journal.parent().unwrap();
         for entry in std::fs::read_dir(directory).unwrap() {
@@ -1038,6 +1130,7 @@ for line in sys.stdin:
         }
         std::fs::remove_dir(directory).unwrap();
         drop(lock);
+        resume.send(()).unwrap();
         let addressed = waiter.join().unwrap().unwrap();
         assert_eq!(addressed, journal);
         assert!(addressed.parent().unwrap().is_dir(), "caller was handed a removed request directory");
@@ -1081,14 +1174,117 @@ for line in sys.stdin:
     #[test]
     fn retention_grace_comes_from_env_and_rejects_zero_or_absurd_values() {
         let hours = |h: u64| Duration::from_secs(h * 3600);
-        assert_eq!(retention_from(None), hours(24));
-        assert_eq!(retention_from(Some("  ")), hours(24));
-        assert_eq!(retention_from(Some(" 72 ")), hours(72));
-        assert_eq!(retention_from(Some("1")), hours(1));
-        assert_eq!(retention_from(Some("8760")), hours(8760));
-        for invalid in ["0", "-5", "1.5", "a day", "8761", "18446744073709551615"] {
-            assert_eq!(retention_from(Some(invalid)), hours(24), "{invalid}");
+        let floor = hours(3);
+        let grace = |raw| retention_from(raw, floor);
+        assert_eq!(grace(None), RetentionSetting { grace: hours(24), source: RetentionSource::Default });
+        assert_eq!(grace(Some("  ")).source, RetentionSource::Default);
+        assert_eq!(grace(Some(" 72 ")), RetentionSetting { grace: hours(72), source: RetentionSource::Env("72".into()) });
+        assert_eq!(grace(Some("3")).grace, hours(3));
+        assert_eq!(grace(Some("8760")).grace, hours(8760));
+        for invalid in ["0", "1", "2", "-5", "1.5", "a day", "8761", "18446744073709551615"] {
+            assert_eq!(grace(Some(invalid)), RetentionSetting { grace: hours(24),
+                source: RetentionSource::Rejected(invalid.into()) }, "{invalid}");
         }
+    }
+
+    /// #1035 review — a dispatched request has its directory but no lifecycle
+    /// marker while it waits at the CLI gate, for up to its class's budget.
+    /// No accepted grace may be shorter than that wait plus a margin.
+    #[test]
+    fn retention_grace_floor_exceeds_the_longest_gate_wait() {
+        let hours = |h: u64| Duration::from_secs(h * 3600);
+        let classes = {
+            let text = crate::reasoner::loop_parse_opts();
+            let mut read = text.clone();
+            read.allowed_tools = vec!["Read".into()];
+            let mut write = text.clone();
+            write.allowed_tools = vec!["Write".into()];
+            let mut agentic = text.clone();
+            agentic.allowed_tools = vec!["Bash(true)".into()];
+            [text, read, write, agentic]
+        };
+        // Another test may briefly override the reasoner timeout; compare
+        // two reads taken under the same setting.
+        let (gate, longest) = (0..1000).find_map(|_| {
+            let gate = longest_gate_wait();
+            let longest = classes.iter().map(crate::reasoner::reasoner_timeout_for).max().unwrap();
+            (gate == longest).then_some((gate, longest))
+        }).expect("longest_gate_wait must be the largest class gate budget");
+        assert!(retention_floor_for(gate) >= longest + hours(1));
+        for wait in [Duration::ZERO, Duration::from_secs(1), hours(2), hours(2) + Duration::from_secs(1), hours(30)] {
+            let floor = retention_floor_for(wait);
+            assert!(floor >= wait + hours(1) && floor.as_secs() % 3600 == 0, "{wait:?} -> {floor:?}");
+        }
+        // Default timeouts: one hour base, doubled for write/agentic calls.
+        assert_eq!(retention_floor_for(hours(2)), hours(3));
+        assert_eq!(retention_floor_for(hours(2) + Duration::from_secs(1)), hours(4));
+        // A floor above the default raises the default with it.
+        assert_eq!(retention_from(None, hours(30)).grace, hours(30));
+        assert_eq!(retention_from(Some("25"), hours(30)).grace, hours(30));
+        assert_eq!(retention_from(Some("31"), hours(30)).grace, hours(31));
+    }
+
+    /// The bridge saves by writing a `.handoff-*` temp, fsyncing, renaming and
+    /// fsyncing the directory, and performs an effect only after that save
+    /// returns. A leftover temp is an interrupted save, never an effect the
+    /// journal fails to record, so it neither blocks nor survives removal.
+    #[test]
+    fn leftover_bridge_save_temp_files_follow_their_request() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let (_temp, root) = private_root();
+        let pending_state = json!({"version": 1, "operations": [completed_row(), started_row()]}).to_string();
+        let finished = request(&root, "synthetic-temp-finished", Some(json!([completed_row()])));
+        write_private(&finished.parent().unwrap().join(".handoff-a1b2c3d4"), &pending_state);
+        let uncertain = request(&root, "synthetic-temp-uncertain", Some(json!([started_row()])));
+        write_private(&uncertain.parent().unwrap().join(".handoff-e5f6a7b8"), &pending_state);
+        let public = request(&root, "synthetic-temp-public", Some(json!([completed_row()])));
+        let public_temp = public.parent().unwrap().join(".handoff-c9d0e1f2");
+        write_private(&public_temp, &pending_state);
+        std::fs::set_permissions(&public_temp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let linked = request(&root, "synthetic-temp-linked", Some(json!([completed_row()])));
+        symlink(&finished, linked.parent().unwrap().join(".handoff-a3b4c5d6")).unwrap();
+        for journal in [&finished, &uncertain, &public, &linked] {
+            age(journal, TWO_DAYS);
+        }
+
+        let report = sweep_finished(&root, GRACE, false).unwrap();
+
+        assert!(gone(&finished), "an interrupted save must not pin a finished request");
+        assert!(uncertain.exists() && public.exists() && linked.exists());
+        assert!(public_temp.exists());
+        assert_eq!((report.removed, report.kept_unfinished, report.kept_untrusted), (1, 1, 2));
+    }
+
+    /// #1035 review — doctor's dead-sweep signal comes from this classification.
+    #[test]
+    fn report_counts_request_dirs_and_finished_journals_a_live_sweep_would_have_removed() {
+        use std::os::unix::fs::symlink;
+        let (_temp, root) = private_root();
+        let hours = |h: u64| Duration::from_secs(h * 3600);
+        let overdue: Vec<_> = (0..2).map(|i| {
+            let journal = request(&root, &format!("synthetic-overdue-{i}"), Some(json!([completed_row()])));
+            age(&journal, TWO_DAYS);
+            journal
+        }).collect();
+        // Past grace by less than two sweep intervals: a live sweep may not have reached it yet.
+        let expiring = request(&root, "synthetic-just-expired", Some(json!([completed_row()])));
+        age(&expiring, GRACE + SWEEP_INTERVAL + hours(1) / 2);
+        let recent = request(&root, "synthetic-recent", Some(json!([completed_row()])));
+        let active = request(&root, "synthetic-overdue-but-active", Some(json!([completed_row()])));
+        write_private(&active.with_extension("active"), &json!({"version": 1, "receipt": "/nonexistent"}).to_string());
+        let uncertain = request(&root, "synthetic-overdue-but-uncertain", Some(json!([started_row()])));
+        for journal in [&active, &uncertain] {
+            age(journal, TWO_DAYS);
+        }
+        write_private(&root.join("notes.txt"), "not a request");
+        symlink(overdue[0].parent().unwrap(), root.join(format!("{:064x}", 7))).unwrap();
+
+        let report = sweep_finished(&root, GRACE, true).unwrap();
+
+        assert_eq!((report.entries, report.requests), (8, 6));
+        assert_eq!((report.removed, report.finished_overdue), (3, 2));
+        assert_eq!((report.kept_recent, report.kept_active, report.kept_unfinished, report.kept_untrusted), (1, 1, 1, 2));
+        assert!(recent.exists());
     }
 
     #[tokio::test(flavor = "current_thread")]

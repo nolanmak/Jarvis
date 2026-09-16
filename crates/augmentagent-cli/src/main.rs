@@ -64,6 +64,7 @@ mod env_cfg;
 mod gmail_attach;
 mod repo_docs;
 mod finance;
+mod handoff_prune;
 mod installers;
 mod logs;
 mod loop_cmd;
@@ -477,13 +478,22 @@ enum Cmd {
     },
     /// Remove finished reasoner handoff journals idle past the retention
     /// grace (#1035): `AUGMENTAGENT_HANDOFF_RETENTION_HOURS`, default 24.
-    /// The daemon sweeps at start and hourly; this is the on-demand pass.
-    /// In-flight, cleanup-unverified and uncertain journals are never
-    /// removed — those stay for `codex-tool-bridge.py --handoff-reconcile`.
+    /// The daemon sweeps at start and hourly with a confirming pass; this
+    /// on-demand pass removes immediately, so it needs `--yes` and refuses
+    /// while augmentagent.service runs. Journals with a lifecycle marker or
+    /// an uncertain row are never removed.
     HandoffPrune {
         /// Count what would be removed; take no locks and change nothing.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// Confirm a removing pass. Without the daemon's confirming pass, a
+        /// turn replayed after an outage would find no receipts.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        /// Remove even while augmentagent.service is active, or when
+        /// `systemctl --user is-active` cannot tell.
+        #[arg(long, default_value_t = false)]
+        force: bool,
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -2283,11 +2293,23 @@ async fn main() -> Result<()> {
     // Journal housekeeping needs no database.
     if let Cmd::HandoffPrune {
         dry_run,
+        yes,
+        force,
         json,
         ref root,
     } = cli.cmd
     {
-        return run_handoff_prune(dry_run, json, root.clone());
+        let root = root
+            .clone()
+            .or_else(augmentagent_channel_core::handoff::journal_root)
+            .context("no --root and no HOME to locate the handoff journal root")?;
+        return handoff_prune::run(
+            handoff_prune::Options { dry_run, yes, force, json },
+            &augmentagent_channel_core::handoff::retention_setting_from_env(),
+            &root,
+            &handoff_prune::daemon_state,
+            &mut std::io::stdout().lock(),
+        );
     }
     let db_path = cli
         .db
@@ -6610,52 +6632,6 @@ fn scheduled_send_interval_secs_from_env() -> u64 {
         })
 }
 
-
-/// #1035 — one on-demand journal retention pass. A dry run reads only.
-fn run_handoff_prune(dry_run: bool, json: bool, root: Option<PathBuf>) -> Result<()> {
-    use augmentagent_channel_core::handoff;
-    let root = root
-        .or_else(handoff::journal_root)
-        .context("no --root and no HOME to locate the handoff journal root")?;
-    let grace = handoff::retention_from_env();
-    let report = handoff::sweep_finished(&root, grace, dry_run)?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "root": root.display().to_string(),
-                "grace_hours": grace.as_secs() / 3600,
-                "dry_run": dry_run,
-                "report": report,
-            }))?
-        );
-        return Ok(());
-    }
-    const MIB: u64 = 1024 * 1024;
-    println!("handoff journals: {}", root.display());
-    println!(
-        "grace {}h; {} entries, {} MB",
-        grace.as_secs() / 3600,
-        report.entries,
-        report.bytes / MIB
-    );
-    println!(
-        "{} {} ({} MB); keep {} (recent {}, active {}, unfinished {}, busy {}, untrusted {})",
-        if dry_run { "would remove" } else { "removed" },
-        report.removed,
-        report.removed_bytes / MIB,
-        report.kept(),
-        report.kept_recent,
-        report.kept_active,
-        report.kept_unfinished,
-        report.kept_busy,
-        report.kept_untrusted,
-    );
-    if dry_run {
-        println!("\n(dry run — nothing was locked, created or removed)");
-    }
-    Ok(())
-}
 
 /// #449 — retire approval cards that no longer deserve the user's attention,
 /// without being asked to.

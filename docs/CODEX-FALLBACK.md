@@ -537,7 +537,8 @@ keeps the original attempt and permits a new one. Resume the same logical reques
 through its normal entry point. Keep receipts through rollout and rollback;
 older adapters reject unknown receipt states rather than replaying them.
 The retention sweep below never removes a journal with a `started` row, so an
-uncertain journal waits for this command however old it is.
+uncertain journal waits for this command however old it is (as long as no
+cleanup marker is left over; see below).
 
 
 ### Handoff journal retention
@@ -550,18 +551,25 @@ these hold:
 
 - **Idle.** No `operations.active` lifecycle marker exists. This is the same
   predicate the resume gate uses; a marker whose cleanup receipt would verify
-  still counts as active until a resume clears it.
+  still counts as active.
 - **Settled.** Every journal row is `completed` with its result, or
   `not_applied` with operator evidence (or no journal was ever written).
   A `started` row (an uncertain outcome), any other or future status, and an
   unreadable, oversized, linked or non-private journal all keep the directory.
 - **Expired.** Nothing in the directory changed for the grace period:
-  `AUGMENTAGENT_HANDOFF_RETENTION_HOURS`, in whole hours, **default 24**
-  (accepted range 1 to 8760; anything else falls back to 24 with a warning).
+  `AUGMENTAGENT_HANDOFF_RETENTION_HOURS`, in whole hours, **default 24**.
+  Values above 8760, or below the floor, fall back to the default with a
+  warning. The floor is the longest CLI-gate wait plus one hour, rounded up
+  to whole hours: 3 hours at the default `AUGMENTAGENT_REASONER_TIMEOUT_SECS`
+  (write and agentic calls may queue for twice that timeout before their
+  provider starts, and the request has no lifecycle marker while it queues).
+  A larger timeout raises the floor, and the default with it if needed.
   Dispatch refreshes the directory timestamp under the lifecycle lock every
   time it addresses a request, so a turn that keeps retrying keeps its receipts.
 - **Confirmed.** The daemon's previous pass already saw the request settled,
-  expired and unchanged. A restarted daemon removes nothing during its first
+  expired and unchanged. "Unchanged" compares metadata, not contents: the
+  device, inode, nanosecond modification time and length of the directory and
+  of every entry. A restarted daemon removes nothing during its first
   interval, which gives turns replayed at startup time to re-address their
   journals however long the daemon was down.
 
@@ -574,19 +582,47 @@ entries relative to an opened directory without following links, and refuses a
 root or request directory that is not owner-private or holds unexpected
 entries. Failures are logged and never stop the daemon.
 
-It never touches in-flight, cleanup-unverified or uncertain journals; those stay
-for the recovery command above. Do not delete handoff state by hand.
+What it never touches, and for how long:
 
-An on-demand pass is available; `--dry-run` takes no locks and changes nothing.
-Unlike the daemon, the on-demand pass does not wait for a confirming pass:
+- **Uncertain journals** (a `started` row, or any status it does not recognise)
+  stay until the recovery command above records a decision. The next passes
+  then treat them like any other finished journal.
+- **Journals with an `operations.active` marker are retained indefinitely.**
+  A marker means a provider is running or its descendants' cleanup has not
+  been verified. The recovery command refuses while a marker exists and never
+  clears one, and the sweep never clears one either. The only path that clears
+  a marker today is the resume gate, when the same turn is dispatched again and
+  its cleanup receipt still verifies. The daemon has no SIGTERM handler, so a
+  service stop or restart during a call leaves a marker behind. Most such
+  turns are never dispatched again (calls without a turn id get a fresh
+  request), and the receipt lives in a temporary directory that may be gone.
+  Those journals stay on disk until a marker-clearing mechanism exists,
+  tracked in a follow-up.
+
+Do not delete handoff state by hand.
+
+An on-demand pass is available. `--dry-run` takes no locks, changes nothing and
+prints the effective grace and where it came from (this shell's environment or
+`.env`, or the default; the daemon reads its own environment, which may differ):
 
 ```sh
 augmentagent handoff-prune --dry-run
-augmentagent handoff-prune
+augmentagent handoff-prune --yes
 ```
 
-`augmentagent doctor` reports the journal count and size (read-only) and warns
-above 5000 request directories or 3 GiB.
+A removing pass requires `--yes`. Unlike the daemon, it does not wait for a
+confirming pass, so run it only with the daemon stopped for a reason, and not
+during an outage in which a loop occurrence was interrupted (its replay after
+restart would find no receipts). It refuses while `augmentagent.service` is
+active, or when `systemctl --user is-active` cannot tell, unless `--force` is
+given.
+
+`augmentagent doctor` reports (read-only) the number and size of request
+directories, finished journals past grace, and, for information, uncertain
+journals and lifecycle markers. It warns above 5000 request directories or
+3 GiB, and when any finished journal has been past grace for more than two
+sweep intervals (plus 15 minutes). A live sweep removes such a journal within two
+intervals, so this catches a dead sweep within hours.
 
 Limit: a turn first re-dispatched more than the grace period after it last ran,
 and more than one sweep interval after the daemon started, is treated as a new

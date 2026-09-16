@@ -81,6 +81,13 @@ fn lock_options() -> std::fs::OpenOptions {
     options
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: runs once on this thread after a waiting lock's file is
+    /// opened and before it blocks, to interleave a concurrent removal.
+    pub(crate) static BEFORE_WAITING_LOCK: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+}
+
 /// Open and flock an owner-private lock file without following links.
 fn flock_private(path: &std::path::Path, options: &std::fs::OpenOptions, wait: bool) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::MetadataExt;
@@ -88,6 +95,10 @@ fn flock_private(path: &std::path::Path, options: &std::fs::OpenOptions, wait: b
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
         return Err(std::io::Error::other("invalid lifecycle lock"));
+    }
+    #[cfg(test)]
+    if wait {
+        if let Some(hook) = BEFORE_WAITING_LOCK.take() { hook() }
     }
     let operation = if wait { libc::LOCK_EX } else { libc::LOCK_EX | libc::LOCK_NB };
     if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 { return Err(std::io::Error::last_os_error()); }
