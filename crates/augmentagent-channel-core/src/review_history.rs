@@ -43,13 +43,26 @@ fn lock(path: &Path) -> anyhow::Result<std::fs::File> {
         info.is_file() && info.uid() == unsafe { libc::geteuid() } && info.mode() & 0o077 == 0,
         "invalid review history lock"
     );
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(anyhow::anyhow!(
-            "review history is in use; retry before invoking a builder"
-        ));
+    // A non-blocking attempt can also meet a holder that is only passing
+    // through: while any thread in this process spawns a child, the child
+    // inherits this descriptor until it execs (CLOEXEC closes it only then),
+    // and flock belongs to the shared open file description. Retry briefly so
+    // that window never reads as a concurrent builder. A real holder still
+    // fails once the bound runs out.
+    let deadline = std::time::Instant::now() + LOCK_PATIENCE;
+    while unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow::anyhow!(
+                "review history is in use; retry before invoking a builder"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
     Ok(file)
 }
+
+/// How long `lock` waits out a transient holder (see above).
+const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_millis(250);
 
 fn load(path: &Path) -> anyhow::Result<History> {
     let file = std::fs::OpenOptions::new()
@@ -212,6 +225,29 @@ mod tests {
         )
         .is_err());
         assert!(authors(&path).is_err());
+    }
+
+    /// A child spawned by another thread holds an inherited copy of the lock
+    /// descriptor until it execs. Releasing ours in that window must not make
+    /// the next `record` fail as if a concurrent builder held the history.
+    /// The child here keeps the copy for ~50 ms, longer than a real spawn.
+    #[test]
+    fn a_lock_descriptor_briefly_inherited_by_a_child_is_waited_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = initialize(
+            &dir.path().join("state"),
+            "synthetic-repository",
+            "synthetic-branch",
+            false,
+        )
+        .unwrap();
+        let held = lock(&path).unwrap();
+        assert_eq!(unsafe { libc::fcntl(held.as_raw_fd(), libc::F_SETFD, 0) }, 0);
+        let mut child = std::process::Command::new("sleep").arg("0.05").spawn().unwrap();
+        drop(held);
+        record(&path, ProviderKind::Codex).unwrap();
+        child.wait().unwrap();
+        assert_eq!(authors(&path).unwrap(), Some(vec![ProviderKind::Codex]));
     }
 
     #[test]
