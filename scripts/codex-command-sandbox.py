@@ -168,7 +168,15 @@ def main():
         raise RuntimeError('cannot bind command lifetime to its parent')
     os.chdir(policy['cwd'])
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (256 * 1024 * 1024, 256 * 1024 * 1024))
+    file_limit = policy.get('file_limit_bytes', 256 * 1024 * 1024)
+    if type(file_limit) is not int or not 1 <= file_limit <= 256 * 1024 * 1024:
+        raise RuntimeError('invalid file resource limit')
+    resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
+    memory_limit = policy.get('memory_limit_bytes')
+    if memory_limit is not None:
+        if type(memory_limit) is not int or not 64 * 1024 * 1024 <= memory_limit <= 2 * 1024 * 1024 * 1024:
+            raise RuntimeError('invalid memory resource limit')
+        resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
     environment = {key: value for key, value in os.environ.items() if key in (
         'HOME', 'PATH', 'LANG', 'LC_ALL', 'TERM', 'CARGO_HOME', 'RUSTUP_HOME', 'RUSTUP_TOOLCHAIN',
         'CARGO_TARGET_DIR', 'TMPDIR', 'NPM_CONFIG_CACHE', 'CARGO_NET_OFFLINE',

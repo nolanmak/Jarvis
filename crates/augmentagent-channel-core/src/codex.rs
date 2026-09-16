@@ -561,6 +561,22 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
     }
 
     #[tokio::test]
+    #[ignore = "requires a logged-in Codex CLI and Poppler; reads a synthetic PDF only"]
+    async fn live_scoped_pdf_page_read_is_visible_to_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = include_bytes!("../../../scripts/tests/fixtures/scoped-document.pdf");
+        let path = dir.path().join("document.pdf");
+        std::fs::write(&path, original).unwrap();
+        let mut options = crate::reasoner::resume_opts(dir.path().into());
+        options.allowed_tools = vec!["Read".into()];
+        options.system_prompt = "Read the requested PDF page with the Jarvis Read tool and answer from the actual rendered page.".into();
+        let result = CodexCliReasoner::openai().call(&options,
+            "Use Jarvis Read on document.pdf with pages=2. What single color fills page 2? Return only COLOR=<color name>.").await.unwrap();
+        assert_eq!(result.trim().to_ascii_lowercase(), "color=blue");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[tokio::test]
     async fn codex_bridge_calls_are_recorded_in_the_common_audit_log() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");

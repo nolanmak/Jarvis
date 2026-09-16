@@ -48,6 +48,33 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertEqual(base64.b64decode(response['content'][0]['data']), original)
         self.assertEqual((self.root / 'pixel.png').read_bytes(), original)
 
+    def test_pdf_read_renders_selected_pages_and_preserves_original(self):
+        import base64
+        original = (Path(__file__).parent / 'fixtures/scoped-document.pdf').read_bytes()
+        (self.root / 'document.pdf').write_bytes(original)
+        server = bridge.Server(self.policy)
+        result = server.call('Read', {'file_path': 'document.pdf', 'pages': '2'})
+        self.assertIn('Page 2 of 2', result['content'][0]['text'])
+        self.assertEqual(len(result['content']), 2)
+        self.assertEqual(result['content'][1]['type'], 'image')
+        self.assertTrue(base64.b64decode(result['content'][1]['data']).startswith(b'\x89PNG\r\n\x1a\n'))
+        self.assertEqual((self.root / 'document.pdf').read_bytes(), original)
+        result = server.call('Read', {'file_path': 'document.pdf'})
+        self.assertEqual(len(result['content']), 4)
+
+    def test_pdf_page_ranges_reject_invalid_or_excessive_requests(self):
+        original = (Path(__file__).parent / 'fixtures/scoped-document.pdf').read_bytes()
+        (self.root / 'document.pdf').write_bytes(original)
+        server = bridge.Server(self.policy)
+        for pages in ('0', '2-1', '1-21', '1,2', '1-999999999', '3'):
+            with self.subTest(pages=pages), self.assertRaises(bridge.Denied):
+                server.call('Read', {'file_path': 'document.pdf', 'pages': pages})
+        with self.assertRaises(bridge.Denied):
+            server.call('Read', {'file_path': 'document.pdf', 'offset': 1})
+        self.policy.write('text.txt', 'synthetic')
+        with self.assertRaises(bridge.Denied):
+            server.call('Read', {'file_path': 'text.txt', 'pages': '1'})
+
     def test_image_read_keeps_file_scope_and_rejects_text_line_arguments(self):
         (self.root / 'image.png').write_bytes(b'\x89PNG\r\n\x1a\nSYNTHETIC')
         server = bridge.Server(self.policy)

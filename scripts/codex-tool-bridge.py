@@ -370,9 +370,15 @@ class Policy:
             for fd in reversed(descriptors):
                 os.close(fd)
 
-    def read(self, name, offset=None, limit=None):
+    def read(self, name, offset=None, limit=None, pages=None):
         self.require('Read')
         data = self._read_bytes(name)
+        if data.startswith(b'%PDF-'):
+            if offset is not None or limit is not None:
+                raise Denied('use PDF page ranges instead of text line ranges')
+            return self.read_pdf(data, pages)
+        if pages is not None:
+            raise Denied('page ranges apply only to PDF documents')
         mime = None
         if data.startswith(b'\x89PNG\r\n\x1a\n'):
             mime = 'image/png'
@@ -396,6 +402,90 @@ class Policy:
                 raise Denied('read offset and limit must be positive integers')
         start = (offset or 1) - 1
         return ''.join(text.splitlines(keepends=True)[start:None if limit is None else start + limit])
+
+    def read_pdf(self, data, pages):
+        import base64
+        import tempfile
+        import sys
+        import signal
+        import time
+        selected = None
+        if pages is not None:
+            if not isinstance(pages, str) or not re.fullmatch(r'[1-9][0-9]{0,5}(?:-[1-9][0-9]{0,5})?', pages):
+                raise Denied('PDF pages must be a page number or inclusive range')
+            parts = [int(part) for part in pages.split('-')]
+            first, last = parts[0], parts[-1]
+            if last < first or last - first + 1 > 20:
+                raise Denied('PDF reads support at most 20 pages per call')
+            selected = (first, last)
+        helper = Path(__file__).with_name('codex-command-sandbox.py')
+        executables = [Path('/usr/bin/pdfinfo'), Path('/usr/bin/pdftoppm')]
+        for executable in [helper, *executables]:
+            if not executable.is_file() or any(executable.resolve() == root or root in executable.resolve().parents
+                                              for root in self.write_roots):
+                raise Denied('trusted PDF renderer or sandbox is unavailable')
+        with tempfile.TemporaryDirectory(prefix='jarvis-pdf-') as temporary:
+            root = Path(temporary)
+            source = root / 'source'; source.mkdir(mode=0o700)
+            output = root / 'output'; output.mkdir(mode=0o700)
+            document = source / 'document.pdf'
+            document.write_bytes(data)
+            policy = root / 'policy.json'
+            policy.write_text(json.dumps({'cwd': str(output), 'read_roots': [str(source)],
+                'write_roots': [str(output)], 'runtime_reads': ['/etc/fonts'],
+                'memory_limit_bytes': 512 * 1024 * 1024, 'file_limit_bytes': MAX_FILE_BYTES}))
+            policy.chmod(0o600)
+            deadline = time.monotonic() + 60
+
+            def render(argv):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise Denied('PDF rendering timed out')
+                with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                    process = subprocess.Popen([sys.executable, '-I', str(helper), str(policy), *argv],
+                        cwd=output, env={'PATH': os.defpath, 'HOME': str(output), 'LANG': 'C.UTF-8'},
+                        stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
+                    try:
+                        try:
+                            status = process.wait(timeout=min(30, remaining))
+                        except subprocess.TimeoutExpired as exc:
+                            raise Denied('PDF rendering timed out') from exc
+                        if status or os.fstat(stdout.fileno()).st_size > MAX_FILE_BYTES:
+                            raise Denied('PDF rendering failed or exceeded its resource limit')
+                        stdout.seek(0)
+                        return stdout.read(MAX_FILE_BYTES + 1)
+                    finally:
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        process.wait()
+
+            info = render(['/usr/bin/pdfinfo', str(document)]).decode('utf-8', errors='replace')
+            match = re.search(r'^Pages:\s+([0-9]+)\s*$', info, flags=re.MULTILINE)
+            if not match or int(match[1]) < 1:
+                raise Denied('PDF page count is unavailable')
+            count = int(match[1])
+            first, last = selected or (1, count)
+            if last > count or last - first + 1 > 20:
+                raise Denied('select an existing range of at most 20 PDF pages')
+            content = []
+            total = 0
+            for page in range(first, last + 1):
+                render(['/usr/bin/pdftoppm', '-f', str(page), '-l', str(page), '-singlefile',
+                        '-scale-to', '1600', '-png', str(document), str(output / 'page')])
+                with os.fdopen(os.open(output / 'page.png', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as stream:
+                    info = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES - total:
+                        raise Denied('PDF render exceeds output size limit; request fewer pages')
+                    image = stream.read(MAX_FILE_BYTES - total + 1)
+                total += len(image)
+                if total > MAX_FILE_BYTES or not image.startswith(b'\x89PNG\r\n\x1a\n'):
+                    raise Denied('PDF renderer returned invalid or oversized image data')
+                content.extend([{'type': 'text', 'text': f'Page {page} of {count}'},
+                    {'type': 'image', 'mimeType': 'image/png', 'data': base64.b64encode(image).decode('ascii')}])
+                (output / 'page.png').unlink()
+            return {'content': content}
 
     def _read(self, name):
         return self._read_bytes(name).decode('utf-8')
@@ -742,7 +832,8 @@ TOOL_SCHEMAS = {
     'Bash': {'command': {'type': 'string'}, 'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 900,
              'description': 'Maximum runtime in seconds.'}},
     'Read': {'file_path': {'type': 'string'}, 'offset': {'type': 'integer', 'minimum': 1},
-             'limit': {'type': 'integer', 'minimum': 1}},
+             'limit': {'type': 'integer', 'minimum': 1}, 'pages': {'type': 'string',
+             'description': 'PDF page number or inclusive range, for example 2-5; at most 20 pages.'}},
     'Glob': {'pattern': {'type': 'string'}, 'path': {'type': 'string'}},
     'Grep': {'pattern': {'type': 'string'}, 'path': {'type': 'string'}, 'ignore_case': {'type': 'boolean'}},
     'Write': {'file_path': {'type': 'string'}, 'content': {'type': 'string'}},
@@ -1019,7 +1110,7 @@ class Server:
                 options['ignore_case'] = arguments.get('ignore_case', False)
             return json.dumps(action(arguments['pattern'], **options))
         if name == 'Read':
-            return self.policy.read(arguments['file_path'], arguments.get('offset'), arguments.get('limit'))
+            return self.policy.read(arguments['file_path'], arguments.get('offset'), arguments.get('limit'), arguments.get('pages'))
         if name == 'Write':
             self.policy.write(arguments['file_path'], arguments['content'])
             return 'File written.'

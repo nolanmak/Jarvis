@@ -172,8 +172,15 @@ cannot stand in for any tool-using profile.
   than attempting UTF-8 decoding. Path checks and file-size limits apply before
   encoding; text line ranges on images are rejected. A live Codex test reads
   a synthetic PNG through the bridge, identifies its undisclosed color, and
-  verifies the original bytes and provider audit record. PDF/document reads
-  still need equivalent coverage.
+  verifies the original bytes and provider audit record.
+- PDF `Read` supports explicit page numbers/ranges and returns rendered page
+  images, including visual content. Poppler (`pdfinfo` and `pdftoppm`) renders
+  only a private snapshot under the command sandbox, with no network, a 512 MiB
+  address-space limit, bounded files and a 60-second request budget. Up to 20
+  pages are allowed per call; larger documents require an explicit range.
+  A live Codex test identifies the undisclosed color on the selected page of a
+  synthetic two-page PDF and verifies the source bytes remain unchanged. Other
+  document formats and the complete query/delivery path remain integration work.
 - Rust launch tests check private configuration permissions, exclusion of secrets
   from arguments, native tool restrictions, separate read/write roots and
   rejection of unknown settings.
