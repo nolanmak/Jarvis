@@ -99,7 +99,13 @@ execution, a passing Cargo socket test and the tool audit.
 Installing runtime files does not deploy or restart the daemon. Retain the previous
 binary and runtime configuration for rollback, including private provider cooldown
 and handoff state. Restore the prior binary/configuration and restart through the
-normal service procedure. Do not delete handoff state to force a retry.
+normal service procedure. Do not delete handoff state to force a retry. Before
+rolling back to a version that cannot read the new handoff journals, pause task
+intake and scheduled mutation workflows. Reconcile in-flight/uncertain operations
+using the current recovery tooling before resuming them; an older binary cannot
+safely infer that an unrecognized receipt means an operation did not occur.
+Verify saved binary hashes and configuration permissions before replacement,
+then verify the running executable and service health after restart.
 
 Build artifacts and writable package caches are private to a bridge session.
 Disk quotas are not supplied by this runtime; provision host capacity separately. Binary source updates and file deletions reconcile in

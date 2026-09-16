@@ -1,10 +1,11 @@
 # Codex fallback implementation
 
 Issue #1019 requires operational parity for every Claude-backed Jarvis workflow.
-This document tracks the implementation contract. The development branch now
-permits Codex routing for text, read, write and full-agentic requests through the
-scoped bridge. This has not been deployed and is not a claim of full workflow
-parity: operational rollout and the remaining acceptance audit still gate release.
+The implementation merged in PR #1021 at `92dcaa9` and is deployed. Codex handles
+text, read, write and full-agentic requests through an enforced scoped bridge.
+The capability manifest records 31 production call sites with conformance tests.
+See [release verification](#release-verification) for deployment evidence and the
+boundary between controlled lifecycle tests and live external delivery.
 
 ## Execution boundary
 
@@ -355,8 +356,9 @@ cannot stand in for any tool-using profile.
   pages are allowed per call; larger documents require an explicit range.
   A live Codex test identifies the undisclosed color on the selected page of a
   synthetic two-page PDF and verifies the source bytes remain unchanged. Other
-  document formats and deployed Discord delivery remain integration work; the
-  local query handler and attachment-preparation path have passed live QA.
+  downloaded formats use original-byte attachment delivery, without conversion.
+  The query handler and attachment-preparation path pass live provider QA;
+  verification does not send synthetic files to live external channels.
 - Rust launch tests check private configuration permissions, exclusion of secrets
   from arguments, native tool restrictions, separate read/write roots and
   rejection of unknown settings.
@@ -382,7 +384,7 @@ cannot stand in for any tool-using profile.
   pin and the same two-pass evidence contract. Codex-specific owner overrides
   for hard complexity and runtime receipts still require actual Codex approval.
   Live independent Claude review after Codex builds and the controlled full
-  lifecycle have passed. Public-service deployment remains unverified.
+  lifecycle have passed. Deployment is verified in the release receipt below.
 
 ## Integration contracts and release gates
 
@@ -400,7 +402,7 @@ acceptance criteria, and a constant-return patch is rejected after reading
 source and inspecting its Git diff. Source bytes remain unchanged by both
 passes. A repeatable broker test also verifies that these presets reject
 Write, Edit, Git commits and build commands. This covers the inspection stages. The controlled lifecycle described above
-also covers merge and fresh-checkout acceptance; service rollout remains open.
+also covers merge and fresh-checkout acceptance; deployed CLI QA is recorded below.
 
 The shared live output-contract suite passed through both Claude and Codex:
 interval parsing, missing-timezone errors, archetype selection, newsletter
@@ -422,10 +424,9 @@ hooks. The production query preset's file-only hooks remain supported.
 Single-web-tool and web-hook profiles need a guarded implementation before
 they can be accepted; they are not silently broadened or claimed as parity.
 
-The implementation and candidate conformance contracts above are complete.
-Release still requires final independent review and CI, merge, verification of
-the deployed revision and CLI behavior, rollback readiness, and task-worktree
-cleanup. Candidate-only receipts must not be described as production deployment.
+The implementation passed independent review, CI and merged release rollout.
+Candidate contract receipts remain distinct from the deployed CLI and running
+binary verification recorded below.
 
 All fixtures and publishable receipts must use synthetic data. Live account
 configuration, private correspondence and raw runtime logs stay outside this repo.
@@ -489,8 +490,8 @@ confirmed, then all five inventory tests passed).
 
 These receipts apply to the candidate worktree. They do not prove deployment.
 Recovery and public dependency provisioning have separate verified contracts
-below. Final independent review, CI and deployed revision/CLI verification remain
-release gates.
+below. Final review, CI and deployed revision/CLI verification are recorded in
+the release receipt.
 
 
 ### Operator recovery for uncertain effects
@@ -549,7 +550,7 @@ full bridge suite passed all 76 tests after these changes.
 
 This closes writable local installation and reuse within one bridge session.
 The public dependency gateway below supplies uncached npm and Cargo packages.
-Final release review and deployed CLI QA remain separate acceptance gates.
+Final release review and deployed CLI QA have separate receipts below.
 
 
 ### Uncached dependency verification
@@ -573,3 +574,44 @@ addon compiled against matching system Node headers in the guest. That worktree
 was removed afterward. Runtime setup now pins a private compiler copy without
 changing the operator's existing Rust installation. These checks establish build
 and dependency contracts; they do not claim service deployment or a merged PR.
+
+
+## Release verification
+
+PR #1021 merged at `92dcaa9` after required CI passed. Independent reviews of
+execution, handoff/reconciliation, writable installations and the public registry
+gateway found no remaining blocking defects after corrections. The final cache
+review confirmed that extracted crate sources are not retained, Git dependencies
+come from the provisioned cache, and explicit offline behavior is preserved.
+
+The optimized CLI and memory server were built from the exact merged source tree.
+The installed CLI and the running daemon executable have the same SHA-256 as the
+tested release candidate; the deployment receipt and previous binaries remain
+private. The daemon restarted successfully and reported zero automatic restarts.
+Existing cooldowns and handoff journals were preserved; automatic updates were
+re-enabled after recording the verified build revision.
+
+Post-deployment CLI QA used an isolated synthetic wiki/database and a private
+Claude cooldown. Real Codex completed Glob/Grep/Read/Write/Edit, memory_recent,
+and the allowlisted local `augmentagent loop list --json` command. Exact edited
+bytes, original document bytes, the delivery marker and provider-attributed tool
+audit all passed. A first candidate probe failed its exact text-byte assertion;
+a second probe with an explicit final-newline requirement passed, as did the
+installed-binary probe. This is an execution receipt, not a guarantee that model
+outputs never need validation.
+
+The current query-handler live test passed with two requests: original attachment
+bytes survived delivery preparation, and the second request skipped the latched
+primary. The controlled auto-ship lifecycle uses real providers, Cargo and Git
+with simulated GitHub operations; it verifies independent review, merge and
+fresh-checkout acceptance. These checks do not send test messages or attachments
+to live external channels or create public test PRs.
+
+Final regression evidence: 2,479 Rust tests passed with no failures across 72
+targets (38 opt-in tests run separately where applicable); 79 bridge, 8 VM,
+5 registry gateway and 5 helper-packaging checks passed. A separate live test
+rejected a corrupted cached crate on an offline rebuild. A clean project install,
+build and all 26 Node tests passed inside the VM. Tracked-file privacy, release-tree
+secret and branch-history secret scans passed. Doctor reports Codex as available
+for every declared capability class; concrete guard/MCP readiness still runs per
+invocation.
