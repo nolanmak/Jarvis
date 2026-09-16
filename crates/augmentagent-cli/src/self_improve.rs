@@ -3882,13 +3882,6 @@ async fn rabbit_pr_comments(repo_root: &Path, pr: u64) -> Vec<serde_json::Value>
 /// short poll window; otherwise `unavailable` — which never blocks. A
 /// rate-limit notice ends the poll immediately.
 async fn wait_for_rabbit(repo_root: &Path, pr: u64, head_sha: &str) -> RabbitReview {
-    // #1032 — in a repo with no `.coderabbit.yaml` nothing will ever review
-    // this PR, so polling for one spends the whole window discovering that.
-    // The fresh path no longer consults this config at all; short-circuiting
-    // the resume lane is the only place it still earns its keep.
-    if !coderabbit_configured(repo_root) {
-        return RabbitReview::unavailable("CodeRabbit is not configured for this repo");
-    }
     let gh = gh_bin();
     let window = rabbit_wait_secs();
     let started = std::time::Instant::now();
@@ -3905,6 +3898,14 @@ async fn wait_for_rabbit(repo_root: &Path, pr: u64, head_sha: &str) -> RabbitRev
         )
         .await;
         let r = rabbit_findings_for_head(&reviews, &comments, head_sha);
+        // #1032 — absence of `.coderabbit.yaml` means nobody is coming, so do
+        // not spend the polling window learning that. It does NOT mean ignore
+        // a review: the GitHub App can be installed without the file, and the
+        // file can be deleted after a review was posted, so the read above
+        // still decides. Skip the wait, never the read.
+        if !r.available && !coderabbit_configured(repo_root) {
+            return RabbitReview::unavailable("CodeRabbit is not configured for this repo");
+        }
         if r.available {
             info!(
                 pr,
@@ -11219,20 +11220,35 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     }
 
     /// Removing the fresh-path check left `coderabbit_configured` with no
-    /// caller. Rather than delete it, it moved to where it does real work: a
-    /// repo with no `.coderabbit.yaml` will never be reviewed, so the resume
-    /// lane must not spend its polling window learning that.
+    /// caller, and my first move was to return early on it — which codex
+    /// caught: the GitHub App can be installed with no `.coderabbit.yaml`, and
+    /// the file can be deleted after a review was posted. Returning early
+    /// there would ignore real findings on the current head.
+    ///
+    /// Absence of the config means nobody is COMING. It never means ignore
+    /// somebody who already spoke. So it skips the wait, never the read.
     #[test]
-    fn the_resume_poll_short_circuits_when_coderabbit_is_not_configured() {
+    fn an_unconfigured_repo_skips_the_wait_but_never_the_read() {
         let src = include_str!("self_improve.rs");
         let start = src.find("async fn wait_for_rabbit(").expect("wait fn");
         let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
-        let guard = body.find("coderabbit_configured(").expect("must check the config");
-        let poll = body.find("loop {").expect("the polling loop");
+
+        let read = body
+            .find("rabbit_findings_for_head(")
+            .expect("the review of the head must be read");
+        let guard = body.find("coderabbit_configured(").expect("must consult the config");
         assert!(
-            guard < poll,
-            "check before polling, or the window is spent discovering there is \
-             nobody to wait for"
+            read < guard,
+            "read the posted review BEFORE deciding nobody is coming, or an \
+             existing finding is ignored whenever the config file is absent"
+        );
+        // And the early return is conditioned on there being no review, not on
+        // the config alone.
+        let line_start = body[..guard].rfind("if ").expect("the guard condition");
+        assert!(
+            body[line_start..guard].contains("!r.available"),
+            "the short-circuit must require that no review exists: {:?}",
+            &body[line_start..guard]
         );
     }
 
