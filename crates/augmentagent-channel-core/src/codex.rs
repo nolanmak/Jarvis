@@ -110,7 +110,12 @@ impl CodexCliReasoner {
         let caller = caller_tag(opts);
         let acquire = self.gate.acquire_timed("codex", &caller, dur);
         let _permit = acquire.await.map_err(ReasonerError::from)?;
-        match tokio::time::timeout(dur, self.call_once(opts, user_message, all_blocks)).await {
+        let clean = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let outcome = tokio::time::timeout(dur, self.call_once(opts, user_message, all_blocks, clean.clone())).await;
+        if !clean.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ReasonerError::CleanupUncertain { provider: provider.into() }.into());
+        }
+        match outcome {
             // Post-classify any untyped failure (stdin EPIPE, read/wait IO)
             // as provider-side Unavailable (#655 review) — an untyped error
             // would abort the whole chain instead of failing over.
@@ -136,6 +141,7 @@ impl CodexCliReasoner {
         opts: &ReasonerOpts,
         user_message: &str,
         all_blocks: bool,
+        clean: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
         let model = model_for(ProviderKind::Codex, tier_of(opts));
@@ -226,8 +232,7 @@ impl CodexCliReasoner {
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
 
         // Always a clean env (the #128 posture): OS essentials + CODEX_HOME
         // + exactly the secrets this backend needs, JIT-loaded. The daemon's
@@ -248,7 +253,7 @@ impl CodexCliReasoner {
         // policy, never exposed to native tools or placed on argv.
 
 
-        let (mut child, process_group) = crate::process_tree::spawn(&mut cmd).map_err(|e| {
+        let (mut child, process_group) = crate::process_tree::spawn_supervised(&cmd, true, clean).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 anyhow::Error::new(ReasonerError::Local {
                     message: format!("{provider}: binary {:?} not found on PATH", self.bin),

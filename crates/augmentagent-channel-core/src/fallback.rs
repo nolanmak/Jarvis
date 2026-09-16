@@ -737,6 +737,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unverified_process_cleanup_blocks_fallback_without_latching() {
+        let dir = tempfile::tempdir().unwrap();
+        let latch = latch_in(&dir);
+        let primary = Scripted::err(|| ReasonerError::CleanupUncertain { provider:"claude".into() }.into());
+        let fallback = Scripted::ok("must not run while old tools may be alive");
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary), (ProviderKind::Codex, fallback.clone()),
+        ], latch.clone());
+        let error = chain.call(&text_only_opts(), "synthetic request").await.unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&error), Some(ReasonerError::CleanupUncertain { .. })));
+        assert_eq!(fallback.count(), 0);
+        assert!(latch.latched_until("claude").is_none());
+    }
+
+    #[tokio::test]
     async fn local_fault_tries_next_without_latching() {
         let dir = tempfile::tempdir().unwrap();
         let latch = latch_in(&dir);

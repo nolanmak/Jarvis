@@ -75,13 +75,16 @@ Exact argument matching does not identify semantically duplicate actions express
 with different arguments. Hook observations do not substitute for verified
 termination of the previous provider and its descendants before handoff.
 
-Both CLI adapters now create an owned process group and kill that group on
-return or cancellation. A real subprocess regression first reproduced a
-background tool writing after its provider was canceled, then passed with group
-cleanup. This covers descendants that retain the group; descendants that detach
-into a new session still require supervision and verification. Broker command
-children cannot call `setsid`/`setpgid`, but primary native tools do not share
-that syscall filter.
+Both CLI adapters now launch beneath a private Linux subreaper supervisor. On
+normal exit or cancellation it kills the provider group, adopts detached orphan
+descendants, and acknowledges cleanup only after reaping all children. Cancellation
+waits for that acknowledgment before releasing the adapter call. Missing cleanup
+confirmation produces `CleanupUncertain`, which blocks fallback without latching
+the provider. Tests first reproduced group-only and detached-session leaks, then
+verified cancellation, normal exit with background work, destruction of the
+supervisor itself, and the fallback exclusion. A live Codex read/write/command
+smoke test passes through the supervisor. Daemon crash/restart recovery and
+persistent handling of an unverified cleanup still require additional coverage.
 
 ## Capability inventory
 

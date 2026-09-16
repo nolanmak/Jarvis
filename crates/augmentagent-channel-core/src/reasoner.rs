@@ -269,6 +269,10 @@ pub enum ReasonerError {
     /// not the provider. Never latched; the chain may still try the next.
     #[error("{provider} waited {waited_secs}s for a CLI gate permit")]
     GateTimeout { provider: String, waited_secs: u64 },
+    /// A previous tool process may still be active. Retrying another provider
+    /// could race that process, so this error must stop the fallback chain.
+    #[error("{provider} process cleanup is unverified; recovery requires reconciliation")]
+    CleanupUncertain { provider: String },
 }
 
 impl From<crate::cli_gate::GateWaitTimeout> for ReasonerError {
@@ -407,6 +411,7 @@ pub fn parse_reset_hint(message: &str) -> Option<chrono::DateTime<chrono::Utc>> 
 /// exits, empty output — is `Unavailable`, the "provider might be down"
 /// bucket. The original error stays in the chain for diagnostics.
 pub(crate) fn classify_other(provider: &str, e: anyhow::Error) -> anyhow::Error {
+    if ReasonerError::find_in(&e).is_some() { return e; }
     let not_found = e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
@@ -714,8 +719,8 @@ impl ClaudeCliReasoner {
     }
 
     /// [`call_once`] under the #656 watchdog. On expiry the in-flight future
-    /// is dropped, which kills the child via `kill_on_drop(true)` — no
-    /// orphaned `claude` processes, no forever-stuck pipeline.
+    /// is dropped, which stops the supervisor and waits for descendant cleanup.
+    /// Missing confirmation blocks failover instead of racing another provider.
     async fn call_once_timed(
         &self,
         opts: &ReasonerOpts,
@@ -732,7 +737,12 @@ impl ClaudeCliReasoner {
         let acquire = self.gate.acquire_timed("claude", &caller, dur);
         let _permit =
             acquire.await.map_err(|e| CallError::GateTimeout { waited_secs: e.waited_secs })?;
-        match tokio::time::timeout(dur, self.call_once(opts, user_message, capture)).await {
+        let clean = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let outcome = tokio::time::timeout(dur, self.call_once(opts, user_message, capture, clean.clone())).await;
+        if !clean.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(CallError::Other(ReasonerError::CleanupUncertain { provider: "claude".into() }.into()));
+        }
+        match outcome {
             Ok(r) => r,
             Err(_) => {
                 warn!(
@@ -790,7 +800,7 @@ enum CallError {
     /// retried. Distinct so callers can back off until the reset instead.
     RateLimited { message: String },
     /// #656 — the watchdog expired before the CLI finished. The child is
-    /// killed via `kill_on_drop`; distinct so the outer wrapper can surface
+    /// cleaned up by its supervisor; distinct so the outer wrapper can surface
     /// a typed, failover-eligible [`ReasonerError::Timeout`].
     Timeout { secs: u64 },
     /// #954 — the #898 gate never handed out a permit, so no child ever ran:
@@ -879,6 +889,7 @@ impl ClaudeCliReasoner {
         opts: &ReasonerOpts,
         user_message: &str,
         capture: TextCapture,
+        clean: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<String, CallError> {
         let mut args: Vec<String> = vec![
             "-p".into(),
@@ -944,11 +955,7 @@ impl ClaudeCliReasoner {
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // #656 — the watchdog in `call_once_timed` cancels this future on
-            // expiry; killing the child on drop is what makes that cancel
-            // real instead of leaking an orphaned CLI still burning quota.
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
         // Scope Write/Edit by setting the spawned CLI's cwd when requested.
         if let Some(cwd) = &opts.cwd {
             cmd.current_dir(cwd);
@@ -986,7 +993,7 @@ impl ClaudeCliReasoner {
                 cmd.env_remove(key);
             }
         }
-        let (mut child, process_group) = crate::process_tree::spawn(&mut cmd)?;
+        let (mut child, process_group) = crate::process_tree::spawn_supervised(&cmd, opts.restrict_env, clean)?;
 
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(user_message.as_bytes()).await?;
