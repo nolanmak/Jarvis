@@ -364,6 +364,33 @@ fn rows_for(saved: &[EvalRow], cases: &[&EvalCase]) -> Vec<EvalRow> {
         .collect()
 }
 
+/// Fold a partial run into the existing baseline.
+///
+/// A `--only` run grades a subset. Saving just that subset would discard the
+/// rest of the baseline, so the next full `--report-only` would report every
+/// other case as unrun — a silent loss of the very record the baseline exists
+/// to keep. Rows present in both are replaced by the fresh result; rows the
+/// run did not cover keep their previous verdict; a case the baseline has
+/// never seen is appended.
+fn merge_into_baseline(baseline: &[EvalRow], fresh: &[EvalRow]) -> Vec<EvalRow> {
+    let mut out: Vec<EvalRow> = baseline
+        .iter()
+        .map(|b| {
+            fresh
+                .iter()
+                .find(|f| f.id == b.id)
+                .cloned()
+                .unwrap_or_else(|| b.clone())
+        })
+        .collect();
+    for f in fresh {
+        if !baseline.iter().any(|b| b.id == f.id) {
+            out.push(f.clone());
+        }
+    }
+    out
+}
+
 /// Save a run: the rows AND when the scoring actually happened.
 pub fn save_run(rows: &[EvalRow], started: &str) -> Result<String> {
     let v = serde_json::json!({
@@ -454,10 +481,10 @@ const SCRATCH_PREFIX: &str = "autopr-eval-";
 /// Scratch dirs left by eval runs that are no longer alive.
 ///
 /// A killed run — ctrl-c, an OOM, a `pkill` — never reaches its cleanup, so
-/// its scratch dir survives AND the git worktrees inside it stay registered in
-/// the repository. Litter in the temp dir is untidy; a stale worktree
-/// registration in someone's repo is this tool leaving state behind somewhere
-/// that is not its own. The next run reclaims both.
+/// its scratch dir survives. Since trees are materialised with `git archive`
+/// there is no registration to leak — the leftovers are only a directory — but
+/// they are a directory holding a full checkout per case, so the next run
+/// reclaims them.
 ///
 /// Conservative on every axis: only `<tmp>/autopr-eval-<pid>`, only when that
 /// pid is gone, and never our own.
@@ -488,9 +515,8 @@ fn stale_scratch(
 ///
 /// The temp dir is shared by every checkout on the box. Without this, an eval
 /// in one repository would reclaim a dead eval's scratch from another: it
-/// would delete that repo's worktree directory while running
-/// `git worktree remove` against the WRONG repository, leaving behind exactly
-/// the stale registration the reclaim exists to prevent.
+/// would delete a checkout belonging to another repository's run — one that
+/// may still be in use if its pid was recycled.
 fn repo_slug(repo_root: &Path) -> String {
     // FNV-1a over the path. A hash, not a name: it only has to be stable,
     // short, and safe in a path segment.
@@ -519,18 +545,8 @@ async fn reclaim_stale_scratch(repo_root: &Path) {
         return;
     }
     for d in &stale {
-        // Deregister each tree BY PATH before the directory goes, so the
-        // repository is left consistent without a repo-wide prune deciding
-        // the fate of worktrees this command never created.
-        if let Ok(entries) = std::fs::read_dir(d) {
-            for tree in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
-                let _ = tokio::process::Command::new("git")
-                    .args(["worktree", "remove", "--force", &tree.to_string_lossy()])
-                    .current_dir(repo_root)
-                    .output()
-                    .await;
-            }
-        }
+        // Nothing to deregister: `git archive` left no bookkeeping behind, so
+        // a dead run's leftovers are just a directory.
         if let Err(e) = std::fs::remove_dir_all(d) {
             eprintln!("could not reclaim {}: {e}", d.display());
         }
@@ -695,10 +711,10 @@ pub async fn run(
                 None => (repo_root.to_path_buf(), None),
                 Some(base) => {
                     let dir = scratch.join(format!("tree-{}", c.id));
-                    match checkout_at(repo_root, base, &dir).await {
+                    match materialise_at(repo_root, base, &dir).await {
                         Ok(()) => (dir.clone(), Some(dir)),
                         Err(e) => {
-                            eprintln!("    could not check out {base}: {e:#}");
+                            eprintln!("    could not materialise {base}: {e:#}");
                             rows.push(grade(c, None));
                             continue;
                         }
@@ -717,11 +733,7 @@ pub async fn run(
                 }
             };
             if let Some(dir) = checkout {
-                let _ = tokio::process::Command::new("git")
-                    .args(["worktree", "remove", "--force", &dir.to_string_lossy()])
-                    .current_dir(repo_root)
-                    .output()
-                    .await;
+                let _ = std::fs::remove_dir_all(&dir);
             }
             let row = grade(c, observed.as_ref());
             println!("    {} — {}", if row.pass { "pass" } else { "MISS" }, row.note);
@@ -735,7 +747,16 @@ pub async fn run(
     let _ = std::fs::remove_dir_all(&scratch);
 
     if !report_only {
-        std::fs::write(&saved_path, save_run(&rows, &started)?)
+        // Fold into the baseline rather than replacing it, or a `--only` run
+        // silently drops every case it did not grade.
+        let to_save = match std::fs::read_to_string(&saved_path)
+            .ok()
+            .and_then(|raw| load_run(&raw).ok())
+        {
+            Some((prev, _)) => merge_into_baseline(&prev, &rows),
+            None => rows.clone(),
+        };
+        std::fs::write(&saved_path, save_run(&to_save, &started)?)
             .with_context(|| format!("write {}", saved_path.display()))?;
     }
 
@@ -752,23 +773,35 @@ pub async fn run(
     Ok(i32::from(s.passed != s.total))
 }
 
-/// A detached worktree at `commit`, so the scoper sees the repository as it
-/// was when the decision was made. Detached on purpose: no branch is created,
-/// so this can never collide with the loop's own branches or the user's.
-async fn checkout_at(repo_root: &Path, commit: &str, dir: &Path) -> Result<()> {
+/// Materialise the repository at `commit` into `dir`, registering NOTHING.
+///
+/// `git worktree add` would be the obvious tool and is the wrong one: it
+/// records the checkout in the repository, so a run that dies before cleanup
+/// leaves a registration behind in a repo this command does not own. `git
+/// archive` writes the same tree with no bookkeeping at all, which means there
+/// is no state to leak and nothing to reclaim but a directory.
+///
+/// Only committed content is written, which is exactly what should be scoped:
+/// the tree as it was, not whatever is lying around untracked today.
+async fn materialise_at(repo_root: &Path, commit: &str, dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).context("create tree dir")?;
+    let tar = dir.with_extension("tar");
     let out = tokio::process::Command::new("git")
-        .args([
-            "worktree",
-            "add",
-            "--detach",
-            "--force",
-            &dir.to_string_lossy(),
-            commit,
-        ])
+        .args(["archive", "--format=tar", "-o", &tar.to_string_lossy(), commit])
         .current_dir(repo_root)
         .output()
         .await
-        .context("spawn git worktree add")?;
+        .context("spawn git archive")?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&tar);
+        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let out = tokio::process::Command::new("tar")
+        .args(["-xf", &tar.to_string_lossy(), "-C", &dir.to_string_lossy()])
+        .output()
+        .await
+        .context("spawn tar")?;
+    let _ = std::fs::remove_file(&tar);
     if !out.status.success() {
         bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -1138,6 +1171,61 @@ mod tests {
     /// Litter in `/tmp` is untidy; a stale registration in someone's
     /// repository is the loop leaving state behind in a place that is not its
     /// own. A later run reclaims both.
+    /// CodeRabbit, and codex before it, on the same thing from two angles:
+    /// the eval registered git worktrees in the repository. Removing them by
+    /// path narrowed the blast radius but kept the class of bug — a run that
+    /// dies between `worktree add` and cleanup leaves a registration behind in
+    /// a repository the eval does not own.
+    ///
+    /// `git archive` materialises the same tree and registers NOTHING, so
+    /// there is no state to leak and nothing to reclaim but a directory. The
+    /// issue promised an evaluator that runs with no worktree; this is what
+    /// that actually takes.
+    #[test]
+    fn the_eval_registers_nothing_in_the_repository() {
+        let src = include_str!("autopr_eval.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("test module")];
+        // The literal git argument, not the word: the prose above explains
+        // why worktrees are gone and should be allowed to say so.
+        assert!(
+            !code.contains(r#""worktree""#),
+            "materialise the tree without registering it, or a killed run \
+             leaves state in a repository this command does not own"
+        );
+        assert!(code.contains("\"archive\""), "git archive is how that is done");
+    }
+
+    /// CodeRabbit: `--only E963` graded one case and saved ONLY that case, so
+    /// the committed baseline lost seven rows and a later full `--report-only`
+    /// reported them as unrun misses. I hit this during QA and papered over it
+    /// with `git checkout`, which is exactly the kind of manual step that
+    /// stops being done.
+    #[test]
+    fn a_partial_run_updates_the_baseline_without_discarding_the_rest() {
+        let baseline = [
+            grade(&case("E1", 1, Expect::Fixable), Some(&observed(true, "old"))),
+            grade(&case("E2", 2, Expect::Fixable), Some(&observed(true, "old"))),
+            grade(&case("E3", 3, Expect::NotFixable), Some(&observed(false, "old"))),
+        ];
+        let fresh = [grade(&case("E2", 2, Expect::Fixable), Some(&observed(false, "new")))];
+
+        let merged = merge_into_baseline(&baseline, &fresh);
+        assert_eq!(
+            merged.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["E1", "E2", "E3"],
+            "baseline order and membership are preserved"
+        );
+        assert!(merged[1].note.contains("new"), "the re-run case is updated");
+        // Untouched rows must survive byte for byte, which is the property
+        // that matters and a stronger claim than inspecting their notes.
+        assert_eq!(merged[0], baseline[0]);
+        assert_eq!(merged[2], baseline[2]);
+
+        let added = merge_into_baseline(&baseline, &[grade(&case("E9", 9, Expect::Fixable), None)]);
+        assert_eq!(added.len(), 4, "a case not in the baseline is appended, not dropped");
+        assert_eq!(added[3].id, "E9");
+    }
+
     #[test]
     fn a_killed_run_leaves_scratch_that_the_next_run_reclaims() {
         let tmp = std::env::temp_dir();
@@ -1185,9 +1273,13 @@ mod tests {
     #[test]
     fn reclaiming_never_touches_a_directory_outside_the_scratch_namespace() {
         let me = repo_slug(Path::new("/repo/a"));
+        // Built from the real temp dir: with TMPDIR set, hardcoded /tmp paths
+        // would be rejected for the wrong reason and the test would pass
+        // vacuously.
+        let tmp = std::env::temp_dir();
         let dirs = vec![
-            PathBuf::from("/tmp/eval-111"),
-            PathBuf::from("/tmp/autopr-eval"),
+            tmp.join("eval-111"),
+            tmp.join("autopr-eval"),
             PathBuf::from(format!("/home/someone/autopr-eval-{me}-111")),
         ];
         assert!(

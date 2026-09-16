@@ -482,11 +482,6 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Health watchdog for the auto-PR loop (#997). Reads the same evidence
-    /// a human would — the daemon log, the baseline cache, free disk, open
-    /// drafts — and reports anything that stops the loop shipping. Run on a
-    /// timer with `--notify` so an outage announces itself instead of
-    /// waiting to be noticed. Exit 1 when anything is an alert.
     /// #1011 — grade the SCOPING pass against fixed, cached issues.
     ///
     /// The unit tests pin what the code does; this measures what the loop
@@ -509,6 +504,11 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         refresh: bool,
     },
+    /// Health watchdog for the auto-PR loop (#997). Reads the same evidence
+    /// a human would — the daemon log, the baseline cache, free disk, open
+    /// drafts — and reports anything that stops the loop shipping. Run on a
+    /// timer with `--notify` so an outage announces itself instead of
+    /// waiting to be noticed. Exit 1 when anything is an alert.
     AutoprHealth {
         /// Post the findings to Discord (DISCORD_WEBHOOK_URL). Silent when healthy.
         #[arg(long, default_value_t = false)]
