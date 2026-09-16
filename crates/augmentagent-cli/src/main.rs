@@ -13180,6 +13180,8 @@ async fn imessage_poll_loop(
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     const POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
+    let wiki_capture = augmentagent_channel_imessage::history_wiki_capture_enabled();
+    info!(wiki_capture, "imessage poller started");
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     loop {
         tokio::select! {
@@ -13232,6 +13234,9 @@ async fn imessage_poll_loop(
             if let Err(e) = propose_high_confidence_merges(root, &store, broker.as_ref()).await {
                 warn!("identity-merge scan failed: {e:#}");
             }
+        }
+        if !wiki_capture {
+            continue;
         }
         let (Some(root), Some(schema)) = (&wiki_root, &wiki_schema) else {
             continue;

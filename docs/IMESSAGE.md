@@ -38,7 +38,8 @@ AUGMENTAGENT_IMESSAGE_REPO_DIR=/absolute/path/to/private/imessage-bundle
 
 The variable keeps its historical name, but the directory does not need Git.
 Restart the daemon after setting it. It imports on startup and every 30 minutes.
-With a configured wiki, subsequent new messages also trigger knowledge capture.
+LLM knowledge capture of new messages is off by default; enable it with
+`AUGMENTAGENT_HISTORY_WIKI_CAPTURE=1`.
 For person-page backfill, preview and then apply:
 
 ```sh
