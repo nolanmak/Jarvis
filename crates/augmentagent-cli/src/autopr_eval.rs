@@ -127,6 +127,10 @@ pub fn production_state_vars() -> &'static [(&'static str, &'static str)] {
         ("AUGMENTAGENT_AUTOPR_BASELINE_FILE", "baseline.json"),
         ("AUGMENTAGENT_AUTOPR_COUNTER_FILE", "counter.json"),
         ("AUGMENTAGENT_AUTOPR_HISTORY_FILE", "history.json"),
+        // #1029 — the record of PRs this box opened. Added because the test
+        // below rediscovered it from `self_improve.rs` and failed until the
+        // eval was taught about it, which is exactly what it is for.
+        ("AUGMENTAGENT_AUTOPR_OPENED_FILE", "opened-prs.json"),
         ("AUGMENTAGENT_SELFIMPROVE_LOCK", "self-improve.lock"),
     ]
 }

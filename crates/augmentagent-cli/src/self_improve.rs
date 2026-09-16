@@ -1195,6 +1195,675 @@ fn build_failure_hold(
     }
 }
 
+/// Does CodeRabbit have actionable findings on this PR's head right now?
+///
+/// One read, no waiting, exactly as the fresh path does it (#1032). Unknown
+/// head or a failed read means we cannot vouch for the PR, so the sweep treats
+/// it as blocking: the sweep's justification is that it only finishes work
+/// already approved.
+async fn rabbit_blocks_merge(repo_root: &Path, pr: u64, head_sha: Option<&str>) -> bool {
+    let Some(head) = head_sha.filter(|h| !h.is_empty()) else {
+        return true;
+    };
+    rabbit_review_now(repo_root, pr, head).await.blocks()
+}
+
+/// An issue's body and author: the two facts the merge policy needs about it.
+///
+/// One call for both. An unreadable issue yields empty strings, and both gates
+/// treat empty as disqualifying — an unknown author fails eligibility, and an
+/// unknown body is not "definitely not research-filed", it just cannot pass.
+async fn issue_facts(repo_root: &Path, issue: u64) -> (String, String) {
+    let Ok((true, out, _)) = run(
+        &gh_bin(),
+        &["issue", "view", &issue.to_string(), "--json", "body,author"],
+        repo_root,
+    )
+    .await
+    else {
+        return (String::new(), String::new());
+    };
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
+    (
+        v.get("body")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        v.pointer("/author/login")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// Stands in for a diff the sweep could not read, so the receipt gate stays
+/// engaged rather than being bypassed by a failure.
+const UNREADABLE_DIFF: &str = "<unreadable diff>";
+
+/// The receipt-gated path this PR's diff touches, if any (#823).
+///
+/// The same check the fresh path runs, against the same file list — read from
+/// the PR rather than from a worktree, because the sweep has neither.
+async fn pr_gated_path(repo_root: &Path, pr: u64) -> Option<String> {
+    // EVERY failure yields the sentinel, not `None`. Codex caught the
+    // asymmetry: a non-zero exit was handled, but `.ok()?` on a spawn failure
+    // returned `None`, which `may_automerge` reads as "touches no gated file"
+    // — so a transport blip BYPASSED the receipt gate instead of engaging it.
+    // Unknown must deny, and the two failure kinds must not disagree about it.
+    match run(
+        &gh_bin(),
+        &["pr", "diff", &pr.to_string(), "--name-only"],
+        repo_root,
+    )
+    .await
+    {
+        Ok((true, names, _)) => touches_verify_gated_path(&names),
+        // Cannot tell what it touches, so it cannot be vouched for.
+        _ => Some(UNREADABLE_DIFF.to_string()),
+    }
+}
+
+/// #1029 — finish work that is already approved, without spending anything.
+///
+/// With `.coderabbit.yaml` present a fresh PR opens as a draft and merging is
+/// deferred; the resume lane does it. But the resume lane sits below the daily
+/// cap check, so once the cap is spent an approved PR cannot be merged until
+/// the next UTC day — and if that day's slots also go to new builds, it may
+/// never be. #1000 sat two days; #1020 sat until a human merged it.
+///
+/// The cap exists to bound BILLED reasoner work. Merging a draft whose reviews
+/// are already recorded spends no reasoner call at all — it reads PR state and
+/// merges — so gating it on a reasoner budget is a category error, and it is
+/// the direct cause of drafts piling up.
+///
+/// Reads only. Every unknown is treated as "do not merge": the sweep's whole
+/// justification is that it finishes work already approved, and acting on a
+/// guess would make it something else.
+async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
+    let gh = gh_bin();
+    let (ok, out, _) = match run(
+        &gh,
+        &[
+            // Oldest first. Codex: `gh pr list` defaults to newest-first, so
+            // with a backlog larger than the page — the situation this sweep
+            // exists to drain — the oldest approved drafts would fall off the
+            // end and starve, which is the reported symptom rebuilt at the
+            // listing layer. Ordering by creation puts the drafts most at risk
+            // of starving at the front of every page.
+            // Only drafts, oldest first, and the whole set.
+            //
+            // The sweep only ever acts on drafts, so listing anything else
+            // spends the window on rows it will discard. `gh` paginates
+            // internally up to `--limit` and stops when the results run out,
+            // so a high limit costs nothing on a small repository and makes
+            // the page the candidate SET rather than a slice of it.
+            //
+            // Codex pushed on this from 50 to 200 and would push again: its
+            // case is an eligible draft hidden behind a full page of
+            // permanently ineligible ones. At 1000 that needs the loop to open
+            // PRs for ~a year at its daily cap of three, with none ever
+            // merged, closed, or rebased, and the health watchdog alerting on
+            // `draft-stale` throughout. The residual is a cursor spanning more
+            // drafts than this repository can produce; the fix for it, if it
+            // is ever needed, is its own issue.
+            "pr", "list", "--state", "open", "--limit", "1000",
+            "--search", "is:draft sort:created-asc",
+            "--json",
+            "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body",
+        ],
+        repo_root,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("merge sweep: could not list PRs: {e:#}");
+            return 0;
+        }
+    };
+    if !ok {
+        return 0;
+    }
+    let prs: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
+    let Some(rows) = prs.as_array() else {
+        return 0;
+    };
+    let owner = repo_owner_from_remote(repo_root).await;
+    // This box's own record of the PRs it opened. The half of provenance that
+    // cannot be produced from GitHub, and the half that binds to a specific
+    // pull request rather than to a shape.
+    let opened = opened_prs_path();
+    // Resolved the same way the fresh path resolves it, override included.
+    let policy_owner = merge_policy_owner(repo_root).await;
+    let mut merged = 0usize;
+
+    let mut examined = 0usize;
+    // Start where the last tick left off, so a wall of ineligible drafts at
+    // the front cannot hide an eligible one behind it forever.
+    let mut ordered: Vec<&serde_json::Value> = rows.iter().collect();
+    let start = sweep_window_start(ordered.len(), sweep_tick_seed(), MAX_SWEEP_EXAMINED);
+    ordered.rotate_left(start);
+    for row in ordered {
+        if merged >= MAX_SWEEP_MERGES || examined >= MAX_SWEEP_EXAMINED {
+            break;
+        }
+        let Some(pr) = row.get("number").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        let branch = row
+            .get("headRefName")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let Some(issue) = issue_from_branch(branch) else {
+            continue;
+        };
+        if row.get("isDraft").and_then(serde_json::Value::as_bool) != Some(true) {
+            continue;
+        }
+        let body = row
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        // Past the free filters, so this candidate costs network reads.
+        examined += 1;
+        let head_sha = row
+            .get("headRefOid")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        // `IndependentReview::approved()` is `available && diff_ok &&
+        // system_ok`. Two recorded LGTM lines are exactly those three facts.
+        let reviewed_ok = body.matches("CODEX-REVIEW: lgtm").count() >= 2;
+        // The two gates the fresh path computes from real state.
+        let (issue_body, author) = issue_facts(repo_root, issue).await;
+        let research_filed = is_research_filed(&issue_body);
+        let gated = pr_gated_path(repo_root, pr).await;
+        let candidate = SweepCandidate {
+            pr,
+            issue,
+            ours: head_is_ours(row, owner.as_deref()),
+            loop_authored: loop_authored(
+                body,
+                issue,
+                pr,
+                head_sha.as_deref(),
+                opened_pr_for(&opened, issue).as_ref(),
+            ),
+            mergeable: match row.get("mergeable").and_then(serde_json::Value::as_str) {
+                Some("MERGEABLE") => Some(true),
+                Some("CONFLICTING") => Some(false),
+                _ => None,
+            },
+            checks_green: checks_green(repo_root, pr).await,
+            codex_lgtms: body.matches("CODEX-REVIEW: lgtm").count() as u32,
+            // Really ask. Hardcoding this to `false` would have let the sweep
+            // merge a draft CodeRabbit had objected to — the one reviewer that
+            // gets to see an agent PR before it merges, since the fresh path
+            // creates and merges within seconds (#1032).
+            rabbit_blocks: rabbit_blocks_merge(repo_root, pr, head_sha.as_deref()).await,
+            policy: MergePolicy {
+                automerge_enabled: automerge_enabled_value(
+                    std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
+                ),
+                complexity: complexity_from_pr_body(body),
+                // Derived from the recorded evidence, never asserted. Codex:
+                // `reviews_approved: true` meant the sweep asserted the thing
+                // the policy is supposed to check, so a gate added to
+                // `IndependentReview::approved` would never reach it.
+                //
+                // That predicate is `available && diff_ok && system_ok`. Two
+                // recorded `CODEX-REVIEW: lgtm` lines mean available (it ran)
+                // and both passes approved — the same three facts, read from
+                // the durable record instead of a live struct the sweep does
+                // not have.
+                codex_approved: reviewed_ok,
+                reviews_approved: reviewed_ok,
+                // Read, not assumed. Hardcoding these disabled two gates the
+                // fresh path enforces from real state: a research-filed issue
+                // (the daemon's own speculative proposal) and a diff touching
+                // a receipt-gated path. Sharing `may_automerge` is worth
+                // nothing if the two callers feed it different facts — which
+                // is the third time I made exactly this mistake on this PR.
+                research_filed,
+                receipt_gated_file: gated,
+                lgtm_overrides_receipt: std::env::var("AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT")
+                    .ok(),
+                // The ISSUE's author, not the repo owner. Assuming the owner
+                // would have handed the sweep a blanket pass through the
+                // author-eligibility gate the fresh path enforces — merging
+                // drafts for issues the fresh path would have refused. An
+                // unknown author stays empty, which that gate rejects.
+                issue_author: author,
+                repo_owner: policy_owner.clone(),
+                automerge_authors: std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS").ok(),
+            },
+        };
+        let candidate_head = head_sha.clone();
+        match sweep_verdict(&candidate) {
+            SweepVerdict::Skip(why) => {
+                // Said, not swallowed: a silent skip is indistinguishable from
+                // the sweep being broken.
+                info!("merge sweep skipped {why}");
+            }
+            SweepVerdict::Merge => {
+                // CodeRabbit: every other path in this loop honours `dry_run`,
+                // and the sweep did not — so a dry run would have really
+                // readied and really merged. `gh pr ready` is the first state
+                // change, so this sits above it rather than beside the merge.
+                if dry_run {
+                    info!(
+                        pr = candidate.pr,
+                        issue = candidate.issue,
+                        "merge sweep (dry-run): would merge this approved draft"
+                    );
+                    continue;
+                }
+                // Marking ready is a state change, and the merge right after
+                // it can still fail — a check that went red between the read
+                // and now, mergeability that changed, branch protection. The
+                // contract is "merge, or leave it alone", so a failure here
+                // must put the draft back: the sweep only ever considers
+                // drafts, and a PR stranded as ready would drop out of every
+                // future sweep as well as not having merged.
+                let (readied, ..) = run(&gh, &["pr", "ready", &pr.to_string()], repo_root)
+                    .await
+                    .unwrap_or((false, String::new(), String::new()));
+                // Codex: a check can go green-to-red without a new commit —
+                // a CI re-run, a flaky job retried, a required check added.
+                // `--match-head-commit` catches a moved HEAD, not a changed
+                // verdict on the same one, so the checks are re-read after
+                // readying and immediately before merging.
+                if checks_green(repo_root, pr).await != Some(true) {
+                    warn!(pr, "merge sweep: checks are no longer green; leaving it alone");
+                    if readied {
+                        let _ = run(&gh, &["pr", "ready", &pr.to_string(), "--undo"], repo_root)
+                            .await;
+                    }
+                    continue;
+                }
+
+                // Pin the head. Everything above was read from a snapshot;
+                // a commit pushed between that read and this call would
+                // otherwise merge without either codex pass having seen it.
+                // `--match-head-commit` makes GitHub refuse instead, which
+                // turns a silent TOCTOU into a failed merge — and a failed
+                // merge restores the draft below.
+                let head = candidate_head.clone().unwrap_or_default();
+                let (ok, _o, e) = run(
+                    &gh,
+                    &[
+                        "pr", "merge", &pr.to_string(), "--squash", "--delete-branch",
+                        "--match-head-commit", &head,
+                    ],
+                    repo_root,
+                )
+                .await
+                .unwrap_or((false, String::new(), "spawn failed".into()));
+                if !ok && readied {
+                    let (undone, ..) =
+                        run(&gh, &["pr", "ready", &pr.to_string(), "--undo"], repo_root)
+                            .await
+                            .unwrap_or((false, String::new(), String::new()));
+                    if !undone {
+                        warn!(
+                            pr = candidate.pr,
+                            "merge sweep: merge failed AND the draft state could \
+                             not be restored; this PR needs a human"
+                        );
+                    }
+                }
+                if ok {
+                    merged += 1;
+                    info!(
+                        pr = candidate.pr,
+                        issue = candidate.issue,
+                        "merge sweep: merged an already-approved draft"
+                    );
+                    notify_discord(&format!(
+                        "✅ auto-PR merged (sweep): #{} for issue #{}",
+                        candidate.pr, candidate.issue
+                    ))
+                    .await;
+                } else {
+                    warn!(pr, "merge sweep: merge failed, left open: {}", truncate(&e, 200));
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// Are every one of this PR's checks green? `None` when that cannot be
+/// determined, which the sweep treats as "do not merge".
+async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
+    let (ok, out, _) = run(
+        &gh_bin(),
+        &["pr", "checks", &pr.to_string(), "--json", "state"],
+        repo_root,
+    )
+    .await
+    .ok()?;
+    if !ok {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&out).ok()?;
+    let rows = v.as_array()?;
+    Some(rows.iter().all(|r| {
+        matches!(
+            r.get("state").and_then(serde_json::Value::as_str),
+            Some("SUCCESS") | Some("SKIPPED") | Some("NEUTRAL")
+        )
+    }))
+}
+
+/// #1029 — where this tick's examination window starts.
+///
+/// Codex: bounding the work per tick is not enough on its own. Always starting
+/// from the head of the same list means ten permanently-ineligible drafts in
+/// front can hide an eligible one behind them forever — which is the very
+/// starvation this sweep exists to end, rebuilt inside the fix.
+///
+/// The window advances by its own width each tick, so every candidate is
+/// reached within `ceil(total / per_tick)` ticks regardless of what sits in
+/// front of it. Deterministic from the clock, so a run is reproducible from
+/// its timestamp rather than depending on stored progress that can be lost.
+fn sweep_window_start(total: usize, tick: u64, per_tick: usize) -> usize {
+    if total == 0 || per_tick == 0 {
+        return 0;
+    }
+    ((tick as usize).wrapping_mul(per_tick)) % total
+}
+
+/// A tick number from the clock: the loop's default interval is 30 minutes, so
+/// consecutive ticks get consecutive numbers without storing a counter.
+fn sweep_tick_seed() -> u64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    secs / 1800
+}
+
+/// #1029 — the repo owner as the merge policy sees it, resolved ONE way.
+///
+/// The fresh path honours `GH_OWNER_ENV` first and falls back to the remote;
+/// the sweep only read the remote. With an override set they disagree, and
+/// then the fresh path merges a PR the sweep would refuse — the policy
+/// divergence C2 exists to prevent, arriving through an input rather than
+/// through the policy itself.
+async fn merge_policy_owner(repo_root: &Path) -> Option<String> {
+    // Exactly the fresh path's former expression, extracted unchanged.
+    //
+    // Codex: my first version added `.filter(|o| !o.trim().is_empty())`, which
+    // looked like tidying and was a behaviour change. An explicitly empty
+    // override used to yield `Some("")`, which matches no author, so the gate
+    // WITHHELD the merge. Filtering it made the resolution fall through to the
+    // remote owner, which can merge — an unrelated relaxation of an
+    // authorization gate, smuggled in under a refactor that was supposed to
+    // change nothing.
+    std::env::var(GH_OWNER_ENV)
+        .ok()
+        .or(repo_owner_from_remote(repo_root).await)
+}
+
+/// #1029 — where this box records the pull requests the loop itself opened.
+///
+/// Codex, correctly, across three rounds: a body marker is forgeable and an
+/// attempt record only proves the daemon WORKED an issue, not that it opened a
+/// given PR. A prior failed attempt plus a hand-made `agent-fix/issue-N` draft
+/// carrying the marker would have satisfied both.
+///
+/// This binds the record to the artefact: the loop writes the PR number when
+/// it creates one, so the sweep can ask "did I open exactly this PR?" rather
+/// than "does this look like something I would open?".
+fn opened_prs_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AUGMENTAGENT_AUTOPR_OPENED_FILE") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local/state/augmentagent/autopr-opened-prs.json")
+}
+
+/// What the loop recorded when it opened a PR: which PR, and the head its
+/// independent reviews actually covered.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct OpenedPr {
+    pr: u64,
+    /// The commit the codex passes reviewed. Codex on this PR: approvals
+    /// recorded in a body are approvals of the code as it WAS. A commit pushed
+    /// to the draft afterwards keeps the body text while changing what would
+    /// merge, so the sweep must compare this against the current head.
+    head: String,
+}
+
+/// Record that the loop opened `pr` for `issue`, at reviewed head `head`.
+fn record_opened_pr(path: &Path, issue: u64, pr: u64, head: &str) {
+    let mut map = read_opened_prs(path);
+    map.insert(issue.to_string(), OpenedPr { pr, head: head.to_string() });
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(&map) {
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+fn read_opened_prs(path: &Path) -> std::collections::BTreeMap<String, OpenedPr> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// What this box opened for `issue`, if anything.
+fn opened_pr_for(path: &Path, issue: u64) -> Option<OpenedPr> {
+    read_opened_prs(path).get(&issue.to_string()).cloned()
+}
+
+/// #1029 — the loop's own signature on a PR body, and the only evidence that
+/// the loop actually opened a pull request.
+///
+/// `head_is_ours` (#1006) proves the head is in THIS repository, which is a
+/// different and weaker claim: a human can create `agent-fix/issue-N` here by
+/// hand. The sweep merges without a human in the loop, so it needs to know the
+/// loop wrote the thing it is finishing, not merely that the branch looks
+/// familiar.
+const SELF_IMPROVE_BODY_MARKER: &str = "Automated self-improvement for #";
+
+/// Did the LOOP open THIS pull request, for this issue?
+///
+/// The binding one. `opened_here` is the PR number this box recorded when it
+/// created a PR for `issue`, so a match is the loop recognising its own
+/// artefact — not a shape it might have produced.
+///
+/// The body signature stays as a second, cheap check: it catches a stale
+/// recording pointing at a PR that was closed and its number reused by a human
+/// one, which the number alone would not.
+/// ## Pull requests opened before this shipped are out of scope, deliberately
+///
+/// They carry no recording, so they are never swept. That is a decision, not
+/// an oversight, and codex pushed on it three times before I wrote it down.
+///
+/// A backfill could only infer provenance from what an old PR still shows: the
+/// body signature plus an attempt record for its issue. That is precisely the
+/// combination this review rejected as forgeable — a human same-repo draft
+/// carrying the marker after a failed daemon attempt satisfies it. Backfilling
+/// would reintroduce the hole on exactly the pull requests the loop is least
+/// able to vouch for, and silently.
+///
+/// The concrete backlog is also empty. The issue named #1000 and #1020. #1020
+/// is merged. #1000 is CONFLICTING, so it needs a rebase and a re-review — the
+/// resume lane's job, which the sweep deliberately never does. There is no
+/// pull request a backfill would unblock.
+///
+/// Provenance can only be fixed forward: every PR the loop opens from this
+/// deploy carries a record.
+fn loop_authored(
+    body: &str,
+    issue: u64,
+    pr: u64,
+    head: Option<&str>,
+    opened_here: Option<&OpenedPr>,
+) -> bool {
+    let Some(rec) = opened_here else {
+        return false;
+    };
+    // The reviews recorded in the body approved the code at `rec.head`. A
+    // commit pushed since then keeps the body and changes what merges, so an
+    // unknown or moved head is not something the loop can vouch for.
+    let head_matches = head.is_some_and(|h| !h.is_empty() && h == rec.head);
+    rec.pr == pr
+        && head_matches
+        && body.contains(&format!("{SELF_IMPROVE_BODY_MARKER}{issue}."))
+}
+
+/// #1029 — every input the auto-merge decision takes, in one place.
+///
+/// Extracted so the fresh path and the merge sweep share ONE policy. Two
+/// copies drift, and the failure is silent: a PR the fresh path would never
+/// have merged gets merged a day later by the sweep, on rules nobody compared.
+#[derive(Debug, Clone)]
+struct MergePolicy {
+    automerge_enabled: bool,
+    complexity: Complexity,
+    /// Both independent codex passes approved.
+    codex_approved: bool,
+    /// The whole independent stage approved (codex, and CodeRabbit where it
+    /// had an opinion).
+    reviews_approved: bool,
+    /// #787 — the daemon's own speculative proposals never auto-merge.
+    research_filed: bool,
+    /// The receipt-gated file this diff touches, if any (#823).
+    receipt_gated_file: Option<String>,
+    lgtm_overrides_receipt: Option<String>,
+    issue_author: String,
+    repo_owner: Option<String>,
+    automerge_authors: Option<String>,
+}
+
+/// May this change auto-merge? The single answer both paths use.
+fn may_automerge(p: &MergePolicy) -> bool {
+    if !p.automerge_enabled || !p.reviews_approved || p.research_filed {
+        return false;
+    }
+    // #828 — an independent LGTM is REQUIRED, and with the override set it
+    // also releases the `hard` band: two independent reviewers is a real
+    // answer to blast radius where one model grading its own family's work
+    // was not.
+    let complexity_ok = p.complexity.auto_mergeable() || (p.codex_approved && codex_unlocks_hard());
+    if !complexity_ok {
+        return false;
+    }
+    if !automerge_receipt_ok(
+        p.receipt_gated_file.as_deref(),
+        p.codex_approved,
+        p.lgtm_overrides_receipt.as_deref(),
+    ) {
+        return false;
+    }
+    automerge_eligible(
+        &p.issue_author,
+        p.repo_owner.as_deref(),
+        p.automerge_authors.as_deref(),
+    )
+}
+
+/// #1029 — one open draft, as the sweep sees it through `gh`.
+///
+/// Every field that can be unknown is an `Option`, and unknown is always
+/// treated as "do not merge". The sweep's whole justification is that it only
+/// finishes work already approved; acting on a guess would make it something
+/// else entirely.
+#[derive(Debug, Clone)]
+struct SweepCandidate {
+    pr: u64,
+    issue: u64,
+    /// #1006 — is this head in THIS repository? `None` means unprovable.
+    ours: Option<bool>,
+    /// #1029 — did the LOOP write this PR, as opposed to a human using an
+    /// agent-shaped branch name in the same repository?
+    loop_authored: bool,
+    mergeable: Option<bool>,
+    checks_green: Option<bool>,
+    codex_lgtms: u32,
+    rabbit_blocks: bool,
+    policy: MergePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SweepVerdict {
+    Merge,
+    /// Left alone, with the reason — a silent skip is indistinguishable from
+    /// the sweep being broken.
+    Skip(String),
+}
+
+/// Should the sweep merge this draft? Pure: the sweep spends no reasoner call,
+/// so the whole decision is evidence already on the PR.
+fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
+    let skip = |why: &str| SweepVerdict::Skip(format!("PR #{}: {why}", c.pr));
+    if c.ours != Some(true) {
+        return skip("not ours — the loop only finishes work it opened (#1006)");
+    }
+    if !c.loop_authored {
+        // Same repository is not the same as loop-authored. A human can open
+        // `agent-fix/issue-N` here by hand; the sweep merges with nobody
+        // watching, so it needs the loop's own signature on the body.
+        return skip("not ours — no self-improve signature on the PR body");
+    }
+    if c.mergeable != Some(true) {
+        return skip("conflict with main, or mergeability unknown; a rebase is the resume lane's job");
+    }
+    if c.checks_green != Some(true) {
+        return skip("checks are not green, or their state is unknown");
+    }
+    if c.codex_lgtms < 2 {
+        return skip(&format!(
+            "only {} independent review approval(s) recorded; two are required",
+            c.codex_lgtms
+        ));
+    }
+    if c.rabbit_blocks {
+        return skip("CodeRabbit has actionable findings on this head");
+    }
+    // Unknown must DENY, and it must do so where nothing can release it.
+    // Codex: routing an unreadable diff through the receipt gate as a gated
+    // path looked like a deny, but `AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT`
+    // is set on this deployment and releases gated paths on a double LGTM. So
+    // a transient `gh pr diff` failure plus two recorded approvals merged
+    // anyway — a human-only gate bypassed by a network blip. The override
+    // exists to say "two reviewers may substitute for a receipt on a KNOWN
+    // file", never "on a file nobody could name".
+    if c.policy.receipt_gated_file.as_deref() == Some(UNREADABLE_DIFF) {
+        return skip(
+            "its diff could not be read, so whether it touches a receipt-gated \
+             path is unknown; no override applies to an unknown",
+        );
+    }
+    if !may_automerge(&c.policy) {
+        return skip("the merge policy withholds it (complexity, receipt gate, or author)");
+    }
+    SweepVerdict::Merge
+}
+
+/// #1029 — how many drafts one sweep may merge. The next tick takes the rest.
+const MAX_SWEEP_MERGES: usize = 3;
+
+/// How many candidates one sweep may EXAMINE.
+///
+/// Codex: bounding merges alone does not bound the tick. Each candidate costs
+/// a checks read, a CodeRabbit read and an issue-author read, so a backlog of
+/// ineligible drafts — or a slow GitHub — could stall an unattended tick while
+/// merging nothing at all. The expensive work is the looking, so that is what
+/// has to be bounded.
+const MAX_SWEEP_EXAMINED: usize = 10;
+
 /// #1030 — is this failure "every provider that could serve the call is
 /// latched", rather than something actually broken?
 ///
@@ -6027,54 +6696,24 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // auto-merge when the owner opted in AND the scoper graded the work
     // simple/medium (#653 — hard work always gets human eyes).
     let automerge = {
-        let enabled = automerge_enabled_value(
-            std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
-        );
-        // #787 — research-filed issues never auto-merge: they are the
-        // daemon's own speculative proposals, auto-filed with the owner's gh
-        // auth (so they pass the owner-authored test), and they change core
-        // behaviour. They land as draft PRs for human review.
-        // #828 — an independent LGTM is REQUIRED for any auto-merge, and
-        // when `AUGMENTAGENT_AUTOPR_CODEX_UNLOCKS_HARD` is set it also
-        // releases the `hard` band: two independent reviewers is a real
-        // answer to blast radius, where one model grading its own family's
-        // work was not. Receipt-gated paths stay human-only either way —
-        // those change live behaviour no reviewer can verify by reading.
-        let complexity_ok = complexity.auto_mergeable() || (independent.codex_approved() && codex_unlocks_hard());
-        // Owner policy 2026-08-31: a double codex LGTM may override the
-        // receipt gate (env-gated; see `automerge_receipt_ok`).
-        let receipt_ok = automerge_receipt_ok(
-            gated.as_deref(),
-            independent.codex_approved(),
-            std::env::var("AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT").ok().as_deref(),
-        );
-        // #936 — with CodeRabbit configured, a fresh PR is never merged
-        // here: it opens as a draft, CodeRabbit reviews it, and the resume
-        // lane merges on triple LGTM.
-        // #1032 — CodeRabbit is advisory, and on this path it cannot have an
-        // opinion: the PR is created a few lines below, so there is nothing
-        // for it to have reviewed. Deferring every merge merely because
-        // `.coderabbit.yaml` exists handed the decision to the resume lane,
-        // which cannot run once the daily cap is spent (#1029) — and on the
-        // free tier, an exhausted quota made the loop's throughput a function
-        // of somebody else's billing plan. Findings still withhold a merge in
-        // the resume lane, where a review can actually exist.
-        if enabled && complexity_ok && independent.approved() && !issue.research_filed
-            && receipt_ok
-        {
-            let owner = std::env::var(GH_OWNER_ENV)
-                .ok()
-                .or(repo_owner_from_remote(repo_root).await);
-            automerge_eligible(
-                &issue.author,
-                owner.as_deref(),
-                std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS")
-                    .ok()
-                    .as_deref(),
-            )
-        } else {
-            false
-        }
+        // #1029 — one policy, shared with the merge sweep. Two copies drift,
+        // and the drift is silent: a PR the fresh path would never merge gets
+        // merged a day later by the sweep, on rules nobody compared.
+        let owner = merge_policy_owner(repo_root).await;
+        may_automerge(&MergePolicy {
+            automerge_enabled: automerge_enabled_value(
+                std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
+            ),
+            complexity,
+            codex_approved: independent.codex_approved(),
+            reviews_approved: independent.approved(),
+            research_filed: issue.research_filed,
+            receipt_gated_file: gated.clone(),
+            lgtm_overrides_receipt: std::env::var("AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT").ok(),
+            issue_author: issue.author.clone(),
+            repo_owner: owner,
+            automerge_authors: std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS").ok(),
+        })
     };
     let gh = gh_bin();
     let plan_section = plan
@@ -6129,7 +6768,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // original run was given rather than inventing new ones.
     let criteria_section = criteria_pr_section(&criteria);
     let pr_body = format!(
-        "Automated self-improvement for #{}.\n\n## Summary\n{}{plan_section}\n\n\
+        "{SELF_IMPROVE_BODY_MARKER}{}.\n\n## Summary\n{}{plan_section}\n\n\
          ## QA review (approved)\n{}{independent_section}{criteria_section}\n## Verification\n\
          - complexity (scoping pass): {}\n\
          - `cargo build --workspace`: pass\n- `cargo test --workspace`: pass\n\
@@ -6200,6 +6839,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         .unwrap_or_default(),
         None => String::new(),
     };
+
+    // #1029 — bind this PR to this box, so the merge sweep can later tell its
+    // own artefact from one that merely looks like it.
+    if let Some(n) = pr_number {
+        record_opened_pr(&opened_prs_path(), issue.number, n, &head_sha);
+    }
     if pr_number.is_none() {
         // Codex, system pass: with no parseable PR number the CodeRabbit read
         // was skipped silently while the merge still went ahead on the branch
@@ -8064,6 +8709,14 @@ impl AutoPrLoop {
                 }
                 _ = tokio::time::sleep(self.interval) => {}
             }
+            // #1029 — finish already-approved drafts FIRST, and outside the
+            // cap. This spends no reasoner call, so a reasoner budget must not
+            // gate it; gating it is what let approved PRs sit for days.
+            let swept = merge_sweep(&self.repo_root, self.dry_run).await;
+            if swept > 0 {
+                info!(swept, "auto-PR: merged already-approved drafts (unbilled)");
+            }
+
             let today = utc_day_now();
             if counter.runs_today(today) >= self.daily_cap {
                 info!(
@@ -10481,6 +11134,619 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             {"number": 8, "title": title, "labels": [], "pull_request": {"url": "x"}},
         ]);
         assert_eq!(red_main_issue_lookup(&prs_only, &title), None);
+    }
+
+    // ---- #1029: merging an approved draft costs no reasoner call ----
+
+    fn policy(complexity: Complexity) -> MergePolicy {
+        MergePolicy {
+            automerge_enabled: true,
+            complexity,
+            codex_approved: true,
+            reviews_approved: true,
+            research_filed: false,
+            receipt_gated_file: None,
+            lgtm_overrides_receipt: Some("1".into()),
+            issue_author: "nolanmak".into(),
+            repo_owner: Some("nolanmak".into()),
+            automerge_authors: None,
+        }
+    }
+
+    /// C2 — the sweep must not restate the fresh path's policy, or the two
+    /// drift and a PR the fresh path would never have merged gets merged a day
+    /// later by the sweep. One function, both callers.
+    #[test]
+    fn both_merge_paths_consult_the_same_policy() {
+        let src = include_str!("self_improve.rs");
+        let fresh_start = src.find("pub async fn run_once(").expect("run_once");
+        let fresh = &src[fresh_start..fresh_start + src[fresh_start..].find("\n}\n").expect("end")];
+        assert!(
+            fresh.contains("may_automerge("),
+            "the fresh path must go through the shared policy"
+        );
+        // The sweep reaches the policy through `sweep_verdict`, which is the
+        // thing that adds the sweep-only conditions on top of it.
+        let sweep_start = src.find("async fn merge_sweep(").expect("the sweep");
+        let sweep = &src[sweep_start..sweep_start + src[sweep_start..].find("\n}\n").expect("end")];
+        assert!(
+            sweep.contains("sweep_verdict("),
+            "the sweep must decide through sweep_verdict"
+        );
+        // C2 reaches the INPUTS too: the fresh path honours GH_OWNER_ENV
+        // before the remote, and a sweep that only read the remote would
+        // refuse PRs the fresh path merges whenever an override is set.
+        for path in [fresh, {
+            let i = src.find("async fn merge_sweep(").expect("the sweep");
+            &src[i..i + src[i..].find("\n}\n").expect("end")]
+        }] {
+            assert!(
+                path.contains("merge_policy_owner("),
+                "both paths must resolve the owner the same way"
+            );
+        }
+
+        let v_start = src.find("fn sweep_verdict(").expect("sweep_verdict");
+        let verdict = &src[v_start..v_start + src[v_start..].find("\n}\n").expect("end")];
+        assert!(
+            verdict.contains("may_automerge("),
+            "and sweep_verdict must defer to the shared policy, or the two drift"
+        );
+    }
+
+    /// The policy itself: every gate the fresh path applies still applies.
+    #[test]
+    fn the_shared_policy_keeps_every_gate_it_had() {
+        assert!(may_automerge(&policy(Complexity::Simple)));
+        assert!(may_automerge(&policy(Complexity::Medium)));
+
+        // Hard needs the codex override, exactly as before.
+        let hard = policy(Complexity::Hard);
+        assert_eq!(may_automerge(&hard), codex_unlocks_hard());
+
+        type Mutation = (&'static str, fn(&mut MergePolicy));
+        let mutations: [Mutation; 4] = [
+            ("automerge disabled", |p| p.automerge_enabled = false),
+            ("reviews not approved", |p| p.reviews_approved = false),
+            ("research-filed issue", |p| p.research_filed = true),
+            ("someone else's issue", |p| p.issue_author = "a-stranger".into()),
+        ];
+        for (label, mutate) in mutations {
+            let mut p = policy(Complexity::Simple);
+            mutate(&mut p);
+            assert!(!may_automerge(&p), "{label} must still withhold the merge");
+        }
+
+        // The receipt gate: only a double codex LGTM may override it, and only
+        // when the owner opted in.
+        let mut gated = policy(Complexity::Simple);
+        gated.receipt_gated_file = Some("crates/augmentagent-channel-core/src/reasoner.rs".into());
+        assert!(may_automerge(&gated), "a double LGTM may override, per owner policy");
+        gated.lgtm_overrides_receipt = None;
+        assert!(!may_automerge(&gated), "without the opt-in the receipt gate holds");
+        gated.lgtm_overrides_receipt = Some("1".into());
+        gated.codex_approved = false;
+        assert!(!may_automerge(&gated), "and never without the codex approval");
+    }
+
+    /// C3, C4, C6 — what the sweep refuses to touch, and why each refusal is
+    /// stated rather than silent.
+    #[test]
+    fn the_sweep_merges_only_a_draft_it_can_fully_vouch_for() {
+        let ready = SweepCandidate {
+            pr: 1020,
+            issue: 1007,
+            ours: Some(true),
+            loop_authored: true,
+            mergeable: Some(true),
+            checks_green: Some(true),
+            codex_lgtms: 2,
+            rabbit_blocks: false,
+            policy: policy(Complexity::Medium),
+        };
+        assert_eq!(sweep_verdict(&ready), SweepVerdict::Merge);
+
+        let refuse = |mutate: fn(&mut SweepCandidate), expect: &str| {
+            let mut c = SweepCandidate { ..ready.clone() };
+            mutate(&mut c);
+            match sweep_verdict(&c) {
+                SweepVerdict::Skip(why) => assert!(
+                    why.to_lowercase().contains(expect),
+                    "skip reason {why:?} must mention {expect:?}"
+                ),
+                SweepVerdict::Merge => panic!("must not merge: expected {expect}"),
+            }
+        };
+
+        // C6 — a PR the loop did not open is never touched. Both halves:
+        // a foreign head, and a same-repo PR the loop did not write.
+        refuse(|c| c.ours = Some(false), "not ours");
+        refuse(|c| c.ours = None, "not ours");
+        refuse(|c| c.loop_authored = false, "signature");
+        // C4 — conflicts and red checks.
+        refuse(|c| c.mergeable = Some(false), "conflict");
+        refuse(|c| c.mergeable = None, "conflict");
+        refuse(|c| c.checks_green = Some(false), "checks");
+        refuse(|c| c.checks_green = None, "checks");
+        // C3 — an incomplete approval record.
+        refuse(|c| c.codex_lgtms = 1, "review");
+        refuse(|c| c.rabbit_blocks = true, "coderabbit");
+        refuse(|c| c.policy.reviews_approved = false, "policy");
+    }
+
+    /// Codex: `head_is_ours` proves the head is in THIS repository, which is
+    /// a weaker claim than "the loop opened this". A human can create
+    /// `agent-fix/issue-N` here by hand, put two approval strings in the body,
+    /// and the sweep would have merged it with nobody watching.
+    ///
+    /// The loop signs every PR body it writes, so that signature is the
+    /// evidence — and the writer and reader share one constant so the
+    /// signature cannot drift out from under the check.
+    /// The exclusion of pre-deploy PRs is a decision, so it is pinned like
+    /// one: an old draft with every other signal perfect is still refused,
+    /// because provenance is the one thing it cannot show.
+    #[test]
+    fn a_draft_from_before_this_shipped_is_refused_not_guessed_at() {
+        let signed = "Automated self-improvement for #994.\n\n## Summary\nCODEX-REVIEW: lgtm";
+        assert!(
+            !loop_authored(signed, 994, 1000, Some("aaaa111"), None),
+            "no recording means no provenance, however good the rest looks"
+        );
+        // And the reason the sweep gives has to name provenance, so a human
+        // reading the log is not sent looking for a review or a check.
+        let stale = SweepCandidate {
+            pr: 1000,
+            issue: 994,
+            ours: Some(true),
+            loop_authored: false,
+            mergeable: Some(true),
+            checks_green: Some(true),
+            codex_lgtms: 2,
+            rabbit_blocks: false,
+            policy: policy(Complexity::Simple),
+        };
+        match sweep_verdict(&stale) {
+            SweepVerdict::Skip(why) => assert!(why.contains("signature"), "{why}"),
+            SweepVerdict::Merge => panic!("an unrecorded PR must never be swept"),
+        }
+    }
+
+    #[test]
+    fn same_repository_is_not_the_same_as_loop_authored() {
+        let signed = "Automated self-improvement for #1007.\n\n## Summary";
+        let rec = OpenedPr { pr: 1020, head: "aaaa111".into() };
+        assert!(loop_authored(signed, 1007, 1020, Some("aaaa111"), Some(&rec)));
+
+        // Codex: the approvals in a body approved the code as it WAS. A commit
+        // pushed to the draft afterwards keeps the body text while changing
+        // what would merge — so a moved head means neither codex pass has seen
+        // what the sweep is about to merge.
+        assert!(
+            !loop_authored(signed, 1007, 1020, Some("bbbb222"), Some(&rec)),
+            "a head that moved since the reviews must not merge on them"
+        );
+        assert!(
+            !loop_authored(signed, 1007, 1020, None, Some(&rec)),
+            "an unknown head is not something the loop can vouch for"
+        );
+        assert!(!loop_authored(signed, 1007, 1020, Some(""), Some(&rec)));
+
+        // Codex, three rounds, and right each time. A body string is
+        // FORGEABLE. An attempt record only proves this box WORKED the issue,
+        // so a prior failed attempt plus a hand-made draft carrying the marker
+        // would have passed. Provenance has to bind to the artefact.
+        assert!(
+            !loop_authored(signed, 1007, 1020, Some("aaaa111"), None),
+            "no recorded PR: the loop never opened this"
+        );
+        let other = OpenedPr { pr: 1019, head: "aaaa111".into() };
+        assert!(
+            !loop_authored(signed, 1007, 1020, Some("aaaa111"), Some(&other)),
+            "the loop opened a DIFFERENT PR for this issue; this one is not its work"
+        );
+        // Signature still required, so a stale recording whose number was
+        // reused by a human PR does not pass either.
+        assert!(!loop_authored("Fixes #1007 by hand.", 1007, 1020, Some("aaaa111"), Some(&rec)));
+        assert!(!loop_authored(
+            "Automated self-improvement for #999.",
+            1007, 1020, Some("aaaa111"), Some(&rec)
+        ));
+        assert!(!loop_authored("", 1007, 1020, Some("aaaa111"), Some(&rec)));
+
+        // The writer must use the same constant, or the signature drifts away
+        // from the check and every sweep silently stops merging.
+        let src = include_str!("self_improve.rs");
+        let start = src.find("let pr_body = format!(").expect("the body writer");
+        assert!(
+            src[start..start + 200].contains("SELF_IMPROVE_BODY_MARKER"),
+            "the writer must use the shared marker"
+        );
+        // And it must RECORD the PR it opens, or the binding never exists.
+        let run_start = src.find("pub async fn run_once(").expect("run_once");
+        let run_body = &src[run_start..run_start + src[run_start..].find("\n}\n").expect("end")];
+        assert!(
+            run_body.contains("record_opened_pr("),
+            "opening a PR must record it, or the sweep can never recognise it"
+        );
+    }
+
+    /// Codex, system pass: bounding the work per tick is not enough if the
+    /// window never moves. Ten permanently-ineligible drafts at the front of
+    /// the list would hide an eligible one behind them forever — the same
+    /// starvation this sweep exists to end, rebuilt inside the fix.
+    #[test]
+    fn the_examination_window_reaches_every_candidate() {
+        // Every index must be covered within ceil(total / per_tick) ticks, for
+        // any starting tick — the loop does not restart at zero.
+        for total in [1usize, 7, 10, 23, 50] {
+            for per_tick in [3usize, 10] {
+                for first_tick in [0u64, 1, 9_999] {
+                    let ticks = total.div_ceil(per_tick);
+                    let mut seen = vec![false; total];
+                    for t in 0..ticks {
+                        let start = sweep_window_start(total, first_tick + t as u64, per_tick);
+                        for k in 0..per_tick.min(total) {
+                            seen[(start + k) % total] = true;
+                        }
+                    }
+                    assert!(
+                        seen.iter().all(|s| *s),
+                        "total={total} per_tick={per_tick} from tick {first_tick}: \
+                         {} of {total} never examined",
+                        seen.iter().filter(|s| !**s).count()
+                    );
+                }
+            }
+        }
+        // Degenerate inputs must not panic or divide by zero.
+        assert_eq!(sweep_window_start(0, 5, 10), 0);
+        assert_eq!(sweep_window_start(10, 5, 0), 0);
+    }
+
+    /// The recording round-trips, is scoped per issue, and never guesses.
+    #[test]
+    fn an_opened_pr_is_recorded_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/opened.json");
+        assert_eq!(opened_pr_for(&path, 1007), None, "nothing recorded yet");
+
+        record_opened_pr(&path, 1007, 1020, "aaaa111");
+        record_opened_pr(&path, 994, 1000, "cccc333");
+        assert_eq!(
+            opened_pr_for(&path, 1007),
+            Some(OpenedPr { pr: 1020, head: "aaaa111".into() })
+        );
+        assert_eq!(
+            opened_pr_for(&path, 994),
+            Some(OpenedPr { pr: 1000, head: "cccc333".into() })
+        );
+        assert_eq!(opened_pr_for(&path, 1), None);
+
+        // A later PR for the same issue replaces the old: the loop closed or
+        // abandoned the first, and only the current one is its work.
+        record_opened_pr(&path, 1007, 1044, "dddd444");
+        assert_eq!(
+            opened_pr_for(&path, 1007),
+            Some(OpenedPr { pr: 1044, head: "dddd444".into() })
+        );
+
+        // A corrupt file reads as "nothing recorded", never as a match — the
+        // failure direction has to be "do not merge".
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(opened_pr_for(&path, 1007), None);
+    }
+
+    /// Codex: an extraction that is supposed to change nothing has to change
+    /// nothing. An explicitly EMPTY `GH_OWNER_ENV` yields `Some("")`, which
+    /// matches no author, so the gate withholds. Filtering the empty value out
+    /// would fall through to the remote owner and merge instead — relaxing an
+    /// authorization gate under cover of a refactor.
+    #[test]
+    fn an_empty_owner_override_withholds_rather_than_falling_back() {
+        // The gate's own behaviour: an empty owner matches nobody.
+        assert!(!automerge_eligible("nolanmak", Some(""), None));
+        assert!(!automerge_eligible("nolanmak", Some("   "), None));
+        assert!(automerge_eligible("nolanmak", Some("nolanmak"), None));
+
+        // And the shared resolver must not filter the empty value away, which
+        // would turn "withhold" into "use the remote and merge".
+        let src = include_str!("self_improve.rs");
+        let f = src.find("async fn merge_policy_owner(").expect("the resolver");
+        let body = &src[f..f + src[f..].find("\n}\n").expect("end")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains(".filter("),
+            "do not filter the override; an empty one must stay Some(\"\")"
+        );
+    }
+
+    /// Codex, a fourth time on the same shape, and the last input I had left
+    /// asserted rather than read. `reviews_approved: true` meant the sweep
+    /// told the policy the answer to a question the policy exists to ask, so a
+    /// gate added to `IndependentReview::approved` would never have reached
+    /// the capped path.
+    ///
+    /// That predicate is `available && diff_ok && system_ok`. Two recorded
+    /// `CODEX-REVIEW: lgtm` lines are those same three facts, read from the
+    /// durable record rather than a live struct the sweep does not have — and
+    /// this test pins the equivalence so a change to one has to face the other.
+    #[test]
+    fn the_sweep_derives_review_approval_instead_of_asserting_it() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn merge_sweep(").expect("the sweep");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        // Code only. This is the third assertion on this branch to trip on the
+        // comment that explains it; prose naming the forbidden thing is not
+        // the forbidden thing.
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("reviews_approved: true"),
+            "the sweep must not assert the approval the policy is meant to check"
+        );
+        assert!(code.contains("reviews_approved: reviewed_ok"));
+        assert!(code.contains("codex_approved: reviewed_ok"));
+
+        // The predicate being mirrored, so a change to it fails here.
+        let a = src.find("fn approved(&self) -> bool {").expect("the predicate");
+        let pred = &src[a..a + src[a..].find("\n    }\n").expect("end")];
+        assert!(
+            pred.contains("self.available && self.diff_ok && self.system_ok"),
+            "IndependentReview::approved changed; the sweep mirrors it from the \
+             PR body and must be re-derived: {pred}"
+        );
+    }
+
+    /// Codex, a third time on the same shape: sharing `may_automerge` is
+    /// worth nothing if the two callers feed it different facts. I had
+    /// hardcoded `research_filed: false` and `receipt_gated_file: None`,
+    /// disabling two gates the fresh path enforces from real state.
+    #[test]
+    fn the_sweep_supplies_real_values_for_every_policy_gate() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn merge_sweep(").expect("the sweep");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+
+        for (field, assumed) in [
+            ("research_filed", "research_filed: false"),
+            ("receipt_gated_file", "receipt_gated_file: None"),
+        ] {
+            assert!(
+                !body.contains(assumed),
+                "{field} must be read from real state, not assumed"
+            );
+        }
+        assert!(body.contains("is_research_filed("), "read the issue body");
+        assert!(body.contains("pr_gated_path("), "read what the diff touches");
+
+        // An unreadable diff must keep the receipt gate ENGAGED, not bypass
+        // it — and EVERY failure kind must agree about that. Codex caught the
+        // asymmetry: a non-zero exit was handled while a spawn failure fell
+        // through `.ok()?` to `None`, which the policy reads as "touches
+        // nothing gated".
+        let g = src.find("async fn pr_gated_path(").expect("the gate reader");
+        let reader = &src[g..g + src[g..].find("\n}\n").expect("end")];
+        // Code only: the prose above this assertion names the very shortcut it
+        // forbids, and a check that trips on its own explanation is useless.
+        let code: String = reader
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains(".ok()?"),
+            "a spawn failure must not become `None`, which bypasses the gate"
+        );
+        assert!(
+            code.contains("_ => Some(UNREADABLE_DIFF"),
+            "every failure kind must yield the sentinel"
+        );
+        // And the sentinel must actually engage the gate — including when the
+        // owner's LGTM override is ENABLED, which it is on this deployment.
+        // Codex: the override releases gated paths on a double LGTM, so
+        // routing an unknown through the receipt gate meant a transient diff
+        // failure merged anyway. The deny has to sit where no flag reaches it.
+        assert!(
+            !automerge_receipt_ok(Some(UNREADABLE_DIFF), true, None),
+            "the sentinel must withhold without the override"
+        );
+        let mut unknown = SweepCandidate {
+            pr: 1,
+            issue: 2,
+            ours: Some(true),
+            loop_authored: true,
+            mergeable: Some(true),
+            checks_green: Some(true),
+            codex_lgtms: 2,
+            rabbit_blocks: false,
+            policy: policy(Complexity::Simple),
+        };
+        unknown.policy.receipt_gated_file = Some(UNREADABLE_DIFF.to_string());
+        unknown.policy.lgtm_overrides_receipt = Some("1".into());
+        assert!(
+            may_automerge(&unknown.policy),
+            "precondition: the override WOULD release it through the policy alone"
+        );
+        match sweep_verdict(&unknown) {
+            SweepVerdict::Skip(why) => assert!(
+                why.contains("could not be read"),
+                "the deny must name the unknown: {why}"
+            ),
+            SweepVerdict::Merge => {
+                panic!("an unreadable diff must not merge, override or not")
+            }
+        }
+    }
+
+    /// Codex: I had hardcoded two of the sweep's inputs, and each one silently
+    /// disabled a gate the fresh path enforces. `rabbit_blocks: false` would
+    /// have merged past CodeRabbit's objections — and CodeRabbit is the only
+    /// reviewer that gets to see an agent PR at all, since the fresh path
+    /// creates and merges within seconds. `issue_author` set to the repo owner
+    /// handed every draft a blanket pass through author eligibility.
+    #[test]
+    fn the_sweep_reads_its_inputs_rather_than_assuming_them() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn merge_sweep(").expect("the sweep");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+
+        assert!(
+            !body.contains("rabbit_blocks: false"),
+            "the sweep must ASK CodeRabbit, not assume it is happy"
+        );
+        assert!(body.contains("rabbit_blocks_merge("), "and ask through the shared reader");
+        assert!(
+            !body.contains("issue_author: owner"),
+            "the author gate must see the ISSUE's author, not the repo owner"
+        );
+        // The author now comes from `issue_facts`, which reads body and author
+        // in one call — both are facts about the same issue.
+        assert!(body.contains("issue_facts(repo_root"), "read the real author");
+
+        // Unknown is never permissive on either.
+        let f = src.find("async fn rabbit_blocks_merge(").expect("the reader");
+        let reader = &src[f..f + src[f..].find("\n}\n").expect("end")];
+        assert!(
+            reader.contains("return true;"),
+            "an unknown head must count as blocking, not as approval"
+        );
+    }
+
+    /// Codex: `gh pr ready` is a state change and the merge after it can
+    /// still fail. Leaving the PR ready-but-unmerged breaks "merge, or leave
+    /// it alone" twice over — the sweep only ever considers DRAFTS, so a
+    /// stranded PR also falls out of every future sweep.
+    #[test]
+    fn a_failed_merge_puts_the_draft_back() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn merge_sweep(").expect("the sweep");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+
+        let ready = body.find(r#""pr", "ready""#).expect("the sweep marks ready");
+        let merge = body.find(r#""pr", "merge""#).expect("then merges");
+        assert!(ready < merge, "ready comes first");
+        // Codex: everything the sweep checked came from a snapshot. A commit
+        // pushed between that read and this call would merge unreviewed, so
+        // the merge pins the head it validated and lets GitHub refuse.
+        assert!(
+            body[merge..].contains(r#""--match-head-commit""#),
+            "the merge must pin the validated head, or the checks are a TOCTOU"
+        );
+
+        // Codex: pinning the head catches a moved commit, not a check that
+        // went green-to-red on the SAME commit — a CI re-run, a flaky job
+        // retried, a required check added. So the checks are re-read after
+        // readying and immediately before merging.
+        let rechecks: Vec<usize> = body
+            .match_indices("checks_green(")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            rechecks.len() >= 2,
+            "checks must be read again just before the merge, not only at scan time"
+        );
+        let last = *rechecks.last().unwrap();
+        assert!(
+            ready < last && last < merge,
+            "the re-read must sit between readying and merging: \
+             ready={ready} recheck={last} merge={merge}"
+        );
+        // And a red re-read must put the draft back rather than merge.
+        assert!(
+            body[last..merge].contains(r#""--undo""#),
+            "a check that went red after readying must restore the draft"
+        );
+        assert!(
+            body[merge..].contains(r#""--undo""#),
+            "a failed merge must restore the draft state"
+        );
+        // The revert must be conditional on the merge having failed, not
+        // unconditional, and must only undo a transition we made.
+        let undo = body[merge..].find(r#""--undo""#).expect("the undo");
+        let guard = body[merge..merge + undo].rfind("if ").expect("a guard");
+        let cond = &body[merge + guard..merge + undo];
+        assert!(cond.contains("!ok"), "only on failure: {cond:?}");
+        assert!(cond.contains("readied"), "only if we made the transition: {cond:?}");
+    }
+
+    /// C1, C5, C7 — the sweep runs while capped, spends no reasoner call, and
+    /// is bounded so a backlog cannot stall a tick.
+    #[test]
+    fn the_sweep_is_free_bounded_and_runs_while_capped() {
+        let src = include_str!("self_improve.rs");
+        // `run` delegates; the tick loop itself is `run_with`.
+        let start = src.find("async fn run_with<F, T>(").expect("the tick loop");
+        let body = &src[start..start + src[start..].find("\n    }\n").expect("end")];
+        let sweep = body.find("merge_sweep(").expect("the tick must run the sweep");
+        let cap = body.find("daily cap reached").expect("the cap check");
+        assert!(
+            sweep < cap,
+            "the sweep must run BEFORE the cap check; merging an approved \
+             draft spends no reasoner call, so a reasoner budget must not gate it"
+        );
+
+        let fn_start = src.find("async fn merge_sweep(").expect("the sweep");
+        let fn_body = &src[fn_start..fn_start + src[fn_start..].find("\n}\n").expect("end")];
+        // C5 — no reasoner, at all.
+        for forbidden in ["reasoner", "build_reasoner", ".call("] {
+            assert!(
+                !fn_body.contains(forbidden),
+                "the sweep must spend no reasoner call, found {forbidden:?}"
+            );
+        }
+        // The LISTING must favour the oldest, or a backlog larger than one
+        // page starves the very drafts this sweep exists to drain — rotation
+        // only rotates within whatever the page happened to contain.
+        assert!(
+            fn_body.contains("sort:created-asc"),
+            "list oldest-first, so the drafts most at risk are always in view"
+        );
+        assert!(
+            fn_body.contains("is:draft"),
+            "list only drafts, so the window is not spent on rows the sweep discards"
+        );
+
+        // And the window must MOVE, or bounding it just relocates the
+        // starvation to whatever sits past the first ten.
+        assert!(
+            fn_body.contains("sweep_window_start("),
+            "rotate the examination window across ticks"
+        );
+
+        // CodeRabbit: a dry run must not really merge, and the guard has to
+        // sit above `gh pr ready` — the first state change — not beside the
+        // merge itself.
+        let merge_arm = fn_body.find("SweepVerdict::Merge").expect("the merge arm");
+        let dry = fn_body[merge_arm..].find("if dry_run").expect("must honour dry_run");
+        let ready = fn_body[merge_arm..]
+            .find(r#""pr", "ready""#)
+            .expect("the first state change");
+        assert!(dry < ready, "check dry_run before the first state change");
+
+        // C7 — bounded on BOTH axes. Codex: capping merges does not cap the
+        // tick, because the expensive part is the looking — a checks read, a
+        // CodeRabbit read and an author read per candidate. A backlog of
+        // ineligible drafts could stall a tick while merging nothing.
+        assert!(
+            fn_body.contains("MAX_SWEEP_MERGES"),
+            "bound how many merges one tick performs"
+        );
+        assert!(
+            fn_body.contains("MAX_SWEEP_EXAMINED"),
+            "and bound how many candidates it examines, which is the real cost"
+        );
+        // And it must never touch the counter.
+        assert!(
+            !fn_body.contains("counter.record("),
+            "a free merge must not charge the daily cap"
+        );
     }
 
     // ---- #1030: a lane with no provider HOLDS, it does not fail ----
