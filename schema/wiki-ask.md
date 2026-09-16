@@ -48,7 +48,7 @@ Before emitting ANY outbound draft — text, DM, email, social reply, comment �
    ```
    ````
 
-4. **Draft to match the receipt.** The delivery layer checks **every paragraph** of the fenced draft against the receipt and appends a visible ⚠️ mismatch note when one contradicts it (a `standard` receipt over an all-lowercase paragraph, or `lowercase` over a capitalized one); a draft with no receipt above it — a bare fenced block, or a paragraph that opens like a message (`hey casey,`) — is flagged as unchecked. A wrong-register draft can no longer be posted as if it matched. Mirror fully, don't half-apply: a `lowercase` draft keeps proper nouns and sentence starts lowercase too, unless the recipient's own samples capitalize them; a `standard` draft capitalizes sentence starts, the pronoun "I", and names.
+4. **Draft to match the receipt.** The delivery layer checks **every sentence start in every paragraph** of the fenced draft against the receipt and appends a visible ⚠️ mismatch note on the first one that contradicts it (a lowercase sentence start under `standard`, a capitalized one under `lowercase` — `hey Casey, thanks for checking in. I'll send it tonight.` under `standard` is a mismatch, not a wash). A wrong-register draft can no longer be posted as if it matched. Mirror fully, don't half-apply: a `lowercase` draft keeps proper nouns and sentence starts lowercase too, unless the recipient's own samples capitalize them; a `standard` draft capitalizes sentence starts, the pronoun "I", and names.
 
 Precedence and scope:
 
@@ -57,7 +57,7 @@ Precedence and scope:
 - **Revision turns** ("make it shorter", "add the link") keep the previously detected register and repeat the receipt; re-detect only if the owner overrides or new recipient messages arrived.
 - **Email bodies** (`gmail compose` / `update-draft` / `send-now`): the receipt is the **first line of the `--body` / `--body-file`**, with the body under it. The command refuses a body without one, checks the whole body against it, refuses a mismatch before anything reaches Gmail (recase and re-run), and strips the receipt so it never ships. When the body went to an approval card, the reply does not repeat the receipt.
 - **The receipt is for the owner's eyes only.** It sits above the fence, never inside it, an `ATTACH`ed file, a card body, or anything else that could be sent. Texts, DMs and social replies are hand-pasted by the owner from the fenced block; email is the only draft a tool sends, and it is gated as above.
-- **Non-draft answers** — lookups, summaries, filing an issue, answering a question — do NOT get a receipt line, and do not use fenced blocks for anything but drafts, since a bare fence is flagged as an unchecked draft.
+- **Non-draft answers** — lookups, summaries, filing an issue, answering a question — do NOT get a receipt line. The receipt is the only thing the delivery layer keys on: a draft you emit without one is checked by nobody, which is the #994 failure again.
 
 ## Delivering files (Discord attachments)
 

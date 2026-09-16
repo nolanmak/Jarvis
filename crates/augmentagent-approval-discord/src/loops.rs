@@ -679,10 +679,12 @@ impl LoopScheduler {
 
 /// The posted text for one loop result. Loops draft through the same
 /// wiki-ask toolbelt as interactive asks but post through [`LoopPoster`],
-/// not `prepare_answer_delivery`, so the #994 register audit runs here.
+/// not `prepare_answer_delivery`, so the #994 register audit runs here. It
+/// keys on a `register:` receipt line, so a loop's status report or code
+/// output (no receipt) posts exactly as before.
 fn loop_result_body(header: &str, answer: &str) -> String {
     let mut body = format!("{header}\n\n{answer}");
-    for note in crate::register::audit_discord_reply(answer) {
+    for note in crate::register::audit_register_receipts(answer) {
         body.push_str("\n\u{26a0}\u{fe0f} ");
         body.push_str(&note);
     }
@@ -914,7 +916,8 @@ mod cron_helpers_tests {
 mod tests {
     use super::*;
 
-    /// #994 — a loop-drafted message is audited like an interactive one.
+    /// #994 — a loop-drafted message is audited like an interactive one;
+    /// a receiptless result (status text, a code fence) is posted as-is.
     #[test]
     fn loop_results_carry_the_register_audit() {
         let answer = "register: standard (she capitalizes), mirroring\n```\n\
@@ -922,7 +925,8 @@ mod tests {
         let body = loop_result_body("🔁 loop `x`", answer);
         assert!(body.starts_with("🔁 loop `x`\n\nregister:"), "{body}");
         assert!(body.contains("\u{26a0}\u{fe0f} register mismatch"), "{body}");
-        assert_eq!(loop_result_body("h", "all quiet."), "h\n\nall quiet.");
+        let plain = "all quiet.\n```\n$ df -h /mnt/build\n```";
+        assert_eq!(loop_result_body("h", plain), format!("h\n\n{plain}"));
     }
 
     #[test]

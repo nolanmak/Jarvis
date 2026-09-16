@@ -4974,7 +4974,13 @@ fn body_for_gmail_write(body: String, subject: &str) -> Result<String> {
                 );
             }
             // `WIKI_ROOT` is in the env only when the wiki-ask drafter is
-            // the caller (`ask_opts` sets it under `restrict_env`).
+            // the caller: `ask_opts` sets it for that one subprocess under
+            // `restrict_env`, and nothing else exports it. Every body that
+            // reaches this fn is a fresh `--body`/`--body-file` from that
+            // drafter or from the owner's shell; queued, scheduled and
+            // retried sends go out by Gmail draft id (`send_draft`) inside
+            // the daemon and never re-enter the CLI, so a body drafted
+            // before the protocol cannot be refused here for lacking one.
             let drafter = std::env::var_os("WIKI_ROOT").is_some();
             let (clean, receipt) = strip_register_receipt(&clean, drafter)?;
             if receipt {
