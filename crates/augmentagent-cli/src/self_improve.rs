@@ -1561,6 +1561,25 @@ const SELF_IMPROVE_BODY_MARKER: &str = "Automated self-improvement for #";
 /// The body signature stays as a second, cheap check: it catches a stale
 /// recording pointing at a PR that was closed and its number reused by a human
 /// one, which the number alone would not.
+/// ## Pull requests opened before this shipped are out of scope, deliberately
+///
+/// They carry no recording, so they are never swept. That is a decision, not
+/// an oversight, and codex pushed on it three times before I wrote it down.
+///
+/// A backfill could only infer provenance from what an old PR still shows: the
+/// body signature plus an attempt record for its issue. That is precisely the
+/// combination this review rejected as forgeable — a human same-repo draft
+/// carrying the marker after a failed daemon attempt satisfies it. Backfilling
+/// would reintroduce the hole on exactly the pull requests the loop is least
+/// able to vouch for, and silently.
+///
+/// The concrete backlog is also empty. The issue named #1000 and #1020. #1020
+/// is merged. #1000 is CONFLICTING, so it needs a rebase and a re-review — the
+/// resume lane's job, which the sweep deliberately never does. There is no
+/// pull request a backfill would unblock.
+///
+/// Provenance can only be fixed forward: every PR the loop opens from this
+/// deploy carries a record.
 fn loop_authored(
     body: &str,
     issue: u64,
@@ -11125,6 +11144,35 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     /// The loop signs every PR body it writes, so that signature is the
     /// evidence — and the writer and reader share one constant so the
     /// signature cannot drift out from under the check.
+    /// The exclusion of pre-deploy PRs is a decision, so it is pinned like
+    /// one: an old draft with every other signal perfect is still refused,
+    /// because provenance is the one thing it cannot show.
+    #[test]
+    fn a_draft_from_before_this_shipped_is_refused_not_guessed_at() {
+        let signed = "Automated self-improvement for #994.\n\n## Summary\nCODEX-REVIEW: lgtm";
+        assert!(
+            !loop_authored(signed, 994, 1000, Some("aaaa111"), None),
+            "no recording means no provenance, however good the rest looks"
+        );
+        // And the reason the sweep gives has to name provenance, so a human
+        // reading the log is not sent looking for a review or a check.
+        let stale = SweepCandidate {
+            pr: 1000,
+            issue: 994,
+            ours: Some(true),
+            loop_authored: false,
+            mergeable: Some(true),
+            checks_green: Some(true),
+            codex_lgtms: 2,
+            rabbit_blocks: false,
+            policy: policy(Complexity::Simple),
+        };
+        match sweep_verdict(&stale) {
+            SweepVerdict::Skip(why) => assert!(why.contains("signature"), "{why}"),
+            SweepVerdict::Merge => panic!("an unrecorded PR must never be swept"),
+        }
+    }
+
     #[test]
     fn same_repository_is_not_the_same_as_loop_authored() {
         let signed = "Automated self-improvement for #1007.\n\n## Summary";
