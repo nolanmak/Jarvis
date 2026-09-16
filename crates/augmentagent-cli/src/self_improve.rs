@@ -1573,9 +1573,17 @@ fn sweep_tick_seed() -> u64 {
 /// divergence C2 exists to prevent, arriving through an input rather than
 /// through the policy itself.
 async fn merge_policy_owner(repo_root: &Path) -> Option<String> {
+    // Exactly the fresh path's former expression, extracted unchanged.
+    //
+    // Codex: my first version added `.filter(|o| !o.trim().is_empty())`, which
+    // looked like tidying and was a behaviour change. An explicitly empty
+    // override used to yield `Some("")`, which matches no author, so the gate
+    // WITHHELD the merge. Filtering it made the resolution fall through to the
+    // remote owner, which can merge — an unrelated relaxation of an
+    // authorization gate, smuggled in under a refactor that was supposed to
+    // change nothing.
     std::env::var(GH_OWNER_ENV)
         .ok()
-        .filter(|o| !o.trim().is_empty())
         .or(repo_owner_from_remote(repo_root).await)
 }
 
@@ -11394,6 +11402,34 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // failure direction has to be "do not merge".
         std::fs::write(&path, b"not json").unwrap();
         assert_eq!(opened_pr_for(&path, 1007), None);
+    }
+
+    /// Codex: an extraction that is supposed to change nothing has to change
+    /// nothing. An explicitly EMPTY `GH_OWNER_ENV` yields `Some("")`, which
+    /// matches no author, so the gate withholds. Filtering the empty value out
+    /// would fall through to the remote owner and merge instead — relaxing an
+    /// authorization gate under cover of a refactor.
+    #[test]
+    fn an_empty_owner_override_withholds_rather_than_falling_back() {
+        // The gate's own behaviour: an empty owner matches nobody.
+        assert!(!automerge_eligible("nolanmak", Some(""), None));
+        assert!(!automerge_eligible("nolanmak", Some("   "), None));
+        assert!(automerge_eligible("nolanmak", Some("nolanmak"), None));
+
+        // And the shared resolver must not filter the empty value away, which
+        // would turn "withhold" into "use the remote and merge".
+        let src = include_str!("self_improve.rs");
+        let f = src.find("async fn merge_policy_owner(").expect("the resolver");
+        let body = &src[f..f + src[f..].find("\n}\n").expect("end")];
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains(".filter("),
+            "do not filter the override; an empty one must stay Some(\"\")"
+        );
     }
 
     /// Codex, a fourth time on the same shape, and the last input I had left
