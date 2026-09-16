@@ -380,6 +380,41 @@ fn rows_for(saved: &[EvalRow], cases: &[&EvalCase]) -> Vec<EvalRow> {
         .collect()
 }
 
+/// Applies environment overrides and puts the previous values back on drop.
+///
+/// `run` is public. "Safe only because the CLI happens to exit straight
+/// afterwards" is a contract that breaks the first time someone calls it from
+/// a test or a longer-lived process, and the thing being overridden is where
+/// the loop keeps its real state. Restoring includes UNSETTING variables that
+/// had no value, which is not the same as setting them empty.
+struct EnvGuard {
+    prior: Vec<(String, Option<String>)>,
+}
+
+impl EnvGuard {
+    fn apply(overrides: Vec<(String, String)>) -> Self {
+        let prior = overrides
+            .iter()
+            .map(|(k, _)| (k.clone(), std::env::var(k).ok()))
+            .collect();
+        for (k, v) in overrides {
+            std::env::set_var(k, v);
+        }
+        Self { prior }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (k, v) in &self.prior {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
+
 /// Fold a partial run into the existing baseline.
 ///
 /// A `--only` run grades a subset. Saving just that subset would discard the
@@ -671,9 +706,8 @@ pub async fn run(
         std::process::id()
     ));
     std::fs::create_dir_all(&scratch).context("create scratch dir")?;
-    for (k, v) in scratch_env(&scratch) {
-        std::env::set_var(k, v);
-    }
+    // Restored on every exit path, including an early `?`.
+    let _env = EnvGuard::apply(scratch_env(&scratch));
 
     // Committed, not ignored: `--report-only` must render the committed eval
     // on a fresh clone without first spending a reasoner call per case, and a
@@ -1395,6 +1429,36 @@ mod tests {
             stale_scratch(dirs.into_iter(), &me, 1, |_| false).is_empty(),
             "only <tmp>/autopr-eval-<this repo>-<pid> is ours to delete"
         );
+    }
+
+    /// Codex, twice: `run` set process-global state overrides and never put
+    /// them back. The CLI path exits immediately so the ordinary invocation is
+    /// insulated, but `run` is public, and "safe only because the caller
+    /// happens to exit" is a contract that breaks the first time someone calls
+    /// it from a test or a longer-lived process. A guard costs twenty lines.
+    #[test]
+    fn the_state_overrides_are_put_back_when_the_run_ends() {
+        let set_before = "AUGMENTAGENT_AUTOPR_COUNTER_FILE";
+        let unset_before = "AUGMENTAGENT_SELFIMPROVE_LOCK";
+        std::env::set_var(set_before, "/original/value");
+        std::env::remove_var(unset_before);
+
+        {
+            let _guard = EnvGuard::apply(scratch_env(Path::new("/tmp/eval-guard-test")));
+            assert!(std::env::var(set_before).unwrap().starts_with("/tmp/eval-guard-test"));
+            assert!(std::env::var(unset_before).is_ok(), "the override is applied");
+        }
+
+        assert_eq!(
+            std::env::var(set_before).as_deref(),
+            Ok("/original/value"),
+            "a variable that had a value must get that value back"
+        );
+        assert!(
+            std::env::var(unset_before).is_err(),
+            "a variable that was UNSET must go back to unset, not to an empty string"
+        );
+        std::env::remove_var(set_before);
     }
 
     // ---- C6: --only selects a subset ----
