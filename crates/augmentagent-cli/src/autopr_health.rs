@@ -144,6 +144,14 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         return out;
     };
 
+    // #1030 C5 — a fresh hold EXPLAINS the quiet, so the findings it accounts
+    // for must not also fire. Reporting "the loop is silent" next to "the loop
+    // is deliberately paused" is precisely the outage triage this rule exists
+    // to prevent: a reader goes looking for a fault that is not there.
+    let held_recently = i
+        .last_provider_hold
+        .is_some_and(|held| (now - held).num_minutes().max(0) <= PROVIDER_HOLD_FRESH_MINS);
+
     if !i.daemon_active {
         out.push(Finding {
             severity: Severity::Alert,
@@ -174,7 +182,8 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         }
     }
 
-    if let Some(last) = i.last_loop_line {
+    // A paused loop is quiet on purpose; the hold above already said so.
+    if let Some(last) = i.last_loop_line.filter(|_| !held_recently) {
         let age = mins_since(now, last);
         if age >= t.loop_silent_mins {
             out.push(Finding {
@@ -285,7 +294,8 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         }
     }
 
-    if let Some(last) = i.last_merge {
+    // A quota pause stops merges too, so it explains this one as well.
+    if let Some(last) = i.last_merge.filter(|_| !held_recently) {
         let days = (now - last).num_days();
         if days >= t.no_merge_days {
             out.push(Finding {
@@ -1016,6 +1026,35 @@ mod tests {
             hold.detail.contains("quota") && hold.detail.contains("Nothing is broken"),
             "say plainly that this is a pause: {}",
             hold.detail
+        );
+
+        // C5 proper: the hold must SUPPRESS what it explains, not merely sit
+        // beside it. A pause reported next to an outage is still an outage to
+        // whoever is reading at 2am.
+        let wedged_looking = HealthInputs {
+            last_provider_hold: Some(t0() - Duration::minutes(10)),
+            last_loop_line: Some(t0() - Duration::hours(6)),
+            last_merge: Some(t0() - Duration::days(9)),
+            ..healthy()
+        };
+        let quiet = analyze(&wedged_looking, &Thresholds::default());
+        for masked in ["loop-silent", "no-progress"] {
+            assert!(
+                !quiet.iter().any(|f| f.code == masked),
+                "{masked} must not fire while a fresh hold explains the quiet: {:?}",
+                quiet.iter().map(|f| f.code).collect::<Vec<_>>()
+            );
+        }
+        assert!(quiet.iter().any(|f| f.code == "provider-hold"));
+
+        // Without the hold, the same evidence IS an outage.
+        let no_hold = analyze(
+            &HealthInputs { last_provider_hold: None, ..wedged_looking },
+            &Thresholds::default(),
+        );
+        assert!(
+            no_hold.iter().any(|f| f.code == "loop-silent"),
+            "the suppression must depend on the hold, not hide the rule"
         );
 
         // Stale holds stop explaining anything.
