@@ -69,27 +69,41 @@ and cannot start an echo loop.
 Grep cannot stall the bridge (#1038). Python's `re` has no timeout, and a
 pattern such as `(a+)+$` on a 40-character line would otherwise run for hours on
 the bridge's only thread, holding the provider's CLI-gate slot until the reasoner
-watchdog. The bridge still walks and reads files itself, through the same scoped
-descriptors and symlink/hard-link checks as Read. Only the regular expression runs
-in a short-lived `python3 -I -S` child. The child gets the pattern and file bytes
-over a pipe, never a path. It has an empty environment, a 1 GiB address-space
-limit, a 3 s CPU limit and a parent-death signal. The walk, reads and match share
-one budget per call: 1.5 s of wall clock and 64 MiB of file bytes. When the
-budget runs out the child is killed, and the model gets a tool error telling it
-to simplify the pattern or narrow the path, so every Grep replies in under 2 s.
-The walk also stops at 10,000 entries, the matcher at 1,000 results, and each
-file at 8 MiB. The bridge answers the next request normally. A SIGTERM from the
-parent watcher now interrupts a long search, which an in-process C-level match
-could not.
+watchdog. Grep therefore runs in two phases with separate bounds.
+
+1. **Walk and read.** The bridge walks and reads files itself, through the same
+   scoped descriptors and symlink/hard-link checks as Read, into an in-memory
+   file. This phase stops at 10 s of wall clock, 64 MiB of file bytes or 10,000
+   walk entries, whichever comes first. Running out is not an error. The reply
+   holds the hits from the files read so far, followed by a second text block:
+   "Grep results are partial: the search stopped at … after N files; narrow the
+   path to search the rest."
+2. **Match.** Only the regular expression runs, in a short-lived `python3 -I -S`
+   child. The child gets the pattern and the collected bytes on stdin, never a
+   path. It has an empty environment, a 1 GiB address-space limit, a 3 s CPU
+   limit and a parent-death signal. It is killed after 1.5 s, and the model gets
+   a tool error advising it to simplify the pattern. The matching phase therefore
+   ends within 2 s, and the bridge answers the next request normally.
+
+Keeping the budgets separate matters on this host, which often runs builds. With
+one shared 1.5 s budget, a literal search of a 27 MB, 7,000-file tree timed out
+under 24 busy loops, with advice to "simplify the pattern". With the split, the
+same search completes in 1.8–2.3 s. A pathological pattern still errors, with
+pattern advice. Its total reply time is the read phase plus at most 1.5 s of
+matching: under 2 s for a small scope, and about 2–3 s over that whole tree
+under load. The matcher still stops at 1,000 results, and each file at 8 MiB. A
+SIGTERM from the parent watcher interrupts a long search, which an in-process
+C-level match could not.
+
 Linear-time engines (the `regex` module, `rg`) are not on the host. A heuristic
 that rejects nested quantifiers would miss patterns like `(a|aa)+$` and refuse
-legitimate ones, so the wall clock is the bound. For a wiki-sized synthetic tree
-(27 MB in 7,000 files) a full-tree Grep takes about 0.5 s. Matching per line is
-unchanged. Grep parity with the Claude path is pinned by a fixed pattern table in
-the shared Python/ripgrep regex subset. The bridge side always runs. The ripgrep
-side runs only where `rg` is installed, and this host has none. Known divergences
-are regex dialect (lookaround and backreferences exist only in Python) and
-ripgrep's default ignore/hidden/binary-file filtering.
+legitimate ones, so the wall clock is the bound. Matching per line is unchanged.
+Grep parity with the Claude path is pinned by a fixed pattern table in the shared
+Python/ripgrep regex subset. The bridge side always runs. The ripgrep side runs
+in the bridge-suites CI job, which installs ripgrep, and wherever `rg` is
+installed locally. Known divergences are regex dialect (lookaround and
+backreferences exist only in Python) and ripgrep's default
+ignore/hidden/binary-file filtering.
 
 The original guards run inside the bridge and fail closed on crash, timeout,
 malformed output or explicit denial. Native Codex hooks are not the enforcement
@@ -422,9 +436,13 @@ cannot stand in for any tool-using profile.
   Glob/Grep over a 1500-level tree, and a stdio bridge that keeps serving after
   deep paths, malformed lines, non-object requests and invalid `tools/call`
   params, with the JSON-RPC codes above.
-- `BoundedGrepTests` pin a pathological pattern replying in under 2 s while the
-  next request is served, a bridge and its matcher exiting within 1 s of parent
-  death mid-match, the scan byte cap, and the fixed parity table. The live-gate
+- `BoundedGrepTests` pin a pathological pattern replying in under 2 s, with
+  pattern advice, while the next request is served. They also pin a bridge and
+  its matcher exiting within 1 s of parent death mid-match, and the fixed parity
+  table. With an injected clock and a slow-read hook, they check that slow
+  reading never counts against the matching bound, and that running out of read
+  time, scan bytes or walk entries returns partial results with a note to narrow
+  the path. The live-gate
   unit test
   `codex::tests::pathological_bridge_grep_releases_the_cli_gate_slot_within_its_bound`
   drives the real packaged bridge through a Codex stand-in under a one-slot

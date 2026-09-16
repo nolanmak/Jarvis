@@ -1744,7 +1744,11 @@ class BoundedGrepTests(unittest.TestCase):
         self.assertLess(elapsed, 2.0)
         self.assertEqual(reply['id'], 2)
         self.assertTrue(reply['result']['isError'])
-        self.assertIn('time limit', reply['result']['content'][0]['text'])
+        text = reply['result']['content'][0]['text']
+        # Matching ran out, so the advice is about the pattern, not the path.
+        self.assertIn('time limit', text)
+        self.assertIn('simplify the pattern', text)
+        self.assertNotIn('narrow the path', text)
         self.assertEqual(self.receive(process, 2), {'jsonrpc': '2.0', 'id': 3, 'result': {}})
 
     def test_parent_death_during_a_long_match_ends_the_bridge_and_its_matcher(self):
@@ -1837,7 +1841,42 @@ sys.stdin.readline()
                     hits.append((path.removeprefix('./'), int(number)))
                 self.assertEqual(sorted(hits), expected)
 
-    def test_total_scanned_bytes_are_capped(self):
+    def grep_with_file_reads_taking(self, seconds_per_file, pattern, **options):
+        """Run Grep while every file read advances an injected clock."""
+        from unittest.mock import patch
+        self.write_tree()
+        policy = bridge.Policy(json.loads(self.config.read_text()))
+        now = [1000.0]
+        read_at = bridge.Policy._read_at
+        def slow_read(instance, directory, leaf):
+            now[0] += seconds_per_file
+            return read_at(instance, directory, leaf)
+        with patch.object(bridge, 'SEARCH_CLOCK', lambda: now[0]), \
+                patch.object(bridge, 'GREP_READ_SECONDS', 10), \
+                patch.object(bridge.Policy, '_read_at', slow_read):
+            return bridge.Server(policy).call('Grep', dict(pattern=pattern, **options))
+
+    def test_slow_file_reading_does_not_count_against_the_matching_bound(self):
+        # Five files at 1.5 s each: far past the 1.5 s matching bound, inside the read bound.
+        result = self.grep_with_file_reads_taking(1.5, 'synthetic', ignore_case=True)
+        self.assertIsInstance(result, str, 'a complete search has no truncation note')
+        self.assertEqual([(hit['path'], hit['line']) for hit in json.loads(result)],
+                         [('notes/alpha.md', 1), ('notes/alpha.md', 3), ('src/main.rs', 2), ('src/main.rs', 4)])
+
+    def test_exhausted_read_budget_returns_partial_results_with_a_path_note(self):
+        # 4 s per file against the 10 s read bound: three files are read, then it stops.
+        result = self.grep_with_file_reads_taking(4.0, 'synthetic', ignore_case=True)
+        self.assertFalse(result.get('isError', False), result)
+        hits, note = json.loads(result['content'][0]['text']), result['content'][1]['text']
+        self.assertEqual([(hit['path'], hit['line']) for hit in hits],
+                         [('notes/alpha.md', 1), ('notes/alpha.md', 3)])
+        self.assertIn('partial', note)
+        self.assertIn('10 s', note)
+        self.assertIn('3 files', note)
+        self.assertIn('narrow the path', note)
+        self.assertNotIn('pattern', note)
+
+    def test_scan_byte_cap_returns_partial_results_with_a_path_note(self):
         from unittest.mock import patch
         self.write_tree()
         policy = bridge.Policy(json.loads(self.config.read_text()))
@@ -1845,13 +1884,33 @@ sys.stdin.readline()
         total = sum(len(content.encode()) for content in GREP_PARITY_TREE.values())
         with patch.object(bridge, 'MAX_SEARCH_BYTES', total):
             self.assertEqual(len(json.loads(server.call('Grep', {'pattern': 'beta'}))), 3)
-        with patch.object(bridge, 'MAX_SEARCH_BYTES', total - 1):
-            with self.assertRaises(bridge.SearchLimit):
-                policy.grep('beta')
-            response = server.dispatch({'method': 'tools/call', 'params': {
+        first_two = sum(len(GREP_PARITY_TREE[name].encode()) for name in ('data/numbers.csv', 'notes/alpha.md'))
+        with patch.object(bridge, 'MAX_SEARCH_BYTES', first_two):
+            result = server.dispatch({'method': 'tools/call', 'params': {
                 'name': 'Grep', 'arguments': {'pattern': 'beta'}}})
-        self.assertTrue(response['isError'])
-        self.assertIn('scan size limit', response['content'][0]['text'])
+        self.assertFalse(result.get('isError', False), result)
+        self.assertEqual([(hit['path'], hit['line']) for hit in json.loads(result['content'][0]['text'])],
+                         [('notes/alpha.md', 2)])
+        note = result['content'][1]['text']
+        self.assertIn('partial', note)
+        self.assertIn('scan limit', note)
+        self.assertIn('2 files', note)
+        self.assertIn('narrow the path', note)
+
+    def test_walk_entry_limit_returns_partial_grep_results_but_still_denies_glob(self):
+        from unittest.mock import patch
+        self.write_tree()
+        policy = bridge.Policy(dict(json.loads(self.config.read_text()), allowed_tools=['Grep', 'Glob']))
+        server = bridge.Server(policy)
+        # Entries in walk order: data, data/numbers.csv, notes, notes/alpha.md, ...
+        with patch.object(bridge, 'MAX_WALK_ENTRIES', 3):
+            result = server.call('Grep', {'pattern': '0'})
+            with self.assertRaises(bridge.Denied):
+                server.call('Glob', {'pattern': '**/*'})
+        self.assertEqual([(hit['path'], hit['line']) for hit in json.loads(result['content'][0]['text'])],
+                         [('data/numbers.csv', 2), ('data/numbers.csv', 3), ('data/numbers.csv', 4)])
+        self.assertIn('entry limit', result['content'][1]['text'])
+        self.assertIn('narrow the path', result['content'][1]['text'])
 
 
 class HelperReadinessTests(unittest.TestCase):
