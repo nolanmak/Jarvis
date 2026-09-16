@@ -1337,6 +1337,7 @@ async fn merge_sweep(repo_root: &Path) -> usize {
                 automerge_authors: std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS").ok(),
             },
         };
+        let candidate_head = head_sha.clone();
         match sweep_verdict(&candidate) {
             SweepVerdict::Skip(why) => {
                 // Said, not swallowed: a silent skip is indistinguishable from
@@ -1354,9 +1355,19 @@ async fn merge_sweep(repo_root: &Path) -> usize {
                 let (readied, ..) = run(&gh, &["pr", "ready", &pr.to_string()], repo_root)
                     .await
                     .unwrap_or((false, String::new(), String::new()));
+                // Pin the head. Everything above was read from a snapshot;
+                // a commit pushed between that read and this call would
+                // otherwise merge without either codex pass having seen it.
+                // `--match-head-commit` makes GitHub refuse instead, which
+                // turns a silent TOCTOU into a failed merge — and a failed
+                // merge restores the draft below.
+                let head = candidate_head.clone().unwrap_or_default();
                 let (ok, _o, e) = run(
                     &gh,
-                    &["pr", "merge", &pr.to_string(), "--squash", "--delete-branch"],
+                    &[
+                        "pr", "merge", &pr.to_string(), "--squash", "--delete-branch",
+                        "--match-head-commit", &head,
+                    ],
                     repo_root,
                 )
                 .await
@@ -11180,6 +11191,13 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let ready = body.find(r#""pr", "ready""#).expect("the sweep marks ready");
         let merge = body.find(r#""pr", "merge""#).expect("then merges");
         assert!(ready < merge, "ready comes first");
+        // Codex: everything the sweep checked came from a snapshot. A commit
+        // pushed between that read and this call would merge unreviewed, so
+        // the merge pins the head it validated and lets GitHub refuse.
+        assert!(
+            body[merge..].contains(r#""--match-head-commit""#),
+            "the merge must pin the validated head, or the checks are a TOCTOU"
+        );
         assert!(
             body[merge..].contains(r#""--undo""#),
             "a failed merge must restore the draft state"
