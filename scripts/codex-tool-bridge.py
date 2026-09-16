@@ -372,7 +372,23 @@ class Policy:
 
     def read(self, name, offset=None, limit=None):
         self.require('Read')
-        text = self._read(name)
+        data = self._read_bytes(name)
+        mime = None
+        if data.startswith(b'\x89PNG\r\n\x1a\n'):
+            mime = 'image/png'
+        elif data.startswith(b'\xff\xd8\xff'):
+            mime = 'image/jpeg'
+        elif data.startswith((b'GIF87a', b'GIF89a')):
+            mime = 'image/gif'
+        elif data.startswith(b'RIFF') and data[8:12] == b'WEBP':
+            mime = 'image/webp'
+        if mime:
+            if offset is not None or limit is not None:
+                raise Denied('text line ranges do not apply to images')
+            import base64
+            return {'content': [{'type': 'image', 'mimeType': mime,
+                                 'data': base64.b64encode(data).decode('ascii')}]}
+        text = data.decode('utf-8')
         if offset is None and limit is None:
             return text
         for value in (offset, limit):

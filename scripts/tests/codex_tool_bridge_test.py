@@ -34,6 +34,29 @@ class ToolPolicyTests(unittest.TestCase):
         self.policy.edit('note.md', 'beta', 'gamma')
         self.assertEqual(self.policy.read('note.md'), 'alpha\ngamma\n')
 
+    def test_scoped_image_read_returns_original_bytes_as_mcp_image(self):
+        import base64
+        # Synthetic eight-pixel-square PNG; no private fixture assets.
+        original = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEElEQVR4nGNgYPiPAw0pCQCpcD/BFMrqcwAAAABJRU5ErkJggg==')
+        (self.root / 'pixel.png').write_bytes(original)
+        server = bridge.Server(self.policy)
+        response = server.dispatch({'method': 'tools/call', 'params': {
+            'name': 'Read', 'arguments': {'file_path': 'pixel.png'}}})
+        self.assertFalse(response.get('isError', False))
+        self.assertEqual(response['content'][0]['type'], 'image')
+        self.assertEqual(response['content'][0]['mimeType'], 'image/png')
+        self.assertEqual(base64.b64decode(response['content'][0]['data']), original)
+        self.assertEqual((self.root / 'pixel.png').read_bytes(), original)
+
+    def test_image_read_keeps_file_scope_and_rejects_text_line_arguments(self):
+        (self.root / 'image.png').write_bytes(b'\x89PNG\r\n\x1a\nSYNTHETIC')
+        server = bridge.Server(self.policy)
+        with self.assertRaises(bridge.Denied):
+            server.call('Read', {'file_path': 'image.png', 'offset': 1})
+        (self.root / 'image-escape.png').symlink_to(self.outside)
+        with self.assertRaises(bridge.Denied):
+            server.call('Read', {'file_path': 'image-escape.png'})
+
     def test_file_tool_schema_supports_narrow_reads_searches_and_replace_all(self):
         server=bridge.Server(self.policy)
         self.policy.write('notes/source.txt','first\nSYNTHETIC needle\nlast\n')

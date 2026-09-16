@@ -168,6 +168,12 @@ cannot stand in for any tool-using profile.
   guards and execution instead of silently being ignored.
 - Recognized but unimplemented local tools fail readiness instead of silently
   disappearing from the advertised tool list.
+- Scoped `Read` returns PNG/JPEG/GIF/WebP bytes as MCP image content rather
+  than attempting UTF-8 decoding. Path checks and file-size limits apply before
+  encoding; text line ranges on images are rejected. A live Codex test reads
+  a synthetic PNG through the bridge, identifies its undisclosed color, and
+  verifies the original bytes and provider audit record. PDF/document reads
+  still need equivalent coverage.
 - Rust launch tests check private configuration permissions, exclusion of secrets
   from arguments, native tool restrictions, separate read/write roots and
   rejection of unknown settings.

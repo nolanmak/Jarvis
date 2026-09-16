@@ -539,6 +539,28 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
     }
 
     #[tokio::test]
+    #[ignore = "requires a logged-in Codex CLI; reads a synthetic image only"]
+    async fn live_scoped_image_read_is_visible_to_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        // Synthetic solid-color PNG; prompt and filename do not reveal color.
+        let original: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 8, 0, 0, 0, 8, 8, 2, 0, 0, 0, 75, 109, 41, 220, 0, 0, 0, 16, 73, 68, 65, 84, 120, 156, 99, 96, 96, 248, 143, 3, 13, 41, 9, 0, 169, 112, 63, 193, 20, 202, 234, 115, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130];
+        let path = dir.path().join("fixture.bin");
+        std::fs::write(&path, original).unwrap();
+        let mut options = crate::reasoner::resume_opts(dir.path().into());
+        options.allowed_tools = vec!["Read".into()];
+        options.system_prompt = "Read the supplied synthetic fixture with the Jarvis Read tool and answer from the actual image.".into();
+        let audit = dir.path().join("audit.jsonl");
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
+        let result = CodexCliReasoner::openai().call(&options,
+            "Use Jarvis Read on fixture.bin. What single color fills the image? Return only COLOR=<color name>.").await.unwrap();
+        assert_eq!(result.trim().to_ascii_lowercase(), "color=blue");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let records = std::fs::read_to_string(audit).unwrap();
+        assert!(records.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|r| r["tool"] == "Read" && r["provider"] == "codex"));
+    }
+
+    #[tokio::test]
     async fn codex_bridge_calls_are_recorded_in_the_common_audit_log() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");
