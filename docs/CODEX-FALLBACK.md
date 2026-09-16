@@ -63,6 +63,19 @@ namespace, including with `PrivateUsers=yes`; direct user/network namespace
 creation was denied. An exit status alone is therefore not evidence of network
 isolation. No host security setting was changed during these probes.
 
+A subsequent host probe verified KVM API access and creation of a VM by the
+service account. A private QEMU runtime extracted from the configured Ubuntu
+package archive booted a matching kernel with a synthetic initramfs, no network
+device, and QEMU's seccomp sandbox enabled. Inside the guest, loopback socket I/O
+and a detached process session both worked. A synthetic read-only 9p share was
+readable; attempted writes failed, and a symlink to a host file outside the share
+could not be read. The guest exposed only `lo` and powered off successfully.
+These probes establish a possible local build runner without administrative
+setup, not complete build parity. Runtime provisioning, scoped build/cache shares,
+resource limits, cancellation, source reconciliation and actual project-suite QA
+must be integrated before replacing the current command sandbox. QEMU device,
+share and sandbox options follow its [invocation reference](https://www.qemu.org/docs/master/system/qemu-manpage.html).
+
 ## Fallback diagnostics
 
 Exhausted-chain errors now distinguish capability exclusion, active cooldown,
