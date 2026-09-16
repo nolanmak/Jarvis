@@ -1,0 +1,85 @@
+{
+  "rows": [
+    {
+      "actual": "fixable",
+      "base": "3bcd247",
+      "expect": "fixable",
+      "fingerprint": "0bba4ce86da3900f",
+      "id": "E989",
+      "issue": 989,
+      "note": "complexity medium, est ~250 lines, 5 criteria",
+      "pass": true
+    },
+    {
+      "actual": "fixable",
+      "base": "350a2a3",
+      "expect": "fixable",
+      "fingerprint": "874f141ec6c67172",
+      "id": "E962",
+      "issue": 962,
+      "note": "complexity hard, est ~550 lines, 5 criteria",
+      "pass": true
+    },
+    {
+      "actual": "fixable",
+      "base": "967fcd1",
+      "expect": "fixable",
+      "fingerprint": "3fa5163ed5776cb2",
+      "id": "E968",
+      "issue": 968,
+      "note": "complexity medium, est ~250 lines, 5 criteria",
+      "pass": true
+    },
+    {
+      "actual": "fixable",
+      "base": "d0db8e0",
+      "expect": "fixable",
+      "fingerprint": "d87b3f98b42fadcf",
+      "id": "E963",
+      "issue": 963,
+      "note": "complexity medium, est ~300 lines, 4 criteria",
+      "pass": true
+    },
+    {
+      "actual": "fixable",
+      "base": "26b7df7",
+      "expect": "fixable",
+      "fingerprint": "6ddb8f766d1cd822",
+      "id": "E954",
+      "issue": 954,
+      "note": "complexity hard, est ~450 lines, 5 criteria",
+      "pass": true
+    },
+    {
+      "actual": "not-fixable",
+      "base": null,
+      "expect": "not-fixable",
+      "fingerprint": "dd67ae42f9e725df",
+      "id": "E977",
+      "issue": 977,
+      "note": "refused: This issue is an acceptance checklist, not a code change: the implementation shipped and was verified in #976, and every unchecked item requires the owner to act interactively — authorizing …",
+      "pass": true
+    },
+    {
+      "actual": "not-fixable",
+      "base": null,
+      "expect": "not-fixable",
+      "fingerprint": "f8591e77a99dc7af",
+      "id": "E929",
+      "issue": 929,
+      "note": "refused: This is the umbrella tracking issue for an epic, and its actionable content is already decomposed into #926–#928 — the code shows #926 and #927 are substantially shipped (`high_confidence_me…",
+      "pass": true
+    },
+    {
+      "actual": "not-fixable",
+      "base": null,
+      "expect": "not-fixable",
+      "fingerprint": "dfa4080ffdfd9f88",
+      "id": "E882",
+      "issue": 882,
+      "note": "refused: This is a tracking/epic issue, not a unit of work: four of its six sub-issues (#883–#886) are already shipped — the `augmentagent-channel-imessage` crate with bundle reader, config, and sync…",
+      "pass": true
+    }
+  ],
+  "started": "2026-09-16T02:51:18Z"
+}
