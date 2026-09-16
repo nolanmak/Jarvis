@@ -21,10 +21,77 @@ class Denied(ValueError):
     """An operation is outside the declared profile."""
 
 
+class ReconciliationRequired(Denied):
+    """Prior effects are uncertain; reads may gather evidence, writes must wait."""
+
+
 FILE_TOOLS = {'Read', 'Write', 'Edit', 'Glob', 'Grep', 'LS'}
 KNOWN_TOOLS = FILE_TOOLS | {'WebSearch', 'WebFetch', 'NotebookEdit'}
 CONTROL_PARTS = {'.git', '.codex', '.claude', '.ssh', '.gnupg', '.aws', '.azure'}
 MAX_FILE_BYTES = 8 * 1024 * 1024
+
+
+def literal_command_argv(command):
+    # Quotes may contain ordinary punctuation as literal argument data.
+    # Reject expansion syntax even inside double quotes, and never invoke
+    # a shell; a policy match is made on parsed tokens, not string prefixes.
+    quote = None
+    escaped = False
+    for ch in command:
+        if ch in '\n\r\x00':
+            raise Denied('multiline commands are not supported')
+        if escaped:
+            escaped = False
+            continue
+        if ch == '\\' and quote != "'":
+            escaped = True
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+            elif quote == '"' and ch in '$`':
+                raise Denied('shell expansion is not permitted')
+        elif ch in "'\"":
+            quote = ch
+        elif ch in ';|&<>($`)':
+            raise Denied('shell operators are not permitted')
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise Denied('invalid command quoting') from exc
+    return argv
+
+
+def read_only_operation(name, arguments):
+    """Known read contracts, not server-supplied advisory annotations.
+
+    Permission and pre-tool guards still run before any bridge execution.
+    Unknown tools/commands remain potentially mutating. The SocialAPI verb set
+    mirrors its existing mandatory read-only guard's operation contract.
+    """
+    if name in ('Read', 'Glob', 'Grep', 'LS', 'WebSearch', 'WebFetch'):
+        return True
+    if name.startswith('mcp__socialapi__'):
+        verb = re.split(r'[_-]', name[len('mcp__socialapi__'):].lower(), maxsplit=1)[0]
+        return verb in {'list', 'get', 'fetch', 'read', 'search', 'show', 'view',
+                        'find', 'lookup', 'describe', 'count', 'check'}
+    if name != 'Bash' or not isinstance(arguments.get('command'), str):
+        return False
+    try:
+        argv = literal_command_argv(arguments['command'])
+    except Denied:
+        return False
+    if not argv:
+        return False
+    program = Path(argv[0]).name
+    if program in ('ls', 'printf'):
+        return True
+    if len(argv) < 3:
+        return False
+    if program == 'augmentagent':
+        return (argv[1] == 'gmail' and argv[2] in {'search', 'accounts', 'list-attachments', 'get-attachment'}
+            or argv[1] == 'repo-docs' and argv[2] in {'sources', 'list', 'get'})
+    return program == 'aa-gh' and argv[1] in {'issue', 'pr'} and argv[2] in {'list', 'view', 'diff', 'checks'}
 
 
 class HandoffJournal:
@@ -114,10 +181,10 @@ class HandoffJournal:
             for row in reversed(state['operations']):
                 if row['tool'] == name and row['arguments'] == arguments:
                     if row['status'] != 'completed':
-                        raise Denied('latest operation requires reconciliation')
+                        raise ReconciliationRequired('latest operation requires reconciliation')
                     return row['result']
             if any(row['status'] == 'started' for row in state['operations']):
-                raise Denied('uncertain operation requires reconciliation before further mutations')
+                raise ReconciliationRequired('uncertain operation requires reconciliation before further mutations')
             row = {'tool': name, 'arguments': arguments, 'status': 'started'}
             state['operations'].append(row)
             self.save(state)  # must reach durable storage BEFORE the effect
@@ -136,14 +203,14 @@ class HandoffJournal:
                 or not isinstance(identifier, str) or not identifier
                 or phase not in ('PreToolUse', 'PostToolUse', 'PostToolUseFailure')):
             raise Denied('invalid primary operation event')
-        if name in ('Read', 'Glob', 'Grep', 'LS', 'WebSearch', 'WebFetch'):
+        if read_only_operation(name, arguments):
             return
         with self.locked():
             state = self.load()
             matching = [row for row in state['operations'] if row.get('primary_id') == identifier]
             if phase == 'PreToolUse':
                 if matching or any(row['status'] == 'started' for row in state['operations']):
-                    raise Denied('unfinished primary operation requires reconciliation')
+                    raise ReconciliationRequired('unfinished primary operation requires reconciliation')
                 state['operations'].append({'tool': name, 'arguments': arguments,
                     'primary_id': identifier, 'status': 'started'})
                 self.save(state)
@@ -593,33 +660,7 @@ class Policy:
                     process.wait()
 
     def command_argv(self, command):
-        # Quotes may contain ordinary punctuation as literal argument data.
-        # Reject expansion syntax even inside double quotes, and never invoke
-        # a shell; a policy match is made on parsed tokens, not string prefixes.
-        quote = None
-        escaped = False
-        for ch in command:
-            if ch in '\n\r\x00':
-                raise Denied('multiline commands are not supported')
-            if escaped:
-                escaped = False
-                continue
-            if ch == '\\' and quote != "'":
-                escaped = True
-                continue
-            if quote:
-                if ch == quote:
-                    quote = None
-                elif quote == '"' and ch in '$`':
-                    raise Denied('shell expansion is not permitted')
-            elif ch in "'\"":
-                quote = ch
-            elif ch in ';|&<>($`)':
-                raise Denied('shell operators are not permitted')
-        try:
-            argv = shlex.split(command)
-        except ValueError as exc:
-            raise Denied('invalid command quoting') from exc
+        argv = literal_command_argv(command)
         for tokens, prefix in self.command_patterns:
             if argv == tokens or (prefix and argv[:len(tokens)] == tokens):
                 return argv
@@ -934,7 +975,7 @@ class Server:
         if name == 'Bash':
             argv = self.policy.command_argv(arguments['command'])
             external = Path(argv[0]).name in ('augmentagent', 'aa-gh')
-        if external and self.policy.handoff:
+        if external and self.policy.handoff and not read_only_operation(name, arguments):
             return self.policy.handoff.execute(name, arguments,
                 lambda: self.execute(name, arguments))
         return self.execute(name, arguments)
@@ -981,6 +1022,10 @@ class Server:
                 params = request['params']
                 output = self.call(params['name'], params.get('arguments', {}))
                 return output if isinstance(output, dict) else {'content': [{'type': 'text', 'text': output}]}
+            except ReconciliationRequired:
+                return {'isError': True, 'content': [{'type': 'text', 'text':
+                    'An earlier operation has an uncertain outcome. Use read-only tools to inspect current state. '
+                    'Do not repeat or start external changes until that outcome is reconciled.'}]}
             except (Denied, KeyError, TypeError, UnicodeError, OSError, ValueError):
                 return {'isError': True, 'content': [{'type': 'text',
                         'text': 'Operation denied or invalid for the configured profile.'}]}

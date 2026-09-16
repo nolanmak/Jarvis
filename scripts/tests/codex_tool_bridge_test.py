@@ -363,6 +363,53 @@ console.log('DEPENDENCY_FIXTURE_OK');
 
 
 class HandoffTests(unittest.TestCase):
+    def test_uncertain_write_allows_fresh_reconciliation_reads_but_no_more_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);workspace=root/'workspace';workspace.mkdir()
+            journal=bridge.HandoffJournal(root/'handoff.json')
+            def uncertain():
+                raise ConnectionError('synthetic ambiguous outcome')
+            with self.assertRaises(ConnectionError):
+                journal.execute('Bash',{'command':'aa-gh issue create --title Synthetic'},uncertain)
+            policy=bridge.Policy({'cwd':str(workspace),'read_roots':[str(workspace)],'write_roots':[],
+                'allowed_tools':['Bash(augmentagent gmail *)','Bash(augmentagent repo-docs *)',
+                                 'Bash(aa-gh issue *)','mcp__socialapi__*'],
+                'handoff_path':str(root/'handoff.json')})
+            server=bridge.Server(policy)
+            calls=[]
+            def read_result(name, arguments):
+                calls.append((name,arguments))
+                return {'content':[{'type':'text','text':str(len(calls))}]}
+            server.execute=read_result
+            commands=['augmentagent gmail search --query Synthetic','aa-gh issue list --search Synthetic',
+                      'augmentagent repo-docs list --source synthetic']
+            for command in commands:
+                first=server.call('Bash',{'command':command})
+                second=server.call('Bash',{'command':command})
+                self.assertNotEqual(first,second,'reconciliation reads must not return stale receipts')
+            server.call('mcp__socialapi__get_post',{'id':'synthetic'})
+            for command in ['aa-gh issue create --title Another',
+                            'augmentagent gmail compose --body Synthetic',
+                            'augmentagent gmail search --query Synthetic; aa-gh issue create --title Another']:
+                with self.subTest(command=command), self.assertRaises(bridge.Denied):
+                    server.call('Bash',{'command':command})
+            self.assertEqual(len(calls),7)
+            response=server.dispatch({'method':'tools/call','params':{
+                'name':'Bash','arguments':{'command':'aa-gh issue create --title PRIVATE_SYNTHETIC_TITLE'}}})
+            self.assertTrue(response['isError'])
+            text=response['content'][0]['text']
+            self.assertIn('read-only tools',text)
+            self.assertIn('uncertain outcome',text)
+            self.assertNotIn('PRIVATE_SYNTHETIC_TITLE',text)
+
+    def test_primary_read_hooks_do_not_create_uncertain_mutation_receipts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'handoff.json'
+            journal=bridge.HandoffJournal(path)
+            journal.observe_hook({'hook_event_name':'PreToolUse','tool_use_id':'synthetic-read',
+                'tool_name':'Bash','tool_input':{'command':'augmentagent repo-docs sources'}})
+            self.assertFalse(path.exists())
+
     def test_claude_hook_records_before_execution_and_codex_reuses_result(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/'handoff.json'

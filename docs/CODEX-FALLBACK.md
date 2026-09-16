@@ -81,7 +81,12 @@ completed receipt only after a successful result, with file and directory fsync
 and an exclusive execution lock. A restarted bridge returns the stored result
 for identical completed tool arguments. Uncertain outcomes, including reported
 tool errors, block further external effects until reconciliation. Local reads
-remain fresh. Tests cover restart, ambiguous connection failure, corrupt and
+remain fresh. Known read-only Gmail, repository-document, GitHub inspection and
+guarded SocialAPI operations also bypass mutation receipts so they can gather
+current evidence during reconciliation. Unknown operation contracts remain
+potentially mutating; server advisory annotations alone do not exempt a tool.
+An uncertain write returns a safe, actionable tool error without its arguments.
+Tests cover restart, ambiguous connection failure, corrupt and
 symlink state, model-scope exclusion and actual bridge receipt reuse.
 
 Production dispatch now assigns private journal paths for write/agentic calls and
