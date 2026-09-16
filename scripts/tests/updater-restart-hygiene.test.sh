@@ -144,5 +144,25 @@ daemon_restarted && ok "healthy: restarts" || bad "healthy: restarts" "no restar
   || bad "healthy: records the restart in restart-history" "history: $(cat "$HISTORY" 2>/dev/null)"
 rm -rf "$TMP"
 
+# --- in-flight run under XDG_STATE_HOME defers the restart (#1048) ----------
+# run_updater sets XDG_STATE_HOME=$TMP/state and HOME=$TMP. The Rust loop
+# resolves its lock as $XDG_STATE_HOME/augmentagent/self-improve.lock, so a
+# held lock there must defer, even though $HOME/.local/state has none.
+make_case
+XDG_LOCK="$TMP/state/augmentagent/self-improve.lock"
+touch "$XDG_LOCK"
+flock -x "$XDG_LOCK" -c 'sleep 20' & XDG_HOLDER=$!
+sleep 0.3
+( unset AUGMENTAGENT_SELFIMPROVE_LOCK; run_updater ); rc=$?
+daemon_restarted && bad "xdg lock: does not restart under a live build" "systemctl restart was invoked" \
+                 || ok "xdg lock: does not restart under a live build"
+[ -s "$STAMP_FILE" ] && bad "xdg lock: withholds the build stamp" "stamp written" \
+                     || ok "xdg lock: withholds the build stamp"
+grep -q "self-improve run in flight" "$LOG_FILE" && ok "xdg lock: logs the in-flight deferral" \
+  || bad "xdg lock: logs the in-flight deferral" "$(tail -3 "$LOG_FILE")"
+# `flock -c` hands the locked fd to its child: stop the child first.
+pkill -P "$XDG_HOLDER" 2>/dev/null; wait "$XDG_HOLDER" 2>/dev/null
+rm -rf "$TMP"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
