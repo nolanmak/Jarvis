@@ -1534,6 +1534,38 @@ fn codex_review_opts(worktree: PathBuf, system_prompt: &str) -> augmentagent_cha
     }
 }
 
+/// #1012 — appended to a reviewer's system prompt ONLY when the run actually
+/// has criteria.
+///
+/// Composed rather than baked into the constants so that a run without
+/// criteria sends the reviewer the exact prompt it sent before this feature
+/// existed. That is not pedantry about bytes: a reviewer told how to grade
+/// criteria it was never given has been handed an invitation to invent some.
+const CRITERIA_REVIEW_RULE: &str = "\n\
+ACCEPTANCE CRITERIA (#1012): the message carries an acceptance-criteria block, \
+written by the scoping pass BEFORE any code existed. Give a verdict for each \
+one — met, not met, or not addressed — naming the evidence you used. An unmet \
+criterion is `changes-requested` on its own. They are a FLOOR and not a \
+ceiling: still report anything material they missed, and if a criterion is \
+itself wrong or impossible, say so and argue why rather than failing the \
+change over it.\n";
+
+/// A reviewer's system prompt for this run: the base verbatim when there are
+/// no criteria, otherwise the base with [`CRITERIA_REVIEW_RULE`] inserted
+/// ahead of the output-format instruction.
+fn review_system(base: &str, criteria: &[String]) -> String {
+    if criteria.is_empty() {
+        return base.to_string();
+    }
+    const ANCHOR: &str = "Your output MUST start with this line EXACTLY";
+    match base.find(ANCHOR) {
+        Some(i) => format!("{}{CRITERIA_REVIEW_RULE}{}", &base[..i], &base[i..]),
+        // The anchor is pinned by a test; if it ever moves, append rather than
+        // silently drop the rule.
+        None => format!("{base}{CRITERIA_REVIEW_RULE}"),
+    }
+}
+
 const CODEX_DIFF_REVIEW_SYSTEM: &str = "PUBLIC OUTPUT RULE: This response may become a public PR description. Use only technical behavior and invented examples. Never copy private messages, personal names, account or invoice details, live traces, local paths, or generated programs with private inputs.\n\
 You are an INDEPENDENT reviewer on a \
 staged autonomous fix pipeline. A different model wrote the change you are \
@@ -1570,14 +1602,6 @@ evidence. A NEW finding on a revision round must clear the materiality bar \
 with room to spare — each round of fresh eyes will always find something \
 smaller, and that ratchet is a process failure, not rigor.\n\
 \n\
-\n\
-ACCEPTANCE CRITERIA (#1012): when the message carries an acceptance-criteria \
-block, it was written by the scoping pass BEFORE any code existed. Give a \
-verdict for each one — met, not met, or not addressed — naming the evidence \
-you used. An unmet criterion is `changes-requested` on its own. They are a \
-FLOOR and not a ceiling: still report anything material they missed, and if \
-a criterion is itself wrong or impossible, say so and argue why rather than \
-failing the change over it.\n\
 Your output MUST start with this line EXACTLY:\n\
 CODEX-REVIEW: lgtm | changes-requested\n\
 Then a blank line, then 3-8 sentences: for lgtm, what you verified and how \
@@ -1610,14 +1634,6 @@ this change behaviour for traffic nobody asked it to change? Is it hot-path?\n\
 returns something unexpected?\n\
 - Duplication: does this reimplement something the repo already has?\n\
 \n\
-\n\
-ACCEPTANCE CRITERIA (#1012): when the message carries an acceptance-criteria \
-block, it was written by the scoping pass BEFORE any code existed. Give a \
-verdict for each one — met, not met, or not addressed — naming the evidence \
-you used. An unmet criterion is `changes-requested` on its own. They are a \
-FLOOR and not a ceiling: still report anything material they missed, and if \
-a criterion is itself wrong or impossible, say so and argue why rather than \
-failing the change over it.\n\
 Your output MUST start with this line EXACTLY:\n\
 CODEX-REVIEW: lgtm | changes-requested\n\
 Then a blank line, then 3-8 sentences naming the specific callers/invariants \
@@ -2050,9 +2066,11 @@ async fn independent_review(
         "{context}\n\n## Pre-computed call sites\n{evidence}"
     );
 
+    let diff_system = review_system(CODEX_DIFF_REVIEW_SYSTEM, criteria);
+    let sys_system = review_system(CODEX_SYSTEM_REVIEW_SYSTEM, criteria);
     let passes = [
-        ("focused diff review", CODEX_DIFF_REVIEW_SYSTEM, &context),
-        ("system-interaction review", CODEX_SYSTEM_REVIEW_SYSTEM, &system_context),
+        ("focused diff review", diff_system.as_str(), &context),
+        ("system-interaction review", sys_system.as_str(), &system_context),
     ];
     let mut sections: Vec<String> = Vec::new();
     for (label, system, prompt) in passes {
@@ -10064,13 +10082,22 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         );
         assert!(criteria_review_section(&[]).is_empty());
         assert!(criteria_pr_section(&[]).is_empty());
+        // Codex review: the SYSTEM prompts must be untouched too, or a run
+        // without criteria still sends a reviewer rules for grading criteria
+        // it was never given — an invitation to invent some.
+        for base in [CODEX_DIFF_REVIEW_SYSTEM, CODEX_SYSTEM_REVIEW_SYSTEM] {
+            assert_eq!(review_system(base, &[]), base, "byte-identical, not merely equivalent");
+            assert!(!base.contains("ACCEPTANCE CRITERIA"), "the rule must be composed in, not baked in");
+        }
     }
 
     /// C4 — both reviewers grade against the list, and neither loses the rules
     /// that stop them ratcheting.
     #[test]
     fn both_codex_prompts_require_a_verdict_per_criterion() {
-        for sys in [CODEX_DIFF_REVIEW_SYSTEM, CODEX_SYSTEM_REVIEW_SYSTEM] {
+        let cs = crit(&["C1: one"]);
+        for base in [CODEX_DIFF_REVIEW_SYSTEM, CODEX_SYSTEM_REVIEW_SYSTEM] {
+            let sys = review_system(base, &cs);
             let l = sys.to_lowercase();
             assert!(
                 l.contains("acceptance criteria"),
@@ -10089,6 +10116,13 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         }
         assert!(CODEX_DIFF_REVIEW_SYSTEM.contains("MATERIALITY"));
         assert!(CODEX_DIFF_REVIEW_SYSTEM.contains("CONVERGENCE"));
+        // The rule lands BEFORE the output-format instruction, not after it,
+        // where it would read as part of the required output.
+        let composed = review_system(CODEX_DIFF_REVIEW_SYSTEM, &cs);
+        assert!(
+            composed.find("ACCEPTANCE CRITERIA").unwrap()
+                < composed.find("Your output MUST start").unwrap()
+        );
     }
 
     #[test]
