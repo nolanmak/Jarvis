@@ -34,6 +34,36 @@ class ToolPolicyTests(unittest.TestCase):
         self.policy.edit('note.md', 'beta', 'gamma')
         self.assertEqual(self.policy.read('note.md'), 'alpha\ngamma\n')
 
+    def test_file_tool_schema_supports_narrow_reads_searches_and_replace_all(self):
+        server=bridge.Server(self.policy)
+        self.policy.write('notes/source.txt','first\nSYNTHETIC needle\nlast\n')
+        self.policy.write('unrelated.txt','needle elsewhere\n')
+        self.assertEqual(server.call('Read',{'file_path':'notes/source.txt','offset':2,'limit':1}),
+                         'SYNTHETIC needle\n')
+        hits=json.loads(server.call('Grep',{'pattern':'synthetic','path':'notes/source.txt','ignore_case':True}))
+        self.assertEqual(len(hits),1)
+        self.assertEqual(hits[0]['line'],2)
+        self.assertEqual(json.loads(server.call('Glob',{'pattern':'*.txt','path':'notes'})),['source.txt'])
+        self.policy.write('repeat.txt','old old')
+        server.call('Edit',{'file_path':'repeat.txt','old_string':'old','new_string':'new','replace_all':True})
+        self.assertEqual(self.policy.read('repeat.txt'),'new new')
+        schemas={tool['name']:tool['inputSchema'] for tool in server.tools()}
+        self.assertEqual(schemas['Read']['required'],['file_path'])
+        self.assertIn('timeout',schemas['Bash']['properties'])
+
+    def test_file_tool_optional_arguments_are_validated_before_execution(self):
+        server=bridge.Server(self.policy)
+        self.policy.write('note.txt','before')
+        for arguments in [
+            {'file_path':'note.txt','offset':0},
+            {'file_path':'note.txt','limit':True},
+            {'file_path':'note.txt','unknown':'ignored input'},
+        ]:
+            with self.subTest(arguments=arguments), self.assertRaises(bridge.Denied):
+                server.call('Read',arguments)
+        with self.assertRaises(bridge.Denied):
+            server.call('Grep',{'pattern':'x','path':str(self.outside)})
+
     def test_nested_write_search_and_glob_exclude_secret_paths(self):
         self.policy.write('notes/project.md', 'synthetic project needle')
         (self.root / '.env').write_text('needle SECRET')
@@ -182,6 +212,30 @@ print('SYNTHETIC_BUILD_OK')
         self.assertEqual((self.root/'Cargo.lock').read_text(),'synthetic lock\n')
         self.assertFalse((self.root/'target').exists())
         self.assertEqual((self.root/'.env').read_text(),'SYNTHETIC_TOKEN=PRIVATE')
+
+    def test_build_preserves_home_identity_without_granting_home_file_access(self):
+        fakebin=Path(self.temp.name)/'bin';fakebin.mkdir()
+        owner=Path(self.temp.name)/'owner';owner.mkdir()
+        (owner/'private.txt').write_text('SYNTHETIC_PRIVATE')
+        cargo=fakebin/'cargo'
+        cargo.write_text('''#!/usr/bin/python3
+import os
+from pathlib import Path
+assert os.environ.get('HOME'), 'OS home identity was dropped'
+try:
+    (Path(os.environ['HOME'])/'private.txt').read_text()
+except PermissionError:
+    print('HOME_CONTENT_DENIED')
+else:
+    raise AssertionError('home file escaped confinement')
+''')
+        cargo.chmod(0o700)
+        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+            'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Bash(cargo *)'],
+            'environment':{'PATH':str(fakebin)+':/usr/bin','HOME':str(owner)}})
+        result=policy.run_command('cargo test')
+        self.assertEqual(result['exit_code'],0,result)
+        self.assertIn('HOME_CONTENT_DENIED',result['stdout'])
 
     def test_real_cargo_can_build_and_test_a_dependency_free_fixture(self):
         import shutil

@@ -170,7 +170,7 @@ def main():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_FSIZE, (256 * 1024 * 1024, 256 * 1024 * 1024))
     environment = {key: value for key, value in os.environ.items() if key in (
-        'PATH', 'LANG', 'LC_ALL', 'TERM', 'CARGO_HOME', 'RUSTUP_HOME', 'RUSTUP_TOOLCHAIN',
+        'HOME', 'PATH', 'LANG', 'LC_ALL', 'TERM', 'CARGO_HOME', 'RUSTUP_HOME', 'RUSTUP_TOOLCHAIN',
         'CARGO_TARGET_DIR', 'TMPDIR', 'NPM_CONFIG_CACHE', 'CARGO_NET_OFFLINE',
         'NPM_CONFIG_USERCONFIG', 'NPM_CONFIG_GLOBALCONFIG',
         'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_OPTIONAL_LOCKS', 'GIT_DIR', 'GIT_WORK_TREE')}

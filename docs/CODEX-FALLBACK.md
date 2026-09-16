@@ -41,6 +41,17 @@ the original write guards and concurrent-edit checks before being copied back.
 Build artifacts, binary changes and deletions are not copied back. Real synthetic
 Cargo and npm tests verify execution; dependency provisioning, cache persistence,
 binary/deletion reconciliation and full project builds remain integration gates.
+An actual `cargo check -p augmentagent-channel-core --offline -j 2` completed
+inside the build sandbox, compiling the real dependency tree. Running the core
+unit suite inside it exposed further gaps: local HTTP fixtures cannot open sockets,
+process supervision tests cannot create sessions/groups, and the sanitized HOME
+environment changes one path-redaction fixture. That run had 340 passes, 22
+failures (including the expected routing regression), and one ignored live test.
+These failures are outstanding build parity work, not grounds to skip the tests
+or globally remove confinement.
+The HOME identity is now preserved as an OS environment value; a focused
+regression confirms that this still grants no read access to files in that home.
+The full sandboxed core suite has not yet been rerun after that correction.
 Git inspection receives read-only repository metadata and disables external diff
 helpers, hooks, fsmonitor and user/system configuration. On the tested deployment, the default Codex
 command sandbox fails during loopback setup. Its legacy Landlock backend runs a
@@ -121,6 +132,10 @@ cannot stand in for any tool-using profile.
 - Bridge tests cover file read/write/edit, nested writes, bounded search, tool
   declaration, traversal and intermediate symlink escapes, sensitive paths,
   command parsing, and guard denial/crash/malformed-response handling.
+- File-tool schemas and dispatch support optional line ranges, scoped/file
+  searches, case-insensitive matching, explicit replace-all edits and bounded
+  command timeouts. Invalid or unknown local arguments are rejected before
+  guards and execution instead of silently being ignored.
 - Rust launch tests check private configuration permissions, exclusion of secrets
   from arguments, native tool restrictions, separate read/write roots and
   rejection of unknown settings.

@@ -298,9 +298,16 @@ class Policy:
             for fd in reversed(descriptors):
                 os.close(fd)
 
-    def read(self, name):
+    def read(self, name, offset=None, limit=None):
         self.require('Read')
-        return self._read(name)
+        text = self._read(name)
+        if offset is None and limit is None:
+            return text
+        for value in (offset, limit):
+            if value is not None and (type(value) is not int or value < 1):
+                raise Denied('read offset and limit must be positive integers')
+        start = (offset or 1) - 1
+        return ''.join(text.splitlines(keepends=True)[start:None if limit is None else start + limit])
 
     def _read(self, name):
         return self._read_bytes(name).decode('utf-8')
@@ -349,12 +356,12 @@ class Policy:
         self.require('Write')
         self._write(name, content)
 
-    def edit(self, name, old, new):
+    def edit(self, name, old, new, replace_all=False):
         self.require('Edit')
         content = self.read(name)
-        if not old or content.count(old) != 1:
+        if not old or (content.count(old) != 1 and not replace_all) or old not in content:
             raise Denied('edit must identify exactly one match')
-        self._write(name, content.replace(old, new, 1))
+        self._write(name, content.replace(old, new, -1 if replace_all else 1))
 
     def files(self, path='.', excluded_dirs=()):
         base = Path(os.path.abspath(self.cwd / path))
@@ -400,16 +407,19 @@ class Policy:
                 if fnmatch.fnmatchcase(relative, pattern) or
                 (pattern.startswith('**/') and fnmatch.fnmatchcase(relative, pattern[3:]))]
 
-    def grep(self, pattern, path='.'):
+    def grep(self, pattern, path='.', ignore_case=False):
         self.require('Grep')
         if not isinstance(pattern, str) or len(pattern) > 1024:
             raise Denied('invalid search pattern')
         try:
-            expression = re.compile(pattern)
+            expression = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
         except re.error as exc:
             raise Denied('invalid search expression') from exc
         results = []
-        for absolute, relative in self.files(path):
+        candidate = Path(os.path.abspath(self.cwd / path))
+        self._relative(str(candidate / '__search_scope__') if candidate.is_dir() else str(candidate))
+        candidates = [(str(candidate), candidate.name)] if candidate.is_file() else self.files(path)
+        for absolute, relative in candidates:
             try:
                 text = self._read(absolute)
             except (Denied, UnicodeError):
@@ -667,14 +677,18 @@ class BuildSnapshot:
 
 
 TOOL_SCHEMAS = {
-    'Bash': {'command': {'type': 'string'}},
-    'Read': {'file_path': {'type': 'string'}},
-    'Glob': {'pattern': {'type': 'string'}},
-    'Grep': {'pattern': {'type': 'string'}},
+    'Bash': {'command': {'type': 'string'}, 'timeout': {'type': 'integer', 'minimum': 1, 'maximum': 900,
+             'description': 'Maximum runtime in seconds.'}},
+    'Read': {'file_path': {'type': 'string'}, 'offset': {'type': 'integer', 'minimum': 1},
+             'limit': {'type': 'integer', 'minimum': 1}},
+    'Glob': {'pattern': {'type': 'string'}, 'path': {'type': 'string'}},
+    'Grep': {'pattern': {'type': 'string'}, 'path': {'type': 'string'}, 'ignore_case': {'type': 'boolean'}},
     'Write': {'file_path': {'type': 'string'}, 'content': {'type': 'string'}},
     'Edit': {'file_path': {'type': 'string'}, 'old_string': {'type': 'string'},
-             'new_string': {'type': 'string'}},
+             'new_string': {'type': 'string'}, 'replace_all': {'type': 'boolean'}},
 }
+TOOL_REQUIRED = {'Bash': ['command'], 'Read': ['file_path'], 'Glob': ['pattern'],
+    'Grep': ['pattern'], 'Write': ['file_path', 'content'], 'Edit': ['file_path', 'old_string', 'new_string']}
 
 
 class Remote:
@@ -896,13 +910,25 @@ class Server:
         self.discover()
         local = [{'name': name, 'description': 'Scoped Jarvis ' + name,
                  'inputSchema': {'type': 'object', 'properties': fields,
-                                 'required': list(fields), 'additionalProperties': False}}
+                                 'required': TOOL_REQUIRED[name], 'additionalProperties': False}}
                 for name, fields in TOOL_SCHEMAS.items()
                 if name in self.policy.tools or (name == 'Bash' and self.policy.command_patterns)]
         return local + [definition for _, _, definition in self.remote_tools.values()]
 
     def call(self, name, arguments):
         self.policy.require(name)
+        if name in TOOL_SCHEMAS:
+            fields = TOOL_SCHEMAS[name]
+            if (not isinstance(arguments, dict) or set(arguments) - set(fields)
+                    or set(TOOL_REQUIRED[name]) - set(arguments)):
+                raise Denied('invalid tool argument fields')
+            types = {'string': str, 'integer': int, 'boolean': bool}
+            for key, value in arguments.items():
+                field = fields[key]
+                if type(value) is not types[field['type']]:
+                    raise Denied('invalid tool argument type')
+                if ('minimum' in field and value < field['minimum']) or ('maximum' in field and value > field['maximum']):
+                    raise Denied('tool argument outside supported range')
         self.policy.before(name, arguments)
         external = name.startswith('mcp__')
         if name == 'Bash':
@@ -915,7 +941,7 @@ class Server:
 
     def execute(self, name, arguments):
         if name == 'Bash':
-            outcome = self.policy.run_command(arguments['command'])
+            outcome = self.policy.run_command(arguments['command'], arguments.get('timeout', 120))
             return {'isError': outcome['exit_code'] != 0,
                     'content': [{'type': 'text', 'text': json.dumps(outcome)}]}
         if name.startswith('mcp__'):
@@ -926,14 +952,17 @@ class Server:
             return self.remotes[server].request('tools/call', {'name': leaf, 'arguments': arguments})
         if name in ('Glob', 'Grep'):
             action = self.policy.glob if name == 'Glob' else self.policy.grep
-            return json.dumps(action(arguments['pattern']))
+            options = {'path': arguments.get('path', '.')}
+            if name == 'Grep':
+                options['ignore_case'] = arguments.get('ignore_case', False)
+            return json.dumps(action(arguments['pattern'], **options))
         if name == 'Read':
-            return self.policy.read(arguments['file_path'])
+            return self.policy.read(arguments['file_path'], arguments.get('offset'), arguments.get('limit'))
         if name == 'Write':
             self.policy.write(arguments['file_path'], arguments['content'])
             return 'File written.'
         if name == 'Edit':
-            self.policy.edit(arguments['file_path'], arguments['old_string'], arguments['new_string'])
+            self.policy.edit(arguments['file_path'], arguments['old_string'], arguments['new_string'], arguments.get('replace_all', False))
             return 'File edited.'
         raise Denied('tool execution is not implemented')
 
