@@ -601,6 +601,120 @@ console.log('DEPENDENCY_FIXTURE_OK');
 
 
 class HandoffTests(unittest.TestCase):
+    def test_operator_reconciliation_records_observed_completion_without_replay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            journal.execute('mcp__fixture__create', {}, lambda: {'isError': True})
+            fingerprint = journal.inspect()[0]['fingerprint']
+            result = {'content': [{'type': 'text', 'text': 'synthetic-created'}]}
+            journal.reconcile({'index': 0, 'fingerprint': fingerprint, 'outcome': 'completed',
+                'evidence': 'Synthetic service lookup confirms the created object.', 'result': result})
+            def forbidden():
+                self.fail('reconciled effect must not execute again')
+            restarted = bridge.HandoffJournal(journal.path)
+            self.assertEqual(restarted.execute('mcp__fixture__create', {}, forbidden), result)
+            self.assertEqual(restarted.load()['operations'][0]['reconciliation']['outcome'], 'completed')
+            with self.assertRaises(bridge.Denied):
+                restarted.reconcile({'index': 0, 'fingerprint': fingerprint, 'outcome': 'not_applied',
+                    'evidence': 'Stale conflicting decision.'})
+
+    def test_operator_verified_absence_allows_one_new_attempt_and_retains_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            journal.execute('mcp__fixture__create', {}, lambda: {'isError': True})
+            journal.reconcile({'index': 0, 'fingerprint': journal.inspect()[0]['fingerprint'],
+                'outcome': 'not_applied', 'evidence': 'Synthetic service confirms request was rejected before commit.'})
+            result = {'content': [{'type': 'text', 'text': 'synthetic-retry-created'}]}
+            count = []
+            def apply():
+                count.append(1)
+                return result
+            self.assertEqual(journal.execute('mcp__fixture__create', {}, apply), result)
+            self.assertEqual(journal.execute('mcp__fixture__create', {}, apply), result)
+            self.assertEqual(count, [1])
+            self.assertEqual([row['status'] for row in journal.load()['operations']], ['not_applied', 'completed'])
+
+    def test_reconciliation_rejects_active_request_stale_state_and_missing_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            journal.execute('mcp__fixture__create', {}, lambda: {'isError': True})
+            decision = {'index': 0, 'fingerprint': journal.inspect()[0]['fingerprint'],
+                'outcome': 'not_applied', 'evidence': 'Synthetic authoritative lookup.'}
+            before = journal.path.read_bytes()
+            marker = journal.path.with_suffix('.active')
+            marker.write_text('synthetic-running')
+            with self.assertRaises(bridge.Denied):
+                journal.reconcile(decision)
+            marker.unlink()
+            for invalid in [dict(decision, fingerprint='stale'), dict(decision, evidence=''),
+                    dict(decision, index=True), dict(decision, outcome='completed'),
+                    dict(decision, outcome='completed', result={'isError': True}),
+                    dict(decision, outcome='unknown')]:
+                with self.assertRaises(bridge.Denied):
+                    journal.reconcile(invalid)
+                self.assertEqual(journal.path.read_bytes(), before)
+
+    def test_reconciliation_serializes_with_launcher_and_rejects_untrusted_locks(self):
+        import fcntl
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            journal.execute('mcp__fixture__create', {}, lambda: {'isError': True})
+            decision = {'index': 0, 'fingerprint': journal.inspect()[0]['fingerprint'],
+                'outcome': 'not_applied', 'evidence': 'Synthetic authoritative lookup.'}
+            before = journal.path.read_bytes()
+            lock = journal.path.with_suffix('.lifecycle-lock')
+            descriptor = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaises(bridge.Denied):
+                    journal.reconcile(decision)
+            finally:
+                os.close(descriptor)
+            lock.unlink()
+            outside = Path(tmp) / 'outside'
+            outside.write_text('SYNTHETIC_UNCHANGED')
+            lock.symlink_to(outside)
+            with self.assertRaises((bridge.Denied, OSError)):
+                journal.reconcile(decision)
+            self.assertEqual(outside.read_text(), 'SYNTHETIC_UNCHANGED')
+            self.assertEqual(journal.path.read_bytes(), before)
+
+    def test_reconciled_absence_allows_primary_retry_but_blocks_late_old_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            event = {'tool_name': 'mcp__fixture__create', 'tool_input': {},
+                'tool_use_id': 'synthetic-old', 'hook_event_name': 'PreToolUse'}
+            journal.observe_hook(event)
+            journal.reconcile({'index': 0, 'fingerprint': journal.inspect()[0]['fingerprint'],
+                'outcome': 'not_applied', 'evidence': 'Synthetic service confirms absence.'})
+            before = journal.path.read_bytes()
+            with self.assertRaises(bridge.Denied):
+                journal.observe_hook(dict(event, hook_event_name='PostToolUse', tool_response='stale'))
+            self.assertEqual(journal.path.read_bytes(), before)
+            journal.observe_hook(dict(event, tool_use_id='synthetic-new'))
+            journal.observe_hook(dict(event, tool_use_id='synthetic-new', hook_event_name='PostToolUse',
+                tool_response='synthetic-created'))
+            self.assertEqual([row['status'] for row in journal.load()['operations']], ['not_applied', 'completed'])
+
+    def test_reconciliation_cli_keeps_private_payloads_out_of_errors_and_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            journal.execute('mcp__fixture__create', {'body': 'SYNTHETIC_PRIVATE_BODY'}, lambda: {'isError': True})
+            command = [sys.executable, str(SPEC.origin)]
+            status = subprocess.run(command + ['--handoff-status', str(journal.path)], capture_output=True, text=True)
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertNotIn('SYNTHETIC_PRIVATE_BODY', status.stdout + status.stderr)
+            decision = {'index': 0, 'fingerprint': json.loads(status.stdout)[0]['fingerprint'],
+                'outcome': 'not_applied', 'evidence': 'Synthetic authoritative lookup.'}
+            outcome = subprocess.run(command + ['--handoff-reconcile', str(journal.path)],
+                input=json.dumps(decision), capture_output=True, text=True)
+            self.assertEqual(outcome.returncode, 0, outcome.stderr)
+            invalid = subprocess.run(command + ['--handoff-reconcile', str(journal.path)],
+                input='SYNTHETIC_PRIVATE_BODY', capture_output=True, text=True)
+            self.assertNotEqual(invalid.returncode, 0)
+            self.assertNotIn('SYNTHETIC_PRIVATE_BODY', invalid.stdout + invalid.stderr)
+
     def test_memory_reconciliation_reads_stay_fresh_while_writes_are_uncertain(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);workspace=root/'workspace';workspace.mkdir()

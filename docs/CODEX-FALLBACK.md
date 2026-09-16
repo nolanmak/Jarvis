@@ -197,13 +197,25 @@ The disconnect variant also passed with both real CLIs: the fixture performed
 its effect and exited before sending a response. The primary journal retained
 `started`, Codex received an audited reconciliation refusal, the journal stayed
 unchanged and the effect counter remained one. This verifies safe refusal after
-an ambiguous transport failure; it does not resolve that ambiguity automatically.
+an ambiguous transport failure. The extended fixture then checks the synthetic
+service counter, records an operator completion receipt through the recovery CLI,
+and resumes Codex. The response contains the verified receipt and the counter
+remains one; no second external effect occurs.
 
-This is not completed cross-provider handoff. Durable reconciliation decisions,
-effect-aware read/reconciliation operations, retention, caller identity coverage,
-intentional repeated-action semantics and interruption cleanup remain gates.
+Uncertain effects can now be resolved with an owner-only recovery command after
+checking the authoritative service. Decisions require the exact operation
+fingerprint and evidence; they preserve the original attempt and a timestamped
+receipt. Verified completion reuses the observed result without another effect.
+Verified absence permits one fresh attempt, which receives normal journal and
+approval enforcement. Active requests, unverified cleanup, stale fingerprints
+and conflicting decisions are refused. The model cannot invoke this recovery API.
+See [operator recovery](#operator-recovery-for-uncertain-effects) below.
+
 Argument matching does not identify all semantically duplicate actions expressed
-through different commands or tools. Hook observations do not substitute for verified
+through different commands or tools. To intentionally repeat an identical external
+action, use a new user request so it has a separate operation journal. Journals are
+retained privately without age-based deletion; unresolved receipts must not be
+removed to force progress. Hook observations do not substitute for verified
 termination of the previous provider and its descendants before handoff.
 
 Both CLI adapters now launch beneath a private Linux subreaper supervisor. On
@@ -498,6 +510,47 @@ inventory now rejects entries without a named conformance test (red regression
 confirmed, then all five inventory tests passed).
 
 These receipts apply to the candidate worktree. They do not prove deployment.
-The remaining release audit must resolve durable reconciliation after uncertain
-external effects, validate the intended dependency-provisioning workflow, complete
+The remaining release audit must verify the recovery path and intended
+dependency-provisioning workflow, complete
 independent review and CI, then verify the deployed revision and CLI behavior.
+
+
+### Operator recovery for uncertain effects
+
+An error or timeout does not prove that an external write failed. First inspect
+the authoritative service using read-only access. Stop the affected request and
+let normal supervisor cleanup complete. From the trusted checkout, inspect its
+owner-private journal (the directory is under
+`~/.local/state/augmentagent/reasoner-handoffs/`):
+
+```sh
+python3 scripts/codex-tool-bridge.py --handoff-status /absolute/private/request/operations.json
+```
+
+Status returns indexes, tool names, states and fingerprints; it omits arguments,
+results and evidence. Do not publish the private journal. Create a private JSON
+decision file with the returned `index` and `fingerprint`, an `outcome` of
+`completed` or `not_applied`, and nonempty `evidence` describing the authoritative
+check. `completed` also requires the observed successful MCP-shaped `result`, for
+example `{"content":[{"type":"text","text":"synthetic-created"}]}`. Only choose
+`not_applied` when absence of the effect is established, not merely because a
+lookup is inconclusive. Submit it through stdin:
+
+```sh
+python3 scripts/codex-tool-bridge.py --handoff-reconcile /absolute/private/request/operations.json < /absolute/private/decision.json
+```
+
+The command locks against both journal execution and provider startup, refuses
+active/unverified requests and stale decisions, and fsyncs the decision before
+reporting success. It never clears cleanup markers or exposes journal payloads
+in errors. A completed decision supplies the result on replay; an absence decision
+keeps the original attempt and permits a new one. Resume the same logical request
+through its normal entry point. Keep receipts through rollout and rollback;
+older adapters reject unknown receipt states rather than replaying them.
+
+
+The recovery change passed all 73 bridge tests, including both provider hook
+paths, real CLI status/decision submission, concurrent lifecycle locking, stale
+and malformed decisions, private-error output, and late-result rejection. The
+Rust handoff regressions passed, and the real two-provider disconnect/reconcile/
+resume fixture passed with one observed effect throughout.

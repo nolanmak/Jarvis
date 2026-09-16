@@ -193,8 +193,36 @@ for line in sys.stdin:
             assert!(second.contains("SYNTHETIC_RECEIPT_1"), "{second}");
         }
         assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
-        let after: Value = serde_json::from_slice(&std::fs::read(journal).unwrap()).unwrap();
+        let after: Value = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
         assert_eq!(after, state);
+        if disconnect {
+            // Operator observes the authoritative synthetic service counter,
+            // records its result through the shipped recovery CLI, then resumes.
+            let helper = private.path().join("recovery.py");
+            std::fs::write(&helper, include_bytes!("../../../scripts/codex-tool-bridge.py")).unwrap();
+            let status = std::process::Command::new("python3").arg(&helper)
+                .arg("--handoff-status").arg(&journal).output().unwrap();
+            assert!(status.status.success());
+            let rows: Vec<Value> = serde_json::from_slice(&status.stdout).unwrap();
+            let row = rows.iter().find(|row| row["tool"] == "mcp__fixture__record").unwrap();
+            assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+            let decision = json!({"index":row["index"], "fingerprint":row["fingerprint"],
+                "outcome":"completed", "evidence":"Authoritative synthetic counter equals one.",
+                "result":{"content":[{"type":"text","text":"SYNTHETIC_RECEIPT_1"}]}});
+            let mut recovery = std::process::Command::new("python3").arg(&helper)
+                .arg("--handoff-reconcile").arg(&journal)
+                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()).spawn().unwrap();
+            recovery.stdin.take().unwrap().write_all(decision.to_string().as_bytes()).unwrap();
+            let result = recovery.wait_with_output().unwrap();
+            assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+            let recovered = resume_message(&journal, request).unwrap();
+            let response = CodexCliReasoner::openai().call(&opts, &recovered).await.unwrap();
+            assert!(response.contains("SYNTHETIC_RECEIPT_1"), "{response}");
+            assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+            let final_state: Value = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+            assert_eq!(final_state["operations"][row["index"].as_u64().unwrap() as usize]["status"], "completed");
+        }
     }
 
     #[test]

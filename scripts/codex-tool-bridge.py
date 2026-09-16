@@ -200,7 +200,11 @@ class HandoffJournal:
             for row in state['operations']:
                 if (not isinstance(row, dict) or not isinstance(row.get('tool'), str)
                         or not isinstance(row.get('arguments'), dict)
-                        or row.get('status') not in ('started', 'completed')
+                        or row.get('status') not in ('started', 'completed', 'not_applied')
+                        or (row['status'] == 'not_applied' and (
+                            not isinstance(row.get('reconciliation'), dict)
+                            or row['reconciliation'].get('outcome') != 'not_applied'
+                            or not row['reconciliation'].get('evidence')))
                         or (row['status'] == 'completed' and 'result' not in row)):
                     raise Denied('invalid handoff operation')
             return state
@@ -228,11 +232,84 @@ class HandoffJournal:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
+    @staticmethod
+    def fingerprint(row):
+        import hashlib
+        return hashlib.sha256(json.dumps(row, sort_keys=True, ensure_ascii=True,
+            separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+
+    def inspect(self):
+        # Deliberately omit arguments, results and evidence from operator status.
+        with self.locked():
+            return [{'index': index, 'tool': row['tool'], 'status': row['status'],
+                'fingerprint': self.fingerprint(row)}
+                for index, row in enumerate(self.load()['operations'])]
+
+    def reconcile(self, decision):
+        """Owner-only recovery API, never advertised as a model tool.
+
+        Evidence is the operator's attestation after inspecting the authoritative
+        service. No absence inference is made from transport failures/timeouts.
+        The same lifecycle lock as the provider launcher prevents a new invocation
+        starting while a decision is committed. Active or unverified cleanup must
+        be recovered through the normal supervisor path first.
+        """
+        import datetime
+        import fcntl
+        if (not isinstance(decision, dict)
+                or type(decision.get('index')) is not int or decision['index'] < 0
+                or not isinstance(decision.get('fingerprint'), str)
+                or decision.get('outcome') not in ('completed', 'not_applied')
+                or not isinstance(decision.get('evidence'), str)
+                or not decision['evidence'].strip() or len(decision['evidence']) > 16384):
+            raise Denied('invalid reconciliation decision')
+        if decision['outcome'] == 'completed':
+            result = decision.get('result')
+            if (not isinstance(result, dict) or result.get('isError')
+                    or not isinstance(result.get('content'), list)):
+                raise Denied('completion requires a successful observed tool receipt')
+        elif 'result' in decision:
+            raise Denied('absence decision cannot include a completion receipt')
+        if not self.path.is_absolute() or self.path.parent.resolve() != self.path.parent:
+            raise Denied('untrusted reconciliation path')
+        with self.locked():
+            # The request-directory trust check and journal lock above also cover
+            # this lifecycle-lock location. Both locks stay held through fsync.
+            descriptor = os.open(self.path.with_suffix('.lifecycle-lock'),
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                    raise Denied('untrusted lifecycle lock')
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if os.path.lexists(self.path.with_suffix('.active')):
+                    raise Denied('request active or cleanup unverified')
+                state = self.load()
+                index = decision['index']
+                if index >= len(state['operations']):
+                    raise Denied('unknown reconciliation operation')
+                row = state['operations'][index]
+                if row['status'] != 'started' or self.fingerprint(row) != decision['fingerprint']:
+                    raise Denied('reconciliation is stale or operation already resolved')
+                row['status'] = decision['outcome']
+                if decision['outcome'] == 'completed':
+                    row['result'] = decision['result']
+                row['reconciliation'] = {'outcome': decision['outcome'],
+                    'evidence': decision['evidence'], 'prior_fingerprint': decision['fingerprint'],
+                    'recorded_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}
+                self.save(state)
+            except OSError as error:
+                raise Denied('reconciliation unavailable while lifecycle state is busy or untrusted') from error
+            finally:
+                os.close(descriptor)
+
     def execute(self, name, arguments, action):
         with self.locked():
             state = self.load()
             for row in reversed(state['operations']):
                 if same_operation(row, name, arguments):
+                    if row['status'] == 'not_applied':
+                        break  # operator proved absence; preserve this row and append a new attempt
                     if row['status'] != 'completed':
                         raise ReconciliationRequired('latest operation requires reconciliation')
                     return row['result']
@@ -275,6 +352,8 @@ class HandoffJournal:
             if len(matching) != 1 or matching[0]['tool'] != name or matching[0]['arguments'] != arguments:
                 raise Denied('unmatched primary result requires reconciliation')
             row = matching[0]
+            if row['status'] == 'not_applied':
+                raise Denied('late primary result conflicts with operator reconciliation')
             if phase == 'PostToolUseFailure':
                 return  # failure is not evidence of absence of an effect
             if 'tool_response' not in event:
@@ -1459,7 +1538,21 @@ def serve(config_path):
 
 if __name__ == '__main__':
     import sys
-    if len(sys.argv) == 3 and sys.argv[1] == '--handoff-hook':
+    if len(sys.argv) == 3 and sys.argv[1] in ('--handoff-status', '--handoff-reconcile'):
+        try:
+            journal = HandoffJournal(sys.argv[2])
+            if sys.argv[1] == '--handoff-status':
+                print(json.dumps(journal.inspect()))
+            else:
+                payload = sys.stdin.read(1024 * 1024 + 1)
+                if len(payload) > 1024 * 1024:
+                    raise Denied('reconciliation input exceeds limit')
+                journal.reconcile(json.loads(payload))
+                print('Reconciliation recorded.')
+        except Exception:
+            print('Handoff recovery refused: invalid/stale decision, untrusted state, or unverified request cleanup.', file=sys.stderr)
+            sys.exit(2)
+    elif len(sys.argv) == 3 and sys.argv[1] == '--handoff-hook':
         try:
             HandoffJournal(sys.argv[2]).observe_hook(json.load(sys.stdin))
         except CompletedOperation:
