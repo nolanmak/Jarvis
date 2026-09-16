@@ -489,15 +489,22 @@ async fn reclaim_stale_scratch(repo_root: &Path) {
         return;
     }
     for d in &stale {
+        // Deregister each tree BY PATH before the directory goes, so the
+        // repository is left consistent without a repo-wide prune deciding
+        // the fate of worktrees this command never created.
+        if let Ok(entries) = std::fs::read_dir(d) {
+            for tree in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+                let _ = tokio::process::Command::new("git")
+                    .args(["worktree", "remove", "--force", &tree.to_string_lossy()])
+                    .current_dir(repo_root)
+                    .output()
+                    .await;
+            }
+        }
         if let Err(e) = std::fs::remove_dir_all(d) {
             eprintln!("could not reclaim {}: {e}", d.display());
         }
     }
-    let _ = tokio::process::Command::new("git")
-        .args(["worktree", "prune"])
-        .current_dir(repo_root)
-        .output()
-        .await;
     println!("reclaimed {} scratch dir(s) from earlier runs", stale.len());
 }
 
@@ -685,11 +692,6 @@ pub async fn run(
         }
     }
 
-    let _ = tokio::process::Command::new("git")
-        .args(["worktree", "prune"])
-        .current_dir(repo_root)
-        .output()
-        .await;
     let _ = std::fs::remove_dir_all(&scratch);
 
     if !report_only {
@@ -1096,6 +1098,25 @@ mod tests {
         assert!(
             stale_scratch(dirs.into_iter(), 1, |_| false).is_empty(),
             "only /tmp/autopr-eval-<pid> is ours to delete"
+        );
+    }
+
+    /// Codex review: the eval ran `git worktree prune`, which is repo-wide.
+    /// It only drops registrations whose directory is gone, but the eval has
+    /// no business deciding that for a worktree it did not create — a sibling
+    /// session's tree on a slow mount is not ours to deregister. Every tree
+    /// the eval makes is removed by path instead.
+    #[test]
+    fn the_eval_never_prunes_worktrees_it_did_not_create() {
+        let src = include_str!("autopr_eval.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("test module")];
+        assert!(
+            !code.contains(r#""prune""#),
+            "a repo-wide prune can deregister a worktree this command never made"
+        );
+        assert!(
+            code.contains(r#""worktree", "remove", "--force""#),
+            "trees must be removed by path, which only ever affects our own"
         );
     }
 
