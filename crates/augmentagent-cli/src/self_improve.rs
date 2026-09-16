@@ -6013,44 +6013,28 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // no waiting: findings on THIS head withhold the merge and are said out
     // loud on the PR; every flavour of absence (no review, rate-limited,
     // free-tier quota gone) merges on the double codex LGTM.
-    // The head GitHub actually has for this PR. A CodeRabbit review is keyed
-    // to the commit GitHub recorded, so GitHub is the authority and is asked
-    // first — codex is right that a local remote-tracking ref can be stale,
-    // and filtering reviews against an old sha would miss findings on the very
-    // head being merged.
+    // The head GitHub actually has for this PR, from GitHub, or nothing.
     //
-    // The local ref is the FALLBACK, not the source: it covers a transient API
-    // failure without inventing an answer. If both are unavailable the state
-    // is reported as unknown rather than assumed clean — unknown is not
-    // absent, which is the lesson this whole path is built around.
-    let head_sha = {
-        let authoritative = match pr_number {
-            Some(n) => run(
-                &gh,
-                &["pr", "view", &n.to_string(), "--json", "headRefOid", "-q", ".headRefOid"],
-                repo_root,
-            )
-            .await
-            .ok()
-            .filter(|(ok, ..)| *ok)
-            .map(|(_, out, _)| out.trim().to_string())
-            .filter(|sha| sha.len() == 40),
-            None => None,
-        };
-        match authoritative {
-            Some(sha) => sha,
-            None => run(
-                "git",
-                &["rev-parse", &format!("refs/remotes/origin/{branch}")],
-                repo_root,
-            )
-            .await
-            .ok()
-            .filter(|(ok, ..)| *ok)
-            .map(|(_, out, _)| out.trim().to_string())
-            .filter(|sha| sha.len() == 40)
-            .unwrap_or_default(),
-        }
+    // A CodeRabbit review is keyed to the commit GitHub recorded, so only
+    // GitHub can answer. I tried a local remote-tracking ref as a fallback for
+    // availability; codex was right to reject it twice. A stale ref does not
+    // degrade gracefully — it returns a CONFIDENT wrong answer, and reviews
+    // filtered against an old sha silently miss findings on the very head
+    // being merged. A guess that looks like knowledge is worse than an
+    // admitted unknown, which is the whole argument of this code path.
+    let head_sha = match pr_number {
+        Some(n) => run(
+            &gh,
+            &["pr", "view", &n.to_string(), "--json", "headRefOid", "-q", ".headRefOid"],
+            repo_root,
+        )
+        .await
+        .ok()
+        .filter(|(ok, ..)| *ok)
+        .map(|(_, out, _)| out.trim().to_string())
+        .filter(|sha| sha.len() == 40)
+        .unwrap_or_default(),
+        None => String::new(),
     };
     if pr_number.is_none() {
         // Codex, system pass: with no parseable PR number the CodeRabbit read
