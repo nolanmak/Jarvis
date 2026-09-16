@@ -117,6 +117,13 @@ the live adapter test uses default discovery or the daemon override.
 
 ## Fallback diagnostics
 
+Required MCP startup failures use fixed readiness categories for initialization,
+timeout and missing tools, rather than an unsupported-method error or a traceback
+containing configured paths. The Codex adapter maps these categories to local
+readiness failures before logging or returning native CLI details, so they do not
+create provider-outage cooldowns. Synthetic tests verify that private configuration
+markers do not appear in the returned diagnostics.
+
 Doctor reports routing capacity separately for text, read, write and agentic
 workloads. Each configured provider is identified as a candidate, capability
 excluded, on cooldown, or unavailable at binary/auth preflight. A single candidate

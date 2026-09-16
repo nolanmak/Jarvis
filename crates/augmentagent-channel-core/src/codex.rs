@@ -376,6 +376,15 @@ impl CodexCliReasoner {
                     .map(str::to_string)
             })
             .unwrap_or_else(|| format!("{provider} exited {status:?} with no output"));
+        for (category, message) in [
+            ("mcp_start", "required MCP server could not start or initialize; check its binary, authentication and transport"),
+            ("mcp_timeout", "required MCP server timed out; check its availability and timeout setting"),
+            ("mcp_tools", "required MCP tool is missing; check the server version and tool profile"),
+        ] {
+            if detail.contains(&format!("JARVIS_READINESS:{category} ")) {
+                return Err(ReasonerError::Local { message: format!("codex: {message}") }.into());
+            }
+        }
         warn!("{provider} exec failed: {detail}");
         if looks_rate_limited(&detail) {
             return Err(rate_limit_err(provider, detail));
@@ -492,6 +501,37 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
         assert_eq!(got, "{\"decision\":\"reply\"}", "LastBlock keeps the final message");
         let all = r.call_transcript(&opts(), "classify this").await.unwrap();
         assert!(all.contains("scratch note") && all.contains("decision"));
+    }
+
+    #[tokio::test]
+    async fn required_bridge_readiness_failures_are_local_and_do_not_repeat_private_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(&dir, "fake-codex-readiness", r#"
+cat >/dev/null
+echo '{"type":"turn.failed","error":{"message":"required MCP server: JARVIS_READINESS:mcp_start PRIVATE_SYNTHETIC_CONFIGURATION"}}'
+exit 1
+"#);
+        let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global() };
+        let error = reasoner.call(&opts(), "Synthetic request").await.unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&error), Some(ReasonerError::Local { .. })), "{error}");
+        assert!(error.to_string().contains("MCP"));
+        assert!(!error.to_string().contains("PRIVATE_SYNTHETIC"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires installed Codex; verifies failure before any model tool execution"]
+    async fn live_missing_mcp_server_reports_local_readiness() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut options = crate::reasoner::resume_opts(fixture.path().into());
+        options.allowed_tools = vec!["mcp__fixture__search".into()];
+        options.settings_json = Some(serde_json::json!({"mcpServers":{"fixture":{
+            "command":fixture.path().join("PRIVATE_SYNTHETIC_MISSING_BINARY"),
+            "env":{"SYNTHETIC_SECRET":"PRIVATE_SYNTHETIC_TOKEN"}
+        }}}).to_string());
+        let error = CodexCliReasoner::openai().call(&options, "Synthetic readiness probe").await.unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&error), Some(ReasonerError::Local { .. })), "{error}");
+        assert!(error.to_string().contains("MCP"), "{error}");
+        assert!(!error.to_string().contains("PRIVATE_SYNTHETIC"), "{error}");
     }
 
     #[tokio::test]

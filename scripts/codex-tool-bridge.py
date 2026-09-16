@@ -21,6 +21,18 @@ class Denied(ValueError):
     """An operation is outside the declared profile."""
 
 
+class Readiness(Denied):
+    """Public diagnostics contain fixed categories, never configuration."""
+    MESSAGES = {
+        'mcp_start': 'Configured MCP server could not start or initialize; check its binary, authentication and transport.',
+        'mcp_timeout': 'Configured MCP server timed out; check its availability and timeout setting.',
+        'mcp_tools': 'Configured MCP server is missing a required tool; check the server version and tool profile.',
+    }
+
+    def __init__(self, category):
+        super().__init__('JARVIS_READINESS:' + category + ' ' + self.MESSAGES[category])
+
+
 class ReconciliationRequired(Denied):
     """Prior effects are uncertain; reads may gather evidence, writes must wait."""
 
@@ -992,7 +1004,7 @@ class Remote:
                 return reply
             remaining = deadline - time.monotonic()
             if remaining <= 0 or not select.select([self.process.stdout], [], [], max(0, remaining))[0]:
-                raise Denied('MCP timed out; request was not replayed')
+                raise Readiness('mcp_timeout')
             chunk = os.read(self.process.stdout.fileno(), 65536)
             if not chunk:
                 raise Denied('MCP connection closed; request was not replayed')
@@ -1108,11 +1120,14 @@ class Server:
             missing = [tool for tool in self.policy.tools if tool.startswith('mcp__')
                        and not tool.endswith('__*') and tool not in self.remote_tools]
             if missing:
-                raise Denied('required MCP tools are unavailable')
+                raise Readiness('mcp_tools')
             self.discovered = True
-        except Exception:
+        except Readiness:
             self.close()
             raise
+        except Exception as exc:
+            self.close()
+            raise Readiness('mcp_start') from exc
 
     def tools(self):
         self.discover()
@@ -1193,6 +1208,8 @@ class Server:
                 return {'isError': True, 'content': [{'type': 'text', 'text':
                     'An earlier operation has an uncertain outcome. Use read-only tools to inspect current state. '
                     'Do not repeat or start external changes until that outcome is reconciled.'}]}
+            except Readiness as error:
+                return {'isError': True, 'content': [{'type': 'text', 'text': str(error)}]}
             except (Denied, KeyError, TypeError, UnicodeError, OSError, ValueError):
                 return {'isError': True, 'content': [{'type': 'text',
                         'text': 'Operation denied or invalid for the configured profile.'}]}
@@ -1237,6 +1254,9 @@ def serve(config_path):
                 continue
             try:
                 response = {'jsonrpc': '2.0', 'id': request['id'], 'result': server.dispatch(request)}
+            except Readiness as error:
+                response = {'jsonrpc': '2.0', 'id': request['id'],
+                            'error': {'code': -32001, 'message': str(error)}}
             except Denied:
                 response = {'jsonrpc': '2.0', 'id': request['id'],
                             'error': {'code': -32601, 'message': 'Unsupported method'}}

@@ -662,7 +662,7 @@ for line in sys.stdin:
                     'args':['-I',str(fake)],'timeout':0.1}}}})
             server=bridge.Server(policy);self.addCleanup(server.close)
             start=time.monotonic()
-            with self.assertRaises(bridge.Denied): server.tools()
+            with self.assertRaisesRegex(bridge.Readiness, 'JARVIS_READINESS:mcp_timeout'): server.tools()
             self.assertLess(time.monotonic()-start,3)
 
     def test_missing_declared_remote_tool_fails_readiness(self):
@@ -679,8 +679,23 @@ for line in sys.stdin:
             policy=bridge.Policy({'cwd':tmp,'allowed_tools':['mcp__fixture__missing'],
                 'settings':{'mcpServers':{'fixture':{'command':sys.executable,'args':['-I',str(fake)]}}}})
             server=bridge.Server(policy);self.addCleanup(server.close)
-            with self.assertRaises(bridge.Denied):
+            with self.assertRaisesRegex(bridge.Readiness, 'JARVIS_READINESS:mcp_tools'):
                 server.dispatch({'method':'initialize','params':{}})
+
+    def test_missing_mcp_binary_reports_sanitized_readiness_not_unsupported_method(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);config=root/'policy.json'
+            config.write_text(json.dumps({'cwd':str(root),'allowed_tools':['mcp__fixture__search'],
+                'settings':{'mcpServers':{'fixture':{'command':str(root/'PRIVATE_SYNTHETIC_BINARY'),
+                    'env':{'SYNTHETIC_SECRET':'PRIVATE_SYNTHETIC_TOKEN'}}}}}));config.chmod(0o600)
+            request=json.dumps({'jsonrpc':'2.0','id':1,'method':'initialize'})+'\n'
+            result=subprocess.run([sys.executable,str(SPEC.origin),str(config)],input=request,
+                text=True,capture_output=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+            response=json.loads(result.stdout)
+            self.assertEqual(response['error']['code'],-32001)
+            self.assertIn('JARVIS_READINESS:mcp_start',response['error']['message'])
+            self.assertNotIn('PRIVATE_SYNTHETIC',result.stdout+result.stderr)
 
     def test_http_proxy_carries_session_and_auth_without_replaying_requests(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
