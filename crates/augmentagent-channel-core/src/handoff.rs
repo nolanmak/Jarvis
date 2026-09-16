@@ -107,6 +107,16 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Claude and Codex login; synthetic MCP counter only"]
     async fn live_primary_receipt_prevents_codex_repeating_an_external_effect() {
+        live_external_handoff(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Claude and Codex login; synthetic MCP disconnect after effect"]
+    async fn live_primary_disconnect_blocks_uncertain_effect_replay() {
+        live_external_handoff(true).await;
+    }
+
+    async fn live_external_handoff(disconnect: bool) {
         use crate::reasoner::{ClaudeCliReasoner, Reasoner};
         use crate::codex::CodexCliReasoner;
         use std::os::unix::fs::PermissionsExt;
@@ -116,7 +126,7 @@ mod tests {
         let counter = private.path().join("counter.txt");
         let server = private.path().join("fixture.py");
         std::fs::write(&server, r#"
-import json, pathlib, sys
+import json, os, pathlib, sys
 counter = pathlib.Path(sys.argv[1])
 for line in sys.stdin:
     request = json.loads(line)
@@ -133,37 +143,53 @@ for line in sys.stdin:
         assert request['params']['arguments'] == {'value':'synthetic'}
         count = int(counter.read_text()) + 1 if counter.exists() else 1
         counter.write_text(str(count))
+        if sys.argv[2] == 'disconnect':
+            os._exit(0)  # Effect happened, but neither provider receives a result.
         result = {'content':[{'type':'text','text':'SYNTHETIC_RECEIPT_'+str(count)}]}
     else:
         result = {}
     print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}),flush=True)
 "#).unwrap();
         let mut opts = crate::reasoner::loop_parse_opts();
-        opts.system_prompt = "Use only the supplied fixture MCP tool. Report its actual receipt. Do not use files or shell tools.".into();
+        opts.system_prompt = "Use only the supplied fixture MCP tool. Report its actual receipt or error. Do not retry errors. Do not use files or shell tools.".into();
         opts.allowed_tools = vec!["mcp__fixture__record".into()];
         opts.cwd = Some(workspace.path().into());
         opts.restrict_env = true;
         opts.settings_json = Some(json!({"mcpServers":{"fixture":{
-            "command":"python3","args":["-I",server,counter]
+            "command":"python3","args":["-I",server,counter,if disconnect { "disconnect" } else { "complete" }]
         }}}).to_string());
         let journal = private.path().join("operations.json");
         opts.handoff_path = Some(journal.clone());
         let request = "Call the fixture record tool with value=synthetic and return its receipt.";
-        let first = ClaudeCliReasoner::new().call(&opts, request).await.unwrap();
-        assert!(first.contains("SYNTHETIC_RECEIPT_1"), "{first}");
+        let first = ClaudeCliReasoner::new().call(&opts, request).await;
+        if !disconnect {
+            let first = first.unwrap();
+            assert!(first.contains("SYNTHETIC_RECEIPT_1"), "{first}");
+        }
         assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
         let state: Value = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
         let operations = state["operations"].as_array().unwrap();
         let effects: Vec<_> = operations.iter().filter(|row| row["tool"] == "mcp__fixture__record").collect();
         // Claude may also perform built-in MCP discovery before the call.
         assert_eq!(effects.len(), 1);
-        assert_eq!(effects[0]["status"], "completed");
+        assert_eq!(effects[0]["status"], if disconnect { "started" } else { "completed" });
         assert!(effects[0]["primary_id"].is_string());
-        assert!(operations.iter().all(|row| row["status"] == "completed"));
+        if !disconnect { assert!(operations.iter().all(|row| row["status"] == "completed")); }
         // Deliberately omit recovery prose: durable enforcement must still
         // return the receipt if the fallback tries to repeat the operation.
+        let audit = private.path().join("fallback-audit.jsonl");
+        opts.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
         let second = CodexCliReasoner::openai().call(&opts, request).await.unwrap();
-        assert!(second.contains("SYNTHETIC_RECEIPT_1"), "{second}");
+        if disconnect {
+            let records: Vec<Value> = std::fs::read_to_string(audit).unwrap().lines()
+                .map(|line| serde_json::from_str(line).unwrap()).collect();
+            assert!(records.iter().any(|row| row["provider"] == "codex"
+                && row["tool"] == "mcp__fixture__record"
+                && row["stderr_truncated"].as_str().is_some_and(|text| text.contains("uncertain outcome"))),
+                "fallback must receive the reconciliation refusal");
+        } else {
+            assert!(second.contains("SYNTHETIC_RECEIPT_1"), "{second}");
+        }
         assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
         let after: Value = serde_json::from_slice(&std::fs::read(journal).unwrap()).unwrap();
         assert_eq!(after, state);

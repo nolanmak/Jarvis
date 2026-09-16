@@ -525,6 +525,33 @@ console.log('DEPENDENCY_FIXTURE_OK');
 
 
 class HandoffTests(unittest.TestCase):
+    def test_memory_reconciliation_reads_stay_fresh_while_writes_are_uncertain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);workspace=root/'workspace';workspace.mkdir()
+            path=root/'handoff.json'
+            journal=bridge.HandoffJournal(path)
+            with self.assertRaises(ConnectionError):
+                journal.execute('mcp__memory__memory_write',{'body':'Synthetic'},
+                    lambda: (_ for _ in ()).throw(ConnectionError('uncertain')))
+            policy=bridge.Policy({'cwd':str(workspace),'read_roots':[str(workspace)],
+                'write_roots':[],'allowed_tools':['mcp__memory__*'],'handoff_path':str(path)})
+            server=bridge.Server(policy)
+            calls=[]
+            def read(name, arguments):
+                calls.append(name)
+                return {'content':[{'type':'text','text':str(len(calls))}]}
+            server.execute=read
+            for leaf in ['memory_search','memory_recent','search_conversation_history','read_conversation_thread']:
+                name='mcp__memory__'+leaf
+                self.assertNotEqual(server.call(name,{}),server.call(name,{}))
+                journal.observe_hook({'hook_event_name':'PreToolUse','tool_use_id':'read-'+leaf,
+                    'tool_name':name,'tool_input':{}})
+            for leaf in ['memory_write','memory_delete','memory_unknown']:
+                with self.assertRaises(bridge.ReconciliationRequired):
+                    server.call('mcp__memory__'+leaf,{})
+            self.assertEqual(len(calls),8)
+            self.assertEqual(len(journal.load()['operations']),1)
+
     def test_uncertain_write_allows_fresh_reconciliation_reads_but_no_more_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);workspace=root/'workspace';workspace.mkdir()

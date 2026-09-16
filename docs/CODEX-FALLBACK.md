@@ -157,6 +157,9 @@ remain fresh. Known read-only Gmail, repository-document, GitHub inspection and
 guarded SocialAPI operations also bypass mutation receipts so they can gather
 current evidence during reconciliation. Unknown operation contracts remain
 potentially mutating; server advisory annotations alone do not exempt a tool.
+The memory server's four explicit read contracts (search, recent, conversation
+search and thread read) also remain fresh while a write is uncertain. Memory
+writes and unknown tools still require reconciliation before they can run.
 An uncertain write returns a safe, actionable tool error without its arguments.
 Tests cover restart, ambiguous connection failure, corrupt and
 symlink state, model-scope exclusion and actual bridge receipt reuse.
@@ -185,7 +188,13 @@ same action without being given recovery prose. Codex returned the first
 receipt and the counter remained one. This verifies actual primary hook and
 fallback broker interoperability for a completed action.
 
-This is not completed cross-provider handoff. Live interrupted-effect recovery,
+The disconnect variant also passed with both real CLIs: the fixture performed
+its effect and exited before sending a response. The primary journal retained
+`started`, Codex received an audited reconciliation refusal, the journal stayed
+unchanged and the effect counter remained one. This verifies safe refusal after
+an ambiguous transport failure; it does not resolve that ambiguity automatically.
+
+This is not completed cross-provider handoff. Durable reconciliation decisions,
 effect-aware read/reconciliation operations, retention, caller identity coverage,
 intentional repeated-action semantics and interruption cleanup remain gates.
 Argument matching does not identify all semantically duplicate actions expressed
