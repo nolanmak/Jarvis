@@ -1293,6 +1293,7 @@ async fn merge_sweep(repo_root: &Path) -> usize {
             pr,
             issue,
             ours: head_is_ours(row, owner.as_deref()),
+            loop_authored: loop_authored(body, issue),
             mergeable: match row.get("mergeable").and_then(serde_json::Value::as_str) {
                 Some("MERGEABLE") => Some(true),
                 Some("CONFLICTING") => Some(false),
@@ -1407,6 +1408,21 @@ async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
     }))
 }
 
+/// #1029 — the loop's own signature on a PR body, and the only evidence that
+/// the loop actually opened a pull request.
+///
+/// `head_is_ours` (#1006) proves the head is in THIS repository, which is a
+/// different and weaker claim: a human can create `agent-fix/issue-N` here by
+/// hand. The sweep merges without a human in the loop, so it needs to know the
+/// loop wrote the thing it is finishing, not merely that the branch looks
+/// familiar.
+const SELF_IMPROVE_BODY_MARKER: &str = "Automated self-improvement for #";
+
+/// Did the loop write this PR body, for this issue?
+fn loop_authored(body: &str, issue: u64) -> bool {
+    body.contains(&format!("{SELF_IMPROVE_BODY_MARKER}{issue}."))
+}
+
 /// #1029 — every input the auto-merge decision takes, in one place.
 ///
 /// Extracted so the fresh path and the merge sweep share ONE policy. Two
@@ -1470,6 +1486,9 @@ struct SweepCandidate {
     issue: u64,
     /// #1006 — is this head in THIS repository? `None` means unprovable.
     ours: Option<bool>,
+    /// #1029 — did the LOOP write this PR, as opposed to a human using an
+    /// agent-shaped branch name in the same repository?
+    loop_authored: bool,
     mergeable: Option<bool>,
     checks_green: Option<bool>,
     codex_lgtms: u32,
@@ -1491,6 +1510,12 @@ fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
     let skip = |why: &str| SweepVerdict::Skip(format!("PR #{}: {why}", c.pr));
     if c.ours != Some(true) {
         return skip("not ours — the loop only finishes work it opened (#1006)");
+    }
+    if !c.loop_authored {
+        // Same repository is not the same as loop-authored. A human can open
+        // `agent-fix/issue-N` here by hand; the sweep merges with nobody
+        // watching, so it needs the loop's own signature on the body.
+        return skip("not ours — no self-improve signature on the PR body");
     }
     if c.mergeable != Some(true) {
         return skip("conflict with main, or mergeability unknown; a rebase is the resume lane's job");
@@ -6423,7 +6448,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // original run was given rather than inventing new ones.
     let criteria_section = criteria_pr_section(&criteria);
     let pr_body = format!(
-        "Automated self-improvement for #{}.\n\n## Summary\n{}{plan_section}\n\n\
+        "{SELF_IMPROVE_BODY_MARKER}{}.\n\n## Summary\n{}{plan_section}\n\n\
          ## QA review (approved)\n{}{independent_section}{criteria_section}\n## Verification\n\
          - complexity (scoping pass): {}\n\
          - `cargo build --workspace`: pass\n- `cargo test --workspace`: pass\n\
@@ -10873,6 +10898,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             pr: 1020,
             issue: 1007,
             ours: Some(true),
+            loop_authored: true,
             mergeable: Some(true),
             checks_green: Some(true),
             codex_lgtms: 2,
@@ -10893,9 +10919,11 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             }
         };
 
-        // C6 — a PR the loop did not open is never touched.
+        // C6 — a PR the loop did not open is never touched. Both halves:
+        // a foreign head, and a same-repo PR the loop did not write.
         refuse(|c| c.ours = Some(false), "not ours");
         refuse(|c| c.ours = None, "not ours");
+        refuse(|c| c.loop_authored = false, "signature");
         // C4 — conflicts and red checks.
         refuse(|c| c.mergeable = Some(false), "conflict");
         refuse(|c| c.mergeable = None, "conflict");
@@ -10905,6 +10933,33 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         refuse(|c| c.codex_lgtms = 1, "review");
         refuse(|c| c.rabbit_blocks = true, "coderabbit");
         refuse(|c| c.policy.reviews_approved = false, "policy");
+    }
+
+    /// Codex: `head_is_ours` proves the head is in THIS repository, which is
+    /// a weaker claim than "the loop opened this". A human can create
+    /// `agent-fix/issue-N` here by hand, put two approval strings in the body,
+    /// and the sweep would have merged it with nobody watching.
+    ///
+    /// The loop signs every PR body it writes, so that signature is the
+    /// evidence — and the writer and reader share one constant so the
+    /// signature cannot drift out from under the check.
+    #[test]
+    fn same_repository_is_not_the_same_as_loop_authored() {
+        assert!(loop_authored("Automated self-improvement for #1007.\n\n## Summary", 1007));
+        // A human PR on an agent-shaped branch.
+        assert!(!loop_authored("Fixes #1007 by hand.\n\n## Summary", 1007));
+        // Right shape, wrong issue: not this PR's provenance.
+        assert!(!loop_authored("Automated self-improvement for #999.", 1007));
+        assert!(!loop_authored("", 1007));
+
+        // The writer must use the same constant, or the signature drifts away
+        // from the check and every sweep silently stops merging.
+        let src = include_str!("self_improve.rs");
+        let start = src.find("let pr_body = format!(").expect("the body writer");
+        assert!(
+            src[start..start + 200].contains("SELF_IMPROVE_BODY_MARKER"),
+            "the writer must use the shared marker"
+        );
     }
 
     /// Codex: I had hardcoded two of the sweep's inputs, and each one silently
