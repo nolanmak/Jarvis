@@ -11439,6 +11439,48 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         );
     }
 
+    /// The residual codex and I did not agree on, written down as a test so
+    /// it is a decision on the record rather than an accident.
+    ///
+    /// If CodeRabbit's state cannot be READ — both the local remote-tracking
+    /// ref and the `gh` fallback failed — the merge proceeds, and the PR says
+    /// it proceeded without that state. Codex argued for failing closed on the
+    /// grounds that an unread review is not an absent one, which is true and
+    /// is why the lookup now reads a local ref first.
+    ///
+    /// The direction is the owner's, 2026-09-16: "if Codex give LGTM should
+    /// merge not wait for coderabbit. Im on their free tier so might run out."
+    /// An advisory input that can block when it is merely unreachable is not
+    /// advisory, and stranding an approved PR is the exact failure this issue
+    /// exists to end — #1000 sat for two days, #1020 until merged by hand.
+    /// Reaching this path needs a local git read AND a GitHub call to fail AND
+    /// CodeRabbit to have posted findings in the seconds between create and
+    /// merge.
+    #[test]
+    fn an_unreadable_coderabbit_state_merges_and_says_so() {
+        // Unknown must produce a REAL review object carrying its reason, so it
+        // flows into the PR body like any other state rather than vanishing.
+        let unknown = RabbitReview::unavailable("its state could not be read (head lookup failed)");
+        assert!(
+            !unknown.blocks() && unknown.approved(),
+            "an unreachable advisory reviewer cannot withhold a merge"
+        );
+        let note = rabbit_merge_note(&unknown);
+        assert!(
+            note.contains("could not be read"),
+            "the PR must say the state was unknown, not imply it was clean: {note}"
+        );
+
+        // And the code takes that branch rather than skipping the read wholesale.
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        assert!(
+            body.contains("could not be read (head lookup failed)"),
+            "the unknown case must construct a stated review, not an empty default"
+        );
+    }
+
     /// C7, narrowed — and the narrowing is the point rather than a dodge.
     ///
     /// I wrote C7 as "the note says what CodeRabbit's state was at merge time"
