@@ -716,9 +716,10 @@ impl ClaudeCliReasoner {
                 ReasonerError::GateTimeout { provider: "claude".into(), waited_secs },
             )),
             // Untyped on purpose — content-level, neither latches nor fails
-            // over (#655 review).
+            // over (#655 review). A Content TurnFailure (#1040), so the chain
+            // can tell a finished-but-silent turn from any other untyped error.
             Err(CallError::EmptyOutput) => {
-                Err(anyhow::anyhow!("claude produced no assistant text"))
+                Err(crate::turn_failure::TurnFailure::empty_output("claude").into())
             }
             Err(CallError::ConfigCorrupted { stderr }) => {
                 let recovered = match restore_latest_claude_backup() {
@@ -752,7 +753,7 @@ impl ClaudeCliReasoner {
                             return Err(ReasonerError::GateTimeout { provider, waited_secs }.into());
                         }
                         Err(CallError::EmptyOutput) => {
-                            return Err(anyhow::anyhow!("claude produced no assistant text"));
+                            return Err(crate::turn_failure::TurnFailure::empty_output("claude").into());
                         }
                         Err(CallError::Other(e)) => return Err(classify_other("claude", e)),
                     }
@@ -3882,6 +3883,22 @@ sleep 0.15
         assert!(max >= 2, "gate should still allow concurrency, saw {max}");
         assert_eq!(gate.in_flight(), 0);
         assert_eq!(gate.waiting(), 0);
+    }
+
+    /// #1069 review M3 — claude's empty output is the same content-level
+    /// ending as codex's: a `TurnFailure` of class Content, still untyped for
+    /// the chain, so the fallback layer can tell it apart from any other
+    /// untyped error before recording a completed-without-summary verdict.
+    #[tokio::test]
+    async fn empty_output_is_a_content_turn_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(&dir, "fake-claude-empty", "cat >/dev/null\n");
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
+        assert!(ReasonerError::find_in(&err).is_none(), "{err:#}");
+        assert_eq!(err.to_string(), "claude produced no assistant text");
+        assert_eq!(err.downcast_ref::<crate::turn_failure::TurnFailure>().map(|f| f.class),
+            Some(crate::turn_failure::FailureClass::Content));
     }
 
     /// A permit must go back on every exit path: non-zero exit, and the

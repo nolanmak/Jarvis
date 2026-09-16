@@ -13,17 +13,23 @@
 //!   content-level problem — re-asking a different model would convert
 //!   refusals into plausible-but-wrong answers, the #450/#451 pathway.
 //!   Adapters use this on purpose for turns that ended on their own content:
-//!   claude's `EmptyOutput`, and codex's [`TurnFailure`](crate::turn_failure::TurnFailure)
-//!   classes (#1040). The table in `turn_failure` decides which codex
-//!   failures are outages.
-//! - **Finished work without a summary is not dispatched again (#1040).** When a write or
-//!   agentic call ends untyped after its journal recorded completed
-//!   operations, the chain returns
-//!   [`CompletedWithoutSummary`](crate::CompletedWithoutSummary)
-//!   and records that verdict next to the journal. A later dispatch of the
-//!   same request returns the verdict again without spawning a provider.
-//!   A provider-side interruption is not a finished turn, so the next
-//!   provider still resumes from the receipts, as before.
+//!   a content-class [`TurnFailure`](crate::turn_failure::TurnFailure),
+//!   which claude's empty output and codex's content failures both are
+//!   (#1040). The table in `turn_failure` decides which codex failures are
+//!   outages. A codex failure that table does not recognise is an outage on a
+//!   text or read call, and untyped on a write or agentic call. For write or
+//!   agentic calls, `UNRECOGNISED_STRIKE_LIMIT` consecutive untyped failures
+//!   latch the provider for the short outage cooldown, but the failed calls
+//!   are never re-dispatched.
+//! - **Finished work without a summary is not dispatched again (#1040).**
+//!   When a write or agentic call ends with a Content `TurnFailure` and its
+//!   journal holds completed operations and no uncertain ones, the chain
+//!   returns [`CompletedWithoutSummary`](crate::CompletedWithoutSummary) and
+//!   records that verdict next to the journal. A later dispatch that uses
+//!   the same journal (the same turn identity) returns the verdict again
+//!   without spawning a provider. A provider-side interruption or an
+//!   unrecognised ending is not a finished turn, so a retry still resumes
+//!   from the receipts, as before.
 //! - **One pass over the chain per call.** No per-provider retries; #448's
 //!   no-retry rule survives intact inside each adapter.
 //!
@@ -69,6 +75,24 @@ fn default_unavailable_cooldown() -> chrono::Duration {
         .filter(|s| *s > 0)
         .unwrap_or(60);
     chrono::Duration::seconds(secs)
+}
+
+/// #1040 / #1069 review H1 — consecutive unrecognised failures on write or
+/// agentic calls before the provider is latched for the outage cooldown.
+///
+/// One is not enough: it may be a content failure in wording the table does
+/// not know, and latching would take a healthy provider away from every other
+/// caller. Three in a row with no success between them is the provider, not
+/// one request. The latch that follows is the same short outage cooldown
+/// (`AUGMENTAGENT_COOLDOWN_UNAVAILABLE_SECS`, 60 s by default), so a real
+/// outage costs at most three spawns per cooldown instead of one per request,
+/// and a wrong guess costs one minute. The failed calls themselves are never
+/// re-dispatched: the latch only affects later requests.
+const UNRECOGNISED_STRIKE_LIMIT: u32 = 3;
+
+/// Strikes further apart than this do not add up to a run.
+fn unrecognised_strike_window() -> chrono::Duration {
+    chrono::Duration::hours(1)
 }
 
 /// Hard ceiling on any latch derived from a PARSED reset hint (#655 review).
@@ -537,24 +561,50 @@ impl FallbackReasoner {
                     }
                     // CleanupUncertain: typed, and it stops the chain.
                     Some(_) => return Err(err),
-                    // Untyped: a content-level ending (no final text, a turn
-                    // that failed on its own content, or a failure nothing
-                    // recognised). Never latched, never failed over. If a
-                    // mutating call already completed operations, report
-                    // that (#1040 C3) so a retry cannot repeat them.
+                    // Untyped: the turn ended on its own content (no final
+                    // text, a content-level turn.failed), a failure nothing
+                    // recognised on a write-capable call, or an error from
+                    // above the provider layer. Never failed over.
                     None => {
-                        if let (true, Some(journal)) = (mutating, &opts.handoff_path) {
-                            match crate::handoff_outcome::settle(journal) {
-                                Ok(Some(verdict)) => {
-                                    warn!(provider = name, completed = verdict.completed,
-                                        "call ended without a summary after completing operations; \
-                                         recorded so the request is not dispatched again");
-                                    return Err(err.context(verdict));
+                        use crate::turn_failure::{FailureClass, TurnFailure};
+                        match err.downcast_ref::<TurnFailure>().map(|failure| failure.class) {
+                            // #1040 C3: a mutating call that finished its work
+                            // without a summary is never dispatched again.
+                            Some(FailureClass::Content) if mutating => if let Some(journal) = &opts.handoff_path {
+                                match crate::handoff_outcome::settle(journal) {
+                                    Ok(crate::handoff_outcome::Settlement::Completed(verdict)) => {
+                                        warn!(provider = name, completed = verdict.completed,
+                                            "call ended without a summary after completing operations; \
+                                             recorded so the request is not dispatched again");
+                                        return Err(err.context(verdict));
+                                    }
+                                    Ok(crate::handoff_outcome::Settlement::Uncertain { uncertain }) => {
+                                        warn!(provider = name, uncertain,
+                                            "call ended without a summary with uncertain operations; \
+                                             they need reconciliation, no verdict recorded");
+                                        return Err(err.context(format!(
+                                            "{uncertain} operation(s) of this request are uncertain and need \
+                                             reconciliation before it can finish")));
+                                    }
+                                    Ok(crate::handoff_outcome::Settlement::Nothing) => {}
+                                    Err(error) => warn!(provider = name,
+                                        "operation journal unreadable after a content-level ending ({error:#})"),
                                 }
-                                Ok(None) => {}
-                                Err(error) => warn!(provider = name,
-                                    "operation journal unreadable after a content-level ending ({error:#})"),
+                            },
+                            // #1069 review H1: never re-dispatched, but a run
+                            // of them is an outage the table does not know.
+                            Some(FailureClass::Unrecognised) => {
+                                let strikes = self.latch.strike(name, unrecognised_strike_window());
+                                if strikes >= UNRECOGNISED_STRIKE_LIMIT {
+                                    let until = Utc::now() + default_unavailable_cooldown();
+                                    warn!(provider = name, strikes, %until,
+                                        "consecutive unrecognised failures; latched for the outage cooldown \
+                                         (the failed calls are not re-dispatched)");
+                                    self.latch.latch(name, until,
+                                        &format!("{name}: {strikes} consecutive unrecognised failures"));
+                                }
                             }
+                            _ => {}
                         }
                         return Err(err);
                     }
@@ -1257,7 +1307,7 @@ exit 1
     }
 
     fn no_summary() -> anyhow::Error {
-        anyhow::anyhow!("codex produced no assistant text")
+        crate::turn_failure::TurnFailure::empty_output("codex").into()
     }
 
     fn completed_operation() -> serde_json::Value {
@@ -1291,7 +1341,7 @@ exit 1
         ], latch.clone());
         chain.handoff_root = Some(dir.path().join("private/handoffs"));
         let opts = write_request(&dir);
-        let expected = crate::handoff_outcome::CompletedWithoutSummary { completed: 1, uncertain: 0 };
+        let expected = crate::handoff_outcome::CompletedWithoutSummary { completed: 1 };
         for attempt in 0..3 {
             let err = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
             assert!(ReasonerError::find_in(&err).is_none(), "attempt {attempt} must stay untyped: {err:#}");
@@ -1325,6 +1375,146 @@ exit 1
             assert!(err.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>().is_none());
         }
         assert_eq!(primary.count(), 2);
+    }
+
+    /// A stub CLI that records one line per spawn in the returned file.
+    fn counting_stub(dir: &tempfile::TempDir, name: &str, body: &str) -> (String, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.path().join(name);
+        let count = dir.path().join(format!("{name}.count"));
+        std::fs::write(&bin, format!("#!/usr/bin/env bash\ncat >/dev/null\necho spawn >> '{}'\n{body}", count.display())).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (bin.to_string_lossy().into_owned(), count)
+    }
+
+    fn spawns(count: &std::path::Path) -> usize {
+        std::fs::read_to_string(count).map(|text| text.lines().count()).unwrap_or(0)
+    }
+
+    /// A turn that began and failed with text the table does not recognise
+    /// (a bad model override: codex 0.154's 404 shape).
+    const UNRECOGNISED_TURN: &str = r#"echo '{"type":"turn.started"}'
+echo '{"type":"turn.failed","error":{"message":"unexpected status 404 Not Found: model_not_found"}}'
+exit 1
+"#;
+
+    /// #1069 review H1 — a text-only or read-only call cannot repeat a write,
+    /// so an unrecognised codex failure there is an outage: codex is latched,
+    /// the next provider serves, and later calls do not respawn codex (the
+    /// triage re-poll storm the latch exists for).
+    #[tokio::test]
+    async fn unrecognised_codex_failure_on_text_and_read_calls_latches_and_fails_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut read = text_only_opts();
+        read.allowed_tools = vec!["Read".into(), "Grep".into()];
+        for (label, opts) in [("text", text_only_opts()), ("read", read)] {
+            let (bin, count) = counting_stub(&dir, &format!("fake-codex-{label}"), UNRECOGNISED_TURN);
+            let latch = CooldownLatch::at(dir.path().join(format!("{label}-cooldowns.json")));
+            let backup = Scripted::ok("served by the next provider");
+            let chain = FallbackReasoner::for_tests(vec![
+                (ProviderKind::Codex, Arc::new(crate::codex::CodexCliReasoner::with_bin(bin)) as Arc<dyn Reasoner>),
+                (ProviderKind::Gemini, backup.clone() as Arc<dyn Reasoner>),
+            ], latch.clone());
+            for _ in 0..3 {
+                assert_eq!(chain.call(&opts, "synthetic triage").await.unwrap(), "served by the next provider", "{label}");
+            }
+            assert!(latch.latched_until("codex").is_some(), "{label}: codex must be latched");
+            assert_eq!(spawns(&count), 1, "{label}: a latched codex is not respawned per call");
+            assert_eq!(backup.count(), 3, "{label}");
+        }
+    }
+
+    /// #1069 review H1 — on a write-capable call an unrecognised failure is
+    /// never re-dispatched and the first strikes latch nothing. Three in a row
+    /// with no success between latch codex for the short outage cooldown, so
+    /// later requests stop respawning it. The failed calls themselves are
+    /// still never re-run on another provider.
+    #[tokio::test]
+    async fn repeated_unrecognised_write_failures_back_off_without_redispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, count) = counting_stub(&dir, "fake-codex-write", UNRECOGNISED_TURN);
+        let latch = latch_in(&dir);
+        let backup = Scripted::ok("a new request served elsewhere");
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, Arc::new(crate::codex::CodexCliReasoner::with_bin(bin)) as Arc<dyn Reasoner>),
+            (ProviderKind::Claude, backup.clone() as Arc<dyn Reasoner>),
+        ], latch.clone());
+        let opts = write_request(&dir);
+        for strike in 1..=3 {
+            let err = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
+            assert!(ReasonerError::find_in(&err).is_none(), "strike {strike}: {err:#}");
+            assert_eq!(backup.count(), 0, "strike {strike}: the failed write is never re-run elsewhere");
+            assert_eq!(latch.latched_until("codex").is_some(), strike == 3, "strike {strike}: latch");
+        }
+        assert_eq!(chain.call(&opts, "Another synthetic ingest request").await.unwrap(), "a new request served elsewhere");
+        assert_eq!(spawns(&count), 3, "a backed-off codex is not respawned");
+    }
+
+    /// #1069 review M3 — only a content-level ending earns the "completed
+    /// without summary" verdict. A codex killed mid-turn after a write is an
+    /// unrecognised ending: the request did not finish, so no verdict is
+    /// recorded and a caller retry is dispatched again (resuming from the
+    /// receipts, which stop the completed operation repeating).
+    #[tokio::test]
+    async fn killed_mid_write_turn_is_not_marked_completed() {
+        struct EffectThenKilled {
+            inner: crate::codex::CodexCliReasoner,
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Reasoner for EffectThenKilled {
+            async fn call(&self, opts: &ReasonerOpts, message: &str) -> anyhow::Result<String> {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let path = opts.handoff_path.as_ref().expect("mutating calls carry an operation journal");
+                std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(path)?
+                    .write_all(serde_json::json!({"version": 1, "operations": completed_operation()}).to_string().as_bytes())?;
+                self.inner.call(opts, message).await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, count) = counting_stub(&dir, "fake-codex-killed", "echo '{\"type\":\"turn.started\"}'\nkill -9 $$\n");
+        let primary = Arc::new(EffectThenKilled { inner: crate::codex::CodexCliReasoner::with_bin(bin), calls: AtomicUsize::new(0) });
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
+        chain.handoff_root = Some(dir.path().join("private/handoffs"));
+        let opts = write_request(&dir);
+        for attempt in 0..2 {
+            let err = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
+            assert!(err.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>().is_none(),
+                "attempt {attempt}: an unfinished request is not completed: {err:#}");
+            assert_eq!(err.downcast_ref::<crate::turn_failure::TurnFailure>().map(|f| f.class),
+                Some(crate::turn_failure::FailureClass::Unrecognised), "attempt {attempt}");
+        }
+        assert_eq!(primary.calls.load(Ordering::SeqCst), 2, "the unfinished request is dispatched again");
+        assert_eq!(spawns(&count), 2);
+    }
+
+    /// #1069 review M1(d) — a verdict is permanent, so none is recorded while
+    /// any operation is uncertain. The request stays on the journal's own
+    /// reconciliation gate instead, and says so.
+    #[tokio::test]
+    async fn uncertain_operations_block_on_reconciliation_not_on_a_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rows = completed_operation();
+        rows.as_array_mut().unwrap().push(serde_json::json!(
+            {"tool": "mcp__fixture__update", "arguments": {}, "status": "started"}));
+        let primary = Journaling::new(rows, no_summary);
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
+        chain.handoff_root = Some(dir.path().join("private/handoffs"));
+        let opts = write_request(&dir);
+        for attempt in 0..2 {
+            let err = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
+            assert!(err.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>().is_none(),
+                "attempt {attempt}: {err:#}");
+            assert!(format!("{err:#}").contains("reconciliation"), "attempt {attempt}: {err:#}");
+        }
+        assert_eq!(primary.count(), 2);
+        assert!(primary.messages.lock().unwrap()[1].contains("started"), "the retry carries the uncertain receipt");
     }
 
     /// #1040 keeps the #1021 handoff contract: a provider-side interruption

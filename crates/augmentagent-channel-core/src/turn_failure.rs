@@ -18,26 +18,40 @@
 //! | `Auth`         | `ReasonerError::Unavailable`   | short             | yes           |
 //! | `Binary`       | `ReasonerError::Unavailable`   | short             | yes           |
 //! | `Content`      | [`TurnFailure`]                | never             | never         |
-//! | `Unrecognised` | [`TurnFailure`]                | never             | never         |
+//! | `Unrecognised`, text or read call | `ReasonerError::Unavailable` | short | yes |
+//! | `Unrecognised`, write or agentic call | [`TurnFailure`] | short, after repeated strikes | never |
 //!
 //! [`TurnFailure`] is deliberately not a [`ReasonerError`]. `FallbackReasoner`
-//! returns any such error immediately, the same way it handles claude's
-//! `EmptyOutput`. Callers can still downcast it to read the class. For
-//! write and agentic calls, the chain then checks the request's operation
-//! journal (see `handoff_outcome`), so a caller retry cannot repeat work that
-//! already finished.
+//! returns any such error immediately. Claude's `EmptyOutput` is a Content
+//! `TurnFailure` too. Callers can still downcast it to read the class. When a
+//! write or agentic call ends in Content, the chain also checks the request's
+//! operation journal (see `handoff_outcome`), so a caller retry cannot repeat
+//! work that already finished.
 //!
-//! **Default when nothing matches: `Unrecognised`, never an outage.** A missed
-//! outage costs one failed call and no latch, and the next call probes the
-//! provider again. A content failure misread as an outage latches a healthy
-//! provider (for hours, on a quota misread) and dispatches the request again,
-//! repeating effects that may already have happened. Content rows are matched
-//! before provider rows for the same reason. The one exception comes before
-//! the turn begins: if the provider exits before reporting any turn or item
-//! event, no tool can have run, so an unexplained exit counts as the binary
-//! failing to start. That keeps a broken install failing over, as it did
+//! **Default when nothing matches: `Unrecognised`, routed by what the call
+//! can do.**
+//! - A write or agentic call fails safe: the chain does not advance, and the
+//!   first failures latch nothing. A content failure misread as an outage
+//!   would latch a healthy provider (for hours, on a quota misread) and
+//!   dispatch the request again, repeating effects that may already have
+//!   happened. Some unknown failures are real outages, though, and they must
+//!   not respawn the provider on every later request. So `FallbackReasoner`
+//!   latches the provider for the short outage cooldown after a few
+//!   consecutive unrecognised failures.
+//! - A text-only or read-only call cannot repeat a write, so an unrecognised
+//!   failure there is an outage: latch and fail over. Otherwise a provider
+//!   failing in a way the table does not know would be respawned on every
+//!   triage re-poll, and the next provider would never serve.
+//!
+//! Content rows are matched before the other needle rows for the same reason.
+//! An explicit HTTP status (`status 429`, `status 503`, `status 401`) is
+//! matched before any needle. It is the transport's own verdict, while the
+//! body is free text that can quote anything. If the provider exits before
+//! reporting any turn or item event, no tool can have run, so an unexplained
+//! exit counts as the binary failing to start and fails over, as it did
 //! before #1040.
 
+use crate::providers::CapabilityClass;
 use crate::reasoner::{parse_reset_hint, ReasonerError};
 
 /// One failure class per row of the module table.
@@ -91,10 +105,11 @@ const READINESS: &[(&str, &str)] = &[
     ("mcp_tools", "required MCP tool is missing; check the server version and tool profile"),
 ];
 
-/// The classifier, in match order: the first row with a needle found in the
+/// The needle rows, in match order: the first row with a needle found in the
 /// lowercased failure text wins. `Content` comes first (see the module doc).
-/// Needles are the wording codex and the Responses API use. Keep them
-/// specific: a needle that shows up inside unrelated text becomes a latch.
+/// Needles are the wording codex and the Responses API use, taken from the
+/// installed CLI (`strings`) where it has one. Keep them specific: a needle
+/// that shows up inside unrelated text becomes a latch.
 const RULES: &[(FailureClass, &[&str])] = &[
     (FailureClass::Content, &[
         // Context overflow, in each wording codex and the API use.
@@ -104,12 +119,16 @@ const RULES: &[(FailureClass, &[&str])] = &[
         "exceeds the model-context limit",
         "input exceeds the maximum length",
         "ran out of room",
-        // A policy refusal of this request.
-        "usage policy",
+        // A policy refusal of this request. Not a bare "usage policy" or
+        // "flagged for possible": quota and account messages use those too.
+        "invalid prompt:",
         "invalid_prompt",
+        "violating our usage policy",
         "content_filter",
         "misalignment policy",
-        "flagged for possible",
+        "cyber policy",
+        "request has been flagged for possible",
+        "content was flagged for possible",
         // The Jarvis bridge refusing further tool calls in this request.
         "requires reconciliation",
         "reconciliation required",
@@ -125,8 +144,14 @@ const RULES: &[(FailureClass, &[&str])] = &[
         "payment required",
         "quota exceeded",
         "quota exhausted",
+        "exceeded your current quota",
+        "check your plan and billing",
         "usage not included",
         "usage_not_included",
+        // Plan and workspace walls.
+        "upgrade to plus",
+        "out of credits",
+        "spend cap",
     ]),
     (FailureClass::Auth, &[
         "unauthorized",
@@ -137,10 +162,19 @@ const RULES: &[(FailureClass, &[&str])] = &[
         "invalid_api_key",
         "access token",
         "refresh token",
+        "authentication token",
+        "authentication session",
         "token expired",
         "token has expired",
+        "token is expired",
+        "token_expired",
+        "token data",
+        "auth is missing",
+        "auth is not configured",
         "sign in again",
+        "signing in again",
         "log in again",
+        "deactivated",
     ]),
     (FailureClass::Transport, &[
         "stream disconnected",
@@ -156,6 +190,7 @@ const RULES: &[(FailureClass, &[&str])] = &[
         "failed to lookup address",
         "network is unreachable",
         "no route to host",
+        "upstream connect error",
         "internal server error",
         "bad gateway",
         "service unavailable",
@@ -168,12 +203,29 @@ const RULES: &[(FailureClass, &[&str])] = &[
     ]),
     (FailureClass::Binary, &[
         "panicked at",
+        "agent loop died",
     ]),
 ];
 
 /// HTTP statuses that name a quota wall on their own. Matched as standalone
 /// digit tokens only (#655 review): a bare substring fired inside request ids.
 const QUOTA_STATUS_CODES: &[&str] = &["429", "402"];
+
+/// The class an explicit HTTP status names: `unexpected status 520 …`,
+/// `last status: 529`, `HTTP/1.1 503`. 400, 403 and 404 name no class on
+/// their own (a 400 can be a context overflow, a 403 a policy block, a 404 a
+/// mistyped model override), so their bodies decide.
+fn explicit_status(lower: &str) -> Option<FailureClass> {
+    static STATUS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\b(?:status|http)(?:/\d(?:\.\d)?)?[\s:=]*(\d{3})\b").expect("status pattern")
+    });
+    STATUS.captures_iter(lower).find_map(|captures| match captures[1].parse::<u16>().ok()? {
+        402 | 429 => Some(FailureClass::Quota),
+        401 => Some(FailureClass::Auth),
+        500..=599 => Some(FailureClass::Transport),
+        _ => None,
+    })
+}
 
 /// Classify a provider's failure text. Set `turn_began` once the provider
 /// has reported any turn or item event, because tools may have run from then
@@ -183,6 +235,9 @@ pub fn classify(detail: &str, turn_began: bool) -> FailureClass {
         return FailureClass::Readiness;
     }
     let lower = detail.to_ascii_lowercase();
+    if let Some(class) = explicit_status(&lower) {
+        return class;
+    }
     let status_token = |code: &&str| lower.split(|c: char| !c.is_ascii_digit()).any(|t| t == *code);
     for (class, needles) in RULES {
         if needles.iter().any(|needle| lower.contains(needle))
@@ -217,9 +272,9 @@ impl TurnFailure {
     }
 }
 
-/// The error the fallback chain acts on for `class`, following the module
-/// table.
-pub(crate) fn turn_error(provider: &str, class: FailureClass, detail: String) -> anyhow::Error {
+/// The error the fallback chain acts on for `class` on a call of
+/// `capability`, following the module table.
+pub(crate) fn turn_error(provider: &str, class: FailureClass, capability: CapabilityClass, detail: String) -> anyhow::Error {
     let short = || detail.chars().take(300).collect::<String>();
     match class {
         FailureClass::Readiness => {
@@ -236,6 +291,14 @@ pub(crate) fn turn_error(provider: &str, class: FailureClass, detail: String) ->
         }.into(),
         FailureClass::Transport | FailureClass::Auth | FailureClass::Binary => {
             ReasonerError::Unavailable { provider: provider.into(), message: short() }.into()
+        }
+        // A text or read call cannot repeat a write, so an unexplained failure
+        // there is an outage: the chain latches the provider and moves on.
+        FailureClass::Unrecognised if matches!(capability, CapabilityClass::TextOnly | CapabilityClass::ReadTools) => {
+            ReasonerError::Unavailable {
+                provider: provider.into(),
+                message: format!("{}: {}", class.label(), short()),
+            }.into()
         }
         FailureClass::Content | FailureClass::Unrecognised => TurnFailure {
             provider: provider.into(),
@@ -293,6 +356,61 @@ mod tests {
         }
     }
 
+    /// #1069 review H2/L3: exact wording from the installed codex 0.154
+    /// binary (`strings`), plus the probe's HTTP shapes, that the first
+    /// table missed or misread. Each line is a string codex can emit.
+    #[test]
+    fn codex_0_154_plan_auth_capacity_and_status_wording_is_classified() {
+        let cases: &[(&str, FailureClass)] = &[
+            // Plan and billing walls.
+            ("To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus.", Quota),
+            ("Your workspace is out of credits. Ask your workspace owner to refill in order to continue.", Quota),
+            ("You hit your spend cap set in your workspace. Increase your spend cap to continue.", Quota),
+            ("You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.", Quota),
+            ("You've hit your usage limit for gpt-5.5-codex. Switch to another model now, or try again at 3:00 PM.", Quota),
+            ("You exceeded your current quota, please check your plan and billing details.", Quota),
+            ("stream disconnected before completion: Your organization has exceeded its usage limit; see usage policy", Quota),
+            // An explicit HTTP status outranks free text in its body.
+            ("unexpected status 429 Too Many Requests: usage policy note: context window headroom", Quota),
+            // Auth.
+            ("Token data is not available.", Auth),
+            ("ChatGPT auth is missing token data", Auth),
+            ("external auth is not configured", Auth),
+            ("Your authentication session could not be refreshed automatically. Please log out and sign in again.", Auth),
+            ("Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.", Auth),
+            ("unexpected status 401: Provided authentication token is expired. Please try signing in again., auth error code: token_expired", Auth),
+            ("unexpected status 403 Forbidden: Your account was flagged for possible abuse and has been deactivated", Auth),
+            ("Your workspace has been deactivated", Auth),
+            // Transport and capacity, including 5xx without a standard phrase.
+            ("unexpected status 520 <html>cloudflare</html>", Transport),
+            ("unexpected status 503: upstream connect error or disconnect/reset before headers. reset reason: overflow", Transport),
+            ("exceeded retry limit, last status: 529, request id: abc", Transport),
+            ("Server overloaded; retry later.", Transport),
+            // The CLI's own agent loop crashing.
+            ("internal error; agent loop died unexpectedly", Binary),
+            // Content refusals, in their exact wording.
+            ("Invalid prompt: we've limited access to this content for safety reasons.", Content),
+            ("This content was flagged for possible biological risk.", Content),
+            ("cyber policy: synthetic refusal", Content),
+        ];
+        for (detail, want) in cases {
+            assert_eq!(classify(detail, true), *want, "{detail}");
+        }
+    }
+
+    /// Codex configuration faults (a bad `AUGMENTAGENT_MODEL_CODEX_*`
+    /// override) stay unrecognised: the capability class, not the table,
+    /// decides whether they fail over (see `routes_unrecognised_by_capability`).
+    #[test]
+    fn model_configuration_faults_stay_unrecognised() {
+        for detail in [
+            "unexpected status 400 Bad Request: {\"detail\":\"The 'gpt-9' model is not supported when using Codex with a ChatGPT account.\"}",
+            "unexpected status 404 Not Found: {\"error\":{\"message\":\"The model `gpt-9` does not exist or you do not have access to it.\",\"code\":\"model_not_found\"}}",
+        ] {
+            assert_eq!(classify(detail, true), Unrecognised, "{detail}");
+        }
+    }
+
     #[test]
     fn content_is_matched_before_any_provider_row() {
         // A 400 carrying a context overflow must not read as anything else,
@@ -323,22 +441,55 @@ mod tests {
 
     #[test]
     fn errors_follow_the_module_table() {
-        for class in [Readiness, Quota, Transport, Auth, Binary, Content, Unrecognised] {
-            let error = turn_error("codex", class, "synthetic detail JARVIS_READINESS:mcp_tools PRIVATE".into());
-            let typed = ReasonerError::find_in(&error);
-            match class {
-                Readiness => assert!(matches!(typed, Some(ReasonerError::Local { .. }))),
-                Quota => assert!(matches!(typed, Some(ReasonerError::RateLimited { .. }))),
-                Transport | Auth | Binary => assert!(matches!(typed, Some(ReasonerError::Unavailable { .. }))),
-                Content | Unrecognised => {
-                    assert!(typed.is_none(), "{class:?} must stay untyped");
-                    assert_eq!(error.downcast_ref::<TurnFailure>().map(|f| f.class), Some(class));
+        use CapabilityClass::*;
+        for capability in [TextOnly, ReadTools, WriteTools, FullAgentic] {
+            let may_write = matches!(capability, WriteTools | FullAgentic);
+            for class in [Readiness, Quota, Transport, Auth, Binary, Content, Unrecognised] {
+                let error = turn_error("codex", class, capability, "synthetic detail JARVIS_READINESS:mcp_tools PRIVATE".into());
+                let typed = ReasonerError::find_in(&error);
+                match class {
+                    Readiness => assert!(matches!(typed, Some(ReasonerError::Local { .. }))),
+                    Quota => assert!(matches!(typed, Some(ReasonerError::RateLimited { .. }))),
+                    Transport | Auth | Binary => assert!(matches!(typed, Some(ReasonerError::Unavailable { .. }))),
+                    Unrecognised if !may_write => assert!(matches!(typed, Some(ReasonerError::Unavailable { .. })),
+                        "{capability:?}: an unrecognised text/read failure is an outage"),
+                    Content | Unrecognised => {
+                        assert!(typed.is_none(), "{class:?} on {capability:?} must stay untyped");
+                        assert_eq!(error.downcast_ref::<TurnFailure>().map(|f| f.class), Some(class));
+                    }
+                }
+                if class == Readiness {
+                    assert!(!error.to_string().contains("PRIVATE"), "{error}");
+                    assert!(error.to_string().contains("MCP tool is missing"), "{error}");
                 }
             }
-            if class == Readiness {
-                assert!(!error.to_string().contains("PRIVATE"), "{error}");
-                assert!(error.to_string().contains("MCP tool is missing"), "{error}");
+        }
+    }
+
+    /// #1069 review H1, pinned against the table: codex 0.154 failures the
+    /// table does not know, on each capability class.
+    #[test]
+    fn routes_unrecognised_by_capability() {
+        use CapabilityClass::*;
+        for detail in ["synthetic unrecognised failure 7F3A", "unexpected status 404 Not Found: model_not_found"] {
+            let class = classify(detail, true);
+            assert_eq!(class, Unrecognised, "{detail}");
+            for capability in [TextOnly, ReadTools] {
+                assert!(ReasonerError::find_in(&turn_error("codex", class, capability, detail.into()))
+                    .is_some_and(ReasonerError::is_provider_side), "{capability:?}");
+            }
+            for capability in [WriteTools, FullAgentic] {
+                assert!(ReasonerError::find_in(&turn_error("codex", class, capability, detail.into())).is_none(), "{capability:?}");
             }
         }
+    }
+
+    #[test]
+    fn an_explicit_status_outranks_body_text_but_400_403_404_do_not_decide() {
+        assert_eq!(classify("unexpected status 503 Service Unavailable: context window", true), Transport);
+        assert_eq!(classify("HTTP/1.1 502 upstream said: usage policy", true), Transport);
+        assert_eq!(classify("unexpected status 400 Bad Request: context_length_exceeded", true), Content);
+        assert_eq!(classify("unexpected status 403 Forbidden: This request has been flagged for possible cybersecurity risk.", true), Content);
+        assert_eq!(classify("request id 5031 failed with a synthetic reason", true), Unrecognised);
     }
 }
