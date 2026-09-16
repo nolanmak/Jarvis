@@ -1021,7 +1021,11 @@ fn split_criteria(raw: &str) -> (String, Vec<String>) {
     let mut in_block = false;
     for line in raw.lines() {
         let t = line.trim();
-        if t.to_ascii_lowercase().starts_with("criteria:") {
+        // A BARE `criteria:` line opens the block, nothing else. Accepting
+        // `CRITERIA: here is why ...` would invent criteria out of the spec's
+        // own bullets AND delete a line of the spec the builder must follow —
+        // and losing spec content is the worse half of that.
+        if t.eq_ignore_ascii_case("criteria:") {
             in_block = true;
             continue;
         }
@@ -9804,6 +9808,41 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
                 parse_scope_output(degraded).criteria.is_empty(),
                 "degraded input must yield no criteria: {degraded:?}"
             );
+        }
+    }
+
+    /// Codex review of this PR: only a BARE `criteria:` line is the block
+    /// header. `CRITERIA: here is why...` is prose, and treating it as a
+    /// header would both invent criteria out of the spec's own bullets and
+    /// silently delete a line of the spec the builder was supposed to follow.
+    /// Losing spec content is the worse half of that.
+    #[test]
+    fn only_a_bare_criteria_line_opens_the_block() {
+        let out = parse_scope_output(
+            "VERDICT: fixable\n\n\
+             Criteria: the approach below is constrained by the existing gate.\n\
+             - Files to touch: a.rs\n\
+             - Edge case: empty input\n",
+        );
+        assert!(
+            out.criteria.is_empty(),
+            "a prose line is not a block header: {:?}",
+            out.criteria
+        );
+        assert!(
+            out.body.contains("Criteria: the approach below"),
+            "the spec line must survive, not be eaten as a header:\n{}",
+            out.body
+        );
+        assert!(
+            out.body.contains("Files to touch: a.rs") && out.body.contains("Edge case: empty input"),
+            "spec bullets must not be swallowed as criteria:\n{}",
+            out.body
+        );
+        // Trailing whitespace is still a bare header, and case does not matter.
+        for header in ["CRITERIA:", "criteria:  ", "  Criteria:"] {
+            let o = parse_scope_output(&format!("VERDICT: fixable\n{header}\n- C1: a thing\n\nspec"));
+            assert_eq!(o.criteria, vec!["C1: a thing".to_string()], "header {header:?}");
         }
     }
 
