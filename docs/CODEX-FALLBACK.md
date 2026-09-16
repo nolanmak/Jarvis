@@ -117,6 +117,13 @@ the live adapter test uses default discovery or the daemon override.
 
 ## Fallback diagnostics
 
+Doctor reports routing capacity separately for text, read, write and agentic
+workloads. Each configured provider is identified as a candidate, capability
+excluded, on cooldown, or unavailable at binary/auth preflight. A single candidate
+warns that no backup remains; zero candidates is an error. This does not claim
+MCP, guard or sandbox readiness, which still needs validation for the concrete
+invocation. The existing chain finding retains detailed binary/auth explanations.
+
 Exhausted-chain errors now distinguish capability exclusion, active cooldown,
 attempted quota failure, timeout, provider unavailability, local readiness failure
 and CLI-gate timeout for the entries in the chain. The display contains only
@@ -238,10 +245,14 @@ uses auto-ship's actual `fix_opts` prompt and tools, a latched primary, private
 handoff state and real Codex. It observes a failing Cargo regression, edits the
 source, passes the same unchanged acceptance test, and successfully inspects
 `git diff`. Cargo executes inside the VM; no target directory is produced in the
-source checkout. The author record contains Codex and reviewer candidate
-selection excludes it. This proves the builder slice; durable resume provenance,
-qualifying live independent review and the full issue/PR/merge/deployment lifecycle
-remain separate acceptance requirements.
+source checkout. The test now uses the production chain constructor and persists
+builder history, then reloads it through a fresh reasoner instance. Codex remains
+the sole recorded builder and is excluded from review. With Claude still latched,
+the independent review is unavailable and cannot approve. After clearing only the
+synthetic test cooldown, real Claude completes and approves the focused-diff and
+system-interaction passes. That approval does not grant Codex-specific merge
+overrides. This proves the builder and reviewer slices; the full issue/PR/merge/
+deployment lifecycle remains a separate acceptance requirement.
 
 The remaining provider conformance suite must cover:
 

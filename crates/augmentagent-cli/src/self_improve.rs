@@ -7730,9 +7730,20 @@ impl AutoPrLoop {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    #[ignore = "requires Codex login and private build VM; synthetic auto-ship builder fixture"]
+    #[ignore = "requires Codex/Claude login and private build VM; synthetic builder and reviewer fixture"]
     async fn live_codex_fallback_builder_fixes_code_and_runs_red_green_tests() {
-        use augmentagent_channel_core::{FallbackReasoner, CooldownLatch, ProviderKind, Reasoner};
+        use augmentagent_channel_core::{build_reasoner, CooldownLatch, ProviderKind, Reasoner};
+        if std::env::var_os("JARVIS_BUILDER_REVIEW_CHILD").is_none() {
+            let isolated = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "self_improve::tests::live_codex_fallback_builder_fixes_code_and_runs_red_green_tests", "--ignored", "--nocapture"])
+                .env("JARVIS_BUILDER_REVIEW_CHILD", "1")
+                .env("AUGMENTAGENT_REASONER_CHAIN", "claude,codex")
+                .env("AUGMENTAGENT_COOLDOWN_FILE", isolated.path().join("cooldown.json"))
+                .output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
         let fixture = tempfile::tempdir().unwrap();
         let repo = fixture.path();
         std::fs::create_dir(repo.join("src")).unwrap();
@@ -7748,12 +7759,11 @@ mod tests {
         let private_state = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(private_state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let latch = CooldownLatch::at(private_state.path().join("cooldown.json"));
+        let latch = CooldownLatch::system();
         latch.latch("claude", chrono::Utc::now() + chrono::Duration::minutes(5), "synthetic quota");
-        let reasoner = FallbackReasoner::for_tests(vec![
-            (ProviderKind::Claude, std::sync::Arc::new(augmentagent_channel_core::ClaudeCliReasoner::default())),
-            (ProviderKind::Codex, std::sync::Arc::new(augmentagent_channel_core::codex::CodexCliReasoner::openai())),
-        ], latch);
+        let reasoner = build_reasoner();
+        assert_eq!(reasoner.provider_names(), vec!["claude", "codex"]);
+        reasoner.track_review_history(repo, "synthetic-builder-review", false).unwrap();
         let mut opts = fix_opts(repo.into());
         opts.handoff_path = Some(private_state.path().join("operations.json"));
         let audit_dir = tempfile::tempdir().unwrap();
@@ -7779,6 +7789,27 @@ mod tests {
         assert_eq!(reasoner.mutation_providers(), vec![ProviderKind::Codex]);
         assert_eq!(independent_reviewer_candidates(Some(&reasoner.mutation_providers())), vec![ProviderKind::Claude]);
         assert!(!repo.join("target").exists(), "build output escaped the disposable VM snapshot");
+        assert_eq!(reasoner.review_authors().unwrap(), Some(vec![ProviderKind::Codex]));
+        let resumed = build_reasoner();
+        resumed.track_review_history(repo, "synthetic-builder-review", true).unwrap();
+        assert_eq!(resumed.review_authors().unwrap(), Some(vec![ProviderKind::Codex]), "resume lost builder identity");
+        let diff = std::process::Command::new("git").current_dir(repo).args(["diff", "--", "src/lib.rs"]).output().unwrap();
+        assert!(diff.status.success());
+        let diff = String::from_utf8(diff.stdout).unwrap();
+        let issue = Issue { number: 42, title: "Correct synthetic addition".into(),
+            body: "The add function must return the sum of its two arguments; preserve the supplied regression test.".into(),
+            author: "synthetic-author".into(), author_trusted: true, research_filed: false };
+        let criteria = vec!["The add function returns 5 for (2,3) and 3 for (-4,7).".into()];
+        let unavailable = independent_review(&resumed, &issue, &summary, &diff, repo.into(), None, &criteria).await;
+        assert!(!unavailable.available && !unavailable.approved(), "latched independent reviewer must block merge");
+        assert!(unavailable.notes.contains("merge remains blocked"));
+        // Simulate reviewer recovery in this isolated cooldown file only.
+        latch.clear("claude");
+        let reviewed = independent_review(&resumed, &issue, &summary, &diff, repo.into(), None, &criteria).await;
+        assert!(reviewed.available, "{}", reviewed.notes);
+        assert_eq!(reviewed.provider, Some(ProviderKind::Claude));
+        assert!(reviewed.approved(), "{}", reviewed.notes);
+        assert!(!reviewed.codex_approved(), "independent Claude review cannot grant Codex-only overrides");
     }
 
     #[test]
