@@ -31,7 +31,12 @@ never grants Landlock access to such a file. One helper decides this for both:
 a regular file with `st_nlink == 1`. Both scripts run as `python3 -I`, so a plain
 import between them cannot work. The bridge therefore loads the sandbox module
 by explicit path from the packaged launch directory. The sandbox is already
-embedded beside the bridge, so no new file is shipped.
+embedded beside the bridge, so no new file is shipped. The bridge loads and
+checks the helper at startup against its effective write roots. If the helper
+is missing or model-writable, `initialize`, `tools/list` and `tools/call` fail
+readiness with `JARVIS_READINESS:mcp_start` and stderr says why, instead of
+every file tool returning a generic denial. Every later caller's write roots are
+also checked against the cached helper path.
 
 Tool paths are capped at 32 components below their scope root and at 4096 bytes
 as an absolute path (Linux `PATH_MAX`). The caps apply to Read, Write and Edit and

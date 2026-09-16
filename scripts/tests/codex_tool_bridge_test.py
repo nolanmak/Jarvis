@@ -1854,6 +1854,73 @@ sys.stdin.readline()
         self.assertIn('scan size limit', response['content'][0]['text'])
 
 
+class HelperReadinessTests(unittest.TestCase):
+    """#1043 review: the shared verification helper is checked at bridge startup."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / 'workspace'
+        self.root.mkdir()
+        (self.root / 'note.txt').write_text('SYNTHETIC_NOTE')
+
+    def serve_from(self, launch, write_roots, with_helper):
+        import shutil
+        launch.mkdir(parents=True, exist_ok=True)
+        shutil.copy(SPEC.origin, launch / 'tool-bridge.py')
+        if with_helper:
+            shutil.copy(Path(SPEC.origin).with_name('codex-command-sandbox.py'), launch / 'codex-command-sandbox.py')
+        config = Path(self.temp.name) / 'policy.json'
+        config.write_text(json.dumps({'cwd': str(self.root), 'read_roots': [str(self.root)],
+                                      'write_roots': [str(root) for root in write_roots],
+                                      'allowed_tools': ['Read', 'Write']}))
+        config.chmod(0o600)
+        messages = [
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}},
+            {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'},
+            {'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call',
+             'params': {'name': 'Read', 'arguments': {'file_path': 'note.txt'}}},
+            {'jsonrpc': '2.0', 'id': 4, 'method': 'ping'},
+        ]
+        run = subprocess.run([sys.executable, '-I', str(launch / 'tool-bridge.py'), str(config)],
+                             input=''.join(json.dumps(m) + '\n' for m in messages),
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return run, [json.loads(line) for line in run.stdout.splitlines()]
+
+    def assert_not_ready(self, run, replies):
+        self.assertEqual([reply['id'] for reply in replies], [1, 2, 3, 4])
+        for reply in replies[:3]:
+            self.assertEqual(reply['error']['code'], -32001, reply)
+            self.assertIn('JARVIS_READINESS:mcp_start ', reply['error']['message'])
+        self.assertEqual(replies[3]['result'], {})
+        self.assertIn('verification helper', run.stderr)
+        self.assertNotIn('SYNTHETIC_NOTE', run.stdout)
+
+    def test_missing_verification_helper_fails_readiness_instead_of_denying_tools(self):
+        run, replies = self.serve_from(Path(self.temp.name) / 'launch', [], with_helper=False)
+        self.assert_not_ready(run, replies)
+
+    def test_model_writable_verification_helper_fails_readiness_at_startup(self):
+        run, replies = self.serve_from(self.root / 'launch', [self.root], with_helper=True)
+        self.assert_not_ready(run, replies)
+
+    def test_packaged_helper_outside_write_roots_is_ready(self):
+        run, replies = self.serve_from(Path(self.temp.name) / 'launch', [self.root], with_helper=True)
+        self.assertEqual(replies[0]['result']['serverInfo']['name'], 'jarvis-tools')
+        self.assertEqual(replies[2]['result']['content'][0]['text'], 'SYNTHETIC_NOTE')
+
+    def test_cached_helper_is_still_refused_for_a_policy_that_can_write_it(self):
+        helper_directory = Path(bridge.__file__).resolve().parent
+        self.assertIsNotNone(bridge.file_verification())
+        with self.assertRaisesRegex(bridge.Denied, 'model-writable'):
+            bridge.file_verification([helper_directory])
+        policy = bridge.Policy({'cwd': str(helper_directory), 'read_roots': [str(helper_directory)],
+                                'write_roots': [str(helper_directory)], 'allowed_tools': ['Read']})
+        with self.assertRaises(bridge.Denied):
+            policy.read('codex-command-sandbox.py')
+
+
 class TransportTests(unittest.TestCase):
     def test_bridge_survives_launcher_thread_exit_while_parent_process_is_alive(self):
         import queue

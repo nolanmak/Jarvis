@@ -141,16 +141,17 @@ def file_verification(write_roots=()):
     sys.path, so the sandbox is loaded by explicit path. It is always packaged
     beside the bridge (codex_tools.rs) and is already trusted to confine
     commands. Sharing its module keeps one hard-link/regular-file rule for
-    bridge reads and Landlock grants (#1043). Loading happens once per process,
-    and only while the helper is outside the calling policy's writable scopes.
+    bridge reads and Landlock grants (#1043). serve() loads and checks it at
+    startup against the effective write roots, so a missing or model-writable
+    helper fails readiness. The module is loaded once per process, but every
+    caller's write roots are checked against its path.
     """
     global _FILE_VERIFICATION
     if _FILE_VERIFICATION is None:
         import importlib.util
         try:
             helper = Path(__file__).with_name('codex-command-sandbox.py').resolve(strict=True)
-            if any(helper == root or root in helper.parents for root in write_roots):
-                raise Denied('file verification helper is in a model-writable directory')
+            _refuse_writable_helper(str(helper), write_roots)
             spec = importlib.util.spec_from_file_location('jarvis_command_sandbox', helper)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
@@ -160,8 +161,18 @@ def file_verification(write_roots=()):
             raise
         except Exception as exc:
             raise Denied('file verification helper is unavailable') from exc
-        _FILE_VERIFICATION = module
-    return _FILE_VERIFICATION
+        _FILE_VERIFICATION = (module, str(helper))
+    module, helper = _FILE_VERIFICATION
+    _refuse_writable_helper(helper, write_roots)
+    return module
+
+
+def _refuse_writable_helper(helper, write_roots):
+    # String comparison of resolved paths: this runs for every file read.
+    for root in write_roots:
+        root = str(root)
+        if helper == root or helper.startswith(root.rstrip('/') + '/'):
+            raise Denied('file verification helper is in a model-writable directory')
 
 
 def literal_command_argv(command):
@@ -1755,11 +1766,13 @@ class Remote:
 
 
 class Server:
-    def __init__(self, policy):
+    def __init__(self, policy, startup_failure=None):
         self.policy = policy
         self.remotes = {}
         self.remote_tools = {}
         self.discovered = False
+        # A Readiness found while starting; reported on every tool method.
+        self.startup_failure = startup_failure
 
     def close(self):
         try:
@@ -1862,6 +1875,8 @@ class Server:
 
     def dispatch(self, request):
         method = request.get('method')
+        if self.startup_failure is not None and method in ('initialize', 'tools/list', 'tools/call'):
+            raise self.startup_failure
         if method == 'initialize':
             self.discover()
             return {'protocolVersion': '2024-11-05', 'capabilities': {'tools': {}},
@@ -2012,7 +2027,17 @@ def serve(config_path):
         if any(flags & (select.POLLIN | select.POLLHUP) for _, flags in events):
             os.kill(os.getpid(), signal.SIGTERM)
     threading.Thread(target=watch_parent, daemon=True).start()
-    server = Server(Policy(config))
+    policy = Policy(config)
+    startup_failure = None
+    try:
+        # Verify the shared file rule before any tool runs, against this
+        # policy's write roots. Otherwise every file tool would only return
+        # a silent generic denial.
+        file_verification(policy.write_roots)
+    except Denied as error:
+        print(f'Jarvis tool bridge is not ready: {error}.', file=sys.stderr, flush=True)
+        startup_failure = Readiness('mcp_start')
+    server = Server(policy, startup_failure)
     try:
         for line in read_request_lines(sys.stdin.buffer):
             response = safe_dispatch(server, line)
