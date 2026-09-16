@@ -57,6 +57,21 @@ helpers, hooks, fsmonitor and user/system configuration. On the tested deploymen
 command sandbox fails during loopback setup. Its legacy Landlock backend runs a
 simple command but rejects permission profiles requiring direct runtime
 enforcement; selecting that backend alone does not prove read confinement.
+Additional host probes found no installed Docker/Podman runtime. A user-service
+`PrivateNetwork=yes` probe exited successfully but retained the host network
+namespace, including with `PrivateUsers=yes`; direct user/network namespace
+creation was denied. An exit status alone is therefore not evidence of network
+isolation. No host security setting was changed during these probes.
+
+## Fallback diagnostics
+
+Exhausted-chain errors now distinguish capability exclusion, active cooldown,
+attempted quota failure, timeout, provider unavailability, local readiness failure
+and CLI-gate timeout for the entries in the chain. The display contains only
+provider names and failure categories. The original typed provider error remains
+in the error chain for existing cooldown/retry callers. Constructor-time exclusions
+and detailed binary/auth/sandbox readiness still require integration with status
+and doctor output.
 
 ## Handoff journal implementation status
 

@@ -288,14 +288,17 @@ impl FallbackReasoner {
         let mut first_provider_err: Option<anyhow::Error> = None;
         let mut last_err: Option<anyhow::Error> = None;
         let mut skipped_latched = 0usize;
+        let mut diagnostics = Vec::new();
 
         for entry in &self.entries {
             let name = entry.kind.name();
             if !allowed_for(entry.kind, class) {
+                diagnostics.push(format!("{name}: skipped ({class:?} unsupported)"));
                 continue;
             }
             if let Some(until) = self.latch.latched_until(name) {
                 skipped_latched += 1;
+                diagnostics.push(format!("{name}: skipped (cooldown)"));
                 tracing::debug!(provider = name, %until, "provider latched; skipping");
                 continue;
             }
@@ -324,6 +327,12 @@ impl FallbackReasoner {
                 }
                 Err(err) => match ReasonerError::find_in(&err) {
                     Some(re) if re.is_provider_side() => {
+                        let outcome = match re {
+                            ReasonerError::RateLimited { .. } => "quota",
+                            ReasonerError::Timeout { .. } => "timeout",
+                            _ => "provider unavailable",
+                        };
+                        diagnostics.push(format!("{name}: attempted ({outcome})"));
                         // Timeout on an agentic/write run is "this one call
                         // ran long", not "provider down" (#655 review) —
                         // don't take unrelated triage/draft calls down with
@@ -369,6 +378,10 @@ impl FallbackReasoner {
                         continue;
                     }
                     Some(ReasonerError::Local { .. } | ReasonerError::GateTimeout { .. }) => {
+                        let outcome = if matches!(ReasonerError::find_in(&err), Some(ReasonerError::GateTimeout { .. })) {
+                            "CLI gate timeout"
+                        } else { "local readiness failure" };
+                        diagnostics.push(format!("{name}: attempted ({outcome})"));
                         // Our fault, not the provider's — a bad local config or
                         // (#954) a jammed CLI gate. Eligible for the next
                         // provider (cerebras is HTTP, ungated), never latched.
@@ -383,7 +396,7 @@ impl FallbackReasoner {
             }
         }
 
-        Err(first_provider_err.or(last_err).unwrap_or_else(|| {
+        let error = first_provider_err.or(last_err).unwrap_or_else(|| {
             anyhow::Error::new(ReasonerError::Unavailable {
                 provider: "chain".into(),
                 message: format!(
@@ -396,7 +409,11 @@ impl FallbackReasoner {
                         .join(",")
                 ),
             })
-        }))
+        });
+        // Keep the original typed error available to retry/cooldown callers.
+        // The display context contains only classifications, never prompts,
+        // settings, stderr, tool arguments, or credentials.
+        Err(error.context(format!("reasoner chain exhausted for {class:?}: {}", diagnostics.join("; "))))
     }
 }
 
@@ -617,6 +634,41 @@ mod tests {
         assert_eq!(got, "primary answer");
         assert_eq!(a.count(), 1);
         assert_eq!(b.count(), 0, "fallback must not be probed on success");
+    }
+
+    #[tokio::test]
+    async fn exhausted_chain_explains_cooldown_and_capability_exclusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let latch = latch_in(&dir);
+        latch.latch("claude", Utc::now() + chrono::Duration::minutes(5), "synthetic quota");
+        let primary = Scripted::ok("must not spawn");
+        let backup = Scripted::ok("must not spawn");
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary.clone()), (ProviderKind::Cerebras, backup.clone()),
+        ], latch);
+        let opts = crate::reasoner::ask_opts(dir.path().into(), dir.path().into());
+        let error = chain.call(&opts, "PRIVATE_SYNTHETIC_PROMPT").await.unwrap_err();
+        let display = error.to_string();
+        assert!(display.contains("claude: skipped (cooldown)"), "{display}");
+        assert!(display.contains("cerebras: skipped (FullAgentic unsupported)"), "{display}");
+        assert!(!display.contains("PRIVATE_SYNTHETIC_PROMPT"));
+        assert_eq!(primary.count() + backup.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn exhaustion_keeps_original_quota_type_and_reports_local_backup_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = Scripted::err(rate_limited);
+        let backup = Scripted::err(|| ReasonerError::Local { message:"PRIVATE_SYNTHETIC_CONFIG".into() }.into());
+        let chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary), (ProviderKind::Codex, backup),
+        ], latch_in(&dir));
+        let error = chain.call(&text_only_opts(), "synthetic request").await.unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&error), Some(ReasonerError::RateLimited { .. })));
+        let display = error.to_string();
+        assert!(display.contains("claude: attempted (quota)"), "{display}");
+        assert!(display.contains("codex: attempted (local readiness failure)"), "{display}");
+        assert!(!display.contains("PRIVATE_SYNTHETIC_CONFIG"));
     }
 
     #[tokio::test]
