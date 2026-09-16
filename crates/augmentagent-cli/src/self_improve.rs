@@ -6046,6 +6046,19 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             (None, None) => String::new(),
         }
     };
+    if pr_number.is_none() {
+        // Codex, system pass: with no parseable PR number the whole CodeRabbit
+        // read was skipped silently, while the merge below still went ahead on
+        // the branch name. Same unknown-is-not-absent mistake, third location.
+        // The merge still proceeds — advisory, per the owner directive — but
+        // it is said out loud rather than simply not happening.
+        warn!(
+            issue = issue.number,
+            %pr_url,
+            "could not parse a PR number; merging on the double codex LGTM \
+             without reading CodeRabbit's state"
+        );
+    }
     if let Some(n) = pr_number {
         // A failed head lookup is NOT silence. The owner directive is that a
         // double codex LGTM is the bar and CodeRabbit is advisory, so a
@@ -11511,13 +11524,21 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             "the PR must say the state was unknown, not imply it was clean: {note}"
         );
 
-        // And the code takes that branch rather than skipping the read wholesale.
+        // Every way of not knowing is stated, not skipped. Three of them:
+        // the head lookup failed, the GitHub call failed, or the PR number
+        // could not be parsed at all.
         let src = include_str!("self_improve.rs");
         let start = src.find("pub async fn run_once(").expect("run_once");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        for stated in [
+            "could not be read (head lookup failed)",
+            "could not parse a PR number",
+        ] {
+            assert!(body.contains(stated), "an unknown must be stated: {stated:?}");
+        }
         assert!(
-            body.contains("could not be read (head lookup failed)"),
-            "the unknown case must construct a stated review, not an empty default"
+            include_str!("self_improve.rs").contains("could not be read (GitHub call failed)"),
+            "a failed GitHub read must be stated too"
         );
     }
 
