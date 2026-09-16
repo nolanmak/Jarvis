@@ -1195,6 +1195,31 @@ fn build_failure_hold(
     }
 }
 
+/// Does CodeRabbit have actionable findings on this PR's head right now?
+///
+/// One read, no waiting, exactly as the fresh path does it (#1032). Unknown
+/// head or a failed read means we cannot vouch for the PR, so the sweep treats
+/// it as blocking: the sweep's justification is that it only finishes work
+/// already approved.
+async fn rabbit_blocks_merge(repo_root: &Path, pr: u64, head_sha: Option<&str>) -> bool {
+    let Some(head) = head_sha.filter(|h| !h.is_empty()) else {
+        return true;
+    };
+    rabbit_review_now(repo_root, pr, head).await.blocks()
+}
+
+/// The GitHub login that opened an issue, for the author-eligibility gate.
+async fn issue_author(repo_root: &Path, issue: u64) -> Option<String> {
+    let (ok, out, _) = run(
+        &gh_bin(),
+        &["issue", "view", &issue.to_string(), "--json", "author", "-q", ".author.login"],
+        repo_root,
+    )
+    .await
+    .ok()?;
+    ok.then(|| out.trim().to_string()).filter(|a| !a.is_empty())
+}
+
 /// #1029 — finish work that is already approved, without spending anything.
 ///
 /// With `.coderabbit.yaml` present a fresh PR opens as a draft and merging is
@@ -1217,7 +1242,7 @@ async fn merge_sweep(repo_root: &Path) -> usize {
         &gh,
         &[
             "pr", "list", "--state", "open", "--limit", "50", "--json",
-            "number,headRefName,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body",
+            "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body",
         ],
         repo_root,
     )
@@ -1260,6 +1285,10 @@ async fn merge_sweep(repo_root: &Path) -> usize {
             .get("body")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
+        let head_sha = row
+            .pointer("/headRefOid")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         let candidate = SweepCandidate {
             pr,
             issue,
@@ -1271,7 +1300,11 @@ async fn merge_sweep(repo_root: &Path) -> usize {
             },
             checks_green: checks_green(repo_root, pr).await,
             codex_lgtms: body.matches("CODEX-REVIEW: lgtm").count() as u32,
-            rabbit_blocks: false,
+            // Really ask. Hardcoding this to `false` would have let the sweep
+            // merge a draft CodeRabbit had objected to — the one reviewer that
+            // gets to see an agent PR before it merges, since the fresh path
+            // creates and merges within seconds (#1032).
+            rabbit_blocks: rabbit_blocks_merge(repo_root, pr, head_sha.as_deref()).await,
             policy: MergePolicy {
                 automerge_enabled: automerge_enabled_value(
                     std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
@@ -1283,7 +1316,12 @@ async fn merge_sweep(repo_root: &Path) -> usize {
                 receipt_gated_file: None,
                 lgtm_overrides_receipt: std::env::var("AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT")
                     .ok(),
-                issue_author: owner.clone().unwrap_or_default(),
+                // The ISSUE's author, not the repo owner. Assuming the owner
+                // would have handed the sweep a blanket pass through the
+                // author-eligibility gate the fresh path enforces — merging
+                // drafts for issues the fresh path would have refused. An
+                // unknown author stays empty, which that gate rejects.
+                issue_author: issue_author(repo_root, issue).await.unwrap_or_default(),
                 repo_owner: owner.clone(),
                 automerge_authors: std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS").ok(),
             },
@@ -10845,6 +10883,38 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         refuse(|c| c.codex_lgtms = 1, "review");
         refuse(|c| c.rabbit_blocks = true, "coderabbit");
         refuse(|c| c.policy.reviews_approved = false, "policy");
+    }
+
+    /// Codex: I had hardcoded two of the sweep's inputs, and each one silently
+    /// disabled a gate the fresh path enforces. `rabbit_blocks: false` would
+    /// have merged past CodeRabbit's objections — and CodeRabbit is the only
+    /// reviewer that gets to see an agent PR at all, since the fresh path
+    /// creates and merges within seconds. `issue_author` set to the repo owner
+    /// handed every draft a blanket pass through author eligibility.
+    #[test]
+    fn the_sweep_reads_its_inputs_rather_than_assuming_them() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn merge_sweep(").expect("the sweep");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+
+        assert!(
+            !body.contains("rabbit_blocks: false"),
+            "the sweep must ASK CodeRabbit, not assume it is happy"
+        );
+        assert!(body.contains("rabbit_blocks_merge("), "and ask through the shared reader");
+        assert!(
+            !body.contains("issue_author: owner"),
+            "the author gate must see the ISSUE's author, not the repo owner"
+        );
+        assert!(body.contains("issue_author(repo_root"), "read the real author");
+
+        // Unknown is never permissive on either.
+        let f = src.find("async fn rabbit_blocks_merge(").expect("the reader");
+        let reader = &src[f..f + src[f..].find("\n}\n").expect("end")];
+        assert!(
+            reader.contains("return true;"),
+            "an unknown head must count as blocking, not as approval"
+        );
     }
 
     /// C1, C5, C7 — the sweep runs while capped, spends no reasoner call, and
