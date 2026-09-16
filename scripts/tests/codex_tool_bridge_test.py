@@ -751,7 +751,7 @@ print(child.pid, flush=True)
         while time.monotonic()<deadline:
             try:
                 state=Path(f'/proc/{pid}/stat').read_text().split(') ',1)[1].split()[0]
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):  # exited before or during the read
                 return
             if state=='Z':
                 return
@@ -1791,7 +1791,7 @@ sys.stdin.readline()
                 while time.monotonic() < deadline:
                     try:
                         state = Path(f'/proc/{child}/stat').read_text().rsplit(') ', 1)[1].split()[0]
-                    except FileNotFoundError:
+                    except (FileNotFoundError, ProcessLookupError):
                         break
                     if state == 'Z':
                         break
