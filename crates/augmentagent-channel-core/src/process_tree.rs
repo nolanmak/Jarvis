@@ -12,6 +12,7 @@ pub(crate) struct ProcessGroup {
     id: libc::pid_t,
     receipt: PathBuf,
     clean: Arc<AtomicBool>,
+    active_request: Option<PathBuf>,
     _directory: tempfile::TempDir,
 }
 
@@ -26,12 +27,18 @@ impl Drop for ProcessGroup {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
-        let clean = std::fs::read_to_string(&self.receipt)
+        let processes_reaped = std::fs::read_to_string(&self.receipt)
             .is_ok_and(|value| value == "all-descendants-reaped\n");
+        let mut clean = processes_reaped;
+        if clean {
+            if let Some(marker) = &self.active_request {
+                clean = retire_request(marker).is_ok();
+            }
+        }
         self.clean.store(clean, Ordering::SeqCst);
         if !clean {
             // Do not falsely acknowledge cleanup. Adapters stop the chain.
-            unsafe { libc::kill(self.id, libc::SIGKILL); }
+            if !processes_reaped { unsafe { libc::kill(self.id, libc::SIGKILL); } }
             tracing::error!("provider descendant cleanup is unverified; failover blocked");
         }
     }
@@ -39,12 +46,37 @@ impl Drop for ProcessGroup {
 
 #[cfg(test)]
 pub(crate) fn spawn(command: &mut Command) -> std::io::Result<(Child, ProcessGroup)> {
-    spawn_supervised(command, false, Arc::new(AtomicBool::new(true)))
+    spawn_supervised(command, false, Arc::new(AtomicBool::new(true)), None)
+}
+
+fn retire_request(marker: &std::path::Path) -> std::io::Result<()> {
+    std::fs::remove_file(marker)?;
+    std::fs::File::open(marker.parent().expect("request marker has parent"))?.sync_all()
+}
+
+fn begin_request(journal: Option<&std::path::Path>) -> std::io::Result<Option<PathBuf>> {
+    use std::os::unix::fs::MetadataExt;
+    let Some(journal) = journal else { return Ok(None) };
+    let parent = journal.parent().ok_or_else(|| std::io::Error::other("invalid handoff path"))?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    if !journal.is_absolute() || !metadata.is_dir() || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::other("handoff directory must be owner-private"));
+    }
+    let marker = journal.with_extension("active");
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&marker)
+        .map_err(|error| if error.kind() == std::io::ErrorKind::AlreadyExists {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "previous request cleanup is unverified")
+        } else { error })?;
+    file.write_all(b"in-flight; clear only after verified descendant cleanup\n")?;
+    file.sync_all()?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(Some(marker))
 }
 
 /// Provider adapters configure piped stdio and supply their environment-clear
 /// policy explicitly; Command does not expose whether env_clear was selected.
-pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<AtomicBool>)
+pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<AtomicBool>, journal: Option<&std::path::Path>)
     -> std::io::Result<(Child, ProcessGroup)> {
     let original = command.as_std();
     let program = std::path::Path::new(original.get_program());
@@ -80,10 +112,18 @@ pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<At
         if let Some(value) = value { supervised.env(key, value); }
         else { supervised.env_remove(key); }
     }
-    let child = supervised.spawn()?;
+    let active_request = begin_request(journal)?;
+    let child = match supervised.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            // No process was created, so this request has no surviving tools.
+            if let Some(marker) = &active_request { retire_request(marker)?; }
+            return Err(error);
+        }
+    };
     let id = child.id().expect("newly spawned child has a pid") as libc::pid_t;
     clean.store(false, Ordering::SeqCst);
-    Ok((child, ProcessGroup { id, receipt, clean, _directory: directory }))
+    Ok((child, ProcessGroup { id, receipt, clean, active_request, _directory: directory }))
 }
 
 #[cfg(test)]
@@ -93,6 +133,27 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     #[tokio::test]
+    async fn request_is_exclusive_until_verified_cleanup_then_can_resume() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = directory.path().join("operations.json");
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'ready\\n'; sleep 0.2"]);
+        let clean = Arc::new(AtomicBool::new(true));
+        let (mut child, group) = spawn_supervised(&command, false, clean.clone(), Some(&journal)).unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+        assert_eq!(output.next_line().await.unwrap().as_deref(), Some("ready"));
+        assert!(journal.with_extension("active").exists());
+        let conflict = spawn_supervised(&command, false, Arc::new(AtomicBool::new(true)), Some(&journal)).err().unwrap();
+        assert_eq!(conflict.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(child.wait().await.unwrap().success());
+        drop(group);
+        assert!(clean.load(Ordering::SeqCst));
+        assert!(!journal.with_extension("active").exists());
+        assert_eq!(crate::handoff::resume_message(&journal, "synthetic request").unwrap(), "synthetic request");
+    }
+
+    #[tokio::test]
     async fn successful_provider_exit_also_reaps_detached_background_work() {
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("unexpected-after-success");
@@ -100,7 +161,7 @@ mod tests {
         command.args(["-c", "setsid sh -c 'sleep 0.3; printf escaped > \"$1\"' sh \"$1\" & printf 'result\\n'", "sh"])
             .arg(&marker);
         let clean = Arc::new(AtomicBool::new(true));
-        let (child, group) = spawn_supervised(&command, false, clean.clone()).unwrap();
+        let (child, group) = spawn_supervised(&command, false, clean.clone(), None).unwrap();
         let output = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait_with_output()).await.unwrap().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         assert_eq!(output.stdout, b"result\n");
@@ -112,10 +173,13 @@ mod tests {
 
     #[tokio::test]
     async fn destroyed_supervisor_cannot_report_successful_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = directory.path().join("operations.json");
         let mut command = Command::new("sh");
         command.args(["-c", "printf '%s\\n' $$; sleep 30"]);
         let clean = Arc::new(AtomicBool::new(true));
-        let (mut child, group) = spawn_supervised(&command, false, clean.clone()).unwrap();
+        let (mut child, group) = spawn_supervised(&command, false, clean.clone(), Some(&journal)).unwrap();
         let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
         let provider_pid: libc::pid_t = output.next_line().await.unwrap().unwrap().parse().unwrap();
         unsafe { libc::kill(group.id, libc::SIGKILL); }
@@ -125,6 +189,8 @@ mod tests {
         // clean the owned fixture explicitly, even if the assertion fails.
         unsafe { libc::kill(-provider_pid, libc::SIGKILL); }
         assert!(!clean.load(Ordering::SeqCst));
+        assert!(journal.with_extension("active").exists());
+        assert!(crate::handoff::resume_message(&journal, "synthetic request").is_err());
     }
 
     #[tokio::test]

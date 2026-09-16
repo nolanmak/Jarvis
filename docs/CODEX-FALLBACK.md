@@ -114,8 +114,15 @@ confirmation produces `CleanupUncertain`, which blocks fallback without latching
 the provider. Tests first reproduced group-only and detached-session leaks, then
 verified cancellation, normal exit with background work, destruction of the
 supervisor itself, and the fallback exclusion. A live Codex read/write/command
-smoke test passes through the supervisor. Daemon crash/restart recovery and
-persistent handling of an unverified cleanup still require additional coverage.
+smoke test passes through the supervisor. Journal-backed invocations now create
+an owner-private, fsynced active-request marker before spawning. Verified cleanup
+retires it; missing cleanup confirmation preserves it. The dispatcher checks
+this marker before reading any operation receipts, so a restarted request cannot
+silently retry, even if the crash preceded the first tool call. The marker also
+prevents concurrent invocation of the same request. Tests cover exclusivity,
+normal retirement and persistence after supervisor destruction. Automatic
+reconciliation after a daemon crash and callers without stable turn identities
+remain integration work; stale markers are deliberately not cleared by age.
 
 ## Capability inventory
 

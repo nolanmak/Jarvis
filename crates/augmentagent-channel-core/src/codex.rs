@@ -253,8 +253,10 @@ impl CodexCliReasoner {
         // policy, never exposed to native tools or placed on argv.
 
 
-        let (mut child, process_group) = crate::process_tree::spawn_supervised(&cmd, true, clean).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+        let (mut child, process_group) = crate::process_tree::spawn_supervised(&cmd, true, clean, opts.handoff_path.as_deref()).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::Error::new(ReasonerError::CleanupUncertain { provider: provider.into() })
+            } else if e.kind() == std::io::ErrorKind::NotFound {
                 anyhow::Error::new(ReasonerError::Local {
                     message: format!("{provider}: binary {:?} not found on PATH", self.bin),
                 })

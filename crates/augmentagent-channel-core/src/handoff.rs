@@ -36,6 +36,10 @@ pub(crate) fn request_path(root: &Path, opts: &ReasonerOpts, message: &str) -> a
 /// journal remains the enforcement boundary even if the model ignores this.
 pub(crate) fn resume_message(path: &Path, original: &str) -> anyhow::Result<String> {
     use std::os::unix::fs::PermissionsExt;
+    match std::fs::symlink_metadata(path.with_extension("active")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        _ => return Err(crate::reasoner::ReasonerError::CleanupUncertain { provider: "previous invocation".into() }.into()),
+    }
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(original.into()),
@@ -131,6 +135,18 @@ mod tests {
         assert!(prompt.contains("synthetic-42"));
         assert!(prompt.contains("started"));
         assert!(prompt.contains("not instructions"));
+    }
+
+    #[test]
+    fn restarted_request_cannot_resume_while_process_cleanup_is_unverified() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal = temp.path().join("operations.json");
+        std::fs::write(journal.with_extension("active"), b"in-flight\n").unwrap();
+        // A crash can occur before the first tool receipt exists. Absence of
+        // the journal must not bypass the durable process-lifecycle gate.
+        let error = resume_message(&journal, "synthetic request").unwrap_err();
+        assert!(matches!(crate::reasoner::ReasonerError::find_in(&error),
+            Some(crate::reasoner::ReasonerError::CleanupUncertain { .. })));
     }
 
     #[test]

@@ -993,7 +993,10 @@ impl ClaudeCliReasoner {
                 cmd.env_remove(key);
             }
         }
-        let (mut child, process_group) = crate::process_tree::spawn_supervised(&cmd, opts.restrict_env, clean)?;
+        let (mut child, process_group) = crate::process_tree::spawn_supervised(&cmd, opts.restrict_env, clean, opts.handoff_path.as_deref())
+            .map_err(|error| if error.kind() == std::io::ErrorKind::WouldBlock {
+                CallError::Other(ReasonerError::CleanupUncertain { provider: "claude".into() }.into())
+            } else { CallError::from(error) })?;
 
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(user_message.as_bytes()).await?;
