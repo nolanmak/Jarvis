@@ -104,7 +104,9 @@ fn inventory_accounts_for_every_production_preset_and_wrapper() {
         for field in ["permission_profile", "output_contract"] {
             assert!(entry[field].as_str().is_some_and(|value| !value.is_empty()), "missing {field}: {callsite}");
         }
-        assert!(entry["conformance"].is_array(), "missing conformance tracking: {callsite}");
+        assert!(entry["conformance"].as_array().is_some_and(|tests| !tests.is_empty()
+            && tests.iter().all(|test| test.as_str().is_some_and(|name| !name.trim().is_empty()))),
+            "missing conformance test: {callsite}");
         let profile = entry["permission_profile"].as_str().unwrap();
         assert!(manifest["profiles"][profile].is_object(), "unknown permission profile: {profile}");
     }

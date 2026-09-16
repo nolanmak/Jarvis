@@ -48,27 +48,49 @@ async fn structured_outputs(provider: &dyn Reasoner) {
     assert!(tone["punctuation"].is_object());
 }
 
+mod common;
+
 async fn executable_draft(provider: &dyn Reasoner) {
     use augmentagent_channel_core::{code_mode, prompt};
+    use augmentagent_store::{Store, models::Email};
     let manifest = code_mode::manifest_v1();
     let mut options = reasoner::triage_opts(None);
-    // Communication handlers use this system prompt with an empty host tool
-    // list and default model; actions run through the existing dispatcher.
+    // All seven communication handlers construct this exact model/tool profile.
     options.system_prompt = prompt::code_mode_system(&manifest);
     options.model = None;
-    let response = provider.call(&options,
-        "Synthetic drafting fixture. All context is supplied here: the sender asks if the fixture is ready, and it is ready. Draft the exact body 'The fixture is ready.' for gmail. No context lookups are necessary. Do not send anything.")
-        .await.unwrap();
-    let source = code_mode::extract_ts_block(&response).unwrap();
-    // This dispatcher has no account or sending capability. The real Deno
-    // runner still validates and executes the provider's generated program.
-    let dispatcher = code_mode::StubDispatcher::always_null(&["draft"]);
-    let outcome = code_mode::run_program(&source, &manifest, &dispatcher).await.unwrap();
-    assert_eq!(outcome.trace.len(), 1, "unexpected extra operations");
-    assert_eq!(outcome.trace[0].call, "draft");
-    assert_eq!(outcome.trace[0].args_summary[0], "gmail");
-    assert_eq!(outcome.trace[0].args_summary[1], "The fixture is ready.");
-    assert!(outcome.trace[0].error.is_none());
+    let fixture = tempfile::tempdir().unwrap();
+    let db = fixture.path().join("synthetic.db");
+    common::seed_node_owned_tables(&db);
+    let store = Store::open(&db).unwrap();
+    for platform in ["gmail", "linkedin", "slack", "discord", "whatsapp", "twitter", "instagram"] {
+        let email = Email {
+            message_id: format!("synthetic-{platform}"), thread_id: Some(format!("synthetic-thread-{platform}")),
+            from: "fixture@example.com".into(), to: "owner@example.com".into(), cc: String::new(), attachments: vec![],
+            subject: "Fixture readiness".into(), body: "Is the fixture ready?".into(), date: "2026-01-01T12:00:00Z".into(),
+            account_entity_id: Some("synthetic-account".into()), platform: platform.into(), kind: "dm".into(),
+        };
+        store.upsert_email(&email).unwrap();
+        let user = prompt::code_mode_user_message(&email,
+            "All required context is supplied: the fixture is ready. Draft exactly 'The fixture is ready.'. No further context lookups are needed. Do not send anything.", "", "", "", "");
+        let response = provider.call(&options, &user).await.unwrap();
+        let source = code_mode::extract_ts_block(&response).unwrap();
+        // Execute the actual generated program and persist the pending action.
+        // This local dispatcher has no sender or account-service integration.
+        let dispatcher = code_mode::DefaultDispatcher::new(&store,
+            code_mode::MessageContext { channel: platform.into(), email, account_id: Some("synthetic-account".into()) }, &source);
+        let outcome = code_mode::run_program(&source, &manifest, &dispatcher).await.unwrap();
+        assert_eq!(outcome.trace.len(), 1, "{platform}: unexpected extra operations");
+        assert_eq!(outcome.trace[0].call, "draft");
+        assert_eq!(outcome.trace[0].args_summary[1], "The fixture is ready.");
+        assert!(outcome.trace[0].error.is_none());
+        let action = dispatcher.last_action_id().expect("draft must persist an action");
+        let (status, body, recorded_source): (String, String, String) = rusqlite::Connection::open(&db).unwrap()
+            .query_row("SELECT status, draftBody, generatedSource FROM actions WHERE id=?1", [&action],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        assert_eq!(status, "pending", "{platform}: model output must not approve or send the draft");
+        assert_eq!(body, "The fixture is ready.");
+        assert_eq!(recorded_source, source);
+    }
 }
 
 #[tokio::test]
@@ -196,3 +218,35 @@ async fn codex_wiki_mutation_contracts() {
 async fn claude_wiki_mutation_contracts() {
     wiki_mutation_contracts(&ClaudeCliReasoner::new()).await;
 }
+
+async fn classic_draft(provider: &dyn Reasoner) {
+    use augmentagent_channel_core::prompt;
+    use augmentagent_store::models::Email;
+    let wiki = tempfile::tempdir().unwrap();
+    std::fs::write(wiki.path().join("fixture.md"), "The fixture status is SYNTHETIC_READY_B7.\n").unwrap();
+    let email = Email {
+        message_id: "synthetic-classic-draft".into(), thread_id: None,
+        from: "fixture@example.com".into(), to: "owner@example.com".into(), cc: String::new(), attachments: vec![],
+        subject: "Fixture status".into(), body: "Please confirm the fixture status.".into(),
+        date: "2026-01-01T12:00:00Z".into(), account_entity_id: None, platform: "gmail".into(), kind: "dm".into(),
+    };
+    for with_wiki in [false, true] {
+        let options = reasoner::draft_opts(include_str!("../../../skills/email-triage/SKILL.md").into(),
+            with_wiki.then(|| wiki.path().into()));
+        let hint = if with_wiki {
+            format!("Read fixture.md under the wiki root `{}` for the status. Include its exact status marker in the draft.", wiki.path().display())
+        } else { "The fixture status is SYNTHETIC_READY_B7. Include this exact status marker in the draft.".into() };
+        let response = provider.call(&options, &prompt::draft_user_message(&email, &hint, "", "", "", "")).await.unwrap();
+        assert!(response.contains("SYNTHETIC_READY_B7"), "{response}");
+        assert!(!response.contains("```"), "classic drafts must be prose, not generated programs");
+    }
+    assert_eq!(std::fs::read_to_string(wiki.path().join("fixture.md")).unwrap(), "The fixture status is SYNTHETIC_READY_B7.\n");
+}
+
+#[tokio::test]
+#[ignore = "requires Codex login; classic drafting with and without synthetic wiki context"]
+async fn codex_classic_draft_contract() { classic_draft(&CodexCliReasoner::openai()).await; }
+
+#[tokio::test]
+#[ignore = "requires Claude login; same classic draft fixtures as Codex"]
+async fn claude_classic_draft_contract() { classic_draft(&ClaudeCliReasoner::new()).await; }

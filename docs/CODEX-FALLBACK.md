@@ -4,7 +4,7 @@ Issue #1019 requires operational parity for every Claude-backed Jarvis workflow.
 This document tracks the implementation contract. The development branch now
 permits Codex routing for text, read, write and full-agentic requests through the
 scoped bridge. This has not been deployed and is not a claim of full workflow
-parity: remaining provider conformance and operational QA still gate release.
+parity: operational rollout and the remaining acceptance audit still gate release.
 
 ## Execution boundary
 
@@ -63,7 +63,7 @@ These failures are outstanding build parity work, not grounds to skip the tests
 or globally remove confinement.
 The HOME identity is now preserved as an OS environment value; a focused
 regression confirms that this still grants no read access to files in that home.
-The full sandboxed core suite has not yet been rerun after that correction.
+The subsequent VM run described below resolved the socket, session and HOME failures.
 Git inspection receives read-only repository metadata and disables external diff
 helpers, hooks, fsmonitor and user/system configuration. On the tested deployment, the default Codex
 command sandbox fails during loopback setup. Its legacy Landlock backend runs a
@@ -241,9 +241,9 @@ through the bridge against allowed-read and denied-write probes. All twelve core
 presets also execute file operations through the packaged stdio bridge: scoped
 Read/Glob/Grep, permitted Write/Edit, read-only mutation denial and outside-root
 read/write denial. These deterministic probes cover file tools; they do not
-substitute for MCP initialization or model output contracts. Provider execution/output coverage is
-tracked separately as pending; inventory and policy checks alone do not prove
-full workflow parity.
+substitute for MCP initialization or model output contracts. Provider execution/output coverage is recorded separately in the manifest. All
+31 entries now have named conformance evidence; inventory and policy checks alone
+do not prove operational rollout.
 
 The live `live_wiki_query_profile_executes_files_and_memory_mcp` test uses the
 production query instructions, tool inventory and scope hook, with a synthetic
@@ -310,15 +310,21 @@ builders fail closed; missing review capacity does not consume rejection rounds.
 Behavior tests cover provider recovery and builder failure without dispatching an
 independent provider as a replacement author.
 
-The remaining provider conformance suite must cover:
+The completed provider conformance suite includes:
 
-| Source | Presets / operations |
+| Production boundary | Current evidence |
 |---|---|
-| `channel-core/reasoner.rs` | `draft_opts`, `ask_opts`, `social_adapter_opts` |
-| `channel-core/reasoner.rs`, `mcp.rs` | `socialapi_draft_opts`, `with_socialapi_readonly_mcp`, configured stdio/HTTP MCP additions |
-| `cli/self_improve.rs` | `scope_opts`, `review_opts`, `fix_opts`, `codex_review_opts` |
-| `cli/main.rs` | text-only reasoner selftest and production query dispatch |
-| channel crates | email signature extraction, journal composition, voice extraction, email/LinkedIn/WhatsApp/Slack/Instagram/Twitter/Discord parsing calls |
+| Classic drafting | Both providers draft with and without scoped wiki context |
+| Seven communication channels | Both providers generate programs consumed by the real Deno runner and dispatcher; each persists a pending draft with the original generated source |
+| Optional social MCP wrappers | Both providers perform authenticated reads through both production constructors; deterministic negative probes enforce the original read-only guard |
+| Signature, voice, journal and social adaptation | Both providers pass the actual extraction/composition consumers; social adaptation must complete provider calls instead of silently returning the source |
+| Scheduled Discord/Slack digests | Real scheduler ticks with synthetic stores and a capturing broker; Claude quota refusal invokes Codex, then skips the latched primary; successful delivery is throttled |
+| Query and document delivery | Real query handler, original-byte attachment preparation and latched-primary exclusion |
+| Auto-ship | Controlled full lifecycle with real providers/builds, local Git and simulated GitHub; independent review after primary recovery, merge and fresh-checkout acceptance |
+| Selftest | Actual candidate CLI returns PONG with a healthy primary and an isolated pre-latched primary; deterministic binary tests cover routing and healthy-primary preference |
+
+Live channel fixtures have no external sending integration. These checks establish
+provider and consumer contracts, not live account delivery or deployed daemon QA.
 
 Output parity includes model tier selection, code-mode parsing, images, last
 assistant block versus complete transcript, original attachment markers, tool
@@ -376,8 +382,8 @@ cannot stand in for any tool-using profile.
   independent capacity blocks approval. Claude reviews use an explicit model
   pin and the same two-pass evidence contract. Codex-specific owner overrides
   for hard complexity and runtime receipts still require actual Codex approval.
-  Live independent Claude review after Codex builds has passed. The complete
-  issue/PR/merge/deployment lifecycle remains unverified.
+  Live independent Claude review after Codex builds and the controlled full
+  lifecycle have passed. Public-service deployment remains unverified.
 
 ## Remaining integration gates
 
@@ -478,3 +484,20 @@ citation filter and patch application. Both providers produce supported cited
 fields, preserve original frontmatter/body content, leave source files untouched,
 and return an empty patch for a page without evidence. The page request explicitly
 names migration as the task so thin pages do not trigger a clarification response.
+
+
+### Completed channel and integration conformance
+
+The latest full workspace regression passed 2,479 tests with zero failures across
+72 targets; 38 live/environment-dependent tests remain opt-in in that command.
+The newly added paired live suites were run explicitly: optional HTTP MCP,
+seven-channel code-mode drafting, classic drafts with optional wiki context,
+signature/voice/journal/social formats, and scheduled digests. The current query
+fallback and controlled auto-ship lifecycle also passed again. The capability
+inventory now rejects entries without a named conformance test (red regression
+confirmed, then all five inventory tests passed).
+
+These receipts apply to the candidate worktree. They do not prove deployment.
+The remaining release audit must resolve durable reconciliation after uncertain
+external effects, validate the intended dependency-provisioning workflow, complete
+independent review and CI, then verify the deployed revision and CLI behavior.

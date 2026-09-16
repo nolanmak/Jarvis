@@ -97,9 +97,10 @@
       "output_contract": "Complete assistant transcript with original ATTACH markers and image context",
       "conformance": [
         "capability_inventory::core_presets_match_permission_contracts",
-        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "query_delivery_contract_tests::live_query_fallback_delivers_original_and_skips_latched_primary"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::digest_opts",
@@ -119,9 +120,11 @@
       "output_contract": "Draft response; sending remains approval-gated",
       "conformance": [
         "capability_inventory::core_presets_match_permission_contracts",
-        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_classic_draft_contract",
+        "provider_output_contracts::claude_classic_draft_contract"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::ingest_opts",
@@ -177,18 +180,22 @@
       "output_contract": "Platform-specific content adaptation",
       "conformance": [
         "capability_inventory::core_presets_match_permission_contracts",
-        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_channel_tests::live_codex_channel_formats",
+        "provider_channel_tests::live_claude_channel_formats"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::socialapi_draft_opts",
       "permission_profile": "social-read-mcp",
       "output_contract": "Draft response using optional read-only integration context",
       "conformance": [
-        "capability_inventory::optional_mcp_profiles_preserve_readonly_guard_and_private_auth"
+        "capability_inventory::optional_mcp_profiles_preserve_readonly_guard_and_private_auth",
+        "live_optional_mcp::live_codex_optional_http_mcp",
+        "live_optional_mcp::live_claude_optional_http_mcp"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::tone_summarize_opts",
@@ -231,9 +238,11 @@
       "permission_profile": "social-read-mcp",
       "output_contract": "Preserve the wrapped preset output contract",
       "conformance": [
-        "capability_inventory::optional_mcp_profiles_preserve_readonly_guard_and_private_auth"
+        "capability_inventory::optional_mcp_profiles_preserve_readonly_guard_and_private_auth",
+        "live_optional_mcp::live_codex_optional_http_mcp",
+        "live_optional_mcp::live_claude_optional_http_mcp"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/resolve.rs::extract_opts",
@@ -251,16 +260,21 @@
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "conformance": [
         "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
         "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-discord-dm/src/digest.rs::run_one_digest",
       "permission_profile": "wiki-read",
       "output_contract": "Activity digest prose; wiki writes removed from the inherited ingestion preset",
-      "conformance": [],
-      "provider_conformance": "pending"
+      "conformance": [
+        "digest::tests::live_codex_digest_fallback_contract",
+        "digest::tests::live_claude_digest_contract"
+      ],
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-email/src/channel.rs::process_email",
@@ -268,16 +282,21 @@
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "conformance": [
         "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
         "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-email/src/sigextract.rs::extract",
       "permission_profile": "text",
       "output_contract": "Structured extraction from supplied context",
-      "conformance": [],
-      "provider_conformance": "pending"
+      "conformance": [
+        "provider_channel_tests::live_codex_channel_formats",
+        "provider_channel_tests::live_claude_channel_formats"
+      ],
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-instagram/src/channel.rs::handle_dm",
@@ -285,16 +304,21 @@
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "conformance": [
         "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
         "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-journal/src/compose.rs::compose_opts",
       "permission_profile": "text",
       "output_contract": "Journal prose composed from supplied context",
-      "conformance": [],
-      "provider_conformance": "pending"
+      "conformance": [
+        "provider_channel_tests::live_codex_channel_formats",
+        "provider_channel_tests::live_claude_channel_formats"
+      ],
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-linkedin/src/channel.rs::process_email",
@@ -302,9 +326,11 @@
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "conformance": [
         "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
         "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-slack/src/channel.rs::handle_priority",
@@ -312,9 +338,11 @@
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "conformance": [
         "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
         "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-twitter/src/channel.rs::dispatch_reply_arm",
@@ -322,16 +350,21 @@
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "conformance": [
         "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
         "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-voice/src/extract.rs::opts",
       "permission_profile": "text",
       "output_contract": "Structured extraction from supplied context",
-      "conformance": [],
-      "provider_conformance": "pending"
+      "conformance": [
+        "provider_channel_tests::live_codex_channel_formats",
+        "provider_channel_tests::live_claude_channel_formats"
+      ],
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-whatsapp/src/channel.rs::handle_message",
@@ -339,16 +372,21 @@
       "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
       "conformance": [
         "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
         "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-cli/src/main.rs::run_reasoner_selftest",
       "permission_profile": "text",
       "output_contract": "Selftest response used for text-only failover diagnosis",
-      "conformance": [],
-      "provider_conformance": "pending"
+      "conformance": [
+        "reasoner_failover_e2e::quota_refusal_fails_over_to_codex_and_latches",
+        "reasoner_failover_e2e::healthy_primary_never_spawns_fallback"
+      ],
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-cli/src/self_improve.rs::codex_review_opts",
@@ -357,7 +395,7 @@
       "conformance": [
         "self_improve::lifecycle_tests::live_fallback_pipeline_resumes_after_independent_reviewer_recovers"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-cli/src/self_improve.rs::fix_opts",
@@ -367,7 +405,7 @@
         "self_improve::tests::live_codex_fallback_builder_fixes_code_and_runs_red_green_tests",
         "self_improve::lifecycle_tests::live_fallback_pipeline_resumes_after_independent_reviewer_recovers"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-cli/src/self_improve.rs::review_opts",
@@ -378,7 +416,7 @@
         "self_improve::tests::live_codex_scopes_source_and_rejects_an_incomplete_fix",
         "self_improve::lifecycle_tests::live_fallback_pipeline_resumes_after_independent_reviewer_recovers"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-cli/src/self_improve.rs::scope_opts",
@@ -389,7 +427,7 @@
         "self_improve::tests::live_codex_scopes_source_and_rejects_an_incomplete_fix",
         "self_improve::lifecycle_tests::live_fallback_pipeline_resumes_after_independent_reviewer_recovers"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     }
   ]
 }
