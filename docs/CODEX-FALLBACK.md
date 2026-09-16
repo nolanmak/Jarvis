@@ -183,9 +183,16 @@ cannot stand in for any tool-using profile.
   status. This is still not full chat, integration or auto-ship parity.
 - The dispatcher records every provider attempted with mutation-capable tools,
   including failed and cancelled calls. Text-only calls, cooldown skips and
-  capability exclusions do not count as builders. This is instance-local
-  attribution; durable draft authorship and independent reviewer selection are
-  still required before enabling auto-ship fallback.
+  capability exclusions do not count as builders. Auto-ship binds a private,
+  durable history per repository and branch before invoking any builder. History
+  writes must succeed before a provider runs; restarting or opening a fresh
+  attempt cannot erase earlier authors. Missing legacy history remains unknown.
+- Independent review selects Codex or Claude only when that provider is absent
+  from the draft's complete builder history. Unknown/corrupt history or no
+  independent capacity blocks approval. Claude reviews use an explicit model
+  pin and the same two-pass evidence contract. Codex-specific owner overrides
+  for hard complexity and runtime receipts still require actual Codex approval.
+  Live reviewer parity and the complete auto-ship lifecycle remain unverified.
 
 ## Remaining integration gates
 

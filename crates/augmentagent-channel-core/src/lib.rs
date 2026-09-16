@@ -20,6 +20,7 @@ pub mod fallback;
 pub mod gemini;
 pub mod governor;
 mod handoff;
+mod review_history;
 mod process_tree;
 pub mod images;
 pub mod ingest;
