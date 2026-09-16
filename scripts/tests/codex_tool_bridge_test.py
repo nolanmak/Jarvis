@@ -1596,6 +1596,39 @@ class BridgeResilienceTests(unittest.TestCase):
                          {'jsonrpc': '2.0', 'id': 42, 'error': {'code': -32600, 'message': 'Request exceeds size limit'}})
         self.assertIsNone(json.loads(bridge.oversized_response(lines[2]))['id'])
 
+    def test_oversized_line_with_a_non_json_leading_id_does_not_kill_the_bridge(self):
+        # Review repro: leading-zero ids matched the recovery regex, then
+        # json.loads(b'01') raised outside the protective try.
+        filler = b'x' * (bridge.MAX_REQUEST_BYTES + 1024)
+        for head in (b'{"jsonrpc":"2.0","id":01,', b'{"jsonrpc":"2.0","id":-0123,'):
+            with self.subTest(head=head):
+                run, replies = self.run_bridge([
+                    head + b'"method":"ping","params":{"pad":"' + filler + b'"}}\n',
+                    self.line({'jsonrpc': '2.0', 'id': 2, 'method': 'ping'}),
+                ])
+                self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+                self.assertEqual(replies, [
+                    {'jsonrpc': '2.0', 'id': None, 'error': {'code': -32600, 'message': 'Request exceeds size limit'}},
+                    {'jsonrpc': '2.0', 'id': 2, 'result': {}},
+                ])
+
+    def test_oversized_id_recovery_accepts_only_json_integers_and_cannot_raise_out(self):
+        for head, expected in [(b'{"jsonrpc":"2.0","id":0,', 0), (b'{"jsonrpc":"2.0","id":-7,', -7),
+                               (b'{"jsonrpc":"2.0","id":120,', 120), (b'{"jsonrpc":"2.0","id":"a-1",', 'a-1'),
+                               (b'{"jsonrpc":"2.0","id":01,', None), (b'{"jsonrpc":"2.0","id":-0123,', None),
+                               (b'{"jsonrpc":"2.0","id":00}', None)]:
+            with self.subTest(head=head):
+                response = json.loads(bridge.oversized_response(bridge.OversizedRequest(head)))
+                self.assertEqual(response['id'], expected)
+        from unittest.mock import patch
+        def broken(request):
+            raise ValueError('SYNTHETIC_RECOVERY_BUG')
+        with patch.object(bridge, 'oversized_response', broken):
+            response = json.loads(bridge.safe_dispatch(bridge.Server(self.policy),
+                                                       bridge.OversizedRequest(b'{"jsonrpc":"2.0","id":5,')))
+        self.assertEqual(response['error']['code'], -32603)
+        self.assertNotIn('SYNTHETIC_RECOVERY_BUG', json.dumps(response))
+
 
 GREP_PARITY_TREE = {
     'data/numbers.csv': 'id,value\n1,100\n22,2000\n333,30000\n',

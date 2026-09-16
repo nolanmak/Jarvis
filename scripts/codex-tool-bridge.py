@@ -1919,7 +1919,9 @@ def oversized_response(request):
     # Codex serializes jsonrpc then id first. Trust an id only in that exact
     # head position, never one found inside params, so no other pending call
     # can be completed by mistake. Otherwise the id is unknown (null).
-    match = re.match(rb'\{"jsonrpc":"2\.0","id":(-?[0-9]{1,18}|"[A-Za-z0-9_.:-]{1,128}")[,}]', request.prefix)
+    # Integers follow JSON's grammar (no leading zeros), so json.loads accepts
+    # every match; safe_dispatch still contains any failure here.
+    match = re.match(rb'\{"jsonrpc":"2\.0","id":(-?(?:0|[1-9][0-9]{0,17})|"[A-Za-z0-9_.:-]{1,128}")[,}]', request.prefix)
     identifier = json.loads(match[1]) if match else None
     return json.dumps(rpc_error(identifier, -32600, 'Request exceeds size limit'))
 
@@ -1934,12 +1936,12 @@ def safe_dispatch(server, line):
     error, so these replies cannot complete, wedge or echo against a pending
     call. Notifications and client responses carry no id and are never answered.
     """
-    if isinstance(line, OversizedRequest):
-        return oversized_response(line)
-    if not line.strip():
-        return None
     identifier = None
     try:
+        if isinstance(line, OversizedRequest):
+            return oversized_response(line)
+        if not line.strip():
+            return None
         try:
             request = json.loads(line.decode('utf-8'))
         except (ValueError, RecursionError, MemoryError):
