@@ -6078,6 +6078,26 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         if rabbit.blocks() {
             let why = rabbit_merge_note(&rabbit);
             warn!(issue = issue.number, pr = n, "auto-merge withheld: {why}");
+            // Codex: the body was composed on the assumption this would merge,
+            // so it opens with "Auto-merged: ...". Returning here without
+            // correcting it leaves a user-visible false claim on a PR that was
+            // NOT merged — worse than saying nothing, because a reader trusts
+            // it. Correct the claim first, then explain in a comment.
+            let corrected = pr_body.replace(
+                &merge_note,
+                &format!(
+                    "Auto-merge WITHHELD: the gate passed and two independent \
+                     codex reviews approved, but {why} A human decides from here.",
+                ),
+            );
+            if corrected != pr_body {
+                let _ = run(
+                    &gh,
+                    &["pr", "edit", &n.to_string(), "--body", &corrected],
+                    repo_root,
+                )
+                .await;
+            }
             let _ = run(&gh, &["pr", "comment", &n.to_string(), "--body", &why], repo_root).await;
             notify_discord(&format!(
                 "📝 auto-PR needs review: {} — {pr_url}\n{why}",
@@ -11432,6 +11452,13 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             create < read && read < merge,
             "the read must sit between creating the PR and merging it: \
              create={create} read={read} merge={merge}"
+        );
+
+        // A withheld merge must not leave the body claiming it merged: the
+        // body is composed before the read, on the assumption it will.
+        assert!(
+            body[read..merge].contains("Auto-merge WITHHELD"),
+            "correct the auto-merged claim when the merge is withheld"
         );
 
         // Findings withhold the merge and are said out loud, not swallowed.
