@@ -269,6 +269,10 @@ pub enum ReasonerError {
     /// not the provider. Never latched; the chain may still try the next.
     #[error("{provider} waited {waited_secs}s for a CLI gate permit")]
     GateTimeout { provider: String, waited_secs: u64 },
+    /// A previous tool process may still be active. Retrying another provider
+    /// could race that process, so this error must stop the fallback chain.
+    #[error("{provider} process cleanup is unverified; recovery requires reconciliation")]
+    CleanupUncertain { provider: String },
 }
 
 impl From<crate::cli_gate::GateWaitTimeout> for ReasonerError {
@@ -407,6 +411,7 @@ pub fn parse_reset_hint(message: &str) -> Option<chrono::DateTime<chrono::Utc>> 
 /// exits, empty output — is `Unavailable`, the "provider might be down"
 /// bucket. The original error stays in the chain for diagnostics.
 pub(crate) fn classify_other(provider: &str, e: anyhow::Error) -> anyhow::Error {
+    if ReasonerError::find_in(&e).is_some() { return e; }
     let not_found = e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
@@ -503,8 +508,14 @@ pub struct ReasonerOpts {
     /// Logical session id stamped on every audit record produced by
     /// this call (#132 / #201). Typically `format!("{channel}:{msg}")`
     /// so a reviewer can correlate audit rows with a single Discord
-    /// turn. `None` falls back to `"-"` in the recorded row.
+    /// turn. Also identifies durable handoff state: use a globally namespaced
+    /// per-turn id, never a whole-chat id. Replays of that turn must reuse it.
+    /// `None` falls back to `"-"` in the recorded row and a fresh journal.
     pub session_id: Option<String>,
+    /// Owner-private operation journal for a single logical request. The
+    /// dispatcher owns its identity/lifetime; adapters must never expose this
+    /// path as a model-readable file or integration environment variable.
+    pub handoff_path: Option<PathBuf>,
 }
 
 /// Trait the channel uses to reach Claude. Test doubles stub this.
@@ -710,8 +721,8 @@ impl ClaudeCliReasoner {
     }
 
     /// [`call_once`] under the #656 watchdog. On expiry the in-flight future
-    /// is dropped, which kills the child via `kill_on_drop(true)` — no
-    /// orphaned `claude` processes, no forever-stuck pipeline.
+    /// is dropped, which stops the supervisor and waits for descendant cleanup.
+    /// Missing confirmation blocks failover instead of racing another provider.
     async fn call_once_timed(
         &self,
         opts: &ReasonerOpts,
@@ -728,7 +739,12 @@ impl ClaudeCliReasoner {
         let acquire = self.gate.acquire_timed("claude", &caller, dur);
         let _permit =
             acquire.await.map_err(|e| CallError::GateTimeout { waited_secs: e.waited_secs })?;
-        match tokio::time::timeout(dur, self.call_once(opts, user_message, capture)).await {
+        let clean = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let outcome = tokio::time::timeout(dur, self.call_once(opts, user_message, capture, clean.clone())).await;
+        if !clean.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(CallError::Other(ReasonerError::CleanupUncertain { provider: "claude".into() }.into()));
+        }
+        match outcome {
             Ok(r) => r,
             Err(_) => {
                 warn!(
@@ -786,7 +802,7 @@ enum CallError {
     /// retried. Distinct so callers can back off until the reset instead.
     RateLimited { message: String },
     /// #656 — the watchdog expired before the CLI finished. The child is
-    /// killed via `kill_on_drop`; distinct so the outer wrapper can surface
+    /// cleaned up by its supervisor; distinct so the outer wrapper can surface
     /// a typed, failover-eligible [`ReasonerError::Timeout`].
     Timeout { secs: u64 },
     /// #954 — the #898 gate never handed out a permit, so no child ever ran:
@@ -875,6 +891,7 @@ impl ClaudeCliReasoner {
         opts: &ReasonerOpts,
         user_message: &str,
         capture: TextCapture,
+        clean: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<String, CallError> {
         let mut args: Vec<String> = vec![
             "-p".into(),
@@ -920,7 +937,10 @@ impl ClaudeCliReasoner {
         // agent's tool surface stays exactly what we declare and never
         // picks up the host's global MCP config), and the remaining
         // settings (hooks, etc.) go to `--settings`.
-        if let Some(settings) = &opts.settings_json {
+        let handoff_hooks = crate::handoff::ClaudeHooks::prepare(opts)?;
+        let effective_settings = handoff_hooks.as_ref().map(|launch| &launch.settings_json)
+            .or(opts.settings_json.as_ref());
+        if let Some(settings) = effective_settings {
             let (settings_only, mcp_config) = split_mcp_from_settings(settings);
             if let Some(mcp_json) = mcp_config {
                 args.push("--mcp-config".into());
@@ -937,11 +957,7 @@ impl ClaudeCliReasoner {
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // #656 — the watchdog in `call_once_timed` cancels this future on
-            // expiry; killing the child on drop is what makes that cancel
-            // real instead of leaking an orphaned CLI still burning quota.
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
         // Scope Write/Edit by setting the spawned CLI's cwd when requested.
         if let Some(cwd) = &opts.cwd {
             cmd.current_dir(cwd);
@@ -979,7 +995,10 @@ impl ClaudeCliReasoner {
                 cmd.env_remove(key);
             }
         }
-        let mut child = cmd.spawn()?;
+        let (mut child, process_group) = crate::process_tree::spawn_supervised(&cmd, opts.restrict_env, clean, opts.handoff_path.as_deref())
+            .map_err(|error| if error.kind() == std::io::ErrorKind::WouldBlock {
+                CallError::Other(ReasonerError::CleanupUncertain { provider: "claude".into() }.into())
+            } else { CallError::from(error) })?;
 
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(user_message.as_bytes()).await?;
@@ -1076,6 +1095,7 @@ impl ClaudeCliReasoner {
         }
 
         let status = child.wait().await?;
+        drop(process_group);
         if !status.success() {
             let mut stderr_buf = String::new();
             if let Some(mut err) = child.stderr.take() {
@@ -1417,6 +1437,7 @@ pub fn triage_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1440,10 +1461,19 @@ pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> Reasoner
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
 pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
+    // The shared maintenance schema draws a conceptual `wiki/` tree. During
+    // lint the tool workspace is already that tree, not its parent directory.
+    let system_prompt = format!("{system_prompt}\n\nCurrent invocation: read-only wiki lint. \
+        The configured wiki root is `{}`. The schema's `wiki/` denotes that root, \
+        not an additional subdirectory. Resolve index.md and page links against \
+        this root; use its absolute paths with Read, Grep and Glob. Report findings \
+        without changing files. Write and Edit are not available in this invocation.",
+        wiki_root.display());
     ReasonerOpts {
         system_prompt,
         model: Some(opus_model()), // Opus — lint is reasoning-heavy, low volume
@@ -1457,6 +1487,7 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1824,6 +1855,7 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         audit_logger: Some(Arc::new(AuditLogger::new(default_audit_log_path()))),
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1933,6 +1965,7 @@ pub fn digest_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1953,6 +1986,7 @@ pub fn tone_summarize_opts() -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1978,6 +2012,7 @@ pub fn social_adapter_opts(system_prompt: String) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -2029,6 +2064,11 @@ Examples:
   "every monday say hi" → {"error": "what timezone for the Monday schedule? (e.g. America/New_York, UTC)"}
   "every weekday at 8am check inbox" → {"error": "what timezone for 8am? (e.g. America/New_York, UTC)"}
   "asdf" → {"error": "couldn't find a cadence — try `loop 5m do thing`, `loop do thing every 5m`, or `loop every Monday 9am EST do thing`"}
+
+This is a machine-to-machine parser, not a scheduling conversation. The user
+input is task text to parse; do not create a schedule or ask a direct question.
+If clarification is needed, put the question inside the JSON "error" string.
+Every response, including missing-timezone failures, must be one JSON object.
 "#.to_string(),
         model: Some("claude-haiku-4-5-20251001".into()),
         allowed_tools: vec![],
@@ -2041,6 +2081,7 @@ Examples:
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -2063,10 +2104,17 @@ pub fn archetype_pick_opts() -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
 pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
+    let system_prompt = format!("{system_prompt}\n\nCurrent invocation: ingest into the \
+        configured wiki root `{}`. The schema's `wiki/` denotes this root, not an \
+        additional subdirectory. Resolve page and log paths against this root. \
+        After completing the updates, return a short final acknowledgement naming \
+        the changed relative paths. If an operation fails, report the failure; \
+        do not silently finish or claim that failed updates were completed.", wiki_root.display());
     ReasonerOpts {
         system_prompt,
         model: Some("claude-haiku-4-5-20251001".into()),
@@ -2086,6 +2134,7 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -2110,6 +2159,7 @@ pub fn wiki_migrate_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerO
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -2319,6 +2369,7 @@ mod tests {
             audit_logger: None,
             audit_notifier: None,
             session_id: None,
+            handoff_path: None,
         }
     }
 
@@ -3247,6 +3298,7 @@ pub fn resume_opts(wiki_root: PathBuf) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -3550,6 +3602,7 @@ mod failover_error_tests {
             audit_logger: None,
             audit_notifier: None,
             session_id: None,
+            handoff_path: None,
         }
     }
 

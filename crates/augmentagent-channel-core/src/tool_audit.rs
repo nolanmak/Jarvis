@@ -59,6 +59,9 @@ const MAX_STREAM_BYTES: usize = 4 * 1024;
 /// fields without a migration plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {
+    /// Serving provider. Absent on historical records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// RFC3339 timestamp at the moment of record creation.
     pub ts: String,
     /// Logical session id — typically `<channel_id>:<message_id>` so a
@@ -372,6 +375,11 @@ impl AuditLogger {
         if let Err(e) = file.write_all(&payload).await {
             warn!("tool-audit: write {} failed: {e}", self.path.display());
         }
+        // Tokio file writes may still be buffered after write_all returns.
+        // Finish the append before readers or retention observe this file.
+        if let Err(e) = file.flush().await {
+            warn!("tool-audit: flush {} failed: {e}", self.path.display());
+        }
         // #1004 — housekeeping runs AFTER the record has landed, and only
         // once the append lock is released. Pruning first delayed the first
         // write of each process, which was enough to reorder concurrent
@@ -425,6 +433,7 @@ pub fn build_audit_record(
         (Some(captured), None)
     };
     AuditRecord {
+        provider: None,
         ts,
         session_id,
         tool,
@@ -600,6 +609,7 @@ mod tests {
     #[test]
     fn format_notice_prefers_file_path_over_blob() {
         let rec = AuditRecord {
+        provider: None,
             ts: "2026-05-27T00:00:00Z".into(),
             session_id: "ch:msg".into(),
             tool: "Write".into(),
@@ -618,6 +628,7 @@ mod tests {
     #[test]
     fn format_notice_includes_bash_exit_code() {
         let rec = AuditRecord {
+        provider: None,
             ts: "2026-05-27T00:00:00Z".into(),
             session_id: "ch:msg".into(),
             tool: "Bash".into(),
@@ -677,6 +688,7 @@ mod tests {
         let path = tmp.path().join("nested").join("tool-audit.log");
         let logger = AuditLogger::new(path.clone());
         let rec1 = AuditRecord {
+        provider: None,
             ts: "2026-05-27T00:00:00Z".into(),
             session_id: "ch:1".into(),
             tool: "Write".into(),
@@ -686,6 +698,7 @@ mod tests {
             stderr_truncated: None,
         };
         let rec2 = AuditRecord {
+        provider: None,
             ts: "2026-05-27T00:00:01Z".into(),
             session_id: "ch:2".into(),
             tool: "Bash".into(),

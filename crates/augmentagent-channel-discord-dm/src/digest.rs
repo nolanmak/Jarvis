@@ -382,6 +382,53 @@ mod tests {
         }
     }
 
+    async fn live_digest_contract<R: Reasoner + 'static>(reasoner: Arc<R>) {
+        let wiki = tempfile::tempdir().unwrap();
+        for platform in ["discord", "slack"] {
+            let (store, _database) = mk_store();
+            add_digest_sub(&store, platform, "synthetic-channel");
+            let mut email = mk_email("synthetic-decision", "synthetic-channel", platform);
+            email.body = "Decision: the synthetic parser rollout is paused until human approval.".into();
+            store.upsert_email(&email).unwrap();
+            let broker = Arc::new(CountingBroker::new());
+            let scheduler = DigestScheduler::for_platform(store, reasoner.clone(),
+                broker.clone() as Arc<dyn ApprovalBroker>, Some(wiki.path().into()), platform, "Synthetic channel");
+            assert_eq!(scheduler.tick_once().await.unwrap(), 1);
+            assert_eq!(scheduler.tick_once().await.unwrap(), 0, "a completed digest must be throttled");
+            let digests = broker.digests.lock().unwrap();
+            assert_eq!(digests.len(), 1);
+            let body = digests[0].1.to_lowercase();
+            assert!(body.contains("parser") && body.contains("approval"), "{body}");
+        }
+        assert_eq!(std::fs::read_dir(wiki.path()).unwrap().count(), 0, "digest must not write wiki files");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Codex login; local scheduled digests with a synthetic quota refusal"]
+    async fn live_codex_digest_fallback_contract() {
+        use augmentagent_channel_core::{FallbackReasoner, CooldownLatch, ProviderKind, ReasonerError, codex::CodexCliReasoner};
+        struct Quota;
+        #[async_trait]
+        impl Reasoner for Quota {
+            async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+                Err(ReasonerError::RateLimited { provider: "claude".into(), message: "synthetic quota".into(), reset_at: None }.into())
+            }
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let reasoner = Arc::new(FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, Arc::new(Quota) as Arc<dyn Reasoner>),
+            (ProviderKind::Codex, Arc::new(CodexCliReasoner::openai()) as Arc<dyn Reasoner>),
+        ], CooldownLatch::at(fixture.path().join("cooldown.json"))));
+        live_digest_contract(reasoner.clone()).await;
+        assert_eq!(reasoner.usage(), vec![("claude", 1, 0), ("codex", 2, 2)]);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Claude login; same local scheduled digest contract as Codex"]
+    async fn live_claude_digest_contract() {
+        live_digest_contract(Arc::new(augmentagent_channel_core::reasoner::ClaudeCliReasoner::new())).await;
+    }
+
     #[tokio::test]
     async fn tick_once_posts_exactly_one_slack_digest_per_subscription() {
         let (store, _dir) = mk_store();

@@ -67,7 +67,17 @@ pub fn pause_after_failures() -> i64 {
 /// asking the bot directly.
 #[async_trait]
 pub trait LoopRunner: Send + Sync {
-    async fn run_prompt(&self, prompt: &str) -> anyhow::Result<String>;
+    /// `request_id` identifies this occurrence across scheduler restarts.
+    async fn run_prompt(&self, request_id: &str, prompt: &str) -> anyhow::Result<String>;
+}
+
+fn loop_request_id(id: &str, created_at_ms: i64, last_run_ms: Option<i64>) -> String {
+    // Until record_user_loop_run commits, retrying a crashed occurrence must
+    // reuse its journal. The next recorded occurrence gets a different anchor.
+    match last_run_ms {
+        Some(previous) => format!("loop:{id}:after:{previous}"),
+        None => format!("loop:{id}:created:{created_at_ms}"),
+    }
 }
 
 /// Posts a loop's result back to the surface it was created from. Keyed by the
@@ -646,7 +656,8 @@ impl LoopScheduler {
     async fn run_one(&self, l: &UserLoop) {
         info!(loop_id = %l.id, "running loop");
         let pause_after = pause_after_failures();
-        match self.runner.run_prompt(&l.prompt).await {
+        let request_id = loop_request_id(&l.id, l.created_at_ms, l.last_run_ms);
+        match self.runner.run_prompt(&request_id, &l.prompt).await {
             Ok(answer) => {
                 let header = format!("🔁 loop `{}` · _{}_", l.id, truncate(&l.prompt, 80));
                 let body = format!("{header}\n\n{answer}");
@@ -901,6 +912,60 @@ mod cron_helpers_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn occurrence_identity_survives_restart_and_advances_after_recorded_run() {
+        struct Runner {
+            ids: std::sync::Mutex<Vec<String>>,
+            complete: std::sync::atomic::AtomicBool,
+            started: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl LoopRunner for Runner {
+            async fn run_prompt(&self, request_id: &str, _prompt: &str) -> anyhow::Result<String> {
+                self.ids.lock().unwrap().push(request_id.into());
+                self.started.notify_one();
+                if !self.complete.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                Ok("synthetic result".into())
+            }
+        }
+        struct Poster;
+        #[async_trait]
+        impl LoopPoster for Poster {
+            async fn post_to(&self, _channel: &str, _body: &str) -> anyhow::Result<()> { Ok(()) }
+        }
+        let (store, file) = tmp_store();
+        store.create_user_loop("synthetic-owner", "discord", "synthetic-channel", 60,
+            "synthetic task", None, None, None).unwrap();
+        let runner = Arc::new(Runner { ids: std::sync::Mutex::new(Vec::new()),
+            complete: std::sync::atomic::AtomicBool::new(false), started: tokio::sync::Notify::new() });
+        {
+            let row = store.list_active_user_loops().unwrap().remove(0);
+            let scheduler = LoopScheduler::new(Arc::new(store), runner.clone(), Arc::new(Poster));
+            let running = scheduler.run_one(&row);
+            tokio::pin!(running);
+            tokio::select! {
+                _ = &mut running => panic!("fixture must stop during execution"),
+                _ = runner.started.notified() => {}
+            }
+            // Drop the in-flight task and store, as during process shutdown.
+        }
+        let reopened = Arc::new(Store::open(file.path()).unwrap());
+        let row = reopened.list_active_user_loops().unwrap().remove(0);
+        assert!(row.last_run_ms.is_none());
+        runner.complete.store(true, std::sync::atomic::Ordering::SeqCst);
+        let scheduler = LoopScheduler::new(reopened.clone(), runner.clone(), Arc::new(Poster));
+        scheduler.run_one(&row).await;
+        let next = reopened.list_active_user_loops().unwrap().remove(0);
+        assert!(next.last_run_ms.is_some());
+        scheduler.run_one(&next).await;
+        let ids = runner.ids.lock().unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], ids[1], "restarted occurrence must reuse its request identity");
+        assert_ne!(ids[1], ids[2], "next occurrence must not reuse prior receipts");
+    }
 
     #[test]
     fn interval_parsing() {

@@ -1,5 +1,10 @@
 //! `augmentagent` binary.
 
+#[cfg(test)]
+mod provider_migration_tests;
+#[cfg(test)]
+mod provider_channel_tests;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -7368,7 +7373,10 @@ fn migration_system_prompt(schema_body: &str) -> String {
 
 /// Build the per-page user prompt: full page contents.
 fn migration_user_prompt(slug: &str, page: &str) -> String {
-    format!("Page: people/{slug}.md\n\n{page}")
+    format!("Perform the v2 migration extraction for this page. Return only the YAML \
+        patch described in the system instructions; return {{}} if the page contains \
+        no supported fields. Do not modify files or ask which workflow to run.\n\n\
+        Page: people/{slug}.md\n\n{page}")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8309,6 +8317,7 @@ async fn run_reasoner_selftest(prompt: &str) -> Result<()> {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     };
     let result = reasoner.call(&opts, prompt).await;
     // The latches the call itself took are the observable half of a failover
@@ -8445,6 +8454,138 @@ impl QueryHandler for WikiQuerier {
     }
 }
 
+#[cfg(test)]
+mod query_delivery_contract_tests {
+    use super::*;
+    use augmentagent_channel_core::{CooldownLatch, ReasonerOpts};
+    use augmentagent_channel_core::providers::{classify, CapabilityClass, ProviderKind};
+
+    struct TranscriptFixture {
+        marker: String,
+    }
+
+    struct QuotaFixture(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl Reasoner for QuotaFixture {
+        async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(augmentagent_channel_core::ReasonerError::RateLimited {
+                provider: "claude".into(), message: "Synthetic quota refusal".into(), reset_at: None,
+            }.into())
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Codex login and JARVIS_TEST_MEMORY_BIN; synthetic query/delivery only"]
+    async fn live_query_fallback_delivers_original_and_skips_latched_primary() {
+        use std::sync::atomic::Ordering;
+        if std::env::var_os("JARVIS_QUERY_CONTRACT_CHILD").is_none() {
+            let isolated = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "query_delivery_contract_tests::live_query_fallback_delivers_original_and_skips_latched_primary", "--ignored", "--nocapture"])
+                .env("JARVIS_QUERY_CONTRACT_CHILD", "1")
+                .env_remove("AUGMENTAGENT_DB")
+                .env_remove("AUGMENTAGENT_TRANSCRIPTS_DIR")
+                .env("AUGMENTAGENT_TOOL_AUDIT_LOG", isolated.path().join("audit.jsonl"))
+                .output().unwrap();
+            assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            return;
+        }
+        let memory = PathBuf::from(std::env::var_os("JARVIS_TEST_MEMORY_BIN").expect("set memory binary"));
+        assert!(memory.is_absolute() && memory.is_file());
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path();
+        let wiki = repo.join("wiki");
+        std::fs::create_dir(&wiki).unwrap();
+        std::fs::create_dir_all(repo.join("target/release")).unwrap();
+        std::fs::create_dir(repo.join("scripts")).unwrap();
+        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/aa-wiki-scope-guard.sh"),
+            repo.join("scripts/aa-wiki-scope-guard.sh")).unwrap();
+        std::os::unix::fs::symlink(memory, repo.join("target/release/augmentagent-mcp-memory")).unwrap();
+        std::fs::write(wiki.join("note.txt"), "SYNTHETIC_DELIVERY_62BD\n").unwrap();
+        let original = b"%PDF-1.7\n\x00\xffSYNTHETIC_ORIGINAL";
+        let document = augmentagent_docs::delivery::stage(&wiki, "Synthetic report.pdf", original).unwrap();
+        let primary = Arc::new(QuotaFixture(std::sync::atomic::AtomicUsize::new(0)));
+        let reasoner = Arc::new(FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary.clone()),
+            (ProviderKind::Codex, Arc::new(augmentagent_channel_core::codex::CodexCliReasoner::openai())),
+        ], CooldownLatch::at(repo.join("cooldowns.json"))));
+        let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(), repo_root: repo.into() };
+        for turn in 0..2 {
+            let mut ctx = augmentagent_approval_discord::AuditCtx::empty();
+            ctx.session_id = format!("synthetic-channel:synthetic-turn-{turn}");
+            let prompt = format!("Use only local tools for this synthetic document request. Read note.txt and include its text in your reply. \
+                Call memory_recent with limit 1 on the empty synthetic database. Deliver the already-staged original file \
+                using this exact standalone marker: ATTACH: {}\nDo not read, render, rewrite, or modify the PDF. \
+                Do not call shell commands or external services.", document.strip_prefix(&wiki).unwrap().display());
+            let answer = handler.answer(&ctx, &prompt).await.unwrap();
+            let (text, attachments) = augmentagent_approval_discord::attachments::prepare_answer_delivery(&answer, Some(&wiki)).await;
+            assert!(text.contains("SYNTHETIC_DELIVERY_62BD"), "{text}");
+            assert_eq!(attachments.len(), 1, "{text}");
+            assert_eq!(attachments[0].data, original);
+            assert_eq!(attachments[0].filename, "Synthetic report.pdf");
+        }
+        assert_eq!(primary.0.load(Ordering::SeqCst), 1);
+        assert_eq!(reasoner.usage(), vec![("claude", 1, 0), ("codex", 2, 2)]);
+        let audit = std::fs::read_to_string(std::env::var_os("AUGMENTAGENT_TOOL_AUDIT_LOG").unwrap()).unwrap();
+        for turn in 0..2 {
+            for tool in ["Read", "mcp__memory__memory_recent"] {
+                assert!(audit.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .any(|record| record["provider"] == "codex" && record["tool"] == tool
+                        && record["session_id"] == format!("synthetic-channel:synthetic-turn-{turn}")
+                        && record["stdout_truncated"].is_string() && record["stderr_truncated"].is_null()),
+                    "missing successful {tool} audit for turn {turn}");
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Reasoner for TranscriptFixture {
+        async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+            anyhow::bail!("query delivery must retain the full transcript")
+        }
+
+        async fn call_transcript(&self, opts: &ReasonerOpts, prompt: &str) -> anyhow::Result<String> {
+            assert_eq!(classify(opts), CapabilityClass::FullAgentic);
+            assert_eq!(opts.session_id.as_deref(), Some("synthetic-channel:synthetic-turn"));
+            assert!(opts.restrict_env);
+            assert!(opts.settings_json.as_ref().unwrap().contains("PreToolUse"));
+            assert!(prompt.contains("SYNTHETIC_OWNER_RULE"));
+            assert!(prompt.contains("Deliver the original synthetic document"));
+            Ok(format!("Here is the original document.\n{}\nFinal receipt.", self.marker))
+        }
+    }
+
+    #[tokio::test]
+    async fn query_handler_preserves_context_and_original_attachment_bytes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let wiki = fixture.path().join("wiki");
+        std::fs::create_dir_all(wiki.join("about")).unwrap();
+        std::fs::write(wiki.join("about/me.md"),
+            "## Agent behavior rules\n\nSYNTHETIC_OWNER_RULE\n").unwrap();
+        let original = b"%PDF-1.7\n\x00\xffSYNTHETIC_ORIGINAL";
+        let document = augmentagent_docs::delivery::stage(&wiki, "Synthetic report.pdf", original).unwrap();
+        let reasoner = Arc::new(FallbackReasoner::for_tests(
+            vec![(ProviderKind::Claude, Arc::new(TranscriptFixture {
+                marker: format!("ATTACH: {}", document.display()),
+            }))], CooldownLatch::at(fixture.path().join("cooldowns.json"))));
+        let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(),
+            repo_root: fixture.path().to_path_buf() };
+        let mut context = augmentagent_approval_discord::AuditCtx::empty();
+        context.session_id = "synthetic-channel:synthetic-turn".into();
+        let answer = handler.answer(&context, "Deliver the original synthetic document").await.unwrap();
+        let (text, attachments) = augmentagent_approval_discord::attachments::prepare_answer_delivery(
+            &answer, Some(&wiki)).await;
+        assert!(text.contains("Here is the original document.") && text.contains("Final receipt."));
+        assert!(!text.contains("ATTACH:") && !text.contains("couldn't attach"));
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "Synthetic report.pdf");
+        assert_eq!(attachments[0].data, original);
+        assert_eq!(reasoner.usage(), vec![("claude", 1, 1)]);
+    }
+}
+
 /// Bridge: turns the raw serenity bits in `AuditCtx` into a channel-core
 /// [`AuditNotifier`] impl. Lives in the CLI crate because it's the only
 /// crate that depends on BOTH the discord crate (for `serenity` + `AuditCtx`)
@@ -8482,8 +8623,9 @@ struct LoopReasonerRunner {
 
 #[async_trait]
 impl LoopRunner for LoopReasonerRunner {
-    async fn run_prompt(&self, prompt: &str) -> anyhow::Result<String> {
-        let opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
+    async fn run_prompt(&self, request_id: &str, prompt: &str) -> anyhow::Result<String> {
+        let mut opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
+        opts.session_id = Some(request_id.to_string());
         // #389 — loops fire through the same query toolbelt, so they carry
         // the same owner-rules preamble as interactive asks.
         let prompt = match owner_rules_block(&self.wiki_root) {

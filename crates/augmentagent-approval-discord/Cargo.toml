@@ -29,10 +29,8 @@ dashmap = { workspace = true }
 serenity = { workspace = true }
 serde = { workspace = true }
 reqwest = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 serde_json = { workspace = true }
 tempfile = "3"
-# #176 — the `process_loops` test fakes use `libc::ESRCH` to model
-# "no such process" responses from the signaler.
-libc = "0.2"

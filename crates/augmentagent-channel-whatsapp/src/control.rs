@@ -209,10 +209,10 @@ impl WhatsappControlSurface {
                     return Ok(true);
                 };
                 // WhatsApp has no Discord http/channel for side-channel audit
-                // notifications; the chat JID as session id still keys the
-                // reasoner's NDJSON audit log (#201).
+                // notifications. A per-message identity correlates audit rows
+                // and durable handoff without conflating separate chat turns.
                 let audit_ctx = AuditCtx {
-                    session_id: format!("wa:{chat_jid}"),
+                    session_id: msg.stable_id(),
                     http: None,
                     channel_id: None,
                 };

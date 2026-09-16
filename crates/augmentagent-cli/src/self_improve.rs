@@ -855,6 +855,7 @@ pub(crate) fn scope_opts(worktree: PathBuf) -> augmentagent_channel_core::Reason
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1343,6 +1344,7 @@ fn review_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1502,12 +1504,10 @@ fn codex_model() -> String {
 
 /// Text-only preset for the independent reviewer (#840).
 ///
-/// It carries no tools on purpose. Codex has no `Read`/`Grep`/`Glob` — those
-/// are Claude Code tool names, and `allowed_tools` is never passed to the
-/// codex adapter at all; codex's only tool is a shell governed by `-s`. On
-/// this host that shell cannot start, so granting tools would be capability
-/// theatre. The reviewer is given the diff and pre-computed call sites as
-/// text instead, which is what it can actually act on.
+/// It carries no tools on purpose: the independent reviewer receives the
+/// frozen diff and pre-computed caller evidence as text. The Codex adapter
+/// supports declared tools through its scoped bridge, but this review stage
+/// does not need workspace mutation or command execution.
 ///
 /// `cwd` is still pinned to the worktree: it costs nothing and keeps the
 /// spawn's working directory off the deploy checkout.
@@ -1515,12 +1515,7 @@ fn codex_review_opts(worktree: PathBuf, system_prompt: &str) -> augmentagent_cha
     augmentagent_channel_core::ReasonerOpts {
         system_prompt: system_prompt.to_string(),
         model: Some(codex_model()),
-        // #840 — NO tools. Codex cannot execute anything on this host (its
-        // read-only sandbox is bubblewrap; AppArmor blocks unprivileged user
-        // namespaces), so tools would be surface with no capability behind
-        // it. Everything the reviewer needs is supplied as text, including
-        // pre-computed caller evidence. This keeps the preset TextOnly, which
-        // codex is cleared for with no policy widening.
+        // The reviewer uses supplied evidence; keep its host tool scope empty.
         allowed_tools: vec![],
         add_dirs: vec![worktree.clone()],
         permission_mode: "default".into(),
@@ -1531,6 +1526,7 @@ fn codex_review_opts(worktree: PathBuf, system_prompt: &str) -> augmentagent_cha
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1965,7 +1961,8 @@ fn resumable_from(
 
 /// Outcome of the independent stage (#828).
 struct IndependentReview {
-    /// False when codex could not be reached at all — NOT the same as a
+    provider: Option<augmentagent_channel_core::ProviderKind>,
+    /// False when the reviewer could not be reached — NOT the same as a
     /// rejection, and must never be treated as an approval.
     available: bool,
     diff_ok: bool,
@@ -1976,6 +1973,12 @@ struct IndependentReview {
 impl IndependentReview {
     fn approved(&self) -> bool {
         self.available && self.diff_ok && self.system_ok
+    }
+
+    /// Existing owner opt-ins explicitly require two Codex approvals.
+    /// A different independent provider does not inherit those overrides.
+    fn codex_approved(&self) -> bool {
+        self.provider == Some(augmentagent_channel_core::ProviderKind::Codex) && self.approved()
     }
 
     /// One-line outcome for logs, the dry-run message, and the PR body.
@@ -1993,6 +1996,7 @@ impl IndependentReview {
 
     fn unavailable(reason: String) -> Self {
         Self {
+            provider: None,
             available: false,
             diff_ok: false,
             system_ok: false,
@@ -2001,14 +2005,18 @@ impl IndependentReview {
     }
 }
 
-/// #828 — two independent codex passes: one focused on the diff, one on how
-/// the change lands in the rest of the system.
-///
-/// Pinned to codex via `build_pinned`, which returns `None` rather than
-/// falling back. That is the whole point: `build_reasoner` would hand back
-/// Claude, and an "independent" review served by the author's own model is
-/// worse than none, because the PR would claim a second opinion it never got.
+/// Select only providers outside every recorded builder attempt. Unknown
+/// legacy provenance requires human review rather than assuming Claude built it.
+fn independent_reviewer_candidates(authors: Option<&[augmentagent_channel_core::ProviderKind]>) -> Vec<augmentagent_channel_core::ProviderKind> {
+    use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+    let Some(authors) = authors else { return vec![] };
+    [Codex, Claude].into_iter().filter(|provider| !authors.contains(provider)).collect()
+}
+
+/// Two independent passes with a pinned provider that did not build this draft.
+/// Review never falls back to the builder when independent capacity is absent.
 async fn independent_review(
+    builder: &augmentagent_channel_core::FallbackReasoner,
     issue: &Issue,
     summary: &str,
     diff: &str,
@@ -2016,12 +2024,18 @@ async fn independent_review(
     prior_findings: Option<&str>,
     criteria: &[String],
 ) -> IndependentReview {
-    let Some(reasoner) = augmentagent_channel_core::build_pinned(
-        augmentagent_channel_core::ProviderKind::Codex,
-    ) else {
+    let authors = match builder.review_authors() {
+        Ok(Some(authors)) => authors,
+        Ok(None) => return IndependentReview::unavailable(
+            "builder provenance is unknown; preserve this draft for human review".into()),
+        Err(_) => return IndependentReview::unavailable(
+            "builder provenance could not be verified; preserve this draft for human review".into()),
+    };
+    let selected = independent_reviewer_candidates(Some(&authors)).into_iter()
+        .find_map(|provider| augmentagent_channel_core::build_pinned(provider).map(|reasoner| (provider, reasoner)));
+    let Some((provider, reasoner)) = selected else {
         return IndependentReview::unavailable(
-            "codex is not installed or not authenticated (`codex login`)".into(),
-        );
+            "no authenticated independent reviewer remains outside the draft's builders".into());
     };
 
     // #889 — on revision rounds the reviewer sees its own prior findings, so
@@ -2055,6 +2069,7 @@ async fn independent_review(
     );
 
     let mut out = IndependentReview {
+        provider: Some(provider),
         available: true,
         diff_ok: false,
         system_ok: false,
@@ -2074,23 +2089,26 @@ async fn independent_review(
     ];
     let mut sections: Vec<String> = Vec::new();
     for (label, system, prompt) in passes {
-        let opts = codex_review_opts(worktree.clone(), system);
+        let mut opts = codex_review_opts(worktree.clone(), system);
+        if provider == augmentagent_channel_core::ProviderKind::Claude {
+            opts.model = Some(build_model());
+        }
         match reasoner.call(&opts, prompt).await {
             Ok(raw) => {
                 let (ok, notes) = parse_codex_review(&raw);
-                info!(issue = issue.number, pass = label, approved = ok, "codex review");
+                info!(issue = issue.number, provider = provider.name(), pass = label, approved = ok, "independent review");
                 if label.starts_with("focused") {
                     out.diff_ok = ok;
                 } else {
                     out.system_ok = ok;
                 }
-                sections.push(format!("### Codex — {label}\n{}", truncate(&notes, 1500)));
+                sections.push(format!("### {} — {label}\n{}", provider.name(), truncate(&notes, 1500)));
             }
             Err(e) => {
                 // Provider-side failure is "no independent review", never an
                 // approval and never a rejection of the diff.
-                warn!(issue = issue.number, pass = label, "codex review failed: {e:#}");
-                return IndependentReview::unavailable(format!("{label} failed: {e}"));
+                warn!(issue = issue.number, provider = provider.name(), pass = label, "independent review failed: {e:#}");
+                return IndependentReview::unavailable(format!("{} {label} failed; merge remains blocked", provider.name()));
             }
         }
     }
@@ -2284,6 +2302,7 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -3376,7 +3395,7 @@ fn round_comment(round: u32, kind: &str, findings: &str, sha: &str) -> String {
     format!(
         "Auto-resume — review round {round} ({kind}).\n\n\
          **Findings addressed by this revision:**\n{}\n\n\
-         Revision pushed as `{sha}`; codex re-reviews this commit next.",
+         Revision pushed as `{sha}`; the independent reviewer checks this commit next.",
         truncate(findings, 2500)
     )
 }
@@ -3991,6 +4010,8 @@ async fn resume_draft_pr(
     // original scoping pass wrote, not a fresh set nobody agreed to.
     let resumed_criteria = criteria_from_pr_body(&pr_body);
 
+    reasoner.track_review_history(repo_root, branch, true)?;
+
     // Worktree from the PR's branch, brought up to date with main. A merge
     // conflict is a human's job — say so on the PR and move on.
     let worktree = repo_root
@@ -4039,7 +4060,7 @@ async fn resume_draft_pr(
                 let (_ok, hunks, _) = run("git", &["diff"], &worktree).await?;
                 builder_ran = true;
                 match reasoner
-                    .call(
+                    .call_revision(
                         &fix_opts(worktree.clone()),
                         &build_conflict_prompt(&issue, &pr_body, &files, &hunks),
                     )
@@ -4240,7 +4261,7 @@ async fn resume_draft_pr(
             rounds_done += 1;
             info!(pr, issue = issue.number, round = rounds_done, lines_now, "resume: shrink round");
             match reasoner
-                .call(
+                .call_revision(
                     &fix_opts(worktree.clone()),
                     &build_revise_prompt(&issue, &shrink_findings(lines_now), lines_now, prior_attempts.as_deref()),
                 )
@@ -4320,7 +4341,7 @@ async fn resume_draft_pr(
                     "resume: gate-repair round"
                 );
                 match reasoner
-                    .call(
+                    .call_revision(
                         &fix_opts(worktree.clone()),
                         &build_revise_prompt(&issue, &gate_findings(&gate_text), lines_now, prior_attempts.as_deref()),
                     )
@@ -4374,9 +4395,27 @@ async fn resume_draft_pr(
         }
 
         let independent =
-            independent_review(&issue, &summary, &diff, worktree.clone(), prior_notes.as_deref(), &resumed_criteria)
+            independent_review(reasoner, &issue, &summary, &diff, worktree.clone(), prior_notes.as_deref(), &resumed_criteria)
                 .await;
         prior_notes = Some(independent.notes.clone());
+        if !independent.available {
+            // Capacity cannot be repaired by another code revision. Preserve
+            // the draft and retry after recovery without consuming rejection
+            // attempts or recruiting the reviewer as a builder.
+            if !dry_run {
+                let (ok, _, error) = run("git", &["push", "origin", branch], &worktree).await?;
+                if !ok {
+                    cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                    bail!("resume: preserving draft failed: {error}");
+                }
+                let _ = run(&gh, &["pr", "comment", &pr.to_string(), "--body",
+                    "Auto-resume: independent review capacity is unavailable. Verified changes remain in this draft; merge is blocked until an independent reviewer is available."], repo_root).await;
+            }
+            cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+            return Ok(RunReport::built(format!(
+                "PR #{pr}: independent review unavailable; still draft"
+            )));
+        }
         // #936 — CodeRabbit is the (advisory) third reviewer. It judges the
         // PUSHED head, so push first (a no-op when nothing changed).
         let rabbit = if dry_run {
@@ -4395,7 +4434,7 @@ async fn resume_draft_pr(
             }
         };
         notes_log.push(format!(
-            "round {rounds_done}: codex {}; CodeRabbit {} ({})",
+            "round {rounds_done}: independent {}; CodeRabbit {} ({})",
             independent.status(),
             rabbit.status(),
             rabbit.note
@@ -4421,6 +4460,17 @@ async fn resume_draft_pr(
                     )));
                 }
             }
+            // A reviewer change cannot bypass the existing receipt policy.
+            let (names_ok, names, _) = run("git", &["diff", "--name-only", "origin/main...HEAD"], &worktree).await?;
+            let receipt_ok = names_ok && automerge_receipt_ok(
+                touches_verify_gated_path(&names).as_deref(),
+                independent.codex_approved(),
+                std::env::var("AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT").ok().as_deref(),
+            );
+            if !receipt_ok {
+                cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
+                return Ok(RunReport::built(format!("PR #{pr}: independent review approved; runtime receipt gate still requires human review")));
+            }
             if dry_run {
                 cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
                 return Ok(RunReport::built(format!(
@@ -4437,7 +4487,7 @@ async fn resume_draft_pr(
             let _ = run(
                 &gh,
                 &["pr", "comment", &pr.to_string(), "--body",
-                  &format!("Auto-resume: LGTM from every reviewer (codex: {}; CodeRabbit: {}) \
+                  &format!("Auto-resume: LGTM from every reviewer (independent: {}; CodeRabbit: {}) \
                             after {rounds_done} revision round(s) against current \
                             `main`.\n\n{}",
                            independent.status(),
@@ -4449,7 +4499,7 @@ async fn resume_draft_pr(
             let enabled = automerge_enabled_value(
                 std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
             );
-            let complexity_ok = complexity.auto_mergeable() || codex_unlocks_hard();
+            let complexity_ok = complexity.auto_mergeable() || (independent.codex_approved() && codex_unlocks_hard());
             if !(enabled && complexity_ok && !issue.research_filed) {
                 cleanup(worktree, branch.to_string(), repo_root.to_path_buf()).await;
                 notify_discord(&format!(
@@ -4534,7 +4584,7 @@ async fn resume_draft_pr(
             "resume: revising against findings"
         );
         let rev_summary = match reasoner
-            .call(
+            .call_revision(
                 &fix_opts(worktree.clone()),
                 &build_revise_prompt(&issue, &findings, lines_now, prior_attempts.as_deref()),
             )
@@ -4945,6 +4995,8 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     }
 
     let branch = format!("{BRANCH_PREFIX}{}", issue.number);
+    let reasoner = build_reasoner();
+    reasoner.track_review_history(repo_root, &branch, false)?;
     // #692 — a FIXED path, force-recreated per issue (the branch stays
     // per-issue). Test binaries bake `env!("CARGO_MANIFEST_DIR")` at compile
     // time; with the shared gate target cache, binaries compiled under a
@@ -4983,8 +5035,6 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         .await;
         let _ = run("git", &["branch", "-D", &br], &root).await;
     };
-
-    let reasoner = build_reasoner();
 
     // #803 — what earlier attempts on this issue already failed on, plus the
     // wall-clock and reasoner spend of THIS attempt, so a hard issue's cost is
@@ -5235,7 +5285,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // shrink ⇒ the refusal below proceeds unchanged.
         info!(issue = issue.number, lines, "initial diff over cap; one shrink attempt");
         if let Ok(rs) = reasoner
-            .call(
+            .call_revision(
                 &fix_opts(worktree.clone()),
                 &build_revise_prompt(&issue, &shrink_findings(lines), lines, prior_attempts.as_deref()),
             )
@@ -5402,7 +5452,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // carrying both verdicts for a human. It does count as a failed attempt,
     // because a second opinion disagreeing is exactly what this stage is for.
     let mut independent =
-        independent_review(&issue, &summary, &full_diff, worktree.clone(), None, &criteria).await;
+        independent_review(&reasoner, &issue, &summary, &full_diff, worktree.clone(), None, &criteria).await;
     let mut revision_note = String::new();
     if independent.available && !independent.approved() {
         warn!(
@@ -5437,7 +5487,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         info!(issue = issue.number, round, max_rounds, "revising against the independent findings");
         let round1 = independent.status();
         match reasoner
-            .call(
+            .call_revision(
                 &fix_opts(worktree.clone()),
                 &build_revise_prompt(&issue, &findings, lines, prior_attempts.as_deref()),
             )
@@ -5559,7 +5609,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 lines = lines2;
                 let prior = independent.notes.clone();
                 independent =
-                    independent_review(&issue, &rev_summary, &diff2, worktree.clone(), Some(&prior), &criteria)
+                    independent_review(&reasoner, &issue, &rev_summary, &diff2, worktree.clone(), Some(&prior), &criteria)
                         .await;
                 revision_note.push_str(&format!(
                     "\n### Revision round {round} (prior verdict: {round1})\n{}\n\n\
@@ -5662,7 +5712,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 "commit refused by the personal-data guard; one repair round"
             );
             match reasoner
-                .call(&fix_opts(worktree.clone()), &build_pii_fix_prompt(&hits))
+                .call_revision(&fix_opts(worktree.clone()), &build_pii_fix_prompt(&hits))
                 .await
             {
                 Ok(summary_of_fix) => {
@@ -5752,12 +5802,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // answer to blast radius, where one model grading its own family's
         // work was not. Receipt-gated paths stay human-only either way —
         // those change live behaviour no reviewer can verify by reading.
-        let complexity_ok = complexity.auto_mergeable() || codex_unlocks_hard();
+        let complexity_ok = complexity.auto_mergeable() || (independent.codex_approved() && codex_unlocks_hard());
         // Owner policy 2026-08-31: a double codex LGTM may override the
         // receipt gate (env-gated; see `automerge_receipt_ok`).
         let receipt_ok = automerge_receipt_ok(
             gated.as_deref(),
-            independent.approved(),
+            independent.codex_approved(),
             std::env::var("AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT").ok().as_deref(),
         );
         // #936 — with CodeRabbit configured, a fresh PR is never merged
@@ -5800,13 +5850,13 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
              exercise against the running daemon before they ship."
         ),
         (false, None) if !independent.approved() => format!(
-            "Draft — a human must review and merge. The independent codex \
+            "Draft — a human must review and merge. The independent \
              review did not approve it ({}).",
             independent.status()
         ),
         (false, None) if coderabbit_configured(repo_root) => {
             "Draft — CodeRabbit reviews it next; the resume lane merges on triple LGTM \
-             (claude, codex, CodeRabbit)."
+             (builder QA, independent reviewer, CodeRabbit)."
                 .to_string()
         }
         (false, None) => "Draft — a human must review and merge.".to_string(),
@@ -5824,7 +5874,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         )
     };
     let independent_section = format!(
-        "\n\n## Independent review (codex)\n{}{revision_note}\n",
+        "\n\n## Independent review\n{}{revision_note}\n",
         truncate(&independent.notes, 3000)
     );
     // #1012 — durable, so a resumed run reviews against the same criteria the
@@ -7696,7 +7746,210 @@ impl AutoPrLoop {
 }
 
 #[cfg(test)]
+#[path = "self_improve_lifecycle_tests.rs"]
+mod lifecycle_tests;
+
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn source_inspection_presets_enforce_read_only_bridge_access() {
+        use augmentagent_channel_core::codex_tools::BridgeLaunch;
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("source");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("fixture.txt"), "SYNTHETIC_SOURCE").unwrap();
+        for opts in [scope_opts(repo.clone()), review_opts(repo.clone())] {
+            let launch = tempfile::tempdir().unwrap();
+            let bridge = BridgeLaunch::prepare(&opts, launch.path()).unwrap();
+            let script = r#"
+import json, runpy, sys
+module = runpy.run_path(sys.argv[1])
+policy = module['Policy'](json.load(open(sys.argv[2])))
+server = module['Server'](policy)
+assert 'SYNTHETIC_SOURCE' in str(server.call('Read', {'file_path': 'fixture.txt'}))
+for tool, arguments in [
+    ('Write', {'file_path': 'fixture.txt', 'content': 'UNAUTHORIZED'}),
+    ('Edit', {'file_path': 'fixture.txt', 'old_string': 'SOURCE', 'new_string': 'CHANGED'}),
+    ('Bash', {'command': 'git commit -am unauthorized'}),
+    ('Bash', {'command': 'cargo test'}),
+]:
+    try:
+        server.call(tool, arguments)
+    except module['Denied']:
+        continue
+    raise AssertionError('read-only preset admitted ' + tool)
+"#;
+            let output = std::process::Command::new("python3").args(["-I", "-c", script])
+                .arg(launch.path().join("tool-bridge.py")).arg(bridge.policy_path).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(std::fs::read_to_string(repo.join("fixture.txt")).unwrap(), "SYNTHETIC_SOURCE");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Codex login; synthetic read-only scope and rejecting review"]
+    async fn live_codex_scopes_source_and_rejects_an_incomplete_fix() {
+        use augmentagent_channel_core::{codex::CodexCliReasoner, Reasoner};
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path();
+        std::fs::create_dir(repo.join("src")).unwrap();
+        std::fs::write(repo.join("Cargo.toml"),
+            "[package]\nname=\"synthetic-scope\"\nversion=\"0.1.0\"\nedition=\"2021\"\n").unwrap();
+        let original = "pub fn add(a:i32,b:i32)->i32 { a-b }\n";
+        std::fs::write(repo.join("src/lib.rs"), original).unwrap();
+        for args in [vec!["init", "-q"], vec!["add", "."],
+            vec!["-c", "user.name=Synthetic", "-c", "user.email=fixture@example.com", "commit", "-qm", "Synthetic baseline"]] {
+            assert!(std::process::Command::new("git").current_dir(repo).args(args).status().unwrap().success());
+        }
+        let audit_dir = tempfile::tempdir().unwrap();
+        let audit = audit_dir.path().join("audit.jsonl");
+        let logger = std::sync::Arc::new(augmentagent_channel_core::tool_audit::AuditLogger::new(audit.clone()));
+        let reasoner = CodexCliReasoner::openai();
+        let mut opts = scope_opts(repo.into());
+        opts.audit_logger = Some(logger.clone());
+        let scoped = reasoner.call(&opts,
+            "Scope this synthetic repository issue: add(2,3) returns -1 instead of 5. Make addition correct for positive and negative integers in range, with regression tests. Read src/lib.rs and inspect git status first. Do not edit anything.")
+            .await.unwrap();
+        let scope = parse_scope_output(&scoped);
+        assert!(scope.fixable, "{scoped}");
+        assert!(!scope.guarded_paths, "{scoped}");
+        assert!(scope.criteria.len() >= 2, "{scoped}");
+        assert!(scope.body.contains("src/lib.rs"), "{scoped}");
+        assert_eq!(std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(), original);
+
+        // A deliberately incorrect proposed patch. The read-only reviewer must
+        // inspect the actual diff and reject it without repairing the source.
+        let incomplete = "pub fn add(_a:i32,_b:i32)->i32 { 5 }\n";
+        std::fs::write(repo.join("src/lib.rs"), incomplete).unwrap();
+        let mut opts = review_opts(repo.into());
+        opts.audit_logger = Some(logger);
+        let review = reasoner.call(&opts,
+            "Review the current uncommitted diff against this requirement: add must return the sum for positive and negative integers in range. Read the actual source and git diff. Passing the single example add(2,3)=5 is insufficient; reject missing regression coverage and incorrect behavior. Do not edit anything.")
+            .await.unwrap();
+        assert!(!parse_review_output(&review).0, "{review}");
+        assert!(review.lines().take(5).any(|line| line.trim().eq_ignore_ascii_case("REVIEW: reject")), "{review}");
+        assert_eq!(std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(), incomplete);
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(audit).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        for tool in ["Read", "Bash"] {
+            assert!(records.iter().any(|record| record["provider"] == "codex" && record["tool"] == tool
+                && record["stdout_truncated"].as_str().is_some_and(|text| !text.is_empty())), "missing {tool}");
+        }
+        assert!(records.iter().any(|record| record["tool"] == "Bash" && record["exit_code"] == 0
+            && record["args"]["command"].as_str().is_some_and(|command| command.starts_with("git diff"))
+            && record["stdout_truncated"].as_str().is_some_and(|text| text.contains("_a:i32"))),
+            "review must successfully inspect the proposed patch");
+        assert!(!records.iter().any(|record| matches!(record["tool"].as_str(), Some("Write" | "Edit"))));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Codex/Claude login and private build VM; synthetic builder and reviewer fixture"]
+    async fn live_codex_fallback_builder_fixes_code_and_runs_red_green_tests() {
+        use augmentagent_channel_core::{build_reasoner, CooldownLatch, ProviderKind, Reasoner};
+        if std::env::var_os("JARVIS_BUILDER_REVIEW_CHILD").is_none() {
+            let isolated = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "self_improve::tests::live_codex_fallback_builder_fixes_code_and_runs_red_green_tests", "--ignored", "--nocapture"])
+                .env("JARVIS_BUILDER_REVIEW_CHILD", "1")
+                .env("AUGMENTAGENT_REASONER_CHAIN", "claude,codex")
+                .env("AUGMENTAGENT_COOLDOWN_FILE", isolated.path().join("cooldown.json"))
+                .output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path();
+        std::fs::create_dir(repo.join("src")).unwrap();
+        std::fs::create_dir(repo.join("tests")).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]\nname=\"synthetic-builder\"\nversion=\"0.1.0\"\nedition=\"2021\"\n").unwrap();
+        std::fs::write(repo.join("src/lib.rs"), "pub fn add(a:i32,b:i32)->i32 { a-b }\n").unwrap();
+        let regression = "#[test]\nfn sum_is_correct(){assert_eq!(synthetic_builder::add(2,3),5);assert_eq!(synthetic_builder::add(-4,7),3);}\n";
+        std::fs::write(repo.join("tests/add.rs"), regression).unwrap();
+        for args in [vec!["init", "-q"], vec!["add", "."],
+            vec!["-c", "user.name=Synthetic", "-c", "user.email=builder@example.com", "commit", "-qm", "Synthetic baseline"]] {
+            assert!(std::process::Command::new("git").current_dir(repo).args(args).status().unwrap().success());
+        }
+        let private_state = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(private_state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let latch = CooldownLatch::system();
+        latch.latch("claude", chrono::Utc::now() + chrono::Duration::minutes(5), "synthetic quota");
+        let reasoner = build_reasoner();
+        assert_eq!(reasoner.provider_names(), vec!["claude", "codex"]);
+        reasoner.track_review_history(repo, "synthetic-builder-review", false).unwrap();
+        let mut opts = fix_opts(repo.into());
+        opts.handoff_path = Some(private_state.path().join("operations.json"));
+        let audit_dir = tempfile::tempdir().unwrap();
+        let audit = audit_dir.path().join("audit.jsonl");
+        opts.audit_logger = Some(std::sync::Arc::new(augmentagent_channel_core::tool_audit::AuditLogger::new(audit.clone())));
+        let summary = reasoner.call(&opts,
+            "Fix the synthetic add function so it returns the sum. The existing tests/add.rs regression is authoritative: \
+             do not change it. First run cargo test --offline and observe the failure, then fix src/lib.rs and rerun \
+             cargo test --offline until it passes. Inspect git diff before finishing. Do not commit or publish anything.")
+            .await.unwrap();
+        assert_eq!(std::fs::read_to_string(repo.join("tests/add.rs")).unwrap(), regression, "builder changed the acceptance test");
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(audit).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        let test_runs: Vec<_> = records.iter().filter(|record| record["provider"] == "codex" && record["tool"] == "Bash"
+            && record["args"]["command"].as_str().is_some_and(|command| command.contains("cargo test"))).collect();
+        assert!(test_runs.len() >= 2, "missing red/green test runs: {summary}; synthetic audit: {records:?}");
+        assert!(test_runs[0]["exit_code"].as_i64().is_some_and(|code| code != 0), "initial regression did not fail");
+        assert!(test_runs.iter().skip(1).any(|record| record["exit_code"] == 0
+            && record["stdout_truncated"].as_str().is_some_and(|out| out.contains("1 passed"))), "missing passing regression: {summary}");
+        assert!(records.iter().any(|record| record["tool"] == "Bash" && record["exit_code"] == 0
+            && record["args"]["command"].as_str().is_some_and(|command| command.starts_with("git diff"))), "missing diff review: {summary}");
+        assert_eq!(reasoner.usage(), vec![("codex", 1, 1)]);
+        assert_eq!(reasoner.mutation_providers(), vec![ProviderKind::Codex]);
+        assert_eq!(independent_reviewer_candidates(Some(&reasoner.mutation_providers())), vec![ProviderKind::Claude]);
+        assert!(!repo.join("target").exists(), "build output escaped the disposable VM snapshot");
+        assert_eq!(reasoner.review_authors().unwrap(), Some(vec![ProviderKind::Codex]));
+        let resumed = build_reasoner();
+        resumed.track_review_history(repo, "synthetic-builder-review", true).unwrap();
+        assert_eq!(resumed.review_authors().unwrap(), Some(vec![ProviderKind::Codex]), "resume lost builder identity");
+        let diff = std::process::Command::new("git").current_dir(repo).args(["diff", "--", "src/lib.rs"]).output().unwrap();
+        assert!(diff.status.success());
+        let diff = String::from_utf8(diff.stdout).unwrap();
+        let issue = Issue { number: 42, title: "Correct synthetic addition".into(),
+            body: "The add function must return the sum of its two arguments; preserve the supplied regression test.".into(),
+            author: "synthetic-author".into(), author_trusted: true, research_filed: false };
+        let criteria = vec!["The add function returns 5 for (2,3) and 3 for (-4,7).".into()];
+        let unavailable = independent_review(&resumed, &issue, &summary, &diff, repo.into(), None, &criteria).await;
+        assert!(!unavailable.available && !unavailable.approved(), "latched independent reviewer must block merge");
+        assert!(unavailable.notes.contains("merge remains blocked"));
+        // Simulate reviewer recovery in this isolated cooldown file only.
+        latch.clear("claude");
+        let reviewed = independent_review(&resumed, &issue, &summary, &diff, repo.into(), None, &criteria).await;
+        assert!(reviewed.available, "{}", reviewed.notes);
+        assert_eq!(reviewed.provider, Some(ProviderKind::Claude));
+        assert!(reviewed.approved(), "{}", reviewed.notes);
+        assert!(!reviewed.codex_approved(), "independent Claude review cannot grant Codex-only overrides");
+    }
+
+    #[test]
+    fn independent_reviewer_excludes_all_builders_and_unknown_history() {
+        use augmentagent_channel_core::ProviderKind::{Claude, Codex};
+        assert_eq!(independent_reviewer_candidates(Some(&[Claude])), vec![Codex]);
+        assert_eq!(independent_reviewer_candidates(Some(&[Codex])), vec![Claude]);
+        assert!(independent_reviewer_candidates(Some(&[Claude, Codex])).is_empty());
+        assert!(independent_reviewer_candidates(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn independent_review_without_provenance_blocks_before_provider_or_repository_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let builder = augmentagent_channel_core::FallbackReasoner::for_tests(vec![],
+            augmentagent_channel_core::CooldownLatch::at(dir.path().join("cooldown.json")));
+        let issue = Issue {
+            number: 42, title: "Synthetic change".into(), body: String::new(),
+            author: "synthetic-author".into(), author_trusted: true, research_filed: false,
+        };
+        let review = independent_review(&builder, &issue, "synthetic summary", "synthetic diff",
+            dir.path().join("nonexistent-worktree"), None, &[]).await;
+        assert!(!review.available);
+        assert!(!review.approved());
+        assert!(review.notes.contains("provenance is unknown"));
+        assert_eq!(builder.calls(), 0);
+    }
     use super::*;
 
     #[test]
@@ -8449,12 +8702,18 @@ CODEX-REVIEW: lgtm").0);
     #[test]
     fn independent_approval_requires_availability_and_both_passes() {
         let mk = |available, diff_ok, system_ok| IndependentReview {
+            provider: Some(augmentagent_channel_core::ProviderKind::Codex),
             available,
             diff_ok,
             system_ok,
             notes: String::new(),
         };
         assert!(mk(true, true, true).approved());
+        assert!(mk(true, true, true).codex_approved());
+        let mut other = mk(true, true, true);
+        other.provider = Some(augmentagent_channel_core::ProviderKind::Claude);
+        assert!(other.approved());
+        assert!(!other.codex_approved(), "Claude cannot inherit Codex-specific merge overrides");
         assert!(!mk(true, true, false).approved(), "system pass must count");
         assert!(!mk(true, false, true).approved(), "diff pass must count");
         // The one that matters: codex unreachable is NOT an approval.

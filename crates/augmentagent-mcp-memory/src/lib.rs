@@ -791,16 +791,38 @@ pub fn serve_stdio(server: Server) -> anyhow::Result<()> {
         if trimmed.is_empty() {
             continue;
         }
-        let response = match serde_json::from_str::<McpRequest>(trimmed) {
-            Ok(req) => server.dispatch(&req),
-            Err(e) => json!({
-                "jsonrpc": "2.0",
-                "id": Value::Null,
-                "error": {
-                    "code": -32700,
-                    "message": format!("parse error: {e}"),
+        let invalid = |code, message| json!({
+            "jsonrpc": "2.0", "id": Value::Null,
+            "error": {"code": code, "message": message}
+        });
+        let parsed = serde_json::from_str::<Value>(trimmed)
+            .map_err(|_| invalid(-32700, "parse error"))
+            .and_then(|mut value| {
+                // MCP requests require a string or integer ID. Only a valid
+                // envelope with an absent ID is a notification; malformed
+                // messages must never reach a mutating tool.
+                let id_ok = value.get("id").is_none_or(|id|
+                    id.is_string() || id.is_i64() || id.is_u64());
+                let params_ok = value.get("params").is_none_or(|params|
+                    params.is_object() || params.is_array());
+                if value.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+                    || !value.get("method").is_some_and(Value::is_string)
+                    || !id_ok || !params_ok {
+                    return Err(invalid(-32600, "invalid request"));
                 }
-            }),
+                let notification = value.get("id").is_none();
+                if notification {
+                    value.as_object_mut().unwrap().insert("id".into(), Value::Null);
+                }
+                serde_json::from_value::<McpRequest>(value)
+                    .map(|request| (request, notification))
+                    .map_err(|_| invalid(-32600, "invalid request"))
+            });
+        let response = match parsed {
+            // Do not dispatch id-less tool calls: effects need a request ID.
+            Ok((_, true)) => continue,
+            Ok((req, false)) => server.dispatch(&req),
+            Err(response) => response,
         };
         let serialized = serde_json::to_string(&response).context("serialize response")?;
         writeln!(out, "{serialized}").context("write stdout")?;
