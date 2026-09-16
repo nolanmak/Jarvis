@@ -58,7 +58,15 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
-        let tmp = TempDir::new().expect("tempdir");
+        // `AUGMENTAGENT_E2E_SCRATCH` pins where the per-scenario scratch
+        // homes, latches and databases live (default: the system temp dir).
+        let tmp = match std::env::var_os("AUGMENTAGENT_E2E_SCRATCH") {
+            Some(root) if !root.is_empty() => {
+                std::fs::create_dir_all(&root).expect("e2e scratch root");
+                TempDir::new_in(root).expect("tempdir")
+            }
+            _ => TempDir::new().expect("tempdir"),
+        };
         // The fakes keep their invocation counters under $HOME (see
         // `_lib.sh`), so the scratch home doubles as the counter store.
         std::fs::create_dir_all(tmp.path().join("home")).expect("scratch home");
@@ -304,4 +312,104 @@ fn healthy_primary_never_spawns_fallback() {
     assert_eq!(rig.spawns("claude"), 1);
     assert_eq!(rig.spawns("codex"), 0, "fallback must not be probed on success");
     assert!(rig.latch("claude").is_none());
+}
+
+/// #1040 — the fallback-shaped chain for these scenarios: codex first, so a
+/// wrongly advanced chain shows up as a claude spawn.
+const CODEX_FIRST: &str = "codex,claude";
+
+/// #1040 C1 — codex finished its turn (a tool call completed) but produced no
+/// final message. Content-level, like claude's EmptyOutput: the call fails
+/// untyped, codex is NOT latched, and the chain does NOT advance to re-run the
+/// call's work on claude.
+#[test]
+fn codex_empty_output_neither_latches_nor_fails_over() {
+    let rig = Rig::new();
+    let out = rig.run(
+        "codex succeeds with no final message",
+        rig.cmd(
+            CODEX_FIRST,
+            &[
+                ("CODEX_CLI", "fake-codex-empty.sh"),
+                ("CLAUDE_CLI", "fake-claude-ok.sh"),
+            ],
+        ),
+    );
+
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("codex produced no assistant text"), "{stderr}");
+    assert!(stdout_of(&out).contains("cooldowns (after call): none active"));
+    assert!(rig.latch("codex").is_none(), "empty output must not latch codex");
+    assert_eq!(rig.spawns("codex"), 1);
+    assert_eq!(rig.spawns("claude"), 0, "empty output must not advance the chain");
+}
+
+/// #1040 C2 — a `turn.failed` for the request's own content (context-window
+/// overflow) is not a provider outage: no latch, no chain advance.
+#[test]
+fn codex_context_window_failure_neither_latches_nor_fails_over() {
+    let rig = Rig::new();
+    let out = rig.run(
+        "codex turn.failed: context window",
+        rig.cmd(
+            CODEX_FIRST,
+            &[
+                ("CODEX_CLI", "fake-codex-context-window.sh"),
+                ("CLAUDE_CLI", "fake-claude-ok.sh"),
+            ],
+        ),
+    );
+
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    let stderr = stderr_of(&out);
+    assert!(stderr.contains("context window"), "{stderr}");
+    assert!(rig.latch("codex").is_none(), "a content-level failure must not latch codex");
+    assert_eq!(rig.spawns("codex"), 1);
+    assert_eq!(rig.spawns("claude"), 0, "a content-level failure must not advance the chain");
+}
+
+/// #1040 control — the usage-limit `turn.failed` keeps its pre-#1040
+/// routing: RateLimited, codex latched, claude serves, and the next call
+/// skips codex entirely.
+#[test]
+fn codex_usage_limit_still_latches_and_fails_over() {
+    let rig = Rig::new();
+    let fakes = [
+        ("CODEX_CLI", "fake-codex-usage-limit.sh"),
+        ("CLAUDE_CLI", "fake-claude-ok.sh"),
+    ];
+    let out = rig.run("codex usage limit", rig.cmd(CODEX_FIRST, &fakes));
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("response: PONG-FROM-FAKE-CLAUDE"));
+    let (_, reason) = rig.latch("codex").expect("a quota wall must latch codex");
+    assert!(reason.contains("codex rate limit"), "{reason}");
+
+    let out2 = rig.run("codex latched", rig.cmd(CODEX_FIRST, &fakes));
+    assert!(out2.status.success(), "{}", stderr_of(&out2));
+    assert_eq!(rig.spawns("codex"), 1, "a latched codex must not be spawned again");
+    assert_eq!(rig.spawns("claude"), 2);
+}
+
+/// #1040 C2, second half — transport failures are still provider outages:
+/// Unavailable, codex latched, claude serves.
+#[test]
+fn codex_transport_failure_still_latches_and_fails_over() {
+    let rig = Rig::new();
+    let out = rig.run(
+        "codex stream disconnected",
+        rig.cmd(
+            CODEX_FIRST,
+            &[
+                ("CODEX_CLI", "fake-codex-stream-disconnected.sh"),
+                ("CLAUDE_CLI", "fake-claude-ok.sh"),
+            ],
+        ),
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("response: PONG-FROM-FAKE-CLAUDE"));
+    let (_, reason) = rig.latch("codex").expect("a transport failure must latch codex");
+    assert!(reason.contains("codex unavailable"), "{reason}");
+    assert!(reason.contains("stream disconnected"), "{reason}");
+    assert_eq!(rig.spawns("claude"), 1);
 }

@@ -12,6 +12,18 @@
 //!   happened above the provider layer (test doubles, extraction) or is a
 //!   content-level problem — re-asking a different model would convert
 //!   refusals into plausible-but-wrong answers, the #450/#451 pathway.
+//!   Adapters use this on purpose for turns that ended on their own content:
+//!   claude's `EmptyOutput`, and codex's [`TurnFailure`](crate::turn_failure::TurnFailure)
+//!   classes (#1040). The table in `turn_failure` decides which codex
+//!   failures are outages.
+//! - **Finished work without a summary is not dispatched again (#1040).** When a write or
+//!   agentic call ends untyped after its journal recorded completed
+//!   operations, the chain returns
+//!   [`CompletedWithoutSummary`](crate::CompletedWithoutSummary)
+//!   and records that verdict next to the journal. A later dispatch of the
+//!   same request returns the verdict again without spawning a provider.
+//!   A provider-side interruption is not a finished turn, so the next
+//!   provider still resumes from the receipts, as before.
 //! - **One pass over the chain per call.** No per-provider retries; #448's
 //!   no-retry rule survives intact inside each adapter.
 //!
@@ -379,14 +391,27 @@ impl FallbackReasoner {
         // retrofit a history that misses an earlier mutating dispatch.
         self.review_history.lock().unwrap_or_else(|e| e.into_inner()).admitted = true;
         let class = classify(opts);
+        let mutating = matches!(class,
+            crate::providers::CapabilityClass::WriteTools | crate::providers::CapabilityClass::FullAgentic);
         let mut request_opts = opts.clone();
-        if request_opts.handoff_path.is_none() && matches!(class,
-            crate::providers::CapabilityClass::WriteTools | crate::providers::CapabilityClass::FullAgentic) {
+        if request_opts.handoff_path.is_none() && mutating {
             if let Some(root) = &self.handoff_root {
                 request_opts.handoff_path = Some(crate::handoff::request_path(root, opts)?);
             }
         }
         let opts = &request_opts;
+        // #1040 C3 — this request already finished its work without a
+        // summary. Dispatching it again (a caller retry, a replayed turn)
+        // would repeat the work, so return the same outcome and spawn nothing.
+        // An unreadable verdict is an error here too: never dispatch on doubt.
+        if mutating {
+            if let Some(journal) = &opts.handoff_path {
+                if let Some(verdict) = crate::handoff_outcome::recorded(journal)? {
+                    info!(completed = verdict.completed, "request already completed without a summary; not dispatching it again");
+                    return Err(anyhow::Error::new(verdict));
+                }
+            }
+        }
         let primary = self.entries.first().map(|e| e.kind);
         // The PRIMARY's provider-side error is what callers must see when
         // the whole chain fails (#655 review): a trailing Local fault from a
@@ -417,8 +442,7 @@ impl FallbackReasoner {
                 Some(path) => crate::handoff::resume_message(path, user_message)?,
                 None => user_message.to_string(),
             };
-            if matches!(class, crate::providers::CapabilityClass::WriteTools
-                | crate::providers::CapabilityClass::FullAgentic) {
+            if mutating {
                 let history = self.review_history.lock().unwrap_or_else(|e| e.into_inner()).path.clone();
                 if let Some(path) = history {
                     crate::review_history::record(&path, entry.kind)?;
@@ -511,7 +535,29 @@ impl FallbackReasoner {
                         }
                         continue;
                     }
-                    _ => return Err(err),
+                    // CleanupUncertain: typed, and it stops the chain.
+                    Some(_) => return Err(err),
+                    // Untyped: a content-level ending (no final text, a turn
+                    // that failed on its own content, or a failure nothing
+                    // recognised). Never latched, never failed over. If a
+                    // mutating call already completed operations, report
+                    // that (#1040 C3) so a retry cannot repeat them.
+                    None => {
+                        if let (true, Some(journal)) = (mutating, &opts.handoff_path) {
+                            match crate::handoff_outcome::settle(journal) {
+                                Ok(Some(verdict)) => {
+                                    warn!(provider = name, completed = verdict.completed,
+                                        "call ended without a summary after completing operations; \
+                                         recorded so the request is not dispatched again");
+                                    return Err(err.context(verdict));
+                                }
+                                Ok(None) => {}
+                                Err(error) => warn!(provider = name,
+                                    "operation journal unreadable after a content-level ending ({error:#})"),
+                            }
+                        }
+                        return Err(err);
+                    }
                 },
             }
         }
@@ -1131,6 +1177,185 @@ mod tests {
         assert!(matches!(ReasonerError::find_in(&error), Some(ReasonerError::CleanupUncertain { .. })));
         assert_eq!(fallback.count(), 0);
         assert!(latch.latched_until("claude").is_none());
+    }
+
+    /// #1040 C1/C2 — the real codex adapter behind the chain, fed the
+    /// fault-injection shapes. A turn that ended on its own content (no final
+    /// message, context overflow) neither latches codex nor advances the
+    /// chain; quota and transport failures still do both.
+    #[tokio::test]
+    async fn codex_content_level_endings_neither_latch_nor_advance_but_outages_still_fail_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("empty", r#"echo '{"type":"turn.started"}'
+echo '{"type":"turn.completed","usage":{"input_tokens":1}}'
+"#, false),
+            ("context-window", r#"echo '{"type":"turn.started"}'
+echo '{"type":"turn.failed","error":{"message":"Codex ran out of room in the model context window. Start a new thread."}}'
+exit 1
+"#, false),
+            ("usage-limit", r#"echo '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again later."}}'
+exit 1
+"#, true),
+            ("stream-disconnected", r#"echo '{"type":"turn.started"}'
+echo '{"type":"turn.failed","error":{"message":"stream disconnected before completion: error sending request"}}'
+exit 1
+"#, true),
+        ];
+        for (name, body, provider_side) in cases {
+            let bin = dir.path().join(format!("fake-codex-{name}"));
+            std::fs::write(&bin, format!("#!/usr/bin/env bash\ncat >/dev/null\n{body}")).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let latch = CooldownLatch::at(dir.path().join(format!("{name}-cooldowns.json")));
+            let backup = Scripted::ok("served by the next provider");
+            let codex = crate::codex::CodexCliReasoner::with_bin(bin.to_string_lossy().into_owned());
+            let chain = FallbackReasoner::for_tests(vec![
+                (ProviderKind::Codex, Arc::new(codex) as Arc<dyn Reasoner>),
+                (ProviderKind::Claude, backup.clone() as Arc<dyn Reasoner>),
+            ], latch.clone());
+            let result = chain.call(&text_only_opts(), "synthetic request").await;
+            assert_eq!(latch.latched_until("codex").is_some(), provider_side, "{name}: latch");
+            assert_eq!(backup.count(), usize::from(provider_side), "{name}: chain advance");
+            match result {
+                Ok(text) => assert!(provider_side && text == "served by the next provider", "{name}: {text}"),
+                Err(err) => assert!(!provider_side && ReasonerError::find_in(&err).is_none(), "{name}: {err:#}"),
+            }
+        }
+    }
+
+    /// A mutating provider double: records `operations` in the request's
+    /// journal (as the bridge or the primary hooks would), then ends with
+    /// `outcome`. Captures every message it is handed.
+    struct Journaling {
+        operations: serde_json::Value,
+        outcome: fn() -> anyhow::Error,
+        messages: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Journaling {
+        fn new(operations: serde_json::Value, outcome: fn() -> anyhow::Error) -> Arc<Self> {
+            Arc::new(Self { operations, outcome, messages: std::sync::Mutex::new(Vec::new()) })
+        }
+        fn count(&self) -> usize {
+            self.messages.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl Reasoner for Journaling {
+        async fn call(&self, opts: &ReasonerOpts, message: &str) -> anyhow::Result<String> {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            self.messages.lock().unwrap().push(message.to_string());
+            let path = opts.handoff_path.as_ref().expect("mutating calls carry an operation journal");
+            let mut file = std::fs::OpenOptions::new().create(true).write(true).truncate(true)
+                .mode(0o600).open(path)?;
+            file.write_all(serde_json::json!({"version": 1, "operations": self.operations}).to_string().as_bytes())?;
+            Err((self.outcome)())
+        }
+    }
+
+    fn no_summary() -> anyhow::Error {
+        anyhow::anyhow!("codex produced no assistant text")
+    }
+
+    fn completed_operation() -> serde_json::Value {
+        serde_json::json!([{"tool": "mcp__fixture__create", "arguments": {"title": "Synthetic"},
+            "status": "completed", "result": {"content": [{"type": "text", "text": "synthetic-42"}]}}])
+    }
+
+    /// An ingest-shaped (WriteTools) request with a stable turn identity, so a
+    /// caller retry addresses the same operation journal.
+    fn write_request(dir: &tempfile::TempDir) -> ReasonerOpts {
+        let wiki = dir.path().join("wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+        let mut opts = crate::reasoner::ingest_opts("Synthetic ingestion".into(), wiki);
+        opts.session_id = Some("synthetic-turn-1040".into());
+        assert_eq!(classify(&opts), crate::providers::CapabilityClass::WriteTools);
+        opts
+    }
+
+    /// #1040 C3 — the issue's scenario: the write happened, then the turn
+    /// ended without a summary. Neither the chain nor a caller retry of the
+    /// same request may dispatch it again.
+    #[tokio::test]
+    async fn completed_write_without_summary_is_not_redispatched_by_fallback_or_caller_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let latch = latch_in(&dir);
+        let primary = Journaling::new(completed_operation(), no_summary);
+        let backup = Scripted::ok("must not repeat the completed write");
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>),
+            (ProviderKind::Claude, backup.clone() as Arc<dyn Reasoner>),
+        ], latch.clone());
+        chain.handoff_root = Some(dir.path().join("private/handoffs"));
+        let opts = write_request(&dir);
+        let expected = crate::handoff_outcome::CompletedWithoutSummary { completed: 1, uncertain: 0 };
+        for attempt in 0..3 {
+            let err = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
+            assert!(ReasonerError::find_in(&err).is_none(), "attempt {attempt} must stay untyped: {err:#}");
+            assert_eq!(err.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>(), Some(&expected),
+                "attempt {attempt}: {err:#}");
+            if attempt == 0 {
+                assert!(format!("{err:#}").contains("codex produced no assistant text"),
+                    "the provider's own ending stays in the chain: {err:#}");
+            }
+        }
+        assert_eq!(primary.count(), 1, "a caller retry must not re-dispatch completed work");
+        assert_eq!(backup.count(), 0, "the chain must not re-run completed work elsewhere");
+        assert!(latch.active().is_empty(), "a content-level ending latches nothing");
+    }
+
+    /// #1040 C3 negative control: with no completed operation there is
+    /// nothing to protect, so the error stays the provider's own and a caller
+    /// retry is dispatched normally.
+    #[tokio::test]
+    async fn content_level_end_without_completed_operations_stays_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = Journaling::new(serde_json::json!([]), no_summary);
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Codex, primary.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
+        chain.handoff_root = Some(dir.path().join("private/handoffs"));
+        let opts = write_request(&dir);
+        for _ in 0..2 {
+            let err = chain.call(&opts, "Synthetic ingest request").await.unwrap_err();
+            assert_eq!(err.to_string(), "codex produced no assistant text");
+            assert!(err.downcast_ref::<crate::handoff_outcome::CompletedWithoutSummary>().is_none());
+        }
+        assert_eq!(primary.count(), 2);
+    }
+
+    /// #1040 keeps the #1021 handoff contract: a provider-side interruption
+    /// is not a finished turn, so the next provider still resumes the same
+    /// write request from its receipts (the journal, not a re-run, is what
+    /// stops a completed operation repeating).
+    #[tokio::test]
+    async fn provider_side_interruption_after_completed_operations_still_resumes_with_receipts() {
+        struct Resuming(std::sync::Mutex<Vec<String>>);
+        #[async_trait]
+        impl Reasoner for Resuming {
+            async fn call(&self, _: &ReasonerOpts, message: &str) -> anyhow::Result<String> {
+                self.0.lock().unwrap().push(message.to_string());
+                Ok("resumed from receipts".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let primary = Journaling::new(completed_operation(), rate_limited);
+        let backup = Arc::new(Resuming(std::sync::Mutex::new(Vec::new())));
+        let mut chain = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>),
+            (ProviderKind::Codex, backup.clone() as Arc<dyn Reasoner>),
+        ], latch_in(&dir));
+        chain.handoff_root = Some(dir.path().join("private/handoffs"));
+        let opts = write_request(&dir);
+        assert_eq!(chain.call(&opts, "Synthetic ingest request").await.unwrap(), "resumed from receipts");
+        assert_eq!(primary.count(), 1);
+        let handed = backup.0.lock().unwrap().clone();
+        assert_eq!(handed.len(), 1);
+        assert!(handed[0].starts_with("Synthetic ingest request") && handed[0].contains("synthetic-42"),
+            "the next provider must receive the completed receipt: {handed:?}");
     }
 
     #[tokio::test]
