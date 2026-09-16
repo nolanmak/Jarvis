@@ -1279,7 +1279,7 @@ async fn pr_gated_path(repo_root: &Path, pr: u64) -> Option<String> {
 /// Reads only. Every unknown is treated as "do not merge": the sweep's whole
 /// justification is that it finishes work already approved, and acting on a
 /// guess would make it something else.
-async fn merge_sweep(repo_root: &Path) -> usize {
+async fn merge_sweep(repo_root: &Path, dry_run: bool) -> usize {
     let gh = gh_bin();
     let (ok, out, _) = match run(
         &gh,
@@ -1445,6 +1445,18 @@ async fn merge_sweep(repo_root: &Path) -> usize {
                 info!("merge sweep skipped {why}");
             }
             SweepVerdict::Merge => {
+                // CodeRabbit: every other path in this loop honours `dry_run`,
+                // and the sweep did not — so a dry run would have really
+                // readied and really merged. `gh pr ready` is the first state
+                // change, so this sits above it rather than beside the merge.
+                if dry_run {
+                    info!(
+                        pr = candidate.pr,
+                        issue = candidate.issue,
+                        "merge sweep (dry-run): would merge this approved draft"
+                    );
+                    continue;
+                }
                 // Marking ready is a state change, and the merge right after
                 // it can still fail — a check that went red between the read
                 // and now, mergeability that changed, branch protection. The
@@ -8700,7 +8712,7 @@ impl AutoPrLoop {
             // #1029 — finish already-approved drafts FIRST, and outside the
             // cap. This spends no reasoner call, so a reasoner budget must not
             // gate it; gating it is what let approved PRs sit for days.
-            let swept = merge_sweep(&self.repo_root).await;
+            let swept = merge_sweep(&self.repo_root, self.dry_run).await;
             if swept > 0 {
                 info!(swept, "auto-PR: merged already-approved drafts (unbilled)");
             }
@@ -11707,6 +11719,16 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             fn_body.contains("sweep_window_start("),
             "rotate the examination window across ticks"
         );
+
+        // CodeRabbit: a dry run must not really merge, and the guard has to
+        // sit above `gh pr ready` — the first state change — not beside the
+        // merge itself.
+        let merge_arm = fn_body.find("SweepVerdict::Merge").expect("the merge arm");
+        let dry = fn_body[merge_arm..].find("if dry_run").expect("must honour dry_run");
+        let ready = fn_body[merge_arm..]
+            .find(r#""pr", "ready""#)
+            .expect("the first state change");
+        assert!(dry < ready, "check dry_run before the first state change");
 
         // C7 — bounded on BOTH axes. Codex: capping merges does not cap the
         // tick, because the expensive part is the looking — a checks read, a
