@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # #1048: the PR verification gate must demand a bridge-suite receipt when a PR
 # changes the Codex enforcement scripts (bridge, command sandbox, build VM,
-# dependency proxy, provider supervisor). CI may skip the sandbox tests on a
-# kernel without Landlock ABI 6, so a receipt from an enforcing host is the
-# only proof they ran.
+# dependency proxy, provider supervisor). CI never runs the real-VM tests and
+# PRs are opened before CI reports, so the receipt records an enforcing local
+# run (and the VM run where it applies).
 #
 # Drives the real scripts/agent-pr-verify-gate.sh with synthetic PreToolUse
 # events against throwaway git repositories. No network, no real PRs.

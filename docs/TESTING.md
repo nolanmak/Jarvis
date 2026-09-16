@@ -9,7 +9,7 @@ daemon state. The Codex fallback contract they verify is in
 
 | Suite | Where it runs | Needs |
 |---|---|---|
-| Python bridge, sandbox, VM-snapshot and dependency-proxy suites (`scripts/tests/*_test.py`) | CI, every PR and push to `main` | Nothing. Sandbox tests skip without Landlock ABI 6 |
+| Python bridge, sandbox, VM-snapshot and dependency-proxy suites (`scripts/tests/*_test.py`) | CI, every PR and push to `main` | Nothing. Locally, sandbox tests skip without Landlock ABI 6; in CI they fail |
 | PR gate receipt rules (`scripts/tests/agent-pr-verify-gate.test.sh`) | CI, same job | `jq`, `git` |
 | Privacy scripts, Node build and tests | CI (`privacy.yml`) | Nothing |
 | Rust unit tests | Locally and in the auto-PR gate, per crate. Not in GitHub CI | `cargo` |
@@ -22,9 +22,11 @@ daemon state. The Codex fallback contract they verify is in
 `.github/workflows/bridge-suites.yml` has one job, `bridge-suites`. It runs on
 `ubuntu-latest` for every pull request and every push to `main`:
 
-1. Installs `poppler-utils` and `libseccomp2`.
+1. Installs `poppler-utils`, `libseccomp2` and `ripgrep` (apt retries 3 times).
 2. Prints `python3 scripts/tests/host_capabilities.py`, which shows the kernel's
    Landlock ABI and whether the command sandbox and the PDF renderer are usable.
+   The job sets `REQUIRE_ENFORCEABLE_SANDBOX=1`, so this step fails when either
+   is not.
 3. Fails if any of the four enforcement suites is missing:
    `codex_tool_bridge_test`, `codex_command_sandbox_test`, `codex_build_vm_test`
    and `build_dependency_proxy_test`.
@@ -33,12 +35,19 @@ daemon state. The Codex fallback contract they verify is in
 
 Tests that confine a real process (bridge `Bash` and build commands, PDF
 rendering, `SandboxTests`) need Landlock ABI 6 (Linux 6.12+), `libseccomp.so.2`
-and Poppler. On a host without them these tests **skip with that reason**, and
-never fail. `host_capabilities.py` checks the host directly instead of calling
-the sandbox, so a sandbox bug still fails on a host that supports it. The
-hosted runner kernel reported Landlock ABI 7 when this job was added, so CI runs
-every sandbox test. The capability step logs this on every run. If a future
-runner image loses support, the step log shows it and those tests skip.
+and Poppler. `host_capabilities.py` checks the host directly instead of calling
+the sandbox, so a sandbox bug still fails on a host that supports it.
+
+- **Locally** (switch unset), a host without them **skips** these tests with the
+  reason.
+- **In CI**, `REQUIRE_ENFORCEABLE_SANDBOX=1` turns each of those skips into a
+  **failure**, and the capability step exits 1. A runner image that loses
+  Landlock, libseccomp or Poppler fails the job instead of passing with no
+  sandbox coverage. The hosted runner reported Landlock ABI 7 when this job
+  was added.
+
+`scripts/tests/host_capabilities_test.py` pins the switch with a faked report:
+skip when it is off, failure when it is on.
 
 The only tests that skip in CI are the opt-in ones below: 5 `BuildVmTests`, 7
 bridge `test_vm_*` tests and the live discovery test.
@@ -104,19 +113,33 @@ and the auto-PR ledgers all live there. The Rust code resolves it in one place,
 - `$XDG_STATE_HOME/augmentagent` when `XDG_STATE_HOME` is an absolute path,
 - otherwise `$HOME/.local/state/augmentagent`.
 
-The shell scripts use the same rule. Per-file overrides such as
+Per-file overrides such as
 `AUGMENTAGENT_COOLDOWN_FILE`, `AUGMENTAGENT_TOOL_AUDIT_LOG` and
 `AUGMENTAGENT_TOKEN_USAGE_LOG` still win. Live tests can't just replace `HOME`,
 because they need the real `~/.claude` and `~/.codex` logins. Replacing
-`XDG_STATE_HOME` moves every state file and leaves the logins alone.
+`XDG_STATE_HOME` moves every state file the Rust code resolves and leaves the
+logins alone.
+
+Other readers of this state, and what cannot follow the rule:
+
+| Reader | Follows `XDG_STATE_HOME`? |
+|---|---|
+| `scripts/lib/service-restart.sh` (updater): self-improve lane locks, restart stamps | Yes, the identical rule (`augmentagent_state_dir`). Pinned by `service-restart.test.sh` and `updater-restart-hygiene.test.sh` |
+| `check-for-updates.sh` `built-commit` and `update.log`, `install-*.sh` log dirs | Yes, as `${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent`. Same result unless the value is relative, which Rust ignores and these would use. Set it only to an absolute path |
+| systemd `StandardOutput`/`StandardError` (`stdout.log`, `stderr.log`, the timer logs) | **No.** Fixed when the unit is written: `install-autostart.sh` expands `XDG_STATE_HOME` at install time, and `scripts/systemd/*.service` hardcode `%h/.local/state` or an absolute home. `autopr-health` reads `stderr.log` from the resolved state dir, so if `XDG_STATE_HOME` changes after install it looks in the wrong place |
+| Legacy Node dashboard, `src/dashboard.ts` (`/api/audit`) | **No.** Reads `$HOME/.local/state/augmentagent/tool-audit.log` unless `AUGMENTAGENT_TOOL_AUDIT_LOG` is set |
+
+None of this matters on the live host today: nothing sets `XDG_STATE_HOME`
+there, so every reader uses `$HOME/.local/state/augmentagent`.
 
 The test harnesses apply this override themselves:
 
-- **`augmentagent-channel-core`'s own test binary** never uses the real
-  directory. Without an explicit `XDG_STATE_HOME`, `state_dir()` returns a
-  private scratch directory for the process. That covers the handoff and Codex
-  live tests.
-- **Live tests in other crates and in `channel-core/tests/`** call
+- **`augmentagent-channel-core`'s own unit-test binary** uses a private
+  scratch directory **only when `XDG_STATE_HOME` is unset**. That covers the
+  handoff and Codex live tests in `src/`. If `XDG_STATE_HOME` is set, those
+  tests use it as given, so don't point it at the real directory.
+- **Integration tests (`channel-core/tests/`) and live tests in other crates**
+  link the normal build and rely on `isolate_for_tests()`. They call
   `augmentagent_channel_core::state_dir::isolate_for_tests()` before creating
   any reasoner. It points `XDG_STATE_HOME` at a private scratch directory,
   unless it already names a directory other than the real one. It panics if a
@@ -137,6 +160,11 @@ Tests pin this behaviour:
   checks the auto-PR ledgers.
 - `state_dir::tests::no_state_path_bypasses_the_shared_resolver` fails if any
   crate builds a `.local/state/augmentagent` path by hand.
+- `memory_nudge::tests::default_cycles_root_honors_xdg` checks the rule through
+  the pure `state_dir::resolve()`.
+- `scripts/tests/service-restart.test.sh` and
+  `scripts/tests/updater-restart-hygiene.test.sh` check that the updater finds a
+  lane lock held under `$XDG_STATE_HOME/augmentagent`.
 
 For a manual live run, add your own fence as well. It costs nothing:
 
@@ -163,8 +191,9 @@ these scripts:
 - `scripts/build-dependency-proxy.py`
 - `scripts/provider-supervisor.py`
 
-CI can skip the sandbox tests, and it never runs the VM tests, so the receipt
-records a run on a host that enforces the sandbox:
+CI runs the Python suites only after the PR exists and never runs the VM tests,
+and a local host without Landlock skips the sandbox tests. So the receipt
+records a run, before the PR, on a host that enforces the sandbox:
 
 ```text
 command:      python3 scripts/tests/host_capabilities.py

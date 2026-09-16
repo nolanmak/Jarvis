@@ -406,12 +406,25 @@ mod tests {
         assert!(format!("{err}").contains("headline must not be empty"));
     }
 
-    /// XDG_STATE_HOME handling is pinned once, for every state path, by
-    /// `state_dir::tests` in a child process (#1048). Mutating it here would
-    /// race every parallel test that resolves a state path.
+    /// The XDG rule itself, through the pure resolver: mutating the real
+    /// XDG_STATE_HOME here would race every parallel test that resolves a
+    /// state path (#1048). The env-driven path is pinned in a child process
+    /// by `state_dir::tests::every_state_path_and_write_follows_the_state_home_override`.
     #[test]
     fn default_cycles_root_honors_xdg() {
-        assert_eq!(default_cycles_root(), crate::state_dir::state_dir().unwrap());
+        use crate::state_dir::resolve;
+        let home = || Some(std::ffi::OsString::from("/synthetic/home"));
+        assert_eq!(
+            resolve(Some("/tmp/state-test".into()), home()),
+            Some(PathBuf::from("/tmp/state-test/augmentagent"))
+        );
+        assert_ne!(resolve(None, home()), resolve(Some("/tmp/state-test".into()), home()));
+        assert_eq!(resolve(Some("".into()), home()), resolve(None, home()), "empty is unset");
+        assert_eq!(
+            resolve(Some("relative".into()), home()),
+            resolve(None, home()),
+            "a relative XDG_STATE_HOME is ignored"
+        );
     }
 
     #[test]

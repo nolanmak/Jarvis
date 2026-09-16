@@ -1,10 +1,25 @@
 //! The daemon's private state directory, resolved in one place (#1048).
 //!
 //! `$XDG_STATE_HOME/augmentagent` when `XDG_STATE_HOME` is an absolute path,
-//! else `$HOME/.local/state/augmentagent`. That is the rule the shell scripts
-//! already use (`${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent`); per the
-//! XDG spec a relative value is ignored. Neither systemd unit sets
-//! `XDG_STATE_HOME`, so the running daemon keeps its existing paths.
+//! else `$HOME/.local/state/augmentagent`; per the XDG spec an empty or
+//! relative value is ignored. No systemd unit sets `XDG_STATE_HOME`, so the
+//! running daemon keeps its existing paths.
+//!
+//! Shell and Node readers of the same state, and what cannot follow the rule:
+//! - `scripts/lib/service-restart.sh` (`augmentagent_state_dir`) applies this
+//!   exact rule to the self-improve lane locks and its restart stamps.
+//! - `check-for-updates.sh` and the `install-*.sh` scripts use
+//!   `${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent`: the same result
+//!   except for a relative value, which they would use and this ignores.
+//! - systemd `StandardOutput`/`StandardError` paths (the daemon's `stdout.log`
+//!   and `stderr.log`, which `autopr-health` reads from [`state_dir`]) are
+//!   fixed when the unit is written: `install-autostart.sh` expands
+//!   `XDG_STATE_HOME` at install time, and `scripts/systemd/*.service`
+//!   hardcode `%h/.local/state` or an absolute home path. Changing
+//!   `XDG_STATE_HOME` later does not move them.
+//! - The legacy Node dashboard (`src/dashboard.ts`) reads
+//!   `$HOME/.local/state/augmentagent/tool-audit.log` unless
+//!   `AUGMENTAGENT_TOOL_AUDIT_LOG` is set; it ignores `XDG_STATE_HOME`.
 //!
 //! Every state file the Rust code resolves on its own derives from here: the
 //! cooldown latch, handoff journals, review history, tool-audit and
@@ -30,10 +45,12 @@ pub fn resolve(state_home: Option<OsString>, home: Option<OsString>) -> Option<P
 /// The state directory for this process, or `None` without `HOME` or an
 /// absolute `XDG_STATE_HOME`. Callers keep their own HOME-less fallback.
 ///
-/// This crate's own test binary never resolves the real directory: without
-/// an explicit `XDG_STATE_HOME` it gets a private per-process scratch dir, so
-/// no unit or live test here (the handoff and Codex live tests included) can
-/// write the owner's cooldowns, journals or logs.
+/// In this crate's own unit-test binary, and only while `XDG_STATE_HOME` is
+/// unset, it returns a private per-process scratch dir instead of
+/// `$HOME/.local/state/augmentagent`; that covers the handoff and Codex live
+/// tests in `src/`. When `XDG_STATE_HOME` is set, those tests use it as
+/// given. Integration tests (`tests/`) and other crates link the normal
+/// build, so their live tests rely on [`isolate_for_tests`].
 pub fn state_dir() -> Option<PathBuf> {
     #[cfg(test)]
     if std::env::var_os(STATE_HOME_ENV).is_none() {

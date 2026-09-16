@@ -130,9 +130,9 @@ while IFS= read -r f; do
     crates/augmentagent-approval-discord/src/loops.rs)           MATCHED+="$f"$'\n' ;;
     crates/augmentagent-approval-discord/src/process_loops.rs)   MATCHED+="$f"$'\n' ;;
     # #1048: the Codex fallback's enforcement boundary. CI runs their
-    # suites, but a kernel without Landlock ABI 6 skips every sandbox test
-    # and the real-VM tests never run there. The receipt is the proof they
-    # ran on a host that enforces the sandbox.
+    # suites (and fails without sandbox enforcement), but only after the PR
+    # exists, and the real-VM tests never run there. The receipt is the proof
+    # they ran first on a host that enforces the sandbox.
     scripts/codex-tool-bridge.py|scripts/codex-command-sandbox.py|scripts/codex-build-vm.py|scripts/build-dependency-proxy.py|scripts/provider-supervisor.py)
       MATCHED+="$f"$'\n'; BRIDGE_MATCHED+="$f"$'\n' ;;
   esac
@@ -160,8 +160,8 @@ if [[ -n "$BRIDGE_MATCHED" ]]; then
   BRIDGE_SECTION=$(cat <<'BRIDGE'
   scripts/codex-tool-bridge.py, codex-command-sandbox.py, codex-build-vm.py, build-dependency-proxy.py
   OR provider-supervisor.py (the Codex enforcement boundary; see docs/TESTING.md):
-      CI runs these suites, but a kernel without Landlock ABI 6 SKIPS every sandbox test and the
-      real-VM tests never run in CI. The receipt must prove they ran un-skipped on this host:
+      CI runs these suites only after the PR exists, and never runs the real-VM tests. Locally, a kernel
+      without Landlock ABI 6 SKIPS every sandbox test. The receipt must prove they ran un-skipped here:
         python3 scripts/tests/host_capabilities.py
         (cd scripts && python3 -m unittest discover -s tests -p '*_test.py' -v)
       → the report must say "command sandbox: enforceable" and "PDF renderer: installed", and the
