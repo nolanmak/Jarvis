@@ -2,6 +2,22 @@
 use std::path::{Path, PathBuf};
 use crate::reasoner::ReasonerOpts;
 
+fn configured_vm_path(override_path: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    if let Some(path) = override_path.filter(|p| !p.is_empty()) {
+        // A broken explicit override must fail, never silently select another runtime.
+        return Some(PathBuf::from(path));
+    }
+    let path = PathBuf::from(home?).join(".local/share/augmentagent/build-vm/runtime.json");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        _ => Some(path), // unreadable/symlinked configuration is checked by the broker
+    }
+}
+
+pub(crate) fn build_vm_config_path() -> Option<PathBuf> {
+    configured_vm_path(std::env::var_os("AUGMENTAGENT_BUILD_VM_CONFIG"), std::env::var_os("HOME"))
+}
+
 pub struct BridgeLaunch {
     pub native_cwd: PathBuf,
     pub config_overrides: Vec<String>,
@@ -45,7 +61,7 @@ impl BridgeLaunch {
             "session_id": opts.session_id,
             "handoff_path": opts.handoff_path,
             // Operator configuration, deliberately not sourced from opts.env.
-            "build_vm_config": std::env::var_os("AUGMENTAGENT_BUILD_VM_CONFIG").map(PathBuf::from),
+            "build_vm_config": build_vm_config_path(),
         });
         fn private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
             let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
@@ -91,6 +107,20 @@ impl BridgeLaunch {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn vm_configuration_uses_durable_default_and_preserves_explicit_overrides() {
+        let home = tempfile::tempdir().unwrap();
+        let home_arg = Some(home.path().as_os_str().to_owned());
+        assert_eq!(configured_vm_path(None, home_arg.clone()), None);
+        let default = home.path().join(".local/share/augmentagent/build-vm/runtime.json");
+        std::fs::create_dir_all(default.parent().unwrap()).unwrap();
+        std::fs::write(&default, "{}").unwrap();
+        assert_eq!(configured_vm_path(None, home_arg.clone()), Some(default));
+        let explicit = home.path().join("missing-explicit.json");
+        assert_eq!(configured_vm_path(Some(explicit.as_os_str().to_owned()), home_arg), Some(explicit));
+        assert_eq!(configured_vm_path(None, None), None);
+    }
 
     #[test]
     fn launch_keeps_native_tools_confined_and_private_config_out_of_argv() {

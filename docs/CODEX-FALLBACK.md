@@ -88,9 +88,10 @@ A Cargo fixture compiles and runs socket/session tests in the guest. Running
 the actual core unit suite from a fresh snapshot compiled in 2m26s and produced
 376 passes, three ignored live tests, and only the existing full-agentic routing
 regression failure. The earlier socket, session and HOME failures did not recur.
-When the operator sets `AUGMENTAGENT_BUILD_VM_CONFIG`, bridge Cargo/npm/npx
-commands now use this runner. The adapter reads this setting from its own process
-environment, never from profile environment overrides. The launcher bundles both
+Bridge Cargo/npm/npx commands use this runner when the private default runtime
+configuration exists, or the operator sets `AUGMENTAGENT_BUILD_VM_CONFIG`. The
+adapter reads the override from its own process environment, never from profile
+environment overrides. See [runtime setup and rollback](BUILD-VM.md). The launcher bundles both
 the VM helper and process supervisor privately. Checkout path arguments translate
 to the guest workspace, guest tools do not depend on the host command PATH, and
 root npm dependencies mount read-only. Source reconciliation runs only after VM
@@ -98,11 +99,13 @@ shutdown and retains original Write hooks and concurrent-edit checks. A real
 bridge test verifies npm dependency loading, loopback, process sessions, source
 updates and guard denial. Live Codex QA ran a Cargo socket test through the
 packaged bridge, verified its successful tool audit and confirmed build outputs
-stayed out of the source worktree. Private durable runtime provisioning, cache
+stayed out of the source worktree. A durable private runtime was provisioned with
+a package/version/hash record; a second live test passed using default discovery
+without an environment override. This did not restart or deploy the daemon. Cache
 reuse, missing dependency provisioning, nested npm workspaces, resource policy
-and binary/deletion reconciliation remain integration work. Real-VM tests require
-`JARVIS_TEST_VM_CONFIG` pointing to owner-private runtime configuration; the live
-adapter test additionally requires `AUGMENTAGENT_BUILD_VM_CONFIG`.
+and binary/deletion reconciliation remain integration work. Real-VM Python tests
+require `JARVIS_TEST_VM_CONFIG` pointing to owner-private runtime configuration;
+the live adapter test uses default discovery or the daemon override.
 
 ## Fallback diagnostics
 

@@ -577,9 +577,9 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
     }
 
     #[tokio::test]
-    #[ignore = "requires Codex login and AUGMENTAGENT_BUILD_VM_CONFIG; builds synthetic code only"]
+    #[ignore = "requires Codex login and a configured VM runtime; builds synthetic code only"]
     async fn live_codex_builds_and_tests_with_the_vm_bridge() {
-        assert!(std::env::var_os("AUGMENTAGENT_BUILD_VM_CONFIG").is_some());
+        assert!(crate::codex_tools::build_vm_config_path().is_some());
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("Cargo.toml"),
