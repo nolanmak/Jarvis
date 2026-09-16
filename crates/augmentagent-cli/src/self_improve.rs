@@ -1018,32 +1018,66 @@ const MAX_CRITERION_CHARS: usize = 200;
 fn split_criteria(raw: &str) -> (String, Vec<String>) {
     let mut kept: Vec<&str> = Vec::new();
     let mut criteria: Vec<String> = Vec::new();
+    // Lines consumed since the header, so a block that turns out to be
+    // malformed can hand every one of them back to the spec untouched.
+    let mut pending: Vec<&str> = Vec::new();
+    let mut pending_items: Vec<String> = Vec::new();
     let mut in_block = false;
+
     for line in raw.lines() {
         let t = line.trim();
-        // A BARE `criteria:` line opens the block, nothing else. Accepting
-        // `CRITERIA: here is why ...` would invent criteria out of the spec's
-        // own bullets AND delete a line of the spec the builder must follow —
-        // and losing spec content is the worse half of that.
-        if t.eq_ignore_ascii_case("criteria:") {
-            in_block = true;
+
+        if !in_block {
+            // A BARE `criteria:` line opens the block, nothing else. Accepting
+            // `CRITERIA: here is why ...` would invent criteria out of the
+            // spec's own bullets AND delete a line the builder must follow.
+            if t.eq_ignore_ascii_case("criteria:") {
+                in_block = true;
+                pending.push(line);
+                pending_items.clear();
+                continue;
+            }
+            kept.push(line);
             continue;
         }
-        if in_block {
-            if let Some(item) = t.strip_prefix('-') {
-                let item = item.trim();
-                if !item.is_empty() {
-                    criteria.push(item.to_string());
-                }
-                continue;
-            }
-            if t.is_empty() {
-                continue;
-            }
+
+        // Inside the block. A blank line CLOSES it: without that, the spec's
+        // own "Files to touch" bullets further down were harvested as
+        // acceptance criteria, and an unmet criterion is `changes-requested`,
+        // so implementation notes would have become a merge gate.
+        if t.is_empty() {
+            criteria = std::mem::take(&mut pending_items);
+            pending.clear();
             in_block = false;
+            kept.push(line);
+            continue;
         }
+
+        if let Some(item) = t.strip_prefix('-') {
+            pending.push(line);
+            let item = item.trim();
+            if !item.is_empty() {
+                pending_items.push(item.to_string());
+            }
+            continue;
+        }
+
+        // Prose interrupting the bullets. The block is not cleanly formed, so
+        // it is worth nothing: a criterion harvested by accident does not just
+        // add noise, it burns revision rounds and can end a run in a gave-up.
+        // Fall back to the no-criteria path, which is today's behaviour, and
+        // return every buffered line to the spec so nothing is lost.
+        pending_items.clear();
+        kept.append(&mut pending);
         kept.push(line);
+        in_block = false;
     }
+
+    // A block that runs to the end of the output is cleanly formed.
+    if in_block {
+        criteria = pending_items;
+    }
+
     cap_criteria(&mut criteria);
     (kept.join("\n"), criteria)
 }
@@ -9908,31 +9942,57 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert_eq!(scoped.criteria[0].chars().count(), MAX_CRITERION_CHARS);
     }
 
-    /// Codex review, first finding, and a clarification of C1 rather than a
-    /// change to it. A block that opens correctly and later drifts into prose
-    /// keeps the bullets it already stated and hands the prose back to the
-    /// spec. Discarding a well-formed criterion because a later line was not a
-    /// bullet would lose real information for a cosmetic reason; the property
-    /// C1 actually protects is that nothing here can fail a run.
+    /// Codex held this finding across two rounds and it was right to. An
+    /// unmet criterion is `changes-requested`, so a criterion harvested by
+    /// accident does not merely add noise — it burns revision rounds and can
+    /// end a run in a gave-up. Anything less than a cleanly-formed block is
+    /// therefore worth nothing, and falls back to the no-criteria path, which
+    /// is today's behaviour exactly.
     #[test]
-    fn a_block_that_drifts_into_prose_keeps_its_bullets_and_returns_the_prose() {
+    fn a_block_interrupted_by_prose_is_worth_nothing() {
         let out = parse_scope_output(
             "VERDICT: fixable\nCRITERIA:\n\
              - C1: every lane is guarded\n\
              Note: a second criterion was considered and dropped.\n\
              - Files to touch: a.rs\n",
         );
-        assert_eq!(out.criteria, vec!["C1: every lane is guarded".to_string()]);
         assert!(
-            out.body.contains("Note: a second criterion"),
-            "prose returns to the spec:\n{}",
-            out.body
+            out.criteria.is_empty(),
+            "an interrupted block must not yield a merge gate: {:?}",
+            out.criteria
         );
-        assert!(
-            out.body.contains("Files to touch: a.rs"),
-            "and so does everything after it, which is the whole point:\n{}",
-            out.body
+        // Nothing is thrown away — the builder still gets every line.
+        for kept in ["C1: every lane is guarded", "Note: a second criterion", "Files to touch: a.rs"] {
+            assert!(out.body.contains(kept), "{kept:?} was lost:\n{}", out.body);
+        }
+    }
+
+    /// The case codex's example did not reach, and the more dangerous one: a
+    /// blank line did not close the block, so the spec's OWN bullets below it
+    /// were harvested as acceptance criteria. Those are implementation notes,
+    /// not properties, and they would have become a merge gate.
+    #[test]
+    fn a_blank_line_closes_the_block_so_spec_bullets_are_never_harvested() {
+        let out = parse_scope_output(
+            "VERDICT: fixable\nCRITERIA:\n\
+             - C1: every lane is guarded\n\
+             \n\
+             - Files to touch: a.rs\n\
+             - Edge case: empty input\n",
         );
+        assert_eq!(
+            out.criteria,
+            vec!["C1: every lane is guarded".to_string()],
+            "only the bullets above the blank line are criteria"
+        );
+        assert!(out.body.contains("Files to touch: a.rs"), "{}", out.body);
+        assert!(out.body.contains("Edge case: empty input"), "{}", out.body);
+    }
+
+    #[test]
+    fn a_block_that_runs_to_the_end_of_the_output_is_clean() {
+        let out = parse_scope_output("VERDICT: fixable\nCRITERIA:\n- C1: a\n- C2: b");
+        assert_eq!(out.criteria, vec!["C1: a".to_string(), "C2: b".to_string()]);
     }
 
     /// C2 — the PR body is the durable store, exactly as it already is for
