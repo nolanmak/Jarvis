@@ -314,9 +314,8 @@ The remaining provider conformance suite must cover:
 
 | Source | Presets / operations |
 |---|---|
-| `channel-core/reasoner.rs` | `triage_opts`, `draft_opts`, `lint_opts`, `ask_opts`, `digest_opts`, `tone_summarize_opts`, `social_adapter_opts`, `loop_parse_opts`, `archetype_pick_opts`, `ingest_opts`, `wiki_migrate_opts`, `resume_opts` |
+| `channel-core/reasoner.rs` | `draft_opts`, `ask_opts`, `social_adapter_opts`, `ingest_opts`, `wiki_migrate_opts`, `resume_opts` |
 | `channel-core/reasoner.rs`, `mcp.rs` | `socialapi_draft_opts`, `with_socialapi_readonly_mcp`, configured stdio/HTTP MCP additions |
-| `channel-core/resolve.rs` | `extract_opts` |
 | `cli/self_improve.rs` | `scope_opts`, `review_opts`, `fix_opts`, `codex_review_opts` |
 | `cli/main.rs` | text-only reasoner selftest and production query dispatch |
 | channel crates | email signature extraction, journal composition, voice extraction, email/LinkedIn/WhatsApp/Slack/Instagram/Twitter/Discord parsing calls |
@@ -449,3 +448,16 @@ manifests, unrelated installs, and a real guest build from a fresh Git worktree.
 A separate fresh checkout of this project passed `npm run build --offline` and
 all 26 `npm test --offline` tests through the VM bridge, then was removed.
 Fetching packages that are not installed remains a provisioning prerequisite.
+
+
+### Shared output-contract verification
+
+The six live `provider_output_contracts` tests pass through both Claude and Codex.
+They cover interval parsing and missing-timezone handling, archetype selection,
+newsletter triage, insufficient-sample tone output, and a generated draft executed
+by the real code-mode runner with a non-sending dispatcher. Additional fixtures
+verify exhaustive digest coverage, booking-link extraction through the production
+ask detector, and read-only linting with audited source inspection and a reported
+broken link. The lint preset explicitly identifies the configured wiki root so
+schema examples do not imply an extra `wiki/` subdirectory. These receipts verify
+the named contracts; they do not establish deployment or the remaining profiles.

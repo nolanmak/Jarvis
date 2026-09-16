@@ -89,7 +89,7 @@
         "provider_output_contracts::codex_production_structured_output_contracts",
         "provider_output_contracts::claude_production_structured_output_contracts"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::ask_opts",
@@ -107,9 +107,11 @@
       "output_contract": "Digest prose with supplied coverage and tone requirements",
       "conformance": [
         "capability_inventory::core_presets_match_permission_contracts",
-        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_digest_extraction_and_lint_contracts",
+        "provider_output_contracts::claude_digest_extraction_and_lint_contracts"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::draft_opts",
@@ -137,9 +139,11 @@
       "output_contract": "Structured lint findings",
       "conformance": [
         "capability_inventory::core_presets_match_permission_contracts",
-        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_digest_extraction_and_lint_contracts",
+        "provider_output_contracts::claude_digest_extraction_and_lint_contracts"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::loop_parse_opts",
@@ -151,7 +155,7 @@
         "provider_output_contracts::codex_production_structured_output_contracts",
         "provider_output_contracts::claude_production_structured_output_contracts"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::resume_opts",
@@ -192,7 +196,7 @@
         "provider_output_contracts::codex_production_structured_output_contracts",
         "provider_output_contracts::claude_production_structured_output_contracts"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::triage_opts",
@@ -204,7 +208,7 @@
         "provider_output_contracts::codex_production_structured_output_contracts",
         "provider_output_contracts::claude_production_structured_output_contracts"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::wiki_migrate_opts",
@@ -229,8 +233,11 @@
       "callsite": "crates/augmentagent-channel-core/src/resolve.rs::extract_opts",
       "permission_profile": "text",
       "output_contract": "Structured extraction from supplied context",
-      "conformance": [],
-      "provider_conformance": "pending"
+      "conformance": [
+        "provider_output_contracts::codex_digest_extraction_and_lint_contracts",
+        "provider_output_contracts::claude_digest_extraction_and_lint_contracts"
+      ],
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-discord-dm/src/channel.rs::handle_priority",

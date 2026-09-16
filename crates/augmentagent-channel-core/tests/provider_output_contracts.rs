@@ -94,3 +94,57 @@ async fn codex_production_structured_output_contracts() {
 async fn claude_production_structured_output_contracts() {
     structured_outputs(&ClaudeCliReasoner::new()).await;
 }
+
+async fn digest_extraction_and_lint(provider: std::sync::Arc<dyn Reasoner>) {
+    use augmentagent_channel_core::{resolve, tool_audit::AuditLogger};
+    let digest = provider.call(&reasoner::digest_opts(None),
+        "Synthetic last 24 hours. Total emails: 3; flagged: 2; pending approvals: 1.\n\
+         ## Flagged items (all, last 24h) — EXHAUSTIVE\n\
+         - alpha@example.com | FIXTURE_ALPHA | requires a decision\n\
+         - beta@example.com | FIXTURE_BETA | requests a missing document\n\
+         ## Pending approvals (all, oldest first) — EXHAUSTIVE\n\
+         - gamma@example.com | FIXTURE_GAMMA | waiting 2d\n\
+         All context is supplied here. No additional senders or activity.")
+        .await.unwrap();
+    for marker in ["FIXTURE_ALPHA", "FIXTURE_BETA", "FIXTURE_GAMMA"] {
+        assert!(digest.contains(marker), "digest omitted {marker}: {digest}");
+    }
+    assert!(digest.len() <= 1500, "small digest exceeded the delivery limit");
+
+    let asks = resolve::detect_asks_shadow(&provider, resolve::AskResolveMode::Shadow,
+        "Please send me your Calendly booking link so I can choose a time.").await;
+    assert!(asks.iter().any(|ask| ask.kind() == resolve::ResolverKind::Calendly
+        && ask.conf() >= resolve::INJECT_CONFIDENCE_FLOOR), "{asks:?}");
+
+    let wiki = tempfile::tempdir().unwrap();
+    let index = "# Synthetic wiki\n\n[Missing project](projects/missing-fixture.md)\n";
+    std::fs::write(wiki.path().join("index.md"), index).unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let audit = logs.path().join("audit.jsonl");
+    let mut options = reasoner::lint_opts(
+        include_str!("../../../schema/wiki-skill.md").into(), wiki.path().into());
+    options.audit_logger = Some(std::sync::Arc::new(AuditLogger::new(audit.clone())));
+    let report = provider.call(&options, &format!(
+        "Run the lint workflow against the synthetic wiki at `{}`. Inspect index.md and verify its link target. Produce a markdown report using relative paths. Do not change any files.", wiki.path().display()))
+        .await.unwrap();
+    assert!(report.contains("missing-fixture"), "lint missed the broken link at {}: {report}; audit: {}",
+        wiki.path().display(), std::fs::read_to_string(&audit).unwrap_or_default());
+    assert_eq!(std::fs::read_to_string(wiki.path().join("index.md")).unwrap(), index);
+    assert!(!wiki.path().join("projects/missing-fixture.md").exists());
+    let records: Vec<Value> = std::fs::read_to_string(audit).unwrap().lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert!(records.iter().any(|record| record["tool"] == "Read" || record["tool"] == "Grep"),
+        "lint must inspect the synthetic source");
+}
+
+#[tokio::test]
+#[ignore = "requires Codex login; synthetic digest, extraction and read-only lint"]
+async fn codex_digest_extraction_and_lint_contracts() {
+    digest_extraction_and_lint(std::sync::Arc::new(CodexCliReasoner::openai())).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Claude login; same synthetic digest, extraction and lint as Codex"]
+async fn claude_digest_extraction_and_lint_contracts() {
+    digest_extraction_and_lint(std::sync::Arc::new(ClaudeCliReasoner::new())).await;
+}

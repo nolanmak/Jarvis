@@ -1466,6 +1466,14 @@ pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> Reasoner
 }
 
 pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
+    // The shared maintenance schema draws a conceptual `wiki/` tree. During
+    // lint the tool workspace is already that tree, not its parent directory.
+    let system_prompt = format!("{system_prompt}\n\nCurrent invocation: read-only wiki lint. \
+        The configured wiki root is `{}`. The schema's `wiki/` denotes that root, \
+        not an additional subdirectory. Resolve index.md and page links against \
+        this root; use its absolute paths with Read, Grep and Glob. Report findings \
+        without changing files. Write and Edit are not available in this invocation.",
+        wiki_root.display());
     ReasonerOpts {
         system_prompt,
         model: Some(opus_model()), // Opus — lint is reasoning-heavy, low volume
