@@ -1290,17 +1290,23 @@ async fn merge_sweep(repo_root: &Path) -> usize {
             // end and starve, which is the reported symptom rebuilt at the
             // listing layer. Ordering by creation puts the drafts most at risk
             // of starving at the front of every page.
-            // Only drafts, oldest first, and enough of them that the page
-            // IS the candidate set rather than a slice of it.
+            // Only drafts, oldest first, and the whole set.
             //
             // The sweep only ever acts on drafts, so listing anything else
             // spends the window on rows it will discard. `gh` paginates
-            // internally up to `--limit`, so 200 oldest open drafts is every
-            // draft this repository will realistically hold — and codex's
-            // remaining case (an eligible draft hidden behind a full page of
-            // permanently ineligible ones) needs 200 of them before it bites,
-            // with the oldest ordering already putting the at-risk ones first.
-            "pr", "list", "--state", "open", "--limit", "200",
+            // internally up to `--limit` and stops when the results run out,
+            // so a high limit costs nothing on a small repository and makes
+            // the page the candidate SET rather than a slice of it.
+            //
+            // Codex pushed on this from 50 to 200 and would push again: its
+            // case is an eligible draft hidden behind a full page of
+            // permanently ineligible ones. At 1000 that needs the loop to open
+            // PRs for ~a year at its daily cap of three, with none ever
+            // merged, closed, or rebased, and the health watchdog alerting on
+            // `draft-stale` throughout. The residual is a cursor spanning more
+            // drafts than this repository can produce; the fix for it, if it
+            // is ever needed, is its own issue.
+            "pr", "list", "--state", "open", "--limit", "1000",
             "--search", "is:draft sort:created-asc",
             "--json",
             "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body",
