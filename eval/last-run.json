@@ -33,7 +33,7 @@
       "expect": "fixable",
       "id": "E963",
       "issue": 963,
-      "note": "complexity medium, est ~260 lines, 5 criteria",
+      "note": "complexity medium, est ~240 lines, 5 criteria",
       "pass": true
     },
     {
@@ -73,5 +73,5 @@
       "pass": true
     }
   ],
-  "started": "2026-09-16T02:23:56Z"
+  "started": "2026-09-16T02:36:25Z"
 }

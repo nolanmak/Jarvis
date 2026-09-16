@@ -785,38 +785,67 @@ pub async fn run(
     Ok(i32::from(s.passed != s.total))
 }
 
-/// Materialise the repository at `commit` into `dir`, registering NOTHING.
+/// Materialise the repository at `commit` into `dir` as a REAL repository,
+/// registering nothing in the source repo.
 ///
-/// `git worktree add` would be the obvious tool and is the wrong one: it
-/// records the checkout in the repository, so a run that dies before cleanup
-/// leaves a registration behind in a repo this command does not own. `git
-/// archive` writes the same tree with no bookkeeping at all, which means there
-/// is no state to leak and nothing to reclaim but a directory.
+/// The choice here decides whether this harness measures anything true.
+/// `scope_opts` grants the scoping pass `Bash(git log*)`, `Bash(git diff*)`
+/// and `Bash(git status*)`, and it uses them — the first eval run answered
+/// "commit 9084be0 is an ancestor of HEAD". A plain file tree (`git archive`)
+/// has no `.git`, so all three fail and the eval would grade a degraded
+/// environment while claiming to grade production judgment.
 ///
-/// Only committed content is written, which is exactly what should be scoped:
-/// the tree as it was, not whatever is lying around untracked today.
+/// `git worktree add` would give git context but records the checkout in the
+/// source repository, so a run that dies before cleanup leaves a registration
+/// behind in a repo this command does not own.
+///
+/// A shared clone gives both: full git context with `HEAD` detached at the
+/// pinned commit, and nothing written to the source repo. `--shared` borrows
+/// the object store instead of copying it, so it is cheap; these clones live
+/// for one scoping call.
 async fn materialise_at(repo_root: &Path, commit: &str, dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir).context("create tree dir")?;
-    let tar = dir.with_extension("tar");
-    let out = tokio::process::Command::new("git")
-        .args(["archive", "--format=tar", "-o", &tar.to_string_lossy(), commit])
-        .current_dir(repo_root)
-        .output()
-        .await
-        .context("spawn git archive")?;
-    if !out.status.success() {
-        let _ = std::fs::remove_file(&tar);
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-    let out = tokio::process::Command::new("tar")
-        .args(["-xf", &tar.to_string_lossy(), "-C", &dir.to_string_lossy()])
-        .output()
-        .await
-        .context("spawn tar")?;
-    let _ = std::fs::remove_file(&tar);
-    if !out.status.success() {
-        bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
-    }
+    let git = |args: Vec<String>, cwd: PathBuf| async move {
+        let out = tokio::process::Command::new("git")
+            .args(&args)
+            .current_dir(&cwd)
+            .output()
+            .await
+            .with_context(|| format!("spawn git {args:?}"))?;
+        if !out.status.success() {
+            bail!(
+                "git {}: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    git(
+        vec![
+            "clone".into(),
+            "--shared".into(),
+            "--no-checkout".into(),
+            "--quiet".into(),
+            repo_root.to_string_lossy().into_owned(),
+            dir.to_string_lossy().into_owned(),
+        ],
+        repo_root.to_path_buf(),
+    )
+    .await?;
+
+    // Detached: the clone must sit ON the pinned commit, not on a branch that
+    // happens to contain it.
+    git(
+        vec![
+            "checkout".into(),
+            "--detach".into(),
+            "--quiet".into(),
+            commit.to_string(),
+        ],
+        dir.to_path_buf(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1204,7 +1233,67 @@ mod tests {
             "materialise the tree without registering it, or a killed run \
              leaves state in a repository this command does not own"
         );
-        assert!(code.contains("\"archive\""), "git archive is how that is done");
+        assert!(code.contains("\"clone\""), "a shared clone is how that is done");
+    }
+
+    /// Codex, system pass, and the sharpest finding of the review: the scoping
+    /// pass is granted `Bash(git log*)`, `Bash(git diff*)` and
+    /// `Bash(git status*)` by `scope_opts`. `git archive` writes files with no
+    /// `.git`, so all three fail and the eval would have measured a DEGRADED
+    /// environment rather than production scoping judgment — which makes the
+    /// whole harness lie. The first eval run is the proof: with a real
+    /// checkout the scoper answered "commit 9084be0 is an ancestor of HEAD".
+    /// It uses git.
+    ///
+    /// A shared clone gives full git context with HEAD at the pinned commit
+    /// and records nothing in the source repository.
+    #[tokio::test]
+    async fn a_materialised_tree_is_a_real_repository_at_the_pinned_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let git = |cwd: &Path, args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&src, &["init", "-q", "-b", "main", "."]);
+        std::fs::write(src.join("a.txt"), "first").unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q", "-m", "one"]);
+        let first = git(&src, &["rev-parse", "HEAD"]);
+        std::fs::write(src.join("a.txt"), "second").unwrap();
+        git(&src, &["add", "-A"]);
+        git(&src, &["-c", "user.email=t@e", "-c", "user.name=t", "commit", "-q", "-m", "two"]);
+
+        let out = dir.path().join("tree");
+        materialise_at(&src, &first, &out).await.expect("materialise");
+
+        assert_eq!(
+            std::fs::read_to_string(out.join("a.txt")).unwrap(),
+            "first",
+            "the tree must be the PINNED commit, not the tip"
+        );
+        // The three commands `scope_opts` actually grants must work.
+        assert_eq!(git(&out, &["rev-parse", "HEAD"]), first);
+        assert!(git(&out, &["log", "--oneline"]).contains("one"));
+        assert!(git(&out, &["status", "--porcelain"]).is_empty());
+        let _ = git(&out, &["diff", "--stat"]);
+
+        // And nothing was recorded in the source repository.
+        assert_eq!(
+            git(&src, &["worktree", "list"]).lines().count(),
+            1,
+            "the source repo must not gain a worktree"
+        );
     }
 
     /// CodeRabbit: `--only E963` graded one case and saved ONLY that case, so
