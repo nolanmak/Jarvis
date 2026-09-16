@@ -1,0 +1,50 @@
+[
+  {
+    "id": "E1",
+    "issue": 1006,
+    "expect": "fixable",
+    "title": "Auto-PR loop mistakes a fork's agent-fix branch for its own",
+    "body": "## Problem\n\nThe loop identifies its own work by branch name alone: any open PR whose head is `agent-fix/issue-<N>` is treated as ours. A pull request from a fork can carry the same head name. Three lanes then misbehave: the dedup guard reports the issue as already claimed and skips it, the resume path checks out a head we cannot prove is ours, and the gave-up sweep would CLOSE a stranger's draft with a comment.\n\n## Fix\n\nFilter on head provenance, not name. `gh pr list --json` already returns `isCrossRepository` and `headRepositoryOwner`; a head is ours only when it is not cross-repository and its owner matches the repo owner. The closing lane must fail closed when the evidence is missing (leaving one of our stale drafts open is harmless; closing someone else's PR is not undone by an apology). The refusal must record nothing: no ledger mark, no GitHub write.\n\n## Acceptance\n\n- A fork draft named `agent-fix/issue-42` never satisfies the dedup guard, is never resumed, and is never closed by the sweep.\n- Our own branch with the same name still is, in all three lanes.\n- Unit tests over the parsed `gh` JSON for both shapes.",
+    "author": "owner"
+  },
+  {
+    "id": "E2",
+    "issue": 955,
+    "expect": "fixable",
+    "title": "Scoper labels an issue out for good after a single failed attempt",
+    "body": "Since the prior-attempts digest was added to the scoping prompt, one failed attempt has been enough for the scoper to return `not-fixable`, and that verdict is terminal: the issue gets the gave-up label and leaves the pool. Four issues left that way this week, each after exactly one review-reject or one red gate.\n\nThe prompt already says a single failed attempt is never evidence of unfixability, but the code trusts the verdict. Enforce the rule in code instead: a not-fixable verdict may label out only when there is no charged failure at all (first-pass triage: research ask, epic, owner decision) or when two failures of the SAME kind are recorded. A review-reject or a red gate means the issue was built, so it is never labelled out on that evidence.\n\nAlso sweep the issues already stamped: on a dry-run-free tick, re-triage gave-up issues whose comment history shows only one attempt, and remove the label so they rejoin the pool.\n\nTests: a table over recorded failure kinds → may-label-out, and a structural test that the label path goes through the new helper.",
+    "author": "owner"
+  },
+  {
+    "id": "E3",
+    "issue": 997,
+    "expect": "fixable",
+    "title": "Health watchdog for the auto-PR loop",
+    "body": "Every outage the loop has had was plainly visible in the daemon log, and every one was found because a human noticed no PRs and went looking. The loop cannot report its own death: a wedged reasoner logs nothing, a dead tick task logs nothing.\n\nAdd `augmentagent autopr-health [--notify] [--json]`: an out-of-process check, run on a timer, that reads the same evidence a human would and posts findings to Discord.\n\nOne rule per real incident:\n- daemon unit not active\n- no reasoner-backed poll completed in 45 minutes\n- no loop log line in 95 minutes\n- free disk under 15 GB on root or the gate target\n- baseline cache red for more than N hours\n- the same PR refused with the same reason on consecutive days\n- deployed commit behind origin/main for over an hour\n- nothing merged in 3 days\n- an agent draft older than N days\n\nAnalysis must be a pure function over a collected inputs struct so each rule is unit-tested against the shape of its incident; collection is a thin layer. Exit 1 on any alert so a timer can gate on it. No new dependencies.",
+    "author": "owner"
+  },
+  {
+    "id": "E4",
+    "issue": 433,
+    "expect": "not-fixable",
+    "title": "Spike: evaluate meeting-transcript providers before we buy one",
+    "body": "Before committing to a transcript vendor for the meeting-notes feature, spend a bounded spike comparing the candidates on: transcript accuracy on a sample of our own recorded calls, webhook latency from meeting end to transcript available, speaker attribution quality, export format and API stability, and monthly price at our call volume.\n\nDeliverable is a short write-up with a recommendation and a go/no-go on the paid tier. This gates the purchase decision and the rest of the meeting-transcripts work; nothing in the codebase changes until the owner picks a vendor.",
+    "author": "owner"
+  },
+  {
+    "id": "E5",
+    "issue": 431,
+    "expect": "not-fixable",
+    "title": "Epic: meeting transcripts in the knowledge base",
+    "body": "Tracking issue for bringing meeting transcripts into the wiki. Children:\n\n- vendor spike and purchase decision\n- OAuth/API credential setup for the chosen vendor\n- an ingest channel that polls for finished transcripts and stores them as evidence\n- wiki page generation per meeting with attendees, decisions, and action items\n- Discord notification when a transcript lands\n- backfill of the last quarter's meetings\n\nEach child gets its own issue and its own PR; this one stays open until all of them land and is closed by hand. Multi-week; sequencing depends on the spike outcome.",
+    "author": "owner"
+  },
+  {
+    "id": "E6",
+    "issue": 826,
+    "expect": "not-fixable",
+    "title": "Auto-updater skips the daemon restart when the build finishes after a pull",
+    "body": "`scripts/check-for-updates.sh` pulls, rebuilds when `crates/` or `Cargo.*` changed, and then restarts the user unit. When the pull and the build land in different ticks, the restart check compares the wrong two commits and silently decides nothing changed, so the new binary sits on disk while the old process keeps running. There is no log line for the skipped restart.\n\nFix the comparison in the updater script so it restarts whenever the built commit differs from the running one, and log the skip decision either way. This is the deploy path: it needs to be edited carefully and tested on the box.",
+    "author": "owner"
+  }
+]

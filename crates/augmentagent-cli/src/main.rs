@@ -49,6 +49,7 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod whatsapp_history;
+mod autopr_eval;
 mod autopr_health;
 mod channel_router;
 mod code_mode;
@@ -493,6 +494,21 @@ enum Cmd {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+    /// Scope-pass eval for the auto-PR loop (#1011): replays the cached
+    /// issues in `eval/autopr-cases.json` through the real stage-1 scoping
+    /// pass, grades the fixable / not-fixable verdict and writes
+    /// `eval/RESULTS.md`. Touches no loop state; exit 1 on any miss.
+    AutoprEval {
+        /// Fixture file (default: eval/autopr-cases.json).
+        #[arg(long)]
+        cases: Option<PathBuf>,
+        /// Comma-separated case ids to run; the report covers only these.
+        #[arg(long)]
+        only: Option<String>,
+        /// Render the report from the fixture alone: no reasoner calls.
+        #[arg(long, default_value_t = false)]
+        report_only: bool,
     },
     Doctor {
         /// Force JSON (`--json`) or human table. Default: auto — JSON when
@@ -2234,6 +2250,13 @@ async fn main() -> Result<()> {
     if let Cmd::Finance { ref op } = cli.cmd {
         return finance::run(op, &db_path, cli.wiki_dir.as_deref()).await;
     }
+    // The scope-pass eval (#1011) needs no database: dispatch before the
+    // store opens so a run from a scratch checkout creates no data.db.
+    if let Cmd::AutoprEval { ref cases, ref only, report_only } = cli.cmd {
+        let root = std::env::current_dir().context("current_dir")?;
+        let code = autopr_eval::run(&root, cases.as_deref(), only.as_deref(), report_only).await?;
+        std::process::exit(code);
+    }
     // PDF exports need no database or network credentials. In particular, do
     // not try to create data.db when invoked from a fresh wiki directory.
     if let Cmd::Doc {
@@ -2276,6 +2299,7 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Finance { .. } => unreachable!("finance dispatched before general store"),
+        Cmd::AutoprEval { .. } => unreachable!("autopr-eval dispatched before general store"),
         Cmd::AccountsList => {
             let accounts = store.get_active_gmail_accounts()?;
             if accounts.is_empty() {

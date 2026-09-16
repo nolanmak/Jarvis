@@ -833,7 +833,7 @@ fn resolve_model(env_val: Option<&str>, default: &str) -> String {
 /// owner's behalf) are often under-specified; the scoper reads the actual
 /// code and turns the ask into a concrete implementation spec the builder
 /// can follow, instead of letting the builder guess scope while editing.
-fn scope_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
+pub(crate) fn scope_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     augmentagent_channel_core::ReasonerOpts {
         system_prompt: SCOPE_SYSTEM.to_string(),
         model: Some(scope_model()),
@@ -958,14 +958,14 @@ Output ONLY the header and spec/reason, no preamble.";
 /// Complexity grade the scoping pass assigns (#653). Anything above
 /// [`Complexity::Medium`] never auto-merges — it lands as a draft PR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Complexity {
+pub(crate) enum Complexity {
     Simple,
     Medium,
     Hard,
 }
 
 impl Complexity {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Simple => "simple",
             Self::Medium => "medium",
@@ -979,21 +979,21 @@ impl Complexity {
     }
 }
 
-/// Parsed stage-1 output (#653).
+/// Parsed stage-1 output (#653). Crate-visible for the #1011 scope eval.
 #[derive(Debug)]
-struct ScopeOutcome {
-    fixable: bool,
-    complexity: Complexity,
+pub(crate) struct ScopeOutcome {
+    pub(crate) fixable: bool,
+    pub(crate) complexity: Complexity,
     /// #843 — the scoper's own size estimate. `None` when the header was
     /// missing or unparseable (older prompt, formatting glitch): absence must
     /// not refuse work, only an explicit over-cap estimate may.
-    est_diff_lines: Option<usize>,
+    pub(crate) est_diff_lines: Option<usize>,
     /// #843 — the scoper's answer to "would the diff touch a guarded path?".
     /// Defaults to `false` for the same reason.
     guarded_paths: bool,
     /// The spec (fixable) or the refusal reason (not-fixable) — the raw text
     /// with the header lines removed.
-    body: String,
+    pub(crate) body: String,
     /// #1012 — checkable properties the change must satisfy, written BEFORE
     /// any code exists. The builder writes the code and its tests, so a
     /// passing test proves only that the builder was self-consistent; these
@@ -1169,7 +1169,7 @@ fn criteria_review_section(criteria: &[String]) -> String {
 /// verdict defaults to *fixable* (an unparsed run should still attempt the
 /// fix); missing/unknown complexity defaults to *hard* (never auto-merge on
 /// a formatting glitch — the conservative direction).
-fn parse_scope_output(raw: &str) -> ScopeOutcome {
+pub(crate) fn parse_scope_output(raw: &str) -> ScopeOutcome {
     let (raw, criteria) = split_criteria(raw);
     let raw = raw.as_str();
     let mut fixable = true;
@@ -2156,7 +2156,7 @@ fn build_fix_prompt(issue: &Issue, plan: Option<&str>, prior: Option<&str>) -> S
 /// Build the stage-1 scoping prompt. Prior failures go in (#803) so the
 /// scoper re-plans around the dead end instead of reproducing the spec that
 /// already failed.
-fn build_scope_prompt(issue: &Issue, prior: Option<&str>) -> String {
+pub(crate) fn build_scope_prompt(issue: &Issue, prior: Option<&str>) -> String {
     format!(
         "GitHub issue #{}: {}\n\n{}{}\n\nProduce the verdict header and (if \
          fixable) the implementation spec now.",
@@ -6199,7 +6199,7 @@ async fn retriage_gave_up(repo_root: &Path, issues: &serde_json::Value) {
 /// never-terminating channel loops, so the task simply dies and the auto-PR
 /// loop stays dead until the next process restart. Walk back to the nearest
 /// char boundary instead.
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
