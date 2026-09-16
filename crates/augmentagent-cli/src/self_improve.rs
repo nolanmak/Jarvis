@@ -1236,24 +1236,31 @@ async fn issue_facts(repo_root: &Path, issue: u64) -> (String, String) {
     )
 }
 
+/// Stands in for a diff the sweep could not read, so the receipt gate stays
+/// engaged rather than being bypassed by a failure.
+const UNREADABLE_DIFF: &str = "<unreadable diff>";
+
 /// The receipt-gated path this PR's diff touches, if any (#823).
 ///
 /// The same check the fresh path runs, against the same file list — read from
 /// the PR rather than from a worktree, because the sweep has neither.
 async fn pr_gated_path(repo_root: &Path, pr: u64) -> Option<String> {
-    let (ok, names, _) = run(
+    // EVERY failure yields the sentinel, not `None`. Codex caught the
+    // asymmetry: a non-zero exit was handled, but `.ok()?` on a spawn failure
+    // returned `None`, which `may_automerge` reads as "touches no gated file"
+    // — so a transport blip BYPASSED the receipt gate instead of engaging it.
+    // Unknown must deny, and the two failure kinds must not disagree about it.
+    match run(
         &gh_bin(),
         &["pr", "diff", &pr.to_string(), "--name-only"],
         repo_root,
     )
     .await
-    .ok()?;
-    if !ok {
-        // Cannot tell what it touches, so it cannot be vouched for. Naming a
-        // sentinel keeps the receipt gate engaged rather than bypassed.
-        return Some("<unreadable diff>".to_string());
+    {
+        Ok((true, names, _)) => touches_verify_gated_path(&names),
+        // Cannot tell what it touches, so it cannot be vouched for.
+        _ => Some(UNREADABLE_DIFF.to_string()),
     }
-    touches_verify_gated_path(&names)
 }
 
 /// #1029 — finish work that is already approved, without spending anything.
@@ -11366,12 +11373,32 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(body.contains("is_research_filed("), "read the issue body");
         assert!(body.contains("pr_gated_path("), "read what the diff touches");
 
-        // An unreadable diff must keep the receipt gate ENGAGED, not bypass it.
+        // An unreadable diff must keep the receipt gate ENGAGED, not bypass
+        // it — and EVERY failure kind must agree about that. Codex caught the
+        // asymmetry: a non-zero exit was handled while a spawn failure fell
+        // through `.ok()?` to `None`, which the policy reads as "touches
+        // nothing gated".
         let g = src.find("async fn pr_gated_path(").expect("the gate reader");
         let reader = &src[g..g + src[g..].find("\n}\n").expect("end")];
+        // Code only: the prose above this assertion names the very shortcut it
+        // forbids, and a check that trips on its own explanation is useless.
+        let code: String = reader
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(
-            reader.contains("<unreadable diff>"),
-            "an unreadable diff must name a gated path, so the gate still applies"
+            !code.contains(".ok()?"),
+            "a spawn failure must not become `None`, which bypasses the gate"
+        );
+        assert!(
+            code.contains("_ => Some(UNREADABLE_DIFF"),
+            "every failure kind must yield the sentinel"
+        );
+        // And the sentinel must actually engage the gate.
+        assert!(
+            !automerge_receipt_ok(Some(UNREADABLE_DIFF), true, None),
+            "the sentinel must withhold a merge without the owner's override"
         );
     }
 
