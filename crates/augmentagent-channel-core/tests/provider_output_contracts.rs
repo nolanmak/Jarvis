@@ -148,3 +148,51 @@ async fn codex_digest_extraction_and_lint_contracts() {
 async fn claude_digest_extraction_and_lint_contracts() {
     digest_extraction_and_lint(std::sync::Arc::new(ClaudeCliReasoner::new())).await;
 }
+
+async fn wiki_mutation_contracts(provider: &dyn Reasoner) {
+    let wiki = tempfile::tempdir().unwrap();
+    std::fs::create_dir(wiki.path().join("about")).unwrap();
+    let prior = "# Synthetic profile\n\nPrior non-resume preference: SYNTHETIC_PRESERVE_42.\n";
+    std::fs::write(wiki.path().join("about/me.md"), prior).unwrap();
+    let response = provider.call(&reasoner::resume_opts(wiki.path().into()),
+        "Synthetic resume fixture, not a real person. Name: Fixture Author. Current role: Test Engineer at Example Organization. Skills: Rust and TypeScript. No contact information and no other people named. Ingest this resume, preserving existing non-resume content.")
+        .await.unwrap();
+    let profile = std::fs::read_to_string(wiki.path().join("about/me.md")).unwrap();
+    for expected in ["SYNTHETIC_PRESERVE_42", "Rust", "TypeScript", "source: resume"] {
+        assert!(profile.contains(expected), "missing {expected}: {profile}");
+    }
+    let marker = response.lines().filter(|line| !line.trim().is_empty()).last().unwrap();
+    assert!(marker.starts_with("wrote:") && marker.contains("about/me.md"), "{response}");
+    assert!(!profile.contains('@'), "must not invent contact information");
+
+    std::fs::create_dir_all(wiki.path().join("people")).unwrap();
+    let person = wiki.path().join("people/fixture_at_example_com.md");
+    std::fs::write(&person, "---\nkind: person\nkey: fixture_at_example_com\ncreated: 2026-01-01\nupdated: 2026-01-01\nsources: [synthetic-prior]\n---\n# Fixture\n\nPreviously confirmed: SYNTHETIC_PRESERVE_73.\n").unwrap();
+    std::fs::write(wiki.path().join("index.md"), "SYNTHETIC_DERIVED_INDEX\n").unwrap();
+    let mut opts = reasoner::ingest_opts(include_str!("../../../schema/wiki-skill.md").into(), wiki.path().into());
+    let logs = tempfile::tempdir().unwrap();
+    let audit = logs.path().join("audit.jsonl");
+    opts.audit_logger = Some(std::sync::Arc::new(augmentagent_channel_core::tool_audit::AuditLogger::new(audit.clone())));
+    provider.call(&opts, &format!(
+        "Run ingest against the wiki root `{}`. Synthetic email: messageId synthetic-inbound-901; threadId synthetic-thread-901; from fixture@example.com; subject Fixture preferences; body: My preferred programming language is Rust. Decision: skip. Outcome: skipped. This is the only message in the thread, with no ask. Update the existing person page and log; preserve previous facts and the derived index.", wiki.path().display()))
+        .await.unwrap_or_else(|error| panic!("ingest failed: {error}; synthetic audit: {}",
+            std::fs::read_to_string(&audit).unwrap_or_default()));
+    let page = std::fs::read_to_string(person).unwrap();
+    for expected in ["SYNTHETIC_PRESERVE_73", "synthetic-inbound-901", "Rust"] {
+        assert!(page.contains(expected), "missing {expected}: {page}");
+    }
+    assert_eq!(std::fs::read_to_string(wiki.path().join("index.md")).unwrap(), "SYNTHETIC_DERIVED_INDEX\n");
+    assert!(std::fs::read_to_string(wiki.path().join("log.md")).unwrap().contains("ingest"));
+}
+
+#[tokio::test]
+#[ignore = "requires Codex login; synthetic resume and email wiki writes only"]
+async fn codex_wiki_mutation_contracts() {
+    wiki_mutation_contracts(&CodexCliReasoner::openai()).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Claude login; same synthetic resume and email wiki writes as Codex"]
+async fn claude_wiki_mutation_contracts() {
+    wiki_mutation_contracts(&ClaudeCliReasoner::new()).await;
+}

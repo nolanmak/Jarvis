@@ -314,7 +314,7 @@ The remaining provider conformance suite must cover:
 
 | Source | Presets / operations |
 |---|---|
-| `channel-core/reasoner.rs` | `draft_opts`, `ask_opts`, `social_adapter_opts`, `ingest_opts`, `wiki_migrate_opts`, `resume_opts` |
+| `channel-core/reasoner.rs` | `draft_opts`, `ask_opts`, `social_adapter_opts` |
 | `channel-core/reasoner.rs`, `mcp.rs` | `socialapi_draft_opts`, `with_socialapi_readonly_mcp`, configured stdio/HTTP MCP additions |
 | `cli/self_improve.rs` | `scope_opts`, `review_opts`, `fix_opts`, `codex_review_opts` |
 | `cli/main.rs` | text-only reasoner selftest and production query dispatch |
@@ -461,3 +461,20 @@ ask detector, and read-only linting with audited source inspection and a reporte
 broken link. The lint preset explicitly identifies the configured wiki root so
 schema examples do not imply an extra `wiki/` subdirectory. These receipts verify
 the named contracts; they do not establish deployment or the remaining profiles.
+
+
+### Shared wiki mutation and migration contracts
+
+Both providers pass the synthetic resume and ingest contracts. Resume seeding
+preserves existing non-resume facts, adds sourced skills without inventing contact
+information, and emits the required `wrote:` marker. Ingest preserves prior facts,
+records a cited preference, updates the log, and leaves the derived index unchanged.
+The ingest preset explicitly identifies its root and requires a final completion
+acknowledgement: an earlier Codex run performed the writes but returned no response,
+which the adapter correctly rejected rather than silently reporting success.
+
+The CLI's shared live migration tests use the production prompt, YAML parser,
+citation filter and patch application. Both providers produce supported cited
+fields, preserve original frontmatter/body content, leave source files untouched,
+and return an empty patch for a page without evidence. The page request explicitly
+names migration as the task so thin pages do not trigger a clarification response.

@@ -129,9 +129,11 @@
       "output_contract": "Wiki update and completion response",
       "conformance": [
         "capability_inventory::core_presets_match_permission_contracts",
-        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_wiki_mutation_contracts",
+        "provider_output_contracts::claude_wiki_mutation_contracts"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::lint_opts",
@@ -163,9 +165,11 @@
       "output_contract": "Seeded wiki files and completion response",
       "conformance": [
         "capability_inventory::core_presets_match_permission_contracts",
-        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_wiki_mutation_contracts",
+        "provider_output_contracts::claude_wiki_mutation_contracts"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::social_adapter_opts",
@@ -216,9 +220,11 @@
       "output_contract": "Structured migration patch; caller preserves existing frontmatter",
       "conformance": [
         "capability_inventory::core_presets_match_permission_contracts",
-        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge"
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_migration_tests::live_codex_migration_contract",
+        "provider_migration_tests::live_claude_migration_contract"
       ],
-      "provider_conformance": "pending"
+      "provider_conformance": "verified"
     },
     {
       "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::with_socialapi_readonly_mcp",

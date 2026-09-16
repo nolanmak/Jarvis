@@ -2109,6 +2109,12 @@ pub fn archetype_pick_opts() -> ReasonerOpts {
 }
 
 pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
+    let system_prompt = format!("{system_prompt}\n\nCurrent invocation: ingest into the \
+        configured wiki root `{}`. The schema's `wiki/` denotes this root, not an \
+        additional subdirectory. Resolve page and log paths against this root. \
+        After completing the updates, return a short final acknowledgement naming \
+        the changed relative paths. If an operation fails, report the failure; \
+        do not silently finish or claim that failed updates were completed.", wiki_root.display());
     ReasonerOpts {
         system_prompt,
         model: Some("claude-haiku-4-5-20251001".into()),

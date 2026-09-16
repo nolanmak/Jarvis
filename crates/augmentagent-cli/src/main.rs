@@ -1,5 +1,8 @@
 //! `augmentagent` binary.
 
+#[cfg(test)]
+mod provider_migration_tests;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -7368,7 +7371,10 @@ fn migration_system_prompt(schema_body: &str) -> String {
 
 /// Build the per-page user prompt: full page contents.
 fn migration_user_prompt(slug: &str, page: &str) -> String {
-    format!("Page: people/{slug}.md\n\n{page}")
+    format!("Perform the v2 migration extraction for this page. Return only the YAML \
+        patch described in the system instructions; return {{}} if the page contains \
+        no supported fields. Do not modify files or ask which workflow to run.\n\n\
+        Page: people/{slug}.md\n\n{page}")
 }
 
 #[allow(clippy::too_many_arguments)]
