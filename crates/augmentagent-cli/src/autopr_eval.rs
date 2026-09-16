@@ -20,7 +20,7 @@
 
 use anyhow::{bail, Context, Result};
 use augmentagent_channel_core::Reasoner;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -419,6 +419,70 @@ pub fn rows_from_json(json: &str) -> Result<Vec<EvalRow>> {
 // Runner. The only impure part: one scoping call per case.
 // ---------------------------------------------------------------------------
 
+/// The prefix every eval scratch dir carries, under the system temp dir.
+const SCRATCH_PREFIX: &str = "autopr-eval-";
+
+/// Scratch dirs left by eval runs that are no longer alive.
+///
+/// A killed run — ctrl-c, an OOM, a `pkill` — never reaches its cleanup, so
+/// its scratch dir survives AND the git worktrees inside it stay registered in
+/// the repository. Litter in the temp dir is untidy; a stale worktree
+/// registration in someone's repo is this tool leaving state behind somewhere
+/// that is not its own. The next run reclaims both.
+///
+/// Conservative on every axis: only `<tmp>/autopr-eval-<pid>`, only when that
+/// pid is gone, and never our own.
+fn stale_scratch(
+    dirs: impl Iterator<Item = PathBuf>,
+    mine: u32,
+    alive: impl Fn(u32) -> bool,
+) -> Vec<PathBuf> {
+    let tmp = std::env::temp_dir();
+    dirs.filter(|d| {
+        if d.parent() != Some(tmp.as_path()) {
+            return false;
+        }
+        let Some(name) = d.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        let Some(pid) = name.strip_prefix(SCRATCH_PREFIX).and_then(|p| p.parse::<u32>().ok())
+        else {
+            return false;
+        };
+        pid != mine && !alive(pid)
+    })
+    .collect()
+}
+
+/// Is a process with this id still running?
+fn pid_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Remove what previous runs left behind, then drop any worktree
+/// registrations that pointed into them.
+async fn reclaim_stale_scratch(repo_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let dirs = entries.filter_map(|e| e.ok()).map(|e| e.path());
+    let stale = stale_scratch(dirs, std::process::id(), pid_alive);
+    if stale.is_empty() {
+        return;
+    }
+    for d in &stale {
+        if let Err(e) = std::fs::remove_dir_all(d) {
+            eprintln!("could not reclaim {}: {e}", d.display());
+        }
+    }
+    let _ = tokio::process::Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(repo_root)
+        .output()
+        .await;
+    println!("reclaimed {} scratch dir(s) from earlier runs", stale.len());
+}
+
 /// A fixture path as it should appear in a committed report: relative to the
 /// repository when it lives inside it, so `RESULTS.md` does not record whose
 /// checkout produced it.
@@ -513,7 +577,8 @@ pub async fn run(
     // read one. Scoping alone should touch none of them, but "should" is how
     // state gets written anyway, and a corrupted ledger costs real shipped
     // work. The dir is removed on the way out.
-    let scratch = std::env::temp_dir().join(format!("autopr-eval-{}", std::process::id()));
+    reclaim_stale_scratch(repo_root).await;
+    let scratch = std::env::temp_dir().join(format!("{SCRATCH_PREFIX}{}", std::process::id()));
     std::fs::create_dir_all(&scratch).context("create scratch dir")?;
     for (k, v) in scratch_env(&scratch) {
         std::env::set_var(k, v);
@@ -979,6 +1044,38 @@ mod tests {
                 "every override must land in the scratch dir, got {v}"
             );
         }
+    }
+
+    /// Found in QA, by killing a run: the scratch dir and the git worktrees
+    /// inside it survive, and a worktree stays REGISTERED in the user's repo.
+    /// Litter in `/tmp` is untidy; a stale registration in someone's
+    /// repository is the loop leaving state behind in a place that is not its
+    /// own. A later run reclaims both.
+    #[test]
+    fn a_killed_run_leaves_scratch_that_the_next_run_reclaims() {
+        let dirs = vec![
+            PathBuf::from("/tmp/autopr-eval-111"), // dead: reclaim
+            PathBuf::from("/tmp/autopr-eval-222"), // alive: another eval, leave it
+            PathBuf::from("/tmp/autopr-eval-333"), // ours: leave it
+            PathBuf::from("/tmp/autopr-eval-bogus"), // unparseable: leave it
+            PathBuf::from("/tmp/something-else"), // not ours at all
+        ];
+        let alive = |pid: u32| pid == 222;
+        let stale = stale_scratch(dirs.iter().cloned(), 333, alive);
+        assert_eq!(stale, vec![PathBuf::from("/tmp/autopr-eval-111")]);
+    }
+
+    #[test]
+    fn reclaiming_never_touches_a_directory_outside_the_scratch_namespace() {
+        let dirs = vec![
+            PathBuf::from("/tmp/eval-111"),
+            PathBuf::from("/tmp/autopr-eval"),
+            PathBuf::from("/home/someone/autopr-eval-111"),
+        ];
+        assert!(
+            stale_scratch(dirs.into_iter(), 1, |_| false).is_empty(),
+            "only /tmp/autopr-eval-<pid> is ours to delete"
+        );
     }
 
     // ---- C6: --only selects a subset ----
