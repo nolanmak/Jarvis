@@ -335,6 +335,24 @@ pub fn render_report(rows: &[EvalRow], cases_path: &str, started: &str) -> Strin
     out
 }
 
+/// The saved rows for exactly the selected cases, in fixture order.
+///
+/// A case the saved run never covered becomes an explicit unrun row rather
+/// than vanishing: dropping it would shrink the denominator and inflate the
+/// score, which is the one thing a score must never do.
+fn rows_for(saved: &[EvalRow], cases: &[&EvalCase]) -> Vec<EvalRow> {
+    cases
+        .iter()
+        .map(|c| {
+            saved
+                .iter()
+                .find(|r| r.id == c.id)
+                .cloned()
+                .unwrap_or_else(|| grade(c, None))
+        })
+        .collect()
+}
+
 /// Save a run: the rows AND when the scoring actually happened.
 pub fn save_run(rows: &[EvalRow], started: &str) -> Result<String> {
     let v = serde_json::json!({
@@ -600,7 +618,7 @@ pub async fn run(
             )
         })?;
         let (saved_rows, saved_started) = load_run(&raw)?;
-        rows = saved_rows;
+        rows = rows_for(&saved_rows, &cases);
         started = saved_started;
     } else {
         let reasoner = augmentagent_channel_core::build_reasoner();
@@ -1096,6 +1114,39 @@ mod tests {
         assert_eq!(select(&cases, None).expect("all").len(), 3);
         let err = select(&cases, Some("E9")).expect_err("unknown id must not silently select nothing");
         assert!(format!("{err:#}").contains("E9"));
+    }
+
+    /// Codex review: `--only E989 --report-only` selected E989 and then
+    /// rendered all eight saved rows, because the saved run replaced the
+    /// selection wholesale. A report that silently covers more than you asked
+    /// for is a report you cannot trust to answer "did my change fix E989".
+    #[test]
+    fn report_only_honours_the_selection_too() {
+        let all = vec![
+            grade(&case("E1", 1, Expect::Fixable), Some(&observed(true, "ok"))),
+            grade(&case("E2", 2, Expect::Fixable), Some(&observed(true, "ok"))),
+            grade(&case("E3", 3, Expect::NotFixable), Some(&observed(false, "ok"))),
+        ];
+        let cases = vec![case("E1", 1, Expect::Fixable), case("E3", 3, Expect::NotFixable)];
+        let picked = rows_for(&all, &cases.iter().collect::<Vec<_>>());
+        assert_eq!(
+            picked.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["E1", "E3"]
+        );
+    }
+
+    /// A selected case the saved run never covered must not be silently
+    /// dropped — that would quietly shrink the denominator and inflate the
+    /// score.
+    #[test]
+    fn a_selected_case_missing_from_the_saved_run_is_reported_as_unrun() {
+        let all = vec![grade(&case("E1", 1, Expect::Fixable), Some(&observed(true, "ok")))];
+        let cases = vec![case("E1", 1, Expect::Fixable), case("E9", 9, Expect::Fixable)];
+        let picked = rows_for(&all, &cases.iter().collect::<Vec<_>>());
+        assert_eq!(picked.len(), 2, "the denominator must not shrink");
+        let missing = picked.iter().find(|r| r.id == "E9").expect("E9 present");
+        assert!(!missing.pass);
+        assert!(missing.actual.contains("no verdict"), "{}", missing.actual);
     }
 
     // ---- C7: grade the parser we actually ship ----
