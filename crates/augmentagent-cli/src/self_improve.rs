@@ -1354,6 +1354,9 @@ async fn merge_sweep(repo_root: &Path) -> usize {
             .get("headRefOid")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        // `IndependentReview::approved()` is `available && diff_ok &&
+        // system_ok`. Two recorded LGTM lines are exactly those three facts.
+        let reviewed_ok = body.matches("CODEX-REVIEW: lgtm").count() >= 2;
         // The two gates the fresh path computes from real state.
         let (issue_body, author) = issue_facts(repo_root, issue).await;
         let research_filed = is_research_filed(&issue_body);
@@ -1386,8 +1389,18 @@ async fn merge_sweep(repo_root: &Path) -> usize {
                     std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE").ok().as_deref(),
                 ),
                 complexity: complexity_from_pr_body(body),
-                codex_approved: body.matches("CODEX-REVIEW: lgtm").count() >= 2,
-                reviews_approved: true,
+                // Derived from the recorded evidence, never asserted. Codex:
+                // `reviews_approved: true` meant the sweep asserted the thing
+                // the policy is supposed to check, so a gate added to
+                // `IndependentReview::approved` would never reach it.
+                //
+                // That predicate is `available && diff_ok && system_ok`. Two
+                // recorded `CODEX-REVIEW: lgtm` lines mean available (it ran)
+                // and both passes approved — the same three facts, read from
+                // the durable record instead of a live struct the sweep does
+                // not have.
+                codex_approved: reviewed_ok,
+                reviews_approved: reviewed_ok,
                 // Read, not assumed. Hardcoding these disabled two gates the
                 // fresh path enforces from real state: a research-filed issue
                 // (the daemon's own speculative proposal) and a diff touching
@@ -11371,6 +11384,46 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // failure direction has to be "do not merge".
         std::fs::write(&path, b"not json").unwrap();
         assert_eq!(opened_pr_for(&path, 1007), None);
+    }
+
+    /// Codex, a fourth time on the same shape, and the last input I had left
+    /// asserted rather than read. `reviews_approved: true` meant the sweep
+    /// told the policy the answer to a question the policy exists to ask, so a
+    /// gate added to `IndependentReview::approved` would never have reached
+    /// the capped path.
+    ///
+    /// That predicate is `available && diff_ok && system_ok`. Two recorded
+    /// `CODEX-REVIEW: lgtm` lines are those same three facts, read from the
+    /// durable record rather than a live struct the sweep does not have — and
+    /// this test pins the equivalence so a change to one has to face the other.
+    #[test]
+    fn the_sweep_derives_review_approval_instead_of_asserting_it() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn merge_sweep(").expect("the sweep");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        // Code only. This is the third assertion on this branch to trip on the
+        // comment that explains it; prose naming the forbidden thing is not
+        // the forbidden thing.
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("reviews_approved: true"),
+            "the sweep must not assert the approval the policy is meant to check"
+        );
+        assert!(code.contains("reviews_approved: reviewed_ok"));
+        assert!(code.contains("codex_approved: reviewed_ok"));
+
+        // The predicate being mirrored, so a change to it fails here.
+        let a = src.find("fn approved(&self) -> bool {").expect("the predicate");
+        let pred = &src[a..a + src[a..].find("\n    }\n").expect("end")];
+        assert!(
+            pred.contains("self.available && self.diff_ok && self.system_ok"),
+            "IndependentReview::approved changed; the sweep mirrors it from the \
+             PR body and must be re-derived: {pred}"
+        );
     }
 
     /// Codex, a third time on the same shape: sharing `may_automerge` is
