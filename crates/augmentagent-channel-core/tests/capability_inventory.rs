@@ -268,16 +268,46 @@ fn optional_mcp_profiles_preserve_readonly_guard_and_private_auth() {
             assert_eq!(policy["environment"]["SOCIALAPI_API_KEY"], "fixture");
             assert_eq!(policy["settings"], serde_json::from_str::<serde_json::Value>(opts.settings_json.as_ref().unwrap()).unwrap());
             let probe = r#"
-import json, runpy, sys
+import json, runpy, sys, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 bridge = runpy.run_path(sys.argv[1])
-policy = bridge['Policy'](json.load(open(sys.argv[2])))
-policy.before('mcp__socialapi__get_post', {})
+config = json.load(open(sys.argv[2]))
+received = []
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def do_POST(self):
+        request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        received.append((request, self.headers.get('Authorization')))
+        if 'id' not in request:
+            self.send_response(202); self.end_headers(); return
+        if request['method'] == 'initialize':
+            result = {'protocolVersion':'2025-03-26','capabilities':{'tools':{}},'serverInfo':{'name':'fixture','version':'1'}}
+        elif request['method'] == 'tools/list':
+            result = {'tools':[{'name':name,'inputSchema':{'type':'object','properties':{}}}
+                for name in ['get_post','create_post']]}
+        else:
+            result = {'content':[{'type':'text','text':'SYNTHETIC_POST'}]}
+        body = json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}).encode()
+        self.send_response(200); self.send_header('Content-Type','application/json')
+        self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+httpd = ThreadingHTTPServer(('127.0.0.1',0), Handler)
+threading.Thread(target=httpd.serve_forever,daemon=True).start()
+config['settings']['mcpServers']['socialapi']['url'] = f'http://127.0.0.1:{httpd.server_port}/mcp'
+policy = bridge['Policy'](config)
+server = bridge['Server'](policy)
 try:
-    policy.before('mcp__socialapi__create_post', {})
-except bridge['Denied']:
-    pass
-else:
-    raise AssertionError('write operation escaped original read-only guard')
+    assert 'SYNTHETIC_POST' in str(server.call('mcp__socialapi__get_post', {}))
+    try:
+        server.call('mcp__socialapi__create_post', {})
+    except bridge['Denied']:
+        pass
+    else:
+        raise AssertionError('write operation escaped original read-only guard')
+    calls = [request['params']['name'] for request, _ in received if request['method']=='tools/call']
+    assert calls == ['get_post'], 'rejected mutation reached the remote endpoint'
+    assert all(auth == 'Bearer fixture' for _, auth in received)
+finally:
+    server.close(); httpd.shutdown(); httpd.server_close()
 "#;
             let output = Command::new("python3").args(["-I", "-c", probe])
                 .arg(launch_dir.join("tool-bridge.py")).arg(&launch.policy_path).output().unwrap();

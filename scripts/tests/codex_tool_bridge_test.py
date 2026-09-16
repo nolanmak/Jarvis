@@ -902,6 +902,54 @@ for line in sys.stdin:
         self.assertTrue(all(auth=='Bearer synthetic-token' for _,auth,_ in received))
         self.assertTrue(all(session=='synthetic-session' for method,_,session in received if method!='initialize'))
 
+    def test_http_timeout_is_diagnosed_without_retry_or_clearing_uncertain_effect(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        for phase in ['initialize','tools/call']:
+            received=[]
+            release=threading.Event()
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self,*args): pass
+                def do_POST(self):
+                    request=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                    method=request['method'];received.append(method)
+                    if method==phase:
+                        release.wait(2);return
+                    if 'id' not in request:
+                        self.send_response(202);self.end_headers();return
+                    result=({'protocolVersion':'2025-03-26','capabilities':{'tools':{}},
+                             'serverInfo':{'name':'fixture','version':'1'}} if method=='initialize'
+                            else {'tools':[{'name':'create','inputSchema':{'type':'object','properties':{}}}]})
+                    data=json.dumps({'jsonrpc':'2.0','id':request['id'],'result':result}).encode()
+                    self.send_response(200);self.send_header('Content-Type','application/json')
+                    self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+            httpd=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+            threading.Thread(target=httpd.serve_forever,daemon=True).start()
+            try:
+                with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
+                    root=Path(tmp);workspace=root/'workspace';workspace.mkdir()
+                    journal=root/'handoff.json'
+                    policy=bridge.Policy({'cwd':str(workspace),'allowed_tools':['mcp__fixture__create'],
+                        'handoff_path':str(journal),
+                        'settings':{'mcpServers':{'fixture':{'type':'http','timeout':0.05,
+                            'url':f'http://127.0.0.1:{httpd.server_port}/mcp'}}}})
+                    server=bridge.Server(policy)
+                    try:
+                        with self.assertRaisesRegex(bridge.Readiness,'JARVIS_READINESS:mcp_timeout'):
+                            server.tools()
+                            if phase=='tools/call':
+                                server.call('mcp__fixture__create',{})
+                    finally:
+                        server.close()
+                    self.assertEqual(received.count(phase),1)
+                    if phase=='tools/call':
+                        state=bridge.HandoffJournal(journal).load()
+                        self.assertEqual(state['operations'][0]['status'],'started')
+                    else:
+                        self.assertFalse(journal.exists())
+            finally:
+                release.set();httpd.shutdown();httpd.server_close()
+
 
 class TransportTests(unittest.TestCase):
     def test_bridge_survives_launcher_thread_exit_while_parent_process_is_alive(self):

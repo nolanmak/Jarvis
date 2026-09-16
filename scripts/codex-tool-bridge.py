@@ -1075,7 +1075,15 @@ class Remote:
         import select
         data = (json.dumps(message) + '\n').encode()
         if self.process is None:
-            return self.http(data, expect_response)
+            from urllib.error import URLError
+            try:
+                return self.http(data, expect_response)
+            except TimeoutError as error:
+                raise Readiness('mcp_timeout') from error
+            except URLError as error:
+                if isinstance(error.reason, TimeoutError):
+                    raise Readiness('mcp_timeout') from error
+                raise
         if self.process.poll() is not None:
             raise Denied('MCP process is unavailable; request was not replayed')
         self.process.stdin.write(data)

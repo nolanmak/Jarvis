@@ -367,6 +367,14 @@ cannot stand in for any tool-using profile.
 
 ## Remaining integration gates
 
+Both optional social drafting presets now exercise their production policy
+through an authenticated local HTTP MCP fixture. Reads reach the endpoint with
+the configured bearer header; the original read-only hook rejects an offered
+write tool before any remote call. HTTP initialization and tool-call timeouts
+produce the sanitized `mcp_timeout` readiness category without retrying the
+request. A timed-out mutation retains its uncertain journal entry. These are
+synthetic transport and policy contracts, not live social-account operations.
+
 Codex's production source-inspection presets have live scope/review coverage:
 a synthetic arithmetic defect yields a parseable implementation plan and
 acceptance criteria, and a constant-return patch is rejected after reading
