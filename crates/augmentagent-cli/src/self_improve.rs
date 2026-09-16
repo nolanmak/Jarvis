@@ -6018,8 +6018,24 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             .unwrap_or_default(),
         None => String::new(),
     };
-    if let (Some(n), false) = (pr_number, head_sha.is_empty()) {
-        let rabbit = rabbit_review_now(repo_root, n, &head_sha).await;
+    if let Some(n) = pr_number {
+        // A failed head lookup is NOT silence. The owner directive is that a
+        // double codex LGTM is the bar and CodeRabbit is advisory, so a
+        // transient GitHub error must not strand a PR the gate and two
+        // independent reviewers approved — that is the sitting-draft problem
+        // this issue exists to end. But it is recorded rather than swallowed,
+        // so a merge taken without CodeRabbit's state is visible as such.
+        let rabbit = if head_sha.is_empty() {
+            warn!(
+                issue = issue.number,
+                pr = n,
+                "could not read the PR head; merging on the double codex LGTM \
+                 without CodeRabbit's state"
+            );
+            RabbitReview::unavailable("its state could not be read (head lookup failed)")
+        } else {
+            rabbit_review_now(repo_root, n, &head_sha).await
+        };
         if rabbit.blocks() {
             let why = rabbit_merge_note(&rabbit);
             warn!(issue = issue.number, pr = n, "auto-merge withheld: {why}");
@@ -6042,12 +6058,26 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // gate and two reviewers already approved.
         let observed = pr_body.replace(RABBIT_NOT_WAITED_FOR, &rabbit_merge_note(&rabbit));
         if observed != pr_body {
-            let _ = run(
+            let (edited, _, e) = run(
                 &gh,
                 &["pr", "edit", &n.to_string(), "--body", &observed],
                 repo_root,
             )
-            .await;
+            .await
+            .unwrap_or((false, String::new(), "spawn failed".into()));
+            if !edited {
+                // Explicit, not swallowed: the body keeps the placeholder, so
+                // say in the log what the body could not. Still merging — the
+                // approval that matters already happened.
+                warn!(
+                    issue = issue.number,
+                    pr = n,
+                    "could not record CodeRabbit's merge-time state in the PR \
+                     body ({}); it was: {}",
+                    truncate(&e, 200),
+                    rabbit_merge_note(&rabbit)
+                );
+            }
         }
     }
 
