@@ -5309,20 +5309,32 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     let mut summary = match reasoner.call(&opts, &prompt).await {
         Ok(s) => s,
         Err(err) => {
+            // #1030 — classify BEFORE recording anything. A provider can
+            // become latched between the preflight above and this call, and
+            // on that path nothing was spent: recording a ReasonerError
+            // attempt first would charge the issue for a quota pause, which
+            // is exactly what C1 forbids. A genuine fault still falls through
+            // to the recording below, so the health watchdog keeps the one
+            // signal that separates waiting from broken.
+            if held_for_no_provider(&err).is_some() {
+                // Re-ask the chain so the message names who is latched and
+                // until when, rather than echoing the fallback layer's own
+                // text, which says neither.
+                let why = match reasoner.unavailable_reason(
+                    augmentagent_channel_core::CapabilityClass::FullAgentic,
+                ) {
+                    Some(latched) => no_provider_message("FullAgentic", &latched),
+                    None => no_provider_message("FullAgentic", &[]),
+                };
+                info!(issue = issue.number, "auto-PR held: {why}");
+                cleanup(worktree, branch, repo_root.to_path_buf()).await;
+                return Ok(RunReport::held(why));
+            }
             record_reasoner_error(
                 issue.number,
                 rec(FailureKind::ReasonerError, "build", &format!("{err:#}"), "", 0),
             );
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
-            // #1030 — "every provider that could serve this is latched" is a
-            // quota pause, not a fault: nothing was spent, nothing recorded.
-            // Hold the tick unbilled and say when work resumes. A genuine
-            // fault still propagates, so the health watchdog keeps the one
-            // signal that separates waiting from broken.
-            if let Some(why) = held_for_no_provider(&err) {
-                info!(issue = issue.number, "auto-PR held: {why}");
-                return Ok(RunReport::held(why));
-            }
             return Err(err).context("reasoner failed during self-improve");
         }
     };
@@ -10453,6 +10465,33 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         );
         // A provider latched with no known reset still has to appear.
         assert!(msg.to_lowercase().contains("unknown") || msg.contains("codex"), "{msg}");
+    }
+
+    /// Codex on this PR: a provider can become latched BETWEEN the preflight
+    /// and the build call, and on that path the old code recorded a
+    /// ReasonerError attempt before classifying — charging the issue for a
+    /// quota pause, which is the thing C1 forbids. It also logged the
+    /// fallback layer's own message, which names neither the latched provider
+    /// nor its reset.
+    #[test]
+    fn a_hold_discovered_at_the_build_call_records_nothing_and_still_names_names() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+
+        let arm = body.find("Err(err) => {").expect("the build error arm");
+        let tail = &body[arm..];
+        let classify = tail.find("held_for_no_provider(").expect("must classify");
+        let record = tail.find("record_reasoner_error(").expect("must record real faults");
+        assert!(
+            classify < record,
+            "classify before recording, or a quota pause is charged as an attempt"
+        );
+        assert!(
+            tail[classify..record].contains("no_provider_message("),
+            "the hold must name who is latched and until when, not echo the \
+             fallback layer's text"
+        );
     }
 
     /// C3 — check before spending the scoping call. The scoper ran, produced a
