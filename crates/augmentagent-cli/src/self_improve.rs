@@ -1504,12 +1504,10 @@ fn codex_model() -> String {
 
 /// Text-only preset for the independent reviewer (#840).
 ///
-/// It carries no tools on purpose. Codex has no `Read`/`Grep`/`Glob` — those
-/// are Claude Code tool names, and `allowed_tools` is never passed to the
-/// codex adapter at all; codex's only tool is a shell governed by `-s`. On
-/// this host that shell cannot start, so granting tools would be capability
-/// theatre. The reviewer is given the diff and pre-computed call sites as
-/// text instead, which is what it can actually act on.
+/// It carries no tools on purpose: the independent reviewer receives the
+/// frozen diff and pre-computed caller evidence as text. The Codex adapter
+/// supports declared tools through its scoped bridge, but this review stage
+/// does not need workspace mutation or command execution.
 ///
 /// `cwd` is still pinned to the worktree: it costs nothing and keeps the
 /// spawn's working directory off the deploy checkout.
@@ -1517,12 +1515,7 @@ fn codex_review_opts(worktree: PathBuf, system_prompt: &str) -> augmentagent_cha
     augmentagent_channel_core::ReasonerOpts {
         system_prompt: system_prompt.to_string(),
         model: Some(codex_model()),
-        // #840 — NO tools. Codex cannot execute anything on this host (its
-        // read-only sandbox is bubblewrap; AppArmor blocks unprivileged user
-        // namespaces), so tools would be surface with no capability behind
-        // it. Everything the reviewer needs is supplied as text, including
-        // pre-computed caller evidence. This keeps the preset TextOnly, which
-        // codex is cleared for with no policy widening.
+        // The reviewer uses supplied evidence; keep its host tool scope empty.
         allowed_tools: vec![],
         add_dirs: vec![worktree.clone()],
         permission_mode: "default".into(),

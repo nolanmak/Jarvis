@@ -1,0 +1,328 @@
+{
+  "version": 1,
+  "profiles": {
+    "text": {
+      "scope": "No host tools; provider receives supplied context only",
+      "operations": []
+    },
+    "wiki-read-optional": {
+      "scope": "Optional wiki read roots; no writes",
+      "operations": [
+        "Read",
+        "Grep",
+        "Glob"
+      ]
+    },
+    "wiki-read": {
+      "scope": "Declared wiki read roots; no writes",
+      "operations": [
+        "Read",
+        "Grep",
+        "Glob"
+      ]
+    },
+    "wiki-write": {
+      "scope": "Scoped wiki reads and writes; control and credential paths excluded",
+      "operations": [
+        "Read",
+        "Grep",
+        "Glob",
+        "Write",
+        "Edit"
+      ]
+    },
+    "wiki-agentic": {
+      "scope": "Wiki writes, declared context reads, approved service commands and configured MCP; original guards enforced",
+      "operations": [
+        "Read",
+        "Grep",
+        "Glob",
+        "Write",
+        "Edit",
+        "Bash allowlist",
+        "WebSearch",
+        "WebFetch",
+        "configured MCP"
+      ]
+    },
+    "social-read-mcp": {
+      "scope": "Optional authenticated MCP with read-only guard plus declared wiki reads",
+      "operations": [
+        "Read",
+        "Grep",
+        "Glob",
+        "guarded MCP"
+      ]
+    },
+    "source-inspect": {
+      "scope": "Worktree source and read-only Git metadata; no source writes",
+      "operations": [
+        "Read",
+        "Grep",
+        "Glob",
+        "Bash(ls)",
+        "Bash(git log/diff/status)"
+      ]
+    },
+    "source-build": {
+      "scope": "Worktree source writes; disposable confined Cargo/npm builds; gated publication and independent review remain outside builder",
+      "operations": [
+        "Read",
+        "Grep",
+        "Glob",
+        "Write",
+        "Edit",
+        "Bash(cargo/npm)",
+        "Bash(git diff/status)",
+        "Bash(ls)"
+      ]
+    }
+  },
+  "presets": [
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::archetype_pick_opts",
+      "permission_profile": "text",
+      "output_contract": "Structured archetype selection",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts"
+      ],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::ask_opts",
+      "permission_profile": "wiki-agentic",
+      "output_contract": "Complete assistant transcript with original ATTACH markers and image context",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts"
+      ],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::digest_opts",
+      "permission_profile": "wiki-read-optional",
+      "output_contract": "Digest prose with supplied coverage and tone requirements",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts"
+      ],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::draft_opts",
+      "permission_profile": "wiki-read-optional",
+      "output_contract": "Draft response; sending remains approval-gated",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts"
+      ],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::ingest_opts",
+      "permission_profile": "wiki-write",
+      "output_contract": "Wiki update and completion response",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts"
+      ],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::lint_opts",
+      "permission_profile": "wiki-read",
+      "output_contract": "Structured lint findings",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts"
+      ],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::loop_parse_opts",
+      "permission_profile": "text",
+      "output_contract": "Structured recurring-task specification",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts"
+      ],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::resume_opts",
+      "permission_profile": "wiki-write",
+      "output_contract": "Seeded wiki files and completion response",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts"
+      ],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::social_adapter_opts",
+      "permission_profile": "text",
+      "output_contract": "Platform-specific content adaptation",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts"
+      ],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::socialapi_draft_opts",
+      "permission_profile": "social-read-mcp",
+      "output_contract": "Draft response using optional read-only integration context",
+      "conformance": [
+        "capability_inventory::optional_mcp_profiles_preserve_readonly_guard_and_private_auth"
+      ],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::tone_summarize_opts",
+      "permission_profile": "text",
+      "output_contract": "Structured voice descriptor",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts"
+      ],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::triage_opts",
+      "permission_profile": "wiki-read-optional",
+      "output_contract": "Structured triage decision",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts"
+      ],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::wiki_migrate_opts",
+      "permission_profile": "wiki-read",
+      "output_contract": "Structured migration patch; caller preserves existing frontmatter",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts"
+      ],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::with_socialapi_readonly_mcp",
+      "permission_profile": "social-read-mcp",
+      "output_contract": "Preserve the wrapped preset output contract",
+      "conformance": [
+        "capability_inventory::optional_mcp_profiles_preserve_readonly_guard_and_private_auth"
+      ],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/resolve.rs::extract_opts",
+      "permission_profile": "text",
+      "output_contract": "Structured extraction from supplied context",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-discord-dm/src/channel.rs::handle_priority",
+      "permission_profile": "text",
+      "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-discord-dm/src/digest.rs::run_one_digest",
+      "permission_profile": "wiki-read",
+      "output_contract": "Activity digest prose; wiki writes removed from the inherited ingestion preset",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-email/src/channel.rs::process_email",
+      "permission_profile": "text",
+      "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-email/src/sigextract.rs::extract",
+      "permission_profile": "text",
+      "output_contract": "Structured extraction from supplied context",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-instagram/src/channel.rs::handle_dm",
+      "permission_profile": "text",
+      "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-journal/src/compose.rs::compose_opts",
+      "permission_profile": "text",
+      "output_contract": "Journal prose composed from supplied context",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-linkedin/src/channel.rs::process_email",
+      "permission_profile": "text",
+      "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-slack/src/channel.rs::handle_priority",
+      "permission_profile": "text",
+      "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-twitter/src/channel.rs::dispatch_reply_arm",
+      "permission_profile": "text",
+      "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-voice/src/extract.rs::opts",
+      "permission_profile": "text",
+      "output_contract": "Structured extraction from supplied context",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-whatsapp/src/channel.rs::handle_message",
+      "permission_profile": "text",
+      "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/main.rs::run_reasoner_selftest",
+      "permission_profile": "text",
+      "output_contract": "Selftest response used for text-only failover diagnosis",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/self_improve.rs::codex_review_opts",
+      "permission_profile": "text",
+      "output_contract": "Independent review of supplied diff and caller evidence",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/self_improve.rs::fix_opts",
+      "permission_profile": "source-build",
+      "output_contract": "Source edits and verification results; no self-approval",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/self_improve.rs::review_opts",
+      "permission_profile": "source-inspect",
+      "output_contract": "Review findings and acceptance grading",
+      "conformance": [],
+      "provider_conformance": "pending"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/self_improve.rs::scope_opts",
+      "permission_profile": "source-inspect",
+      "output_contract": "Scope verdict, complexity, implementation plan and acceptance criteria",
+      "conformance": [],
+      "provider_conformance": "pending"
+    }
+  ]
+}

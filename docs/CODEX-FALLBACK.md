@@ -88,8 +88,17 @@ persistent handling of an unverified cleanup still require additional coverage.
 
 ## Capability inventory
 
-The checked-in manifest and conformance suite must cover these constructors and
-call sites, including dynamically added tools:
+The checked-in [capability manifest](reasoner-capabilities.json) currently records
+31 production constructors, wrappers and policy-changing call sites. A Rust AST
+inventory test checks it against source, including code after test modules,
+opt-in wrappers and tool-list mutations. Parameterized tests construct twelve
+core presets and check capability classification, declared tools and bridge write
+scope, including optional wiki access. Isolated opt-in integration tests cover
+both wrapper constructors with the feature disabled and enabled, preserving
+private authentication configuration and executing the original read-only guard
+through the bridge against allowed-read and denied-write probes. Provider execution/output coverage is
+tracked separately as pending; inventory and policy checks alone do not prove
+full workflow parity. The remaining provider conformance suite must cover:
 
 | Source | Presets / operations |
 |---|---|
