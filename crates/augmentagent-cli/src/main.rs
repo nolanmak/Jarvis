@@ -1062,6 +1062,9 @@ enum JournalOp {
     Backfill {
         #[arg(long, default_value_t = 200)]
         max_entries: usize,
+        /// Archive journal revisions without spawning derived-memory model calls.
+        #[arg(long)]
+        archive_only: bool,
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         dry_run: bool,
     },
@@ -1076,6 +1079,13 @@ enum JournalOp {
     Show {
         #[arg(long)]
         date: Option<String>,
+    },
+    /// List local immutable journal revisions, or print an exact saved revision.
+    History {
+        #[arg(long)]
+        entry_id: String,
+        #[arg(long)]
+        revision: Option<String>,
     },
     /// #900 — print the persisted watermark and in-progress cursor.
     Status,
@@ -3476,11 +3486,12 @@ async fn main() -> Result<()> {
         },
         Cmd::Journal { op } => match op {
             JournalOp::PollOnce { dry_run } => {
-                run_journal_poll_once(cli.wiki_dir.clone(), store, dry_run, None, false).await?;
+                run_journal_poll_once(cli.wiki_dir.clone(), store, dry_run, None, false, false).await?;
                 Ok(())
             }
             JournalOp::Backfill {
                 max_entries,
+                archive_only,
                 dry_run,
             } => {
                 run_journal_poll_once(
@@ -3489,6 +3500,7 @@ async fn main() -> Result<()> {
                     dry_run,
                     Some(max_entries),
                     true,
+                    archive_only,
                 )
                 .await?;
                 Ok(())
@@ -3499,6 +3511,24 @@ async fn main() -> Result<()> {
             }
             JournalOp::Show { date } => {
                 run_journal_show(date.clone()).await?;
+                Ok(())
+            }
+            JournalOp::History { entry_id, revision } => {
+                let root = cli.wiki_dir.as_ref().context("--wiki-dir is required for journal history")?;
+                if let Some(hash) = revision {
+                    use std::io::Write;
+                    std::io::stdout().write_all(&augmentagent_channel_journal::section::read_revision(root, &entry_id, &hash)?)?;
+                } else {
+                    for hash in augmentagent_channel_journal::section::revisions(root, &entry_id)? {
+                        let bytes = augmentagent_channel_journal::section::read_revision(root, &entry_id, &hash)?;
+                        let page = std::str::from_utf8(&bytes)?;
+                        let header = page.strip_prefix("---\n").and_then(|s| s.split("\n---").next());
+                        let metadata = header.map(|s| s.lines().filter(|line|
+                            line.starts_with("version: ") || line.starts_with("updated: ") || line.starts_with("created: ")
+                        ).collect::<Vec<_>>().join("; ")).unwrap_or_else(|| "legacy page".into());
+                        println!("{hash}  {metadata}");
+                    }
+                }
                 Ok(())
             }
             JournalOp::Status => {
@@ -15878,6 +15908,7 @@ async fn run_journal_poll_once(
     dry_run: bool,
     max_entries: Option<usize>,
     allow_base_sync: bool,
+    archive_only: bool,
 ) -> Result<()> {
     use augmentagent_channel_journal::{
         JournalChannel, JournalChannelConfig, JournalRuntime, DEFAULT_BASE_SYNC_THRESHOLD,
@@ -15905,7 +15936,7 @@ async fn run_journal_poll_once(
         return Ok(());
     };
     let wiki_schema_path = wiki_dir
-        .as_ref()
+        .as_ref().filter(|_| !archive_only)
         .map(|_| PathBuf::from("schema/wiki-skill.md"));
     let config = JournalChannelConfig {
         owner_id: runtime.config.owner_id.clone(),
@@ -16028,10 +16059,38 @@ async fn run_journal_status(store: Arc<Store>) -> Result<()> {
     let owner = runtime.config.owner_id.as_str();
     let watermark = store.get_journal_sync_state(owner)?;
     let cursor = store.get_journal_sync_cursor(owner)?;
-    println!("owner:     {owner}");
-    println!("watermark: {watermark:?}");
-    println!("cursor:    {cursor:?}");
+    println!("{}", journal_status_summary(watermark, cursor.as_ref()));
     Ok(())
+}
+
+fn journal_status_summary(watermark: Option<i64>, cursor: Option<&augmentagent_store::JournalSyncCursor>) -> String {
+    fn timestamp(ms: i64) -> String {
+        chrono::DateTime::from_timestamp_millis(ms).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".into())
+    }
+    let complete = watermark.map(timestamp).unwrap_or_else(|| "never".into());
+    let pending = cursor.map(|c| format!("in progress since {} (pagination token withheld)", timestamp(c.started_at_ms)))
+        .unwrap_or_else(|| "none".into());
+    format!("Configured poll interval: 10 minutes (not a success guarantee)\nLast completed source watermark: {complete}\nBacklog cursor: {pending}\nA stale watermark or persistent backlog requires journal recovery; Git mirror sync is separate.")
+}
+
+#[cfg(test)]
+mod journal_cli_tests {
+    use super::*;
+    #[test]
+    fn status_redacts_cursor_and_describes_freshness() {
+        let cursor = augmentagent_store::JournalSyncCursor { last_sync_ms: Some(1), started_at_ms: 1000,
+            next_token: Some("SYNTHETIC_PRIVATE_PAGINATION_TOKEN".into()) };
+        let summary = journal_status_summary(Some(0), Some(&cursor));
+        assert!(!summary.contains("SYNTHETIC_PRIVATE"));
+        assert!(summary.contains("1970-01-01") && summary.contains("in progress") && summary.contains("10 minutes"));
+    }
+    #[test]
+    fn archive_only_backfill_is_explicit_and_bounded() {
+        let cli = Cli::try_parse_from(["augmentagent", "--wiki-dir", "fixture", "journal", "backfill",
+            "--archive-only", "--max-entries", "50"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Journal { op: JournalOp::Backfill {
+            archive_only: true, max_entries: 50, .. } }));
+    }
 }
 
 async fn run_calendar_poll_once(

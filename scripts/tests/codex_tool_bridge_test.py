@@ -927,6 +927,27 @@ class HandoffTests(unittest.TestCase):
             self.assertEqual(len(calls),8)
             self.assertEqual(len(journal.load()['operations']),1)
 
+    def test_discovery_and_memory_reads_work_through_hook_with_uncertain_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal = bridge.HandoffJournal(Path(tmp) / 'operations.json')
+            journal.save({'version': 1, 'operations': [{'tool': 'mcp__fixture__write',
+                'arguments': {}, 'status': 'started'}]})
+            original = journal.path.read_bytes()
+            for name, arguments in [('ToolSearch', {'query': 'select:mcp__memory__search_conversation_history'}),
+                                    ('mcp__memory__search_conversation_history', {'query': 'synthetic'}),
+                                    ('mcp__memory__read_conversation_thread', {'thread_id': 'synthetic'})]:
+                for phase in ('PreToolUse', 'PostToolUse', 'PostToolUseFailure'):
+                    event = {'tool_name': name, 'tool_input': arguments, 'tool_use_id': 'synthetic-read',
+                        'hook_event_name': phase, 'tool_response': {'content': []}}
+                    result = subprocess.run([sys.executable, '-I', str(SPEC.origin), '--handoff-hook',
+                        str(journal.path)], input=json.dumps(event), capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(journal.path.read_bytes(), original)
+            for name in ('mcp__fixture__ToolSearch', 'ToolSearchAndWrite', 'Write'):
+                with self.assertRaises(bridge.ReconciliationRequired):
+                    journal.observe_hook({'tool_name': name, 'tool_input': {},
+                        'tool_use_id': 'synthetic-write', 'hook_event_name': 'PreToolUse'})
+
     def test_uncertain_write_allows_fresh_reconciliation_reads_but_no_more_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);workspace=root/'workspace';workspace.mkdir()
