@@ -3784,6 +3784,72 @@ fn coderabbit_configured(repo_root: &Path) -> bool {
     repo_root.join(".coderabbit.yaml").exists() || repo_root.join(".coderabbit.yml").exists()
 }
 
+/// CodeRabbit's state for `head_sha` right now — one read, no polling.
+///
+/// #1032 — the fresh path creates the PR and then merges it as two separate
+/// `gh` calls, so there IS an interval, however short. If CodeRabbit reviewed
+/// in it and found something, merging over that would be exactly the
+/// "advisory means ignored" reading this change exists to avoid. Read once and
+/// never wait: [`wait_for_rabbit`] is the resume lane's tool, which can afford
+/// a window.
+async fn rabbit_review_now(repo_root: &Path, pr: u64, head_sha: &str) -> RabbitReview {
+    let reviews = gh_json(
+        repo_root,
+        &format!("repos/{{owner}}/{{repo}}/pulls/{pr}/reviews?per_page=100"),
+    )
+    .await;
+    let comments = gh_json(
+        repo_root,
+        &format!("repos/{{owner}}/{{repo}}/pulls/{pr}/comments?per_page=100"),
+    )
+    .await;
+    // `gh_json` returns `Null` for a failed call, and `rabbit_findings_for_head`
+    // would read that as an empty review list — turning "we could not ask"
+    // into "there is nothing", which is the unknown-is-not-absent mistake one
+    // layer down from where I first fixed it. An empty ARRAY is a real answer;
+    // `Null` is not.
+    if reviews.is_null() || comments.is_null() {
+        return RabbitReview::unavailable("its state could not be read (GitHub call failed)");
+    }
+    rabbit_findings_for_head(&reviews, &comments, head_sha)
+}
+
+/// #1032 — what the PR body says about CodeRabbit on an auto-merged fresh PR.
+///
+/// It states the POLICY, not a review state. Codex caught an earlier draft
+/// claiming "the PR did not exist until this merge": the PR is created moments
+/// before the merge, so that was false, and a note that misdescribes the
+/// mechanism is worse than one that says less. The loop did not wait, and that
+/// is the whole of what it can honestly assert here.
+const RABBIT_NOT_WAITED_FOR: &str =
+    "CodeRabbit is advisory and was not waited for; it reviews the merged \
+     commit and anything it finds becomes a follow-up issue.";
+
+/// What to record about CodeRabbit when a merge is taken.
+///
+/// #1032, owner directive: a double codex LGTM is the bar and CodeRabbit is
+/// advisory. On the FRESH path it cannot have an opinion yet — the PR is being
+/// created by this very call — so the note says that plainly rather than
+/// implying a review happened. The resume lane, which sees PRs that have
+/// existed long enough to be reviewed, still respects findings through
+/// [`RabbitReview::blocks`].
+fn rabbit_merge_note(review: &RabbitReview) -> String {
+    if review.blocks() {
+        return format!(
+            "CodeRabbit: {} actionable finding(s) on this head — merge withheld.",
+            review.actionable
+        );
+    }
+    if review.available {
+        return "CodeRabbit: reviewed this head, nothing actionable.".to_string();
+    }
+    format!(
+        "CodeRabbit: advisory and not waited for — at merge time, {}. It \
+         reviews the merged commit; anything it finds becomes a follow-up.",
+        if review.note.is_empty() { "no review of this head" } else { &review.note }
+    )
+}
+
 /// How long to poll for a review that is on its way (default 5 min; `0`
 /// = consider only what is already there).
 fn rabbit_wait_secs() -> u64 {
@@ -3874,6 +3940,14 @@ async fn wait_for_rabbit(repo_root: &Path, pr: u64, head_sha: &str) -> RabbitRev
         )
         .await;
         let r = rabbit_findings_for_head(&reviews, &comments, head_sha);
+        // #1032 — absence of `.coderabbit.yaml` means nobody is coming, so do
+        // not spend the polling window learning that. It does NOT mean ignore
+        // a review: the GitHub App can be installed without the file, and the
+        // file can be deleted after a review was posted, so the read above
+        // still decides. Skip the wait, never the read.
+        if !r.available && !coderabbit_configured(repo_root) {
+            return RabbitReview::unavailable("CodeRabbit is not configured for this repo");
+        }
         if r.available {
             info!(
                 pr,
@@ -5813,9 +5887,16 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         // #936 — with CodeRabbit configured, a fresh PR is never merged
         // here: it opens as a draft, CodeRabbit reviews it, and the resume
         // lane merges on triple LGTM.
+        // #1032 — CodeRabbit is advisory, and on this path it cannot have an
+        // opinion: the PR is created a few lines below, so there is nothing
+        // for it to have reviewed. Deferring every merge merely because
+        // `.coderabbit.yaml` exists handed the decision to the resume lane,
+        // which cannot run once the daily cap is spent (#1029) — and on the
+        // free tier, an exhausted quota made the loop's throughput a function
+        // of somebody else's billing plan. Findings still withhold a merge in
+        // the resume lane, where a review can actually exist.
         if enabled && complexity_ok && independent.approved() && !issue.research_filed
             && receipt_ok
-            && !coderabbit_configured(repo_root)
         {
             let owner = std::env::var(GH_OWNER_ENV)
                 .ok()
@@ -5837,9 +5918,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         .map(|p| format!("\n\n## Implementation spec (scoping pass)\n{}", truncate(p, 1500)))
         .unwrap_or_default();
     let merge_note = match (automerge, gated.as_deref()) {
-        (true, _) => "Auto-merged: owner-authored issue graded ≤medium, \
-                      AUGMENTAGENT_AUTOPR_AUTOMERGE=1."
-            .to_string(),
+        (true, _) => format!(
+            "Auto-merged: owner-authored issue graded ≤medium, \
+             AUGMENTAGENT_AUTOPR_AUTOMERGE=1, and two independent codex \
+             reviews approved it. {}",
+            RABBIT_NOT_WAITED_FOR
+        ),
         // #823 — name the file, so the reviewer knows why this is a draft
         // even though the grade alone would have merged it.
         (false, Some(f)) => format!(
@@ -5854,11 +5938,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
              review did not approve it ({}).",
             independent.status()
         ),
-        (false, None) if coderabbit_configured(repo_root) => {
-            "Draft — CodeRabbit reviews it next; the resume lane merges on triple LGTM \
-             (builder QA, independent reviewer, CodeRabbit)."
-                .to_string()
-        }
+        // #1032 removed the arm that said "CodeRabbit reviews it next; the
+        // resume lane merges on triple LGTM". That is no longer why a PR is a
+        // draft, and a note describing a path the code no longer takes is
+        // worse than no note: it sends a reader looking for a resume that is
+        // never coming.
         (false, None) => "Draft — a human must review and merge.".to_string(),
     };
     // #817 — say so in the PR when the builder left scratch behind; a drop
@@ -5922,6 +6006,150 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             issue.number
         )));
     }
+    let pr_number = pr_url.rsplit('/').next().and_then(|n| n.parse::<u64>().ok());
+
+    // #1032 C7 — the PR exists now, so CodeRabbit's state is finally a real
+    // question rather than one about a PR that has not been created. One read,
+    // no waiting: findings on THIS head withhold the merge and are said out
+    // loud on the PR; every flavour of absence (no review, rate-limited,
+    // free-tier quota gone) merges on the double codex LGTM.
+    // The head GitHub actually has for this PR, from GitHub, or nothing.
+    //
+    // A CodeRabbit review is keyed to the commit GitHub recorded, so only
+    // GitHub can answer. I tried a local remote-tracking ref as a fallback for
+    // availability; codex was right to reject it twice. A stale ref does not
+    // degrade gracefully — it returns a CONFIDENT wrong answer, and reviews
+    // filtered against an old sha silently miss findings on the very head
+    // being merged. A guess that looks like knowledge is worse than an
+    // admitted unknown, which is the whole argument of this code path.
+    let head_sha = match pr_number {
+        Some(n) => run(
+            &gh,
+            &["pr", "view", &n.to_string(), "--json", "headRefOid", "-q", ".headRefOid"],
+            repo_root,
+        )
+        .await
+        .ok()
+        .filter(|(ok, ..)| *ok)
+        .map(|(_, out, _)| out.trim().to_string())
+        .filter(|sha| sha.len() == 40)
+        .unwrap_or_default(),
+        None => String::new(),
+    };
+    if pr_number.is_none() {
+        // Codex, system pass: with no parseable PR number the CodeRabbit read
+        // was skipped silently while the merge still went ahead on the branch
+        // name. The read genuinely cannot happen — the reviews endpoint needs
+        // a number — but the RECORD still can: `gh` takes a branch as a PR
+        // selector, which is how the merge below identifies it too. So the
+        // body says the state was unknown rather than keeping a placeholder
+        // that implies it was checked.
+        let unknown =
+            RabbitReview::unavailable("its state could not be read (no PR number to query)");
+        warn!(
+            issue = issue.number,
+            %pr_url,
+            "could not parse a PR number; merging on the double codex LGTM \
+             without reading CodeRabbit's state"
+        );
+        let observed = pr_body.replace(RABBIT_NOT_WAITED_FOR, &rabbit_merge_note(&unknown));
+        if observed != pr_body {
+            let _ = run(&gh, &["pr", "edit", &branch, "--body", &observed], repo_root).await;
+        }
+    }
+    if let Some(n) = pr_number {
+        // A failed head lookup is NOT silence. The owner directive is that a
+        // double codex LGTM is the bar and CodeRabbit is advisory, so a
+        // transient GitHub error must not strand a PR the gate and two
+        // independent reviewers approved — that is the sitting-draft problem
+        // this issue exists to end. But it is recorded rather than swallowed,
+        // so a merge taken without CodeRabbit's state is visible as such.
+        let rabbit = if head_sha.is_empty() {
+            warn!(
+                issue = issue.number,
+                pr = n,
+                "could not read the PR head; merging on the double codex LGTM \
+                 without CodeRabbit's state"
+            );
+            RabbitReview::unavailable("its state could not be read (head lookup failed)")
+        } else {
+            rabbit_review_now(repo_root, n, &head_sha).await
+        };
+        if rabbit.blocks() {
+            let why = rabbit_merge_note(&rabbit);
+            warn!(issue = issue.number, pr = n, "auto-merge withheld: {why}");
+            // Codex: the body was composed on the assumption this would merge,
+            // so it opens with "Auto-merged: ...". Returning here without
+            // correcting it leaves a user-visible false claim on a PR that was
+            // NOT merged — worse than saying nothing, because a reader trusts
+            // it. Correct the claim first, then explain in a comment.
+            let corrected = pr_body.replace(
+                &merge_note,
+                &format!(
+                    "Auto-merge WITHHELD: the gate passed and two independent \
+                     codex reviews approved, but {why} A human decides from here.",
+                ),
+            );
+            if corrected != pr_body {
+                let _ = run(
+                    &gh,
+                    &["pr", "edit", &n.to_string(), "--body", &corrected],
+                    repo_root,
+                )
+                .await;
+            }
+            let _ = run(&gh, &["pr", "comment", &n.to_string(), "--body", &why], repo_root).await;
+            notify_discord(&format!(
+                "📝 auto-PR needs review: {} — {pr_url}\n{why}",
+                issue.title
+            ))
+            .await;
+            return Ok(RunReport::built(format!(
+                "issue #{}: PR opened, auto-merge withheld — {why} {pr_url}",
+                issue.number
+            )));
+        }
+        // Not blocking, so this merge is going ahead. Replace the placeholder
+        // policy line with what the read actually found, so the body records
+        // CodeRabbit's state AT MERGE TIME rather than the same sentence
+        // whether it was silent, rate-limited, or had reviewed and found
+        // nothing. Best-effort: a failed edit must never hold up a merge the
+        // gate and two reviewers already approved.
+        let observed = pr_body.replace(RABBIT_NOT_WAITED_FOR, &rabbit_merge_note(&rabbit));
+        if observed != pr_body {
+            let (edited, _, e) = run(
+                &gh,
+                &["pr", "edit", &n.to_string(), "--body", &observed],
+                repo_root,
+            )
+            .await
+            .unwrap_or((false, String::new(), "spawn failed".into()));
+            // One retry: the state is worth a second attempt before it only
+            // exists in a log line.
+            let edited = if edited {
+                true
+            } else {
+                run(&gh, &["pr", "edit", &n.to_string(), "--body", &observed], repo_root)
+                    .await
+                    .map(|(ok, ..)| ok)
+                    .unwrap_or(false)
+            };
+            if !edited {
+                // Explicit, not swallowed: the body keeps the placeholder, so
+                // say in the log what the body could not. Still merging — the
+                // approval that matters already happened.
+                warn!(
+                    issue = issue.number,
+                    pr = n,
+                    "could not record CodeRabbit's merge-time state in the PR \
+                     body ({}); it was: {}",
+                    truncate(&e, 200),
+                    rabbit_merge_note(&rabbit)
+                );
+            }
+        }
+    }
+
     // Merge immediately: the verification gate already passed, and `--auto`
     // needs branch protection this repo doesn't run. A merge failure (main
     // moved, protection added later) leaves the PR open for a human — never
@@ -5932,7 +6160,6 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         repo_root,
     )
     .await?;
-    let pr_number = pr_url.rsplit('/').next().and_then(|n| n.parse::<u64>().ok());
     let merged_anyway = match pr_number {
         Some(n) if !ok => pr_is_merged(repo_root, n).await,
         _ => false,
@@ -11065,19 +11292,329 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
 
     // Structural: with CodeRabbit configured, run_once never merges a fresh
     // PR itself — it opens a draft and the resume lane merges on triple LGTM.
+    /// #1032, owner directive: a double codex LGTM is the bar. CodeRabbit is
+    /// advisory, and the fresh path must decide on what is ALREADY posted.
+    ///
+    /// This replaces the rule that merely having `.coderabbit.yaml` deferred
+    /// every merge to the resume lane. With #1029 — the resume lane cannot run
+    /// once the daily cap is spent — that turned an approved PR into one that
+    /// sits indefinitely, and on CodeRabbit's free tier an exhausted quota
+    /// made the loop's throughput a function of somebody else's billing plan.
     #[test]
-    fn run_once_defers_merge_when_coderabbit_is_configured() {
+    fn the_fresh_path_decides_on_coderabbit_without_waiting_for_it() {
         let src = include_str!("self_improve.rs");
         let start = src.find("pub async fn run_once(").expect("run_once");
         let end = start + src[start..].find("\n}\n").expect("end");
         let body = &src[start..end];
         let am = body.find("let automerge = {").expect("automerge block");
         let create = body.find(r#"vec!["pr", "create"]"#).expect("pr create");
+        let decision = &body[am..create];
+
         assert!(
-            body[am..create].contains("coderabbit_configured("),
-            "the automerge decision must consult the CodeRabbit config"
+            !decision.contains("coderabbit_configured("),
+            "presence of a config file must not decide a merge; its findings must"
+        );
+        // Never wait. `wait_for_rabbit` polls for up to `rabbit_wait_secs`;
+        // the fresh path must not spend that window — and cannot usefully,
+        // since the PR is created a few lines later.
+        assert!(
+            !decision.contains("wait_for_rabbit("),
+            "the fresh path must not poll or sleep for a review"
+        );
+
+        // Advisory is not the same as ignored: the RESUME lane still withholds
+        // a merge on findings, which is where a review can actually exist.
+        let resume_start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let resume = &src[resume_start..resume_start + src[resume_start..].find("\n}\n").unwrap()];
+        assert!(
+            resume.contains("wait_for_rabbit(") || resume.contains("rabbit"),
+            "the resume lane must still consult CodeRabbit"
         );
     }
+
+    /// C1-C4 as one table: only a review OF THIS HEAD with actionable findings
+    /// withholds a merge. Every flavour of absence — never reviewed, rate
+    /// limited, quota exhausted, draft skipped, or a review of older code —
+    /// means merge on the codex verdict.
+    #[test]
+    fn only_findings_on_the_current_head_withhold_a_merge() {
+        let head = "bbbb222";
+        let review_on = |sha: &str, count: u32| {
+            serde_json::json!([{
+                "user": {"login": RABBIT_LOGIN},
+                "commit_id": sha,
+                "body": format!("**Actionable comments posted: {count}**"),
+            }])
+        };
+        let none = serde_json::json!([]);
+
+        // A review of THIS head with findings: blocks.
+        let blocking = rabbit_findings_for_head(&review_on(head, 3), &none, head);
+        assert!(blocking.blocks(), "findings on the current head must block");
+        assert!(!blocking.approved());
+
+        // A review of this head with nothing actionable: merges.
+        assert!(rabbit_findings_for_head(&review_on(head, 0), &none, head).approved());
+
+        // A review of OLDER code never blocks — it did not see this diff.
+        assert!(
+            rabbit_findings_for_head(&review_on("aaaa111", 9), &none, head).approved(),
+            "a stale review must not withhold a merge"
+        );
+
+        // No review at all.
+        assert!(rabbit_findings_for_head(&none, &none, head).approved());
+
+        // Rate limited, quota exhausted, draft skipped: all absence. The
+        // first entry is the notice CodeRabbit ACTUALLY posted on this repo,
+        // verbatim including its HTML comment preamble and blockquote markup —
+        // the free tier is what makes this shape the common one, so a parser
+        // change that turned it into a block would stall the loop for a reason
+        // that has nothing to do with the code under review.
+        for note in [
+            "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n\
+             <!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n\n\
+             > [!WARNING]\n> ## Review limit reached\n> \n\
+             > **Next included review available in 11 minutes.**\n> \n\
+             > [Check out review usage here](https://app.coderabbit.ai/dashboard/review-capacity)",
+            "> ## Review limit reached\n> Next included review available in 11 minutes.",
+            "Draft PR not reviewed",
+        ] {
+            let comments = serde_json::json!([{ "user": {"login": RABBIT_LOGIN}, "body": note }]);
+            let r = rabbit_findings_for_head(&none, &comments, head);
+            assert!(
+                r.approved() && !r.blocks(),
+                "absence must never block: {:?}",
+                &note[..note.len().min(60)]
+            );
+        }
+
+        // And the wait decision must STOP on that verbatim notice rather than
+        // poll it out, naming the minutes so the log explains itself.
+        let real_notice = "<!-- rate limited by coderabbit.ai -->\n> ## Review limit reached\n\
+                           > **Next included review available in 11 minutes.**";
+        match rabbit_wait_decision(Some(real_notice), 0, 300) {
+            RabbitWait::Stop(why) => {
+                assert!(why.contains("rate-limited"), "{why}");
+                assert!(why.contains("11"), "the wait must name the minutes: {why}");
+            }
+            _ => panic!("a rate-limit notice must stop the wait at once, not poll or ask"),
+        }
+    }
+
+    /// Removing the fresh-path check left `coderabbit_configured` with no
+    /// caller, and my first move was to return early on it — which codex
+    /// caught: the GitHub App can be installed with no `.coderabbit.yaml`, and
+    /// the file can be deleted after a review was posted. Returning early
+    /// there would ignore real findings on the current head.
+    ///
+    /// Absence of the config means nobody is COMING. It never means ignore
+    /// somebody who already spoke. So it skips the wait, never the read.
+    #[test]
+    fn an_unconfigured_repo_skips_the_wait_but_never_the_read() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn wait_for_rabbit(").expect("wait fn");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+
+        let read = body
+            .find("rabbit_findings_for_head(")
+            .expect("the review of the head must be read");
+        let guard = body.find("coderabbit_configured(").expect("must consult the config");
+        assert!(
+            read < guard,
+            "read the posted review BEFORE deciding nobody is coming, or an \
+             existing finding is ignored whenever the config file is absent"
+        );
+        // And the early return is conditioned on there being no review, not on
+        // the config alone.
+        let line_start = body[..guard].rfind("if ").expect("the guard condition");
+        assert!(
+            body[line_start..guard].contains("!r.available"),
+            "the short-circuit must require that no review exists: {:?}",
+            &body[line_start..guard]
+        );
+    }
+
+    /// C7 for real, after three rounds of codex declining my attempts to argue
+    /// it away. The PR is created and merged as two separate `gh` calls, so
+    /// CodeRabbit's state at MERGE time is a real question — and the merge path
+    /// must ask it rather than report a fixed string.
+    #[test]
+    fn the_merge_asks_coderabbit_after_the_pr_exists_and_before_it_merges() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+
+        let create = body.find(r#"vec!["pr", "create"]"#).expect("pr create");
+        let read = body.find("rabbit_review_now(").expect("must read CodeRabbit at merge time");
+        let merge = body.find(r#""pr", "merge""#).expect("pr merge");
+        assert!(
+            create < read && read < merge,
+            "the read must sit between creating the PR and merging it: \
+             create={create} read={read} merge={merge}"
+        );
+
+        // A withheld merge must not leave the body claiming it merged: the
+        // body is composed before the read, on the assumption it will.
+        assert!(
+            body[read..merge].contains("Auto-merge WITHHELD"),
+            "correct the auto-merged claim when the merge is withheld"
+        );
+
+        // Findings withhold the merge and are said out loud, not swallowed.
+        let block = body[read..merge].find("blocks()").expect("must act on findings");
+        let region = &body[read + block..merge];
+        assert!(region.contains("return Ok("), "a blocking review must skip the merge");
+        assert!(
+            region.contains(r#""pr", "comment""#),
+            "say why on the PR, or a withheld merge is indistinguishable from a bug"
+        );
+        // Never a wait: that is the resume lane's tool.
+        assert!(
+            !body[create..merge].contains("wait_for_rabbit("),
+            "the fresh path must not poll for a review"
+        );
+
+        // A SUCCESSFUL merge must record the observed state too, or every
+        // merge carries the same sentence whether CodeRabbit was silent,
+        // rate-limited, or had reviewed and found nothing.
+        assert!(
+            body[read..merge].contains("rabbit_merge_note(&rabbit)")
+                && body[read..merge].contains(r#""pr", "edit""#),
+            "the non-blocking path must write what the read found into the body"
+        );
+    }
+
+    /// Codex, system pass, and a concrete instance of the very thing I had
+    /// just written a policy note about: `gh_json` returns `Null` when the
+    /// call fails, and `rabbit_findings_for_head` reads a missing array as an
+    /// empty one. So a failed GitHub read became "no review" — silently
+    /// merging over findings that exist. An empty ARRAY is an answer; `Null`
+    /// is not, and the two must not collapse.
+    #[test]
+    fn a_failed_github_read_is_unknown_not_an_empty_review_list() {
+        let head = "bbbb222";
+        let null = serde_json::Value::Null;
+        let empty = serde_json::json!([]);
+
+        // The parser cannot tell them apart, which is why the caller must.
+        assert!(rabbit_findings_for_head(&null, &empty, head).approved());
+        assert!(rabbit_findings_for_head(&empty, &empty, head).approved());
+
+        // So the fetch wrapper refuses to parse a null and says why.
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn rabbit_review_now(").expect("fetch wrapper");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+        let guard = body.find("is_null()").expect("must reject a failed read");
+        let parse = body.find("rabbit_findings_for_head(").expect("the parse");
+        assert!(
+            guard < parse,
+            "check for a failed call BEFORE parsing, or absence and failure collapse"
+        );
+        assert!(
+            body[guard..parse].contains("unavailable("),
+            "a failed read must become a stated unknown, not a default"
+        );
+    }
+
+    /// The residual codex and I did not agree on, written down as a test so
+    /// it is a decision on the record rather than an accident.
+    ///
+    /// If CodeRabbit's state cannot be READ — both the local remote-tracking
+    /// ref and the `gh` fallback failed — the merge proceeds, and the PR says
+    /// it proceeded without that state. Codex argued for failing closed on the
+    /// grounds that an unread review is not an absent one, which is true and
+    /// is why the lookup now reads a local ref first.
+    ///
+    /// The direction is the owner's, 2026-09-16: "if Codex give LGTM should
+    /// merge not wait for coderabbit. Im on their free tier so might run out."
+    /// An advisory input that can block when it is merely unreachable is not
+    /// advisory, and stranding an approved PR is the exact failure this issue
+    /// exists to end — #1000 sat for two days, #1020 until merged by hand.
+    /// Reaching this path needs a local git read AND a GitHub call to fail AND
+    /// CodeRabbit to have posted findings in the seconds between create and
+    /// merge.
+    #[test]
+    fn an_unreadable_coderabbit_state_merges_and_says_so() {
+        // Unknown must produce a REAL review object carrying its reason, so it
+        // flows into the PR body like any other state rather than vanishing.
+        let unknown = RabbitReview::unavailable("its state could not be read (head lookup failed)");
+        assert!(
+            !unknown.blocks() && unknown.approved(),
+            "an unreachable advisory reviewer cannot withhold a merge"
+        );
+        let note = rabbit_merge_note(&unknown);
+        assert!(
+            note.contains("could not be read"),
+            "the PR must say the state was unknown, not imply it was clean: {note}"
+        );
+
+        // Every way of not knowing is stated, not skipped. Three of them:
+        // the head lookup failed, the GitHub call failed, or the PR number
+        // could not be parsed at all.
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        // The no-number path cannot READ CodeRabbit (the endpoint needs a
+        // number) but must still RECORD that, via the branch selector `gh`
+        // accepts — the same one the merge itself uses.
+        let no_num = body.find("no PR number to query").expect("state must be named");
+        let edit = body[no_num..].find(r#""pr", "edit", &branch"#);
+        assert!(edit.is_some(), "record it on the PR by branch, not only in a log");
+
+        for stated in [
+            "could not be read (head lookup failed)",
+            "could not parse a PR number",
+            "no PR number to query",
+        ] {
+            assert!(body.contains(stated), "an unknown must be stated: {stated:?}");
+        }
+        assert!(
+            include_str!("self_improve.rs").contains("could not be read (GitHub call failed)"),
+            "a failed GitHub read must be stated too"
+        );
+    }
+
+    /// C7, narrowed — and the narrowing is the point rather than a dodge.
+    ///
+    /// I wrote C7 as "the note says what CodeRabbit's state was at merge time"
+    /// before I had the ordering straight. On the fresh path the PR is created
+    /// moments before the merge, so there is no meaningful review state to
+    /// report, and my first attempt asserted something false: "the PR did not
+    /// exist until this merge". Codex caught it.
+    ///
+    /// So the note states the POLICY and makes no claim about a review. What a
+    /// reader needs is why no CodeRabbit verdict appears, and where its
+    /// findings will turn up instead.
+    #[test]
+    fn the_merge_note_states_the_policy_and_claims_no_review() {
+        let l = RABBIT_NOT_WAITED_FOR.to_lowercase();
+        assert!(l.contains("advisory") && l.contains("not waited for"));
+        assert!(
+            !l.contains("did not exist"),
+            "the note must not describe the mechanism wrongly"
+        );
+        assert!(
+            l.contains("follow-up") || l.contains("follow up"),
+            "say where CodeRabbit's findings go, or the reader assumes they are lost"
+        );
+
+        // The resume lane, where a review CAN exist, still reports real state.
+        let blocked = rabbit_merge_note(&RabbitReview {
+            available: true,
+            skipped: false,
+            head_sha: "abc".into(),
+            actionable: 3,
+            findings: Vec::new(),
+            note: String::new(),
+        });
+        assert!(blocked.contains('3') && blocked.contains("withheld"), "{blocked}");
+        assert!(
+            rabbit_merge_note(&RabbitReview::unavailable("rate-limited (11 min); not waiting"))
+                .contains("rate-limited")
+        );
+    }
+
 
     #[test]
     fn rate_limit_note_parses_minutes() {
