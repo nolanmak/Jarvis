@@ -186,6 +186,22 @@ mod tests {
         tempfile::tempdir().expect("tempdir")
     }
 
+    #[tokio::test]
+    async fn downloaded_original_is_delivered_without_rerendering() {
+        let dir = root();
+        let original = b"%PDF-1.7\n\x00\xfforiginal bytes";
+        let path = augmentagent_docs::delivery::stage(dir.path(), "Example report.pdf", original).unwrap();
+        let marker = format!("ATTACH: {}", path.display());
+        let (text, files) = prepare_answer_delivery(&marker, Some(dir.path())).await;
+        assert!(!text.contains("couldn't attach"));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "Example report.pdf");
+        assert_eq!(files[0].data, original);
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let (_, refused) = prepare_answer_delivery(&format!("ATTACH: {}", outside.path().display()), Some(dir.path())).await;
+        assert!(refused.is_empty());
+    }
+
     #[test]
     fn plain_answer_passes_through_untouched() {
         let dir = root();

@@ -35,3 +35,8 @@ jobs:
       - run: cargo test --locked -p augmentagent-cli --test pdf_generation
       - run: cargo test --locked -p augmentagent-channel-core ask_opts_pdf_generation --lib
       - run: "cargo test --locked -p augmentagent-approval-discord attachments:: --lib"
+      - name: Read-only repository documents and delivery CLI
+        run: |
+          cargo test --locked -p augmentagent-cli --bin augmentagent repo_docs::tests
+          cargo test --locked -p augmentagent-cli --test repo_docs_cli
+          cargo test --locked -p augmentagent-channel-core --lib query_document_commands

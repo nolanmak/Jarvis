@@ -157,9 +157,19 @@ pub async fn run_gmail_get_attachment(
     attachment_id: Option<String>,
     name: Option<String>,
     out: Option<PathBuf>,
+    deliver: bool,
+    wiki_root: Option<PathBuf>,
     extract: bool,
     json: bool,
 ) -> Result<()> {
+    let delivery_root = wiki_root.or_else(|| std::env::var_os("WIKI_ROOT").map(PathBuf::from));
+    if deliver {
+        anyhow::ensure!(out.is_none(), "--deliver cannot be combined with --out");
+        anyhow::ensure!(
+            delivery_root.as_ref().is_some_and(|p| p.is_dir()),
+            "--deliver requires --wiki-dir or WIKI_ROOT pointing to an existing wiki"
+        );
+    }
     let (entity_id, email) = crate::resolve_gmail_entity_id(&store, account)?;
     let gmail = composio_client(&store)?;
     let metas = gmail
@@ -201,10 +211,15 @@ pub async fn run_gmail_get_attachment(
     .unwrap_or("application/octet-stream")
     .to_string();
 
-    let path = out.unwrap_or_else(|| tmp_doc_path(&message_id, idx, &filename));
-    write_no_follow(&path, &bytes)
-        .await
-        .with_context(|| format!("write {}", path.display()))?;
+    let path = if deliver {
+        augmentagent_docs::delivery::stage(delivery_root.as_ref().unwrap(), &filename, &bytes)?
+    } else {
+        let path = out.unwrap_or_else(|| tmp_doc_path(&message_id, idx, &filename));
+        write_no_follow(&path, &bytes)
+            .await
+            .with_context(|| format!("write {}", path.display()))?;
+        path
+    };
 
     // #939 — same pipeline as Discord drops. A failed extraction never undoes
     // a successful download; it's reported and the caller still has the file.
@@ -242,10 +257,16 @@ pub async fn run_gmail_get_attachment(
         if let Some((txt, chars, outcome)) = &extracted {
             v["extracted"] = crate::doc_cmd::receipt_json(&path, Some(txt), *chars, outcome);
         }
+        if deliver {
+            v["attach"] = serde_json::json!(format!("ATTACH: {}", path.display()));
+        }
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
     println!("{}", saved_line(&path, bytes.len(), &mime, &filename));
+    if deliver {
+        println!("ATTACH: {}", path.display());
+    }
     if let Some((txt, chars, outcome)) = &extracted {
         println!("{}", crate::doc_cmd::human_line(Some(txt), *chars, outcome));
     }
