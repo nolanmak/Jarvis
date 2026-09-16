@@ -37,6 +37,84 @@ personal wiki, and social/posting integrations.
   `agent-fixable` issues and open draft PRs; a user-facing `/loop` command
   registers cron-style recurring agent tasks.
 
+## Set up Jarvis with your coding agent
+
+Copy the prompt below into a terminal coding agent such as Codex or Claude Code.
+It guides setup from a fresh machine to a verified running assistant, asks you
+which providers and integrations you want, and pauses for you to sign in when
+needed. Codex can be your primary provider without installing Claude Code.
+This is an agent-guided setup recipe, not an unattended installer; Linux is the
+supported deployment target.
+
+```text
+Help me install and configure https://github.com/nolanmak/Jarvis from scratch.
+Do the setup using the terminal, explain progress briefly, and walk me through
+any steps that need my input. Use the checked-out code and CLI --help as the
+source of truth; do not invent commands or report unverified success.
+
+1. Discover and plan
+   Check my OS, available disk/RAM, installed tools, and any existing Jarvis
+   checkout or services. Use Linux for the daemon; if this machine is unsupported,
+   help me choose a Linux host before proceeding. Ask where to install, whether
+   I want Codex or Claude as primary (and an optional fallback), which control
+   surface/integrations to connect first, and whether to enable startup at login.
+   Reuse an existing installation safely; preserve local config and data.
+
+2. Install and configure
+   Clone the repo if needed. Read README.md, .env.example, docs/SECURITY.md,
+   docs/CODEX-FALLBACK.md, and the docs for my selected integrations. Inspect
+   scripts before running them; adapt paths to this machine, not the author's.
+   Install missing prerequisites using supported instructions for this OS.
+   Build both binaries with:
+   cargo build --release -p augmentagent-cli -p augmentagent-mcp-memory
+   If the dashboard or chosen OAuth flow needs it, run npm ci and npm run build
+   and configure the dashboard.
+   Use ./target/release/augmentagent until it is available on PATH.
+   Create local .env from .env.example only if absent. Keep secrets private,
+   preserve existing values, and initialize the private wiki/database using
+   documented CLI behavior. Never commit accounts, credentials, or wiki data.
+
+3. Choose and authenticate the model provider
+   Set AUGMENTAGENT_REASONER_CHAIN to my choice:
+   codex (Codex only), claude (Claude only), codex,claude (Codex first), or
+   claude,codex (Claude first). Install/authenticate only the chosen providers.
+   Use each provider CLI's current help and official installation/login flow.
+   Ask me to complete browser/device login or enter credentials directly into
+   the local terminal/secret store; never ask me to paste secrets into chat.
+   Check authentication and Jarvis's capability/tool readiness. Codex uses
+   Jarvis's guarded tool bridge; keep its guards enabled. Explain any missing
+   capability or usage limit rather than silently switching my provider choice.
+
+4. Connect my selected integrations
+   Inspect augmentagent setup --help, setup oauth --help, and the relevant
+   channel's help/docs. Configure required callback/dashboard/sidecar services
+   before starting each connection. Let me complete consent, QR scans, or local
+   credential entry, then verify the connection without printing secrets.
+   Set up my chosen control surface and approval routing. Leave unselected
+   integrations off. Explain which actions each connection permits.
+   Offer journal sync/private Git backups and auto-ship as optional follow-ups;
+   configure those only if selected. Verify any knowledge-base remote is private.
+
+5. Verify and start
+   Run augmentagent doctor, augmentagent status, and focused checks for enabled
+   channels; distinguish optional unconfigured services from actual failures.
+   Run a synthetic read/write/tool smoke check through the selected provider in
+   an isolated test workspace. Verify a dry-run request before live operation.
+   Ask before sending a test message, enabling outbound automation/auto-ship,
+   or starting live polling. Keep reply approvals and existing guards enabled.
+   If I selected autostart, inspect scripts/install-autostart.sh before using it:
+   it starts the live daemon. Verify the service, provider availability in its
+   environment, and a successful poll; an active process alone is not enough.
+   Do not expose the dashboard publicly as part of basic setup.
+
+6. Hand over
+   Tell me what works, which provider is primary, what's still unconfigured or
+   blocked, where private data lives, and the exact commands to start, stop,
+   inspect logs, update, and recover backups. Give me one first task to try.
+   Do not claim completion until the checks pass; resume after authentication
+   rather than leaving me with a list of commands to finish myself.
+```
+
 ## Architecture
 
 Dual implementation with shared behavior:
