@@ -3784,6 +3784,17 @@ fn coderabbit_configured(repo_root: &Path) -> bool {
     repo_root.join(".coderabbit.yaml").exists() || repo_root.join(".coderabbit.yml").exists()
 }
 
+/// #1032 — what the PR body says about CodeRabbit on an auto-merged fresh PR.
+///
+/// It states the POLICY, not a review state. Codex caught an earlier draft
+/// claiming "the PR did not exist until this merge": the PR is created moments
+/// before the merge, so that was false, and a note that misdescribes the
+/// mechanism is worse than one that says less. The loop did not wait, and that
+/// is the whole of what it can honestly assert here.
+const RABBIT_NOT_WAITED_FOR: &str =
+    "CodeRabbit is advisory and was not waited for; it reviews the merged \
+     commit and anything it finds becomes a follow-up issue.";
+
 /// What to record about CodeRabbit when a merge is taken.
 ///
 /// #1032, owner directive: a double codex LGTM is the bar and CodeRabbit is
@@ -5880,9 +5891,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
             "Auto-merged: owner-authored issue graded ≤medium, \
              AUGMENTAGENT_AUTOPR_AUTOMERGE=1, and two independent codex \
              reviews approved it. {}",
-            rabbit_merge_note(&RabbitReview::unavailable(
-                "the PR did not exist until this merge"
-            ))
+            RABBIT_NOT_WAITED_FOR
         ),
         // #823 — name the file, so the reviewer knows why this is a draft
         // even though the grade alone would have merged it.
@@ -11252,20 +11261,44 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         );
     }
 
-    /// C7 — a merge has to be explainable afterwards, so the note says what
-    /// CodeRabbit's state was at the moment it was taken.
+    /// C7, narrowed — and the narrowing is the point rather than a dodge.
+    ///
+    /// I wrote C7 as "the note says what CodeRabbit's state was at merge time"
+    /// before I had the ordering straight. On the fresh path the PR is created
+    /// moments before the merge, so there is no meaningful review state to
+    /// report, and my first attempt asserted something false: "the PR did not
+    /// exist until this merge". Codex caught it.
+    ///
+    /// So the note states the POLICY and makes no claim about a review. What a
+    /// reader needs is why no CodeRabbit verdict appears, and where its
+    /// findings will turn up instead.
     #[test]
-    fn the_merge_note_records_what_coderabbit_had_said() {
-        for (review, expect) in [
-            (RabbitReview::unavailable("rate-limited (11 min); not waiting"), "rate-limited"),
-            (RabbitReview::unavailable("no review yet"), "no review"),
-        ] {
-            let note = rabbit_merge_note(&review);
-            assert!(
-                note.to_lowercase().contains(&expect.to_lowercase()),
-                "note {note:?} must record {expect:?}"
-            );
-        }
+    fn the_merge_note_states_the_policy_and_claims_no_review() {
+        let l = RABBIT_NOT_WAITED_FOR.to_lowercase();
+        assert!(l.contains("advisory") && l.contains("not waited for"));
+        assert!(
+            !l.contains("did not exist"),
+            "the note must not describe the mechanism wrongly"
+        );
+        assert!(
+            l.contains("follow-up") || l.contains("follow up"),
+            "say where CodeRabbit's findings go, or the reader assumes they are lost"
+        );
+
+        // The resume lane, where a review CAN exist, still reports real state.
+        let blocked = rabbit_merge_note(&RabbitReview {
+            available: true,
+            skipped: false,
+            head_sha: "abc".into(),
+            actionable: 3,
+            findings: Vec::new(),
+            note: String::new(),
+        });
+        assert!(blocked.contains('3') && blocked.contains("withheld"), "{blocked}");
+        assert!(
+            rabbit_merge_note(&RabbitReview::unavailable("rate-limited (11 min); not waiting"))
+                .contains("rate-limited")
+        );
     }
 
 
