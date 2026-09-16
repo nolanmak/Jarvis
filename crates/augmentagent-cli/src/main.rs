@@ -8446,6 +8446,62 @@ impl QueryHandler for WikiQuerier {
     }
 }
 
+#[cfg(test)]
+mod query_delivery_contract_tests {
+    use super::*;
+    use augmentagent_channel_core::{CooldownLatch, ReasonerOpts};
+    use augmentagent_channel_core::providers::{classify, CapabilityClass, ProviderKind};
+
+    struct TranscriptFixture {
+        marker: String,
+    }
+
+    #[async_trait]
+    impl Reasoner for TranscriptFixture {
+        async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+            anyhow::bail!("query delivery must retain the full transcript")
+        }
+
+        async fn call_transcript(&self, opts: &ReasonerOpts, prompt: &str) -> anyhow::Result<String> {
+            assert_eq!(classify(opts), CapabilityClass::FullAgentic);
+            assert_eq!(opts.session_id.as_deref(), Some("synthetic-channel:synthetic-turn"));
+            assert!(opts.restrict_env);
+            assert!(opts.settings_json.as_ref().unwrap().contains("PreToolUse"));
+            assert!(prompt.contains("SYNTHETIC_OWNER_RULE"));
+            assert!(prompt.contains("Deliver the original synthetic document"));
+            Ok(format!("Here is the original document.\n{}\nFinal receipt.", self.marker))
+        }
+    }
+
+    #[tokio::test]
+    async fn query_handler_preserves_context_and_original_attachment_bytes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let wiki = fixture.path().join("wiki");
+        std::fs::create_dir_all(wiki.join("about")).unwrap();
+        std::fs::write(wiki.join("about/me.md"),
+            "## Agent behavior rules\n\nSYNTHETIC_OWNER_RULE\n").unwrap();
+        let original = b"%PDF-1.7\n\x00\xffSYNTHETIC_ORIGINAL";
+        let document = augmentagent_docs::delivery::stage(&wiki, "Synthetic report.pdf", original).unwrap();
+        let reasoner = Arc::new(FallbackReasoner::for_tests(
+            vec![(ProviderKind::Claude, Arc::new(TranscriptFixture {
+                marker: format!("ATTACH: {}", document.display()),
+            }))], CooldownLatch::at(fixture.path().join("cooldowns.json"))));
+        let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(),
+            repo_root: fixture.path().to_path_buf() };
+        let mut context = augmentagent_approval_discord::AuditCtx::empty();
+        context.session_id = "synthetic-channel:synthetic-turn".into();
+        let answer = handler.answer(&context, "Deliver the original synthetic document").await.unwrap();
+        let (text, attachments) = augmentagent_approval_discord::attachments::prepare_answer_delivery(
+            &answer, Some(&wiki)).await;
+        assert!(text.contains("Here is the original document.") && text.contains("Final receipt."));
+        assert!(!text.contains("ATTACH:") && !text.contains("couldn't attach"));
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "Synthetic report.pdf");
+        assert_eq!(attachments[0].data, original);
+        assert_eq!(reasoner.usage(), vec![("claude", 1, 1)]);
+    }
+}
+
 /// Bridge: turns the raw serenity bits in `AuditCtx` into a channel-core
 /// [`AuditNotifier`] impl. Lives in the CLI crate because it's the only
 /// crate that depends on BOTH the discord crate (for `serenity` + `AuditCtx`)

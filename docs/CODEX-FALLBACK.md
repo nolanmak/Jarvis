@@ -202,6 +202,17 @@ test now includes the synthetic response/audit when that assertion fails.
 This live receipt does not establish automatic fallback, delivery-handler
 coverage or reliability across all output contracts.
 
+The deterministic `query_handler_preserves_context_and_original_attachment_bytes`
+contract calls the real `WikiQuerier::answer` and Discord attachment preparation
+with a stubbed primary provider. It verifies the production full-agentic profile,
+scope hook, restricted environment, session context, owner rules, transcript
+capture and original binary bytes. Live Codex fallback through that handler is
+still outstanding. Outbound attachment reads now use a pinned wiki directory
+descriptor and reject symlinks at every subsequent path component; metadata and
+the byte cap are checked on the opened file. Tests cover swaps after marker
+validation, root replacement, oversized files and nonregular files including
+FIFOs, without reopening the validated absolute path for delivery.
+
 The remaining provider conformance suite must cover:
 
 | Source | Presets / operations |
