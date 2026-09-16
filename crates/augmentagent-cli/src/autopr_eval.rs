@@ -200,6 +200,12 @@ pub fn select<'a>(cases: &'a [EvalCase], only: Option<&str>) -> Result<Vec<&'a E
         return Ok(cases.iter().collect());
     };
     let wanted: Vec<&str> = only.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    if wanted.is_empty() {
+        // `--only "$IDS"` with an unset variable lands here. Grading nothing
+        // and reporting `0/0 passed` is the one answer a regression harness
+        // must never give.
+        bail!("--only named no case ids; pass at least one, or omit the flag to run them all");
+    }
     for w in &wanted {
         if !cases.iter().any(|c| c.id.eq_ignore_ascii_case(w)) {
             bail!("--only names {w:?}, which is not an id in the fixture file");
@@ -1303,6 +1309,17 @@ mod tests {
         assert_eq!(select(&cases, None).expect("all").len(), 3);
         let err = select(&cases, Some("E9")).expect_err("unknown id must not silently select nothing");
         assert!(format!("{err:#}").contains("E9"));
+
+        // Codex: `--only "$IDS"` with an unset variable is an ordinary way to
+        // invoke this, and it used to grade nothing and exit 0 reporting
+        // `0/0 passed`. A harness whose whole job is catching regressions must
+        // never report success for having checked nothing.
+        for empty in ["", "   ", ",", " , ,"] {
+            assert!(
+                select(&cases, Some(empty)).is_err(),
+                "--only {empty:?} must not silently select zero cases"
+            );
+        }
     }
 
     /// Codex review: `--only E989 --report-only` selected E989 and then
