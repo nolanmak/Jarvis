@@ -56,6 +56,7 @@ mod doc_cmd;
 mod doctor;
 mod env_cfg;
 mod gmail_attach;
+mod repo_docs;
 mod finance;
 mod installers;
 mod logs;
@@ -98,6 +99,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Read documents from explicitly configured read-only GitHub sources.
+    RepoDocs {
+        #[command(subcommand)]
+        op: repo_docs::Command,
+    },
     /// Connect bank accounts, sync transactions, and query local finance records.
     Finance {
         #[command(subcommand)]
@@ -1650,6 +1656,9 @@ enum GmailOp {
     /// extract its text to the sibling `.txt`, running Mistral OCR when a PDF
     /// has no text layer and MISTRAL_API_KEY is set (#939).
     GetAttachment {
+        /// Stage the exact original inside the wiki for Discord ATTACH delivery.
+        #[arg(long, conflicts_with = "out")]
+        deliver: bool,
         /// Email address or Composio entity_id. Required when more than one
         /// account is connected.
         #[arg(long)]
@@ -2214,6 +2223,9 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Cmd::RepoDocs { ref op } = cli.cmd {
+        return repo_docs::run(op, cli.wiki_dir.as_deref()).await;
+    }
     let db_path = cli
         .db
         .clone()
@@ -3104,6 +3116,7 @@ async fn main() -> Result<()> {
             dry_run,
             max_issues,
         } => research::run_research(store, since_hours, post_discord, dry_run, max_issues).await,
+        Cmd::RepoDocs { .. } => unreachable!("handled before database initialization"),
         Cmd::Gmail { ref op } => match op {
             GmailOp::Search { query, limit, full, account } => {
                 run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await
@@ -3119,7 +3132,7 @@ async fn main() -> Result<()> {
                 .await
             }
             GmailOp::GetAttachment {
-                account, message_id, attachment_id, name, out, extract, json,
+                account, message_id, attachment_id, name, out, extract, json, deliver,
             } => {
                 gmail_attach::run_gmail_get_attachment(
                     store,
@@ -3128,6 +3141,8 @@ async fn main() -> Result<()> {
                     attachment_id.clone(),
                     name.clone(),
                     out.clone(),
+                    *deliver,
+                    cli.wiki_dir.clone(),
                     *extract,
                     *json,
                 )

@@ -1621,6 +1621,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             repo_root.to_string_lossy().into_owned(),
         ),
     ];
+    // Honor the operator's private document-source configuration location.
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        env.push(("XDG_CONFIG_HOME".into(), config_home.to_string_lossy().into_owned()));
+    }
     // #915/#922 — the scope guard allows the READ tools under the transcript
     // clone, but only if it can see the same variable the daemon used to
     // open the dir (`add_dirs` below); `restrict_env` means nothing is
@@ -1778,6 +1782,12 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             // hits "This command requires approval" on perfectly
             // legitimate issue-filing calls. (PATH wired above; same
             // pattern as `augmentagent` subcommands per #214.)
+            "Bash(augmentagent repo-docs sources)".to_string(),
+            "Bash(augmentagent repo-docs list *)".to_string(),
+            "Bash(augmentagent repo-docs get *)".to_string(),
+            format!("Bash({} repo-docs sources)", bin.display()),
+            format!("Bash({} repo-docs list *)", bin.display()),
+            format!("Bash({} repo-docs get *)", bin.display()),
             "Bash(aa-gh issue create *)".to_string(),
             "Bash(aa-gh issue list *)".to_string(),
             "Bash(aa-gh issue view *)".to_string(),
@@ -2118,6 +2128,16 @@ mod tests {
     /// #1004 — every preset audits now. The regression this guards is the one
     /// that existed for months: the agent that edits the repo and pushes
     /// branches produced no tool record, because its preset passed `None`.
+    #[test]
+    fn query_document_commands_are_read_only_and_explicit() {
+        let root = tempfile::tempdir().unwrap();
+        let opts = ask_opts(root.path().to_path_buf(), root.path().to_path_buf());
+        for command in ["Bash(augmentagent repo-docs sources)", "Bash(augmentagent repo-docs list *)", "Bash(augmentagent repo-docs get *)"] {
+            assert!(opts.allowed_tools.contains(&command.to_string()));
+        }
+        assert!(!opts.allowed_tools.iter().any(|s| s == "Bash(augmentagent repo-docs *)" || s == "Bash(gh *)"));
+    }
+
     #[test]
     fn tool_auditing_is_on_by_default_and_explicitly_disableable() {
         let _g = audit_env_guard();
