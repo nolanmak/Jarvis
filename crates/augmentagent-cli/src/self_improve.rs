@@ -1820,6 +1820,20 @@ fn sweep_verdict(c: &SweepCandidate) -> SweepVerdict {
     if c.rabbit_blocks {
         return skip("CodeRabbit has actionable findings on this head");
     }
+    // Unknown must DENY, and it must do so where nothing can release it.
+    // Codex: routing an unreadable diff through the receipt gate as a gated
+    // path looked like a deny, but `AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT`
+    // is set on this deployment and releases gated paths on a double LGTM. So
+    // a transient `gh pr diff` failure plus two recorded approvals merged
+    // anyway — a human-only gate bypassed by a network blip. The override
+    // exists to say "two reviewers may substitute for a receipt on a KNOWN
+    // file", never "on a file nobody could name".
+    if c.policy.receipt_gated_file.as_deref() == Some(UNREADABLE_DIFF) {
+        return skip(
+            "its diff could not be read, so whether it touches a receipt-gated \
+             path is unknown; no override applies to an unknown",
+        );
+    }
     if !may_automerge(&c.policy) {
         return skip("the merge policy withholds it (complexity, receipt gate, or author)");
     }
@@ -11522,11 +11536,41 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             code.contains("_ => Some(UNREADABLE_DIFF"),
             "every failure kind must yield the sentinel"
         );
-        // And the sentinel must actually engage the gate.
+        // And the sentinel must actually engage the gate — including when the
+        // owner's LGTM override is ENABLED, which it is on this deployment.
+        // Codex: the override releases gated paths on a double LGTM, so
+        // routing an unknown through the receipt gate meant a transient diff
+        // failure merged anyway. The deny has to sit where no flag reaches it.
         assert!(
             !automerge_receipt_ok(Some(UNREADABLE_DIFF), true, None),
-            "the sentinel must withhold a merge without the owner's override"
+            "the sentinel must withhold without the override"
         );
+        let mut unknown = SweepCandidate {
+            pr: 1,
+            issue: 2,
+            ours: Some(true),
+            loop_authored: true,
+            mergeable: Some(true),
+            checks_green: Some(true),
+            codex_lgtms: 2,
+            rabbit_blocks: false,
+            policy: policy(Complexity::Simple),
+        };
+        unknown.policy.receipt_gated_file = Some(UNREADABLE_DIFF.to_string());
+        unknown.policy.lgtm_overrides_receipt = Some("1".into());
+        assert!(
+            may_automerge(&unknown.policy),
+            "precondition: the override WOULD release it through the policy alone"
+        );
+        match sweep_verdict(&unknown) {
+            SweepVerdict::Skip(why) => assert!(
+                why.contains("could not be read"),
+                "the deny must name the unknown: {why}"
+            ),
+            SweepVerdict::Merge => {
+                panic!("an unreadable diff must not merge, override or not")
+            }
+        }
     }
 
     /// Codex: I had hardcoded two of the sweep's inputs, and each one silently
