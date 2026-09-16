@@ -49,6 +49,7 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod whatsapp_history;
+mod autopr_eval;
 mod autopr_health;
 mod channel_router;
 mod code_mode;
@@ -486,6 +487,28 @@ enum Cmd {
     /// drafts — and reports anything that stops the loop shipping. Run on a
     /// timer with `--notify` so an outage announces itself instead of
     /// waiting to be noticed. Exit 1 when anything is an alert.
+    /// #1011 — grade the SCOPING pass against fixed, cached issues.
+    ///
+    /// The unit tests pin what the code does; this measures what the loop
+    /// DECIDES. Runs the scoping pass only — no build, no gate, no worktree,
+    /// no production state, and one reasoner call per case. Exit 1 on any miss.
+    AutoprEval {
+        /// Fixture file. Default: eval/autopr-cases.json
+        #[arg(long)]
+        cases: Option<std::path::PathBuf>,
+        /// Grade only these case ids, comma-separated.
+        #[arg(long)]
+        only: Option<String>,
+        /// Where to write the markdown report. Default: eval/RESULTS.md
+        #[arg(long)]
+        report: Option<std::path::PathBuf>,
+        /// Re-render the report from the fixtures without calling a reasoner.
+        #[arg(long, default_value_t = false)]
+        report_only: bool,
+        /// Re-fetch the cached issue text from GitHub, then exit.
+        #[arg(long, default_value_t = false)]
+        refresh: bool,
+    },
     AutoprHealth {
         /// Post the findings to Discord (DISCORD_WEBHOOK_URL). Silent when healthy.
         #[arg(long, default_value_t = false)]
@@ -3968,6 +3991,31 @@ async fn main() -> Result<()> {
                 }
             }
             Ok(())
+        }
+        Cmd::AutoprEval {
+            ref cases,
+            ref only,
+            ref report,
+            report_only,
+            refresh,
+        } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let cases_path = cases
+                .clone()
+                .unwrap_or_else(|| root.join(autopr_eval::DEFAULT_CASES));
+            if refresh {
+                autopr_eval::refresh(&root, &cases_path).await?;
+                return Ok(());
+            }
+            let code = autopr_eval::run(
+                &root,
+                Some(&cases_path),
+                only.as_deref(),
+                report.as_deref(),
+                report_only,
+            )
+            .await?;
+            std::process::exit(code);
         }
         Cmd::AutoprHealth { notify, json } => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));

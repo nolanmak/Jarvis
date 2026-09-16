@@ -1,0 +1,71 @@
+[
+  {
+    "id": "E989",
+    "issue": 989,
+    "title": "Code-mode protocol parsing fails when generated code logs to stdout",
+    "body": "## Software behavior\n\nA generated program writes diagnostic text to stdout before its JSON result. The runner attempts to decode the text as a protocol frame, then fails. Keep console diagnostics separate from the structured output channel and cover the behavior with a synthetic program. Channel routing should also preserve the inbound platform.\n\nPrivacy cleanup: private correspondence and operational details were removed. Use synthetic data for reproduction.",
+    "author": "nolanmak",
+    "expect": "fixable",
+    "base": "3bcd247"
+  },
+  {
+    "id": "E962",
+    "issue": 962,
+    "title": "New-compose (non-reply) approval card mislabels recipient as 'From' and Revise fails with 'something went wrong'",
+    "body": "## Software behavior\n\nA new-compose approval card labels the recipient as From and revision fails because no reply context exists. Use synthetic account and recipient identities. Preserve an explicit compose envelope, render To/From correctly and make revisions work for both new and legacy compose cards.\n\nPrivacy cleanup: private correspondence and operational details were removed. Use synthetic data for reproduction.",
+    "author": "nolanmak",
+    "expect": "fixable",
+    "base": "350a2a3"
+  },
+  {
+    "id": "E968",
+    "issue": 968,
+    "title": "Contact-merge approval card omits who each record is (forces user to ask)",
+    "body": "Summary\nThe contact-merge approval card only shows the raw stub key, a message count, and the merge mechanics. It does not say WHO the stub or the target person actually is, so the user has to stop and ask before they can approve.\n\nExample (reported 2026-09-09, values synthesized)\nCard content shown to user, roughly:\n\n  Merge '<phone>_at_contact' into <target-slug>?\n  Contact stub <phone>_at_contact — 0 messages, last text 2026-09-09\n  — DRAFT —\n  Approve folds this stub into <target-slug> — moves its identities and Source lines onto the target (fill-blanks only), deletes the stub, and repoints its phone rows.\n  fills: source ...\n\nNothing on the card explains that the stub is a phone number from a specific group chat, or who the target person is (name, relationship). The user had to ask the agent to look both pages up before approving.\n\nRequested change\nMerge cards should carry enough identity context to decide in place, e.g.:\n- Stub: resolved display name / phone / email, source (which chat or thread it came from), message count, last-seen date.\n- Target: display name, key identifying facts (relationship, phone/email), source page.\n- A one-line 'why these two match' (shared phone/email/identity fact that triggered the merge suggestion).\n\nRepro: open any contact-merge approval card generated from a bare phone/email stub.",
+    "author": "nolanmak",
+    "expect": "fixable",
+    "base": "967fcd1"
+  },
+  {
+    "id": "E963",
+    "issue": 963,
+    "title": "Approval card truncates multi-recipient To/Cc list (doesn't show everyone on the chain)",
+    "body": "## Software behavior\n\nAn approval card omits some To/CC recipients when the draft has multiple recipients, although the approved message retains the complete envelope. Reproduce with reserved example.com addresses. Render every recipient, including after revision or nudge reposting.\n\nPrivacy cleanup: private correspondence and operational details were removed. Use synthetic data for reproduction.",
+    "author": "nolanmak",
+    "expect": "fixable",
+    "base": "d0db8e0"
+  },
+  {
+    "id": "E954",
+    "issue": 954,
+    "title": "Daemon-wide reasoner freeze: CLI gate acquire is outside the watchdog, so a leaked permit silently stops email triage and the auto-PR loop",
+    "body": "## What happened\nFrom **2026-09-04 04:08Z until a manual restart at 19:09Z** (15 h) every reasoner call in the daemon blocked. The process stayed `active`, pollers that need no LLM (socialapi-dm) kept completing, but:\n- the Gmail poller's last `poll complete` was 04:08:18Z — **no email triage for 15 h**;\n- the auto-PR loop's in-flight run (#888, revision round 2) logged its post-revision gate failure at 04:07:44Z and then nothing — no repair round, no outcome, no further ticks (the loop awaits `run_once` inline, so a wedged run stops the tick loop too);\n- no `panicked`, no watchdog (`exceeded the …s watchdog`) warning, no `cli_gate … saturated` warning, no lock message, **no child processes** under the daemon (`pgrep -P <pid>` empty), 16 fds, 13 threads, no orphaned grandchildren, no shared pipes, no OOM in the kernel log, disk 29G free.\n\nThe one place a reasoner call can wait forever with none of those symptoms is the process-global CLI gate from #898 (`cli_gate.rs`, capacity 4):\n\n```rust\n// reasoner.rs — call_once_timed\nlet _permit = self.gate.acquire(\"claude\").await;              // NOT covered by the watchdog\nmatch tokio::time::timeout(dur, self.call_once(...)).await { … }\n```\n- `acquire` is outside the watchdog, so a caller queued for a permit never times out.\n- The saturation warning fires only when `waiting() > capacity`; with ≤4 callers queued (one per channel) it says nothing — which is exactly the silent shape seen here.\n- If four `CliPermit`s are held by futures that are neither running a child nor timing out, the whole daemon's reasoning stops with no trace. How they came to be held is not established from the logs; the last sign of life was the #888 gate `cargo test` failing at 04:07:44Z with a linker error tail (`… rustcINNvgE/symbols.o \"<257 object files omitted>\"`) — i.e. the box was under memory pressure at that moment.\n\n## Ask (TDD)\n1. `acquire` must be bounded: wrap it in its own timeout (e.g. the same `reasoner_timeout_for(opts)`), returning a typed `ReasonerError` so the fallback chain / caller can react, and log at WARN with `in_flight`/`waiting`/`capacity` whenever a caller waits more than ~60 s **regardless of `waiting() > capacity`**.\n   - test: a gate with capacity 1 and one permit held → a second `acquire` errors after the timeout instead of hanging; the warning is logged once per minute while queued.\n2. A permit-hold watchdog: log (and expose via `doctor`) permits held longer than the reasoner timeout, with the provider and the caller's preset; consider force-releasing after 2× the timeout since no legitimate CLI call lasts that long.\n   - test: a permit held past the deadline is reported; `in_flight` returns to 0 after release.\n3. `AutoPrLoop::run` must not await `run_once` inline unbounded: wrap the run in a timeout (e.g. 3 h) so a wedged run cannot stop the tick loop; log the abandoned run as an `Infra` harness failure (#803).\n   - structural test: the `run_once` await inside the loop is wrapped in `tokio::time::timeout`.\n4. `augmentagent doctor` shows the gate's `in_flight`/`waiting` and the age of the oldest permit, so this is diagnosable without a restart.\n\n## Evidence\n- `~/.local/state/augmentagent/stderr.log` 2026-09-04T04:06:54Z–04:07:44Z (last self_improve lines), then only `socialapi-dm`/`linkedin` polls until 19:09Z.\n- Restart at 19:09:25Z: `reasoner CLI gate armed … capacity=4`, `auto-PR loop started`, Gmail polling resumed.\n- Related: #898 (the gate), #897 (the OOM it was built for), #656 (watchdog), #803 (harness-failure accounting).",
+    "author": "nolanmak",
+    "expect": "fixable",
+    "base": "26b7df7"
+  },
+  {
+    "id": "E977",
+    "issue": 977,
+    "title": "Complete owner bank authorization and live acceptance for Plaid finance",
+    "body": "The Plaid integration was implemented and merged in #976 (scope: #975). Production application credentials and Hosted Link creation have been verified through the CLI. A transient systemd user service successfully read the persisted Link credential. No bank has been authorized yet, so live financial data has not been fetched.\n\nRemaining owner-dependent acceptance:\n- [ ] Owner authorizes the intended bank accounts through Hosted Link (keep connection URLs and account details out of GitHub).\n- [ ] Complete the Link session via `augmentagent finance complete --session SESSION_ID` and verify the Item is stored.\n- [ ] Run `augmentagent --wiki-dir ./wiki finance sync`; verify history readiness, account selection, and totals against bank records.\n- [x] Confirm the initial finance overview reaches the existing private KB mirror (transaction-ledger verification follows after linking).\n- [ ] Verify an unattended import from `augmentagent-finance-sync.timer` after linking.\n- [ ] If original bank PDFs are wanted, grant Statements consent for supported accounts and verify the first archived PDF/checksum.\n\nThe six-hour timer is installed and enabled. Its first deployed service run exited successfully with no linked accounts, the deployed CLI validated production credentials, and the initial finance overview was pushed to the verified-private KB remote. Bank authorization is interactive and cannot be completed from application API keys alone. No additional implementation approval is required.",
+    "author": "nolanmak",
+    "expect": "not-fixable"
+  },
+  {
+    "id": "E929",
+    "issue": 929,
+    "title": "Texting contacts → KB identity association: suggest, approve in Discord, merge (tracking)",
+    "body": "Owner ask (2026-09-02): a recurring process that looks at text contacts actively messaging them, and when a contact has no association to an email identity / canonical KB page, finds a good fit and asks approval in Discord with a card before merging.\n\nGround rule from the wiki schema: never auto-merge — when in doubt, keep pages separate. The process only proposes; the owner approves each fold.\n\nFoundation already on main (shipped with the #882 backfill work):\n- `person merge <from> <into> [--apply]` — deterministic stub-merge executor (`crm::merge_stub_into`, fill-blanks, idempotent; deletes the stub; `Store::repoint_phone_identity` heals the phone index). Proven live: landlord_philly_at_contact → centra-associates.\n- Backfill resolver falls through stale `identity_phone` rows instead of resurrecting deleted stubs.\n\nSub-issues, in dependency order:\n\n- [ ] #926 — suggester core: active unassociated texters + ranked candidates (CLI dry-run surface)\n- [ ] #927 — Discord approval card, kind `identity_merge`, Approve executes the merge\n- [ ] #928 — serve loop: daily tick, max 3 cards/day, `AUGMENTAGENT_MERGE_SUGGEST` gate",
+    "author": "nolanmak",
+    "expect": "not-fixable"
+  },
+  {
+    "id": "E882",
+    "issue": 882,
+    "title": "iMessage history → agent knowledge base (tracking)",
+    "body": "Ingest the operator's iMessage archive into the knowledge base. The archive lives in a separate private git repo as an OKF v0.2 bundle — one directory per conversation (`conversations/<dir>/messages.md`, YAML frontmatter + entries formatted `### [ISO-8601 offset] <sender>`, `me` = operator, bodies until the next header, `\\`-escaped collisions), with `index.md`/`index.json` catalogs and attachments in S3 under keys mirroring the same layout (`conversations/<dir>/attachments/<id>-<name>`). The bundle is kept current every 30 minutes by an external sync job.\n\nSub-issues, in dependency order:\n\n- [x] #883 — `imessage` identity support + wire `lookup_person_by_phone`\n- [x] #884 — bundle reader + config (`augmentagent-channel-imessage`)\n- [x] #885 — historical backfill → person pages (dry-run first)\n- [x] #886 — incremental ingest → `emails` table + wiki (`search_conversation_history` for free)\n- [ ] #887 — retrieval: triage/draft hints + wiki-ask access\n- [ ] #888 — stretch: S3 attachment fetch for the ask agent\n\nNon-goals for now: iMessage as a *send* channel (no reply path — macOS automation for sending is a separate risk decision), tapbacks/edits (not in the bundle), tone profiles from texts (`tone_examples.source` has a CHECK constraint requiring a migration — revisit later).",
+    "author": "nolanmak",
+    "expect": "not-fixable"
+  }
+]

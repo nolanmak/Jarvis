@@ -93,3 +93,4 @@ __pycache__/
 # and braces for anyone pointing the env overrides at the working tree.
 token-usage.jsonl
 tool-audit.log
+eval/.last-run.json
