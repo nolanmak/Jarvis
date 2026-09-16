@@ -594,6 +594,31 @@ mod tests {
         assert_eq!(b.count(), 2);
     }
 
+    /// #1019: exercise the actual chat preset, not a text-only selftest.
+    #[tokio::test]
+    async fn wiki_ask_quota_falls_back_to_codex_and_skips_latched_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        std::fs::create_dir(&wiki).unwrap();
+        let opts = crate::reasoner::ask_opts(wiki, dir.path().to_path_buf());
+        assert_eq!(classify(&opts), crate::providers::CapabilityClass::FullAgentic);
+        let primary = Scripted::err(rate_limited);
+        let backup = Scripted::ok("tool-capable backup response");
+        let chain = FallbackReasoner::for_tests(
+            vec![
+                (ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>),
+                (ProviderKind::Codex, backup.clone() as Arc<dyn Reasoner>),
+            ],
+            latch_in(&dir),
+        );
+        for _ in 0..2 {
+            assert_eq!(chain.call(&opts, "Read the synthetic project note").await.unwrap(),
+                "tool-capable backup response");
+        }
+        assert_eq!(primary.count(), 1);
+        assert_eq!(backup.count(), 2);
+    }
+
     #[tokio::test]
     async fn parsed_reset_hint_is_used_for_the_latch() {
         let dir = tempfile::tempdir().unwrap();

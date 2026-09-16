@@ -12,6 +12,7 @@ pub mod cerebras;
 pub mod cli_gate;
 pub mod code_mode;
 pub mod codex;
+pub mod codex_tools;
 pub mod cooldown;
 pub mod decision;
 pub mod engagement;

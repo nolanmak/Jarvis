@@ -1,0 +1,85 @@
+# Codex fallback implementation
+
+Issue #1019 requires operational parity for every Claude-backed Jarvis workflow.
+This document tracks the implementation contract. It is not a claim that agentic
+fallback is enabled: the production routing gate remains closed until the bridge,
+provider conformance tests and deployed QA pass.
+
+## Execution boundary
+
+The model runs in a fresh empty directory with project configuration discovery
+excluded, native shell/apps/plugins/browser/computer/image tools disabled, and a
+named minimal-read/no-write/no-command-network permission profile. Provider login
+remains in the existing adapter; integration credentials belong to private bridge
+configuration, never command-line arguments or model-visible policy text.
+
+A required stdio MCP bridge exposes the operations declared by `ReasonerOpts`.
+The bridge enforces tool identity, workspace scope, argv validation and existing
+pre-tool guards. Every filesystem path component is opened without following
+symlinks. Read roots and write roots are separate; transcript context is not a
+writable workspace. Credential and control directories are excluded.
+
+The original guards run inside the bridge and fail closed on crash, timeout,
+malformed output or explicit denial. Native Codex hooks are not the enforcement
+boundary: a live synthetic probe found that a crashing hook allowed an MCP call
+to continue. Another live probe confirmed that the restricted native permission
+profile rejected an edit while the bridge successfully read and wrote a synthetic
+file, preserving its bytes.
+
+Commands must use parsed argv, never a model-generated shell script. Matching a
+command prefix alone does not sandbox programs such as Cargo or npm: they can
+execute project code. Build execution therefore needs a separately verified
+filesystem/process/network boundary. On the tested deployment, the default Codex
+command sandbox fails during loopback setup. Its legacy Landlock backend runs a
+simple command but rejects permission profiles requiring direct runtime
+enforcement; selecting that backend alone does not prove read confinement.
+
+## Capability inventory
+
+The checked-in manifest and conformance suite must cover these constructors and
+call sites, including dynamically added tools:
+
+| Source | Presets / operations |
+|---|---|
+| `channel-core/reasoner.rs` | `triage_opts`, `draft_opts`, `lint_opts`, `ask_opts`, `digest_opts`, `tone_summarize_opts`, `social_adapter_opts`, `loop_parse_opts`, `archetype_pick_opts`, `ingest_opts`, `wiki_migrate_opts`, `resume_opts` |
+| `channel-core/reasoner.rs`, `mcp.rs` | `socialapi_draft_opts`, `with_socialapi_readonly_mcp`, configured stdio/HTTP MCP additions |
+| `channel-core/resolve.rs` | `extract_opts` |
+| `cli/self_improve.rs` | `scope_opts`, `review_opts`, `fix_opts`, `codex_review_opts` |
+| `cli/main.rs` | text-only reasoner selftest and production query dispatch |
+| channel crates | email signature extraction, journal composition, voice extraction, email/LinkedIn/WhatsApp/Slack/Instagram/Twitter/Discord parsing calls |
+
+Output parity includes model tier selection, code-mode parsing, images, last
+assistant block versus complete transcript, original attachment markers, tool
+audit records, cancellation and shared CLI-gate lifecycle. A text-only selftest
+cannot stand in for any tool-using profile.
+
+## Current verification
+
+- Production-shaped wiki-ask quota regression reproduces the existing rejection;
+  it intentionally remains red until agentic routing and enforcement are ready.
+- Bridge tests cover file read/write/edit, nested writes, bounded search, tool
+  declaration, traversal and intermediate symlink escapes, sensitive paths,
+  command parsing, and guard denial/crash/malformed-response handling.
+- Rust launch tests check private configuration permissions, exclusion of secrets
+  from arguments, native tool restrictions, separate read/write roots and
+  rejection of unknown settings.
+- Live synthetic CLI probes establish MCP connectivity and file operations; they
+  do not establish full chat, integration, shell, or auto-ship parity.
+
+## Remaining integration gates
+
+1. Complete bridge command execution, MCP proxying, web/document support and
+   precise readiness reporting. Validate all accepted settings and tool schemas;
+   never advertise an operation that is silently ignored.
+2. Wire the launch contract into the Codex adapter and audit stream, including
+   startup failure, timeout, cancellation and descendant process cleanup.
+3. Add durable handoff accounting for completed and uncertain mutations. Seed the
+   fallback with known progress, reconcile uncertain effects, and prevent replay.
+4. Complete the machine-checked capability manifest and provider conformance tests.
+5. Enable the capability routing matrix only after these contracts pass. Preserve
+   independent auto-ship review and all existing merge gates.
+6. Verify the deployed query/delivery path and a controlled full auto-ship lifecycle,
+   document rollback, merge green reviewed changes and remove task-owned worktrees.
+
+All fixtures and publishable receipts must use synthetic data. Live account
+configuration, private correspondence and raw runtime logs stay outside this repo.
