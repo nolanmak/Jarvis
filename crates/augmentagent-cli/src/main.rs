@@ -8364,36 +8364,102 @@ fn owner_rules_block(wiki_root: &std::path::Path) -> Option<String> {
     // = how turns are conducted (deliverable placement, routing). The split
     // is documented in schema/wiki-ask.md's durable-facts pass.
     const SECTIONS: [&str; 2] = ["Writing style preferences", "Agent behavior rules"];
-    // Generous cap: me.md rule sections are a handful of bullets today;
-    // truncation is a guard against unbounded growth, not an expectation.
-    const MAX_BLOCK_CHARS: usize = 4000;
 
     let me = std::fs::read_to_string(wiki_root.join("about").join("me.md")).ok()?;
-    let mut block = String::new();
-    for sec in SECTIONS {
-        if let Some(body) = extract_md_section(&me, sec) {
-            let body = body.trim();
-            if !body.is_empty() {
-                block.push_str("### ");
-                block.push_str(sec);
-                block.push('\n');
-                block.push_str(body);
-                block.push_str("\n\n");
-            }
-        }
-    }
-    if block.trim().is_empty() {
+    let sections: Vec<(&str, &str)> = SECTIONS
+        .iter()
+        .filter_map(|sec| {
+            let body = extract_md_section(&me, sec)?.trim();
+            (!body.is_empty()).then_some((*sec, body))
+        })
+        .collect();
+    if sections.is_empty() {
         return None;
     }
-    if block.len() > MAX_BLOCK_CHARS {
-        let mut end = MAX_BLOCK_CHARS;
-        while end > 0 && !block.is_char_boundary(end) {
-            end -= 1;
-        }
-        block.truncate(end);
-        block.push_str("\n[truncated — read wiki/about/me.md for the rest]\n");
+
+    let rendered = |sec: &str, body: &str| format!("### {sec}\n{body}\n\n");
+    // CHARACTERS, not bytes. The cap is named and documented in characters,
+    // and `str::len()` counts UTF-8 bytes — so an owner writing accented
+    // words, curly quotes or emoji had their rules cut thousands of
+    // characters early, which is #1007 reintroduced for anyone not writing
+    // pure ASCII.
+    let total: usize = sections
+        .iter()
+        .map(|(sec, body)| rendered(sec, body).chars().count())
+        .sum();
+    if total <= OWNER_RULES_MAX_CHARS {
+        return Some(sections.iter().map(|(s, b)| rendered(s, b)).collect());
+    }
+
+    // Over budget: give every section an equal share so no category can be
+    // dropped wholesale, handing whatever a section leaves unspent to the
+    // ones after it. `truncate_rules_body` never returns more than the budget
+    // it is given, and each share covers its own `### ` heading, so the block
+    // as a whole stays under the cap.
+    let mut block = String::new();
+    let mut left = OWNER_RULES_MAX_CHARS;
+    for (i, (sec, body)) in sections.iter().enumerate() {
+        let share = left / (sections.len() - i);
+        let body_budget = share.saturating_sub(rendered(sec, "").chars().count());
+        let part = rendered(sec, &truncate_rules_body(body, body_budget));
+        left = left.saturating_sub(part.chars().count());
+        block.push_str(&part);
     }
     Some(block)
+}
+
+/// Ceiling on the whole injected block. It guards against unbounded growth of
+/// an owner-edited file, not an expectation — it holds the standing rule set
+/// several times over (#1007: the old 4000-char whole-block cut fell inside
+/// "Agent behavior rules" as soon as the style section grew, so behavior rules
+/// were silently dropped and re-filing them could never help).
+const OWNER_RULES_MAX_CHARS: usize = 16_000;
+
+/// Stands in for the rules a section had to drop. Fixed text, so the space it
+/// needs can be reserved exactly.
+const OWNER_RULES_TRUNCATED: &str = "[truncated — read wiki/about/me.md for the rest]";
+
+/// Keep whole lines of a rules section while they fit `budget` — a prefix of
+/// the section in file order — then say the rest was dropped. The marker is
+/// paid for out of `budget`, so the result never exceeds it and the caller's
+/// cap is a real ceiling.
+///
+/// `budget` counts CHARACTERS. Byte offsets are still used to slice, but only
+/// ever at line boundaries, which are always char boundaries too.
+///
+/// Rules are only ever dropped whole. Half a bullet is worse than no bullet —
+/// "- Never send email without an approval card" cut mid-line reads as
+/// "- Never send email", a rule that means something else entirely — so a
+/// section whose very first rule outgrows its budget keeps the heading and the
+/// marker alone. Line boundaries are also char boundaries, so no UTF-8 walk is
+/// needed.
+fn truncate_rules_body(body: &str, budget: usize) -> String {
+    if body.chars().count() <= budget {
+        return body.to_string();
+    }
+    // Shares are thousands of chars, so the marker always fits; the guard just
+    // keeps the "never exceeds `budget`" promise unconditional.
+    let Some(room) = budget.checked_sub(OWNER_RULES_TRUNCATED.chars().count() + 1) else {
+        return String::new();
+    };
+    // `kept_chars` spends the budget; `cut` is the byte offset to slice at.
+    // They advance together and only ever at line boundaries.
+    let mut cut = 0;
+    let mut kept_chars = 0;
+    for line in body.split_inclusive('\n') {
+        let line_chars = line.chars().count();
+        if kept_chars + line_chars > room {
+            break;
+        }
+        kept_chars += line_chars;
+        cut += line.len();
+    }
+    let mut kept = body[..cut].trim_end().to_string();
+    if !kept.is_empty() {
+        kept.push('\n');
+    }
+    kept.push_str(OWNER_RULES_TRUNCATED);
+    kept
 }
 
 /// Return the body of the `## <heading>` section of a markdown doc: the text
@@ -9247,7 +9313,7 @@ mod approval_body_tests {
 
 #[cfg(test)]
 mod owner_rules_tests {
-    use super::{extract_md_section, owner_rules_block};
+    use super::{extract_md_section, owner_rules_block, OWNER_RULES_MAX_CHARS};
 
     const ME_MD: &str = "# About Me\n\n## Identity\n\nNolan.\n\n## Writing style preferences\n\n- No em-dashes. (user said, 2026-05-04)\n- Deliverable is the text itself. (user said, 2026-07-08)\n\n## Agent behavior rules\n\n- Email asks end with an approval card.\n\n## Routing preferences\n\n- VIPs flagged.\n";
 
@@ -9285,6 +9351,73 @@ mod owner_rules_tests {
     }
 
     #[test]
+    fn block_within_budget_is_emitted_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        std::fs::write(tmp.path().join("about").join("me.md"), ME_MD).unwrap();
+        assert_eq!(
+            owner_rules_block(tmp.path()).unwrap(),
+            "### Writing style preferences\n- No em-dashes. (user said, 2026-05-04)\n- Deliverable \
+             is the text itself. (user said, 2026-07-08)\n\n### Agent behavior rules\n- Email asks \
+             end with an approval card.\n\n"
+        );
+    }
+
+    /// CodeRabbit on PR #1020: the cap is named and documented in CHARACTERS
+    /// but every sum used `str::len()`, which counts UTF-8 bytes. An owner
+    /// writing rules with accented words, curly quotes or emoji would have
+    /// their rules silently truncated thousands of characters early — which is
+    /// #1007, the bug this PR exists to fix, reintroduced through the back
+    /// door for anyone not writing pure ASCII.
+    #[test]
+    fn a_non_ascii_rule_set_is_measured_in_characters_not_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+
+        // Three bytes per character, so this is ~12k characters but ~36k
+        // bytes: comfortably inside a 16,000-CHARACTER ceiling and far outside
+        // a 16,000-byte one.
+        let rule = format!("- Répondre en français — {}\n", "é".repeat(200));
+        let body: String = std::iter::repeat(rule.as_str()).take(55).collect();
+        assert!(body.chars().count() < OWNER_RULES_MAX_CHARS, "fixture must fit the char cap");
+        assert!(body.len() > OWNER_RULES_MAX_CHARS, "fixture must exceed the byte cap");
+
+        let me = format!("# About Me\n\n## Agent behavior rules\n\n{body}");
+        std::fs::write(tmp.path().join("about").join("me.md"), me).unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+
+        assert!(
+            !block.contains("wiki/about/me.md"),
+            "a rule set inside the character cap must not be truncated:\n{}",
+            &block[block.len().saturating_sub(200)..]
+        );
+        assert_eq!(
+            block.matches("Répondre en français").count(),
+            55,
+            "every rule must survive"
+        );
+    }
+
+    /// And the ceiling itself is a character ceiling, so a genuinely oversized
+    /// non-ASCII file is still bounded — in characters, not bytes.
+    #[test]
+    fn the_cap_bounds_characters_even_when_bytes_run_far_ahead() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        let rule = format!("- Règle — {}\n", "é".repeat(200));
+        let body: String = std::iter::repeat(rule.as_str()).take(400).collect();
+        let me = format!("# About Me\n\n## Agent behavior rules\n\n{body}");
+        std::fs::write(tmp.path().join("about").join("me.md"), me).unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+        assert!(
+            block.chars().count() <= OWNER_RULES_MAX_CHARS,
+            "block is {} chars, cap is {OWNER_RULES_MAX_CHARS}",
+            block.chars().count()
+        );
+        assert!(block.contains("wiki/about/me.md"), "an over-cap file must say so");
+    }
+
+    #[test]
     fn missing_me_md_yields_none() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(owner_rules_block(tmp.path()).is_none());
@@ -9294,14 +9427,157 @@ mod owner_rules_tests {
     fn oversized_block_truncates_with_marker() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("about")).unwrap();
-        let big = format!(
-            "## Writing style preferences\n\n{}\n",
-            "- rule with some padding text to inflate the size\n".repeat(200)
-        );
+        let rule = "- rule with some padding text to inflate the size\n";
+        let big = format!("## Writing style preferences\n\n{}\n", rule.repeat(800));
         std::fs::write(tmp.path().join("about").join("me.md"), big).unwrap();
         let block = owner_rules_block(tmp.path()).unwrap();
-        assert!(block.len() < 4200, "cap not applied: {} chars", block.len());
-        assert!(block.contains("[truncated"), "missing truncation marker");
+        assert_within_cap(&block);
+        assert!(block.contains("truncated"), "missing truncation marker");
+        assert!(block.contains("wiki/about/me.md"), "marker must name me.md");
+        assert_no_partial_bullets(&block, &[rule.trim_end()]);
+    }
+
+    /// me.md in the shape of the #1007 repro: `n` uniquely-numbered bullets
+    /// under each rule section, each padded to `pad` extra chars.
+    fn me_md_with_bullets(n: usize, pad: usize) -> String {
+        let mut md = String::from("# About Me\n\n## Identity\n\nOwner placeholder.\n");
+        for sec in ["Writing style preferences", "Agent behavior rules"] {
+            md.push_str(&format!("\n## {sec}\n\n"));
+            for i in 1..=n {
+                md.push_str(&format!("- {sec} rule {i}: {}\n", "x".repeat(pad)));
+            }
+        }
+        md.push_str("\n## Routing preferences\n\n- VIPs flagged.\n");
+        md
+    }
+
+    /// Every bullet line the block emits must be one of `bullets` verbatim —
+    /// i.e. truncation dropped whole bullets and never cut inside one.
+    fn assert_no_partial_bullets(block: &str, bullets: &[&str]) {
+        for line in block.lines().filter(|l| l.starts_with("- ")) {
+            assert!(bullets.contains(&line), "bullet emitted partially: {line:?}");
+        }
+    }
+
+    /// The cap covers the truncation markers too, so it is a hard ceiling on
+    /// what every prompt pays for owner rules.
+    fn assert_within_cap(block: &str) {
+        assert!(
+            block.len() <= OWNER_RULES_MAX_CHARS,
+            "cap not applied: {} chars",
+            block.len()
+        );
+    }
+
+    #[test]
+    fn eight_bullets_per_section_are_injected_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        std::fs::write(
+            tmp.path().join("about").join("me.md"),
+            me_md_with_bullets(8, 300),
+        )
+        .unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+        assert!(
+            block.len() > 4000,
+            "repro must exceed the old cap to be meaningful: {} chars",
+            block.len()
+        );
+        assert!(
+            !block.contains("truncated"),
+            "standing rule set must fit the budget whole"
+        );
+        for i in 1..=8 {
+            assert!(
+                block.contains(&format!("Writing style preferences rule {i}:")),
+                "style rule {i} dropped"
+            );
+            assert!(
+                block.contains(&format!("Agent behavior rules rule {i}:")),
+                "behavior rule {i} dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_sections_truncate_per_section_on_bullet_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        let me = me_md_with_bullets(8, 1200);
+        std::fs::write(tmp.path().join("about").join("me.md"), &me).unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+
+        assert!(block.contains("### Writing style preferences"));
+        assert!(block.contains("### Agent behavior rules"));
+        // Neither category may be silently dropped: both keep leading rules...
+        assert!(block.contains("Writing style preferences rule 1:"));
+        assert!(block.contains("Agent behavior rules rule 1:"));
+        assert!(block.contains("Agent behavior rules rule 2:"));
+        // ...and both say so when they drop the rest.
+        assert_eq!(
+            block.matches("read wiki/about/me.md").count(),
+            2,
+            "each truncated section needs its own marker: {block}"
+        );
+        assert!(block.ends_with('\n'), "block must end on a line boundary");
+        assert_within_cap(&block);
+        let bullets: Vec<&str> = me.lines().filter(|l| l.starts_with("- ")).collect();
+        assert_no_partial_bullets(&block, &bullets);
+    }
+
+    #[test]
+    fn lone_oversized_section_gets_the_whole_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        let mut me = String::from("# About Me\n\n## Agent behavior rules\n\n");
+        for i in 1..=20 {
+            me.push_str(&format!("- behavior rule {i}: {}\n", "x".repeat(1200)));
+        }
+        std::fs::write(tmp.path().join("about").join("me.md"), me).unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+        assert!(
+            block.contains("behavior rule 10:"),
+            "the only section must inherit the missing section's share: {} chars",
+            block.len()
+        );
+        assert_within_cap(&block);
+    }
+
+    #[test]
+    fn rule_longer_than_the_budget_is_dropped_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        let long_rule = format!(
+            "- Never send email without {}an approval card.",
+            "x ".repeat(20_000)
+        );
+        let me = format!("# About Me\n\n## Agent behavior rules\n\n{long_rule}\n- Flag VIPs.\n");
+        std::fs::write(tmp.path().join("about").join("me.md"), me).unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+        assert!(block.contains("### Agent behavior rules"));
+        // A half-rule inverts its own meaning, so none of it is emitted.
+        assert!(
+            !block.contains("Never send email"),
+            "oversized rule emitted partially: {block}"
+        );
+        assert!(block.contains("wiki/about/me.md"), "missing marker");
+        assert_no_partial_bullets(&block, &[long_rule.as_str(), "- Flag VIPs."]);
+        assert_within_cap(&block);
+    }
+
+    /// #1007 criterion: every `<owner_rules>` preamble must be built by the
+    /// shared helper, or a caller could hand-roll a block that skips the
+    /// per-section budget. The needles are split so this test never matches
+    /// its own source.
+    #[test]
+    fn every_owner_rules_preamble_uses_the_shared_helper() {
+        let src = include_str!("main.rs");
+        let preamble = concat!("Standing rules from the ", "owner (wiki/about/me.md)");
+        let preambles = src.matches(preamble).count();
+        let calls = src.matches(concat!("owner_rules", "_block(&")).count();
+        assert_eq!(preambles, 3, "wiki ask, Discord query, loop runner");
+        assert_eq!(calls, preambles, "a preamble bypasses owner_rules_block");
     }
 }
 
