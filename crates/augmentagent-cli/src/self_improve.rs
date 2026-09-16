@@ -11181,16 +11181,40 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         // No review at all.
         assert!(rabbit_findings_for_head(&none, &none, head).approved());
 
-        // Rate limited, quota exhausted, draft skipped: all absence.
+        // Rate limited, quota exhausted, draft skipped: all absence. The
+        // first entry is the notice CodeRabbit ACTUALLY posted on this repo,
+        // verbatim including its HTML comment preamble and blockquote markup —
+        // the free tier is what makes this shape the common one, so a parser
+        // change that turned it into a block would stall the loop for a reason
+        // that has nothing to do with the code under review.
         for note in [
+            "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n\
+             <!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n\n\
+             > [!WARNING]\n> ## Review limit reached\n> \n\
+             > **Next included review available in 11 minutes.**\n> \n\
+             > [Check out review usage here](https://app.coderabbit.ai/dashboard/review-capacity)",
             "> ## Review limit reached\n> Next included review available in 11 minutes.",
             "Draft PR not reviewed",
         ] {
             let comments = serde_json::json!([{ "user": {"login": RABBIT_LOGIN}, "body": note }]);
+            let r = rabbit_findings_for_head(&none, &comments, head);
             assert!(
-                rabbit_findings_for_head(&none, &comments, head).approved(),
-                "absence must never block: {note:?}"
+                r.approved() && !r.blocks(),
+                "absence must never block: {:?}",
+                &note[..note.len().min(60)]
             );
+        }
+
+        // And the wait decision must STOP on that verbatim notice rather than
+        // poll it out, naming the minutes so the log explains itself.
+        let real_notice = "<!-- rate limited by coderabbit.ai -->\n> ## Review limit reached\n\
+                           > **Next included review available in 11 minutes.**";
+        match rabbit_wait_decision(Some(real_notice), 0, 300) {
+            RabbitWait::Stop(why) => {
+                assert!(why.contains("rate-limited"), "{why}");
+                assert!(why.contains("11"), "the wait must name the minutes: {why}");
+            }
+            _ => panic!("a rate-limit notice must stop the wait at once, not poll or ask"),
         }
     }
 
