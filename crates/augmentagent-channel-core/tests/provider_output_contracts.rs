@@ -4,6 +4,9 @@ use augmentagent_channel_core::{archetype, codex::CodexCliReasoner, decision,
     reasoner::{self, ClaudeCliReasoner, Reasoner, ReasonerOpts}};
 use serde_json::Value;
 
+// Every live contract first isolates its state (#1048): the providers' global
+// usage and audit logs must not reach the owner's live state dir.
+
 // Consumers tolerate fenced JSON; tone profiles store the descriptor as text.
 // Validate the structured payload rather than requiring stricter formatting.
 fn structured_object(raw: &str) -> Value {
@@ -13,6 +16,7 @@ fn structured_object(raw: &str) -> Value {
 }
 
 async fn structured_outputs(provider: &dyn Reasoner) {
+    augmentagent_channel_core::state_dir::isolate_for_tests();
     let interval = provider.call(&reasoner::loop_parse_opts(),
         "Every 7 minutes for 35 minutes say fixture-ready").await.unwrap();
     let interval = structured_object(&interval);
@@ -69,6 +73,7 @@ fn code_mode_draft_profile_pins_the_quality_model() {
 }
 
 async fn executable_draft(provider: &dyn Reasoner) {
+    augmentagent_channel_core::state_dir::isolate_for_tests();
     use augmentagent_channel_core::{code_mode, prompt};
     use augmentagent_store::{Store, models::Email};
     let manifest = code_mode::manifest_v1();
@@ -133,6 +138,7 @@ async fn claude_production_structured_output_contracts() {
 }
 
 async fn digest_extraction_and_lint(provider: std::sync::Arc<dyn Reasoner>) {
+    augmentagent_channel_core::state_dir::isolate_for_tests();
     use augmentagent_channel_core::{resolve, tool_audit::AuditLogger};
     let digest = provider.call(&reasoner::digest_opts(None),
         "Synthetic last 24 hours. Total emails: 3; flagged: 2; pending approvals: 1.\n\
@@ -187,6 +193,7 @@ async fn claude_digest_extraction_and_lint_contracts() {
 }
 
 async fn wiki_mutation_contracts(provider: &dyn Reasoner) {
+    augmentagent_channel_core::state_dir::isolate_for_tests();
     let wiki = tempfile::tempdir().unwrap();
     std::fs::create_dir(wiki.path().join("about")).unwrap();
     let prior = "# Synthetic profile\n\nPrior non-resume preference: SYNTHETIC_PRESERVE_42.\n";
@@ -235,6 +242,7 @@ async fn claude_wiki_mutation_contracts() {
 }
 
 async fn classic_draft(provider: &dyn Reasoner) {
+    augmentagent_channel_core::state_dir::isolate_for_tests();
     use augmentagent_channel_core::prompt;
     use augmentagent_store::models::Email;
     let wiki = tempfile::tempdir().unwrap();

@@ -33,6 +33,7 @@ pub mod reasoner;
 pub mod resolve;
 pub mod secret_loader;
 pub mod skills;
+pub mod state_dir;
 pub mod timeparse;
 pub mod log_retention;
 pub mod token_usage;

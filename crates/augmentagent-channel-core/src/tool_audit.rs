@@ -241,10 +241,7 @@ pub fn default_audit_log_path() -> PathBuf {
     if let Ok(explicit) = std::env::var("AUGMENTAGENT_TOOL_AUDIT_LOG") {
         return PathBuf::from(explicit);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(home)
-        .join(".local/state/augmentagent")
-        .join("tool-audit.log")
+    crate::state_dir::state_dir_or("/tmp").join("tool-audit.log")
 }
 
 /// Append-only NDJSON writer. Cheap to clone (`Arc<Mutex<…>>` inside) so

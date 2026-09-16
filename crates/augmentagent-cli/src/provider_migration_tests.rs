@@ -6,6 +6,7 @@ use augmentagent_wiki::migrate::{apply_patch, classify, parse_patch, parse_sourc
     render_patch_lines, split_frontmatter, validate_citations, MigrationDecision};
 
 async fn migration(provider: &dyn Reasoner) {
+    augmentagent_channel_core::state_dir::isolate_for_tests(); // #1048
     let wiki = tempfile::tempdir().unwrap();
     let page = "---\nkind: person\nkey: fixture\nsources: [synthetic-message-101]\n---\n# Fixture\n\nFixture works as a Test Engineer at Example Organization, starting 2026-01-01. (m: synthetic-message-101)\n";
     std::fs::create_dir(wiki.path().join("people")).unwrap();

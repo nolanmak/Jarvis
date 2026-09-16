@@ -383,6 +383,8 @@ mod tests {
     }
 
     async fn live_digest_contract<R: Reasoner + 'static>(reasoner: Arc<R>) {
+        // #1048: live provider calls must not write the owner's state dir.
+        augmentagent_channel_core::state_dir::isolate_for_tests();
         let wiki = tempfile::tempdir().unwrap();
         for platform in ["discord", "slack"] {
             let (store, _database) = mk_store();

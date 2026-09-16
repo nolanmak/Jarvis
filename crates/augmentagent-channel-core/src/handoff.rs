@@ -8,8 +8,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn system_root() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home)
-        .join(".local/state/augmentagent/reasoner-handoffs"))
+    crate::state_dir::state_dir().map(|dir| dir.join("reasoner-handoffs"))
 }
 
 /// A channel turn id makes a replay after restart address the same journal.

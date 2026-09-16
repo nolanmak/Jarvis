@@ -10,6 +10,8 @@ impl Drop for Server {
 }
 
 async fn contract(provider: &str) {
+    // #1048: never write the owner's live state; the child inherits it.
+    augmentagent_channel_core::state_dir::isolate_for_tests();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
     let name = format!("live_{provider}_optional_http_mcp");
     if std::env::var_os("JARVIS_LIVE_MCP_CHILD").is_none() {

@@ -468,9 +468,7 @@ pub fn scan_repeated_refusals(log: &str, since: DateTime<Utc>) -> Vec<(u64, Stri
 }
 
 fn state_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".local/state/augmentagent"))
-        .unwrap_or_else(|| PathBuf::from("."))
+    augmentagent_channel_core::state_dir::state_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn free_gb(path: &Path) -> Option<f64> {

@@ -40,21 +40,17 @@ pub struct CooldownLatch {
 
 impl CooldownLatch {
     /// System latch path: `AUGMENTAGENT_COOLDOWN_FILE` override (tests), else
-    /// `~/.local/state/augmentagent/reasoner-cooldowns.json` (same state dir
-    /// as the daemon logs), else a cwd-relative fallback so a HOME-less
-    /// environment still functions.
+    /// `reasoner-cooldowns.json` in the shared [`state_dir`](crate::state_dir)
+    /// (same state dir as the daemon logs), else a cwd-relative fallback so a
+    /// HOME-less environment still functions.
     pub fn system() -> Self {
         if let Ok(p) = std::env::var("AUGMENTAGENT_COOLDOWN_FILE") {
             if !p.trim().is_empty() {
                 return Self { path: PathBuf::from(p) };
             }
         }
-        let path = std::env::var_os("HOME")
-            .map(|h| {
-                PathBuf::from(h)
-                    .join(".local/state/augmentagent")
-                    .join("reasoner-cooldowns.json")
-            })
+        let path = crate::state_dir::state_dir()
+            .map(|dir| dir.join("reasoner-cooldowns.json"))
             .unwrap_or_else(|| PathBuf::from("reasoner-cooldowns.json"));
         Self { path }
     }
@@ -62,6 +58,11 @@ impl CooldownLatch {
     /// Test constructor pinned to an explicit path.
     pub fn at(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    /// The latch file this instance reads and writes.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     fn read_all(&self) -> BTreeMap<String, CooldownEntry> {

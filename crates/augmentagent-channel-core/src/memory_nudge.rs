@@ -254,19 +254,16 @@ impl CycleLogger {
     }
 }
 
-/// Resolve the default cycles root: `$XDG_STATE_HOME/augmentagent/` if set,
-/// else `$HOME/.local/state/augmentagent/`, matching the existing daemon
+/// Resolve the default cycles root: the shared [`state_dir`](crate::state_dir)
+/// (`$XDG_STATE_HOME/augmentagent/` if set, else
+/// `$HOME/.local/state/augmentagent/`), matching the existing daemon
 /// state-dir layout (see systemd unit's `StateDirectory=`).
 ///
 /// Returns just the parent dir; the [`CycleLogger`] will create `cycles/`
 /// underneath. The path is not guaranteed to exist — callers should pass
 /// it to [`CycleLogger::new`] which creates the subtree on first write.
 pub fn default_cycles_root() -> PathBuf {
-    if let Ok(state) = std::env::var("XDG_STATE_HOME") {
-        return PathBuf::from(state).join("augmentagent");
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".local/state/augmentagent")
+    crate::state_dir::state_dir_or(".")
 }
 
 #[cfg(test)]
@@ -409,18 +406,12 @@ mod tests {
         assert!(format!("{err}").contains("headline must not be empty"));
     }
 
+    /// XDG_STATE_HOME handling is pinned once, for every state path, by
+    /// `state_dir::tests` in a child process (#1048). Mutating it here would
+    /// race every parallel test that resolves a state path.
     #[test]
     fn default_cycles_root_honors_xdg() {
-        let prev = std::env::var("XDG_STATE_HOME").ok();
-        std::env::set_var("XDG_STATE_HOME", "/tmp/state-test");
-        assert_eq!(
-            default_cycles_root(),
-            PathBuf::from("/tmp/state-test/augmentagent")
-        );
-        match prev {
-            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
+        assert_eq!(default_cycles_root(), crate::state_dir::state_dir().unwrap());
     }
 
     #[test]
