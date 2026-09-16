@@ -239,6 +239,37 @@ impl FallbackReasoner {
     }
 
     /// Providers currently configured (for status surfaces).
+    /// #1030 — which providers eligible for `class` are currently latched, or
+    /// `None` if at least one can serve the call right now.
+    ///
+    /// Lets a caller ask BEFORE spending a reasoner call on a lane that cannot
+    /// finish. The auto-PR loop used to run its scoping pass, produce a
+    /// decision, and only then discover at the build call that every provider
+    /// for the write-tools preset was on cooldown — a call that bought
+    /// nothing, on a tick that then ended as a failure rather than a pause.
+    ///
+    /// Returns the latched providers with their reset times where known, so
+    /// the caller can say when work resumes instead of just that it stopped.
+    pub fn unavailable_reason(
+        &self,
+        class: crate::providers::CapabilityClass,
+    ) -> Option<Vec<(String, Option<chrono::DateTime<chrono::Utc>>)>> {
+        let mut latched = Vec::new();
+        for entry in &self.entries {
+            if !allowed_for(entry.kind, class) {
+                continue;
+            }
+            let name = entry.kind.name();
+            match self.latch.latched_until(name) {
+                // Something can serve it: not unavailable.
+                None => return None,
+                Some(until) => latched.push((name.to_string(), Some(until))),
+            }
+        }
+        // No eligible provider at all is also unavailable, with nothing to name.
+        Some(latched)
+    }
+
     pub fn provider_names(&self) -> Vec<&'static str> {
         self.entries.iter().map(|e| e.kind.name()).collect()
     }

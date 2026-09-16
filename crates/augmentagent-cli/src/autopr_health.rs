@@ -56,6 +56,10 @@ pub struct Finding {
     pub fix: String,
 }
 
+/// #1030 — how recently a provider hold still explains a quiet loop. Longer
+/// than the tick interval, so one pause covers the gap it causes.
+const PROVIDER_HOLD_FRESH_MINS: i64 = 90;
+
 /// Everything the rules judge. Absent evidence is `None`, which never fires a
 /// rule: a missing log is a reason to stay quiet, not to cry wolf.
 #[derive(Debug, Clone, Default)]
@@ -81,6 +85,10 @@ pub struct HealthInputs {
     /// When the cached red-`main` verdict was written, if `main` is currently
     /// recorded red.
     pub red_main_since: Option<DateTime<Utc>>,
+    /// #1030 — when the loop last held a tick because every provider cleared
+    /// for the build preset was latched on quota. A pause, not an outage, and
+    /// it must not be triaged as one.
+    pub last_provider_hold: Option<DateTime<Utc>>,
     /// `(pr, reason, times seen)` for resume refusals in the scanned window.
     pub repeated_refusals: Vec<(u64, String, u32)>,
     /// Open PR numbers, when they could be listed. A refusal loop only
@@ -178,6 +186,29 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                 ),
                 fix: "The tick task may have died while the process lives; \
                       restart the daemon and check for a panic in stderr.log."
+                    .into(),
+            });
+        }
+    }
+
+    // #1030 — a quota pause looks exactly like a stalled loop from the
+    // outside: no PRs, no merges, ticks that end without producing anything.
+    // Saying so explicitly is the difference between "wait" and "go and fix
+    // something", and the two get triaged very differently at 2am.
+    if let Some(held) = i.last_provider_hold {
+        let age = (now - held).num_minutes().max(0);
+        if age <= PROVIDER_HOLD_FRESH_MINS {
+            out.push(Finding {
+                severity: Severity::Warn,
+                code: "provider-hold",
+                detail: format!(
+                    "the build lane is paused: every provider cleared for it is \
+                     on a quota cooldown (last held {age} min ago). Nothing is \
+                     broken and nothing was spent."
+                ),
+                fix: "Wait for the cooldown, or widen the chain for this \
+                      preset. `augmentagent reasoner-selftest` shows which \
+                      providers are latched and until when."
                     .into(),
             });
         }
@@ -582,6 +613,9 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         daemon_active: daemon_active(),
         last_reasoner_poll: last_timestamp_with(&log, r#"poll complete channel="gmail""#),
         last_loop_line: last_timestamp_with(&log, "augmentagent::self_improve"),
+        // #1030 — the loop logs this exact phrase when every provider cleared
+        // for the build preset is on a quota cooldown.
+        last_provider_hold: last_timestamp_with(&log, "auto-PR held: no provider can serve"),
         last_merge: last_merge(repo_root),
         deployed_is_current: deploy.0,
         deploy_lag_mins: deploy.1,
@@ -656,6 +690,7 @@ async fn notify_discord(text: &str) {
 
 #[cfg(test)]
 mod tests {
+    // (tests continue below; the #1030 case is appended at the end)
     use super::*;
     use chrono::Duration;
 
@@ -670,6 +705,7 @@ mod tests {
         HealthInputs {
             now_or_epoch: Some(t0()),
             daemon_active: true,
+            last_provider_hold: None,
             last_reasoner_poll: Some(t0() - Duration::minutes(4)),
             last_loop_line: Some(t0() - Duration::minutes(12)),
             last_merge: Some(t0() - Duration::hours(20)),
@@ -953,5 +989,46 @@ mod tests {
         assert_eq!(*pr, 987);
         assert_eq!(*times, 2, "the run counters must not split the group");
         assert!(reason.contains("Cargo.lock"));
+    }
+
+    /// #1030 C5 — a quota pause and a wedged loop look identical from
+    /// outside: no PRs, no merges, ticks producing nothing. The watchdog has
+    /// to tell them apart, because one says wait and the other says go and fix
+    /// something.
+    #[test]
+    fn a_provider_hold_is_reported_as_a_pause_not_an_outage() {
+        let found = analyze(
+            &HealthInputs {
+                last_provider_hold: Some(t0() - Duration::minutes(10)),
+                ..healthy()
+            },
+            &Thresholds::default(),
+        );
+        let hold = found
+            .iter()
+            .find(|f| f.code == "provider-hold")
+            .expect("a recent hold must be reported");
+        assert!(
+            matches!(hold.severity, Severity::Warn),
+            "a quota pause is not an alert: nothing is broken"
+        );
+        assert!(
+            hold.detail.contains("quota") && hold.detail.contains("Nothing is broken"),
+            "say plainly that this is a pause: {}",
+            hold.detail
+        );
+
+        // Stale holds stop explaining anything.
+        let stale = analyze(
+            &HealthInputs {
+                last_provider_hold: Some(t0() - Duration::minutes(PROVIDER_HOLD_FRESH_MINS + 30)),
+                ..healthy()
+            },
+            &Thresholds::default(),
+        );
+        assert!(
+            !stale.iter().any(|f| f.code == "provider-hold"),
+            "an old pause must not keep excusing a quiet loop"
+        );
     }
 }

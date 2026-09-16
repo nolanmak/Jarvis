@@ -1165,6 +1165,59 @@ fn criteria_review_section(criteria: &[String]) -> String {
     )
 }
 
+/// #1030 — is this failure "every provider that could serve the call is
+/// latched", rather than something actually broken?
+///
+/// The distinction is the whole point. A latched chain means NOTHING was
+/// spent: no reasoner call succeeded, no worktree survived, no attempt was
+/// recorded. That is a quota pause, and the tick should hold — unbilled, with
+/// a reason — instead of ending as a failure. A genuine fault (missing binary,
+/// crashed adapter, connection reset) must stay loud, or the health watchdog
+/// and a human reading logs lose the only signal that separates "we are
+/// waiting for quota" from "something is broken".
+///
+/// Keyed on the synthetic `chain` provider the fallback layer uses when it ran
+/// out of candidates, so a real provider's `Unavailable` still reads as a
+/// fault.
+fn held_for_no_provider(err: &anyhow::Error) -> Option<String> {
+    match augmentagent_channel_core::ReasonerError::find_in(err) {
+        Some(augmentagent_channel_core::ReasonerError::Unavailable { provider, message })
+            if provider == "chain" =>
+        {
+            Some(message.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The log line for a held tick: which providers are latched, and when they
+/// come back.
+///
+/// Without the reset time a reader has to cross-reference the fallback module
+/// to learn whether this is a quota pause or an outage — and those get
+/// triaged very differently.
+fn no_provider_message(
+    class: &str,
+    latched: &[(String, Option<chrono::DateTime<chrono::Utc>>)],
+) -> String {
+    let who = if latched.is_empty() {
+        "no eligible provider".to_string()
+    } else {
+        latched
+            .iter()
+            .map(|(name, until)| match until {
+                Some(t) => format!("{name} until {}", t.format("%H:%M UTC")),
+                None => format!("{name} (reset unknown)"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "no provider can serve a {class} call right now: {who}. Nothing was \
+         spent; the next tick retries."
+    )
+}
+
 /// Parse the scoper's `VERDICT:` / `COMPLEXITY:` header, tolerantly: the
 /// lines may appear anywhere in the first few lines, any case. Missing
 /// verdict defaults to *fixable* (an unparsed run should still attempt the
@@ -5135,6 +5188,19 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     // (which gates auto-merge), and expands the ask into an implementation
     // spec before the builder edits anything. Scoping failure degrades to
     // the single-stage behaviour with complexity defaulting to hard.
+    // #1030 — ask BEFORE spending the scoping call whether the build lane can
+    // be served at all. The build preset is the demanding one; when every
+    // provider cleared for it is latched on quota, the scoping call buys
+    // nothing and the tick used to end as a failure rather than a pause.
+    if let Some(latched) = reasoner.unavailable_reason(
+        augmentagent_channel_core::CapabilityClass::FullAgentic,
+    ) {
+        let why = no_provider_message("FullAgentic", &latched);
+        info!(issue = issue.number, "auto-PR held: {why}");
+        cleanup(worktree, branch, repo_root.to_path_buf()).await;
+        return Ok(RunReport::held(why));
+    }
+
     let scope_prompt = build_scope_prompt(&issue, prior_attempts.as_deref());
     let scope = match reasoner
         .call(&scope_opts(worktree.clone()), &scope_prompt)
@@ -5248,6 +5314,15 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 rec(FailureKind::ReasonerError, "build", &format!("{err:#}"), "", 0),
             );
             cleanup(worktree, branch, repo_root.to_path_buf()).await;
+            // #1030 — "every provider that could serve this is latched" is a
+            // quota pause, not a fault: nothing was spent, nothing recorded.
+            // Hold the tick unbilled and say when work resumes. A genuine
+            // fault still propagates, so the health watchdog keeps the one
+            // signal that separates waiting from broken.
+            if let Some(why) = held_for_no_provider(&err) {
+                info!(issue = issue.number, "auto-PR held: {why}");
+                return Ok(RunReport::held(why));
+            }
             return Err(err).context("reasoner failed during self-improve");
         }
     };
@@ -10317,6 +10392,95 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             {"number": 8, "title": title, "labels": [], "pull_request": {"url": "x"}},
         ]);
         assert_eq!(red_main_issue_lookup(&prs_only, &title), None);
+    }
+
+    // ---- #1030: a lane with no provider HOLDS, it does not fail ----
+
+    /// C1 + C4 — the whole point is that these two stay distinguishable.
+    ///
+    /// "Every provider that could serve this call is latched" means nothing
+    /// was spent: no reasoner call succeeded, no worktree survived, no attempt
+    /// was recorded. That is a quota pause, and the loop already has a word
+    /// for it. A genuine fault — a missing binary, a crashed adapter — is a
+    /// harness failure and must stay loud, or the health watchdog and I lose
+    /// the only signal that tells the two apart.
+    #[test]
+    fn a_latched_chain_is_a_hold_while_a_real_fault_stays_an_error() {
+        let chain_exhausted = anyhow::Error::new(
+            augmentagent_channel_core::ReasonerError::Unavailable {
+                provider: "chain".into(),
+                message: "no provider available for FullAgentic call (1 latched; \
+                          chain: claude,codex,cerebras)"
+                    .into(),
+            },
+        );
+        let why = held_for_no_provider(&chain_exhausted).expect("a latched chain must hold");
+        assert!(why.contains("FullAgentic") || why.contains("no provider"), "{why}");
+
+        // Everything else is a real failure and must NOT be converted.
+        for genuine in [
+            anyhow::Error::new(augmentagent_channel_core::ReasonerError::Local {
+                message: "claude binary not found".into(),
+            }),
+            anyhow::Error::new(augmentagent_channel_core::ReasonerError::Unavailable {
+                provider: "claude".into(),
+                message: "connection reset".into(),
+            }),
+            anyhow::anyhow!("something else entirely"),
+        ] {
+            assert!(
+                held_for_no_provider(&genuine).is_none(),
+                "a real fault must stay an error: {genuine:#}"
+            );
+        }
+    }
+
+    /// C2 — the log has to name the provider and when it comes back, or the
+    /// reader has to cross-reference the fallback module to learn that this is
+    /// a quota pause rather than an outage.
+    #[test]
+    fn the_hold_message_names_the_provider_and_when_it_returns() {
+        let until = chrono::Utc::now() + chrono::Duration::minutes(42);
+        let msg = no_provider_message(
+            "FullAgentic",
+            &[("claude".to_string(), Some(until)), ("codex".to_string(), None)],
+        );
+        assert!(msg.contains("claude") && msg.contains("codex"), "{msg}");
+        assert!(msg.contains("FullAgentic"), "{msg}");
+        assert!(
+            msg.contains(&until.format("%H:%M").to_string()),
+            "the reset time must be readable: {msg}"
+        );
+        // A provider latched with no known reset still has to appear.
+        assert!(msg.to_lowercase().contains("unknown") || msg.contains("codex"), "{msg}");
+    }
+
+    /// C3 — check before spending the scoping call. The scoper ran, produced a
+    /// decision, and only then did the build discover there was nobody to
+    /// build with; that call bought nothing.
+    #[test]
+    fn availability_is_checked_before_the_scoping_call_is_spent() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("pub async fn run_once(").expect("run_once");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        let check = body
+            .find("unavailable_reason(")
+            .expect("run_once must ask whether the build lane can be served");
+        let scope = body
+            .find("build_scope_prompt(")
+            .expect("the scoping call");
+        assert!(
+            check < scope,
+            "ask before spending a reasoner call on a lane that cannot finish"
+        );
+    }
+
+    /// And the hold must be idle-class: unbilled, nothing recorded.
+    #[test]
+    fn a_hold_costs_nothing() {
+        let r = RunReport::held("claude latched until 09:30".into());
+        assert!(!r.billed, "a hold spent nothing, so it must not charge the cap");
+        assert!(r.is_idle(), "and nothing more should happen this tick");
     }
 
     // ---- #1012: acceptance criteria from the scoping pass ----
