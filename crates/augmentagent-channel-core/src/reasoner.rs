@@ -431,6 +431,27 @@ pub(crate) fn classify_other(provider: &str, e: anyhow::Error) -> anyhow::Error 
     }
 }
 
+/// The audit logger a preset gets when it does not supply one (#1004).
+///
+/// `AUGMENTAGENT_TOOL_AUDIT=0|false|off|no` turns auditing off entirely —
+/// the escape hatch for a machine where the volume is unwelcome. Anything
+/// else, including unset, means audit.
+///
+/// Before this, `ask_opts` was the only preset that passed a logger, so the
+/// auto-PR builder — running with `acceptEdits` and Write/Edit/Bash — left no
+/// record of what it did. Retention (14 days) is what makes on-by-default
+/// affordable.
+pub fn default_audit_logger() -> Option<Arc<crate::tool_audit::AuditLogger>> {
+    let enabled = match std::env::var("AUGMENTAGENT_TOOL_AUDIT") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    };
+    enabled.then(crate::tool_audit::AuditLogger::global)
+}
+
 /// Per-call options for a `Reasoner`. Each call type (triage, draft, ingest)
 /// gets a different preset — see `triage_opts`, `draft_opts`, `ingest_opts`.
 #[derive(Debug, Clone)]
@@ -974,7 +995,16 @@ impl ClaudeCliReasoner {
         // #201 audit context: only spin up pairing state if a logger or
         // notifier is configured, so the no-audit path (triage/draft/ingest)
         // pays zero overhead.
-        let audit_active = opts.audit_logger.is_some() || opts.audit_notifier.is_some();
+        // #1004 — tool auditing is on for EVERY preset now, not just the one
+        // that opted in. The agent that edits the repo and pushes branches
+        // (the auto-PR builder) was the one producing no record of what it
+        // read, wrote or ran. A preset may still pass its own logger; this is
+        // only the default when it passes none.
+        let audit_logger = opts
+            .audit_logger
+            .clone()
+            .or_else(default_audit_logger);
+        let audit_active = audit_logger.is_some() || opts.audit_notifier.is_some();
         let audit_session = opts
             .session_id
             .clone()
@@ -988,16 +1018,24 @@ impl ClaudeCliReasoner {
         // (#446).
         let mut text_blocks: Vec<String> = Vec::new();
         let mut result_text: Option<String> = None;
+        // #1001 — the CLI reports exact usage on its terminal `result` event.
+        // It costs nothing to read and is the only measurement of what this
+        // daemon actually spends, so capture it as the stream goes by.
+        let call_started = std::time::Instant::now();
+        let mut observed_usage: Option<crate::token_usage::TokenUsage> = None;
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
+            }
+            if let Some(u) = crate::token_usage::parse_usage(&line) {
+                observed_usage = Some(u);
             }
             if audit_active {
                 audit_stream_line(
                     &line,
                     &mut pending_tool_uses,
                     &audit_session,
-                    opts.audit_logger.as_ref(),
+                    audit_logger.as_ref(),
                     opts.audit_notifier.as_ref(),
                 );
             }
@@ -1023,6 +1061,19 @@ impl ClaudeCliReasoner {
             }
         }
         let final_text = select_final_text(&text_blocks, result_text.as_deref(), capture);
+        // #1001 — record what the call cost. Best effort by construction: the
+        // logger swallows its own IO errors, so accounting can never fail a
+        // call the model already answered.
+        if let Some(usage) = observed_usage {
+            crate::token_usage::UsageLogger::global().append(&crate::token_usage::UsageRecord {
+                ts: chrono::Utc::now().to_rfc3339(),
+                provider: "claude".into(),
+                model: opts.model.clone().unwrap_or_else(|| "(inherited)".into()),
+                class: format!("{:?}", crate::providers::classify(opts)),
+                usage,
+                duration_ms: call_started.elapsed().as_millis() as u64,
+            });
+        }
 
         let status = child.wait().await?;
         if !status.success() {
@@ -2057,6 +2108,48 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    /// Serialises the env-var tests in this module against each other.
+    fn audit_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// #1004 — every preset audits now. The regression this guards is the one
+    /// that existed for months: the agent that edits the repo and pushes
+    /// branches produced no tool record, because its preset passed `None`.
+    #[test]
+    fn tool_auditing_is_on_by_default_and_explicitly_disableable() {
+        let _g = audit_env_guard();
+        let prev = std::env::var("AUGMENTAGENT_TOOL_AUDIT").ok();
+
+        std::env::remove_var("AUGMENTAGENT_TOOL_AUDIT");
+        assert!(
+            default_audit_logger().is_some(),
+            "unset must mean audit — a preset should not have to opt in"
+        );
+
+        for off in ["0", "false", "off", "no", "OFF", " False "] {
+            std::env::set_var("AUGMENTAGENT_TOOL_AUDIT", off);
+            assert!(default_audit_logger().is_none(), "{off:?} must disable auditing");
+        }
+        for on in ["1", "true", "yes", "anything-else"] {
+            std::env::set_var("AUGMENTAGENT_TOOL_AUDIT", on);
+            assert!(default_audit_logger().is_some(), "{on:?} must keep auditing");
+        }
+
+        // One shared instance, so the hourly retention check is rate-limited
+        // across every caller rather than once per preset.
+        std::env::remove_var("AUGMENTAGENT_TOOL_AUDIT");
+        let a = default_audit_logger().unwrap();
+        let b = default_audit_logger().unwrap();
+        assert!(Arc::ptr_eq(&a, &b), "one process, one audit logger");
+
+        match prev {
+            Some(v) => std::env::set_var("AUGMENTAGENT_TOOL_AUDIT", v),
+            None => std::env::remove_var("AUGMENTAGENT_TOOL_AUDIT"),
+        }
+    }
 
     /// In-memory `AuditNotifier` for the audit_stream_line integration test.
     /// Records every `notify` call (session_id + tool name) so the test can

@@ -416,8 +416,23 @@ where
             );
             return Ok(true);
         }
+        // #1010 — deterministic wiki/journal/ page, written whenever a wiki
+        // root is configured (independent of the ingest schema). Best-effort:
+        // a filesystem error is logged and never fails the poll.
+        let mut captured = false;
+        if let Some(root) = &self.config.wiki_root {
+            match crate::section::write_entry(root, entry, &text) {
+                Ok(path) => {
+                    captured = true;
+                    info!(entry_id = %entry.id, path = %path.display(), "journal entry → wiki section");
+                }
+                Err(e) => {
+                    warn!(entry_id = %entry.id, "journal section write failed (continuing): {e}");
+                }
+            }
+        }
         let (Some(root), Some(schema)) = (&self.config.wiki_root, &self.wiki_schema) else {
-            return Ok(false);
+            return Ok(captured);
         };
         spawn_ingest(
             Arc::clone(&self.reasoner),
@@ -678,6 +693,32 @@ mod tests {
         JournalChannel::new(store, api, Arc::new(FixedDek), Arc::new(NoopReasoner), config)
     }
 
+    fn channel_on_with_wiki(
+        store: Arc<Store>,
+        pages: Vec<EntryPage>,
+        opts: Opts,
+        wiki_root: Option<std::path::PathBuf>,
+    ) -> JournalChannel<FakeApi, NoopReasoner> {
+        let api = Arc::new(FakeApi {
+            pages,
+            calls: Mutex::new(Vec::new()),
+            fail_once_at: Mutex::new(None),
+            hang: Mutex::new(false),
+        });
+        let config = JournalChannelConfig {
+            owner_id: "owner-1".into(),
+            dry_run: opts.dry_run,
+            wiki_root,
+            wiki_schema_path: None,
+            poll_interval: opts.interval,
+            max_entries_per_poll: opts.cap,
+            base_sync_threshold: opts.threshold,
+            allow_base_sync: opts.allow_base_sync,
+            max_pages_per_poll: opts.max_pages,
+        };
+        JournalChannel::new(store, api, Arc::new(FixedDek), Arc::new(NoopReasoner), config)
+    }
+
     fn channel(
         pages: Vec<EntryPage>,
         opts: Opts,
@@ -712,6 +753,53 @@ mod tests {
         assert_eq!(outcome.tombstones, 1);
         assert_eq!(outcome.decrypt_failures, 0);
         assert_eq!(outcome.watermark_ms, Some(1_751_000_000_000));
+    }
+
+    #[tokio::test]
+    async fn live_poll_writes_section_files_under_wiki_root() {
+        // #1010 — a live poll must leave a deterministic journal/ page for
+        // every ingested entry, independent of the LLM-ingest schema.
+        let page = EntryPage {
+            items: vec![entry("e1", false, Some(encrypted("<p>synthetic hello</p>").await))],
+            next_token: None,
+            started_at: Some(1_751_000_000_000),
+        };
+        let (store, _db) = fresh_store();
+        let wiki = tempfile::tempdir().unwrap();
+        let ch = channel_on_with_wiki(
+            Arc::clone(&store),
+            vec![page],
+            LIVE,
+            Some(wiki.path().to_path_buf()),
+        );
+        let outcome = ch.poll_once().await.unwrap();
+        assert_eq!(outcome.ingested, 1, "{outcome:?}");
+        let path = wiki.path().join("journal/2026/2026-07-01-e1.md");
+        let written = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("section page missing at {}", path.display()));
+        assert!(written.starts_with("---\nkind: journal\n"), "{written}");
+        assert!(written.contains("synthetic hello"), "{written}");
+        // marked ingested — the next poll must not rewrite endlessly
+        assert!(store.journal_entry_ingested("owner-1", "e1", 3).unwrap());
+    }
+
+    #[tokio::test]
+    async fn dry_run_writes_no_section_files() {
+        let page = EntryPage {
+            items: vec![entry("e1", false, Some(encrypted("<p>synthetic</p>").await))],
+            next_token: None,
+            started_at: Some(1),
+        };
+        let (store, _db) = fresh_store();
+        let wiki = tempfile::tempdir().unwrap();
+        let ch = channel_on_with_wiki(
+            Arc::clone(&store),
+            vec![page],
+            DRY,
+            Some(wiki.path().to_path_buf()),
+        );
+        ch.poll_once().await.unwrap();
+        assert!(!wiki.path().join("journal").exists(), "dry-run must not touch the wiki");
     }
 
     #[tokio::test]

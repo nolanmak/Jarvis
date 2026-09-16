@@ -24,11 +24,14 @@ pub mod mcp;
 pub mod memory_nudge;
 pub mod prompt;
 pub mod providers;
+pub mod public_report;
 pub mod reasoner;
 pub mod resolve;
 pub mod secret_loader;
 pub mod skills;
 pub mod timeparse;
+pub mod log_retention;
+pub mod token_usage;
 pub mod tool_audit;
 pub mod trigger;
 

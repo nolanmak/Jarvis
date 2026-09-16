@@ -32,7 +32,7 @@ identities:                    # person pages only; optional, omit block if empt
   discord: "<snowflake>"       # quote numeric IDs so YAML parses them as strings
   twitter: <handle>
   slack: <workspace-user-id>
-  whatsapp: "<phone>"
+  whatsapp: ["<jid>", ...]     # array — number JID (<number>@s.whatsapp.net) and @lid alias commonly coexist
   instagram: <handle>
   phone: ["<E.164>", ...]      # array — mobile + work line is common
   imessage: ["<E.164 or apple-id email>", ...]  # array; phone-shaped handles also match `phone`

@@ -249,6 +249,15 @@ pub fn default_audit_log_path() -> PathBuf {
 #[derive(Clone, Debug)]
 pub struct AuditLogger {
     path: PathBuf,
+    /// When this process last ran a retention pass (#1004). `None` in the
+    /// field below means this logger never prunes at all.
+    last_prune: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Whether this logger owns its file's retention (#1004). Only the
+    /// process-global daemon log does. A logger built with an explicit path
+    /// is a plain writer: it must not delete records behind its caller's
+    /// back, which would make "write it and read it" untrue for anyone
+    /// pointing one at a file of their own.
+    manages_retention: bool,
     // Serializes appends across concurrent callers. The mutex is held only
     // for the duration of one write (~µs), so this is not a hot-path
     // bottleneck.
@@ -261,14 +270,71 @@ impl AuditLogger {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
+            last_prune: Arc::new(Mutex::new(None)),
+            manages_retention: false,
             write_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// The process-wide logger every preset shares (#1004). One instance so
+    /// the retention check is rate-limited across all callers rather than
+    /// per-preset.
+    pub fn global() -> Arc<AuditLogger> {
+        static GLOBAL: std::sync::OnceLock<Arc<AuditLogger>> = std::sync::OnceLock::new();
+        Arc::clone(GLOBAL.get_or_init(|| {
+            Arc::new(AuditLogger {
+                manages_retention: true,
+                ..AuditLogger::new(default_audit_log_path())
+            })
+        }))
     }
 
     /// On-disk path this logger writes to. Useful for the dashboard panel
     /// to know which file to tail.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Drop records past the retention window, at most once an hour per
+    /// process. Called on the write path because there is no other reliable
+    /// clock here — but the cheap first-line check means the common case is
+    /// a few bytes read, and the once-an-hour gate means even that is rare.
+    ///
+    /// Runs while holding the append lock, so a concurrent record cannot
+    /// land between the read and the rename and be lost.
+    async fn maybe_prune(&self) {
+        if !self.manages_retention {
+            return;
+        }
+        let days = crate::log_retention::tool_audit_retention_days();
+        if days == 0 {
+            return;
+        }
+        {
+            let mut last = self.last_prune.lock().await;
+            let due = last.is_none_or(|t: std::time::Instant| {
+                t.elapsed() >= std::time::Duration::from_secs(3600)
+            });
+            if !due {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        let _guard = self.write_lock.lock().await;
+        let path = self.path.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            crate::log_retention::prune_file(&path, crate::log_retention::cutoff(days))
+        })
+        .await
+        .unwrap_or_default();
+        if out.removed > 0 {
+            tracing::info!(
+                removed = out.removed,
+                kept = out.kept,
+                days,
+                "tool-audit: pruned records past the retention window"
+            );
+        }
     }
 
     /// Append one record. mkdir -p the parent on first write. Failures are
@@ -306,6 +372,14 @@ impl AuditLogger {
         if let Err(e) = file.write_all(&payload).await {
             warn!("tool-audit: write {} failed: {e}", self.path.display());
         }
+        // #1004 — housekeeping runs AFTER the record has landed, and only
+        // once the append lock is released. Pruning first delayed the first
+        // write of each process, which was enough to reorder concurrent
+        // record tasks; this log is read chronologically, so that ordering
+        // is a property worth keeping.
+        drop(file);
+        drop(_guard);
+        self.maybe_prune().await;
     }
 }
 

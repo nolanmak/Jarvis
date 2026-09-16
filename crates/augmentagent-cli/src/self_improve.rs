@@ -433,6 +433,18 @@ pub fn diff_line_count(diff: &str) -> usize {
 }
 
 async fn run(cmd: &str, args: &[&str], cwd: &Path) -> Result<(bool, String, String)> {
+    // All maintenance issue/PR writes flow through this runner. Return a normal
+    // failed-command result so callers still clean up their worktree and record
+    // the refusal, without sending private text to GitHub or echoing it in logs.
+    if matches!(args.first(), Some(&"issue" | &"pr")) {
+        for pair in args.windows(2) {
+            if matches!(pair[0], "--title" | "--body" | "--comment") {
+                if let Err(err) = augmentagent_channel_core::public_report::validate("", pair[1]) {
+                    return Ok((false, String::new(), err.to_string()));
+                }
+            }
+        }
+    }
     let out = Command::new(cmd)
         .args(args)
         .current_dir(cwd)
@@ -766,7 +778,8 @@ async fn has_open_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
     let (ok, stdout, _) = run(
         &gh,
         &[
-            "pr", "list", "--state", "open", "--head", &branch, "--json", "number",
+            "pr", "list", "--state", "open", "--head", &branch, "--json",
+            "number,isCrossRepository,headRepositoryOwner",
         ],
         repo_root,
     )
@@ -778,7 +791,11 @@ async fn has_open_agent_pr(repo_root: &Path, issue: u64) -> Result<bool> {
         return Ok(true);
     }
     let arr: serde_json::Value = serde_json::from_str(&stdout).unwrap_or(serde_json::json!([]));
-    Ok(arr.as_array().map(|a| !a.is_empty()).unwrap_or(false))
+    // #1006 — only OUR branch claims the issue. A fork may carry the same
+    // name, and treating that as a claim skips the issue forever with no
+    // comment, no label and no trace.
+    let owner = repo_owner_from_remote(repo_root).await;
+    Ok(agent_pr_exists(&arr, owner.as_deref()))
 }
 
 /// Reasoner opts scoped to write/edit/bash within the per-attempt worktree.
@@ -841,7 +858,8 @@ fn scope_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     }
 }
 
-const SCOPE_SYSTEM: &str = "You are the scoping pass of a staged autonomous \
+const SCOPE_SYSTEM: &str = "PUBLIC OUTPUT RULE: This response may become a public PR description. Use only technical behavior and invented examples. Never copy private messages, personal names, account or invoice details, live traces, local paths, or generated programs with private inputs.\n\
+You are the scoping pass of a staged autonomous \
 fix pipeline for this codebase. You are given a GitHub issue that may be \
 vague, under-specified, or not actually fixable by a coding agent at all \
 (research asks, epics, infrastructure/purchasing decisions). READ the \
@@ -1146,7 +1164,8 @@ fn review_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     }
 }
 
-const REVIEW_SYSTEM: &str = "You are the QA review pass of a staged autonomous \
+const REVIEW_SYSTEM: &str = "PUBLIC OUTPUT RULE: This response may become a public PR description. Use only technical behavior and invented examples. Never copy private messages, personal names, account or invoice details, live traces, local paths, or generated programs with private inputs.\n\
+You are the QA review pass of a staged autonomous \
 fix pipeline. A separate builder agent has just edited this worktree to fix a \
 GitHub issue; the build and test suite already pass. Your job is to review the \
 work like a skeptical senior engineer before it ships. Run `git diff` and read \
@@ -1333,7 +1352,8 @@ fn codex_review_opts(worktree: PathBuf, system_prompt: &str) -> augmentagent_cha
     }
 }
 
-const CODEX_DIFF_REVIEW_SYSTEM: &str = "You are an INDEPENDENT reviewer on a \
+const CODEX_DIFF_REVIEW_SYSTEM: &str = "PUBLIC OUTPUT RULE: This response may become a public PR description. Use only technical behavior and invented examples. Never copy private messages, personal names, account or invoice details, live traces, local paths, or generated programs with private inputs.\n\
+You are an INDEPENDENT reviewer on a \
 staged autonomous fix pipeline. A different model wrote the change you are \
 about to read; its own QA pass already approved it. You are the second \
 opinion, and you were chosen because you do not share that model's blind \
@@ -1375,7 +1395,8 @@ Then a blank line, then 3-8 sentences: for lgtm, what you verified and how \
 file:line and why each is material. Read-only — do NOT edit anything. Output \
 ONLY the verdict line and your notes.";
 
-const CODEX_SYSTEM_REVIEW_SYSTEM: &str = "You are an INDEPENDENT reviewer on a \
+const CODEX_SYSTEM_REVIEW_SYSTEM: &str = "PUBLIC OUTPUT RULE: This response may become a public PR description. Use only technical behavior and invented examples. Never copy private messages, personal names, account or invoice details, live traces, local paths, or generated programs with private inputs.\n\
+You are an INDEPENDENT reviewer on a \
 staged autonomous fix pipeline, and this is the SYSTEM-INTERACTION pass. A \
 separate review already judged the diff on its own terms. Your job is the \
 question that one cannot answer from the hunks: what does this change do to \
@@ -1584,7 +1605,7 @@ async fn find_resumable_draft(
             "--state",
             "open",
             "--json",
-            "number,isDraft,headRefName",
+            "number,isDraft,headRefName,isCrossRepository,headRepositoryOwner",
         ],
         repo_root,
     )
@@ -1632,11 +1653,16 @@ async fn find_resumable_draft(
         return None;
     };
 
+    // #1006 — resolved once here because the closing sweep below needs it
+    // too: closing a PR is a write, and the loop must not perform one on a
+    // pull request it cannot prove is its own.
+    let owner = repo_owner_from_remote(repo_root).await;
+
     // #934 — a draft whose issue already gave up is closed on sight (branch
     // kept, revival instructions in the comment) so `gh pr list` shows only
     // work that is actually in play.
     if !dry_run {
-        for (pr, issue) in drafts_to_close(&prs, &gave_up) {
+        for (pr, issue) in drafts_to_close(&prs, &gave_up, owner.as_deref()) {
             close_gave_up_pr(
                 repo_root,
                 pr,
@@ -1649,18 +1675,58 @@ async fn find_resumable_draft(
     }
 
     let ledger = AttemptLedger::load(&attempt_ledger_path());
-    resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only)
+    resumable_from(&prs, &ledger, utc_day_now(), &gave_up, only, owner.as_deref())
 }
 
-/// The oldest eligible draft `(pr, issue, branch)` — or, with `only`, that
-/// issue's draft and nothing else (#932: a red main's fix PR outranks every
-/// other draft, and must never fall back to "some other PR").
+/// Is this PR's head branch in THIS repository, rather than a fork?
+///
+/// Tri-state on purpose. `Some(true)`/`Some(false)` are answers; `None` means
+/// the row carries no evidence either way, and the two callers fall back in
+/// OPPOSITE directions because their unsafe sides are opposite — see
+/// [`agent_pr_exists`] and [`resumable_from`].
+///
+/// `isCrossRepository` is GitHub's own answer and outranks everything else: it
+/// needs no `origin` remote, no network call and no local configuration, so a
+/// box that cannot resolve its own repo owner is still protected. The login
+/// comparison is only the fallback for a `gh` too old to report the flag.
+fn head_is_ours(pr: &serde_json::Value, owner: Option<&str>) -> Option<bool> {
+    if let Some(cross) = pr
+        .get("isCrossRepository")
+        .and_then(serde_json::Value::as_bool)
+    {
+        return Some(!cross);
+    }
+    let owner = owner.map(str::trim).filter(|o| !o.is_empty())?;
+    let login = pr
+        .pointer("/headRepositoryOwner/login")
+        .and_then(serde_json::Value::as_str)?;
+    Some(login.eq_ignore_ascii_case(owner))
+}
+
+/// Does an OPEN agent PR of ours appear in this `gh pr list --head` result?
+/// Pure, so the fork case is testable without a network call.
+///
+/// Fails OPEN on no evidence: an unidentifiable PR counts as ours, so the
+/// issue reads as claimed and is skipped. The other direction is far worse —
+/// reporting "no agent PR" for an issue that already has one in flight makes
+/// the loop open a DUPLICATE against its own live branch. A skipped issue
+/// returns on the next tick; two PRs racing one issue do not un-happen.
+fn agent_pr_exists(prs: &serde_json::Value, owner: Option<&str>) -> bool {
+    prs.as_array()
+        .map(|a| {
+            a.iter()
+                .any(|pr| head_is_ours(pr, owner).unwrap_or(true))
+        })
+        .unwrap_or(false)
+}
+
 fn resumable_from(
     prs: &serde_json::Value,
     ledger: &AttemptLedger,
     today: u64,
     gave_up: &std::collections::HashSet<u64>,
     only: Option<u64>,
+    owner: Option<&str>,
 ) -> Option<(u64, u64, String)> {
     prs.as_array()?
         .iter()
@@ -1669,6 +1735,13 @@ fn resumable_from(
             let number = pr.get("number")?.as_u64()?;
             let branch = pr.get("headRefName")?.as_str()?;
             let issue = issue_from_branch(branch)?;
+            // #1006 — a fork's branch is never ours to resume.
+            // Fails CLOSED on no evidence (`unwrap_or(false)`): refusing to
+            // resume costs one unbilled tick and the next retries, whereas
+            // checking out a head we cannot prove is ours is exactly #1006.
+            if !head_is_ours(pr, owner).unwrap_or(false) {
+                return None;
+            }
             let wanted = only.is_none_or(|o| o == issue);
             (draft && wanted && !ledger.attempted_today(today, issue) && !gave_up.contains(&issue))
                 .then(|| (number, issue, branch.to_string()))
@@ -1969,7 +2042,12 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
     }
 }
 
-const SELF_IMPROVE_SYSTEM: &str = "You are an autonomous maintenance engineer for the \
+const SELF_IMPROVE_SYSTEM: &str = "PUBLIC OUTPUT RULE: PR descriptions, review summaries, issue comments and committed \
+fixtures must contain only technical behavior and synthetic examples. Do not copy \
+private messages, names, account details, invoice data, local paths, live traces \
+or generated programs containing private inputs from an issue or local runtime. \
+Paraphrase the software defect and use reserved example.com addresses.\n\
+You are an autonomous maintenance engineer for the \
 AugmentAgent codebase. You are given a single GitHub issue (usually with an \
 implementation spec from a scoping pass). Implement the smallest correct fix. \
 Constraints you MUST honor:\n\
@@ -2715,6 +2793,7 @@ async fn red_main_recent_commits(repo_root: &Path, packages: &[String]) -> Strin
 /// `gh issue create` for a red main; the number parsed from the URL gh
 /// prints. Labels are best-effort: a repo without them still gets the issue.
 async fn file_red_main_issue(repo_root: &Path, title: &str, body: &str) -> Result<u64> {
+    augmentagent_channel_core::public_report::validate(title, body)?;
     let gh = gh_bin();
     let labelled = [
         "issue",
@@ -3197,9 +3276,18 @@ async fn close_gave_up_pr(
 /// Open DRAFTS on agent branches whose issue already carries the gave-up
 /// label: `(pr, issue)`. A ready PR is a human's decision now; a human
 /// branch is never ours.
+///
+/// #1006 — and neither is a fork's. This is the one lane of the three that
+/// does not merely skip work: its caller CLOSES what it returns. A stranger's
+/// draft named `agent-fix/issue-<N>`, for an issue carrying the gave-up label,
+/// would be closed with a comment by an automation with no business touching
+/// it. So it fails closed on no evidence ([`head_is_ours`] returning `None`):
+/// leaving one of our own stale drafts open is harmless and self-corrects,
+/// and closing someone else's pull request is not undone by an apology.
 fn drafts_to_close(
     prs: &serde_json::Value,
     gave_up: &std::collections::HashSet<u64>,
+    owner: Option<&str>,
 ) -> Vec<(u64, u64)> {
     prs.as_array()
         .map(|a| {
@@ -3209,6 +3297,9 @@ fn drafts_to_close(
                     let number = pr.get("number")?.as_u64()?;
                     let branch = pr.get("headRefName")?.as_str()?;
                     let issue = issue_from_branch(branch)?;
+                    if !head_is_ours(pr, owner).unwrap_or(false) {
+                        return None;
+                    }
                     (draft && gave_up.contains(&issue)).then_some((number, issue))
                 })
                 .collect()
@@ -3577,6 +3668,25 @@ async fn resume_draft_pr(
     let gh = gh_bin();
     note_current_issue(issue_no);
     info!(pr, issue = issue_no, %branch, "resuming sitting draft PR");
+
+    // #1006 — before anything else, and specifically BEFORE the ledger mark
+    // below. The head may not be in this repository at all (a fork), or may
+    // have been deleted after a merge; either way there is nothing to check
+    // out. `ls-remote` cannot distinguish "no such ref" from "could not
+    // reach origin", and both land here, so doing this after the mark would
+    // let a single origin blip retire a perfectly good draft until tomorrow.
+    // Probing first costs one tick instead. This also used to `bail!` out of
+    // the worktree add, killing the tick and every draft behind it.
+    if !remote_branch_exists(repo_root, branch).await {
+        // Records nothing, per #1006: no ledger mark, and no GitHub write.
+        // The loop re-reads its open drafts every tick, so a `gh pr comment`
+        // here would be one note per tick, forever, on a PR that nobody is
+        // going to resume. The log line and the report are the trace.
+        warn!(pr, %branch, "resume: head branch is not on origin; skipping");
+        return Ok(RunReport::triage(format!(
+            "PR #{pr}: head branch `{branch}` is not on origin; skipped"
+        )));
+    }
 
     // Whatever happens next counts as today's attempt on this issue, so a
     // failing resume moves on to other work instead of re-running every tick.
@@ -8424,7 +8534,7 @@ CODEX-REVIEW: lgtm").0);
         assert!(p.contains("#845"));
         // The live #853 resume burned four rounds because "do not start
         // over" entrenched a structurally wrong approach: the guard matched
-        // greeting names against address tokens ("Gary" vs "glozoff"), codex
+        // greeting names against address tokens ("Alex" vs "unrelated_handle"), codex
         // showed the reported case could never pass, and the builder kept
         // patching details around the hole. Revisions must be allowed to
         // pivot when the finding is architectural.
@@ -8963,6 +9073,43 @@ CODEX-REVIEW: lgtm").0);
             "the orphaned branch must be detected, or the next attempt dies \
              at a non-fast-forward push every tick forever"
         );
+    }
+
+    /// #1006 — the refusal path rests entirely on this helper's contract:
+    /// it must answer `false` and never propagate an error, or the tick it
+    /// was written to protect dies anyway. The sibling test above covers
+    /// present and absent against a real remote; this covers the third case,
+    /// an origin that cannot be reached at all, which is the one an origin
+    /// outage produces and the one a caller is most likely to get wrong.
+    #[tokio::test]
+    async fn an_unreachable_origin_reads_as_no_branch_rather_than_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git");
+            assert!(out.status.success(), "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr));
+        };
+        git(&work, &["init", "-q", "-b", "main", "."]);
+        git(&work, &["remote", "add", "origin",
+                     &dir.path().join("does-not-exist.git").to_string_lossy()]);
+
+        // Returning at all is half the assertion: the signature is `bool`,
+        // so there is no error to propagate and nothing can kill the tick.
+        assert!(
+            !remote_branch_exists(&work, &format!("{BRANCH_PREFIX}1")).await,
+            "an unreachable origin must read as `no branch`, so the resume \
+             lane refuses cheaply instead of failing the whole tick"
+        );
+
+        // No remote at all is the same story.
+        git(&work, &["remote", "remove", "origin"]);
+        assert!(!remote_branch_exists(&work, &format!("{BRANCH_PREFIX}1")).await);
     }
 
     // ---- #816: single-flight lock ----
@@ -9558,33 +9705,38 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(line.contains("&& !is_red_main_issue(&issue.body)"), "{line}");
     }
 
+    /// #932, with its fixtures brought up to what `gh` actually returns now
+    /// that #1006 filters on head provenance. `isCrossRepository: false` is
+    /// the ordinary case for every PR this loop opens, and carrying it here
+    /// keeps the pinning rules under test independent of the fork guard —
+    /// which has its own tests for the degraded-evidence directions.
     #[test]
     fn resumable_draft_can_be_pinned_to_one_issue() {
         let prs: serde_json::Value = serde_json::json!([
-            {"number": 101, "isDraft": true, "headRefName": "agent-fix/issue-11"},
-            {"number": 100, "isDraft": true, "headRefName": "agent-fix/issue-10"},
-            {"number": 102, "isDraft": false, "headRefName": "agent-fix/issue-12"},
-            {"number": 103, "isDraft": true, "headRefName": "feature/human"},
+            {"number": 101, "isDraft": true, "headRefName": "agent-fix/issue-11", "isCrossRepository": false},
+            {"number": 100, "isDraft": true, "headRefName": "agent-fix/issue-10", "isCrossRepository": false},
+            {"number": 102, "isDraft": false, "headRefName": "agent-fix/issue-12", "isCrossRepository": false},
+            {"number": 103, "isDraft": true, "headRefName": "feature/human", "isCrossRepository": false},
         ]);
         let mut ledger = AttemptLedger::default();
         let gave_up: std::collections::HashSet<u64> = [12u64].into_iter().collect();
         // Unpinned: oldest eligible draft.
         assert_eq!(
-            resumable_from(&prs, &ledger, 100, &gave_up, None),
+            resumable_from(&prs, &ledger, 100, &gave_up, None, Some("nolanmak")),
             Some((100, 10, "agent-fix/issue-10".to_string()))
         );
         // Pinned to the red-main issue: that draft even though it is newer.
         assert_eq!(
-            resumable_from(&prs, &ledger, 100, &gave_up, Some(11)),
+            resumable_from(&prs, &ledger, 100, &gave_up, Some(11), Some("nolanmak")),
             Some((101, 11, "agent-fix/issue-11".to_string()))
         );
         // Pinned to an issue without an eligible draft: nothing, never a
         // fallback to some other PR.
-        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(12)), None);
-        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(99)), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(12), Some("nolanmak")), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(99), Some("nolanmak")), None);
         // The daily ledger still applies to the pinned draft.
         ledger.mark(100, 11);
-        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(11)), None);
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(11), Some("nolanmak")), None);
     }
 
     // --- #933 auto-rebase: the builder resolves a draft's merge conflict ---
@@ -9790,16 +9942,16 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn drafts_to_close_are_open_drafts_of_gave_up_issues() {
         let prs: serde_json::Value = serde_json::json!([
-            {"number": 853, "isDraft": true, "headRefName": "agent-fix/issue-845"},
-            {"number": 855, "isDraft": true, "headRefName": "agent-fix/issue-652"},
-            {"number": 900, "isDraft": false, "headRefName": "agent-fix/issue-700"},
-            {"number": 901, "isDraft": true, "headRefName": "feature/human"},
+            {"number": 853, "isDraft": true, "headRefName": "agent-fix/issue-845", "isCrossRepository": false},
+            {"number": 855, "isDraft": true, "headRefName": "agent-fix/issue-652", "isCrossRepository": false},
+            {"number": 900, "isDraft": false, "headRefName": "agent-fix/issue-700", "isCrossRepository": false},
+            {"number": 901, "isDraft": true, "headRefName": "feature/human", "isCrossRepository": false},
         ]);
         let gave_up: std::collections::HashSet<u64> = [845u64, 700].into_iter().collect();
         // Only DRAFTS on agent branches whose issue gave up; a ready PR (900)
         // is a human's decision now, a human branch (901) is never ours.
-        assert_eq!(drafts_to_close(&prs, &gave_up), vec![(853u64, 845u64)]);
-        assert!(drafts_to_close(&prs, &std::collections::HashSet::new()).is_empty());
+        assert_eq!(drafts_to_close(&prs, &gave_up, Some("nolanmak")), vec![(853u64, 845u64)]);
+        assert!(drafts_to_close(&prs, &std::collections::HashSet::new(), Some("nolanmak")).is_empty());
     }
 
     // Structural: every gave-up in resume_draft_pr closes the PR (branch
@@ -10888,5 +11040,299 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             body[ret..].starts_with("return Ok(RunReport::triage("),
             "no builder ran, so the refusal must be unbilled"
         );
+    }
+
+    // --- #1006: a fork must not be mistaken for the loop's own branch ------
+
+    /// `gh pr list --json ...isCrossRepository,headRepositoryOwner` shape.
+    /// A `gh pr list` row. `head_owner` absent models a `gh` that cannot
+    /// report it; `cross` absent models one without `isCrossRepository`.
+    fn pr_json_full(
+        number: u64,
+        branch: &str,
+        draft: bool,
+        head_owner: Option<&str>,
+        cross: Option<bool>,
+    ) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "number": number,
+            "isDraft": draft,
+            "headRefName": branch,
+        });
+        if let Some(owner) = head_owner {
+            v["headRepositoryOwner"] = serde_json::json!({ "login": owner });
+        }
+        if let Some(cross) = cross {
+            v["isCrossRepository"] = serde_json::json!(cross);
+        }
+        v
+    }
+
+    /// The common case: login evidence only, no `isCrossRepository`.
+    fn pr_json(number: u64, branch: &str, draft: bool, head_owner: Option<&str>) -> serde_json::Value {
+        pr_json_full(number, branch, draft, head_owner, None)
+    }
+
+    #[test]
+    fn a_forks_branch_is_not_ours_however_it_is_named() {
+        // The whole attack is a branch NAME the loop trusts, in a repo it
+        // does not own.
+        let b = "agent-fix/issue-10";
+        assert_eq!(head_is_ours(&pr_json(1, b, true, Some("nolanmak")), Some("nolanmak")), Some(true));
+        assert_eq!(head_is_ours(&pr_json(1, b, true, Some("NolanMak")), Some("nolanmak")), Some(true),
+            "GitHub logins are case-insensitive");
+        assert_eq!(head_is_ours(&pr_json(2, b, true, Some("stranger")), Some("nolanmak")), Some(false));
+
+        // `isCrossRepository` is GitHub's own answer, so it needs no local
+        // config and it OUTRANKS the login comparison. Without this the guard
+        // would be only as good as our ability to resolve `origin`.
+        for owner in [None, Some(""), Some("nolanmak"), Some("wrong")] {
+            assert_eq!(head_is_ours(&pr_json_full(3, b, true, None, Some(false)), owner), Some(true),
+                "authoritative not-cross settles it for owner {owner:?}");
+            assert_eq!(head_is_ours(&pr_json_full(4, b, true, None, Some(true)), owner), Some(false),
+                "authoritative cross settles it for owner {owner:?}");
+        }
+
+        // Genuinely no evidence: neither field, or no resolvable owner to
+        // compare a login against. The predicate says so rather than guessing;
+        // each lane picks its own safe direction.
+        assert_eq!(head_is_ours(&pr_json(5, b, true, None), Some("nolanmak")), None);
+        for unknown in [None, Some(""), Some("   ")] {
+            assert_eq!(head_is_ours(&pr_json(6, b, true, Some("stranger")), unknown), None, "{unknown:?}");
+        }
+    }
+
+    /// CodeRabbit on this PR found a THIRD lane consuming the same
+    /// branch-name trust, and it is the worst of them: `drafts_to_close`
+    /// does not merely skip work, it makes the loop CLOSE a pull request.
+    /// A stranger's fork draft named `agent-fix/issue-<N>`, for an issue that
+    /// happens to carry the gave-up label, would be closed with a comment by
+    /// an automation that has no business touching it.
+    ///
+    /// Fails closed on no evidence: leaving one of our own stale drafts open
+    /// is harmless and self-corrects, while closing someone else's PR is not
+    /// something an apology undoes.
+    #[test]
+    fn the_loop_never_closes_a_pr_it_cannot_prove_is_its_own() {
+        let gave_up: std::collections::HashSet<u64> = [10u64].into_iter().collect();
+        let ours = pr_json(100, "agent-fix/issue-10", true, Some("nolanmak"));
+        let fork = pr_json(101, "agent-fix/issue-10", true, Some("stranger"));
+        let flagged_fork = pr_json_full(102, "agent-fix/issue-10", true, None, Some(true));
+
+        assert_eq!(
+            drafts_to_close(&serde_json::json!([ours, fork, flagged_fork]), &gave_up, Some("nolanmak")),
+            vec![(100, 10)],
+            "only our own draft may be closed"
+        );
+        // No evidence at all: close nothing rather than guess.
+        assert!(
+            drafts_to_close(&serde_json::json!([pr_json(103, "agent-fix/issue-10", true, None)]), &gave_up, None)
+                .is_empty(),
+            "an unidentifiable PR must never be closed by the loop"
+        );
+        // And GitHub's flag alone is enough to keep working with no owner.
+        assert_eq!(
+            drafts_to_close(
+                &serde_json::json!([pr_json_full(104, "agent-fix/issue-10", true, None, Some(false))]),
+                &gave_up,
+                None
+            ),
+            vec![(104, 10)],
+        );
+    }
+
+    /// CodeRabbit's second finding. `resume_draft_pr` marks the issue as
+    /// attempted-today at its very top, so any skip below that point retires
+    /// the draft until tomorrow. A failed `ls-remote` is indistinguishable
+    /// from an absent branch, so one origin blip would park a perfectly good
+    /// draft for a day. Probe before the ledger is touched, and the blip
+    /// costs one tick instead.
+    #[test]
+    fn an_origin_blip_does_not_retire_a_draft_for_the_day() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+        let probe = body.find("remote_branch_exists(repo_root, branch)").expect("origin probe");
+        let mark = body.find("AttemptLedger::mark_persist").expect("ledger mark");
+        assert!(
+            probe < mark,
+            "probe origin before spending the day's attempt on this issue"
+        );
+    }
+
+    /// With no evidence at all the two lanes must fall back in OPPOSITE
+    /// directions, because their unsafe sides are opposite.
+    ///
+    /// Resume fails closed: refusing to resume costs an unbilled tick and the
+    /// next one retries, whereas checking out an unproven head is the very
+    /// thing #1006 is about.
+    ///
+    /// Dedup fails open — "assume it is ours, so the issue is claimed."
+    /// Failing closed there would report no agent PR for an issue that already
+    /// has one in flight, so the loop would open a DUPLICATE against its own
+    /// live branch. A skipped issue comes back next tick. Duplicate PRs racing
+    /// the same issue do not un-happen.
+    #[test]
+    fn with_no_evidence_each_lane_fails_to_its_own_safe_side() {
+        let ours = pr_json(100, "agent-fix/issue-10", true, Some("nolanmak"));
+        let fork = pr_json(101, "agent-fix/issue-11", true, Some("stranger"));
+        let ledger = AttemptLedger::default();
+        let gave_up = std::collections::HashSet::new();
+
+        for unknown in [None, Some(""), Some("   ")] {
+            assert_eq!(head_is_ours(&ours, unknown), None, "{unknown:?}");
+            assert_eq!(
+                resumable_from(&serde_json::json!([ours, fork]), &ledger, 100, &gave_up, None, unknown),
+                None,
+                "resume must fail closed on no evidence ({unknown:?})"
+            );
+            assert!(
+                agent_pr_exists(&serde_json::json!([ours]), unknown),
+                "dedup must fail open on no evidence, or the loop opens duplicates ({unknown:?})"
+            );
+        }
+
+        // And the authoritative flag rescues both lanes without any owner:
+        // degraded local config stops mattering the moment GitHub answers.
+        let ours_flagged = pr_json_full(100, "agent-fix/issue-10", true, None, Some(false));
+        let fork_flagged = pr_json_full(99, "agent-fix/issue-9", true, None, Some(true));
+        assert_eq!(
+            resumable_from(&serde_json::json!([fork_flagged, ours_flagged]), &ledger, 100, &gave_up, None, None),
+            Some((100, 10, "agent-fix/issue-10".to_string())),
+            "the flag alone must skip the fork and still reach our draft"
+        );
+        assert!(
+            !agent_pr_exists(&serde_json::json!([fork_flagged]), None),
+            "a PR GitHub calls cross-repository must never claim an issue"
+        );
+    }
+
+    /// Attack 1 from #1006: a fork draft named `agent-fix/issue-<N>` for an
+    /// issue the OWNER wrote. It sorts to the front by PR number and the
+    /// resume lane would pick it, then die fetching a branch not on origin.
+    #[test]
+    fn resume_ignores_fork_drafts_and_still_picks_our_own() {
+        let prs = serde_json::json!([
+            pr_json(100, "agent-fix/issue-10", true, Some("stranger")),
+            pr_json(101, "agent-fix/issue-11", true, Some("nolanmak")),
+        ]);
+        let ledger = AttemptLedger::default();
+        let gave_up = std::collections::HashSet::new();
+        assert_eq!(
+            resumable_from(&prs, &ledger, 100, &gave_up, None, Some("nolanmak")),
+            Some((101, 11, "agent-fix/issue-11".to_string())),
+            "the lower-numbered fork PR must not win the queue"
+        );
+        // Pinning to the fork's issue finds nothing rather than falling back.
+        assert_eq!(resumable_from(&prs, &ledger, 100, &gave_up, Some(10), Some("nolanmak")), None);
+        // With no fork in play, selection is unchanged.
+        let ours = serde_json::json!([pr_json(100, "agent-fix/issue-10", true, Some("nolanmak"))]);
+        assert_eq!(
+            resumable_from(&ours, &ledger, 100, &gave_up, None, Some("nolanmak")),
+            Some((100, 10, "agent-fix/issue-10".to_string()))
+        );
+    }
+
+    /// Attack 2 from #1006: the same fork PR makes the dedup guard report
+    /// "already claimed", so the issue is skipped forever with no comment,
+    /// no label and no trace.
+    #[test]
+    fn dedup_does_not_let_a_fork_claim_an_issue() {
+        let only_fork = serde_json::json!([pr_json(100, "agent-fix/issue-10", false, Some("stranger"))]);
+        assert!(
+            !agent_pr_exists(&only_fork, Some("nolanmak")),
+            "a stranger's branch must never claim one of our issues"
+        );
+        // Our own PR still claims it, draft or not.
+        let ours = serde_json::json!([pr_json(101, "agent-fix/issue-10", true, Some("nolanmak"))]);
+        assert!(agent_pr_exists(&ours, Some("nolanmak")));
+        // Mixed: ours wins.
+        let mixed = serde_json::json!([
+            pr_json(100, "agent-fix/issue-10", false, Some("stranger")),
+            pr_json(101, "agent-fix/issue-10", true, Some("nolanmak")),
+        ]);
+        assert!(agent_pr_exists(&mixed, Some("nolanmak")));
+        assert!(!agent_pr_exists(&serde_json::json!([]), Some("nolanmak")));
+    }
+
+    /// The loop must ask GitHub for the head repository, or the filters above
+    /// have nothing to judge.
+    #[test]
+    fn pr_queries_request_the_head_repository() {
+        let src = include_str!("self_improve.rs");
+        for f in ["async fn find_resumable_draft(", "async fn has_open_agent_pr("] {
+            let start = src.find(f).expect(f);
+            let body = &src[start..start + src[start..].find("\n}\n").expect("fn end")];
+            assert!(
+                body.contains("isCrossRepository"),
+                "{f} must request GitHub's own cross-repository answer; without \
+                 it the guard is only as good as resolving our own `origin`"
+            );
+            assert!(
+                body.contains("headRepositoryOwner"),
+                "{f} must also request the login, the fallback for a `gh` too \
+                 old to report the flag"
+            );
+        }
+    }
+
+    /// A head branch we cannot fetch (a fork, or one deleted after merge)
+    /// must end the run as triage, not as an `Err` that kills the whole tick
+    /// and every other draft behind it.
+    #[test]
+    fn an_unfetchable_head_branch_does_not_kill_the_tick() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn resume_draft_pr(").expect("resume fn");
+        let end = start + src[start..].find("\n}\n").expect("fn end");
+        let body = &src[start..end];
+        let check = body
+            .find("remote_branch_exists(repo_root, branch)")
+            .expect("resume must confirm the head branch is on origin");
+        let worktree_add = body.find(r#""worktree", "add""#).expect("worktree add");
+        assert!(check < worktree_add, "check before creating a worktree from it");
+        let ret = check + body[check..].find("return Ok(RunReport::").expect("a report, not a bail");
+        assert!(ret < worktree_add, "the missing-branch path returns before the worktree add");
+        // Scoped to the guard block itself. Everything after it may still
+        // `bail!` on its own terms — the #300 trust refusal does — but this
+        // path must not, because a fork's branch is not an error condition
+        // for the tick.
+        assert!(
+            !body[check..ret].contains("bail!"),
+            "a fork's branch is not an error condition for the tick"
+        );
+        // And nothing fallible may run against the branch BEFORE the check.
+        // `git fetch origin <fork-branch>` is guaranteed to fail; today `run`
+        // reports that as Ok((false, ..)) so it happens to be survivable, but
+        // resting a denial-of-service guard on that semantic is how the hole
+        // comes back. Ask for the branch first, then touch the network.
+        let fetch = body.find(r#""fetch", "origin", branch"#).expect("resume fetches the branch");
+        assert!(
+            check < fetch,
+            "confirm the branch is on origin before fetching it, so no failure path precedes the guard"
+        );
+        // #1006 asks for a refusal that "records nothing". The loop re-reads
+        // its open drafts every tick, so any GitHub write here is not one
+        // note — it is one per tick, forever, on a PR nobody is resuming.
+        assert!(
+            !body[check..ret].contains("\"comment\""),
+            "the missing-branch refusal must not write to GitHub; it repeats every tick"
+        );
+    }
+
+}
+
+#[cfg(test)]
+mod public_write_tests {
+    #[tokio::test]
+    async fn rejects_private_issue_and_pr_payloads_before_spawning() {
+        let private = "person".to_owned() + "@" + "gmail.com";
+        for surface in ["issue", "pr"] {
+            let (ok, out, err) = super::run("/nonexistent/gh-must-not-run",
+                &[surface, "comment", "1", "--body", &private], std::path::Path::new(".")).await.unwrap();
+            assert!(!ok);
+            assert!(out.is_empty());
+            assert!(err.starts_with("public report blocked:"));
+            assert!(!err.contains(&private));
+        }
     }
 }

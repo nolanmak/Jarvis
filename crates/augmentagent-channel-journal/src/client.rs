@@ -146,6 +146,20 @@ pub trait JournalApi: Send + Sync {
     async fn create_entry(&self, new_entry: NewEntry) -> Result<Entry, JournalError>;
 }
 
+/// Read-only selection for `journal show`: the newest live entry (content
+/// present, not deleted), optionally restricted to a `YYYY-MM-DD` prefix of
+/// `created_at` (RFC3339 timestamps compare lexicographically).
+pub fn pick_latest<'a, I: IntoIterator<Item = &'a Entry>>(
+    items: I,
+    date: Option<&str>,
+) -> Option<&'a Entry> {
+    items
+        .into_iter()
+        .filter(|e| e.deleted != Some(true) && e.content.is_some())
+        .filter(|e| date.map_or(true, |d| e.created_at.starts_with(d)))
+        .max_by(|a, b| a.created_at.cmp(&b.created_at))
+}
+
 pub struct ShadowNoteClient {
     http: reqwest::Client,
     url: String,
@@ -459,6 +473,39 @@ mod tests {
             "_version": 1, "_deleted": null, "_lastChangedAt": 1751356800000i64,
             "owner": "cognito-sub-123"
         })
+    }
+
+    fn probe(id: &str, created: &str, deleted: bool, content: bool) -> Entry {
+        Entry {
+            id: id.into(),
+            owner_id: "o".into(),
+            created_at: created.into(),
+            content: content.then(|| "x".into()),
+            title: None,
+            topic: None,
+            bookmarked: None,
+            updated_at: None,
+            version: Some(1),
+            deleted: Some(deleted),
+            last_changed_at: None,
+            owner: None,
+        }
+    }
+
+    #[test]
+    fn pick_latest_skips_dead_entries_and_honors_date() {
+        let items = vec![
+            probe("a", "2026-09-14T21:00:00.000Z", false, true),
+            probe("b", "2026-09-15T08:10:00.000Z", false, true),
+            probe("c", "2026-09-15T09:00:00.000Z", true, true),   // deleted
+            probe("d", "2026-09-15T09:30:00.000Z", false, false), // no content
+        ];
+        assert_eq!(pick_latest(items.iter(), None).map(|e| e.id.as_str()), Some("b"));
+        assert_eq!(
+            pick_latest(items.iter(), Some("2026-09-14")).map(|e| e.id.as_str()),
+            Some("a")
+        );
+        assert!(pick_latest(items.iter(), Some("2026-01-01")).is_none());
     }
 
     #[tokio::test]

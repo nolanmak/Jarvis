@@ -451,6 +451,30 @@ enum Cmd {
     /// tool binaries on `$PATH`, build freshness, `.env` presence). Emits
     /// severity-tagged findings; exit 0 unless any check is `error`. `--fix`
     /// lands as a follow-up issue — doctor stays strictly read-only.
+    /// Prune the machine-local NDJSON logs past their retention windows
+    /// (#1004): tool-call audit 14 days, token usage 90 days. Both loggers
+    /// also do this themselves once an hour; this is the on-demand view, and
+    /// the one to run after changing a retention env var.
+    LogsPrune {
+        /// Report what would be removed without rewriting anything.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Token usage per day (#1001). Reads the append-only log the reasoner
+    /// writes on every call (`~/.local/state/augmentagent/token-usage.jsonl`,
+    /// outside the repo) and rolls it up by day and model — the measurement
+    /// behind "does the loop have room to take more issues?".
+    TokenUsage {
+        /// Only the last N days.
+        #[arg(long, default_value_t = 14)]
+        days: u32,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Health watchdog for the auto-PR loop (#997). Reads the same evidence
     /// a human would — the daemon log, the baseline cache, free disk, open
     /// drafts — and reports anything that stops the loop shipping. Run on a
@@ -1011,6 +1035,14 @@ enum JournalOp {
     /// drop any in-progress cursor, so only entries changed from now on
     /// are ingested.
     SkipToNow,
+    /// Read-only: fetch and print one journal entry (default: the latest by
+    /// created_at; --date YYYY-MM-DD picks that day's latest). Walks the
+    /// owner's entries via list_entries and decrypts locally — no sync
+    /// state is read or written, nothing is marked ingested.
+    Show {
+        #[arg(long)]
+        date: Option<String>,
+    },
     /// #900 — print the persisted watermark and in-progress cursor.
     Status,
 }
@@ -3422,6 +3454,10 @@ async fn main() -> Result<()> {
                 run_journal_skip_to_now(store).await?;
                 Ok(())
             }
+            JournalOp::Show { date } => {
+                run_journal_show(date.clone()).await?;
+                Ok(())
+            }
             JournalOp::Status => {
                 run_journal_status(store).await?;
                 Ok(())
@@ -3844,6 +3880,80 @@ async fn main() -> Result<()> {
         // === setup+maintenance subcommands (alphabetical) ===
         Cmd::Channel { name, op, args } => channel_router::dispatch(name, op, args).await,
         Cmd::CodeMode { op } => code_mode::run(store, op).await,
+        Cmd::LogsPrune { dry_run, json } => {
+            use augmentagent_channel_core::{log_retention as lr, token_usage as tu};
+            let targets = [
+                (
+                    "tool-audit",
+                    augmentagent_channel_core::tool_audit::default_audit_log_path(),
+                    lr::tool_audit_retention_days(),
+                ),
+                (
+                    "token-usage",
+                    tu::default_usage_log_path(),
+                    lr::token_usage_retention_days(),
+                ),
+            ];
+            let mut report = Vec::new();
+            for (name, path, days) in targets {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let outcome = if days == 0 {
+                    lr::PruneOutcome { skipped: true, ..Default::default() }
+                } else if dry_run {
+                    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+                    lr::retain_since(&raw, lr::cutoff(days)).1
+                } else {
+                    lr::prune_file(&path, lr::cutoff(days))
+                };
+                report.push(serde_json::json!({
+                    "log": name,
+                    "path": path.display().to_string(),
+                    "retention_days": days,
+                    "bytes": size,
+                    "removed": outcome.removed,
+                    "kept": outcome.kept,
+                    "skipped": outcome.skipped,
+                }));
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for r in &report {
+                    let kb = r["bytes"].as_u64().unwrap_or(0) / 1024;
+                    println!(
+                        "{:<12} {:>4}d  {:>7} KB  removed {:<6} kept {}{}",
+                        r["log"].as_str().unwrap_or(""),
+                        r["retention_days"].as_u64().unwrap_or(0),
+                        kb,
+                        r["removed"].as_u64().unwrap_or(0),
+                        r["kept"].as_u64().unwrap_or(0),
+                        if r["skipped"].as_bool().unwrap_or(false) { "  (nothing to do)" } else { "" },
+                    );
+                }
+                if dry_run {
+                    println!("\n(dry run — nothing was rewritten)");
+                }
+            }
+            Ok(())
+        }
+        Cmd::TokenUsage { days, json } => {
+            use augmentagent_channel_core::token_usage as tu;
+            let path = tu::default_usage_log_path();
+            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            let mut rolled = tu::rollup(&raw);
+            if rolled.len() > days as usize {
+                rolled.drain(..rolled.len() - days as usize);
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rolled)?);
+            } else {
+                print!("{}", tu::format_report(&rolled));
+                if raw.is_empty() {
+                    println!("  (log: {})", path.display());
+                }
+            }
+            Ok(())
+        }
         Cmd::AutoprHealth { notify, json } => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let code = autopr_health::run(&root, notify, json).await?;
@@ -15351,6 +15461,19 @@ async fn run_journal_poll_once(
         DEFAULT_MAX_ENTRIES_PER_POLL, DEFAULT_MAX_PAGES_PER_POLL,
     };
 
+    // #1010 postmortem — a LIVE pass consumes entries (journal_ingested
+    // rows advance) as it processes them. Without a wiki root there is no
+    // section write and the fire-and-forget LLM ingest dies with this CLI
+    // process, so entries are consumed with nothing produced and never
+    // revisited. Exactly this ate 400 entries on 2026-09-15 (recovered by
+    // clearing journal_ingested + journal_sync_cursor and restarting).
+    if !dry_run && wiki_dir.is_none() {
+        anyhow::bail!(
+            "a live journal pass requires --wiki-dir (entries would be marked \
+             ingested with nothing written); use --dry-run true to only count"
+        );
+    }
+
     let Some(runtime) = JournalRuntime::from_env().await? else {
         println!(
             "shadownote journal not configured (SHADOWNOTE_APPSYNC_URL / \
@@ -15395,6 +15518,56 @@ async fn run_journal_poll_once(
             outcome.deferred
         );
     }
+    Ok(())
+}
+
+/// Read-only fetch of one entry for QA (`journal show`). Walks the owner's
+/// partition via `list_entries`, picks the newest live entry (optionally
+/// date-filtered), decrypts locally, prints. Touches no sync state.
+async fn run_journal_show(date: Option<String>) -> Result<()> {
+    use augmentagent_channel_journal::client::{pick_latest, JournalApi};
+    use augmentagent_channel_journal::{crypto, html, section, JournalRuntime};
+
+    let Some(runtime) = JournalRuntime::from_env().await? else {
+        println!("shadownote journal not configured; nothing to show");
+        return Ok(());
+    };
+    let mut items = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..200 {
+        let page = runtime.client.list_entries(token).await?;
+        items.extend(page.items);
+        token = page.next_token;
+        if token.is_none() {
+            break;
+        }
+    }
+    let Some(entry) = pick_latest(items.iter(), date.as_deref()) else {
+        println!(
+            "no live entry found{}",
+            date.map(|d| format!(" for {d}")).unwrap_or_default()
+        );
+        return Ok(());
+    };
+    let content = entry.content.as_deref().expect("pick_latest guarantees content");
+    let text = crypto::decrypt_entry_content(content, runtime.dek.as_ref())
+        .await
+        .map(|h| html::html_to_text(&h))
+        .context("decrypt entry")?;
+    println!("id:      {}", entry.id);
+    println!("created: {}", entry.created_at);
+    if let Some(u) = entry.updated_at.as_deref() {
+        println!("updated: {u}");
+    }
+    if let Some(t) = entry.topic.as_deref() {
+        println!("topic:   {t}");
+    }
+    if let Some(t) = entry.title.as_deref() {
+        println!("title:   {t}");
+    }
+    println!("section: wiki/{}", section::entry_rel_path(entry).display());
+    println!("---");
+    println!("{text}");
     Ok(())
 }
 

@@ -35,8 +35,11 @@ pub struct Identities {
     pub twitter: Option<String>,
     #[serde(default)]
     pub slack: Option<String>,
-    #[serde(default)]
-    pub whatsapp: Option<String>,
+    /// WhatsApp JIDs (#1009). Multi-valued — a person's number JID
+    /// (`<number>@s.whatsapp.net`) and their `@lid` alias commonly coexist.
+    /// Lenient like the other list fields: a legacy bare scalar still parses.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub whatsapp: Vec<String>,
     #[serde(default)]
     pub instagram: Option<String>,
     /// E.164-normalized phone (#62). Multi-valued — a person commonly has a
@@ -93,7 +96,7 @@ impl Identities {
             "discord" => self.discord.as_deref() == Some(id),
             "twitter" => self.twitter.as_deref() == Some(id),
             "slack" => self.slack.as_deref() == Some(id),
-            "whatsapp" => self.whatsapp.as_deref() == Some(id),
+            "whatsapp" => self.whatsapp.iter().any(|h| h == id),
             "instagram" => self.instagram.as_deref() == Some(id),
             "phone" => {
                 // E.164 ids compared verbatim (already normalized upstream).
@@ -420,6 +423,40 @@ mod tests {
         assert_eq!(p.identities.email, vec!["a@example.com"]);
         assert_eq!(p.identities.imessage, vec!["29694"], "number stringified");
         assert!(index.lookup("imessage", "29694").is_some());
+    }
+
+    #[test]
+    fn whatsapp_accepts_list_and_scalar_shapes() {
+        // A person legitimately has a number JID and a @lid alias, so LLM
+        // ingest writes lists; legacy pages carry a bare scalar. Both must
+        // parse — a shape mismatch silently drops the page from the index.
+        let dir = tempfile::TempDir::new().unwrap();
+        let layout = WikiLayout::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(layout.people_dir()).unwrap();
+        std::fs::write(
+            layout.people_dir().join("w1.md"),
+            "---\nkind: person\nidentities:\n  whatsapp:\n    - \"1234567890@s.whatsapp.net\"\n    - \"111222333444555@lid\"\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            layout.people_dir().join("w2.md"),
+            "---\nkind: person\nidentities:\n  whatsapp: \"15550001111\"\n---\n",
+        )
+        .unwrap();
+        let index = IdentityIndex::build(&layout).unwrap();
+        assert_eq!(index.len(), 2, "both shapes must index");
+        assert_eq!(
+            index.lookup("whatsapp", "111222333444555@lid").map(|p| p.slug.as_str()),
+            Some("w1")
+        );
+        assert_eq!(
+            index.lookup("whatsapp", "1234567890@s.whatsapp.net").map(|p| p.slug.as_str()),
+            Some("w1")
+        );
+        assert_eq!(
+            index.lookup("whatsapp", "15550001111").map(|p| p.slug.as_str()),
+            Some("w2")
+        );
     }
 
     #[test]

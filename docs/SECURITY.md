@@ -91,3 +91,15 @@ titles and bodies for obvious emails and credentials before posting. It cannot
 detect every private fact; review the content before requesting a report.
 Reports require an explicit `--body` or `--body-file`; interactive editors and
 templates are refused because their final contents cannot be checked first.
+
+Automatic code-mode failure reports publish only a fixed stage, an allowlisted
+channel, repair status and fallback mode. Raw generated programs, error strings,
+model labels and message/action identifiers remain out of the public report.
+The original failed program remains in the private action store for diagnosis.
+Query-agent and maintenance-agent prompts require synthetic technical summaries;
+quoted user requests and private message context do not belong in public reports.
+
+The Rust issue publisher, research issue filer and maintenance issue/PR writes
+also validate titles and bodies before spawning GitHub commands. Recognizable
+emails, phone numbers, token shapes and raw diagnostic identifiers cause a
+refusal with values withheld. Reserved example domains remain valid fixtures.

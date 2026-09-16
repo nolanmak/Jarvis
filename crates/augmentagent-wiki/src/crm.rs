@@ -204,7 +204,7 @@ fn merge_into_existing(src: &str, patch: &PersonPatch) -> MergeResult {
 /// scalar. Writer and reader (`identity::Identities`) must agree on this
 /// set — a scalar written under a list key makes the whole page unparseable
 /// and silently drops it from the identity index.
-const MULTI_VALUED: &[&str] = &["email", "phone", "imessage"];
+const MULTI_VALUED: &[&str] = &["email", "phone", "imessage", "whatsapp"];
 
 fn is_multi_valued(platform: &str) -> bool {
     MULTI_VALUED.contains(&platform)
@@ -1014,6 +1014,29 @@ mod tests {
         // feeds a card's prose.
         assert!(identity_summary("# Jane\n\nno front-matter here\n").is_empty());
         assert!(identity_summary("---\nkind: person\nidentities:\n  phone: [\"+1\"]\n").is_empty());
+    }
+
+    #[test]
+    fn whatsapp_identity_is_a_list_and_extends_in_place() {
+        let patch = PersonPatch::new()
+            .with_display_name("W")
+            .identity("whatsapp", "1234567890@s.whatsapp.net");
+        let out = merge_person_page(None, &patch);
+        // second handle (a @lid alias) must union into the list, not be
+        // dropped as an already-present single-valued key
+        let more = merge_person_page(
+            Some(&out.content),
+            &PersonPatch::new().identity("whatsapp", "111222333444555@lid"),
+        );
+        assert!(more.changed, "second handle must be added:\n{}", more.content);
+        let dir = tempfile::TempDir::new().unwrap();
+        let layout = WikiLayout::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(layout.people_dir()).unwrap();
+        std::fs::write(layout.people_dir().join("w.md"), &more.content).unwrap();
+        let index = IdentityIndex::build(&layout).unwrap();
+        assert_eq!(index.len(), 1, "page must parse:\n{}", more.content);
+        assert!(index.lookup("whatsapp", "1234567890@s.whatsapp.net").is_some());
+        assert!(index.lookup("whatsapp", "111222333444555@lid").is_some());
     }
 
     #[test]

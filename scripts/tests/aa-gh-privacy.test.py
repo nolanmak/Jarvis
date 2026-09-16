@@ -60,6 +60,14 @@ pathlib.Path(os.environ['TEST_SENT']).write_text(json.dumps({'args': args, 'body
             self.assertNotIn(email, result.stderr)
             self.assertNotIn(token, result.stderr)
 
+    def test_raw_private_report_shapes_are_blocked(self):
+        for body in ["User's words: quoted private request", "Original program: private input",
+                     "urn:li:messagingMessage:private", "phone: " + "+1" + "2025550199",
+                     "phone: (202) " + "555-0199", "messageId: abcdef1234567890", "/home/" + "private-owner/app"]:
+            with self.subTest(body=body):
+                self.assertNotEqual(self.invoke('comment', '1', '--body', body).returncode, 0)
+                self.assertFalse(self.result.exists())
+
     def test_overrides_and_interactive_bodies_rejected(self):
         for extra in [[], ['--editor'], ['--body', 'safe', '-bhidden'],
                       ['--body', 'safe', '--body=other'],

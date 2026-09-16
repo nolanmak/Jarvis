@@ -35,6 +35,7 @@ pub mod config;
 pub mod crypto;
 pub mod html;
 pub mod s3;
+pub mod section;
 
 pub use channel::{
     JournalChannel, JournalChannelConfig, JournalRuntime, PollOutcome, DEFAULT_BASE_SYNC_THRESHOLD,
