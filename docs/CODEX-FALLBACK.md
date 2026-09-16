@@ -75,6 +75,14 @@ Exact argument matching does not identify semantically duplicate actions express
 with different arguments. Hook observations do not substitute for verified
 termination of the previous provider and its descendants before handoff.
 
+Both CLI adapters now create an owned process group and kill that group on
+return or cancellation. A real subprocess regression first reproduced a
+background tool writing after its provider was canceled, then passed with group
+cleanup. This covers descendants that retain the group; descendants that detach
+into a new session still require supervision and verification. Broker command
+children cannot call `setsid`/`setpgid`, but primary native tools do not share
+that syscall filter.
+
 ## Capability inventory
 
 The checked-in manifest and conformance suite must cover these constructors and

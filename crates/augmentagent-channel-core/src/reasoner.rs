@@ -986,7 +986,7 @@ impl ClaudeCliReasoner {
                 cmd.env_remove(key);
             }
         }
-        let mut child = cmd.spawn()?;
+        let (mut child, process_group) = crate::process_tree::spawn(&mut cmd)?;
 
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(user_message.as_bytes()).await?;
@@ -1083,6 +1083,7 @@ impl ClaudeCliReasoner {
         }
 
         let status = child.wait().await?;
+        drop(process_group);
         if !status.success() {
             let mut stderr_buf = String::new();
             if let Some(mut err) = child.stderr.take() {

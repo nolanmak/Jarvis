@@ -36,6 +36,7 @@ chrono-tz = { workspace = true }
 # settings via temp files (neither CLI takes them as an argument string).
 tempfile = "3"
 sha2 = "0.10"
+libc = "0.2"
 # #35 Phase 2 — Composio-backed free/busy + Drive search resolver clients.
 # Self-contained reqwest client (intentional duplication, see resolve.rs).
 reqwest = { workspace = true }
