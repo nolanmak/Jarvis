@@ -1165,6 +1165,36 @@ fn criteria_review_section(criteria: &[String]) -> String {
     )
 }
 
+/// #1030 — the whole build-failure decision, as one testable thing.
+///
+/// Codex on the PR: pinning the source text of `run_once` lets a refactor keep
+/// the strings while recording an attempt or billing the hold. The decision
+/// that actually matters is this one, so it lives where it can be exercised
+/// directly: given the error and what the chain says about the lane, is this a
+/// pause or a fault?
+///
+/// `Some(report)` means hold — unbilled, nothing recorded. `None` means fall
+/// through to the normal failure handling, which records the attempt.
+fn build_failure_hold(
+    err: &anyhow::Error,
+    lane: &augmentagent_channel_core::LaneAvailability,
+) -> Option<RunReport> {
+    // Both must agree. The chain's error text cannot tell "everyone is on
+    // cooldown" from "nobody is cleared for this preset", and only the first
+    // is a pause; asking the chain settles it.
+    held_for_no_provider(err)?;
+    match lane {
+        augmentagent_channel_core::LaneAvailability::AllLatched(latched) => {
+            Some(RunReport::held(no_provider_message(
+                "FullAgentic",
+                latched,
+                SpentBeforeHold::ScopingCall,
+            )))
+        }
+        _ => None,
+    }
+}
+
 /// #1030 — is this failure "every provider that could serve the call is
 /// latched", rather than something actually broken?
 ///
@@ -5369,18 +5399,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 // "nobody is cleared for this preset", and those are a wait
                 // and a fault respectively — so ask the chain directly rather
                 // than inferring from the message.
-                // Only a confirmed all-latched chain is a pause. Anything
-                // else — not latched at all, or nothing eligible for this
-                // preset — is a real failure and falls through to the
-                // recording below.
-                if let augmentagent_channel_core::LaneAvailability::AllLatched(latched) = reasoner
-                    .lane_availability(augmentagent_channel_core::CapabilityClass::FullAgentic)
-                {
-                    let why =
-                        no_provider_message("FullAgentic", &latched, SpentBeforeHold::ScopingCall);
-                    info!(issue = issue.number, "auto-PR held: {why}");
+                let lane = reasoner
+                    .lane_availability(augmentagent_channel_core::CapabilityClass::FullAgentic);
+                if let Some(report) = build_failure_hold(&err, &lane) {
+                    info!(issue = issue.number, "auto-PR held: {report}");
                     cleanup(worktree, branch, repo_root.to_path_buf()).await;
-                    return Ok(RunReport::held(why));
+                    return Ok(report);
                 }
             }
             record_reasoner_error(
@@ -10532,31 +10556,59 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(!raced.contains("Nothing was spent"), "{raced}");
     }
 
-    /// Codex on this PR: a provider can become latched BETWEEN the preflight
-    /// and the build call, and on that path the old code recorded a
-    /// ReasonerError attempt before classifying — charging the issue for a
-    /// quota pause, which is the thing C1 forbids. It also logged the
-    /// fallback layer's own message, which names neither the latched provider
-    /// nor its reset.
+    /// Codex on this PR, twice, and the second time about the TEST rather than
+    /// the code: a source-text pin lets a refactor keep the strings while
+    /// recording an attempt or billing the hold. So the decision moved into
+    /// `build_failure_hold`, where it can be exercised for real.
+    ///
+    /// The decision needs BOTH signals to agree. The chain's error text cannot
+    /// tell "everyone is on cooldown" from "nobody is cleared for this
+    /// preset", and only the first is a pause.
     #[test]
-    fn a_hold_discovered_at_the_build_call_records_nothing_and_still_names_names() {
-        let src = include_str!("self_improve.rs");
-        let start = src.find("pub async fn run_once(").expect("run_once");
-        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+    fn a_build_failure_holds_only_when_the_chain_confirms_a_quota_pause() {
+        use augmentagent_channel_core::LaneAvailability;
+        let chain_err = anyhow::Error::new(
+            augmentagent_channel_core::ReasonerError::Unavailable {
+                provider: "chain".into(),
+                message: "no provider available for FullAgentic call".into(),
+            },
+        );
+        let real_fault = anyhow::Error::new(
+            augmentagent_channel_core::ReasonerError::Local {
+                message: "claude binary not found".into(),
+            },
+        );
+        let until = chrono::Utc::now() + chrono::Duration::minutes(20);
+        let latched = LaneAvailability::AllLatched(vec![("claude".into(), Some(until))]);
 
-        let arm = body.find("Err(err) => {").expect("the build error arm");
-        let tail = &body[arm..];
-        let classify = tail.find("held_for_no_provider(").expect("must classify");
-        let record = tail.find("record_reasoner_error(").expect("must record real faults");
+        // The only combination that holds.
+        let held = build_failure_hold(&chain_err, &latched).expect("a confirmed pause holds");
+        assert!(!held.billed, "a hold must never charge the daily cap");
+        assert!(held.is_idle(), "and must end the tick");
         assert!(
-            classify < record,
-            "classify before recording, or a quota pause is charged as an attempt"
+            held.message.contains("claude") && held.message.contains("unbilled"),
+            "it must name who is latched and what it cost: {}",
+            held.message
         );
+
+        // Everything else falls through to the normal failure handling, which
+        // is what records the attempt.
         assert!(
-            tail[classify..record].contains("no_provider_message("),
-            "the hold must name who is latched and until when, not echo the \
-             fallback layer's text"
+            build_failure_hold(&real_fault, &latched).is_none(),
+            "a local fault is not a pause even while the chain is latched"
         );
+        for lane in [
+            LaneAvailability::Available,
+            LaneAvailability::NoEligibleProvider,
+            LaneAvailability::AllLatched(vec![]),
+        ] {
+            let holds = build_failure_hold(&chain_err, &lane).is_some();
+            assert_eq!(
+                holds,
+                matches!(lane, LaneAvailability::AllLatched(_)),
+                "only a confirmed all-latched chain is a pause: {lane:?}"
+            );
+        }
     }
 
     /// Codex, system pass: "every eligible provider is on cooldown" and "no
