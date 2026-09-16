@@ -1290,14 +1290,20 @@ async fn merge_sweep(repo_root: &Path) -> usize {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         let head_sha = row
-            .pointer("/headRefOid")
+            .get("headRefOid")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
         let candidate = SweepCandidate {
             pr,
             issue,
             ours: head_is_ours(row, owner.as_deref()),
-            loop_authored: loop_authored(body, issue, pr, opened_pr_for(&opened, issue)),
+            loop_authored: loop_authored(
+                body,
+                issue,
+                pr,
+                head_sha.as_deref(),
+                opened_pr_for(&opened, issue).as_ref(),
+            ),
             mergeable: match row.get("mergeable").and_then(serde_json::Value::as_str) {
                 Some("MERGEABLE") => Some(true),
                 Some("CONFLICTING") => Some(false),
@@ -1434,10 +1440,22 @@ fn opened_prs_path() -> PathBuf {
         .join(".local/state/augmentagent/autopr-opened-prs.json")
 }
 
-/// Record that the loop opened `pr` for `issue`.
-fn record_opened_pr(path: &Path, issue: u64, pr: u64) {
+/// What the loop recorded when it opened a PR: which PR, and the head its
+/// independent reviews actually covered.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct OpenedPr {
+    pr: u64,
+    /// The commit the codex passes reviewed. Codex on this PR: approvals
+    /// recorded in a body are approvals of the code as it WAS. A commit pushed
+    /// to the draft afterwards keeps the body text while changing what would
+    /// merge, so the sweep must compare this against the current head.
+    head: String,
+}
+
+/// Record that the loop opened `pr` for `issue`, at reviewed head `head`.
+fn record_opened_pr(path: &Path, issue: u64, pr: u64, head: &str) {
     let mut map = read_opened_prs(path);
-    map.insert(issue.to_string(), pr);
+    map.insert(issue.to_string(), OpenedPr { pr, head: head.to_string() });
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -1449,16 +1467,16 @@ fn record_opened_pr(path: &Path, issue: u64, pr: u64) {
     }
 }
 
-fn read_opened_prs(path: &Path) -> std::collections::BTreeMap<String, u64> {
+fn read_opened_prs(path: &Path) -> std::collections::BTreeMap<String, OpenedPr> {
     std::fs::read(path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
-/// The PR this box opened for `issue`, if any.
-fn opened_pr_for(path: &Path, issue: u64) -> Option<u64> {
-    read_opened_prs(path).get(&issue.to_string()).copied()
+/// What this box opened for `issue`, if anything.
+fn opened_pr_for(path: &Path, issue: u64) -> Option<OpenedPr> {
+    read_opened_prs(path).get(&issue.to_string()).cloned()
 }
 
 /// #1029 — the loop's own signature on a PR body, and the only evidence that
@@ -1480,8 +1498,23 @@ const SELF_IMPROVE_BODY_MARKER: &str = "Automated self-improvement for #";
 /// The body signature stays as a second, cheap check: it catches a stale
 /// recording pointing at a PR that was closed and its number reused by a human
 /// one, which the number alone would not.
-fn loop_authored(body: &str, issue: u64, pr: u64, opened_here: Option<u64>) -> bool {
-    opened_here == Some(pr) && body.contains(&format!("{SELF_IMPROVE_BODY_MARKER}{issue}."))
+fn loop_authored(
+    body: &str,
+    issue: u64,
+    pr: u64,
+    head: Option<&str>,
+    opened_here: Option<&OpenedPr>,
+) -> bool {
+    let Some(rec) = opened_here else {
+        return false;
+    };
+    // The reviews recorded in the body approved the code at `rec.head`. A
+    // commit pushed since then keeps the body and changes what merges, so an
+    // unknown or moved head is not something the loop can vouch for.
+    let head_matches = head.is_some_and(|h| !h.is_empty() && h == rec.head);
+    rec.pr == pr
+        && head_matches
+        && body.contains(&format!("{SELF_IMPROVE_BODY_MARKER}{issue}."))
 }
 
 /// #1029 — every input the auto-merge decision takes, in one place.
@@ -6551,11 +6584,6 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         )));
     }
     let pr_number = pr_url.rsplit('/').next().and_then(|n| n.parse::<u64>().ok());
-    // #1029 — bind this PR to this box, so the merge sweep can later tell its
-    // own artefact from one that merely looks like it.
-    if let Some(n) = pr_number {
-        record_opened_pr(&opened_prs_path(), issue.number, n);
-    }
 
     // #1032 C7 — the PR exists now, so CodeRabbit's state is finally a real
     // question rather than one about a PR that has not been created. One read,
@@ -6585,6 +6613,12 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         .unwrap_or_default(),
         None => String::new(),
     };
+
+    // #1029 — bind this PR to this box, so the merge sweep can later tell its
+    // own artefact from one that merely looks like it.
+    if let Some(n) = pr_number {
+        record_opened_pr(&opened_prs_path(), issue.number, n, &head_sha);
+    }
     if pr_number.is_none() {
         // Codex, system pass: with no parseable PR number the CodeRabbit read
         // was skipped silently while the merge still went ahead on the branch
@@ -11012,25 +11046,44 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn same_repository_is_not_the_same_as_loop_authored() {
         let signed = "Automated self-improvement for #1007.\n\n## Summary";
-        assert!(loop_authored(signed, 1007, 1020, Some(1020)));
+        let rec = OpenedPr { pr: 1020, head: "aaaa111".into() };
+        assert!(loop_authored(signed, 1007, 1020, Some("aaaa111"), Some(&rec)));
+
+        // Codex: the approvals in a body approved the code as it WAS. A commit
+        // pushed to the draft afterwards keeps the body text while changing
+        // what would merge — so a moved head means neither codex pass has seen
+        // what the sweep is about to merge.
+        assert!(
+            !loop_authored(signed, 1007, 1020, Some("bbbb222"), Some(&rec)),
+            "a head that moved since the reviews must not merge on them"
+        );
+        assert!(
+            !loop_authored(signed, 1007, 1020, None, Some(&rec)),
+            "an unknown head is not something the loop can vouch for"
+        );
+        assert!(!loop_authored(signed, 1007, 1020, Some(""), Some(&rec)));
 
         // Codex, three rounds, and right each time. A body string is
         // FORGEABLE. An attempt record only proves this box WORKED the issue,
         // so a prior failed attempt plus a hand-made draft carrying the marker
         // would have passed. Provenance has to bind to the artefact.
         assert!(
-            !loop_authored(signed, 1007, 1020, None),
+            !loop_authored(signed, 1007, 1020, Some("aaaa111"), None),
             "no recorded PR: the loop never opened this"
         );
+        let other = OpenedPr { pr: 1019, head: "aaaa111".into() };
         assert!(
-            !loop_authored(signed, 1007, 1020, Some(1019)),
+            !loop_authored(signed, 1007, 1020, Some("aaaa111"), Some(&other)),
             "the loop opened a DIFFERENT PR for this issue; this one is not its work"
         );
         // Signature still required, so a stale recording whose number was
         // reused by a human PR does not pass either.
-        assert!(!loop_authored("Fixes #1007 by hand.", 1007, 1020, Some(1020)));
-        assert!(!loop_authored("Automated self-improvement for #999.", 1007, 1020, Some(1020)));
-        assert!(!loop_authored("", 1007, 1020, Some(1020)));
+        assert!(!loop_authored("Fixes #1007 by hand.", 1007, 1020, Some("aaaa111"), Some(&rec)));
+        assert!(!loop_authored(
+            "Automated self-improvement for #999.",
+            1007, 1020, Some("aaaa111"), Some(&rec)
+        ));
+        assert!(!loop_authored("", 1007, 1020, Some("aaaa111"), Some(&rec)));
 
         // The writer must use the same constant, or the signature drifts away
         // from the check and every sweep silently stops merging.
@@ -11056,16 +11109,25 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let path = dir.path().join("nested/opened.json");
         assert_eq!(opened_pr_for(&path, 1007), None, "nothing recorded yet");
 
-        record_opened_pr(&path, 1007, 1020);
-        record_opened_pr(&path, 994, 1000);
-        assert_eq!(opened_pr_for(&path, 1007), Some(1020));
-        assert_eq!(opened_pr_for(&path, 994), Some(1000));
+        record_opened_pr(&path, 1007, 1020, "aaaa111");
+        record_opened_pr(&path, 994, 1000, "cccc333");
+        assert_eq!(
+            opened_pr_for(&path, 1007),
+            Some(OpenedPr { pr: 1020, head: "aaaa111".into() })
+        );
+        assert_eq!(
+            opened_pr_for(&path, 994),
+            Some(OpenedPr { pr: 1000, head: "cccc333".into() })
+        );
         assert_eq!(opened_pr_for(&path, 1), None);
 
         // A later PR for the same issue replaces the old: the loop closed or
         // abandoned the first, and only the current one is its work.
-        record_opened_pr(&path, 1007, 1044);
-        assert_eq!(opened_pr_for(&path, 1007), Some(1044));
+        record_opened_pr(&path, 1007, 1044, "dddd444");
+        assert_eq!(
+            opened_pr_for(&path, 1007),
+            Some(OpenedPr { pr: 1044, head: "dddd444".into() })
+        );
 
         // A corrupt file reads as "nothing recorded", never as a match — the
         // failure direction has to be "do not merge".
