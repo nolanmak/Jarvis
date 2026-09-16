@@ -1199,6 +1199,7 @@ fn held_for_no_provider(err: &anyhow::Error) -> Option<String> {
 fn no_provider_message(
     class: &str,
     latched: &[(String, Option<chrono::DateTime<chrono::Utc>>)],
+    spent: SpentBeforeHold,
 ) -> String {
     let who = if latched.is_empty() {
         "no eligible provider".to_string()
@@ -1213,9 +1214,39 @@ fn no_provider_message(
             .join(", ")
     };
     format!(
-        "no provider can serve a {class} call right now: {who}. Nothing was \
-         spent; the next tick retries."
+        "no provider can serve a {class} call right now: {who}. {}; the next \
+         tick retries.",
+        spent.describe()
     )
+}
+
+/// What a held tick had already spent when it discovered there was nobody to
+/// serve the build lane.
+///
+/// Codex on #1030: the preflight path really has spent nothing, but a provider
+/// can latch between that check and the build call — and by then a scoping
+/// call has succeeded. Reporting both as "nothing was spent" is simply untrue
+/// of the second, and a log line that misreports cost is how cost stops being
+/// trusted. Neither is BILLED: a scoping call that yields no diff is already
+/// unbilled everywhere else in this loop (the triage path says so out loud),
+/// and the cap counts runs that produced reviewable work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpentBeforeHold {
+    /// Caught by the preflight, before any call.
+    Nothing,
+    /// The chain latched between the preflight and the build call.
+    ScopingCall,
+}
+
+impl SpentBeforeHold {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Nothing => "Nothing was spent",
+            Self::ScopingCall => {
+                "A scoping call was spent but no build ran, so this is unbilled"
+            }
+        }
+    }
 }
 
 /// Parse the scoper's `VERDICT:` / `COMPLEXITY:` header, tolerantly: the
@@ -5195,7 +5226,7 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
     if let Some(latched) = reasoner.unavailable_reason(
         augmentagent_channel_core::CapabilityClass::FullAgentic,
     ) {
-        let why = no_provider_message("FullAgentic", &latched);
+        let why = no_provider_message("FullAgentic", &latched, SpentBeforeHold::Nothing);
         info!(issue = issue.number, "auto-PR held: {why}");
         cleanup(worktree, branch, repo_root.to_path_buf()).await;
         return Ok(RunReport::held(why));
@@ -5323,8 +5354,10 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 let why = match reasoner.unavailable_reason(
                     augmentagent_channel_core::CapabilityClass::FullAgentic,
                 ) {
-                    Some(latched) => no_provider_message("FullAgentic", &latched),
-                    None => no_provider_message("FullAgentic", &[]),
+                    Some(latched) => {
+                        no_provider_message("FullAgentic", &latched, SpentBeforeHold::ScopingCall)
+                    }
+                    None => no_provider_message("FullAgentic", &[], SpentBeforeHold::ScopingCall),
                 };
                 info!(issue = issue.number, "auto-PR held: {why}");
                 cleanup(worktree, branch, repo_root.to_path_buf()).await;
@@ -10456,6 +10489,7 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let msg = no_provider_message(
             "FullAgentic",
             &[("claude".to_string(), Some(until)), ("codex".to_string(), None)],
+            SpentBeforeHold::Nothing,
         );
         assert!(msg.contains("claude") && msg.contains("codex"), "{msg}");
         assert!(msg.contains("FullAgentic"), "{msg}");
@@ -10465,6 +10499,17 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         );
         // A provider latched with no known reset still has to appear.
         assert!(msg.to_lowercase().contains("unknown") || msg.contains("codex"), "{msg}");
+        assert!(msg.contains("Nothing was spent"), "{msg}");
+
+        // Codex on this PR: the race path HAS spent a scoping call, and saying
+        // "nothing was spent" there is simply untrue. A log line that
+        // misreports cost is how cost stops being trusted.
+        let raced = no_provider_message("FullAgentic", &[], SpentBeforeHold::ScopingCall);
+        assert!(
+            raced.contains("scoping call was spent") && raced.contains("unbilled"),
+            "the race path must report what it actually spent: {raced}"
+        );
+        assert!(!raced.contains("Nothing was spent"), "{raced}");
     }
 
     /// Codex on this PR: a provider can become latched BETWEEN the preflight
