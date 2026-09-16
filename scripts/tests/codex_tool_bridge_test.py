@@ -2158,6 +2158,7 @@ class ReadAllowanceTests(unittest.TestCase):
     named directory, one pattern-matched leaf. The directory is world-writable
     in production, so the leaf must be a private, unshared regular file owned by
     this process's user. A synthetic directory stands in for /tmp here.
+    The daemon writes attachments under umask 0002 (0664, its own group).
     """
     PATTERN = r'aa-(txt|img|doc)-[0-9]+-[0-9]+\.[a-zA-Z0-9]+'
 
@@ -2258,37 +2259,62 @@ class ReadAllowanceTests(unittest.TestCase):
         ]:
             with self.subTest(path=path):
                 self.assertDeniedRead(path)
+        # A one-segment name pattern (the iMessage session dir's) also fits `.` and `..`.
+        session = self.make_policy([self.allowance(pattern=r'[A-Za-z0-9._-]+')])
+        self.assertEqual(session.read(str(self.attachment)), 'SYNTHETIC_ATTACHMENT')
+        for path in (inbox + '/..', inbox + '/.', inbox + '/../outside.txt', inbox + '/nested/aa-txt-7-0.md'):
+            with self.subTest(path=path):
+                self.assertDeniedRead(path, session)
 
     def test_allowance_refuses_planted_links_and_shared_or_special_files(self):
         import os
         os.symlink(self.outside, self.inbox / 'aa-txt-8-0.md')
         os.symlink(self.attachment, self.inbox / 'aa-txt-8-1.md')
         os.link(self.outside, self.inbox / 'aa-txt-9-0.md')
-        self.private(self.inbox / 'aa-txt-10-0.md', 'SYNTHETIC_SHARED').chmod(0o620)
-        self.private(self.inbox / 'aa-txt-10-1.md', 'SYNTHETIC_SHARED').chmod(0o602)
+        self.private(self.inbox / 'aa-txt-10-1.md', 'SYNTHETIC_SHARED').chmod(0o666)
+        self.private(self.inbox / 'aa-txt-10-2.md', 'SYNTHETIC_SHARED').chmod(0o602)
         os.mkfifo(self.inbox / 'aa-txt-11-0.md', 0o600)
         (self.inbox / 'aa-txt-12-0.md').mkdir()
-        for name in ('aa-txt-8-0.md', 'aa-txt-8-1.md', 'aa-txt-9-0.md', 'aa-txt-10-0.md',
-                     'aa-txt-10-1.md', 'aa-txt-11-0.md', 'aa-txt-12-0.md', 'aa-txt-13-0.md'):
+        names = ['aa-txt-8-0.md', 'aa-txt-8-1.md', 'aa-txt-9-0.md', 'aa-txt-10-1.md', 'aa-txt-10-2.md',
+                 'aa-txt-11-0.md', 'aa-txt-12-0.md', 'aa-txt-13-0.md']
+        # Group write through a group other than the daemon's own.
+        other_groups = [group for group in os.getgroups() if group != os.getgid()]
+        if other_groups:
+            shared = self.private(self.inbox / 'aa-txt-10-0.md', 'SYNTHETIC_SHARED')
+            os.chown(shared, -1, other_groups[0])
+            shared.chmod(0o660)
+            names.append(shared.name)
+        for name in names:
             with self.subTest(name=name):
                 self.assertDeniedRead(self.inbox / name)
         # The hard-linked inode is refused even though the model reached it by an allowed name.
         self.assertEqual(os.stat(self.outside).st_nlink, 2)
 
+    def test_daemon_umask_attachment_is_readable(self):
+        # umask 0002: the daemon's own attachments are 0664 in its primary group.
+        self.attachment.chmod(0o664)
+        self.assertEqual(bridge.Server(self.policy).call('Read', {'file_path': str(self.attachment)}),
+                         'SYNTHETIC_ATTACHMENT')
+
     def test_allowance_refuses_files_owned_by_another_user(self):
         import os
         import stat
-        uid = os.getuid()
-        def info(mode=stat.S_IFREG | 0o600, links=1, owner=uid):
-            return os.stat_result((mode, 1, 1, links, owner, 0, 5, 0, 0, 0))
-        self.assertTrue(bridge.allowance_file_permitted(info(), uid))
-        self.assertFalse(bridge.allowance_file_permitted(info(owner=uid + 1), uid), 'foreign owner')
-        self.assertFalse(bridge.allowance_file_permitted(info(owner=0), uid), 'root-owned')
-        self.assertFalse(bridge.allowance_file_permitted(info(mode=stat.S_IFREG | 0o620), uid), 'group-writable')
-        self.assertFalse(bridge.allowance_file_permitted(info(mode=stat.S_IFREG | 0o602), uid), 'world-writable')
-        self.assertFalse(bridge.allowance_file_permitted(info(links=2), uid), 'hard link')
-        self.assertFalse(bridge.allowance_file_permitted(info(mode=stat.S_IFLNK | 0o777), uid), 'symlink')
-        self.assertFalse(bridge.allowance_file_permitted(info(mode=stat.S_IFDIR | 0o700), uid), 'directory')
+        uid, gid = os.getuid(), os.getgid()
+        def info(mode=stat.S_IFREG | 0o600, links=1, owner=uid, group=gid):
+            return os.stat_result((mode, 1, 1, links, owner, group, 5, 0, 0, 0))
+        def permitted(metadata):
+            return bridge.allowance_file_permitted(metadata, uid, gid)
+        self.assertTrue(permitted(info()))
+        self.assertTrue(permitted(info(mode=stat.S_IFREG | 0o664)), 'daemon umask 0002, own group')
+        self.assertFalse(permitted(info(owner=uid + 1)), 'foreign owner')
+        self.assertFalse(permitted(info(owner=uid + 1, mode=stat.S_IFREG | 0o644)), 'foreign owner, not writable')
+        self.assertFalse(permitted(info(owner=0)), 'root-owned')
+        self.assertFalse(permitted(info(mode=stat.S_IFREG | 0o660, group=gid + 1)), 'writable by another group')
+        self.assertFalse(permitted(info(mode=stat.S_IFREG | 0o602)), 'world-writable')
+        self.assertFalse(permitted(info(mode=stat.S_IFREG | 0o666)), 'world-writable, own group')
+        self.assertFalse(permitted(info(links=2)), 'hard link')
+        self.assertFalse(permitted(info(mode=stat.S_IFLNK | 0o777)), 'symlink')
+        self.assertFalse(permitted(info(mode=stat.S_IFDIR | 0o700)), 'directory')
         # End to end with a real file another user owns, when the host has one.
         system = Path('/etc/hostname')
         try:

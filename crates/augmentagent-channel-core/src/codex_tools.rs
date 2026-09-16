@@ -45,7 +45,8 @@ pub const PORTABLE_NAME: &str = r"[A-Za-z0-9._-]+";
 
 /// Read, and only Read, of a file directly inside `directory` whose whole name
 /// matches `name_pattern`. The bridge opens the directory without following
-/// symlinks and requires a private regular file owned by the daemon's user.
+/// symlinks and requires a single-link regular file owned by the daemon's user
+/// that no other user can write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadAllowance {
     pub directory: PathBuf,

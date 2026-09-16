@@ -134,8 +134,10 @@ runs the scope guard on Read, which is exactly when Claude has them. Because
 opens every directory component with `O_NOFOLLOW`. The directory must belong to
 root or the daemon user and must not be writable by others unless it is sticky.
 The leaf is opened with `O_NOFOLLOW` and must be a single-link regular file
-(`verify_regular_private_file`), owned by the daemon user and not group- or
-world-writable. The guard cannot see owners or link counts, so for planted
+(`verify_regular_private_file`) owned by the daemon user. It must not be
+world-writable, and group write is accepted only through the daemon's own
+primary group: the unit runs with `UMask=0002`, so every attachment the daemon
+writes is 0664. The guard cannot see owners or link counts, so for planted
 hostile files the bridge is stricter. For files the daemon writes, both decide
 alike.
 

@@ -594,13 +594,14 @@ impl Drop for QueryAttachmentFiles {
 /// query preset's environment. Codex: the packaged bridge with the query preset's
 /// policy (which also runs that guard). Every probe must get the same decision
 /// from both, and the expected one. Files live where the daemon writes them
-/// (`/tmp`, `/tmp/aa-imsg/<session>`), uniquely named and removed afterwards.
+/// (`/tmp`, `/tmp/aa-imsg/<session>`), with the mode its umask 0002 gives them
+/// (0664), uniquely named and removed afterwards.
 #[test]
 fn query_attachments_read_identically_under_claude_guard_and_codex_bridge() {
     use augmentagent_channel_core::{reasoner::*, codex_tools::BridgeLaunch};
     use serde_json::{json, Value};
     use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     use std::process::{Command, Stdio};
     if rerun_with_query_attachment_features("query_attachments_read_identically_under_claude_guard_and_codex_bridge") {
         return;
@@ -618,10 +619,12 @@ fn query_attachments_read_identically_under_claude_guard_and_codex_bridge() {
     let session = PathBuf::from(env_value(&opts, "AUGMENTAGENT_IMESSAGE_TMP_DIR").expect("session dir minted"));
     let transcripts = PathBuf::from(env_value(&opts, "AUGMENTAGENT_TRANSCRIPTS_DIR").unwrap());
 
-    let private_file = |path: &Path, text: &str| {
+    // As the daemon writes them: its unit runs with UMask=0002.
+    let daemon_file = |path: &Path, text: &str| {
         let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
             .unwrap_or_else(|error| panic!("create {}: {error}", path.display()));
         file.write_all(text.as_bytes()).unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o664)).unwrap();
     };
     let unique = format!("{}{:09}", std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos());
@@ -633,7 +636,7 @@ fn query_attachments_read_identically_under_claude_guard_and_codex_bridge() {
     for (file, text) in [(&discord_txt, "SYNTHETIC_DISCORD_TEXT\n"), (&discord_doc, "SYNTHETIC_DISCORD_DOCUMENT\n"),
                          (&tmp_sibling, "SYNTHETIC_OUTSIDE_SCOPE")] {
         cleanup.files.push(file.clone());
-        private_file(file, text);
+        daemon_file(file, text);
     }
     let mut dirs = std::fs::DirBuilder::new();
     dirs.mode(0o700);
@@ -646,14 +649,14 @@ fn query_attachments_read_identically_under_claude_guard_and_codex_bridge() {
         cleanup.dirs.push(dir.clone());
     }
     let imessage = session.join("9-note-3fa2b1c0.txt");
-    private_file(&imessage, "SYNTHETIC_IMESSAGE_ATTACHMENT\n");
-    private_file(&other_session.join("9-note-3fa2b1c0.txt"), "SYNTHETIC_OUTSIDE_SCOPE");
+    daemon_file(&imessage, "SYNTHETIC_IMESSAGE_ATTACHMENT\n");
+    daemon_file(&other_session.join("9-note-3fa2b1c0.txt"), "SYNTHETIC_OUTSIDE_SCOPE");
     std::fs::create_dir(session.join("nested")).unwrap();
-    private_file(&session.join("nested/9-note.txt"), "SYNTHETIC_OUTSIDE_SCOPE");
-    private_file(&wiki.join("people/sample.md"), "SYNTHETIC_WIKI_PAGE\n");
-    private_file(&transcripts.join("meeting.md"), "SYNTHETIC_TRANSCRIPT\n");
+    daemon_file(&session.join("nested/9-note.txt"), "SYNTHETIC_OUTSIDE_SCOPE");
+    daemon_file(&wiki.join("people/sample.md"), "SYNTHETIC_WIKI_PAGE\n");
+    daemon_file(&transcripts.join("meeting.md"), "SYNTHETIC_TRANSCRIPT\n");
     let outside = fixture.path().join("outside.txt");
-    private_file(&outside, "SYNTHETIC_OUTSIDE_SCOPE");
+    daemon_file(&outside, "SYNTHETIC_OUTSIDE_SCOPE");
 
     let path = |p: &Path| p.display().to_string();
     // (label, tool, arguments, readable, expected text)
