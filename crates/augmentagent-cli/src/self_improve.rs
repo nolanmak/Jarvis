@@ -3836,8 +3836,9 @@ fn rabbit_merge_note(review: &RabbitReview) -> String {
         return "CodeRabbit: reviewed this head, nothing actionable.".to_string();
     }
     format!(
-        "CodeRabbit: advisory, not waited for ({}).",
-        if review.note.is_empty() { "no review" } else { &review.note }
+        "CodeRabbit: advisory and not waited for — at merge time, {}. It \
+         reviews the merged commit; anything it finds becomes a follow-up.",
+        if review.note.is_empty() { "no review of this head" } else { &review.note }
     )
 }
 
@@ -6032,6 +6033,21 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
                 "issue #{}: PR opened, auto-merge withheld — {why} {pr_url}",
                 issue.number
             )));
+        }
+        // Not blocking, so this merge is going ahead. Replace the placeholder
+        // policy line with what the read actually found, so the body records
+        // CodeRabbit's state AT MERGE TIME rather than the same sentence
+        // whether it was silent, rate-limited, or had reviewed and found
+        // nothing. Best-effort: a failed edit must never hold up a merge the
+        // gate and two reviewers already approved.
+        let observed = pr_body.replace(RABBIT_NOT_WAITED_FOR, &rabbit_merge_note(&rabbit));
+        if observed != pr_body {
+            let _ = run(
+                &gh,
+                &["pr", "edit", &n.to_string(), "--body", &observed],
+                repo_root,
+            )
+            .await;
         }
     }
 
@@ -11351,6 +11367,15 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(
             !body[create..merge].contains("wait_for_rabbit("),
             "the fresh path must not poll for a review"
+        );
+
+        // A SUCCESSFUL merge must record the observed state too, or every
+        // merge carries the same sentence whether CodeRabbit was silent,
+        // rate-limited, or had reviewed and found nothing.
+        assert!(
+            body[read..merge].contains("rabbit_merge_note(&rabbit)")
+                && body[read..merge].contains(r#""pr", "edit""#),
+            "the non-blocking path must write what the read found into the body"
         );
     }
 
