@@ -40,3 +40,5 @@ jobs:
           JARVIS_TEST_VM_CONFIG: ""
           JARVIS_TEST_LIVE_DISCOVERY: ""
         run: python3 -m unittest discover -s tests -p '*_test.py' -v
+      - name: Test the PR verification gate's bridge-suite receipt rule
+        run: bash scripts/tests/agent-pr-verify-gate.test.sh
