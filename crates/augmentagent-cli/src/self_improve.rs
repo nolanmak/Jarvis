@@ -1262,9 +1262,10 @@ async fn merge_sweep(repo_root: &Path) -> usize {
         return 0;
     };
     let owner = repo_owner_from_remote(repo_root).await;
-    // This box's own record of what it has worked on. Read once: it is the
-    // half of provenance that cannot be forged from GitHub.
-    let history = AttemptHistory::load(&attempt_history_path());
+    // This box's own record of the PRs it opened. The half of provenance that
+    // cannot be produced from GitHub, and the half that binds to a specific
+    // pull request rather than to a shape.
+    let opened = opened_prs_path();
     let mut merged = 0usize;
 
     for row in rows {
@@ -1296,7 +1297,7 @@ async fn merge_sweep(repo_root: &Path) -> usize {
             pr,
             issue,
             ours: head_is_ours(row, owner.as_deref()),
-            loop_authored: loop_authored(body, issue, history.digest(issue).is_some()),
+            loop_authored: loop_authored(body, issue, pr, opened_pr_for(&opened, issue)),
             mergeable: match row.get("mergeable").and_then(serde_json::Value::as_str) {
                 Some("MERGEABLE") => Some(true),
                 Some("CONFLICTING") => Some(false),
@@ -1411,6 +1412,55 @@ async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
     }))
 }
 
+/// #1029 — where this box records the pull requests the loop itself opened.
+///
+/// Codex, correctly, across three rounds: a body marker is forgeable and an
+/// attempt record only proves the daemon WORKED an issue, not that it opened a
+/// given PR. A prior failed attempt plus a hand-made `agent-fix/issue-N` draft
+/// carrying the marker would have satisfied both.
+///
+/// This binds the record to the artefact: the loop writes the PR number when
+/// it creates one, so the sweep can ask "did I open exactly this PR?" rather
+/// than "does this look like something I would open?".
+fn opened_prs_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AUGMENTAGENT_AUTOPR_OPENED_FILE") {
+        if !p.trim().is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local/state/augmentagent/autopr-opened-prs.json")
+}
+
+/// Record that the loop opened `pr` for `issue`.
+fn record_opened_pr(path: &Path, issue: u64, pr: u64) {
+    let mut map = read_opened_prs(path);
+    map.insert(issue.to_string(), pr);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(&map) {
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &json).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+fn read_opened_prs(path: &Path) -> std::collections::BTreeMap<String, u64> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// The PR this box opened for `issue`, if any.
+fn opened_pr_for(path: &Path, issue: u64) -> Option<u64> {
+    read_opened_prs(path).get(&issue.to_string()).copied()
+}
+
 /// #1029 — the loop's own signature on a PR body, and the only evidence that
 /// the loop actually opened a pull request.
 ///
@@ -1421,20 +1471,17 @@ async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
 /// familiar.
 const SELF_IMPROVE_BODY_MARKER: &str = "Automated self-improvement for #";
 
-/// Did the LOOP open this pull request, for this issue?
+/// Did the LOOP open THIS pull request, for this issue?
 ///
-/// Two independent pieces of evidence, because neither alone is proof:
+/// The binding one. `opened_here` is the PR number this box recorded when it
+/// created a PR for `issue`, so a match is the loop recognising its own
+/// artefact — not a shape it might have produced.
 ///
-/// - the signature on the PR body, which anyone with write access could type;
-/// - a record in this box's own attempt history, which they could not — it
-///   lives in the daemon state directory and is written only when the loop
-///   actually worked the issue.
-///
-/// Codex was right that a body string is forgeable. The local record is the
-/// part that is not, and requiring both means a human would have to both
-/// impersonate the format AND have this daemon have worked the same issue.
-fn loop_authored(body: &str, issue: u64, attempted_here: bool) -> bool {
-    attempted_here && body.contains(&format!("{SELF_IMPROVE_BODY_MARKER}{issue}."))
+/// The body signature stays as a second, cheap check: it catches a stale
+/// recording pointing at a PR that was closed and its number reused by a human
+/// one, which the number alone would not.
+fn loop_authored(body: &str, issue: u64, pr: u64, opened_here: Option<u64>) -> bool {
+    opened_here == Some(pr) && body.contains(&format!("{SELF_IMPROVE_BODY_MARKER}{issue}."))
 }
 
 /// #1029 — every input the auto-merge decision takes, in one place.
@@ -6504,6 +6551,11 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         )));
     }
     let pr_number = pr_url.rsplit('/').next().and_then(|n| n.parse::<u64>().ok());
+    // #1029 — bind this PR to this box, so the merge sweep can later tell its
+    // own artefact from one that merely looks like it.
+    if let Some(n) = pr_number {
+        record_opened_pr(&opened_prs_path(), issue.number, n);
+    }
 
     // #1032 C7 — the PR exists now, so CodeRabbit's state is finally a real
     // question rather than one about a PR that has not been created. One read,
@@ -10960,21 +11012,25 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
     #[test]
     fn same_repository_is_not_the_same_as_loop_authored() {
         let signed = "Automated self-improvement for #1007.\n\n## Summary";
-        assert!(loop_authored(signed, 1007, true));
+        assert!(loop_authored(signed, 1007, 1020, Some(1020)));
 
-        // Codex: a body string is FORGEABLE. Someone with write access can
-        // type the signature, so it cannot be the only evidence — this box's
-        // own attempt record is the half they cannot write.
+        // Codex, three rounds, and right each time. A body string is
+        // FORGEABLE. An attempt record only proves this box WORKED the issue,
+        // so a prior failed attempt plus a hand-made draft carrying the marker
+        // would have passed. Provenance has to bind to the artefact.
         assert!(
-            !loop_authored(signed, 1007, false),
-            "a forged signature with no local record must not pass"
+            !loop_authored(signed, 1007, 1020, None),
+            "no recorded PR: the loop never opened this"
         );
-        // And the local record alone is not enough either: the loop attempts
-        // issues it never opens a PR for.
-        assert!(!loop_authored("Fixes #1007 by hand.\n\n## Summary", 1007, true));
-        // Right shape, wrong issue: not this PR's provenance.
-        assert!(!loop_authored("Automated self-improvement for #999.", 1007, true));
-        assert!(!loop_authored("", 1007, true));
+        assert!(
+            !loop_authored(signed, 1007, 1020, Some(1019)),
+            "the loop opened a DIFFERENT PR for this issue; this one is not its work"
+        );
+        // Signature still required, so a stale recording whose number was
+        // reused by a human PR does not pass either.
+        assert!(!loop_authored("Fixes #1007 by hand.", 1007, 1020, Some(1020)));
+        assert!(!loop_authored("Automated self-improvement for #999.", 1007, 1020, Some(1020)));
+        assert!(!loop_authored("", 1007, 1020, Some(1020)));
 
         // The writer must use the same constant, or the signature drifts away
         // from the check and every sweep silently stops merging.
@@ -10984,6 +11040,37 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             src[start..start + 200].contains("SELF_IMPROVE_BODY_MARKER"),
             "the writer must use the shared marker"
         );
+        // And it must RECORD the PR it opens, or the binding never exists.
+        let run_start = src.find("pub async fn run_once(").expect("run_once");
+        let run_body = &src[run_start..run_start + src[run_start..].find("\n}\n").expect("end")];
+        assert!(
+            run_body.contains("record_opened_pr("),
+            "opening a PR must record it, or the sweep can never recognise it"
+        );
+    }
+
+    /// The recording round-trips, is scoped per issue, and never guesses.
+    #[test]
+    fn an_opened_pr_is_recorded_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/opened.json");
+        assert_eq!(opened_pr_for(&path, 1007), None, "nothing recorded yet");
+
+        record_opened_pr(&path, 1007, 1020);
+        record_opened_pr(&path, 994, 1000);
+        assert_eq!(opened_pr_for(&path, 1007), Some(1020));
+        assert_eq!(opened_pr_for(&path, 994), Some(1000));
+        assert_eq!(opened_pr_for(&path, 1), None);
+
+        // A later PR for the same issue replaces the old: the loop closed or
+        // abandoned the first, and only the current one is its work.
+        record_opened_pr(&path, 1007, 1044);
+        assert_eq!(opened_pr_for(&path, 1007), Some(1044));
+
+        // A corrupt file reads as "nothing recorded", never as a match — the
+        // failure direction has to be "do not merge".
+        std::fs::write(&path, b"not json").unwrap();
+        assert_eq!(opened_pr_for(&path, 1007), None);
     }
 
     /// Codex: I had hardcoded two of the sweep's inputs, and each one silently
