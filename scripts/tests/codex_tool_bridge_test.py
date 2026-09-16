@@ -294,6 +294,25 @@ else:
         self.assertEqual(result['exit_code'],0,result)
         self.assertIn('HOME_CONTENT_DENIED',result['stdout'])
 
+    def test_dependency_copy_preserves_links_as_data_and_rejects_nonregular_roots(self):
+        import os
+        source = Path(self.temp.name) / 'dependencies'; source.mkdir()
+        private = Path(self.temp.name) / 'private.txt'; private.write_text('SYNTHETIC_PRIVATE')
+        (source / 'link').symlink_to(private)
+        (source / 'index.js').write_text('SYNTHETIC_PACKAGE')
+        target = Path(self.temp.name) / 'copy'
+        bridge.copy_dependency_tree(source, target)
+        self.assertTrue((target / 'link').is_symlink())
+        self.assertEqual(os.readlink(target / 'link'), str(private))
+        self.assertEqual((target / 'index.js').read_text(), 'SYNTHETIC_PACKAGE')
+        self.assertEqual(private.read_text(), 'SYNTHETIC_PRIVATE')
+        root_link = Path(self.temp.name) / 'root-link'; root_link.symlink_to(source)
+        with self.assertRaises(bridge.Denied):
+            bridge.copy_dependency_tree(root_link, Path(self.temp.name) / 'invalid')
+        os.mkfifo(source / 'fifo')
+        with self.assertRaises((bridge.Denied, OSError)):
+            bridge.copy_dependency_tree(source, Path(self.temp.name) / 'fifo-copy')
+
     def test_real_cargo_can_build_and_test_a_dependency_free_fixture(self):
         import shutil
         if not shutil.which('cargo'):
@@ -307,6 +326,76 @@ else:
         self.assertEqual(outcome['exit_code'],0,outcome)
         self.assertIn('1 passed',outcome['stdout'])
         self.assertFalse((self.root/'target').exists())
+
+    @unittest.skipUnless(__import__('os').environ.get('JARVIS_TEST_VM_CONFIG'), 'requires private KVM runtime')
+    def test_vm_npm_ci_installs_local_locked_dependency_and_next_build_uses_it(self):
+        import io
+        import os
+        import tarfile
+        with tarfile.open(self.root / 'fixture.tgz', 'w:gz') as archive:
+            for name, data in {
+                'package/package.json': json.dumps({'name': 'fixture', 'version': '1.0.0',
+                    'scripts': {'install': 'node install.js'}}),
+                'package/index.js': "module.exports='SYNTHETIC_INSTALLED';",
+                'package/install.js': "require('fs').writeFileSync('installed.txt','SYNTHETIC_GUEST_INSTALL');",
+            }.items():
+                raw = data.encode(); info = tarfile.TarInfo(name); info.size = len(raw)
+                archive.addfile(info, io.BytesIO(raw))
+        (self.root / 'package.json').write_text(json.dumps({'name': 'synthetic-install', 'version': '1.0.0',
+            'dependencies': {'fixture': 'file:fixture.tgz'}, 'scripts': {'test': 'node test.js'}}))
+        (self.root / 'test.js').write_text("""const fs=require('fs');
+if(require('fixture')!=='SYNTHETIC_INSTALLED') throw new Error('old dependency');
+if(fs.readFileSync('node_modules/fixture/installed.txt','utf8')!=='SYNTHETIC_GUEST_INSTALL') throw new Error('install script missing');
+try { fs.writeFileSync('node_modules/fixture/installed.txt','MUST_NOT_WRITE'); throw new Error('writable cache'); }
+catch(error) { if(error.code!=='EROFS') throw error; }
+console.log('SYNTHETIC_INSTALL_BUILD_OK');""")
+        # Generate the local-file lock without lifecycle scripts or network.
+        locked = subprocess.run(['npm', 'install', '--package-lock-only', '--ignore-scripts', '--offline',
+            '--no-audit', '--no-fund'], cwd=self.root, capture_output=True, text=True,
+            env={'PATH': os.defpath, 'HOME': self.temp.name, 'NPM_CONFIG_USERCONFIG': '/dev/null',
+                 'NPM_CONFIG_GLOBALCONFIG': str(Path(self.temp.name) / 'empty-global-config')}, timeout=30)
+        self.assertEqual(locked.returncode, 0, locked.stderr)
+        old = self.root / 'node_modules/fixture'; old.mkdir(parents=True)
+        (old / 'index.js').write_text("module.exports='SYNTHETIC_OLD';")
+        policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+            'write_roots': [str(self.root)], 'allowed_tools': ['Read', 'Write', 'Edit', 'Bash(npm *)'],
+            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG']})
+        installed = policy.run_command('npm ci --offline --no-audit --no-fund', timeout=60)
+        self.assertEqual(installed['exit_code'], 0, installed)
+        built = policy.run_command('npm test --offline', timeout=60)
+        self.assertEqual(built['exit_code'], 0, built)
+        self.assertIn('SYNTHETIC_INSTALL_BUILD_OK', built['stdout'])
+        self.assertEqual((old / 'index.js').read_text(), "module.exports='SYNTHETIC_OLD';")
+        self.assertFalse((old / 'installed.txt').exists(), 'guest install must not mutate host dependencies')
+        owned_cache = Path(policy._node_install_cache[2].name)
+        self.assertTrue(owned_cache.exists())
+        changed = json.loads((self.root / 'package.json').read_text())
+        changed['dependencies']['fixture'] = 'file:different-fixture.tgz'
+        (self.root / 'package.json').write_text(json.dumps(changed))
+        stale = policy.run_command('npm test --offline', timeout=60)
+        self.assertNotEqual(stale['exit_code'], 0, 'changed resolution must not reuse this bridge install')
+        bridge.Server(policy).close()
+        self.assertFalse(owned_cache.exists(), 'closing the bridge must remove its private dependency copy')
+
+
+    @unittest.skipUnless(__import__('os').environ.get('JARVIS_TEST_VM_CONFIG'), 'requires private KVM runtime')
+    def test_vm_install_rejects_concurrent_manifest_edit_before_sync(self):
+        import os
+        from unittest.mock import patch
+        (self.root / 'package.json').write_text(json.dumps({'name': 'synthetic-race', 'version': '1.0.0'}))
+        policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+            'write_roots': [str(self.root)], 'allowed_tools': ['Read', 'Write', 'Bash(npm *)'],
+            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG']})
+        original_copy = bridge.BuildSnapshot.__init__
+        def concurrent_owner_edit(snapshot, *args, **kwargs):
+            original_copy(snapshot, *args, **kwargs)
+            (self.root / 'package.json').write_text(json.dumps({'name': 'synthetic-owner-edit', 'version': '2.0.0'}))
+        with patch.object(bridge.BuildSnapshot, '__init__', concurrent_owner_edit):
+            with self.assertRaisesRegex(bridge.Denied, 'manifests changed'):
+                policy.run_command('npm install --offline --no-audit --no-fund', timeout=60)
+        self.assertEqual(json.loads((self.root / 'package.json').read_text())['name'], 'synthetic-owner-edit')
+        self.assertFalse((self.root / 'package-lock.json').exists(), 'stale lock must not reach the checkout before rejection')
+        self.assertIsNone(policy._node_install_cache)
 
     @unittest.skipUnless(__import__('os').environ.get('JARVIS_TEST_VM_CONFIG'), 'requires a private VM runtime')
     def test_vm_build_dispatch_supports_loopback_dependencies_and_guarded_reconciliation(self):

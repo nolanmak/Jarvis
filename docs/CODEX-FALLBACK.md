@@ -554,3 +554,21 @@ paths, real CLI status/decision submission, concurrent lifecycle locking, stale
 and malformed decisions, private-error output, and late-result rejection. The
 Rust handoff regressions passed, and the real two-provider disconnect/reconcile/
 resume fixture passed with one observed effect throughout.
+
+
+### Writable dependency installation
+
+A new real-VM regression reproduced `npm ci` failing with EROFS because existing
+installed dependencies were mounted read-only. Installation commands now use a
+private writable copy; npm and its lifecycle scripts execute inside the guest.
+The subsequent build consumes the installed result read-only. The synthetic
+local-tarball fixture verifies the new package, its install-script output, a
+passing build, untouched host dependencies, invalidation after manifest changes,
+and removal when the bridge closes. The real-VM checks also cover cache cleanup and a concurrent owner manifest edit.
+The latter first reproduced a stale lockfile reaching the checkout before denial;
+the pre-sync manifest check now rejects it without writing that lockfile. The
+full bridge suite passed all 76 tests after these changes.
+
+This closes writable local installation and reuse within one bridge session.
+Uncached registry retrieval is still required before claiming full dependency
+provisioning or merging the complete fallback release.

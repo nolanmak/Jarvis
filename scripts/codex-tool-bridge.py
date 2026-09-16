@@ -394,6 +394,7 @@ class Policy:
                 self.hooks.append((matcher, command))
         self.read_roots = self._roots(config.get('read_roots', []))
         self.write_roots = self._roots(config.get('write_roots', []))
+        self._node_install_cache = None
         self.build_vm_config = config.get('build_vm_config')
         if self.build_vm_config:
             path = Path(self.build_vm_config)
@@ -946,12 +947,60 @@ class Policy:
                     guest.append(flag + '=' + guest_path(argument))
                 else:
                     guest.append(guest_path(value))
-            dependencies = self.node_dependency_roots() if name in ('npm', 'npx') else []
+            install = name == 'npm' and npm_subcommand(guest) in {
+                'ci', 'install', 'i', 'update', 'up', 'uninstall', 'remove', 'rm', 'rebuild'}
+            dependencies = []
+            if name in ('npm', 'npx'):
+                manifests = self.node_manifest_state()
+                if self._node_install_cache and self._node_install_cache[0] == manifests:
+                    dependencies = self._node_install_cache[1]
+                elif not install:
+                    dependencies = self.node_dependency_roots()
+                else:
+                    # An install can repair a missing or changed dependency tree;
+                    # do not require a matching linked-checkout lock first.
+                    dependencies = self.local_node_dependencies(self.cwd)
             with tempfile.TemporaryDirectory(prefix='jarvis-vm-build-') as temporary:
                 snapshot = BuildSnapshot(self, Path(temporary) / 'workspace')
+                view = Policy({'cwd': str(snapshot.root), 'read_roots': [str(snapshot.root)],
+                    'allowed_tools': ['Read']})
+                initial_manifests = view.node_manifest_state() if name in ('npm', 'npx') else None
+                if dependencies and initial_manifests != manifests:
+                    raise Denied('dependency manifests changed before build; retry')
+                if install:
+                    for relative, source in dependencies:
+                        copy_dependency_tree(source, snapshot.root / relative)
                 result = vm.run(runtime, snapshot.root, guest, {}, timeout=timeout,
-                    node_workspaces=dependencies)
+                    node_workspaces=[] if install else dependencies)
+                if initial_manifests is not None and initial_manifests != self.node_manifest_state():
+                    raise Denied('dependency manifests changed during build; retry before syncing sources')
                 snapshot.sync()
+                if install and result['exit_code'] == 0:
+                    # Never install guest-produced executables into the host
+                    # checkout. Retain this bridge's private dependency copy and
+                    # mount it read-only for subsequent build/test commands.
+                    owner = tempfile.TemporaryDirectory(prefix='jarvis-node-install-')
+                    try:
+                        roots = []
+                        for relative, source in self.local_node_dependencies(snapshot.root):
+                            destination = Path(owner.name) / relative
+                            copy_dependency_tree(source, destination)
+                            roots.append((relative, destination))
+                        installed_state = view.node_manifest_state()
+                        if installed_state != self.node_manifest_state():
+                            raise Denied('dependency manifests changed during install; retry before building')
+                        previous = self._node_install_cache
+                        # Dispatch is serial in serve(). Clear before eviction so
+                        # a cleanup error cannot leave a pointer to a deleted cache.
+                        self._node_install_cache = None
+                        if previous:
+                            previous[2].cleanup()
+                        import weakref
+                        weakref.finalize(self, owner.cleanup)
+                        self._node_install_cache = (installed_state, roots, owner)
+                    except Exception:
+                        owner.cleanup()
+                        raise
                 return result
         except vm.Unavailable as exc:
             raise Denied(str(exc)) from exc
@@ -959,6 +1008,14 @@ class Policy:
             raise
         except (OSError, ValueError, KeyError) as exc:
             raise Denied('VM runtime or source reconciliation is unavailable') from exc
+
+    def close(self):
+        if self._node_install_cache:
+            self._node_install_cache[2].cleanup()
+            self._node_install_cache = None
+
+    def node_manifest_state(self):
+        return {name: self._read_bytes(name) for name in self.dependency_manifests(self.cwd)}
 
     def node_dependency_roots(self):
         dependencies = self.local_node_dependencies(self.cwd)
@@ -1081,6 +1138,55 @@ class Policy:
             if argv == tokens or (prefix and argv[:len(tokens)] == tokens):
                 return argv
         raise Denied('command is not permitted by this profile')
+
+
+def npm_subcommand(argv):
+    """Locate npm's command while respecting leading path/workspace options."""
+    index = 1
+    while index < len(argv):
+        value = argv[index]
+        if value in ('--prefix', '--workspace', '-w', '--cache', '--userconfig', '--globalconfig'):
+            index += 2
+        elif value.startswith('-'):
+            index += 1
+        else:
+            return value
+    return None
+
+
+def copy_dependency_tree(source, destination):
+    """Copy untrusted package data without following links or copying devices.
+
+    Symlinks remain data for the guest, including npm's .bin/workspace links.
+    No host operation dereferences them. Guest execution has already terminated
+    before its dependency outputs are collected here.
+    """
+    import shutil
+    source, destination = Path(source), Path(destination)
+    if source.is_symlink() or not source.is_dir():
+        raise Denied('dependency copy requires a regular directory root')
+    count = 0
+    for _, directories, files in os.walk(source, followlinks=False):
+        count += len(directories) + len(files)
+        if count > 100000:
+            raise Denied('dependency copy exceeds entry limit')
+    total = 0
+    entries = 0
+    def copy_regular(source, target):
+        nonlocal total, entries
+        descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as reader:
+            info = os.fstat(reader.fileno())
+            total += info.st_size
+            entries += 1
+            if not stat.S_ISREG(info.st_mode) or total > 2 * 1024**3 or entries > 100000:
+                raise Denied('dependency copy exceeds limits or contains a nonregular file')
+            with open(target, 'xb') as writer:
+                shutil.copyfileobj(reader, writer, 1024 * 1024)
+            os.chmod(target, info.st_mode & 0o777)
+        return target
+    # copytree does not follow directory symlinks when symlinks=True.
+    shutil.copytree(source, destination, symlinks=True, copy_function=copy_regular)
 
 
 class BuildSnapshot:
@@ -1364,8 +1470,11 @@ class Server:
         self.discovered = False
 
     def close(self):
-        for remote in self.remotes.values():
-            remote.close()
+        try:
+            for remote in self.remotes.values():
+                remote.close()
+        finally:
+            self.policy.close()
 
     def discover(self):
         if self.discovered:

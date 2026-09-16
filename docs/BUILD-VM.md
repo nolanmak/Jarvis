@@ -51,6 +51,16 @@ The guest mounts host `/usr` read-only for compiler and Python userspace. Option
 `toolchain`, `registry` and `cargo_git` directories supply read-only Rust dependencies.
 Commands run offline. npm dependencies come from root and nested workspace
 `node_modules` directories, mounted read-only at their original relative paths.
+For npm installation commands, the bridge copies available dependencies into a
+private writable snapshot, then runs npm and lifecycle scripts only in the guest.
+Successful installations are retained privately for the bridge's lifetime and
+mounted read-only for subsequent build/test commands. Resolution-input changes
+invalidate that copy; closing the bridge removes it. Generated executables never
+replace the host checkout's installed dependencies. File copies reject devices
+and symlinked roots, preserve internal links as guest data, and limit each tree to
+100,000 entries and 2 GiB. This currently supports dependencies available from
+local package sources; fetching uncached registry packages remains a release gap.
+
 Fresh linked Git worktrees can reuse installed dependencies from their registered
 main checkout when the requested worktree has no installed dependency roots.
 Lockfile bytes and dependency declarations must match; test/build script edits
