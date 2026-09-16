@@ -21,7 +21,7 @@ Create `~/.config/augmentagent/repo-docs.json` (or under XDG_CONFIG_HOME), mode 
 }
 ```
 
-Use a genuine read-only deploy key: the local CLI cannot determine an arbitrary SSH key's server-side permissions. The provisioning check is essential. Do not reuse the general owner SSH key. Git runs with an empty inherited environment, disabled global/system configuration and hooks, no SSH agent, and only the explicitly configured identity. This limits this document-fetching path; it does not revoke credentials used by unrelated self-improvement or issue-publishing tools.
+Use a genuine read-only deploy key: the local CLI cannot determine an arbitrary SSH key's server-side permissions. The provisioning check is essential. Do not reuse the general owner SSH key. Git runs with an empty inherited environment, disabled global/system configuration and hooks, no SSH agent, and only the explicitly configured identity. The query issue helper is also restricted to the Jarvis report repository so it cannot write issues/comments in a document repository. This limits the query tools; it does not revoke credentials used by unrelated self-improvement or issue-publishing tools.
 
 ## Commands
 

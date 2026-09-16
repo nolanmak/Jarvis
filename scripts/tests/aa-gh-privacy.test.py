@@ -32,6 +32,16 @@ pathlib.Path(os.environ['TEST_SENT']).write_text(json.dumps({'args': args, 'body
                               cwd=self.root, env=self.env, input=stdin,
                               text=True, capture_output=True)
 
+    def test_issue_helper_cannot_write_to_other_repositories(self):
+        for selector in [['--repo', 'example/private-docs'], ['--repo=example/private-docs'],
+                         ['-R', 'example/private-docs'], ['-Rexample/private-docs']]:
+            result = self.invoke('create', '--title', 'Example', '--body', 'Synthetic report', *selector)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(self.result.exists())
+        result = self.invoke('comment', 'https://github.com/example/private-docs/issues/1', '--body', 'Synthetic report')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.result.exists())
+
     def test_reads_pass_through(self):
         for verb in ['list', 'view']:
             self.assertEqual(self.invoke(verb, '--json', 'body').returncode, 0)
