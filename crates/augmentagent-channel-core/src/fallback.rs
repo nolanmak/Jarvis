@@ -742,8 +742,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("operations.json");
         let mut opts = text_only_opts();
-        // Exercise the dispatch seam independently of the still-closed agentic
-        // routing gate. Production-shaped routing has its own regression.
+        // Exercise checkpoint propagation independently of capability selection.
+        // Production-shaped routing has its own regression.
         opts.handoff_path = Some(path.clone());
         let fb = FallbackReasoner::for_tests(vec![
             (ProviderKind::Claude, Arc::new(CheckpointProvider { primary:true, expected:path.clone() })),
@@ -858,6 +858,36 @@ mod tests {
         }
         assert_eq!(primary.count(), 1);
         assert_eq!(backup.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn codex_fallback_routes_each_capability_and_keeps_healthy_primary_preferred() {
+        let fixture = tempfile::tempdir().unwrap();
+        let wiki = fixture.path().join("wiki");
+        std::fs::create_dir(&wiki).unwrap();
+        let profiles = [
+            text_only_opts(),
+            crate::reasoner::draft_opts("Synthetic draft".into(), Some(wiki.clone())),
+            crate::reasoner::ingest_opts("Synthetic ingestion".into(), wiki.clone()),
+            crate::reasoner::ask_opts(wiki, fixture.path().into()),
+        ];
+        for (index, opts) in profiles.iter().enumerate() {
+            for primary_available in [true, false] {
+                let primary = if primary_available { Scripted::ok("primary") } else { Scripted::err(rate_limited) };
+                let backup = Scripted::ok("backup");
+                let latch = CooldownLatch::at(fixture.path().join(format!("{index}-{primary_available}.json")));
+                let chain = FallbackReasoner::for_tests(vec![
+                    (ProviderKind::Claude, primary.clone() as Arc<dyn Reasoner>),
+                    (ProviderKind::Codex, backup.clone() as Arc<dyn Reasoner>),
+                ], latch);
+                for _ in 0..2 {
+                    assert_eq!(chain.call_transcript(opts, "Synthetic task").await.unwrap(),
+                        if primary_available { "primary" } else { "backup" });
+                }
+                assert_eq!(primary.count(), if primary_available { 2 } else { 1 });
+                assert_eq!(backup.count(), if primary_available { 0 } else { 2 });
+            }
+        }
     }
 
     #[tokio::test]

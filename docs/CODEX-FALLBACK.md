@@ -1,9 +1,10 @@
 # Codex fallback implementation
 
 Issue #1019 requires operational parity for every Claude-backed Jarvis workflow.
-This document tracks the implementation contract. It is not a claim that agentic
-fallback is enabled: the production routing gate remains closed until the bridge,
-provider conformance tests and deployed QA pass.
+This document tracks the implementation contract. The development branch now
+permits Codex routing for text, read, write and full-agentic requests through the
+scoped bridge. This has not been deployed and is not a claim of full workflow
+parity: remaining provider conformance and operational QA still gate release.
 
 ## Execution boundary
 
@@ -199,19 +200,31 @@ test covers both. After that fix, live Codex completed Glob/Grep/Read/Write/Edit
 and `memory_recent`, with successful provider-attributed audit records. One
 earlier post-fix call initialized but did not produce the requested file; the
 test now includes the synthetic response/audit when that assertion fails.
-This live receipt does not establish automatic fallback, delivery-handler
-coverage or reliability across all output contracts.
+This direct-adapter receipt does not establish reliability across all output
+contracts; automatic fallback and handler coverage are tested separately below.
 
 The deterministic `query_handler_preserves_context_and_original_attachment_bytes`
 contract calls the real `WikiQuerier::answer` and Discord attachment preparation
 with a stubbed primary provider. It verifies the production full-agentic profile,
 scope hook, restricted environment, session context, owner rules, transcript
-capture and original binary bytes. Live Codex fallback through that handler is
-still outstanding. Outbound attachment reads now use a pinned wiki directory
+capture and original binary bytes. The live
+`live_query_fallback_delivers_original_and_skips_latched_primary` contract now
+passes through that handler with a synthetic quota-refusing primary and real
+Codex. Two successive requests preserve original PDF bytes, use scoped Read and
+the real memory MCP server, and record Codex as the serving provider. The second
+request skips the latched primary. These are local handler/delivery-preparation
+checks, not a Discord network send or deployed-daemon receipt. Outbound attachment
+reads now use a pinned wiki directory
 descriptor and reject symlinks at every subsequent path component; metadata and
 the byte cap are checked on the opened file. Tests cover swaps after marker
 validation, root replacement, oversized files and nonregular files including
 FIFOs, without reopening the validated absolute path for delivery.
+
+Routing regressions now cover all four capability classes with both a healthy
+primary and a quota-refusing primary, including a second request during cooldown.
+The previously failing production-shaped wiki-ask regression passes. The full
+core unit suite reports 379 passes and five ignored live tests with routing
+enabled; live tests are run explicitly for the receipts described above.
 
 The remaining provider conformance suite must cover:
 
@@ -291,8 +304,9 @@ cannot stand in for any tool-using profile.
 3. Add durable handoff accounting for completed and uncertain mutations. Seed the
    fallback with known progress, reconcile uncertain effects, and prevent replay.
 4. Complete the machine-checked capability manifest and provider conformance tests.
-5. Enable the capability routing matrix only after these contracts pass. Preserve
-   independent auto-ship review and all existing merge gates.
+5. Release the expanded capability routing only after these contracts pass.
+   Development routing is enabled for integration QA; preserve independent
+   auto-ship review and all existing merge gates before deployment.
 6. Verify the deployed query/delivery path and a controlled full auto-ship lifecycle,
    document rollback, merge green reviewed changes and remove task-owned worktrees.
 
