@@ -81,6 +81,7 @@ pub struct FallbackReasoner {
     /// auto-PR loop builds one reasoner per attempt, so this IS the attempt's
     /// spend and the record of which provider actually served it.
     usage: std::sync::Mutex<Vec<(&'static str, u32, u32)>>,
+    handoff_root: Option<std::path::PathBuf>,
 }
 
 /// Why `kind` cannot serve calls on this box (binary absent, no resolvable
@@ -164,6 +165,7 @@ pub fn build_reasoner() -> Arc<FallbackReasoner> {
         entries,
         latch: CooldownLatch::system(),
         usage: std::sync::Mutex::new(Vec::new()),
+        handoff_root: crate::handoff::system_root(),
     })
 }
 
@@ -184,6 +186,7 @@ pub fn build_pinned(kind: ProviderKind) -> Option<Arc<FallbackReasoner>> {
             entries: vec![entry],
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
+            handoff_root: crate::handoff::system_root(),
         })
     })
 }
@@ -199,6 +202,7 @@ impl FallbackReasoner {
             }],
             latch: CooldownLatch::system(),
             usage: std::sync::Mutex::new(Vec::new()),
+            handoff_root: crate::handoff::system_root(),
         }
     }
 
@@ -214,6 +218,7 @@ impl FallbackReasoner {
                 .collect(),
             latch,
             usage: std::sync::Mutex::new(Vec::new()),
+            handoff_root: None,
         }
     }
 
@@ -267,6 +272,14 @@ impl FallbackReasoner {
         transcript: bool,
     ) -> anyhow::Result<String> {
         let class = classify(opts);
+        let mut request_opts = opts.clone();
+        if request_opts.handoff_path.is_none() && matches!(class,
+            crate::providers::CapabilityClass::WriteTools | crate::providers::CapabilityClass::FullAgentic) {
+            if let Some(root) = &self.handoff_root {
+                request_opts.handoff_path = Some(crate::handoff::request_path(root, opts, user_message)?);
+            }
+        }
+        let opts = &request_opts;
         let primary = self.entries.first().map(|e| e.kind);
         // The PRIMARY's provider-side error is what callers must see when
         // the whole chain fails (#655 review): a trailing Local fault from a
@@ -287,10 +300,14 @@ impl FallbackReasoner {
                 continue;
             }
             self.note_call(name);
+            let resumed_message = match &opts.handoff_path {
+                Some(path) => crate::handoff::resume_message(path, user_message)?,
+                None => user_message.to_string(),
+            };
             let res = if transcript {
-                entry.reasoner.call_transcript(opts, user_message).await
+                entry.reasoner.call_transcript(opts, &resumed_message).await
             } else {
-                entry.reasoner.call(opts, user_message).await
+                entry.reasoner.call(opts, &resumed_message).await
             };
             match res {
                 Ok(text) => {
@@ -545,6 +562,43 @@ mod tests {
 
     fn latch_in(dir: &tempfile::TempDir) -> CooldownLatch {
         CooldownLatch::at(dir.path().join("cooldowns.json"))
+    }
+
+    #[tokio::test]
+    async fn fallback_receives_primary_receipts_and_same_journal() {
+        struct CheckpointProvider { primary: bool, expected: std::path::PathBuf }
+        #[async_trait]
+        impl Reasoner for CheckpointProvider {
+            async fn call(&self, opts: &ReasonerOpts, message: &str) -> anyhow::Result<String> {
+                assert_eq!(opts.handoff_path.as_ref(), Some(&self.expected));
+                if self.primary {
+                    use std::io::Write;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    assert_eq!(message, "synthetic request");
+                    let mut file = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600)
+                        .open(&self.expected)?;
+                    file.write_all(serde_json::to_string(&serde_json::json!({"version":1,"operations":[
+                        {"tool":"mcp__fixture__create","arguments":{},"status":"completed","result":"synthetic-42"}
+                    ]}))?.as_bytes())?;
+                    return Err(rate_limited());
+                }
+                assert!(message.starts_with("synthetic request"));
+                assert!(message.contains("synthetic-42"));
+                assert!(message.contains("Do not repeat"));
+                Ok("resumed with known progress".into())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.json");
+        let mut opts = text_only_opts();
+        // Exercise the dispatch seam independently of the still-closed agentic
+        // routing gate. Production-shaped routing has its own regression.
+        opts.handoff_path = Some(path.clone());
+        let fb = FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, Arc::new(CheckpointProvider { primary:true, expected:path.clone() })),
+            (ProviderKind::Codex, Arc::new(CheckpointProvider { primary:false, expected:path })),
+        ], latch_in(&dir));
+        assert_eq!(fb.call(&opts, "synthetic request").await.unwrap(), "resumed with known progress");
     }
 
     #[tokio::test]

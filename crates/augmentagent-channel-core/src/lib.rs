@@ -19,6 +19,7 @@ pub mod engagement;
 pub mod fallback;
 pub mod gemini;
 pub mod governor;
+mod handoff;
 pub mod images;
 pub mod ingest;
 pub mod mcp;

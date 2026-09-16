@@ -111,8 +111,10 @@ class HandoffJournal:
     def execute(self, name, arguments, action):
         with self.locked():
             state = self.load()
-            for row in state['operations']:
-                if row['tool'] == name and row['arguments'] == arguments and row['status'] == 'completed':
+            for row in reversed(state['operations']):
+                if row['tool'] == name and row['arguments'] == arguments:
+                    if row['status'] != 'completed':
+                        raise Denied('latest operation requires reconciliation')
                     return row['result']
             if any(row['status'] == 'started' for row in state['operations']):
                 raise Denied('uncertain operation requires reconciliation before further mutations')
@@ -124,6 +126,44 @@ class HandoffJournal:
                 row.update(status='completed', result=result)
                 self.save(state)
             return result
+
+    def observe_hook(self, event):
+        name = event.get('tool_name')
+        arguments = event.get('tool_input')
+        identifier = event.get('tool_use_id')
+        phase = event.get('hook_event_name')
+        if (not isinstance(name, str) or not isinstance(arguments, dict)
+                or not isinstance(identifier, str) or not identifier
+                or phase not in ('PreToolUse', 'PostToolUse', 'PostToolUseFailure')):
+            raise Denied('invalid primary operation event')
+        if name in ('Read', 'Glob', 'Grep', 'LS', 'WebSearch', 'WebFetch'):
+            return
+        with self.locked():
+            state = self.load()
+            matching = [row for row in state['operations'] if row.get('primary_id') == identifier]
+            if phase == 'PreToolUse':
+                if matching or any(row['status'] == 'started' for row in state['operations']):
+                    raise Denied('unfinished primary operation requires reconciliation')
+                state['operations'].append({'tool': name, 'arguments': arguments,
+                    'primary_id': identifier, 'status': 'started'})
+                self.save(state)
+                return
+            if len(matching) != 1 or matching[0]['tool'] != name or matching[0]['arguments'] != arguments:
+                raise Denied('unmatched primary result requires reconciliation')
+            row = matching[0]
+            if phase == 'PostToolUseFailure':
+                return  # failure is not evidence of absence of an effect
+            if 'tool_response' not in event:
+                raise Denied('missing primary result requires reconciliation')
+            response = event['tool_response']
+            if isinstance(response, dict) and response.get('isError'):
+                return
+            if not (isinstance(response, dict) and isinstance(response.get('content'), list)):
+                response = {'content': [{'type': 'text', 'text': json.dumps(response)}]}
+            if row['status'] == 'completed' and row['result'] != response:
+                raise Denied('conflicting primary result requires reconciliation')
+            row.update(status='completed', result=response)
+            self.save(state)
 
 
 class Policy:
@@ -953,4 +993,13 @@ def serve(config_path):
 
 if __name__ == '__main__':
     import sys
-    serve(sys.argv[1])
+    if len(sys.argv) == 3 and sys.argv[1] == '--handoff-hook':
+        try:
+            HandoffJournal(sys.argv[2]).observe_hook(json.load(sys.stdin))
+        except Exception:
+            # Claude uses exit 2 to deny PreToolUse, while ordinary script
+            # failures can be non-blocking. Never expose journal payloads here.
+            print('Handoff checkpoint unavailable or uncertain; reconciliation required.', file=sys.stderr)
+            sys.exit(2)
+    else:
+        serve(sys.argv[1])

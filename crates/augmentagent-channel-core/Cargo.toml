@@ -35,6 +35,7 @@ chrono-tz = { workspace = true }
 # #655 — provider adapters (codex/gemini) pass system prompts and per-spawn
 # settings via temp files (neither CLI takes them as an argument string).
 tempfile = "3"
+sha2 = "0.10"
 # #35 Phase 2 — Composio-backed free/busy + Drive search resolver clients.
 # Self-contained reqwest client (intentional duplication, see resolve.rs).
 reqwest = { workspace = true }

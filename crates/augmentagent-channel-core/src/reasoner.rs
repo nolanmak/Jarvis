@@ -924,7 +924,10 @@ impl ClaudeCliReasoner {
         // agent's tool surface stays exactly what we declare and never
         // picks up the host's global MCP config), and the remaining
         // settings (hooks, etc.) go to `--settings`.
-        if let Some(settings) = &opts.settings_json {
+        let handoff_hooks = crate::handoff::ClaudeHooks::prepare(opts)?;
+        let effective_settings = handoff_hooks.as_ref().map(|launch| &launch.settings_json)
+            .or(opts.settings_json.as_ref());
+        if let Some(settings) = effective_settings {
             let (settings_only, mcp_config) = split_mcp_from_settings(settings);
             if let Some(mcp_json) = mcp_config {
                 args.push("--mcp-config".into());

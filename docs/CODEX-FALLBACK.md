@@ -58,12 +58,22 @@ tool errors, block further external effects until reconciliation. Local reads
 remain fresh. Tests cover restart, ambiguous connection failure, corrupt and
 symlink state, model-scope exclusion and actual bridge receipt reuse.
 
-This is the journal foundation, not completed cross-provider handoff. Production
-dispatch does not yet assign durable request identities or populate the journal
-from Claude. Primary pre/post-tool capture, effect-aware read/reconciliation
-operations, progress context, retention and intentional repeated-action semantics
-must be integrated before enabling agentic failover. Exact argument matching does
-not identify semantically duplicate actions expressed with different arguments.
+Production dispatch now assigns private journal paths for write/agentic calls and
+forwards recorded progress to the next provider. Requests with a channel turn id
+have a stable hashed identity across restart; callers without an id get distinct
+journals and still need caller-owned restart identity. Claude receives pre-tool,
+post-tool and failed-tool hooks using the documented [hook event contract](https://code.claude.com/docs/en/hooks).
+The pre-tool hook persists started state; successful post-tool events normalize
+results for Codex. The generated command turns script startup failures into exit
+2. Tests execute that command, including quoted paths and blocking results, and
+exercise receipt forwarding through the dispatcher.
+
+This is not completed cross-provider handoff. Live primary hook conformance,
+effect-aware read/reconciliation operations, retention, caller identity coverage,
+intentional repeated-action semantics and interruption cleanup remain gates.
+Exact argument matching does not identify semantically duplicate actions expressed
+with different arguments. Hook observations do not substitute for verified
+termination of the previous provider and its descendants before handoff.
 
 ## Capability inventory
 

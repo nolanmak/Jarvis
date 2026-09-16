@@ -309,6 +309,44 @@ console.log('DEPENDENCY_FIXTURE_OK');
 
 
 class HandoffTests(unittest.TestCase):
+    def test_claude_hook_records_before_execution_and_codex_reuses_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'handoff.json'
+            event={'hook_event_name':'PreToolUse','tool_use_id':'synthetic-call-1',
+                'tool_name':'mcp__fixture__create_issue','tool_input':{'title':'Synthetic'}}
+            journal=bridge.HandoffJournal(path)
+            journal.observe_hook(event)
+            state=json.loads(path.read_text())
+            self.assertEqual(state['operations'][0]['status'],'started')
+            result={'content':[{'type':'text','text':'synthetic-issue-42'}]}
+            journal.observe_hook(dict(event,hook_event_name='PostToolUse',tool_response=result))
+            def forbidden():
+                self.fail('Codex must not repeat completed Claude operation')
+            self.assertEqual(bridge.HandoffJournal(path).execute(event['tool_name'],event['tool_input'],forbidden),result)
+
+    def test_claude_failed_tool_remains_uncertain_and_unmatched_result_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal=bridge.HandoffJournal(Path(tmp)/'handoff.json')
+            event={'hook_event_name':'PreToolUse','tool_use_id':'synthetic-call-1',
+                'tool_name':'mcp__fixture__create_issue','tool_input':{'title':'Synthetic'}}
+            with self.assertRaises(bridge.Denied):
+                journal.observe_hook(dict(event,hook_event_name='PostToolUse',tool_response='unknown'))
+            journal.observe_hook(event)
+            journal.observe_hook(dict(event,hook_event_name='PostToolUseFailure',error='synthetic error'))
+            with self.assertRaisesRegex(bridge.Denied,'reconciliation'):
+                journal.execute(event['tool_name'],event['tool_input'],lambda:None)
+
+    def test_later_uncertain_attempt_cannot_be_hidden_by_an_older_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal=bridge.HandoffJournal(Path(tmp)/'handoff.json')
+            event={'hook_event_name':'PreToolUse','tool_use_id':'synthetic-call-1',
+                'tool_name':'mcp__fixture__update','tool_input':{'value':'Synthetic'}}
+            journal.observe_hook(event)
+            journal.observe_hook(dict(event,hook_event_name='PostToolUse',tool_response='first result'))
+            journal.observe_hook(dict(event,tool_use_id='synthetic-call-2'))
+            with self.assertRaisesRegex(bridge.Denied,'reconciliation'):
+                journal.execute(event['tool_name'],event['tool_input'],lambda:None)
+
     def test_server_reuses_external_receipt_but_refreshes_local_reads(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);workspace=root/'workspace';workspace.mkdir()
