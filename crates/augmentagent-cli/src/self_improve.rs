@@ -1208,16 +1208,52 @@ async fn rabbit_blocks_merge(repo_root: &Path, pr: u64, head_sha: Option<&str>) 
     rabbit_review_now(repo_root, pr, head).await.blocks()
 }
 
-/// The GitHub login that opened an issue, for the author-eligibility gate.
-async fn issue_author(repo_root: &Path, issue: u64) -> Option<String> {
-    let (ok, out, _) = run(
+/// An issue's body and author: the two facts the merge policy needs about it.
+///
+/// One call for both. An unreadable issue yields empty strings, and both gates
+/// treat empty as disqualifying — an unknown author fails eligibility, and an
+/// unknown body is not "definitely not research-filed", it just cannot pass.
+async fn issue_facts(repo_root: &Path, issue: u64) -> (String, String) {
+    let Ok((true, out, _)) = run(
         &gh_bin(),
-        &["issue", "view", &issue.to_string(), "--json", "author", "-q", ".author.login"],
+        &["issue", "view", &issue.to_string(), "--json", "body,author"],
+        repo_root,
+    )
+    .await
+    else {
+        return (String::new(), String::new());
+    };
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or(serde_json::Value::Null);
+    (
+        v.get("body")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        v.pointer("/author/login")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// The receipt-gated path this PR's diff touches, if any (#823).
+///
+/// The same check the fresh path runs, against the same file list — read from
+/// the PR rather than from a worktree, because the sweep has neither.
+async fn pr_gated_path(repo_root: &Path, pr: u64) -> Option<String> {
+    let (ok, names, _) = run(
+        &gh_bin(),
+        &["pr", "diff", &pr.to_string(), "--name-only"],
         repo_root,
     )
     .await
     .ok()?;
-    ok.then(|| out.trim().to_string()).filter(|a| !a.is_empty())
+    if !ok {
+        // Cannot tell what it touches, so it cannot be vouched for. Naming a
+        // sentinel keeps the receipt gate engaged rather than bypassed.
+        return Some("<unreadable diff>".to_string());
+    }
+    touches_verify_gated_path(&names)
 }
 
 /// #1029 — finish work that is already approved, without spending anything.
@@ -1303,6 +1339,10 @@ async fn merge_sweep(repo_root: &Path) -> usize {
             .get("headRefOid")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        // The two gates the fresh path computes from real state.
+        let (issue_body, author) = issue_facts(repo_root, issue).await;
+        let research_filed = is_research_filed(&issue_body);
+        let gated = pr_gated_path(repo_root, pr).await;
         let candidate = SweepCandidate {
             pr,
             issue,
@@ -1333,8 +1373,14 @@ async fn merge_sweep(repo_root: &Path) -> usize {
                 complexity: complexity_from_pr_body(body),
                 codex_approved: body.matches("CODEX-REVIEW: lgtm").count() >= 2,
                 reviews_approved: true,
-                research_filed: false,
-                receipt_gated_file: None,
+                // Read, not assumed. Hardcoding these disabled two gates the
+                // fresh path enforces from real state: a research-filed issue
+                // (the daemon's own speculative proposal) and a diff touching
+                // a receipt-gated path. Sharing `may_automerge` is worth
+                // nothing if the two callers feed it different facts — which
+                // is the third time I made exactly this mistake on this PR.
+                research_filed,
+                receipt_gated_file: gated,
                 lgtm_overrides_receipt: std::env::var("AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT")
                     .ok(),
                 // The ISSUE's author, not the repo owner. Assuming the owner
@@ -1342,7 +1388,7 @@ async fn merge_sweep(repo_root: &Path) -> usize {
                 // author-eligibility gate the fresh path enforces — merging
                 // drafts for issues the fresh path would have refused. An
                 // unknown author stays empty, which that gate rejects.
-                issue_author: issue_author(repo_root, issue).await.unwrap_or_default(),
+                issue_author: author,
                 repo_owner: policy_owner.clone(),
                 automerge_authors: std::env::var("AUGMENTAGENT_AUTOPR_AUTOMERGE_AUTHORS").ok(),
             },
@@ -11298,6 +11344,37 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert_eq!(opened_pr_for(&path, 1007), None);
     }
 
+    /// Codex, a third time on the same shape: sharing `may_automerge` is
+    /// worth nothing if the two callers feed it different facts. I had
+    /// hardcoded `research_filed: false` and `receipt_gated_file: None`,
+    /// disabling two gates the fresh path enforces from real state.
+    #[test]
+    fn the_sweep_supplies_real_values_for_every_policy_gate() {
+        let src = include_str!("self_improve.rs");
+        let start = src.find("async fn merge_sweep(").expect("the sweep");
+        let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+
+        for (field, assumed) in [
+            ("research_filed", "research_filed: false"),
+            ("receipt_gated_file", "receipt_gated_file: None"),
+        ] {
+            assert!(
+                !body.contains(assumed),
+                "{field} must be read from real state, not assumed"
+            );
+        }
+        assert!(body.contains("is_research_filed("), "read the issue body");
+        assert!(body.contains("pr_gated_path("), "read what the diff touches");
+
+        // An unreadable diff must keep the receipt gate ENGAGED, not bypass it.
+        let g = src.find("async fn pr_gated_path(").expect("the gate reader");
+        let reader = &src[g..g + src[g..].find("\n}\n").expect("end")];
+        assert!(
+            reader.contains("<unreadable diff>"),
+            "an unreadable diff must name a gated path, so the gate still applies"
+        );
+    }
+
     /// Codex: I had hardcoded two of the sweep's inputs, and each one silently
     /// disabled a gate the fresh path enforces. `rabbit_blocks: false` would
     /// have merged past CodeRabbit's objections — and CodeRabbit is the only
@@ -11319,7 +11396,9 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
             !body.contains("issue_author: owner"),
             "the author gate must see the ISSUE's author, not the repo owner"
         );
-        assert!(body.contains("issue_author(repo_root"), "read the real author");
+        // The author now comes from `issue_facts`, which reads body and author
+        // in one call — both are facts about the same issue.
+        assert!(body.contains("issue_facts(repo_root"), "read the real author");
 
         // Unknown is never permissive on either.
         let f = src.find("async fn rabbit_blocks_merge(").expect("the reader");
