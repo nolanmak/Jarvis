@@ -2887,6 +2887,8 @@ async fn main() -> Result<()> {
                             allow_base_sync: false,
                             max_pages_per_poll:
                                 augmentagent_channel_journal::DEFAULT_MAX_PAGES_PER_POLL,
+                            exclude_topics:
+                                augmentagent_channel_journal::scrub::exclude_topics_from_env(),
                         },
                     );
                     let sd = shutdown.clone();
@@ -15948,6 +15950,7 @@ async fn run_journal_poll_once(
         base_sync_threshold: DEFAULT_BASE_SYNC_THRESHOLD,
         allow_base_sync,
         max_pages_per_poll: DEFAULT_MAX_PAGES_PER_POLL,
+        exclude_topics: augmentagent_channel_journal::scrub::exclude_topics_from_env(),
     };
     let reasoner = build_reasoner();
     let channel = JournalChannel::new(
@@ -15996,6 +15999,16 @@ async fn run_journal_show(date: Option<String>) -> Result<()> {
             break;
         }
     }
+    // #1055 — never show excluded topics (the password vault), and scrub
+    // whatever is shown.
+    let extra = augmentagent_channel_journal::scrub::exclude_topics_from_env();
+    let before = items.len();
+    items.retain(|e| {
+        !augmentagent_channel_journal::scrub::is_excluded_topic(e.topic.as_deref(), &extra)
+    });
+    if items.len() < before {
+        println!("(skipped {} entries in excluded topics)", before - items.len());
+    }
     let Some(entry) = pick_latest(items.iter(), date.as_deref()) else {
         println!(
             "no live entry found{}",
@@ -16008,6 +16021,10 @@ async fn run_journal_show(date: Option<String>) -> Result<()> {
         .await
         .map(|h| html::html_to_text(&h))
         .context("decrypt entry")?;
+    let (text, redactions) = augmentagent_channel_journal::scrub::scrub_secrets(&text);
+    if redactions > 0 {
+        println!("({redactions} secret-shaped values redacted)");
+    }
     println!("id:      {}", entry.id);
     println!("created: {}", entry.created_at);
     if let Some(u) = entry.updated_at.as_deref() {

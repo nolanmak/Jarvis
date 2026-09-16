@@ -71,6 +71,10 @@ pub struct JournalChannelConfig {
     /// #901 — pages fetched per `poll_once` before it yields with the
     /// cursor persisted; a bound on a server that never stops paginating.
     pub max_pages_per_poll: usize,
+    /// #1055 — additional excluded topics (env
+    /// `AUGMENTAGENT_JOURNAL_EXCLUDE_TOPICS`) on top of `scrub`'s built-ins.
+    /// Entries in an excluded topic are consumed but store zero bytes.
+    pub exclude_topics: Vec<String>,
 }
 
 /// #900 — AppSync DataStore's delta-sync TTL defaults to 30 minutes; polling
@@ -99,6 +103,9 @@ pub struct PollOutcome {
     pub ingested: usize,
     /// Rows already recorded in `journal_ingested` at this `_version`.
     pub skipped_already_ingested: usize,
+    /// #1055 — entries in an excluded topic: consumed (never retried),
+    /// zero bytes stored, never handed to ingest.
+    pub excluded_topic: usize,
     /// Rows seen but left for a later tick: `max_entries_per_poll` ran out.
     pub deferred: usize,
     /// This pass resumed a persisted in-progress cursor.
@@ -326,8 +333,12 @@ where
                     budget -= 1;
                     outcome.processed += 1;
                     match self.ingest_entry(entry).await {
-                        Ok(captured) => {
-                            if captured { outcome.ingested += 1; }
+                        Ok(disposition) => {
+                            match disposition {
+                                Disposition::Captured => outcome.ingested += 1,
+                                Disposition::Excluded => outcome.excluded_topic += 1,
+                                Disposition::Skipped => {}
+                            }
                             if !dry_run {
                                 self.store.mark_journal_ingested(owner, &entry.id, version).map_err(store_err)?;
                             }
@@ -404,9 +415,9 @@ where
 
     /// Ok(true) = counted as ingested (or would-ingest under dry-run).
     /// Errors are decrypt failures — logged by id only, never content.
-    async fn ingest_entry(&self, entry: &Entry) -> Result<bool, JournalError> {
+    async fn ingest_entry(&self, entry: &Entry) -> Result<Disposition, JournalError> {
         let Some(content) = entry.content.as_deref() else {
-            return Ok(false);
+            return Ok(Disposition::Skipped);
         };
         let html = match decrypt_entry_content(content, self.dek.as_ref()).await {
             Ok(h) => h,
@@ -416,6 +427,19 @@ where
             }
         };
         let text = html_to_text(&html);
+        // #1055 — excluded topics (the password vault): consume the entry so
+        // sync never retries it, but store ZERO bytes — no section page, no
+        // history revision, no ingest. Checked before the dry-run branch so
+        // dry runs report exclusions truthfully.
+        if crate::scrub::is_excluded_topic(entry.topic.as_deref(), &self.config.exclude_topics) {
+            info!(entry_id = %entry.id, "journal entry in excluded topic: consumed, nothing stored");
+            return Ok(Disposition::Excluded);
+        }
+        // #1055 — everything else is scrubbed before any byte is written.
+        let (text, redactions) = crate::scrub::scrub_secrets(&text);
+        if redactions > 0 {
+            info!(entry_id = %entry.id, redactions, "journal entry scrubbed before storage");
+        }
         if self.config.dry_run {
             info!(
                 entry_id = %entry.id,
@@ -423,17 +447,16 @@ where
                 chars = text.len(),
                 "dry-run: would ingest journal entry"
             );
-            return Ok(true);
+            return Ok(Disposition::Captured);
         }
         let root = self.config.wiki_root.as_ref().ok_or_else(||
             JournalError::Archive("live journal ingest requires a wiki root".into()))?;
         crate::section::write_entry(root, entry, &text)
             .map_err(|_| JournalError::Archive("durable journal write failed; checkpoint retained for retry".into()))?;
         info!(entry_id = %entry.id, "journal revision archived");
-        let captured = true;
-        if text.is_empty() { return Ok(captured); }
+        if text.is_empty() { return Ok(Disposition::Captured); }
         let (Some(root), Some(schema)) = (&self.config.wiki_root, &self.wiki_schema) else {
-            return Ok(captured);
+            return Ok(Disposition::Captured);
         };
         spawn_ingest(
             Arc::clone(&self.reasoner),
@@ -445,8 +468,19 @@ where
             None,
             IngestTrigger::Journal,
         );
-        Ok(true)
+        Ok(Disposition::Captured)
     }
+}
+
+/// What `ingest_entry` did with a live entry (#1055).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// No content — nothing to store.
+    Skipped,
+    /// Stored (section + history) and handed to ingest where configured.
+    Captured,
+    /// Excluded topic: consumed with zero bytes stored.
+    Excluded,
 }
 
 /// Same synthetic-`Email` adaptation the voice channel uses. The
@@ -690,6 +724,7 @@ mod tests {
             base_sync_threshold: opts.threshold,
             allow_base_sync: opts.allow_base_sync,
             max_pages_per_poll: opts.max_pages,
+            exclude_topics: Vec::new(),
         };
         JournalChannel::new(store, api, Arc::new(FixedDek), Arc::new(NoopReasoner), config)
     }
@@ -716,6 +751,7 @@ mod tests {
             base_sync_threshold: opts.threshold,
             allow_base_sync: opts.allow_base_sync,
             max_pages_per_poll: opts.max_pages,
+            exclude_topics: Vec::new(),
         };
         JournalChannel::new(store, api, Arc::new(FixedDek), Arc::new(NoopReasoner), config)
     }
@@ -829,6 +865,64 @@ mod tests {
         assert!(!store.journal_entry_ingested("owner-1", "broken", 3).unwrap());
         assert_eq!(store.get_journal_sync_state("owner-1").unwrap(), None);
         assert!(store.get_journal_sync_cursor("owner-1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn excluded_topic_entry_is_consumed_with_zero_bytes_stored() {
+        // #1055 — the password vault: marked ingested (never retried), but
+        // no section page, no history revision, no ingest.
+        let mut e = entry("vault1", false, Some(encrypted("<p>password: synthetic123</p>").await));
+        e.topic = Some("Passwords".into());
+        let page = EntryPage { items: vec![e], next_token: None, started_at: Some(1_751_000_000_000) };
+        let (store, _db) = fresh_store();
+        let wiki = tempfile::tempdir().unwrap();
+        let ch = channel_on_with_wiki(Arc::clone(&store), vec![page], LIVE, Some(wiki.path().to_path_buf()));
+        let outcome = ch.poll_once().await.unwrap();
+        assert_eq!(outcome.excluded_topic, 1, "{outcome:?}");
+        assert_eq!(outcome.ingested, 0, "{outcome:?}");
+        let stray = walk_files(wiki.path());
+        assert!(stray.is_empty(), "zero bytes must be stored, found {stray:?}");
+        assert!(store.journal_entry_ingested("owner-1", "vault1", 3).unwrap(), "consumed, never retried");
+    }
+
+    #[tokio::test]
+    async fn secrets_are_scrubbed_before_any_byte_is_written() {
+        let page = EntryPage {
+            items: vec![entry("e1", false, Some(encrypted("<p>note password: synthetic123 end</p>").await))],
+            next_token: None,
+            started_at: Some(1_751_000_000_000),
+        };
+        let (store, _db) = fresh_store();
+        let wiki = tempfile::tempdir().unwrap();
+        let ch = channel_on_with_wiki(Arc::clone(&store), vec![page], LIVE, Some(wiki.path().to_path_buf()));
+        let outcome = ch.poll_once().await.unwrap();
+        assert_eq!(outcome.ingested, 1, "{outcome:?}");
+        let files = walk_files(wiki.path());
+        assert!(!files.is_empty());
+        for f in &files {
+            let body = std::fs::read_to_string(f).unwrap();
+            assert!(!body.contains("synthetic123"), "unscrubbed secret in {}", f.display());
+        }
+        assert!(
+            files.iter().any(|f| std::fs::read_to_string(f).unwrap().contains("password: [redacted]")),
+            "redaction marker missing: {files:?}"
+        );
+    }
+
+    fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        fn rec(d: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            if let Ok(rd) = std::fs::read_dir(d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() { rec(&p, out); } else { out.push(p); }
+                }
+            }
+        }
+        rec(root, &mut out);
+        // the #1031 writer.lock is bookkeeping, not content
+        out.retain(|p| p.file_name().map(|n| n != "writer.lock").unwrap_or(true));
+        out
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
+regex = "1"
 
 # IAM SigV4 signing for AppSync + KMS envelope keys. The ShadowNote
 # integration deliberately uses IAM (never Cognito user auth) so the daemon

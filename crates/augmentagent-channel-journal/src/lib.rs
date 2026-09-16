@@ -35,6 +35,7 @@ pub mod config;
 pub mod crypto;
 pub mod html;
 pub mod s3;
+pub mod scrub;
 pub mod section;
 
 pub use channel::{
