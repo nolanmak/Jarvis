@@ -339,6 +339,15 @@ cannot stand in for any tool-using profile.
 
 ## Remaining integration gates
 
+Codex's production source-inspection presets have live scope/review coverage:
+a synthetic arithmetic defect yields a parseable implementation plan and
+acceptance criteria, and a constant-return patch is rejected after reading
+source and inspecting its Git diff. Source bytes remain unchanged by both
+passes. A repeatable broker test also verifies that these presets reject
+Write, Edit, Git commits and build commands. This covers the inspection stages;
+the complete auto-ship publication, merge and deployment lifecycle is still
+an outstanding gate.
+
 The shared live output-contract suite passed through both Claude and Codex:
 interval parsing, missing-timezone errors, archetype selection, newsletter
 triage and insufficient-sample tone descriptors. It also generated and executed

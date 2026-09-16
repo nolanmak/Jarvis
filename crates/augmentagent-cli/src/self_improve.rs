@@ -7729,6 +7729,97 @@ impl AutoPrLoop {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn source_inspection_presets_enforce_read_only_bridge_access() {
+        use augmentagent_channel_core::codex_tools::BridgeLaunch;
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("source");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("fixture.txt"), "SYNTHETIC_SOURCE").unwrap();
+        for opts in [scope_opts(repo.clone()), review_opts(repo.clone())] {
+            let launch = tempfile::tempdir().unwrap();
+            let bridge = BridgeLaunch::prepare(&opts, launch.path()).unwrap();
+            let script = r#"
+import json, runpy, sys
+module = runpy.run_path(sys.argv[1])
+policy = module['Policy'](json.load(open(sys.argv[2])))
+server = module['Server'](policy)
+assert 'SYNTHETIC_SOURCE' in str(server.call('Read', {'file_path': 'fixture.txt'}))
+for tool, arguments in [
+    ('Write', {'file_path': 'fixture.txt', 'content': 'UNAUTHORIZED'}),
+    ('Edit', {'file_path': 'fixture.txt', 'old_string': 'SOURCE', 'new_string': 'CHANGED'}),
+    ('Bash', {'command': 'git commit -am unauthorized'}),
+    ('Bash', {'command': 'cargo test'}),
+]:
+    try:
+        server.call(tool, arguments)
+    except module['Denied']:
+        continue
+    raise AssertionError('read-only preset admitted ' + tool)
+"#;
+            let output = std::process::Command::new("python3").args(["-I", "-c", script])
+                .arg(launch.path().join("tool-bridge.py")).arg(bridge.policy_path).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(std::fs::read_to_string(repo.join("fixture.txt")).unwrap(), "SYNTHETIC_SOURCE");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Codex login; synthetic read-only scope and rejecting review"]
+    async fn live_codex_scopes_source_and_rejects_an_incomplete_fix() {
+        use augmentagent_channel_core::{codex::CodexCliReasoner, Reasoner};
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path();
+        std::fs::create_dir(repo.join("src")).unwrap();
+        std::fs::write(repo.join("Cargo.toml"),
+            "[package]\nname=\"synthetic-scope\"\nversion=\"0.1.0\"\nedition=\"2021\"\n").unwrap();
+        let original = "pub fn add(a:i32,b:i32)->i32 { a-b }\n";
+        std::fs::write(repo.join("src/lib.rs"), original).unwrap();
+        for args in [vec!["init", "-q"], vec!["add", "."],
+            vec!["-c", "user.name=Synthetic", "-c", "user.email=fixture@example.com", "commit", "-qm", "Synthetic baseline"]] {
+            assert!(std::process::Command::new("git").current_dir(repo).args(args).status().unwrap().success());
+        }
+        let audit_dir = tempfile::tempdir().unwrap();
+        let audit = audit_dir.path().join("audit.jsonl");
+        let logger = std::sync::Arc::new(augmentagent_channel_core::tool_audit::AuditLogger::new(audit.clone()));
+        let reasoner = CodexCliReasoner::openai();
+        let mut opts = scope_opts(repo.into());
+        opts.audit_logger = Some(logger.clone());
+        let scoped = reasoner.call(&opts,
+            "Scope this synthetic repository issue: add(2,3) returns -1 instead of 5. Make addition correct for positive and negative integers in range, with regression tests. Read src/lib.rs and inspect git status first. Do not edit anything.")
+            .await.unwrap();
+        let scope = parse_scope_output(&scoped);
+        assert!(scope.fixable, "{scoped}");
+        assert!(!scope.guarded_paths, "{scoped}");
+        assert!(scope.criteria.len() >= 2, "{scoped}");
+        assert!(scope.body.contains("src/lib.rs"), "{scoped}");
+        assert_eq!(std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(), original);
+
+        // A deliberately incorrect proposed patch. The read-only reviewer must
+        // inspect the actual diff and reject it without repairing the source.
+        let incomplete = "pub fn add(_a:i32,_b:i32)->i32 { 5 }\n";
+        std::fs::write(repo.join("src/lib.rs"), incomplete).unwrap();
+        let mut opts = review_opts(repo.into());
+        opts.audit_logger = Some(logger);
+        let review = reasoner.call(&opts,
+            "Review the current uncommitted diff against this requirement: add must return the sum for positive and negative integers in range. Read the actual source and git diff. Passing the single example add(2,3)=5 is insufficient; reject missing regression coverage and incorrect behavior. Do not edit anything.")
+            .await.unwrap();
+        assert!(!parse_review_output(&review).0, "{review}");
+        assert!(review.lines().take(5).any(|line| line.trim().eq_ignore_ascii_case("REVIEW: reject")), "{review}");
+        assert_eq!(std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(), incomplete);
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(audit).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        for tool in ["Read", "Bash"] {
+            assert!(records.iter().any(|record| record["provider"] == "codex" && record["tool"] == tool
+                && record["stdout_truncated"].as_str().is_some_and(|text| !text.is_empty())), "missing {tool}");
+        }
+        assert!(records.iter().any(|record| record["tool"] == "Bash" && record["exit_code"] == 0
+            && record["args"]["command"].as_str().is_some_and(|command| command.starts_with("git diff"))
+            && record["stdout_truncated"].as_str().is_some_and(|text| text.contains("_a:i32"))),
+            "review must successfully inspect the proposed patch");
+        assert!(!records.iter().any(|record| matches!(record["tool"].as_str(), Some("Write" | "Edit"))));
+    }
+
     #[tokio::test]
     #[ignore = "requires Codex/Claude login and private build VM; synthetic builder and reviewer fixture"]
     async fn live_codex_fallback_builder_fixes_code_and_runs_red_green_tests() {

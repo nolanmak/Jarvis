@@ -357,14 +357,20 @@
       "callsite": "crates/augmentagent-cli/src/self_improve.rs::review_opts",
       "permission_profile": "source-inspect",
       "output_contract": "Review findings and acceptance grading",
-      "conformance": [],
+      "conformance": [
+        "self_improve::tests::source_inspection_presets_enforce_read_only_bridge_access",
+        "self_improve::tests::live_codex_scopes_source_and_rejects_an_incomplete_fix"
+      ],
       "provider_conformance": "pending"
     },
     {
       "callsite": "crates/augmentagent-cli/src/self_improve.rs::scope_opts",
       "permission_profile": "source-inspect",
       "output_contract": "Scope verdict, complexity, implementation plan and acceptance criteria",
-      "conformance": [],
+      "conformance": [
+        "self_improve::tests::source_inspection_presets_enforce_read_only_bridge_access",
+        "self_improve::tests::live_codex_scopes_source_and_rejects_an_incomplete_fix"
+      ],
       "provider_conformance": "pending"
     }
   ]
