@@ -6047,17 +6047,25 @@ pub async fn run_once(repo_root: &Path, dry_run: bool) -> Result<RunReport> {
         }
     };
     if pr_number.is_none() {
-        // Codex, system pass: with no parseable PR number the whole CodeRabbit
-        // read was skipped silently, while the merge below still went ahead on
-        // the branch name. Same unknown-is-not-absent mistake, third location.
-        // The merge still proceeds — advisory, per the owner directive — but
-        // it is said out loud rather than simply not happening.
+        // Codex, system pass: with no parseable PR number the CodeRabbit read
+        // was skipped silently while the merge still went ahead on the branch
+        // name. The read genuinely cannot happen — the reviews endpoint needs
+        // a number — but the RECORD still can: `gh` takes a branch as a PR
+        // selector, which is how the merge below identifies it too. So the
+        // body says the state was unknown rather than keeping a placeholder
+        // that implies it was checked.
+        let unknown =
+            RabbitReview::unavailable("its state could not be read (no PR number to query)");
         warn!(
             issue = issue.number,
             %pr_url,
             "could not parse a PR number; merging on the double codex LGTM \
              without reading CodeRabbit's state"
         );
+        let observed = pr_body.replace(RABBIT_NOT_WAITED_FOR, &rabbit_merge_note(&unknown));
+        if observed != pr_body {
+            let _ = run(&gh, &["pr", "edit", &branch, "--body", &observed], repo_root).await;
+        }
     }
     if let Some(n) = pr_number {
         // A failed head lookup is NOT silence. The owner directive is that a
@@ -11530,9 +11538,17 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         let src = include_str!("self_improve.rs");
         let start = src.find("pub async fn run_once(").expect("run_once");
         let body = &src[start..start + src[start..].find("\n}\n").expect("end")];
+        // The no-number path cannot READ CodeRabbit (the endpoint needs a
+        // number) but must still RECORD that, via the branch selector `gh`
+        // accepts — the same one the merge itself uses.
+        let no_num = body.find("no PR number to query").expect("state must be named");
+        let edit = body[no_num..].find(r#""pr", "edit", &branch"#);
+        assert!(edit.is_some(), "record it on the PR by branch, not only in a log");
+
         for stated in [
             "could not be read (head lookup failed)",
             "could not parse a PR number",
+            "no PR number to query",
         ] {
             assert!(body.contains(stated), "an unknown must be stated: {stated:?}");
         }
