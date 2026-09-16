@@ -4,7 +4,8 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 
 /// Private supervisor owns all descendants, even after session detachment.
 /// The caller must check `clean` before treating an error as failover-eligible.
@@ -32,7 +33,7 @@ impl Drop for ProcessGroup {
         let mut clean = processes_reaped;
         if clean {
             if let Some(marker) = &self.active_request {
-                clean = retire_request(marker).is_ok();
+                clean = retire_request(marker, &self.receipt).is_ok();
             }
         }
         self.clean.store(clean, Ordering::SeqCst);
@@ -49,26 +50,94 @@ pub(crate) fn spawn(command: &mut Command) -> std::io::Result<(Child, ProcessGro
     spawn_supervised(command, false, Arc::new(AtomicBool::new(true)), None)
 }
 
-fn retire_request(marker: &std::path::Path) -> std::io::Result<()> {
-    std::fs::remove_file(marker)?;
+fn private_directory(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !path.is_absolute() || !metadata.is_dir() || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::other("lifecycle directory must be owner-private"));
+    }
+    Ok(())
+}
+
+fn private_read(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt;
+    private_directory(path.parent().ok_or_else(|| std::io::Error::other("invalid lifecycle path"))?)?;
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0
+        || metadata.uid() != unsafe { libc::geteuid() } || metadata.len() > 4096 {
+        return Err(std::io::Error::other("invalid lifecycle receipt"));
+    }
+    let mut bytes = Vec::new();
+    file.take(4097).read_to_end(&mut bytes)?;
+    if bytes.len() > 4096 { return Err(std::io::Error::other("oversized lifecycle receipt")); }
+    Ok(bytes)
+}
+
+fn lifecycle_lock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::MetadataExt;
+    private_directory(path.parent().ok_or_else(|| std::io::Error::other("invalid lifecycle path"))?)?;
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path.with_extension("lifecycle-lock"))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::other("invalid lifecycle lock"));
+    }
+    // Held only across bounded local state reads/writes, never provider work.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 { return Err(std::io::Error::last_os_error()); }
+    Ok(file) // closing the descriptor releases the cross-process lock
+}
+
+fn marker_receipt(marker: &std::path::Path) -> std::io::Result<PathBuf> {
+    let value: serde_json::Value = serde_json::from_slice(&private_read(marker)?)?;
+    let receipt = value["receipt"].as_str().filter(|_| value["version"] == 1)
+        .ok_or_else(|| std::io::Error::other("invalid lifecycle marker"))?;
+    let receipt = PathBuf::from(receipt);
+    if !receipt.is_absolute() { return Err(std::io::Error::other("invalid receipt location")); }
+    Ok(receipt)
+}
+
+fn retire_request(marker: &std::path::Path, receipt: &std::path::Path) -> std::io::Result<()> {
+    let _lock = lifecycle_lock(marker)?;
+    match marker_receipt(marker) {
+        Ok(current) if current == receipt => {
+            std::fs::remove_file(marker)?;
+            std::fs::File::open(marker.parent().expect("request marker has parent"))?.sync_all()
+        }
+        Ok(_) => Ok(()), // a newer invocation already owns this logical request
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn ensure_request_idle(journal: &std::path::Path) -> std::io::Result<()> {
+    let marker = journal.with_extension("active");
+    if matches!(std::fs::symlink_metadata(&marker), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(());
+    }
+    let _lock = lifecycle_lock(&marker)?;
+    let receipt = match marker_receipt(&marker) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        result => result?,
+    };
+    if private_read(&receipt)? != b"all-descendants-reaped\n" {
+        return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "cleanup receipt is incomplete"));
+    }
+    std::fs::remove_file(&marker)?;
     std::fs::File::open(marker.parent().expect("request marker has parent"))?.sync_all()
 }
 
-fn begin_request(journal: Option<&std::path::Path>) -> std::io::Result<Option<PathBuf>> {
-    use std::os::unix::fs::MetadataExt;
+fn begin_request(journal: Option<&std::path::Path>, receipt: &std::path::Path) -> std::io::Result<Option<PathBuf>> {
     let Some(journal) = journal else { return Ok(None) };
     let parent = journal.parent().ok_or_else(|| std::io::Error::other("invalid handoff path"))?;
-    let metadata = std::fs::symlink_metadata(parent)?;
-    if !journal.is_absolute() || !metadata.is_dir() || metadata.file_type().is_symlink()
-        || metadata.permissions().mode() & 0o077 != 0 || metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(std::io::Error::other("handoff directory must be owner-private"));
-    }
+    let _lock = lifecycle_lock(journal)?;
     let marker = journal.with_extension("active");
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&marker)
         .map_err(|error| if error.kind() == std::io::ErrorKind::AlreadyExists {
             std::io::Error::new(std::io::ErrorKind::WouldBlock, "previous request cleanup is unverified")
         } else { error })?;
-    file.write_all(b"in-flight; clear only after verified descendant cleanup\n")?;
+    file.write_all(serde_json::json!({"version":1,"receipt":receipt}).to_string().as_bytes())?;
     file.sync_all()?;
     std::fs::File::open(parent)?.sync_all()?;
     Ok(Some(marker))
@@ -112,12 +181,12 @@ pub(crate) fn spawn_supervised(command: &Command, clear_env: bool, clean: Arc<At
         if let Some(value) = value { supervised.env(key, value); }
         else { supervised.env_remove(key); }
     }
-    let active_request = begin_request(journal)?;
+    let active_request = begin_request(journal, &receipt)?;
     let child = match supervised.spawn() {
         Ok(child) => child,
         Err(error) => {
             // No process was created, so this request has no surviving tools.
-            if let Some(marker) = &active_request { retire_request(marker)?; }
+            if let Some(marker) = &active_request { retire_request(marker, &receipt)?; }
             return Err(error);
         }
     };
@@ -131,6 +200,78 @@ mod tests {
     use super::*;
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[test]
+    fn restart_uses_a_verified_receipt_but_never_age_or_partial_state() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = directory.path().join("operations.json");
+        let receipt = directory.path().join("cleanup-complete");
+        let marker = journal.with_extension("active");
+        let mut file = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(&marker).unwrap();
+        file.write_all(serde_json::json!({"version":1,"receipt":receipt}).to_string().as_bytes()).unwrap();
+        assert!(crate::handoff::resume_message(&journal, "synthetic request").is_err());
+        let mut proof = std::fs::OpenOptions::new().create_new(true).write(true).mode(0o600).open(&receipt).unwrap();
+        proof.write_all(b"partial").unwrap();
+        assert!(crate::handoff::resume_message(&journal, "synthetic request").is_err());
+        std::fs::write(&receipt, b"all-descendants-reaped\n").unwrap();
+        assert_eq!(crate::handoff::resume_message(&journal, "synthetic request").unwrap(), "synthetic request");
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn recovery_rejects_symlink_or_public_receipt_and_preserves_newer_owner() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = directory.path().join("operations.json");
+        let receipt = directory.path().join("cleanup-complete");
+        let marker = begin_request(Some(&journal), &receipt).unwrap().unwrap();
+        let other = directory.path().join("other-proof");
+        std::fs::write(&other, b"all-descendants-reaped\n").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&other, &receipt).unwrap();
+        assert!(ensure_request_idle(&journal).is_err());
+        std::fs::remove_file(&receipt).unwrap();
+        std::fs::write(&receipt, b"all-descendants-reaped\n").unwrap();
+        std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(ensure_request_idle(&journal).is_err());
+        std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o600)).unwrap();
+        ensure_request_idle(&journal).unwrap();
+        begin_request(Some(&journal), &other).unwrap();
+        retire_request(&marker, &receipt).unwrap();
+        assert!(marker.exists(), "old invocation removed the newer owner's marker");
+    }
+
+    #[tokio::test]
+    async fn daemon_crash_triggers_cleanup_and_receipt_based_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = directory.path().join("operations.json");
+        let receipt = directory.path().join("cleanup-complete");
+        let unexpected = directory.path().join("unexpected-detached-effect");
+        let helper = directory.path().join("supervisor.py");
+        std::fs::write(&helper, include_bytes!("../../../scripts/provider-supervisor.py")).unwrap();
+        begin_request(Some(&journal), &receipt).unwrap();
+        let mut controller = Command::new("python3");
+        controller.args(["-I", "-c", "import subprocess,sys,time; subprocess.Popen(sys.argv[1:]); time.sleep(30)",
+            "python3", "-I"]).arg(&helper).arg(&receipt)
+            .args(["sh", "-c", "setsid sh -c 'printf \"ready\\n\"; sleep 0.5; printf escaped > \"$1\"' sh \"$1\" & wait", "sh"])
+            .arg(&unexpected).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        let mut controller = controller.spawn().unwrap();
+        let mut output = BufReader::new(controller.stdout.take().unwrap()).lines();
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(3), output.next_line()).await.unwrap().unwrap();
+        assert_eq!(ready.as_deref(), Some("ready"));
+        controller.start_kill().unwrap();
+        controller.wait().await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !receipt.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(crate::handoff::resume_message(&journal, "synthetic request").unwrap(), "synthetic request");
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(!unexpected.exists(), "detached tool survived the daemon crash");
+    }
 
     #[tokio::test]
     async fn request_is_exclusive_until_verified_cleanup_then_can_resume() {

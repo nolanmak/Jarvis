@@ -36,9 +36,8 @@ pub(crate) fn request_path(root: &Path, opts: &ReasonerOpts, message: &str) -> a
 /// journal remains the enforcement boundary even if the model ignores this.
 pub(crate) fn resume_message(path: &Path, original: &str) -> anyhow::Result<String> {
     use std::os::unix::fs::PermissionsExt;
-    match std::fs::symlink_metadata(path.with_extension("active")) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-        _ => return Err(crate::reasoner::ReasonerError::CleanupUncertain { provider: "previous invocation".into() }.into()),
+    if crate::process_tree::ensure_request_idle(path).is_err() {
+        return Err(crate::reasoner::ReasonerError::CleanupUncertain { provider: "previous invocation".into() }.into());
     }
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(value) => value,
