@@ -1,4 +1,5 @@
 """Real Linux confinement probes using only synthetic files and processes."""
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,16 @@ PROBE = next((str(path) for candidate in ('/usr/bin/python3', '/bin/python3', sy
               if (path := Path(candidate).resolve()).is_file() and os.access(path, os.X_OK)
               and any(path.is_relative_to(root) for root in ('/usr', '/bin', '/lib', '/lib64'))), None)
 
+# Hosts that cannot enforce confinement (for example hosted CI kernels older
+# than Linux 6.12) skip with the reason; supported hosts still run every probe.
+CAPABILITIES_SPEC = importlib.util.spec_from_file_location(
+    'host_capabilities', Path(__file__).with_name('host_capabilities.py'))
+capabilities = importlib.util.module_from_spec(CAPABILITIES_SPEC)
+CAPABILITIES_SPEC.loader.exec_module(capabilities)
+SANDBOX_UNAVAILABLE = capabilities.sandbox_unavailable_reason()
 
+
+@unittest.skipIf(SANDBOX_UNAVAILABLE, SANDBOX_UNAVAILABLE or 'sandbox available')
 @unittest.skipIf(PROBE is None, "no Python interpreter under sandbox executable roots")
 class SandboxTests(unittest.TestCase):
     def test_allowed_io_succeeds_but_escape_network_and_parent_signal_fail(self):

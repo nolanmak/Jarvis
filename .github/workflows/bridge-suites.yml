@@ -1,0 +1,42 @@
+name: Codex bridge suites
+
+# #1048: the Codex tool bridge is the enforcement boundary for the fallback
+# path. Its Python suites (bridge, command sandbox, build VM, dependency proxy)
+# run on every PR and on main. Owner-run suites (live providers, real VM via
+# JARVIS_TEST_VM_CONFIG) skip here; see docs/TESTING.md.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bridge-suites:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install renderer and syscall-filter libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends poppler-utils libseccomp2
+      - name: Report sandbox capabilities
+        run: python3 scripts/tests/host_capabilities.py
+      - name: Require the four enforcement suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          for suite in codex_tool_bridge_test codex_command_sandbox_test \
+                       codex_build_vm_test build_dependency_proxy_test; do
+            test -f "scripts/tests/$suite.py" || { echo "missing suite: $suite" >&2; exit 1; }
+          done
+      - name: Run Python suites
+        working-directory: scripts
+        # Live and VM suites need explicit opt-in env vars and skip without them.
+        env:
+          JARVIS_TEST_VM_CONFIG: ""
+          JARVIS_TEST_LIVE_DISCOVERY: ""
+        run: python3 -m unittest discover -s tests -p '*_test.py' -v

@@ -12,6 +12,18 @@ SPEC = importlib.util.spec_from_file_location(
 bridge = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bridge)
 
+# Tests that run commands or render PDFs go through the kernel sandbox. A host
+# that cannot enforce it (hosted CI kernels older than Linux 6.12, no
+# libseccomp, no Poppler) skips them with the reason instead of failing.
+CAPABILITIES_SPEC = importlib.util.spec_from_file_location(
+    'host_capabilities', Path(__file__).with_name('host_capabilities.py'))
+capabilities = importlib.util.module_from_spec(CAPABILITIES_SPEC)
+CAPABILITIES_SPEC.loader.exec_module(capabilities)
+SANDBOX_UNAVAILABLE = capabilities.sandbox_unavailable_reason()
+POPPLER_UNAVAILABLE = capabilities.poppler_unavailable_reason()
+requires_sandbox = unittest.skipIf(SANDBOX_UNAVAILABLE, SANDBOX_UNAVAILABLE or 'sandbox available')
+requires_poppler = unittest.skipIf(POPPLER_UNAVAILABLE, POPPLER_UNAVAILABLE or 'Poppler available')
+
 
 class ToolPolicyTests(unittest.TestCase):
     def setUp(self):
@@ -48,6 +60,8 @@ class ToolPolicyTests(unittest.TestCase):
         self.assertEqual(base64.b64decode(response['content'][0]['data']), original)
         self.assertEqual((self.root / 'pixel.png').read_bytes(), original)
 
+    @requires_sandbox
+    @requires_poppler
     def test_pdf_read_renders_selected_pages_and_preserves_original(self):
         import base64
         original = (Path(__file__).parent / 'fixtures/scoped-document.pdf').read_bytes()
@@ -241,6 +255,7 @@ class ToolPolicyTests(unittest.TestCase):
             with self.subTest(command=command), self.assertRaises(bridge.Denied):
                 self.policy.command_argv(command)
 
+    @requires_sandbox
     def test_allowed_command_executes_and_does_not_evaluate_shell_text(self):
         outcome=self.policy.run_command("printf 'hello; world'")
         self.assertEqual(outcome['exit_code'],0)
@@ -248,6 +263,7 @@ class ToolPolicyTests(unittest.TestCase):
         with self.assertRaises(bridge.Denied):
             self.policy.run_command('printf ok; id')
 
+    @requires_sandbox
     def test_bash_result_survives_mcp_dispatch(self):
         response=bridge.Server(self.policy).dispatch({'method':'tools/call','params':{
             'name':'Bash','arguments':{'command':'printf DISPATCH_OK'}}})
@@ -289,6 +305,7 @@ class ToolPolicyTests(unittest.TestCase):
             with self.subTest(argv=argv),self.assertRaises(bridge.Denied):
                 policy.check_service_argv(argv)
 
+    @requires_sandbox
     def test_build_command_uses_disposable_workspace_and_syncs_safe_source_changes(self):
         fakebin=Path(self.temp.name)/'bin';fakebin.mkdir()
         cargo=fakebin/'cargo'
@@ -317,6 +334,7 @@ print('SYNTHETIC_BUILD_OK')
         self.assertFalse((self.root/'target').exists())
         self.assertEqual((self.root/'.env').read_text(),'SYNTHETIC_TOKEN=PRIVATE')
 
+    @requires_sandbox
     def test_build_preserves_home_identity_without_granting_home_file_access(self):
         fakebin=Path(self.temp.name)/'bin';fakebin.mkdir()
         owner=Path(self.temp.name)/'owner';owner.mkdir()
@@ -375,6 +393,7 @@ else:
         self.assertFalse((target / 'registry/src').exists())
         self.assertFalse((target / 'git').exists())
 
+    @requires_sandbox
     def test_real_cargo_can_build_and_test_a_dependency_free_fixture(self):
         import shutil
         if not shutil.which('cargo'):
@@ -730,6 +749,7 @@ fs.writeFileSync('result.txt','SYNTHETIC_LINKED_BUILD_OK');
             snapshot.sync()
         self.assertEqual((self.root/'source.rs').read_text(),'concurrent editor output')
 
+    @requires_sandbox
     def test_build_background_child_is_stopped_when_parent_exits(self):
         import os
         import time
@@ -764,6 +784,7 @@ print(child.pid, flush=True)
         snapshot.sync()
         self.assertFalse((self.root/'escape.txt').exists())
 
+    @requires_sandbox
     def test_git_diff_reads_worktree_metadata_without_writing_it(self):
         subprocess.run(['git','init','-q',str(self.root)],check=True)
         (self.root/'tracked.txt').write_text('before\n')
@@ -779,6 +800,7 @@ print(child.pid, flush=True)
         with self.assertRaises(bridge.Denied):
             policy.run_command('git diff --ext-diff')
 
+    @requires_sandbox
     def test_real_npm_can_run_a_dependency_free_project_test(self):
         import shutil
         if not shutil.which('npm'):
@@ -792,6 +814,7 @@ print(child.pid, flush=True)
         self.assertIn('NPM_FIXTURE_OK',outcome['stdout'])
         self.assertFalse((self.root/'.npm-cache').exists())
 
+    @requires_sandbox
     def test_npm_uses_existing_dependencies_without_allowing_changes(self):
         import shutil
         if not shutil.which('npm'):
