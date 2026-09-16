@@ -1271,7 +1271,12 @@ async fn merge_sweep(repo_root: &Path) -> usize {
     let mut merged = 0usize;
 
     let mut examined = 0usize;
-    for row in rows {
+    // Start where the last tick left off, so a wall of ineligible drafts at
+    // the front cannot hide an eligible one behind it forever.
+    let mut ordered: Vec<&serde_json::Value> = rows.iter().collect();
+    let start = sweep_window_start(ordered.len(), sweep_tick_seed(), MAX_SWEEP_EXAMINED);
+    ordered.rotate_left(start);
+    for row in ordered {
         if merged >= MAX_SWEEP_MERGES || examined >= MAX_SWEEP_EXAMINED {
             break;
         }
@@ -1432,6 +1437,34 @@ async fn checks_green(repo_root: &Path, pr: u64) -> Option<bool> {
             Some("SUCCESS") | Some("SKIPPED") | Some("NEUTRAL")
         )
     }))
+}
+
+/// #1029 — where this tick's examination window starts.
+///
+/// Codex: bounding the work per tick is not enough on its own. Always starting
+/// from the head of the same list means ten permanently-ineligible drafts in
+/// front can hide an eligible one behind them forever — which is the very
+/// starvation this sweep exists to end, rebuilt inside the fix.
+///
+/// The window advances by its own width each tick, so every candidate is
+/// reached within `ceil(total / per_tick)` ticks regardless of what sits in
+/// front of it. Deterministic from the clock, so a run is reproducible from
+/// its timestamp rather than depending on stored progress that can be lost.
+fn sweep_window_start(total: usize, tick: u64, per_tick: usize) -> usize {
+    if total == 0 || per_tick == 0 {
+        return 0;
+    }
+    ((tick as usize).wrapping_mul(per_tick)) % total
+}
+
+/// A tick number from the clock: the loop's default interval is 30 minutes, so
+/// consecutive ticks get consecutive numbers without storing a counter.
+fn sweep_tick_seed() -> u64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    secs / 1800
 }
 
 /// #1029 — the repo owner as the merge policy sees it, resolved ONE way.
@@ -11151,6 +11184,39 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         );
     }
 
+    /// Codex, system pass: bounding the work per tick is not enough if the
+    /// window never moves. Ten permanently-ineligible drafts at the front of
+    /// the list would hide an eligible one behind them forever — the same
+    /// starvation this sweep exists to end, rebuilt inside the fix.
+    #[test]
+    fn the_examination_window_reaches_every_candidate() {
+        // Every index must be covered within ceil(total / per_tick) ticks, for
+        // any starting tick — the loop does not restart at zero.
+        for total in [1usize, 7, 10, 23, 50] {
+            for per_tick in [3usize, 10] {
+                for first_tick in [0u64, 1, 9_999] {
+                    let ticks = total.div_ceil(per_tick);
+                    let mut seen = vec![false; total];
+                    for t in 0..ticks {
+                        let start = sweep_window_start(total, first_tick + t as u64, per_tick);
+                        for k in 0..per_tick.min(total) {
+                            seen[(start + k) % total] = true;
+                        }
+                    }
+                    assert!(
+                        seen.iter().all(|s| *s),
+                        "total={total} per_tick={per_tick} from tick {first_tick}: \
+                         {} of {total} never examined",
+                        seen.iter().filter(|s| !**s).count()
+                    );
+                }
+            }
+        }
+        // Degenerate inputs must not panic or divide by zero.
+        assert_eq!(sweep_window_start(0, 5, 10), 0);
+        assert_eq!(sweep_window_start(10, 5, 0), 0);
+    }
+
     /// The recording round-trips, is scoped per issue, and never guesses.
     #[test]
     fn an_opened_pr_is_recorded_and_read_back() {
@@ -11274,6 +11340,13 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
                 "the sweep must spend no reasoner call, found {forbidden:?}"
             );
         }
+        // And the window must MOVE, or bounding it just relocates the
+        // starvation to whatever sits past the first ten.
+        assert!(
+            fn_body.contains("sweep_window_start("),
+            "rotate the examination window across ticks"
+        );
+
         // C7 — bounded on BOTH axes. Codex: capping merges does not cap the
         // tick, because the expensive part is the looking — a checks read, a
         // CodeRabbit read and an author read per candidate. A backlog of
