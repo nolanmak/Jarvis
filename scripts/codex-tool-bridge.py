@@ -27,6 +27,105 @@ CONTROL_PARTS = {'.git', '.codex', '.claude', '.ssh', '.gnupg', '.aws', '.azure'
 MAX_FILE_BYTES = 8 * 1024 * 1024
 
 
+class HandoffJournal:
+    """Durable operation receipts. Uncertain effects require reconciliation.
+
+    The journal belongs to one logical request and lives outside tool scopes.
+    The lock covers execution, so concurrent/restarted brokers cannot both
+    perform the same operation. Errors never imply that an external effect did
+    not happen. Completed receipts may be returned without executing again.
+    """
+    def __init__(self, path):
+        self.path = Path(path)
+
+    @contextmanager
+    def locked(self):
+        import fcntl
+        descriptor = None
+        try:
+            info = self.path.parent.stat()
+            if info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise Denied('handoff directory must be owner-private')
+            descriptor = os.open(str(self.path) + '.lock',
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                raise Denied('untrusted handoff lock')
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, Denied) as exc:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise Denied('handoff state unavailable; reconciliation required') from exc
+        try:
+            yield
+        finally:
+            os.close(descriptor)
+
+    def load(self):
+        try:
+            descriptor = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return {'version': 1, 'operations': []}
+        except OSError as exc:
+            raise Denied('untrusted handoff state') from exc
+        try:
+            with os.fdopen(descriptor) as stream:
+                info = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or info.st_mode & 0o077 or info.st_size > 16 * 1024 * 1024):
+                    raise Denied('untrusted handoff state')
+                state = json.load(stream)
+            if not isinstance(state, dict) or state.get('version') != 1 or not isinstance(state.get('operations'), list):
+                raise Denied('invalid handoff state')
+            for row in state['operations']:
+                if (not isinstance(row, dict) or not isinstance(row.get('tool'), str)
+                        or not isinstance(row.get('arguments'), dict)
+                        or row.get('status') not in ('started', 'completed')
+                        or (row['status'] == 'completed' and 'result' not in row)):
+                    raise Denied('invalid handoff operation')
+            return state
+        except (OSError, ValueError) as exc:
+            raise Denied('handoff state unreadable; reconciliation required') from exc
+
+    def save(self, state):
+        import tempfile
+        payload = json.dumps(state, ensure_ascii=True, allow_nan=False).encode()
+        if len(payload) > 16 * 1024 * 1024:
+            raise Denied('handoff state exceeds limit; reconciliation required')
+        descriptor, temporary = tempfile.mkstemp(prefix='.handoff-', dir=self.path.parent)
+        try:
+            with os.fdopen(descriptor, 'wb') as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+            directory = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def execute(self, name, arguments, action):
+        with self.locked():
+            state = self.load()
+            for row in state['operations']:
+                if row['tool'] == name and row['arguments'] == arguments and row['status'] == 'completed':
+                    return row['result']
+            if any(row['status'] == 'started' for row in state['operations']):
+                raise Denied('uncertain operation requires reconciliation before further mutations')
+            row = {'tool': name, 'arguments': arguments, 'status': 'started'}
+            state['operations'].append(row)
+            self.save(state)  # must reach durable storage BEFORE the effect
+            result = action()
+            if not (isinstance(result, dict) and result.get('isError')):
+                row.update(status='completed', result=result)
+                self.save(state)
+            return result
+
+
 class Policy:
     def __init__(self, config):
         self.cwd = Path(config['cwd']).resolve(strict=True)
@@ -52,6 +151,14 @@ class Policy:
                 self.hooks.append((matcher, command))
         self.read_roots = self._roots(config.get('read_roots', []))
         self.write_roots = self._roots(config.get('write_roots', []))
+        self.handoff = None
+        if config.get('handoff_path'):
+            path = Path(config['handoff_path'])
+            resolved = path.resolve()
+            if not path.is_absolute() or any(resolved == root or root in resolved.parents
+                                             for root in self.read_roots + self.write_roots):
+                raise Denied('handoff state must be outside model tool scopes')
+            self.handoff = HandoffJournal(path)
         self.tools = frozenset(config.get('allowed_tools', []))
         self.command_patterns = []
         for tool in self.tools:
@@ -757,6 +864,16 @@ class Server:
     def call(self, name, arguments):
         self.policy.require(name)
         self.policy.before(name, arguments)
+        external = name.startswith('mcp__')
+        if name == 'Bash':
+            argv = self.policy.command_argv(arguments['command'])
+            external = Path(argv[0]).name in ('augmentagent', 'aa-gh')
+        if external and self.policy.handoff:
+            return self.policy.handoff.execute(name, arguments,
+                lambda: self.execute(name, arguments))
+        return self.execute(name, arguments)
+
+    def execute(self, name, arguments):
         if name == 'Bash':
             outcome = self.policy.run_command(arguments['command'])
             return {'isError': outcome['exit_code'] != 0,

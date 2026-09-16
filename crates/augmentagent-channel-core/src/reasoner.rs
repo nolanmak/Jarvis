@@ -505,6 +505,10 @@ pub struct ReasonerOpts {
     /// so a reviewer can correlate audit rows with a single Discord
     /// turn. `None` falls back to `"-"` in the recorded row.
     pub session_id: Option<String>,
+    /// Owner-private operation journal for a single logical request. The
+    /// dispatcher owns its identity/lifetime; adapters must never expose this
+    /// path as a model-readable file or integration environment variable.
+    pub handoff_path: Option<PathBuf>,
 }
 
 /// Trait the channel uses to reach Claude. Test doubles stub this.
@@ -1417,6 +1421,7 @@ pub fn triage_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1440,6 +1445,7 @@ pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> Reasoner
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1457,6 +1463,7 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1824,6 +1831,7 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         audit_logger: Some(Arc::new(AuditLogger::new(default_audit_log_path()))),
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1933,6 +1941,7 @@ pub fn digest_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1953,6 +1962,7 @@ pub fn tone_summarize_opts() -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1978,6 +1988,7 @@ pub fn social_adapter_opts(system_prompt: String) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -2041,6 +2052,7 @@ Examples:
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -2063,6 +2075,7 @@ pub fn archetype_pick_opts() -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -2086,6 +2099,7 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -2110,6 +2124,7 @@ pub fn wiki_migrate_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerO
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -2319,6 +2334,7 @@ mod tests {
             audit_logger: None,
             audit_notifier: None,
             session_id: None,
+            handoff_path: None,
         }
     }
 
@@ -3247,6 +3263,7 @@ pub fn resume_opts(wiki_root: PathBuf) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -3550,6 +3567,7 @@ mod failover_error_tests {
             audit_logger: None,
             audit_notifier: None,
             session_id: None,
+            handoff_path: None,
         }
     }
 

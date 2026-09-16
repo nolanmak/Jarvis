@@ -422,6 +422,7 @@ impl<A: InstagramApi, R: Reasoner + 'static> InstagramChannel<A, R> {
                     audit_logger: None,
                     audit_notifier: None,
                     session_id: None,
+                    handoff_path: None,
                 };
                 let message_ctx = MessageContext {
                     channel: "instagram".to_string(),

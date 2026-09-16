@@ -8309,6 +8309,7 @@ async fn run_reasoner_selftest(prompt: &str) -> Result<()> {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     };
     let result = reasoner.call(&opts, prompt).await;
     // The latches the call itself took are the observable half of a failover

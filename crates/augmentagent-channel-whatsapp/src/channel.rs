@@ -466,6 +466,7 @@ impl<R: Reasoner + 'static> WhatsappChannel<R> {
                     audit_logger: None,
                     audit_notifier: None,
                     session_id: None,
+                    handoff_path: None,
                 };
                 let message_ctx = MessageContext {
                     channel: "whatsapp".to_string(),

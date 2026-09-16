@@ -47,6 +47,24 @@ command sandbox fails during loopback setup. Its legacy Landlock backend runs a
 simple command but rejects permission profiles requiring direct runtime
 enforcement; selecting that backend alone does not prove read confinement.
 
+## Handoff journal implementation status
+
+The bridge accepts an optional owner-private operation journal outside all model
+file scopes. It persists a started receipt before an external tool call and a
+completed receipt only after a successful result, with file and directory fsync
+and an exclusive execution lock. A restarted bridge returns the stored result
+for identical completed tool arguments. Uncertain outcomes, including reported
+tool errors, block further external effects until reconciliation. Local reads
+remain fresh. Tests cover restart, ambiguous connection failure, corrupt and
+symlink state, model-scope exclusion and actual bridge receipt reuse.
+
+This is the journal foundation, not completed cross-provider handoff. Production
+dispatch does not yet assign durable request identities or populate the journal
+from Claude. Primary pre/post-tool capture, effect-aware read/reconciliation
+operations, progress context, retention and intentional repeated-action semantics
+must be integrated before enabling agentic failover. Exact argument matching does
+not identify semantically duplicate actions expressed with different arguments.
+
 ## Capability inventory
 
 The checked-in manifest and conformance suite must cover these constructors and

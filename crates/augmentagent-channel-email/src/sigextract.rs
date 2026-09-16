@@ -955,6 +955,7 @@ impl<'a> SignatureExtractor<'a> {
             audit_logger: None,
             audit_notifier: None,
             session_id: None,
+            handoff_path: None,
         };
 
         for attempt in 0..2 {

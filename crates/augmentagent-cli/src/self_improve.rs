@@ -855,6 +855,7 @@ pub(crate) fn scope_opts(worktree: PathBuf) -> augmentagent_channel_core::Reason
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1343,6 +1344,7 @@ fn review_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1531,6 +1533,7 @@ fn codex_review_opts(worktree: PathBuf, system_prompt: &str) -> augmentagent_cha
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -2284,6 +2287,7 @@ fn fix_opts(worktree: PathBuf) -> augmentagent_channel_core::ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 

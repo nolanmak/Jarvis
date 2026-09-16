@@ -308,6 +308,92 @@ console.log('DEPENDENCY_FIXTURE_OK');
         self.assertEqual(self.policy.read('note.md'), 'same same')
 
 
+class HandoffTests(unittest.TestCase):
+    def test_server_reuses_external_receipt_but_refreshes_local_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);workspace=root/'workspace';workspace.mkdir()
+            config={'cwd':str(workspace),'read_roots':[str(workspace)],'write_roots':[],
+                'allowed_tools':['Read','mcp__fixture__create_issue'],
+                'handoff_path':str(root/'handoff.json')}
+            calls=[]
+            class Remote:
+                def request(self, method, arguments):
+                    calls.append(arguments)
+                    return {'content':[{'type':'text','text':'synthetic-issue-42'}]}
+            def server():
+                instance=bridge.Server(bridge.Policy(config))
+                instance.discovered=True
+                instance.remotes={'fixture':Remote()}
+                instance.remote_tools={'mcp__fixture__create_issue':('fixture','create_issue',{})}
+                return instance
+            first=server().call('mcp__fixture__create_issue',{'title':'Synthetic'})
+            self.assertEqual(server().call('mcp__fixture__create_issue',{'title':'Synthetic'}),first)
+            self.assertEqual(len(calls),1)
+            (workspace/'note.txt').write_text('before')
+            instance=server()
+            self.assertEqual(instance.call('Read',{'file_path':'note.txt'}),'before')
+            (workspace/'note.txt').write_text('after')
+            self.assertEqual(instance.call('Read',{'file_path':'note.txt'}),'after')
+
+    def test_handoff_state_cannot_be_in_model_read_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(bridge.Denied,'outside model tool scopes'):
+                bridge.Policy({'cwd':tmp,'read_roots':[tmp],'allowed_tools':['Read'],
+                    'handoff_path':str(Path(tmp)/'handoff.json')})
+
+    def test_reported_tool_error_leaves_uncertain_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            journal=bridge.HandoffJournal(Path(tmp)/'handoff.json')
+            failure={'isError':True,'content':[{'type':'text','text':'synthetic error'}]}
+            self.assertEqual(journal.execute('mcp__fixture__create',{},lambda:failure),failure)
+            with self.assertRaisesRegex(bridge.Denied,'reconciliation'):
+                journal.execute('mcp__fixture__create',{},lambda:None)
+
+    def test_completed_external_operation_is_replayed_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'handoff.json'
+            journal=bridge.HandoffJournal(path)
+            calls=[]
+            arguments={'title':'Synthetic issue','body':'Synthetic scope'}
+            def create():
+                calls.append('create')
+                return {'content':[{'type':'text','text':'synthetic-issue-42'}]}
+            expected=journal.execute('mcp__fixture__create_issue',arguments,create)
+            restarted=bridge.HandoffJournal(path)
+            actual=restarted.execute('mcp__fixture__create_issue',dict(reversed(list(arguments.items()))),create)
+            self.assertEqual(actual,expected)
+            self.assertEqual(calls,['create'])
+            self.assertEqual(path.stat().st_mode & 0o777,0o600)
+
+    def test_uncertain_external_result_blocks_replay_and_new_mutations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'handoff.json'
+            journal=bridge.HandoffJournal(path)
+            calls=[]
+            def disconnected():
+                calls.append('external effect')
+                raise ConnectionError('synthetic connection dropped after accepting operation')
+            with self.assertRaises(ConnectionError):
+                journal.execute('mcp__fixture__create_issue',{'title':'Synthetic'},disconnected)
+            restarted=bridge.HandoffJournal(path)
+            for args in ({'title':'Synthetic'},{'title':'Another synthetic issue'}):
+                with self.assertRaisesRegex(bridge.Denied,'reconciliation'):
+                    restarted.execute('mcp__fixture__create_issue',args,disconnected)
+            self.assertEqual(calls,['external effect'])
+
+    def test_corrupt_or_symlink_journal_never_executes_operation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);path=root/'handoff.json'
+            path.write_text('not valid json');path.chmod(0o600)
+            def forbidden():
+                self.fail('operation must not run with untrusted handoff state')
+            with self.assertRaises(bridge.Denied):
+                bridge.HandoffJournal(path).execute('Write',{'file_path':'note'},forbidden)
+            path.unlink();path.symlink_to(root/'missing')
+            with self.assertRaises(bridge.Denied):
+                bridge.HandoffJournal(path).execute('Write',{'file_path':'note'},forbidden)
+
+
 class RemoteToolsTests(unittest.TestCase):
     def test_stdio_proxy_preserves_results_and_does_not_expose_other_tools(self):
         with tempfile.TemporaryDirectory() as tmp:
