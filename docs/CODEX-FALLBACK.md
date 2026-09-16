@@ -76,6 +76,23 @@ resource limits, cancellation, source reconciliation and actual project-suite QA
 must be integrated before replacing the current command sandbox. QEMU device,
 share and sandbox options follow its [invocation reference](https://www.qemu.org/docs/master/system/qemu-manpage.html).
 
+The prototype `scripts/codex-build-vm.py` now executes a disposable snapshot in
+that guest. The workload runs as an unprivileged UID with no-new-privileges;
+runtime and dependency mounts are read-only and disable setuid/device semantics.
+A root-only guest control directory separates the command result from workload
+output. The host waits for VM exit and the supervisor cleanup receipt before
+accepting it. Real tests cover scoped writes, blocked host/symlink access, absence
+of daemon environment secrets, read-only cache mounts, receipt-forgery refusal,
+exit codes and cancellation after a detached child has demonstrably started.
+A Cargo fixture compiles and runs socket/session tests in the guest. Running
+the actual core unit suite from a fresh snapshot compiled in 2m26s and produced
+376 passes, three ignored live tests, and only the existing full-agentic routing
+regression failure. The earlier socket, session and HOME failures did not recur.
+This runner is not yet wired into bridge command dispatch. Private runtime
+provisioning, command/path translation, cache reuse, npm support, resource policy
+and guarded source reconciliation remain integration work. Its real-VM tests
+require `JARVIS_TEST_VM_CONFIG` pointing to owner-private runtime configuration.
+
 ## Fallback diagnostics
 
 Exhausted-chain errors now distinguish capability exclusion, active cooldown,
