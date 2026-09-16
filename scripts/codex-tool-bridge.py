@@ -823,13 +823,11 @@ class Policy:
                     guest.append(flag + '=' + guest_path(argument))
                 else:
                     guest.append(guest_path(value))
-            dependencies = self.cwd / 'node_modules'
-            if dependencies.is_symlink():
-                raise Denied('dependency directory must not be a symlink')
+            dependencies = self.node_dependency_roots() if name in ('npm', 'npx') else []
             with tempfile.TemporaryDirectory(prefix='jarvis-vm-build-') as temporary:
                 snapshot = BuildSnapshot(self, Path(temporary) / 'workspace')
                 result = vm.run(runtime, snapshot.root, guest, {}, timeout=timeout,
-                    node_modules=dependencies if dependencies.is_dir() and name in ('npm', 'npx') else None)
+                    node_workspaces=dependencies)
                 snapshot.sync()
                 return result
         except vm.Unavailable as exc:
@@ -838,6 +836,31 @@ class Policy:
             raise
         except (OSError, ValueError, KeyError) as exc:
             raise Denied('VM runtime or source reconciliation is unavailable') from exc
+
+    def node_dependency_roots(self):
+        dependencies = []
+        visited = 0
+        for base, directories, _ in os.walk(self.cwd, followlinks=False):
+            visited += len(directories) + 1
+            if visited > 10000:
+                raise Denied('dependency discovery exceeds entry limit')
+            descend = []
+            for name in directories:
+                path = Path(base) / name
+                try:
+                    self._relative(str(path))
+                except Denied:
+                    continue
+                if name == 'node_modules':
+                    if path.is_symlink():
+                        raise Denied('dependency directory must not be a symlink')
+                    dependencies.append((str(path.relative_to(self.cwd)), path))
+                    if len(dependencies) > 16:
+                        raise Denied('too many npm workspace dependency roots')
+                elif name not in BuildSnapshot.EXCLUDED and not path.is_symlink():
+                    descend.append(name)
+            directories[:] = descend
+        return dependencies
 
     def command_argv(self, command):
         argv = literal_command_argv(command)

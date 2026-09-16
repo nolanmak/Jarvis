@@ -13,6 +13,21 @@ SPEC.loader.exec_module(vm)
 
 
 class SnapshotValidationTests(unittest.TestCase):
+    def test_dependency_mounts_reject_escape_overlap_and_symlink_destinations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);workspace=root/'workspace';workspace.mkdir()
+            dependency=root/'dependency';dependency.mkdir()
+            (workspace/'escape').symlink_to(root)
+            for mappings in [
+                [('../node_modules',dependency)],
+                [('/node_modules',dependency)],
+                [('node_modules/pkg/node_modules',dependency)],
+                [('node_modules',dependency),('node_modules',dependency)],
+                [('escape/node_modules',dependency)],
+            ]:
+                with self.subTest(mappings=mappings), self.assertRaises(vm.Unavailable):
+                    vm.run(None,workspace,['true'],{},node_workspaces=mappings)
+
     def test_host_hard_links_are_rejected_before_a_vm_starts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); workspace = root / 'workspace'; workspace.mkdir()

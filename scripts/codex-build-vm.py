@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shlex
 import stat
 import subprocess
 import sys
@@ -125,7 +126,7 @@ with path.open('w') as receipt:
 '''
 
 
-def run(runtime, workspace, argv, environment, timeout=120, node_modules=None):
+def run(runtime, workspace, argv, environment, timeout=120, node_modules=None, node_workspaces=()):
     """Execute argv in a disposable source snapshot; return after verified VM exit."""
     workspace = Path(workspace)
     if os.getuid() == 0:
@@ -144,11 +145,25 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None):
             info = (Path(base) / name).lstat()
             if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
                 raise Unavailable('VM snapshot must not contain host hard links')
-    config = runtime.config
+    node_mounts = list(node_workspaces)
     if node_modules is not None:
-        node_modules = Path(node_modules)
-        if not node_modules.is_absolute() or node_modules.is_symlink() or not node_modules.is_dir():
+        node_mounts.append(('node_modules', node_modules))
+    if len(node_mounts) > 16:
+        raise Unavailable('too many npm workspace dependency roots')
+    seen = set()
+    for relative, source in node_mounts:
+        relative, source = Path(relative), Path(source)
+        if (relative.is_absolute() or '..' in relative.parts or relative.name != 'node_modules'
+                or 'node_modules' in relative.parts[:-1] or relative in seen):
+            raise Unavailable('invalid npm dependency mount destination')
+        seen.add(relative)
+        for index in range(1, len(relative.parts) + 1):
+            target = workspace.joinpath(*relative.parts[:index])
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
+                raise Unavailable('npm dependency mount traverses a non-directory or symlink')
+        if not source.is_absolute() or source.resolve() != source or not source.is_dir():
             raise Unavailable('invalid read-only npm dependency directory')
+    config = runtime.config
     with tempfile.TemporaryDirectory(prefix='jarvis-build-vm-') as temporary:
         private = Path(temporary)
         control = private / 'control'; control.mkdir(mode=0o700)
@@ -176,10 +191,12 @@ def run(runtime, workspace, argv, environment, timeout=120, node_modules=None):
             if key in config:
                 shares.append((key, Path(config[key]), True))
                 dependency_mounts.append(f'mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev {key} {destination} || poweroff -f')
-        if node_modules is not None:
-            shares.append(('node_modules', node_modules, True))
-            dependency_mounts.append('/bootstrap/busybox mkdir -p /workspace/node_modules')
-            dependency_mounts.append('mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev node_modules /workspace/node_modules || poweroff -f')
+        for index, (relative, source) in enumerate(node_mounts):
+            tag = f'node_{index}'
+            destination = shlex.quote(str(Path('/workspace') / relative))
+            shares.append((tag, Path(source), True))
+            dependency_mounts.append(f'/bootstrap/busybox mkdir -p {destination} || poweroff -f')
+            dependency_mounts.append(f'mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev {tag} {destination} || poweroff -f')
         boot = '''#!/bootstrap/sh
 export PATH=/bootstrap
 mount -t devtmpfs devtmpfs /dev

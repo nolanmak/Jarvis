@@ -49,8 +49,11 @@ See the [QEMU command documentation](https://www.qemu.org/docs/master/system/qem
 
 The guest mounts host `/usr` read-only for compiler and Python userspace. Optional
 `toolchain`, `registry` and `cargo_git` directories supply read-only Rust dependencies.
-Commands run offline. npm dependencies currently come from the checkout's root
-`node_modules` directory, mounted read-only. Memory must be 512–4096 MiB; guests
+Commands run offline. npm dependencies come from root and nested workspace
+`node_modules` directories, mounted read-only at their original relative paths.
+Discovery skips control/build directories, refuses symlinked dependency roots,
+and permits at most 16 mounts per build. Destination traversal, duplicate mounts
+and symlinked mount destinations are rejected before launching a guest. Memory must be 512–4096 MiB; guests
 use two virtual CPUs. A configuration file alone does not prove runtime readiness.
 The guest supervisor collects stdout and stderr through pipes with a combined
 8 MiB cap, terminating an overproducing command while it is still running. Output
@@ -77,8 +80,8 @@ binary and runtime configuration for rollback, including private provider cooldo
 and handoff state. Restore the prior binary/configuration and restart through the
 normal service procedure. Do not delete handoff state to force a retry.
 
-Cache reuse, missing dependency provisioning, nested npm dependencies, disk resource
-limits remain incomplete. Binary source updates and file deletions reconcile in
+Cache reuse, missing dependency provisioning and disk resource limits remain
+incomplete. Binary source updates and file deletions reconcile in
 the source-build profile; profiles with text-only Write hooks reject those
 changes explicitly. Full fallback rollout and controlled auto-ship acceptance
 must be verified separately.

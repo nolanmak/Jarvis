@@ -106,7 +106,7 @@ adapter reads the override from its own process environment, never from profile
 environment overrides. See [runtime setup and rollback](BUILD-VM.md). The launcher bundles both
 the VM helper and process supervisor privately. Checkout path arguments translate
 to the guest workspace, guest tools do not depend on the host command PATH, and
-root npm dependencies mount read-only. Source reconciliation runs only after VM
+root and nested npm workspace dependencies mount read-only. Source reconciliation runs only after VM
 shutdown and retains original Write hooks and concurrent-edit checks. A real
 bridge test verifies npm dependency loading, loopback, process sessions, source
 updates and guard denial. Live Codex QA ran a Cargo socket test through the
@@ -114,8 +114,10 @@ packaged bridge, verified its successful tool audit and confirmed build outputs
 stayed out of the source worktree. A durable private runtime was provisioned with
 a package/version/hash record; a second live test passed using default discovery
 without an environment override. This did not restart or deploy the daemon. Cache
-reuse, missing dependency provisioning, nested npm workspaces and resource policy
-remain integration work. Real-VM Python tests
+reuse, missing dependency provisioning and resource policy remain integration
+work. A real VM test runs npm in a nested workspace whose path contains spaces,
+loads its local dependency, verifies dependency writes are denied and reconciles
+the generated source output. Real-VM Python tests
 require `JARVIS_TEST_VM_CONFIG` pointing to owner-private runtime configuration;
 the live adapter test uses default discovery or the daemon override.
 

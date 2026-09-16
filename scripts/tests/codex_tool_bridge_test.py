@@ -343,6 +343,40 @@ const server=net.createServer(); server.listen(0,'127.0.0.1',()=>{
             bridge.Policy(config).run_command('npm test --offline', timeout=30)
         self.assertEqual(self.policy.read('source.txt'), 'before')
 
+    @unittest.skipUnless(__import__('os').environ.get('JARVIS_TEST_VM_CONFIG'), 'requires private KVM runtime')
+    def test_vm_npm_workspace_dependencies_are_available_and_readonly(self):
+        import os
+        package=self.root/'packages/worker space'
+        (package/'node_modules/fixture').mkdir(parents=True)
+        dependency=package/'node_modules/fixture/index.js'
+        dependency.write_text("module.exports='SYNTHETIC_NESTED_DEPENDENCY';")
+        (package/'package.json').write_text(json.dumps({'scripts':{'test':'node job.js'}}))
+        (package/'job.js').write_text("""const fs=require('node:fs');
+console.log(require('fixture'));
+let denied=false;
+try { fs.writeFileSync('node_modules/fixture/index.js','UNAUTHORIZED'); }
+catch(error) { denied=true; }
+if(!denied) throw new Error('dependency mount was writable');
+fs.writeFileSync('result.txt','SYNTHETIC_WORKSPACE_OK');
+""")
+        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+            'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Bash(npm *)'],
+            'build_vm_config':os.environ['JARVIS_TEST_VM_CONFIG']})
+        outcome=policy.run_command("npm --prefix 'packages/worker space' test --offline",timeout=30)
+        self.assertEqual(outcome['exit_code'],0,outcome)
+        self.assertIn('SYNTHETIC_NESTED_DEPENDENCY',outcome['stdout'])
+        self.assertEqual((package/'result.txt').read_text(),'SYNTHETIC_WORKSPACE_OK')
+        self.assertEqual(dependency.read_text(),"module.exports='SYNTHETIC_NESTED_DEPENDENCY';")
+
+    def test_dependency_discovery_rejects_links_and_excludes_control_and_build_paths(self):
+        for relative in ['node_modules','packages/widget/node_modules','.git/node_modules','target/node_modules']:
+            (self.root/relative).mkdir(parents=True)
+        found=self.policy.node_dependency_roots()
+        self.assertEqual({relative for relative,_ in found},{'node_modules','packages/widget/node_modules'})
+        nested=self.root/'packages/widget/node_modules'
+        nested.rmdir();nested.symlink_to(self.root/'node_modules')
+        with self.assertRaises(bridge.Denied): self.policy.node_dependency_roots()
+
     def test_build_reconciles_binary_sources_and_deletions(self):
         (self.root/'asset.bin').write_bytes(b'\x00\xffold')
         (self.root/'obsolete.rs').write_text('obsolete')
