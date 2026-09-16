@@ -258,6 +258,12 @@ class Policy:
                 self.hooks.append((matcher, command))
         self.read_roots = self._roots(config.get('read_roots', []))
         self.write_roots = self._roots(config.get('write_roots', []))
+        self.build_vm_config = config.get('build_vm_config')
+        if self.build_vm_config:
+            path = Path(self.build_vm_config)
+            if not path.is_absolute() or any(path.resolve() == root or root in path.resolve().parents
+                                             for root in self.write_roots):
+                raise Denied('VM configuration must be outside model-writable scopes')
         self.handoff = None
         if config.get('handoff_path'):
             path = Path(config['handoff_path'])
@@ -647,6 +653,9 @@ class Policy:
         import time
         import sys
         argv = self.command_argv(command)
+        build = Path(argv[0]).name in ('cargo', 'npm', 'npx')
+        if build and self.build_vm_config:
+            return self.run_vm_build(argv, timeout)
         executable = shutil.which(argv[0], path=self.environment.get('PATH', os.defpath))
         if not executable:
             raise Denied('configured command is not installed')
@@ -654,7 +663,6 @@ class Policy:
         resolved_executable = executable.resolve(strict=True)
         if any(resolved_executable == root or root in resolved_executable.parents for root in self.write_roots):
             raise Denied('command executable is in a model-writable directory')
-        build = Path(argv[0]).name in ('cargo', 'npm', 'npx')
         service = Path(argv[0]).name in ('augmentagent', 'aa-gh')
         if service:
             self.check_service_argv(argv)
@@ -769,6 +777,53 @@ class Policy:
                     except ProcessLookupError:
                         pass
                     process.wait()
+
+    def run_vm_build(self, argv, timeout):
+        import importlib.util
+        import tempfile
+        helper = Path(__file__).with_name('codex-build-vm.py')
+        if not helper.is_file():
+            raise Denied('VM build runner is unavailable')
+        spec = importlib.util.spec_from_file_location('jarvis_build_vm', helper)
+        vm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(vm)
+        try:
+            runtime = vm.Runtime.load(Path(self.build_vm_config))
+            artifacts = [runtime.config[key] for key in ('qemu', 'kernel', 'busybox', 'firmware',
+                'data_dir', 'library_dir', 'module_dir')] + runtime.config['modules']
+            if any(Path(path).resolve() == root or root in Path(path).resolve().parents
+                   for path in artifacts for root in self.write_roots):
+                raise Denied('VM runtime artifacts must be outside model-writable scopes')
+            # The allowlisted host command chooses a fixed guest executable.
+            # Host CLI shims and absolute checkout paths are not guest paths.
+            name = Path(argv[0]).name
+            guest = ['/toolchain/bin/cargo' if name == 'cargo' else '/usr/bin/' + name]
+            source = str(self.cwd)
+            def guest_path(value):
+                if value == source or value.startswith(source + '/'):
+                    return '/workspace' + value[len(source):]
+                return value
+            for value in argv[1:]:
+                if value.startswith('-') and '=' in value:
+                    flag, argument = value.split('=', 1)
+                    guest.append(flag + '=' + guest_path(argument))
+                else:
+                    guest.append(guest_path(value))
+            dependencies = self.cwd / 'node_modules'
+            if dependencies.is_symlink():
+                raise Denied('dependency directory must not be a symlink')
+            with tempfile.TemporaryDirectory(prefix='jarvis-vm-build-') as temporary:
+                snapshot = BuildSnapshot(self, Path(temporary) / 'workspace')
+                result = vm.run(runtime, snapshot.root, guest, {}, timeout=timeout,
+                    node_modules=dependencies if dependencies.is_dir() and name in ('npm', 'npx') else None)
+                snapshot.sync()
+                return result
+        except vm.Unavailable as exc:
+            raise Denied(str(exc)) from exc
+        except Denied:
+            raise
+        except (OSError, ValueError, KeyError) as exc:
+            raise Denied('VM runtime or source reconciliation is unavailable') from exc
 
     def command_argv(self, command):
         argv = literal_command_argv(command)

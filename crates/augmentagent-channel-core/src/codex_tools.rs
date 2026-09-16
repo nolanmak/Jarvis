@@ -44,6 +44,8 @@ impl BridgeLaunch {
             "settings": settings,
             "session_id": opts.session_id,
             "handoff_path": opts.handoff_path,
+            // Operator configuration, deliberately not sourced from opts.env.
+            "build_vm_config": std::env::var_os("AUGMENTAGENT_BUILD_VM_CONFIG").map(PathBuf::from),
         });
         fn private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
             let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
@@ -56,6 +58,8 @@ impl BridgeLaunch {
         private_file(&policy_path, &serde_json::to_vec(&policy)?)?;
         private_file(&server_path, include_bytes!("../../../scripts/codex-tool-bridge.py"))?;
         private_file(&directory.join("codex-command-sandbox.py"), include_bytes!("../../../scripts/codex-command-sandbox.py"))?;
+        private_file(&directory.join("codex-build-vm.py"), include_bytes!("../../../scripts/codex-build-vm.py"))?;
+        private_file(&directory.join("provider-supervisor.py"), include_bytes!("../../../scripts/provider-supervisor.py"))?;
         let native_cwd = directory.join("native-workspace");
         std::fs::create_dir(&native_cwd)?;
         // Codex sees no project-local config/AGENTS from the tool workspace.
@@ -98,6 +102,7 @@ mod tests {
         let mut opts = crate::reasoner::ask_opts(wiki.clone(), temp.path().into());
         opts.add_dirs.push(transcripts.clone());
         opts.env.push(("SYNTHETIC_TOKEN".into(), "secret-fixture-only".into()));
+        opts.env.push(("AUGMENTAGENT_BUILD_VM_CONFIG".into(), "untrusted-profile-override".into()));
         opts.handoff_path = Some(temp.path().join("private-handoff.json"));
         let launch = BridgeLaunch::prepare(&opts, &launch_dir).unwrap();
         assert!(launch.native_cwd.starts_with(&launch_dir));
@@ -112,6 +117,10 @@ mod tests {
         assert!(!args.contains("danger-full-access"));
         let policy: serde_json::Value = serde_json::from_slice(&std::fs::read(&launch.policy_path).unwrap()).unwrap();
         assert_eq!(policy["handoff_path"], serde_json::json!(opts.handoff_path));
+        assert_ne!(policy["build_vm_config"], "untrusted-profile-override");
+        for helper in ["codex-build-vm.py", "provider-supervisor.py"] {
+            assert_eq!(std::fs::metadata(launch_dir.join(helper)).unwrap().permissions().mode() & 0o777, 0o600);
+        }
         assert_eq!(policy["write_roots"], serde_json::json!([wiki]));
         assert!(policy["read_roots"].as_array().unwrap().contains(&serde_json::json!(transcripts)));
         assert_eq!(std::fs::metadata(launch.policy_path).unwrap().permissions().mode() & 0o777, 0o600);

@@ -577,6 +577,32 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
     }
 
     #[tokio::test]
+    #[ignore = "requires Codex login and AUGMENTAGENT_BUILD_VM_CONFIG; builds synthetic code only"]
+    async fn live_codex_builds_and_tests_with_the_vm_bridge() {
+        assert!(std::env::var_os("AUGMENTAGENT_BUILD_VM_CONFIG").is_some());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"),
+            "[package]\nname=\"synthetic-live-vm\"\nversion=\"0.1.0\"\nedition=\"2021\"\n").unwrap();
+        let source = "#[test] fn loopback_works() { let _listener = std::net::TcpListener::bind(\"127.0.0.1:0\").unwrap(); }\n";
+        std::fs::write(dir.path().join("src/lib.rs"), source).unwrap();
+        let mut options = crate::reasoner::resume_opts(dir.path().into());
+        options.allowed_tools.push("Bash(cargo *)".into());
+        options.system_prompt = "Run the requested synthetic project's tests using the Jarvis Bash tool and report the actual result. Preserve the supplied test source.".into();
+        let log_dir = tempfile::tempdir().unwrap();
+        let audit = log_dir.path().join("audit.jsonl");
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
+        CodexCliReasoner::openai().call(&options,
+            "Run cargo test --offline with Jarvis Bash, then report whether the test passed.").await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap(), source);
+        assert!(!dir.path().join("target").exists(), "build outputs must stay out of the source worktree");
+        let records = std::fs::read_to_string(audit).unwrap();
+        assert!(records.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|r| r["tool"] == "Bash" && r["provider"] == "codex" && r["exit_code"] == 0
+                && r["stdout_truncated"].as_str().is_some_and(|s| s.contains("1 passed"))));
+    }
+
+    #[tokio::test]
     async fn codex_bridge_calls_are_recorded_in_the_common_audit_log() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("audit.jsonl");

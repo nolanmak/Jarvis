@@ -308,6 +308,36 @@ else:
         self.assertIn('1 passed',outcome['stdout'])
         self.assertFalse((self.root/'target').exists())
 
+    @unittest.skipUnless(__import__('os').environ.get('JARVIS_TEST_VM_CONFIG'), 'requires a private VM runtime')
+    def test_vm_build_dispatch_supports_loopback_dependencies_and_guarded_reconciliation(self):
+        import os
+        (self.root / 'node_modules/fixture').mkdir(parents=True)
+        (self.root / 'node_modules/fixture/index.js').write_text("module.exports='SYNTHETIC_DEPENDENCY';")
+        self.policy.write('source.txt', 'before')
+        self.policy.write('package.json', json.dumps({'scripts': {'test': 'node job.js'}}))
+        self.policy.write('job.js', """const net=require('node:net'),fs=require('node:fs');
+const child=require('node:child_process').spawnSync('setsid',['true']);
+if(child.status!==0) throw new Error('session failed');
+const server=net.createServer(); server.listen(0,'127.0.0.1',()=>{
+ console.log(require('fixture')); fs.writeFileSync('source.txt','after');server.close();
+});""")
+        config = {'cwd': str(self.root), 'read_roots': [str(self.root)], 'write_roots': [str(self.root)],
+            'allowed_tools': ['Read', 'Write', 'Bash(npm *)'],
+            'environment': {'PATH': '/nonexistent-synthetic-host-bin'},
+            'build_vm_config': os.environ['JARVIS_TEST_VM_CONFIG']}
+        outcome = bridge.Policy(config).run_command(f'npm --prefix={self.root} test --offline', timeout=30)
+        self.assertEqual(outcome['exit_code'], 0, outcome)
+        self.assertIn('SYNTHETIC_DEPENDENCY', outcome['stdout'])
+        self.assertEqual(self.policy.read('source.txt'), 'after')
+        self.policy.write('source.txt', 'before')
+        hook = Path(self.temp.name) / 'deny-write.py'
+        hook.write_text("print('{\"decision\":\"block\"}')")
+        config['settings'] = {'hooks': {'PreToolUse': [{'matcher': 'Write',
+            'hooks': [{'type': 'command', 'command': f'{sys.executable} {hook}'}]}]}}
+        with self.assertRaises(bridge.Denied):
+            bridge.Policy(config).run_command('npm test --offline', timeout=30)
+        self.assertEqual(self.policy.read('source.txt'), 'before')
+
     def test_build_reconciliation_preserves_concurrent_source_edits(self):
         (self.root/'source.rs').write_text('original')
         snapshot=bridge.BuildSnapshot(self.policy,Path(self.temp.name)/'snapshot')

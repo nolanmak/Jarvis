@@ -105,7 +105,7 @@ with open('/stdout','w+b') as stdout,open('/stderr','w+b') as stderr:
 '''
 
 
-def run(runtime, workspace, argv, environment, timeout=120):
+def run(runtime, workspace, argv, environment, timeout=120, node_modules=None):
     """Execute argv in a disposable source snapshot; return after verified VM exit."""
     workspace = Path(workspace)
     if os.getuid() == 0:
@@ -125,6 +125,10 @@ def run(runtime, workspace, argv, environment, timeout=120):
             if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
                 raise Unavailable('VM snapshot must not contain host hard links')
     config = runtime.config
+    if node_modules is not None:
+        node_modules = Path(node_modules)
+        if not node_modules.is_absolute() or node_modules.is_symlink() or not node_modules.is_dir():
+            raise Unavailable('invalid read-only npm dependency directory')
     with tempfile.TemporaryDirectory(prefix='jarvis-build-vm-') as temporary:
         private = Path(temporary)
         control = private / 'control'; control.mkdir(mode=0o700)
@@ -152,6 +156,10 @@ def run(runtime, workspace, argv, environment, timeout=120):
             if key in config:
                 shares.append((key, Path(config[key]), True))
                 dependency_mounts.append(f'mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev {key} {destination} || poweroff -f')
+        if node_modules is not None:
+            shares.append(('node_modules', node_modules, True))
+            dependency_mounts.append('/bootstrap/busybox mkdir -p /workspace/node_modules')
+            dependency_mounts.append('mount -t 9p -o trans=virtio,version=9p2000.L,ro,nosuid,nodev node_modules /workspace/node_modules || poweroff -f')
         boot = '''#!/bootstrap/sh
 export PATH=/bootstrap
 mount -t devtmpfs devtmpfs /dev
