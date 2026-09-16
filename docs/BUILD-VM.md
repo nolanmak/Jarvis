@@ -78,5 +78,7 @@ and handoff state. Restore the prior binary/configuration and restart through th
 normal service procedure. Do not delete handoff state to force a retry.
 
 Cache reuse, missing dependency provisioning, nested npm dependencies, disk resource
-limits and binary/deletion reconciliation remain incomplete. Full fallback routing
-and controlled auto-ship acceptance must be verified separately.
+limits remain incomplete. Binary source updates and file deletions reconcile in
+the source-build profile; profiles with text-only Write hooks reject those
+changes explicitly. Full fallback rollout and controlled auto-ship acceptance
+must be verified separately.

@@ -314,12 +314,15 @@ else:
         (self.root / 'node_modules/fixture').mkdir(parents=True)
         (self.root / 'node_modules/fixture/index.js').write_text("module.exports='SYNTHETIC_DEPENDENCY';")
         self.policy.write('source.txt', 'before')
+        self.policy.write('obsolete.txt', 'remove this source')
         self.policy.write('package.json', json.dumps({'scripts': {'test': 'node job.js'}}))
         self.policy.write('job.js', """const net=require('node:net'),fs=require('node:fs');
 const child=require('node:child_process').spawnSync('setsid',['true']);
 if(child.status!==0) throw new Error('session failed');
 const server=net.createServer(); server.listen(0,'127.0.0.1',()=>{
- console.log(require('fixture')); fs.writeFileSync('source.txt','after');server.close();
+ console.log(require('fixture')); fs.writeFileSync('source.txt','after');
+ fs.writeFileSync('asset.bin',Buffer.from([0,255,7]));
+ if(fs.existsSync('obsolete.txt')) fs.unlinkSync('obsolete.txt');server.close();
 });""")
         config = {'cwd': str(self.root), 'read_roots': [str(self.root)], 'write_roots': [str(self.root)],
             'allowed_tools': ['Read', 'Write', 'Bash(npm *)'],
@@ -329,6 +332,8 @@ const server=net.createServer(); server.listen(0,'127.0.0.1',()=>{
         self.assertEqual(outcome['exit_code'], 0, outcome)
         self.assertIn('SYNTHETIC_DEPENDENCY', outcome['stdout'])
         self.assertEqual(self.policy.read('source.txt'), 'after')
+        self.assertEqual((self.root/'asset.bin').read_bytes(),b'\x00\xff\x07')
+        self.assertFalse((self.root/'obsolete.txt').exists())
         self.policy.write('source.txt', 'before')
         hook = Path(self.temp.name) / 'deny-write.py'
         hook.write_text("print('{\"decision\":\"block\"}')")
@@ -337,6 +342,42 @@ const server=net.createServer(); server.listen(0,'127.0.0.1',()=>{
         with self.assertRaises(bridge.Denied):
             bridge.Policy(config).run_command('npm test --offline', timeout=30)
         self.assertEqual(self.policy.read('source.txt'), 'before')
+
+    def test_build_reconciles_binary_sources_and_deletions(self):
+        (self.root/'asset.bin').write_bytes(b'\x00\xffold')
+        (self.root/'obsolete.rs').write_text('obsolete')
+        snapshot=bridge.BuildSnapshot(self.policy,Path(self.temp.name)/'snapshot')
+        (snapshot.root/'asset.bin').write_bytes(b'\x00\xffnew')
+        (snapshot.root/'new.bin').write_bytes(b'\x00\xffcreated')
+        (snapshot.root/'obsolete.rs').unlink()
+        (snapshot.root/'target').mkdir()
+        (snapshot.root/'target/output.bin').write_bytes(b'\xffexcluded')
+        snapshot.sync()
+        self.assertEqual((self.root/'asset.bin').read_bytes(),b'\x00\xffnew')
+        self.assertEqual((self.root/'new.bin').read_bytes(),b'\x00\xffcreated')
+        self.assertFalse((self.root/'obsolete.rs').exists())
+        self.assertFalse((self.root/'target').exists())
+
+    def test_build_deletion_refuses_concurrent_edits_and_symlink_substitution(self):
+        (self.root/'source.rs').write_text('original')
+        snapshot=bridge.BuildSnapshot(self.policy,Path(self.temp.name)/'snapshot')
+        (snapshot.root/'source.rs').unlink()
+        (self.root/'source.rs').write_text('concurrent')
+        with self.assertRaises(bridge.Denied): snapshot.sync()
+        self.assertEqual((self.root/'source.rs').read_text(),'concurrent')
+        (self.root/'source.rs').write_text('original')
+        (snapshot.root/'source.rs').symlink_to(self.outside)
+        with self.assertRaises(bridge.Denied): snapshot.sync()
+        self.assertEqual((self.root/'source.rs').read_text(),'original')
+
+    def test_binary_reconciliation_does_not_skip_text_hook_contracts(self):
+        import re
+        snapshot=bridge.BuildSnapshot(self.policy,Path(self.temp.name)/'snapshot')
+        (snapshot.root/'asset.bin').write_bytes(b'\xffnew')
+        self.policy.hooks=[(re.compile('Write'),['true'])]
+        with self.assertRaisesRegex(bridge.Denied,'hook'):
+            snapshot.sync()
+        self.assertFalse((self.root/'asset.bin').exists())
 
     def test_build_reconciliation_preserves_concurrent_source_edits(self):
         (self.root/'source.rs').write_text('original')

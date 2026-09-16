@@ -522,7 +522,9 @@ class Policy:
                 return data
 
     def _write(self, name, content):
-        data = content.encode('utf-8')
+        self._write_bytes(name, content.encode('utf-8'))
+
+    def _write_bytes(self, name, data):
         if len(data) > MAX_FILE_BYTES:
             raise Denied('file exceeds size limit')
         with self.parent(name, writing=True) as (parent, leaf):
@@ -873,26 +875,52 @@ class BuildSnapshot:
         view = Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
                        'write_roots': [], 'allowed_tools': ['Read']})
         changes = []
+        present = set()
         for absolute, relative in view.files(excluded_dirs=self.EXCLUDED):
+            present.add(relative)
             data = view._read_bytes(absolute)
-            if self.original.get(relative) == data:
-                continue
-            # Reconciliation cannot quietly overwrite edits from another actor.
+            if self.original.get(relative) != data:
+                changes.append((relative, data))
+        for relative in self.original.keys() - present:
+            candidate = self.root / relative
+            parts = Path(relative).parts
+            if candidate.exists() or any(self.root.joinpath(*parts[:i]).is_symlink()
+                                         for i in range(1, len(parts) + 1)):
+                raise Denied('source replaced by nonregular path during build')
+            changes.append((relative, None))
+        planned = []
+        for relative, data in changes:
             destination = self.policy.cwd / relative
             if relative in self.original:
                 if self.policy._read_bytes(str(destination)) != self.original[relative]:
                     raise Denied('source changed during build; reconcile before retrying')
             elif destination.exists() or destination.is_symlink():
                 raise Denied('source path appeared during build; reconcile before retrying')
-            try:
-                text = data.decode('utf-8')
-            except UnicodeError:
-                continue  # binary build outputs stay in the disposable workspace
+            text = None
+            if data is not None:
+                try:
+                    text = data.decode('utf-8')
+                except UnicodeError:
+                    pass
+            # Native Write hooks accept text, not deletion or arbitrary bytes.
+            # Never pretend those effects are an empty/encoded text write. The
+            # production source-build profile has no such hooks; custom hooked
+            # profiles require an explicit byte-aware contract before widening.
+            if text is None and any(matcher.fullmatch('Write') for matcher, _ in self.policy.hooks):
+                raise Denied('binary/deletion reconciliation cannot represent the configured Write hook contract')
             self.policy._relative(str(destination), writing=True)
-            changes.append((str(destination), text))
-        for destination, text in changes:
-            self.policy.before('Write', {'file_path': destination, 'content': text})
-            self.policy.write(destination, text)
+            if text is not None:
+                self.policy.before('Write', {'file_path': str(destination), 'content': text})
+            planned.append((str(destination), data))
+        for destination, data in planned:
+            if data is None:
+                with self.policy.parent(destination, writing=True) as (parent, leaf):
+                    info = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+                    if not stat.S_ISREG(info.st_mode):
+                        raise Denied('deletion requires a regular source file')
+                    os.unlink(leaf, dir_fd=parent)
+            else:
+                self.policy._write_bytes(destination, data)
 
 
 TOOL_SCHEMAS = {

@@ -46,9 +46,13 @@ snapshots with separate temporary configuration and output directories. Existing
 Cargo caches, Rust toolchains and npm dependencies are read-only; missing
 dependencies cannot currently be downloaded. UTF-8 source changes pass through
 the original write guards and concurrent-edit checks before being copied back.
-Build artifacts, binary changes and deletions are not copied back. Real synthetic
-Cargo and npm tests verify execution; dependency provisioning, cache persistence,
-binary/deletion reconciliation and full project builds remain integration gates.
+Binary source changes and file deletions also reconcile under the source-build
+profile, retaining scope and concurrent-edit checks; build artifact directories
+remain excluded. A profile with a matching text-only Write hook rejects binary
+or deletion reconciliation explicitly, because those effects cannot faithfully
+be represented as a text Write event. Real synthetic Cargo and npm tests verify
+execution; dependency provisioning, cache persistence and full project builds
+remain integration gates.
 An actual `cargo check -p augmentagent-channel-core --offline -j 2` completed
 inside the build sandbox, compiling the real dependency tree. Running the core
 unit suite inside it exposed further gaps: local HTTP fixtures cannot open sockets,
@@ -110,8 +114,8 @@ packaged bridge, verified its successful tool audit and confirmed build outputs
 stayed out of the source worktree. A durable private runtime was provisioned with
 a package/version/hash record; a second live test passed using default discovery
 without an environment override. This did not restart or deploy the daemon. Cache
-reuse, missing dependency provisioning, nested npm workspaces, resource policy
-and binary/deletion reconciliation remain integration work. Real-VM Python tests
+reuse, missing dependency provisioning, nested npm workspaces and resource policy
+remain integration work. Real-VM Python tests
 require `JARVIS_TEST_VM_CONFIG` pointing to owner-private runtime configuration;
 the live adapter test uses default discovery or the daemon override.
 
@@ -279,8 +283,8 @@ cannot stand in for any tool-using profile.
 
 ## Current verification
 
-- Production-shaped wiki-ask quota regression reproduces the existing rejection;
-  it intentionally remains red until agentic routing and enforcement are ready.
+- The production-shaped wiki-ask quota regression now passes, alongside routing
+  tests for all four capability classes and live handler/delivery fallback QA.
 - Bridge tests cover file read/write/edit, nested writes, bounded search, tool
   declaration, traversal and intermediate symlink escapes, sensitive paths,
   command parsing, and guard denial/crash/malformed-response handling.
@@ -302,7 +306,8 @@ cannot stand in for any tool-using profile.
   pages are allowed per call; larger documents require an explicit range.
   A live Codex test identifies the undisclosed color on the selected page of a
   synthetic two-page PDF and verifies the source bytes remain unchanged. Other
-  document formats and the complete query/delivery path remain integration work.
+  document formats and deployed Discord delivery remain integration work; the
+  local query handler and attachment-preparation path have passed live QA.
 - Rust launch tests check private configuration permissions, exclusion of secrets
   from arguments, native tool restrictions, separate read/write roots and
   rejection of unknown settings.
@@ -327,7 +332,8 @@ cannot stand in for any tool-using profile.
   independent capacity blocks approval. Claude reviews use an explicit model
   pin and the same two-pass evidence contract. Codex-specific owner overrides
   for hard complexity and runtime receipts still require actual Codex approval.
-  Live reviewer parity and the complete auto-ship lifecycle remain unverified.
+  Live independent Claude review after Codex builds has passed. The complete
+  issue/PR/merge/deployment lifecycle remains unverified.
 
 ## Remaining integration gates
 
