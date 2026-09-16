@@ -435,3 +435,17 @@ they can be accepted; they are not silently broadened or claimed as parity.
 
 All fixtures and publishable receipts must use synthetic data. Live account
 configuration, private correspondence and raw runtime logs stay outside this repo.
+
+
+### Fresh Node worktree verification
+
+The bridge can reuse matching installed dependencies from a linked worktree's
+registered main checkout. It checks lockfiles and dependency declarations before
+mounting selected package roots read-only; generated lockfiles and unrelated
+installs outside the requested project are excluded. Changed resolution inputs
+are rejected rather than tested against a different dependency tree. Synthetic
+contracts cover matching resolution, script-only edits, mismatches, symlinked
+manifests, unrelated installs, and a real guest build from a fresh Git worktree.
+A separate fresh checkout of this project passed `npm run build --offline` and
+all 26 `npm test --offline` tests through the VM bridge, then was removed.
+Fetching packages that are not installed remains a provisioning prerequisite.

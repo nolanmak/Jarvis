@@ -368,6 +368,82 @@ fs.writeFileSync('result.txt','SYNTHETIC_WORKSPACE_OK');
         self.assertEqual((package/'result.txt').read_text(),'SYNTHETIC_WORKSPACE_OK')
         self.assertEqual(dependency.read_text(),"module.exports='SYNTHETIC_NESTED_DEPENDENCY';")
 
+    def linked_dependency_fixture(self):
+        main=Path(self.temp.name)/'main'
+        main.mkdir()
+        def git(*args):
+            subprocess.run(['git',*args],cwd=main,check=True,capture_output=True)
+        git('init','--initial-branch=main')
+        package={'name':'synthetic','version':'1.0.0','dependencies':{'fixture':'1.0.0'},
+            'scripts':{'test':'node job.js'}}
+        (main/'package.json').write_text(json.dumps(package))
+        (main/'package-lock.json').write_text(json.dumps({'lockfileVersion':3,'packages':{'':package}}))
+        (main/'job.js').write_text("console.log(require('fixture'));")
+        git('add','.')
+        git('-c','user.name=Synthetic','-c','user.email=fixture@example.com','commit','-qm','fixture')
+        linked=Path(self.temp.name)/'linked'
+        git('worktree','add','-b','synthetic-build',str(linked))
+        (main/'node_modules/fixture').mkdir(parents=True)
+        (main/'node_modules/fixture/index.js').write_text("module.exports='SYNTHETIC_DEPENDENCY';")
+        policy=bridge.Policy({'cwd':str(linked),'read_roots':[str(linked)],
+            'write_roots':[str(linked)],'allowed_tools':['Read','Write','Bash(npm *)']})
+        return main,linked,policy
+
+    def test_linked_worktree_reuses_dependencies_only_with_matching_resolution(self):
+        main,linked,policy=self.linked_dependency_fixture()
+        self.assertEqual(policy.node_dependency_roots(), [('node_modules',main/'node_modules')])
+        # Changing project code or test scripts does not change dependency resolution.
+        package=json.loads((linked/'package.json').read_text())
+        package['scripts']['test']='node changed-test.js'
+        (linked/'package.json').write_text(json.dumps(package))
+        self.assertEqual(policy.node_dependency_roots(), [('node_modules',main/'node_modules')])
+        package['dependencies']['fixture']='2.0.0'
+        (linked/'package.json').write_text(json.dumps(package))
+        with self.assertRaisesRegex(bridge.Denied,'dependency'):
+            policy.node_dependency_roots()
+
+    @unittest.skipUnless(__import__('os').environ.get('JARVIS_TEST_VM_CONFIG'), 'requires private KVM runtime')
+    def test_vm_build_in_fresh_worktree_uses_readonly_checkout_dependencies(self):
+        import os
+        main,linked,policy=self.linked_dependency_fixture()
+        policy.build_vm_config=os.environ['JARVIS_TEST_VM_CONFIG']
+        (linked/'job.js').write_text("""const fs=require('node:fs');
+if(require('fixture')!=='SYNTHETIC_DEPENDENCY') throw new Error('missing dependency');
+let denied=false;
+try {fs.writeFileSync('node_modules/fixture/index.js','UNAUTHORIZED');} catch(error) {denied=true;}
+if(!denied) throw new Error('writable dependency');
+fs.writeFileSync('result.txt','SYNTHETIC_LINKED_BUILD_OK');
+""")
+        result=policy.run_command('npm test --offline',timeout=30)
+        self.assertEqual(result['exit_code'],0,result)
+        self.assertEqual((linked/'result.txt').read_text(),'SYNTHETIC_LINKED_BUILD_OK')
+        self.assertFalse((linked/'node_modules').exists())
+        self.assertEqual((main/'node_modules/fixture/index.js').read_text(),"module.exports='SYNTHETIC_DEPENDENCY';")
+        with self.assertRaises(bridge.Denied): policy.read(str(main/'package.json'))
+
+    def test_linked_dependencies_ignore_unrelated_or_unlocked_installs(self):
+        main,linked,policy=self.linked_dependency_fixture()
+        (main/'unrelated/node_modules').mkdir(parents=True)
+        (main/'unrelated/package.json').write_text('{}')
+        (main/'unrelated/package-lock.json').write_text('{}')
+        for root in (main,linked):
+            (root/'sidecar').mkdir()
+            (root/'sidecar/package.json').write_text('{"dependencies":{"fixture":"1.0.0"}}')
+        (main/'sidecar/node_modules').mkdir()
+        (main/'sidecar/package-lock.json').write_text('{}')
+        self.assertEqual(policy.node_dependency_roots(), [('node_modules',main/'node_modules')])
+
+    def test_linked_worktree_rejects_changed_lock_and_symlinked_manifest(self):
+        main,linked,policy=self.linked_dependency_fixture()
+        lock=linked/'package-lock.json'
+        original=lock.read_bytes()
+        lock.write_text('{}')
+        with self.assertRaises(bridge.Denied): policy.node_dependency_roots()
+        lock.write_bytes(original)
+        manifest=linked/'package.json'
+        manifest.unlink();manifest.symlink_to(main/'package.json')
+        with self.assertRaises(bridge.Denied): policy.node_dependency_roots()
+
     def test_dependency_discovery_rejects_links_and_excludes_control_and_build_paths(self):
         for relative in ['node_modules','packages/widget/node_modules','.git/node_modules','target/node_modules']:
             (self.root/relative).mkdir(parents=True)

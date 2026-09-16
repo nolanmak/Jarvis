@@ -51,6 +51,15 @@ The guest mounts host `/usr` read-only for compiler and Python userspace. Option
 `toolchain`, `registry` and `cargo_git` directories supply read-only Rust dependencies.
 Commands run offline. npm dependencies come from root and nested workspace
 `node_modules` directories, mounted read-only at their original relative paths.
+Fresh linked Git worktrees can reuse installed dependencies from their registered
+main checkout when the requested worktree has no installed dependency roots.
+Lockfile bytes and dependency declarations must match; test/build script edits
+are allowed. Nested independent packages require their own matching lockfile;
+workspaces may use the root lock. Unrelated or unlocked installs are excluded.
+The main checkout stays outside model file access, and its dependency mounts
+remain read-only. This reuses installed packages; it does not download missing
+packages or execute host installation scripts.
+
 Discovery skips control/build directories, refuses symlinked dependency roots,
 and permits at most 16 mounts per build. Destination traversal, duplicate mounts
 and symlinked mount destinations are rejected before launching a guest. Memory must be 512–4096 MiB; guests

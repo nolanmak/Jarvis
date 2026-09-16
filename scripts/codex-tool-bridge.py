@@ -754,11 +754,10 @@ class Policy:
                         '-c', 'core.fsmonitor=false', *argv[1:]]
             if snapshot:
                 if Path(argv[0]).name in ('npm', 'npx'):
-                    dependencies = self.cwd / 'node_modules'
-                    if dependencies.is_symlink():
-                        raise Denied('dependency directory must not be a symlink')
-                    if dependencies.is_dir():
-                        (run_cwd / 'node_modules').symlink_to(dependencies, target_is_directory=True)
+                    for relative, dependencies in self.node_dependency_roots():
+                        target = run_cwd / relative
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.symlink_to(dependencies, target_is_directory=True)
                         dependency_roots.append(str(dependencies))
                 home = Path(self.environment.get('HOME', str(Path.home())))
                 cargo_home = Path(self.environment.get('CARGO_HOME', str(home / '.cargo')))
@@ -883,9 +882,99 @@ class Policy:
             raise Denied('VM runtime or source reconciliation is unavailable') from exc
 
     def node_dependency_roots(self):
+        dependencies = self.local_node_dependencies(self.cwd)
+        if dependencies or not (self.cwd / '.git').is_file():
+            return dependencies
+        # A linked worktree does not contain gitignored installed packages.
+        # Discover only its registered main checkout, never arbitrary siblings.
+        import shutil
+        executable = shutil.which('git', path=self.environment.get('PATH', os.defpath))
+        if not executable or any(Path(executable).resolve().is_relative_to(root) for root in self.write_roots):
+            raise Denied('trusted Git dependency discovery is unavailable')
+        git_env = {'PATH': os.defpath, 'GIT_CONFIG_NOSYSTEM': '1',
+            'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_OPTIONAL_LOCKS': '0'}
+        def git(*args):
+            result = subprocess.run([executable, '-c', 'core.fsmonitor=false', *args],
+                cwd=self.cwd, env=git_env, capture_output=True, text=True, timeout=10)
+            if result.returncode:
+                raise Denied('Git dependency checkout discovery failed')
+            return result.stdout
+        common = (self.cwd / git('rev-parse', '--git-common-dir').strip()).resolve(strict=True)
+        source = common.parent
+        registered = git('worktree', 'list', '--porcelain', '-z').split('\0')
+        if (common.name != '.git' or source == self.cwd
+                or f'worktree {self.cwd}' not in registered
+                or f'worktree {source}' not in registered
+                or any(source == root or source.is_relative_to(root) for root in self.write_roots)):
+            raise Denied('dependency source is not a separate registered checkout')
+        source_policy = Policy({'cwd':str(source), 'read_roots':[str(source)],
+            'write_roots':[], 'allowed_tools':['Read']})
+        # Compare resolution inputs, not scripts: editing a regression test or
+        # build script must not force a new install of identical dependencies.
+        fields = ('name', 'version', 'dependencies', 'devDependencies', 'optionalDependencies',
+                  'peerDependencies', 'peerDependenciesMeta', 'workspaces', 'overrides',
+                  'engines', 'os', 'cpu', 'packageManager', 'bundledDependencies', 'bundleDependencies')
+        try:
+            manifests = self.dependency_manifests(self.cwd)
+            if 'package-lock.json' not in manifests:
+                raise Denied('dependency checkout requires matching lockfiles and manifests')
+            root_lock = json.loads(self._read_bytes('package-lock.json'))
+            if not isinstance(root_lock, dict):
+                raise Denied('dependency lockfile must be an object')
+            dependencies = []
+            for relative in sorted(manifests):
+                current = self._read_bytes(relative)
+                original = source_policy._read_bytes(relative)
+                if Path(relative).name == 'package.json':
+                    current, original = json.loads(current), json.loads(original)
+                    current = {key:current.get(key) for key in fields}
+                    original = {key:original.get(key) for key in fields}
+                if current != original:
+                    raise Denied('dependency checkout resolution differs; install matching dependencies first')
+                if Path(relative).name == 'package.json':
+                    package = Path(relative).parent
+                    # Independent nested projects need their own matching lock;
+                    # npm workspaces can instead be covered by the root lock.
+                    locked = (str(package / 'package-lock.json') in manifests
+                        or str(package / 'npm-shrinkwrap.json') in manifests
+                        or str(package) in root_lock.get('packages', {}))
+                    dependency = source / package / 'node_modules'
+                    if locked and dependency.exists():
+                        if dependency.is_symlink() or not dependency.is_dir():
+                            raise Denied('dependency directory must be a real directory')
+                        dependencies.append((str(package / 'node_modules'), dependency))
+                        if len(dependencies) > 16:
+                            raise Denied('too many npm workspace dependency roots')
+        except Denied:
+            raise
+        except (OSError, ValueError, AttributeError, TypeError) as exc:
+            raise Denied('dependency checkout manifests are unavailable or invalid') from exc
+        return dependencies
+
+    def dependency_manifests(self, root):
+        manifests = set()
+        visited = 0
+        for base, directories, files in os.walk(root, followlinks=False):
+            visited += len(directories) + len(files) + 1
+            if visited > 10000:
+                raise Denied('dependency manifest discovery exceeds entry limit')
+            directories[:] = [name for name in directories
+                if name not in BuildSnapshot.EXCLUDED and name not in CONTROL_PARTS
+                and name != '.env' and not name.startswith('.env.')
+                and not (Path(base) / name).is_symlink()
+                and not (Path(base) / name / '.git').exists()]
+            for name in files:
+                if name in ('package.json', 'package-lock.json', 'npm-shrinkwrap.json'):
+                    path = Path(base) / name
+                    if path.is_symlink():
+                        raise Denied('dependency manifest must not be a symlink')
+                    manifests.add(str(path.relative_to(root)))
+        return manifests
+
+    def local_node_dependencies(self, root):
         dependencies = []
         visited = 0
-        for base, directories, _ in os.walk(self.cwd, followlinks=False):
+        for base, directories, _ in os.walk(root, followlinks=False):
             visited += len(directories) + 1
             if visited > 10000:
                 raise Denied('dependency discovery exceeds entry limit')
@@ -893,13 +982,13 @@ class Policy:
             for name in directories:
                 path = Path(base) / name
                 try:
-                    self._relative(str(path))
+                    self._relative(str(self.cwd / path.relative_to(root)))
                 except Denied:
                     continue
                 if name == 'node_modules':
                     if path.is_symlink():
                         raise Denied('dependency directory must not be a symlink')
-                    dependencies.append((str(path.relative_to(self.cwd)), path))
+                    dependencies.append((str(path.relative_to(root)), path))
                     if len(dependencies) > 16:
                         raise Denied('too many npm workspace dependency roots')
                 elif name not in BuildSnapshot.EXCLUDED and not path.is_symlink():
