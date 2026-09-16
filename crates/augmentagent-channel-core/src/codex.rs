@@ -1,41 +1,19 @@
-//! Codex CLI reasoner adapter (#655/#661).
+//! Codex CLI reasoner adapter with a constrained Jarvis tool bridge (#1019).
 //!
-//! Translates the same [`ReasonerOpts`] every preset already builds into a
-//! `codex exec` spawn:
+//! Each call uses an empty native workspace, minimal native filesystem access,
+//! and a required MCP bridge compiled into the adapter. The bridge receives
+//! the preset's scope, tools, guards and integration configuration privately.
+//! Model-generated commands are parsed into argv; general commands use the
+//! bridge's kernel sandbox and trusted service verbs retain approval checks.
 //!
-//! ```text
-//! CODEX_HOME=<home> codex exec --json --skip-git-repo-check \
-//!     --ignore-user-config -C <cwd> -s read-only \
-//!     -c approval_policy=never -c model_instructions_file=<tmp>/instructions.md \
-//!     -m <model> -
-//! ```
+//! Native project instructions, user config, plugins and shell tools are
+//! excluded. Images supplied by the caller still use native `-i` input.
+//! Provider authentication uses the existing CODEX_API_KEY/keyring or persistent
+//! CODEX_HOME login. Integration credentials do not reach the native tool env.
 //!
-//! Design notes (researched 2026-08-19, developers.openai.com/codex):
-//!
-//! - **No `--system-prompt` flag**: the preset's system prompt is written to
-//!   a temp file and wired via `-c model_instructions_file=…`, which fully
-//!   replaces codex's base instructions. The spawn `cwd` is pinned;
-//!   `--ignore-user-config` keeps the owner's interactive
-//!   `~/.codex/config.toml` out, and `-c project_doc_max_bytes=0` keeps
-//!   repo AGENTS.md out (it is project-doc discovery, which
-//!   --ignore-user-config does NOT cover — verified live 2026-08-19).
-//! - **Sandbox `read-only` always**: the eligibility policy only routes
-//!   text-only and read-tools presets here (#658), and codex's kernel
-//!   sandbox (Landlock) enforcing "no writes, no network for commands" is
-//!   strictly stronger than what those presets grant Claude.
-//! - **Auth**: `CODEX_API_KEY` (JIT keyring load, honored only by
-//!   `codex exec`) when present, else the `auth.json` under the resolved
-//!   CODEX_HOME (ChatGPT-plan login; token refresh writes back because the
-//!   home is persistent, not a per-spawn tempdir).
-//!   (NB: the Cerebras tier was planned to ride this adapter via a custom
-//!   `model_provider`, but codex ≥0.148 removed `wire_api = "chat"` and
-//!   Cerebras has no Responses API — verified live 2026-08-19. Cerebras is a
-//!   thin chat-completions client instead: see `crate::cerebras`, #663.)
-//! - **Failure mapping**: quota exhaustion surfaces as `turn.failed` (+
-//!   non-zero exit) with a usage-limit message — mapped to
-//!   [`ReasonerError::RateLimited`]. Connection/5xx → `Unavailable`.
-//!   Missing binary → `Local`. All under the #656 watchdog with
-//!   `kill_on_drop`.
+//! The adapter captures final or all assistant blocks and normalizes bridge
+//! tool events into the common audit log. Routing eligibility remains a separate
+//! capability gate; adapter smoke tests alone do not establish full parity.
 
 use std::process::Stdio;
 
@@ -79,6 +57,32 @@ pub struct CodexCliReasoner {
     bin: String,
     /// #898 — shared cap on concurrent CLI children.
     gate: std::sync::Arc<crate::cli_gate::CliGate>,
+}
+
+async fn record_tool_item(opts: &ReasonerOpts, item: &serde_json::Value) {
+    use crate::tool_audit::{build_audit_record, is_high_risk};
+    if item.get("type").and_then(|v| v.as_str()) != Some("mcp_tool_call") { return; }
+    let server = item.get("server").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let leaf = item.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let tool = if server == "jarvis" { leaf.to_string() } else { format!("mcp__{server}__{leaf}") };
+    let args = item.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+    let result = item.get("result");
+    let content = result.and_then(|r| r.get("content")).and_then(|r| r.as_array())
+        .map(|items| items.iter().filter_map(|r| r.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n"))
+        .unwrap_or_else(|| item.get("error").filter(|e| !e.is_null()).map(ToString::to_string).unwrap_or_default());
+    let failed = item.get("status").and_then(|s| s.as_str()) == Some("failed")
+        || result.is_some_and(|r| r.get("isError").or_else(|| r.get("is_error")).and_then(|b| b.as_bool()).unwrap_or(false));
+    let session = opts.session_id.as_deref().unwrap_or("-");
+    let mut record = build_audit_record(chrono::Utc::now().to_rfc3339(), session.into(), tool.clone(), args, &content, failed);
+    record.provider = Some("codex".into());
+    if tool == "Bash" {
+        record.exit_code = serde_json::from_str::<serde_json::Value>(&content).ok()
+            .and_then(|v| v.get("exit_code").and_then(|c| c.as_i64())).and_then(|c| i32::try_from(c).ok());
+    }
+    if let Some(logger) = &opts.audit_logger { logger.record(&record).await; }
+    if is_high_risk(&tool) {
+        if let Some(notifier) = &opts.audit_notifier { notifier.notify(session, &record).await; }
+    }
 }
 
 impl CodexCliReasoner {
@@ -167,6 +171,17 @@ impl CodexCliReasoner {
         } else {
             &opts.system_prompt
         };
+        let bridge = crate::codex_tools::BridgeLaunch::prepare(opts, tmp.path()).map_err(|error| {
+            anyhow::Error::new(ReasonerError::Local {
+                message: format!("codex tool policy is not ready: {error}"),
+            })
+        })?;
+        let effective_system = format!("{effective_system}\n\nJarvis tool transport: use the jarvis MCP tools for the \
+            declared file, command and integration operations. The tool workspace is {}. \
+            Relative tool paths resolve there. Commands accept one executable and its arguments; \
+            split compound shell operations into separate calls. Preserve ATTACH output markers \
+            verbatim when delivering original files. Use native web tools for declared web operations.",
+            opts.cwd.as_ref().or(opts.add_dirs.first()).map(|p| p.display().to_string()).unwrap_or_default());
         let instructions = tmp.path().join("instructions.md");
         std::fs::write(&instructions, effective_system).map_err(|e| {
             anyhow::Error::new(ReasonerError::Local {
@@ -179,8 +194,9 @@ impl CodexCliReasoner {
             "--json".into(),
             "--skip-git-repo-check".into(),
             "--ignore-user-config".into(),
-            "-s".into(),
-            "read-only".into(),
+            "--ignore-rules".into(),
+            "--ephemeral".into(),
+            "--strict-config".into(),
             "-c".into(),
             "approval_policy=never".into(),
             // AGENTS.md is project-doc discovery, NOT user config — verified
@@ -189,7 +205,7 @@ impl CodexCliReasoner {
             "-c".into(),
             "project_doc_max_bytes=0".into(),
             "-c".into(),
-            format!("model_instructions_file={}", instructions.display()),
+            format!("model_instructions_file={}", serde_json::to_string(&instructions)?),
             "-m".into(),
             model.clone(),
         ];
@@ -197,15 +213,12 @@ impl CodexCliReasoner {
             args.push("-i".into());
             args.push(img.to_string_lossy().into_owned());
         }
-        // cwd: preset pin wins; else the first --add-dir (wiki root for the
-        // read-tools presets); else the daemon cwd.
-        let cwd = opts
-            .cwd
-            .clone()
-            .or_else(|| opts.add_dirs.first().cloned())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        for config in &bridge.config_overrides {
+            args.push("-c".into());
+            args.push(config.clone());
+        }
         args.push("-C".into());
-        args.push(cwd.to_string_lossy().into_owned());
+        args.push(bridge.native_cwd.to_string_lossy().into_owned());
         // "-" = read the prompt from stdin, mirroring the claude spawn shape.
         args.push("-".into());
 
@@ -231,10 +244,9 @@ impl CodexCliReasoner {
         }
         // else: auth.json under CODEX_HOME carries ChatGPT-plan auth.
         //
-        // opts.env is deliberately NOT forwarded (#655 review): it exists
-        // for the full-agentic ask preset's sub-CLIs (AUGMENTAGENT_DB,
-        // COMPOSIO/Discord secrets), and no preset eligible to route here
-        // needs any of it. Fail-closed beats convenient.
+        // Integration environment is carried in the owner-private broker
+        // policy, never exposed to native tools or placed on argv.
+
 
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -285,6 +297,11 @@ impl CodexCliReasoner {
                 debug!("{provider} jsonl parse skip: {line}");
                 continue;
             };
+            if v.get("type").and_then(|t| t.as_str()) == Some("item.completed") {
+                if let Some(item) = v.get("item") {
+                    record_tool_item(opts, item).await;
+                }
+            }
             match v.get("type").and_then(|t| t.as_str()) {
                 Some("item.completed") => {
                     let item = v.get("item");
@@ -466,6 +483,71 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
         assert_eq!(got, "{\"decision\":\"reply\"}", "LastBlock keeps the final message");
         let all = r.call_transcript(&opts(), "classify this").await.unwrap();
         assert!(all.contains("scratch note") && all.contains("decision"));
+    }
+
+    #[tokio::test]
+    async fn tool_using_spawn_has_a_required_scoped_bridge_and_no_native_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("argv.txt");
+        let bin = stub(&dir, "fake-codex", &format!(
+            "cat >/dev/null\nprintf '%s\\n' \"$@\" >{}\necho '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"ok\"}}}}'\n",
+            record.display()
+        ));
+        let mut options = crate::reasoner::resume_opts(dir.path().into());
+        options.env.push(("SYNTHETIC_TOKEN".into(), "private-fixture-only".into()));
+        let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global() };
+        reasoner.call(&options, "Read a synthetic note").await.unwrap();
+        let args = std::fs::read_to_string(record).unwrap();
+        assert!(args.contains("mcp_servers.jarvis="));
+        assert!(args.contains("required=true"));
+        assert!(args.contains("features.shell_tool=false"));
+        assert!(args.contains("default_permissions=jarvis_bridge"));
+        assert!(!args.contains("private-fixture-only"));
+        assert!(!args.contains("danger-full-access"));
+    }
+
+    /// Live receipt, separate from deterministic adapter/stub tests.
+    #[tokio::test]
+    #[ignore = "requires a logged-in Codex CLI; creates synthetic files only"]
+    async fn live_scoped_bridge_reads_writes_and_executes_a_command() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source.txt"), "SYNTHETIC_SOURCE_4F2A\n").unwrap();
+        let mut options = crate::reasoner::resume_opts(dir.path().into());
+        options.system_prompt = "You verify a synthetic tool fixture. Follow the exact requested operations.".into();
+        options.allowed_tools.push("Bash(printf *)".into());
+        let audit = dir.path().join("audit.jsonl");
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
+        let result = CodexCliReasoner::openai().call(&options,
+            "Use jarvis Read on source.txt, jarvis Write to copy its exact content INCLUDING its trailing newline into result.txt, \
+             then jarvis Bash to execute printf SYNTHETIC_COMMAND_7B3C. \
+             Report the actual tool outcomes and command output.").await.unwrap();
+        assert_eq!(std::fs::read(dir.path().join("result.txt")).unwrap(), b"SYNTHETIC_SOURCE_4F2A\n");
+        assert!(result.contains("SYNTHETIC_COMMAND_7B3C"), "{result}");
+        let records = std::fs::read_to_string(audit).unwrap();
+        assert!(records.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|r| r["tool"] == "Bash" && r["provider"] == "codex" && r["exit_code"] == 0
+                && r["stdout_truncated"].as_str().is_some_and(|s| s.contains("SYNTHETIC_COMMAND_7B3C"))));
+    }
+
+    #[tokio::test]
+    async fn codex_bridge_calls_are_recorded_in_the_common_audit_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let bin = stub(&dir, "fake-codex-audit", r#"
+cat >/dev/null
+echo '{"type":"item.completed","item":{"id":"synthetic-tool","type":"mcp_tool_call","server":"jarvis","tool":"Write","arguments":{"file_path":"note.md","content":"synthetic"},"result":{"content":[{"type":"text","text":"written"}]},"status":"completed"}}'
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
+"#);
+        let mut options = opts();
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(log.clone())));
+        options.session_id = Some("synthetic-session".into());
+        CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global() }
+            .call(&options, "synthetic audit probe").await.unwrap();
+        let row: serde_json::Value = serde_json::from_str(std::fs::read_to_string(log).unwrap().trim()).unwrap();
+        assert_eq!(row["provider"], "codex");
+        assert_eq!(row["tool"], "Write");
+        assert_eq!(row["session_id"], "synthetic-session");
+        assert_eq!(row["stdout_truncated"], "written");
     }
 
     #[tokio::test]

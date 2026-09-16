@@ -93,6 +93,8 @@ class Policy:
                     raise Denied('enforcement hook failed')
                 if outcome.stdout.strip():
                     decision = json.loads(outcome.stdout)
+                    if not isinstance(decision, dict) or not isinstance(decision.get('hookSpecificOutput', {}), dict):
+                        raise Denied('invalid enforcement decision')
                     if (decision.get('decision') == 'block' or
                         decision.get('hookSpecificOutput', {}).get('permissionDecision') == 'deny'):
                         raise Denied('enforcement hook denied the operation')
@@ -100,8 +102,13 @@ class Policy:
                 raise Denied('enforcement hook failed closed') from exc
 
     def require(self, tool):
-        if tool not in self.tools:
-            raise Denied('tool is not permitted by this profile')
+        if tool in self.tools or (tool == 'Bash' and self.command_patterns):
+            return
+        if tool.startswith('mcp__'):
+            server, separator, name = tool[5:].partition('__')
+            if separator and name and f'mcp__{server}__*' in self.tools:
+                return
+        raise Denied('tool is not permitted by this profile')
 
     def _relative(self, name, writing=False):
         if not isinstance(name, str) or not name or '\x00' in name:
@@ -262,6 +269,93 @@ class Policy:
                         return results
         return results
 
+    def check_service_argv(self, argv):
+        name = Path(argv[0]).name
+        if name == 'augmentagent' and len(argv) > 2 and argv[1] == 'gmail':
+            if argv[2] not in {'search', 'list-attachments', 'get-attachment', 'accounts',
+                               'compose', 'update-draft'}:
+                raise Denied('this Gmail operation is not available through the approval-gated agent')
+        inputs = {'--body-file', '--reply-to-body-file', '--attach', '--attachment',
+                  '--input', '-F', '--body-file'}
+        outputs = {'--out', '--output'}
+        forbidden = {'--db', '--wiki-dir', '--config', '--config-file'}
+        index = 1
+        while index < len(argv):
+            token = argv[index]
+            flag, sep, value = token.partition('=')
+            if token.startswith('-F') and token != '-F':
+                flag, sep, value = '-F', '=', token[2:]
+            if flag in forbidden:
+                raise Denied('service configuration overrides are not permitted')
+            if flag in inputs | outputs:
+                if not sep:
+                    index += 1
+                    if index >= len(argv):
+                        raise Denied('missing file argument')
+                    value = argv[index]
+                if value == '-':
+                    raise Denied('use a scoped file instead of service stdin')
+                self._relative(value, writing=flag in outputs)
+                resolved = (self.cwd / value).resolve()
+                self._relative(str(resolved), writing=flag in outputs)
+            index += 1
+
+    def run_command(self, command, timeout=120):
+        import shutil
+        import tempfile
+        import signal
+        import time
+        import sys
+        argv = self.command_argv(command)
+        executable = shutil.which(argv[0], path=self.environment.get('PATH', os.defpath))
+        if not executable:
+            raise Denied('configured command is not installed')
+        executable = Path(executable).resolve(strict=True)
+        if any(executable == root or root in executable.parents for root in self.write_roots):
+            raise Denied('command executable is in a model-writable directory')
+        service = Path(argv[0]).name in ('augmentagent', 'aa-gh')
+        if service:
+            self.check_service_argv(argv)
+        argv[0] = str(executable)
+        helper = Path(__file__).with_name('codex-command-sandbox.py')
+        if not helper.is_file():
+            raise Denied('command sandbox helper is unavailable')
+        with tempfile.TemporaryDirectory(prefix='jarvis-command-') as temporary:
+            directory = Path(temporary)
+            policy_file = directory / 'policy.json'
+            policy_file.write_text(json.dumps({'cwd': str(self.cwd),
+                'read_roots': [str(p) for p in self.read_roots], 'write_roots': []}))
+            policy_file.chmod(0o600)
+            with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                launch = argv if service else [sys.executable, '-I', str(helper), str(policy_file), *argv]
+                process = subprocess.Popen(launch,
+                    cwd=self.cwd, env=self.environment, stdin=subprocess.DEVNULL,
+                    stdout=stdout, stderr=stderr, start_new_session=True)
+                deadline = time.monotonic() + min(max(timeout, 1), 900)
+                try:
+                    while process.poll() is None:
+                        if time.monotonic() > deadline:
+                            raise Denied('command timed out; inspect progress before retrying')
+                        if os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size > MAX_FILE_BYTES:
+                            raise Denied('command exceeded output limit')
+                        try:
+                            process.wait(timeout=0.1)
+                        except subprocess.TimeoutExpired:
+                            pass
+                    stdout.seek(0); stderr.seek(0)
+                    return {'exit_code': process.returncode,
+                            'stdout': stdout.read(MAX_FILE_BYTES).decode(errors='replace'),
+                            'stderr': stderr.read(MAX_FILE_BYTES).decode(errors='replace')}
+                finally:
+                    # A child may exit after launching background descendants.
+                    # The sandbox forbids setsid/setpgid, so group cleanup covers
+                    # them as well. No persistent terminal is exposed.
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+
     def command_argv(self, command):
         # Quotes may contain ordinary punctuation as literal argument data.
         # Reject expansion syntax even inside double quotes, and never invoke
@@ -297,6 +391,7 @@ class Policy:
 
 
 TOOL_SCHEMAS = {
+    'Bash': {'command': {'type': 'string'}},
     'Read': {'file_path': {'type': 'string'}},
     'Glob': {'pattern': {'type': 'string'}},
     'Grep': {'pattern': {'type': 'string'}},
@@ -306,21 +401,244 @@ TOOL_SCHEMAS = {
 }
 
 
+class Remote:
+    """MCP transport owned by the broker, never by the model's shell.
+
+    Requests are sent exactly once. In particular, connection/session failures
+    are not permission to repeat a tools/call with potentially external effects.
+    """
+    def __init__(self, config, policy):
+        def expand(value):
+            if isinstance(value, str):
+                def substitute(match):
+                    if match[1] not in policy.environment:
+                        raise Denied('required MCP environment value is missing')
+                    return policy.environment[match[1]]
+                return re.sub(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}', substitute, value)
+            if isinstance(value, list):
+                return [expand(item) for item in value]
+            if isinstance(value, dict):
+                return {key: expand(item) for key, item in value.items()}
+            return value
+        config = expand(config)
+        self.config = config
+        self.process = None
+        self.buffer = b''
+        self.sequence = 0
+        self.closed = False
+        self.session = None
+        self.protocol = '2024-11-05'
+        self.timeout = min(float(config.get('timeout', 30)), 120)
+        if self.timeout <= 0:
+            raise Denied('invalid MCP timeout')
+        if config.get('type', 'stdio') == 'http':
+            from urllib.parse import urlparse
+            parsed = urlparse(config.get('url', ''))
+            if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username:
+                raise Denied('invalid MCP endpoint')
+        elif config.get('type', 'stdio') == 'stdio':
+            env = dict(policy.environment)
+            env.update(config.get('env', {}))
+            self.process = subprocess.Popen([config['command'], *config.get('args', [])],
+                cwd=policy.cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, start_new_session=True, bufsize=0)
+        else:
+            raise Denied('unsupported MCP transport')
+        try:
+            result = self.request('initialize', {'protocolVersion': self.protocol,
+                'capabilities': {}, 'clientInfo': {'name': 'jarvis-tool-bridge', 'version': '1'}})
+            self.protocol = result['protocolVersion']
+            self.notify('notifications/initialized', {})
+        except Exception:
+            self.close()
+            raise
+
+    def notify(self, method, params):
+        self.exchange({'jsonrpc': '2.0', 'method': method, 'params': params}, False)
+
+    def request(self, method, params):
+        self.sequence += 1
+        message = {'jsonrpc': '2.0', 'id': self.sequence, 'method': method, 'params': params}
+        reply = self.exchange(message, True)
+        if reply.get('id') != self.sequence or 'error' in reply or not isinstance(reply.get('result'), dict):
+            raise Denied('MCP returned an invalid or failed response')
+        return reply['result']
+
+    def exchange(self, message, expect_response):
+        import time
+        import select
+        data = (json.dumps(message) + '\n').encode()
+        if self.process is None:
+            return self.http(data, expect_response)
+        if self.process.poll() is not None:
+            raise Denied('MCP process is unavailable; request was not replayed')
+        self.process.stdin.write(data)
+        if not expect_response:
+            return None
+        deadline = time.monotonic() + self.timeout
+        while True:
+            if b'\n' in self.buffer:
+                line, self.buffer = self.buffer.split(b'\n', 1)
+                reply = json.loads(line)
+                if 'method' in reply:
+                    # No sampling, elicitation or other reverse RPC capability
+                    # was advertised. Reject requests rather than delegating
+                    # new authority to an external server.
+                    if 'id' in reply:
+                        rejection = {'jsonrpc': '2.0', 'id': reply['id'], 'error': {
+                            'code': -32601, 'message': 'Client capability not available'}}
+                        self.process.stdin.write((json.dumps(rejection) + '\n').encode())
+                    continue
+                if 'id' not in reply:
+                    continue
+                return reply
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([self.process.stdout], [], [], max(0, remaining))[0]:
+                raise Denied('MCP timed out; request was not replayed')
+            chunk = os.read(self.process.stdout.fileno(), 65536)
+            if not chunk:
+                raise Denied('MCP connection closed; request was not replayed')
+            self.buffer += chunk
+            if len(self.buffer) > MAX_FILE_BYTES:
+                raise Denied('MCP response exceeds size limit')
+
+    def http(self, data, expect_response):
+        import urllib.request
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        headers = dict(self.config.get('headers', {}))
+        headers.update({'Content-Type': 'application/json',
+                        'Accept': 'application/json, text/event-stream',
+                        'MCP-Protocol-Version': self.protocol})
+        if self.session is not None:
+            headers['Mcp-Session-Id'] = self.session
+        request = urllib.request.Request(self.config['url'], data=data, headers=headers, method='POST')
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=self.timeout) as response:
+            session = response.headers.get('Mcp-Session-Id')
+            if session:
+                self.session = session
+            if not expect_response:
+                return None
+            if 'text/event-stream' in response.headers.get('Content-Type', ''):
+                size = 0
+                event = []
+                for line in response:
+                    size += len(line)
+                    if size > MAX_FILE_BYTES:
+                        raise Denied('MCP event stream exceeds size limit')
+                    if line.strip() == b'' and event:
+                        item = json.loads(b'\n'.join(event))
+                        event = []
+                        if 'id' in item:
+                            return item
+                    elif line.startswith(b'data:'):
+                        event.append(line[5:].lstrip().rstrip(b'\r\n'))
+                raise Denied('MCP stream ended before its result')
+            body = response.read(MAX_FILE_BYTES + 1)
+            if len(body) > MAX_FILE_BYTES:
+                raise Denied('MCP response exceeds size limit')
+            return json.loads(body)
+
+    def tools(self):
+        result = []
+        cursor = None
+        seen = set()
+        for _ in range(100):
+            page = self.request('tools/list', {'cursor': cursor} if cursor else {})
+            result.extend(page.get('tools', []))
+            cursor = page.get('nextCursor')
+            if not cursor:
+                return result
+            if cursor in seen:
+                raise Denied('MCP tool cursor did not advance')
+            seen.add(cursor)
+        raise Denied('MCP tool list exceeds page limit')
+
+    def close(self):
+        import signal
+        if self.closed:
+            return
+        self.closed = True
+        if self.process is not None:
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.process.pid, signal.SIGKILL)
+                self.process.wait()
+            except ProcessLookupError:
+                self.process.wait()
+            finally:
+                self.process.stdin.close()
+                self.process.stdout.close()
+
+
 class Server:
     def __init__(self, policy):
         self.policy = policy
+        self.remotes = {}
+        self.remote_tools = {}
+        self.discovered = False
+
+    def close(self):
+        for remote in self.remotes.values():
+            remote.close()
+
+    def discover(self):
+        if self.discovered:
+            return
+        try:
+            for name, config in self.policy.settings.get('mcpServers', {}).items():
+                prefix = f'mcp__{name}__'
+                if not any(t.startswith(prefix) for t in self.policy.tools):
+                    continue
+                if not re.fullmatch(r'[A-Za-z0-9_-]+', name):
+                    raise Denied('invalid MCP server name')
+                remote = Remote(config, self.policy)
+                self.remotes[name] = remote
+                for tool in remote.tools():
+                    leaf = tool.get('name', '')
+                    if not re.fullmatch(r'[A-Za-z0-9_.-]+', leaf):
+                        raise Denied('invalid MCP tool name')
+                    full = prefix + leaf
+                    try:
+                        self.policy.require(full)
+                    except Denied:
+                        continue
+                    self.remote_tools[full] = (name, leaf, dict(tool, name=full))
+            missing = [tool for tool in self.policy.tools if tool.startswith('mcp__')
+                       and not tool.endswith('__*') and tool not in self.remote_tools]
+            if missing:
+                raise Denied('required MCP tools are unavailable')
+            self.discovered = True
+        except Exception:
+            self.close()
+            raise
 
     def tools(self):
-        return [{'name': name, 'description': 'Scoped Jarvis ' + name,
+        self.discover()
+        local = [{'name': name, 'description': 'Scoped Jarvis ' + name,
                  'inputSchema': {'type': 'object', 'properties': fields,
                                  'required': list(fields), 'additionalProperties': False}}
-                for name, fields in TOOL_SCHEMAS.items() if name in self.policy.tools]
+                for name, fields in TOOL_SCHEMAS.items()
+                if name in self.policy.tools or (name == 'Bash' and self.policy.command_patterns)]
+        return local + [definition for _, _, definition in self.remote_tools.values()]
 
     def call(self, name, arguments):
         self.policy.require(name)
         self.policy.before(name, arguments)
+        if name == 'Bash':
+            outcome = self.policy.run_command(arguments['command'])
+            return {'isError': outcome['exit_code'] != 0,
+                    'content': [{'type': 'text', 'text': json.dumps(outcome)}]}
+        if name.startswith('mcp__'):
+            self.discover()
+            if name not in self.remote_tools:
+                raise Denied('configured MCP tool is unavailable')
+            server, leaf, _ = self.remote_tools[name]
+            return self.remotes[server].request('tools/call', {'name': leaf, 'arguments': arguments})
         if name in ('Glob', 'Grep'):
-            import json
             action = self.policy.glob if name == 'Glob' else self.policy.grep
             return json.dumps(action(arguments['pattern']))
         if name == 'Read':
@@ -336,6 +654,7 @@ class Server:
     def dispatch(self, request):
         method = request.get('method')
         if method == 'initialize':
+            self.discover()
             return {'protocolVersion': '2024-11-05', 'capabilities': {'tools': {}},
                     'serverInfo': {'name': 'jarvis-tools', 'version': '1'}}
         if method == 'ping':
@@ -346,8 +665,8 @@ class Server:
             try:
                 params = request['params']
                 output = self.call(params['name'], params.get('arguments', {}))
-                return {'content': [{'type': 'text', 'text': output}]}
-            except (Denied, KeyError, TypeError, UnicodeError):
+                return output if isinstance(output, dict) else {'content': [{'type': 'text', 'text': output}]}
+            except (Denied, KeyError, TypeError, UnicodeError, OSError, ValueError):
                 return {'isError': True, 'content': [{'type': 'text',
                         'text': 'Operation denied or invalid for the configured profile.'}]}
         raise Denied('unsupported protocol method')
@@ -362,17 +681,28 @@ def serve(config_path):
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise Denied('policy must be a private owner-controlled regular file')
         config = json.load(stream)
+    import ctypes
+    import signal
+    def stop(signum, frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, stop)
+    parent = os.getppid()
+    if ctypes.CDLL(None).prctl(1, signal.SIGTERM, 0, 0, 0) != 0 or os.getppid() != parent:
+        raise Denied('cannot bind bridge lifetime to parent')
     server = Server(Policy(config))
-    for line in sys.stdin:
-        request = json.loads(line)
-        if 'id' not in request:
-            continue
-        try:
-            response = {'jsonrpc': '2.0', 'id': request['id'], 'result': server.dispatch(request)}
-        except Denied:
-            response = {'jsonrpc': '2.0', 'id': request['id'],
-                        'error': {'code': -32601, 'message': 'Unsupported method'}}
-        print(json.dumps(response), flush=True)
+    try:
+        for line in sys.stdin:
+            request = json.loads(line)
+            if 'id' not in request:
+                continue
+            try:
+                response = {'jsonrpc': '2.0', 'id': request['id'], 'result': server.dispatch(request)}
+            except Denied:
+                response = {'jsonrpc': '2.0', 'id': request['id'],
+                            'error': {'code': -32601, 'message': 'Unsupported method'}}
+            print(json.dumps(response), flush=True)
+    finally:
+        server.close()
 
 
 if __name__ == '__main__':

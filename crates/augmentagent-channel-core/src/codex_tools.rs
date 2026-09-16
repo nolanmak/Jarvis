@@ -30,7 +30,11 @@ impl BridgeLaunch {
         if !roots.contains(&cwd) { roots.push(cwd.clone()); }
         let writes = opts.allowed_tools.iter().any(|t| matches!(t.as_str(), "Write" | "Edit" | "NotebookEdit"));
         let write_roots = if writes { vec![cwd.clone()] } else { vec![] };
-        let environment: BTreeMap<_, _> = opts.env.iter().cloned().collect();
+        let mut environment: BTreeMap<String, String> = BTreeMap::new();
+        for key in ["HOME", "PATH", "USER", "LOGNAME", "LANG", "TERM", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"] {
+            if let Ok(value) = std::env::var(key) { environment.insert(key.into(), value); }
+        }
+        environment.extend(opts.env.iter().cloned());
         let policy = json!({
             "cwd": cwd,
             "read_roots": roots,
@@ -50,6 +54,7 @@ impl BridgeLaunch {
         let server_path = directory.join("tool-bridge.py");
         private_file(&policy_path, &serde_json::to_vec(&policy)?)?;
         private_file(&server_path, include_bytes!("../../../scripts/codex-tool-bridge.py"))?;
+        private_file(&directory.join("codex-command-sandbox.py"), include_bytes!("../../../scripts/codex-command-sandbox.py"))?;
         let native_cwd = directory.join("native-workspace");
         std::fs::create_dir(&native_cwd)?;
         // Codex sees no project-local config/AGENTS from the tool workspace.
@@ -61,13 +66,16 @@ impl BridgeLaunch {
             "project_doc_max_bytes=0".into(),
             "web_search=disabled".into(),
         ];
+        if opts.allowed_tools.iter().any(|t| matches!(t.as_str(), "WebSearch" | "WebFetch")) {
+            config_overrides.push("web_search=live".into());
+        }
         for feature in ["shell_tool", "apps", "plugins", "multi_agent", "browser_use",
                         "computer_use", "image_generation", "view_image", "skill_search",
                         "skill_mcp_dependency_install", "shell_snapshot"] {
             config_overrides.push(format!("features.{feature}=false"));
         }
         config_overrides.push(format!(
-            "mcp_servers.jarvis={{command=\"python3\",args=[\"-I\",{},{}],required=true,default_tools_approval_mode=\"approve\"}}",
+            "mcp_servers.jarvis={{command=\"python3\",args=[\"-I\",{},{}],required=true,startup_timeout_sec=120,tool_timeout_sec=900,default_tools_approval_mode=\"approve\"}}",
             serde_json::to_string(&server_path)?, serde_json::to_string(&policy_path)?
         ));
         Ok(Self { native_cwd, config_overrides, policy_path })

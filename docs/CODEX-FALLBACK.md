@@ -29,7 +29,11 @@ file, preserving its bytes.
 Commands must use parsed argv, never a model-generated shell script. Matching a
 command prefix alone does not sandbox programs such as Cargo or npm: they can
 execute project code. Build execution therefore needs a separately verified
-filesystem/process/network boundary. On the tested deployment, the default Codex
+filesystem/process/network boundary. The command helper now enforces Landlock
+ABI 6+ read/write scopes plus a seccomp deny list for networking, process
+introspection and escape from the cleanup process group. Source-file read grants
+use opened inodes and exclude credential/control paths. The current general
+command profile is read-only; writable build snapshots remain to be integrated. On the tested deployment, the default Codex
 command sandbox fails during loopback setup. Its legacy Landlock backend runs a
 simple command but rejects permission profiles requiring direct runtime
 enforcement; selecting that backend alone does not prove read confinement.
@@ -63,16 +67,21 @@ cannot stand in for any tool-using profile.
 - Rust launch tests check private configuration permissions, exclusion of secrets
   from arguments, native tool restrictions, separate read/write roots and
   rejection of unknown settings.
-- Live synthetic CLI probes establish MCP connectivity and file operations; they
-  do not establish full chat, integration, shell, or auto-ship parity.
+- Stdio and HTTP MCP tests cover tool allowlists, session/auth forwarding,
+  environment interpolation, missing-tool readiness and hung-child cleanup.
+- Kernel sandbox tests verify scoped I/O, outside/symlink/credential-read denial,
+  blocked network sockets and blocked signals to the parent.
+- The live Codex adapter smoke test performs scoped reads, exact writes and an
+  allowed command; the common audit log verifies the serving provider and exit
+  status. This is still not full chat, integration or auto-ship parity.
 
 ## Remaining integration gates
 
-1. Complete bridge command execution, MCP proxying, web/document support and
-   precise readiness reporting. Validate all accepted settings and tool schemas;
-   never advertise an operation that is silently ignored.
-2. Wire the launch contract into the Codex adapter and audit stream, including
-   startup failure, timeout, cancellation and descendant process cleanup.
+1. Complete writable build/test snapshots, production integration conformance,
+   web/document support and precise readiness reporting. Validate all accepted
+   settings and tool schemas; never silently discard a required capability.
+2. Finish lifecycle verification for the integrated adapter and audit stream,
+   including startup failure, timeout, cancellation and descendant cleanup.
 3. Add durable handoff accounting for completed and uncertain mutations. Seed the
    fallback with known progress, reconcile uncertain effects, and prevent replay.
 4. Complete the machine-checked capability manifest and provider conformance tests.
