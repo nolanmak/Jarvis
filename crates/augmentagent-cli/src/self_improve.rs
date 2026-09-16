@@ -1290,8 +1290,18 @@ async fn merge_sweep(repo_root: &Path) -> usize {
             // end and starve, which is the reported symptom rebuilt at the
             // listing layer. Ordering by creation puts the drafts most at risk
             // of starving at the front of every page.
-            "pr", "list", "--state", "open", "--limit", "50",
-            "--search", "sort:created-asc",
+            // Only drafts, oldest first, and enough of them that the page
+            // IS the candidate set rather than a slice of it.
+            //
+            // The sweep only ever acts on drafts, so listing anything else
+            // spends the window on rows it will discard. `gh` paginates
+            // internally up to `--limit`, so 200 oldest open drafts is every
+            // draft this repository will realistically hold — and codex's
+            // remaining case (an eligible draft hidden behind a full page of
+            // permanently ineligible ones) needs 200 of them before it bites,
+            // with the oldest ordering already putting the at-risk ones first.
+            "pr", "list", "--state", "open", "--limit", "200",
+            "--search", "is:draft sort:created-asc",
             "--json",
             "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body",
         ],
@@ -11599,6 +11609,10 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
         assert!(
             fn_body.contains("sort:created-asc"),
             "list oldest-first, so the drafts most at risk are always in view"
+        );
+        assert!(
+            fn_body.contains("is:draft"),
+            "list only drafts, so the window is not spent on rows the sweep discards"
         );
 
         // And the window must MOVE, or bounding it just relocates the
