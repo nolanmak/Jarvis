@@ -1284,7 +1284,15 @@ async fn merge_sweep(repo_root: &Path) -> usize {
     let (ok, out, _) = match run(
         &gh,
         &[
-            "pr", "list", "--state", "open", "--limit", "50", "--json",
+            // Oldest first. Codex: `gh pr list` defaults to newest-first, so
+            // with a backlog larger than the page — the situation this sweep
+            // exists to drain — the oldest approved drafts would fall off the
+            // end and starve, which is the reported symptom rebuilt at the
+            // listing layer. Ordering by creation puts the drafts most at risk
+            // of starving at the front of every page.
+            "pr", "list", "--state", "open", "--limit", "50",
+            "--search", "sort:created-asc",
+            "--json",
             "number,headRefName,headRefOid,isDraft,isCrossRepository,headRepositoryOwner,mergeable,body",
         ],
         repo_root,
@@ -11532,6 +11540,14 @@ error: test failed, to rerun pass `-p augmentagent-channel-contacts --lib`
                 "the sweep must spend no reasoner call, found {forbidden:?}"
             );
         }
+        // The LISTING must favour the oldest, or a backlog larger than one
+        // page starves the very drafts this sweep exists to drain — rotation
+        // only rotates within whatever the page happened to contain.
+        assert!(
+            fn_body.contains("sort:created-asc"),
+            "list oldest-first, so the drafts most at risk are always in view"
+        );
+
         // And the window must MOVE, or bounding it just relocates the
         // starvation to whatever sits past the first ten.
         assert!(
