@@ -270,6 +270,11 @@ class Policy:
         self.command_patterns = []
         for tool in self.tools:
             if tool in KNOWN_TOOLS:
+                # Web tools are native Codex capabilities. Every other local
+                # contract must have an executable bridge schema, not merely
+                # a recognized name that vanishes from tools/list.
+                if tool not in TOOL_SCHEMAS and tool not in {'WebSearch', 'WebFetch'}:
+                    raise Denied('unsupported local tool in capability profile')
                 continue
             if tool.startswith('mcp__') and len(tool.split('__', 2)) == 3:
                 continue

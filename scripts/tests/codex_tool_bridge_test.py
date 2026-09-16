@@ -94,6 +94,13 @@ class ToolPolicyTests(unittest.TestCase):
             bridge.Policy({'cwd': str(self.root), 'allowed_tools': [],
                            'settings': {'hooks': {'FutureEvent': []}}})
 
+    def test_unimplemented_local_tools_fail_readiness_instead_of_disappearing(self):
+        for tool in ('LS', 'NotebookEdit'):
+            with self.subTest(tool=tool), self.assertRaisesRegex(bridge.Denied, 'unsupported local tool'):
+                policy = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
+                                        'allowed_tools': [tool]})
+                bridge.Server(policy).tools()
+
     def test_readonly_profile_cannot_write_or_edit(self):
         p = bridge.Policy({'cwd': str(self.root), 'read_roots': [str(self.root)],
                            'write_roots': [], 'allowed_tools': ['Read']})
