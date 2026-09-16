@@ -1,6 +1,6 @@
 //! Source inventory: adding a production preset requires an explicit contract.
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use syn::visit::{self, Visit};
 
 fn test_only(attributes: &[syn::Attribute]) -> bool {
@@ -474,4 +474,270 @@ fn scanner_reports_unpinned_models_and_stated_tiers() {
     assert_eq!(sites["handle"].tiers, BTreeSet::from(["quality".into()]));
     assert_eq!(sites["dynamic"].tiers, BTreeSet::from(["unstated at the call site".into()]));
     assert!(!sites["wraps"].constructs && sites["wraps"].tiers.is_empty());
+}
+
+/// #1045 — re-run `test` in a child with the query preset's optional attachment
+/// features configured (iMessage fetch and the transcript clone), so the process
+/// environment it needs never races other tests. True in the parent.
+fn rerun_with_query_attachment_features(test: &str) -> bool {
+    use std::process::Command;
+    const CHILD: &str = "JARVIS_QUERY_ATTACHMENT_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return false;
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let transcripts = scratch.path().join("transcripts");
+    std::fs::create_dir(&transcripts).unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", test, "--nocapture", "--test-threads", "1"]);
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("AWS_") || name.starts_with("AUGMENTAGENT_") {
+            command.env_remove(&key);
+        }
+    }
+    let output = command
+        .env(CHILD, "1")
+        .env("AUGMENTAGENT_IMESSAGE_S3_BUCKET", "synthetic-bucket")
+        .env("AUGMENTAGENT_TRANSCRIPTS_DIR", &transcripts)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}{}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("1 passed"), "child did not run {test}: {stdout}");
+    true
+}
+
+fn env_value(opts: &augmentagent_channel_core::reasoner::ReasonerOpts, key: &str) -> Option<String> {
+    opts.env.iter().rev().find(|(name, _)| name == key).map(|(_, value)| value.clone())
+}
+
+/// #1045 red 1 — the query preset's bridge policy carries the scope guard's
+/// single-file Read exceptions, including this session's iMessage attachment
+/// dir, as pattern-scoped allowances. Nothing becomes a read root, and presets
+/// without the guard get none.
+#[test]
+fn query_preset_policy_carries_attachment_read_allowances_not_wider_roots() {
+    use augmentagent_channel_core::{reasoner::*, codex_tools::BridgeLaunch};
+    use serde_json::{json, Value};
+    if rerun_with_query_attachment_features("query_preset_policy_carries_attachment_read_allowances_not_wider_roots") {
+        return;
+    }
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let wiki = fixture.path().join("wiki");
+    std::fs::create_dir(&wiki).unwrap();
+    let wiki = wiki.canonicalize().unwrap();
+    let policy = |opts: &ReasonerOpts, name: &str| -> Value {
+        let launch_dir = fixture.path().join(name);
+        std::fs::create_dir(&launch_dir).unwrap();
+        let launch = BridgeLaunch::prepare(opts, &launch_dir).unwrap();
+        serde_json::from_slice(&std::fs::read(launch.policy_path).unwrap()).unwrap()
+    };
+    let discord = json!({"tools": ["Read"], "directory": "/tmp",
+        "name_pattern": r"aa-(txt|img|doc)-[0-9]+-[0-9]+\.[a-zA-Z0-9]+"});
+    // C3: the query preset's contract names this evidence.
+    let manifest: Value = serde_json::from_slice(&std::fs::read(repo.join("docs/reasoner-capabilities.json")).unwrap()).unwrap();
+    let entry = manifest["presets"].as_array().unwrap().iter()
+        .find(|entry| entry["callsite"] == "crates/augmentagent-channel-core/src/reasoner.rs::ask_opts").unwrap();
+    for test in ["capability_inventory::query_preset_policy_carries_attachment_read_allowances_not_wider_roots",
+                 "capability_inventory::query_attachments_read_identically_under_claude_guard_and_codex_bridge"] {
+        assert!(entry["conformance"].as_array().unwrap().iter().any(|name| name == test), "manifest lacks {test}");
+    }
+
+    let opts = ask_opts(wiki.clone(), repo.clone());
+    let session = env_value(&opts, "AUGMENTAGENT_IMESSAGE_TMP_DIR").expect("session dir minted");
+    let transcripts = PathBuf::from(env_value(&opts, "AUGMENTAGENT_TRANSCRIPTS_DIR").unwrap())
+        .canonicalize().unwrap();
+    let query = policy(&opts, "query");
+    assert_eq!(query["read_allowances"], json!([discord.clone(),
+        {"tools": ["Read"], "directory": session, "name_pattern": "[A-Za-z0-9._-]+"}]));
+    assert_eq!(query["read_roots"], json!([wiki, transcripts]), "attachment dirs must not become read roots");
+    assert_eq!(query["write_roots"], json!([wiki]));
+
+    // Without iMessage fetch configured, only the Discord attachment exception remains.
+    std::env::remove_var("AUGMENTAGENT_IMESSAGE_S3_BUCKET");
+    let opts = ask_opts(wiki.clone(), repo);
+    assert_eq!(env_value(&opts, "AUGMENTAGENT_IMESSAGE_TMP_DIR"), None);
+    assert_eq!(policy(&opts, "query-no-imessage")["read_allowances"], json!([discord]));
+
+    for (name, opts) in [
+        ("triage", triage_opts(Some(wiki.clone()))),
+        ("digest", digest_opts(Some(wiki.clone()))),
+        ("lint", lint_opts("Synthetic".into(), wiki.clone())),
+        ("ingest", ingest_opts("Synthetic".into(), wiki.clone())),
+        ("resume", resume_opts(wiki.clone())),
+        ("tone", tone_summarize_opts()),
+    ] {
+        assert_eq!(policy(&opts, name)["read_allowances"], json!([]), "{name}: no scope guard, no exceptions");
+    }
+}
+
+struct QueryAttachmentFiles {
+    files: Vec<PathBuf>,
+    dirs: Vec<PathBuf>,
+}
+
+impl Drop for QueryAttachmentFiles {
+    fn drop(&mut self) {
+        for file in &self.files {
+            let _ = std::fs::remove_file(file);
+        }
+        for dir in &self.dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// #1045 C1 — the same synthetic inbound attachments, read the way each provider
+/// reads them. Claude: the real `aa-wiki-scope-guard.sh` hook decides, with the
+/// query preset's environment. Codex: the packaged bridge with the query preset's
+/// policy (which also runs that guard). Every probe must get the same decision
+/// from both, and the expected one. Files live where the daemon writes them
+/// (`/tmp`, `/tmp/aa-imsg/<session>`), uniquely named and removed afterwards.
+#[test]
+fn query_attachments_read_identically_under_claude_guard_and_codex_bridge() {
+    use augmentagent_channel_core::{reasoner::*, codex_tools::BridgeLaunch};
+    use serde_json::{json, Value};
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::process::{Command, Stdio};
+    if rerun_with_query_attachment_features("query_attachments_read_identically_under_claude_guard_and_codex_bridge") {
+        return;
+    }
+    if Command::new("jq").arg("--version").output().is_err() {
+        eprintln!("skipping: the scope guard needs jq");
+        return;
+    }
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let fixture = tempfile::tempdir().unwrap();
+    let wiki = fixture.path().join("wiki");
+    std::fs::create_dir_all(wiki.join("people")).unwrap();
+    let opts = ask_opts(wiki.clone(), repo.clone());
+    let wiki = wiki.canonicalize().unwrap();
+    let session = PathBuf::from(env_value(&opts, "AUGMENTAGENT_IMESSAGE_TMP_DIR").expect("session dir minted"));
+    let transcripts = PathBuf::from(env_value(&opts, "AUGMENTAGENT_TRANSCRIPTS_DIR").unwrap());
+
+    let private_file = |path: &Path, text: &str| {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
+            .unwrap_or_else(|error| panic!("create {}: {error}", path.display()));
+        file.write_all(text.as_bytes()).unwrap();
+    };
+    let unique = format!("{}{:09}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos());
+    let discord_txt = PathBuf::from(format!("/tmp/aa-txt-{unique}-0.md"));
+    let discord_doc = PathBuf::from(format!("/tmp/aa-doc-{unique}-1.txt"));
+    let tmp_sibling = PathBuf::from(format!("/tmp/aa-note-{unique}.txt"));
+    let other_session = PathBuf::from(format!("{}-other", session.display()));
+    let mut cleanup = QueryAttachmentFiles { files: vec![], dirs: vec![] };
+    for (file, text) in [(&discord_txt, "SYNTHETIC_DISCORD_TEXT\n"), (&discord_doc, "SYNTHETIC_DISCORD_DOCUMENT\n"),
+                         (&tmp_sibling, "SYNTHETIC_OUTSIDE_SCOPE")] {
+        cleanup.files.push(file.clone());
+        private_file(file, text);
+    }
+    let mut dirs = std::fs::DirBuilder::new();
+    dirs.mode(0o700);
+    match dirs.create(session.parent().unwrap()) {
+        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => panic!("create attachment root: {error}"),
+        _ => {}
+    }
+    for dir in [&session, &other_session] {
+        dirs.create(dir).unwrap();
+        cleanup.dirs.push(dir.clone());
+    }
+    let imessage = session.join("9-note-3fa2b1c0.txt");
+    private_file(&imessage, "SYNTHETIC_IMESSAGE_ATTACHMENT\n");
+    private_file(&other_session.join("9-note-3fa2b1c0.txt"), "SYNTHETIC_OUTSIDE_SCOPE");
+    std::fs::create_dir(session.join("nested")).unwrap();
+    private_file(&session.join("nested/9-note.txt"), "SYNTHETIC_OUTSIDE_SCOPE");
+    private_file(&wiki.join("people/sample.md"), "SYNTHETIC_WIKI_PAGE\n");
+    private_file(&transcripts.join("meeting.md"), "SYNTHETIC_TRANSCRIPT\n");
+    let outside = fixture.path().join("outside.txt");
+    private_file(&outside, "SYNTHETIC_OUTSIDE_SCOPE");
+
+    let path = |p: &Path| p.display().to_string();
+    // (label, tool, arguments, readable, expected text)
+    let probes: Vec<(&str, &str, Value, bool, &str)> = vec![
+        ("wiki page", "Read", json!({"file_path": path(&wiki.join("people/sample.md"))}), true, "SYNTHETIC_WIKI_PAGE"),
+        ("Discord text attachment", "Read", json!({"file_path": path(&discord_txt)}), true, "SYNTHETIC_DISCORD_TEXT"),
+        ("Discord converted document", "Read", json!({"file_path": path(&discord_doc)}), true, "SYNTHETIC_DISCORD_DOCUMENT"),
+        ("fetched iMessage attachment", "Read", json!({"file_path": path(&imessage)}), true, "SYNTHETIC_IMESSAGE_ATTACHMENT"),
+        ("transcript read", "Read", json!({"file_path": path(&transcripts.join("meeting.md"))}), true, "SYNTHETIC_TRANSCRIPT"),
+        ("transcript grep", "Grep", json!({"pattern": "SYNTHETIC_TRANSCRIPT", "path": path(&transcripts)}), true, "meeting.md"),
+        ("transcript glob", "Glob", json!({"pattern": "*.md", "path": path(&transcripts)}), true, "meeting.md"),
+        ("literal aa-txt-.. sibling", "Read", json!({"file_path": "/tmp/aa-txt-.."}), false, ""),
+        ("dot-dot through an attachment name", "Read",
+            json!({"file_path": format!("{}/../{}", path(&discord_txt), tmp_sibling.file_name().unwrap().to_str().unwrap())}), false, ""),
+        ("non-attachment file in /tmp", "Read", json!({"file_path": path(&tmp_sibling)}), false, ""),
+        ("attachment glob in /tmp", "Glob", json!({"pattern": "aa-txt-*", "path": "/tmp"}), false, ""),
+        ("attachment grep", "Grep", json!({"pattern": "SYNTHETIC", "path": path(&discord_txt)}), false, ""),
+        ("attachment write", "Write", json!({"file_path": path(&discord_txt), "content": "UNAUTHORIZED"}), false, ""),
+        ("attachment edit", "Edit", json!({"file_path": path(&discord_txt), "old_string": "SYNTHETIC", "new_string": "UNAUTHORIZED"}), false, ""),
+        ("another session's attachment", "Read", json!({"file_path": path(&other_session.join("9-note-3fa2b1c0.txt"))}), false, ""),
+        ("escape from the session dir", "Read", json!({"file_path": format!("{}/../{}/9-note-3fa2b1c0.txt",
+            path(&session), other_session.file_name().unwrap().to_str().unwrap())}), false, ""),
+        ("nested path under the session dir", "Read", json!({"file_path": path(&session.join("nested/9-note.txt"))}), false, ""),
+        ("session dir grep", "Grep", json!({"pattern": "SYNTHETIC", "path": path(&session)}), false, ""),
+        ("session dir write", "Write", json!({"file_path": path(&session.join("new.txt")), "content": "UNAUTHORIZED"}), false, ""),
+        ("transcript write", "Write", json!({"file_path": path(&transcripts.join("meeting.md")), "content": "UNAUTHORIZED"}), false, ""),
+        ("outside file", "Read", json!({"file_path": path(&outside)}), false, ""),
+    ];
+
+    // Claude: the hook sees the query preset's environment (restrict_env keeps
+    // only OS essentials plus `opts.env`) and runs in the preset's cwd.
+    let guard_allows = |tool: &str, arguments: &Value| -> bool {
+        let mut command = Command::new(repo.join("scripts/aa-wiki-scope-guard.sh"));
+        command.env_clear();
+        for (key, value) in std::env::vars() {
+            if matches!(key.as_str(), "HOME" | "PATH" | "LANG") || key.starts_with("LC_") {
+                command.env(key, value);
+            }
+        }
+        let mut child = command.envs(opts.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .current_dir(opts.cwd.as_ref().unwrap())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap()
+            .write_all(json!({"tool_name": tool, "tool_input": arguments}).to_string().as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() {
+            return false;
+        }
+        if stdout.trim().is_empty() {
+            return true;
+        }
+        let decision: Value = serde_json::from_str(stdout.trim()).unwrap();
+        !(decision["decision"] == "block" || decision["hookSpecificOutput"]["permissionDecision"] == "deny")
+    };
+
+    // Codex: one packaged bridge process with the query preset's policy.
+    let launch_dir = fixture.path().join("launch");
+    std::fs::create_dir(&launch_dir).unwrap();
+    let launch = BridgeLaunch::prepare(&opts, &launch_dir).unwrap();
+    let mut child = Command::new("python3").arg(launch_dir.join("tool-bridge.py")).arg(&launch.policy_path)
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    for (id, (_, tool, arguments, _, _)) in probes.iter().enumerate() {
+        writeln!(input, "{}", json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments}})).unwrap();
+    }
+    drop(input);
+    let result = child.wait_with_output().unwrap();
+    assert!(result.status.success(), "bridge exited: {}", String::from_utf8_lossy(&result.stderr));
+    let responses: Vec<Value> = String::from_utf8(result.stdout).unwrap().lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(responses.len(), probes.len(), "lost MCP responses");
+
+    let mut mismatches = Vec::new();
+    for ((label, tool, arguments, readable, text), response) in probes.iter().zip(&responses) {
+        let claude = guard_allows(tool, arguments);
+        let codex = response.get("error").is_none() && response["result"]["isError"] != true;
+        if claude != *readable || codex != *readable || (codex && !response.to_string().contains(text)) {
+            mismatches.push(format!("{label}: expected {readable}, claude {claude}, codex {codex}: {response}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "providers disagree on attachment reads:\n{}", mismatches.join("\n"));
+    assert_eq!(std::fs::read_to_string(&discord_txt).unwrap(), "SYNTHETIC_DISCORD_TEXT\n");
+    assert!(!session.join("new.txt").exists());
+    assert_eq!(std::fs::read_to_string(transcripts.join("meeting.md")).unwrap(), "SYNTHETIC_TRANSCRIPT\n");
 }

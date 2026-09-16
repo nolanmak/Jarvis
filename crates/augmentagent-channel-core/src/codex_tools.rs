@@ -18,6 +18,97 @@ pub(crate) fn build_vm_config_path() -> Option<PathBuf> {
     configured_vm_path(std::env::var_os("AUGMENTAGENT_BUILD_VM_CONFIG"), std::env::var_os("HOME"))
 }
 
+// #1045 — single-file Read exceptions outside the read roots.
+//
+// The query preset's scope guard (`scripts/aa-wiki-scope-guard.sh`, #127)
+// lets Claude `Read`, and nothing else, two kinds of inbound attachment temp
+// file. This is the one definition of those exceptions. The bridge policy is
+// built from it at launch, and the guard's regexes are pinned to it by
+// `scope_guard_carve_outs_mirror_the_read_allowance_definition`, so the same
+// attachment paths are readable under Claude and Codex. The guard keeps its
+// own copy on purpose: it is the only check on the Claude path and a second,
+// independent check inside the bridge, so it must not take its policy from an
+// environment value.
+
+/// Hook script whose Read carve-outs these definitions describe.
+pub const SCOPE_GUARD_SCRIPT: &str = "aa-wiki-scope-guard.sh";
+/// Discord attachments (augmentagent-approval-discord, #441/#939) are written
+/// to `/tmp/aa-{img,txt,doc}-<msg_id>-<idx>.<ext>`.
+pub const DISCORD_ATTACHMENT_DIR: &str = "/tmp";
+pub const DISCORD_ATTACHMENT_NAME: &str = r"aa-(txt|img|doc)-[0-9]+-[0-9]+\.[a-zA-Z0-9]+";
+/// `imessage fetch-attachment` (#888) saves into the ask session's own
+/// directory, minted by `ask_opts` under this root and named by this variable.
+pub const IMESSAGE_SESSION_DIR_ENV: &str = "AUGMENTAGENT_IMESSAGE_TMP_DIR";
+pub const IMESSAGE_ATTACHMENT_ROOT: &str = "/tmp/aa-imsg";
+/// One path segment: the session directory name and the CLI-sanitized file name.
+pub const PORTABLE_NAME: &str = r"[A-Za-z0-9._-]+";
+
+/// Read, and only Read, of a file directly inside `directory` whose whole name
+/// matches `name_pattern`. The bridge opens the directory without following
+/// symlinks and requires a private regular file owned by the daemon's user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadAllowance {
+    pub directory: PathBuf,
+    pub name_pattern: &'static str,
+}
+
+impl ReadAllowance {
+    fn policy(&self) -> serde_json::Value {
+        serde_json::json!({"tools": ["Read"], "directory": self.directory, "name_pattern": self.name_pattern})
+    }
+}
+
+fn full_match(pattern: &str, value: &str) -> bool {
+    regex::Regex::new(&format!(r"\A(?:{pattern})\z")).is_ok_and(|expression| expression.is_match(value))
+}
+
+/// The session directory the guard accepts: exactly one portable segment
+/// below [`IMESSAGE_ATTACHMENT_ROOT`]. `.` and `..` fit the segment pattern but
+/// name no child; the guard can never match them because it resolves the
+/// requested path first, so they grant nothing here either.
+pub fn imessage_session_dir(value: &str) -> Option<PathBuf> {
+    let name = value.strip_prefix(IMESSAGE_ATTACHMENT_ROOT)?.strip_prefix('/')?;
+    (full_match(PORTABLE_NAME, name) && name != "." && name != "..").then(|| PathBuf::from(value))
+}
+
+/// Whether `opts` runs the scope guard on Read: Claude grants the carve-outs
+/// exactly there, and the bridge runs the same hook before every Read.
+fn runs_scope_guard_on_read(opts: &ReasonerOpts) -> bool {
+    let Some(settings) = opts.settings_json.as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok()) else { return false };
+    let groups = settings.pointer("/hooks/PreToolUse").and_then(|value| value.as_array());
+    groups.into_iter().flatten().any(|group| {
+        let matcher = group.get("matcher").and_then(|value| value.as_str()).unwrap_or(".*");
+        full_match(matcher, "Read") && group.get("hooks").and_then(|value| value.as_array())
+            .into_iter().flatten().any(|hook| {
+                hook.get("type").and_then(|value| value.as_str()) == Some("command")
+                    && hook.get("command").and_then(|value| value.as_str())
+                        .and_then(|command| Path::new(command).file_name())
+                        .is_some_and(|name| name == SCOPE_GUARD_SCRIPT)
+            })
+    })
+}
+
+/// The Read exceptions `opts` is entitled to: none unless it allows Read under
+/// the scope guard; then Discord attachments, plus this session's iMessage
+/// attachment directory when one was minted (last assignment wins, as in the
+/// spawned environment).
+pub fn read_allowances(opts: &ReasonerOpts) -> Vec<ReadAllowance> {
+    if !opts.allowed_tools.iter().any(|tool| tool == "Read") || !runs_scope_guard_on_read(opts) {
+        return Vec::new();
+    }
+    let mut allowances = vec![ReadAllowance {
+        directory: PathBuf::from(DISCORD_ATTACHMENT_DIR),
+        name_pattern: DISCORD_ATTACHMENT_NAME,
+    }];
+    let session = opts.env.iter().rev().find(|(key, _)| key == IMESSAGE_SESSION_DIR_ENV)
+        .and_then(|(_, value)| imessage_session_dir(value));
+    if let Some(directory) = session {
+        allowances.push(ReadAllowance { directory, name_pattern: PORTABLE_NAME });
+    }
+    allowances
+}
+
 pub struct BridgeLaunch {
     pub native_cwd: PathBuf,
     pub config_overrides: Vec<String>,
@@ -74,6 +165,8 @@ impl BridgeLaunch {
         let policy = json!({
             "cwd": cwd,
             "read_roots": roots,
+            // Pattern-scoped single files, never directories to walk (#1045).
+            "read_allowances": read_allowances(opts).iter().map(ReadAllowance::policy).collect::<Vec<_>>(),
             "write_roots": write_roots,
             "allowed_tools": opts.allowed_tools,
             "environment": environment,
@@ -216,5 +309,146 @@ mod tests {
         let launch = BridgeLaunch::prepare(&opts, temp.path()).unwrap();
         let policy: serde_json::Value = serde_json::from_slice(&std::fs::read(launch.policy_path).unwrap()).unwrap();
         assert_eq!(policy["write_roots"], serde_json::json!([]));
+    }
+
+    /// The guard's carve-out regexes are rendered from the definition, gate on
+    /// Read alone, and no other path regex hides in the guard (#1045 C2).
+    #[test]
+    fn scope_guard_carve_outs_mirror_the_read_allowance_definition() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/aa-wiki-scope-guard.sh");
+        assert!(path.ends_with(SCOPE_GUARD_SCRIPT));
+        let script = std::fs::read_to_string(path).unwrap();
+        // Directories are inserted literally, so they must mean the same as regex text everywhere.
+        for directory in [DISCORD_ATTACHMENT_DIR, IMESSAGE_ATTACHMENT_ROOT] {
+            assert!(directory.chars().all(|c| c.is_ascii_alphanumeric() || "/_-".contains(c)), "{directory}");
+        }
+        // Logical statements: comment lines dropped, `\` continuations joined.
+        let code = script.lines().filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<Vec<_>>().join("\n").replace("\\\n", " ");
+        let mut found = BTreeMap::new();
+        for statement in code.lines() {
+            for operand in statement.split("=~").skip(1) {
+                found.insert(operand.split_whitespace().next().unwrap().to_string(), statement.to_string());
+            }
+        }
+        let discord = format!("^{DISCORD_ATTACHMENT_DIR}/{DISCORD_ATTACHMENT_NAME}$");
+        let session_dir = format!("^{IMESSAGE_ATTACHMENT_ROOT}/{PORTABLE_NAME}$");
+        let session_file = format!("^\"${IMESSAGE_SESSION_DIR_ENV}\"/{PORTABLE_NAME}$");
+        // The transcript clone's tool gate is the guard's only other regex.
+        let transcript_tools = "^(Read|Glob|Grep)$".to_string();
+        assert_eq!(found.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([discord.clone(), session_dir.clone(), session_file.clone(), transcript_tools]),
+            "scope guard regexes drifted from the read allowance definition");
+        for carve_out in [&discord, &session_dir, &session_file] {
+            let statement = &found[carve_out];
+            assert!(statement.contains(r#""$TOOL" == "Read""#), "not Read-gated: {statement}");
+            for tool in ["Glob", "Grep", "Write", "Edit"] {
+                assert!(!statement.contains(tool), "{tool} in a Read carve-out: {statement}");
+            }
+        }
+        assert_eq!(found[&session_dir], found[&session_file], "session file regex must require a validated session dir");
+    }
+
+    /// The same names are admitted by the real guard (bash ERE, in the daemon's
+    /// UTF-8 locale) and the definition (Rust regex); the bridge's Python dialect
+    /// is exercised by the capability inventory's paired provider test. The
+    /// guard strips a trailing newline from the resolved path (command
+    /// substitution), so only interior control characters are probed.
+    #[test]
+    fn scope_guard_and_definition_agree_on_attachment_names() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        if Command::new("jq").arg("--version").output().is_err() {
+            return;
+        }
+        let guard = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/aa-wiki-scope-guard.sh");
+        let wiki = tempfile::tempdir().unwrap();
+        let session = "/tmp/aa-imsg/1045-17";
+        let guard_allows = |path: &str| -> bool {
+            let mut command = Command::new("bash");
+            command.arg(guard).env_clear().env("WIKI_ROOT", wiki.path()).env(IMESSAGE_SESSION_DIR_ENV, session);
+            // The daemon's locale: bash bracket ranges are collation-dependent.
+            command.env("PATH", std::env::var_os("PATH").unwrap()).env("LANG", "en_US.UTF-8");
+            let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(serde_json::json!({"tool_name": "Read",
+                "tool_input": {"file_path": path}}).to_string().as_bytes()).unwrap();
+            let output = child.wait_with_output().unwrap();
+            output.status.success() && !String::from_utf8_lossy(&output.stdout).contains("\"block\"")
+        };
+        for name in ["aa-txt-1045-0.md", "aa-img-1045-12.PNG", "aa-doc-1045-3.txt", "aa-txt-..", "aa-txt-1045-0.",
+                     "aa-txt-1045-0", "aa-txt-1045-0.md.bak", "aa-TXT-1045-0.md", "aa-pdf-1045-0.md",
+                     "aa-txt--1045-0.md", "aa-txt-1045-0.m d", "aa-txt-1045-0.m\u{e9}", "aa-txt-\u{661}-0.md",
+                     "xaa-txt-1045-0.md", "aa-txt-1045-0\n.md", "aa-txt-1045-0.md/x", "aa-\u{3c4}xt-1045-0.md"] {
+            let expected = full_match(DISCORD_ATTACHMENT_NAME, name);
+            assert_eq!(guard_allows(&format!("{DISCORD_ATTACHMENT_DIR}/{name}")), expected, "{name:?}");
+        }
+        assert!(full_match(DISCORD_ATTACHMENT_NAME, "aa-txt-1045-0.md"));
+        for name in ["9-IMG_001-3fa2b1c0.jpeg", "note.txt", ".", "..", "a b", "a/b", "\u{e9}", "\u{df}", "", "a\nb"] {
+            let expected = full_match(PORTABLE_NAME, name) && name != "." && name != "..";
+            assert_eq!(guard_allows(&format!("{session}/{name}")), expected, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn read_allowance_patterns_are_portable_single_segment_names() {
+        // Literals, bracket ranges, groups, alternation, `+` and `\.`: the same in
+        // POSIX ERE (the guard), Rust regex and Python `re` (the bridge).
+        let portable = regex::Regex::new(r"\A(?:[A-Za-z0-9_-]|\\\.|\[[A-Za-z0-9._-]+\]|[()|+])+\z").unwrap();
+        for pattern in [DISCORD_ATTACHMENT_NAME, PORTABLE_NAME] {
+            assert!(portable.is_match(pattern), "{pattern}");
+            for name in ["", "/", "a/b", "aa-txt-1-0.md/", "/aa-txt-1-0.md", "a\nb", "a\0b"] {
+                assert!(!full_match(pattern, name), "{pattern} admits {name:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn imessage_session_dir_is_exactly_one_portable_child_of_the_root() {
+        assert_eq!(imessage_session_dir("/tmp/aa-imsg/4242-17"), Some(PathBuf::from("/tmp/aa-imsg/4242-17")));
+        for value in ["", "/tmp/aa-imsg", "/tmp/aa-imsg/", "/tmp/aa-imsg/.", "/tmp/aa-imsg/..", "/tmp/aa-imsg/a/b",
+                      "/tmp/aa-imsg/a b", "/tmp/aa-imsgX/a", "/tmp/aa-imsg//a", "tmp/aa-imsg/a", "/tmp/aa-imsg/a\n",
+                      "/tmp/aa-imsg/a/", "/tmp/aa-imsg/../etc"] {
+            assert_eq!(imessage_session_dir(value), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn read_allowances_follow_the_scope_guard_on_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let discord = ReadAllowance { directory: PathBuf::from("/tmp"), name_pattern: DISCORD_ATTACHMENT_NAME };
+        let query = crate::reasoner::ask_opts(temp.path().into(), temp.path().into());
+        assert!(runs_scope_guard_on_read(&query));
+        let mut opts = query.clone();
+        opts.env.retain(|(key, _)| key != IMESSAGE_SESSION_DIR_ENV);
+        assert_eq!(read_allowances(&opts), vec![discord.clone()]);
+        opts.env.push((IMESSAGE_SESSION_DIR_ENV.into(), "/tmp/aa-imsg/1-1".into()));
+        opts.env.push((IMESSAGE_SESSION_DIR_ENV.into(), "/tmp/aa-imsg/2-2".into()));
+        assert_eq!(read_allowances(&opts), vec![discord.clone(),
+            ReadAllowance { directory: PathBuf::from("/tmp/aa-imsg/2-2"), name_pattern: PORTABLE_NAME }]);
+        opts.env.push((IMESSAGE_SESSION_DIR_ENV.into(), "/tmp/aa-imsg/..".into()));
+        assert_eq!(read_allowances(&opts), vec![discord.clone()], "an invalid last value grants no session dir");
+
+        let mut no_read = opts.clone();
+        no_read.allowed_tools.retain(|tool| tool != "Read");
+        assert!(read_allowances(&no_read).is_empty());
+        let hooks = |matcher: &str, command: &str| Some(serde_json::json!({"hooks": {"PreToolUse": [{
+            "matcher": matcher, "hooks": [{"type": "command", "command": command}]}]}}).to_string());
+        for (matcher, command) in [("Write|Edit", "/repo/scripts/aa-wiki-scope-guard.sh"),
+                                   ("Read", "/repo/scripts/other-guard.sh"),
+                                   ("Read", "/repo/scripts/aa-wiki-scope-guard.sh.bak")] {
+            let mut other = opts.clone();
+            other.settings_json = hooks(matcher, command);
+            assert!(read_allowances(&other).is_empty(), "{matcher} {command}");
+        }
+        let mut guarded = opts.clone();
+        guarded.settings_json = hooks("Read|Grep", "/repo/scripts/aa-wiki-scope-guard.sh");
+        assert_eq!(read_allowances(&guarded), vec![discord]);
+        let mut unguarded = opts;
+        unguarded.settings_json = None;
+        assert!(read_allowances(&unguarded).is_empty());
+        for opts in [crate::reasoner::triage_opts(Some(temp.path().into())), crate::reasoner::resume_opts(temp.path().into())] {
+            assert!(read_allowances(&opts).is_empty());
+        }
     }
 }

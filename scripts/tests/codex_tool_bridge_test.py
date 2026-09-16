@@ -2148,5 +2148,194 @@ sys.stdin.readline()
             self.assertFalse((root / 'bad.txt').exists())
 
 
+
+class ReadAllowanceTests(unittest.TestCase):
+    """#1045: single-file Read exceptions outside the read roots.
+
+    The query preset's scope guard lets Claude Read inbound attachment temp
+    files (`/tmp/aa-{txt,img,doc}-<id>-<idx>.<ext>`, `$AUGMENTAGENT_IMESSAGE_TMP_DIR/<name>`).
+    The bridge admits the same reads as policy allowances: Read only, one
+    named directory, one pattern-matched leaf. The directory is world-writable
+    in production, so the leaf must be a private, unshared regular file owned by
+    this process's user. A synthetic directory stands in for /tmp here.
+    """
+    PATTERN = r'aa-(txt|img|doc)-[0-9]+-[0-9]+\.[a-zA-Z0-9]+'
+
+    def setUp(self):
+        import os
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+        self.root = self.base / 'wiki'
+        self.root.mkdir()
+        self.inbox = self.base / 'inbox'
+        self.inbox.mkdir(mode=0o700)
+        self.outside = self.base / 'outside.txt'
+        self.outside.write_text('SYNTHETIC_PRIVATE')
+        self.attachment = self.private(self.inbox / 'aa-txt-7-0.md', 'SYNTHETIC_ATTACHMENT')
+        self.policy = self.make_policy()
+        self.addCleanup(os.chmod, self.inbox, 0o700)
+
+    @staticmethod
+    def private(path, text):
+        path.write_text(text)
+        path.chmod(0o600)
+        return path
+
+    def allowance(self, directory=None, pattern=None, tools=('Read',)):
+        return {'tools': list(tools), 'directory': str(directory or self.inbox),
+                'name_pattern': pattern or self.PATTERN}
+
+    def make_policy(self, allowances=None, tools=('Read', 'Write', 'Edit', 'Glob', 'Grep'), **extra):
+        config = {'cwd': str(self.root), 'read_roots': [str(self.root)], 'write_roots': [str(self.root)],
+                  'allowed_tools': list(tools),
+                  'read_allowances': [self.allowance()] if allowances is None else allowances}
+        config.update(extra)
+        return bridge.Policy(config)
+
+    def assertDeniedRead(self, path, policy=None):
+        server = bridge.Server(policy or self.policy)
+        with self.assertRaises(bridge.Denied, msg=str(path)):
+            server.call('Read', {'file_path': str(path)})
+        response = server.dispatch({'method': 'tools/call', 'params': {
+            'name': 'Read', 'arguments': {'file_path': str(path)}}})
+        self.assertTrue(response.get('isError'), str(path))
+        self.assertNotIn('SYNTHETIC', json.dumps(response))
+
+    def test_allowed_attachment_reads_as_original_text_and_image(self):
+        import base64
+        server = bridge.Server(self.policy)
+        response = server.dispatch({'method': 'tools/call', 'params': {
+            'name': 'Read', 'arguments': {'file_path': str(self.attachment)}}})
+        self.assertFalse(response.get('isError', False), response)
+        self.assertEqual(response['content'][0]['text'], 'SYNTHETIC_ATTACHMENT')
+        self.assertEqual(server.call('Read', {'file_path': str(self.attachment), 'offset': 1, 'limit': 1}),
+                         'SYNTHETIC_ATTACHMENT')
+        pixel = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEElEQVR4nGNgYPiPAw0pCQCpcD/BFMrqcwAAAABJRU5ErkJggg==')
+        image = self.inbox / 'aa-img-7-1.png'
+        image.write_bytes(pixel)
+        image.chmod(0o600)
+        result = server.call('Read', {'file_path': str(image)})
+        self.assertEqual(result['content'][0]['mimeType'], 'image/png')
+        self.assertEqual(base64.b64decode(result['content'][0]['data']), pixel)
+
+    def test_allowance_grants_read_only_never_search_write_or_edit(self):
+        server = bridge.Server(self.policy)
+        for tool, arguments in [
+            ('Glob', {'pattern': '*', 'path': str(self.inbox)}),
+            ('Glob', {'pattern': 'aa-txt-*', 'path': str(self.base)}),
+            ('Grep', {'pattern': 'SYNTHETIC', 'path': str(self.inbox)}),
+            ('Grep', {'pattern': 'SYNTHETIC', 'path': str(self.attachment)}),
+            ('Write', {'file_path': str(self.attachment), 'content': 'UNAUTHORIZED'}),
+            ('Write', {'file_path': str(self.inbox / 'aa-txt-8-0.md'), 'content': 'UNAUTHORIZED'}),
+            ('Edit', {'file_path': str(self.attachment), 'old_string': 'SYNTHETIC', 'new_string': 'UNAUTHORIZED'}),
+        ]:
+            with self.subTest(tool=tool, arguments=arguments):
+                response = server.dispatch({'method': 'tools/call', 'params': {'name': tool, 'arguments': arguments}})
+                self.assertTrue(response.get('isError'), response)
+                self.assertNotIn('SYNTHETIC', json.dumps(response))
+        self.assertEqual(self.attachment.read_text(), 'SYNTHETIC_ATTACHMENT')
+        self.assertFalse((self.inbox / 'aa-txt-8-0.md').exists())
+        # The allowance never implies the Read tool itself.
+        self.assertDeniedRead(self.attachment, self.make_policy(tools=('Glob',)))
+
+    def test_allowance_rejects_lookalike_names_and_path_tricks(self):
+        for name in ('aa-txt-..', 'aa-txt-a-0.md', 'aa-pdf-7-0.md', 'aa-txt-7-0.md.bak', 'aa-txt-7-0.',
+                     'lookalike.txt', 'aa-txt-7-0'):
+            self.private(self.inbox / name, 'SYNTHETIC_OUTSIDE_SCOPE')
+        (self.inbox / 'nested').mkdir()
+        self.private(self.inbox / 'nested' / 'aa-txt-7-0.md', 'SYNTHETIC_OUTSIDE_SCOPE')
+        (self.base / 'inbox-evil').mkdir()
+        self.private(self.base / 'inbox-evil' / 'aa-txt-7-0.md', 'SYNTHETIC_OUTSIDE_SCOPE')
+        inbox = str(self.inbox)
+        for path in [
+            inbox + '/aa-txt-..', inbox + '/aa-txt-a-0.md', inbox + '/aa-pdf-7-0.md',
+            inbox + '/aa-txt-7-0.md.bak', inbox + '/aa-txt-7-0.', inbox + '/aa-txt-7-0',
+            inbox + '/aa-txt-7-0.md/../lookalike.txt', inbox + '/aa-txt-7-0.md/../../outside.txt',
+            inbox + '/aa-txt-7-0.md/../aa-txt-7-0.md', inbox + '//aa-txt-7-0.md', inbox + '/./aa-txt-7-0.md',
+            inbox + '/nested/aa-txt-7-0.md', inbox + '/nested/../aa-txt-7-0.md', inbox + '-evil/aa-txt-7-0.md',
+            '../inbox/aa-txt-7-0.md', 'aa-txt-7-0.md', inbox + '/aa-txt-7-0.md\x00', inbox + '/aa-txt-7-0.md/',
+        ]:
+            with self.subTest(path=path):
+                self.assertDeniedRead(path)
+
+    def test_allowance_refuses_planted_links_and_shared_or_special_files(self):
+        import os
+        os.symlink(self.outside, self.inbox / 'aa-txt-8-0.md')
+        os.symlink(self.attachment, self.inbox / 'aa-txt-8-1.md')
+        os.link(self.outside, self.inbox / 'aa-txt-9-0.md')
+        self.private(self.inbox / 'aa-txt-10-0.md', 'SYNTHETIC_SHARED').chmod(0o620)
+        self.private(self.inbox / 'aa-txt-10-1.md', 'SYNTHETIC_SHARED').chmod(0o602)
+        os.mkfifo(self.inbox / 'aa-txt-11-0.md', 0o600)
+        (self.inbox / 'aa-txt-12-0.md').mkdir()
+        for name in ('aa-txt-8-0.md', 'aa-txt-8-1.md', 'aa-txt-9-0.md', 'aa-txt-10-0.md',
+                     'aa-txt-10-1.md', 'aa-txt-11-0.md', 'aa-txt-12-0.md', 'aa-txt-13-0.md'):
+            with self.subTest(name=name):
+                self.assertDeniedRead(self.inbox / name)
+        # The hard-linked inode is refused even though the model reached it by an allowed name.
+        self.assertEqual(os.stat(self.outside).st_nlink, 2)
+
+    def test_allowance_refuses_files_owned_by_another_user(self):
+        import os
+        import stat
+        uid = os.getuid()
+        def info(mode=stat.S_IFREG | 0o600, links=1, owner=uid):
+            return os.stat_result((mode, 1, 1, links, owner, 0, 5, 0, 0, 0))
+        self.assertTrue(bridge.allowance_file_permitted(info(), uid))
+        self.assertFalse(bridge.allowance_file_permitted(info(owner=uid + 1), uid), 'foreign owner')
+        self.assertFalse(bridge.allowance_file_permitted(info(owner=0), uid), 'root-owned')
+        self.assertFalse(bridge.allowance_file_permitted(info(mode=stat.S_IFREG | 0o620), uid), 'group-writable')
+        self.assertFalse(bridge.allowance_file_permitted(info(mode=stat.S_IFREG | 0o602), uid), 'world-writable')
+        self.assertFalse(bridge.allowance_file_permitted(info(links=2), uid), 'hard link')
+        self.assertFalse(bridge.allowance_file_permitted(info(mode=stat.S_IFLNK | 0o777), uid), 'symlink')
+        self.assertFalse(bridge.allowance_file_permitted(info(mode=stat.S_IFDIR | 0o700), uid), 'directory')
+        # End to end with a real file another user owns, when the host has one.
+        system = Path('/etc/hostname')
+        try:
+            real = os.lstat(system)
+        except OSError:
+            self.skipTest('no foreign-owned regular file fixture on this host')
+        if not stat.S_ISREG(real.st_mode) or real.st_nlink != 1 or real.st_uid == uid or uid == 0:
+            self.skipTest('no foreign-owned regular file fixture on this host')
+        policy = self.make_policy([self.allowance(directory=system.parent, pattern='hostname')])
+        self.assertDeniedRead(system, policy)
+
+    def test_allowance_directory_opens_without_symlinks_and_must_not_be_shared(self):
+        import os
+        os.symlink(self.inbox, self.base / 'inbox-link')
+        os.symlink(self.base, self.base / 'alias')
+        for directory in (self.base / 'inbox-link', self.base / 'alias' / 'inbox'):
+            with self.subTest(directory=directory):
+                policy = self.make_policy([self.allowance(directory=directory)])
+                self.assertDeniedRead(directory / 'aa-txt-7-0.md', policy)
+        self.inbox.chmod(0o777)
+        self.assertDeniedRead(self.attachment)
+        self.inbox.chmod(0o770)
+        self.assertDeniedRead(self.attachment)
+        # A sticky shared directory, like /tmp, protects entries of other owners.
+        self.inbox.chmod(0o1777)
+        self.assertEqual(bridge.Server(self.policy).call('Read', {'file_path': str(self.attachment)}),
+                         'SYNTHETIC_ATTACHMENT')
+
+    def test_malformed_allowances_fail_closed(self):
+        valid = self.allowance()
+        for entries in [
+            {}, 'aa-txt', [str(self.inbox)],
+            [dict(valid, tools=['Read', 'Glob'])], [dict(valid, tools=['Grep'])], [dict(valid, tools='Read')],
+            [dict(valid, tools=[])], [dict(valid, directory='/')], [dict(valid, directory='relative/inbox')],
+            [dict(valid, directory=str(self.inbox) + '/')], [dict(valid, directory=str(self.inbox) + '/../inbox')],
+            [dict(valid, directory='/' + str(self.inbox))], [dict(valid, directory=str(self.inbox) + '/.')],
+            [dict(valid, directory=str(self.inbox) + '\x00')], [dict(valid, directory=None)],
+            [dict(valid, name_pattern='(')], [dict(valid, name_pattern=7)], [dict(valid, name_pattern='')],
+            [dict(valid, recursive=True)], [{'tools': ['Read'], 'directory': str(self.inbox)}],
+        ]:
+            with self.subTest(entries=entries), self.assertRaises(bridge.Denied):
+                self.make_policy(entries)
+
+    def test_handoff_state_cannot_match_a_read_allowance(self):
+        with self.assertRaisesRegex(bridge.Denied, 'outside model tool scopes'):
+            self.make_policy(handoff_path=str(self.inbox / 'aa-txt-99-0.md'))
+
+
 if __name__ == '__main__':
     unittest.main()
