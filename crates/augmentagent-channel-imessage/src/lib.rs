@@ -15,7 +15,7 @@ pub mod sync;
 pub use bundle::{
     entry_date, parse_entries, synthetic_imessage_email, Bundle, Conversation, MessageEntry,
 };
-pub use config::ImessageConfig;
+pub use config::{history_wiki_capture_enabled, ImessageConfig};
 pub use page::bump_updated;
 pub use sync::{
     batched_delta_email, poll_once, ImessageReport, ImessageSyncer, PollDelta, PollStats,
