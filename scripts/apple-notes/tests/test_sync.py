@@ -428,7 +428,7 @@ class SyncTests(unittest.TestCase):
         # Regression: a note quarantined by the first-line scan was exported on
         # the next run because the cached skip entry short-circuited the scan
         # without carrying its reason forward.
-        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VySWQiOiJ1c2VyXzAxIn0.c2lnbmF0dXJlc2lnbmF0dXJl"  # pii-ok: synthetic fixture
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJ1c2VySWQiOiJ1c2VyXzAxIn0.c2lnbmF0dXJlc2lnbmF0dXJl"  # pii-ok gitleaks:allow synthetic fixture
         uuid = add_note(self.con, 10, jwt[:30], f"{jwt}\n\nmore text")
         self.run_sync()
         for _ in range(2):
