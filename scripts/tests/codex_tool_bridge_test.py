@@ -324,7 +324,7 @@ print('SYNTHETIC_BUILD_OK')
         cargo.chmod(0o700)
         (self.root/'source.rs').write_text('source')
         (self.root/'.env').write_text('SYNTHETIC_TOKEN=PRIVATE')
-        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+        policy=bridge.Policy({'build_runner':'host','cwd':str(self.root),'read_roots':[str(self.root)],
             'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Edit','Bash(cargo *)'],
             'environment':{'PATH':str(fakebin)+':/usr/bin','SYNTHETIC_TOKEN':'PRIVATE'}})
         result=policy.run_command('cargo test')
@@ -353,7 +353,7 @@ else:
     raise AssertionError('home file escaped confinement')
 ''')
         cargo.chmod(0o700)
-        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+        policy=bridge.Policy({'build_runner':'host','cwd':str(self.root),'read_roots':[str(self.root)],
             'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Bash(cargo *)'],
             'environment':{'PATH':str(fakebin)+':/usr/bin','HOME':str(owner)}})
         result=policy.run_command('cargo test')
@@ -402,7 +402,7 @@ else:
         (self.root/'src').mkdir()
         (self.root/'Cargo.toml').write_text('[package]\nname="synthetic-build"\nversion="0.1.0"\nedition="2021"\n')
         (self.root/'src/lib.rs').write_text('#[test] fn synthetic_passes() { assert_eq!(2 + 2, 4); }\n')
-        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+        policy=bridge.Policy({'build_runner':'host','cwd':str(self.root),'read_roots':[str(self.root)],
             'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Edit','Bash(cargo *)']})
         outcome=policy.run_command('cargo test --offline',timeout=60)
         self.assertEqual(outcome['exit_code'],0,outcome)
@@ -762,7 +762,7 @@ child=subprocess.Popen(['/usr/bin/python3','-c','import time; time.sleep(30)'])
 print(child.pid, flush=True)
 ''')
         cargo.chmod(0o700)
-        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+        policy=bridge.Policy({'build_runner':'host','cwd':str(self.root),'read_roots':[str(self.root)],
             'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Bash(cargo *)'],
             'environment':{'PATH':str(fakebin)+':/usr/bin'}})
         outcome=policy.run_command('cargo test')
@@ -808,7 +808,7 @@ print(child.pid, flush=True)
             self.skipTest('npm is not installed')
         (self.root/'package.json').write_text(json.dumps({'name':'synthetic-build','version':'1.0.0',
             'scripts':{'test':"node -e \"require('node:assert').equal(2+2,4); console.log('NPM_FIXTURE_OK')\""}}))
-        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+        policy=bridge.Policy({'build_runner':'host','cwd':str(self.root),'read_roots':[str(self.root)],
             'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Edit','Bash(npm *)']})
         outcome=policy.run_command('npm test --offline',timeout=60)
         self.assertEqual(outcome['exit_code'],0,outcome)
@@ -832,7 +832,7 @@ console.log('DEPENDENCY_FIXTURE_OK');
 ''')
         (self.root/'package.json').write_text(json.dumps({'name':'synthetic-build','version':'1.0.0',
             'scripts':{'test':'node test.js'}}))
-        policy=bridge.Policy({'cwd':str(self.root),'read_roots':[str(self.root)],
+        policy=bridge.Policy({'build_runner':'host','cwd':str(self.root),'read_roots':[str(self.root)],
             'write_roots':[str(self.root)],'allowed_tools':['Read','Write','Edit','Bash(npm *)']})
         outcome=policy.run_command('npm test --offline',timeout=60)
         self.assertEqual(outcome['exit_code'],0,outcome)
@@ -2099,6 +2099,116 @@ class HelperReadinessTests(unittest.TestCase):
                                 'write_roots': [str(helper_directory)], 'allowed_tools': ['Read']})
         with self.assertRaises(bridge.Denied):
             policy.read('codex-command-sandbox.py')
+
+
+class BuildRunnerReadinessTests(unittest.TestCase):
+    """#1041: builds never silently fall back to the host runner."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / 'workspace'
+        self.root.mkdir()
+        self.fakebin = Path(self.temp.name) / 'bin'
+        self.fakebin.mkdir()
+        for name in ('cargo', 'npm', 'npx', 'printf'):
+            tool = self.fakebin / name
+            tool.write_text('#!/bin/sh\necho SYNTHETIC_HOST_RUN\n')
+            tool.chmod(0o700)
+
+    def policy(self, **extra):
+        config = {'cwd': str(self.root), 'read_roots': [str(self.root)],
+                  'write_roots': [str(self.root)],
+                  'allowed_tools': ['Bash(cargo *)', 'Bash(npm *)', 'Bash(npx *)', 'Bash(printf *)'],
+                  'environment': {'PATH': str(self.fakebin) + ':/usr/bin'}}
+        config.update(extra)
+        return bridge.Policy(config)
+
+    def test_missing_vm_config_fails_closed_for_every_build_command(self):
+        for runner in ({}, {'build_runner': 'unavailable'}, {'build_runner': 'vm'}):
+            policy = self.policy(**runner)
+            self.assertIsNone(policy.build_runner)
+            for command in ('cargo test', 'npm test', 'npx tsc'):
+                with self.subTest(runner=runner, command=command):
+                    with self.assertRaises(bridge.Readiness) as raised:
+                        policy.run_command(command)
+                    self.assertIn('JARVIS_READINESS:build_vm_unavailable', str(raised.exception))
+                    self.assertIn('AUGMENTAGENT_BUILD_VM=host', str(raised.exception))
+
+    def test_readiness_reaches_the_model_as_a_named_tool_error(self):
+        server = bridge.Server(self.policy())
+        response = server.dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': 'cargo build'}}})
+        self.assertTrue(response['isError'])
+        self.assertIn('JARVIS_READINESS:build_vm_unavailable', response['content'][0]['text'])
+
+    def test_runner_selection_is_explicit(self):
+        self.assertEqual(self.policy(build_runner='host').build_runner, 'host')
+        config = Path(self.temp.name) / 'runtime.json'
+        self.assertEqual(self.policy(build_vm_config=str(config)).build_runner, 'vm')
+        with self.assertRaises(bridge.Denied):
+            self.policy(build_runner='container')
+
+    @requires_sandbox
+    def test_non_build_commands_are_unaffected_by_a_missing_vm(self):
+        outcome = self.policy().run_command('printf synthetic')
+        self.assertEqual(outcome['exit_code'], 0, outcome)
+        # Non-build commands always run in the host command sandbox.
+        self.assertEqual(list(outcome)[0], 'runner')
+        self.assertEqual(outcome['runner'], 'host')
+
+    @requires_sandbox
+    def test_host_opt_out_runs_builds_on_the_host_and_names_the_runner(self):
+        outcome = self.policy(build_runner='host').run_command('cargo test')
+        self.assertEqual(outcome['exit_code'], 0, outcome)
+        self.assertIn('SYNTHETIC_HOST_RUN', outcome['stdout'])
+        self.assertEqual(outcome['runner'], 'host')
+        # First key, so a truncated serialisation still names the runner.
+        self.assertTrue(json.dumps(outcome).startswith('{"runner": "host"'))
+
+    def test_vm_runner_outcome_names_the_runner(self):
+        policy = self.policy(build_vm_config=str(Path(self.temp.name) / 'runtime.json'))
+        policy.run_vm_build = lambda argv, timeout: {'exit_code': 0, 'stdout': '', 'stderr': ''}
+        outcome = policy.run_command('cargo test')
+        self.assertEqual(outcome['runner'], 'vm')
+        self.assertEqual(list(outcome)[0], 'runner')
+
+    def call_bash(self, policy, command, timeout=120):
+        return bridge.Server(policy).dispatch({'method': 'tools/call', 'params': {
+            'name': 'Bash', 'arguments': {'command': command, 'timeout': timeout}}})
+
+    def test_quoted_build_command_is_gated_and_names_the_runner(self):
+        policy = self.policy(build_vm_config=str(Path(self.temp.name) / 'runtime.json'))
+        policy.run_vm_build = lambda argv, timeout: {'exit_code': 0, 'stdout': '', 'stderr': ''}
+        response = self.call_bash(policy, '"cargo" test')
+        self.assertTrue(response['content'][0]['text'].startswith('{"runner": "vm"'), response)
+
+    def test_vm_denial_after_the_build_started_keeps_the_runner(self):
+        policy = self.policy(build_vm_config=str(Path(self.temp.name) / 'runtime.json'))
+        def broker_fails_mid_build(argv, timeout):
+            policy.mark_command_started()
+            raise bridge.Denied('VM execution or cleanup failed')
+        policy.run_vm_build = broker_fails_mid_build
+        response = self.call_bash(policy, 'cargo test')
+        self.assertTrue(response['isError'])
+        self.assertTrue(response['content'][0]['text'].startswith('[runner=vm] '), response)
+
+    def test_refusal_before_any_process_starts_carries_no_runner(self):
+        policy = self.policy(build_runner='host', environment={'PATH': str(Path(self.temp.name) / 'empty')})
+        response = self.call_bash(policy, 'cargo test')
+        self.assertTrue(response['isError'])
+        self.assertNotIn('[runner=', response['content'][0]['text'])
+        policy = self.policy(build_vm_config=str(Path(self.temp.name) / 'runtime.json'))
+        policy.run_vm_build = lambda argv, timeout: (_ for _ in ()).throw(bridge.Denied('VM runtime is unavailable'))
+        self.assertNotIn('[runner=', self.call_bash(policy, 'cargo test')['content'][0]['text'])
+
+    @requires_sandbox
+    def test_host_build_timeout_after_start_keeps_the_runner(self):
+        slow = self.fakebin / 'cargo'
+        slow.write_text('#!/bin/sh\nexec sleep 30\n')
+        response = self.call_bash(self.policy(build_runner='host'), 'cargo test', timeout=1)
+        self.assertTrue(response['isError'])
+        self.assertTrue(response['content'][0]['text'].startswith('[runner=host] '), response)
 
 
 class TransportTests(unittest.TestCase):

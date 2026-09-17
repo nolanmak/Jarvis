@@ -79,6 +79,24 @@ pub struct AuditRecord {
     pub stdout_truncated: Option<String>,
     /// Captured stderr, truncated to [`MAX_STREAM_BYTES`] if longer.
     pub stderr_truncated: Option<String>,
+    /// `Bash` only (#1041): where the command ran, `vm` or `host`, or `none`
+    /// when it was refused before any process started. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
+}
+
+/// Tool-result texts with which the Claude CLI refuses a call before running
+/// it: an ungranted permission, a denied permission, or a PreToolUse hook deny.
+const CLAUDE_REFUSALS: &[&str] = &[
+    "Claude requested permissions to use ",
+    "Permission to use ",
+    "Hook PreToolUse:",
+    "PreToolUse:",
+];
+
+fn is_claude_refusal(content: &str) -> bool {
+    let content = content.trim_start();
+    CLAUDE_REFUSALS.iter().any(|prefix| content.starts_with(prefix))
 }
 
 /// A tool call extracted from the stream-json output of the claude CLI.
@@ -429,6 +447,11 @@ pub fn build_audit_record(
     } else {
         (Some(captured), None)
     };
+    // The Claude lane runs every Bash command in a host shell unless its
+    // permission check refused it. The Codex caller overrides this with the
+    // runner its bridge reports.
+    let runner = (tool == "Bash")
+        .then(|| if is_error && is_claude_refusal(result_content) { "none" } else { "host" }.to_string());
     AuditRecord {
         provider: None,
         ts,
@@ -438,6 +461,7 @@ pub fn build_audit_record(
         exit_code: None,
         stdout_truncated,
         stderr_truncated,
+        runner,
     }
 }
 
@@ -614,6 +638,7 @@ mod tests {
             exit_code: None,
             stdout_truncated: None,
             stderr_truncated: None,
+            runner: None,
         };
         let notice = format_notice(&rec);
         assert!(notice.contains("Write"));
@@ -633,6 +658,7 @@ mod tests {
             exit_code: Some(0),
             stdout_truncated: Some("a\nb".into()),
             stderr_truncated: None,
+            runner: None,
         };
         let notice = format_notice(&rec);
         assert!(notice.contains("Bash"));
@@ -679,6 +705,37 @@ mod tests {
         assert_eq!(body.len(), MAX_STREAM_BYTES);
     }
 
+    #[test]
+    fn claude_bash_records_name_the_host_runner_without_parsing_the_command() {
+        // Every Claude-lane Bash command that executed ran in a host shell,
+        // whatever its first word, and whether or not it exited non-zero.
+        for (command, content, is_error) in [
+            ("cd crates && cargo build", "Compiling", false),
+            ("FOO=1 cargo test", "ok", false),
+            ("timeout 60 cargo test", "Exit code 101\nerror", true),
+            ("git status", "clean", false),
+        ] {
+            let record = build_audit_record("ts".into(), "s".into(), "Bash".into(),
+                serde_json::json!({"command": command}), content, is_error);
+            assert_eq!(record.runner.as_deref(), Some("host"), "{command}");
+            assert_eq!(serde_json::to_value(&record).unwrap()["runner"], "host");
+        }
+        // A command the permission check refused never ran.
+        for denial in [
+            "Claude requested permissions to use Bash, but you haven't granted it yet.",
+            "Permission to use Bash with command cargo build has been denied.",
+            "Hook PreToolUse:Bash denied this tool",
+        ] {
+            let record = build_audit_record("ts".into(), "s".into(), "Bash".into(),
+                serde_json::json!({"command": "cargo build"}), denial, true);
+            assert_eq!(record.runner.as_deref(), Some("none"), "{denial}");
+        }
+        let write = build_audit_record("ts".into(), "s".into(), "Write".into(),
+            serde_json::json!({"command": "cargo test"}), "ok", false);
+        assert!(write.runner.is_none());
+        assert!(serde_json::to_value(&write).unwrap().get("runner").is_none(), "non-Bash rows stay unchanged");
+    }
+
     #[tokio::test]
     async fn audit_logger_writes_and_appends_ndjson() {
         let tmp = tempfile::tempdir().unwrap();
@@ -693,6 +750,7 @@ mod tests {
             exit_code: None,
             stdout_truncated: None,
             stderr_truncated: None,
+            runner: None,
         };
         let rec2 = AuditRecord {
         provider: None,
@@ -703,6 +761,7 @@ mod tests {
             exit_code: Some(0),
             stdout_truncated: Some("a".into()),
             stderr_truncated: None,
+            runner: None,
         };
         logger.record(&rec1).await;
         logger.record(&rec2).await;

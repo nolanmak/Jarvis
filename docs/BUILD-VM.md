@@ -13,6 +13,70 @@ default. Set `AUGMENTAGENT_BUILD_VM_CONFIG` in the daemon environment to overrid
 it. An explicit invalid path fails; it does not fall back to the default.
 Task/profile environment variables cannot select a different runtime.
 
+### Runner selection and readiness (#1041)
+
+The daemon resolves one build runner for Codex `cargo`, `npm` and `npx` commands:
+
+| Daemon environment | Runner |
+| --- | --- |
+| `AUGMENTAGENT_BUILD_VM_CONFIG=<path>` | `vm` (an invalid path fails; the opt-out does not override it) |
+| `AUGMENTAGENT_BUILD_VM=host` | `host` (explicit opt-out: the host command sandbox) |
+| default `runtime.json` present | `vm` |
+| none of the above | unavailable |
+
+There is no silent host fallback. When the runner is unavailable, every build
+command returns the tool error `JARVIS_READINESS:build_vm_unavailable` and nothing
+runs; other commands are unaffected. The daemon logs a warning at launch when a
+build-capable profile starts without a runner.
+
+Every `Bash` row in `tool-audit.log` carries `runner`: `vm` or `host` for a command
+whose process started, `none` for one refused before any process started (a
+readiness error, a policy denial, or a Claude permission refusal). The bridge
+decides the runner before execution and reports it as the first key of the
+result, or as a `[runner=vm]` / `[runner=host]` prefix on a failure raised after
+the process started (for example a timeout), so truncation cannot drop it.
+Non-build commands and every Claude-lane command run on the host.
+
+`augmentagent doctor` reports the `build_vm` check as one of: `config missing`,
+`config invalid`, `qemu or kernel missing`, `kvm not accessible` (error: no
+read-write access, or no device), `kvm not accessible after logout` (warning:
+access comes only from a per-user ACL entry such as the login-seat grant, not
+from the owner, the `kvm` group entry under the ACL mask, or other bits), or `ok`.
+With the opt-out set it warns that builds run on the host.
+
+### Host provisioning: KVM access that survives logout (operator step)
+
+On desktop hosts `/dev/kvm` is usually `root:kvm 0660` plus a logind `uaccess`
+ACL for the user at the active seat. That ACL is removed when the seat session
+ends, after which qemu cannot open `/dev/kvm` and every VM build is denied. Doctor
+detects this state (`getfacl /dev/kvm` shows `user:<you>:rw-` while `id -nG` does
+not list `kvm`). Grant access through group membership instead. This needs sudo:
+
+```sh
+sudo usermod -aG kvm "$USER"
+sudo reboot
+```
+
+Group membership applies only to processes started after a new login. A user
+manager that survives (any remaining SSH, tmux, remote-desktop or other session)
+keeps the old groups, and so does every service it restarts, so reboot, or at
+minimum end every session of the user, including SSH, tmux and remote desktop,
+before starting the daemon again. Then verify:
+
+```sh
+id -nG | tr ' ' '\n' | grep -x kvm
+augmentagent doctor   # build_vm: ok, not the ACL warning
+```
+
+**Not recommended: `loginctl enable-linger`.** Lingering is not needed for this
+step (group membership already removes the dependency on the seat ACL). Side
+effects: every enabled user unit (the daemon, the updater, auto-PR and wiki-sync
+timers, remote-desktop units) starts at boot with no one logged in, spending the
+Claude subscription quota unattended while gnome-keyring stays locked, so secrets
+read from the keyring fail.
+
+Record the change in the private provisioning record.
+
 Keep the directory mode 0700 and configuration mode 0600, owned by the daemon
 user. All paths must be absolute. Host executable artifacts must be owned by root
 or the daemon user and must not be group/world writable. Example schema (replace
@@ -42,7 +106,8 @@ every example path with a provisioned local artifact):
 Provision QEMU with KVM, virtio-9p and seccomp support, a compatible Linux kernel,
 its matching uncompressed modules in dependency order, and a static BusyBox.
 The module list depends on which drivers the kernel includes; virtio PCI must be
-available before loading 9p. The daemon user needs access to `/dev/kvm`.
+available before loading 9p. The daemon user needs read-write access to `/dev/kvm`
+through the `kvm` group, not only a login-seat ACL (see above).
 On Debian/Ubuntu, distribution packages and their shared-library dependencies
 can be extracted into a private directory using `dpkg-deb -x`; system installation
 is not required. Keep package versions and hashes in a private provisioning record.

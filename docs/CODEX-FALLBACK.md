@@ -52,7 +52,8 @@ it is the address the service CLIs use to reach the Secret Service keyring.
 
 The policy also carries non-secret but private paths: `settings` (hooks and
 MCP server definitions, including each server's `env`), `session_id`,
-`handoff_path` and `build_vm_config`. Model provider credentials
+`handoff_path`, `build_vm_config` and `build_runner` (`vm`, `host` or
+`unavailable`, #1041). Model provider credentials
 (`CODEX_API_KEY`, Codex `auth.json`) are never in the policy.
 
 A required stdio MCP bridge exposes the operations declared by `ReasonerOpts`.
@@ -260,7 +261,10 @@ regression failure. The earlier socket, session and HOME failures did not recur.
 Bridge Cargo/npm/npx commands use this runner when the private default runtime
 configuration exists, or the operator sets `AUGMENTAGENT_BUILD_VM_CONFIG`. The
 adapter reads the override from its own process environment, never from profile
-environment overrides. See [runtime setup and rollback](BUILD-VM.md). The launcher bundles both
+environment overrides. Without either, build commands fail closed with
+`JARVIS_READINESS:build_vm_unavailable` unless the operator sets
+`AUGMENTAGENT_BUILD_VM=host` (#1041); there is no silent host fallback.
+See [runtime setup and rollback](BUILD-VM.md). The launcher bundles both
 the VM helper and process supervisor privately. Checkout path arguments translate
 to the guest workspace, guest tools do not depend on the host command PATH, and
 root and nested npm workspace dependencies mount read-only. Source reconciliation runs only after VM
