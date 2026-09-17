@@ -5159,6 +5159,16 @@ fn strip_register_receipt(body: &str, inbound: Option<&str>) -> Result<(String, 
     let (first, rest) = lead.split_once('\n').unwrap_or((lead, ""));
     let receipt = reg::is_register_receipt(first);
     let clean = if receipt {
+        // A receipt that decided nothing vouches for nothing. Dropping it
+        // would ship the #994 bug wearing a badge that says it was checked.
+        if reg::is_undecided_receipt(first) {
+            anyhow::bail!(
+                "the register: receipt records no decision — name the register \
+                 (`register: standard`/`lowercase`) or the default you are \
+                 falling back to (`register: unknown, defaulting to lowercase`), \
+                 then re-run"
+            );
+        }
         if let Some(note) = reg::audit_register_receipts(lead).into_iter().next() {
             anyhow::bail!("{note}: recase the body to match its receipt, then re-run");
         }
@@ -8983,6 +8993,66 @@ mod unescape_body_tests {
 
 #[cfg(test)]
 mod approval_body_tests {
+    /// #994 review, finding 1: `strip_register_receipt` dropped ANY first
+    /// line that parsed as a receipt, including from a hand-composed email
+    /// that happens to open by discussing a register. There is no drafter flag
+    /// at this boundary, so the discriminator has to be the line's SHAPE: the
+    /// protocol emits `register: <word>` optionally followed by a parenthetical
+    /// reason, and nothing else. Ordinary prose that merely starts with the
+    /// word is body text and must survive untouched.
+    #[test]
+    fn a_sentence_that_merely_starts_with_register_is_not_a_receipt() {
+        for prose in [
+            "register: standard rates apply from April, per the attached table.",
+            "Register: lowercase letters are fine for the form field.",
+            "register: unknown callers are blocked by the new rule.",
+        ] {
+            let body = format!("{prose}\n\nRest of the mail.\n");
+            let (clean, receipt) = strip_register_receipt(&body, None).expect("prose must send");
+            assert!(!receipt, "prose must not be read as a receipt: {prose:?}");
+            assert_eq!(clean, body, "and must reach the recipient unmutated");
+        }
+
+        // The protocol's own shapes still parse and are still dropped. The
+        // draft under each receipt has to AGREE with it, or the mismatch audit
+        // fires for its own separate and correct reason.
+        for (real, draft) in [
+            ("register: standard", "Hi there, quick update.\n"),
+            ("register: lowercase (you asked)", "hi there, quick update.\n"),
+            ("register: standard (she capitalizes), mirroring", "Hi there, quick update.\n"),
+            ("register: unknown, defaulting to lowercase", "hi there, quick update.\n"),
+        ] {
+            let body = format!("{real}\n{draft}");
+            let (clean, receipt) = strip_register_receipt(&body, None)
+                .unwrap_or_else(|e| panic!("{real:?} must parse and send: {e:#}"));
+            assert!(receipt, "protocol receipt must still be recognised: {real:?}");
+            assert_eq!(clean, draft, "and the receipt line must be dropped");
+        }
+    }
+
+    /// #994 review, finding 2: `register: unknown` with no declared default
+    /// records no decision at all, yet it was accepted and stripped — so a
+    /// drafted mail could reach Gmail with the casing bug this issue is about,
+    /// carrying a receipt that vouched for nothing.
+    #[test]
+    fn an_undecided_register_receipt_refuses_instead_of_shipping() {
+        let body = "register: unknown\nhey casey, thanks for checking in.\n";
+        let err = strip_register_receipt(body, None)
+            .expect_err("an undecided receipt must not ship");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(msg.contains("register"), "{msg}");
+        assert!(
+            msg.contains("decision") || msg.contains("defaulting to"),
+            "the error must say what to do about it: {msg}"
+        );
+
+        // Naming a default IS a decision, and still sends.
+        let decided = "register: unknown, defaulting to lowercase\nhey casey, thanks.\n";
+        let (clean, receipt) = strip_register_receipt(decided, None).expect("a decided receipt sends");
+        assert!(receipt);
+        assert_eq!(clean, "hey casey, thanks.\n");
+    }
+
     use super::strip_register_receipt;
     use super::{
         body_without_leaked_subject, compose_card_identity, compose_pending_disposition,

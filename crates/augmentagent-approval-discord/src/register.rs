@@ -43,8 +43,44 @@ impl fmt::Display for Register {
     }
 }
 
+/// Does the text after `register:` look like the protocol's own receipt rather
+/// than the start of a sentence?
+///
+/// Accepts the keyword alone, or the keyword followed only by a parenthetical
+/// reason and short bookkeeping (`, mirroring`, `, defaulting to lowercase`).
+/// Rejects the keyword followed by more prose, which is what an ordinary
+/// sentence looks like.
+fn has_receipt_shape(rest: &str) -> bool {
+    let word_len = rest.chars().take_while(char::is_ascii_alphabetic).count();
+    let mut tail = rest[word_len..].trim();
+    // An optional parenthetical reason: "(she capitalizes)".
+    if let Some(open) = tail.strip_prefix('(') {
+        match open.split_once(')') {
+            Some((_, after)) => tail = after.trim(),
+            // An unclosed parenthesis is prose, not a receipt.
+            None => return false,
+        }
+    }
+    let tail = tail.trim_start_matches(',').trim();
+    if tail.is_empty() {
+        return true;
+    }
+    // Only the protocol's own short notes may follow.
+    let t = tail.to_ascii_lowercase();
+    t.starts_with("defaulting to") || t == "mirroring"
+}
+
 /// Parse one line as a receipt. `unknown` resolves to the default it names
-/// (`defaulting to lowercase`); an `unknown` naming none checks nothing.
+/// (`defaulting to lowercase`); an `unknown` naming none decides nothing and
+/// callers on a send path must refuse it.
+///
+/// The line must have the PROTOCOL's shape, not merely start with the word.
+/// Review of #994: the Gmail path drops a first line that parses as a receipt,
+/// and there is no drafter flag at that boundary — so "register: standard
+/// rates apply from April" in a hand-composed mail would be silently eaten.
+/// The protocol emits the keyword, then optionally a parenthetical reason and
+/// short trailing notes; a sentence continuing into ordinary prose is body
+/// text and must survive untouched.
 fn parse_receipt(line: &str) -> Option<Option<Register>> {
     let trimmed = line.trim();
     let head = trimmed.get(..REGISTER_RECEIPT_PREFIX.len())?;
@@ -52,6 +88,9 @@ fn parse_receipt(line: &str) -> Option<Option<Register>> {
         return None;
     }
     let rest = trimmed[REGISTER_RECEIPT_PREFIX.len()..].trim_start();
+    if !has_receipt_shape(rest) {
+        return None;
+    }
     let word: String = rest
         .chars()
         .take_while(char::is_ascii_alphabetic)
@@ -84,6 +123,17 @@ fn parse_receipt(line: &str) -> Option<Option<Register>> {
 /// payload on the receipt heading it and drops that owner-facing line.
 pub fn is_register_receipt(line: &str) -> bool {
     parse_receipt(line).is_some()
+}
+
+/// True when `line` is a receipt that records NO decision: `register: unknown`
+/// with no `defaulting to …`.
+///
+/// Review of #994: such a receipt was accepted and stripped, so a drafted mail
+/// could reach Gmail carrying a receipt that vouched for nothing — the casing
+/// bug this issue is about, wearing a badge that says it was checked. A send
+/// path must refuse it rather than drop it.
+pub fn is_undecided_receipt(line: &str) -> bool {
+    matches!(parse_receipt(line), Some(None))
 }
 
 fn is_fence(line: &str) -> bool {
