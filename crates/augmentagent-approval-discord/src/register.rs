@@ -193,20 +193,39 @@ fn draft_paragraphs<'a>(lines: &[&'a str], receipt_idx: Option<usize>) -> (Vec<V
     (paragraphs, i)
 }
 
-/// Casing at each sentence start of the paragraph: the first word of every
-/// line and every word after a `.`/`!`/`?`. Only sentence-shaped lines (three
+/// Casing at each sentence start of the paragraph: its first word, and every
+/// word after a `.`/`!`/`?`. A sentence runs ACROSS a soft wrap, so a line
+/// break is not a boundary. Only sentence-shaped paragraphs (three
 /// or more words) are evidence — a greeting or a sign-off is cased either
 /// way — a list marker demotes the item's first word, and URL/handle/
 /// abbreviation/brand-shaped words (`github.com/x`, `@sam`, `e.g.`,
 /// `iPhone`) are skipped: their casing says nothing about register.
 fn sentence_starts(paragraph: &[&str]) -> (usize, usize) {
     let (mut upper, mut lower) = (0, 0);
+    // Evidence is judged per PARAGRAPH, not per line, and a sentence runs
+    // across a soft wrap.
+    //
+    // Review of #994: `at_start` used to reset on every physical line, so an
+    // ordinary wrapped draft read as beginning a new sentence at each wrap
+    // point and a correctly-cased email was flagged. The same audit gates
+    // Gmail writes, so that would have REFUSED real mail unattended.
+    //
+    // The three-word floor moves with it: it exists so a greeting or a
+    // sign-off is not evidence, and those are their own paragraphs. Applying
+    // it per line also dropped short continuation lines, taking their
+    // sentence-ending punctuation with them.
+    if paragraph
+        .iter()
+        .flat_map(|l| l.split_whitespace())
+        .filter(|w| w.chars().any(char::is_alphabetic))
+        .count()
+        < 3
+    {
+        return (0, 0);
+    }
+    let mut at_start = true;
     for line in paragraph {
         let words: Vec<&str> = line.split_whitespace().collect();
-        if words.iter().filter(|w| w.chars().any(char::is_alphabetic)).count() < 3 {
-            continue;
-        }
-        let mut at_start = true;
         for (n, word) in words.iter().enumerate() {
             let Some(first) = word.chars().find(|c| c.is_alphabetic()) else {
                 // `-`, `1.`, `•` open a list item; a blockquote `>` does not.
@@ -311,6 +330,43 @@ pub fn audit_register_receipts(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #994 review: `sentence_starts` treated the first word of EVERY physical
+    /// line as a sentence start, so an ordinary soft-wrapped draft read as
+    /// beginning a lowercase sentence at each wrap point.
+    ///
+    /// That is not a cosmetic false positive. The same audit gates Gmail
+    /// writes, so a correctly-cased, normally-wrapped email would have been
+    /// REFUSED — unattended, on live traffic.
+    #[test]
+    fn a_soft_wrapped_line_does_not_start_a_new_sentence() {
+        let wrapped = "register: standard (she capitalizes), mirroring\n\
+                       Hello Casey, I wanted to let you know\n\
+                       that the proposal is ready. It went out\n\
+                       this morning with the revised figures.\n";
+        assert!(
+            audit_register_receipts(wrapped).is_empty(),
+            "a wrapped standard draft must not be flagged: {:?}",
+            audit_register_receipts(wrapped)
+        );
+
+        // The same text unwrapped must agree — wrapping cannot change the
+        // verdict, which is the whole bug.
+        let flat = "register: standard (she capitalizes), mirroring\n\
+                    Hello Casey, I wanted to let you know that the proposal is \
+                    ready. It went out this morning with the revised figures.\n";
+        assert!(audit_register_receipts(flat).is_empty());
+
+        // And a genuine lowercase sentence after a full stop is still caught,
+        // wrapped or not — the fix must not blind the audit.
+        let real = "register: standard (she capitalizes), mirroring\n\
+                    Hello Casey, the proposal is ready. it went out\n\
+                    this morning with the revised figures.\n";
+        assert!(
+            !audit_register_receipts(real).is_empty(),
+            "a lowercase sentence start after a period is still a mismatch"
+        );
+    }
     use super::*;
 
     /// #994 verbatim: the recipient's thread reads "Hi, I wanted to check in
