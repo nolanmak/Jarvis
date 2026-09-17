@@ -327,11 +327,20 @@ pub(crate) fn caller_tag(opts: &ReasonerOpts) -> String {
 /// than a triage/draft call — give them 2× the base budget so the watchdog
 /// catches hangs, not honest work.
 pub(crate) fn reasoner_timeout_for(opts: &ReasonerOpts) -> std::time::Duration {
-    use crate::providers::{classify, CapabilityClass};
+    reasoner_timeout_for_class(crate::providers::classify(opts))
+}
+
+/// The watchdog budget for one capability class. [`reasoner_timeout_for`]
+/// classifies a call and asks this; code that needs a bound across every class
+/// (the handoff retention floor, #1035) asks it directly instead of building
+/// throwaway `ReasonerOpts`, which the capability inventory would count as a
+/// production call site.
+pub(crate) fn reasoner_timeout_for_class(class: crate::providers::CapabilityClass) -> std::time::Duration {
+    use crate::providers::CapabilityClass;
     let base = reasoner_timeout();
-    match classify(opts) {
+    match class {
         CapabilityClass::FullAgentic | CapabilityClass::WriteTools => base * 2,
-        _ => base,
+        CapabilityClass::TextOnly | CapabilityClass::ReadTools => base,
     }
 }
 
