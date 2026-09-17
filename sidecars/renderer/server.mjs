@@ -33,6 +33,7 @@
 import { createServer } from 'node:net';
 import { mkdir, stat, unlink } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -46,8 +47,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Config
 // ---------------------------------------------------------------------------
 
+// #1079 — macOS has no /run/user; match augmentagent-renderer-client's fallback.
 const RUNTIME =
-  process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.() ?? 1000}`;
+  process.env.XDG_RUNTIME_DIR ||
+  (process.platform === 'linux'
+    ? `/run/user/${process.getuid?.() ?? 1000}`
+    : path.join(os.homedir(), 'Library', 'Caches'));
 const SOCK_PATH =
   process.env.AUGMENTAGENT_RENDERER_SOCK ||
   path.join(RUNTIME, 'augmentagent', 'renderer.sock');

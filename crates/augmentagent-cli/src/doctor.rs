@@ -136,6 +136,9 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
     findings.push(check_sqlite_migrated().await);
     // 3. keyring_reachable — secret-tool present + libsecret reachable
     findings.push(check_keyring_reachable().await);
+    if cfg!(target_os = "macos") {
+        findings.push(check_launchd_agents());
+    }
     // 4. dashboard_reachable — sourced from the status doc when available
     findings.push(check_dashboard_reachable(&status_doc).await);
     // 5. claude_cli_in_path
@@ -152,7 +155,7 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
         check_which(
             "python3_in_path",
             "python3",
-            Some("apt-get install -y python3"),
+            Some(&crate::platform::package_install_hint("python3", "python")),
         )
         .await,
     );
@@ -297,7 +300,7 @@ async fn check_sqlite_migrated() -> Finding {
         Finding::error(
             "sqlite_migrated",
             format!("missing core tables: {}", missing.join(", ")),
-            Some("augmentagent service restart --unit daemon"),
+            Some("augmentagent service --unit daemon restart"),
         )
     }
 }
@@ -311,6 +314,9 @@ fn table_exists(conn: &rusqlite::Connection, name: &str) -> rusqlite::Result<boo
 }
 
 async fn check_keyring_reachable() -> Finding {
+    if cfg!(target_os = "macos") {
+        return check_keychain_reachable().await;
+    }
     // `secret-tool lookup augmentagent _probe`
     //   * exit 0     → probe entry exists (unlikely but ok)
     //   * exit !=0   → keyring reachable, just no probe entry (the "No such
@@ -347,6 +353,76 @@ async fn check_keyring_reachable() -> Finding {
             "keyring_reachable",
             "secret-tool timed out after 2s".to_string(),
             None,
+        ),
+    }
+}
+
+/// #1079 — macOS: the `keyring` crate uses the login Keychain. `security
+/// default-keychain` answers whether one is configured for this session.
+async fn check_keychain_reachable() -> Finding {
+    let res = timeout(
+        SUBPROCESS_TIMEOUT,
+        Command::new("security").arg("default-keychain").output(),
+    )
+    .await;
+    match res {
+        Ok(Ok(out)) if out.status.success() => Finding::ok(
+            "keyring_reachable",
+            format!(
+                "login Keychain reachable ({})",
+                String::from_utf8_lossy(&out.stdout).trim().trim_matches('"')
+            ),
+        ),
+        Ok(Ok(out)) => Finding::error(
+            "keyring_reachable",
+            format!(
+                "no default Keychain: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Some("security default-keychain -s login.keychain-db"),
+        ),
+        Ok(Err(e)) => Finding::error(
+            "keyring_reachable",
+            format!("`security` could not run: {e}"),
+            None,
+        ),
+        Err(_) => Finding::warn(
+            "keyring_reachable",
+            "security timed out after 2s".to_string(),
+            None,
+        ),
+    }
+}
+
+/// #1079 — macOS: is the daemon installed and loaded as a launchd agent?
+/// Linux reports the same through `status` (systemd unit probes).
+fn check_launchd_agents() -> Finding {
+    use crate::platform::{launchd_job, plist_path, LABEL_PREFIX};
+    let installed = plist_path(LABEL_PREFIX).is_some_and(|p| p.exists());
+    let job = launchd_job(LABEL_PREFIX);
+    match (installed, job.loaded, job.running()) {
+        (_, true, true) => Finding::ok(
+            "launchd_agents",
+            format!("{LABEL_PREFIX} running (pid {})", job.pid.unwrap_or(0)),
+        ),
+        (_, true, false) => Finding::warn(
+            "launchd_agents",
+            format!(
+                "{LABEL_PREFIX} loaded but {} (last exit {})",
+                job.state,
+                job.last_exit_code.map_or("n/a".to_string(), |c| c.to_string())
+            ),
+            Some("augmentagent logs --unit daemon"),
+        ),
+        (true, false, _) => Finding::warn(
+            "launchd_agents",
+            format!("{LABEL_PREFIX}.plist is installed but not loaded"),
+            Some("augmentagent service --unit daemon start"),
+        ),
+        (false, false, _) => Finding::warn(
+            "launchd_agents",
+            "daemon is not installed as a launchd agent".to_string(),
+            Some("augmentagent install autostart"),
         ),
     }
 }
@@ -668,6 +744,31 @@ fn check_calendar_scheduled(store: &Store) -> Finding {
             "calendar not configured (needs COMPOSIO_API_KEY + a connected gmail account) — skipped".to_string(),
         );
     }
+    if cfg!(target_os = "macos") {
+        // #1079 — install-calendar.sh writes a launchd agent on macOS.
+        let label = "com.nolanmak.augmentagent.calendar";
+        let installed = crate::platform::plist_path(label).is_some_and(|p| p.exists());
+        return if installed && crate::platform::launchd_job(label).loaded {
+            Finding::ok(
+                "calendar_scheduled",
+                format!("{label} loaded ({gmail_accounts} gmail entity(ies))"),
+            )
+        } else if installed {
+            Finding::warn(
+                "calendar_scheduled",
+                format!("{label}.plist is installed but not loaded, so nothing schedules calendar ingest"),
+                Some("augmentagent install calendar"),
+            )
+        } else {
+            Finding::warn(
+                "calendar_scheduled",
+                format!(
+                    "calendar ingest is configured ({gmail_accounts} gmail entity(ies), Composio key set) but nothing schedules it"
+                ),
+                Some("augmentagent install calendar"),
+            )
+        };
+    }
     if !cfg!(target_os = "linux") {
         return Finding::ok(
             "calendar_scheduled",
@@ -794,11 +895,15 @@ fn check_reasoner_gate() -> Finding {
 }
 
 fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64) -> Finding {
-    const HINT: &str = "journalctl --user -u augmentagent -g 'CLI gate' -n 50";
+    let hint = if crate::platform::ServiceManager::detect().is_launchd() {
+        "augmentagent logs --unit daemon --lines 2000 | grep 'CLI gate' | tail -n 50"
+    } else {
+        "journalctl --user -u augmentagent -g 'CLI gate' -n 50"
+    };
     let Some(s) = snap else {
         return Finding::ok("reasoner_gate", "no reasoner CLI call yet this boot");
     };
-    if !PathBuf::from(format!("/proc/{}", s.pid)).exists() {
+    if !crate::platform::pid_alive(s.pid) {
         return Finding::ok("reasoner_gate", format!("stale snapshot from pid {}", s.pid));
     }
     let state = format!("in_flight {}/{}, waiting {}", s.in_flight, s.capacity, s.waiting);
@@ -814,7 +919,7 @@ fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64) -> Finding {
     if age <= budget {
         return Finding::ok("reasoner_gate", msg);
     }
-    Finding::warn("reasoner_gate", format!("{msg} — reasoning is wedged"), Some(HINT))
+    Finding::warn("reasoner_gate", format!("{msg} — reasoning is wedged"), Some(hint))
 }
 
 /// #1035 — doctor warns when the journal root is past either bound.
@@ -972,6 +1077,14 @@ fn parse_posix_acl(raw: &[u8]) -> Option<Vec<AclEntry>> {
     }).collect())
 }
 
+#[cfg(not(target_os = "linux"))]
+fn read_posix_acl(_path: &std::ffi::CStr) -> Option<Vec<AclEntry>> {
+    // `system.posix_acl_access` is a Linux xattr (and macOS's getxattr takes
+    // six arguments, #1079): no POSIX ACL to read elsewhere.
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn read_posix_acl(path: &std::ffi::CStr) -> Option<Vec<AclEntry>> {
     let name = c"system.posix_acl_access";
     let mut buffer = vec![0u8; 4096];

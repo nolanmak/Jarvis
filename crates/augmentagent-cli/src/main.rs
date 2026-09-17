@@ -70,6 +70,7 @@ mod installers;
 mod logs;
 mod loop_cmd;
 mod loops;
+mod platform;
 mod research;
 mod self_improve;
 mod service;
@@ -1496,10 +1497,10 @@ enum ProactiveOp {
 #[derive(Subcommand)]
 enum BrowserOp {
     /// Start the browser sidecar stack (Xvfb + Chromium + Python sidecar)
-    /// via systemd. Thin wrapper over `systemctl --user start` for the
-    /// three units in `systemd/`. Idempotent.
+    /// via systemd, or (macOS) the Chromium + sidecar launchd agents from
+    /// `install browser-sidecar`. Idempotent.
     Start,
-    /// Stop the browser sidecar stack via systemd.
+    /// Stop the browser sidecar stack.
     Stop,
     /// Import cookies from the local Chrome profile into the managed jar.
     /// Stub — wire when the cookie-jar story lands (out of scope for #75 v0).
@@ -4703,6 +4704,20 @@ const BROWSER_UNITS: &[&str] = &[
     "augmentagent-browser-sidecar.service",
 ];
 
+/// #1079 — macOS has a real display, so its stack has no Xvfb job.
+const BROWSER_UNITS_LAUNCHD: &[&str] = &[
+    "augmentagent-chromium.service",
+    "augmentagent-browser-sidecar.service",
+];
+
+fn browser_units() -> &'static [&'static str] {
+    if platform::ServiceManager::detect().is_launchd() {
+        BROWSER_UNITS_LAUNCHD
+    } else {
+        BROWSER_UNITS
+    }
+}
+
 fn run_systemctl(args: &[&str]) -> Result<std::process::Output> {
     use std::process::Command;
     let out = Command::new("systemctl")
@@ -4714,6 +4729,18 @@ fn run_systemctl(args: &[&str]) -> Result<std::process::Output> {
 }
 
 async fn run_browser_start() -> Result<()> {
+    if platform::ServiceManager::detect().is_launchd() {
+        for unit in BROWSER_UNITS_LAUNCHD {
+            service::run_service(service::ServiceOp::Start, unit, false).await?;
+            println!("started {unit}");
+        }
+        println!(
+            "\nchromium + sidecar agents up. socket: {:?}",
+            augmentagent_browser_client::default_socket_path()
+        );
+        println!("if this is a fresh profile: complete one-time login per sidecars/browser/README.md");
+        return Ok(());
+    }
     for unit in BROWSER_UNITS {
         let out = run_systemctl(&["start", unit])?;
         if !out.status.success() {
@@ -4734,6 +4761,15 @@ async fn run_browser_start() -> Result<()> {
 }
 
 async fn run_browser_stop() -> Result<()> {
+    if platform::ServiceManager::detect().is_launchd() {
+        for unit in BROWSER_UNITS_LAUNCHD.iter().rev() {
+            match service::run_service(service::ServiceOp::Stop, unit, false).await {
+                Ok(()) => println!("stopped {unit}"),
+                Err(e) => eprintln!("stop {unit} failed (continuing): {e:#}"),
+            }
+        }
+        return Ok(());
+    }
     // Stop in reverse order so dependents go down first.
     for unit in BROWSER_UNITS.iter().rev() {
         let out = run_systemctl(&["stop", unit])?;
@@ -4753,9 +4789,18 @@ async fn run_browser_status(json: bool) -> Result<()> {
     use augmentagent_browser_client::{default_socket_path, BrowserClient};
 
     let mut units_state = Vec::new();
-    for unit in BROWSER_UNITS {
-        let out = run_systemctl(&["is-active", unit])?;
-        let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    for unit in browser_units() {
+        let state = if platform::ServiceManager::detect().is_launchd() {
+            match platform::unit_is_active(unit) {
+                Some(true) => "active",
+                Some(false) => "inactive",
+                None => "unknown",
+            }
+            .to_string()
+        } else {
+            let out = run_systemctl(&["is-active", unit])?;
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
         units_state.push((*unit, state));
     }
 
@@ -7714,7 +7759,15 @@ async fn run_wiki_migrate(
         .with_context(|| format!("read schema at {}", schema_path.display()))?;
 
     // §7 pre-flight: refuse to run while the daemon could be writing pages.
-    if !force {
+    if !force && platform::ServiceManager::detect().is_launchd() {
+        if platform::unit_is_active("augmentagent.service") == Some(true) {
+            anyhow::bail!(
+                "the augmentagent daemon is running — pause it first to avoid racing live ingest writes:\n  {}\nThen re-run, and resume after merge:\n  {}\nOr override with --force (NOT RECOMMENDED for the live wiki).",
+                platform::daemon_stop_hint(),
+                platform::daemon_start_hint()
+            );
+        }
+    } else if !force {
         match tokio::process::Command::new("systemctl")
             .args(["--user", "is-active", "augmentagent.service"])
             .output()

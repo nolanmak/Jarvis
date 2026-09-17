@@ -2,11 +2,15 @@
 //! the `/setup` skill (and humans) can stream or dump daemon logs without
 //! memorizing systemd unit names.
 //!
-//! Linux-only by design: AugmentAgent ships as a `--user` systemd service
-//! (see `scripts/install-service.sh`), and `journalctl` is the canonical
+//! On Linux AugmentAgent ships as a `--user` systemd service (see
+//! `scripts/install-autostart.sh`), and `journalctl` is the canonical
 //! query tool. We deliberately keep this a passthrough — no parsing, no
 //! buffering, no re-emission — so `--follow` stays live and `--json`
 //! preserves journalctl's exact one-object-per-line schema.
+//!
+//! On macOS (#1079) the job is a launchd agent with no journal: its plist
+//! names `StandardOutPath`/`StandardErrorPath`, and this tails those files.
+//! `--since` and `--json` are journal features and are refused there.
 //!
 //! Companion to `service` (systemctl wrapper) and `status` (aggregator).
 
@@ -56,6 +60,9 @@ pub async fn run_logs(
     json: bool,
 ) -> Result<()> {
     let resolved = expand_unit(&unit);
+    if crate::platform::ServiceManager::detect().is_launchd() {
+        return run_launchd_logs(&resolved, follow, lines, since.as_deref(), json).await;
+    }
 
     let mut cmd = Command::new("journalctl");
     cmd.arg("--user")
@@ -96,6 +103,77 @@ pub async fn run_logs(
         );
     }
     Ok(())
+}
+
+/// #1079 — tail the launchd agent's stdout/stderr files.
+async fn run_launchd_logs(
+    unit: &str,
+    follow: bool,
+    lines: u32,
+    since: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    use crate::platform::{launchd_label, plist_path};
+    if since.is_some() || json {
+        anyhow::bail!(
+            "--since and --json read the systemd journal; macOS launchd agents log to plain files — \
+             drop the flag (and filter with grep)"
+        );
+    }
+    let label = launchd_label(unit)
+        .with_context(|| format!("`{unit}` has no launchd agent on macOS"))?;
+    let plist = plist_path(&label).context("HOME unset")?;
+    if !plist.exists() {
+        anyhow::bail!("{label} is not installed ({} missing)", plist.display());
+    }
+    let mut files = Vec::new();
+    for key in ["StandardOutPath", "StandardErrorPath"] {
+        if let Some(path) = plist_string(&plist, key).await {
+            if !files.contains(&path) {
+                files.push(path);
+            }
+        }
+    }
+    if files.is_empty() {
+        anyhow::bail!("{} names no StandardOutPath/StandardErrorPath", plist.display());
+    }
+    let mut cmd = Command::new("tail");
+    cmd.arg("-n").arg(lines.to_string());
+    if follow {
+        // -F follows across the rotation/recreation of a log file.
+        cmd.arg("-F");
+    }
+    cmd.args(&files)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = cmd
+        .spawn()
+        .context("spawning `tail`")?
+        .wait()
+        .await
+        .context("waiting on tail")?;
+    if !status.success() {
+        anyhow::bail!("tail exited with status {status} (files: {})", files.join(", "));
+    }
+    Ok(())
+}
+
+/// One string value from a plist, via `plutil -extract <key> raw`.
+async fn plist_string(plist: &std::path::Path, key: &str) -> Option<String> {
+    let out = Command::new("plutil")
+        .args(["-extract", key, "raw", "-o", "-"])
+        .arg(plist)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!v.is_empty()).then_some(v)
 }
 
 #[cfg(test)]

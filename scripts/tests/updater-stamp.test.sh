@@ -62,6 +62,8 @@ esac
 exit 0
 STUB
   chmod +x "$TMP/bin/cargo" "$TMP/bin/systemctl"
+  # Exercise the Linux (systemd) branch on any host (#1079: CI runs macOS too).
+  printf '#!/usr/bin/env bash\necho Linux\n' > "$TMP/bin/uname" && chmod +x "$TMP/bin/uname"
   SYSTEMCTL_STUB_DIR="$TMP"; export SYSTEMCTL_STUB_DIR
   STAMP_FILE="$TMP/state/augmentagent/built-commit"
 }

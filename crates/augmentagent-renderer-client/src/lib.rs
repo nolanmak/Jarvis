@@ -45,13 +45,24 @@ use uuid::Uuid;
 
 /// Default socket path resolution. Honors `AUGMENTAGENT_RENDERER_SOCK`,
 /// then `${XDG_RUNTIME_DIR}/augmentagent/renderer.sock`, finally
-/// `/run/user/<uid>/augmentagent/renderer.sock`.
+/// `/run/user/<uid>/augmentagent/renderer.sock` on Linux and
+/// `~/Library/Caches/augmentagent/renderer.sock` elsewhere (#1079; mirrored in
+/// `sidecars/renderer/server.mjs`).
 pub fn default_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("AUGMENTAGENT_RENDERER_SOCK") {
         return PathBuf::from(p);
     }
-    let runtime = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/run/user/{}", fallback_uid()));
+    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+        if cfg!(target_os = "linux") {
+            format!("/run/user/{}", fallback_uid())
+        } else {
+            // Per-user and the same for launchd agents and terminals, unlike
+            // `$TMPDIR`; `/tmp` only when HOME is unset.
+            std::env::var("HOME")
+                .map(|h| format!("{h}/Library/Caches"))
+                .unwrap_or_else(|_| "/tmp".to_string())
+        }
+    });
     PathBuf::from(runtime)
         .join("augmentagent")
         .join("renderer.sock")

@@ -42,13 +42,25 @@ use uuid::Uuid;
 
 /// Default socket path resolution. Honors `AUGMENTAGENT_BROWSER_SOCK`,
 /// then `${XDG_RUNTIME_DIR}/augmentagent/browser.sock`, finally
-/// `/run/user/<uid>/augmentagent/browser.sock`.
+/// `/run/user/<uid>/augmentagent/browser.sock` on Linux and
+/// `~/Library/Caches/augmentagent/browser.sock` elsewhere (#1079: macOS has neither
+/// `XDG_RUNTIME_DIR` nor `/run/user`; `sidecars/browser/sidecar.py` applies
+/// the same rule).
 pub fn default_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("AUGMENTAGENT_BROWSER_SOCK") {
         return PathBuf::from(p);
     }
-    let runtime = std::env::var("XDG_RUNTIME_DIR")
-        .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc_getuid() }));
+    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+        if cfg!(target_os = "linux") {
+            format!("/run/user/{}", unsafe { libc_getuid() })
+        } else {
+            // Per-user and the same for launchd agents and terminals, unlike
+            // `$TMPDIR`; `/tmp` only when HOME is unset.
+            std::env::var("HOME")
+                .map(|h| format!("{h}/Library/Caches"))
+                .unwrap_or_else(|_| "/tmp".to_string())
+        }
+    });
     PathBuf::from(runtime).join("augmentagent").join("browser.sock")
 }
 

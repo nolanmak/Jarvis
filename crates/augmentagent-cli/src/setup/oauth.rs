@@ -307,10 +307,9 @@ async fn fetch_status(
 ///     URL itself, which would race our heartbeats on the same stdout), or
 ///   - `xdg-open` couldn't be spawned (binary missing).
 async fn open_browser_or_print(url: &str, open_browser: bool) {
-    let display = std::env::var("DISPLAY").unwrap_or_default();
-    let want_browser = open_browser && !display.is_empty();
+    let want_browser = open_browser && crate::platform::has_desktop();
     if want_browser {
-        let spawn = Command::new("xdg-open")
+        let spawn = Command::new(crate::platform::open_url_program())
             .arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())

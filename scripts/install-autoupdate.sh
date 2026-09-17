@@ -20,7 +20,7 @@ die() { printf '\033[1;31m[install-autoupdate ERR]\033[0m %s\n' "$*" >&2; exit 1
 
 install_macos() {
   local PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-  local LOG_DIR="$HOME/Library/Logs/augmentagent"
+  local LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/augmentagent"  # #1079: same dir as Linux
   mkdir -p "$LOG_DIR"
   mkdir -p "$(dirname "$PLIST")"
 

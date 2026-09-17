@@ -42,6 +42,13 @@ pub fn parse_is_active(stdout: &str) -> DaemonState {
 
 /// The production probe: a read-only systemd query.
 pub fn daemon_state() -> DaemonState {
+    if crate::platform::ServiceManager::detect().is_launchd() {
+        return match crate::platform::unit_is_active(DAEMON_UNIT) {
+            Some(true) => DaemonState::Active,
+            Some(false) => DaemonState::Inactive,
+            None => DaemonState::Unknown,
+        };
+    }
     match std::process::Command::new("systemctl")
         .args(["--user", "is-active", DAEMON_UNIT])
         .stdin(Stdio::null())

@@ -63,6 +63,8 @@ esac
 exit 0
 STUB
   chmod +x "$TMP/bin/cargo" "$TMP/bin/systemctl"
+  # Exercise the Linux (systemd) branch on any host (#1079: CI runs macOS too).
+  printf '#!/usr/bin/env bash\necho Linux\n' > "$TMP/bin/uname" && chmod +x "$TMP/bin/uname"
   STUB_DIR="$TMP"; export STUB_DIR
   STAMP_FILE="$TMP/state/augmentagent/built-commit"
   LOG_FILE="$TMP/state/augmentagent/update.log"
@@ -151,8 +153,16 @@ rm -rf "$TMP"
 make_case
 XDG_LOCK="$TMP/state/augmentagent/self-improve.lock"
 touch "$XDG_LOCK"
-flock -x "$XDG_LOCK" -c 'sleep 20' & XDG_HOLDER=$!
-sleep 0.3
+if command -v flock >/dev/null 2>&1; then
+  flock -x "$XDG_LOCK" -c 'sleep 20' & XDG_HOLDER=$!
+  sleep 0.3
+else
+  # macOS has no flock(1); python3 takes the same flock(2) (#1079).
+  python3 -c 'import fcntl, sys, time
+f = open(sys.argv[1], "a"); fcntl.flock(f, fcntl.LOCK_EX); open(sys.argv[1] + ".held", "w").close(); time.sleep(20)' "$XDG_LOCK" &
+  XDG_HOLDER=$!
+  for _ in $(seq 1 50); do [ -e "$XDG_LOCK.held" ] && break; sleep 0.1; done
+fi
 ( unset AUGMENTAGENT_SELFIMPROVE_LOCK; run_updater ); rc=$?
 daemon_restarted && bad "xdg lock: does not restart under a live build" "systemctl restart was invoked" \
                  || ok "xdg lock: does not restart under a live build"
@@ -161,7 +171,7 @@ daemon_restarted && bad "xdg lock: does not restart under a live build" "systemc
 grep -q "self-improve run in flight" "$LOG_FILE" && ok "xdg lock: logs the in-flight deferral" \
   || bad "xdg lock: logs the in-flight deferral" "$(tail -3 "$LOG_FILE")"
 # `flock -c` hands the locked fd to its child: stop the child first.
-pkill -P "$XDG_HOLDER" 2>/dev/null; wait "$XDG_HOLDER" 2>/dev/null
+pkill -P "$XDG_HOLDER" 2>/dev/null; kill "$XDG_HOLDER" 2>/dev/null; wait "$XDG_HOLDER" 2>/dev/null
 rm -rf "$TMP"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
