@@ -29,7 +29,7 @@ don't want that risk, leave the settings below unset.
    # Your DMs and group DMs
    AUGMENTAGENT_DISCORD_EXPORT_DMS=1
    # Servers whose readable text channels are included (comma-separated ids)
-   AUGMENTAGENT_DISCORD_EXPORT_GUILDS=123456789012345678
+   AUGMENTAGENT_DISCORD_EXPORT_GUILDS=<server-id>,<another-server-id>
    ```
 
    Find server ids with `augmentagent discord list-guilds`. Servers not listed
