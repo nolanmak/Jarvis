@@ -10,6 +10,7 @@
 //! Nothing in this crate calls a model. Extraction is deterministic code.
 
 pub mod extract;
+pub mod fts;
 pub mod handles;
 pub mod index;
 pub mod people;
