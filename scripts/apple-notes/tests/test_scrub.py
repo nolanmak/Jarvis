@@ -76,7 +76,7 @@ class KindTests(unittest.TestCase):
 class PrivateKeyTests(unittest.TestCase):
     def test_multiline_openssh_block_collapses_to_one_line(self):
         body = "\n".join("b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW" for _ in range(20))
-        text = f"my key\n-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n-----END OPENSSH PRIVATE KEY-----\nafter"  # pii-ok: synthetic fixture
+        text = f"my key\n-----BEGIN OPENSSH PRIVATE KEY-----\n{body}\n-----END OPENSSH PRIVATE KEY-----\nafter"  # pii-ok gitleaks:allow synthetic fixture
         out, findings = scrub(text)
         self.assertEqual(out, "my key\n[REDACTED:private-key]\nafter")
         self.assertEqual([(f.kind, f.line) for f in findings], [("private-key", 2)])
@@ -99,13 +99,13 @@ class InlinePemTests(unittest.TestCase):
     """Seen in the wild: keys pasted as env values with literal \\n escapes."""
 
     def test_inline_pem_in_quoted_env_value(self):
-        line = 'FIREBASE_KEY="-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBg\\n-----END PRIVATE KEY-----\\n"\nNEXT=1'  # pii-ok: synthetic fixture
+        line = 'FIREBASE_KEY="-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBg\\n-----END PRIVATE KEY-----\\n"\nNEXT=1'  # pii-ok gitleaks:allow synthetic fixture
         out, findings = scrub(line)
         self.assertEqual(out, 'FIREBASE_KEY="[REDACTED:private-key]"\nNEXT=1')
         self.assertEqual([(f.kind, f.line) for f in findings], [("private-key", 1)])
 
     def test_pem_starting_mid_line_and_ending_later(self):
-        text = 'key: -----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY----- trailing\nafter'  # pii-ok: synthetic fixture
+        text = 'key: -----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY----- trailing\nafter'  # pii-ok gitleaks:allow synthetic fixture
         out, findings = scrub(text)
         self.assertEqual(out, "key: [REDACTED:private-key] trailing\nafter")
         self.assertEqual(findings[0].line, 1)
@@ -153,7 +153,7 @@ class IdempotenceTests(unittest.TestCase):
     SAMPLES = [
         "password: hunter22",
         "api_key: sk-" + "A" * 24,
-        "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----",  # pii-ok: synthetic fixture
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----",  # pii-ok gitleaks:allow synthetic fixture
         "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
         "card 4111 1111 1111 1111",
         "pin = 123456",
