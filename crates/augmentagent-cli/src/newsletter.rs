@@ -33,6 +33,12 @@ pub enum Command {
         /// Public RSS/Atom feed URL; repeat to monitor multiple feeds.
         #[arg(long = "feed-url")]
         feed_urls: Vec<String>,
+        /// Maximum age in days for dated research items (1–365).
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=365))]
+        freshness_days: Option<u16>,
+        /// Whether to include source items without a publication date.
+        #[arg(long, value_parser = ["include", "exclude"])]
+        undated_policy: Option<String>,
     },
     /// Start an idempotent research run for a brief revision.
     Research {
@@ -236,8 +242,21 @@ fn feedback_body(
     body
 }
 
-fn brief_body(prompt: &str, topic: &str, feed_urls: &[String]) -> Value {
-    json!({"prompt": prompt, "topic": topic, "feedUrls": feed_urls})
+fn brief_body(
+    prompt: &str,
+    topic: &str,
+    feed_urls: &[String],
+    freshness_days: Option<u16>,
+    undated_policy: Option<&str>,
+) -> Value {
+    let mut body = json!({"prompt": prompt, "topic": topic, "feedUrls": feed_urls});
+    if let Some(days) = freshness_days {
+        body["freshnessDays"] = json!(days);
+    }
+    if let Some(policy) = undated_policy {
+        body["undatedPolicy"] = json!(policy);
+    }
+    body
 }
 
 struct Api {
@@ -344,13 +363,21 @@ pub async fn run(command: &Command) -> Result<()> {
             prompt,
             topic,
             feed_urls,
+            freshness_days,
+            undated_policy,
         } => {
             let id = uuid(newsletter_id)?;
             let key = event_request_key(&format!("brief:{id}"))?;
             api.call(
                 Method::POST,
                 &format!("v1/newsletters/{id}/briefs"),
-                Some(brief_body(prompt, topic, feed_urls)),
+                Some(brief_body(
+                    prompt,
+                    topic,
+                    feed_urls,
+                    *freshness_days,
+                    undated_policy.as_deref(),
+                )),
                 Some(&key),
             )
             .await?
@@ -604,11 +631,22 @@ mod tests {
                 "https://a.example/rss".into(),
                 "https://b.example/atom".into(),
             ],
+            Some(14),
+            Some("exclude"),
         );
         assert_eq!(
             body["feedUrls"],
             json!(["https://a.example/rss", "https://b.example/atom"])
         );
+        assert_eq!(body["freshnessDays"], 14);
+        assert_eq!(body["undatedPolicy"], "exclude");
+    }
+
+    #[test]
+    fn brief_payload_omits_unrequested_freshness_options() {
+        let body = brief_body("Find updates", "robotics", &[], None, None);
+        assert!(body.get("freshnessDays").is_none());
+        assert!(body.get("undatedPolicy").is_none());
     }
 
     #[test]
