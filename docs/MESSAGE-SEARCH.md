@@ -74,3 +74,38 @@ run against an older daemon leaves rows stale (and `check` says so).
 
 Backfill works in small batches with a pause between them so other writers
 (daemon, dashboard) are never starved of the write lock.
+
+## Measuring retrieval (and the embeddings decision)
+
+`augmentagent messages eval` scores retrieval against your own labelled
+questions. It answers one question: after structured search, how often does
+the agent still fail to find the right messages, and are those failures the
+kind semantic search would fix?
+
+```sh
+augmentagent messages eval-template > ~/private/eval-questions.json   # schema
+augmentagent messages search 'restaurant after:2026-06-01'            # find ids to label
+augmentagent messages eval --questions ~/private/eval-questions.json --k 10
+augmentagent --wiki-dir ./wiki messages eval --questions ~/private/eval-questions.json --agent
+```
+
+- **Question sets are private.** They hold your message ids, so the file must
+  live outside this repo; the command refuses a path inside it. Only the
+  schema and the scoring ship here.
+- **Two modes.** Without `--agent` each question's `query` runs against the
+  tools directly (fast, no model, what CI exercises). With `--agent` the real
+  ask agent picks its own tool calls — one model call per question.
+- **Reports** carry ids, metrics and rubric labels, never message text, so
+  they are safe to paste into an issue.
+- **Miss classes:** `vocabulary` (the message shares no content word with the
+  question — the class embeddings would address), `agent` (a query over the
+  question's own words would have found it), `structure` (words match but no
+  operator expresses the constraint), `data` (not in the store).
+
+**Decision rule, fixed before measuring:** vocabulary misses under 10% of
+questions → no embeddings. 10–25% → try cheaper fixes first (alias expansion
+from the wiki, agent query rewriting) and re-measure. Over 25% → open an
+embeddings issue scoped to the classes that missed, with a pluggable provider
+(local by default; a hosted provider sends message text to a third party),
+windowed chunks rather than single messages, and hybrid ranking with FTS.
+The command prints the verdict for the report it just produced.
