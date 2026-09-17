@@ -57,6 +57,31 @@ pub enum Command {
         #[arg(long)]
         newsletter_id: String,
     },
+    /// Record editorial feedback on a research candidate.
+    Feedback {
+        #[arg(long)]
+        newsletter_id: String,
+        #[arg(long)]
+        candidate_id: String,
+        #[arg(long, value_parser = ["useful", "not_useful"])]
+        label: String,
+        #[arg(long, value_parser = ["valuable", "off_topic", "stale", "duplicate", "low_quality", "sponsored", "other"])]
+        reason: String,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long)]
+        supersedes_event_id: Option<String>,
+    },
+    /// List effective editorial feedback.
+    FeedbackList {
+        #[arg(long)]
+        newsletter_id: String,
+    },
+    /// Read the active inspectable ranking version.
+    Rank {
+        #[arg(long)]
+        newsletter_id: String,
+    },
     /// Generate a cited draft from stored evidence.
     Generate {
         #[arg(long)]
@@ -133,6 +158,23 @@ pub fn validated_url_for_agent(raw: &str) -> Result<()> {
 fn uuid(raw: &str) -> Result<&str> {
     uuid::Uuid::parse_str(raw).context("expected UUID")?;
     Ok(raw)
+}
+
+fn feedback_body(
+    candidate_id: &str,
+    label: &str,
+    reason: &str,
+    note: Option<&str>,
+    supersedes_event_id: Option<&str>,
+) -> Value {
+    let mut body = json!({ "candidateId": candidate_id, "label": label, "reason": reason });
+    if let Some(note) = note {
+        body["note"] = json!(note);
+    }
+    if let Some(id) = supersedes_event_id {
+        body["supersedesEventId"] = json!(id);
+    }
+    body
 }
 
 struct Api {
@@ -301,6 +343,52 @@ pub async fn run(command: &Command) -> Result<()> {
             )
             .await?
         }
+        Command::Feedback {
+            newsletter_id,
+            candidate_id,
+            label,
+            reason,
+            note,
+            supersedes_event_id,
+        } => {
+            let id = uuid(newsletter_id)?;
+            let candidate = uuid(candidate_id)?;
+            let supersedes = supersedes_event_id.as_deref().map(uuid).transpose()?;
+            let key = event_request_key(&format!("feedback:{id}:{candidate}"))?;
+            api.call(
+                Method::POST,
+                &format!("v1/newsletters/{id}/feedback"),
+                Some(feedback_body(
+                    candidate,
+                    label,
+                    reason,
+                    note.as_deref(),
+                    supersedes,
+                )),
+                Some(&key),
+            )
+            .await?
+        }
+        Command::FeedbackList { newsletter_id } => {
+            let id = uuid(newsletter_id)?;
+            api.call(
+                Method::GET,
+                &format!("v1/newsletters/{id}/feedback"),
+                None,
+                None,
+            )
+            .await?
+        }
+        Command::Rank { newsletter_id } => {
+            let id = uuid(newsletter_id)?;
+            api.call(
+                Method::GET,
+                &format!("v1/newsletters/{id}/rank"),
+                None,
+                None,
+            )
+            .await?
+        }
         Command::Generate {
             newsletter_id,
             brief_revision,
@@ -356,6 +444,20 @@ mod tests {
         assert!(!trusted_request_id("123:456; evil"));
         assert!(!trusted_request_id("loop:"));
         assert!(!trusted_request_id("person:123"));
+    }
+
+    #[test]
+    fn feedback_payload_omits_absent_optional_fields() {
+        let body = feedback_body(
+            "123e4567-e89b-12d3-a456-426614174000",
+            "not_useful",
+            "off_topic",
+            None,
+            None,
+        );
+        assert_eq!(body["label"], "not_useful");
+        assert!(body.get("note").is_none());
+        assert!(body.get("supersedesEventId").is_none());
     }
 
     #[test]
