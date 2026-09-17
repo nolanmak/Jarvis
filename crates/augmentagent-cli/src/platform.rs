@@ -350,6 +350,27 @@ impl AgentPlist<'_> {
     }
 }
 
+/// Is `label` marked disabled in the GUI domain (`launchctl disable`)?
+pub fn launchd_disabled(label: &str) -> bool {
+    Command::new("launchctl")
+        .args(["print-disabled", &gui_domain()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| parse_print_disabled(&String::from_utf8_lossy(&o.stdout), label))
+        .unwrap_or(false)
+}
+
+/// `launchctl print-disabled` lines read `"label" => disabled|enabled`
+/// (older macOS: `=> true|false`, where true means disabled).
+fn parse_print_disabled(text: &str, label: &str) -> bool {
+    let quoted = format!("\"{label}\"");
+    text.lines()
+        .filter_map(|l| l.trim().split_once(" => "))
+        .find(|(k, _)| *k == quoted)
+        .is_some_and(|(_, v)| matches!(v.trim(), "disabled" | "true"))
+}
+
 /// Run `launchctl <args>`, returning whether it exited 0 and its stderr.
 pub fn launchctl(args: &[&str]) -> std::io::Result<(bool, String)> {
     let out = Command::new("launchctl")
@@ -441,6 +462,21 @@ mod tests {
         assert!(!job.running());
         assert_eq!(job.pid, None);
         assert_eq!(job.last_exit_code, Some(0));
+    }
+
+    #[test]
+    fn reads_the_disabled_bit() {
+        let text = "disabled services = {\n\
+                    \t\"com.nolanmak.augmentagent\" => disabled\n\
+                    \t\"com.nolanmak.augmentagent.updater\" => enabled\n\
+                    \t\"com.nolanmak.augmentagent.digest\" => true\n\
+                    }\n";
+        assert!(parse_print_disabled(text, "com.nolanmak.augmentagent"));
+        assert!(!parse_print_disabled(text, "com.nolanmak.augmentagent.updater"));
+        assert!(parse_print_disabled(text, "com.nolanmak.augmentagent.digest"));
+        // A prefix of another label must not match.
+        assert!(!parse_print_disabled(text, "com.nolanmak.augmentagent.dig"));
+        assert!(!parse_print_disabled(text, "com.nolanmak.augmentagent-dashboard"));
     }
 
     #[test]

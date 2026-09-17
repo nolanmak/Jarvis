@@ -466,7 +466,13 @@ mod launchd {
             "MainPID": job.pid.unwrap_or(0),
             "ActiveEnterTimestamp": job.pid.and_then(platform::process_start_unix)
                 .map(|t| t.to_string()).unwrap_or_default(),
-            "UnitFileState": if installed { "enabled" } else { "not-found" },
+            "UnitFileState": if !installed {
+                "not-found"
+            } else if platform::launchd_disabled(label) {
+                "disabled"
+            } else {
+                "enabled"
+            },
         })
     }
 }
