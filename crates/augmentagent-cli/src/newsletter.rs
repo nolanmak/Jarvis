@@ -37,6 +37,9 @@ pub enum Command {
         /// Public Bluesky handle to monitor; repeat for multiple profiles.
         #[arg(long = "bluesky-profile")]
         bluesky_profiles: Vec<String>,
+        /// Public HTTPS page to capture with a remote browser on every run; repeat up to ten times.
+        #[arg(long = "browser-url")]
+        browser_urls: Vec<String>,
         /// Maximum age in days for dated research items (1–365).
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..=365))]
         freshness_days: Option<u16>,
@@ -279,11 +282,13 @@ fn brief_body(
     topic: &str,
     feed_urls: &[String],
     bluesky_profiles: &[String],
+    browser_urls: &[String],
     freshness_days: Option<u16>,
     undated_policy: Option<&str>,
 ) -> Value {
     let mut body = json!({"prompt": prompt, "topic": topic,
-        "feedUrls": feed_urls, "socialProfiles": bluesky_profiles});
+        "feedUrls": feed_urls, "socialProfiles": bluesky_profiles,
+        "browserUrls": browser_urls});
     if let Some(days) = freshness_days {
         body["freshnessDays"] = json!(days);
     }
@@ -431,6 +436,7 @@ pub async fn run(command: &Command) -> Result<()> {
             topic,
             feed_urls,
             bluesky_profiles,
+            browser_urls,
             freshness_days,
             undated_policy,
         } => {
@@ -444,6 +450,7 @@ pub async fn run(command: &Command) -> Result<()> {
                     topic,
                     feed_urls,
                     bluesky_profiles,
+                    browser_urls,
                     *freshness_days,
                     undated_policy.as_deref(),
                 )),
@@ -749,6 +756,7 @@ mod tests {
                 "https://b.example/atom".into(),
             ],
             &["builder.bsky.social".into()],
+            &[],
             Some(14),
             Some("exclude"),
         );
@@ -762,8 +770,25 @@ mod tests {
     }
 
     #[test]
+    fn brief_payload_can_schedule_public_browser_pages_for_daily_research() {
+        let body = brief_body(
+            "Find events",
+            "events",
+            &[],
+            &[],
+            &["https://events.example/schedule".into()],
+            None,
+            None,
+        );
+        assert_eq!(
+            body["browserUrls"],
+            json!(["https://events.example/schedule"])
+        );
+    }
+
+    #[test]
     fn brief_payload_omits_unrequested_freshness_options() {
-        let body = brief_body("Find updates", "robotics", &[], &[], None, None);
+        let body = brief_body("Find updates", "robotics", &[], &[], &[], None, None);
         assert!(body.get("freshnessDays").is_none());
         assert!(body.get("undatedPolicy").is_none());
     }
