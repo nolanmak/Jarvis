@@ -351,6 +351,10 @@ auto_register() {
 
   case "$(uname -s)" in
     Darwin)
+      # Each schedule is listed once per platform; only launchd labels apply
+      # here. A systemd unit name is never loaded in launchd, so without this
+      # guard it re-ran the installer on every tick (#1079).
+      case "$unit_id" in com.*) ;; *) return 0 ;; esac
       if ! launchctl print "gui/$(id -u)/$unit_id" >/dev/null 2>&1; then
         log "auto-registering $unit_id via $script_name"
         "$script_path" >> "$LOG" 2>&1 || log "auto-register $unit_id failed (continuing)"
