@@ -82,7 +82,8 @@ fn default_unavailable_cooldown() -> chrono::Duration {
 ///
 /// One is not enough: it may be a content failure in wording the table does
 /// not know, and latching would take a healthy provider away from every other
-/// caller. Three in a row with no success between them is the provider, not
+/// caller. Three in a row with no success between them, each within
+/// [`unrecognised_strike_window`] of the previous strike, is the provider, not
 /// one request. The latch that follows is the same short outage cooldown
 /// (`AUGMENTAGENT_COOLDOWN_UNAVAILABLE_SECS`, 60 s by default), so a real
 /// outage costs at most three spawns per cooldown instead of one per request,
@@ -90,7 +91,9 @@ fn default_unavailable_cooldown() -> chrono::Duration {
 /// re-dispatched: the latch only affects later requests.
 const UNRECOGNISED_STRIKE_LIMIT: u32 = 3;
 
-/// Strikes further apart than this do not add up to a run.
+/// The longest gap between two strikes of one run. A strike more than this
+/// after the previous one starts a new run. It bounds each gap, not the span
+/// of the whole run: three strikes 50 minutes apart still latch.
 fn unrecognised_strike_window() -> chrono::Duration {
     chrono::Duration::hours(1)
 }

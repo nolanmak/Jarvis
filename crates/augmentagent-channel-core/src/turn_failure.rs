@@ -36,17 +36,20 @@
 //!   dispatch the request again, repeating effects that may already have
 //!   happened. Some unknown failures are real outages, though, and they must
 //!   not respawn the provider on every later request. So `FallbackReasoner`
-//!   latches the provider for the short outage cooldown after a few
-//!   consecutive unrecognised failures.
+//!   latches the provider for the short outage cooldown after three
+//!   consecutive unrecognised failures, each within an hour of the previous
+//!   one (the window bounds the gap between strikes, not the whole run).
 //! - A text-only or read-only call cannot repeat a write, so an unrecognised
 //!   failure there is an outage: latch and fail over. Otherwise a provider
 //!   failing in a way the table does not know would be respawned on every
 //!   triage re-poll, and the next provider would never serve.
 //!
 //! Content rows are matched before the other needle rows for the same reason.
-//! An explicit HTTP status (`status 429`, `status 503`, `status 401`) is
+//! An HTTP status in codex's own status format at the start of the failure
+//! (`unexpected status 503 …`, `exceeded retry limit, last status: 429`) is
 //! matched before any needle. It is the transport's own verdict, while the
-//! body is free text that can quote anything. If the provider exits before
+//! body is free text that can quote anything. A status mentioned anywhere
+//! else decides nothing. If the provider exits before
 //! reporting any turn or item event, no tool can have run, so an unexplained
 //! exit counts as the binary failing to start and fails over, as it did
 //! before #1040.
@@ -211,20 +214,32 @@ const RULES: &[(FailureClass, &[&str])] = &[
 /// digit tokens only (#655 review): a bare substring fired inside request ids.
 const QUOTA_STATUS_CODES: &[&str] = &["429", "402"];
 
-/// The class an explicit HTTP status names: `unexpected status 520 …`,
-/// `last status: 529`, `HTTP/1.1 503`. 400, 403 and 404 name no class on
-/// their own (a 400 can be a context overflow, a 403 a policy block, a 404 a
-/// mistyped model override), so their bodies decide.
+/// The class an HTTP status names, read only from codex's own status formats
+/// and only where codex writes them: at the start of the failure text
+/// (`unexpected status 520 …`, `exceeded retry limit, last status: 529`, a
+/// `HTTP/1.1 503` status line), optionally inside codex's `Reconnecting...
+/// n/m (…)` notice. The first two are the formats in the codex 0.154 binary.
+/// A status mentioned anywhere else, such as a pasted log inside a content
+/// refusal, decides nothing: the needle rows still read it, Content first.
+///
+/// 400, 403 and 404 name no class on their own (a 400 can be a context
+/// overflow, a 403 a policy block, a 404 a mistyped model override), so their
+/// bodies decide.
 fn explicit_status(lower: &str) -> Option<FailureClass> {
     static STATUS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\b(?:status|http)(?:/\d(?:\.\d)?)?[\s:=]*(\d{3})\b").expect("status pattern")
+        regex::Regex::new(concat!(
+            r"^(?:reconnecting\.\.\. \d+/\d+ \()?",
+            r"(?:unexpected status |exceeded retry limit, last status: |http/\d(?:\.\d)? )",
+            r"(\d{3})\b",
+        )).expect("status pattern")
     });
-    STATUS.captures_iter(lower).find_map(|captures| match captures[1].parse::<u16>().ok()? {
+    let captures = STATUS.captures(lower.trim_start())?;
+    match captures[1].parse::<u16>().ok()? {
         402 | 429 => Some(FailureClass::Quota),
         401 => Some(FailureClass::Auth),
         500..=599 => Some(FailureClass::Transport),
         _ => None,
-    })
+    }
 }
 
 /// Classify a provider's failure text. Set `turn_began` once the provider
@@ -491,5 +506,39 @@ mod tests {
         assert_eq!(classify("unexpected status 400 Bad Request: context_length_exceeded", true), Content);
         assert_eq!(classify("unexpected status 403 Forbidden: This request has been flagged for possible cybersecurity risk.", true), Content);
         assert_eq!(classify("request id 5031 failed with a synthetic reason", true), Unrecognised);
+    }
+
+    /// #1069 re-review — the status rule only reads codex's own status
+    /// formats, at the position codex puts them. A content refusal whose prose
+    /// merely mentions a status (a pasted log, a quoted error) must stay
+    /// Content: read as an outage it would latch a healthy provider and
+    /// re-dispatch the request.
+    #[test]
+    fn a_status_mentioned_in_content_prose_does_not_decide() {
+        for detail in [
+            "Invalid prompt: your prompt references HTTP 500 errors and was flagged as potentially violating our usage policy.",
+            "Invalid prompt: your prompt was flagged as potentially violating our usage policy (HTTP 500 was not the cause).",
+            "Codex ran out of room in the model's context window (status 500 lines of logs pasted). Start a new thread.",
+            "Invalid prompt: the request mentioned status 429 in its text and was flagged as potentially violating our usage policy.",
+            "This request has been flagged for possible cybersecurity risk (http 502 exploit payload).",
+            "This content was flagged for possible biological risk; the HTTP/1.1 503 in the pasted log is unrelated.",
+            "uncertain operation requires reconciliation before further mutations: last status 503 from the tool",
+            "External operation already completed for this request; prior tool returned HTTP 500",
+            "unexpected status 400 Bad Request: context_length_exceeded (retry after status 429 guidance)",
+            "Your input exceeds the context window of this model; see the unexpected status 401 note in https://platform.openai.com/docs/status",
+        ] {
+            assert_eq!(classify(detail, true), Content, "{detail}");
+        }
+        // Codex's own formats, where codex writes them, still decide.
+        for (detail, want) in [
+            ("unexpected status 520 <html>cloudflare</html>", Transport),
+            ("exceeded retry limit, last status: 529, request id: abc", Transport),
+            ("HTTP/1.1 502 upstream said: usage policy", Transport),
+            ("Reconnecting... 5/5 (unexpected status 520 <html>cloudflare</html>)", Transport),
+            ("unexpected status 401: Provided authentication token is expired.", Auth),
+            ("unexpected status 429 Too Many Requests: usage policy note: context window headroom", Quota),
+        ] {
+            assert_eq!(classify(detail, true), want, "{detail}");
+        }
     }
 }

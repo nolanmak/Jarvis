@@ -72,8 +72,10 @@ claude stub records a spawn.
 
 The routing table behind these scenarios is
 `crates/augmentagent-channel-core/src/turn_failure.rs`. Quota, transport,
-auth and binary failures latch and fail over. An explicit HTTP status (429,
-402, 401, 5xx) decides before any wording. Content-level failures (an empty
+auth and binary failures latch and fail over. An HTTP status (429, 402, 401,
+5xx) in codex's own format at the start of the failure (`unexpected status
+NNN`, `exceeded retry limit, last status: NNN`) decides before any wording; a
+status merely mentioned in the text does not. Content-level failures (an empty
 turn, context overflow, a policy refusal, the bridge refusing further tool
 calls) never latch and never advance the chain.
 
@@ -82,8 +84,8 @@ do:
 - A text-only or read-only call cannot repeat a write, so the failure counts
   as an outage: latch and fail over.
 - A write or agentic call fails safe: no chain advance. Three consecutive
-  such failures latch the provider for the short outage cooldown, so later
-  requests stop respawning it.
+  such failures, each within an hour of the previous one, latch the provider
+  for the short outage cooldown, so later requests stop respawning it.
 
 The unit tests pin every row (`turn_failure::tests`,
 `codex::tests::turn_failed_routing_is_pinned_per_failure_class`,
