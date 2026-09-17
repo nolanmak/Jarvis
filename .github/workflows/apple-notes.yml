@@ -1,0 +1,17 @@
+name: Apple Notes exporter
+on:
+  pull_request:
+    paths:
+      - 'scripts/apple-notes/**'
+      - '.github/workflows/apple-notes.yml'
+permissions:
+  contents: read
+jobs:
+  exporter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - run: python3 -m unittest discover -s scripts/apple-notes/tests -v
