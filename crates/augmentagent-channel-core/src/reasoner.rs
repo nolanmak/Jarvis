@@ -2186,13 +2186,63 @@ pub fn archetype_pick_opts() -> ReasonerOpts {
     }
 }
 
+/// Locate a repo `scripts/<name>` helper without threading `repo_root`
+/// through every preset caller: walk the current executable's ancestors
+/// (covers `target/release/augmentagent` and test binaries under
+/// `target/debug/deps/`), then fall back to the working directory.
+fn locate_repo_script(name: &str) -> Option<PathBuf> {
+    let from_exe = std::env::current_exe().ok().and_then(|exe| {
+        exe.ancestors()
+            .map(|a| a.join("scripts").join(name))
+            .find(|p| p.is_file())
+    });
+    from_exe.or_else(|| {
+        std::env::current_dir().ok().and_then(|cwd| {
+            cwd.ancestors()
+                .map(|a| a.join("scripts").join(name))
+                .find(|p| p.is_file())
+        })
+    })
+}
+
 pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
+    // #337 lesson: the guard resolves WIKI_ROOT from the spawned CLI's cwd,
+    // so it must be absolute.
+    let wiki_root = std::fs::canonicalize(&wiki_root).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|d| d.join(&wiki_root))
+            .unwrap_or(wiki_root)
+    });
     let system_prompt = format!("{system_prompt}\n\nCurrent invocation: ingest into the \
         configured wiki root `{}`. The schema's `wiki/` denotes this root, not an \
         additional subdirectory. Resolve page and log paths against this root. \
+        `journal/` under this root is machine-managed — never create or edit \
+        anything there; record durable facts on people/threads/about pages and \
+        cite the message id instead (#1094). \
         After completing the updates, return a short final acknowledgement naming \
         the changed relative paths. If an operation fails, report the failure; \
         do not silently finish or claim that failed updates were completed.", wiki_root.display());
+    // #1094 — hard-block Write/Edit under journal/ regardless of what the
+    // model decides. Missing script (stripped deploy) degrades to the
+    // prompt rule alone, with a warning.
+    let settings_json = match locate_repo_script("aa-journal-guard.sh") {
+        Some(guard) => Some(
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Write|Edit",
+                        "hooks": [{ "type": "command", "command": guard.to_string_lossy() }]
+                    }]
+                }
+            })
+            .to_string(),
+        ),
+        None => {
+            tracing::warn!("aa-journal-guard.sh not found; journal/ write guard is prompt-only");
+            None
+        }
+    };
+    let wiki_root_env = wiki_root.to_string_lossy().into_owned();
     ReasonerOpts {
         system_prompt,
         model: Some("claude-haiku-4-5-20251001".into()),
@@ -2206,8 +2256,8 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         add_dirs: vec![wiki_root],
         permission_mode: "acceptEdits".into(),
         cwd: None,
-        env: Vec::new(),
-        settings_json: None,
+        env: vec![("WIKI_ROOT".into(), wiki_root_env)],
+        settings_json,
         restrict_env: false,
         audit_logger: None,
         audit_notifier: None,
@@ -2612,6 +2662,27 @@ mod tests {
             select_final_text(&blocks, None, TextCapture::AllBlocks),
             "first\n\nsecond"
         );
+    }
+
+    #[test]
+    fn ingest_opts_installs_the_journal_write_guard() {
+        // #1094 — Capture ingest invented its own derived pages under
+        // journal/ (mis-dated duplicates). journal/ is machine-managed by
+        // the deterministic ShadowNote mirror; ingest must be hard-blocked
+        // from writing there, not just asked nicely.
+        let wiki = std::env::temp_dir().join("aa-guard-test-wiki");
+        std::fs::create_dir_all(&wiki).unwrap();
+        let opts = ingest_opts("sys".into(), wiki.clone());
+        let settings = opts.settings_json.as_deref().expect("ingest must ship a settings hook");
+        assert!(settings.contains("aa-journal-guard.sh"), "{settings}");
+        assert!(settings.contains("Write|Edit"), "{settings}");
+        let wiki_root = opts
+            .env
+            .iter()
+            .find(|(k, _)| k == "WIKI_ROOT")
+            .map(|(_, v)| v.clone())
+            .expect("WIKI_ROOT env for the guard");
+        assert!(std::path::Path::new(&wiki_root).is_absolute(), "{wiki_root}");
     }
 
     #[test]

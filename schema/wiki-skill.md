@@ -39,6 +39,12 @@ identities:                    # person pages only; optional, omit block if empt
 ---
 ```
 
+**journal/** — MACHINE-MANAGED (#1010/#1094). The daemon mirrors ShadowNote
+entries deterministically into `journal/<year>/…` with revision history under
+`journal/history/…`. Never create, edit, or derive pages anywhere under
+`journal/` — a hook blocks such writes. To reference journal content from a
+person/thread/about page, cite the `shadownote:<id>:<version>` messageId.
+
 **people/`<slug>`.md** — One page per person. The filename slug is derived from a primary email, but the `identities:` block is authoritative for cross-platform routing.
 
 **Populating `identities:`**

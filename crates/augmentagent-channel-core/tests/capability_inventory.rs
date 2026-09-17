@@ -236,7 +236,11 @@ fn core_presets_match_permission_contracts() {
         ("digest_opts", digest_opts(Some(wiki.clone())), ReadTools, false),
         ("lint_opts", lint_opts("Synthetic lint instructions".into(), wiki.clone()), ReadTools, false),
         ("wiki_migrate_opts", wiki_migrate_opts("Synthetic migration instructions".into(), wiki.clone()), ReadTools, false),
-        ("ingest_opts", ingest_opts("Synthetic ingestion instructions".into(), wiki.clone()), WriteTools, true),
+        // #1094: ingest ships a PreToolUse journal-guard hook; hooks are
+        // honored only by the Claude CLI, so the preset must classify
+        // FullAgentic (Claude-only) — a fallback provider would silently
+        // bypass the guard.
+        ("ingest_opts", ingest_opts("Synthetic ingestion instructions".into(), wiki.clone()), FullAgentic, true),
         ("resume_opts", resume_opts(wiki.clone()), WriteTools, true),
         ("ask_opts", ask_opts(wiki.clone(), fixture.path().into()), FullAgentic, true),
         ("tone_summarize_opts", tone_summarize_opts(), TextOnly, false),

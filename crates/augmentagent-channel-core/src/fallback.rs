@@ -1241,7 +1241,13 @@ mod tests {
         let profiles = [
             text_only_opts(),
             crate::reasoner::draft_opts("Synthetic draft".into(), Some(wiki.clone())),
-            crate::reasoner::ingest_opts("Synthetic ingestion".into(), wiki.clone()),
+            {
+                // WriteTools row: strip the #1094 hook (hooks ⇒ FullAgentic,
+                // already covered by the ask row below).
+                let mut o = crate::reasoner::ingest_opts("Synthetic ingestion".into(), wiki.clone());
+                o.settings_json = None;
+                o
+            },
             crate::reasoner::ask_opts(wiki, fixture.path().into()),
         ];
         for (index, opts) in profiles.iter().enumerate() {
@@ -1432,6 +1438,7 @@ exit 1
         let wiki = dir.path().join("wiki");
         std::fs::create_dir_all(&wiki).unwrap();
         let mut opts = crate::reasoner::ingest_opts("Synthetic ingestion".into(), wiki);
+        opts.settings_json = None; // #1094 hook ⇒ FullAgentic; this test wants the WriteTools shape
         opts.session_id = Some("synthetic-turn-1040".into());
         assert_eq!(classify(&opts), crate::providers::CapabilityClass::WriteTools);
         opts

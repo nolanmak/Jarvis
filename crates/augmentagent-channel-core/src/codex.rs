@@ -1015,8 +1015,12 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
     }
 
     /// A write-capable request for the adapter (ingest-shaped: WriteTools).
+    /// The real ingest preset now ships the #1094 journal-guard hook, which
+    /// classifies FullAgentic (hooks are honored only by the Claude CLI) —
+    /// strip it here because this test exercises the WriteTools routing.
     fn write_opts(dir: &tempfile::TempDir) -> ReasonerOpts {
-        let options = crate::reasoner::ingest_opts("Synthetic ingestion".into(), dir.path().into());
+        let mut options = crate::reasoner::ingest_opts("Synthetic ingestion".into(), dir.path().into());
+        options.settings_json = None;
         assert_eq!(crate::providers::classify(&options), crate::providers::CapabilityClass::WriteTools);
         options
     }
