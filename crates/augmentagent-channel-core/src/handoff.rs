@@ -127,11 +127,13 @@ impl ClaudeHooks {
 //
 // The checkpoint (normally ~60 ms: interpreter start, flock, two fsyncs) runs
 // under `timeout` with its stdout discarded and its stderr on an inner pipe.
-// A relay, itself under `timeout`, copies that pipe out. The shell exits 0
-// only when it reads the checkpoint's own exit status 0. Everything else
-// blocks with exit 2: a refusal from the bridge (whose message is passed on),
-// a timeout, a missing interpreter or wrapper, or a status the relay never
-// saw. A stuck checkpoint that holds the journal lock also keeps later
+// A relay, itself under `timeout` and capped at 64 KiB, copies that pipe to
+// the hook's stderr. The shell reads the checkpoint's exit status from a
+// separate descriptor that only the shell writes and the checkpoint never
+// inherits, so no output can forge it (#1081 review). It exits 0 only on
+// status 0. Everything else blocks with exit 2: a refusal from the bridge
+// (its message already relayed), a timeout, a missing interpreter or
+// wrapper, or no status at all. A stuck checkpoint that holds the journal lock also keeps later
 // checkpoints refused until it ends. Hooks run under `/bin/sh -c` (dash on
 // this host), so the command is POSIX sh only.
 
@@ -145,11 +147,10 @@ const HOOK_KILL_GRACE_SECS: u64 = 2;
 /// Claude Code's own deadline. It fails open, so it sits well above
 /// [`hook_answer_secs`] to cover process start-up on a busy machine.
 const HOOK_CLAUDE_TIMEOUT_SECS: u64 = 60;
-const HOOK_EXIT_MARK: &str = "jarvis-handoff-hook-exit:";
 
 /// The wrapper answers by this bound: the relay outlasts the checkpoint's
-/// deadline and kill grace by a second, so it reads the status line whenever
-/// `timeout` reports one.
+/// deadline and kill grace by a second, so a killed checkpoint's last output
+/// is still relayed.
 const fn hook_answer_secs(checkpoint_secs: u64, kill_grace_secs: u64) -> u64 {
     checkpoint_secs + kill_grace_secs + 1
 }
@@ -163,11 +164,12 @@ fn journal_hook_command(script: &Path, journal: &Path, checkpoint_secs: u64, kil
     }
     let (script, journal) = (shell_quote(script), shell_quote(journal));
     let answer_secs = hook_answer_secs(checkpoint_secs, kill_grace_secs);
-    let mark = HOOK_EXIT_MARK;
-    format!("out=$( {{ timeout -k {kill_grace_secs} {checkpoint_secs} python3 -I {script} --handoff-hook {journal} \
-        2>&1 >/dev/null; echo \"{mark}$?\"; }} | timeout {answer_secs} head -c 65536 ); \
-        case $out in *{mark}0) exit 0;; \
-        *{mark}2) printf '%s' \"${{out%{mark}*}}\" >&2; exit 2;; esac; \
+    // fd 3: the relay pipe (checkpoint stderr). fd 4: the status pipe, read
+    // by `$( )`. Neither the checkpoint nor the relay keeps fd 4, so a stuck
+    // checkpoint cannot hold the status read open either.
+    format!("st=$( {{ {{ timeout -k {kill_grace_secs} {checkpoint_secs} python3 -I {script} --handoff-hook {journal} \
+        2>&3 3>&- 4>&- >/dev/null; echo \"$?\" >&4; }} 3>&1 | timeout {answer_secs} head -c 65536 >&2 4>&-; }} 4>&1 ); \
+        case $st in 0) exit 0;; 2) exit 2;; esac; \
         echo 'Handoff checkpoint failed or did not finish in time; reconciliation required.' >&2; exit 2")
 }
 
@@ -998,10 +1000,9 @@ for line in sys.stdin:
         opts.handoff_path = Some(journal.clone());
         let launch = ClaudeHooks::prepare(&opts).unwrap().unwrap();
         let script = launch._directory.path().join("handoff-hook.py");
-        let expected = format!("out=$( {{ timeout -k 2 30 python3 -I {} --handoff-hook {} 2>&1 >/dev/null; \
-            echo \"jarvis-handoff-hook-exit:$?\"; }} | timeout 33 head -c 65536 ); \
-            case $out in *jarvis-handoff-hook-exit:0) exit 0;; \
-            *jarvis-handoff-hook-exit:2) printf '%s' \"${{out%jarvis-handoff-hook-exit:*}}\" >&2; exit 2;; esac; \
+        let expected = format!("st=$( {{ {{ timeout -k 2 30 python3 -I {} --handoff-hook {} \
+            2>&3 3>&- 4>&- >/dev/null; echo \"$?\" >&4; }} 3>&1 | timeout 33 head -c 65536 >&2 4>&-; }} 4>&1 ); \
+            case $st in 0) exit 0;; 2) exit 2;; esac; \
             echo 'Handoff checkpoint failed or did not finish in time; reconciliation required.' >&2; exit 2",
             shell_quoted(&script), shell_quoted(&journal));
         let settings: Value = serde_json::from_str(&launch.settings_json).unwrap();
@@ -1038,6 +1039,18 @@ for line in sys.stdin:
             assert!(elapsed < bound, "{script:?} answered after {elapsed:?}");
             assert!(stderr.contains("did not finish in time"), "{script:?}: {stderr}");
         }
+
+        // Nothing the checkpoint writes can stand in for its exit status: not
+        // a success marker placed where the relay's size cap cuts its output,
+        // and not a write to any descriptor the wrapper might read a status from.
+        let forged = stub("forged.py", "import os, sys\nsys.stdin.read()\n\
+            mark = 'jarvis-handoff-hook-exit:0'\n\
+            sys.stderr.write('x' * (65536 - len(mark)) + mark + 'y' * 1000)\nsys.stderr.flush()\n\
+            for fd in range(3, 10):\n    try:\n        os.write(fd, b'0')\n    except OSError:\n        pass\n\
+            sys.exit(1)\n");
+        let (code, elapsed, _) = run_hook(&journal_hook_command(&forged, &journal, 1, 1), &event, None);
+        assert_eq!(code, Some(2), "a forged success marker must not pass");
+        assert!(elapsed < bound, "answered after {elapsed:?}");
 
         // The checkpoint cannot start: missing script, interpreter or wrapper.
         let missing = temp.path().join("missing.py");

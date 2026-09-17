@@ -381,11 +381,15 @@ How the generated command works (`journal_hook_command` in
   and its stderr to an inner pipe, so it never holds the hook's own output.
   SIGKILL also ends `timeout` itself, so a stuck checkpoint cannot delay the
   exit status.
-- A relay under `timeout 33` copies the inner pipe to the hook's stderr.
-- The shell exits 0 only when it reads the checkpoint's own exit status 0. A
-  bridge refusal (status 2) is passed through with its message. A timeout, a
-  missing interpreter, script or wrapper, or a status the relay never saw exits
-  2 with a fixed message.
+- A relay under `timeout 33` copies the inner pipe to the hook's stderr, capped
+  at 64 KiB.
+- The checkpoint's exit status travels on its own descriptor, which only the
+  shell writes and the checkpoint never inherits, so nothing the checkpoint
+  prints can forge it. The shell exits 0 only on status 0.
+- Status 2 exits 2 with the relayed message: a bridge refusal, or Python's own
+  "can't open file" message (naming the temporary script path) when the script
+  is missing. A timeout, a missing interpreter or wrapper, any other status, or
+  no status exits 2 with a fixed message.
 - Claude Code's own hook `timeout` is 60 seconds. It still fails open, so the
   guarantee assumes `sh`, `timeout` and `head` start within the 27-second
   margin.
