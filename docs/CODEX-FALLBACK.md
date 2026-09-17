@@ -305,6 +305,33 @@ provider names and failure categories. The original typed provider error remains
 in the error chain for existing cooldown/retry callers. Doctor reports constructor-time capability exclusions and binary/auth preflight;
 concrete sandbox and MCP readiness are validated when a request starts.
 
+## Usage and audit attribution
+
+Both adapters write the same two logs, and every new row names the provider
+that served the call (#1047).
+
+- **Token usage** (`token-usage.jsonl`). Claude's row comes from the CLI's
+  terminal `result` event. Codex's comes from `turn.completed`, whose `usage`
+  follows Responses API accounting: `input_tokens` includes the cached and
+  cache-write input, and `output_tokens` includes reasoning. The row stores the
+  fresh input as `input`, the two cache counts as `cache_read` and
+  `cache_creation`, and reasoning as `reasoning_output`, a breakdown of `output`
+  that the total does not add again. The total is therefore Codex's input plus
+  output. The event carries the thread's running total, and each call runs in a
+  fresh ephemeral thread, so the adapter keeps the last event and never sums
+  them. The row is written before the outcome is classified, because a turn
+  that ends without an answer has still spent its tokens. A failed turn reports
+  no usage, so it writes no row. `model` is the model passed with `-m`, and
+  `class` is the call's capability class. `augmentagent token-usage` totals the
+  window per provider as well as per day. Rows written before this change still
+  parse.
+- **Tool audit** (`tool-audit.log`). The record's `provider` field can only be
+  set through `build_audit_record`, which requires the serving provider. The
+  records are built in the adapters, not the fallback wrapper: the wrapper only
+  sees the finished text, the Claude adapter writes records from spawned tasks
+  and its own default logger, and some callers use an adapter directly. The JSON
+  field name is unchanged, and historical rows without it still parse.
+
 ## Handoff journal implementation status
 
 The bridge accepts an optional owner-private operation journal outside all model

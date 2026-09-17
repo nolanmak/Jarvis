@@ -1,0 +1,32 @@
+---
+source: crates/augmentagent-cli/src/main.rs
+expression: help
+---
+Ask the wiki a question and print the answer. Not read-only: the agent can edit the wiki and run allowlisted commands.
+
+Runs the wiki-query preset (`ask_opts`) through the reasoner chain, on the serving provider's quality-tier model (Opus on Claude). The same tools are granted whichever provider serves the call:
+
+- Read, Grep and Glob inside the wiki, and the meeting-transcripts clone when AUGMENTAGENT_TRANSCRIPTS_DIR is set.
+
+- Write and Edit inside the wiki, to record durable facts.
+
+- WebSearch and WebFetch.
+
+- Conversation and memory recall through the memory MCP server (search and read only, no memory writes).
+
+- Bash limited to an allowlist: `augmentagent gmail` (every subcommand, including send), `finance` status/transactions/summary, `calendar` list-events/create-event, `loop`, `loops`, `meetup events`, `socialapi` and `linkedin` dm/comment, `linkedin recent-dms`, `repo-docs`, `doc render-pdf`, `imessage fetch-attachment`, and `aa-gh issue` create/list/view/comment.
+
+Some of these act outside the wiki: sending email, filing or commenting on GitHub issues, and changing or stopping loops. Calendar events and social DMs and comments are raised as Discord approval cards and happen only when approved.
+
+Usage: ask [OPTIONS] <QUESTION>
+
+Arguments:
+  <QUESTION>
+          The question. Wrap in quotes if multi-word
+
+Options:
+      --post
+          Also post the answer to the Discord approval channel via a one-shot HTTP client, honoring `ATTACH:` file markers (#440). Needs DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID in the env
+
+  -h, --help
+          Print help (see a summary with '-h')

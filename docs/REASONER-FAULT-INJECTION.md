@@ -16,7 +16,7 @@ built binary.
 | `fake-claude-ok.sh` | `claude -p --output-format stream-json` | answers `PONG-FROM-FAKE-CLAUDE`, exit 0 |
 | `fake-claude-quota.sh` | ditto, out of quota | the session-limit refusal as a **successful** completion (#448's shape) → `RateLimited` |
 | `fake-claude-hang.sh` | ditto, wedged | accepts the prompt, never answers → `Timeout` once the watchdog fires |
-| `fake-codex-ok.sh` | `codex exec --json` | JSONL stream ending in `PONG-FROM-FAKE-CODEX`, exit 0 |
+| `fake-codex-ok.sh` | `codex exec --json` | JSONL stream ending in `PONG-FROM-FAKE-CODEX` and a `turn.completed` usage report (recorded in `token-usage.jsonl`, #1047), exit 0 |
 | `fake-codex-usage-limit.sh` | ditto, out of quota | `turn.failed` + exit 1 → `RateLimited` |
 | `fake-codex-empty.sh` | ditto, turn finishes with no final message | a completed tool call, `turn.completed`, no `agent_message`, exit 0 → untyped `TurnFailure` (content-level, #1040) |
 | `fake-codex-context-window.sh` | ditto, request overflows the context window | `turn.failed` context-window message + exit 1 → untyped `TurnFailure` (content-level, #1040) |
@@ -56,6 +56,9 @@ posture): a `FAKE_*` variable would reach the claude stub and nothing else.
 production `build_reasoner()` — as a subprocess, once per scenario: quota
 refusal → codex, hung primary → codex, whole chain refusing, gemini serving
 and latching, and healthy primary with no fallback spawn.
+`a_fallback_served_call_is_counted_under_codex_in_token_usage` then runs
+`augmentagent token-usage` in the same scratch home and checks that the
+codex-served call appears under codex in the per-provider totals (#1047).
 
 ### Content-level codex failures (#1040)
 

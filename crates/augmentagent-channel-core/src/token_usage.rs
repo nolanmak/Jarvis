@@ -33,6 +33,15 @@ pub struct TokenUsage {
     pub cache_creation: u64,
     #[serde(default)]
     pub cache_read: u64,
+    /// Reasoning tokens, a breakdown of `output` that is ALREADY counted
+    /// there, so [`TokenUsage::total`] leaves it out. Only Codex reports it.
+    /// Absent (0) on Claude rows and on every row written before #1047.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reasoning_output: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl TokenUsage {
@@ -53,6 +62,7 @@ impl TokenUsage {
         self.output += other.output;
         self.cache_creation += other.cache_creation;
         self.cache_read += other.cache_read;
+        self.reasoning_output += other.reasoning_output;
     }
 }
 
@@ -74,6 +84,42 @@ pub fn parse_usage(line: &str) -> Option<TokenUsage> {
         output: n("output_tokens"),
         cache_creation: n("cache_creation_input_tokens"),
         cache_read: n("cache_read_input_tokens"),
+        reasoning_output: 0,
+    };
+    (!usage.is_empty()).then_some(usage)
+}
+
+/// Pull usage out of one `codex exec --json` event (#1047).
+///
+/// Only `turn.completed` carries usage. Its fields follow Responses API
+/// accounting, which differs from Claude's in two ways, so they are mapped
+/// onto [`TokenUsage`] rather than copied:
+///
+/// - `input_tokens` INCLUDES `cached_input_tokens` and
+///   `cache_write_input_tokens`. `input` here is the fresh remainder, and the
+///   two cache counts go to `cache_read` / `cache_creation`, so `total()`
+///   equals codex's own input + output instead of counting the cache twice.
+/// - `output_tokens` INCLUDES `reasoning_output_tokens`. It is kept as the
+///   `reasoning_output` breakdown and not added again.
+///
+/// The event reports the THREAD's running total (codex exec builds it from
+/// the last thread token-usage update), not the turn's increment. Every call
+/// runs `--ephemeral` in a fresh thread, so the last event seen is the
+/// call's total: callers keep the last one and must never sum them.
+pub fn codex_turn_usage(event: &serde_json::Value) -> Option<TokenUsage> {
+    if event.get("type").and_then(|t| t.as_str()) != Some("turn.completed") {
+        return None;
+    }
+    let u = event.get("usage")?;
+    let n = |k: &str| u.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let cache_read = n("cached_input_tokens");
+    let cache_creation = n("cache_write_input_tokens");
+    let usage = TokenUsage {
+        input: n("input_tokens").saturating_sub(cache_read).saturating_sub(cache_creation),
+        output: n("output_tokens"),
+        cache_creation,
+        cache_read,
+        reasoning_output: n("reasoning_output_tokens"),
     };
     (!usage.is_empty()).then_some(usage)
 }
@@ -96,6 +142,26 @@ pub struct UsageRecord {
 }
 
 impl UsageRecord {
+    /// The record for one call that just finished (#1047). Both adapters
+    /// build their rows here, so provider, class and timestamp are derived
+    /// the same way for every provider.
+    pub fn for_call(
+        provider: crate::providers::ProviderKind,
+        model: impl Into<String>,
+        class: crate::providers::CapabilityClass,
+        usage: TokenUsage,
+        started: std::time::Instant,
+    ) -> Self {
+        UsageRecord {
+            ts: chrono::Utc::now().to_rfc3339(),
+            provider: provider.name().to_string(),
+            model: model.into(),
+            class: format!("{class:?}"),
+            usage,
+            duration_ms: started.elapsed().as_millis() as u64,
+        }
+    }
+
     pub fn day(&self) -> &str {
         self.ts.get(..10).unwrap_or("")
     }
@@ -220,10 +286,27 @@ pub struct DayTotals {
     pub usage: TokenUsage,
     /// `(model, calls, total tokens)`, biggest first.
     pub by_model: Vec<(String, u64, u64)>,
+    /// Per-provider calls and usage, biggest total first (#1047).
+    pub by_provider: Vec<ProviderTotals>,
 }
 
-/// `(calls, totals, per-model (calls, tokens))` while accumulating one day.
-type DayAccumulator = (u64, TokenUsage, std::collections::BTreeMap<String, (u64, u64)>);
+/// One provider's share of a day (#1047). A struct rather than a tuple so
+/// `token-usage --json` names its fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ProviderTotals {
+    pub provider: String,
+    pub calls: u64,
+    pub usage: TokenUsage,
+}
+
+/// `(calls, totals, per-model (calls, tokens), per-provider (calls, usage))`
+/// while accumulating one day.
+type DayAccumulator = (
+    u64,
+    TokenUsage,
+    std::collections::BTreeMap<String, (u64, u64)>,
+    std::collections::BTreeMap<String, (u64, TokenUsage)>,
+);
 
 /// Roll NDJSON records up per day, newest day last. Unparsable lines are
 /// skipped: a truncated tail (the file is appended to live) must not lose the
@@ -249,9 +332,12 @@ pub fn rollup(ndjson: &str) -> Vec<DayTotals> {
         let m = entry.2.entry(rec.model.clone()).or_insert((0, 0));
         m.0 += 1;
         m.1 += rec.usage.total();
+        let p = entry.3.entry(rec.provider.clone()).or_default();
+        p.0 += 1;
+        p.1.add(&rec.usage);
     }
     days.into_iter()
-        .map(|(day, (calls, usage, models))| {
+        .map(|(day, (calls, usage, models, providers))| {
             let mut by_model: Vec<(String, u64, u64)> = models
                 .into_iter()
                 .map(|(m, (c, t))| (m, c, t))
@@ -263,9 +349,27 @@ pub fn rollup(ndjson: &str) -> Vec<DayTotals> {
                 calls,
                 usage,
                 by_model,
+                by_provider: rank_providers(providers),
             }
         })
         .collect()
+}
+
+/// Provider totals, biggest first; ties by name so the output is stable.
+fn rank_providers(
+    providers: impl IntoIterator<Item = (String, (u64, TokenUsage))>,
+) -> Vec<ProviderTotals> {
+    let mut ranked: Vec<ProviderTotals> = providers
+        .into_iter()
+        .map(|(provider, (calls, usage))| ProviderTotals { provider, calls, usage })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.usage
+            .total()
+            .cmp(&a.usage.total())
+            .then_with(|| a.provider.cmp(&b.provider))
+    });
+    ranked
 }
 
 /// Human table. Kept here so the CLI stays a thin caller and the formatting
@@ -299,6 +403,35 @@ pub fn format_report(days: &[DayTotals]) -> String {
         grand.cache_read,
         grand.total()
     ));
+    // #1047 — per provider over the whole window, so calls a fallback served
+    // are visible next to the primary's.
+    let mut providers: std::collections::BTreeMap<String, (u64, TokenUsage)> =
+        std::collections::BTreeMap::new();
+    for p in days.iter().flat_map(|d| &d.by_provider) {
+        let entry = providers.entry(p.provider.clone()).or_default();
+        entry.0 += p.calls;
+        entry.1.add(&p.usage);
+    }
+    let providers = rank_providers(providers);
+    if !providers.is_empty() {
+        s.push_str(&format!(
+            "\nby provider, {} to {}:\n",
+            days[0].day,
+            days[days.len() - 1].day
+        ));
+        for p in &providers {
+            s.push_str(&format!(
+                "  {:<10} {:>6} calls  input {:>10}  output {:>10}  cache_wr {:>10}  cache_rd {:>10}  total {:>10}\n",
+                p.provider,
+                p.calls,
+                p.usage.input,
+                p.usage.output,
+                p.usage.cache_creation,
+                p.usage.cache_read,
+                p.usage.total()
+            ));
+        }
+    }
     if let Some(last) = days.last() {
         if !last.by_model.is_empty() {
             s.push_str(&format!("\nby model on {}:\n", last.day));
@@ -357,10 +490,132 @@ mod tests {
                 output,
                 cache_creation: 0,
                 cache_read: 0,
+                reasoning_output: 0,
             },
             duration_ms: 1234,
         })
         .unwrap()
+    }
+
+    /// #1047 — the `turn.completed` shape codex-cli 0.154 emits: all five
+    /// fields of its exec `Usage`. `input_tokens` INCLUDES the cached and
+    /// cache-write input and `output_tokens` INCLUDES reasoning (Responses
+    /// API accounting; codex's own `non_cached_input` is input − cached).
+    const CODEX_TURN_COMPLETED: &str = r#"{"type":"turn.completed","usage":{"input_tokens":30000,"cached_input_tokens":24000,"cache_write_input_tokens":1000,"output_tokens":900,"reasoning_output_tokens":400}}"#;
+
+    #[test]
+    fn codex_usage_maps_every_field_without_double_counting() {
+        let event: serde_json::Value = serde_json::from_str(CODEX_TURN_COMPLETED).unwrap();
+        let u = codex_turn_usage(&event).expect("turn.completed carries usage");
+        // Fresh input only, so the cache columns are not counted twice.
+        assert_eq!(u.input, 5_000);
+        assert_eq!(u.cache_read, 24_000);
+        assert_eq!(u.cache_creation, 1_000);
+        assert_eq!(u.output, 900);
+        assert_eq!(u.reasoning_output, 400, "reasoning is kept, not dropped");
+        // What entered or left the model: codex's input + output, exactly.
+        assert_eq!(u.total(), 30_900);
+
+        // Older codex builds omit the cache-write and reasoning fields.
+        let old: serde_json::Value = serde_json::from_str(
+            r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":3}}"#,
+        ).unwrap();
+        let u = codex_turn_usage(&old).unwrap();
+        assert_eq!((u.input, u.cache_read, u.cache_creation, u.output, u.reasoning_output), (6, 4, 0, 3, 0));
+        // A malformed report (cache larger than input) never underflows.
+        let odd: serde_json::Value = serde_json::from_str(
+            r#"{"type":"turn.completed","usage":{"input_tokens":2,"cached_input_tokens":5,"output_tokens":1}}"#,
+        ).unwrap();
+        assert_eq!(codex_turn_usage(&odd).unwrap().input, 0);
+
+        // Only turn.completed counts; nothing else carries usage.
+        for other in [
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"x"}}"#,
+            r#"{"type":"turn.failed","error":{"message":"x"}}"#,
+            r#"{"type":"turn.completed"}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":0,"output_tokens":0}}"#,
+            // Claude's shape is not codex's.
+            RESULT_LINE,
+        ] {
+            let v: serde_json::Value = serde_json::from_str(other).unwrap();
+            assert_eq!(codex_turn_usage(&v), None, "{other}");
+        }
+    }
+
+    /// #1047 — adding `reasoning_output` must not change what older rows
+    /// mean or how Claude rows look on disk.
+    #[test]
+    fn rows_before_and_after_reasoning_output_share_one_format() {
+        let old_row = r#"{"ts":"2026-09-15T01:00:00Z","provider":"claude","model":"claude-opus-5","class":"TextOnly","input":10,"output":5,"cache_creation":0,"cache_read":7,"duration_ms":3}"#;
+        let rec: UsageRecord = serde_json::from_str(old_row).expect("pre-#1047 rows still parse");
+        assert_eq!(rec.usage.reasoning_output, 0);
+        assert_eq!(rec.usage.total(), 22);
+        let claude_line = serde_json::to_string(&rec).unwrap();
+        assert!(!claude_line.contains("reasoning_output"), "a zero breakdown is not written: {claude_line}");
+        let mut codex = rec.clone();
+        codex.provider = "codex".into();
+        codex.usage.reasoning_output = 2;
+        let line = serde_json::to_string(&codex).unwrap();
+        assert!(line.contains(r#""reasoning_output":2"#), "{line}");
+        let back: UsageRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.usage, codex.usage);
+    }
+
+    #[test]
+    fn a_call_record_names_its_provider_model_and_class() {
+        let usage = TokenUsage { input: 1, output: 2, ..Default::default() };
+        let rec = UsageRecord::for_call(
+            crate::providers::ProviderKind::Codex,
+            "gpt-synthetic",
+            crate::providers::CapabilityClass::WriteTools,
+            usage,
+            std::time::Instant::now(),
+        );
+        assert_eq!((rec.provider.as_str(), rec.model.as_str(), rec.class.as_str()), ("codex", "gpt-synthetic", "WriteTools"));
+        assert_eq!(rec.usage, usage);
+        assert!(chrono::DateTime::parse_from_rfc3339(&rec.ts).is_ok(), "{}", rec.ts);
+    }
+
+    fn rec_for(provider: &str, ts: &str, model: &str, input: u64, output: u64) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&rec(ts, model, input, output)).unwrap();
+        v["provider"] = serde_json::json!(provider);
+        v.to_string()
+    }
+
+    /// #1047 C1 — the report splits usage by provider, so calls the fallback
+    /// served are visible instead of folded into one total.
+    #[test]
+    fn rollup_and_report_split_usage_by_provider() {
+        let log = [
+            rec_for("claude", "2026-09-14T01:00:00Z", "claude-opus-5", 100, 10),
+            rec_for("codex", "2026-09-14T02:00:00Z", "gpt-synthetic", 40, 4),
+            rec_for("claude", "2026-09-15T01:00:00Z", "claude-opus-5", 10, 1),
+            rec_for("codex", "2026-09-15T02:00:00Z", "gpt-synthetic", 300, 30),
+            rec_for("codex", "2026-09-15T03:00:00Z", "gpt-synthetic", 5, 5),
+        ]
+        .join("\n");
+        let days = rollup(&log);
+        assert_eq!(days[0].by_provider.len(), 2);
+        assert_eq!(days[0].by_provider[0].provider, "claude", "biggest first");
+        assert_eq!((days[0].by_provider[0].calls, days[0].by_provider[0].usage.total()), (1, 110));
+        assert_eq!(days[1].by_provider[0].provider, "codex");
+        assert_eq!((days[1].by_provider[0].calls, days[1].by_provider[0].usage.total()), (2, 340));
+        let out = format_report(&days);
+        let section = out.split("by provider").nth(1).unwrap_or_else(|| panic!("no provider section: {out}"));
+        let line = |name: &str| section.lines().find(|l| l.trim_start().starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} line: {out}")).to_string();
+        // Every column that makes up the total is printed.
+        assert!(section.contains("cache_wr") && section.contains("cache_rd"), "{out}");
+        // Totals over every day in the report, not just the last.
+        let codex = line("codex");
+        assert!(codex.contains(" 3 calls") && codex.ends_with(" 384"), "{codex}");
+        let claude = line("claude");
+        assert!(claude.contains(" 2 calls") && claude.ends_with(" 121"), "{claude}");
+        // And the --json shape carries it too.
+        let json = serde_json::to_value(&days).unwrap();
+        assert_eq!(json[1]["by_provider"][0]["provider"], "codex");
+        assert_eq!(json[1]["by_provider"][0]["usage"]["input"], 305);
     }
 
     #[test]
