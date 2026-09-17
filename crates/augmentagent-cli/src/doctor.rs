@@ -1077,6 +1077,14 @@ fn parse_posix_acl(raw: &[u8]) -> Option<Vec<AclEntry>> {
     }).collect())
 }
 
+#[cfg(not(target_os = "linux"))]
+fn read_posix_acl(_path: &std::ffi::CStr) -> Option<Vec<AclEntry>> {
+    // `system.posix_acl_access` is a Linux xattr (and macOS's getxattr takes
+    // six arguments, #1079): no POSIX ACL to read elsewhere.
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn read_posix_acl(path: &std::ffi::CStr) -> Option<Vec<AclEntry>> {
     let name = c"system.posix_acl_access";
     let mut buffer = vec![0u8; 4096];
