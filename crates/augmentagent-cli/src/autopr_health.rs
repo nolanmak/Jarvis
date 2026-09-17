@@ -20,7 +20,7 @@
 //! | `updater-stalled`| 2026-09-14: diverged checkout, updater quietly stopped|
 //! | `no-progress`    | the catch-all: nothing merged in N days             |
 //! | `draft-stale`    | a draft nobody will ever finish                     |
-//! | `review-held`    | #1037: a draft no independent reviewer could take, billed daily |
+//! | `review-held`    | #1037: a draft held, unbilled, waiting on a reviewer (was billed daily) |
 //!
 //! Analysis is pure over [`HealthInputs`] so every rule is unit-tested
 //! against the shape of the incident it exists for; collection is a thin

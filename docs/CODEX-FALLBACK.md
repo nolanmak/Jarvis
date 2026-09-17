@@ -422,7 +422,7 @@ comment and the log name one of three reasons:
 | Reason | Cause | What the loop does |
 |---|---|---|
 | Provenance unknown | No complete record of the draft's builders: it predates builder history, or the record was lost. A missing record on resume is written as unknown and stays unknown. | Stands down at once |
-| Provenance unknown | The record exists but cannot be read or trusted (busy lock, permissions, corruption) | Waits, on the budget |
+| Provenance unknown | The record exists but cannot be read or trusted (busy lock, permissions, corruption), whether it fails when the draft is bound or when it is read | Waits, on the budget |
 | No reviewer capacity | Every provider the loop reviews with already built the draft | Stands down at once |
 | No reviewer capacity | The independent reviewer is not installed or authenticated, or its call failed | Waits, on the budget |
 | Reviewer latched until a named reset | The independent reviewer is on a quota cooldown | Waits, on the budget |
@@ -436,7 +436,22 @@ work with nobody independent looking. Standing down labels the issue
 `agent-gave-up` and closes the draft with the reason; the branch is kept. The
 label also stops a fresh attempt from rebuilding over that branch. A human
 merges the draft by reopening it, marking it ready for review and merging it by
-hand, or removes the label to have the loop rebuild the fix from `main`.
+hand, or removes the label to have the loop rebuild the fix from `main`. The
+close happens only after the label is confirmed. If labelling fails, the draft
+stays open and the next pass tries again, because a closed draft on an
+unlabelled issue would let a fresh attempt rebuild over its branch. A stand-down
+removes the draft from the pool, so the tick moves on to the next candidate. A
+hold ends the tick.
+
+**Drafts built from another checkout also show unknown provenance.** Builder
+history is keyed by the repository's canonical path. A draft built by a
+hand-run `self-improve` from a different checkout of the same repository
+therefore has no record in the daemon's checkout, and the daemon closes it as
+unknown provenance. This is reversible, because the branch is kept:
+`gh pr reopen <pr>`, then `gh pr ready <pr>` before anything else, review it,
+and merge it by hand. The stand-down comment says this. A draft reopened while
+its issue still carries the label is closed again by the gave-up sweep (#934),
+and that close comment repeats the recorded reason instead of an attempt count.
 
 **Retry budget.** A reason that can clear on its own waits. The resume lane
 reaches a draft at most once per UTC day (its attempt ledger), and each
@@ -456,6 +471,19 @@ Once the push lands, either plainly or by force-pushing over an orphaned branch
 (#815), the branch record becomes exactly the attempt's builders. That is also
 the only way a record of unknown provenance becomes complete. A resume only
 appends.
+
+**Codex-only overrides need a Codex verdict (#1076).** The owner overrides
+`AUGMENTAGENT_AUTOPR_CODEX_UNLOCKS_HARD` and
+`AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT` require an approval from an actual
+Codex call. The fresh lane, the resume lane and the merge sweep (#1029) decide
+approval with one predicate, `approval_of`, over a verdict the lane records
+from the provider it called. The fresh lane stores that verdict with the
+reviewed head in its record of opened PRs (`autopr-opened-prs.json`). The sweep
+reads only that record, bound to the same PR and head. It no longer counts
+`CODEX-REVIEW: lgtm` lines in the PR body. A Claude review writes the same
+line, and the body also carries model output that can contain any line.
+Records written before this change carry no verdict, so the sweep leaves those
+drafts to the resume lane, which reviews them again.
 
 `augmentagent autopr-health` reports drafts that are waiting under
 `review-held`. The warning says the loop is not wedged and gives each draft's
