@@ -353,6 +353,8 @@ pub struct AuditCtx {
     pub session_id: String,
     pub http: Option<std::sync::Arc<serenity::http::Http>>,
     pub channel_id: Option<serenity::model::id::ChannelId>,
+    /// True only when Discord has an explicit owner allowlist and this author matched it.
+    pub owner_authorized: bool,
 }
 
 impl AuditCtx {
@@ -363,6 +365,7 @@ impl AuditCtx {
             session_id: String::from("-"),
             http: None,
             channel_id: None,
+            owner_authorized: false,
         }
     }
 }

@@ -282,6 +282,7 @@ impl EventHandler for Handler {
                 session_id: format!("{}:{}", channel_id, msg_id),
                 http: Some(http.clone()),
                 channel_id: Some(channel_id),
+                owner_authorized: allowed_user_id.is_some(),
             };
             let result =
                 run_with_typing(&http, channel_id, handler.answer(&audit_ctx, &prompt)).await;

@@ -1,4 +1,4 @@
-//! Credential vault backed by macOS Keychain.
+//! Credential vault backed by macOS Keychain or Linux persistent keyring/Secret Service.
 //!
 //! Every non-Discord-bot channel persists its credentials here under a
 //! consistent naming scheme: `augmentagent/<platform>/<account>`.
