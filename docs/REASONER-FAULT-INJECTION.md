@@ -71,20 +71,34 @@ claude stub records a spawn.
 | `codex_transport_failure_still_latches_and_fails_over` (control) | `fake-codex-stream-disconnected.sh` | claude serves, codex latched `codex unavailable: stream disconnected…` |
 
 The routing table behind these scenarios is
-`crates/augmentagent-channel-core/src/turn_failure.rs`. Only quota,
-transport, auth and binary failures latch. Content-level failures (an empty
+`crates/augmentagent-channel-core/src/turn_failure.rs`. Quota, transport,
+auth and binary failures latch and fail over. An explicit HTTP status (429,
+402, 401, 5xx) decides before any wording. Content-level failures (an empty
 turn, context overflow, a policy refusal, the bridge refusing further tool
-calls) never latch and never advance the chain. Text that matches no row
-after the turn began gets the same treatment, because tools may already have
-run. The unit tests pin every row of that table (`turn_failure::tests`,
-`codex::tests::turn_failed_routing_is_pinned_per_failure_class`).
+calls) never latch and never advance the chain.
+
+Text that matches no row after the turn began is routed by what the call can
+do:
+- A text-only or read-only call cannot repeat a write, so the failure counts
+  as an outage: latch and fail over.
+- A write or agentic call fails safe: no chain advance. Three consecutive
+  such failures latch the provider for the short outage cooldown, so later
+  requests stop respawning it.
+
+The unit tests pin every row (`turn_failure::tests`,
+`codex::tests::turn_failed_routing_is_pinned_per_failure_class`,
+`codex::tests::unexplained_failures_after_the_turn_began_route_by_capability`)
+and the backoff
+(`fallback::tests::repeated_unrecognised_write_failures_back_off_without_redispatch`).
 
 The rig cannot show the other half of #1040: a write request whose journal
 already holds completed operations is not dispatched again. The selftest is
 text-only and carries no operation journal, so that half is covered by
-`fallback::tests::completed_write_without_summary_is_not_redispatched_by_fallback_or_caller_retry`,
-its negative control, and the test that pins the unchanged
-resume-from-receipts path.
+`fallback::tests::completed_write_without_summary_is_not_redispatched_by_fallback_or_caller_retry`
+and its neighbours. They cover the negative control, uncertain rows (no
+verdict), a codex killed mid-turn (no verdict) and the unchanged
+resume-from-receipts path. That protection only reaches callers with a stable
+turn id; see `docs/CODEX-FALLBACK.md`.
 
 ### Why the selftest stays text-only
 
