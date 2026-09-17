@@ -14206,7 +14206,7 @@ async fn run_twitter_validate(
 // ================================================================
 
 async fn run_discord_login(creds_json: PathBuf) -> Result<()> {
-    use augmentagent_channel_discord_dm::{auth::default_creds_path, DiscordAuth, DiscordClient};
+    use augmentagent_channel_discord_dm::{auth::mirror_creds_path, DiscordAuth, DiscordClient};
     let raw = std::fs::read_to_string(&creds_json)
         .with_context(|| format!("read creds file at {}", creds_json.display()))?;
     let auth: DiscordAuth = serde_json::from_str(&raw).context("parse discord creds JSON")?;
@@ -14224,38 +14224,38 @@ async fn run_discord_login(creds_json: PathBuf) -> Result<()> {
     auth.save_to_keychain()
         .context("save discord auth to keychain")?;
 
-    // Also write the file to the vault/repo path so additional hosts mounting
-    // the same vault auto-pick-up on next deploy. Skipped if the destination
-    // is the source (writing to the same file we just read).
+    // The keyring is the store of record. A plaintext copy is written only
+    // when the operator configured an out-of-tree path (env override or a
+    // mounted vault) — never into the source checkout.
     let repo_root = std::env::current_dir().context("current_dir")?;
-    let vault_path = default_creds_path(&repo_root);
-    let mirrored = match (
-        creds_json.canonicalize(),
-        vault_path.canonicalize(),
-    ) {
-        (Ok(a), Ok(b)) if a == b => false,
-        _ => {
-            match auth.save(&vault_path) {
+    let mirrored = match mirror_creds_path(&repo_root) {
+        None => None,
+        Some(path) => match (creds_json.canonicalize(), path.canonicalize()) {
+            (Ok(a), Ok(b)) if a == b => None,
+            _ => match auth.save(&path) {
                 Ok(()) => {
-                    info!(to = %vault_path.display(), "discord creds mirrored to vault path");
-                    true
+                    info!(
+                        to = %path.display(),
+                        "discord creds mirrored to configured path (0600)"
+                    );
+                    Some(path)
                 }
                 Err(e) => {
                     warn!(
                         error = %e,
-                        to = %vault_path.display(),
-                        "vault mirror failed; keychain still saved"
+                        to = %path.display(),
+                        "creds file mirror failed; keychain still saved"
                     );
-                    false
+                    None
                 }
-            }
-        }
+            },
+        },
     };
 
     println!(
-        "discord auth saved to keychain (augmentagent/discord/default)\nuser_id: {}\nvault mirror: {}",
+        "discord auth saved to keychain (augmentagent/discord/default)\nuser_id: {}\nfile copy: {}",
         auth.user_id,
-        if mirrored { vault_path.display().to_string() } else { "(skipped — source is already at vault path)".into() },
+        mirrored.map_or_else(|| "none (keyring only)".into(), |p| p.display().to_string()),
     );
     Ok(())
 }
