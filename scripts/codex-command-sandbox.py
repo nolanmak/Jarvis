@@ -31,6 +31,24 @@ class PathRule(ctypes.Structure):
 CONTROL_PARTS = {'.git', '.codex', '.claude', '.ssh', '.gnupg', '.aws', '.azure'}
 
 
+def regular_private_file(info):
+    """The file-verification rule shared by this sandbox and the tool bridge.
+
+    Only a regular file with exactly one directory entry qualifies. A hard link
+    lets a name inside a scope reach an inode that is also reachable elsewhere,
+    so neither a Landlock grant nor a bridge read may follow one (#1043). The
+    bridge loads this module by explicit path; keep it free of import side
+    effects.
+    """
+    return stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+
+
+def verify_regular_private_file(fd):
+    """Return fstat metadata for an opened regular single-link file, else None."""
+    info = os.fstat(fd)
+    return info if regular_private_file(info) else None
+
+
 def source_read_entries(roots):
     # Grant opened inodes, not paths re-resolved after checking: otherwise a
     # concurrent symlink swap could turn a safe source name into a secret.
@@ -57,8 +75,7 @@ def source_read_entries(roots):
             elif stat.S_ISREG(info.st_mode):
                 child = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
                 try:
-                    current = os.fstat(child)
-                    if stat.S_ISREG(current.st_mode) and current.st_nlink == 1:
+                    if verify_regular_private_file(child) is not None:
                         yield child, (1 << 0) | (1 << 2)
                 finally:
                     os.close(child)

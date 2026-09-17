@@ -21,6 +21,98 @@ pre-tool guards. Every filesystem path component is opened without following
 symlinks. Read roots and write roots are separate; transcript context is not a
 writable workspace. Credential and control directories are excluded.
 
+The rejected escape classes are traversal outside a root, absolute paths
+outside a root, symlinks at any component, credential/control paths, and hard
+links. A hard link can give a name inside a read root to an inode that also
+lives outside it. Bridge Read, Edit and Write refuse any file with more than one
+link, Grep skips it, and Glob does not list it (#1043). The command sandbox
+never grants Landlock access to such a file. One helper decides this for both:
+`verify_regular_private_file` in `scripts/codex-command-sandbox.py` accepts only
+a regular file with `st_nlink == 1`. Both scripts run as `python3 -I`, so a plain
+import between them cannot work. The bridge therefore loads the sandbox module
+by explicit path from the packaged launch directory. The sandbox is already
+embedded beside the bridge, so no new file is shipped. The bridge loads and
+checks the helper at startup against its effective write roots. If the helper
+is missing or model-writable, `initialize`, `tools/list` and `tools/call` fail
+readiness with `JARVIS_READINESS:mcp_start` and stderr says why, instead of
+every file tool returning a generic denial. Every later caller's write roots are
+also checked against the cached helper path.
+
+Tool paths are capped at 32 components below their scope root and at 4096 bytes
+as an absolute path (Linux `PATH_MAX`). The caps apply to Read, Write and Edit and
+to every Glob/Grep entry. A deeper Write is refused before any directory is
+created. Searches skip deeper entries and walk with an explicit stack, so an
+existing deep tree cannot exhaust the interpreter stack (#1042).
+
+No client or model input can end the bridge process short of SIGKILL. Each
+request line passes through one `safe_dispatch` wrapper. Unparsable input
+(invalid JSON, invalid UTF-8 or excessive nesting) gets JSON-RPC `-32700`. A
+value that is not a request object, or has an unusable id, gets `-32600`. Both
+use a null id because no id can be trusted. A request with a readable id but a
+wrong `jsonrpc`/`method` gets `-32600` with that id. A `tools/call` whose params
+are not an object, whose `name` is not a string, or whose `arguments` are not an
+object gets `-32602`. Any other unexpected failure gets `-32603` with no details.
+Tool-level `RecursionError`/`MemoryError` become ordinary tool errors. A request
+line may be at most 24 MiB. That admits a Write of up to 8 MiB of text whose
+JSON escaping needs at most two bytes per byte (quotes, backslashes, newlines,
+tabs; non-ASCII stays raw UTF-8), plus envelope and path. JSON escapes other
+control characters as six bytes each, so text dense with them can exceed the
+cap: a 4 MiB Write of such characters already does. That request is refused with
+`-32600` before parsing, and nothing is written. The cap also bounds parse
+memory: a line of tiny JSON objects costs about 27 times its size in
+`json.loads`. The bridge reads at most 24 MiB of a longer line, skips the rest
+in 1 MiB reads without keeping them, and answers `-32600`. The reply carries the
+id only when it is the compact request's leading field, in JSON integer or simple
+string form. Notifications
+and client responses are never answered. We checked the null-id replies against
+Codex's MCP client (rmcp 3.2.0 in codex-cli 0.154.0). It parses an error without
+an id as `JsonRpcError { id: None }`, logs it and drops it, and it never replies
+to an error. A null-id reply therefore cannot complete or stall a pending call,
+and cannot start an echo loop.
+
+Grep cannot stall the bridge (#1038). Python's `re` has no timeout, and a
+pattern such as `(a+)+$` on a 40-character line would otherwise run for hours on
+the bridge's only thread, holding the provider's CLI-gate slot until the reasoner
+watchdog. Grep therefore runs in two phases with separate bounds.
+
+1. **Walk and read.** The bridge walks and reads files itself, through the same
+   scoped descriptors and symlink/hard-link checks as Read, into an in-memory
+   file. This phase stops at 10 s of wall clock, 64 MiB of file bytes or 10,000
+   walk entries, whichever comes first. Running out is not an error. The reply
+   holds the hits from the files read so far, followed by a second text block:
+   "Grep results are partial: the search stopped at … after N files; narrow the
+   path to search the rest."
+2. **Match.** Only the regular expression runs, in a short-lived `python3 -I -S`
+   child. The child gets the pattern and the collected bytes on stdin, never a
+   path. It has an empty environment, a 1 GiB address-space limit, a 3 s CPU
+   limit and a parent-death signal. It is killed after 1.5 s of wall clock, so
+   the matching phase ends within 2 s, and the bridge answers the next request
+   normally. That wall clock also counts child startup and time spent waiting for
+   a CPU, so the tool error is worded by the child's own CPU time
+   (`RUSAGE_CHILDREN` delta). If the child used at least half the wall time, the
+   model is told to simplify the pattern. Otherwise it is told the host is busy
+   and to retry or narrow the path.
+
+Keeping the budgets separate matters on this host, which often runs builds. With
+one shared 1.5 s budget, a literal search of a 27 MB, 7,000-file tree timed out
+under 24 busy loops, with advice to "simplify the pattern". With the split, the
+same search completes in 1.8–2.3 s. A pathological pattern still errors, with
+pattern advice. Its total reply time is the read phase plus at most 1.5 s of
+matching: under 2 s for a small scope, and about 2–3 s over that whole tree
+under load. The matcher still stops at 1,000 results, and each file at 8 MiB. A
+SIGTERM from the parent watcher interrupts a long search, which an in-process
+C-level match could not.
+
+Linear-time engines (the `regex` module, `rg`) are not on the host. A heuristic
+that rejects nested quantifiers would miss patterns like `(a|aa)+$` and refuse
+legitimate ones, so the wall clock is the bound. Matching per line is unchanged.
+Grep parity with the Claude path is pinned by a fixed pattern table in the shared
+Python/ripgrep regex subset. The bridge side always runs. The ripgrep side runs
+in the bridge-suites CI job, which installs ripgrep, and wherever `rg` is
+installed locally. Known divergences are regex dialect (lookaround and
+backreferences exist only in Python) and ripgrep's default
+ignore/hidden/binary-file filtering.
+
 The original guards run inside the bridge and fail closed on crash, timeout,
 malformed output or explicit denial. Native Codex hooks are not the enforcement
 boundary: a live synthetic probe found that a crashing hook allowed an MCP call
@@ -346,8 +438,25 @@ cannot stand in for any tool-using profile.
 - The production-shaped wiki-ask quota regression now passes, alongside routing
   tests for all four capability classes and live handler/delivery fallback QA.
 - Bridge tests cover file read/write/edit, nested writes, bounded search, tool
-  declaration, traversal and intermediate symlink escapes, sensitive paths,
+  declaration, traversal, intermediate symlink and hard-link escapes, sensitive paths,
   command parsing, and guard denial/crash/malformed-response handling.
+- `BridgeResilienceTests` pin the path depth/length caps for reads and writes,
+  Glob/Grep over a 1500-level tree, and a stdio bridge that keeps serving after
+  deep paths, malformed lines, non-object requests and invalid `tools/call`
+  params, with the JSON-RPC codes above.
+- `BoundedGrepTests` pin a pathological pattern replying in under 2 s, with
+  pattern advice, while the next request is served. They also pin a bridge and
+  its matcher exiting within 1 s of parent death mid-match, and the fixed parity
+  table. With an injected clock and a slow-read hook, they check that slow
+  reading never counts against the matching bound, and that running out of read
+  time, scan bytes or walk entries returns partial results with a note to narrow
+  the path. Injected CPU-usage and clock hooks check both matching-timeout
+  messages: pattern advice when the matcher was using the CPU, and a busy-host
+  retry note when it mostly waited for one. The live-gate
+  unit test
+  `codex::tests::pathological_bridge_grep_releases_the_cli_gate_slot_within_its_bound`
+  drives the real packaged bridge through a Codex stand-in under a one-slot
+  `CliGate`. The slot is free again right after the bounded Grep reply.
 - File-tool schemas and dispatch support optional line ranges, scoped/file
   searches, case-insensitive matching, explicit replace-all edits and bounded
   command timeouts. Invalid or unknown local arguments are rejected before
@@ -374,7 +483,7 @@ cannot stand in for any tool-using profile.
   rejection of unknown settings.
 - Stdio and HTTP MCP tests cover tool allowlists, session/auth forwarding,
   environment interpolation, missing-tool readiness and hung-child cleanup.
-- Kernel sandbox tests verify scoped I/O, outside/symlink/credential-read denial,
+- Kernel sandbox tests verify scoped I/O, outside/symlink/hard-link/credential-read denial,
   blocked network sockets and blocked signals to the parent.
 - Real Cargo and npm fixtures verify compilation/test execution, read-only npm
   dependencies, source reconciliation and exclusion of build outputs. Git diff

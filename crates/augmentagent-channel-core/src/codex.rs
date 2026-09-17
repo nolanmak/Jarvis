@@ -863,4 +863,74 @@ echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"a red sq
         ));
     }
 
+    /// Stands in for Codex: starts the packaged bridge exactly as the
+    /// `mcp_servers.jarvis` override says, sends one Grep and reports how long
+    /// the reply took. It gives up after 30 s so a stalled bridge fails the test
+    /// instead of hanging it.
+    const FAKE_CODEX_PATHOLOGICAL_GREP: &str = r##"
+cat >/dev/null
+exec python3 -I - "$@" <<'PY'
+import json, os, select, subprocess, sys, time
+spec = next(arg for arg in sys.argv[1:] if arg.startswith('mcp_servers.jarvis='))
+args = json.loads('[' + spec.split('args=[', 1)[1].split(']', 1)[0] + ']')
+bridge = subprocess.Popen(['python3', *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+pending = b''
+def call(identifier, method, params, seconds):
+    global pending
+    bridge.stdin.write((json.dumps({'jsonrpc': '2.0', 'id': identifier, 'method': method, 'params': params}) + '\n').encode())
+    bridge.stdin.flush()
+    deadline = time.monotonic() + seconds
+    while b'\n' not in pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([bridge.stdout], [], [], remaining)[0]:
+            return None
+        chunk = os.read(bridge.stdout.fileno(), 65536)
+        if not chunk:
+            return None
+        pending += chunk
+    line, pending = pending.split(b'\n', 1)
+    return json.loads(line)
+call(1, 'initialize', {}, 30)
+started = time.monotonic()
+reply = call(2, 'tools/call', {'name': 'Grep', 'arguments': {'pattern': '(a+)+$'}}, 30)
+elapsed = time.monotonic() - started
+if reply is None:
+    bridge.kill()
+bridge.stdin.close()
+bridge.wait()
+report = json.dumps({'grep_seconds': elapsed, 'reply': reply})
+print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': report}}), flush=True)
+PY
+"##;
+
+    /// #1038 C3: a pathological Grep through the real packaged bridge is
+    /// answered within its bound. The Codex turn then ends normally and its
+    /// CLI-gate slot is released, instead of being held until the watchdog.
+    #[tokio::test]
+    async fn pathological_bridge_grep_releases_the_cli_gate_slot_within_its_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        // Forty characters of backtracking bait for Python's re engine.
+        std::fs::write(workspace.join("bait.txt"), format!("{}b\n", "a".repeat(40))).unwrap();
+        let bin = stub(&dir, "fake-codex-grep", FAKE_CODEX_PATHOLOGICAL_GREP);
+        let gate = std::sync::Arc::new(crate::cli_gate::CliGate::new(1));
+        let reasoner = CodexCliReasoner { bin, gate: gate.clone() };
+        let mut options = opts();
+        options.allowed_tools = vec!["Grep".into()];
+        options.cwd = Some(workspace);
+        let started = std::time::Instant::now();
+        let answer = reasoner.call(&options, "Synthetic pathological search").await.unwrap();
+        let held = started.elapsed();
+        let report: serde_json::Value = serde_json::from_str(answer.trim()).unwrap();
+        assert_eq!(report["reply"]["result"]["isError"], true, "{report}");
+        assert!(report["reply"]["result"]["content"][0]["text"].as_str().unwrap_or_default()
+            .contains("time limit"), "{report}");
+        assert!(report["grep_seconds"].as_f64().unwrap() < 2.0, "{report}");
+        assert!(held < std::time::Duration::from_secs(20), "gate slot held for {held:?}");
+        assert_eq!(gate.in_flight(), 0);
+        let next = gate.acquire_timed("codex", "synthetic-next-call", std::time::Duration::from_millis(500)).await;
+        assert!(next.is_ok(), "the only gate slot was not released");
+    }
+
 }

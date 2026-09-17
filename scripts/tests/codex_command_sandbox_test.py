@@ -52,6 +52,45 @@ print(json.dumps(result))
             self.assertEqual((workspace/'output.txt').read_text(),'ALLOWED_WRITE')
             self.assertFalse((root/'bad.txt').exists())
 
+    def test_hard_link_inside_read_root_is_not_granted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);workspace=root/'workspace';workspace.mkdir()
+            private=root/'private.txt';private.write_text('SYNTHETIC_PRIVATE')
+            os.link(private,workspace/'linked.txt')
+            (workspace/'plain.txt').write_text('SYNTHETIC_PUBLIC')
+            config=root/'policy.json'
+            config.write_text(json.dumps({'cwd':str(workspace),'read_roots':[str(workspace)],'write_roots':[]}))
+            config.chmod(0o600)
+            probe=("import json\nresult={}\nfor name in ('plain.txt','linked.txt'):\n"
+                   " try: result[name]=open(name).read()\n except PermissionError: result[name]='DENIED'\n"
+                   "print(json.dumps(result))")
+            run=subprocess.run([sys.executable,'-I',str(SCRIPT),str(config),PROBE,'-c',probe],
+                capture_output=True,text=True,timeout=10)
+            self.assertEqual(run.returncode,0,run.stderr)
+            self.assertEqual(json.loads(run.stdout),{'plain.txt':'SYNTHETIC_PUBLIC','linked.txt':'DENIED'})
+
+    def test_file_verification_helper_accepts_only_single_link_regular_files(self):
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('sandbox',SCRIPT)
+        sandbox=importlib.util.module_from_spec(spec);spec.loader.exec_module(sandbox)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            (root/'plain.txt').write_text('SYNTHETIC')
+            (root/'target.txt').write_text('SYNTHETIC')
+            os.link(root/'target.txt',root/'linked.txt')
+            os.mkfifo(root/'fifo')
+            (root/'directory').mkdir()
+            expected={'plain.txt':True,'linked.txt':False,'target.txt':False,'fifo':False,'directory':False}
+            for name,accepted in expected.items():
+                descriptor=os.open(root/name,os.O_PATH|os.O_NOFOLLOW)
+                try:
+                    with self.subTest(name=name):
+                        info=sandbox.verify_regular_private_file(descriptor)
+                        self.assertEqual(info is not None,accepted)
+                        self.assertEqual(sandbox.regular_private_file(os.fstat(descriptor)),accepted)
+                finally:
+                    os.close(descriptor)
+
     def test_readonly_profile_cannot_write_even_inside_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);config=root/'policy.json'
