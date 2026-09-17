@@ -99,6 +99,11 @@ pub struct WaMessage {
 }
 
 impl WaMessage {
+    /// Stable across redelivery and linked devices, distinct for every turn.
+    pub fn stable_id(&self) -> String {
+        format!("wa:{}:{}", self.chat.bare(), self.id)
+    }
+
     /// True if this is our own outbound message — never triaged.
     pub fn is_outbound(&self) -> bool {
         self.from_me
@@ -119,7 +124,7 @@ impl WaMessage {
             attachments: Vec::new(),
             to: String::new(),
             cc: String::new(),
-            message_id: format!("wa:{}:{}", self.chat.bare(), self.id),
+            message_id: self.stable_id(),
             thread_id: Some(self.chat.bare()),
             from,
             subject: String::new(),
@@ -207,6 +212,20 @@ fn secs_to_rfc3339(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_identity_survives_redelivery_but_separates_turns() {
+        let mut message = WaMessage {
+            id: "synthetic-turn-one".into(), chat: Jid::new("fixture:1@example.invalid"),
+            sender: Jid::new("fixture@example.invalid"), push_name: String::new(),
+            text: "same request".into(), timestamp: 1, from_me: false,
+        };
+        let first = message.stable_id();
+        message.chat = Jid::new("fixture:2@example.invalid");
+        assert_eq!(first, message.stable_id());
+        message.id = "synthetic-turn-two".into();
+        assert_ne!(first, message.stable_id());
+    }
 
     #[test]
     fn jid_parses_user_and_server() {

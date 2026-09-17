@@ -76,8 +76,10 @@ systemctl --user restart augmentagent.service
 
 `poll-once` pulls a Git feed when present, imports history and prints counts; it
 does not call a model. The daemon polls immediately and every 30 minutes.
-With a configured wiki, it submits new entries in previously imported
-conversations to the existing bounded knowledge-capture queue. The first import
+LLM wiki capture is off by default; with a configured wiki and
+`AUGMENTAGENT_HISTORY_WIKI_CAPTURE=1`, it submits new entries in previously
+imported conversations to the bounded knowledge-capture queue (one model call
+per changed conversation per poll). The first import
 of each conversation populates searchable history without a mass model backfill.
 Wiki capture is best effort; full imported messages remain searchable if capture
 fails or its queue is full. Allow up to another polling interval after an export.

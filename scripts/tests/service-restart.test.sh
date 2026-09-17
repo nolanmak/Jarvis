@@ -253,6 +253,36 @@ else
 fi
 rm -rf "$HYG_DIR"
 
+echo "state dir follows XDG_STATE_HOME like the Rust daemon (#1048):"
+# The auto-PR loop (Rust state_dir::resolve) holds its lane locks in
+# $XDG_STATE_HOME/augmentagent when XDG_STATE_HOME is absolute, else
+# $HOME/.local/state/augmentagent. The updater must look in the same place or
+# it restarts the daemon under a live build. Sourced in a clean subshell per
+# case so the config lines re-evaluate against that environment.
+state_paths() { # <XDG_STATE_HOME or "-unset-"> [extra env...] -> "lock|resume|stamp|history"
+  local xdg="$1"; shift
+  env -u XDG_STATE_HOME -u LOG_DIR -u AUGMENTAGENT_SELFIMPROVE_LOCK \
+      -u AUGMENTAGENT_RESTART_DEFER_STAMP -u AUGMENTAGENT_RESTART_HISTORY \
+      HOME=/synthetic/home "$@" \
+      bash -c '[ "$1" = -unset- ] || export XDG_STATE_HOME="$1"
+               . "$2" 2>/dev/null
+               printf "%s|%s|%s|%s" "$SELF_IMPROVE_LOCK" "$RESUME_LANE_LOCK" \
+                 "$RESTART_DEFER_STAMP" "$RESTART_HISTORY"' \
+      _ "$xdg" "$REPO_ROOT/scripts/lib/service-restart.sh"
+}
+HOME_STATE=/synthetic/home/.local/state/augmentagent
+check "unset XDG_STATE_HOME: locks and stamps under HOME" "$(state_paths -unset-)" \
+  "$HOME_STATE/self-improve.lock|$HOME_STATE/self-improve-resume.lock|$HOME_STATE/restart-deferred-since|$HOME_STATE/restart-history"
+check "absolute XDG_STATE_HOME: locks and stamps under it" "$(state_paths /synthetic/xdg)" \
+  "/synthetic/xdg/augmentagent/self-improve.lock|/synthetic/xdg/augmentagent/self-improve-resume.lock|/synthetic/xdg/augmentagent/restart-deferred-since|/synthetic/xdg/augmentagent/restart-history"
+check "empty XDG_STATE_HOME counts as unset" "$(state_paths '')" \
+  "$HOME_STATE/self-improve.lock|$HOME_STATE/self-improve-resume.lock|$HOME_STATE/restart-deferred-since|$HOME_STATE/restart-history"
+check "relative XDG_STATE_HOME is ignored, as in Rust" "$(state_paths relative/state)" \
+  "$HOME_STATE/self-improve.lock|$HOME_STATE/self-improve-resume.lock|$HOME_STATE/restart-deferred-since|$HOME_STATE/restart-history"
+check "AUGMENTAGENT_SELFIMPROVE_LOCK still wins over XDG_STATE_HOME" \
+  "$(state_paths /synthetic/xdg AUGMENTAGENT_SELFIMPROVE_LOCK=/synthetic/lock/self-improve.lock | cut -d'|' -f1,2)" \
+  "/synthetic/lock/self-improve.lock|/synthetic/lock/self-improve-resume.lock"
+
 echo "should_write_stamp:"
 should_write_stamp 0; check "writes the stamp when nothing failed" "$?" "0"
 should_write_stamp 1; check "withholds the stamp when a required restart failed" "$?" "1"

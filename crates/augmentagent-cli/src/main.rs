@@ -1,5 +1,10 @@
 //! `augmentagent` binary.
 
+#[cfg(test)]
+mod provider_migration_tests;
+#[cfg(test)]
+mod provider_channel_tests;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,6 +54,7 @@ use augmentagent_store::{ActionStatus, Store, TriageResult};
 use async_trait::async_trait;
 
 mod whatsapp_history;
+mod autopr_eval;
 mod autopr_health;
 mod channel_router;
 mod code_mode;
@@ -56,7 +62,9 @@ mod doc_cmd;
 mod doctor;
 mod env_cfg;
 mod gmail_attach;
+mod repo_docs;
 mod finance;
+mod handoff_prune;
 mod installers;
 mod logs;
 mod loop_cmd;
@@ -98,6 +106,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Read documents from explicitly configured read-only GitHub sources.
+    RepoDocs {
+        #[command(subcommand)]
+        op: repo_docs::Command,
+    },
     /// Connect bank accounts, sync transactions, and query local finance records.
     Finance {
         #[command(subcommand)]
@@ -463,6 +476,32 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Remove finished reasoner handoff journals idle past the retention
+    /// grace (#1035): `AUGMENTAGENT_HANDOFF_RETENTION_HOURS`, default 24.
+    /// The daemon sweeps at start and hourly with a confirming pass; this
+    /// on-demand pass removes immediately, so it needs `--yes` and refuses
+    /// while augmentagent.service runs. Journals with a lifecycle marker or
+    /// an uncertain row are never removed.
+    HandoffPrune {
+        /// Count what would be removed; take no locks and change nothing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Confirm a removing pass. Without the daemon's confirming pass, a
+        /// turn replayed after an outage would find no receipts.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        /// Remove even while augmentagent.service is active, or when
+        /// `systemctl --user is-active` cannot tell.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Machine-readable output.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Journal root. Default: reasoner-handoffs in the daemon state dir
+        /// ($XDG_STATE_HOME/augmentagent, else ~/.local/state/augmentagent)
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Token usage per day (#1001). Reads the append-only log the reasoner
     /// writes on every call (`~/.local/state/augmentagent/token-usage.jsonl`,
     /// outside the repo) and rolls it up by day and model — the measurement
@@ -474,6 +513,28 @@ enum Cmd {
         /// Machine-readable output.
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+    /// #1011 — grade the SCOPING pass against fixed, cached issues.
+    ///
+    /// The unit tests pin what the code does; this measures what the loop
+    /// DECIDES. Runs the scoping pass only — no build, no gate, no worktree,
+    /// no production state, and one reasoner call per case. Exit 1 on any miss.
+    AutoprEval {
+        /// Fixture file. Default: eval/autopr-cases.json
+        #[arg(long)]
+        cases: Option<std::path::PathBuf>,
+        /// Grade only these case ids, comma-separated.
+        #[arg(long)]
+        only: Option<String>,
+        /// Where to write the markdown report. Default: eval/RESULTS.md
+        #[arg(long)]
+        report: Option<std::path::PathBuf>,
+        /// Re-render the report from the fixtures without calling a reasoner.
+        #[arg(long, default_value_t = false)]
+        report_only: bool,
+        /// Re-fetch the cached issue text from GitHub, then exit.
+        #[arg(long, default_value_t = false)]
+        refresh: bool,
     },
     /// Health watchdog for the auto-PR loop (#997). Reads the same evidence
     /// a human would — the daemon log, the baseline cache, free disk, open
@@ -1028,6 +1089,9 @@ enum JournalOp {
     Backfill {
         #[arg(long, default_value_t = 200)]
         max_entries: usize,
+        /// Archive journal revisions without spawning derived-memory model calls.
+        #[arg(long)]
+        archive_only: bool,
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         dry_run: bool,
     },
@@ -1042,6 +1106,13 @@ enum JournalOp {
     Show {
         #[arg(long)]
         date: Option<String>,
+    },
+    /// List local immutable journal revisions, or print an exact saved revision.
+    History {
+        #[arg(long)]
+        entry_id: String,
+        #[arg(long)]
+        revision: Option<String>,
     },
     /// #900 — print the persisted watermark and in-progress cursor.
     Status,
@@ -1650,6 +1721,9 @@ enum GmailOp {
     /// extract its text to the sibling `.txt`, running Mistral OCR when a PDF
     /// has no text layer and MISTRAL_API_KEY is set (#939).
     GetAttachment {
+        /// Stage the exact original inside the wiki for Discord ATTACH delivery.
+        #[arg(long, conflicts_with = "out")]
+        deliver: bool,
         /// Email address or Composio entity_id. Required when more than one
         /// account is connected.
         #[arg(long)]
@@ -2214,6 +2288,30 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Cmd::RepoDocs { ref op } = cli.cmd {
+        return repo_docs::run(op, cli.wiki_dir.as_deref()).await;
+    }
+    // Journal housekeeping needs no database.
+    if let Cmd::HandoffPrune {
+        dry_run,
+        yes,
+        force,
+        json,
+        ref root,
+    } = cli.cmd
+    {
+        let root = root
+            .clone()
+            .or_else(augmentagent_channel_core::handoff::journal_root)
+            .context("no --root and no HOME to locate the handoff journal root")?;
+        return handoff_prune::run(
+            handoff_prune::Options { dry_run, yes, force, json },
+            &augmentagent_channel_core::handoff::retention_setting_from_env(),
+            &root,
+            &handoff_prune::daemon_state,
+            &mut std::io::stdout().lock(),
+        );
+    }
     let db_path = cli
         .db
         .clone()
@@ -2629,6 +2727,16 @@ async fn main() -> Result<()> {
             // Collect the enabled channels' runners + optional digest scheduler.
             let mut tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>> = Vec::new();
 
+            // #1035 — reasoner handoff journals: remove finished ones idle past
+            // the grace period, at start and hourly, on the blocking pool.
+            // Never in-flight or uncertain ones; failures only log.
+            tasks.push(tokio::spawn(augmentagent_channel_core::handoff::run_sweep_loop(
+                augmentagent_channel_core::handoff::journal_root(),
+                augmentagent_channel_core::handoff::retention_from_env(),
+                augmentagent_channel_core::handoff::SWEEP_INTERVAL,
+                shutdown.clone(),
+            )));
+
             // Voice-capture listener (#80): long-poll the capture bot. Inert
             // unless a token is in the keyring AND the chat allowlist is
             // non-empty — so prod (neither configured) never spawns it. The
@@ -2837,6 +2945,8 @@ async fn main() -> Result<()> {
                             allow_base_sync: false,
                             max_pages_per_poll:
                                 augmentagent_channel_journal::DEFAULT_MAX_PAGES_PER_POLL,
+                            exclude_topics:
+                                augmentagent_channel_journal::scrub::exclude_topics_from_env(),
                         },
                     );
                     let sd = shutdown.clone();
@@ -3104,6 +3214,8 @@ async fn main() -> Result<()> {
             dry_run,
             max_issues,
         } => research::run_research(store, since_hours, post_discord, dry_run, max_issues).await,
+        Cmd::RepoDocs { .. } => unreachable!("handled before database initialization"),
+        Cmd::HandoffPrune { .. } => unreachable!("handled before database initialization"),
         Cmd::Gmail { ref op } => match op {
             GmailOp::Search { query, limit, full, account } => {
                 run_gmail_search(store, query.clone(), *limit, *full, account.clone()).await
@@ -3119,7 +3231,7 @@ async fn main() -> Result<()> {
                 .await
             }
             GmailOp::GetAttachment {
-                account, message_id, attachment_id, name, out, extract, json,
+                account, message_id, attachment_id, name, out, extract, json, deliver,
             } => {
                 gmail_attach::run_gmail_get_attachment(
                     store,
@@ -3128,6 +3240,8 @@ async fn main() -> Result<()> {
                     attachment_id.clone(),
                     name.clone(),
                     out.clone(),
+                    *deliver,
+                    cli.wiki_dir.clone(),
                     *extract,
                     *json,
                 )
@@ -3433,11 +3547,12 @@ async fn main() -> Result<()> {
         },
         Cmd::Journal { op } => match op {
             JournalOp::PollOnce { dry_run } => {
-                run_journal_poll_once(cli.wiki_dir.clone(), store, dry_run, None, false).await?;
+                run_journal_poll_once(cli.wiki_dir.clone(), store, dry_run, None, false, false).await?;
                 Ok(())
             }
             JournalOp::Backfill {
                 max_entries,
+                archive_only,
                 dry_run,
             } => {
                 run_journal_poll_once(
@@ -3446,6 +3561,7 @@ async fn main() -> Result<()> {
                     dry_run,
                     Some(max_entries),
                     true,
+                    archive_only,
                 )
                 .await?;
                 Ok(())
@@ -3456,6 +3572,24 @@ async fn main() -> Result<()> {
             }
             JournalOp::Show { date } => {
                 run_journal_show(date.clone()).await?;
+                Ok(())
+            }
+            JournalOp::History { entry_id, revision } => {
+                let root = cli.wiki_dir.as_ref().context("--wiki-dir is required for journal history")?;
+                if let Some(hash) = revision {
+                    use std::io::Write;
+                    std::io::stdout().write_all(&augmentagent_channel_journal::section::read_revision(root, &entry_id, &hash)?)?;
+                } else {
+                    for hash in augmentagent_channel_journal::section::revisions(root, &entry_id)? {
+                        let bytes = augmentagent_channel_journal::section::read_revision(root, &entry_id, &hash)?;
+                        let page = std::str::from_utf8(&bytes)?;
+                        let header = page.strip_prefix("---\n").and_then(|s| s.split("\n---").next());
+                        let metadata = header.map(|s| s.lines().filter(|line|
+                            line.starts_with("version: ") || line.starts_with("updated: ") || line.starts_with("created: ")
+                        ).collect::<Vec<_>>().join("; ")).unwrap_or_else(|| "legacy page".into());
+                        println!("{hash}  {metadata}");
+                    }
+                }
                 Ok(())
             }
             JournalOp::Status => {
@@ -3953,6 +4087,31 @@ async fn main() -> Result<()> {
                 }
             }
             Ok(())
+        }
+        Cmd::AutoprEval {
+            ref cases,
+            ref only,
+            ref report,
+            report_only,
+            refresh,
+        } => {
+            let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let cases_path = cases
+                .clone()
+                .unwrap_or_else(|| root.join(autopr_eval::DEFAULT_CASES));
+            if refresh {
+                autopr_eval::refresh(&root, &cases_path).await?;
+                return Ok(());
+            }
+            let code = autopr_eval::run(
+                &root,
+                Some(&cases_path),
+                only.as_deref(),
+                report.as_deref(),
+                report_only,
+            )
+            .await?;
+            std::process::exit(code);
         }
         Cmd::AutoprHealth { notify, json } => {
             let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -7352,7 +7511,10 @@ fn migration_system_prompt(schema_body: &str) -> String {
 
 /// Build the per-page user prompt: full page contents.
 fn migration_user_prompt(slug: &str, page: &str) -> String {
-    format!("Page: people/{slug}.md\n\n{page}")
+    format!("Perform the v2 migration extraction for this page. Return only the YAML \
+        patch described in the system instructions; return {{}} if the page contains \
+        no supported fields. Do not modify files or ask which workflow to run.\n\n\
+        Page: people/{slug}.md\n\n{page}")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8275,14 +8437,16 @@ async fn run_reasoner_selftest(prompt: &str) -> Result<()> {
 
     // Text-only opts (no tools) so every configured provider is eligible —
     // this is the widest possible probe of the chain. Quality tier keeps the
-    // probe on the same models the important presets use.
+    // probe on the same models the important presets use: it resolves through
+    // the same knob as `draft_opts` (#1046).
     let opts = ReasonerOpts {
         system_prompt: "You are a diagnostic probe. Follow the user's instruction exactly, \
                         with no preamble."
             .into(),
-        model: Some(
-            std::env::var("AUGMENTAGENT_OPUS_MODEL").unwrap_or_else(|_| "claude-opus-4-8".into()),
-        ),
+        model: Some(augmentagent_channel_core::providers::model_for(
+            augmentagent_channel_core::ProviderKind::Claude,
+            augmentagent_channel_core::ModelTier::Quality,
+        )),
         allowed_tools: vec![],
         add_dirs: vec![],
         permission_mode: "default".into(),
@@ -8293,6 +8457,7 @@ async fn run_reasoner_selftest(prompt: &str) -> Result<()> {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     };
     let result = reasoner.call(&opts, prompt).await;
     // The latches the call itself took are the observable half of a failover
@@ -8339,36 +8504,102 @@ fn owner_rules_block(wiki_root: &std::path::Path) -> Option<String> {
     // = how turns are conducted (deliverable placement, routing). The split
     // is documented in schema/wiki-ask.md's durable-facts pass.
     const SECTIONS: [&str; 2] = ["Writing style preferences", "Agent behavior rules"];
-    // Generous cap: me.md rule sections are a handful of bullets today;
-    // truncation is a guard against unbounded growth, not an expectation.
-    const MAX_BLOCK_CHARS: usize = 4000;
 
     let me = std::fs::read_to_string(wiki_root.join("about").join("me.md")).ok()?;
-    let mut block = String::new();
-    for sec in SECTIONS {
-        if let Some(body) = extract_md_section(&me, sec) {
-            let body = body.trim();
-            if !body.is_empty() {
-                block.push_str("### ");
-                block.push_str(sec);
-                block.push('\n');
-                block.push_str(body);
-                block.push_str("\n\n");
-            }
-        }
-    }
-    if block.trim().is_empty() {
+    let sections: Vec<(&str, &str)> = SECTIONS
+        .iter()
+        .filter_map(|sec| {
+            let body = extract_md_section(&me, sec)?.trim();
+            (!body.is_empty()).then_some((*sec, body))
+        })
+        .collect();
+    if sections.is_empty() {
         return None;
     }
-    if block.len() > MAX_BLOCK_CHARS {
-        let mut end = MAX_BLOCK_CHARS;
-        while end > 0 && !block.is_char_boundary(end) {
-            end -= 1;
-        }
-        block.truncate(end);
-        block.push_str("\n[truncated — read wiki/about/me.md for the rest]\n");
+
+    let rendered = |sec: &str, body: &str| format!("### {sec}\n{body}\n\n");
+    // CHARACTERS, not bytes. The cap is named and documented in characters,
+    // and `str::len()` counts UTF-8 bytes — so an owner writing accented
+    // words, curly quotes or emoji had their rules cut thousands of
+    // characters early, which is #1007 reintroduced for anyone not writing
+    // pure ASCII.
+    let total: usize = sections
+        .iter()
+        .map(|(sec, body)| rendered(sec, body).chars().count())
+        .sum();
+    if total <= OWNER_RULES_MAX_CHARS {
+        return Some(sections.iter().map(|(s, b)| rendered(s, b)).collect());
+    }
+
+    // Over budget: give every section an equal share so no category can be
+    // dropped wholesale, handing whatever a section leaves unspent to the
+    // ones after it. `truncate_rules_body` never returns more than the budget
+    // it is given, and each share covers its own `### ` heading, so the block
+    // as a whole stays under the cap.
+    let mut block = String::new();
+    let mut left = OWNER_RULES_MAX_CHARS;
+    for (i, (sec, body)) in sections.iter().enumerate() {
+        let share = left / (sections.len() - i);
+        let body_budget = share.saturating_sub(rendered(sec, "").chars().count());
+        let part = rendered(sec, &truncate_rules_body(body, body_budget));
+        left = left.saturating_sub(part.chars().count());
+        block.push_str(&part);
     }
     Some(block)
+}
+
+/// Ceiling on the whole injected block. It guards against unbounded growth of
+/// an owner-edited file, not an expectation — it holds the standing rule set
+/// several times over (#1007: the old 4000-char whole-block cut fell inside
+/// "Agent behavior rules" as soon as the style section grew, so behavior rules
+/// were silently dropped and re-filing them could never help).
+const OWNER_RULES_MAX_CHARS: usize = 16_000;
+
+/// Stands in for the rules a section had to drop. Fixed text, so the space it
+/// needs can be reserved exactly.
+const OWNER_RULES_TRUNCATED: &str = "[truncated — read wiki/about/me.md for the rest]";
+
+/// Keep whole lines of a rules section while they fit `budget` — a prefix of
+/// the section in file order — then say the rest was dropped. The marker is
+/// paid for out of `budget`, so the result never exceeds it and the caller's
+/// cap is a real ceiling.
+///
+/// `budget` counts CHARACTERS. Byte offsets are still used to slice, but only
+/// ever at line boundaries, which are always char boundaries too.
+///
+/// Rules are only ever dropped whole. Half a bullet is worse than no bullet —
+/// "- Never send email without an approval card" cut mid-line reads as
+/// "- Never send email", a rule that means something else entirely — so a
+/// section whose very first rule outgrows its budget keeps the heading and the
+/// marker alone. Line boundaries are also char boundaries, so no UTF-8 walk is
+/// needed.
+fn truncate_rules_body(body: &str, budget: usize) -> String {
+    if body.chars().count() <= budget {
+        return body.to_string();
+    }
+    // Shares are thousands of chars, so the marker always fits; the guard just
+    // keeps the "never exceeds `budget`" promise unconditional.
+    let Some(room) = budget.checked_sub(OWNER_RULES_TRUNCATED.chars().count() + 1) else {
+        return String::new();
+    };
+    // `kept_chars` spends the budget; `cut` is the byte offset to slice at.
+    // They advance together and only ever at line boundaries.
+    let mut cut = 0;
+    let mut kept_chars = 0;
+    for line in body.split_inclusive('\n') {
+        let line_chars = line.chars().count();
+        if kept_chars + line_chars > room {
+            break;
+        }
+        kept_chars += line_chars;
+        cut += line.len();
+    }
+    let mut kept = body[..cut].trim_end().to_string();
+    if !kept.is_empty() {
+        kept.push('\n');
+    }
+    kept.push_str(OWNER_RULES_TRUNCATED);
+    kept
 }
 
 /// Return the body of the `## <heading>` section of a markdown doc: the text
@@ -8429,6 +8660,142 @@ impl QueryHandler for WikiQuerier {
     }
 }
 
+#[cfg(test)]
+mod query_delivery_contract_tests {
+    use super::*;
+    use augmentagent_channel_core::{CooldownLatch, ReasonerOpts};
+    use augmentagent_channel_core::providers::{classify, CapabilityClass, ProviderKind};
+
+    struct TranscriptFixture {
+        marker: String,
+    }
+
+    struct QuotaFixture(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl Reasoner for QuotaFixture {
+        async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(augmentagent_channel_core::ReasonerError::RateLimited {
+                provider: "claude".into(), message: "Synthetic quota refusal".into(), reset_at: None,
+            }.into())
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Codex login and JARVIS_TEST_MEMORY_BIN; synthetic query/delivery only"]
+    async fn live_query_fallback_delivers_original_and_skips_latched_primary() {
+        use std::sync::atomic::Ordering;
+        if std::env::var_os("JARVIS_QUERY_CONTRACT_CHILD").is_none() {
+            let isolated = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "query_delivery_contract_tests::live_query_fallback_delivers_original_and_skips_latched_primary", "--ignored", "--nocapture"])
+                .env("JARVIS_QUERY_CONTRACT_CHILD", "1")
+                .env_remove("AUGMENTAGENT_DB")
+                .env_remove("AUGMENTAGENT_TRANSCRIPTS_DIR")
+                .env("AUGMENTAGENT_TOOL_AUDIT_LOG", isolated.path().join("audit.jsonl"))
+                // #1048: cooldowns, journals and usage stay in the fixture.
+                .env("XDG_STATE_HOME", isolated.path().join("state"))
+                .env_remove("AUGMENTAGENT_TOKEN_USAGE_LOG")
+                .output().unwrap();
+            assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            return;
+        }
+        augmentagent_channel_core::state_dir::isolate_for_tests();
+        let memory = PathBuf::from(std::env::var_os("JARVIS_TEST_MEMORY_BIN").expect("set memory binary"));
+        assert!(memory.is_absolute() && memory.is_file());
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path();
+        let wiki = repo.join("wiki");
+        std::fs::create_dir(&wiki).unwrap();
+        std::fs::create_dir_all(repo.join("target/release")).unwrap();
+        std::fs::create_dir(repo.join("scripts")).unwrap();
+        std::fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/aa-wiki-scope-guard.sh"),
+            repo.join("scripts/aa-wiki-scope-guard.sh")).unwrap();
+        std::os::unix::fs::symlink(memory, repo.join("target/release/augmentagent-mcp-memory")).unwrap();
+        std::fs::write(wiki.join("note.txt"), "SYNTHETIC_DELIVERY_62BD\n").unwrap();
+        let original = b"%PDF-1.7\n\x00\xffSYNTHETIC_ORIGINAL";
+        let document = augmentagent_docs::delivery::stage(&wiki, "Synthetic report.pdf", original).unwrap();
+        let primary = Arc::new(QuotaFixture(std::sync::atomic::AtomicUsize::new(0)));
+        let reasoner = Arc::new(FallbackReasoner::for_tests(vec![
+            (ProviderKind::Claude, primary.clone()),
+            (ProviderKind::Codex, Arc::new(augmentagent_channel_core::codex::CodexCliReasoner::openai())),
+        ], CooldownLatch::at(repo.join("cooldowns.json"))));
+        let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(), repo_root: repo.into() };
+        for turn in 0..2 {
+            let mut ctx = augmentagent_approval_discord::AuditCtx::empty();
+            ctx.session_id = format!("synthetic-channel:synthetic-turn-{turn}");
+            let prompt = format!("Use only local tools for this synthetic document request. Read note.txt and include its text in your reply. \
+                Call memory_recent with limit 1 on the empty synthetic database. Deliver the already-staged original file \
+                using this exact standalone marker: ATTACH: {}\nDo not read, render, rewrite, or modify the PDF. \
+                Do not call shell commands or external services.", document.strip_prefix(&wiki).unwrap().display());
+            let answer = handler.answer(&ctx, &prompt).await.unwrap();
+            let (text, attachments) = augmentagent_approval_discord::attachments::prepare_answer_delivery(&answer, Some(&wiki)).await;
+            assert!(text.contains("SYNTHETIC_DELIVERY_62BD"), "{text}");
+            assert_eq!(attachments.len(), 1, "{text}");
+            assert_eq!(attachments[0].data, original);
+            assert_eq!(attachments[0].filename, "Synthetic report.pdf");
+        }
+        assert_eq!(primary.0.load(Ordering::SeqCst), 1);
+        assert_eq!(reasoner.usage(), vec![("claude", 1, 0), ("codex", 2, 2)]);
+        let audit = std::fs::read_to_string(std::env::var_os("AUGMENTAGENT_TOOL_AUDIT_LOG").unwrap()).unwrap();
+        for turn in 0..2 {
+            for tool in ["Read", "mcp__memory__memory_recent"] {
+                assert!(audit.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .any(|record| record["provider"] == "codex" && record["tool"] == tool
+                        && record["session_id"] == format!("synthetic-channel:synthetic-turn-{turn}")
+                        && record["stdout_truncated"].is_string() && record["stderr_truncated"].is_null()),
+                    "missing successful {tool} audit for turn {turn}");
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Reasoner for TranscriptFixture {
+        async fn call(&self, _: &ReasonerOpts, _: &str) -> anyhow::Result<String> {
+            anyhow::bail!("query delivery must retain the full transcript")
+        }
+
+        async fn call_transcript(&self, opts: &ReasonerOpts, prompt: &str) -> anyhow::Result<String> {
+            assert_eq!(classify(opts), CapabilityClass::FullAgentic);
+            assert_eq!(opts.session_id.as_deref(), Some("synthetic-channel:synthetic-turn"));
+            assert!(opts.restrict_env);
+            assert!(opts.settings_json.as_ref().unwrap().contains("PreToolUse"));
+            assert!(prompt.contains("SYNTHETIC_OWNER_RULE"));
+            assert!(prompt.contains("Deliver the original synthetic document"));
+            Ok(format!("Here is the original document.\n{}\nFinal receipt.", self.marker))
+        }
+    }
+
+    #[tokio::test]
+    async fn query_handler_preserves_context_and_original_attachment_bytes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let wiki = fixture.path().join("wiki");
+        std::fs::create_dir_all(wiki.join("about")).unwrap();
+        std::fs::write(wiki.join("about/me.md"),
+            "## Agent behavior rules\n\nSYNTHETIC_OWNER_RULE\n").unwrap();
+        let original = b"%PDF-1.7\n\x00\xffSYNTHETIC_ORIGINAL";
+        let document = augmentagent_docs::delivery::stage(&wiki, "Synthetic report.pdf", original).unwrap();
+        let reasoner = Arc::new(FallbackReasoner::for_tests(
+            vec![(ProviderKind::Claude, Arc::new(TranscriptFixture {
+                marker: format!("ATTACH: {}", document.display()),
+            }))], CooldownLatch::at(fixture.path().join("cooldowns.json"))));
+        let handler = WikiQuerier { reasoner: reasoner.clone(), wiki_root: wiki.clone(),
+            repo_root: fixture.path().to_path_buf() };
+        let mut context = augmentagent_approval_discord::AuditCtx::empty();
+        context.session_id = "synthetic-channel:synthetic-turn".into();
+        let answer = handler.answer(&context, "Deliver the original synthetic document").await.unwrap();
+        let (text, attachments) = augmentagent_approval_discord::attachments::prepare_answer_delivery(
+            &answer, Some(&wiki)).await;
+        assert!(text.contains("Here is the original document.") && text.contains("Final receipt."));
+        assert!(!text.contains("ATTACH:") && !text.contains("couldn't attach"));
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "Synthetic report.pdf");
+        assert_eq!(attachments[0].data, original);
+        assert_eq!(reasoner.usage(), vec![("claude", 1, 1)]);
+    }
+}
+
 /// Bridge: turns the raw serenity bits in `AuditCtx` into a channel-core
 /// [`AuditNotifier`] impl. Lives in the CLI crate because it's the only
 /// crate that depends on BOTH the discord crate (for `serenity` + `AuditCtx`)
@@ -8466,8 +8833,9 @@ struct LoopReasonerRunner {
 
 #[async_trait]
 impl LoopRunner for LoopReasonerRunner {
-    async fn run_prompt(&self, prompt: &str) -> anyhow::Result<String> {
-        let opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
+    async fn run_prompt(&self, request_id: &str, prompt: &str) -> anyhow::Result<String> {
+        let mut opts = ask_opts(self.wiki_root.clone(), self.repo_root.clone());
+        opts.session_id = Some(request_id.to_string());
         // #389 — loops fire through the same query toolbelt, so they carry
         // the same owner-rules preamble as interactive asks.
         let prompt = match owner_rules_block(&self.wiki_root) {
@@ -9130,7 +9498,7 @@ mod approval_body_tests {
 
 #[cfg(test)]
 mod owner_rules_tests {
-    use super::{extract_md_section, owner_rules_block};
+    use super::{extract_md_section, owner_rules_block, OWNER_RULES_MAX_CHARS};
 
     const ME_MD: &str = "# About Me\n\n## Identity\n\nNolan.\n\n## Writing style preferences\n\n- No em-dashes. (user said, 2026-05-04)\n- Deliverable is the text itself. (user said, 2026-07-08)\n\n## Agent behavior rules\n\n- Email asks end with an approval card.\n\n## Routing preferences\n\n- VIPs flagged.\n";
 
@@ -9168,6 +9536,73 @@ mod owner_rules_tests {
     }
 
     #[test]
+    fn block_within_budget_is_emitted_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        std::fs::write(tmp.path().join("about").join("me.md"), ME_MD).unwrap();
+        assert_eq!(
+            owner_rules_block(tmp.path()).unwrap(),
+            "### Writing style preferences\n- No em-dashes. (user said, 2026-05-04)\n- Deliverable \
+             is the text itself. (user said, 2026-07-08)\n\n### Agent behavior rules\n- Email asks \
+             end with an approval card.\n\n"
+        );
+    }
+
+    /// CodeRabbit on PR #1020: the cap is named and documented in CHARACTERS
+    /// but every sum used `str::len()`, which counts UTF-8 bytes. An owner
+    /// writing rules with accented words, curly quotes or emoji would have
+    /// their rules silently truncated thousands of characters early — which is
+    /// #1007, the bug this PR exists to fix, reintroduced through the back
+    /// door for anyone not writing pure ASCII.
+    #[test]
+    fn a_non_ascii_rule_set_is_measured_in_characters_not_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+
+        // Three bytes per character, so this is ~12k characters but ~36k
+        // bytes: comfortably inside a 16,000-CHARACTER ceiling and far outside
+        // a 16,000-byte one.
+        let rule = format!("- Répondre en français — {}\n", "é".repeat(200));
+        let body: String = std::iter::repeat(rule.as_str()).take(55).collect();
+        assert!(body.chars().count() < OWNER_RULES_MAX_CHARS, "fixture must fit the char cap");
+        assert!(body.len() > OWNER_RULES_MAX_CHARS, "fixture must exceed the byte cap");
+
+        let me = format!("# About Me\n\n## Agent behavior rules\n\n{body}");
+        std::fs::write(tmp.path().join("about").join("me.md"), me).unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+
+        assert!(
+            !block.contains("wiki/about/me.md"),
+            "a rule set inside the character cap must not be truncated:\n{}",
+            &block[block.len().saturating_sub(200)..]
+        );
+        assert_eq!(
+            block.matches("Répondre en français").count(),
+            55,
+            "every rule must survive"
+        );
+    }
+
+    /// And the ceiling itself is a character ceiling, so a genuinely oversized
+    /// non-ASCII file is still bounded — in characters, not bytes.
+    #[test]
+    fn the_cap_bounds_characters_even_when_bytes_run_far_ahead() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        let rule = format!("- Règle — {}\n", "é".repeat(200));
+        let body: String = std::iter::repeat(rule.as_str()).take(400).collect();
+        let me = format!("# About Me\n\n## Agent behavior rules\n\n{body}");
+        std::fs::write(tmp.path().join("about").join("me.md"), me).unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+        assert!(
+            block.chars().count() <= OWNER_RULES_MAX_CHARS,
+            "block is {} chars, cap is {OWNER_RULES_MAX_CHARS}",
+            block.chars().count()
+        );
+        assert!(block.contains("wiki/about/me.md"), "an over-cap file must say so");
+    }
+
+    #[test]
     fn missing_me_md_yields_none() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(owner_rules_block(tmp.path()).is_none());
@@ -9177,14 +9612,157 @@ mod owner_rules_tests {
     fn oversized_block_truncates_with_marker() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("about")).unwrap();
-        let big = format!(
-            "## Writing style preferences\n\n{}\n",
-            "- rule with some padding text to inflate the size\n".repeat(200)
-        );
+        let rule = "- rule with some padding text to inflate the size\n";
+        let big = format!("## Writing style preferences\n\n{}\n", rule.repeat(800));
         std::fs::write(tmp.path().join("about").join("me.md"), big).unwrap();
         let block = owner_rules_block(tmp.path()).unwrap();
-        assert!(block.len() < 4200, "cap not applied: {} chars", block.len());
-        assert!(block.contains("[truncated"), "missing truncation marker");
+        assert_within_cap(&block);
+        assert!(block.contains("truncated"), "missing truncation marker");
+        assert!(block.contains("wiki/about/me.md"), "marker must name me.md");
+        assert_no_partial_bullets(&block, &[rule.trim_end()]);
+    }
+
+    /// me.md in the shape of the #1007 repro: `n` uniquely-numbered bullets
+    /// under each rule section, each padded to `pad` extra chars.
+    fn me_md_with_bullets(n: usize, pad: usize) -> String {
+        let mut md = String::from("# About Me\n\n## Identity\n\nOwner placeholder.\n");
+        for sec in ["Writing style preferences", "Agent behavior rules"] {
+            md.push_str(&format!("\n## {sec}\n\n"));
+            for i in 1..=n {
+                md.push_str(&format!("- {sec} rule {i}: {}\n", "x".repeat(pad)));
+            }
+        }
+        md.push_str("\n## Routing preferences\n\n- VIPs flagged.\n");
+        md
+    }
+
+    /// Every bullet line the block emits must be one of `bullets` verbatim —
+    /// i.e. truncation dropped whole bullets and never cut inside one.
+    fn assert_no_partial_bullets(block: &str, bullets: &[&str]) {
+        for line in block.lines().filter(|l| l.starts_with("- ")) {
+            assert!(bullets.contains(&line), "bullet emitted partially: {line:?}");
+        }
+    }
+
+    /// The cap covers the truncation markers too, so it is a hard ceiling on
+    /// what every prompt pays for owner rules.
+    fn assert_within_cap(block: &str) {
+        assert!(
+            block.len() <= OWNER_RULES_MAX_CHARS,
+            "cap not applied: {} chars",
+            block.len()
+        );
+    }
+
+    #[test]
+    fn eight_bullets_per_section_are_injected_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        std::fs::write(
+            tmp.path().join("about").join("me.md"),
+            me_md_with_bullets(8, 300),
+        )
+        .unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+        assert!(
+            block.len() > 4000,
+            "repro must exceed the old cap to be meaningful: {} chars",
+            block.len()
+        );
+        assert!(
+            !block.contains("truncated"),
+            "standing rule set must fit the budget whole"
+        );
+        for i in 1..=8 {
+            assert!(
+                block.contains(&format!("Writing style preferences rule {i}:")),
+                "style rule {i} dropped"
+            );
+            assert!(
+                block.contains(&format!("Agent behavior rules rule {i}:")),
+                "behavior rule {i} dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_sections_truncate_per_section_on_bullet_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        let me = me_md_with_bullets(8, 1200);
+        std::fs::write(tmp.path().join("about").join("me.md"), &me).unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+
+        assert!(block.contains("### Writing style preferences"));
+        assert!(block.contains("### Agent behavior rules"));
+        // Neither category may be silently dropped: both keep leading rules...
+        assert!(block.contains("Writing style preferences rule 1:"));
+        assert!(block.contains("Agent behavior rules rule 1:"));
+        assert!(block.contains("Agent behavior rules rule 2:"));
+        // ...and both say so when they drop the rest.
+        assert_eq!(
+            block.matches("read wiki/about/me.md").count(),
+            2,
+            "each truncated section needs its own marker: {block}"
+        );
+        assert!(block.ends_with('\n'), "block must end on a line boundary");
+        assert_within_cap(&block);
+        let bullets: Vec<&str> = me.lines().filter(|l| l.starts_with("- ")).collect();
+        assert_no_partial_bullets(&block, &bullets);
+    }
+
+    #[test]
+    fn lone_oversized_section_gets_the_whole_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        let mut me = String::from("# About Me\n\n## Agent behavior rules\n\n");
+        for i in 1..=20 {
+            me.push_str(&format!("- behavior rule {i}: {}\n", "x".repeat(1200)));
+        }
+        std::fs::write(tmp.path().join("about").join("me.md"), me).unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+        assert!(
+            block.contains("behavior rule 10:"),
+            "the only section must inherit the missing section's share: {} chars",
+            block.len()
+        );
+        assert_within_cap(&block);
+    }
+
+    #[test]
+    fn rule_longer_than_the_budget_is_dropped_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("about")).unwrap();
+        let long_rule = format!(
+            "- Never send email without {}an approval card.",
+            "x ".repeat(20_000)
+        );
+        let me = format!("# About Me\n\n## Agent behavior rules\n\n{long_rule}\n- Flag VIPs.\n");
+        std::fs::write(tmp.path().join("about").join("me.md"), me).unwrap();
+        let block = owner_rules_block(tmp.path()).unwrap();
+        assert!(block.contains("### Agent behavior rules"));
+        // A half-rule inverts its own meaning, so none of it is emitted.
+        assert!(
+            !block.contains("Never send email"),
+            "oversized rule emitted partially: {block}"
+        );
+        assert!(block.contains("wiki/about/me.md"), "missing marker");
+        assert_no_partial_bullets(&block, &[long_rule.as_str(), "- Flag VIPs."]);
+        assert_within_cap(&block);
+    }
+
+    /// #1007 criterion: every `<owner_rules>` preamble must be built by the
+    /// shared helper, or a caller could hand-roll a block that skips the
+    /// per-section budget. The needles are split so this test never matches
+    /// its own source.
+    #[test]
+    fn every_owner_rules_preamble_uses_the_shared_helper() {
+        let src = include_str!("main.rs");
+        let preamble = concat!("Standing rules from the ", "owner (wiki/about/me.md)");
+        let preambles = src.matches(preamble).count();
+        let calls = src.matches(concat!("owner_rules", "_block(&")).count();
+        assert_eq!(preambles, 3, "wiki ask, Discord query, loop runner");
+        assert_eq!(calls, preambles, "a preamble bypasses owner_rules_block");
     }
 }
 
@@ -12755,6 +13333,8 @@ async fn imessage_poll_loop(
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     const POLL_INTERVAL: Duration = Duration::from_secs(30 * 60);
+    let wiki_capture = augmentagent_channel_imessage::history_wiki_capture_enabled();
+    info!(wiki_capture, "imessage poller started");
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     loop {
         tokio::select! {
@@ -12807,6 +13387,9 @@ async fn imessage_poll_loop(
             if let Err(e) = propose_high_confidence_merges(root, &store, broker.as_ref()).await {
                 warn!("identity-merge scan failed: {e:#}");
             }
+        }
+        if !wiki_capture {
+            continue;
         }
         let (Some(root), Some(schema)) = (&wiki_root, &wiki_schema) else {
             continue;
@@ -13711,7 +14294,7 @@ async fn run_twitter_validate(
 // ================================================================
 
 async fn run_discord_login(creds_json: PathBuf) -> Result<()> {
-    use augmentagent_channel_discord_dm::{auth::default_creds_path, DiscordAuth, DiscordClient};
+    use augmentagent_channel_discord_dm::{auth::mirror_creds_path, DiscordAuth, DiscordClient};
     let raw = std::fs::read_to_string(&creds_json)
         .with_context(|| format!("read creds file at {}", creds_json.display()))?;
     let auth: DiscordAuth = serde_json::from_str(&raw).context("parse discord creds JSON")?;
@@ -13729,38 +14312,38 @@ async fn run_discord_login(creds_json: PathBuf) -> Result<()> {
     auth.save_to_keychain()
         .context("save discord auth to keychain")?;
 
-    // Also write the file to the vault/repo path so additional hosts mounting
-    // the same vault auto-pick-up on next deploy. Skipped if the destination
-    // is the source (writing to the same file we just read).
+    // The keyring is the store of record. A plaintext copy is written only
+    // when the operator configured an out-of-tree path (env override or a
+    // mounted vault) — never into the source checkout.
     let repo_root = std::env::current_dir().context("current_dir")?;
-    let vault_path = default_creds_path(&repo_root);
-    let mirrored = match (
-        creds_json.canonicalize(),
-        vault_path.canonicalize(),
-    ) {
-        (Ok(a), Ok(b)) if a == b => false,
-        _ => {
-            match auth.save(&vault_path) {
+    let mirrored = match mirror_creds_path(&repo_root) {
+        None => None,
+        Some(path) => match (creds_json.canonicalize(), path.canonicalize()) {
+            (Ok(a), Ok(b)) if a == b => None,
+            _ => match auth.save(&path) {
                 Ok(()) => {
-                    info!(to = %vault_path.display(), "discord creds mirrored to vault path");
-                    true
+                    info!(
+                        to = %path.display(),
+                        "discord creds mirrored to configured path (0600)"
+                    );
+                    Some(path)
                 }
                 Err(e) => {
                     warn!(
                         error = %e,
-                        to = %vault_path.display(),
-                        "vault mirror failed; keychain still saved"
+                        to = %path.display(),
+                        "creds file mirror failed; keychain still saved"
                     );
-                    false
+                    None
                 }
-            }
-        }
+            },
+        },
     };
 
     println!(
-        "discord auth saved to keychain (augmentagent/discord/default)\nuser_id: {}\nvault mirror: {}",
+        "discord auth saved to keychain (augmentagent/discord/default)\nuser_id: {}\nfile copy: {}",
         auth.user_id,
-        if mirrored { vault_path.display().to_string() } else { "(skipped — source is already at vault path)".into() },
+        mirrored.map_or_else(|| "none (keyring only)".into(), |p| p.display().to_string()),
     );
     Ok(())
 }
@@ -15485,6 +16068,7 @@ async fn run_journal_poll_once(
     dry_run: bool,
     max_entries: Option<usize>,
     allow_base_sync: bool,
+    archive_only: bool,
 ) -> Result<()> {
     use augmentagent_channel_journal::{
         JournalChannel, JournalChannelConfig, JournalRuntime, DEFAULT_BASE_SYNC_THRESHOLD,
@@ -15512,7 +16096,7 @@ async fn run_journal_poll_once(
         return Ok(());
     };
     let wiki_schema_path = wiki_dir
-        .as_ref()
+        .as_ref().filter(|_| !archive_only)
         .map(|_| PathBuf::from("schema/wiki-skill.md"));
     let config = JournalChannelConfig {
         owner_id: runtime.config.owner_id.clone(),
@@ -15524,6 +16108,7 @@ async fn run_journal_poll_once(
         base_sync_threshold: DEFAULT_BASE_SYNC_THRESHOLD,
         allow_base_sync,
         max_pages_per_poll: DEFAULT_MAX_PAGES_PER_POLL,
+        exclude_topics: augmentagent_channel_journal::scrub::exclude_topics_from_env(),
     };
     let reasoner = build_reasoner();
     let channel = JournalChannel::new(
@@ -15572,6 +16157,16 @@ async fn run_journal_show(date: Option<String>) -> Result<()> {
             break;
         }
     }
+    // #1055 — never show excluded topics (the password vault), and scrub
+    // whatever is shown.
+    let extra = augmentagent_channel_journal::scrub::exclude_topics_from_env();
+    let before = items.len();
+    items.retain(|e| {
+        !augmentagent_channel_journal::scrub::is_excluded_topic(e.topic.as_deref(), &extra)
+    });
+    if items.len() < before {
+        println!("(skipped {} entries in excluded topics)", before - items.len());
+    }
     let Some(entry) = pick_latest(items.iter(), date.as_deref()) else {
         println!(
             "no live entry found{}",
@@ -15584,6 +16179,10 @@ async fn run_journal_show(date: Option<String>) -> Result<()> {
         .await
         .map(|h| html::html_to_text(&h))
         .context("decrypt entry")?;
+    let (text, redactions) = augmentagent_channel_journal::scrub::scrub_secrets(&text);
+    if redactions > 0 {
+        println!("({redactions} secret-shaped values redacted)");
+    }
     println!("id:      {}", entry.id);
     println!("created: {}", entry.created_at);
     if let Some(u) = entry.updated_at.as_deref() {
@@ -15635,10 +16234,38 @@ async fn run_journal_status(store: Arc<Store>) -> Result<()> {
     let owner = runtime.config.owner_id.as_str();
     let watermark = store.get_journal_sync_state(owner)?;
     let cursor = store.get_journal_sync_cursor(owner)?;
-    println!("owner:     {owner}");
-    println!("watermark: {watermark:?}");
-    println!("cursor:    {cursor:?}");
+    println!("{}", journal_status_summary(watermark, cursor.as_ref()));
     Ok(())
+}
+
+fn journal_status_summary(watermark: Option<i64>, cursor: Option<&augmentagent_store::JournalSyncCursor>) -> String {
+    fn timestamp(ms: i64) -> String {
+        chrono::DateTime::from_timestamp_millis(ms).map(|d| d.to_rfc3339()).unwrap_or_else(|| "invalid".into())
+    }
+    let complete = watermark.map(timestamp).unwrap_or_else(|| "never".into());
+    let pending = cursor.map(|c| format!("in progress since {} (pagination token withheld)", timestamp(c.started_at_ms)))
+        .unwrap_or_else(|| "none".into());
+    format!("Configured poll interval: 10 minutes (not a success guarantee)\nLast completed source watermark: {complete}\nBacklog cursor: {pending}\nA stale watermark or persistent backlog requires journal recovery; Git mirror sync is separate.")
+}
+
+#[cfg(test)]
+mod journal_cli_tests {
+    use super::*;
+    #[test]
+    fn status_redacts_cursor_and_describes_freshness() {
+        let cursor = augmentagent_store::JournalSyncCursor { last_sync_ms: Some(1), started_at_ms: 1000,
+            next_token: Some("SYNTHETIC_PRIVATE_PAGINATION_TOKEN".into()) };
+        let summary = journal_status_summary(Some(0), Some(&cursor));
+        assert!(!summary.contains("SYNTHETIC_PRIVATE"));
+        assert!(summary.contains("1970-01-01") && summary.contains("in progress") && summary.contains("10 minutes"));
+    }
+    #[test]
+    fn archive_only_backfill_is_explicit_and_bounded() {
+        let cli = Cli::try_parse_from(["augmentagent", "--wiki-dir", "fixture", "journal", "backfill",
+            "--archive-only", "--max-entries", "50"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Journal { op: JournalOp::Backfill {
+            archive_only: true, max_entries: 50, .. } }));
+    }
 }
 
 async fn run_calendar_poll_once(

@@ -30,6 +30,18 @@ pub struct CooldownEntry {
     pub until: DateTime<Utc>,
     /// Human-readable cause, e.g. the quota refusal text. Diagnostic only.
     pub reason: String,
+    /// #1040 — consecutive unrecognised failures on write-capable calls, see
+    /// [`CooldownLatch::strike`]. Not a latch by itself; an entry holding only
+    /// strikes has an `until` in the past. Older binaries ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strikes: Option<Strikes>,
+}
+
+/// A run of consecutive unrecognised failures for one provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Strikes {
+    pub count: u32,
+    pub last: DateTime<Utc>,
 }
 
 /// File-backed latch. Cheap to construct; holds no open handles.
@@ -40,21 +52,17 @@ pub struct CooldownLatch {
 
 impl CooldownLatch {
     /// System latch path: `AUGMENTAGENT_COOLDOWN_FILE` override (tests), else
-    /// `~/.local/state/augmentagent/reasoner-cooldowns.json` (same state dir
-    /// as the daemon logs), else a cwd-relative fallback so a HOME-less
-    /// environment still functions.
+    /// `reasoner-cooldowns.json` in the shared [`state_dir`](crate::state_dir)
+    /// (same state dir as the daemon logs), else a cwd-relative fallback so a
+    /// HOME-less environment still functions.
     pub fn system() -> Self {
         if let Ok(p) = std::env::var("AUGMENTAGENT_COOLDOWN_FILE") {
             if !p.trim().is_empty() {
                 return Self { path: PathBuf::from(p) };
             }
         }
-        let path = std::env::var_os("HOME")
-            .map(|h| {
-                PathBuf::from(h)
-                    .join(".local/state/augmentagent")
-                    .join("reasoner-cooldowns.json")
-            })
+        let path = crate::state_dir::state_dir()
+            .map(|dir| dir.join("reasoner-cooldowns.json"))
             .unwrap_or_else(|| PathBuf::from("reasoner-cooldowns.json"));
         Self { path }
     }
@@ -62,6 +70,11 @@ impl CooldownLatch {
     /// Test constructor pinned to an explicit path.
     pub fn at(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    /// The latch file this instance reads and writes.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     fn read_all(&self) -> BTreeMap<String, CooldownEntry> {
@@ -142,8 +155,31 @@ impl CooldownLatch {
             .chars()
             .take(160)
             .collect();
-        map.insert(provider.to_string(), CooldownEntry { until, reason });
+        // A latch starts a new run: earlier strikes are spent.
+        map.insert(provider.to_string(), CooldownEntry { until, reason, strikes: None });
         self.write_all(&map);
+    }
+
+    /// #1040 — count one more consecutive unrecognised failure for `provider`
+    /// and return the run length. A strike is not a latch (`latched_until`
+    /// ignores it). The run ends on a success (`clear`), on a latch, or when
+    /// the previous strike is older than `window`, so strikes days apart
+    /// never add up to a backoff.
+    pub fn strike(&self, provider: &str, window: chrono::Duration) -> u32 {
+        let now = Utc::now();
+        let mut map = self.read_all();
+        let entry = map.entry(provider.to_string()).or_insert_with(|| CooldownEntry {
+            until: now,
+            reason: "unrecognised failures (not latched)".into(),
+            strikes: None,
+        });
+        let count = match entry.strikes {
+            Some(run) if now - run.last <= window => run.count.saturating_add(1),
+            _ => 1,
+        };
+        entry.strikes = Some(Strikes { count, last: now });
+        self.write_all(&map);
+        count
     }
 
     /// Clear `provider`'s latch (called on a successful call so recovery is
@@ -203,6 +239,30 @@ mod tests {
         latch.latch("claude", far, "parsed reset");
         latch.latch("claude", near, "default cooldown");
         assert_eq!(latch.latched_until("claude"), Some(far));
+    }
+
+    #[test]
+    fn strikes_count_a_run_that_success_latch_or_age_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let latch = CooldownLatch::at(dir.path().join("cd.json"));
+        let window = chrono::Duration::hours(1);
+        assert_eq!(latch.strike("codex", window), 1);
+        assert_eq!(latch.strike("codex", window), 2);
+        assert!(latch.latched_until("codex").is_none(), "a strike is not a latch");
+        assert!(latch.active().is_empty(), "strike-only entries are not shown as latches");
+        latch.clear("codex");
+        assert_eq!(latch.strike("codex", window), 1, "a success ends the run");
+        latch.latch("codex", Utc::now() + chrono::Duration::minutes(1), "backoff");
+        assert!(latch.latched_until("codex").is_some());
+        assert_eq!(latch.strike("codex", window), 1, "a latch ends the run");
+        assert_eq!(latch.strike("codex", chrono::Duration::zero() - chrono::Duration::seconds(1)), 1,
+            "a run older than the window starts over");
+        // Other processes on older binaries still read the file.
+        let raw = std::fs::read_to_string(dir.path().join("cd.json")).unwrap();
+        #[derive(Deserialize)]
+        struct Legacy { #[allow(dead_code)] until: DateTime<Utc>, #[allow(dead_code)] reason: String }
+        let legacy: BTreeMap<String, Legacy> = serde_json::from_str(&raw).unwrap();
+        assert!(legacy.contains_key("codex"));
     }
 
     #[test]

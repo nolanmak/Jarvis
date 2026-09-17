@@ -1,0 +1,2 @@
+# Synthetic PDF fixtures contain fixed-width cross-reference records.
+scripts/tests/fixtures/*.pdf binary

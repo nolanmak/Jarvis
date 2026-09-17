@@ -111,8 +111,21 @@ should_write_stamp() {
 # process. Defer the restart while it is held — bounded, because a stale
 # binary is worse than one lost build.
 
-SELF_IMPROVE_LOCK="${AUGMENTAGENT_SELFIMPROVE_LOCK:-$HOME/.local/state/augmentagent/self-improve.lock}"
-RESTART_DEFER_STAMP="${AUGMENTAGENT_RESTART_DEFER_STAMP:-${LOG_DIR:-$HOME/.local/state/augmentagent}/restart-deferred-since}"
+# #1048: the daemon's state dir, by the rule in the Rust
+# augmentagent_channel_core::state_dir::resolve: $XDG_STATE_HOME/augmentagent
+# when XDG_STATE_HOME is an absolute path, else $HOME/.local/state/augmentagent
+# (empty or relative values are ignored). The Rust auto-PR loop takes its lane
+# locks there, so a different rule here would restart under a live build.
+augmentagent_state_dir() {
+  case "${XDG_STATE_HOME:-}" in
+    /*) printf '%s/augmentagent\n' "$XDG_STATE_HOME" ;;
+    *)  printf '%s/.local/state/augmentagent\n' "$HOME" ;;
+  esac
+}
+AUGMENTAGENT_STATE_DIR="$(augmentagent_state_dir)"
+
+SELF_IMPROVE_LOCK="${AUGMENTAGENT_SELFIMPROVE_LOCK:-$AUGMENTAGENT_STATE_DIR/self-improve.lock}"
+RESTART_DEFER_STAMP="${AUGMENTAGENT_RESTART_DEFER_STAMP:-${LOG_DIR:-$AUGMENTAGENT_STATE_DIR}/restart-deferred-since}"
 RESTART_DEFER_MAX_SECS="${AUGMENTAGENT_RESTART_DEFER_MAX_SECS:-2400}"
 
 # Is a self-improve run holding the lock right now?
@@ -165,7 +178,7 @@ maybe_defer_restart() {
 
 MEMINFO_PATH="${AUGMENTAGENT_MEMINFO_PATH:-/proc/meminfo}"
 RESTART_MIN_AVAIL_MB="${AUGMENTAGENT_RESTART_MIN_AVAIL_MB:-3072}"
-RESTART_HISTORY="${AUGMENTAGENT_RESTART_HISTORY:-${LOG_DIR:-$HOME/.local/state/augmentagent}/restart-history}"
+RESTART_HISTORY="${AUGMENTAGENT_RESTART_HISTORY:-${LOG_DIR:-$AUGMENTAGENT_STATE_DIR}/restart-history}"
 RESTARTS_PER_HOUR="${AUGMENTAGENT_RESTARTS_PER_HOUR:-3}"
 RESTART_WINDOW_SECS=3600
 
@@ -230,7 +243,7 @@ record_restart() {
 # minutes and can see both lane locks, so it is the safe place to trim.
 GATE_CACHE_DIR="${AUGMENTAGENT_GATE_TARGET_DIR:-$HOME/.cache/augmentagent-gate-target}"
 GATE_CACHE_MAX_MB="${AUGMENTAGENT_GATE_CACHE_MAX_MB:-20000}"
-RESUME_LANE_LOCK="${AUGMENTAGENT_SELFIMPROVE_LOCK:-$HOME/.local/state/augmentagent/self-improve.lock}"
+RESUME_LANE_LOCK="${AUGMENTAGENT_SELFIMPROVE_LOCK:-$AUGMENTAGENT_STATE_DIR/self-improve.lock}"
 RESUME_LANE_LOCK="${RESUME_LANE_LOCK%.lock}-resume.lock"
 
 any_lane_building() {

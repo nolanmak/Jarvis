@@ -74,7 +74,7 @@ fn decode_entities(s: &str) -> String {
     while let Some(idx) = rest.find('&') {
         out.push_str(&rest[..idx]);
         rest = &rest[idx..];
-        let Some(semi) = rest[..rest.len().min(10)].find(';') else {
+        let Some(semi) = rest.as_bytes().iter().take(10).position(|byte| *byte == b';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -110,6 +110,16 @@ fn decode_entities(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_after_ampersand_never_splits_a_character() {
+        for n in 0..14 {
+            for glyph in ["é", "中", "😀"] {
+                let text = format!("&{}{} &amp; done", "a".repeat(n), glyph.repeat(12));
+                assert_eq!(html_to_text(&text), text.replace("&amp;", "&"));
+            }
+        }
+    }
 
     #[test]
     fn paragraphs_become_lines() {

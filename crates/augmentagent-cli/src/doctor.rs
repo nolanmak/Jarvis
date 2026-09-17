@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use augmentagent_channel_core::cli_gate;
+use augmentagent_channel_core::{cli_gate, handoff};
 use augmentagent_channel_core::providers::{model_for, parse_chain, ModelTier, ProviderKind};
 use augmentagent_store::{rusqlite, Store};
 
@@ -177,8 +177,11 @@ pub async fn run(store: Arc<Store>, json: Option<bool>, deep: bool) -> Result<i3
     findings.push(check_calendar_scheduled(&store));
     // 13. reasoner chain — configured providers + the model each tier runs (#658)
     findings.push(check_reasoner_chain());
+    findings.extend(check_reasoner_workloads());
     // 14. reasoner CLI gate — is the daemon's #898 gate wedged? (#954)
     findings.push(check_reasoner_gate());
+    // 15. handoff journals — is the retention sweep keeping them bounded? (#1035)
+    findings.push(check_handoff_journals());
 
     // --- Deep checks (off by default).
     if deep {
@@ -742,6 +745,45 @@ fn reasoner_chain_finding(raw: &str, ineligible: &[(ProviderKind, String)]) -> F
     }
 }
 
+fn check_reasoner_workloads() -> Vec<Finding> {
+    let raw = std::env::var("AUGMENTAGENT_REASONER_CHAIN").unwrap_or_default();
+    let providers = parse_chain(&raw).providers;
+    let unavailable = providers.iter().copied()
+        .filter(|kind| if *kind == ProviderKind::Claude {
+            !augmentagent_channel_core::providers::bin_resolves(
+                &std::env::var("CLAUDE_CLI").unwrap_or_else(|_| "claude".into()))
+        } else { augmentagent_channel_core::ineligible_reason(*kind).is_some() }).collect::<Vec<_>>();
+    let latch = augmentagent_channel_core::CooldownLatch::system();
+    let latched = providers.iter().copied().filter(|kind| latch.latched_until(kind.name()).is_some()).collect::<Vec<_>>();
+    reasoner_workload_findings(&raw, &unavailable, &latched)
+}
+
+/// Routing capacity is not a promise that a particular MCP server or sandbox
+/// is ready. The adapter must still validate that request's concrete policy.
+fn reasoner_workload_findings(raw: &str, unavailable: &[ProviderKind], latched: &[ProviderKind]) -> Vec<Finding> {
+    use augmentagent_channel_core::providers::{allowed_for, CapabilityClass::*};
+    let configured = parse_chain(raw).providers;
+    [("text", TextOnly), ("read", ReadTools), ("write", WriteTools), ("agentic", FullAgentic)]
+        .into_iter().map(|(label, class)| {
+            let mut candidates = 0;
+            let states = configured.iter().map(|kind| {
+                let state = if !allowed_for(*kind, class) { "capability excluded" }
+                    else if unavailable.contains(kind) { "binary/auth unavailable" }
+                    else if latched.contains(kind) { "cooldown" }
+                    else { candidates += 1; "candidate" };
+                format!("{}: {state}", kind.name())
+            }).collect::<Vec<_>>().join("; ");
+            let (severity, capacity) = match candidates {
+                0 => (Severity::Error, "no usable provider"),
+                1 => (Severity::Warn, "no usable backup"),
+                _ => (Severity::Ok, "backup routing available"),
+            };
+            Finding { name: format!("reasoner_{label}_capacity"), severity,
+                message: format!("{states}; {capacity}. Tool/MCP/sandbox readiness is checked per invocation."),
+                suggested_cmd: None }
+        }).collect()
+}
+
 /// #954 — the #898 gate lives in the daemon, so doctor reads its snapshot: a
 /// permit held past the timeout it promised is the freeze, and says whose.
 fn check_reasoner_gate() -> Finding {
@@ -771,6 +813,59 @@ fn gate_finding(snap: Option<cli_gate::GateSnapshot>, now: u64) -> Finding {
         return Finding::ok("reasoner_gate", msg);
     }
     Finding::warn("reasoner_gate", format!("{msg} — reasoning is wedged"), Some(HINT))
+}
+
+/// #1035 — doctor warns when the journal root is past either bound.
+const HANDOFF_WARN_REQUESTS: u64 = 5_000;
+const HANDOFF_WARN_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+
+/// A read-only dry run over the live root: no locks, nothing created.
+fn check_handoff_journals() -> Finding {
+    let Some(root) = handoff::journal_root() else {
+        return Finding::ok("handoff_journals", "no HOME; journal root unknown");
+    };
+    let grace = handoff::retention_from_env();
+    handoff_journal_finding(handoff::sweep_finished(&root, grace, true), grace)
+}
+
+fn handoff_journal_finding(report: Result<handoff::SweepReport>, grace: Duration) -> Finding {
+    const NAME: &str = "handoff_journals";
+    const HINT: &str = "augmentagent handoff-prune --dry-run";
+    let report = match report {
+        Ok(report) => report,
+        Err(e) => return Finding::warn(NAME, format!("journal root refused: {e:#}"), Some(HINT)),
+    };
+    let msg = format!(
+        "{} request dirs, {} MB; {} finished past the {}h grace ({} by over two sweep intervals); \
+         for information: {} unfinished (operator recovery), {} with lifecycle markers",
+        report.requests,
+        report.bytes / (1024 * 1024),
+        report.removed,
+        grace.as_secs() / 3600,
+        report.finished_overdue,
+        report.kept_unfinished,
+        report.kept_active,
+    );
+    // A live sweep removes every finished journal within two intervals of its
+    // expiry, so one still here means the sweep stopped (#1035 review).
+    if report.finished_overdue > 0 {
+        return Finding::warn(
+            NAME,
+            format!("{msg} — the daemon's hourly sweep does not appear to be running"),
+            Some(HINT),
+        );
+    }
+    if report.requests > HANDOFF_WARN_REQUESTS || report.bytes > HANDOFF_WARN_BYTES {
+        return Finding::warn(
+            NAME,
+            format!(
+                "{msg} — over {HANDOFF_WARN_REQUESTS} dirs or {} GiB; is the daemon's hourly sweep running?",
+                HANDOFF_WARN_BYTES / (1024 * 1024 * 1024)
+            ),
+            Some(HINT),
+        );
+    }
+    Finding::ok(NAME, msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,6 +1223,41 @@ mod tests {
         assert!(dark.message.contains("codex"), "{}", dark.message);
     }
 
+    #[test]
+    fn workload_diagnostics_distinguish_capability_cooldown_and_missing_capacity() {
+        let classes = reasoner_workload_findings("claude,cerebras", &[], &[]);
+        assert_eq!(classes[0].severity, Severity::Ok);
+        assert_eq!(classes[3].severity, Severity::Warn);
+        assert!(classes[3].message.contains("cerebras: capability excluded"));
+        assert!(classes[3].message.contains("no usable backup"));
+        let latched = reasoner_workload_findings("claude,codex", &[], &[ProviderKind::Claude]);
+        assert!(latched.iter().all(|finding| finding.severity == Severity::Warn
+            && finding.message.contains("claude: cooldown") && finding.message.contains("codex: candidate")));
+        let unavailable = reasoner_workload_findings("claude,codex", &[ProviderKind::Codex], &[ProviderKind::Claude]);
+        assert!(unavailable.iter().all(|finding| finding.severity == Severity::Error
+            && finding.message.contains("codex: binary/auth unavailable") && finding.message.contains("no usable provider")));
+    }
+
+    #[test]
+    fn workload_diagnostics_detect_missing_primary_binary() {
+        if std::env::var_os("JARVIS_DOCTOR_CAPACITY_CHILD").is_none() {
+            let state = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "doctor::tests::workload_diagnostics_detect_missing_primary_binary"])
+                .env("JARVIS_DOCTOR_CAPACITY_CHILD", "1")
+                .env("AUGMENTAGENT_REASONER_CHAIN", "claude")
+                .env("CLAUDE_CLI", "/nonexistent-synthetic-claude")
+                .env("AUGMENTAGENT_COOLDOWN_FILE", state.path().join("cooldown.json"))
+                .output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        let findings = check_reasoner_workloads();
+        assert_eq!(findings.len(), 4);
+        assert!(findings.iter().all(|finding| finding.severity == Severity::Error
+            && finding.message.contains("claude: binary/auth unavailable")));
+    }
+
     /// #954 — name the wedge one timeout in, with the holder's caller preset.
     #[test]
     fn gate_finding_flags_a_permit_past_its_budget() {
@@ -1151,6 +1281,45 @@ mod tests {
         let dead = cli_gate::GateSnapshot { pid: u32::MAX, ..wedged(54_000) };
         for ok in [Some(wedged(900)), Some(dead), None] {
             assert_eq!(gate_finding(ok, now).severity, Severity::Ok);
+        }
+    }
+
+    /// #1035 — a journal root past the count or size bound is a warning that
+    /// names the operator entry point; an unreadable or public root too.
+    #[test]
+    fn handoff_journal_finding_warns_over_count_or_size() {
+        let grace = Duration::from_secs(24 * 3600);
+        let healthy = handoff::SweepReport {
+            entries: 423,
+            requests: 420,
+            bytes: 900 * 1024 * 1024,
+            removed: 40,
+            finished_overdue: 0,
+            kept_active: 3,
+            kept_unfinished: 2,
+            ..Default::default()
+        };
+        let ok = handoff_journal_finding(Ok(healthy), grace);
+        assert_eq!(ok.severity, Severity::Ok, "{}", ok.message);
+        // Counts only request dirs, and reports what needs an operator as information.
+        assert!(ok.message.contains("420 request dirs") && !ok.message.contains("423"), "{}", ok.message);
+        assert!(ok.message.contains("3 with lifecycle markers") && ok.message.contains("2 unfinished"), "{}", ok.message);
+        let many = handoff::SweepReport { requests: HANDOFF_WARN_REQUESTS + 1, ..healthy };
+        let large = handoff::SweepReport { bytes: HANDOFF_WARN_BYTES + 1, ..healthy };
+        // Past grace by more than two sweep intervals: a live sweep removes
+        // every such journal, so even one means the sweep is not running.
+        let stalled = handoff::SweepReport { finished_overdue: 1, ..healthy };
+        let stalled_finding = handoff_journal_finding(Ok(stalled), grace);
+        assert!(stalled_finding.message.contains("sweep does not appear to be running"), "{}", stalled_finding.message);
+        let refused = Err(anyhow::anyhow!("handoff directory is not private"));
+        for finding in [
+            handoff_journal_finding(Ok(many), grace),
+            handoff_journal_finding(Ok(large), grace),
+            stalled_finding,
+            handoff_journal_finding(refused, grace),
+        ] {
+            assert_eq!(finding.severity, Severity::Warn, "{}", finding.message);
+            assert_eq!(finding.suggested_cmd.as_deref(), Some("augmentagent handoff-prune --dry-run"));
         }
     }
 

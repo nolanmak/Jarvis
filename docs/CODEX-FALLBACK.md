@@ -1,0 +1,1085 @@
+# Codex fallback implementation
+
+Issue #1019 requires operational parity for every Claude-backed Jarvis workflow.
+The implementation merged in PR #1021 at `92dcaa9` and is deployed. Codex handles
+text, read, write and full-agentic requests through an enforced scoped bridge.
+The capability manifest records 31 production call sites with conformance tests.
+See [release verification](#release-verification) for deployment evidence and the
+boundary between controlled lifecycle tests and live external delivery.
+
+## Execution boundary
+
+The model runs in a fresh empty directory with project configuration discovery
+excluded, native shell/apps/plugins/browser/computer/image tools disabled, and a
+named minimal-read/no-write/no-command-network permission profile. Provider login
+remains in the existing adapter; integration credentials belong to private bridge
+configuration, never command-line arguments or model-visible policy text.
+
+### Bridge policy file and the secrets it holds (#1044)
+
+`BridgeLaunch::prepare` writes the bridge policy, `tool-policy.json` (mode
+0600), into its own randomly named `jarvis-policy-*` directory (mode 0700,
+set atomically at creation). That directory is created under `$XDG_RUNTIME_DIR` when the session has one,
+otherwise under the temporary directory. It is never the launch directory
+that holds `native-workspace`, Codex's cwd, so no path relative to the cwd
+names the policy. The directory is removed when the launch is dropped, after
+the Codex child exits. A SIGKILL or abort of the daemon skips that cleanup, so
+a `jarvis-policy-*` directory holding live tokens can remain in the owner-only
+0700 runtime tmpfs until logout or reboot (or in the temp dir on the fallback).
+That is the same exposure the old launch directory had. The bridge receives the absolute path as its only
+argument and refuses a policy file that is not a private regular file owned by
+the daemon user. Bridge tools cannot open it, because it is outside every read
+root. Native Codex has no file-reading tool under the `jarvis_bridge` profile.
+`live_codex_native_read_of_the_policy_is_denied` is a smoke test of that
+`:minimal` profile against real Codex. It cannot show the path is underivable,
+since the prompt supplies the absolute path; the unit test
+`policy_path_is_not_derivable_from_the_native_cwd` pins that.
+
+The policy's `environment` map holds the fixed OS variables (`HOME`, `PATH`,
+`USER`, `LOGNAME`, `LANG`, `TERM`, `DBUS_SESSION_BUS_ADDRESS`,
+`XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, `CARGO_HOME`, `RUSTUP_HOME`,
+`RUSTUP_TOOLCHAIN`) plus everything in `ReasonerOpts.env`. That map is
+passed to hooks, service CLIs and MCP children. The integration secrets it can
+carry are listed below. `DBUS_SESSION_BUS_ADDRESS` is not a secret itself, but
+it is the address the service CLIs use to reach the Secret Service keyring.
+
+| Secret | Set by | Consumer |
+| --- | --- | --- |
+| `COMPOSIO_API_KEY` | `ask_opts` (keyring, just in time) | `augmentagent gmail` subcommands |
+| `DISCORD_BOT_TOKEN` (and `DISCORD_CHANNEL_ID`) | `ask_opts`, from the daemon environment | `augmentagent gmail compose --post` approval card |
+| Every `AWS_*` variable (and `AUGMENTAGENT_IMESSAGE_S3_*`) | `ask_opts`, only when an iMessage S3 bucket is configured | `imessage fetch-attachment` |
+| `SOCIALAPI_API_KEY` | SocialAPI MCP presets (keyring, just in time) | SocialAPI MCP server |
+
+The policy also carries non-secret but private paths: `settings` (hooks and
+MCP server definitions, including each server's `env`), `session_id`,
+`handoff_path` and `build_vm_config`. Model provider credentials
+(`CODEX_API_KEY`, Codex `auth.json`) are never in the policy.
+
+A required stdio MCP bridge exposes the operations declared by `ReasonerOpts`.
+The bridge enforces tool identity, workspace scope, argv validation and existing
+pre-tool guards. Every filesystem path component is opened without following
+symlinks. Read roots and write roots are separate; transcript context is not a
+writable workspace. Credential and control directories are excluded.
+
+The rejected escape classes are traversal outside a root, absolute paths
+outside a root, symlinks at any component, credential/control paths, and hard
+links. A hard link can give a name inside a read root to an inode that also
+lives outside it. Bridge Read, Edit and Write refuse any file with more than one
+link, Grep skips it, and Glob does not list it (#1043). The command sandbox
+never grants Landlock access to such a file. One helper decides this for both:
+`verify_regular_private_file` in `scripts/codex-command-sandbox.py` accepts only
+a regular file with `st_nlink == 1`. Both scripts run as `python3 -I`, so a plain
+import between them cannot work. The bridge therefore loads the sandbox module
+by explicit path from the packaged launch directory. The sandbox is already
+embedded beside the bridge, so no new file is shipped. The bridge loads and
+checks the helper at startup against its effective write roots. If the helper
+is missing or model-writable, `initialize`, `tools/list` and `tools/call` fail
+readiness with `JARVIS_READINESS:mcp_start` and stderr says why, instead of
+every file tool returning a generic denial. Every later caller's write roots are
+also checked against the cached helper path.
+
+Tool paths are capped at 32 components below their scope root and at 4096 bytes
+as an absolute path (Linux `PATH_MAX`). The caps apply to Read, Write and Edit and
+to every Glob/Grep entry. A deeper Write is refused before any directory is
+created. Searches skip deeper entries and walk with an explicit stack, so an
+existing deep tree cannot exhaust the interpreter stack (#1042).
+
+No client or model input can end the bridge process short of SIGKILL. Each
+request line passes through one `safe_dispatch` wrapper. Unparsable input
+(invalid JSON, invalid UTF-8 or excessive nesting) gets JSON-RPC `-32700`. A
+value that is not a request object, or has an unusable id, gets `-32600`. Both
+use a null id because no id can be trusted. A request with a readable id but a
+wrong `jsonrpc`/`method` gets `-32600` with that id. A `tools/call` whose params
+are not an object, whose `name` is not a string, or whose `arguments` are not an
+object gets `-32602`. Any other unexpected failure gets `-32603` with no details.
+Tool-level `RecursionError`/`MemoryError` become ordinary tool errors. A request
+line may be at most 24 MiB. That admits a Write of up to 8 MiB of text whose
+JSON escaping needs at most two bytes per byte (quotes, backslashes, newlines,
+tabs; non-ASCII stays raw UTF-8), plus envelope and path. JSON escapes other
+control characters as six bytes each, so text dense with them can exceed the
+cap: a 4 MiB Write of such characters already does. That request is refused with
+`-32600` before parsing, and nothing is written. The cap also bounds parse
+memory: a line of tiny JSON objects costs about 27 times its size in
+`json.loads`. The bridge reads at most 24 MiB of a longer line, skips the rest
+in 1 MiB reads without keeping them, and answers `-32600`. The reply carries the
+id only when it is the compact request's leading field, in JSON integer or simple
+string form. Notifications
+and client responses are never answered. We checked the null-id replies against
+Codex's MCP client (rmcp 3.2.0 in codex-cli 0.154.0). It parses an error without
+an id as `JsonRpcError { id: None }`, logs it and drops it, and it never replies
+to an error. A null-id reply therefore cannot complete or stall a pending call,
+and cannot start an echo loop.
+
+Grep cannot stall the bridge (#1038). Python's `re` has no timeout, and a
+pattern such as `(a+)+$` on a 40-character line would otherwise run for hours on
+the bridge's only thread, holding the provider's CLI-gate slot until the reasoner
+watchdog. Grep therefore runs in two phases with separate bounds.
+
+1. **Walk and read.** The bridge walks and reads files itself, through the same
+   scoped descriptors and symlink/hard-link checks as Read, into an in-memory
+   file. This phase stops at 10 s of wall clock, 64 MiB of file bytes or 10,000
+   walk entries, whichever comes first. Running out is not an error. The reply
+   holds the hits from the files read so far, followed by a second text block:
+   "Grep results are partial: the search stopped at … after N files; narrow the
+   path to search the rest."
+2. **Match.** Only the regular expression runs, in a short-lived `python3 -I -S`
+   child. The child gets the pattern and the collected bytes on stdin, never a
+   path. It has an empty environment, a 1 GiB address-space limit, a 3 s CPU
+   limit and a parent-death signal. It is killed after 1.5 s of wall clock, so
+   the matching phase ends within 2 s, and the bridge answers the next request
+   normally. That wall clock also counts child startup and time spent waiting for
+   a CPU, so the tool error is worded by the child's own CPU time
+   (`RUSAGE_CHILDREN` delta). If the child used at least half the wall time, the
+   model is told to simplify the pattern. Otherwise it is told the host is busy
+   and to retry or narrow the path.
+
+Keeping the budgets separate matters on this host, which often runs builds. With
+one shared 1.5 s budget, a literal search of a 27 MB, 7,000-file tree timed out
+under 24 busy loops, with advice to "simplify the pattern". With the split, the
+same search completes in 1.8–2.3 s. A pathological pattern still errors, with
+pattern advice. Its total reply time is the read phase plus at most 1.5 s of
+matching: under 2 s for a small scope, and about 2–3 s over that whole tree
+under load. The matcher still stops at 1,000 results, and each file at 8 MiB. A
+SIGTERM from the parent watcher interrupts a long search, which an in-process
+C-level match could not.
+
+Linear-time engines (the `regex` module, `rg`) are not on the host. A heuristic
+that rejects nested quantifiers would miss patterns like `(a|aa)+$` and refuse
+legitimate ones, so the wall clock is the bound. Matching per line is unchanged.
+Grep parity with the Claude path is pinned by a fixed pattern table in the shared
+Python/ripgrep regex subset. The bridge side always runs. The ripgrep side runs
+in the bridge-suites CI job, which installs ripgrep, and wherever `rg` is
+installed locally. Known divergences are regex dialect (lookaround and
+backreferences exist only in Python) and ripgrep's default
+ignore/hidden/binary-file filtering.
+
+The original guards run inside the bridge and fail closed on crash, timeout,
+malformed output or explicit denial. Native Codex hooks are not the enforcement
+boundary: a live synthetic probe found that a crashing hook allowed an MCP call
+to continue. Another live probe confirmed that the restricted native permission
+profile rejected an edit while the bridge successfully read and wrote a synthetic
+file, preserving its bytes.
+
+The query preset's scope guard also lets Claude Read two kinds of inbound
+attachment file outside the wiki: Discord downloads named
+`/tmp/aa-{txt,img,doc}-<msg_id>-<idx>.<ext>`, and `imessage fetch-attachment`
+output directly inside the session's `$AUGMENTAGENT_IMESSAGE_TMP_DIR`
+(`/tmp/aa-imsg/<session>`). The bridge admits the same reads as policy
+`read_allowances`, never as read roots (#1045). Each allowance names one
+directory and one whole-name pattern and grants Read only; Glob, Grep, Write and
+Edit ignore it, and nested names never match. `codex_tools::read_allowances` is
+the single definition. A preset gets the exceptions only when it allows Read and
+runs the scope guard on Read, which is exactly when Claude has them. Because
+`/tmp` is shared, the bridge requires an absolute, already-normalized path and
+opens every directory component with `O_NOFOLLOW`. The directory must belong to
+root or the daemon user and must not be writable by others unless it is sticky.
+The leaf is opened with `O_NOFOLLOW` and must be a single-link regular file
+(`verify_regular_private_file`) owned by the daemon user. It must not be
+world-writable, and group write is accepted only through the daemon's own
+primary group: the unit runs with `UMask=0002`, so every attachment the daemon
+writes is 0664. The guard cannot see owners or link counts, so for planted
+hostile files the bridge is stricter. For files the daemon writes, both decide
+alike.
+
+The guard keeps its own regexes instead of reading them from the environment.
+On the Claude path it is the only check, and inside the bridge it is a second,
+independent one. `scope_guard_carve_outs_mirror_the_read_allowance_definition`
+renders the regexes from the Rust constants and fails if the guard drifts.
+`scope_guard_and_definition_agree_on_attachment_names` runs the real guard over a
+table of names. That table found a dialect gap: under the daemon's `en_US.UTF-8`
+locale, bash bracket ranges such as `[0-9]` also matched non-ASCII letters and
+digits, so the guard now pins `LC_ALL=C`. The paired test
+`query_attachments_read_identically_under_claude_guard_and_codex_bridge` gives
+the real guard and the packaged bridge the production query policy and one probe
+set. Attachment, iMessage and transcript reads succeed under both. Lookalike
+names, `..` escapes, another session's files, nested paths, searches and writes
+are denied under both. The transcript clone needed no change: `add_dirs` already
+makes it a read root.
+
+The bridge tracks its parent process with a Linux pidfd. A live builder probe
+exposed that the previous parent-death signal was tied to Codex's launching
+thread: when that thread retired, the bridge exited while Codex remained alive.
+A deterministic regression reproduces that failure and now passes. A companion
+test keeps stdin open after the parent exits and verifies the bridge still
+terminates, retaining the parent-process lifecycle boundary.
+
+Commands must use parsed argv, never a model-generated shell script. Matching a
+command prefix alone does not sandbox programs such as Cargo or npm: they can
+execute project code. Build execution therefore needs a separately verified
+filesystem/process/network boundary. The command helper now enforces Landlock
+ABI 6+ read/write scopes plus a seccomp deny list for networking, process
+introspection and escape from the cleanup process group. Source-file read grants
+use opened inodes and exclude credential/control paths. The current general
+command profile is read-only. Cargo/npm commands run in disposable source
+snapshots with separate temporary configuration and output directories. Existing
+Cargo caches, Rust toolchains and npm dependencies are read-only; missing
+public dependencies can be retrieved through the read-only gateway described below. UTF-8 source changes pass through
+the original write guards and concurrent-edit checks before being copied back.
+Binary source changes and file deletions also reconcile under the source-build
+profile, retaining scope and concurrent-edit checks; build artifact directories
+remain excluded. A profile with a matching text-only Write hook rejects binary
+or deletion reconciliation explicitly, because those effects cannot faithfully
+be represented as a text Write event. Real synthetic Cargo and npm tests verify
+execution, private dependency installation/reuse, and scoped source reconciliation.
+The actual project installation, build and Node suite also pass through the VM.
+The HOME identity is preserved as an OS environment value without granting read
+access to files in that home.
+Git inspection receives read-only repository metadata and disables external diff
+helpers, hooks, fsmonitor and user/system configuration. On the tested deployment, the default Codex
+command sandbox fails during loopback setup. Its legacy Landlock backend runs a
+simple command but rejects permission profiles requiring direct runtime
+enforcement; selecting that backend alone does not prove read confinement.
+Additional host probes found no installed Docker/Podman runtime. A user-service
+`PrivateNetwork=yes` probe exited successfully but retained the host network
+namespace, including with `PrivateUsers=yes`; direct user/network namespace
+creation was denied. An exit status alone is therefore not evidence of network
+isolation. No host security setting was changed during these probes.
+
+A subsequent host probe verified KVM API access and creation of a VM by the
+service account. A private QEMU runtime extracted from the configured Ubuntu
+package archive booted a matching kernel with a synthetic initramfs, no network
+device, and QEMU's seccomp sandbox enabled. Inside the guest, loopback socket I/O
+and a detached process session both worked. A synthetic read-only 9p share was
+readable; attempted writes failed, and a symlink to a host file outside the share
+could not be read. The guest exposed only `lo` and powered off successfully.
+QEMU device, share and sandbox options follow its
+[invocation reference](https://www.qemu.org/docs/master/system/qemu-manpage.html).
+
+The runner `scripts/codex-build-vm.py` executes a disposable snapshot in
+that guest. The workload runs as an unprivileged UID with no-new-privileges;
+runtime and dependency mounts are read-only and disable setuid/device semantics.
+A root-only guest control directory separates the command result from workload
+output. The host waits for VM exit and the supervisor cleanup receipt before
+accepting it. Real tests cover scoped writes, blocked host/symlink access, absence
+of daemon environment secrets, read-only cache mounts, receipt-forgery refusal,
+exit codes and cancellation after a detached child has demonstrably started.
+A Cargo fixture compiles and runs socket/session tests in the guest. Running
+the actual core unit suite from a fresh snapshot compiled in 2m26s and produced
+376 passes, three ignored live tests, and only the existing full-agentic routing
+regression failure. The earlier socket, session and HOME failures did not recur.
+Bridge Cargo/npm/npx commands use this runner when the private default runtime
+configuration exists, or the operator sets `AUGMENTAGENT_BUILD_VM_CONFIG`. The
+adapter reads the override from its own process environment, never from profile
+environment overrides. See [runtime setup and rollback](BUILD-VM.md). The launcher bundles both
+the VM helper and process supervisor privately. Checkout path arguments translate
+to the guest workspace, guest tools do not depend on the host command PATH, and
+root and nested npm workspace dependencies mount read-only. Source reconciliation runs only after VM
+shutdown and retains original Write hooks and concurrent-edit checks. A real
+bridge test verifies npm dependency loading, loopback, process sessions, source
+updates and guard denial. Live Codex QA ran a Cargo socket test through the
+packaged bridge, verified its successful tool audit and confirmed build outputs
+stayed out of the source worktree. A durable private runtime was provisioned with
+a package/version/hash record; a second live test passed using default discovery
+without an environment override. This did not restart or deploy the daemon. Cache reuse and public dependency
+retrieval are covered by the verification below; runtime limits are documented
+in BUILD-VM.md. A real VM test runs npm in a nested workspace whose path contains spaces,
+loads its local dependency, verifies dependency writes are denied and reconciles
+the generated source output. Real-VM Python tests
+require `JARVIS_TEST_VM_CONFIG` pointing to owner-private runtime configuration;
+the live adapter test uses default discovery or the daemon override.
+
+## Fallback diagnostics
+
+Required MCP startup failures use fixed readiness categories for initialization,
+timeout and missing tools, rather than an unsupported-method error or a traceback
+containing configured paths. The Codex adapter maps these categories to local
+readiness failures before logging or returning native CLI details, so they do not
+create provider-outage cooldowns. Synthetic tests verify that private configuration
+markers do not appear in the returned diagnostics.
+
+Doctor reports routing capacity separately for text, read, write and agentic
+workloads. Each configured provider is identified as a candidate, capability
+excluded, on cooldown, or unavailable at binary/auth preflight. A single candidate
+warns that no backup remains; zero candidates is an error. This does not claim
+MCP, guard or sandbox readiness, which still needs validation for the concrete
+invocation. The existing chain finding retains detailed binary/auth explanations.
+
+Exhausted-chain errors now distinguish capability exclusion, active cooldown,
+attempted quota failure, timeout, provider unavailability, local readiness failure
+and CLI-gate timeout for the entries in the chain. The display contains only
+provider names and failure categories. The original typed provider error remains
+in the error chain for existing cooldown/retry callers. Doctor reports constructor-time capability exclusions and binary/auth preflight;
+concrete sandbox and MCP readiness are validated when a request starts.
+
+## Handoff journal implementation status
+
+The bridge accepts an optional owner-private operation journal outside all model
+file scopes. It persists a started receipt before an external tool call and a
+completed receipt only after a successful result, with file and directory fsync
+and an exclusive execution lock. A restarted bridge returns the stored result
+for identical completed tool arguments. Uncertain outcomes, including reported
+tool errors, block further external effects until reconciliation. Local reads
+remain fresh. Known read-only Gmail, repository-document, GitHub inspection and
+guarded SocialAPI operations also bypass mutation receipts so they can gather
+current evidence during reconciliation. Unknown operation contracts remain
+potentially mutating; server advisory annotations alone do not exempt a tool.
+The memory server's four explicit read contracts (search, recent, conversation
+search and thread read) also remain fresh while a write is uncertain. Memory
+writes and unknown tools still require reconciliation before they can run.
+An uncertain write returns a safe, actionable tool error without its arguments.
+Tests cover restart, ambiguous connection failure, corrupt and
+symlink state, model-scope exclusion and actual bridge receipt reuse.
+
+Production dispatch now assigns private journal paths for write/agentic calls and
+forwards recorded progress to the next provider. Requests with a channel turn id
+have a stable hashed identity across restart, independent of refreshed clocks,
+owner context and provider settings. WhatsApp uses the stable message id as well
+as the chat id, so separate turns do not share receipts. Scheduled loops pass a
+persisted occurrence identity derived from the loop id and last recorded run;
+a crash before that record reuses the same journal. Callers without an id (or
+with the empty audit placeholder) get distinct journals and still need
+caller-owned restart identity if they resume work. Claude receives pre-tool,
+post-tool and failed-tool hooks using the documented [hook event contract](https://code.claude.com/docs/en/hooks).
+The pre-tool hook persists started state; successful post-tool events normalize
+results for Codex. Tests execute the generated command, including quoted paths
+and blocking results, and exercise receipt forwarding through the dispatcher.
+A stalled or failed checkpoint blocks the call within a fixed bound; see
+[Claude-side checkpoint guarantee](#claude-side-checkpoint-guarantee-1039).
+
+Primary hooks now also block a new tool-call id from repeating a completed
+MCP or broker service action in the same request. Both providers compare parsed
+command arguments, ignoring shell quoting, whitespace, descriptions and timeout
+changes; they retain the original inputs in the journal. Completed local builds
+can run again after source edits. Separate request journals permit a new user
+request with identical arguments. Intentionally repeating the same external
+action inside one request still needs explicit operation identity support.
+
+A live two-provider fixture passed: Claude invoked a synthetic MCP counter,
+its real hooks persisted the completed receipt, and Codex then requested the
+same action without being given recovery prose. Codex returned the first
+receipt and the counter remained one. This verifies actual primary hook and
+fallback broker interoperability for a completed action.
+
+The disconnect variant also passed with both real CLIs: the fixture performed
+its effect and exited before sending a response. The primary journal retained
+`started`, Codex received an audited reconciliation refusal, the journal stayed
+unchanged and the effect counter remained one. This verifies safe refusal after
+an ambiguous transport failure. The extended fixture then checks the synthetic
+service counter, records an operator completion receipt through the recovery CLI,
+and resumes Codex. The response contains the verified receipt and the counter
+remains one; no second external effect occurs.
+
+Uncertain effects can now be resolved with an owner-only recovery command after
+checking the authoritative service. Decisions require the exact operation
+fingerprint and evidence; they preserve the original attempt and a timestamped
+receipt. Verified completion reuses the observed result without another effect.
+Verified absence permits one fresh attempt, which receives normal journal and
+approval enforcement. Active requests, unverified cleanup, stale fingerprints
+and conflicting decisions are refused. The model cannot invoke this recovery API.
+See [operator recovery](#operator-recovery-for-uncertain-effects) below.
+
+Argument matching does not identify all semantically duplicate actions expressed
+through different commands or tools. To intentionally repeat an identical external
+action, use a new user request so it has a separate operation journal. Journals are
+retained privately. The daemon removes only finished journals idle past a grace
+period; unresolved receipts are never removed, by the sweep or by hand, to force
+progress (see [journal retention](#handoff-journal-retention)). Hook observations do not substitute for verified
+termination of the previous provider and its descendants before handoff.
+
+Both CLI adapters now launch beneath a private Linux subreaper supervisor. On
+normal exit or cancellation it kills the provider group, adopts detached orphan
+descendants, and acknowledges cleanup only after reaping all children. Cancellation
+waits for that acknowledgment before releasing the adapter call. Missing cleanup
+confirmation produces `CleanupUncertain`, which blocks fallback without latching
+the provider. Tests first reproduced group-only and detached-session leaks, then
+verified cancellation, normal exit with background work, destruction of the
+supervisor itself, and the fallback exclusion. A live Codex read/write/command
+smoke test passes through the supervisor. Journal-backed invocations now create
+an owner-private, fsynced active-request marker before spawning. Verified cleanup
+retires it; missing cleanup confirmation preserves it. The dispatcher checks
+this marker before reading any operation receipts, so a restarted request cannot
+silently retry, even if the crash preceded the first tool call. The marker also
+prevents concurrent invocation of the same request. Tests cover exclusivity,
+normal retirement and persistence after supervisor destruction. After a daemon
+crash, recovery accepts only an owner-private receipt confirming all descendants
+were reaped. A lifecycle lock and invocation-specific receipt path keep an older
+invocation from retiring a newer invocation's marker. Tests kill a real parent
+process and verify detached work stops before recovery. Production query and loop callers supply stable turn identities; markers are
+never cleared by age.
+
+### Claude-side checkpoint guarantee (#1039)
+
+**Guarantee:** a Claude tool call runs only after its pre-tool checkpoint has
+exited 0, which for a mutating call means its `started` receipt is on disk
+(file and directory fsync). Otherwise the hook blocks the call (exit 2) within
+**33 seconds** of starting. A normal checkpoint takes about 60 ms.
+
+Why the wrapper is needed. Claude Code cancels a hook that outlives its own
+`timeout` and then runs the tool anyway. A live probe on Claude Code 2.1.273
+confirmed this: a stalled pre-tool checkpoint under the old 10-second hook let
+`Write` create its marker. Claude Code also waits for the hook's stdout and
+stderr to close, not for its shell to exit (measured: 1.6 s when a leftover
+process held only stdin, 13.7 s when it held stdout and stderr). A checkpoint
+stuck in fsync can be uninterruptible, so even SIGKILL may not end it until the
+I/O returns, and a plain `timeout` prefix would not bound it.
+
+How the generated command works (`journal_hook_command` in
+`channel-core/src/handoff.rs`, one command for all three events, run by
+`/bin/sh -c`):
+
+- The checkpoint runs under `timeout -k 2 30`. Its stdout goes to `/dev/null`
+  and its stderr to an inner pipe, so it never holds the hook's own output.
+  SIGKILL also ends `timeout` itself, so a stuck checkpoint cannot delay the
+  exit status.
+- A relay under `timeout 33` copies the inner pipe to the hook's stderr, capped
+  at 64 KiB.
+- The checkpoint's exit status travels on its own descriptor, which only the
+  shell writes and the checkpoint never inherits, so nothing the checkpoint
+  prints can forge it. The shell exits 0 only on status 0.
+- Status 2 exits 2 with the relayed message: a bridge refusal, or Python's own
+  "can't open file" message (naming the temporary script path) when the script
+  is missing. A timeout, a missing interpreter or wrapper, any other status, or
+  no status exits 2 with a fixed message.
+- Claude Code's own hook `timeout` is 60 seconds. It still fails open, so the
+  guarantee assumes `sh`, `timeout` and `head` start within the 27-second
+  margin.
+
+After the fix, the same live probe showed the call blocked and no marker
+(`handoff::tests::live_stalled_journal_checkpoint_blocks_the_tool_call`,
+ignored by default). A checkpoint stopped after its atomic replace but before
+the directory fsync can leave a `started` row for a call that was blocked.
+That row needs operator reconciliation like any other uncertain effect. A stuck
+checkpoint that holds the journal lock also makes later checkpoints refuse
+until it ends.
+
+A post-tool or failed-tool checkpoint that fails, times out or cannot run leaves
+the row `started`, never `completed`. Claude's next call and the Codex broker
+both refuse to repeat it, `resume_message` forwards it as uncertain, and
+retention keeps it. `failed_post_tool_checkpoint_leaves_the_operation_uncertain`
+(Rust, through the generated command) and
+`test_failed_post_tool_checkpoint_stays_uncertain_and_is_never_replayed` (the
+bridge's `--handoff-hook` entry point) between them cover a held lock, an
+unwritable journal, a missing interpreter and a failed tool.
+
+## Capability inventory
+
+The checked-in [capability manifest](reasoner-capabilities.json) currently records
+31 production constructors, wrappers and policy-changing call sites. A Rust AST
+inventory test checks it against source, including code after test modules,
+opt-in wrappers and tool-list mutations. Parameterized tests construct twelve
+core presets and check capability classification, declared tools and bridge write
+scope, including optional wiki access. Isolated opt-in integration tests cover
+both wrapper constructors with the feature disabled and enabled, preserving
+private authentication configuration and executing the original read-only guard
+through the bridge against allowed-read and denied-write probes. All twelve core
+presets also execute file operations through the packaged stdio bridge: scoped
+Read/Glob/Grep, permitted Write/Edit, read-only mutation denial and outside-root
+read/write denial. These deterministic probes cover file tools; they do not
+substitute for MCP initialization or model output contracts. Provider execution/output coverage is recorded separately in the manifest. All
+31 entries now have named conformance evidence; inventory and policy checks alone
+do not prove operational rollout.
+
+Each entry also records its `model_tier` (`quality`, `fast`, or `preserved` for
+wrappers that keep the model of the options they receive) and a
+`tier_rationale` (#1046). The same AST scan fails on any production
+construction that leaves `model: None`: no `--model` flag means the spawned CLI
+inherits the owner's interactive model (#448). It also fails when a tier spelled
+at a `ReasonerOpts::pinned(ModelTier::…)` call, or implied by a literal model id,
+disagrees with the manifest. Core presets whose model comes from a helper are
+checked at runtime against `providers::tier_of`.
+
+The live `live_wiki_query_profile_executes_files_and_memory_mcp` test uses the
+production query instructions, tool inventory and scope hook, with a synthetic
+wiki/database and a built memory server selected by `JARVIS_TEST_MEMORY_BIN`.
+It exposed an existing memory-server notification bug: an unsolicited response
+to `notifications/initialized` broke the bridge handshake. The server now ignores
+notifications and does not execute id-less tool calls; a real stdio regression
+test covers both. After that fix, live Codex completed Glob/Grep/Read/Write/Edit
+and `memory_recent`, with successful provider-attributed audit records. One
+earlier post-fix call initialized but did not produce the requested file; the
+test now includes the synthetic response/audit when that assertion fails.
+This direct-adapter receipt does not establish reliability across all output
+contracts; automatic fallback and handler coverage are tested separately below.
+
+The deterministic `query_handler_preserves_context_and_original_attachment_bytes`
+contract calls the real `WikiQuerier::answer` and Discord attachment preparation
+with a stubbed primary provider. It verifies the production full-agentic profile,
+scope hook, restricted environment, session context, owner rules, transcript
+capture and original binary bytes. The live
+`live_query_fallback_delivers_original_and_skips_latched_primary` contract now
+passes through that handler with a synthetic quota-refusing primary and real
+Codex. Two successive requests preserve original PDF bytes, use scoped Read and
+the real memory MCP server, and record Codex as the serving provider. The second
+request skips the latched primary. These are local handler/delivery-preparation
+checks, not a Discord network send or deployed-daemon receipt. Outbound attachment
+reads now use a pinned wiki directory
+descriptor and reject symlinks at every subsequent path component; metadata and
+the byte cap are checked on the opened file. Tests cover swaps after marker
+validation, root replacement, oversized files and nonregular files including
+FIFOs, without reopening the validated absolute path for delivery.
+
+Routing regressions now cover all four capability classes with both a healthy
+primary and a quota-refusing primary, including a second request during cooldown.
+The previously failing production-shaped wiki-ask regression passes. The full
+core unit suite reports 379 passes and five ignored live tests with routing
+enabled; live tests are run explicitly for the receipts described above.
+
+The live `live_codex_fallback_builder_fixes_code_and_runs_red_green_tests` fixture
+uses auto-ship's actual `fix_opts` prompt and tools, a latched primary, private
+handoff state and real Codex. It observes a failing Cargo regression, edits the
+source, passes the same unchanged acceptance test, and successfully inspects
+`git diff`. Cargo executes inside the VM; no target directory is produced in the
+source checkout. The test now uses the production chain constructor and persists
+builder history, then reloads it through a fresh reasoner instance. Codex remains
+the sole recorded builder and is excluded from review. With Claude still latched,
+the independent review is unavailable and cannot approve. After clearing only the
+synthetic test cooldown, real Claude completes and approves the focused-diff and
+system-interaction passes. That approval does not grant Codex-specific merge
+overrides.
+
+The controlled `live_fallback_pipeline_resumes_after_independent_reviewer_recovers`
+test now runs the production auto-ship state machine with real providers and Cargo
+checks, an isolated local Git remote, and a simulated GitHub transport. A latched
+primary routes scoping/building to Codex. Missing independent review capacity
+preserves the draft, including on resume, without further mutation calls. After
+synthetic primary recovery, independent review gates the merge; a fresh checkout
+of the exact merged revision passes additional acceptance tests. Both paths clean
+the pipeline worktree. This does not prove public GitHub or daemon deployment QA.
+
+Review revisions, conflict repairs, and privacy repairs stay within the draft's
+recorded builder providers. A recovered primary remains available for independent
+review instead of becoming another author. Unknown provenance or unavailable
+builders fail closed; missing review capacity does not consume rejection rounds.
+
+### Drafts without an independent review (#1037)
+
+The resume lane asks whether a draft can be independently reviewed before it
+creates a worktree, merges `main`, runs the gate or calls a builder.
+`independent_review` chooses its reviewer through the same function, so the two
+cannot disagree. When no review is possible the tick is `held`, and it bills a
+daily-cap run only if a builder call was actually made on that run. The PR
+comment and the log name one of three reasons:
+
+| Reason | Cause | What the loop does |
+|---|---|---|
+| Provenance unknown | No complete record of the draft's builders: it predates builder history, or the record was lost. A missing record on resume is written as unknown and stays unknown. | Stands down at once |
+| Provenance unknown | The record exists but cannot be read or trusted (busy lock, permissions, corruption), whether it fails when the draft is bound or when it is read | Waits, on the budget |
+| No reviewer capacity | Every provider the loop reviews with already built the draft | Stands down at once |
+| No reviewer capacity | The independent reviewer is not installed or authenticated, or its call failed | Waits, on the budget |
+| Reviewer latched until a named reset | The independent reviewer is on a quota cooldown | Waits, on the budget |
+
+**Unknown provenance requires one human approval.** The loop never reviews,
+revises or merges such a draft. It cannot show that any model reviewing the
+draft is independent of the model that built it, because before #1021 the
+primary built every draft. The other option, reviewing with the primary
+provider only, would let the merge gates open on the builder grading its own
+work with nobody independent looking. Standing down labels the issue
+`agent-gave-up` and closes the draft with the reason; the branch is kept. The
+label also stops a fresh attempt from rebuilding over that branch. A human
+merges the draft by reopening it, marking it ready for review and merging it by
+hand, or removes the label to have the loop rebuild the fix from `main`. The
+close happens only after the label is confirmed. If labelling fails, the draft
+stays open and the next pass tries again, because a closed draft on an
+unlabelled issue would let a fresh attempt rebuild over its branch. A stand-down
+removes the draft from the pool, so the tick moves on to the next candidate. A
+hold ends the tick.
+
+**Drafts built from another checkout also show unknown provenance.** Builder
+history is keyed by the repository's canonical path. A draft built by a
+hand-run `self-improve` from a different checkout of the same repository
+therefore has no record in the daemon's checkout, and the daemon closes it as
+unknown provenance. This is reversible, because the branch is kept:
+`gh pr reopen <pr>`, then `gh pr ready <pr>` before anything else, review it,
+and merge it by hand. The stand-down comment says this. A draft reopened while
+its issue still carries the label is closed again by the gave-up sweep (#934),
+and that close comment repeats the recorded reason instead of an attempt count.
+
+**Retry budget.** A reason that can clear on its own waits. The resume lane
+reaches a draft at most once per UTC day (its attempt ledger), and each
+unavailable outcome is recorded per draft in `autopr-unreviewable.json`
+(`AUGMENTAGENT_AUTOPR_UNREVIEWABLE_FILE`). After three different UTC days with
+no review verdict in between, the loop gives up the same way and names the
+latest reason. Any verdict, approval or changes requested, resets the count. A
+reason that cannot change for the draft stands down on first sight, instead of
+posting the same verdict for three days.
+
+**Branch history resets when the branch is superseded.** A fresh attempt builds
+from `main`, so its own review consults a record of only the builders it
+dispatched. Every builder is also added to the branch record, which keeps
+describing the remote branch. Until the attempt's push lands, the earlier work
+may still be there, so the branch record stays the union and fails closed.
+Once the push lands, either plainly or by force-pushing over an orphaned branch
+(#815), the branch record becomes exactly the attempt's builders. That is also
+the only way a record of unknown provenance becomes complete. A resume only
+appends.
+
+**Codex-only overrides need a Codex verdict (#1076).** The owner overrides
+`AUGMENTAGENT_AUTOPR_CODEX_UNLOCKS_HARD` and
+`AUGMENTAGENT_AUTOPR_LGTM_OVERRIDES_RECEIPT` require an approval from an actual
+Codex call. The fresh lane, the resume lane and the merge sweep (#1029) decide
+approval with one predicate, `approval_of`, over a verdict the lane records
+from the provider it called. The fresh lane stores that verdict with the
+reviewed head in its record of opened PRs (`autopr-opened-prs.json`). The sweep
+reads only that record, bound to the same PR and head. It no longer counts
+`CODEX-REVIEW: lgtm` lines in the PR body. A Claude review writes the same
+line, and the body also carries model output that can contain any line.
+Records written before this change carry no verdict, so the sweep leaves those
+drafts to the resume lane, which reviews them again.
+
+`augmentagent autopr-health` reports drafts that are waiting under
+`review-held`. The warning says the loop is not wedged and gives each draft's
+reason and day count. Those drafts are left out of `draft-stale`.
+Behavior tests cover provider recovery and builder failure without dispatching an
+independent provider as a replacement author.
+
+The completed provider conformance suite includes:
+
+| Production boundary | Current evidence |
+|---|---|
+| Classic drafting | Both providers draft with and without scoped wiki context |
+| Seven communication channels | Both providers generate programs consumed by the real Deno runner and dispatcher; each persists a pending draft with the original generated source |
+| Optional social MCP wrappers | Both providers perform authenticated reads through both production constructors; deterministic negative probes enforce the original read-only guard |
+| Signature, voice, journal and social adaptation | Both providers pass the actual extraction/composition consumers; social adaptation must complete provider calls instead of silently returning the source |
+| Scheduled Discord/Slack digests | Real scheduler ticks with synthetic stores and a capturing broker; Claude quota refusal invokes Codex, then skips the latched primary; successful delivery is throttled |
+| Query and document delivery | Real query handler, original-byte attachment preparation and latched-primary exclusion |
+| Auto-ship | Controlled full lifecycle with real providers/builds, local Git and simulated GitHub; independent review after primary recovery, merge and fresh-checkout acceptance |
+| Selftest | Actual candidate CLI returns PONG with a healthy primary and an isolated pre-latched primary; deterministic binary tests cover routing and healthy-primary preference |
+
+Live channel fixtures have no external sending integration. These checks establish
+provider and consumer contracts, not live account delivery or deployed daemon QA.
+
+Output parity includes model tier selection, code-mode parsing, images, last
+assistant block versus complete transcript, original attachment markers, tool
+audit records, cancellation and shared CLI-gate lifecycle. A text-only selftest
+cannot stand in for any tool-using profile.
+
+## Current verification
+
+[TESTING.md](TESTING.md) lists which of these suites run in CI (the Python
+bridge, sandbox, VM-snapshot and dependency-proxy suites, on every PR), which are
+owner-run (live providers, the real VM via `JARVIS_TEST_VM_CONFIG`), and how to
+run the opt-in ones with `XDG_STATE_HOME` state isolation.
+
+- The production-shaped wiki-ask quota regression now passes, alongside routing
+  tests for all four capability classes and live handler/delivery fallback QA.
+- Bridge tests cover file read/write/edit, nested writes, bounded search, tool
+  declaration, traversal, intermediate symlink and hard-link escapes, sensitive paths,
+  command parsing, and guard denial/crash/malformed-response handling.
+- `BridgeResilienceTests` pin the path depth/length caps for reads and writes,
+  Glob/Grep over a 1500-level tree, and a stdio bridge that keeps serving after
+  deep paths, malformed lines, non-object requests and invalid `tools/call`
+  params, with the JSON-RPC codes above.
+- `BoundedGrepTests` pin a pathological pattern replying in under 2 s, with
+  pattern advice, while the next request is served. They also pin a bridge and
+  its matcher exiting within 1 s of parent death mid-match, and the fixed parity
+  table. With an injected clock and a slow-read hook, they check that slow
+  reading never counts against the matching bound, and that running out of read
+  time, scan bytes or walk entries returns partial results with a note to narrow
+  the path. Injected CPU-usage and clock hooks check both matching-timeout
+  messages: pattern advice when the matcher was using the CPU, and a busy-host
+  retry note when it mostly waited for one. The live-gate
+  unit test
+  `codex::tests::pathological_bridge_grep_releases_the_cli_gate_slot_within_its_bound`
+  drives the real packaged bridge through a Codex stand-in under a one-slot
+  `CliGate`. The slot is free again right after the bounded Grep reply.
+- File-tool schemas and dispatch support optional line ranges, scoped/file
+  searches, case-insensitive matching, explicit replace-all edits and bounded
+  command timeouts. Invalid or unknown local arguments are rejected before
+  guards and execution instead of silently being ignored.
+- Recognized but unimplemented local tools fail readiness instead of silently
+  disappearing from the advertised tool list.
+- Scoped `Read` returns PNG/JPEG/GIF/WebP bytes as MCP image content rather
+  than attempting UTF-8 decoding. Path checks and file-size limits apply before
+  encoding; text line ranges on images are rejected. A live Codex test reads
+  a synthetic PNG through the bridge, identifies its undisclosed color, and
+  verifies the original bytes and provider audit record.
+- PDF `Read` supports explicit page numbers/ranges and returns rendered page
+  images, including visual content. Poppler (`pdfinfo` and `pdftoppm`) renders
+  only a private snapshot under the command sandbox, with no network, a 512 MiB
+  address-space limit, bounded files and a 60-second request budget. Up to 20
+  pages are allowed per call; larger documents require an explicit range.
+  A live Codex test identifies the undisclosed color on the selected page of a
+  synthetic two-page PDF and verifies the source bytes remain unchanged. Other
+  downloaded formats use original-byte attachment delivery, without conversion.
+  The query handler and attachment-preparation path pass live provider QA;
+  verification does not send synthetic files to live external channels.
+- Rust launch tests check private configuration permissions, exclusion of secrets
+  from arguments, native tool restrictions, separate read/write roots and
+  rejection of unknown settings.
+- Stdio and HTTP MCP tests cover tool allowlists, session/auth forwarding,
+  environment interpolation, missing-tool readiness and hung-child cleanup.
+- Kernel sandbox tests verify scoped I/O, outside/symlink/hard-link/credential-read denial,
+  blocked network sockets and blocked signals to the parent.
+- Real Cargo and npm fixtures verify compilation/test execution, read-only npm
+  dependencies, source reconciliation and exclusion of build outputs. Git diff
+  verifies repository metadata access without granting metadata writes.
+- The live Codex adapter smoke test performs scoped reads, exact writes and an
+  allowed command; the common audit log verifies the serving provider and exit
+  status. This is still not full chat, integration or auto-ship parity.
+- The dispatcher records every provider attempted with mutation-capable tools,
+  including failed and cancelled calls. Text-only calls, cooldown skips and
+  capability exclusions do not count as builders. Auto-ship binds a private,
+  durable history per repository and branch before invoking any builder. History
+  writes must succeed before a provider runs; restarting cannot erase earlier
+  authors, and neither can opening a fresh attempt. Only a fresh attempt's
+  landed push replaces them, with that attempt's own builders (#1037). Missing
+  legacy history remains unknown.
+- Independent review selects Codex or Claude only when that provider is absent
+  from the draft's complete builder history. Unknown/corrupt history or no
+  independent capacity blocks approval. Claude reviews use an explicit model
+  pin and the same two-pass evidence contract. Codex-specific owner overrides
+  for hard complexity and runtime receipts still require actual Codex approval.
+  Live independent Claude review after Codex builds and the controlled full
+  lifecycle have passed. Deployment is verified in the release receipt below.
+
+## Integration contracts and release gates
+
+Both optional social drafting presets now exercise their production policy
+through an authenticated local HTTP MCP fixture. Reads reach the endpoint with
+the configured bearer header; the original read-only hook rejects an offered
+write tool before any remote call. HTTP initialization and tool-call timeouts
+produce the sanitized `mcp_timeout` readiness category without retrying the
+request. A timed-out mutation retains its uncertain journal entry. These are
+synthetic transport and policy contracts, not live social-account operations.
+
+Codex's production source-inspection presets have live scope/review coverage:
+a synthetic arithmetic defect yields a parseable implementation plan and
+acceptance criteria, and a constant-return patch is rejected after reading
+source and inspecting its Git diff. Source bytes remain unchanged by both
+passes. A repeatable broker test also verifies that these presets reject
+Write, Edit, Git commits and build commands. This covers the inspection stages. The controlled lifecycle described above
+also covers merge and fresh-checkout acceptance; deployed CLI QA is recorded below.
+
+The shared live output-contract suite passed through both Claude and Codex:
+interval parsing, missing-timezone errors, archetype selection, newsletter
+triage and insufficient-sample tone descriptors. It also generated and executed
+a synthetic draft through the real Deno code-mode runner, with exactly one
+draft operation and no sending capability. The loop prompt now explicitly
+requires clarification inside JSON after the Claude baseline returned a prose
+question that its consumer could not parse. These checks cover shared output
+contracts; they do not establish every channel's integration behavior.
+
+Native web calls now appear in the common audit log with the Codex provider,
+query and native action. A live public-page fixture passed through the adapter
+and verified the audit entry. The CLI uses the same `web_search` event for
+searches and page opens, sometimes with an opaque `other` action; it does not
+include page content in that event. Records preserve this limited evidence.
+Because native web combines search and retrieval and bypasses bridge hooks,
+the adapter requires both WebSearch and WebFetch and rejects matching web
+hooks. The production query preset's file-only hooks remain supported.
+Single-web-tool and web-hook profiles need a guarded implementation before
+they can be accepted; they are not silently broadened or claimed as parity.
+
+The implementation passed independent review, CI and merged release rollout.
+Candidate contract receipts remain distinct from the deployed CLI and running
+binary verification recorded below.
+
+All fixtures and publishable receipts must use synthetic data. Live account
+configuration, private correspondence and raw runtime logs stay outside this repo.
+
+
+### Fresh Node worktree verification
+
+The bridge can reuse matching installed dependencies from a linked worktree's
+registered main checkout. It checks lockfiles and dependency declarations before
+mounting selected package roots read-only; generated lockfiles and unrelated
+installs outside the requested project are excluded. Changed resolution inputs
+are rejected rather than tested against a different dependency tree. Synthetic
+contracts cover matching resolution, script-only edits, mismatches, symlinked
+manifests, unrelated installs, and a real guest build from a fresh Git worktree.
+A separate fresh checkout of this project passed `npm run build --offline` and
+all 26 `npm test --offline` tests through the VM bridge, then was removed.
+Uncached public packages can now be fetched through the guest dependency gateway.
+
+
+### Shared output-contract verification
+
+The six live `provider_output_contracts` tests pass through both Claude and Codex.
+They cover interval parsing and missing-timezone handling, archetype selection,
+newsletter triage, insufficient-sample tone output, and a generated draft executed
+by the real code-mode runner with a non-sending dispatcher. Additional fixtures
+verify exhaustive digest coverage, booking-link extraction through the production
+ask detector, and read-only linting with audited source inspection and a reported
+broken link. The lint preset explicitly identifies the configured wiki root so
+schema examples do not imply an extra `wiki/` subdirectory. These receipts verify
+the named contracts; the inventory table records the other profiles. They do
+not establish deployment.
+
+
+### Shared wiki mutation and migration contracts
+
+Both providers pass the synthetic resume and ingest contracts. Resume seeding
+preserves existing non-resume facts, adds sourced skills without inventing contact
+information, and emits the required `wrote:` marker. Ingest preserves prior facts,
+records a cited preference, updates the log, and leaves the derived index unchanged.
+The ingest preset explicitly identifies its root and requires a final completion
+acknowledgement: an earlier Codex run performed the writes but returned no response,
+which the adapter correctly rejected rather than silently reporting success.
+
+The CLI's shared live migration tests use the production prompt, YAML parser,
+citation filter and patch application. Both providers produce supported cited
+fields, preserve original frontmatter/body content, leave source files untouched,
+and return an empty patch for a page without evidence. The page request explicitly
+names migration as the task so thin pages do not trigger a clarification response.
+
+
+### Completed channel and integration conformance
+
+The latest full workspace regression passed 2,479 tests with zero failures across
+72 targets; 38 live/environment-dependent tests remain opt-in in that command.
+The newly added paired live suites were run explicitly: optional HTTP MCP,
+seven-channel code-mode drafting, classic drafts with optional wiki context,
+signature/voice/journal/social formats, and scheduled digests. The current query
+fallback and controlled auto-ship lifecycle also passed again. The capability
+inventory now rejects entries without a named conformance test (red regression
+confirmed, then all five inventory tests passed).
+
+These receipts apply to the candidate worktree. They do not prove deployment.
+Recovery and public dependency provisioning have separate verified contracts
+below. Final review, CI and deployed revision/CLI verification are recorded in
+the release receipt.
+
+
+### Operator recovery for uncertain effects
+
+An error or timeout does not prove that an external write failed. First inspect
+the authoritative service using read-only access. Stop the affected request and
+let normal supervisor cleanup complete. From the trusted checkout, inspect its
+owner-private journal (the directory is under
+`~/.local/state/augmentagent/reasoner-handoffs/`, or
+`$XDG_STATE_HOME/augmentagent/reasoner-handoffs/` when that is set):
+
+```sh
+python3 scripts/codex-tool-bridge.py --handoff-status /absolute/private/request/operations.json
+```
+
+Status returns indexes, tool names, states and fingerprints; it omits arguments,
+results and evidence. Do not publish the private journal. Create a private JSON
+decision file with the returned `index` and `fingerprint`, an `outcome` of
+`completed` or `not_applied`, and nonempty `evidence` describing the authoritative
+check. `completed` also requires the observed successful MCP-shaped `result`, for
+example `{"content":[{"type":"text","text":"synthetic-created"}]}`. Only choose
+`not_applied` when absence of the effect is established, not merely because a
+lookup is inconclusive. Submit it through stdin:
+
+```sh
+python3 scripts/codex-tool-bridge.py --handoff-reconcile /absolute/private/request/operations.json < /absolute/private/decision.json
+```
+
+The command locks against both journal execution and provider startup, refuses
+active/unverified requests and stale decisions, and fsyncs the decision before
+reporting success. It never clears cleanup markers or exposes journal payloads
+in errors. A completed decision supplies the result on replay; an absence decision
+keeps the original attempt and permits a new one. Resume the same logical request
+through its normal entry point. Keep receipts through rollout and rollback;
+older adapters reject unknown receipt states rather than replaying them.
+The retention sweep below never removes a journal with a `started` row, so an
+uncertain journal waits for this command however old it is (as long as no
+cleanup marker is left over; see below).
+
+
+### Handoff journal retention
+
+Each write or agentic dispatch creates a request directory under
+`~/.local/state/augmentagent/reasoner-handoffs/`, and its journal keeps the full
+tool arguments and results. Without retention that directory grew by about a
+gigabyte a day (#1035). The daemon removes a request directory only when all of
+these hold:
+
+- **Idle.** No `operations.active` lifecycle marker exists. This is the same
+  predicate the resume gate uses; a marker whose cleanup receipt would verify
+  still counts as active.
+- **Settled.** Every journal row is `completed` with its result, or
+  `not_applied` with operator evidence (or no journal was ever written).
+  A `started` row (an uncertain outcome), any other or future status, and an
+  unreadable, oversized, linked or non-private journal all keep the directory.
+- **Expired.** Nothing in the directory changed for the grace period:
+  `AUGMENTAGENT_HANDOFF_RETENTION_HOURS`, in whole hours, **default 24**.
+  Values above 8760, or below the floor, fall back to the default with a
+  warning. The floor is the longest CLI-gate wait plus one hour, rounded up
+  to whole hours: 3 hours at the default `AUGMENTAGENT_REASONER_TIMEOUT_SECS`
+  (write and agentic calls may queue for twice that timeout before their
+  provider starts, and the request has no lifecycle marker while it queues).
+  A larger timeout raises the floor, and the default with it if needed.
+  Dispatch refreshes the directory timestamp under the lifecycle lock every
+  time it addresses a request, so a turn that keeps retrying keeps its receipts.
+- **Confirmed.** The daemon's previous pass already saw the request settled,
+  expired and unchanged. "Unchanged" compares metadata, not contents: the
+  device, inode, nanosecond modification time and length of the directory and
+  of every entry. A restarted daemon removes nothing during its first
+  interval, which gives turns replayed at startup time to re-address their
+  journals however long the daemon was down.
+
+The sweep runs at daemon start and then hourly, on the blocking pool, and logs
+one `handoff journal sweep` INFO line with `removed` and `kept` counts (split
+into recent, active, unfinished, pending, busy and untrusted). It takes the
+lifecycle and journal locks without waiting and skips a request whose lock is
+held, re-checks the request under both locks before removing it, removes
+entries relative to an opened directory without following links, and refuses a
+root or request directory that is not owner-private or holds unexpected
+entries. Failures are logged and never stop the daemon.
+
+What it never touches, and for how long:
+
+- **Uncertain journals** (a `started` row, or any status it does not recognise)
+  stay until the recovery command above records a decision. The next passes
+  then treat them like any other finished journal.
+- **Journals with an `operations.active` marker are retained indefinitely.**
+  A marker means a provider is running or its descendants' cleanup has not
+  been verified. The recovery command refuses while a marker exists and never
+  clears one, and the sweep never clears one either. The only path that clears
+  a marker today is the resume gate, when the same turn is dispatched again and
+  its cleanup receipt still verifies. The daemon has no SIGTERM handler, so a
+  service stop or restart during a call leaves a marker behind. Most such
+  turns are never dispatched again (calls without a turn id get a fresh
+  request), and the receipt lives in a temporary directory that may be gone.
+  Those journals stay on disk until a marker-clearing mechanism exists,
+  tracked in #1071.
+
+Do not delete handoff state by hand.
+
+An on-demand pass is available. `--dry-run` takes no locks, changes nothing and
+prints the effective grace and where it came from (this shell's environment or
+`.env`, or the default; the daemon reads its own environment, which may differ):
+
+```sh
+augmentagent handoff-prune --dry-run
+augmentagent handoff-prune --yes
+```
+
+A removing pass requires `--yes`. Unlike the daemon, it does not wait for a
+confirming pass, so run it only with the daemon stopped for a reason, and not
+during an outage in which a loop occurrence was interrupted (its replay after
+restart would find no receipts). It refuses while `augmentagent.service` is
+active, or when `systemctl --user is-active` cannot tell, unless `--force` is
+given.
+
+`augmentagent doctor` reports (read-only) the number and size of request
+directories, finished journals past grace, and, for information, uncertain
+journals and lifecycle markers. It warns above 5000 request directories or
+3 GiB, and when any finished journal has been past grace for more than two
+sweep intervals (plus 15 minutes). A live sweep removes such a journal within two
+intervals, so this catches a dead sweep within hours.
+
+Limit: a turn first re-dispatched more than the grace period after it last ran,
+and more than one sweep interval after the daemon started, is treated as a new
+request with an empty journal.
+
+### Completed without summary (#1040)
+
+A write or agentic call can do its work and still end content-level: codex
+or claude returns no final message, or codex's turn fails on its own content
+(for example a context-window overflow). That ending never latches the
+provider and never advances the chain. When the request's journal holds
+completed operations and no uncertain ones, dispatch writes
+`operations.completed-without-summary` next to the journal and returns the
+typed `CompletedWithoutSummary` outcome. Every later dispatch of the same
+request returns that outcome without starting a provider.
+
+A few endings deliberately do not produce a verdict:
+
+- **An uncertain row** (`started`). The request stays on the reconciliation
+  path above, and the error says reconciliation is needed.
+- **A provider-side interruption** (quota, timeout, outage). The turn did not
+  finish, so the next provider resumes from the receipts.
+- **A failure the classifier does not recognise**, such as a provider killed
+  mid-turn. A retry resumes from the receipts.
+
+**Scope.** "The same request" means the same turn identity
+(`ReasonerOpts::session_id`), because that is what addresses the same journal.
+Only callers with a stable per-turn id get this retry protection: channel
+queries through the Discord broker (`WikiQuerier`) and `/loop` runs. Wiki
+ingest, digests and the auto-PR builder get a random id per call, so a retry
+from them is a new request with a new journal and runs in full. Deriving
+stable turn ids for those callers is a follow-up.
+
+**Retention.** The verdict is part of its request directory. The sweep
+treats it as a known entry and removes it with the journal once the request
+has been idle past the grace period. The journal goes first, so an
+interrupted sweep leaves a verdict that still refuses dispatch. Once the
+verdict is gone too, a replay of that turn is a new request and **runs the
+request again in full**, under the same retention policy as any other
+expired journal. Within the grace period, a replay is refused.
+
+The verdict is written atomically (a private temp file renamed into place).
+An empty or damaged verdict reads as absent and is logged. A linked,
+non-private or foreign-owned one blocks dispatch until it is inspected.
+
+
+The recovery change passed all 73 bridge tests, including both provider hook
+paths, real CLI status/decision submission, concurrent lifecycle locking, stale
+and malformed decisions, private-error output, and late-result rejection. The
+Rust handoff regressions passed, and the real two-provider disconnect/reconcile/
+resume fixture passed with one observed effect throughout.
+
+
+### Writable dependency installation
+
+A new real-VM regression reproduced `npm ci` failing with EROFS because existing
+installed dependencies were mounted read-only. Installation commands now use a
+private writable copy; npm and its lifecycle scripts execute inside the guest.
+The subsequent build consumes the installed result read-only. The synthetic
+local-tarball fixture verifies the new package, its install-script output, a
+passing build, untouched host dependencies, invalidation after manifest changes,
+and removal when the bridge closes. The real-VM checks also cover cache cleanup and a concurrent owner manifest edit.
+The latter first reproduced a stale lockfile reaching the checkout before denial;
+the pre-sync manifest check now rejects it without writing that lockfile. The
+full bridge suite passed all 76 tests after these changes.
+
+This closes writable local installation and reuse within one bridge session.
+The public dependency gateway below supplies uncached npm and Cargo packages.
+Final release review and deployed CLI QA have separate receipts below.
+
+
+### Uncached dependency verification
+
+The networkless guest now has a read-only public registry gateway. Canonical
+HTTPS URLs are preserved through a guest-only CA; fixed host origins, GET/HEAD
+restrictions, credential isolation, request/byte limits and the enclosing build
+deadline remain enforced. See [runtime setup](BUILD-VM.md#public-dependency-gateway).
+
+Live VM fixtures fetched a public npm package into an empty environment, compiled
+an uncached Cargo dependency, then rebuilt it offline using the private session
+cache. Extracted crate sources and guest-modified Git checkouts are not retained
+between builds; an offline rebuild rejects a corrupted cached archive. They
+verify canonical lockfiles, unchanged operator caches, source-cache
+exclusion, blocked direct networking/HTTP writes and an inaccessible signing key.
+The local install fixture now compiles and loads a synthetic native Node addon.
+
+A fresh worktree of the real project passed `npm ci --no-audit --no-fund`,
+`npm run build --offline` and all 26 `npm test --offline` tests. The native SQLite
+addon compiled against matching system Node headers in the guest. That worktree
+was removed afterward. Runtime setup now pins a private compiler copy without
+changing the operator's existing Rust installation. These checks establish build
+and dependency contracts; they do not claim service deployment or a merged PR.
+
+
+## Release verification
+
+PR #1021 merged at `92dcaa9` after required CI passed. Independent reviews of
+execution, handoff/reconciliation, writable installations and the public registry
+gateway found no remaining blocking defects after corrections. The final cache
+review confirmed that extracted crate sources are not retained, Git dependencies
+come from the provisioned cache, and explicit offline behavior is preserved.
+
+The optimized CLI and memory server were built from the exact merged source tree.
+The installed CLI and the running daemon executable have the same SHA-256 as the
+tested release candidate; the deployment receipt and previous binaries remain
+private. The daemon restarted successfully and reported zero automatic restarts.
+Existing cooldowns and handoff journals were preserved; automatic updates were
+re-enabled after recording the verified build revision.
+
+Post-deployment CLI QA used an isolated synthetic wiki/database and a private
+Claude cooldown. Real Codex completed Glob/Grep/Read/Write/Edit, memory_recent,
+and the allowlisted local `augmentagent loop list --json` command. Exact edited
+bytes, original document bytes, the delivery marker and provider-attributed tool
+audit all passed. A first candidate probe failed its exact text-byte assertion;
+a second probe with an explicit final-newline requirement passed, as did the
+installed-binary probe. This is an execution receipt, not a guarantee that model
+outputs never need validation.
+
+The current query-handler live test passed with two requests: original attachment
+bytes survived delivery preparation, and the second request skipped the latched
+primary. The controlled auto-ship lifecycle uses real providers, Cargo and Git
+with simulated GitHub operations; it verifies independent review, merge and
+fresh-checkout acceptance. These checks do not send test messages or attachments
+to live external channels or create public test PRs.
+
+Final regression evidence: 2,479 Rust tests passed with no failures across 72
+targets (38 opt-in tests run separately where applicable); 79 bridge, 8 VM,
+5 registry gateway and 5 helper-packaging checks passed. A separate live test
+rejected a corrupted cached crate on an offline rebuild. A clean project install,
+build and all 26 Node tests passed inside the VM. Tracked-file privacy, release-tree
+secret and branch-history secret scans passed. Doctor reports Codex as available
+for every declared capability class; concrete guard/MCP readiness still runs per
+invocation.

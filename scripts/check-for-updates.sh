@@ -8,7 +8,9 @@
 # - We compare HEAD to origin/main. If they match, normally zero cost (just a
 #   fetch) — UNLESS the deployed artifacts were not actually built from HEAD
 #   (see "build stamp" below), in which case we force a rebuild.
-# - We only rebuild Rust when something in crates/ changed, so wiki-only
+# - We only rebuild Rust when something compiled into the binaries changed
+#   (crates/, Cargo files, or a file production code embeds with
+#   include_str!/include_bytes! — see RUST_REBUILD_PATHS), so wiki-only
 #   sessions on the daemon side don't trigger expensive rebuilds.
 # - On build failure we DO NOT restart, so a broken push doesn't take the
 #   daemon down — it keeps running on the old binary until next pull fixes.
@@ -295,7 +297,15 @@ log "update available: $LOCAL -> $REMOTE"
 CHANGED_FILES=$(git diff --name-only "$LOCAL" "$REMOTE")
 NEEDS_REBUILD=0
 NEEDS_DASHBOARD_REBUILD=0
-if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(crates/|Cargo\.(toml|lock)|rust-toolchain\.toml)'; then
+# Rust rebuild: crates/ and Cargo files, plus every file outside crates/ that
+# production code compiles in with include_str!/include_bytes! — agent prompts
+# under schema/, the embedded .env.example key list, and the Codex tool bridge,
+# command sandbox, build VM runner, dependency gateway and provider supervisor.
+# Missing one means the PR merges but the daemon keeps the stale embedded copy.
+# scripts/tests/updater-rebuild-trigger.test.sh fails when a new include target
+# outside crates/ is added without being classified here.
+RUST_REBUILD_PATHS='^(crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|schema/|\.env\.example$|scripts/(codex-tool-bridge|codex-command-sandbox|codex-build-vm|build-dependency-proxy|provider-supervisor)\.py$)'
+if printf '%s\n' "$CHANGED_FILES" | grep -qE "$RUST_REBUILD_PATHS"; then
   NEEDS_REBUILD=1
 fi
 # Dashboard rebuild needed when TS sources, EJS views, or package.json change.

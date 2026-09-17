@@ -942,20 +942,11 @@ impl<'a> SignatureExtractor<'a> {
     /// (the prompt re-states "JSON only"); then a pure-regex fallback so we
     /// still capture high-confidence phones/URLs without the LLM.
     pub async fn extract(&self, block: &str) -> Result<ExtractedFields, SigError> {
-        let opts = ReasonerOpts {
-            system_prompt: SYS_PROMPT.to_string(),
-            model: None,
-            allowed_tools: vec![],
-            add_dirs: vec![],
-            permission_mode: "default".to_string(),
-            cwd: None,
-            env: vec![],
-            settings_json: None,
-            restrict_env: false,
-            audit_logger: None,
-            audit_notifier: None,
-            session_id: None,
-        };
+        // #1046: pin the fast tier. `model: None` inherited the owner's
+        // interactive model (#448); this is a strict-JSON extraction with a
+        // regex fallback, the same contract as the Haiku-pinned ask and memo
+        // extractors, run in bulk by `backfill-signatures`.
+        let opts = ReasonerOpts::pinned(augmentagent_channel_core::ModelTier::Fast, SYS_PROMPT);
 
         for attempt in 0..2 {
             let user = if attempt == 0 {
@@ -1275,6 +1266,41 @@ mod tests {
                 Err(e) => Err(anyhow::anyhow!(e)),
             }
         }
+    }
+
+    /// #1046 receipt path: `extract` through the REAL `ClaudeCliReasoner`,
+    /// with `CLAUDE_CLI` pointed at an argv-recording stub, passes `--model`
+    /// with the fast-tier model instead of inheriting the owner's interactive
+    /// model (#448). The stub runs no model, so extraction quality is not
+    /// exercised; the canned JSON only proves the answer parsed.
+    #[tokio::test]
+    async fn extract_spawn_pins_the_fast_model() {
+        use crate::argv_stub::{flag, summarize, ArgvStub};
+        use augmentagent_channel_core::providers::{model_for, ModelTier, ProviderKind};
+        let stub = ArgvStub::new(
+            r#"{"title":"Test Engineer","company":"Example Organization","phones":[],"confidence":{"title":0.9,"company":0.9}}"#,
+        );
+        let reasoner = stub.reasoner();
+        let fields = SignatureExtractor::new(&reasoner)
+            .extract("Fixture Author\nTest Engineer\nExample Organization")
+            .await
+            .unwrap();
+        assert_eq!(fields.company.as_deref(), Some("Example Organization"));
+
+        let calls = stub.calls();
+        println!("[#1046] CLAUDE_CLI={}", stub.bin.display());
+        assert_eq!(calls.len(), 1, "one spawn for a parseable answer");
+        let model = flag(&calls[0], "--model");
+        println!(
+            "[#1046] spawn 0: signature extraction (sigextract::extract): --model {}",
+            model.unwrap_or("<ABSENT>")
+        );
+        println!("[#1046]   argv: {}", summarize(&calls[0]));
+        assert_eq!(flag(&calls[0], "--system-prompt"), Some(SYS_PROMPT));
+        assert_eq!(
+            model,
+            Some(model_for(ProviderKind::Claude, ModelTier::Fast).as_str())
+        );
     }
 
     #[tokio::test]

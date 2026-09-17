@@ -269,6 +269,10 @@ pub enum ReasonerError {
     /// not the provider. Never latched; the chain may still try the next.
     #[error("{provider} waited {waited_secs}s for a CLI gate permit")]
     GateTimeout { provider: String, waited_secs: u64 },
+    /// A previous tool process may still be active. Retrying another provider
+    /// could race that process, so this error must stop the fallback chain.
+    #[error("{provider} process cleanup is unverified; recovery requires reconciliation")]
+    CleanupUncertain { provider: String },
 }
 
 impl From<crate::cli_gate::GateWaitTimeout> for ReasonerError {
@@ -323,11 +327,20 @@ pub(crate) fn caller_tag(opts: &ReasonerOpts) -> String {
 /// than a triage/draft call — give them 2× the base budget so the watchdog
 /// catches hangs, not honest work.
 pub(crate) fn reasoner_timeout_for(opts: &ReasonerOpts) -> std::time::Duration {
-    use crate::providers::{classify, CapabilityClass};
+    reasoner_timeout_for_class(crate::providers::classify(opts))
+}
+
+/// The watchdog budget for one capability class. [`reasoner_timeout_for`]
+/// classifies a call and asks this; code that needs a bound across every class
+/// (the handoff retention floor, #1035) asks it directly instead of building
+/// throwaway `ReasonerOpts`, which the capability inventory would count as a
+/// production call site.
+pub(crate) fn reasoner_timeout_for_class(class: crate::providers::CapabilityClass) -> std::time::Duration {
+    use crate::providers::CapabilityClass;
     let base = reasoner_timeout();
-    match classify(opts) {
+    match class {
         CapabilityClass::FullAgentic | CapabilityClass::WriteTools => base * 2,
-        _ => base,
+        CapabilityClass::TextOnly | CapabilityClass::ReadTools => base,
     }
 }
 
@@ -407,6 +420,7 @@ pub fn parse_reset_hint(message: &str) -> Option<chrono::DateTime<chrono::Utc>> 
 /// exits, empty output — is `Unavailable`, the "provider might be down"
 /// bucket. The original error stays in the chain for diagnostics.
 pub(crate) fn classify_other(provider: &str, e: anyhow::Error) -> anyhow::Error {
+    if ReasonerError::find_in(&e).is_some() { return e; }
     let not_found = e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
@@ -503,8 +517,50 @@ pub struct ReasonerOpts {
     /// Logical session id stamped on every audit record produced by
     /// this call (#132 / #201). Typically `format!("{channel}:{msg}")`
     /// so a reviewer can correlate audit rows with a single Discord
-    /// turn. `None` falls back to `"-"` in the recorded row.
+    /// turn. Also identifies durable handoff state: use a globally namespaced
+    /// per-turn id, never a whole-chat id. Replays of that turn must reuse it.
+    /// `None` falls back to `"-"` in the recorded row and a fresh journal.
     pub session_id: Option<String>,
+    /// Owner-private operation journal for a single logical request. The
+    /// dispatcher owns its identity/lifetime; adapters must never expose this
+    /// path as a model-readable file or integration environment variable.
+    pub handoff_path: Option<PathBuf>,
+}
+
+impl ReasonerOpts {
+    /// #1046: text-only opts with the model pinned by tier.
+    ///
+    /// Call sites outside the `*_opts` presets used to build this struct by
+    /// hand with `model: None`. That emits no `--model` flag, so the spawned
+    /// CLI inherits the owner's interactive `~/.claude/settings.json` model
+    /// and quota (#448). Here the tier is a required argument, and the model
+    /// comes from the same per-provider tier map the fallback chain uses
+    /// ([`crate::providers::model_for`]). Quality follows the Opus presets'
+    /// knob, `AUGMENTAGENT_OPUS_MODEL` (then `AUGMENTAGENT_MODEL_CLAUDE_QUALITY`);
+    /// fast follows `AUGMENTAGENT_MODEL_CLAUDE_FAST`.
+    ///
+    /// No tools, no extra dirs, default permission mode. A call that needs
+    /// more should widen those fields explicitly. The model stays pinned.
+    pub fn pinned(tier: crate::providers::ModelTier, system_prompt: impl Into<String>) -> Self {
+        Self {
+            system_prompt: system_prompt.into(),
+            model: Some(crate::providers::model_for(
+                crate::providers::ProviderKind::Claude,
+                tier,
+            )),
+            allowed_tools: Vec::new(),
+            add_dirs: Vec::new(),
+            permission_mode: "default".into(),
+            cwd: None,
+            env: Vec::new(),
+            settings_json: None,
+            restrict_env: false,
+            audit_logger: None,
+            audit_notifier: None,
+            session_id: None,
+            handoff_path: None,
+        }
+    }
 }
 
 /// Trait the channel uses to reach Claude. Test doubles stub this.
@@ -660,9 +716,10 @@ impl ClaudeCliReasoner {
                 ReasonerError::GateTimeout { provider: "claude".into(), waited_secs },
             )),
             // Untyped on purpose — content-level, neither latches nor fails
-            // over (#655 review).
+            // over (#655 review). A Content TurnFailure (#1040), so the chain
+            // can tell a finished-but-silent turn from any other untyped error.
             Err(CallError::EmptyOutput) => {
-                Err(anyhow::anyhow!("claude produced no assistant text"))
+                Err(crate::turn_failure::TurnFailure::empty_output("claude").into())
             }
             Err(CallError::ConfigCorrupted { stderr }) => {
                 let recovered = match restore_latest_claude_backup() {
@@ -696,7 +753,7 @@ impl ClaudeCliReasoner {
                             return Err(ReasonerError::GateTimeout { provider, waited_secs }.into());
                         }
                         Err(CallError::EmptyOutput) => {
-                            return Err(anyhow::anyhow!("claude produced no assistant text"));
+                            return Err(crate::turn_failure::TurnFailure::empty_output("claude").into());
                         }
                         Err(CallError::Other(e)) => return Err(classify_other("claude", e)),
                     }
@@ -710,8 +767,8 @@ impl ClaudeCliReasoner {
     }
 
     /// [`call_once`] under the #656 watchdog. On expiry the in-flight future
-    /// is dropped, which kills the child via `kill_on_drop(true)` — no
-    /// orphaned `claude` processes, no forever-stuck pipeline.
+    /// is dropped, which stops the supervisor and waits for descendant cleanup.
+    /// Missing confirmation blocks failover instead of racing another provider.
     async fn call_once_timed(
         &self,
         opts: &ReasonerOpts,
@@ -728,7 +785,12 @@ impl ClaudeCliReasoner {
         let acquire = self.gate.acquire_timed("claude", &caller, dur);
         let _permit =
             acquire.await.map_err(|e| CallError::GateTimeout { waited_secs: e.waited_secs })?;
-        match tokio::time::timeout(dur, self.call_once(opts, user_message, capture)).await {
+        let clean = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let outcome = tokio::time::timeout(dur, self.call_once(opts, user_message, capture, clean.clone())).await;
+        if !clean.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(CallError::Other(ReasonerError::CleanupUncertain { provider: "claude".into() }.into()));
+        }
+        match outcome {
             Ok(r) => r,
             Err(_) => {
                 warn!(
@@ -786,7 +848,7 @@ enum CallError {
     /// retried. Distinct so callers can back off until the reset instead.
     RateLimited { message: String },
     /// #656 — the watchdog expired before the CLI finished. The child is
-    /// killed via `kill_on_drop`; distinct so the outer wrapper can surface
+    /// cleaned up by its supervisor; distinct so the outer wrapper can surface
     /// a typed, failover-eligible [`ReasonerError::Timeout`].
     Timeout { secs: u64 },
     /// #954 — the #898 gate never handed out a permit, so no child ever ran:
@@ -875,6 +937,7 @@ impl ClaudeCliReasoner {
         opts: &ReasonerOpts,
         user_message: &str,
         capture: TextCapture,
+        clean: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<String, CallError> {
         let mut args: Vec<String> = vec![
             "-p".into(),
@@ -920,7 +983,10 @@ impl ClaudeCliReasoner {
         // agent's tool surface stays exactly what we declare and never
         // picks up the host's global MCP config), and the remaining
         // settings (hooks, etc.) go to `--settings`.
-        if let Some(settings) = &opts.settings_json {
+        let handoff_hooks = crate::handoff::ClaudeHooks::prepare(opts)?;
+        let effective_settings = handoff_hooks.as_ref().map(|launch| &launch.settings_json)
+            .or(opts.settings_json.as_ref());
+        if let Some(settings) = effective_settings {
             let (settings_only, mcp_config) = split_mcp_from_settings(settings);
             if let Some(mcp_json) = mcp_config {
                 args.push("--mcp-config".into());
@@ -937,11 +1003,7 @@ impl ClaudeCliReasoner {
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // #656 — the watchdog in `call_once_timed` cancels this future on
-            // expiry; killing the child on drop is what makes that cancel
-            // real instead of leaking an orphaned CLI still burning quota.
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
         // Scope Write/Edit by setting the spawned CLI's cwd when requested.
         if let Some(cwd) = &opts.cwd {
             cmd.current_dir(cwd);
@@ -979,7 +1041,10 @@ impl ClaudeCliReasoner {
                 cmd.env_remove(key);
             }
         }
-        let mut child = cmd.spawn()?;
+        let (mut child, process_group) = crate::process_tree::spawn_supervised(&cmd, opts.restrict_env, clean, opts.handoff_path.as_deref())
+            .map_err(|error| if error.kind() == std::io::ErrorKind::WouldBlock {
+                CallError::Other(ReasonerError::CleanupUncertain { provider: "claude".into() }.into())
+            } else { CallError::from(error) })?;
 
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(user_message.as_bytes()).await?;
@@ -1076,6 +1141,7 @@ impl ClaudeCliReasoner {
         }
 
         let status = child.wait().await?;
+        drop(process_group);
         if !status.success() {
             let mut stderr_buf = String::new();
             if let Some(mut err) = child.stderr.take() {
@@ -1369,13 +1435,19 @@ fn triage_model() -> String {
 /// background draft, digest and answer onto their Max subscription. Saying
 /// "Opus" out loud makes the intent real and the daemon immune to `/model`.
 ///
-/// Overridable via `AUGMENTAGENT_OPUS_MODEL` for a no-rebuild tier change.
+/// Overridable via `AUGMENTAGENT_OPUS_MODEL` for a no-rebuild tier change
+/// (or `AUGMENTAGENT_MODEL_CLAUDE_QUALITY`, which it outranks). #1046: this
+/// is the Claude quality cell of the provider tier map, so the presets and
+/// `ReasonerOpts::pinned(ModelTier::Quality, ..)` always agree.
 fn opus_model() -> String {
-    std::env::var("AUGMENTAGENT_OPUS_MODEL").unwrap_or_else(|_| OPUS_MODEL.to_string())
+    crate::providers::model_for(
+        crate::providers::ProviderKind::Claude,
+        crate::providers::ModelTier::Quality,
+    )
 }
 
 /// Default tier for the quality-critical presets. See [`opus_model`].
-const OPUS_MODEL: &str = "claude-opus-4-8";
+pub(crate) const OPUS_MODEL: &str = "claude-opus-4-8";
 
 /// Default triage tier. Opus is a deliberate quality call (see `triage_opts`) —
 /// what #448 removes is the *inherited* `opus[1m]` / `xhigh` variant, not Opus.
@@ -1417,6 +1489,7 @@ pub fn triage_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1440,10 +1513,19 @@ pub fn draft_opts(system_prompt: String, wiki_root: Option<PathBuf>) -> Reasoner
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
 pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
+    // The shared maintenance schema draws a conceptual `wiki/` tree. During
+    // lint the tool workspace is already that tree, not its parent directory.
+    let system_prompt = format!("{system_prompt}\n\nCurrent invocation: read-only wiki lint. \
+        The configured wiki root is `{}`. The schema's `wiki/` denotes that root, \
+        not an additional subdirectory. Resolve index.md and page links against \
+        this root; use its absolute paths with Read, Grep and Glob. Report findings \
+        without changing files. Write and Edit are not available in this invocation.",
+        wiki_root.display());
     ReasonerOpts {
         system_prompt,
         model: Some(opus_model()), // Opus — lint is reasoning-heavy, low volume
@@ -1457,6 +1539,7 @@ pub fn lint_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1621,6 +1704,10 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             repo_root.to_string_lossy().into_owned(),
         ),
     ];
+    // Honor the operator's private document-source configuration location.
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        env.push(("XDG_CONFIG_HOME".into(), config_home.to_string_lossy().into_owned()));
+    }
     // #915/#922 — the scope guard allows the READ tools under the transcript
     // clone, but only if it can see the same variable the daemon used to
     // open the dir (`add_dirs` below); `restrict_env` means nothing is
@@ -1778,6 +1865,12 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
             // hits "This command requires approval" on perfectly
             // legitimate issue-filing calls. (PATH wired above; same
             // pattern as `augmentagent` subcommands per #214.)
+            "Bash(augmentagent repo-docs sources)".to_string(),
+            "Bash(augmentagent repo-docs list *)".to_string(),
+            "Bash(augmentagent repo-docs get *)".to_string(),
+            format!("Bash({} repo-docs sources)", bin.display()),
+            format!("Bash({} repo-docs list *)", bin.display()),
+            format!("Bash({} repo-docs get *)", bin.display()),
             "Bash(aa-gh issue create *)".to_string(),
             "Bash(aa-gh issue list *)".to_string(),
             "Bash(aa-gh issue view *)".to_string(),
@@ -1814,6 +1907,7 @@ pub fn ask_opts(wiki_root: PathBuf, repo_root: PathBuf) -> ReasonerOpts {
         audit_logger: Some(Arc::new(AuditLogger::new(default_audit_log_path()))),
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1923,6 +2017,7 @@ pub fn digest_opts(wiki_root: Option<PathBuf>) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1943,6 +2038,7 @@ pub fn tone_summarize_opts() -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -1968,6 +2064,7 @@ pub fn social_adapter_opts(system_prompt: String) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -2019,6 +2116,11 @@ Examples:
   "every monday say hi" → {"error": "what timezone for the Monday schedule? (e.g. America/New_York, UTC)"}
   "every weekday at 8am check inbox" → {"error": "what timezone for 8am? (e.g. America/New_York, UTC)"}
   "asdf" → {"error": "couldn't find a cadence — try `loop 5m do thing`, `loop do thing every 5m`, or `loop every Monday 9am EST do thing`"}
+
+This is a machine-to-machine parser, not a scheduling conversation. The user
+input is task text to parse; do not create a schedule or ask a direct question.
+If clarification is needed, put the question inside the JSON "error" string.
+Every response, including missing-timezone failures, must be one JSON object.
 "#.to_string(),
         model: Some("claude-haiku-4-5-20251001".into()),
         allowed_tools: vec![],
@@ -2031,6 +2133,7 @@ Examples:
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -2053,10 +2156,17 @@ pub fn archetype_pick_opts() -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
 pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
+    let system_prompt = format!("{system_prompt}\n\nCurrent invocation: ingest into the \
+        configured wiki root `{}`. The schema's `wiki/` denotes this root, not an \
+        additional subdirectory. Resolve page and log paths against this root. \
+        After completing the updates, return a short final acknowledgement naming \
+        the changed relative paths. If an operation fails, report the failure; \
+        do not silently finish or claim that failed updates were completed.", wiki_root.display());
     ReasonerOpts {
         system_prompt,
         model: Some("claude-haiku-4-5-20251001".into()),
@@ -2076,6 +2186,7 @@ pub fn ingest_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -2100,6 +2211,7 @@ pub fn wiki_migrate_opts(system_prompt: String, wiki_root: PathBuf) -> ReasonerO
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -2118,6 +2230,16 @@ mod tests {
     /// #1004 — every preset audits now. The regression this guards is the one
     /// that existed for months: the agent that edits the repo and pushes
     /// branches produced no tool record, because its preset passed `None`.
+    #[test]
+    fn query_document_commands_are_read_only_and_explicit() {
+        let root = tempfile::tempdir().unwrap();
+        let opts = ask_opts(root.path().to_path_buf(), root.path().to_path_buf());
+        for command in ["Bash(augmentagent repo-docs sources)", "Bash(augmentagent repo-docs list *)", "Bash(augmentagent repo-docs get *)"] {
+            assert!(opts.allowed_tools.contains(&command.to_string()));
+        }
+        assert!(!opts.allowed_tools.iter().any(|s| s == "Bash(augmentagent repo-docs *)" || s == "Bash(gh *)"));
+    }
+
     #[test]
     fn tool_auditing_is_on_by_default_and_explicitly_disableable() {
         let _g = audit_env_guard();
@@ -2299,6 +2421,7 @@ mod tests {
             audit_logger: None,
             audit_notifier: None,
             session_id: None,
+            handoff_path: None,
         }
     }
 
@@ -3254,6 +3377,7 @@ pub fn resume_opts(wiki_root: PathBuf) -> ReasonerOpts {
         audit_logger: None,
         audit_notifier: None,
         session_id: None,
+        handoff_path: None,
     }
 }
 
@@ -3364,7 +3488,10 @@ mod model_pin_tests {
     /// their own coding.
     ///
     /// Every preset the daemon runs unattended must name its model out loud.
-    /// If you add a preset, pin it — do not let `None` back in.
+    /// If you add a preset, pin it — do not let `None` back in. Call sites
+    /// outside these presets are covered by the source scan in
+    /// `capability_inventory::every_production_callsite_pins_its_documented_model_tier`
+    /// (#1046).
     #[test]
     fn no_daemon_preset_inherits_the_owners_interactive_model() {
         let wiki = PathBuf::from("/tmp/wiki");
@@ -3382,6 +3509,8 @@ mod model_pin_tests {
             ("archetype_pick", archetype_pick_opts()),
             ("ingest", ingest_opts("sys".into(), wiki.clone())),
             ("wiki_migrate", wiki_migrate_opts("sys".into(), wiki.clone())),
+            ("pinned(Quality)", ReasonerOpts::pinned(crate::providers::ModelTier::Quality, "sys")),
+            ("pinned(Fast)", ReasonerOpts::pinned(crate::providers::ModelTier::Fast, "sys")),
         ];
         for (name, opts) in presets {
             let model = opts.model.as_deref().unwrap_or("");
@@ -3400,6 +3529,21 @@ mod model_pin_tests {
         }
     }
 
+    /// #1046: the tier constructor resolves through the provider tier map and
+    /// stays text-only, so it cannot widen a call site's tool surface.
+    #[test]
+    fn pinned_constructor_uses_the_claude_tier_map() {
+        use crate::providers::{classify, model_for, CapabilityClass, ModelTier, ProviderKind};
+        for tier in [ModelTier::Quality, ModelTier::Fast] {
+            let opts = ReasonerOpts::pinned(tier, "sys");
+            assert_eq!(opts.model, Some(model_for(ProviderKind::Claude, tier)));
+            assert_eq!(opts.system_prompt, "sys");
+            assert_eq!(opts.permission_mode, "default");
+            assert_eq!(classify(&opts), CapabilityClass::TextOnly);
+            assert!(opts.add_dirs.is_empty() && opts.cwd.is_none() && opts.env.is_empty());
+        }
+    }
+
     /// The env overrides exist so a tier change needs no rebuild.
     #[test]
     fn env_overrides_take_precedence() {
@@ -3407,6 +3551,95 @@ mod model_pin_tests {
         assert_eq!(TRIAGE_MODEL, "claude-opus-4-8");
         assert_eq!(OPUS_MODEL, "claude-opus-4-8");
         assert!(!TRIAGE_MODEL.contains("[1m]"));
+    }
+
+    /// #1046 review: one env var moves every quality-tier Claude call. The
+    /// Opus presets read `AUGMENTAGENT_OPUS_MODEL`; `ReasonerOpts::pinned`
+    /// resolves through `providers::model_for`. If the two resolved
+    /// differently, a classic `draft_opts` fallback and the code-mode draft
+    /// it replaces would run different models. Env is process-global, so
+    /// each scenario runs this test again in a child process.
+    #[test]
+    fn one_env_knob_moves_every_quality_tier_call() {
+        use crate::providers::{model_for, ModelTier, ProviderKind};
+        const CHILD: &str = "AUGMENTAGENT_TEST_1046_QUALITY_KNOB";
+        const OPUS: &str = "AUGMENTAGENT_OPUS_MODEL";
+        const CELL: &str = "AUGMENTAGENT_MODEL_CLAUDE_QUALITY";
+        let Ok(expected) = std::env::var(CHILD) else {
+            // (AUGMENTAGENT_OPUS_MODEL, AUGMENTAGENT_MODEL_CLAUDE_QUALITY, model every call must run)
+            for (opus, cell, want) in [
+                (Some("fixture-opus-knob"), None, "fixture-opus-knob"),
+                (None, Some("fixture-cell-knob"), "fixture-cell-knob"),
+                (
+                    Some("fixture-opus-knob"),
+                    Some("fixture-cell-knob"),
+                    "fixture-opus-knob",
+                ),
+                (None, None, OPUS_MODEL),
+            ] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "reasoner::model_pin_tests::one_env_knob_moves_every_quality_tier_call",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, want)
+                    .env_remove(OPUS)
+                    .env_remove(CELL);
+                if let Some(value) = opus {
+                    child.env(OPUS, value);
+                }
+                if let Some(value) = cell {
+                    child.env(CELL, value);
+                }
+                let output = child.output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains("1 passed"),
+                    "{OPUS}={opus:?} {CELL}={cell:?}:\n{stdout}{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let wiki = PathBuf::from("/nonexistent/wiki-1046");
+        let quality = [
+            ("draft_opts", draft_opts("sys".into(), None).model),
+            ("lint_opts", lint_opts("sys".into(), wiki.clone()).model),
+            (
+                "ask_opts",
+                ask_opts(wiki.clone(), PathBuf::from("/nonexistent/repo-1046")).model,
+            ),
+            ("digest_opts", digest_opts(None).model),
+            (
+                "social_adapter_opts",
+                social_adapter_opts("sys".into()).model,
+            ),
+            ("resume_opts", resume_opts(wiki).model),
+            (
+                "ReasonerOpts::pinned(Quality)",
+                ReasonerOpts::pinned(ModelTier::Quality, "sys").model,
+            ),
+            (
+                "model_for(Claude, Quality)",
+                Some(model_for(ProviderKind::Claude, ModelTier::Quality)),
+            ),
+        ];
+        for (name, model) in quality {
+            assert_eq!(
+                model.as_deref(),
+                Some(expected.as_str()),
+                "{name} did not follow the quality knob"
+            );
+        }
+        // The quality knob must not leak into the fast tier.
+        let fast = ReasonerOpts::pinned(ModelTier::Fast, "sys").model.unwrap();
+        assert_eq!(fast, model_for(ProviderKind::Claude, ModelTier::Fast));
+        assert!(
+            !fast.contains("fixture-"),
+            "quality knob leaked into the fast tier: {fast}"
+        );
     }
 }
 
@@ -3557,6 +3790,7 @@ mod failover_error_tests {
             audit_logger: None,
             audit_notifier: None,
             session_id: None,
+            handoff_path: None,
         }
     }
 
@@ -3676,6 +3910,22 @@ sleep 0.15
         assert!(max >= 2, "gate should still allow concurrency, saw {max}");
         assert_eq!(gate.in_flight(), 0);
         assert_eq!(gate.waiting(), 0);
+    }
+
+    /// #1069 review M3 — claude's empty output is the same content-level
+    /// ending as codex's: a `TurnFailure` of class Content, still untyped for
+    /// the chain, so the fallback layer can tell it apart from any other
+    /// untyped error before recording a completed-without-summary verdict.
+    #[tokio::test]
+    async fn empty_output_is_a_content_turn_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub_cli(&dir, "fake-claude-empty", "cat >/dev/null\n");
+        let reasoner = ClaudeCliReasoner { bin, gate: Arc::new(CliGate::new(1)) };
+        let err = reasoner.call(&dummy_opts(), "x").await.unwrap_err();
+        assert!(ReasonerError::find_in(&err).is_none(), "{err:#}");
+        assert_eq!(err.to_string(), "claude produced no assistant text");
+        assert_eq!(err.downcast_ref::<crate::turn_failure::TurnFailure>().map(|f| f.class),
+            Some(crate::turn_failure::FailureClass::Content));
     }
 
     /// A permit must go back on every exit path: non-zero exit, and the

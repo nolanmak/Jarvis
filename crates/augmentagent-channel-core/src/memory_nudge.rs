@@ -254,19 +254,16 @@ impl CycleLogger {
     }
 }
 
-/// Resolve the default cycles root: `$XDG_STATE_HOME/augmentagent/` if set,
-/// else `$HOME/.local/state/augmentagent/`, matching the existing daemon
+/// Resolve the default cycles root: the shared [`state_dir`](crate::state_dir)
+/// (`$XDG_STATE_HOME/augmentagent/` if set, else
+/// `$HOME/.local/state/augmentagent/`), matching the existing daemon
 /// state-dir layout (see systemd unit's `StateDirectory=`).
 ///
 /// Returns just the parent dir; the [`CycleLogger`] will create `cycles/`
 /// underneath. The path is not guaranteed to exist — callers should pass
 /// it to [`CycleLogger::new`] which creates the subtree on first write.
 pub fn default_cycles_root() -> PathBuf {
-    if let Ok(state) = std::env::var("XDG_STATE_HOME") {
-        return PathBuf::from(state).join("augmentagent");
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".local/state/augmentagent")
+    crate::state_dir::state_dir_or(".")
 }
 
 #[cfg(test)]
@@ -409,18 +406,25 @@ mod tests {
         assert!(format!("{err}").contains("headline must not be empty"));
     }
 
+    /// The XDG rule itself, through the pure resolver: mutating the real
+    /// XDG_STATE_HOME here would race every parallel test that resolves a
+    /// state path (#1048). The env-driven path is pinned in a child process
+    /// by `state_dir::tests::every_state_path_and_write_follows_the_state_home_override`.
     #[test]
     fn default_cycles_root_honors_xdg() {
-        let prev = std::env::var("XDG_STATE_HOME").ok();
-        std::env::set_var("XDG_STATE_HOME", "/tmp/state-test");
+        use crate::state_dir::resolve;
+        let home = || Some(std::ffi::OsString::from("/synthetic/home"));
         assert_eq!(
-            default_cycles_root(),
-            PathBuf::from("/tmp/state-test/augmentagent")
+            resolve(Some("/tmp/state-test".into()), home()),
+            Some(PathBuf::from("/tmp/state-test/augmentagent"))
         );
-        match prev {
-            Some(v) => std::env::set_var("XDG_STATE_HOME", v),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
+        assert_ne!(resolve(None, home()), resolve(Some("/tmp/state-test".into()), home()));
+        assert_eq!(resolve(Some("".into()), home()), resolve(None, home()), "empty is unset");
+        assert_eq!(
+            resolve(Some("relative".into()), home()),
+            resolve(None, home()),
+            "a relative XDG_STATE_HOME is ignored"
+        );
     }
 
     #[test]

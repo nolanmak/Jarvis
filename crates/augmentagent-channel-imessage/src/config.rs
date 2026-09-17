@@ -40,3 +40,35 @@ impl ImessageConfig {
         })
     }
 }
+
+/// Opt-in: send each new batch of history messages through the LLM wiki
+/// ingest. Off by default — every changed conversation per poll is one
+/// Haiku call on the owner's subscription, and the rows are already
+/// searchable without it.
+pub const ENV_HISTORY_WIKI_CAPTURE: &str = "AUGMENTAGENT_HISTORY_WIKI_CAPTURE";
+
+pub fn history_wiki_capture_enabled() -> bool {
+    parse_flag(std::env::var(ENV_HISTORY_WIKI_CAPTURE).ok().as_deref())
+}
+
+fn parse_flag(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wiki_capture_is_off_unless_explicitly_enabled() {
+        assert!(!parse_flag(None));
+        assert!(!parse_flag(Some("")));
+        assert!(!parse_flag(Some("0")));
+        assert!(!parse_flag(Some("false")));
+        assert!(parse_flag(Some("1")));
+        assert!(parse_flag(Some(" TRUE ")));
+    }
+}

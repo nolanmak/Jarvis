@@ -12,6 +12,8 @@ pub mod scheduled;
 pub mod sigextract;
 pub mod tone;
 mod channel;
+#[cfg(test)]
+mod argv_stub;
 
 pub use channel::{
     DispatchOutcome, GmailChannel, GmailChannelConfig, GmailWorkHandler, PollOutcome,

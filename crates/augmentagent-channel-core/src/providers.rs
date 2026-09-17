@@ -15,16 +15,14 @@
 //! | class        | claude | codex | gemini | cerebras |
 //! |--------------|--------|-------|--------|----------|
 //! | text-only    |   ✓    |   ✓   |   ✓    |    ✓     |
-//! | read-tools   |   ✓    |  ✗(²) |   ✓    |    ✗ (¹) |
-//! | write-tools  |   ✓    |   ✗   |   ✗    |    ✗ (²) |
-//! | full-agentic |   ✓    |   ✗   |   ✗    |    ✗ (²) |
+//! | read-tools   |   ✓    |   ✓   |   ✓    |    ✗     |
+//! | write-tools  |   ✓    |   ✓   |   ✗    |    ✗     |
+//! | full-agentic |   ✓    |   ✓   |   ✗    |    ✗     |
 //!
-//! (¹) Cerebras read-tools is gated on the offline triage eval (#665).
-//! (²) Gated on the security-parity probes (#664): codex's sandbox does not
-//!     path-scope READS (whole-disk read + always-on shell — see
-//!     [`allowed_for`]), and the guard hooks that enforce wiki path scoping
-//!     are Claude-specific today with documented fail-open traps on both
-//!     codex and gemini.
+//! Codex executes declared tools through the scoped Jarvis bridge, with native
+//! shell disabled. Eligibility is distinct from runtime readiness: unavailable
+//! guards, MCP servers or build isolation fail closed inside the adapter.
+//! Cerebras remains text-only; Gemini retains its existing read-only profile.
 
 use crate::reasoner::ReasonerOpts;
 
@@ -131,15 +129,9 @@ pub fn classify(opts: &ReasonerOpts) -> CapabilityClass {
 
 /// May `kind` serve a call of `class`? See the module-level policy table.
 ///
-/// Codex is TEXT-ONLY for now (#655 review / #664): its read-only sandbox
-/// confines writes and network but NOT reads — the model's shell can read
-/// any file on disk (`.env`, `~/.claude/.credentials.json`, `~/.ssh`), and
-/// read-tools presets feed it untrusted email content. Until the #664
-/// managed PreToolUse deny-hook ships and the escape probes pass, only
-/// no-tool text transforms may route there (their outputs are human-gated
-/// drafts / narrow parsed fields). Gemini KEEPS read-tools: its file tools
-/// are workspace-confined to the pinned cwd and our per-spawn settings strip
-/// the shell tool entirely (`tools.core` allowlist).
+/// Codex uses the constrained bridge for tools and original approval hooks.
+/// Runtime readiness failures do not broaden the permission profile. Gemini
+/// read tools remain confined by its pinned workspace and native tool allowlist.
 pub fn allowed_for(kind: ProviderKind, class: CapabilityClass) -> bool {
     match kind {
         ProviderKind::Claude => true,
@@ -147,23 +139,13 @@ pub fn allowed_for(kind: ProviderKind, class: CapabilityClass) -> bool {
             class,
             CapabilityClass::TextOnly | CapabilityClass::ReadTools
         ),
-        // #840 — codex stays TEXT-ONLY. #828 briefly widened this to
-        // ReadTools on the reasoning that the class "structurally excludes
-        // the shell". That was Claude-shaped: `Read`/`Grep`/`Glob` are Claude
-        // Code tool names, `allowed_tools` is never passed to the codex
-        // adapter, and codex's only tool IS a shell. The classifier said
-        // "no shell" about a provider that has nothing else.
-        //
-        // It also bought nothing: codex cannot execute any command on this
-        // host, because its `-s read-only` sandbox is bubblewrap and AppArmor
-        // blocks unprivileged user namespaces. The independent reviewer now
-        // receives its context as pre-computed text instead (#840), which
-        // needs no widening at all.
-        ProviderKind::Codex | ProviderKind::Cerebras => {
-            matches!(class, CapabilityClass::TextOnly)
-        }
+        ProviderKind::Codex => true,
+        ProviderKind::Cerebras => matches!(class, CapabilityClass::TextOnly),
     }
 }
+
+/// The env var the Opus presets have always read. See [`model_for`].
+pub const OPUS_MODEL_ENV: &str = "AUGMENTAGENT_OPUS_MODEL";
 
 /// Default tier→model map per provider. Every cell is overridable without a
 /// rebuild via `AUGMENTAGENT_MODEL_<PROVIDER>_<TIER>` (e.g.
@@ -171,6 +153,13 @@ pub fn allowed_for(kind: ProviderKind, class: CapabilityClass) -> bool {
 /// out" requirement. Defaults chosen 2026-08-19; the doctor check (#667)
 /// flags pinned ids that stop existing (Cerebras deprecated five model
 /// families in twelve months).
+///
+/// #1046: the Claude quality cell is the one knob for every Opus-class Claude
+/// call. [`OPUS_MODEL_ENV`], which the Opus presets have always read, wins;
+/// then `AUGMENTAGENT_MODEL_CLAUDE_QUALITY`; then the default. The presets
+/// (`draft_opts`, `lint_opts`, …), `ReasonerOpts::pinned(Quality, ..)` and the
+/// reasoner selftest all resolve here, so a classic draft and the code-mode
+/// draft it falls back from can never run different models.
 pub fn model_for(kind: ProviderKind, tier: ModelTier) -> String {
     let tier_name = match tier {
         ModelTier::Quality => "QUALITY",
@@ -181,17 +170,24 @@ pub fn model_for(kind: ProviderKind, tier: ModelTier) -> String {
         kind.name().to_ascii_uppercase(),
         tier_name
     );
-    if let Ok(v) = std::env::var(&env_key) {
-        let v = v.trim().to_string();
-        if !v.is_empty() {
-            return v;
+    let mut keys = Vec::with_capacity(2);
+    if kind == ProviderKind::Claude && tier == ModelTier::Quality {
+        keys.push(OPUS_MODEL_ENV);
+    }
+    keys.push(env_key.as_str());
+    for key in keys {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return v;
+            }
         }
     }
     match (kind, tier) {
-        // Claude cells are unused in practice (presets pin their own model,
-        // which the Claude adapter passes through) but kept total so the
-        // map has no panicking holes.
-        (ProviderKind::Claude, ModelTier::Quality) => "claude-opus-4-8".into(),
+        // Every quality-tier Claude call resolves through this cell (see
+        // above). The fast cell serves `ReasonerOpts::pinned(Fast, ..)`; the
+        // Haiku presets still pin their own id.
+        (ProviderKind::Claude, ModelTier::Quality) => crate::reasoner::OPUS_MODEL.into(),
         (ProviderKind::Claude, ModelTier::Fast) => "claude-haiku-4-5-20251001".into(),
         (ProviderKind::Codex, ModelTier::Quality) => "gpt-5.6-terra".into(),
         (ProviderKind::Codex, ModelTier::Fast) => "gpt-5.6-luna".into(),
@@ -278,6 +274,7 @@ mod tests {
             audit_logger: None,
             audit_notifier: None,
             session_id: None,
+            handoff_path: None,
         }
     }
 
@@ -318,14 +315,10 @@ mod tests {
         assert_eq!(tier_of(&opts(vec![], None)), ModelTier::Quality);
 
         assert!(allowed_for(ProviderKind::Claude, CapabilityClass::FullAgentic));
-        // Codex is text-only: its sandbox cannot path-scope reads, its only
-        // tool is a shell, and on this host that shell cannot even start
-        // (#840 reverted the #828 read-tools widening). No env dependence —
-        // reading ambient state here turned the whole gate red once already.
-        assert!(allowed_for(ProviderKind::Codex, CapabilityClass::TextOnly));
-        assert!(!allowed_for(ProviderKind::Codex, CapabilityClass::ReadTools));
-        assert!(!allowed_for(ProviderKind::Codex, CapabilityClass::WriteTools));
-        assert!(!allowed_for(ProviderKind::Codex, CapabilityClass::FullAgentic));
+        for class in [CapabilityClass::TextOnly, CapabilityClass::ReadTools,
+            CapabilityClass::WriteTools, CapabilityClass::FullAgentic] {
+            assert!(allowed_for(ProviderKind::Codex, class));
+        }
         assert!(allowed_for(ProviderKind::Gemini, CapabilityClass::ReadTools));
         assert!(!allowed_for(ProviderKind::Gemini, CapabilityClass::FullAgentic));
         assert!(allowed_for(ProviderKind::Cerebras, CapabilityClass::TextOnly));

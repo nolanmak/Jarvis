@@ -116,5 +116,16 @@ expect_block "Read escaping the session dir via .. is blocked" \
 expect_block "Write into the session dir is blocked" \
   Write file_path "/tmp/aa-imsg/4242-17/x" "$I_ENV"
 
+# #1045 — Discord attachment tempfiles: Read only, the exact ASCII name shape,
+# in any locale (bash bracket ranges are collation-dependent under UTF-8).
+expect_allow "Read of a Discord attachment tempfile is allowed" \
+  Read file_path "/tmp/aa-txt-1045-0.md" "LANG=en_US.UTF-8"
+expect_block "Grep of a Discord attachment tempfile is blocked" \
+  Grep path "/tmp/aa-txt-1045-0.md" "LANG=en_US.UTF-8"
+expect_block "A non-ASCII digit lookalike is blocked under a UTF-8 locale" \
+  Read file_path $'/tmp/aa-txt-\xd9\xa1-0.md' "LANG=en_US.UTF-8"
+expect_block "A non-ASCII session file name is blocked under a UTF-8 locale" \
+  Read file_path $'/tmp/aa-imsg/4242-17/n\xc3\xa9.jpeg' "$I_ENV" "LANG=en_US.UTF-8"
+
 printf '\n%d ok, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

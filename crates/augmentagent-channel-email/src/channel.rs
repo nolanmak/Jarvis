@@ -865,20 +865,12 @@ impl<G: GmailApi, R: Reasoner + 'static> GmailChannel<G, R> {
                 // Opts mirror `draft_opts`' shape: same permission mode, no
                 // allowed_tools / add_dirs — the Deno sandbox is the tool
                 // surface, not the host claude CLI's Read/Grep/Glob.
-                let code_mode_opts = augmentagent_channel_core::ReasonerOpts {
+                // #1046: pin the quality tier. `model: None` emits no `--model`, so this
+                // draft inherited the owner's interactive model and quota (#448).
+                let code_mode_opts = augmentagent_channel_core::ReasonerOpts::pinned(
+                    augmentagent_channel_core::ModelTier::Quality,
                     system_prompt,
-                    model: None,
-                    allowed_tools: Vec::new(),
-                    add_dirs: Vec::new(),
-                    permission_mode: "default".into(),
-                    cwd: None,
-                    env: Vec::new(),
-                    settings_json: None,
-                    restrict_env: false,
-                    audit_logger: None,
-                    audit_notifier: None,
-                    session_id: None,
-                };
+                );
                 let message_ctx = MessageContext {
                     channel: "gmail".to_string(),
                     email: email.clone(),
@@ -2020,6 +2012,84 @@ mod tests {
         );
         let out = ch.poll_once().await.unwrap();
         assert_eq!(out.replied_dry_run, 1);
+    }
+
+    /// #1046 receipt path. A full dry-run reply poll through the REAL
+    /// `ClaudeCliReasoner`, with `CLAUDE_CLI` pointed at an argv-recording
+    /// stub: the code-mode draft spawn that `process_email` builds must pass
+    /// `--model` with the quality-tier model, and no spawn in the poll may
+    /// omit `--model` (which would inherit the owner's interactive model,
+    /// #448). The stub runs no model, so draft quality is not exercised.
+    #[tokio::test]
+    async fn reply_poll_pins_the_model_on_every_claude_spawn() {
+        use crate::argv_stub::{flag, summarize, ArgvStub};
+        use augmentagent_channel_core::providers::{model_for, ModelTier, ProviderKind};
+        let stub = ArgvStub::new(r#"{"decision":"reply","reason":"synthetic fixture"}"#);
+        let (store, _f) = tmp_store();
+        let gmail = Arc::new(StubGmail {
+            emails: vec![Email {
+                attachments: Vec::new(),
+                to: String::new(),
+                cc: String::new(),
+                message_id: "synthetic-1046".into(),
+                thread_id: Some("synthetic-thread-1046".into()),
+                from: "fixture@example.com".into(),
+                subject: "Fixture question".into(),
+                body: "Is the fixture ready?".into(),
+                date: "2026-01-01".into(),
+                account_entity_id: Some("acc1".into()),
+                platform: "gmail".into(),
+                kind: "dm".into(),
+            }],
+        });
+        let ch = GmailChannel::dry_run(
+            store,
+            gmail,
+            Arc::new(stub.reasoner()),
+            GmailChannelConfig {
+                skill_dir: PathBuf::from("/nonexistent/skill-1046"),
+                ..Default::default()
+            },
+        );
+        ch.poll_once().await.unwrap();
+
+        let code_mode_prompt = code_mode_system(&manifest_v1());
+        let quality = model_for(ProviderKind::Claude, ModelTier::Quality);
+        let calls = stub.calls();
+        println!("[#1046] CLAUDE_CLI={}", stub.bin.display());
+        let mut code_mode_spawns = 0;
+        for (index, argv) in calls.iter().enumerate() {
+            let system = flag(argv, "--system-prompt").unwrap_or_default();
+            let label = if system == code_mode_prompt {
+                "code-mode draft (process_email)"
+            } else if system == TRIAGE_SYSTEM {
+                "triage (triage_opts)"
+            } else {
+                "other preset"
+            };
+            let model = flag(argv, "--model");
+            println!(
+                "[#1046] spawn {index}: {label}: --model {}",
+                model.unwrap_or("<ABSENT>")
+            );
+            println!("[#1046]   argv: {}", summarize(argv));
+            assert!(
+                model.is_some_and(|model| !model.is_empty()),
+                "spawn {index} ({label}) omits --model and inherits the owner's interactive model"
+            );
+            if system == code_mode_prompt {
+                code_mode_spawns += 1;
+                assert_eq!(
+                    model,
+                    Some(quality.as_str()),
+                    "code-mode draft must run the quality tier"
+                );
+            }
+        }
+        assert!(
+            code_mode_spawns > 0,
+            "the poll never reached the code-mode draft spawn: {calls:?}"
+        );
     }
 
     /// Mock gh-CLI runner that records every `gh issue create` call without

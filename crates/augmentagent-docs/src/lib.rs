@@ -278,3 +278,5 @@ pub fn resolve_api_key(keyring: Option<String>, env: Option<String>) -> Option<S
     let present = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     present(keyring).or_else(|| present(env))
 }
+
+pub mod delivery;

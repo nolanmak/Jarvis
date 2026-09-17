@@ -39,9 +39,13 @@ pub async fn run_loop<R: Reasoner + 'static>(
     wiki_schema: Option<String>,
     shutdown: CancellationToken,
 ) -> Result<()> {
+    let wiki_capture = augmentagent_channel_imessage::history_wiki_capture_enabled();
     let mut interval = tokio::time::interval(history::POLL_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    info!("WhatsApp history poller started (30-minute interval)");
+    info!(
+        wiki_capture,
+        "WhatsApp history poller started (30-minute interval)"
+    );
     loop {
         tokio::select! { _ = shutdown.cancelled() => return Ok(()), _ = interval.tick() => {} }
         let report = tokio::select! {
@@ -57,6 +61,9 @@ pub async fn run_loop<R: Reasoner + 'static>(
             skipped = report.skipped,
             "WhatsApp history poll complete"
         );
+        if !wiki_capture {
+            continue;
+        }
         let (Some(root), Some(schema)) = (&wiki_root, &wiki_schema) else {
             continue;
         };

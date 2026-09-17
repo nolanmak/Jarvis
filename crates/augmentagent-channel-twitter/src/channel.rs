@@ -547,20 +547,12 @@ impl<R: Reasoner + 'static> TwitterChannel<R> {
         // those Phase-2/3/5 pre-resolvers (yet); the prompt accepts empty
         // strings as "no injection" so the bytes degrade cleanly.
         let user_msg = code_mode_user_message(&email, &wiki_hint, "", "", "", "");
-        let code_mode_opts = augmentagent_channel_core::ReasonerOpts {
+        // #1046: pin the quality tier. `model: None` emits no `--model`, so this
+        // draft inherited the owner's interactive model and quota (#448).
+        let code_mode_opts = augmentagent_channel_core::ReasonerOpts::pinned(
+            augmentagent_channel_core::ModelTier::Quality,
             system_prompt,
-            model: None,
-            allowed_tools: Vec::new(),
-            add_dirs: Vec::new(),
-            permission_mode: "default".into(),
-            cwd: None,
-            env: Vec::new(),
-            settings_json: None,
-            restrict_env: false,
-            audit_logger: None,
-            audit_notifier: None,
-            session_id: None,
-        };
+        );
         let message_ctx = MessageContext {
             channel: "twitter".to_string(),
             email: email.clone(),

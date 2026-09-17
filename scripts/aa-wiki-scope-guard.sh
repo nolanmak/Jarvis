@@ -21,6 +21,12 @@
 
 set -euo pipefail
 
+# #1045 — bash bracket ranges follow the locale's collation: under en_US.UTF-8
+# `[A-Za-z0-9]` also matches letters such as é and digits such as ١. Pin the C
+# locale so the Read carve-outs below mean exactly the ASCII definition the
+# Codex bridge enforces.
+export LC_ALL=C
+
 if [[ -z "${WIKI_ROOT:-}" ]]; then
   echo "aa-wiki-scope-guard: WIKI_ROOT unset" >&2
   exit 2
@@ -110,6 +116,11 @@ if [[ "$TOOL" =~ ^(Read|Glob|Grep)$ && -n "${AUGMENTAGENT_TRANSCRIPTS_DIR:-}" ]]
   fi
 fi
 
+# The two Read carve-outs below mirror the one definition in
+# crates/augmentagent-channel-core/src/codex_tools.rs (#1045), from which the
+# Codex bridge policy is built. `scope_guard_carve_outs_mirror_the_read_allowance_definition`
+# fails if a regex here drifts from it; change both together.
+#
 # Allow Read on Discord-attachment tempfiles. The discord crate
 # (augmentagent-approval-discord) downloads inbound attachments to
 # /tmp/aa-{img,txt,doc}-<msg_id>-<idx>.<ext> and instructs the model to

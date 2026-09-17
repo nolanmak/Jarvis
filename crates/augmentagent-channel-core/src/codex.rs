@@ -1,41 +1,23 @@
-//! Codex CLI reasoner adapter (#655/#661).
+//! Codex CLI reasoner adapter with a constrained Jarvis tool bridge (#1019).
 //!
-//! Translates the same [`ReasonerOpts`] every preset already builds into a
-//! `codex exec` spawn:
+//! Each call uses an empty native workspace, minimal native filesystem access,
+//! and a required MCP bridge compiled into the adapter. The bridge receives
+//! the preset's scope, tools, guards and integration configuration privately.
+//! Model-generated commands are parsed into argv; general commands use the
+//! bridge's kernel sandbox and trusted service verbs retain approval checks.
 //!
-//! ```text
-//! CODEX_HOME=<home> codex exec --json --skip-git-repo-check \
-//!     --ignore-user-config -C <cwd> -s read-only \
-//!     -c approval_policy=never -c model_instructions_file=<tmp>/instructions.md \
-//!     -m <model> -
-//! ```
+//! Native project instructions, user config, plugins and shell tools are
+//! excluded. Images supplied by the caller still use native `-i` input.
+//! Provider authentication uses the existing CODEX_API_KEY/keyring or persistent
+//! CODEX_HOME login. Integration credentials do not reach the native tool env.
 //!
-//! Design notes (researched 2026-08-19, developers.openai.com/codex):
+//! The adapter captures final or all assistant blocks and normalizes bridge
+//! tool events into the common audit log. Routing eligibility remains a separate
+//! capability gate; adapter smoke tests alone do not establish full parity.
 //!
-//! - **No `--system-prompt` flag**: the preset's system prompt is written to
-//!   a temp file and wired via `-c model_instructions_file=…`, which fully
-//!   replaces codex's base instructions. The spawn `cwd` is pinned;
-//!   `--ignore-user-config` keeps the owner's interactive
-//!   `~/.codex/config.toml` out, and `-c project_doc_max_bytes=0` keeps
-//!   repo AGENTS.md out (it is project-doc discovery, which
-//!   --ignore-user-config does NOT cover — verified live 2026-08-19).
-//! - **Sandbox `read-only` always**: the eligibility policy only routes
-//!   text-only and read-tools presets here (#658), and codex's kernel
-//!   sandbox (Landlock) enforcing "no writes, no network for commands" is
-//!   strictly stronger than what those presets grant Claude.
-//! - **Auth**: `CODEX_API_KEY` (JIT keyring load, honored only by
-//!   `codex exec`) when present, else the `auth.json` under the resolved
-//!   CODEX_HOME (ChatGPT-plan login; token refresh writes back because the
-//!   home is persistent, not a per-spawn tempdir).
-//!   (NB: the Cerebras tier was planned to ride this adapter via a custom
-//!   `model_provider`, but codex ≥0.148 removed `wire_api = "chat"` and
-//!   Cerebras has no Responses API — verified live 2026-08-19. Cerebras is a
-//!   thin chat-completions client instead: see `crate::cerebras`, #663.)
-//! - **Failure mapping**: quota exhaustion surfaces as `turn.failed` (+
-//!   non-zero exit) with a usage-limit message — mapped to
-//!   [`ReasonerError::RateLimited`]. Connection/5xx → `Unavailable`.
-//!   Missing binary → `Local`. All under the #656 watchdog with
-//!   `kill_on_drop`.
+//! Failed and empty turns are routed by the table in `crate::turn_failure`
+//! (#1040): quota, transport, auth and binary failures are provider-side, and
+//! so is a failure the table does not recognise on a text or read call.
 
 use std::process::Stdio;
 
@@ -45,9 +27,8 @@ use tokio::process::Command;
 use tracing::{debug, warn};
 
 use crate::providers::{model_for, tier_of, ProviderKind};
-use crate::reasoner::{
-    caller_tag, parse_reset_hint, reasoner_timeout, Reasoner, ReasonerError, ReasonerOpts,
-};
+use crate::reasoner::{caller_tag, reasoner_timeout, Reasoner, ReasonerError, ReasonerOpts};
+use crate::turn_failure::{turn_error, FailureClass, TurnFailure};
 
 /// Codex binary override (`CODEX_CLI`, mirroring `CLAUDE_CLI`) — also how
 /// the fault-injection test rig (#666) points the adapter at a stub script.
@@ -81,12 +62,50 @@ pub struct CodexCliReasoner {
     gate: std::sync::Arc<crate::cli_gate::CliGate>,
 }
 
+async fn record_tool_item(opts: &ReasonerOpts, item: &serde_json::Value) {
+    use crate::tool_audit::{build_audit_record, is_high_risk};
+    let native_web = item.get("type").and_then(|v| v.as_str()) == Some("web_search");
+    if !native_web && item.get("type").and_then(|v| v.as_str()) != Some("mcp_tool_call") { return; }
+    let server = item.get("server").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let leaf = item.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown");
+    // Codex reports searches and page opens under the same native event type.
+    // Preserve its action verbatim; an opaque `other` is not proof of a fetch.
+    let tool = if native_web { "WebSearch".into() }
+        else if server == "jarvis" { leaf.to_string() } else { format!("mcp__{server}__{leaf}") };
+    let args = if native_web {
+        serde_json::json!({"query": item.get("query"), "action": item.get("action")})
+    } else { item.get("arguments").cloned().unwrap_or(serde_json::Value::Null) };
+    let result = item.get("result");
+    let content = result.and_then(|r| r.get("content")).and_then(|r| r.as_array())
+        .map(|items| items.iter().filter_map(|r| r.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n"))
+        .unwrap_or_else(|| item.get("error").filter(|e| !e.is_null()).map(ToString::to_string).unwrap_or_default());
+    let failed = item.get("status").and_then(|s| s.as_str()) == Some("failed")
+        || result.is_some_and(|r| r.get("isError").or_else(|| r.get("is_error")).and_then(|b| b.as_bool()).unwrap_or(false));
+    let session = opts.session_id.as_deref().unwrap_or("-");
+    let mut record = build_audit_record(chrono::Utc::now().to_rfc3339(), session.into(), tool.clone(), args, &content, failed);
+    record.provider = Some("codex".into());
+    if tool == "Bash" {
+        record.exit_code = serde_json::from_str::<serde_json::Value>(&content).ok()
+            .and_then(|v| v.get("exit_code").and_then(|c| c.as_i64())).and_then(|c| i32::try_from(c).ok());
+    }
+    if let Some(logger) = &opts.audit_logger { logger.record(&record).await; }
+    if is_high_risk(&tool) {
+        if let Some(notifier) = &opts.audit_notifier { notifier.notify(session, &record).await; }
+    }
+}
+
 impl CodexCliReasoner {
     pub fn openai() -> Self {
         Self {
             bin: codex_bin(),
             gate: crate::cli_gate::CliGate::global(),
         }
+    }
+
+    /// Adapter bound to an explicit binary (fault-injection stubs in tests).
+    #[cfg(test)]
+    pub(crate) fn with_bin(bin: String) -> Self {
+        Self { bin, gate: crate::cli_gate::CliGate::global() }
     }
 
     fn provider_name(&self) -> &'static str {
@@ -106,11 +125,17 @@ impl CodexCliReasoner {
         let caller = caller_tag(opts);
         let acquire = self.gate.acquire_timed("codex", &caller, dur);
         let _permit = acquire.await.map_err(ReasonerError::from)?;
-        match tokio::time::timeout(dur, self.call_once(opts, user_message, all_blocks)).await {
+        let clean = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let outcome = tokio::time::timeout(dur, self.call_once(opts, user_message, all_blocks, clean.clone())).await;
+        if !clean.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ReasonerError::CleanupUncertain { provider: provider.into() }.into());
+        }
+        match outcome {
             // Post-classify any untyped failure (stdin EPIPE, read/wait IO)
             // as provider-side Unavailable (#655 review) — an untyped error
-            // would abort the whole chain instead of failing over.
-            Ok(Err(e)) if ReasonerError::find_in(&e).is_none() => {
+            // would abort the whole chain instead of failing over. A
+            // TurnFailure is untyped on purpose (#1040) and passes through.
+            Ok(Err(e)) if ReasonerError::find_in(&e).is_none() && e.downcast_ref::<TurnFailure>().is_none() => {
                 Err(crate::reasoner::classify_other(provider, e))
             }
             Ok(r) => r,
@@ -132,9 +157,11 @@ impl CodexCliReasoner {
         opts: &ReasonerOpts,
         user_message: &str,
         all_blocks: bool,
+        clean: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> anyhow::Result<String> {
         let provider = self.provider_name();
         let model = model_for(ProviderKind::Codex, tier_of(opts));
+        let capability = crate::providers::classify(opts);
 
         // `IMAGE:` markers → native `-i` attachments (see crate::images).
         // The marker lines are stripped from the stdin prompt; codex embeds
@@ -167,6 +194,17 @@ impl CodexCliReasoner {
         } else {
             &opts.system_prompt
         };
+        let bridge = crate::codex_tools::BridgeLaunch::prepare(opts, tmp.path()).map_err(|error| {
+            anyhow::Error::new(ReasonerError::Local {
+                message: format!("codex tool policy is not ready: {error}"),
+            })
+        })?;
+        let effective_system = format!("{effective_system}\n\nJarvis tool transport: use the jarvis MCP tools for the \
+            declared file, command and integration operations. The tool workspace is {}. \
+            Relative tool paths resolve there. Commands accept one executable and its arguments; \
+            split compound shell operations into separate calls. Preserve ATTACH output markers \
+            verbatim when delivering original files. Use native web tools for declared web operations.",
+            opts.cwd.as_ref().or(opts.add_dirs.first()).map(|p| p.display().to_string()).unwrap_or_default());
         let instructions = tmp.path().join("instructions.md");
         std::fs::write(&instructions, effective_system).map_err(|e| {
             anyhow::Error::new(ReasonerError::Local {
@@ -179,8 +217,9 @@ impl CodexCliReasoner {
             "--json".into(),
             "--skip-git-repo-check".into(),
             "--ignore-user-config".into(),
-            "-s".into(),
-            "read-only".into(),
+            "--ignore-rules".into(),
+            "--ephemeral".into(),
+            "--strict-config".into(),
             "-c".into(),
             "approval_policy=never".into(),
             // AGENTS.md is project-doc discovery, NOT user config — verified
@@ -189,7 +228,7 @@ impl CodexCliReasoner {
             "-c".into(),
             "project_doc_max_bytes=0".into(),
             "-c".into(),
-            format!("model_instructions_file={}", instructions.display()),
+            format!("model_instructions_file={}", serde_json::to_string(&instructions)?),
             "-m".into(),
             model.clone(),
         ];
@@ -197,15 +236,12 @@ impl CodexCliReasoner {
             args.push("-i".into());
             args.push(img.to_string_lossy().into_owned());
         }
-        // cwd: preset pin wins; else the first --add-dir (wiki root for the
-        // read-tools presets); else the daemon cwd.
-        let cwd = opts
-            .cwd
-            .clone()
-            .or_else(|| opts.add_dirs.first().cloned())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        for config in &bridge.config_overrides {
+            args.push("-c".into());
+            args.push(config.clone());
+        }
         args.push("-C".into());
-        args.push(cwd.to_string_lossy().into_owned());
+        args.push(bridge.native_cwd.to_string_lossy().into_owned());
         // "-" = read the prompt from stdin, mirroring the claude spawn shape.
         args.push("-".into());
 
@@ -213,8 +249,7 @@ impl CodexCliReasoner {
         cmd.args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
 
         // Always a clean env (the #128 posture): OS essentials + CODEX_HOME
         // + exactly the secrets this backend needs, JIT-loaded. The daemon's
@@ -231,13 +266,14 @@ impl CodexCliReasoner {
         }
         // else: auth.json under CODEX_HOME carries ChatGPT-plan auth.
         //
-        // opts.env is deliberately NOT forwarded (#655 review): it exists
-        // for the full-agentic ask preset's sub-CLIs (AUGMENTAGENT_DB,
-        // COMPOSIO/Discord secrets), and no preset eligible to route here
-        // needs any of it. Fail-closed beats convenient.
+        // Integration environment is carried in the owner-private broker
+        // policy, never exposed to native tools or placed on argv.
 
-        let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+
+        let (mut child, process_group) = crate::process_tree::spawn_supervised(&cmd, true, clean, opts.handoff_path.as_deref()).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::Error::new(ReasonerError::CleanupUncertain { provider: provider.into() })
+            } else if e.kind() == std::io::ErrorKind::NotFound {
                 anyhow::Error::new(ReasonerError::Local {
                     message: format!("{provider}: binary {:?} not found on PATH", self.bin),
                 })
@@ -272,10 +308,16 @@ impl CodexCliReasoner {
             .ok_or_else(|| anyhow::anyhow!("{provider} stdout missing"))?;
         let mut lines = BufReader::new(stdout).lines();
 
-        // Final assistant text = agent_message items, in order. Failure text
-        // = turn.failed / stream error events.
+        // Final assistant text = agent_message items, in order. `turn_failed`
+        // = the turn's own failure event. `stream_error` = the last
+        // stream-level error notice ("Reconnecting…" included), which only
+        // explains a failed exit, never a turn that went on to complete.
+        // `turn_began` = any turn/item event: from then on tools may have run
+        // (#1040 — it decides the fail-safe default in crate::turn_failure).
         let mut messages: Vec<String> = Vec::new();
-        let mut failure: Option<String> = None;
+        let mut turn_failed: Option<String> = None;
+        let mut stream_error: Option<String> = None;
+        let mut turn_began = false;
         while let Some(line) = lines.next_line().await? {
             let line = line.trim();
             if line.is_empty() {
@@ -285,7 +327,16 @@ impl CodexCliReasoner {
                 debug!("{provider} jsonl parse skip: {line}");
                 continue;
             };
-            match v.get("type").and_then(|t| t.as_str()) {
+            let kind = v.get("type").and_then(|t| t.as_str());
+            if kind.is_some_and(|k| k.starts_with("turn.") || k.starts_with("item.")) {
+                turn_began = true;
+            }
+            if kind == Some("item.completed") {
+                if let Some(item) = v.get("item") {
+                    record_tool_item(opts, item).await;
+                }
+            }
+            match kind {
                 Some("item.completed") => {
                     let item = v.get("item");
                     if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
@@ -301,7 +352,7 @@ impl CodexCliReasoner {
                     }
                 }
                 Some("turn.failed") => {
-                    failure = v
+                    turn_failed = v
                         .get("error")
                         .and_then(|e| e.get("message"))
                         .and_then(|m| m.as_str())
@@ -309,13 +360,8 @@ impl CodexCliReasoner {
                         .or(Some("turn.failed with no message".into()));
                 }
                 Some("error") => {
-                    // Stream-level errors include transient "Reconnecting…"
-                    // notices; only keep as failure if nothing succeeds.
-                    if failure.is_none() {
-                        failure = v
-                            .get("message")
-                            .and_then(|m| m.as_str())
-                            .map(str::to_string);
+                    if let Some(message) = v.get("message").and_then(|m| m.as_str()) {
+                        stream_error = Some(message.to_string());
                     }
                 }
                 _ => {}
@@ -323,6 +369,7 @@ impl CodexCliReasoner {
         }
 
         let status = child.wait().await?;
+        drop(process_group);
         let stderr_buf = match stderr_task {
             Some(t) => t.await.unwrap_or_default(),
             None => String::new(),
@@ -338,60 +385,39 @@ impl CodexCliReasoner {
             // Defensive: some limiter builds have surfaced the refusal as
             // ordinary text (the claude failure shape). Catch it here too.
             if crate::reasoner::is_rate_limited(&final_text) {
-                return Err(rate_limit_err(provider, final_text));
+                return Err(turn_error(provider, FailureClass::Quota, capability, final_text));
             }
             return Ok(final_text);
         }
 
-        let detail = failure
-            .or_else(|| {
-                stderr_buf
-                    .lines()
-                    .find(|l| !l.trim().is_empty())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| format!("{provider} exited {status:?} with no output"));
-        warn!("{provider} exec failed: {detail}");
-        if looks_rate_limited(&detail) {
-            return Err(rate_limit_err(provider, detail));
+        // #1040 — which failure this is decides latching and failover, so it
+        // goes through one table (crate::turn_failure), not ad-hoc checks.
+        let detail = match turn_failed {
+            Some(message) => message,
+            // The turn finished and said nothing. Content-level, exactly like
+            // claude's EmptyOutput: untyped, so no latch and no chain advance
+            // (the call's writes may already have happened). Without any turn
+            // event no turn ran, so a silent exit 0 falls through to the
+            // pre-turn classification below: a binary failure (#1069 M2).
+            None if status.success() && turn_began => return Err(TurnFailure::empty_output(provider).into()),
+            None => stream_error
+                .or_else(|| {
+                    stderr_buf
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| format!("{provider} exited {status:?} with no output")),
+        };
+        let class = crate::turn_failure::classify(&detail, turn_began);
+        if class == FailureClass::Readiness {
+            // Native readiness text can carry private configuration.
+            warn!("{provider} exec failed ({})", class.label());
+        } else {
+            warn!("{provider} exec failed ({}): {detail}", class.label());
         }
-        Err(anyhow::Error::new(ReasonerError::Unavailable {
-            provider: provider.into(),
-            message: detail.chars().take(300).collect(),
-        }))
+        Err(turn_error(provider, class, capability, detail))
     }
-}
-
-/// Quota-shaped failure text across both backends: ChatGPT-plan usage-limit
-/// wording, platform 429/insufficient_quota, and Cerebras' 429 RateLimitError
-/// / 402 credits-exhausted (a spend wall latches exactly like a rate wall).
-fn looks_rate_limited(detail: &str) -> bool {
-    let d = detail.to_ascii_lowercase();
-    // Status codes match as standalone digit tokens only (#655 review):
-    // bare substring "429" fired inside unrelated numbers like request ids.
-    let has_code = |code: &str| {
-        d.split(|c: char| !c.is_ascii_digit())
-            .any(|tok| tok == code)
-    };
-    d.contains("usage limit")
-        || d.contains("rate limit")
-        || d.contains("rate_limit")
-        || d.contains("insufficient_quota")
-        || d.contains("resource_exhausted")
-        || d.contains("payment required")
-        || d.contains("quota exceeded")
-        || d.contains("quota exhausted")
-        || has_code("429")
-        || has_code("402")
-}
-
-fn rate_limit_err(provider: &str, message: String) -> anyhow::Error {
-    let reset_at = parse_reset_hint(&message);
-    anyhow::Error::new(ReasonerError::RateLimited {
-        provider: provider.into(),
-        message,
-        reset_at,
-    })
 }
 
 #[async_trait]
@@ -440,6 +466,7 @@ mod tests {
             audit_logger: None,
             audit_notifier: None,
             session_id: None,
+            handoff_path: None,
         }
     }
 
@@ -469,6 +496,249 @@ echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
     }
 
     #[tokio::test]
+    async fn required_bridge_readiness_failures_are_local_and_do_not_repeat_private_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(&dir, "fake-codex-readiness", r#"
+cat >/dev/null
+echo '{"type":"turn.failed","error":{"message":"required MCP server: JARVIS_READINESS:mcp_start PRIVATE_SYNTHETIC_CONFIGURATION"}}'
+exit 1
+"#);
+        let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global() };
+        let error = reasoner.call(&opts(), "Synthetic request").await.unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&error), Some(ReasonerError::Local { .. })), "{error}");
+        assert!(error.to_string().contains("MCP"));
+        assert!(!error.to_string().contains("PRIVATE_SYNTHETIC"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires installed Codex; verifies failure before any model tool execution"]
+    async fn live_missing_mcp_server_reports_local_readiness() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut options = crate::reasoner::resume_opts(fixture.path().into());
+        options.allowed_tools = vec!["mcp__fixture__search".into()];
+        options.settings_json = Some(serde_json::json!({"mcpServers":{"fixture":{
+            "command":fixture.path().join("PRIVATE_SYNTHETIC_MISSING_BINARY"),
+            "env":{"SYNTHETIC_SECRET":"PRIVATE_SYNTHETIC_TOKEN"}
+        }}}).to_string());
+        let error = CodexCliReasoner::openai().call(&options, "Synthetic readiness probe").await.unwrap_err();
+        assert!(matches!(ReasonerError::find_in(&error), Some(ReasonerError::Local { .. })), "{error}");
+        assert!(error.to_string().contains("MCP"), "{error}");
+        assert!(!error.to_string().contains("PRIVATE_SYNTHETIC"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn tool_using_spawn_has_a_required_scoped_bridge_and_no_native_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join("argv.txt");
+        let bin = stub(&dir, "fake-codex", &format!(
+            "cat >/dev/null\nprintf '%s\\n' \"$@\" >{}\necho '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"ok\"}}}}'\n",
+            record.display()
+        ));
+        let mut options = crate::reasoner::resume_opts(dir.path().into());
+        options.env.push(("SYNTHETIC_TOKEN".into(), "private-fixture-only".into()));
+        let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global() };
+        reasoner.call(&options, "Read a synthetic note").await.unwrap();
+        let args = std::fs::read_to_string(record).unwrap();
+        assert!(args.contains("mcp_servers.jarvis="));
+        assert!(args.contains("required=true"));
+        assert!(args.contains("features.shell_tool=false"));
+        assert!(args.contains("default_permissions=jarvis_bridge"));
+        assert!(!args.contains("private-fixture-only"));
+        assert!(!args.contains("danger-full-access"));
+    }
+
+    /// Live receipt, separate from deterministic adapter/stub tests.
+    #[tokio::test]
+    #[ignore = "requires a logged-in Codex CLI; creates synthetic files only"]
+    async fn live_scoped_bridge_reads_writes_and_executes_a_command() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source.txt"), "SYNTHETIC_SOURCE_4F2A\n").unwrap();
+        let mut options = crate::reasoner::resume_opts(dir.path().into());
+        options.system_prompt = "You verify a synthetic tool fixture. Follow the exact requested operations.".into();
+        options.allowed_tools.push("Bash(printf *)".into());
+        let audit = dir.path().join("audit.jsonl");
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
+        let result = CodexCliReasoner::openai().call(&options,
+            "Use jarvis Read on source.txt, jarvis Write to copy its exact content INCLUDING its trailing newline into result.txt, \
+             then jarvis Bash to execute printf SYNTHETIC_COMMAND_7B3C. \
+             Report the actual tool outcomes and command output.").await.unwrap();
+        assert_eq!(std::fs::read(dir.path().join("result.txt")).unwrap(), b"SYNTHETIC_SOURCE_4F2A\n");
+        assert!(result.contains("SYNTHETIC_COMMAND_7B3C"), "{result}");
+        let records = std::fs::read_to_string(audit).unwrap();
+        assert!(records.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|r| r["tool"] == "Bash" && r["provider"] == "codex" && r["exit_code"] == 0
+                && r["stdout_truncated"].as_str().is_some_and(|s| s.contains("SYNTHETIC_COMMAND_7B3C"))));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Codex login and JARVIS_TEST_MEMORY_BIN; synthetic wiki and database only"]
+    async fn live_wiki_query_profile_executes_files_and_memory_mcp() {
+        let memory_bin = std::env::var_os("JARVIS_TEST_MEMORY_BIN")
+            .map(std::path::PathBuf::from).expect("set JARVIS_TEST_MEMORY_BIN to the built memory server");
+        assert!(memory_bin.is_absolute() && memory_bin.is_file());
+        let dir = tempfile::tempdir().unwrap();
+        let wiki = dir.path().join("wiki");
+        std::fs::create_dir(&wiki).unwrap();
+        std::fs::write(wiki.join("source.txt"), "SYNTHETIC_QUERY_83AF\n").unwrap();
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut options = crate::reasoner::ask_opts(wiki.clone(), repo);
+        // Replace deployment-specific dependencies with isolated fixture state;
+        // retain the production instructions, tool inventory and scope hook.
+        options.add_dirs = vec![wiki.clone()];
+        let database = dir.path().join("synthetic.db");
+        let mut settings: serde_json::Value = serde_json::from_str(options.settings_json.as_ref().unwrap()).unwrap();
+        settings["mcpServers"]["memory"]["command"] = serde_json::json!(memory_bin);
+        settings["mcpServers"]["memory"]["env"]["AUGMENTAGENT_DB"] = serde_json::json!(database);
+        options.settings_json = Some(settings.to_string());
+        options.env.retain(|(key, _)| matches!(key.as_str(), "PATH" | "WIKI_ROOT" | "AUGMENTAGENT_REPO_ROOT"));
+        options.env.push(("AUGMENTAGENT_DB".into(), database.to_string_lossy().into_owned()));
+        let audit = dir.path().join("audit.jsonl");
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
+        let response = CodexCliReasoner::openai().call(&options,
+            "Run this synthetic local verification only. Use jarvis Glob to find source.txt, \
+             Grep to search for SYNTHETIC_QUERY in it, and Read to read it. Write its exact bytes \
+             to result.txt, then Edit result.txt to replace QUERY with VERIFIED, preserving the newline. \
+             Call the configured memory_recent MCP tool with limit 1 on the empty synthetic database. \
+             Do not call any external services or shell commands. Report the actual tool results.")
+            .await.unwrap();
+        assert!(wiki.join("result.txt").is_file(), "query did not write the fixture: {response}; audit: {}",
+            std::fs::read_to_string(&audit).unwrap_or_default());
+        assert_eq!(std::fs::read(wiki.join("result.txt")).unwrap(), b"SYNTHETIC_VERIFIED_83AF\n");
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(audit).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        for tool in ["Glob", "Grep", "Read", "Write", "Edit", "mcp__memory__memory_recent"] {
+            assert!(records.iter().any(|record| record["provider"] == "codex" && record["tool"] == tool
+                && record["stdout_truncated"].as_str().is_some_and(|text| !text.is_empty())
+                && record["stderr_truncated"].as_str().is_none_or(|text| text.is_empty())),
+                "missing successful audited {tool}");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a logged-in Codex CLI; reads a synthetic image only"]
+    async fn live_scoped_image_read_is_visible_to_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        // Synthetic solid-color PNG; prompt and filename do not reveal color.
+        let original: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 8, 0, 0, 0, 8, 8, 2, 0, 0, 0, 75, 109, 41, 220, 0, 0, 0, 16, 73, 68, 65, 84, 120, 156, 99, 96, 96, 248, 143, 3, 13, 41, 9, 0, 169, 112, 63, 193, 20, 202, 234, 115, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130];
+        let path = dir.path().join("fixture.bin");
+        std::fs::write(&path, original).unwrap();
+        let mut options = crate::reasoner::resume_opts(dir.path().into());
+        options.allowed_tools = vec!["Read".into()];
+        options.system_prompt = "Read the supplied synthetic fixture with the Jarvis Read tool and answer from the actual image.".into();
+        let audit = dir.path().join("audit.jsonl");
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
+        let result = CodexCliReasoner::openai().call(&options,
+            "Use Jarvis Read on fixture.bin. What single color fills the image? Return only COLOR=<color name>.").await.unwrap();
+        assert_eq!(result.trim().to_ascii_lowercase(), "color=blue");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let records = std::fs::read_to_string(audit).unwrap();
+        assert!(records.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|r| r["tool"] == "Read" && r["provider"] == "codex"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a logged-in Codex CLI and Poppler; reads a synthetic PDF only"]
+    async fn live_scoped_pdf_page_read_is_visible_to_codex() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = include_bytes!("../../../scripts/tests/fixtures/scoped-document.pdf");
+        let path = dir.path().join("document.pdf");
+        std::fs::write(&path, original).unwrap();
+        let mut options = crate::reasoner::resume_opts(dir.path().into());
+        options.allowed_tools = vec!["Read".into()];
+        options.system_prompt = "Read the requested PDF page with the Jarvis Read tool and answer from the actual rendered page.".into();
+        let result = CodexCliReasoner::openai().call(&options,
+            "Use Jarvis Read on document.pdf with pages=2. What single color fills page 2? Return only COLOR=<color name>.").await.unwrap();
+        assert_eq!(result.trim().to_ascii_lowercase(), "color=blue");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Codex login and a configured VM runtime; builds synthetic code only"]
+    async fn live_codex_builds_and_tests_with_the_vm_bridge() {
+        assert!(crate::codex_tools::build_vm_config_path().is_some());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"),
+            "[package]\nname=\"synthetic-live-vm\"\nversion=\"0.1.0\"\nedition=\"2021\"\n").unwrap();
+        let source = "#[test] fn loopback_works() { let _listener = std::net::TcpListener::bind(\"127.0.0.1:0\").unwrap(); }\n";
+        std::fs::write(dir.path().join("src/lib.rs"), source).unwrap();
+        let mut options = crate::reasoner::resume_opts(dir.path().into());
+        options.allowed_tools.push("Bash(cargo *)".into());
+        options.system_prompt = "Run the requested synthetic project's tests using the Jarvis Bash tool and report the actual result. Preserve the supplied test source.".into();
+        let log_dir = tempfile::tempdir().unwrap();
+        let audit = log_dir.path().join("audit.jsonl");
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(audit.clone())));
+        CodexCliReasoner::openai().call(&options,
+            "Run cargo test --offline with Jarvis Bash, then report whether the test passed.").await.unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap(), source);
+        assert!(!dir.path().join("target").exists(), "build outputs must stay out of the source worktree");
+        let records = std::fs::read_to_string(audit).unwrap();
+        assert!(records.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|r| r["tool"] == "Bash" && r["provider"] == "codex" && r["exit_code"] == 0
+                && r["stdout_truncated"].as_str().is_some_and(|s| s.contains("1 passed"))));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Codex login and public web access; reads example.com only"]
+    async fn live_native_web_call_reaches_common_audit_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let mut options = crate::reasoner::resume_opts(dir.path().into());
+        options.allowed_tools = vec!["WebSearch".into(), "WebFetch".into()];
+        options.system_prompt = "Use the native web tool for the requested public page.".into();
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(log.clone())));
+        let response = CodexCliReasoner::openai().call(&options,
+            "Open https://example.com with the web tool and report its heading.").await.unwrap();
+        assert!(response.contains("Example Domain"), "{response}");
+        let records: Vec<serde_json::Value> = std::fs::read_to_string(log).unwrap().lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert!(records.iter().any(|record| record["provider"] == "codex"
+            && record["tool"] == "WebSearch"
+            && record["args"].to_string().contains("example.com")));
+    }
+
+    #[tokio::test]
+    async fn native_web_events_are_audited_without_inventing_response_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let mut options = crate::reasoner::resume_opts(dir.path().into());
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(log.clone())));
+        // Observed CLI completion schema: native fetches also use web_search
+        // with an opaque `other` action and no page response in the event.
+        record_tool_item(&options, &serde_json::json!({
+            "type": "web_search", "query": "https://example.com",
+            "action": {"type": "other"}
+        })).await;
+        let record: serde_json::Value = serde_json::from_str(std::fs::read_to_string(log).unwrap().trim()).unwrap();
+        assert_eq!(record["tool"], "WebSearch");
+        assert_eq!(record["provider"], "codex");
+        assert_eq!(record["args"]["query"], "https://example.com");
+        assert_eq!(record["args"]["action"]["type"], "other");
+        assert_eq!(record["stdout_truncated"], "");
+    }
+
+    #[tokio::test]
+    async fn codex_bridge_calls_are_recorded_in_the_common_audit_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.jsonl");
+        let bin = stub(&dir, "fake-codex-audit", r#"
+cat >/dev/null
+echo '{"type":"item.completed","item":{"id":"synthetic-tool","type":"mcp_tool_call","server":"jarvis","tool":"Write","arguments":{"file_path":"note.md","content":"synthetic"},"result":{"content":[{"type":"text","text":"written"}]},"status":"completed"}}'
+echo '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
+"#);
+        let mut options = opts();
+        options.audit_logger = Some(std::sync::Arc::new(crate::tool_audit::AuditLogger::new(log.clone())));
+        options.session_id = Some("synthetic-session".into());
+        CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global() }
+            .call(&options, "synthetic audit probe").await.unwrap();
+        let row: serde_json::Value = serde_json::from_str(std::fs::read_to_string(log).unwrap().trim()).unwrap();
+        assert_eq!(row["provider"], "codex");
+        assert_eq!(row["tool"], "Write");
+        assert_eq!(row["session_id"], "synthetic-session");
+        assert_eq!(row["stdout_truncated"], "written");
+    }
+
+    #[tokio::test]
     async fn usage_limit_turn_failed_maps_to_rate_limited() {
         let dir = tempfile::tempdir().unwrap();
         let bin = stub(
@@ -488,6 +758,152 @@ exit 1
         match ReasonerError::find_in(&err) {
             Some(ReasonerError::RateLimited { provider, .. }) => assert_eq!(provider, "codex"),
             other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    /// #1040 C1 — a finished turn with no final `agent_message` is
+    /// content-level, like claude's `EmptyOutput`: untyped, so the chain
+    /// neither latches codex nor re-runs the call elsewhere. A transient
+    /// reconnect notice on a turn that then completed changes nothing.
+    #[tokio::test]
+    async fn empty_successful_output_is_content_level_not_a_provider_outage() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(&dir, "fake-codex-empty", r#"
+cat >/dev/null
+echo '{"type":"thread.started","thread_id":"t1"}'
+echo '{"type":"error","message":"Reconnecting... 1/5 (stream disconnected before completion)"}'
+echo '{"type":"item.completed","item":{"type":"mcp_tool_call","server":"jarvis","tool":"Write","arguments":{"file_path":"synthetic.md"},"result":{"content":[{"type":"text","text":"written"}]},"status":"completed"}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":10}}'
+"#);
+        let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global() };
+        for transcript in [false, true] {
+            let err = if transcript {
+                reasoner.call_transcript(&opts(), "synthetic request").await.unwrap_err()
+            } else {
+                reasoner.call(&opts(), "synthetic request").await.unwrap_err()
+            };
+            assert!(ReasonerError::find_in(&err).is_none(), "must stay untyped: {err:#}");
+            assert_eq!(err.to_string(), "codex produced no assistant text");
+            assert_eq!(err.downcast_ref::<TurnFailure>().map(|f| f.class), Some(FailureClass::Content));
+        }
+    }
+
+    /// #1040 C2 — one `turn.failed` per failure class, end to end through a
+    /// stub CLI on a text-only call, pins the adapter's wiring into
+    /// `crate::turn_failure`. Each wording is pinned without a spawn in
+    /// `turn_failure::tests`. `None` = untyped (no latch, no chain advance);
+    /// `Some(true)` = RateLimited; `Some(false)` = Unavailable.
+    #[tokio::test]
+    async fn turn_failed_routing_is_pinned_per_failure_class() {
+        let cases: &[(&str, Option<bool>)] = &[
+            // Content-level: the provider is healthy, the turn is not.
+            ("Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.", None),
+            // Unrecognised on a text-only call: an outage (#1069 review H1).
+            // The write-class fail-safe is pinned in
+            // `unexplained_failures_after_the_turn_began_route_by_capability`.
+            ("synthetic unrecognised failure 7F3A", Some(false)),
+            // Quota walls (the pre-#1040 behaviour, kept), and the plan wall.
+            ("exceeded retry limit, last status: 429 Too Many Requests", Some(true)),
+            ("To use Codex with your ChatGPT plan, upgrade to Plus: https://chatgpt.com/explore/plus.", Some(true)),
+            // Transport and auth: still provider outages.
+            ("stream disconnected before completion: error sending request", Some(false)),
+            ("unexpected status 520 <html>cloudflare</html>", Some(false)),
+            ("unexpected status 401 Unauthorized: missing bearer", Some(false)),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (index, (message, want)) in cases.iter().enumerate() {
+            let events = dir.path().join(format!("events-{index}.jsonl"));
+            let lines = [
+                serde_json::json!({"type": "thread.started", "thread_id": "t1"}),
+                serde_json::json!({"type": "turn.started"}),
+                serde_json::json!({"type": "turn.failed", "error": {"message": message}}),
+            ];
+            std::fs::write(&events, lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+            let bin = stub(&dir, &format!("fake-codex-{index}"),
+                &format!("cat >/dev/null\ncat '{}'\nexit 1\n", events.display()));
+            let reasoner = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global() };
+            let err = reasoner.call(&opts(), "synthetic request").await.unwrap_err();
+            match (want, ReasonerError::find_in(&err)) {
+                (None, None) => {}
+                (Some(true), Some(ReasonerError::RateLimited { provider, .. })) => assert_eq!(provider, "codex"),
+                (Some(false), Some(ReasonerError::Unavailable { provider, .. })) => assert_eq!(provider, "codex"),
+                (want, got) => panic!("{message:?}: wanted {want:?}, got {got:?} ({err:#})"),
+            }
+        }
+    }
+
+    /// A write-capable request for the adapter (ingest-shaped: WriteTools).
+    fn write_opts(dir: &tempfile::TempDir) -> ReasonerOpts {
+        let options = crate::reasoner::ingest_opts("Synthetic ingestion".into(), dir.path().into());
+        assert_eq!(crate::providers::classify(&options), crate::providers::CapabilityClass::WriteTools);
+        options
+    }
+
+    /// #1040 — once the turn began, a failure nothing explains is not
+    /// evidence of an outage: a message-less `turn.failed`, or a process
+    /// that died mid-turn without a word (the supervisor reports a signal
+    /// death as a plain exit 1, so it is indistinguishable from any other
+    /// silent exit). For a write-capable call tools may already have run, so
+    /// fail safe: untyped. #1069 review H1: a text-only or read-only call
+    /// cannot repeat a write, and an untyped ending there would respawn codex
+    /// on every call during an outage the table does not know, so it is an
+    /// outage (latch and fail over).
+    #[tokio::test]
+    async fn unexplained_failures_after_the_turn_began_route_by_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut read_opts = opts();
+        read_opts.allowed_tools = vec!["Read".into(), "Grep".into()];
+        for (name, body) in [
+            ("fake-codex-bare-failure", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\necho '{\"type\":\"turn.failed\",\"error\":{}}'\nexit 1\n"),
+            ("fake-codex-killed", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\nkill -9 $$\n"),
+            ("fake-codex-model", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\necho '{\"type\":\"turn.failed\",\"error\":{\"message\":\"unexpected status 404 Not Found: model_not_found\"}}'\nexit 1\n"),
+        ] {
+            let reasoner = CodexCliReasoner { bin: stub(&dir, name, body), gate: crate::cli_gate::CliGate::global() };
+            let err = reasoner.call(&write_opts(&dir), "synthetic request").await.unwrap_err();
+            assert!(ReasonerError::find_in(&err).is_none(), "{name} (write): {err:#}");
+            assert_eq!(err.downcast_ref::<TurnFailure>().map(|f| f.class), Some(FailureClass::Unrecognised), "{name}");
+            for (label, options) in [("text", opts()), ("read", read_opts.clone())] {
+                let err = reasoner.call(&options, "synthetic request").await.unwrap_err();
+                assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })),
+                    "{name} ({label}): {err:#}");
+            }
+        }
+    }
+
+    /// #1069 review M2 — exit 0 with no turn event at all is not "the turn
+    /// finished and said nothing": no turn ran, so it is the binary failing
+    /// before the turn (fail over), whatever the capability class.
+    #[tokio::test]
+    async fn exit_zero_before_any_turn_event_is_a_binary_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("fake-codex-silent", "cat >/dev/null\n"),
+            ("fake-codex-thread-only", "cat >/dev/null\necho '{\"type\":\"thread.started\",\"thread_id\":\"t1\"}'\n"),
+        ] {
+            let reasoner = CodexCliReasoner { bin: stub(&dir, name, body), gate: crate::cli_gate::CliGate::global() };
+            for options in [opts(), write_opts(&dir)] {
+                let err = reasoner.call(&options, "synthetic request").await.unwrap_err();
+                assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })),
+                    "{name}: {err:#}");
+            }
+        }
+    }
+
+    /// #1040 — binary failures keep latching: a codex that exits non-zero
+    /// before any turn event (nothing can have run), or one that panicked,
+    /// is the provider's process failing, not the request's content.
+    #[tokio::test]
+    async fn binary_failures_still_map_to_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("fake-codex-startup", "cat >/dev/null\necho 'Error: synthetic startup failure' >&2\nexit 1\n"),
+            ("fake-codex-panic", "cat >/dev/null\necho '{\"type\":\"turn.started\"}'\necho \"thread 'main' panicked at core/src/synthetic.rs:1:1:\" >&2\nexit 101\n"),
+        ] {
+            let bin = stub(&dir, name, body);
+            let err = CodexCliReasoner { bin, gate: crate::cli_gate::CliGate::global() }
+                .call(&opts(), "synthetic request").await.unwrap_err();
+            assert!(matches!(ReasonerError::find_in(&err), Some(ReasonerError::Unavailable { .. })),
+                "{name}: {err:#}");
         }
     }
 
@@ -577,6 +993,76 @@ echo '{{"type":"item.completed","item":{{"type":"agent_message","text":"a red sq
             ReasonerError::find_in(&err),
             Some(ReasonerError::Local { .. })
         ));
+    }
+
+    /// Stands in for Codex: starts the packaged bridge exactly as the
+    /// `mcp_servers.jarvis` override says, sends one Grep and reports how long
+    /// the reply took. It gives up after 30 s so a stalled bridge fails the test
+    /// instead of hanging it.
+    const FAKE_CODEX_PATHOLOGICAL_GREP: &str = r##"
+cat >/dev/null
+exec python3 -I - "$@" <<'PY'
+import json, os, select, subprocess, sys, time
+spec = next(arg for arg in sys.argv[1:] if arg.startswith('mcp_servers.jarvis='))
+args = json.loads('[' + spec.split('args=[', 1)[1].split(']', 1)[0] + ']')
+bridge = subprocess.Popen(['python3', *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+pending = b''
+def call(identifier, method, params, seconds):
+    global pending
+    bridge.stdin.write((json.dumps({'jsonrpc': '2.0', 'id': identifier, 'method': method, 'params': params}) + '\n').encode())
+    bridge.stdin.flush()
+    deadline = time.monotonic() + seconds
+    while b'\n' not in pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([bridge.stdout], [], [], remaining)[0]:
+            return None
+        chunk = os.read(bridge.stdout.fileno(), 65536)
+        if not chunk:
+            return None
+        pending += chunk
+    line, pending = pending.split(b'\n', 1)
+    return json.loads(line)
+call(1, 'initialize', {}, 30)
+started = time.monotonic()
+reply = call(2, 'tools/call', {'name': 'Grep', 'arguments': {'pattern': '(a+)+$'}}, 30)
+elapsed = time.monotonic() - started
+if reply is None:
+    bridge.kill()
+bridge.stdin.close()
+bridge.wait()
+report = json.dumps({'grep_seconds': elapsed, 'reply': reply})
+print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': report}}), flush=True)
+PY
+"##;
+
+    /// #1038 C3: a pathological Grep through the real packaged bridge is
+    /// answered within its bound. The Codex turn then ends normally and its
+    /// CLI-gate slot is released, instead of being held until the watchdog.
+    #[tokio::test]
+    async fn pathological_bridge_grep_releases_the_cli_gate_slot_within_its_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        // Forty characters of backtracking bait for Python's re engine.
+        std::fs::write(workspace.join("bait.txt"), format!("{}b\n", "a".repeat(40))).unwrap();
+        let bin = stub(&dir, "fake-codex-grep", FAKE_CODEX_PATHOLOGICAL_GREP);
+        let gate = std::sync::Arc::new(crate::cli_gate::CliGate::new(1));
+        let reasoner = CodexCliReasoner { bin, gate: gate.clone() };
+        let mut options = opts();
+        options.allowed_tools = vec!["Grep".into()];
+        options.cwd = Some(workspace);
+        let started = std::time::Instant::now();
+        let answer = reasoner.call(&options, "Synthetic pathological search").await.unwrap();
+        let held = started.elapsed();
+        let report: serde_json::Value = serde_json::from_str(answer.trim()).unwrap();
+        assert_eq!(report["reply"]["result"]["isError"], true, "{report}");
+        assert!(report["reply"]["result"]["content"][0]["text"].as_str().unwrap_or_default()
+            .contains("time limit"), "{report}");
+        assert!(report["grep_seconds"].as_f64().unwrap() < 2.0, "{report}");
+        assert!(held < std::time::Duration::from_secs(20), "gate slot held for {held:?}");
+        assert_eq!(gate.in_flight(), 0);
+        let next = gate.acquire_timed("codex", "synthetic-next-call", std::time::Duration::from_millis(500)).await;
+        assert!(next.is_ok(), "the only gate slot was not released");
     }
 
 }

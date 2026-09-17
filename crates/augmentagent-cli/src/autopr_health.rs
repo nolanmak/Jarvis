@@ -20,6 +20,7 @@
 //! | `updater-stalled`| 2026-09-14: diverged checkout, updater quietly stopped|
 //! | `no-progress`    | the catch-all: nothing merged in N days             |
 //! | `draft-stale`    | a draft nobody will ever finish                     |
+//! | `review-held`    | #1037: a draft held, unbilled, waiting on a reviewer (was billed daily) |
 //!
 //! Analysis is pure over [`HealthInputs`] so every rule is unit-tested
 //! against the shape of the incident it exists for; collection is a thin
@@ -56,6 +57,10 @@ pub struct Finding {
     pub fix: String,
 }
 
+/// #1030 — how recently a provider hold still explains a quiet loop. Longer
+/// than the tick interval, so one pause covers the gap it causes.
+const PROVIDER_HOLD_FRESH_MINS: i64 = 90;
+
 /// Everything the rules judge. Absent evidence is `None`, which never fires a
 /// rule: a missing log is a reason to stay quiet, not to cry wolf.
 #[derive(Debug, Clone, Default)]
@@ -81,6 +86,10 @@ pub struct HealthInputs {
     /// When the cached red-`main` verdict was written, if `main` is currently
     /// recorded red.
     pub red_main_since: Option<DateTime<Utc>>,
+    /// #1030 — when the loop last held a tick because every provider cleared
+    /// for the build preset was latched on quota. A pause, not an outage, and
+    /// it must not be triaged as one.
+    pub last_provider_hold: Option<DateTime<Utc>>,
     /// `(pr, reason, times seen)` for resume refusals in the scanned window.
     pub repeated_refusals: Vec<(u64, String, u32)>,
     /// Open PR numbers, when they could be listed. A refusal loop only
@@ -90,6 +99,9 @@ pub struct HealthInputs {
     pub open_prs: Option<Vec<u64>>,
     /// `(pr, age in days)` for open agent drafts.
     pub draft_ages_days: Vec<(u64, i64)>,
+    /// #1037 — drafts the resume lane is holding because no independent
+    /// review is possible: `(pr, reason code, reason, days without a review)`.
+    pub unreviewable_drafts: Vec<(u64, String, String, u32)>,
 }
 
 /// Thresholds, so a noisy box can be tuned without a rebuild.
@@ -136,6 +148,14 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         return out;
     };
 
+    // #1030 C5 — a fresh hold EXPLAINS the quiet, so the findings it accounts
+    // for must not also fire. Reporting "the loop is silent" next to "the loop
+    // is deliberately paused" is precisely the outage triage this rule exists
+    // to prevent: a reader goes looking for a fault that is not there.
+    let held_recently = i
+        .last_provider_hold
+        .is_some_and(|held| (now - held).num_minutes().max(0) <= PROVIDER_HOLD_FRESH_MINS);
+
     if !i.daemon_active {
         out.push(Finding {
             severity: Severity::Alert,
@@ -166,7 +186,8 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         }
     }
 
-    if let Some(last) = i.last_loop_line {
+    // A paused loop is quiet on purpose; the hold above already said so.
+    if let Some(last) = i.last_loop_line.filter(|_| !held_recently) {
         let age = mins_since(now, last);
         if age >= t.loop_silent_mins {
             out.push(Finding {
@@ -178,6 +199,29 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
                 ),
                 fix: "The tick task may have died while the process lives; \
                       restart the daemon and check for a panic in stderr.log."
+                    .into(),
+            });
+        }
+    }
+
+    // #1030 — a quota pause looks exactly like a stalled loop from the
+    // outside: no PRs, no merges, ticks that end without producing anything.
+    // Saying so explicitly is the difference between "wait" and "go and fix
+    // something", and the two get triaged very differently at 2am.
+    if let Some(held) = i.last_provider_hold {
+        let age = (now - held).num_minutes().max(0);
+        if age <= PROVIDER_HOLD_FRESH_MINS {
+            out.push(Finding {
+                severity: Severity::Warn,
+                code: "provider-hold",
+                detail: format!(
+                    "the build lane is paused: every provider cleared for it is \
+                     on a quota cooldown (last held {age} min ago). Nothing is \
+                     broken and nothing was spent."
+                ),
+                fix: "Wait for the cooldown, or widen the chain for this \
+                      preset. `augmentagent reasoner-selftest` shows which \
+                      providers are latched and until when."
                     .into(),
             });
         }
@@ -254,7 +298,8 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         }
     }
 
-    if let Some(last) = i.last_merge {
+    // A quota pause stops merges too, so it explains this one as well.
+    if let Some(last) = i.last_merge.filter(|_| !held_recently) {
         let days = (now - last).num_days();
         if days >= t.no_merge_days {
             out.push(Finding {
@@ -271,9 +316,56 @@ pub fn analyze(i: &HealthInputs, t: &Thresholds) -> Vec<Finding> {
         }
     }
 
+    // #1037 — drafts held because no independent review is possible. From
+    // outside this looks like a wedged loop: a draft that never moves, ticks
+    // that end with nothing. It is neither broken nor spending, and which of
+    // the three reasons holds it decides who does what, so each gets its fix.
+    let held: Vec<&(u64, String, String, u32)> = i
+        .unreviewable_drafts
+        .iter()
+        .filter(|(pr, ..)| i.open_prs.as_ref().is_none_or(|open| open.contains(pr)))
+        .collect();
+    if !held.is_empty() {
+        let budget = crate::self_improve::REVIEW_UNAVAILABLE_BUDGET_DAYS;
+        let which = held
+            .iter()
+            .map(|(pr, _, reason, days)| format!("#{pr} {reason} (day {days} of {budget})"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut fixes: Vec<&str> = Vec::new();
+        for (_, code, ..) in &held {
+            let fix = match code.as_str() {
+                "provenance-unknown" => {
+                    "provenance unknown: a human reviews it and merges or closes it, since the \
+                     loop cannot vouch for any model's review of it"
+                }
+                "reviewer-latched" => "reviewer latched: nothing to do, it retries after the reset",
+                _ => {
+                    "no reviewer capacity: check `augmentagent doctor` and \
+                     `augmentagent reasoner-selftest`"
+                }
+            };
+            if !fixes.contains(&fix) {
+                fixes.push(fix);
+            }
+        }
+        out.push(Finding {
+            severity: Severity::Warn,
+            code: "review-held",
+            detail: format!(
+                "the loop is not wedged: these drafts are held, unbilled, because no \
+                 independent review is possible: {which}. After {budget} days it gives up on \
+                 each and says why."
+            ),
+            fix: fixes.join(". "),
+        });
+    }
+
     let stale: Vec<String> = i
         .draft_ages_days
         .iter()
+        // A held draft is already reported, with its reason, just above.
+        .filter(|(pr, _)| !held.iter().any(|(h, ..)| h == pr))
         .filter(|(_, d)| *d >= t.draft_stale_days)
         .map(|(pr, d)| format!("#{pr} ({d}d)"))
         .collect();
@@ -427,9 +519,7 @@ pub fn scan_repeated_refusals(log: &str, since: DateTime<Utc>) -> Vec<(u64, Stri
 }
 
 fn state_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".local/state/augmentagent"))
-        .unwrap_or_else(|| PathBuf::from("."))
+    augmentagent_channel_core::state_dir::state_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn free_gb(path: &Path) -> Option<f64> {
@@ -582,6 +672,9 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         daemon_active: daemon_active(),
         last_reasoner_poll: last_timestamp_with(&log, r#"poll complete channel="gmail""#),
         last_loop_line: last_timestamp_with(&log, "augmentagent::self_improve"),
+        // #1030 — the loop logs this exact phrase when every provider cleared
+        // for the build preset is on a quota cooldown.
+        last_provider_hold: last_timestamp_with(&log, "auto-PR held: no provider can serve"),
         last_merge: last_merge(repo_root),
         deployed_is_current: deploy.0,
         deploy_lag_mins: deploy.1,
@@ -594,6 +687,7 @@ pub fn collect(repo_root: &Path) -> HealthInputs {
         repeated_refusals: scan_repeated_refusals(&log, now - chrono::Duration::days(3)),
         open_prs: open_pr_numbers(),
         draft_ages_days: open_draft_ages(now),
+        unreviewable_drafts: crate::self_improve::unreviewable_drafts(),
     }
 }
 
@@ -656,6 +750,7 @@ async fn notify_discord(text: &str) {
 
 #[cfg(test)]
 mod tests {
+    // (tests continue below; the #1030 case is appended at the end)
     use super::*;
     use chrono::Duration;
 
@@ -670,6 +765,7 @@ mod tests {
         HealthInputs {
             now_or_epoch: Some(t0()),
             daemon_active: true,
+            last_provider_hold: None,
             last_reasoner_poll: Some(t0() - Duration::minutes(4)),
             last_loop_line: Some(t0() - Duration::minutes(12)),
             last_merge: Some(t0() - Duration::hours(20)),
@@ -681,6 +777,7 @@ mod tests {
             repeated_refusals: vec![],
             open_prs: None,
             draft_ages_days: vec![(990, 0)],
+            unreviewable_drafts: vec![],
         }
     }
 
@@ -953,5 +1050,129 @@ mod tests {
         assert_eq!(*pr, 987);
         assert_eq!(*times, 2, "the run counters must not split the group");
         assert!(reason.contains("Cargo.lock"));
+    }
+
+    /// #1030 C5 — a quota pause and a wedged loop look identical from
+    /// outside: no PRs, no merges, ticks producing nothing. The watchdog has
+    /// to tell them apart, because one says wait and the other says go and fix
+    /// something.
+    #[test]
+    fn a_provider_hold_is_reported_as_a_pause_not_an_outage() {
+        let found = analyze(
+            &HealthInputs {
+                last_provider_hold: Some(t0() - Duration::minutes(10)),
+                ..healthy()
+            },
+            &Thresholds::default(),
+        );
+        let hold = found
+            .iter()
+            .find(|f| f.code == "provider-hold")
+            .expect("a recent hold must be reported");
+        assert!(
+            matches!(hold.severity, Severity::Warn),
+            "a quota pause is not an alert: nothing is broken"
+        );
+        assert!(
+            hold.detail.contains("quota") && hold.detail.contains("Nothing is broken"),
+            "say plainly that this is a pause: {}",
+            hold.detail
+        );
+
+        // C5 proper: the hold must SUPPRESS what it explains, not merely sit
+        // beside it. A pause reported next to an outage is still an outage to
+        // whoever is reading at 2am.
+        let wedged_looking = HealthInputs {
+            last_provider_hold: Some(t0() - Duration::minutes(10)),
+            last_loop_line: Some(t0() - Duration::hours(6)),
+            last_merge: Some(t0() - Duration::days(9)),
+            ..healthy()
+        };
+        let quiet = analyze(&wedged_looking, &Thresholds::default());
+        for masked in ["loop-silent", "no-progress"] {
+            assert!(
+                !quiet.iter().any(|f| f.code == masked),
+                "{masked} must not fire while a fresh hold explains the quiet: {:?}",
+                quiet.iter().map(|f| f.code).collect::<Vec<_>>()
+            );
+        }
+        assert!(quiet.iter().any(|f| f.code == "provider-hold"));
+
+        // Without the hold, the same evidence IS an outage.
+        let no_hold = analyze(
+            &HealthInputs { last_provider_hold: None, ..wedged_looking },
+            &Thresholds::default(),
+        );
+        assert!(
+            no_hold.iter().any(|f| f.code == "loop-silent"),
+            "the suppression must depend on the hold, not hide the rule"
+        );
+
+        // Stale holds stop explaining anything.
+        let stale = analyze(
+            &HealthInputs {
+                last_provider_hold: Some(t0() - Duration::minutes(PROVIDER_HOLD_FRESH_MINS + 30)),
+                ..healthy()
+            },
+            &Thresholds::default(),
+        );
+        assert!(
+            !stale.iter().any(|f| f.code == "provider-hold"),
+            "an old pause must not keep excusing a quiet loop"
+        );
+    }
+
+    /// #1037 C6 — a draft the loop cannot get independently reviewed looks,
+    /// from outside, like a wedged loop: a PR that never moves and ticks that
+    /// end with nothing. It is neither wedged nor spending, and the watchdog
+    /// has to say which of the three reasons is holding it, because each one
+    /// is fixed by a different person doing a different thing.
+    #[test]
+    fn a_draft_held_for_review_is_reported_as_held_not_as_a_wedged_loop() {
+        let i = HealthInputs {
+            unreviewable_drafts: vec![
+                (1000, "provenance-unknown".into(),
+                 "provenance unknown: there is no complete record of which providers built this draft".into(), 1),
+                (1001, "reviewer-latched".into(),
+                 "reviewer latched until 2026-09-14 13:30 UTC (claude)".into(), 2),
+                (1002, "no-reviewer-capacity".into(),
+                 "no reviewer capacity: no independent reviewer (codex) is configured and able to serve".into(), 1),
+            ],
+            // All three are also old drafts: the specific finding explains
+            // them, so the generic one must not report them a second time.
+            draft_ages_days: vec![(1000, 9), (1001, 9), (1002, 9), (987, 9)],
+            ..healthy()
+        };
+        let f = analyze(&i, &Thresholds::default());
+        let held = f
+            .iter()
+            .find(|x| x.code == "review-held")
+            .expect("drafts held for review must be reported under their own code");
+        assert_eq!(held.severity, Severity::Warn, "held is not an outage");
+        for (pr, reason) in [
+            ("#1000", "provenance unknown"),
+            ("#1001", "reviewer latched until 2026-09-14 13:30 UTC"),
+            ("#1002", "no reviewer capacity"),
+        ] {
+            assert!(held.detail.contains(pr) && held.detail.contains(reason), "{}", held.detail);
+        }
+        assert!(held.detail.contains("day 2 of 3"), "the budget is visible: {}", held.detail);
+        assert!(
+            held.detail.contains("not wedged") && held.detail.contains("unbilled"),
+            "say plainly that nothing is broken or spent: {}",
+            held.detail
+        );
+        for fix in ["human", "reasoner-selftest"] {
+            assert!(held.fix.contains(fix), "each reason gets its own fix ({fix}): {}", held.fix);
+        }
+        assert!(!f.iter().any(|x| x.code == "loop-silent" || x.code == "reasoner-wedged"));
+        let stale = f.iter().find(|x| x.code == "draft-stale").expect("#987 is still stale");
+        assert!(!stale.detail.contains("#1000") && stale.detail.contains("#987"), "{}", stale.detail);
+
+        // A draft that has since closed or merged is history, not a hold.
+        let closed = HealthInputs { open_prs: Some(vec![987]), ..i.clone() };
+        assert!(!analyze(&closed, &Thresholds::default()).iter().any(|x| x.code == "review-held"));
+        // And with nothing held, nothing is said.
+        assert!(analyze(&healthy(), &Thresholds::default()).is_empty());
     }
 }

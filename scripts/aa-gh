@@ -38,6 +38,37 @@ case "$2" in
     ;;
 esac
 
+# This query helper is only for this project's reports. Never let the
+# ambient owner credential mutate a separately configured document source.
+allowed_repo() {
+  case "${1,,}" in
+    nolanmak/jarvis|nolanmak/myagentassistant) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+repo_next=0
+for arg in "${@:3}"; do
+  if [[ "$repo_next" == 1 ]]; then
+    allowed_repo "$arg" || { echo "aa-gh: repository is outside the issue-report allowlist" >&2; exit 2; }
+    repo_next=0
+    continue
+  fi
+  case "$arg" in
+    --repo|-R) repo_next=1 ;;
+    --repo=*) allowed_repo "${arg#*=}" || { echo "aa-gh: repository is outside the issue-report allowlist" >&2; exit 2; } ;;
+    -R?*) allowed_repo "${arg#-R}" || { echo "aa-gh: repository is outside the issue-report allowlist" >&2; exit 2; } ;;
+    https://github.com/*)
+      target="${arg#https://github.com/}"
+      owner="${target%%/*}"; target="${target#*/}"
+      allowed_repo "$owner/${target%%/*}" || { echo "aa-gh: issue URL is outside the issue-report allowlist" >&2; exit 2; }
+      ;;
+  esac
+done
+[[ "$repo_next" == 0 ]] || { echo "aa-gh: missing repository value" >&2; exit 2; }
+# Pin defaults independently of cwd and inherited GH_REPO/GH_HOST.
+export GH_REPO=nolanmak/Jarvis
+export GH_HOST=github.com
+
 if [[ "$2" == "list" || "$2" == "view" ]]; then
   exec "$GH_BIN" "$@"
 fi
@@ -89,7 +120,8 @@ while [[ $# -gt 0 ]]; do
     --repo=*|--label=*|--assignee=*|--milestone=*|--project=*|--edit-last|--create-if-none)
       GH_ARGS+=("$1"); shift ;;
     -*) refuse "unsupported write option; use explicit long options" ;;
-    *) GH_ARGS+=("$1"); shift ;;
+    *) [[ "$1" =~ ^[0-9]+$ ]] || refuse "issue writes require a numeric issue number"
+       GH_ARGS+=("$1"); shift ;;
   esac
 done
 [[ "$BODY_SET" == 1 ]] || refuse "an explicit --body or --body-file is required"

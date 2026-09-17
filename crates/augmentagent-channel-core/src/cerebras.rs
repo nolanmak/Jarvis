@@ -263,6 +263,7 @@ mod tests {
             audit_logger: None,
             audit_notifier: None,
             session_id: None,
+            handoff_path: None,
         }
     }
 

@@ -8,7 +8,7 @@ data, or secrets may live in tracked source.** This doc is the contract.
 | Kind | Where it lives | In git? |
 |---|---|---|
 | API keys, tokens, Composio key, Discord bot token | `.env` | ❌ gitignored |
-| Discord user creds (bookmarklet) | `discord-creds.json` / OS keyring | ❌ gitignored |
+| Discord user creds (bookmarklet) | OS keyring (optional 0600 file only at an out-of-repo `AUGMENTAGENT_DISCORD_CREDS` path) | ❌ never written to the repo |
 | Recipient email, invoice counter, sending entity | sqlite `data.db` (set via dashboard / `!invoice`) | ❌ gitignored (`*.db`) |
 | Invoice identity: name, address, phone, client, rate, gh repo/author | `.env` (`INVOICE_*`) | ❌ gitignored |
 | Wiki / people pages (PII) | `wiki/` | ❌ gitignored |

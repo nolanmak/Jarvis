@@ -128,6 +128,50 @@ fn validate_under_root(root: &Path, raw: &str) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
+/// Walk from a pinned directory descriptor. Never reopen a validated absolute
+/// path: any component could have been replaced since marker extraction.
+#[cfg(unix)]
+fn read_scoped_attachment(root: &std::fs::File, relative: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind, Read};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let components = relative.components().collect::<Vec<_>>();
+    if components.is_empty() {
+        return Err(Error::new(ErrorKind::InvalidInput, "empty attachment path"));
+    }
+    let mut current = root.try_clone()?;
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(Error::new(ErrorKind::InvalidInput, "attachment path is not relative"));
+        };
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "invalid attachment path"))?;
+        let directory = index + 1 < components.len();
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
+            | if directory { libc::O_DIRECTORY } else { 0 };
+        // SAFETY: the parent descriptor and NUL-terminated name remain live.
+        let descriptor = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if descriptor < 0 { return Err(Error::last_os_error()); }
+        // SAFETY: openat returned a fresh owned descriptor.
+        current = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    }
+    let metadata = current.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_OUTBOUND_ATTACHMENT_BYTES {
+        return Err(Error::new(ErrorKind::InvalidData, "attachment is not a regular file within the size cap"));
+    }
+    let mut bytes = Vec::new();
+    current.take(MAX_OUTBOUND_ATTACHMENT_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_OUTBOUND_ATTACHMENT_BYTES {
+        return Err(Error::new(ErrorKind::InvalidData, "attachment grew beyond the size cap"));
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_scoped_attachment(_root: &std::fs::File, _relative: &Path) -> std::io::Result<Vec<u8>> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "scoped attachment reads require Unix"))
+}
+
 /// One-stop preparation for posting: extract markers, read the surviving
 /// files into serenity attachments, and fold every refusal/read failure into
 /// the posted text as a `⚠️` line. Returns `(posted_text, attachments)`.
@@ -140,6 +184,19 @@ pub async fn prepare_answer_delivery(
     answer: &str,
     wiki_root: Option<&Path>,
 ) -> (String, Vec<CreateAttachment>) {
+    // Pin the trusted root before resolving model-provided markers. Replacing
+    // that directory later cannot redirect reads into a different tree.
+    let pinned_root = wiki_root.and_then(|root| {
+        let canonical = root.canonicalize().ok()?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let descriptor = options.open(&canonical).ok()?;
+        Some((canonical, descriptor))
+    });
     let extracted = extract_attach_markers(answer, wiki_root);
     let mut notes = extracted.notes;
     // #994 — a `register:` receipt that contradicts the draft under it is
@@ -151,7 +208,18 @@ pub async fn prepare_answer_delivery(
 
     let mut attachments = Vec::with_capacity(extracted.files.len());
     for path in &extracted.files {
-        match CreateAttachment::path(path).await {
+        let result = match &pinned_root {
+            Some((root, descriptor)) => match (path.strip_prefix(root), descriptor.try_clone()) {
+                (Ok(relative), Ok(descriptor)) => {
+                    let relative = relative.to_path_buf();
+                    tokio::task::spawn_blocking(move || read_scoped_attachment(&descriptor, &relative))
+                        .await.unwrap_or_else(|_| Err(std::io::Error::other("attachment reader failed")))
+                }
+                _ => Err(std::io::Error::other("attachment root changed")),
+            },
+            None => Err(std::io::Error::other("attachment root unavailable")),
+        }.map(|bytes| CreateAttachment::bytes(bytes, path.file_name().unwrap_or_default().to_string_lossy()));
+        match result {
             Ok(a) => attachments.push(a),
             Err(e) => {
                 warn!("outbound attachment read failed for {}: {e}", path.display());
@@ -190,6 +258,78 @@ mod tests {
 
     fn root() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_rechecks_opened_file_after_validation_and_rejects_path_swaps() {
+        let dir = root();
+        fs::create_dir(dir.path().join("documents")).unwrap();
+        let candidate = dir.path().join("documents/report.pdf");
+        fs::write(&candidate, b"SYNTHETIC_ORIGINAL").unwrap();
+        let selected = extract_attach_markers("ATTACH: documents/report.pdf", Some(dir.path()));
+        assert_eq!(selected.files.len(), 1);
+        let pinned_root = fs::File::open(dir.path()).unwrap();
+        let outside = root();
+        fs::write(outside.path().join("report.pdf"), b"SYNTHETIC_PRIVATE").unwrap();
+        fs::remove_file(&candidate).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("report.pdf"), &candidate).unwrap();
+        assert!(read_scoped_attachment(&pinned_root, Path::new("documents/report.pdf")).is_err());
+        fs::remove_file(&candidate).unwrap();
+        fs::remove_dir(dir.path().join("documents")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("documents")).unwrap();
+        assert!(read_scoped_attachment(&pinned_root, Path::new("documents/report.pdf")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_rejects_file_growth_and_nonregular_replacements() {
+        let dir = root();
+        let candidate = dir.path().join("report.pdf");
+        fs::write(&candidate, b"SYNTHETIC_ORIGINAL").unwrap();
+        assert_eq!(extract_attach_markers("ATTACH: report.pdf", Some(dir.path())).files.len(), 1);
+        let pinned_root = fs::File::open(dir.path()).unwrap();
+        fs::File::create(&candidate).unwrap().set_len(MAX_OUTBOUND_ATTACHMENT_BYTES + 1).unwrap();
+        assert!(read_scoped_attachment(&pinned_root, Path::new("report.pdf")).is_err());
+        fs::remove_file(&candidate).unwrap();
+        fs::create_dir(&candidate).unwrap();
+        assert!(read_scoped_attachment(&pinned_root, Path::new("report.pdf")).is_err());
+        fs::remove_dir(&candidate).unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        let fifo = std::ffi::CString::new(candidate.as_os_str().as_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path in an owned temporary directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(read_scoped_attachment(&pinned_root, Path::new("report.pdf")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_keeps_the_pinned_root_when_its_path_is_replaced() {
+        let fixture = root();
+        let wiki = fixture.path().join("wiki");
+        fs::create_dir(&wiki).unwrap();
+        fs::write(wiki.join("report.pdf"), b"SYNTHETIC_ORIGINAL").unwrap();
+        let pinned_root = fs::File::open(&wiki).unwrap();
+        fs::rename(&wiki, fixture.path().join("previous-wiki")).unwrap();
+        fs::create_dir(&wiki).unwrap();
+        fs::write(wiki.join("report.pdf"), b"SYNTHETIC_REPLACEMENT").unwrap();
+        assert_eq!(read_scoped_attachment(&pinned_root, Path::new("report.pdf")).unwrap(), b"SYNTHETIC_ORIGINAL");
+    }
+
+    #[tokio::test]
+    async fn downloaded_original_is_delivered_without_rerendering() {
+        let dir = root();
+        let original = b"%PDF-1.7\n\x00\xfforiginal bytes";
+        let path = augmentagent_docs::delivery::stage(dir.path(), "Example report.pdf", original).unwrap();
+        let marker = format!("ATTACH: {}", path.display());
+        let (text, files) = prepare_answer_delivery(&marker, Some(dir.path())).await;
+        assert!(!text.contains("couldn't attach"));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "Example report.pdf");
+        assert_eq!(files[0].data, original);
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let (_, refused) = prepare_answer_delivery(&format!("ATTACH: {}", outside.path().display()), Some(dir.path())).await;
+        assert!(refused.is_empty());
     }
 
     #[test]

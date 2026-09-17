@@ -90,10 +90,13 @@ fi
 #   3. reasoner-config Rust  — `reasoner.rs` wires prompts to allowlists +
 #                              env vars, and silent bugs there (like #214)
 #                              are exactly what this gate exists to catch.
+# Later widenings (#229 runtime Rust, #1048 Codex bridge/sandbox scripts)
+# are annotated inline below.
 #
 # Patterns are evaluated as fixed POSIX globs against each changed path.
 # A single match means "verification required".
 MATCHED=""
+BRIDGE_MATCHED=""
 while IFS= read -r f; do
   [[ -z "$f" ]] && continue
   case "$f" in
@@ -126,6 +129,12 @@ while IFS= read -r f; do
     crates/augmentagent-approval-discord/src/event_handler.rs)   MATCHED+="$f"$'\n' ;;
     crates/augmentagent-approval-discord/src/loops.rs)           MATCHED+="$f"$'\n' ;;
     crates/augmentagent-approval-discord/src/process_loops.rs)   MATCHED+="$f"$'\n' ;;
+    # #1048: the Codex fallback's enforcement boundary. CI runs their
+    # suites (and fails without sandbox enforcement), but only after the PR
+    # exists, and the real-VM tests never run there. The receipt is the proof
+    # they ran first on a host that enforces the sandbox.
+    scripts/codex-tool-bridge.py|scripts/codex-command-sandbox.py|scripts/codex-build-vm.py|scripts/build-dependency-proxy.py|scripts/provider-supervisor.py)
+      MATCHED+="$f"$'\n'; BRIDGE_MATCHED+="$f"$'\n' ;;
   esac
 done <<<"$CHANGED"
 
@@ -143,6 +152,34 @@ if [[ -f "$RECEIPT" && -s "$RECEIPT" ]]; then
   exit 0
 fi
 
+# Bridge/sandbox scripts need a specific receipt: the Python suites run on a
+# host that enforces the sandbox, plus the owner-run VM suite for the VM-side
+# scripts. Shown only when one of those files matched.
+BRIDGE_SECTION=""
+if [[ -n "$BRIDGE_MATCHED" ]]; then
+  BRIDGE_SECTION=$(cat <<'BRIDGE'
+  scripts/codex-tool-bridge.py, codex-command-sandbox.py, codex-build-vm.py, build-dependency-proxy.py
+  OR provider-supervisor.py (the Codex enforcement boundary; see docs/TESTING.md):
+      CI runs these suites only after the PR exists, and never runs the real-VM tests. Locally, a kernel
+      without Landlock ABI 6 SKIPS every sandbox test. The receipt must prove they ran un-skipped here:
+        python3 scripts/tests/host_capabilities.py
+        (cd scripts && python3 -m unittest discover -s tests -p '*_test.py' -v)
+      → the report must say "command sandbox: enforceable" and "PDF renderer: installed", and the
+        run must end in OK with only the opt-in VM/live tests skipped.
+      For codex-build-vm.py, build-dependency-proxy.py or provider-supervisor.py, also run the
+      real-VM tests (one VM at a time; the runtime config is private, never commit it):
+        (cd scripts && JARVIS_TEST_VM_CONFIG=<runtime.json> python3 -m unittest tests.codex_build_vm_test tests.codex_tool_bridge_test -v)
+      The receipt for these files must contain:
+        command:      the exact commands above
+        capabilities: the three host_capabilities.py output lines
+        observed:     the "Ran N tests" and "OK (skipped=K)" lines, plus every skip reason
+        vm:           the JARVIS_TEST_VM_CONFIG run's result line, or "not run: <reason>"
+        verifies:     the changed script(s)
+BRIDGE
+)
+  BRIDGE_SECTION+=$'\n\n'
+fi
+
 # Block. Tell the agent EXACTLY what to do — the failure mode here is
 # always "agent doesn't know the project has a wiki ask verification
 # path", so spell out the command, the receipt path, and a one-line
@@ -156,7 +193,7 @@ The gate exists because PRs in this codebase have repeatedly compiled clean + pa
 
 How to satisfy the gate — pick the verification path matching your changed file:
 
-  schema/wiki-ask.md OR crates/augmentagent-channel-core/src/reasoner.rs (ask_opts/allowlist/prompt):
+${BRIDGE_SECTION}  schema/wiki-ask.md OR crates/augmentagent-channel-core/src/reasoner.rs (ask_opts/allowlist/prompt):
       ./target/release/augmentagent --wiki-dir ./wiki wiki ask "<question that exercises the change>"
       → observe: the agent actually invokes the new tool / sees the new prompt section.
 

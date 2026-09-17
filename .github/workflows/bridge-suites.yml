@@ -1,0 +1,50 @@
+name: Codex bridge suites
+
+# #1048: the Codex tool bridge is the enforcement boundary for the fallback
+# path. Its Python suites (bridge, command sandbox, build VM, dependency proxy)
+# run on every PR and on main. Owner-run suites (live providers, real VM via
+# JARVIS_TEST_VM_CONFIG) skip here; see docs/TESTING.md.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bridge-suites:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # The runner must enforce the sandbox: a missing Landlock ABI 6,
+      # libseccomp or Poppler fails the report step and every sandbox test
+      # instead of skipping them (local runs still skip).
+      REQUIRE_ENFORCEABLE_SANDBOX: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install renderer, syscall-filter library and ripgrep
+        run: |
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+            poppler-utils libseccomp2 ripgrep
+      - name: Report sandbox capabilities
+        run: python3 scripts/tests/host_capabilities.py
+      - name: Require the four enforcement suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          for suite in codex_tool_bridge_test codex_command_sandbox_test \
+                       codex_build_vm_test build_dependency_proxy_test; do
+            test -f "scripts/tests/$suite.py" || { echo "missing suite: $suite" >&2; exit 1; }
+          done
+      - name: Run Python suites
+        working-directory: scripts
+        # Live and VM suites need explicit opt-in env vars and skip without them.
+        env:
+          JARVIS_TEST_VM_CONFIG: ""
+          JARVIS_TEST_LIVE_DISCOVERY: ""
+        run: python3 -m unittest discover -s tests -p '*_test.py' -v
+      - name: Test the PR verification gate's bridge-suite receipt rule
+        run: bash scripts/tests/agent-pr-verify-gate.test.sh

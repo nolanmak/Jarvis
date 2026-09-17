@@ -121,6 +121,8 @@ pub enum JournalError {
     Signing(String),
     #[error("response decode: {0}")]
     Decode(#[from] serde_json::Error),
+    #[error("journal archive: {0}")]
+    Archive(String),
     #[error("store: {0}")]
     Store(String),
 }

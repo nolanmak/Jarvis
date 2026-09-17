@@ -1,3 +1,4 @@
+# User unit (%h = your home). Install with its .timer into ~/.config/systemd/user/.
 [Unit]
 Description=AugmentAgent auto-PR loop health watchdog (one check)
 Documentation=https://github.com/nolanmak/Jarvis/pull/997
@@ -5,11 +6,13 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/nolan-makatche/AugmentAgent
-EnvironmentFile=-/home/nolan-makatche/AugmentAgent/.env
+WorkingDirectory=%h/AugmentAgent
+EnvironmentFile=-%h/AugmentAgent/.env
 # Out of process on purpose: a wedged or dead daemon cannot report itself.
-ExecStart=/home/nolan-makatche/AugmentAgent/target/release/augmentagent autopr-health --notify
+ExecStart=%h/AugmentAgent/target/release/augmentagent autopr-health --notify
 # A finding exits 1; that is a report, not a unit failure.
 SuccessExitStatus=0 1
-StandardOutput=append:/home/nolan-makatche/.local/state/augmentagent/autopr-health.log
-StandardError=append:/home/nolan-makatche/.local/state/augmentagent/autopr-health.log
+# append: does not create parent dirs; StateDirectory does (as in siblings).
+StateDirectory=augmentagent
+StandardOutput=append:%h/.local/state/augmentagent/autopr-health.log
+StandardError=append:%h/.local/state/augmentagent/autopr-health.log

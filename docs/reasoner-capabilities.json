@@ -1,0 +1,502 @@
+{
+  "version": 1,
+  "profiles": {
+    "text": {
+      "scope": "No host tools; provider receives supplied context only",
+      "operations": []
+    },
+    "wiki-read-optional": {
+      "scope": "Optional wiki read roots; no writes",
+      "operations": [
+        "Read",
+        "Grep",
+        "Glob"
+      ]
+    },
+    "wiki-read": {
+      "scope": "Declared wiki read roots; no writes",
+      "operations": [
+        "Read",
+        "Grep",
+        "Glob"
+      ]
+    },
+    "wiki-write": {
+      "scope": "Scoped wiki reads and writes; control and credential paths excluded",
+      "operations": [
+        "Read",
+        "Grep",
+        "Glob",
+        "Write",
+        "Edit"
+      ]
+    },
+    "wiki-agentic": {
+      "scope": "Wiki writes, declared context reads, single-file Read of inbound attachment temp files, approved service commands and configured MCP; original guards enforced",
+      "operations": [
+        "Read",
+        "Read (Discord and iMessage attachment files only)",
+        "Grep",
+        "Glob",
+        "Write",
+        "Edit",
+        "Bash allowlist",
+        "WebSearch",
+        "WebFetch",
+        "configured MCP"
+      ]
+    },
+    "social-read-mcp": {
+      "scope": "Optional authenticated MCP with read-only guard plus declared wiki reads",
+      "operations": [
+        "Read",
+        "Grep",
+        "Glob",
+        "guarded MCP"
+      ]
+    },
+    "source-inspect": {
+      "scope": "Worktree source and read-only Git metadata; no source writes",
+      "operations": [
+        "Read",
+        "Grep",
+        "Glob",
+        "Bash(ls)",
+        "Bash(git log/diff/status)"
+      ]
+    },
+    "source-build": {
+      "scope": "Worktree source writes; disposable confined Cargo/npm builds; gated publication and independent review remain outside builder",
+      "operations": [
+        "Read",
+        "Grep",
+        "Glob",
+        "Write",
+        "Edit",
+        "Bash(cargo/npm)",
+        "Bash(git diff/status)",
+        "Bash(ls)"
+      ]
+    }
+  },
+  "presets": [
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::archetype_pick_opts",
+      "permission_profile": "text",
+      "output_contract": "Structured archetype selection",
+      "model_tier": "fast",
+      "tier_rationale": "Pins Haiku: single-call archetype classification (#36); cost and latency matter, output only selects an optional prompt fragment.",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_production_structured_output_contracts",
+        "provider_output_contracts::claude_production_structured_output_contracts"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::ask_opts",
+      "permission_profile": "wiki-agentic",
+      "output_contract": "Complete assistant transcript with original ATTACH markers and image context",
+      "model_tier": "quality",
+      "tier_rationale": "Pins Opus: owner-facing answers where coherence matters; interactive, low volume.",
+      "attachment_reads": "Read-only exceptions for inbound attachment temp files, defined once in codex_tools::read_allowances and mirrored by scripts/aa-wiki-scope-guard.sh",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "capability_inventory::query_preset_policy_carries_attachment_read_allowances_not_wider_roots",
+        "capability_inventory::query_attachments_read_identically_under_claude_guard_and_codex_bridge",
+        "codex_tools::tests::scope_guard_carve_outs_mirror_the_read_allowance_definition",
+        "codex_tools::tests::scope_guard_and_definition_agree_on_attachment_names",
+        "codex_tool_bridge_test::ReadAllowanceTests",
+        "query_delivery_contract_tests::live_query_fallback_delivers_original_and_skips_latched_primary"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::digest_opts",
+      "permission_profile": "wiki-read-optional",
+      "output_contract": "Digest prose with supplied coverage and tone requirements",
+      "model_tier": "quality",
+      "tier_rationale": "Pins Opus: digest tone and coverage benefit from quality; one call per digest.",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_digest_extraction_and_lint_contracts",
+        "provider_output_contracts::claude_digest_extraction_and_lint_contracts"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::draft_opts",
+      "permission_profile": "wiki-read-optional",
+      "output_contract": "Draft response; sending remains approval-gated",
+      "model_tier": "quality",
+      "tier_rationale": "Pins Opus: reply drafts are the product the owner approves.",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_classic_draft_contract",
+        "provider_output_contracts::claude_classic_draft_contract"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::ingest_opts",
+      "permission_profile": "wiki-write",
+      "output_contract": "Wiki update and completion response",
+      "model_tier": "fast",
+      "tier_rationale": "Pins Haiku: per-message wiki upkeep runs on every ingested message, so cost dominates.",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_wiki_mutation_contracts",
+        "provider_output_contracts::claude_wiki_mutation_contracts"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::lint_opts",
+      "permission_profile": "wiki-read",
+      "output_contract": "Structured lint findings",
+      "model_tier": "quality",
+      "tier_rationale": "Pins Opus: lint is reasoning-heavy and low volume.",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_digest_extraction_and_lint_contracts",
+        "provider_output_contracts::claude_digest_extraction_and_lint_contracts"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::loop_parse_opts",
+      "permission_profile": "text",
+      "output_contract": "Structured recurring-task specification",
+      "model_tier": "fast",
+      "tier_rationale": "Pins Haiku: interactive /loop parsing where sub-second feedback matters; one small JSON object.",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_production_structured_output_contracts",
+        "provider_output_contracts::claude_production_structured_output_contracts"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::resume_opts",
+      "permission_profile": "wiki-write",
+      "output_contract": "Seeded wiki files and completion response",
+      "model_tier": "quality",
+      "tier_rationale": "Pins Opus: one-shot, high-leverage wiki seeding.",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_wiki_mutation_contracts",
+        "provider_output_contracts::claude_wiki_mutation_contracts"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::social_adapter_opts",
+      "permission_profile": "text",
+      "output_contract": "Platform-specific content adaptation",
+      "model_tier": "quality",
+      "tier_rationale": "Pins Opus: voice and format fidelity across platforms matter; a handful of variants per compose.",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_channel_tests::live_codex_channel_formats",
+        "provider_channel_tests::live_claude_channel_formats"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::socialapi_draft_opts",
+      "permission_profile": "social-read-mcp",
+      "output_contract": "Draft response using optional read-only integration context",
+      "model_tier": "preserved",
+      "tier_rationale": "Builds nothing itself: wraps draft_opts (quality) and keeps its model.",
+      "conformance": [
+        "capability_inventory::optional_mcp_profiles_preserve_readonly_guard_and_private_auth",
+        "live_optional_mcp::live_codex_optional_http_mcp",
+        "live_optional_mcp::live_claude_optional_http_mcp"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::tone_summarize_opts",
+      "permission_profile": "text",
+      "output_contract": "Structured voice descriptor",
+      "model_tier": "fast",
+      "tier_rationale": "Pins Haiku: pure transform of a sent-mail corpus into a small voice descriptor (#73); per-recipient refresh.",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_production_structured_output_contracts",
+        "provider_output_contracts::claude_production_structured_output_contracts"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::triage_opts",
+      "permission_profile": "wiki-read-optional",
+      "output_contract": "Structured triage decision",
+      "model_tier": "quality",
+      "tier_rationale": "Pins Opus (AUGMENTAGENT_TRIAGE_MODEL): #448 measured that cheaper triage regressed decision quality against 13,685 labelled decisions.",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_output_contracts::codex_production_structured_output_contracts",
+        "provider_output_contracts::claude_production_structured_output_contracts"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::wiki_migrate_opts",
+      "permission_profile": "wiki-read",
+      "output_contract": "Structured migration patch; caller preserves existing frontmatter",
+      "model_tier": "fast",
+      "tier_rationale": "Pins Haiku: one-shot corpus migration where cost scales with page count; Rust applies the patch.",
+      "conformance": [
+        "capability_inventory::core_presets_match_permission_contracts",
+        "capability_inventory::core_presets_execute_scoped_file_contracts_through_packaged_bridge",
+        "provider_migration_tests::live_codex_migration_contract",
+        "provider_migration_tests::live_claude_migration_contract"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/reasoner.rs::with_socialapi_readonly_mcp",
+      "permission_profile": "social-read-mcp",
+      "output_contract": "Preserve the wrapped preset output contract",
+      "model_tier": "preserved",
+      "tier_rationale": "Builds nothing itself: adds the read-only MCP profile to the wrapped preset and keeps its model.",
+      "conformance": [
+        "capability_inventory::optional_mcp_profiles_preserve_readonly_guard_and_private_auth",
+        "live_optional_mcp::live_codex_optional_http_mcp",
+        "live_optional_mcp::live_claude_optional_http_mcp"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-core/src/resolve.rs::extract_opts",
+      "permission_profile": "text",
+      "output_contract": "Structured extraction from supplied context",
+      "model_tier": "fast",
+      "tier_rationale": "Pins Haiku: structured ask extraction from supplied text; a confidence floor gates what is injected into drafts.",
+      "conformance": [
+        "provider_output_contracts::codex_digest_extraction_and_lint_contracts",
+        "provider_output_contracts::claude_digest_extraction_and_lint_contracts"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-discord-dm/src/channel.rs::handle_priority",
+      "permission_profile": "text",
+      "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
+      "model_tier": "quality",
+      "tier_rationale": "Quality. Generates the reply-draft program the owner approves, in the same flow as its classic fallback draft_opts (quality). Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon quality tier (claude-opus-4-8 by default, env-overridable via AUGMENTAGENT_OPUS_MODEL, the same knob draft_opts reads, or AUGMENTAGENT_MODEL_CLAUDE_QUALITY). Volume is bounded to messages that survive triage and the reply guards.",
+      "conformance": [
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-discord-dm/src/digest.rs::run_one_digest",
+      "permission_profile": "wiki-read",
+      "output_contract": "Activity digest prose; wiki writes removed from the inherited ingestion preset",
+      "model_tier": "preserved",
+      "tier_rationale": "Builds nothing itself: narrows ingest_opts (fast) to read-only tools and keeps its model.",
+      "conformance": [
+        "digest::tests::live_codex_digest_fallback_contract",
+        "digest::tests::live_claude_digest_contract"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-email/src/channel.rs::process_email",
+      "permission_profile": "text",
+      "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
+      "model_tier": "quality",
+      "tier_rationale": "Quality. Generates the reply-draft program the owner approves, in the same flow as its classic fallback draft_opts (quality). Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon quality tier (claude-opus-4-8 by default, env-overridable via AUGMENTAGENT_OPUS_MODEL, the same knob draft_opts reads, or AUGMENTAGENT_MODEL_CLAUDE_QUALITY). Volume is bounded to messages that survive triage and the reply guards.",
+      "conformance": [
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-email/src/sigextract.rs::extract",
+      "permission_profile": "text",
+      "output_contract": "Structured extraction from supplied context",
+      "model_tier": "fast",
+      "tier_rationale": "Fast. Strict-JSON extraction of contact fields from an already-detected signature block, the same output contract as resolve.rs::extract_opts and voice extract.rs::opts, which pin Haiku. Runs only in the manual backfill-signatures batch (up to --limit 2000 emails). Output is guarded: per-field confidence gates auto-fill (0.7 default), merges are fill-blanks-only, a regex fallback covers parse failures, and low-confidence fields go to a Discord digest. Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon fast tier (claude-haiku-4-5-20251001 by default, env-overridable via AUGMENTAGENT_MODEL_CLAUDE_FAST).",
+      "conformance": [
+        "provider_channel_tests::live_codex_channel_formats",
+        "provider_channel_tests::live_claude_channel_formats"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-instagram/src/channel.rs::handle_dm",
+      "permission_profile": "text",
+      "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
+      "model_tier": "quality",
+      "tier_rationale": "Quality. Generates the reply-draft program the owner approves, in the same flow as its classic fallback draft_opts (quality). Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon quality tier (claude-opus-4-8 by default, env-overridable via AUGMENTAGENT_OPUS_MODEL, the same knob draft_opts reads, or AUGMENTAGENT_MODEL_CLAUDE_QUALITY). Volume is bounded to messages that survive triage and the reply guards.",
+      "conformance": [
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-journal/src/compose.rs::compose_opts",
+      "permission_profile": "text",
+      "output_contract": "Journal prose composed from supplied context",
+      "model_tier": "fast",
+      "tier_rationale": "Pins Haiku: short journal prose composed from supplied conversation, no tools.",
+      "conformance": [
+        "provider_channel_tests::live_codex_channel_formats",
+        "provider_channel_tests::live_claude_channel_formats"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-linkedin/src/channel.rs::process_email",
+      "permission_profile": "text",
+      "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
+      "model_tier": "quality",
+      "tier_rationale": "Quality. Generates the reply-draft program the owner approves, in the same flow as its classic fallback draft_opts (quality). Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon quality tier (claude-opus-4-8 by default, env-overridable via AUGMENTAGENT_OPUS_MODEL, the same knob draft_opts reads, or AUGMENTAGENT_MODEL_CLAUDE_QUALITY). Volume is bounded to messages that survive triage and the reply guards.",
+      "conformance": [
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-slack/src/channel.rs::handle_priority",
+      "permission_profile": "text",
+      "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
+      "model_tier": "quality",
+      "tier_rationale": "Quality. Generates the reply-draft program the owner approves, in the same flow as its classic fallback draft_opts (quality). Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon quality tier (claude-opus-4-8 by default, env-overridable via AUGMENTAGENT_OPUS_MODEL, the same knob draft_opts reads, or AUGMENTAGENT_MODEL_CLAUDE_QUALITY). Volume is bounded to messages that survive triage and the reply guards.",
+      "conformance": [
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-twitter/src/channel.rs::dispatch_reply_arm",
+      "permission_profile": "text",
+      "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
+      "model_tier": "quality",
+      "tier_rationale": "Quality. Generates the reply-draft program the owner approves, in the same flow as its classic fallback draft_opts (quality). Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon quality tier (claude-opus-4-8 by default, env-overridable via AUGMENTAGENT_OPUS_MODEL, the same knob draft_opts reads, or AUGMENTAGENT_MODEL_CLAUDE_QUALITY). Volume is bounded to messages that survive triage and the reply guards.",
+      "conformance": [
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-voice/src/extract.rs::opts",
+      "permission_profile": "text",
+      "output_contract": "Structured extraction from supplied context",
+      "model_tier": "fast",
+      "tier_rationale": "Pins Haiku: structures a voice-memo transcript; the raw transcript is kept if structuring fails.",
+      "conformance": [
+        "provider_channel_tests::live_codex_channel_formats",
+        "provider_channel_tests::live_claude_channel_formats"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-channel-whatsapp/src/channel.rs::handle_message",
+      "permission_profile": "text",
+      "output_contract": "Fenced TypeScript for the existing code-mode executor; host tools disabled",
+      "model_tier": "quality",
+      "tier_rationale": "Quality. Generates the reply-draft program the owner approves, in the same flow as its classic fallback draft_opts (quality). Previously inherited the owner's interactive model (Opus 5 at time of review); now the daemon quality tier (claude-opus-4-8 by default, env-overridable via AUGMENTAGENT_OPUS_MODEL, the same knob draft_opts reads, or AUGMENTAGENT_MODEL_CLAUDE_QUALITY). Volume is bounded to messages that survive triage and the reply guards.",
+      "conformance": [
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::codex_generated_draft_executes_in_code_mode",
+        "provider_output_contracts::claude_generated_draft_executes_in_code_mode"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/main.rs::run_reasoner_selftest",
+      "permission_profile": "text",
+      "output_contract": "Selftest response used for text-only failover diagnosis",
+      "model_tier": "quality",
+      "tier_rationale": "Pins the daemon quality tier (AUGMENTAGENT_OPUS_MODEL, the same knob as draft_opts) so the probe exercises the models the important presets use.",
+      "conformance": [
+        "reasoner_failover_e2e::quota_refusal_fails_over_to_codex_and_latches",
+        "reasoner_failover_e2e::healthy_primary_never_spawns_fallback"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/self_improve.rs::codex_review_opts",
+      "permission_profile": "text",
+      "output_contract": "Independent review of supplied diff and caller evidence",
+      "model_tier": "quality",
+      "tier_rationale": "Pins a Codex model id (AUGMENTAGENT_AUTOPR_CODEX_MODEL); a non-haiku pin maps to the quality tier for the independent review.",
+      "conformance": [
+        "self_improve::lifecycle_tests::live_fallback_pipeline_resumes_after_independent_reviewer_recovers"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/self_improve.rs::fix_opts",
+      "permission_profile": "source-build",
+      "output_contract": "Source edits and verification results; no self-approval",
+      "model_tier": "quality",
+      "tier_rationale": "Pins the auto-PR build model (AUGMENTAGENT_AUTOPR_BUILD_MODEL) for source edits and verification.",
+      "conformance": [
+        "self_improve::tests::live_codex_fallback_builder_fixes_code_and_runs_red_green_tests",
+        "self_improve::lifecycle_tests::live_fallback_pipeline_resumes_after_independent_reviewer_recovers"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/self_improve.rs::review_opts",
+      "permission_profile": "source-inspect",
+      "output_contract": "Review findings and acceptance grading",
+      "model_tier": "quality",
+      "tier_rationale": "Pins the auto-PR scope model (AUGMENTAGENT_AUTOPR_SCOPE_MODEL) for acceptance grading.",
+      "conformance": [
+        "self_improve::tests::source_inspection_presets_enforce_read_only_bridge_access",
+        "self_improve::tests::live_codex_scopes_source_and_rejects_an_incomplete_fix",
+        "self_improve::lifecycle_tests::live_fallback_pipeline_resumes_after_independent_reviewer_recovers"
+      ],
+      "provider_conformance": "verified"
+    },
+    {
+      "callsite": "crates/augmentagent-cli/src/self_improve.rs::scope_opts",
+      "permission_profile": "source-inspect",
+      "output_contract": "Scope verdict, complexity, implementation plan and acceptance criteria",
+      "model_tier": "quality",
+      "tier_rationale": "Pins the auto-PR scope model (AUGMENTAGENT_AUTOPR_SCOPE_MODEL) for scoping and planning.",
+      "conformance": [
+        "self_improve::tests::source_inspection_presets_enforce_read_only_bridge_access",
+        "self_improve::tests::live_codex_scopes_source_and_rejects_an_incomplete_fix",
+        "self_improve::lifecycle_tests::live_fallback_pipeline_resumes_after_independent_reviewer_recovers"
+      ],
+      "provider_conformance": "verified"
+    }
+  ]
+}

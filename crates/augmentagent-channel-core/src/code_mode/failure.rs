@@ -859,6 +859,7 @@ mod tests {
                 audit_logger: None,
                 audit_notifier: None,
                 session_id: None,
+                handoff_path: None,
             },
             user_msg: "draft a reply".to_string(),
             manifest: manifest_v1(),
