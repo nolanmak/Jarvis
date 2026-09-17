@@ -405,6 +405,18 @@ async fn sync_channel(
             after = n.clone();
         }
         if hit_cap || !full_page || newest.is_none() {
+            if !hit_cap {
+                // Caught up. When the conversation's reported last message
+                // wasn't returned (deleted), advance to it anyway so later
+                // runs see the conversation as unchanged instead of
+                // re-fetching an empty page every time.
+                let reported = target.last_message_id.as_deref().map_or(0, snowflake);
+                let reported = live_cap.map_or(reported, |cap| reported.min(cap));
+                if reported > snowflake(&after) {
+                    set_cursor(store, &target.channel_id, &reported.to_string())
+                        .map_err(store_err)?;
+                }
+            }
             break;
         }
     }
@@ -587,6 +599,40 @@ mod tests {
         assert_eq!(report.inserted, 0);
         assert_eq!(report.requests, 1);
         assert_eq!(row_count(&store), 151);
+    }
+
+    #[tokio::test]
+    async fn deleted_last_message_does_not_refetch_every_run() {
+        let mut server = mockito::Server::new_async().await;
+        // Discord still reports 99 as last_message_id, but 99 was deleted.
+        let _dms = server
+            .mock("GET", "/users/@me/channels")
+            .with_body(dm_list("99"))
+            .expect(2)
+            .create_async()
+            .await;
+        let _p = server
+            .mock("GET", "/channels/10/messages?limit=100&after=0")
+            .with_body(json!([msg(50, "500", "still here")]).to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let _stuck = server
+            .mock("GET", "/channels/10/messages?limit=100&after=50")
+            .with_body("[]")
+            .expect(0)
+            .create_async()
+            .await;
+        let client = DiscordClient::with_base_url(auth(), server.url());
+        let (_d, store) = store();
+        let first = sync_once(&client, &store, "900", &cfg_dms()).await.unwrap();
+        assert_eq!((first.inserted, first.requests), (1, 2));
+        assert_eq!(cursor(&store, "10").unwrap().as_deref(), Some("99"));
+        let second = sync_once(&client, &store, "900", &cfg_dms()).await.unwrap();
+        assert_eq!(
+            (second.unchanged, second.fetched, second.requests),
+            (1, 0, 1)
+        );
     }
 
     #[tokio::test]
