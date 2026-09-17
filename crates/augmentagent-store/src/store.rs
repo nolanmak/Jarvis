@@ -1717,6 +1717,33 @@ impl Store {
              BEGIN INSERT OR REPLACE INTO message_index_queue(message_id) VALUES (OLD.messageId); END;",
         )?;
 
+        // #1101 — handle → person cache derived from the wiki identity index
+        // (rebuildable any time via `augmentagent messages resolve-people`),
+        // plus a participants view joining it onto the message index.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_people (\
+                 handle     TEXT PRIMARY KEY,\
+                 person_key TEXT NOT NULL\
+             );\
+             CREATE INDEX IF NOT EXISTS idx_message_people_person ON message_people(person_key);\
+             CREATE TABLE IF NOT EXISTS message_person_names (\
+                 person_key TEXT NOT NULL,\
+                 name       TEXT NOT NULL,\
+                 PRIMARY KEY (person_key, name)\
+             );\
+             CREATE INDEX IF NOT EXISTS idx_message_person_names_name ON message_person_names(name);\
+             CREATE TABLE IF NOT EXISTS message_people_meta (\
+                 key   TEXT PRIMARY KEY,\
+                 value TEXT NOT NULL\
+             );\
+             CREATE VIEW IF NOT EXISTS conversation_people AS \
+             SELECT h.conversation_id, h.handle, mp.person_key FROM ( \
+                 SELECT conversation_id, sender_handle AS handle FROM message_index WHERE from_me = 0 \
+                 UNION \
+                 SELECT conversation_id, counterpart_handle FROM message_index WHERE counterpart_handle IS NOT NULL \
+             ) h LEFT JOIN message_people mp ON mp.handle = h.handle;",
+        )?;
+
         Ok(())
     }
 

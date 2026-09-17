@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 augmentagent-store = { path = "../augmentagent-store" }
+augmentagent-wiki = { path = "../augmentagent-wiki" }
 
 anyhow = { workspace = true }
 serde = { workspace = true }
